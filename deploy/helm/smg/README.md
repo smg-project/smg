@@ -183,6 +183,27 @@ A router that gets its workers at runtime through the admin API (`POST /workers`
 
 The gateway drains in-flight requests for `router.shutdownGracePeriodSeconds` (default 180, passed as `--shutdown-grace-period-secs`); the pod's `terminationGracePeriodSeconds` is that plus `router.terminationGraceMarginSeconds` (default 30), so the kubelet does not kill the drain at its default 30 s.
 
+#### Dashboard and Alerts
+
+`grafana.dashboard.enabled` ships a Grafana dashboard as a ConfigMap (label `grafana_dashboard: "1"` for the sidecar loader) with 41 panels in seven rows: traffic (request rate, responses by status, 5xx ratio, errors by API code and router error type, token throughput), latency (TTFT and time per output token p50/p95/p99 and per model, request and HTTP duration p99), capacity and queues (admission in-flight and queued, rejections, engine running and waiting requests, KV cache usage and in-flight request age per worker, connections), workers (healthy count, health and circuit-breaker state per worker, health checks, overload shed and fallback, retries), cache and KV events (engine prefix cache hit rate, cache-aware decisions and match ratio, KV event lag, integrity counters, degraded ranks, index size), Symphony (outputs by outcome, malformed outputs by reason, fallbacks and refusals) and runtime (tokio busy ratio, event-loop stalls and delay, dropped log lines, memory, tasks, tokenizer cache). Every panel queries a family the gateway describes; the gateway's test suite holds the dashboard to the catalog.
+
+`prometheusRule.enabled` adds a `PrometheusRule` with ten alerts, thresholds under `prometheusRule.alerts` (the defaults and their rationale are in `values.yaml`):
+
+| Alert | Severity | Fires when |
+|---|---|---|
+| `SmgGatewayDown` | critical | the router's scrape target is down for `scrapeMissingFor` (`prometheusRule.jobSelector` names the target; empty = the Service name) |
+| `SmgNoHealthyWorker` | critical | no registered worker is healthy for `noHealthyWorkerFor` |
+| `SmgHighErrorRatio` | critical | the 5xx share of responses exceeds `errorRatio` for `errorRatioFor` |
+| `SmgTtftP99High` | critical | p99 time to first token exceeds `ttftP99Seconds` for `ttftP99For` |
+| `SmgKvUsageNearCapacity` | warning | a worker's KV token usage exceeds `kvUsage` for `kvUsageFor` |
+| `SmgCircuitBreakerOpen` | warning | a worker's circuit breaker stays open for `circuitBreakerOpenFor` |
+| `SmgAdmissionRejections` | warning | the admission queue rejects requests for `admissionRejectionsFor` |
+| `SmgEventLoopStalls` | warning | more than `eventLoopStalls` event-loop stalls in ten minutes |
+| `SmgDroppedLogLines` | warning | a log sink dropped lines in the last ten minutes |
+| `SmgKvEventDegradedRanks` | warning | an engine rank's KV index stays degraded for `degradedRanksFor` |
+
+Readiness itself is a kubelet signal: with kube-state-metrics in the cluster, `kube_pod_status_ready` on the router pods complements `SmgGatewayDown`.
+
 #### Startup Probes
 
 Model loading takes 60-300 seconds. Workers have startup probes with generous defaults:
@@ -212,7 +233,7 @@ workers:
 | [`with-postgres.yaml`](examples/with-postgres.yaml) | PostgreSQL history backend, its URL in a Secret |
 | [`with-service-discovery.yaml`](examples/with-service-discovery.yaml) | K8s auto-discovery |
 | [`with-ingress.yaml`](examples/with-ingress.yaml) | Ingress with TLS |
-| [`with-monitoring.yaml`](examples/with-monitoring.yaml) | ServiceMonitor + Grafana dashboard |
+| [`with-monitoring.yaml`](examples/with-monitoring.yaml) | ServiceMonitor + Grafana dashboard + PrometheusRule |
 
 ## Testing
 

@@ -11,45 +11,1198 @@ metadata:
 data:
   smg-dashboard.json: |
     {
-      "annotations": { "list": [] },
+      "annotations": {
+        "list": []
+      },
       "editable": true,
       "fiscalYearStartMonth": 0,
-      "graphTooltip": 0,
+      "graphTooltip": 1,
       "links": [],
       "panels": [
         {
-          "title": "Request Rate",
-          "type": "timeseries",
-          "datasource": "Prometheus",
-          "targets": [{ "expr": "sum by (model, endpoint) (rate(smg_router_requests_total[5m]))", "legendFormat": "{{ "{{" }}model{{ "}}" }} {{ "{{" }}endpoint{{ "}}" }}" }],
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 }
+          "title": "Traffic",
+          "type": "row",
+          "collapsed": false,
+          "gridPos": {
+            "h": 1,
+            "w": 24,
+            "x": 0,
+            "y": 0
+          },
+          "panels": []
         },
         {
-          "title": "Request Latency (p99)",
+          "title": "Request rate",
           "type": "timeseries",
           "datasource": "Prometheus",
-          "targets": [{ "expr": "histogram_quantile(0.99, sum by (le) (rate(smg_router_request_duration_seconds_bucket[5m])))", "legendFormat": "p99" }],
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 }
+          "targets": [
+            {
+              "expr": "sum by (model, endpoint) (rate(smg_router_requests_total[5m]))",
+              "legendFormat": "{{ "{{" }}model{{ "}}" }} {{ "{{" }}endpoint{{ "}}" }}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 1
+          }
         },
         {
-          "title": "Active Workers",
+          "title": "Responses by status",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum by (status_code) (rate(smg_http_responses_total[5m]))",
+              "legendFormat": "{{ "{{" }}status_code{{ "}}" }}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 1
+          }
+        },
+        {
+          "title": "5xx ratio",
           "type": "stat",
           "datasource": "Prometheus",
-          "targets": [{ "expr": "sum(max by (worker) (smg_worker_health))", "legendFormat": "workers" }],
-          "gridPos": { "h": 4, "w": 6, "x": 0, "y": 8 }
+          "targets": [
+            {
+              "expr": "sum(rate(smg_http_responses_total{status_code=~\"5..\"}[5m])) / sum(rate(smg_http_responses_total[5m]))",
+              "legendFormat": "5xx"
+            }
+          ],
+          "description": "Server-side failures over every response; the SmgHighErrorRatio alert fires above prometheusRule.alerts.errorRatio.",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "orange",
+                    "value": 0.01
+                  },
+                  {
+                    "color": "red",
+                    "value": 0.05
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ]
+            },
+            "colorMode": "value",
+            "graphMode": "none"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 1
+          }
         },
         {
-          "title": "Queue Depth",
+          "title": "Errors by API code",
           "type": "timeseries",
           "datasource": "Prometheus",
-          "targets": [{ "expr": "sum(smg_admission_queue_depth)", "legendFormat": "queue" }],
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 }
+          "targets": [
+            {
+              "expr": "sum by (error_code) (rate(smg_http_responses_total{error_code!=\"\"}[5m]))",
+              "legendFormat": "{{ "{{" }}error_code{{ "}}" }}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 9
+          }
+        },
+        {
+          "title": "Router errors by type",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum by (error_type) (rate(smg_router_request_errors_total[5m]))",
+              "legendFormat": "{{ "{{" }}error_type{{ "}}" }}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 9
+          }
+        },
+        {
+          "title": "Token throughput",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum by (token_type) (rate(smg_router_tokens_total[5m]))",
+              "legendFormat": "{{ "{{" }}token_type{{ "}}" }}"
+            }
+          ],
+          "description": "Prompt and generated tokens per second (gRPC backends).",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 9
+          }
+        },
+        {
+          "title": "Latency",
+          "type": "row",
+          "collapsed": false,
+          "gridPos": {
+            "h": 1,
+            "w": 24,
+            "x": 0,
+            "y": 17
+          },
+          "panels": []
+        },
+        {
+          "title": "Time to first token",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.5, sum by (le) (rate(smg_router_ttft_seconds_bucket[5m])))",
+              "legendFormat": "p50"
+            },
+            {
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(smg_router_ttft_seconds_bucket[5m])))",
+              "legendFormat": "p95"
+            },
+            {
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(smg_router_ttft_seconds_bucket[5m])))",
+              "legendFormat": "p99"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 18
+          }
+        },
+        {
+          "title": "Time to first token p99 by model",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.99, sum by (le, model) (rate(smg_router_ttft_seconds_bucket[5m])))",
+              "legendFormat": "{{ "{{" }}model{{ "}}" }}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 18
+          }
+        },
+        {
+          "title": "Time per output token",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.5, sum by (le) (rate(smg_router_tpot_seconds_bucket[5m])))",
+              "legendFormat": "p50"
+            },
+            {
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(smg_router_tpot_seconds_bucket[5m])))",
+              "legendFormat": "p95"
+            },
+            {
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(smg_router_tpot_seconds_bucket[5m])))",
+              "legendFormat": "p99"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 18
+          }
+        },
+        {
+          "title": "Time per output token p99 by model",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.99, sum by (le, model) (rate(smg_router_tpot_seconds_bucket[5m])))",
+              "legendFormat": "{{ "{{" }}model{{ "}}" }}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 26
+          }
+        },
+        {
+          "title": "Request duration p99 by endpoint",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.99, sum by (le, endpoint) (rate(smg_router_request_duration_seconds_bucket[5m])))",
+              "legendFormat": "{{ "{{" }}endpoint{{ "}}" }}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 26
+          }
+        },
+        {
+          "title": "HTTP duration p99 by route",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.99, sum by (le, path) (rate(smg_http_request_duration_seconds_bucket[5m])))",
+              "legendFormat": "{{ "{{" }}path{{ "}}" }}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 26
+          }
+        },
+        {
+          "title": "Capacity and queues",
+          "type": "row",
+          "collapsed": false,
+          "gridPos": {
+            "h": 1,
+            "w": 24,
+            "x": 0,
+            "y": 34
+          },
+          "panels": []
+        },
+        {
+          "title": "Admission: in flight and queued",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum(smg_admission_inflight)",
+              "legendFormat": "in flight"
+            },
+            {
+              "expr": "sum(smg_admission_queue_depth)",
+              "legendFormat": "queued"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 35
+          }
+        },
+        {
+          "title": "Admission rejections",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum(rate(smg_admission_queue_rejected_total[5m]))",
+              "legendFormat": "rejected"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 35
+          }
+        },
+        {
+          "title": "Engine running requests per worker",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "max by (worker) (smg_engine_running_requests)",
+              "legendFormat": "{{ "{{" }}worker{{ "}}" }}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 35
+          }
+        },
+        {
+          "title": "Engine waiting requests per worker",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "max by (worker) (smg_engine_waiting_requests)",
+              "legendFormat": "{{ "{{" }}worker{{ "}}" }}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 43
+          }
+        },
+        {
+          "title": "KV cache usage per worker",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "max by (worker) (smg_engine_token_usage)",
+              "legendFormat": "{{ "{{" }}worker{{ "}}" }}"
+            }
+          ],
+          "description": "The engine's KV token usage ratio; the SmgKvUsageNearCapacity alert fires above prometheusRule.alerts.kvUsage.",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "orange",
+                    "value": 0.8
+                  },
+                  {
+                    "color": "red",
+                    "value": 0.9
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 43
+          }
+        },
+        {
+          "title": "In-flight requests by age",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum by (le) (smg_http_inflight_request_age_count)",
+              "legendFormat": "<= {{ "{{" }}le{{ "}}" }} s"
+            }
+          ],
+          "description": "Non-cumulative age buckets; a growing tail is work that does not finish.",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 43
+          }
+        },
+        {
+          "title": "Active HTTP connections",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum(smg_http_connections_active)",
+              "legendFormat": "connections"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 51
+          }
+        },
+        {
+          "title": "Workers",
+          "type": "row",
+          "collapsed": false,
+          "gridPos": {
+            "h": 1,
+            "w": 24,
+            "x": 0,
+            "y": 59
+          },
+          "panels": []
+        },
+        {
+          "title": "Healthy workers",
+          "type": "stat",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum(max by (worker) (smg_worker_health))",
+              "legendFormat": "healthy"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "red",
+                    "value": null
+                  },
+                  {
+                    "color": "green",
+                    "value": 1
+                  }
+                ]
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ]
+            },
+            "colorMode": "value",
+            "graphMode": "none"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 60
+          }
+        },
+        {
+          "title": "Worker health",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "max by (worker) (smg_worker_health)",
+              "legendFormat": "{{ "{{" }}worker{{ "}}" }}"
+            }
+          ],
+          "description": "1 healthy, 0 unhealthy, per worker.",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 60
+          }
+        },
+        {
+          "title": "Circuit breaker state",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "max by (worker) (smg_worker_cb_state)",
+              "legendFormat": "{{ "{{" }}worker{{ "}}" }}"
+            }
+          ],
+          "description": "0 closed, 1 open (the worker is skipped), 2 half-open.",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 60
+          }
+        },
+        {
+          "title": "Health checks by result",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum by (result) (rate(smg_worker_health_checks_total[5m]))",
+              "legendFormat": "{{ "{{" }}result{{ "}}" }}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 68
+          }
+        },
+        {
+          "title": "Overload: shed and fallback",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum by (stage) (rate(smg_worker_overload_shed_total[5m]))",
+              "legendFormat": "shed {{ "{{" }}stage{{ "}}" }}"
+            },
+            {
+              "expr": "sum by (stage) (rate(smg_worker_overload_fallback_total[5m]))",
+              "legendFormat": "fallback {{ "{{" }}stage{{ "}}" }}"
+            },
+            {
+              "expr": "sum by (stage) (rate(smg_worker_liveness_fallback_total[5m]))",
+              "legendFormat": "liveness fallback {{ "{{" }}stage{{ "}}" }}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 68
+          }
+        },
+        {
+          "title": "Worker retries",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum by (endpoint) (rate(smg_worker_retries_total[5m]))",
+              "legendFormat": "retry {{ "{{" }}endpoint{{ "}}" }}"
+            },
+            {
+              "expr": "sum by (endpoint) (rate(smg_worker_retries_exhausted_total[5m]))",
+              "legendFormat": "exhausted {{ "{{" }}endpoint{{ "}}" }}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 68
+          }
+        },
+        {
+          "title": "Cache and KV events",
+          "type": "row",
+          "collapsed": false,
+          "gridPos": {
+            "h": 1,
+            "w": 24,
+            "x": 0,
+            "y": 76
+          },
+          "panels": []
+        },
+        {
+          "title": "Engine prefix cache hit rate per worker",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "max by (worker) (smg_engine_cache_hit_rate)",
+              "legendFormat": "{{ "{{" }}worker{{ "}}" }}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 77
+          }
+        },
+        {
+          "title": "Cache-aware decisions by branch",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum by (branch) (rate(smg_cache_aware_policy_branch_total[5m]))",
+              "legendFormat": "{{ "{{" }}branch{{ "}}" }}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 77
+          }
+        },
+        {
+          "title": "Prefix match ratio",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.5, sum by (le) (rate(smg_cache_aware_match_ratio_bucket[5m])))",
+              "legendFormat": "p50"
+            },
+            {
+              "expr": "histogram_quantile(0.9, sum by (le) (rate(smg_cache_aware_match_ratio_bucket[5m])))",
+              "legendFormat": "p90"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 77
+          }
+        },
+        {
+          "title": "KV event lag p99 per worker",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.99, sum by (le, worker) (rate(smg_kv_event_lag_seconds_bucket[5m])))",
+              "legendFormat": "{{ "{{" }}worker{{ "}}" }}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 85
+          }
+        },
+        {
+          "title": "KV event integrity",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum by (outcome) (rate(smg_kv_event_gaps_total[5m]))",
+              "legendFormat": "gap {{ "{{" }}outcome{{ "}}" }}"
+            },
+            {
+              "expr": "sum by (reason) (rate(smg_kv_event_resyncs_total[5m]))",
+              "legendFormat": "resync {{ "{{" }}reason{{ "}}" }}"
+            },
+            {
+              "expr": "sum(rate(smg_kv_event_missed_batches_total[5m]))",
+              "legendFormat": "missed batches"
+            },
+            {
+              "expr": "sum(rate(smg_kv_event_stream_errors_total[5m]))",
+              "legendFormat": "stream errors"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 85
+          }
+        },
+        {
+          "title": "KV event degraded ranks",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum by (worker) (smg_kv_event_degraded_ranks)",
+              "legendFormat": "{{ "{{" }}worker{{ "}}" }}"
+            }
+          ],
+          "description": "Ranks whose index may be stale (an unreplayed gap or a late relay snapshot) until the next resync.",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 85
+          }
+        },
+        {
+          "title": "KV index entries per model",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "max by (model) (smg_kv_index_entries)",
+              "legendFormat": "{{ "{{" }}model{{ "}}" }}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 93
+          }
+        },
+        {
+          "title": "Symphony",
+          "type": "row",
+          "collapsed": false,
+          "gridPos": {
+            "h": 1,
+            "w": 24,
+            "x": 0,
+            "y": 101
+          },
+          "panels": []
+        },
+        {
+          "title": "Outputs by outcome",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum by (outcome) (rate(smg_symphony_outputs_total[5m]))",
+              "legendFormat": "{{ "{{" }}outcome{{ "}}" }}"
+            }
+          ],
+          "description": "clean, malformed, failed, empty, unknown_tool: how the tables read the models' outputs.",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 102
+          }
+        },
+        {
+          "title": "Malformed outputs by reason",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum by (reason) (rate(smg_symphony_malformed_total[5m]))",
+              "legendFormat": "{{ "{{" }}reason{{ "}}" }}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 102
+          }
+        },
+        {
+          "title": "Fallbacks, refusals and suppressed calls",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum by (reason) (rate(smg_symphony_fallback_total[5m]))",
+              "legendFormat": "fallback {{ "{{" }}reason{{ "}}" }}"
+            },
+            {
+              "expr": "sum(rate(smg_symphony_refused_total[5m]))",
+              "legendFormat": "refused"
+            },
+            {
+              "expr": "sum(rate(smg_symphony_calls_suppressed_total[5m]))",
+              "legendFormat": "calls suppressed"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 102
+          }
+        },
+        {
+          "title": "Runtime",
+          "type": "row",
+          "collapsed": false,
+          "gridPos": {
+            "h": 1,
+            "w": 24,
+            "x": 0,
+            "y": 110
+          },
+          "panels": []
+        },
+        {
+          "title": "Tokio worker busy ratio",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "max by (worker) (smg_tokio_worker_busy_ratio)",
+              "legendFormat": "worker {{ "{{" }}worker{{ "}}" }}"
+            }
+          ],
+          "description": "Above 0.95 a worker thread is saturated.",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 111
+          }
+        },
+        {
+          "title": "Event loop: stalls and delay p99",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum(rate(smg_tokio_event_loop_stalls_total[5m]))",
+              "legendFormat": "stalls/s"
+            },
+            {
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(smg_tokio_event_loop_delay_seconds_bucket[5m])))",
+              "legendFormat": "delay p99 (s)"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 111
+          }
+        },
+        {
+          "title": "Dropped log lines",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum by (sink) (smg_log_dropped_lines)",
+              "legendFormat": "{{ "{{" }}sink{{ "}}" }}"
+            }
+          ],
+          "description": "Lines the non-blocking log sinks dropped since start; any growth is a sink that cannot keep up.",
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 111
+          }
+        },
+        {
+          "title": "Memory",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum(smg_allocator_resident_bytes)",
+              "legendFormat": "resident"
+            },
+            {
+              "expr": "sum(smg_allocator_allocated_bytes)",
+              "legendFormat": "allocated"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 0,
+            "y": 119
+          }
+        },
+        {
+          "title": "Tasks and global queue",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum(smg_tokio_alive_tasks)",
+              "legendFormat": "alive tasks"
+            },
+            {
+              "expr": "sum(smg_tokio_global_queue_depth)",
+              "legendFormat": "global queue"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 8,
+            "y": 119
+          }
+        },
+        {
+          "title": "Tokenizer cache lookups",
+          "type": "timeseries",
+          "datasource": "Prometheus",
+          "targets": [
+            {
+              "expr": "sum by (layer, result) (rate(smg_tokenizer_cache_lookups_total[5m]))",
+              "legendFormat": "{{ "{{" }}layer{{ "}}" }} {{ "{{" }}result{{ "}}" }}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "reqps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 8,
+            "x": 16,
+            "y": 119
+          }
         }
       ],
       "schemaVersion": 39,
-      "tags": ["smg", "llm", "inference"],
-      "templating": { "list": [] },
-      "time": { "from": "now-1h", "to": "now" },
+      "tags": [
+        "smg",
+        "llm",
+        "inference"
+      ],
+      "templating": {
+        "list": []
+      },
+      "time": {
+        "from": "now-1h",
+        "to": "now"
+      },
       "title": "SMG Overview",
       "uid": "{{ include "smg.fullname" . | trunc 31 | trimSuffix "-" }}-overview"
     }

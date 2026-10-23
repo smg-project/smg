@@ -322,6 +322,56 @@ grafana:
       grafana_dashboard: "1"
 
 # =============================================================================
+# Prometheus alerting rules (a PrometheusRule for the Prometheus Operator)
+# =============================================================================
+# Ten alerts over the families the router already exposes; the thresholds are
+# starting points for a serving fleet, not laws: set them to the deployment's
+# SLOs. The rationale of each default:
+#   errorRatio 0.05 for 5m: one response in twenty failing server-side for five
+#     minutes is an outage to a retrying client; a shorter window pages on one
+#     worker's restart.
+#   ttftP99Seconds 5 for 10m: time to first token is the wait a user sees; a
+#     p99 above five seconds for ten minutes means queues are building in
+#     front of the engines (set it to the SLO once there is one).
+#   noHealthyWorkerFor 1m: nothing can be served; one minute rides out the
+#     overlap of a rolling restart.
+#   kvUsage 0.9 for 10m: above ninety percent of its KV cache an engine
+#     preempts and recomputes; sustained, the fleet is undersized.
+#   scrapeMissingFor 2m: a target down for two scrape intervals is a pod that
+#     is gone or not ready, not a missed scrape.
+#   circuitBreakerOpenFor 5m: a breaker that stays open outlives its own
+#     retry timeout: the worker is failing every probe.
+#   admissionRejectionsFor 5m: rejections at the admission queue for five
+#     minutes are sustained overload, not a burst.
+#   eventLoopStalls 5 per 10m: a stall is a wake drift over 5 ms on the
+#     runtime's canary; a handful in ten minutes is a blocked thread or CPU
+#     starvation.
+#   degradedRanksFor 30m: a degraded rank is expected right after a gateway
+#     attaches to a running engine and clears at the next resync; half an
+#     hour means it did not.
+prometheusRule:
+  enabled: false
+  # -- Labels the Prometheus Operator selects rules by (e.g. release: prometheus).
+  labels: {}
+  # -- The label matcher of the router's scrape target in the `up` series,
+  #    e.g. job="smg-router". Empty: the Service name the ServiceMonitor
+  #    creates (<fullname>-router), which is the Operator's default job label.
+  jobSelector: ""
+  alerts:
+    errorRatio: 0.05
+    errorRatioFor: 5m
+    ttftP99Seconds: 5
+    ttftP99For: 10m
+    noHealthyWorkerFor: 1m
+    kvUsage: 0.9
+    kvUsageFor: 10m
+    scrapeMissingFor: 2m
+    circuitBreakerOpenFor: 5m
+    admissionRejectionsFor: 5m
+    eventLoopStalls: 5
+    degradedRanksFor: 30m
+
+# =============================================================================
 # Workers Configuration
 # =============================================================================
 # Each entry creates a Deployment + Service for one model/engine combo.
