@@ -438,15 +438,17 @@ class Worker:
     def _build_cmd(self) -> list[str]:
         """Build engine-specific launch command using model specs."""
         if self.worker_type == WorkerType.ENCODE and (
-            self.engine != "tokenspeed" or self.mode != ConnectionMode.GRPC
+            self.engine not in ("tokenspeed", "sglang") or self.mode != ConnectionMode.GRPC
         ):
-            raise ValueError("EPD encode workers currently require TokenSpeed over gRPC")
+            raise ValueError("EPD encode workers require native SGLang or TokenSpeed over gRPC")
         spec = get_model_spec(self.model_id)
         model_path = spec["model"]
         tp_size = self.tp or spec.get("tp", 1)
         features = spec.get("features", [])
 
         if self.engine == "sglang":
+            if self.worker_type == WorkerType.ENCODE and "multimodal" not in features:
+                raise ValueError("SGLang encode workers require a multimodal model")
             if self.mode == ConnectionMode.ZMQ:
                 # The launcher validates the complete engine argument list
                 # (it refuses a DP launch this wire does not carry yet), so
@@ -507,6 +509,19 @@ class Worker:
 
         if self.mode == ConnectionMode.GRPC:
             cmd.append("--grpc-mode")
+
+        if self.worker_type == WorkerType.ENCODE:
+            owned_flags = {
+                "--encoder-only",
+                "--encoder-transfer-backend",
+                "--grpc-mode",
+                "--language-only",
+                "--disaggregation-mode",
+            }
+            extras = [*spec.get("sglang_args", []), *(self.extra_engine_args or [])]
+            if any(arg.split("=", 1)[0] in owned_flags for arg in extras):
+                raise ValueError("SGLang encoder role and transfer flags are owned by Worker")
+            cmd.extend(["--encoder-only", "--encoder-transfer-backend", "zmq_to_scheduler"])
 
         if "embedding" in features:
             cmd.append("--is-embedding")
@@ -979,6 +994,12 @@ class Worker:
 
         if self.extra_env:
             env.update(self.extra_env)
+        if (
+            self.engine == "sglang"
+            and self.worker_type == WorkerType.ENCODE
+            and self.mode == ConnectionMode.GRPC
+        ):
+            env.pop("SMG_SGLANG_SERVICER_IMPL", None)
         return env
 
     def read_log(self) -> str:

@@ -19,7 +19,12 @@ def test_worker_type_encode_exists():
 
 @pytest.mark.parametrize(
     "engine,mode",
-    [(engine, mode) for engine in ("sglang", "vllm") for mode in ConnectionMode]
+    [
+        (engine, mode)
+        for engine in ("sglang", "vllm")
+        for mode in ConnectionMode
+        if (engine, mode) != ("sglang", ConnectionMode.GRPC)
+    ]
     + [(engine, ConnectionMode.GRPC) for engine in ("trtllm", "mlx", "mock")]
     + [("tokenspeed", mode) for mode in (ConnectionMode.HTTP, ConnectionMode.ZMQ)],
 )
