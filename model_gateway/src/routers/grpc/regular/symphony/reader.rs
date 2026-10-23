@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
-use llm_tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
+use llm_tokenizer::stop::StopSequenceDecoder;
 use openai_protocol::common::Tool;
 use parking_lot::RwLock;
 use symphony::{
@@ -342,21 +342,15 @@ impl Reader {
         delta.clear();
         let mut stopped = false;
         for &token_id in token_ids {
-            let output = decoder.process_token(token_id).map_err(|e| {
-                self.failed(format!(
-                    "Stop decoder failed to process token {token_id}: {e}"
-                ))
-            })?;
             let start = delta.text.len();
-            match output {
-                SequenceDecoderOutput::Text(released) => delta.text.push_str(&released),
-                SequenceDecoderOutput::StoppedWithText(released) => {
-                    delta.text.push_str(&released);
-                    stopped = true;
-                }
-                SequenceDecoderOutput::Stopped => stopped = true,
-                SequenceDecoderOutput::Held => {}
-            }
+            stopped = decoder
+                .process_token_into(token_id, &mut delta.text)
+                .map_err(|e| {
+                    self.failed(format!(
+                        "Stop decoder failed to process token {token_id}: {e}"
+                    ))
+                })?
+                .stopped();
             delta.spans.push(TokenSpan {
                 token_id,
                 start,

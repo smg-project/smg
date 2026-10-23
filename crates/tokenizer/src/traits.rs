@@ -131,6 +131,17 @@ pub trait IncrementalDecoder: Send + Sync {
     /// the token only extends a multi-byte character or is skipped).
     fn step(&mut self, token_id: TokenIdType) -> Result<String>;
 
+    /// Feed one token; appends the text that became final with it to `out`
+    /// and says whether there was any (none when the token only extends a
+    /// multi-byte character or is skipped). The default goes through
+    /// [`step`](Self::step); a decoder that has the text at hand appends it
+    /// without a string of its own per token.
+    fn step_into(&mut self, token_id: TokenIdType, out: &mut String) -> Result<bool> {
+        let text = self.step(token_id)?;
+        out.push_str(&text);
+        Ok(!text.is_empty())
+    }
+
     /// Forget all state, as for a new stream.
     fn reset(&mut self);
 }

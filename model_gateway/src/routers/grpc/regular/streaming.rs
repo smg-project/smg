@@ -1015,21 +1015,11 @@ impl StreamingProcessor {
         let mut chunk_text = String::new();
 
         for &token_id in token_ids {
-            match stop_decoder
-                .process_token(token_id)
-                .map_err(|e| format!("Stop decoder failed to process token {token_id}: {e}"))?
-            {
-                SequenceDecoderOutput::Text(text) => {
-                    append_decoded(&mut chunk_text, text);
-                }
-                SequenceDecoderOutput::StoppedWithText(text) => {
-                    append_decoded(&mut chunk_text, text);
-                    return Ok((chunk_text, true));
-                }
-                SequenceDecoderOutput::Stopped => {
-                    return Ok((chunk_text, true));
-                }
-                SequenceDecoderOutput::Held => {}
+            let step = stop_decoder
+                .process_token_into(token_id, &mut chunk_text)
+                .map_err(|e| format!("Stop decoder failed to process token {token_id}: {e}"))?;
+            if step.stopped() {
+                return Ok((chunk_text, true));
             }
         }
         Ok((chunk_text, false))
@@ -4761,17 +4751,6 @@ struct OpeningDelta {
     refusal: Option<()>,
 }
 
-/// Append a decoded piece to the chunk's text: the first piece (a chunk
-/// usually has one) is taken over rather than copied into a second
-/// allocation.
-fn append_decoded(chunk_text: &mut String, text: String) {
-    if chunk_text.is_empty() {
-        *chunk_text = text;
-    } else {
-        chunk_text.push_str(&text);
-    }
-}
-
 fn opening_choice(index: u32, opens_tool_call: bool) -> OpeningChoice {
     OpeningChoice {
         index,
@@ -5140,20 +5119,5 @@ mod tests {
             .finish()
             .expect_err("EOF decode error must propagate");
         assert!(error.to_string().contains("pending token decode failed"));
-    }
-
-    #[test]
-    fn decoded_pieces_of_a_chunk_concatenate_in_order() {
-        // The first piece is taken over, later ones appended: the chunk's
-        // text is the pieces in order either way.
-        let mut one = String::new();
-        append_decoded(&mut one, "Hello".to_string());
-        assert_eq!(one, "Hello");
-
-        let mut several = String::new();
-        append_decoded(&mut several, "Hel".to_string());
-        append_decoded(&mut several, "lo".to_string());
-        append_decoded(&mut several, ", world".to_string());
-        assert_eq!(several, "Hello, world");
     }
 }

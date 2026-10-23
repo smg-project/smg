@@ -524,17 +524,11 @@ fn decode_chunk_text(
 fn stop_decoded_text(decoder: &mut StopSequenceDecoder, token_ids: &[u32]) -> String {
     let mut text = String::new();
     for &token_id in token_ids {
-        match decoder
-            .process_token(token_id)
-            .unwrap_or(SequenceDecoderOutput::Held)
-        {
-            SequenceDecoderOutput::Text(released) => text.push_str(&released),
-            SequenceDecoderOutput::StoppedWithText(released) => {
-                text.push_str(&released);
-                break;
-            }
-            SequenceDecoderOutput::Stopped => break,
-            SequenceDecoderOutput::Held => {}
+        let before = text.len();
+        match decoder.process_token_into(token_id, &mut text) {
+            Ok(step) if step.stopped() => break,
+            Ok(_) => {}
+            Err(_) => text.truncate(before),
         }
     }
     text

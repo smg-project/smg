@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::traits::{IncrementalDecoder, TokenIdType, Tokenizer as TokenizerTrait};
+use crate::traits::{DecodeStep, IncrementalDecoder, TokenIdType, Tokenizer as TokenizerTrait};
 
 /// Maintains state for an ongoing sequence of tokens and their decoded text.
 ///
@@ -190,6 +190,32 @@ impl Sequence {
             self.total_tokens += 1;
             return Ok(text);
         }
+        Ok(self.step_generic(token_id)?.into_text())
+    }
+
+    /// [`append_token`](Self::append_token), with the newly decoded text
+    /// appended to `out`; says whether there was any. A stream that collects
+    /// its text in one buffer takes each token's text without a string per
+    /// token.
+    #[inline]
+    pub fn append_token_into(&mut self, token_id: TokenIdType, out: &mut String) -> Result<bool> {
+        if let Some(decoder) = self.incremental.as_mut() {
+            let appended = decoder.step_into(token_id, out)?;
+            self.total_tokens += 1;
+            return Ok(appended);
+        }
+        Ok(match self.step_generic(token_id)?.text {
+            Some(text) if !text.is_empty() => {
+                out.push_str(&text);
+                true
+            }
+            _ => false,
+        })
+    }
+
+    /// One token through the generic algorithm (`Decoder::decode_step`), with
+    /// the sequence's counters kept.
+    fn step_generic(&mut self, token_id: TokenIdType) -> Result<DecodeStep> {
         let step = self.tokenizer.decode_step_reporting(
             token_id,
             &mut self.token_ids,
@@ -202,7 +228,7 @@ impl Sequence {
         if step.prefix_mismatch {
             self.prefix_mismatches += 1;
         }
-        Ok(step.into_text())
+        Ok(step)
     }
 
     /// Finish incremental decoding without inventing an extra token.

@@ -7,7 +7,7 @@ use std::{sync::Arc, time::Instant};
 
 use futures::future::try_join_all;
 use llm_tokenizer::{
-    stop::{SequenceDecoderOutput, StopSequenceDecoder},
+    stop::{SequenceDecoderOutput, SequenceDecoderStep, StopSequenceDecoder},
     traits::Tokenizer,
 };
 use openai_protocol::{
@@ -1251,23 +1251,17 @@ fn decode_complete(
     index: u32,
 ) -> Result<Decoded, DecodeFailure> {
     stop_decoder.reset();
-    let outputs = stop_decoder
-        .process_tokens(output_ids)
-        .map_err(|e| DecodeFailure::Process(e.to_string()))?;
-
     let mut text = String::new();
     let mut stopped = false;
     let mut held = false;
-    let mut token_ends = Vec::with_capacity(outputs.len());
-    for output in outputs {
-        match output {
-            SequenceDecoderOutput::Text(t) => text.push_str(&t),
-            SequenceDecoderOutput::StoppedWithText(t) => {
-                text.push_str(&t);
-                stopped = true;
-            }
-            SequenceDecoderOutput::Stopped => stopped = true,
-            SequenceDecoderOutput::Held => held = true,
+    let mut token_ends = Vec::with_capacity(output_ids.len());
+    for &token_id in output_ids {
+        match stop_decoder
+            .process_token_into(token_id, &mut text)
+            .map_err(|e| DecodeFailure::Process(e.to_string()))?
+        {
+            SequenceDecoderStep::Held => held = true,
+            step => stopped |= step.stopped(),
         }
         token_ends.push(text.len());
         if stopped {
@@ -1276,11 +1270,13 @@ fn decode_complete(
     }
 
     let tail = stop_decoder
-        .finish()
+        .finish_into(&mut text)
         .map_err(|e| DecodeFailure::Finish(e.to_string()))?;
     utils::warn_detokenize_recoveries(request_id, index, stop_decoder);
-    if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) = tail {
-        text.push_str(&t);
+    if matches!(
+        tail,
+        SequenceDecoderStep::Text | SequenceDecoderStep::StoppedWithText
+    ) {
         if let Some(last) = token_ends.last_mut() {
             *last = text.len();
         }
