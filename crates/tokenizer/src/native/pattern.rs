@@ -25,7 +25,50 @@ struct Class {
     categories: u16,
     ranges: Vec<(u32, u32)>,
     /// Membership of U+0000..=U+007F, resolved once.
-    ascii: u128,
+    ascii: AsciiSet,
+}
+
+/// A set of ASCII characters as a membership table, one entry per code
+/// point. The matcher asks it once per character it tests (every class test
+/// and every first-set test on ASCII text), and a table read is one load
+/// where a bit of a 128-bit word costs a two-word select and a variable shift.
+#[derive(Clone, Copy)]
+struct AsciiSet([bool; 128]);
+
+impl Default for AsciiSet {
+    fn default() -> Self {
+        Self([false; 128])
+    }
+}
+
+impl std::fmt::Debug for AsciiSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let members: String = (0u8..128)
+            .filter(|&code| self.0[usize::from(code)])
+            .map(char::from)
+            .collect();
+        f.debug_tuple("AsciiSet").field(&members).finish()
+    }
+}
+
+impl AsciiSet {
+    /// Membership of `code`, which the caller has checked is below U+0080.
+    #[inline]
+    fn contains(&self, code: u32) -> bool {
+        debug_assert!(code < 128);
+        self.0[(code & 0x7f) as usize]
+    }
+
+    fn insert(&mut self, code: u32) {
+        self.0[(code & 0x7f) as usize] = true;
+    }
+
+    fn union(mut self, other: Self) -> Self {
+        for (mine, theirs) in self.0.iter_mut().zip(other.0) {
+            *mine |= theirs;
+        }
+        self
+    }
 }
 
 const CAT_LETTER: u16 = 1 << 0;
@@ -68,10 +111,10 @@ fn in_ranges(ranges: &[(u32, u32)], code: u32) -> bool {
 
 impl Class {
     fn finish(mut self) -> Self {
-        let mut ascii = 0u128;
+        let mut ascii = AsciiSet::default();
         for code in 0u32..128 {
             if self.contains_slow(code) {
-                ascii |= 1 << code;
+                ascii.insert(code);
             }
         }
         self.ascii = ascii;
@@ -92,7 +135,7 @@ impl Class {
     fn contains(&self, c: char) -> bool {
         let code = u32::from(c);
         if code < 128 {
-            (self.ascii >> code) & 1 == 1
+            self.ascii.contains(code)
         } else {
             self.contains_slow(code)
         }
@@ -142,13 +185,13 @@ enum Node {
     NotAhead(usize),
 }
 
-/// The characters a match of a node can begin with: a bit per ASCII code
-/// point, one bit for every character beyond ASCII (set when a class may hold
-/// any of them), and whether the node can match without consuming a
+/// The characters a match of a node can begin with: a table of the ASCII
+/// code points, one bit for every character beyond ASCII (set when a class
+/// may hold any of them), and whether the node can match without consuming a
 /// character, in which case any character may follow it.
 #[derive(Debug, Clone, Copy, Default)]
 struct First {
-    ascii: u128,
+    ascii: AsciiSet,
     non_ascii: bool,
     nullable: bool,
 }
@@ -159,7 +202,7 @@ impl First {
         let code = u32::from(c);
         self.nullable
             || if code < 128 {
-                (self.ascii >> code) & 1 == 1
+                self.ascii.contains(code)
             } else {
                 self.non_ascii
             }
@@ -170,7 +213,7 @@ impl First {
     fn then(self, next: First) -> First {
         if self.nullable {
             First {
-                ascii: self.ascii | next.ascii,
+                ascii: self.ascii.union(next.ascii),
                 non_ascii: self.non_ascii || next.non_ascii,
                 nullable: next.nullable,
             }
@@ -181,7 +224,7 @@ impl First {
 
     fn or(self, other: First) -> First {
         First {
-            ascii: self.ascii | other.ascii,
+            ascii: self.ascii.union(other.ascii),
             non_ascii: self.non_ascii || other.non_ascii,
             nullable: self.nullable || other.nullable,
         }
