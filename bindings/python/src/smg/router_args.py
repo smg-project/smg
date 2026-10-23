@@ -972,7 +972,8 @@ class RouterArgs:
             default=RouterArgs.least_load_default_throughput,
             help=(
                 "Input throughput (tokens/s) for least_load prefill workers; fallback"
-                " output throughput for other workers when no live rate is reported."
+                " output throughput for other workers when no candidate reports a live"
+                " rate."
                 " Shared across roles; separate prefill/decode values require"
                 " constructing RouterConfig programmatically in Rust."
             ),

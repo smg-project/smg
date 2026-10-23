@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install the latest published TokenSpeed nightly for CI, with the scheduler
+# Install the pinned TokenSpeed nightly for CI, with the scheduler
 # package selected for that nightly by the compatibility helper.
 # CUDA tooling supports runtime JIT; SMG gRPC packages come from this checkout.
 # TOKENSPEED_BUILD_ONLY=1 prepares the carrier image without per-PR SMG glue.
@@ -20,8 +20,12 @@ if [ -f ".venv/bin/activate" ]; then
 fi
 
 # Keep the carrier stamp compatible with the image cache tooling. The ref
-# identifies the carrier, while pip selects the latest published nightly.
+# identifies the carrier; the runtime version is the pinned nightly
+# (.github/versions/tokenspeed-nightly.txt, moved by a pull request that its
+# own TokenSpeed lanes gate) unless TOKENSPEED_VERSION names another one.
 TOKENSPEED_REF="${TOKENSPEED_REF:-$(tr -d '[:space:]' < "${REPO_ROOT}/.github/versions/tokenspeed.ref")}"
+TOKENSPEED_VERSION="${TOKENSPEED_VERSION:-$(tr -d '[:space:]' < "${REPO_ROOT}/.github/versions/tokenspeed-nightly.txt")}"
+export TOKENSPEED_VERSION
 TOKENSPEED_PREBUILT_STAMP="${TOKENSPEED_PREBUILT_STAMP:-/opt/smg-ci/tokenspeed.ref}"
 
 # Install uv for faster package management (mirrors ci_install_sglang.sh).
@@ -121,10 +125,10 @@ install_tokenspeed() {
             export PIP_CACHE_DIR="$cache"
         fi
     fi
-    requirement="tokenspeed"
-    if [ -n "${TOKENSPEED_VERSION:-}" ]; then
-        requirement="tokenspeed==${TOKENSPEED_VERSION}"
-    fi
+    # The exact pin: on the carrier's payload pip finds it installed and
+    # changes nothing; a bare runner installs it from the nightly index.
+    requirement="tokenspeed==${TOKENSPEED_VERSION}"
+    echo "Installing ${requirement}"
     $RETRY 3 10 python3 -m pip install --upgrade "$requirement" \
         --extra-index-url https://lightseek.org/whl/nightly
     python3 - <<'PY'
@@ -200,7 +204,7 @@ setup_cuda_env
 bash "${SCRIPT_DIR}/ci_ensure_python_headers.sh"
 ensure_rdma_libs
 
-# Upgrade even when the carrier already contains TokenSpeed.
+# The carrier's payload already holds the pin; a bare runner installs it.
 install_tokenspeed
 
 if [ "${TOKENSPEED_BUILD_ONLY:-0}" = "1" ]; then

@@ -1287,8 +1287,8 @@ pub enum PolicyConfig {
         /// when a request's token count is unknown at routing time.
         #[serde(default = "default_least_load_mean_prefill")]
         mean_prefill_tokens: u32,
-        /// Throughput (tokens/s) for prefill workers, and fallback when other
-        /// workers report no live `gen_throughput`. Set to per-replica input
+        /// Throughput (tokens/s) for prefill workers, and fallback for other
+        /// workers when no candidate reports a live `gen_throughput`. Set to per-replica input
         /// tokens/s for prefill, output tokens/s otherwise; co-tunes with
         /// `kv_pressure_weight`. The CLI shares one value across roles; use
         /// programmatically constructed `prefill_policy` / `decode_policy` for

@@ -176,7 +176,9 @@ pub struct CacheAwareConfig {
     /// deviations, never under four requests unless this value is lower) and
     /// the held prefix's price (`balance_prefix_margin_tokens`), so a pool
     /// whose per-worker in-flight count stays below this value can still
-    /// spill.
+    /// spill. Outside the fleet-wide KV-pressure fallback, a request with no
+    /// cache match routes among the workers under the same gate, so a burst
+    /// of misses is bounded by the same margins.
     pub balance_abs_threshold: usize,
     /// Relative load margin (multiple of the healthy-fleet mean) for the
     /// per-request candidate gate; fires only together with
