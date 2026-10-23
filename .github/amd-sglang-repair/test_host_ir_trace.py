@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
-from host_ir_trace import LIMIT, ParserTrace, copy_sources  # noqa: E402
+from host_ir_trace import LIMIT, ParserTrace, copy_sources, read_source  # noqa: E402
 
 
 def compact_call():
@@ -114,3 +114,44 @@ def test_whole_public_source_copy_and_bounds(tmp_path, mutation):
         record = json.loads((output / "index.json").read_text())[0]
         assert (output / record["file"]).read_bytes() == source.read_bytes()
         assert record["sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("required", [False, True])
+def test_missing_public_sources_recorded_and_required_only_rejects(tmp_path, required):
+    source = tmp_path / "absent.py"
+    output = tmp_path / "sources"
+    if required:
+        with pytest.raises(FileNotFoundError, match="required actual"):
+            copy_sources(output, (source,), (source,))
+    else:
+        copy_sources(output, (source,), ())
+    assert json.loads((output / "index.json").read_text()) == [
+        {"path": str(source), "exists": False, "required": required}
+    ]
+
+
+def test_public_source_read_requests_only_bounded_bytes(tmp_path, monkeypatch):
+    source = tmp_path / "public.py"
+    source.write_bytes(b"x" * (LIMIT + 2))
+    original = Path.open
+    reads = []
+
+    class LimitedReader:
+        def __enter__(self):
+            self.stream = original(source, "rb")
+            return self
+
+        def read(self, size):
+            reads.append(size)
+            return self.stream.read(size)
+
+        def __exit__(self, *args):
+            self.stream.close()
+
+    def limited(path, *args, **kwargs):
+        return LimitedReader() if path == source else original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", limited)
+    with pytest.raises(ValueError, match="exceeds cap"):
+        read_source(source)
+    assert reads == [LIMIT + 1]

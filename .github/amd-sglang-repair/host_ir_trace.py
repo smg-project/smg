@@ -21,6 +21,14 @@ def sha(raw):
     return hashlib.sha256(raw).hexdigest()
 
 
+def read_source(path):
+    with path.open("rb") as stream:
+        raw = stream.read(LIMIT + 1)
+    if len(raw) > LIMIT:
+        raise ValueError("public host-IR source size exceeds cap")
+    return raw
+
+
 class ParserTrace:
     def __init__(self, code, directory):
         self.code, self.directory = code, directory
@@ -95,7 +103,7 @@ class ParserTrace:
 def observe(directory):
     module = sys.modules["tilelang.jit.adapter.wrapper"]
     source = Path(module.__file__).resolve()
-    verify_loaded({"path": str(source), "sha256": sha(source.read_bytes())})
+    verify_loaded({"path": str(source), "sha256": sha(read_source(source))})
     function = module.TLCUDASourceWrapper.parse_source_information
     if Path(function.__code__.co_filename).resolve() != SOURCE:
         raise ValueError("actual parser code filename differs")
@@ -103,18 +111,30 @@ def observe(directory):
     return ParserTrace(function.__code__, directory)
 
 
-def copy_sources(copied, paths=SOURCES):
+def copy_sources(copied, paths=SOURCES, required=SOURCES[:2]):
     # Whole public files only; no arbitrary globals, environment or frame locals are serialized.
-    records, total = [], 0
+    records, missing, total = [], [], 0
     copied.mkdir()
     for index, path in enumerate(paths):
         if path.resolve() != path:
             raise ValueError("public source path escapes allowlist")
-        raw = path.read_bytes()
+        try:
+            raw = read_source(path)
+        except FileNotFoundError:
+            records.append({"path": str(path), "exists": False, "required": path in required})
+            if path in required:
+                missing.append(str(path))
+            continue
         total += len(raw)
-        if len(raw) > LIMIT or total > 2 * 1024 * 1024:
+        if total > 2 * 1024 * 1024:
             raise ValueError("public host-IR source size exceeds cap")
         name = f"{index:02d}-{path.name}"
         (copied / name).write_bytes(raw)
-        records.append({"path": str(path), "file": name, "bytes": len(raw), "sha256": sha(raw)})
+        records.append(
+            {"path": str(path), "exists": True, "file": name, "bytes": len(raw), "sha256": sha(raw)}
+        )
     (copied / "index.json").write_text(json.dumps(records, indent=2) + "\n")
+    if missing:
+        raise FileNotFoundError(
+            "required actual wrapper/adapter source missing: " + ", ".join(missing)
+        )

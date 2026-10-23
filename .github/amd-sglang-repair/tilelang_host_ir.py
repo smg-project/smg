@@ -21,7 +21,8 @@ def sha(data):
 
 
 def apply(source, output):
-    original = source.read_bytes()
+    with source.open("rb") as stream:
+        original = stream.read(40155)  # Exact original size plus one; no unbounded source read.
     if sha(original) != ORIGINAL_SHA or original.count(OLD) != 1:
         raise ValueError("TileLang wrapper differs from exact image source")
     fixed = original.replace(OLD, NEW)
@@ -30,8 +31,9 @@ def apply(source, output):
     if output.exists():
         raise ValueError("refuse host-IR receipt overwrite")
     source.write_bytes(fixed)
-    if sha(source.read_bytes()) != FIXED_SHA:
-        raise ValueError("installed host-IR backport verification failed")
+    with source.open("rb") as stream:
+        if sha(stream.read(40287)) != FIXED_SHA:
+            raise ValueError("installed host-IR backport verification failed")
     output.write_text(
         json.dumps(
             {
