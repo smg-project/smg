@@ -1,4 +1,4 @@
-"""Require all original cached models and the real installed Rust launcher binding."""
+"""Require the original cached models for the Symphony Python-servicer lane."""
 
 import json
 import os

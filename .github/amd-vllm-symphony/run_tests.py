@@ -1,4 +1,4 @@
-"""Run the complete original Rust-servicer chat row with strict terminal accounting."""
+"""Run the complete current Symphony chat row with strict terminal accounting."""
 
 import json
 import os
