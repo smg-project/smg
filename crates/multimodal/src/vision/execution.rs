@@ -134,7 +134,7 @@ fn pool(threads: NonZeroUsize) -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
-/// Spawns the tasks of one [`scope`]: onto the pool, or inline in order.
+/// Spawns the tasks of one `scope`: onto the pool, or inline in order.
 pub struct Spawner<'a, 'scope> {
     inner: SpawnerInner<'a, 'scope>,
 }

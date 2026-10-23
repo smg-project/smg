@@ -17,6 +17,16 @@ global:
 router:
   replicas: 1
 
+  # -- Rollout progress deadline of the router Deployment, in seconds.
+  #    /readiness follows the engine, so the deadline covers the gateway's own
+  #    worker start-up bound (--worker-startup-timeout-secs, 1800 s by default)
+  #    plus the chart's tail after it (one start-up poll of 30 s, the readiness
+  #    probe's period, the registration) and a margin for the image pull and
+  #    container start, which run on the rollout's clock before the gateway's.
+  #    Raise it with --worker-startup-timeout-secs (README, Readiness
+  #    Deadlines). The mesh StatefulSet has no such field.
+  progressDeadlineSeconds: 1920
+
   # -- Routing policy: cache_aware, round_robin, power_of_two, manual, random, prefix_hash
   policy: cache_aware
 
@@ -197,7 +207,10 @@ router:
   #    router whose workers are registered at runtime through the admin API
   #    (no `workers`, `router.workerUrls` or `router.serviceDiscovery`
   #    configured) stays unready until the first one is: set `path: /health`
-  #    there, or register through a port-forward to the pod.
+  #    there, or register through a port-forward to the pod. A worker's engine
+  #    counts as healthy only once it reports so, which for a large checkpoint
+  #    is tens of minutes after its pod starts: every deadline on the router's
+  #    readiness has to cover that bring-up (README, Readiness Deadlines).
   readinessProbe:
     path: /readiness
     initialDelaySeconds: 5
@@ -322,6 +335,63 @@ grafana:
       grafana_dashboard: "1"
 
 # =============================================================================
+# Prometheus alerting rules (a PrometheusRule for the Prometheus Operator)
+# =============================================================================
+# Ten alerts over the families the router already exposes; the thresholds are
+# starting points for a serving fleet, not laws: set them to the deployment's
+# SLOs. The rationale of each default:
+#   errorRatio 0.05 for 5m: one response in twenty failing server-side for five
+#     minutes is an outage to a retrying client; a shorter window pages on one
+#     worker's restart.
+#   ttftP99Seconds 5 for 10m: time to first token is the wait a user sees; a
+#     p99 above five seconds for ten minutes means queues are building in
+#     front of the engines (set it to the SLO once there is one).
+#   noHealthyWorkerFor 1m: nothing can be served; one minute rides out the
+#     overlap of a rolling restart.
+#   kvUsage 0.9 for 10m: above ninety percent of its KV cache an engine
+#     preempts and recomputes; sustained, the fleet is undersized.
+#   scrapeMissingFor 2m: a target down for two scrape intervals is a pod that
+#     is gone or not ready, not a missed scrape; a target that left discovery
+#     (no up series at all) counts the same.
+#   circuitBreakerOpenFor 5m: the breaker reopens on each failed trial after
+#     its timeout, so a worker that fails requests while passing its health
+#     probes cycles open -> half-open -> open; five minutes in either state
+#     is that worker, not one failed call.
+#   admissionRejectionsFor 5m: rejections at the admission queue for five
+#     minutes are sustained overload, not a burst.
+#   eventLoopStalls 5 per 10m: a stall is a wake drift over 5 ms on the
+#     runtime's canary; a handful in ten minutes is a blocked thread or CPU
+#     starvation.
+#   degradedRanksFor 30m: a degraded rank is expected right after a gateway
+#     attaches to a running engine and clears at the next resync; half an
+#     hour means it did not.
+prometheusRule:
+  enabled: false
+  # -- Labels the Prometheus Operator selects rules by (e.g. release: prometheus).
+  labels: {}
+  # -- The label matcher that selects this release's series (every alert
+  #    carries it and keeps namespace and job through its aggregation, so
+  #    several releases on one Prometheus alert apart), e.g.
+  #    namespace="team-a", job="smg-router".
+  #    Empty: this release's namespace and the Service name the ServiceMonitor
+  #    scrapes (<fullname>-router, the Operator's default job label); the
+  #    namespace keeps a same-named release in another namespace out.
+  jobSelector: ""
+  alerts:
+    errorRatio: 0.05
+    errorRatioFor: 5m
+    ttftP99Seconds: 5
+    ttftP99For: 10m
+    noHealthyWorkerFor: 1m
+    kvUsage: 0.9
+    kvUsageFor: 10m
+    scrapeMissingFor: 2m
+    circuitBreakerOpenFor: 5m
+    admissionRejectionsFor: 5m
+    eventLoopStalls: 5
+    degradedRanksFor: 30m
+
+# =============================================================================
 # Workers Configuration
 # =============================================================================
 # Each entry creates a Deployment + Service for one model/engine combo.
@@ -341,6 +411,12 @@ workers: []
 #       repository: smg-project/smg     # default: the path the engine images are published under
 #       tag: ""                         # engine-specific image tag (required)
 #     port: 8000                        # worker serving port
+#     metrics:                          # the engine pod's Prometheus endpoint (gRPC mode only)
+#       enabled: false                  # true: the worker runs the Rust servicer, which serves
+#                                       # GET /metrics (smg_servicer_*); the Python servicer has no
+#                                       # endpoint, and the SGLang Rust servicer serves neither
+#                                       # PD/EPD disaggregation nor image/video input yet
+#       port: 29100                     # the metrics listener's port; must differ from `port`
 #     resources: {}
 #     extraArgs: []                     # extra engine CLI args
 #     extraEnv: []
@@ -351,6 +427,7 @@ workers: []
 #       initialDelaySeconds: 60
 #       periodSeconds: 10
 #       failureThreshold: 30
+#     progressDeadlineSeconds: 600      # rollout deadline; default: the startup probe's budget + 120 s, at least 600
 
 # Engine default ports (used when worker.port is not set)
 engineDefaults:

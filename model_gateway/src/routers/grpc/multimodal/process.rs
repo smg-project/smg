@@ -1058,7 +1058,7 @@ mod tests {
 
         let clip = video_clip_options(&video);
 
-        assert!((clip.sample_fps - 0.8).abs() < 1e-6);
+        assert_eq!(clip.sample_fps, 0.8);
         assert!(clip.max_long_side_pixel.is_none());
     }
 

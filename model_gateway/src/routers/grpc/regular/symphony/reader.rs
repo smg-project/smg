@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, LazyLock},
 };
 
-use llm_tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
+use llm_tokenizer::stop::StopSequenceDecoder;
 use openai_protocol::common::Tool;
 use parking_lot::RwLock;
 use symphony::{
@@ -342,21 +342,15 @@ impl Reader {
         delta.clear();
         let mut stopped = false;
         for &token_id in token_ids {
-            let output = decoder.process_token(token_id).map_err(|e| {
-                SymphonyError::Read(format!(
-                    "Stop decoder failed to process token {token_id}: {e}"
-                ))
-            })?;
             let start = delta.text.len();
-            match output {
-                SequenceDecoderOutput::Text(released) => delta.text.push_str(&released),
-                SequenceDecoderOutput::StoppedWithText(released) => {
-                    delta.text.push_str(&released);
-                    stopped = true;
-                }
-                SequenceDecoderOutput::Stopped => stopped = true,
-                SequenceDecoderOutput::Held => {}
-            }
+            stopped = decoder
+                .process_token_into(token_id, &mut delta.text)
+                .map_err(|e| {
+                    self.failed(format!(
+                        "Stop decoder failed to process token {token_id}: {e}"
+                    ))
+                })?
+                .stopped();
             delta.spans.push(TokenSpan {
                 token_id,
                 start,
@@ -484,6 +478,16 @@ impl Reader {
         self.ended
     }
 
+    /// The error of an output the reader could not read whole, which the request fails with:
+    /// the decoder refused a token or the text it held, or the table refused the output
+    /// ([`Self::feed`]). The output is recorded as failed for the table and is over: its end
+    /// counts nothing more.
+    pub(crate) fn failed(&mut self, why: String) -> SymphonyError {
+        self.ended = true;
+        telemetry::record_failed(self.table);
+        SymphonyError::Read(why)
+    }
+
     /// Feeds `input` to the engine, its events into `out` after the ones already there: the
     /// reader's one way in. The events this step added are tallied, and limited to the first
     /// call where the request asks. An output the engine refuses is recorded as failed for the
@@ -492,8 +496,7 @@ impl Reader {
         let before = out.len();
         let last = out.as_slice().last().map_or(0, telemetry::bytes_of);
         self.engine.feed(input, out).map_err(|e| {
-            telemetry::record_failed(self.table);
-            SymphonyError::Read(format!(
+            self.failed(format!(
                 "Symphony failed to read the output with the {} table: {e}",
                 self.table
             ))
@@ -951,6 +954,58 @@ mod tests {
             .is_none(),
             "{scrape}"
         );
+    }
+
+    /// A call whose elements nest past the bound the JSON reader applies to every syntax
+    /// (`PartialJson::DEFAULT_MAX_DEPTH` containers, the arguments object counted) still reaches
+    /// the client as a call: its arguments close whole without the member that crossed the
+    /// bound, so a strict reader takes them, and the output counts as malformed under
+    /// `invalid_arguments`, once.
+    #[test]
+    fn a_call_nested_past_the_bound_reaches_the_client_whole_and_counts_as_malformed() {
+        use symphony::{adapt::chat::message, formats::minimax_m3, json::PartialJson};
+        let levels = PartialJson::DEFAULT_MAX_DEPTH + 1;
+        let body = format!("{}1{}", "<d>".repeat(levels), "</d>".repeat(levels))
+            .replace('<', "]<]minimax[>[<");
+        let output = format!(
+            "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"lookup\">{body}\
+             ]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>"
+        );
+        let scrape = rendered(|| {
+            let events = read_pieces(minimax_m3(), "]~b]ai\n", &[&output], EngineFinish::Stop);
+            let choice = message(0, &events);
+            let calls = choice.message.tool_calls.expect("the call");
+            assert_eq!(calls.len(), 1, "{events:?}");
+            assert_eq!(calls[0].function.name, "lookup");
+            let arguments: Value =
+                serde_json::from_str(calls[0].function.arguments.as_deref().expect("arguments"))
+                    .expect("arguments a strict reader takes");
+            // The arguments object and the containers below it, as many as the reader takes:
+            // the deepest closes empty, the member that would have crossed the bound unwritten.
+            let mut depth = 0;
+            let mut value = &arguments;
+            while let Some(inner) = value.get("d") {
+                depth += 1;
+                value = inner;
+            }
+            assert_eq!(depth, PartialJson::DEFAULT_MAX_DEPTH - 1, "{arguments}");
+            assert_eq!(value, &serde_json::json!({}), "{arguments}");
+            assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+        });
+        let outputs = line_with(
+            &scrape,
+            "smg_symphony_outputs_total",
+            &["table=\"minimax_m3\"", "outcome=\"malformed\""],
+        )
+        .expect("the outputs counter");
+        assert!(outputs.ends_with(" 1"), "{outputs}");
+        let reason = line_with(
+            &scrape,
+            "smg_symphony_malformed_total",
+            &["table=\"minimax_m3\"", "reason=\"invalid_arguments\""],
+        )
+        .expect("the reason counter");
+        assert!(reason.ends_with(" 1"), "{reason}");
     }
 
     /// The released bytes have their places in the output, not the event's: the content spans
@@ -1909,6 +1964,73 @@ mod tests {
     }
 
     #[test]
+    fn a_string_value_a_calls_closing_marker_finds_open_is_delivered_whole_under_tool_calls() {
+        // The keyed syntax as a live stream carries it: the model skips the value's closing tag,
+        // writes the call's closing marker and then its stop token, which the engine hides. The
+        // message carries one call whose arguments parse, the value every byte the model wrote,
+        // under `tool_calls`; the output is counted malformed under the marker's reason.
+        use symphony::{adapt::chat::message, formats::glm4};
+        let tools: Vec<Tool> = serde_json::from_value(json!([{
+            "type": "function", "function": {
+                "name": "answer_string",
+                "parameters": {"type": "object", "properties": {"answer": {"type": "string"}}}
+            }
+        }]))
+        .expect("tools");
+        let assignment = Assignment {
+            format: Arc::new(glm4()),
+            prompt: GLM4_PROMPT.to_string(),
+        };
+        let pieces = [
+            "\n<think></think>\n<tool_call>answer_string\n<arg_key>answer</arg_key>\n<arg_value>",
+            "Logistic regression is a statistical method for a binary outcome",
+            ".",
+            "<|end_of_box|>",
+            "\n",
+            "</tool_call>",
+        ];
+        let mut all: Vec<Event<'static>> = Vec::new();
+        let mut events = Events::new();
+        let mut reader = Reader::new(&assignment, tools.into(), &mut events).expect("a reader");
+        all.extend(events.into_owned().drain());
+        for piece in pieces {
+            let mut delta = Delta::default();
+            let mut events = Events::new();
+            reader
+                .tail(piece.to_string(), &mut delta, &mut events)
+                .expect("read");
+            all.extend(events.into_owned().drain());
+        }
+        let mut events = Events::new();
+        reader
+            .end(EngineFinish::Stop, who(), &mut events)
+            .expect("ended");
+        all.extend(events.into_owned().drain());
+        let choice = message(0, &all);
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+        let calls = choice.message.tool_calls.expect("one call");
+        assert_eq!(calls.len(), 1);
+        let arguments: Value =
+            serde_json::from_str(calls[0].function.arguments.as_deref().expect("arguments"))
+                .expect("whole JSON");
+        assert_eq!(
+            arguments["answer"],
+            "Logistic regression is a statistical method for a binary outcome.<|end_of_box|>\n"
+        );
+        assert!(all.iter().any(|event| matches!(
+            event,
+            Event::Malformed {
+                why: symphony::MalformedReason::OpenAtTheMarker,
+                ..
+            }
+        )));
+        assert_eq!(
+            telemetry::reason_label(symphony::MalformedReason::OpenAtTheMarker),
+            "open_at_the_marker"
+        );
+    }
+
+    #[test]
     fn a_reader_ends_once() {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
@@ -1927,6 +2049,54 @@ mod tests {
             .end(EngineFinish::Stop, who(), &mut again)
             .expect("ended");
         assert!(again.is_empty());
+    }
+
+    #[test]
+    fn a_token_the_decoder_refuses_fails_the_output_and_counts_it_once() {
+        let assignment = Assignment {
+            format: Arc::new(qwen3(CallSyntax::Json)),
+            prompt: String::new(),
+        };
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(Refusing::default());
+        let mut decoder = StopSequenceDecoder::new(
+            tokenizer,
+            llm_tokenizer::StopSequenceConfig::default(),
+            false,
+        );
+        let scrape = rendered(|| {
+            let mut events = Events::new();
+            let mut reader =
+                Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
+            let mut delta = Delta::default();
+            let tokens = [u32::from('H'), Refusing::REFUSED];
+            let error = reader
+                .read(&mut decoder, &tokens, &mut delta, &mut events)
+                .expect_err("the token no character carries");
+            assert!(
+                matches!(&error, SymphonyError::Read(why)
+                    if why.contains("Stop decoder failed to process token 55296")),
+                "{error}"
+            );
+            // The output is over: its end counts nothing more.
+            assert!(reader.ended());
+            let mut again = Events::new();
+            reader
+                .end(EngineFinish::Stop, who(), &mut again)
+                .expect("ended");
+            assert!(again.is_empty());
+        });
+        let outputs = line_with(
+            &scrape,
+            "smg_symphony_outputs_total",
+            &["table=\"qwen3\"", "outcome=\"failed\""],
+        )
+        .expect("the failed count");
+        assert!(outputs.ends_with(" 1"), "{outputs}");
+        assert_eq!(
+            scrape.matches("smg_symphony_outputs_total{").count(),
+            1,
+            "{scrape}"
+        );
     }
 
     #[tokio::test]

@@ -8,10 +8,12 @@ use engine_zmq_adapter::{
 };
 use engine_zmq_client::StartupBudget;
 use openai_protocol::worker::RuntimeType;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use super::State;
-use crate::{record_error, servicer_config::SilenceBounds, SharedError};
+use crate::{
+    engine_link::load_tokenizer_once, record_error, servicer_config::SilenceBounds, SharedError,
+};
 
 /// Load the tokenizer and connect the engine, in the background of a server
 /// that is already listening. Failures gate health and surface as the last
@@ -38,26 +40,7 @@ pub(super) async fn connect_engine(
     tokenizer_dir: Option<String>,
     last_error: SharedError,
 ) {
-    let tokenizer = match tokenizer_dir.as_deref() {
-        _ if state.tokenizer.get().is_some() => None,
-        Some(dir) => match llm_tokenizer::factory::create_tokenizer_async(dir).await {
-            Ok(tokenizer) => Some(tokenizer),
-            Err(load_error) => {
-                warn!(
-                    %dir,
-                    %load_error,
-                    "tokenizer load failed; string stops will be refused"
-                );
-                None
-            }
-        },
-        None => {
-            warn!("no tokenizer directory configured; string stops will be refused");
-            None
-        }
-    };
-    // A pre-seeded tokenizer wins; `set` is a no-op then.
-    let _ = state.tokenizer.set(tokenizer);
+    load_tokenizer_once(&state.tokenizer, tokenizer_dir.as_deref()).await;
 
     let eos = if state.model.eos_token_ids.is_empty() {
         EosTokenIds::default()
@@ -74,7 +57,7 @@ pub(super) async fn connect_engine(
         StartupBudget {
             silence: startup_timeout,
             ceiling: startup_ceiling,
-            liveness: Some(state.engine.liveness.clone()),
+            liveness: Some(state.shared.engine.liveness.clone()),
         },
     )
     .await
@@ -98,7 +81,7 @@ pub(super) async fn connect_engine(
                 prefill_tokens_per_sec = silence.prefill_tokens_per_sec,
                 "vLLM engine connected"
             );
-            let _ = state.engine.client.set(client);
+            let _ = state.shared.engine.client.set(client);
         }
         Err(connect_error) => {
             let ceiling = startup_ceiling
@@ -108,7 +91,7 @@ pub(super) async fn connect_engine(
                  {startup_timeout:?} without a sign of life from the engine, ceiling {ceiling})"
             );
             error!(%message);
-            state.engine.fail(message.clone());
+            state.shared.engine.fail(message.clone());
             record_error(&last_error, message);
         }
     }

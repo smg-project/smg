@@ -11,6 +11,7 @@ use tonic::{Code, Request, Status};
 use tracing::warn;
 
 use super::State;
+use crate::admin::flush_timeout;
 
 /// The Python servicer's `PROFILE_COMM_TIMEOUT`.
 const PROFILE_WAIT: Duration = Duration::from_secs(600);
@@ -19,13 +20,8 @@ pub(super) async fn flush_cache(
     state: &State,
     request: Request<common::FlushCacheRequest>,
 ) -> Result<common::FlushCacheResponse, Status> {
-    let timeout_s = request.get_ref().timeout_s;
-    if !timeout_s.is_finite() || timeout_s < 0.0 {
-        return Err(Status::invalid_argument(
-            "timeout_s must be finite and non-negative",
-        ));
-    }
-    let engine = state.engine()?;
+    let timeout_s = flush_timeout(request.get_ref().timeout_s)?;
+    let engine = state.shared.engine()?;
     // The scheduler itself waits up to `timeout_s` for an idle moment (a
     // zero flushes at once or refuses); the reply wait is that plus slack,
     // the Python servicer's `max(30, timeout_s + 10)`.
@@ -53,7 +49,7 @@ pub(super) async fn start_profile(
     state: &State,
     request: common::StartProfileRequest,
 ) -> Result<common::ProfileResponse, Status> {
-    let engine = state.engine()?;
+    let engine = state.shared.engine()?;
     let start = SglangProfileStart {
         output_dir: request.output_dir,
         start_step: request.start_step.map(i64::from),
@@ -71,7 +67,7 @@ pub(super) async fn start_profile(
 }
 
 pub(super) async fn stop_profile(state: &State) -> Result<common::ProfileResponse, Status> {
-    let engine = state.engine()?;
+    let engine = state.shared.engine()?;
     profile(
         engine.profile_sglang(None, PROFILE_WAIT).await,
         "Stop profiling",

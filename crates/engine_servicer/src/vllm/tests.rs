@@ -50,7 +50,9 @@ use zip::{CompressionMethod, ZipArchive};
 use super::*;
 use crate::{
     kv_events,
-    testing::{assert_bucket_edges, assert_golden, http_get, servicer_config, Bounded},
+    testing::{
+        assert_bucket_edges, assert_golden, captured_logs, http_get, servicer_config, Bounded,
+    },
     tokenizer_bundle, ServicerError,
 };
 
@@ -432,6 +434,7 @@ async fn health_gates_on_the_engine_link_and_the_drain_flag() {
     assert_eq!(held.message, "Warming up");
     let (admitted, _cancel) = server
         .state
+        .shared
         .registry
         .register("held-probe")
         .expect("admission stays open while readiness is held");
@@ -455,7 +458,7 @@ async fn health_gates_on_the_engine_link_and_the_drain_flag() {
     assert!(!draining.healthy);
     assert_eq!(draining.message, "Draining");
     assert!(
-        server.state.registry.register("late").is_err(),
+        server.state.shared.registry.register("late").is_err(),
         "the drain closes admission"
     );
 
@@ -1424,14 +1427,14 @@ async fn the_launchers_stats_flag_classifies_the_wire_before_its_first_batch() {
     model.log_stats = Some(true);
     let h = harness(model, None).await;
     assert_eq!(
-        h.server.state.engine.reports_steps(),
+        h.server.state.shared.engine.reports_steps(),
         Some(true),
         "step-reporting from the start, no batch seen"
     );
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
     let untold = harness(model_info(), None).await;
     assert_eq!(
-        untold.server.state.engine.reports_steps(),
+        untold.server.state.shared.engine.reports_steps(),
         Some(false),
         "told nothing: classified by the first stats-only step batch"
     );
@@ -1488,6 +1491,7 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
     let relay = h
         .server
         .state
+        .shared
         .kv_relay
         .clone()
         .expect("a relay for the publisher");
@@ -1548,7 +1552,7 @@ async fn remote_kv_waiting_load_is_reported_per_rank() {
     let mut model = model_info();
     model.data_parallel_size = 2;
     let (mut h, _rank1_in, mut rank1_out) = two_rank_harness(model).await;
-    let source = LoadFromState(Arc::downgrade(&h.server.state));
+    let source = kv_events::LoadFromState(Arc::downgrade(&h.server.state));
     for (runnable, deferred) in [(0_u64, 4_u64), (3, 4), (0, 0)] {
         let expected_total = i32::try_from(runnable + deferred).unwrap();
         let expected_record_total = u32::try_from(expected_total).unwrap();
@@ -1565,7 +1569,7 @@ async fn remote_kv_waiting_load_is_reported_per_rank() {
             .await
             .unwrap();
         wait_until(|| {
-            h.server.state.engine().is_ok_and(|client| {
+            h.server.state.shared.engine().is_ok_and(|client| {
                 client
                     .get_loads()
                     .loads
@@ -1637,7 +1641,7 @@ async fn a_second_rank_reports_its_own_hit_rate_and_throughput() {
     );
     // Rank 0 has not reported a scheduler step: a batch of its gets no
     // record rather than rank 1's figures.
-    let source = LoadFromState(Arc::downgrade(&h.server.state));
+    let source = kv_events::LoadFromState(Arc::downgrade(&h.server.state));
     assert!(kv_events::LoadSource::load(&source, Some(0)).is_none());
     // Then rank 0 reports an idle step.
     h.engine_out
@@ -1651,6 +1655,7 @@ async fn a_second_rank_reports_its_own_hit_rate_and_throughput() {
     wait_until(|| {
         h.server
             .state
+            .shared
             .engine()
             .is_ok_and(|client| client.get_loads().loads.len() == 2)
     })
@@ -1893,6 +1898,7 @@ async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_
     let relay = h
         .server
         .state
+        .shared
         .kv_relay
         .clone()
         .expect("a relay for the publisher");
@@ -3821,7 +3827,12 @@ async fn a_shutdown_after_the_engines_completion_ends_the_stream_cleanly() {
     assert_eq!(done.output_ids, vec![10]);
     // The shutdown lands between the completion and the poll that ends the
     // stream: `cancel_all` is what `stop()` fires first.
-    h.server.state.registry.cancel_all().expect("cancel_all");
+    h.server
+        .state
+        .shared
+        .registry
+        .cancel_all()
+        .expect("cancel_all");
     assert!(
         stream.next().bounded().await.is_none(),
         "a clean end after the completion, not a status"
@@ -3895,6 +3906,110 @@ async fn drain_refuses_new_decode_requests_but_keeps_the_rejection_notice() {
     assert_eq!(notice.request_id, "draining");
     assert!(notice.abort_immediately);
     assert_eq!(h.server.active_requests(), 0);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A PD decode side on `connector`, with the request the adapter refuses
+/// after admission closed and before the engine got it (a negative
+/// temperature fails its own check of the sampling params): the refusal
+/// path of the notice.
+fn decode_side_on(connector: &str) -> VllmModelInfo {
+    let mut model = model_info();
+    model.kv_connector = connector.to_string();
+    model.kv_role = "kv_consumer".to_string();
+    model.kv_engine_id = "decode-engine".to_string();
+    model
+}
+
+fn refused_decode_request(id: &str) -> vllm::GenerateRequest {
+    let mut request = generate_request(id, true, Vec::new());
+    request.sampling_params.as_mut().unwrap().temperature = Some(-1.0);
+    request.kv_transfer_params_json =
+        Some(r#"{"do_remote_prefill":true,"remote_block_ids":[3]}"#.to_string());
+    request
+}
+
+/// On the NIXL connector a decode side refused before the engine got it
+/// still sends the rejection notice.
+#[tokio::test]
+async fn a_nixl_decode_side_refused_before_the_engine_still_sends_the_notice() {
+    let mut h = harness(decode_side_on("NixlConnector"), None).await;
+    let status = h
+        .client
+        .generate(refused_decode_request("pd-nixl"))
+        .await
+        .expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    let notice = recv_add(&mut h.engine_in).await;
+    assert_eq!(notice.request_id, "pd-nixl");
+    assert!(notice.abort_immediately);
+    assert_eq!(notice.prompt_token_ids.as_deref(), Some(&[0][..]));
+    // The notice's own stream is dropped once the add is out.
+    assert_eq!(
+        recv_abort(&mut h.engine_in).await,
+        vec!["pd-nixl".to_string()]
+    );
+    assert_engine_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// On the Mooncake connector the same refusal sends no notice (the decode
+/// engine would die on it) and logs one warning line that names the request
+/// and the reason; the refused id is free again.
+#[tokio::test]
+async fn a_mooncake_decode_side_withholds_the_notice_with_one_warning_line() {
+    let logs = captured_logs();
+    let mut h = harness(decode_side_on("MooncakeConnector"), None).await;
+    let status = h
+        .client
+        .generate(refused_decode_request("pd-mooncake"))
+        .await
+        .expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_engine_idle(&mut h.engine_in).await;
+    let lines = logs.lines_containing("pd-mooncake");
+    assert_eq!(lines.len(), 1, "one warning line: {lines:?}");
+    assert!(lines[0].contains("WARN"), "{}", lines[0]);
+    assert!(
+        lines[0].contains("KV-transfer rejection notice withheld on the Mooncake connector"),
+        "{}",
+        lines[0]
+    );
+    let _stream = h
+        .client
+        .generate(generate_request("pd-mooncake", true, Vec::new()))
+        .await
+        .expect("the refused id is free again")
+        .into_inner();
+    let accepted = recv_add(&mut h.engine_in).await;
+    assert_eq!(accepted.request_id, "pd-mooncake");
+    assert!(!accepted.abort_immediately);
+    assert_eq!(logs.lines_containing("pd-mooncake").len(), 1);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A Mooncake decode side abandoned while its media is still being fetched
+/// (the notice the drop guard sends on every other connector) withholds it
+/// too.
+#[tokio::test]
+async fn a_cancelled_mooncake_decode_side_withholds_the_notice() {
+    let logs = captured_logs();
+    let processor = MockMediaProcessor::slow(Ok(processed_media()), Duration::from_millis(1500), 4);
+    let mut h = harness_with(decode_side_on("MooncakeConnector"), None, Some(processor)).await;
+    let mut request = media_request("mr-mooncake");
+    request.kv_transfer_params_json =
+        Some(r#"{"do_remote_prefill":true,"remote_block_ids":[3]}"#.to_string());
+    let _ = tokio::time::timeout(Duration::from_millis(200), h.client.generate(request)).await;
+    // The guard fires when the abandoned request's future is dropped.
+    wait_until(|| !logs.lines_containing("mr-mooncake").is_empty()).await;
+    assert_engine_idle(&mut h.engine_in).await;
+    let lines = logs.lines_containing("mr-mooncake");
+    assert_eq!(lines.len(), 1, "one warning line: {lines:?}");
+    assert!(
+        lines[0].contains("withheld on the Mooncake connector"),
+        "{}",
+        lines[0]
+    );
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -4254,7 +4369,7 @@ async fn the_scrape_pins_the_families_after_a_scripted_sequence() {
         .unwrap();
     chunk_tokens(c1.message().bounded().await.unwrap().unwrap());
     h.server.set_serving(false);
-    h.server.state.registry.cancel_all().unwrap();
+    h.server.state.shared.registry.cancel_all().unwrap();
     let cut = c1.message().bounded().await.expect_err("a cut is a status");
     assert_eq!(cut.code(), Code::Unavailable);
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["c1".to_string()]);

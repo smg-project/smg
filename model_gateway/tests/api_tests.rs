@@ -1,6 +1,5 @@
 //! API integration tests
 
-#[path = "common/mod.rs"]
-pub mod common;
+pub use smg_test_harness as common;
 
 mod api;

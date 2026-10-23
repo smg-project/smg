@@ -79,8 +79,9 @@ impl UpstreamCut {
 
 /// `error` and its sources, outermost first: a body error reads "error
 /// decoding response body" on its own, and keeps the transport's reason (the
-/// connection reset, the transfer closed before its end) in the chain.
-fn cause(error: &reqwest::Error) -> String {
+/// connection reset, the transfer closed before its end) in the chain. The
+/// detail a side's failure below HTTP is answered with (see `pd_router`).
+pub(crate) fn cause(error: &reqwest::Error) -> String {
     let mut text = error.to_string();
     let mut source = error.source();
     while let Some(inner) = source {

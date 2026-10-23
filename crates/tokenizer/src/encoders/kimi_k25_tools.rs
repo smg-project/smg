@@ -3,7 +3,7 @@
 //! Ported from <https://huggingface.co/moonshotai/Kimi-K2.5/blob/main/tool_declaration_ts.py>.
 //! Mirrors the upstream Python reference function-by-function. Output must be
 //! byte-equal to the Python reference; gated by golden tests in
-//! `tests/kimi_k25_renderer_detection.rs`.
+//! `tests/render/kimi_k25_renderer_detection.rs`.
 
 use std::{collections::HashMap, fmt::Write};
 

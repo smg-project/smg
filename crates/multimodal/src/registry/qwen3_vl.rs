@@ -94,9 +94,9 @@ impl Qwen3VLVisionSpec {
     /// reported no timing: the preprocessor config's `fps`, else the family's 2.
     fn sample_fps(preprocessor_config: Option<&PreProcessorConfig>) -> f64 {
         preprocessor_config
-            .and_then(|config| config.get_extra::<f32>("fps"))
+            .and_then(|config| config.get_extra::<f64>("fps"))
             .filter(|fps| fps.is_finite() && *fps > 0.0)
-            .map_or(2.0, f64::from)
+            .unwrap_or(2.0)
     }
 
     /// The seconds stamped on each of `grid_t` temporal groups, as the family's

@@ -154,11 +154,11 @@ mod tests {
         }
     }
 
-    /// Prose where the invoke has tags, before its first child or after its last: the words
-    /// keep the whitespace between them, one `Malformed` event per word with the whitespace
-    /// before it, the newline after the tag the syntax read dropped as the template's; the chat
-    /// message's content and the stream's deltas are the model's words, whole, at every cut and
-    /// one character at a time alike.
+    /// Prose where the invoke has tags, before its first child or after its last: refused word by
+    /// word, each word with the whitespace before it, under one counted `Malformed` event of no
+    /// bytes per word, the newline after the tag the syntax read dropped as the template's; the
+    /// chat message's content and the stream's deltas never carry the words, at every cut and one
+    /// character at a time alike, and the refused bytes joined are the model's prose, whole.
     #[test]
     fn text_where_the_syntax_has_tags_keeps_the_models_whitespace_between_its_words() {
         let prose = "please note this and that";
@@ -188,7 +188,22 @@ mod tests {
             events
                 .iter()
                 .filter_map(|event| match event {
-                    Event::Dropped { text, .. } => Some(text.text.to_string()),
+                    Event::Dropped {
+                        text,
+                        why: DropReason::Wrapper,
+                    } => Some(text.text.to_string()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let refused = |events: &[Event]| -> Vec<String> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Dropped {
+                        text,
+                        why: DropReason::MalformedCall,
+                    } => Some(text.text.to_string()),
                     _ => None,
                 })
                 .collect()
@@ -200,30 +215,33 @@ mod tests {
             let whole = run_with(declared(), "", &[output]);
             assert_eq!(bytes(&whole), output);
             assert_eq!(arguments_of(&whole, 0), r#"{"city": "Paris"}"#);
-            let expected: Vec<(String, MalformedReason)> = ["please", " note", " this", " and", " that"]
-                .into_iter()
-                .map(|word| (word.to_string(), MalformedReason::TextBetweenTags))
-                .collect();
-            assert_eq!(words(&whole), expected, "{output:?}");
+            assert_eq!(
+                words(&whole),
+                vec![(String::new(), MalformedReason::TextBetweenTags); 5],
+                "{output:?}"
+            );
+            assert_eq!(
+                refused(&whole),
+                ["please", " note", " this", " and", " that"],
+                "{output:?}"
+            );
             assert!(!dropped(&whole).contains(&" ".to_string()), "{output:?}");
-            assert_eq!(shown(&whole).as_deref(), Some(prose), "{output:?}");
-            assert_eq!(streamed(&whole), prose, "{output:?}");
-            // A word a delta boundary cuts leaves in two pieces: the same text, joined.
+            assert_eq!(shown(&whole), None, "{output:?}");
+            assert_eq!(streamed(&whole), "", "{output:?}");
+            // A word a delta boundary cuts leaves in two pieces: the same bytes refused, joined.
             let joined = |events: &[Event]| -> String {
-                words(events)
-                    .into_iter()
-                    .map(|(word, why)| {
-                        assert_eq!(why, MalformedReason::TextBetweenTags);
-                        word
-                    })
-                    .collect()
+                for (word, why) in words(events) {
+                    assert_eq!(why, MalformedReason::TextBetweenTags);
+                    assert_eq!(word, "");
+                }
+                refused(events).concat()
             };
             for cut in (1..output.len()).filter(|&cut| output.is_char_boundary(cut)) {
                 let events = run_with(declared(), "", &[&output[..cut], &output[cut..]]);
                 assert_eq!(bytes(&events), output, "cut at {cut}");
                 assert_eq!(joined(&events), prose, "cut at {cut}");
-                assert_eq!(shown(&events).as_deref(), Some(prose), "cut at {cut}");
-                assert_eq!(streamed(&events), prose, "cut at {cut}");
+                assert_eq!(shown(&events), None, "cut at {cut}");
+                assert_eq!(streamed(&events), "", "cut at {cut}");
             }
             let pieces: Vec<&str> = output
                 .char_indices()
@@ -232,13 +250,14 @@ mod tests {
             let events = run_with(declared(), "", &pieces);
             assert_eq!(bytes(&events), output);
             assert_eq!(joined(&events), prose);
-            assert_eq!(streamed(&events), prose);
+            assert_eq!(streamed(&events), "");
         }
         // The template's separator inside the prose keeps its place and the words their spaces.
         let output = "<tool_call><invoke name=\"get_weather\">please ]<]minimax[>[note this<city>Paris</city></invoke></tool_call>";
         let events = run_with(declared(), "", &[output]);
         assert_eq!(bytes(&events), output);
-        assert_eq!(shown(&events).as_deref(), Some("please note this"));
+        assert_eq!(shown(&events), None);
+        assert_eq!(refused(&events).concat(), "please note this");
         assert_eq!(arguments_of(&events, 0), r#"{"city": "Paris"}"#);
     }
 
@@ -479,13 +498,13 @@ mod tests {
         let events = run("", &[output]);
         assert_eq!(bytes(&events), output);
         assert_eq!(names(&events), ["f"]);
-        // The open object closes, and the leaf never written is reported.
+        // The open object closes, and the leaf never written is refused.
         assert_eq!(arguments_of(&events, 0), r#"{"opts": {"a": 1}}"#);
         assert_eq!(ends(&events), 1);
         assert_eq!(content(&events), "The weather is sunny.");
         assert!(events.iter().any(|event| matches!(
             event,
-            Event::Malformed { text, .. } if text.text == "<b>tex"
+            Event::Dropped { text, why: DropReason::MalformedCall } if text.text == "<b>tex"
         )));
     }
 
@@ -545,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn text_that_is_not_a_tag_is_a_values_text_and_text_between_tags_is_reported() {
+    fn text_that_is_not_a_tag_is_a_values_text_and_text_between_tags_is_refused() {
         let output = concat!(
             "<tool_call>\n<invoke name=\"f\"><expr>a < b and c > d</expr>junk<n>1</n>",
             "<q>a <b> c</q></invoke>\n</tool_call>"
@@ -558,8 +577,9 @@ mod tests {
         );
         assert!(events.iter().any(|event| matches!(
             event,
-            Event::Malformed { text, .. } if text.text == "junk"
+            Event::Dropped { text, why: DropReason::MalformedCall } if text.text == "junk"
         )));
+        assert!(!content(&events).contains("junk"));
     }
 
     #[test]
@@ -575,8 +595,8 @@ mod tests {
     #[test]
     fn a_separator_inside_the_invoke_tag_is_carried_and_never_splits_a_character() {
         // The separator arriving between the name's quote and the `>`, after a multi-byte
-        // character: the tail is reported around it, in order, the separator in an event of its
-        // own, and the call starts (smg #2850, claude[bot]).
+        // character: the tail is refused around it, counted once, its bytes in order around the
+        // separator's own event, and the call starts (smg #2850, claude[bot]).
         let output = concat!(
             "</mm:think><tool_call>\n<invoke name=\"add\" ñ]<]minimax[>[x><a>1</a></invoke>\n",
             "</tool_call>"
@@ -592,7 +612,18 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(malformed, [" ñ", "x"]);
+        assert_eq!(malformed, [""]);
+        let refused: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped {
+                    text,
+                    why: DropReason::MalformedCall,
+                } => Some(&*text.text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refused, [" ñ", "x"]);
         assert!(events.iter().any(|event| matches!(
             event,
             Event::Dropped { text, .. } if text.text == "]<]minimax[>["
@@ -624,12 +655,12 @@ mod tests {
         );
         assert!(events.contains(&dropped("</tool_call>")));
         assert_eq!(content(&events), "Done.");
-        // An invoke that named no call is reported with whichever terminal ended it.
+        // An invoke that named no call is refused whole with whichever terminal ended it.
         let output = "<tool_call>\n<invoke name=\"</tool_call>";
         let events = run("", &[output]);
         assert!(events.iter().any(|event| matches!(
             event,
-            Event::Malformed { text, .. } if text.text.ends_with("</tool_call>")
+            Event::Dropped { text, why: DropReason::MalformedCall } if text.text.ends_with("</tool_call>")
         )));
         assert!(matches!(
             events.last(),
@@ -638,35 +669,42 @@ mod tests {
     }
 
     /// The invoke's close inside a streamed string, by its own closing tag, the block's close or
-    /// the next invoke: nothing is closed for a value the model never closed; the fragments
-    /// stand, and the one `Malformed` event before the end carries the start of a tag held there
-    /// or no bytes and says that the arguments are no whole value, under the engine's name for a
-    /// region a marker closed.
+    /// the next invoke: the model ended the call, so the value's bytes are the value whole. The
+    /// string is closed, the start of a tag held there its text since no tag followed, under one
+    /// `Malformed { OpenAtTheMarker }` event of no bytes right before the closing quote; the
+    /// containers above it and the object close, and the arguments read as JSON.
     #[test]
-    fn the_invokes_close_inside_a_string_leaves_it_open_and_reports_what_was_held() {
-        for (output, held) in [
+    fn the_invokes_close_inside_a_string_closes_it_there_and_says_so() {
+        for (output, value) in [
             (
                 "</mm:think><tool_call>\n<invoke name=\"alert\"><name>Par</na</invoke>\n</tool_call>",
-                "</na",
+                "Par</na",
             ),
-            ("</mm:think><tool_call>\n<invoke name=\"alert\"><name>Par</tool_call>", ""),
+            ("</mm:think><tool_call>\n<invoke name=\"alert\"><name>Par</tool_call>", "Par"),
             (
                 "</mm:think><tool_call>\n<invoke name=\"alert\"><name>Par<invoke name=\"alert\">\
                  </invoke>\n</tool_call>",
-                "",
+                "Par",
             ),
         ] {
             let events = run_with(tools(), "", &[output]);
             assert_eq!(bytes(&events), output, "{output:?}");
-            assert_eq!(arguments_of(&events, 0), r#"{"name": "Par"#, "{output:?}");
-            let ended = events
+            assert_eq!(
+                arguments_of(&events, 0),
+                format!("{{\"name\": \"{value}\"}}"),
+                "{output:?}"
+            );
+            let at = events
                 .iter()
-                .position(|event| matches!(event, Event::ToolCallEnd { index: 0, .. }))
-                .expect("the call ends");
+                .position(|event| matches!(event, Event::Malformed { .. }))
+                .expect("the one word");
             assert!(
                 matches!(
-                    &events[ended - 1],
-                    Event::Malformed { text, why: MalformedReason::BlockWithoutACompleteCall } if text.text == held
+                    &events[at..at + 2],
+                    [
+                        Event::Malformed { text, why: MalformedReason::OpenAtTheMarker },
+                        Event::ToolCallArguments { index: 0, json, .. }
+                    ] if text.text.is_empty() && json == "\""
                 ),
                 "{output:?}: {events:#?}"
             );
@@ -830,5 +868,298 @@ mod tests {
             arguments(&events),
             value!({"tags": ["1234"], "meta": {"id": 7, "flag": "true"}})
         );
+    }
+
+    /// A call whose elements nest past the bound the JSON reader applies to every syntax
+    /// (`PartialJson::DEFAULT_MAX_DEPTH` containers, the arguments object counted) is refused
+    /// from the element that would cross it: nothing of that member is written, the bytes from
+    /// its own tag to the call's end are dropped as a malformed call's behind one counted
+    /// `Malformed { InvalidArguments }` of no bytes, the containers open close whole, so the
+    /// arguments stay a value a strict reader takes, and every byte is accounted for, whole and
+    /// at every cut. Nesting up to the bound reads as before, for an object's members and a
+    /// list's items alike.
+    #[test]
+    fn nesting_past_the_json_readers_bound_is_refused_from_the_element_that_crosses_it() {
+        use crate::{json::PartialJson, testing::the_same_at_every_cut};
+        let deepest = PartialJson::DEFAULT_MAX_DEPTH;
+        // `levels` elements nested under the arguments object, the innermost a leaf, the
+        // template's separator before every tag.
+        let chain = |tag: &str, levels: usize| {
+            let body = format!(
+                "{}1{}",
+                format!("<{tag}>").repeat(levels),
+                format!("</{tag}>").repeat(levels)
+            );
+            format!(
+                "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"alert\">{}\
+                 ]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+                separated(&body)
+            )
+        };
+        let malformed = |events: &[Event]| -> Vec<(String, MalformedReason)> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
+                    _ => None,
+                })
+                .collect()
+        };
+        // The bytes dropped as a malformed call's, in order; the separators among them leave
+        // as the wrapper's own drops.
+        let refused = |events: &[Event]| -> String {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Dropped {
+                        text,
+                        why: DropReason::MalformedCall,
+                    } => Some(text.text.as_ref()),
+                    _ => None,
+                })
+                .collect()
+        };
+        // `inner` wrapped `times` times: in objects under the key, or in lists.
+        let wrapped = |tag: &str, inner: serde_json::Value, times: usize| {
+            (0..times).fold(inner, |value, _| {
+                if tag == "item" {
+                    value!([value])
+                } else {
+                    value!({ tag: value })
+                }
+            })
+        };
+        for tag in ["d", "item"] {
+            // A chain of `deepest` elements makes `deepest - 1` containers below the arguments
+            // object: as many as the reader takes, nothing refused.
+            let within = chain(tag, deepest);
+            let events = run("", &[&within]);
+            assert_eq!(bytes(&events), within, "{tag}");
+            assert_eq!(names(&events), ["alert"], "{tag}");
+            let json = arguments_of(&events, 0);
+            assert!(
+                PartialJson::default().parse(&json, false).is_ok(),
+                "{tag}: {json}"
+            );
+            assert_eq!(
+                arguments(&events),
+                value!({ tag: wrapped(tag, value!(1), deepest - 1) }),
+                "{tag}"
+            );
+            assert!(malformed(&events).is_empty(), "{tag}: {events:?}");
+
+            // One element more: the element below the deepest container would make it the
+            // container past the bound, and is refused from its own tag to the call's end; the
+            // deepest container closes empty, the ones above it whole.
+            let past = chain(tag, deepest + 1);
+            let events = run("", &[&past]);
+            assert_eq!(bytes(&events), past, "{tag}");
+            assert_eq!(names(&events), ["alert"], "{tag}");
+            let json = arguments_of(&events, 0);
+            assert!(
+                PartialJson::default().parse(&json, false).is_ok(),
+                "{tag}: a prefix the parser takes: {json}"
+            );
+            let empty = if tag == "item" {
+                value!([])
+            } else {
+                value!({})
+            };
+            assert_eq!(
+                arguments(&events),
+                value!({ tag: wrapped(tag, empty, deepest - 2) }),
+                "{tag}: the member that crossed the bound is not written"
+            );
+            // Counted once, with no bytes of its own; the bytes from the tag of the element
+            // that would cross the bound (the `deepest`-th) to the last closing tag are
+            // dropped as the call's, the separators among them as the wrapper's.
+            assert_eq!(
+                malformed(&events),
+                [(String::new(), MalformedReason::InvalidArguments)],
+                "{tag}"
+            );
+            let tail = format!(
+                "{}1{}",
+                format!("<{tag}>").repeat(2),
+                format!("</{tag}>").repeat(deepest + 1)
+            );
+            assert_eq!(refused(&events), tail, "{tag}");
+            assert_eq!(content(&events), "", "{tag}");
+            assert_eq!(ends(&events), 1, "{tag}");
+            // The same at every cut.
+            the_same_at_every_cut(|pieces| run("", pieces), &past);
+        }
+    }
+
+    /// A leaf's own JSON counts toward the same bound: a list under the deepest container the
+    /// reader takes would be the container past it, and is refused from the leaf's own tag to
+    /// the call's end, exactly as a tag there would be; one level up it is read.
+    #[test]
+    fn a_leafs_own_nesting_counts_toward_the_bound() {
+        use crate::{json::PartialJson, testing::the_same_at_every_cut};
+        let deepest = PartialJson::DEFAULT_MAX_DEPTH;
+        let chain = |levels: usize, leaf: &str| {
+            let body = format!("{}{leaf}{}", "<d>".repeat(levels), "</d>".repeat(levels));
+            format!(
+                "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"alert\">{}\
+                 ]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+                separated(&body)
+            )
+        };
+        let wrapped = |inner: serde_json::Value, times: usize| {
+            (0..times).fold(inner, |value, _| value!({ "d": value }))
+        };
+        let malformed = |events: &[Event]| -> Vec<(String, MalformedReason)> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let refused = |events: &[Event]| -> String {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Dropped {
+                        text,
+                        why: DropReason::MalformedCall,
+                    } => Some(text.text.as_ref()),
+                    _ => None,
+                })
+                .collect()
+        };
+        // `deepest - 1` elements: `deepest - 2` containers below the arguments object and a
+        // leaf; its list is the last container the reader takes.
+        let within = chain(deepest - 1, "[1]");
+        let events = run("", &[&within]);
+        assert_eq!(bytes(&events), within);
+        let json = arguments_of(&events, 0);
+        assert!(PartialJson::default().parse(&json, false).is_ok(), "{json}");
+        assert_eq!(
+            arguments(&events),
+            value!({ "d": wrapped(value!([1]), deepest - 2) })
+        );
+        assert!(malformed(&events).is_empty(), "{events:?}");
+
+        // One element more: the leaf's list would be the container past the bound; the leaf is
+        // refused from its own tag, the deepest container closes empty, the ones above it whole.
+        let past = chain(deepest, "[1]");
+        let events = run("", &[&past]);
+        assert_eq!(bytes(&events), past);
+        assert_eq!(names(&events), ["alert"]);
+        let json = arguments_of(&events, 0);
+        assert!(PartialJson::default().parse(&json, false).is_ok(), "{json}");
+        assert_eq!(
+            arguments(&events),
+            value!({ "d": wrapped(value!({}), deepest - 2) }),
+            "the leaf that crossed the bound is not written"
+        );
+        assert_eq!(
+            malformed(&events),
+            [(String::new(), MalformedReason::InvalidArguments)]
+        );
+        assert_eq!(
+            refused(&events),
+            format!("<d>[1]{}", "</d>".repeat(deepest))
+        );
+        assert_eq!(content(&events), "");
+        assert_eq!(ends(&events), 1);
+        the_same_at_every_cut(|pieces| run("", pieces), &past);
+
+        // The same leaf at the same depth as a scalar is read: only a container uses the depth.
+        let scalar = chain(deepest, "1");
+        let events = run("", &[&scalar]);
+        assert!(malformed(&events).is_empty(), "{events:?}");
+        assert_eq!(
+            arguments(&events),
+            value!({ "d": wrapped(value!(1), deepest - 1) })
+        );
+    }
+
+    /// An empty element the tool declares a container is written as `[]` or `{}`: at the bound
+    /// that would be the container past it, so the element is refused from its own tag as a
+    /// leaf there would be; one level up it is written.
+    #[test]
+    fn an_empty_element_declared_a_container_at_the_bound_is_refused() {
+        use crate::json::PartialJson;
+        let deepest = PartialJson::DEFAULT_MAX_DEPTH;
+        // `levels` nested `<d>` elements, the innermost empty; the tool declares an object at
+        // every level but the innermost, an array there.
+        let output = |levels: usize| {
+            let body = format!("{}{}", "<d>".repeat(levels), "</d>".repeat(levels));
+            format!(
+                "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"alert\">{}\
+                 ]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+                separated(&body)
+            )
+        };
+        let schema = |levels: usize| {
+            let innermost = value!({"type": "array", "items": {"type": "integer"}});
+            let nested = (1..levels).fold(
+                innermost,
+                |schema, _| value!({"type": "object", "properties": {"d": schema}}),
+            );
+            declared(
+                "alert",
+                value!({"type": "object", "properties": {"d": nested}}),
+            )
+        };
+        let wrapped = |inner: serde_json::Value, times: usize| {
+            (0..times).fold(inner, |value, _| value!({ "d": value }))
+        };
+        let malformed = |events: &[Event]| -> Vec<(String, MalformedReason)> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let refused = |events: &[Event]| -> String {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Dropped {
+                        text,
+                        why: DropReason::MalformedCall,
+                    } => Some(text.text.as_ref()),
+                    _ => None,
+                })
+                .collect()
+        };
+        // `deepest - 1` elements: the empty array is the last container the reader takes.
+        let within = output(deepest - 1);
+        let events = run_with(schema(deepest - 1), "", &[&within]);
+        assert_eq!(bytes(&events), within);
+        let json = arguments_of(&events, 0);
+        assert!(PartialJson::default().parse(&json, false).is_ok(), "{json}");
+        assert_eq!(
+            arguments(&events),
+            value!({ "d": wrapped(value!([]), deepest - 2) })
+        );
+        assert!(malformed(&events).is_empty(), "{events:?}");
+
+        // One element more: the empty array would be the container past the bound.
+        let past = output(deepest);
+        let events = run_with(schema(deepest), "", &[&past]);
+        assert_eq!(bytes(&events), past);
+        assert_eq!(names(&events), ["alert"]);
+        let json = arguments_of(&events, 0);
+        assert!(PartialJson::default().parse(&json, false).is_ok(), "{json}");
+        assert_eq!(
+            arguments(&events),
+            value!({ "d": wrapped(value!({}), deepest - 2) }),
+            "the element that crossed the bound is not written"
+        );
+        assert_eq!(
+            malformed(&events),
+            [(String::new(), MalformedReason::InvalidArguments)]
+        );
+        assert_eq!(refused(&events), format!("<d>{}", "</d>".repeat(deepest)));
+        assert_eq!(content(&events), "");
+        assert_eq!(ends(&events), 1);
     }
 }

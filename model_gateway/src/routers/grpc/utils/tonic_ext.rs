@@ -27,7 +27,9 @@ pub(crate) trait TonicStatusExt {
     /// a bad gateway, never the request's fault. So is a status tonic made
     /// of an HTTP/2 fault under the call (the connection went away, a stream
     /// reset below gRPC, a protocol fault), whatever code tonic picked from
-    /// the frame's reason.
+    /// the frame's reason, and one made of the socket under the call
+    /// failing (the connection reset or closed with the call in flight),
+    /// which tonic has no code for.
     fn http_status(&self) -> StatusCode;
 
     /// Convert this gRPC error into an HTTP error response with the appropriate status code.
@@ -89,8 +91,10 @@ impl TonicStatusExt for tonic::Status {
         // picks its code from the frame's reason: ENHANCE_YOUR_CALM reads as
         // RESOURCE_EXHAUSTED, which would answer the client a 429 rate limit
         // it never hit, PROTOCOL_ERROR as INTERNAL, the code of a worker's
-        // own answer. The worker's connection failed under the call: a 502
-        // the breaker samples and the retry layer replays elsewhere.
+        // own answer; a failure of the socket under the call (a reset, a
+        // close with the call in flight) gets UNKNOWN, no worker's code at
+        // all. The worker's connection failed under the call: a 502 the
+        // breaker samples and the retry layer replays elsewhere.
         if is_transport_failure(self) {
             return StatusCode::BAD_GATEWAY;
         }

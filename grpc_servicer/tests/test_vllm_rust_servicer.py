@@ -426,6 +426,7 @@ def _config(**overrides):
 
 
 def test_smg_media_options_follow_the_engine_config(tmp_path, monkeypatch):
+    """Propagate engine settings and default media download budgets to Rust."""
     from smg_grpc_servicer.vllm import mm_processor
     from smg_grpc_servicer.vllm.mm_processor import MmSettings
 
@@ -450,6 +451,8 @@ def test_smg_media_options_follow_the_engine_config(tmp_path, monkeypatch):
         "engine_item_limits": None,
         "engine_encoder_budget": None,
         "max_item_bytes": 10,
+        "fetch_timeout_ms": 10000,
+        "video_fetch_timeout_ms": 30000,
         "video_frame_budget": None,
         "video_loader_rule": None,
         "turbojpeg": None,
@@ -620,6 +623,8 @@ def test_smg_media_options_carry_the_processor_kwargs_from_where_the_engine_keep
         "engine_item_limits": None,
         "engine_encoder_budget": None,
         "max_item_bytes": 10,
+        "fetch_timeout_ms": 10000,
+        "video_fetch_timeout_ms": 30000,
         "video_frame_budget": None,
         "video_loader_rule": None,
         "turbojpeg": None,
@@ -778,6 +783,31 @@ def test_model_info_carries_the_pooler_config():
     config = _config(pooler_config=SimpleNamespace(use_activation=None, dimensions=None))
     info = rust.model_info_from_config(config)
     assert info["pooler_use_activation"] is None and info["pooler_dimensions"] is None
+
+
+def test_model_info_names_the_mooncake_mover_the_rust_servicer_withholds_the_notice_on():
+    """The Rust servicer withholds a PD decode side's rejection notice on the
+    Mooncake connector by the name the launcher hands it, so a wrapper whose
+    mover is Mooncake is handed ``MooncakeConnector`` too (the mover's engine
+    id with it), as ``GetServerInfo`` reports the pair."""
+    config = _config()
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="MultiConnector",
+        kv_role="kv_consumer",
+        engine_id="eng-d",
+        kv_connector_extra_config={
+            "connectors": [
+                {"kv_connector": "MooncakeConnector", "engine_id": "decode-engine"},
+                {"kv_connector": "SharedStorageConnector"},
+            ]
+        },
+    )
+    info = rust.model_info_from_config(config)
+    assert (info["kv_connector"], info["kv_role"], info["kv_engine_id"]) == (
+        "MooncakeConnector",
+        "kv_consumer",
+        "decode-engine",
+    )
 
 
 def test_model_info_projects_a_multi_connector_onto_the_child_that_moves_the_kv():
@@ -1987,3 +2017,23 @@ def test_the_switch_turns_the_kv_event_publisher_on_for_the_python_servicer_too(
     with pytest.raises(SystemExit):
         asyncio.run(switched(args))
     assert handed == [None] and served[-1] is not args
+
+
+@pytest.mark.parametrize("source", ["flag", "env"])
+def test_smg_media_options_forward_download_timeouts(source, monkeypatch):
+    """Pass each resolved timeout through the actual launcher-to-Rust options."""
+    from smg_grpc_servicer.vllm import mm_processor
+
+    monkeypatch.setattr(mm_processor, "vllm_default_video_frames", lambda: None)
+    parser = argparse.ArgumentParser()
+    mm_processor.add_mm_arguments(parser)
+    flags = ["--mm-fetch-timeout-ms", "60000", "--mm-video-fetch-timeout-ms", "120000"]
+    env = {"SMG_VLLM_MM_FETCH_TIMEOUT_MS": "60000", "SMG_VLLM_MM_VIDEO_FETCH_TIMEOUT_MS": "120000"}
+    settings = mm_processor.MmSettings.from_args(
+        parser.parse_args(flags if source == "flag" else [])
+    ).resolve(env=env)
+    options = rust.smg_media_options(
+        _config(is_multimodal_model=True), settings, None, encoder_budget=0
+    )
+    assert options["fetch_timeout_ms"] == 60000
+    assert options["video_fetch_timeout_ms"] == 120000
