@@ -2838,24 +2838,54 @@ fn a_worker_with_an_emptied_index_gets_the_warm_up_slice_whatever_its_age() {
     // w1's first block (the shared head) followed by eleven novel blocks.
     let mut request: Vec<u32> = (1..=4).collect();
     request.extend(90_000..90_044);
-    let picks: Vec<usize> = (0..8)
-        .map(|_| {
-            policy
-                .select_worker(
-                    &workers,
-                    &SelectWorkerInfo {
-                        tokens: Some(&request),
-                        ..Default::default()
-                    },
-                )
-                .unwrap()
-        })
-        .collect();
+    let recorder = PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Full(String::from("smg_cache_aware_match_ratio")),
+            CACHE_AWARE_MATCH_RATIO_BUCKETS,
+        )
+        .unwrap()
+        .build_recorder();
+    let handle = recorder.handle();
+    let picks: Vec<usize> = metrics::with_local_recorder(&recorder, || {
+        (0..8)
+            .map(|_| {
+                policy
+                    .select_worker(
+                        &workers,
+                        &SelectWorkerInfo {
+                            tokens: Some(&request),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect()
+    });
     assert!(
         picks.contains(&1),
         "the emptied worker got its slice of the thin-overlap requests: {picks:?}"
     );
     assert!(picks.contains(&0), "the holder kept the rest: {picks:?}");
+    // Every decision observed the chosen worker's overlap, the slice's
+    // included (w2 holds nothing: a zero; w1 one block of twelve), so the
+    // histogram's count is the count of decisions.
+    let sliced = picks.iter().filter(|&&pick| pick == 1).count();
+    let rendered = handle.render();
+    assert!(
+        rendered.lines().any(|line| line
+            .starts_with("smg_cache_aware_policy_branch_total{branch=\"warmup_slice\"} ")),
+        "no warm-up slice decision in:\n{rendered}"
+    );
+    for series in [
+        format!("smg_cache_aware_match_ratio_bucket{{le=\"0\"}} {sliced}"),
+        String::from("smg_cache_aware_match_ratio_bucket{le=\"0.1\"} 8"),
+        String::from("smg_cache_aware_match_ratio_count 8"),
+    ] {
+        assert!(
+            rendered.lines().any(|line| line == series),
+            "missing {series} in:\n{rendered}"
+        );
+    }
 }
 
 #[test]

@@ -892,7 +892,7 @@ pub(crate) fn init_metrics() {
     );
     describe_histogram!(
         "smg_cache_aware_match_ratio",
-        "Cache-aware tree-mode best prefix match ratio per request (matched/input, 0..1)"
+        "The predicted overlap of a cache-aware routing decision as a ratio (0..1), one observation per decision: in tree mode the best prefix match in the tree (matched/input units, whatever branch the decision took); in event mode the chosen worker's overlap in blocks over the request's blocks (0 where the chosen worker holds none: a miss, a spill, a warm-up placement)"
     );
 
     // Layer 3: Worker resilience metrics (circuit breaker)
@@ -2333,8 +2333,9 @@ impl Metrics {
         .increment(released as u64);
     }
 
-    /// Record the best prefix match ratio (matched/input, 0..1) of a cache-aware
-    /// tree-mode routing decision
+    /// Record the predicted overlap ratio (0..1) of a cache-aware routing
+    /// decision: the tree's best prefix match in tree mode, the chosen
+    /// worker's overlap over the request's blocks in event mode.
     pub fn record_cache_aware_match_ratio(ratio: f64) {
         histogram!("smg_cache_aware_match_ratio").record(ratio);
     }
