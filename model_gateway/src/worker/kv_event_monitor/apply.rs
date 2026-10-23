@@ -72,7 +72,7 @@ impl KvEventMonitor {
             worker_blocks.counters.untracked_tier += 1;
             return;
         };
-        if worker_blocks.sub_block(&stored.blocks) {
+        if worker_blocks.sub_block(worker_id, &stored.blocks) {
             return;
         }
 
@@ -150,7 +150,9 @@ impl KvEventMonitor {
     /// and its block of record: a clear is the worker's new cache incarnation
     /// (its publisher restarted or resynced), and a worker that comes back
     /// with a narrower block than it stored before must index its stores as
-    /// they come, not count every one as a sub-block store.
+    /// they come, not count every one as a sub-block store. The dropped
+    /// record is kept until that first store, which is logged when it is
+    /// narrower ([`WorkerIndexState::sub_block`]).
     pub(super) fn apply_cleared(
         worker_id: u32,
         indexer: &KvIndex,
@@ -158,6 +160,7 @@ impl KvEventMonitor {
     ) {
         indexer.apply_cleared(worker_id, &mut worker_blocks.blocks);
         worker_blocks.copies.clear();
+        worker_blocks.record_before_clear = worker_blocks.block_of_record;
         worker_blocks.block_of_record = 0;
     }
 }
@@ -310,6 +313,10 @@ pub(crate) struct WorkerIndexState {
     /// Tokens per block of the widest block the worker's stores carried so
     /// far, 0 until a store names a width: the worker's block of record.
     block_of_record: i32,
+    /// The block of record a clear dropped, until the worker's first store
+    /// after it names a width: a narrower one is logged, since the model-level
+    /// size that chunks requests keeps the old width.
+    record_before_clear: i32,
     pub(crate) counters: WorkerIndexCounters,
 }
 
@@ -362,7 +369,7 @@ impl WorkerIndexState {
     /// them on the chain, so they are counted and left out. The engines
     /// write one width per store, so the first block's width is the store's;
     /// a width of zero is unknown and neither raises nor trips the record.
-    fn sub_block(&mut self, blocks: &[KvBlock]) -> bool {
+    fn sub_block(&mut self, worker_id: u32, blocks: &[KvBlock]) -> bool {
         let Some(width) = blocks
             .first()
             .map(|block| block.block_size)
@@ -370,6 +377,19 @@ impl WorkerIndexState {
         else {
             return false;
         };
+        if self.record_before_clear > 0 {
+            if width < self.record_before_clear {
+                warn!(
+                    worker_id,
+                    before = self.record_before_clear,
+                    after = width,
+                    "the first KV event store after a clear names a narrower block than the \
+                     worker's previous record: its stores are indexed, but requests are chunked \
+                     at the model's learned block size until the model's last worker leaves"
+                );
+            }
+            self.record_before_clear = 0;
+        }
         if width > self.block_of_record {
             self.block_of_record = width;
         } else if width < self.block_of_record {
@@ -1217,6 +1237,10 @@ mod tests {
         assert_eq!(indexer.current_size(), 1);
         KvEventMonitor::apply_cleared(w1, &indexer, &mut wb);
         assert_eq!(indexer.current_size(), 0);
+        assert_eq!(
+            wb.record_before_clear, 32,
+            "kept for the first store's log line"
+        );
         KvEventMonitor::apply_stored(
             &stored_width(2, 4, &[1, 2, 3, 4], None),
             w1,
@@ -1230,5 +1254,10 @@ mod tests {
         );
         assert_eq!(wb.counters.sub_block_stores, 0);
         assert_eq!(wb.counters.sub_block_blocks, 0);
+        assert_eq!(wb.block_of_record, 4);
+        assert_eq!(
+            wb.record_before_clear, 0,
+            "the first store after the clear settles it"
+        );
     }
 }

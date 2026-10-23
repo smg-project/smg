@@ -415,6 +415,23 @@ mod tests {
         }
     }
 
+    /// One stored block of `width` tokens under `parent`, its tokens unique to `id`.
+    fn stored_width(parent: Option<i64>, id: i64, width: i32) -> KvCacheEvent {
+        KvCacheEvent {
+            event_id: 0,
+            data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
+                blocks: vec![KvBlock {
+                    block_hash: id,
+                    token_ids: (0..width as u32).map(|i| (id as u32) * 64 + i).collect(),
+                    block_size: width,
+                    ..Default::default()
+                }],
+                parent_block_hash: parent,
+                ..Default::default()
+            })),
+        }
+    }
+
     fn batch(seq: u64, rank: Option<i32>, events: Vec<KvCacheEvent>) -> KvEventBatch {
         KvEventBatch {
             sequence_number: seq,
@@ -630,7 +647,7 @@ mod tests {
                             .collect();
                         self.reference.apply_removed(self.worker, &hashes);
                     }
-                    kv_cache_event::Data::Cleared(_) => self.reference.apply_cleared(self.worker),
+                    kv_cache_event::Data::Cleared(_) => self.reference_clear(),
                 }
             }
         }
@@ -639,6 +656,13 @@ mod tests {
         fn deliver(&mut self, b: &KvEventBatch) -> BatchOutcome {
             self.reference_apply(b);
             self.feed(b)
+        }
+
+        /// A clear of the reference: its index and its block of record go
+        /// together, as production's do on a clear.
+        fn reference_clear(&mut self) {
+            self.reference.apply_cleared(self.worker);
+            self.block_of_record = 0;
         }
 
         fn assert_matches_reference(&self) {
@@ -817,13 +841,49 @@ mod tests {
         }
         // The engine restarts: its cache is empty and it counts from 0 again.
         let fresh = batch(0, None, vec![stored(None, &[21, 22])]);
-        sim.reference.apply_cleared(sim.worker);
+        sim.reference_clear();
         sim.reference_apply(&fresh);
         assert_eq!(sim.feed(&fresh), BatchOutcome::Applied);
         assert_eq!(
             sim.deliver(&batch(1, None, vec![stored(Some(22), &[23])])),
             BatchOutcome::Applied
         );
+        assert!(!sim.state.ranks[&0].is_degraded());
+        sim.assert_matches_reference();
+    }
+
+    /// The engine restarts with a narrower block than it stored before: the
+    /// clear takes the block of record with the blocks, so the fresh stores
+    /// are indexed as they come (none counted as a sub-block store) and
+    /// production matches the reference, whose record resets the same way.
+    #[test]
+    fn recovery_publisher_restart_with_a_narrower_block_matches_reference() {
+        let mut sim = Sim::new();
+        sim.deliver(&batch(
+            1,
+            None,
+            vec![stored_width(None, 1, 32), stored_width(Some(1), 2, 32)],
+        ));
+        for seq in 2..=(RESTART_WINDOW + 5) {
+            sim.deliver(&batch(seq, None, vec![]));
+        }
+        assert_eq!(sim.state.index.counters.sub_block_stores, 0);
+        // The engine restarts at a 4-token block: its cache is empty and it
+        // counts from 0 again.
+        let fresh = batch(
+            0,
+            None,
+            vec![stored_width(None, 11, 4), stored_width(Some(11), 12, 4)],
+        );
+        sim.reference_clear();
+        sim.reference_apply(&fresh);
+        assert_eq!(sim.feed(&fresh), BatchOutcome::Applied);
+        assert_eq!(
+            sim.indexer.worker_block_count(sim.worker),
+            2,
+            "the narrower blocks are indexed"
+        );
+        assert_eq!(sim.state.index.counters.sub_block_stores, 0);
         assert!(!sim.state.ranks[&0].is_degraded());
         sim.assert_matches_reference();
     }
@@ -838,7 +898,7 @@ mod tests {
         // engine stream live; neither can replay).
         sim.state.ranks.get_mut(&0).unwrap().reconnected();
         let fresh = batch(1, None, vec![stored(None, &[7])]);
-        sim.reference.apply_cleared(sim.worker);
+        sim.reference_clear();
         sim.reference_apply(&fresh);
         assert_eq!(sim.feed(&fresh), BatchOutcome::Applied);
         sim.assert_matches_reference();
@@ -853,7 +913,7 @@ mod tests {
         // SGLang's first batch after a restart carries AllBlocksCleared and
         // its counter starts over, with the servicer's stream still up.
         let first = batch(0, None, vec![cleared(), stored(None, &[9])]);
-        sim.reference.apply_cleared(sim.worker);
+        sim.reference_clear();
         sim.reference_apply(&first);
         assert_eq!(sim.feed(&first), BatchOutcome::Applied);
         sim.assert_matches_reference();
@@ -911,7 +971,7 @@ mod tests {
         // as a first one rather than clearing the index again.
         sim.state.reconnected();
         let fresh = batch(1, Some(1), vec![stored(None, &[111])]);
-        sim.reference.apply_cleared(sim.worker);
+        sim.reference_clear();
         sim.reference_apply(&fresh);
         assert_eq!(sim.feed(&fresh), BatchOutcome::Applied);
         assert_eq!(
@@ -936,7 +996,7 @@ mod tests {
         sim.deliver(&batch(2, None, vec![on_host]));
         sim.state.reconnected();
         let fresh = batch(1, None, vec![stored(None, &[1, 2])]);
-        sim.reference.apply_cleared(sim.worker);
+        sim.reference_clear();
         sim.reference_apply(&fresh);
         assert_eq!(sim.feed(&fresh), BatchOutcome::Applied);
         assert_eq!(
@@ -1246,22 +1306,6 @@ mod tests {
                 .find(|line| line.starts_with(&format!("{name}{{worker=\"grpc://w1:9000\"}}")))
                 .and_then(|line| line.rsplit(' ').next())
                 .and_then(|value| value.parse().ok())
-        }
-
-        fn stored_width(parent: Option<i64>, id: i64, width: i32) -> KvCacheEvent {
-            KvCacheEvent {
-                event_id: 0,
-                data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
-                    blocks: vec![KvBlock {
-                        block_hash: id,
-                        token_ids: (0..width as u32).map(|i| (id as u32) * 64 + i).collect(),
-                        block_size: width,
-                        ..Default::default()
-                    }],
-                    parent_block_hash: parent,
-                    ..Default::default()
-                })),
-            }
         }
 
         let recorder = PrometheusBuilder::new().build_recorder();
