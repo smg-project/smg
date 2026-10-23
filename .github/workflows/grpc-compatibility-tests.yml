@@ -1,0 +1,44 @@
+name: gRPC Runtime Compatibility
+
+on:
+  pull_request:
+    paths:
+      - crates/grpc_client/proto/**
+      - crates/grpc_client/python/**
+      - grpc_servicer/**
+      - scripts/check_grpc_compatibility.py
+      - scripts/ci_install_e2e_deps.sh
+      - scripts/ci_setup_vllm_rocm_image.sh
+      - scripts/test_grpc_ci_dependencies.py
+      - .github/workflows/grpc-compatibility-tests.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  peers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install ruff==0.15.0
+      - run: ruff check scripts/check_grpc_compatibility.py
+      - run: ruff format --check scripts/check_grpc_compatibility.py
+      - run: |
+          python -m venv .grpc178
+          .grpc178/bin/python -m pip install grpcio==1.78.0 grpcio-tools==1.78.0 grpcio-health-checking==1.78.0 grpcio-reflection==1.78.0 protobuf==6.31.1
+          .grpc178/bin/python -m pip install crates/grpc_client/python/ grpc_servicer/
+          .grpc178/bin/python -m pip check
+          .grpc178/bin/python -m pip install pytest pytest-asyncio msgspec pydantic numpy pyzmq pillow
+          .grpc178/bin/python -m pytest -q scripts/test_grpc_ci_dependencies.py
+          .grpc178/bin/python -m pytest -q grpc_servicer/tests -rs
+          python -m venv .grpc181
+          .grpc181/bin/python -m pip install grpcio==1.81.1 grpcio-tools==1.81.1 grpcio-health-checking==1.81.1 grpcio-reflection==1.81.1 protobuf==6.33.6
+          .grpc181/bin/python -m pip check
+          .grpc178/bin/python grpc_servicer/scripts/gen_proto_stubs.py .gencode178
+          .grpc181/bin/python grpc_servicer/scripts/gen_proto_stubs.py .gencode181
+          python scripts/check_grpc_compatibility.py .grpc178/bin/python .gencode178 .grpc181/bin/python .gencode181
