@@ -664,9 +664,6 @@ async fn execute_sglang_epd_dispatch(
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
-    use futures::future::try_join_all;
-    use smg_grpc_client::{encode_with_prefill, SglangEncoderClient};
-
     if request.as_sglang().encode_handoff.is_none() {
         return Err(error::bad_request(
             "sglang_encode_handoff_missing",
@@ -694,76 +691,23 @@ async fn execute_sglang_epd_dispatch(
                 "SGLang EPD requires a finite registered request timeout",
             )
         })?;
-    let deadline = tokio::time::Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| {
-            error::bad_request(
-                "sglang_encode_timeout_overflow",
-                "SGLang EPD deadline overflow",
-            )
-        })?;
-    let connections = handoff
-        .encoder_urls
-        .iter()
-        .zip(&handoff.num_items_assigned)
-        .filter(|(_, count)| **count != 0)
-        .map(|(url, _)| SglangEncoderClient::connect(url));
-    let encoders = tokio::time::timeout_at(deadline, try_join_all(connections))
-        .await
-        .map_err(|_| {
-            error::gateway_timeout(
-                "sglang_encode_connect_timeout",
-                "Encoder connection deadline elapsed",
-            )
-        })?
-        .map_err(|e| error::service_unavailable("sglang_encode_connect_failed", e.to_string()))?;
     let ProtoGenerateRequest::Sglang(request) = request else {
-        unreachable!()
+        return Err(error::bad_request(
+            "sglang_encode_backend_invalid",
+            "SGLang EPD requires a SGLang request",
+        ));
     };
-    let mut pd_error = None;
-    let result = encode_with_prefill(
-        encoders,
-        *request,
-        deadline.saturating_duration_since(tokio::time::Instant::now()),
-        |prefill| async {
-            match execute_pd_dispatch(
-                ProtoGenerateRequest::Sglang(Box::new(prefill)),
-                clients,
-                workers,
-                model,
-                prefill_guard,
-                ledger,
-            )
-            .await
-            {
-                Ok(result) => Ok(result),
-                Err(response) => {
-                    pd_error = Some(response);
-                    Err(tonic::Status::cancelled(
-                        "P/D dispatch failed; original response retained",
-                    ))
-                }
-            }
-        },
-    )
-    .await;
-    if let Some(response) = pd_error {
-        return Err(response);
-    }
-    result
-        .map(|(_, result)| result)
-        .map_err(|status| match status.code() {
-            tonic::Code::InvalidArgument => {
-                error::bad_request("sglang_encode_failed", status.to_string())
-            }
-            tonic::Code::DeadlineExceeded => {
-                error::gateway_timeout("sglang_encode_failed", status.to_string())
-            }
-            tonic::Code::Unavailable => {
-                error::service_unavailable("sglang_encode_failed", status.to_string())
-            }
-            _ => error::bad_gateway("sglang_encode_failed", status.to_string()),
-        })
+    super::sglang_encode::dispatch(*request, timeout, |prefill| {
+        execute_pd_dispatch(
+            ProtoGenerateRequest::Sglang(Box::new(prefill)),
+            clients,
+            workers,
+            model,
+            prefill_guard,
+            ledger,
+        )
+    })
+    .await
 }
 
 #[expect(

@@ -170,3 +170,87 @@ pub(crate) fn handoff(
         num_items_assigned: counts,
     })
 }
+
+/// Run actual Encode RPCs with the caller's existing PD dispatch. Only the
+/// zmq_to_scheduler backend includes scheduler delivery in Encode completion.
+pub(crate) async fn dispatch<F, Fut, T>(
+    request: sglang_proto::GenerateRequest,
+    timeout: std::time::Duration,
+    dispatch_pd: F,
+) -> std::result::Result<T, axum::response::Response>
+where
+    F: FnOnce(sglang_proto::GenerateRequest) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, axum::response::Response>>,
+{
+    use futures::future::try_join_all;
+    use smg_grpc_client::{encode_with_prefill, SglangEncoderClient};
+
+    use crate::routers::error;
+
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .filter(|_| !timeout.is_zero())
+        .ok_or_else(|| {
+            error::bad_request(
+                "sglang_encode_timeout_invalid",
+                "SGLang EPD deadline is invalid",
+            )
+        })?;
+    let handoff = request.encode_handoff.as_ref().ok_or_else(|| {
+        error::bad_request(
+            "sglang_encode_handoff_missing",
+            "SGLang encoder handoff missing",
+        )
+    })?;
+    let connections = handoff
+        .encoder_urls
+        .iter()
+        .zip(&handoff.num_items_assigned)
+        .filter(|(_, count)| **count != 0)
+        .map(|(url, _)| SglangEncoderClient::connect(url));
+    let encoders = tokio::time::timeout_at(deadline, try_join_all(connections))
+        .await
+        .map_err(|_| {
+            error::gateway_timeout(
+                "sglang_encode_connect_timeout",
+                "Encoder connection deadline elapsed",
+            )
+        })?
+        .map_err(|e| error::service_unavailable("sglang_encode_connect_failed", e.to_string()))?;
+    let mut pd_error = None;
+    let pd_error_slot = &mut pd_error;
+    let result = encode_with_prefill(
+        encoders,
+        request,
+        deadline.saturating_duration_since(tokio::time::Instant::now()),
+        |prefill| async move {
+            match dispatch_pd(prefill).await {
+                Ok(result) => Ok(result),
+                Err(response) => {
+                    *pd_error_slot = Some(response);
+                    Err(tonic::Status::cancelled(
+                        "P/D dispatch failed; original response retained",
+                    ))
+                }
+            }
+        },
+    )
+    .await;
+    if let Some(response) = pd_error {
+        return Err(response);
+    }
+    result
+        .map(|(_, result)| result)
+        .map_err(|status| match status.code() {
+            tonic::Code::InvalidArgument => {
+                error::bad_request("sglang_encode_failed", status.to_string())
+            }
+            tonic::Code::DeadlineExceeded => {
+                error::gateway_timeout("sglang_encode_failed", status.to_string())
+            }
+            tonic::Code::Unavailable => {
+                error::service_unavailable("sglang_encode_failed", status.to_string())
+            }
+            _ => error::bad_gateway("sglang_encode_failed", status.to_string()),
+        })
+}
