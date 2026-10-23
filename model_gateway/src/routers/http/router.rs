@@ -260,7 +260,13 @@ impl Router {
                             ),
                         }
                     }
-                    Err(e) => convert_reqwest_error(e),
+                    Err(e) => {
+                        error!(
+                            worker = worker.url(),
+                            endpoint, "Failed to proxy GET request: {e}"
+                        );
+                        convert_reqwest_error(e)
+                    }
                 }
             }
             Err(e) => error::service_unavailable("no_workers", e),
@@ -849,7 +855,13 @@ impl Router {
 
                     send_with_stale_conn_retry(request_builder)
                         .await
-                        .map_err(convert_reqwest_error)
+                        .map_err(|e| {
+                            error!(
+                                worker = worker.url(),
+                                endpoint, "Failed to send request: {e}"
+                            );
+                            convert_reqwest_error(e)
+                        })
                 }
             })
             .collect();
