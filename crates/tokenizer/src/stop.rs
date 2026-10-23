@@ -259,7 +259,8 @@ impl StopSequenceDecoder {
     /// Says what the token did (text released, held, a stop matched, a stop
     /// matched with text released before or with it); the text itself is in
     /// `out`, after what was there. A stream appends its tokens' text to one
-    /// buffer this way, with no string per token.
+    /// buffer this way, with no string per token. When the call fails, `out`
+    /// is as it was: nothing is appended before the last step that can fail.
     pub fn process_token_into(
         &mut self,
         token_id: TokenIdType,
@@ -283,6 +284,17 @@ impl StopSequenceDecoder {
         if hidden_stop || visible_stop {
             // A stop token closes the byte run before it; it must not discard
             // pending text, and a string stop within that text takes precedence.
+            // A visible stop's own text is decoded first: the steps that can
+            // fail run before anything is appended to `out`.
+            let stop_text = if visible_stop && !hidden_stop {
+                Some(
+                    self.sequence
+                        .tokenizer()
+                        .decode(&[token_id], self.sequence.skip_special_tokens())?,
+                )
+            } else {
+                None
+            };
             let before = out.len();
             let pending = self.sequence.finish()?;
             self.jail_buffer.push_str(&pending);
@@ -293,13 +305,8 @@ impl StopSequenceDecoder {
             out.push_str(&self.jail_buffer);
             self.jail_buffer.clear();
             self.stopped = true;
-            if visible_stop && !hidden_stop {
-                out.push_str(
-                    &self
-                        .sequence
-                        .tokenizer()
-                        .decode(&[token_id], self.sequence.skip_special_tokens())?,
-                );
+            if let Some(stop_text) = stop_text {
+                out.push_str(&stop_text);
             }
             return Ok(if out.len() == before && hidden_stop {
                 SequenceDecoderStep::Stopped
