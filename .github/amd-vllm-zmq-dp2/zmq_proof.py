@@ -51,6 +51,7 @@ def witness(gateway, workers, model, native):
     argv = result["launch_argv"]
     require(argument(argv, "-m") == "smg.launch_router", "wrong original gateway launcher")
     require(argument(argv, "--backend") == "vllm", "actual gateway backend differs")
+    metrics_model = argument(argv, "--model-path")
     i = argv.index("--worker-urls") + 1 if argv.count("--worker-urls") == 1 else 0
     require(i > 0, "missing/duplicate worker URLs")
     urls = []
@@ -83,8 +84,7 @@ def witness(gateway, workers, model, native):
             "engine handshake differs",
         )
         require(
-            args.count("serve") == 1
-            and args[args.index("serve") + 1] == argument(argv, "--model-path"),
+            args.count("serve") == 1 and args[args.index("serve") + 1] == metrics_model,
             "gateway/engine model path differs",
         )
         require(worker.gpu_ids == [0, 1], "original two-VF worker slice changed")
@@ -142,6 +142,8 @@ def witness(gateway, workers, model, native):
     )
     return {
         **result,
+        "case_model": model,
+        "metrics_model": metrics_model,
         "engines": engines,
         "native_path": str(path),
         "native_sha256": NATIVE_HASHES[key],
@@ -197,13 +199,20 @@ class ZmqProof:
                     "model": model,
                     "before": witness(gateway, workers, model, self.native),
                 }
+                metrics_model = record["before"]["metrics_model"]
                 # Stop extra sampling after one original gateway/model proves both ranks.
                 if not any(s["ranks"] == {0, 1} for s in self.activity.values()):
-                    key = (record["before"]["pid"], record["before"]["start_ticks"], model)
+                    key = (
+                        record["before"]["pid"],
+                        record["before"]["start_ticks"],
+                        model,
+                        metrics_model,
+                    )
                     state = self.activity.setdefault(
                         key,
                         {
                             "model": model,
+                            "metrics_model": metrics_model,
                             "gateway_pid": key[0],
                             "gateway_start_ticks": key[1],
                             "worker": workers[0].base_url,
@@ -216,7 +225,7 @@ class ZmqProof:
                     window = ActivityWindow(
                         gateway.metrics_url,
                         workers[0].base_url,
-                        model,
+                        metrics_model,
                         item.nodeid,
                         self.output,
                         state,
@@ -250,6 +259,7 @@ class ZmqProof:
                             "native_path",
                             "native_sha256",
                             "rank_identities",
+                            "metrics_model",
                         )
                     ),
                     "ZMQ process identity changed during original case",
