@@ -1,20 +1,27 @@
-name: SGLang image source capture
+name: SGLang encoder interface source capture
 
 on:
   workflow_dispatch:
+    inputs:
+      confirmed_source_admission:
+        description: Root-only admission after source review and current budget check
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: amd-sglang-source-capture-20261022
+  group: amd-epd-source-capture-20261023
   cancel-in-progress: false
 
 jobs:
-  engine-source-capture:
-    name: engine-source-capture
+  encoder-source-capture:
+    if: ${{ inputs.confirmed_source_admission }}
+    name: encoder-source-capture
     runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
-    timeout-minutes: 2
+    timeout-minutes: 3
     container:
       image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
     steps:
@@ -28,13 +35,13 @@ jobs:
           test ! -e /dev/kfd
           test ! -e /dev/dri
       - name: Read bounded public package sources
-        run: timeout --signal=INT --kill-after=5s 40s python3 .github/amd-source/collect_sglang_source.py --output engine-source-results
+        run: timeout --signal=INT --kill-after=5s 85s python3 .github/amd-source/collect_sglang_source.py --output engine-source-results
       - name: Upload source evidence
         if: always()
         timeout-minutes: 1
         uses: actions/upload-artifact@v7
         with:
-          name: sglang-image-source-${{ github.run_id }}-${{ github.run_attempt }}
+          name: sglang-encoder-source-${{ github.run_id }}-${{ github.run_attempt }}
           path: engine-source-results/
           if-no-files-found: error
           retention-days: 7
