@@ -1,5 +1,8 @@
 //! SGLang IMAGE media and contiguous encoder placement, separate from TS rooms.
 
+#[cfg(test)]
+mod tests;
+
 use std::sync::Arc;
 
 use anyhow::{anyhow, ensure, Result};
