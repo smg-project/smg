@@ -135,6 +135,12 @@ impl MultimodalData {
         match self {
             Self::Sglang(data) => {
                 data.image_data.iter().map(Vec::len).sum::<usize>()
+                    + data
+                        .encoder_image_urls
+                        .iter()
+                        .flatten()
+                        .map(String::len)
+                        .sum::<usize>()
                     + data.pixel_values.len()
                     + tensor_bytes(&data.model_specific_tensors)
             }
@@ -175,6 +181,7 @@ impl VllmMultimodalData {
 /// SGLang multimodal data: preprocessed tensors with patch-only placeholders.
 #[derive(Debug)]
 pub struct SglangMultimodalData {
+    pub encoder_image_urls: Option<Vec<String>>,
     pub image_data: Vec<Vec<u8>>,
     pub pixel_values: Vec<u8>,
     pub pixel_values_shape: Vec<u32>,
@@ -320,8 +327,28 @@ impl TokenSpeedTensor {
 }
 
 impl SglangMultimodalData {
+    pub(crate) fn for_encoder(images: Vec<String>) -> Self {
+        Self {
+            encoder_image_urls: Some(images),
+            image_data: Vec::new(),
+            pixel_values: Vec::new(),
+            pixel_values_shape: Vec::new(),
+            pixel_values_dtype: String::new(),
+            model_specific_tensors: HashMap::new(),
+            im_token_id: None,
+            mm_placeholders: Vec::new(),
+        }
+    }
+
     /// Convert to SGLang proto MultimodalInputs.
     pub fn into_proto(self) -> sglang::MultimodalInputs {
+        if let Some(image_urls) = self.encoder_image_urls {
+            return sglang::MultimodalInputs {
+                image_urls,
+                modalities: vec!["image".to_string()],
+                ..Default::default()
+            };
+        }
         let model_specific_tensors = self
             .model_specific_tensors
             .into_iter()
@@ -4118,6 +4145,7 @@ mod tests {
         assert_eq!(trtllm.inline_bytes(), 8);
 
         let sglang = MultimodalData::Sglang(SglangMultimodalData {
+            encoder_image_urls: None,
             image_data: vec![vec![0; 2]],
             pixel_values: vec![0; 16],
             pixel_values_shape: vec![4, 4],

@@ -89,7 +89,7 @@ impl PipelineStage for EncodeStage {
         }
 
         let (bootstrap_info, dispatch) = plan.into_parts();
-        ctx.state.encode_outputs = Some(EncodeOutputs {
+        ctx.state.encode_outputs = Some(EncodeOutputs::TokenSpeed {
             bootstrap_info,
             dispatch,
         });
@@ -470,7 +470,7 @@ mod tests {
             assert!(!dispatch.is_empty());
 
             let state = ProcessingState {
-                encode_outputs: Some(EncodeOutputs {
+                encode_outputs: Some(EncodeOutputs::TokenSpeed {
                     bootstrap_info: Vec::new(),
                     dispatch,
                 }),

@@ -492,9 +492,12 @@ pub(crate) struct AttemptStamp {
 /// Owns the encode jobs' SHM/RDMA Drop guards: dropping this before request
 /// execution dispatches (early return / cancellation) reclaims the staged
 /// `/dev/shm` segments via `PreparedEncodeItem`'s `Drop`.
-pub(crate) struct EncodeOutputs {
-    pub bootstrap_info: Vec<EncodeItemBootstrapInfo>,
-    pub dispatch: EncodeDispatchPlan,
+pub(crate) enum EncodeOutputs {
+    TokenSpeed {
+        bootstrap_info: Vec<EncodeItemBootstrapInfo>,
+        dispatch: EncodeDispatchPlan,
+    },
+    Sglang(super::common::stages::sglang_encode::SglangEncodePlan),
 }
 
 /// Execution shape produced by request building. Retained until the retry
