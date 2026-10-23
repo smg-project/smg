@@ -1472,24 +1472,31 @@ impl BasicWorker {
     fn breaker_allows(&self, rt: &WorkerRuntime) -> bool {
         let allows = self.circuit_breaker.load().can_execute();
         if allows && rt.published_state() == CIRCUIT_OPEN_CODE {
-            self.publish_state_under(rt);
+            self.publish_state_under(rt, false);
         }
         allows
     }
 
     /// [`Worker::publish_state`] under the runtime guard the caller holds:
     /// the pair the facts give now is set to 1 and the pair published before
-    /// it to 0, when they differ. One publish at a time, from the facts to
-    /// the last write: every fact is stored before its publish is called, so
-    /// the last publish in lock order reads every fact that moved, and the
-    /// series end on the pair the facts give.
-    fn publish_state_under(&self, rt: &WorkerRuntime) {
+    /// it to 0, when they differ; with `forget_previous` (a registration,
+    /// whose address's series were dropped) the pair is set whether or not
+    /// it was the one published before. One publish at a time, from the
+    /// facts to the last write: every fact is stored before its publish is
+    /// called, so the last publish in lock order reads every fact that
+    /// moved, and the series end on the pair the facts give. The breaker is
+    /// read as stored: its timeout's move belongs to the routing decision's
+    /// read ([`Self::breaker_allows`]), which publishes it.
+    fn publish_state_under(&self, rt: &WorkerRuntime, forget_previous: bool) {
         let _publish = rt.publish_lock();
+        if forget_previous {
+            rt.swap_published_state(0);
+        }
         let index = routing_state_series(
             rt.status(),
             rt.is_overloaded(),
             rt.stall_reason(),
-            self.circuit_breaker.load().state() == super::circuit_breaker::CircuitState::Open,
+            self.circuit_breaker.load().peek_state() == super::circuit_breaker::CircuitState::Open,
         );
         let code = index as u8 + 1;
         let previous = rt.swap_published_state(code);
@@ -2017,24 +2024,26 @@ impl Worker for BasicWorker {
 
     fn record_circuit_breaker_outcome(&self, success: bool) {
         let breaker = self.circuit_breaker.load();
-        let before = breaker.state();
+        // The state as stored, before and after: the timeout's move from
+        // open to half-open belongs to the routing decision's read, as
+        // before this series existed, not to a record that happens to land
+        // after the timeout.
+        let before = breaker.peek_state();
         breaker.record_outcome(success);
         // A trip or a close moved the routing state; a record that left the
         // breaker where it was publishes nothing, so the steady path takes
         // no lock.
-        if breaker.state() != before {
+        if breaker.peek_state() != before {
             self.publish_state();
         }
     }
 
     fn publish_state(&self) {
-        self.publish_state_under(&self.runtime.load());
+        self.publish_state_under(&self.runtime.load(), false);
     }
 
     fn republish_state(&self) {
-        let rt = self.runtime.load();
-        rt.swap_published_state(0);
-        self.publish_state_under(&rt);
+        self.publish_state_under(&self.runtime.load(), true);
     }
 
     fn resilience(&self) -> &ResolvedResilience {
@@ -3835,6 +3844,39 @@ mod tests {
             assert_eq!(current_state(&handle.render()), "excluded/not_ready");
             worker.set_status(WorkerStatus::Ready);
             assert_eq!(current_state(&handle.render()), "excluded/circuit_open");
+
+            // A record that lands on an open breaker past its timeout is
+            // ignored, as before this series existed: the breaker does not
+            // go to half-open and back on the record (no transition counted),
+            // and the series stays on circuit_open until the routing
+            // decision reads the breaker.
+            let late = BasicWorkerBuilder::new("http://worker:8000")
+                .health_config(no_health_check())
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    timeout_duration: Duration::from_millis(10),
+                    ..CircuitBreakerConfig::default()
+                })
+                .build();
+            late.republish_state();
+            late.record_circuit_breaker_outcome(false);
+            thread::sleep(Duration::from_millis(20));
+            late.record_circuit_breaker_outcome(false);
+            let rendered = handle.render();
+            assert_eq!(current_state(&rendered), "excluded/circuit_open");
+            assert!(
+                rendered
+                    .lines()
+                    .any(|line| line.contains("smg_worker_cb_transitions_total")
+                        && line.contains("from=\"open\",to=\"half_open\"")
+                        && line.ends_with(" 0")),
+                "{rendered}"
+            );
+            assert!(
+                late.circuit_breaker_can_execute(),
+                "the decision's read starts the trial"
+            );
+            assert_eq!(current_state(&handle.render()), "available/none");
 
             // The address's series were dropped (a removal) and the worker
             // registers again: the plain publish sees no move, the

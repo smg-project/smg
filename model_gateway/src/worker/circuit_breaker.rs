@@ -183,6 +183,15 @@ impl CircuitBreaker {
         self.check_and_update_state_returning()
     }
 
+    /// The state as stored, without the timeout check [`Self::state`] runs:
+    /// for a reader that must not move the breaker (a comparison around a
+    /// record, a gauge of the state as it is). An open breaker past its
+    /// timeout still reads open here; the routing decision's read moves it.
+    #[inline]
+    pub fn peek_state(&self) -> CircuitState {
+        CircuitState::from_int(self.state.load(Ordering::Acquire))
+    }
+
     /// Check and update state, returning the current state (lock-free)
     #[inline]
     fn check_and_update_state_returning(&self) -> CircuitState {
