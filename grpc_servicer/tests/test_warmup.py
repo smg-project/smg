@@ -354,6 +354,10 @@ def test_an_engine_that_asks_for_every_prefill_length_gets_the_remainders_last_i
     assert not any(s.kind == "remainder" for s in fast.steps)
     assert "remainder" not in fast.describe()
     assert [s.kind for s in fast.steps] == [s.kind for s in plan_warmup(SMALL, "fast").steps]
+    # Without the ask, the plan reads as before.
+    before = plan_warmup(SMALL, "full")
+    assert not any(s.kind == "remainder" for s in before.steps)
+    assert "remainder" not in before.describe()
 
 
 def test_a_fast_start_on_an_engine_that_asks_for_every_length_warns_that_the_hazard_stays(caplog):
@@ -371,10 +375,6 @@ def test_a_fast_start_on_an_engine_that_asks_for_every_length_warns_that_the_haz
     assert warmup.plan_for(warmup.WarmupSetting(True, "full"), asks, knob="K") is not None
     assert warmup.plan_for(warmup.WarmupSetting(True, "fast"), SMALL, knob="K") is not None
     assert not [r for r in caplog.records if r.levelno == logging.WARNING]
-    # Without the ask, the plan reads as before.
-    before = plan_warmup(SMALL, "full")
-    assert not any(s.kind == "remainder" for s in before.steps)
-    assert "remainder" not in before.describe()
 
 
 def test_the_remainders_cover_the_counts_a_chunked_prefills_last_chunk_can_take():
