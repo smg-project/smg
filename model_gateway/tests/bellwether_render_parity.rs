@@ -190,35 +190,11 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          the model, until the recorder pins the day",
     ),
     (
-        "arcee-blitz-caller-beta/render/*",
-        "the checkpoint's chat_template is a list of named templates (default, \
-         tool_use), which the gateway's loader does not read: no case of the model \
-         renders",
-    ),
-    (
         "arcee-blitz/render/*",
         "the template writes the day of the render into the prompt with strftime_now and \
          the group was recorded on 2026-10-13, where the job renders SOURCE_DATE_EPOCH's \
          day, 2026-10-14, the day most of the dated groups were recorded; every case of \
          the model, until the recorder pins the day",
-    ),
-    (
-        "autoglm-phone-9b-multilingual/render/*",
-        "the gateway hands this template the text of an assistant or system turn as a \
-         parts list, which the template prints as JSON where the reference run had the \
-         string",
-    ),
-    (
-        "autoglm-phone-9b/render/*",
-        "the gateway hands this template the text of an assistant or system turn as a \
-         parts list, which the template prints as JSON where the reference run had the \
-         string",
-    ),
-    (
-        "caller/render/*",
-        "the checkpoint's chat_template is a list of named templates (default, \
-         tool_use), which the gateway's loader does not read: no case of the model \
-         renders",
     ),
     (
         "cosmos3-edge-policy-droid/render/*",
@@ -229,18 +205,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "cosmos3-edge/render/*",
         "the template writes a newline before the first turn, which the gateway's render \
          drops: every case of the model",
-    ),
-    (
-        "deephermes-3-llama-3-8b-preview/render/*",
-        "the checkpoint's chat_template is a list of named templates (default, \
-         tool_use), which the gateway's loader does not read: no case of the model \
-         renders",
-    ),
-    (
-        "deephermes-financial-fundamentals-prediction-specialist-atropos/render/*",
-        "the checkpoint's chat_template is a list of named templates (default, \
-         tool_use), which the gateway's loader does not read: no case of the model \
-         renders",
     ),
     (
         "deepseek-v3.1/render/bfcl-*",
@@ -368,24 +332,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          parameter",
     ),
     (
-        "falcon-e-3b-base-prequantized/render/*",
-        "the gateway hands this template the text of an assistant or system turn as a \
-         parts list, which the template prints as JSON where the reference run had the \
-         string",
-    ),
-    (
-        "falcon3-10b-base-1.58bit-prequantized/render/*",
-        "the gateway hands this template the text of an assistant or system turn as a \
-         parts list, which the template prints as JSON where the reference run had the \
-         string",
-    ),
-    (
-        "glm-4.1v-9b-base/render/*",
-        "the gateway hands this template the text of an assistant or system turn as a \
-         parts list, which the template prints as JSON where the reference run had the \
-         string",
-    ),
-    (
         "granite-3.2-8b-instruct-preview/render/*",
         "the template writes the day of the render into the prompt with strftime_now and \
          the group was recorded on 2026-10-13, where the job renders SOURCE_DATE_EPOCH's \
@@ -398,12 +344,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          the group was recorded on 2026-10-13, where the job renders SOURCE_DATE_EPOCH's \
          day, 2026-10-14, the day most of the dated groups were recorded; every case of \
          the model, until the recorder pins the day",
-    ),
-    (
-        "hermes-3-llama-3.1-8b/render/*",
-        "the checkpoint's chat_template is a list of named templates (default, \
-         tool_use), which the gateway's loader does not read: no case of the model \
-         renders",
     ),
     (
         "hermes-4-14b/render/hermes-func-calling-*",
@@ -436,18 +376,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "hermes-4-14b/render/tools-history-single-call",
         "the gateway parses tool-call arguments into objects before rendering, which this \
          template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "hunyuanocr/render/*",
-        "the gateway hands this template the text of an assistant or system turn as a \
-         parts list, which the template prints as JSON where the reference run had the \
-         string",
-    ),
-    (
-        "hyperclovax-seed-omni-8b/render/*",
-        "the gateway hands this template the text of an assistant or system turn as a \
-         parts list, which the template prints as JSON where the reference run had the \
-         string",
     ),
     (
         "lightonocr-0.9b-16k-1025/render/*",
@@ -500,12 +428,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          template does not render as the reference does (smg-project/smg#2783)",
     ),
     (
-        "llava-critic-r1-7b-llama32v/render/*",
-        "the gateway hands this template the text of an assistant or system turn as a \
-         parts list, which the template prints as JSON where the reference run had the \
-         string",
-    ),
-    (
         "mimo-vl-7b-rl-2508/render/glaive-v2-61.jsonl",
         "the gateway parses a history call's arguments into an object before rendering, \
          which the template, writing the string as recorded, renders otherwise: a \
@@ -529,12 +451,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     ("nanbeige4-3b-thinking-2511/render/*", LEGACY_FILE_PIPELINE),
     ("nanbeige4.1-3b/render/*", LEGACY_FILE_PIPELINE),
     ("nanollama/render/*", LEGACY_FILE_PIPELINE),
-    (
-        "nanowhale-100m-base/render/*",
-        "the gateway's renderer detection picks the DeepSeek encoder port from the \
-         checkpoint's architecture, where the checkpoint ships a chat template of its \
-         own, which the reference ran: every case of the model",
-    ),
     (
         "nft-7b/render/swehero-5.jsonl",
         "the gateway parses a history call's arguments into an object before rendering, \
