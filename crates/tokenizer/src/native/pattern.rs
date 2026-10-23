@@ -180,6 +180,9 @@ enum Node {
     Alt {
         alternatives: Vec<Node>,
         firsts: Vec<First>,
+        /// Per alternative, the two-character look when the alternative
+        /// begins with an optional one-character class ([`first_sets`]).
+        leads: Vec<Option<Lead>>,
     },
     /// `(?!...)` over one class: succeeds when the next character is not in it.
     NotAhead(usize),
@@ -231,6 +234,21 @@ impl First {
     }
 }
 
+/// An alternative that begins with an optional one-character class, `P?`,
+/// followed by a rest that cannot match empty and begins with `rest`: it
+/// can match at a position only when the first character may begin the
+/// rest, or is in `P` and the second character may begin the rest. The
+/// first set alone admits every character of `P`, so without this look the
+/// matcher enters the alternative at every such character, consumes it,
+/// fails the rest, backs off, fails the rest again without it, and backs
+/// out: for the word alternative of the GPT-2 family that is every space
+/// and punctuation character of the text.
+#[derive(Debug, Clone, Copy)]
+struct Lead {
+    prefix: usize,
+    rest: First,
+}
+
 /// A parsed pattern: the program the matcher runs, compiled once from the
 /// tree the parser built.
 #[derive(Debug, Clone)]
@@ -239,6 +257,8 @@ pub(crate) struct Pattern {
     program: Vec<Op>,
     /// The first-character sets the `Split` ops index.
     firsts: Vec<First>,
+    /// The two-character looks the `Split` ops index ([`Lead`]).
+    leads: Vec<Lead>,
 }
 
 /// One instruction of a compiled pattern. The tree is flattened into a
@@ -258,8 +278,13 @@ enum Op {
     /// when they fail (the following alternative's `Split`, the op after an
     /// optional group, or [`NO_NEXT`] for the last alternative). `first`
     /// indexes the set of characters the ops that follow can begin with, and
-    /// a character outside it takes `next` without an entry on the stack.
-    Split { next: usize, first: usize },
+    /// a character outside it takes `next` without an entry on the stack;
+    /// `lead` indexes a two-character look ([`Lead`]) or is [`NO_LEAD`].
+    Split {
+        next: usize,
+        first: usize,
+        lead: usize,
+    },
     /// The end of an alternative: continue after the alternation.
     Jump(usize),
     /// The whole pattern matched up to the position.
@@ -268,6 +293,9 @@ enum Op {
 
 /// `Split.next` of the last alternative: a failure there backtracks.
 const NO_NEXT: usize = usize::MAX;
+
+/// `Split.lead` of a split without a two-character look.
+const NO_LEAD: usize = usize::MAX;
 
 /// A choice the matcher may come back to: `pc` is the `Split` whose `next`
 /// is the way not taken, or the `Run` that may give back characters, in which
@@ -311,12 +339,14 @@ impl Pattern {
         }
         let mut program = Vec::new();
         let mut firsts = Vec::new();
-        compile(&root, &mut program, &mut firsts);
+        let mut leads = Vec::new();
+        compile(&root, &mut program, &mut firsts, &mut leads);
         program.push(Op::Match);
         Some(Self {
             classes: parser.classes,
             program,
             firsts,
+            leads,
         })
     }
 
@@ -382,8 +412,14 @@ impl Pattern {
                         false
                     }
                 },
-                Op::Split { next, first } => {
+                Op::Split { next, first, lead } => {
                     let excluded = match next_char(text, pos) {
+                        Some((c, len)) if lead != NO_LEAD => {
+                            let lead = &self.leads[lead];
+                            !(lead.rest.may_start(c)
+                                || (self.classes[lead.prefix].contains(c)
+                                    && matches!(next_char(text, pos + len), Some((second, _)) if lead.rest.may_start(second))))
+                        }
                         Some((c, _)) => !self.firsts[first].may_start(c),
                         None => false,
                     };
@@ -451,7 +487,7 @@ impl Pattern {
 /// splits index go to `firsts`. Alternatives are laid out in order, each
 /// ending in a jump past the alternation, so that the program tries them the
 /// way the tree matcher did.
-fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
+fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>, leads: &mut Vec<Lead>) {
     match node {
         Node::Class(class) => program.push(Op::Char(*class)),
         Node::ClassRepeat { class, min, max } => program.push(Op::Run {
@@ -476,48 +512,66 @@ fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
                 program.push(Op::Split {
                     next: NO_NEXT,
                     first: set,
+                    lead: NO_LEAD,
                 });
-                compile(node, program, firsts);
+                compile(node, program, firsts, leads);
                 program[split] = Op::Split {
                     next: program.len(),
                     first: set,
+                    lead: NO_LEAD,
                 };
             }
             // `{1}`: the body itself.
-            _ => compile(node, program, firsts),
+            _ => compile(node, program, firsts, leads),
         },
         Node::Concat(nodes) => {
             for node in nodes {
-                compile(node, program, firsts);
+                compile(node, program, firsts, leads);
             }
         }
         Node::Alt {
             alternatives,
             firsts: sets,
+            leads: looks,
         } => {
             // The sets are filled by `first_sets` before the compile; an
             // alternation without them would compile to no ops and match
             // empty. Once per pattern, so the check stays in release builds.
             assert_eq!(sets.len(), alternatives.len());
+            assert_eq!(looks.len(), alternatives.len());
             let mut previous_split = None;
             let mut jumps = Vec::new();
-            for (index, (alternative, first)) in alternatives.iter().zip(sets).enumerate() {
+            for (index, ((alternative, first), look)) in
+                alternatives.iter().zip(sets).zip(looks).enumerate()
+            {
                 let split = program.len();
                 if let Some(previous) = previous_split {
-                    if let Op::Split { first: set, .. } = program[previous] {
+                    if let Op::Split {
+                        first: set, lead, ..
+                    } = program[previous]
+                    {
                         program[previous] = Op::Split {
                             next: split,
                             first: set,
+                            lead,
                         };
                     }
                 }
+                let lead = match look {
+                    Some(look) => {
+                        leads.push(*look);
+                        leads.len() - 1
+                    }
+                    None => NO_LEAD,
+                };
                 program.push(Op::Split {
                     next: NO_NEXT,
                     first: firsts.len(),
+                    lead,
                 });
                 firsts.push(*first);
                 previous_split = Some(split);
-                compile(alternative, program, firsts);
+                compile(alternative, program, firsts, leads);
                 if index + 1 < alternatives.len() {
                     jumps.push(program.len());
                     program.push(Op::Jump(NO_NEXT));
@@ -635,15 +689,88 @@ fn first_sets(node: &mut Node, classes: &[Class]) -> First {
         Node::Alt {
             alternatives,
             firsts,
+            leads,
         } => {
             *firsts = alternatives
                 .iter_mut()
                 .map(|alternative| first_sets(alternative, classes))
                 .collect();
+            *leads = alternatives
+                .iter()
+                .map(|alternative| lead_of(alternative, classes))
+                .collect();
             firsts
                 .iter()
                 .fold(First::default(), |all, first| all.or(*first))
         }
+        Node::NotAhead(_) => First {
+            nullable: true,
+            ..First::default()
+        },
+    }
+}
+
+/// The two-character look of an alternative of the shape `P? rest` where
+/// `P` is one class, optional, and the rest cannot match empty: the first
+/// sets of the alternatives are final here ([`first_sets`] has visited
+/// every node), so the rest's set is read off its nodes.
+fn lead_of(alternative: &Node, classes: &[Class]) -> Option<Lead> {
+    let Node::Concat(nodes) = alternative else {
+        return None;
+    };
+    let (head, rest) = nodes.split_first()?;
+    let prefix = match head {
+        Node::ClassRepeat {
+            class,
+            min: 0,
+            max: 1,
+        } => *class,
+        Node::Repeat {
+            node,
+            min: 0,
+            max: 1,
+            ..
+        } => match **node {
+            Node::Class(class) => class,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let mut first = First {
+        nullable: true,
+        ..First::default()
+    };
+    for node in rest {
+        first = first.then(first_of(node, classes));
+    }
+    (!rest.is_empty() && !first.nullable).then_some(Lead {
+        prefix,
+        rest: first,
+    })
+}
+
+/// The first set of a node whose alternations already carry their sets.
+fn first_of(node: &Node, classes: &[Class]) -> First {
+    match node {
+        Node::Class(class) => classes[*class].first(),
+        Node::ClassRepeat { class, min, .. } => First {
+            nullable: *min == 0,
+            ..classes[*class].first()
+        },
+        Node::Repeat { min, first, .. } => First {
+            nullable: *min == 0 || first.nullable,
+            ..*first
+        },
+        Node::Concat(nodes) => nodes.iter().fold(
+            First {
+                nullable: true,
+                ..First::default()
+            },
+            |first, node| first.then(first_of(node, classes)),
+        ),
+        Node::Alt { firsts, .. } => firsts
+            .iter()
+            .fold(First::default(), |all, first| all.or(*first)),
         Node::NotAhead(_) => First {
             nullable: true,
             ..First::default()
@@ -679,6 +806,7 @@ impl Parser<'_> {
             Node::Alt {
                 alternatives,
                 firsts: Vec::new(),
+                leads: Vec::new(),
             }
         })
     }
@@ -1157,6 +1285,75 @@ mod tests {
             .collect()
     }
 
+    /// The split's two-character look of the alternatives whose first split
+    /// is at `pc`, in order: the characters a text may begin with for the
+    /// alternative to be entered, over a two-character text.
+    fn entered(pattern: &Pattern, pc: usize, text: &str) -> Vec<usize> {
+        let mut sets = Vec::new();
+        let mut pc = pc;
+        let mut index = 0;
+        loop {
+            let Op::Split { next, first, lead } = pattern.program[pc] else {
+                panic!("op {pc} is not a split: {:?}", pattern.program[pc]);
+            };
+            let (c, len) = next_char(text, 0).expect("a character");
+            let enters = if lead == NO_LEAD {
+                pattern.firsts[first].may_start(c)
+            } else {
+                let lead = &pattern.leads[lead];
+                lead.rest.may_start(c)
+                    || (pattern.classes[lead.prefix].contains(c)
+                        && matches!(next_char(text, len), Some((second, _)) if lead.rest.may_start(second)))
+            };
+            if enters {
+                sets.push(index);
+            }
+            if next == NO_NEXT {
+                return sets;
+            }
+            pc = next;
+            index += 1;
+        }
+    }
+
+    #[test]
+    fn an_optional_prefix_needs_the_run_after_it() {
+        let parsed = Pattern::parse(QWEN2).expect("parses");
+        // The word alternative (1) and the punctuation alternative (3) begin
+        // with an optional class; their split reads the second character.
+        // The whitespace alternatives (4, 5, 6) admit a space by their first
+        // sets and fail inside the program, as before.
+        assert_eq!(parsed.leads.len(), 2);
+        assert_eq!(entered(&parsed, 0, " a"), vec![1, 4, 5, 6]);
+        assert_eq!(entered(&parsed, 0, " 1"), vec![4, 5, 6]);
+        assert_eq!(entered(&parsed, 0, " \""), vec![3, 4, 5, 6]);
+        assert_eq!(entered(&parsed, 0, "  "), vec![4, 5, 6]);
+        assert_eq!(entered(&parsed, 0, " \n"), vec![4, 5, 6]);
+        assert_eq!(entered(&parsed, 0, " "), vec![4, 5, 6]);
+        // A punctuation character may begin a word (alternative 1) or a
+        // punctuation run (3); the clitic alternative (0) admits an
+        // apostrophe by its first set.
+        assert_eq!(entered(&parsed, 0, "\"a"), vec![1, 3]);
+        assert_eq!(entered(&parsed, 0, "'x"), vec![0, 1, 3]);
+        assert_eq!(entered(&parsed, 0, "\"\""), vec![3]);
+        // Beyond ASCII the look is as exact as the first sets: one bit for
+        // every character past U+007F, so a non-ASCII character enters every
+        // alternative built from a category (the clitics, literal, stay out).
+        assert_eq!(entered(&parsed, 0, "\u{e9}a"), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(entered(&parsed, 0, " \u{e9}"), vec![1, 3, 4, 5, 6]);
+        assert_eq!(entered(&parsed, 0, " \u{4e2d}"), vec![1, 3, 4, 5, 6]);
+        // The cased pattern's two word alternatives and its punctuation
+        // alternative carry a look; the clitic groups inside them do not.
+        let cased = Pattern::parse(CASED).expect("parses");
+        assert_eq!(cased.leads.len(), 3);
+        // The first word alternative takes a lower-case run (after an
+        // optional upper-case one), the second needs an upper-case letter.
+        assert_eq!(entered(&cased, 0, " a"), vec![0, 4, 5, 6]);
+        assert_eq!(entered(&cased, 0, " A"), vec![0, 1, 4, 5, 6]);
+        assert_eq!(entered(&cased, 0, " 1"), vec![4, 5, 6]);
+        assert_eq!(entered(&cased, 0, " ,"), vec![3, 4, 5, 6]);
+    }
+
     #[test]
     fn every_known_pattern_parses() {
         for pattern in PATTERNS {
@@ -1169,7 +1366,7 @@ mod tests {
     fn split_chain(pattern: &Pattern, mut pc: usize) -> Vec<First> {
         let mut sets = Vec::new();
         loop {
-            let Op::Split { next, first } = pattern.program[pc] else {
+            let Op::Split { next, first, .. } = pattern.program[pc] else {
                 panic!("op {pc} is not a split: {:?}", pattern.program[pc]);
             };
             sets.push(pattern.firsts[first]);
