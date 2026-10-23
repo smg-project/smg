@@ -990,7 +990,7 @@ struct DiscoveryArgs {
     router_selector: Vec<String>,
 
     /// Override each worker's model_id from pod metadata.
-    /// Accepted values: "namespace", "label:<key>", or "annotation:<key>"
+    /// Accepted values: `namespace`, `label:<key>`, or `annotation:<key>`
     #[arg(long, help_heading = "Service Discovery (Kubernetes)", value_parser = parse_model_id_from)]
     model_id_from: Option<String>,
 
