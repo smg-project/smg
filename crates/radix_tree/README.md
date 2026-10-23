@@ -25,6 +25,7 @@ tree.store(w, None, &[(key, content), ...])?;      // anchor a chain
 tree.store(w, Some(parent_key), &more)?;           // extend it
 tree.remove(w, &[key]);                            // event-feed eviction
 tree.truncate_tail(w, keep);                       // prefix-closed capacity cut
+tree.evict_oldest(w, keep);                        // least-recently-stored chains first
 tree.clear(w);                                     // epoch bump
 tree.retire_holder(w);                             // frees everything, id recycled
 

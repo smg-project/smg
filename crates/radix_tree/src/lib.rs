@@ -8,8 +8,13 @@
 //! keyed by `(position, content)` with lineage-disambiguated
 //! membership and an internal per-holder registry;
 //! order-insensitive set semantics make convergence hold by
-//! construction. Both are single-writer: no locks, no atomics, no
-//! shards (§8).
+//! construction. Both are single-writer: no locks, no shards (§8);
+//! every observable mutation goes through `&mut self`. The one
+//! interior-mutable piece is the chain core's per-(holder, chain)
+//! recency hint (`AtomicU64`), which the shared-lock duplicate walks
+//! (`dup_prefix_touch`, `covered_touch`) refresh through `&self`. It
+//! is advisory — it orders `evict_oldest` and nothing else — and a
+//! racing update can only cost a tick of freshness, never a block.
 
 #![forbid(unsafe_code)]
 
