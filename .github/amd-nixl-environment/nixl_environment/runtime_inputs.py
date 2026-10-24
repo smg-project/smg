@@ -119,7 +119,9 @@ def distribution_proof(name, item, root):
             require(relative.endswith(".dist-info/RECORD") or ("__pycache__" in Path(relative).parts and relative.endswith(".pyc")), "unhashed installed RECORD member")
     with zipfile.ZipFile(root / item["wheel"]) as wheel:
         for member in wheel.infolist():
-            require(not member.is_dir() and not Path(member.filename).is_absolute() and ".." not in Path(member.filename).parts, "wheel member path")
+            require(not Path(member.filename).is_absolute() and ".." not in Path(member.filename).parts, "wheel member path")
+            if member.is_dir():
+                continue  # Genuine setproctitle/PyYAML wheels include directory entries.
             if member.filename.endswith(".dist-info/RECORD"):
                 continue  # pip adds installer/direct_url/console entries to this file.
             raw = wheel.read(member)
