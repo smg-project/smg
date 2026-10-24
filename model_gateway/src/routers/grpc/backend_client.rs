@@ -442,8 +442,17 @@ fn build_zmq_request<B>(
             )?;
             Ok(ProtoGenerateRequest::Sglang(Box::new(req)))
         }
+        ZmqDialect::Trtllm => Err(DIRECT_LANE_NOT_FOR_TRTLLM.to_string()),
     }
 }
+
+/// The direct ZMQ lane builds no request for a TensorRT-LLM engine: that
+/// engine is reached through its gRPC servicer (the Rust servicer speaks the
+/// engine's wire on its node), and the gateway's own link to the wire serves
+/// the other dialects only.
+pub(crate) const DIRECT_LANE_NOT_FOR_TRTLLM: &str =
+    "a TensorRT-LLM engine is served through its gRPC \
+                                          servicer, not the gateway's direct ZMQ lane";
 
 /// Build a request kind with no multimodal or tool inputs (completion, plain
 /// generate) for a ZMQ backend. `text` is the builders' shared text parameter
@@ -475,6 +484,7 @@ fn build_zmq_plain_request<B, T>(
         ZmqDialect::Sglang => Ok(ProtoGenerateRequest::Sglang(Box::new(sglang(
             request_id, body, text, token_ids,
         )?))),
+        ZmqDialect::Trtllm => Err(DIRECT_LANE_NOT_FOR_TRTLLM.to_string()),
     }
 }
 

@@ -13,11 +13,12 @@ use engine_zmq_client::{
     check_engine_layouts,
     codec::OpaqueValue,
     connect_handshake,
-    connector::{Client, EngineCoreClient, SglangClient, TokenSpeedClient},
+    connector::{Client, EngineCoreClient, SglangClient, TokenSpeedClient, TrtllmClient},
     protocol::{
         handshake::EngineCoreReadyResponse,
         sglang::{request::SglangRequest, SglangProtocol},
         tokenspeed::{wire_carries_control_calls, TokenSpeedProtocol},
+        trtllm::TrtllmProtocol,
         vllm::{request::EngineCoreRequest, sampling::EngineCoreSamplingParams, VllmProtocol},
         EngineLoad, EngineProtocol,
     },
@@ -26,7 +27,7 @@ use engine_zmq_client::{
 use futures::StreamExt;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::worker::{RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse};
-use smg_grpc_client::{sglang_proto, tokenspeed_proto, vllm_proto as vllm};
+use smg_grpc_client::{sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto as vllm};
 
 #[cfg(unix)]
 use crate::sockets::unlink_stale_socket;
@@ -46,6 +47,10 @@ use crate::{
     tokenspeed::{
         constraint_ref as tokenspeed_constraint_ref, fan_out_tokenspeed_requests,
         translate_request_tokenspeed_for, GridTensors, RankIndices, TokenSpeedGenerateStream,
+    },
+    trtllm::{
+        constraint_ref as trtllm_constraint_ref, fan_out_trtllm_requests, translate_request_trtllm,
+        TrtllmGenerateStream,
     },
     vllm::{
         fan_out_requests, has_media, kv_transfer_params, now_secs, ranked_candidate_count,
@@ -68,7 +73,9 @@ const SUPPORTED_TASKS_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) fn default_structured_outputs_support(dialect: ZmqDialect) -> StructuredOutputsSupport {
     match dialect {
         ZmqDialect::Vllm => StructuredOutputsSupport::default(),
-        ZmqDialect::TokenSpeed | ZmqDialect::Sglang => StructuredOutputsBackendConfig::Other.into(),
+        ZmqDialect::TokenSpeed | ZmqDialect::Sglang | ZmqDialect::Trtllm => {
+            StructuredOutputsBackendConfig::Other.into()
+        }
     }
 }
 
@@ -97,6 +104,8 @@ pub enum ZmqDialect {
     TokenSpeed,
     /// SGLang's scheduler, behind the SMG plugin that performs the handshake.
     Sglang,
+    /// TensorRT-LLM's LLM API, behind the shim that performs the handshake.
+    Trtllm,
 }
 
 /// The connected client for a [`ZmqDialect`]. All share the transport and
@@ -107,6 +116,7 @@ pub(crate) enum ZmqBackend {
     Vllm(Arc<EngineCoreClient>),
     TokenSpeed(Arc<TokenSpeedClient>),
     Sglang(Arc<SglangClient>),
+    Trtllm(Arc<TrtllmClient>),
 }
 
 /// Per-connection constants of a [`ZmqEngineClient`], fixed at connect time.
@@ -173,6 +183,16 @@ pub async fn connect_for_worker(
     startup: Duration,
     request_timeout: Option<Duration>,
 ) -> Result<ZmqEngineClient, String> {
+    // This dialect is served through its gRPC servicer: the gateway's direct
+    // lane has no request builder for it, so a worker registered on it is
+    // refused here, at registration, instead of handshaken, counted healthy
+    // and failed on every request.
+    if matches!(runtime, RuntimeType::Trtllm) {
+        return Err(format!(
+            "runtime {runtime} is served through its gRPC servicer, not the gateway's direct \
+             ZMQ lane"
+        ));
+    }
     // The engine can't stop at EOS on its own (it has no tokenizer or model
     // config); resolve the EOS ids from the local model dir so every request
     // carries them.
@@ -261,6 +281,7 @@ pub enum ZmqModelInfo {
     Vllm(vllm::GetModelInfoResponse),
     TokenSpeed(Box<tokenspeed_proto::GetModelInfoResponse>),
     Sglang(Box<sglang_proto::GetModelInfoResponse>),
+    Trtllm(Box<trtllm_proto::GetModelInfoResponse>),
 }
 
 /// Server metadata as the connected engine's native proto response.
@@ -268,6 +289,7 @@ pub enum ZmqServerInfo {
     Vllm(Box<vllm::GetServerInfoResponse>),
     TokenSpeed(Box<tokenspeed_proto::GetServerInfoResponse>),
     Sglang(Box<sglang_proto::GetServerInfoResponse>),
+    Trtllm(Box<trtllm_proto::GetServerInfoResponse>),
 }
 
 /// Direct ZMQ connection to a same-host engine (vLLM EngineCore or TokenSpeed),
@@ -313,10 +335,11 @@ impl ZmqEngineClient {
             RuntimeType::Vllm | RuntimeType::Unspecified => ZmqDialect::Vllm,
             RuntimeType::TokenSpeed => ZmqDialect::TokenSpeed,
             RuntimeType::Sglang => ZmqDialect::Sglang,
+            RuntimeType::Trtllm => ZmqDialect::Trtllm,
             other => {
                 return Err(format!(
                     "ZMQ direct backend has no engine implementation for runtime \
-                     {other}; only vllm, tokenspeed and sglang are supported"
+                     {other}; only vllm, tokenspeed, sglang and trtllm are supported"
                 )
                 .into())
             }
@@ -339,6 +362,7 @@ impl ZmqEngineClient {
             ZmqDialect::Vllm => check_engine_layouts::<VllmProtocol>(&transport)?,
             ZmqDialect::TokenSpeed => check_engine_layouts::<TokenSpeedProtocol>(&transport)?,
             ZmqDialect::Sglang => check_engine_layouts::<SglangProtocol>(&transport)?,
+            ZmqDialect::Trtllm => check_engine_layouts::<TrtllmProtocol>(&transport)?,
         }
         let backend = match dialect {
             ZmqDialect::Vllm => ZmqBackend::Vllm(Arc::new(EngineCoreClient::new(transport))),
@@ -346,6 +370,7 @@ impl ZmqEngineClient {
                 ZmqBackend::TokenSpeed(Arc::new(TokenSpeedClient::new(transport)))
             }
             ZmqDialect::Sglang => ZmqBackend::Sglang(Arc::new(SglangClient::new(transport))),
+            ZmqDialect::Trtllm => ZmqBackend::Trtllm(Arc::new(TrtllmClient::new(transport))),
         };
         let client = Self {
             backend,
@@ -527,6 +552,7 @@ impl ZmqEngineClient {
             ZmqBackend::Vllm(_) => ZmqDialect::Vllm,
             ZmqBackend::TokenSpeed(_) => ZmqDialect::TokenSpeed,
             ZmqBackend::Sglang(_) => ZmqDialect::Sglang,
+            ZmqBackend::Trtllm(_) => ZmqDialect::Trtllm,
         }
     }
 
@@ -537,6 +563,7 @@ impl ZmqEngineClient {
             ZmqDialect::Vllm => RuntimeType::Vllm,
             ZmqDialect::TokenSpeed => RuntimeType::TokenSpeed,
             ZmqDialect::Sglang => RuntimeType::Sglang,
+            ZmqDialect::Trtllm => RuntimeType::Trtllm,
         }
     }
 
@@ -547,6 +574,7 @@ impl ZmqEngineClient {
             ZmqBackend::Vllm(client) => client.engines(),
             ZmqBackend::TokenSpeed(client) => client.engines(),
             ZmqBackend::Sglang(client) => client.engines(),
+            ZmqBackend::Trtllm(client) => client.engines(),
         }
     }
 
@@ -556,9 +584,11 @@ impl ZmqEngineClient {
     pub(crate) fn vllm_client(&self, operation: &str) -> Result<&EngineCoreClient, tonic::Status> {
         match &self.backend {
             ZmqBackend::Vllm(client) => Ok(client),
-            ZmqBackend::TokenSpeed(_) | ZmqBackend::Sglang(_) => Err(tonic::Status::unimplemented(
-                format!("{operation} is only available on a vLLM ZMQ backend"),
-            )),
+            ZmqBackend::TokenSpeed(_) | ZmqBackend::Sglang(_) | ZmqBackend::Trtllm(_) => {
+                Err(tonic::Status::unimplemented(format!(
+                    "{operation} is only available on a vLLM ZMQ backend"
+                )))
+            }
         }
     }
 
@@ -568,9 +598,11 @@ impl ZmqEngineClient {
     pub(crate) fn sglang_client(&self, operation: &str) -> Result<&SglangClient, tonic::Status> {
         match &self.backend {
             ZmqBackend::Sglang(client) => Ok(client),
-            ZmqBackend::Vllm(_) | ZmqBackend::TokenSpeed(_) => Err(tonic::Status::unimplemented(
-                format!("{operation} is only available on an SGLang ZMQ backend"),
-            )),
+            ZmqBackend::Vllm(_) | ZmqBackend::TokenSpeed(_) | ZmqBackend::Trtllm(_) => {
+                Err(tonic::Status::unimplemented(format!(
+                    "{operation} is only available on an SGLang ZMQ backend"
+                )))
+            }
         }
     }
 
@@ -1084,6 +1116,51 @@ impl ZmqEngineClient {
         )))
     }
 
+    /// Submit a `TrtllmService` generate request to the engine's shim and
+    /// stream back vLLM-proto responses, the `n > 1` fan-out merged.
+    pub async fn generate_trtllm(
+        &self,
+        req: trtllm_proto::GenerateRequest,
+    ) -> Result<ZmqGenerateStream, tonic::Status> {
+        let deadline = self.request_deadline();
+        let subs = self.generate_trtllm_streams(req, None).await?;
+        Ok(ZmqGenerateStream::trtllm(subs).with_deadline(deadline))
+    }
+
+    /// [`Self::generate_sglang_streams_with_trace`] for a TensorRT-LLM
+    /// backend: the `n > 1` fan-out submitted to the shim, each sub tagged
+    /// with its proto `sequence_index`, left unmerged. `trace_headers` is the
+    /// caller's W3C trace context, carried on each sub's request for the
+    /// engine's own spans.
+    pub async fn generate_trtllm_streams(
+        &self,
+        req: trtllm_proto::GenerateRequest,
+        trace_headers: Option<BTreeMap<String, String>>,
+    ) -> Result<Vec<TrtllmGenerateStream>, tonic::Status> {
+        let ZmqBackend::Trtllm(client) = &self.backend else {
+            return Err(tonic::Status::internal(
+                "this ZMQ backend is not a TensorRT-LLM engine",
+            ));
+        };
+        // A constraint the engine's grammar backend cannot enforce is refused
+        // here, before anything reaches the engine, as on every wire.
+        refuse_unenforceable_constraint(
+            trtllm_constraint_ref(&req),
+            self.structured_outputs_support(),
+        )
+        .map_err(tonic::Status::invalid_argument)?;
+        let max_model_len = self.prompt_bound()?;
+        let mut streams = Vec::new();
+        for (index, sub) in fan_out_trtllm_requests(req).into_iter().enumerate() {
+            let mut request = translate_request_trtllm(sub, max_model_len)
+                .map_err(tonic::Status::invalid_argument)?;
+            request.trace_headers.clone_from(&trace_headers);
+            let stream = client.submit(request).await.map_err(zmq_status)?;
+            streams.push(TrtllmGenerateStream::new(stream, index as u32));
+        }
+        Ok(streams)
+    }
+
     /// Whether every connected TokenSpeed rank declared the control reply at
     /// its handshake (the control-wire revision), so the scheduler's control
     /// RPCs can be carried to it; false on a scheduler that declares none and
@@ -1123,9 +1200,9 @@ impl ZmqEngineClient {
                 }
                 control_on_every_rank(client, method, args, wait).await
             }
-            ZmqBackend::Vllm(_) => Err(tonic::Status::unimplemented(format!(
-                "{rpc} is only available on an SGLang or TokenSpeed ZMQ backend"
-            ))),
+            ZmqBackend::Vllm(_) | ZmqBackend::Trtllm(_) => Err(tonic::Status::unimplemented(
+                format!("{rpc} is only available on an SGLang or TokenSpeed ZMQ backend"),
+            )),
         }
     }
 
@@ -1185,6 +1262,7 @@ impl ZmqEngineClient {
             ZmqBackend::Vllm(client) => client.is_alive(),
             ZmqBackend::TokenSpeed(client) => client.is_alive(),
             ZmqBackend::Sglang(client) => client.is_alive(),
+            ZmqBackend::Trtllm(client) => client.is_alive(),
         }
     }
 
@@ -1264,6 +1342,7 @@ impl ZmqEngineClient {
             ZmqBackend::Vllm(client) => client.engine_load(engine_index),
             ZmqBackend::TokenSpeed(client) => client.engine_load(engine_index),
             ZmqBackend::Sglang(client) => client.engine_load(engine_index),
+            ZmqBackend::Trtllm(client) => client.engine_load(engine_index),
         }
     }
 
@@ -1275,6 +1354,7 @@ impl ZmqEngineClient {
             ZmqBackend::Vllm(client) => client.output_silence(),
             ZmqBackend::TokenSpeed(client) => client.output_silence(),
             ZmqBackend::Sglang(client) => client.output_silence(),
+            ZmqBackend::Trtllm(client) => client.output_silence(),
         }
     }
 
@@ -1286,6 +1366,7 @@ impl ZmqEngineClient {
             ZmqBackend::Vllm(client) => client.reports_steps(),
             ZmqBackend::TokenSpeed(client) => client.reports_steps(),
             ZmqBackend::Sglang(client) => client.reports_steps(),
+            ZmqBackend::Trtllm(client) => client.reports_steps(),
         }
     }
 
@@ -1298,6 +1379,7 @@ impl ZmqEngineClient {
             ZmqBackend::Vllm(client) => client.note_reports_steps(),
             ZmqBackend::TokenSpeed(client) => client.note_reports_steps(),
             ZmqBackend::Sglang(client) => client.note_reports_steps(),
+            ZmqBackend::Trtllm(client) => client.note_reports_steps(),
         }
     }
 
@@ -1308,6 +1390,7 @@ impl ZmqEngineClient {
             ZmqBackend::Vllm(client) => client.prefill_pending_tokens(),
             ZmqBackend::TokenSpeed(client) => client.prefill_pending_tokens(),
             ZmqBackend::Sglang(client) => client.prefill_pending_tokens(),
+            ZmqBackend::Trtllm(client) => client.prefill_pending_tokens(),
         }
     }
 
@@ -1319,6 +1402,7 @@ impl ZmqEngineClient {
             ZmqBackend::Vllm(client) => client.set_silence_death_timeout(timeout),
             ZmqBackend::TokenSpeed(client) => client.set_silence_death_timeout(timeout),
             ZmqBackend::Sglang(client) => client.set_silence_death_timeout(timeout),
+            ZmqBackend::Trtllm(client) => client.set_silence_death_timeout(timeout),
         }
     }
 
@@ -1330,6 +1414,7 @@ impl ZmqEngineClient {
             ZmqBackend::Vllm(client) => client.set_prefill_tokens_per_sec(tokens_per_sec),
             ZmqBackend::TokenSpeed(client) => client.set_prefill_tokens_per_sec(tokens_per_sec),
             ZmqBackend::Sglang(client) => client.set_prefill_tokens_per_sec(tokens_per_sec),
+            ZmqBackend::Trtllm(client) => client.set_prefill_tokens_per_sec(tokens_per_sec),
         }
     }
 
@@ -1398,6 +1483,17 @@ impl ZmqEngineClient {
                     ..Default::default()
                 }))
             }
+            // The handshake's window bounds the sequence; the proto's input
+            // bound follows it here (the servicer's facts refine both).
+            ZmqBackend::Trtllm(_) => {
+                let max_seq_len = i32::try_from(max_context_length).unwrap_or(i32::MAX);
+                ZmqModelInfo::Trtllm(Box::new(trtllm_proto::GetModelInfoResponse {
+                    model_id: self.meta.model_id.clone(),
+                    max_input_len: max_seq_len,
+                    max_seq_len,
+                    ..Default::default()
+                }))
+            }
         }
     }
 
@@ -1442,6 +1538,33 @@ impl ZmqEngineClient {
                         .and_then(|n| i32::try_from(n).ok())
                         .unwrap_or(0),
                     ..Default::default()
+                }))
+            }
+            // The handshake carries the version (as `vllm_version`, prefixed
+            // by the shim) and the parallel sizes.
+            ZmqBackend::Trtllm(_) => {
+                let ready = self.ready_response();
+                ZmqServerInfo::Trtllm(Box::new(trtllm_proto::GetServerInfoResponse {
+                    version: ready
+                        .map(|r| {
+                            r.vllm_version
+                                .strip_prefix("trtllm-")
+                                .unwrap_or(&r.vllm_version)
+                                .to_string()
+                        })
+                        .unwrap_or_default(),
+                    backend: "tensorrt-llm".to_string(),
+                    tensor_parallel_size: ready.map_or(1, |r| {
+                        i32::try_from(r.tensor_parallel_size).unwrap_or(i32::MAX)
+                    }),
+                    pipeline_parallel_size: ready.map_or(1, |r| {
+                        i32::try_from(r.pipeline_parallel_size).unwrap_or(i32::MAX)
+                    }),
+                    context_parallel_size: ready.map_or(1, |r| {
+                        i32::try_from(r.decode_context_parallel_size).unwrap_or(i32::MAX)
+                    }),
+                    world_size: ready
+                        .map_or(1, |r| i32::try_from(r.world_size).unwrap_or(i32::MAX)),
                 }))
             }
         }
@@ -1601,6 +1724,34 @@ mod tests {
         );
         engine.expect("mock engine");
         client.expect("adapter connect")
+    }
+
+    /// The dialect only its servicer speaks is refused on the gateway's
+    /// connect path before any handshake: a worker registered on it would
+    /// otherwise connect, count healthy and fail every request. The
+    /// servicer's own connect path keeps taking it.
+    #[tokio::test]
+    async fn the_gateway_connect_path_refuses_the_servicer_only_dialect() {
+        let started = std::time::Instant::now();
+        let err = match connect_for_worker(
+            "ipc:///tmp/no-such-worker",
+            "m".to_string(),
+            RuntimeType::Trtllm,
+            None,
+            1,
+            Duration::from_secs(5),
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("the gateway's connect path accepted the servicer-only dialect"),
+            Err(err) => err,
+        };
+        assert!(err.contains("direct ZMQ lane"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "refused before the handshake"
+        );
     }
 
     #[tokio::test]
@@ -1926,12 +2077,12 @@ mod tests {
             1,
             "m".to_string(),
             EosTokenIds::default(),
-            RuntimeType::Trtllm,
+            RuntimeType::Mlx,
             Duration::from_secs(600),
         )
         .await
         else {
-            panic!("TRT-LLM has no ZMQ engine adapter");
+            panic!("MLX has no ZMQ engine adapter");
         };
         assert!(
             error.to_string().contains("no engine implementation"),

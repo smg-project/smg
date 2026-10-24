@@ -27,6 +27,9 @@ pub(crate) async fn generate(
         ProtoGenerateRequest::Vllm(req) => client.generate_vllm(*req).await,
         ProtoGenerateRequest::TokenSpeed(req) => client.generate_tokenspeed(*req).await,
         ProtoGenerateRequest::Sglang(req) => client.generate_sglang(*req).await,
+        // A TensorRT-LLM engine is reached through its gRPC servicer (the
+        // Rust servicer speaks this wire on the engine's node); the direct
+        // lane serves no request of its proto.
         ProtoGenerateRequest::Trtllm(_) | ProtoGenerateRequest::Mlx(_) => Err(
             tonic::Status::internal("ZMQ backends serve vLLM, TokenSpeed and SGLang requests only"),
         ),
@@ -39,6 +42,7 @@ pub(crate) fn model_info(client: &ZmqEngineClient) -> ModelInfo {
         ZmqModelInfo::Vllm(info) => ModelInfo::Vllm(info),
         ZmqModelInfo::TokenSpeed(info) => ModelInfo::TokenSpeed(info),
         ZmqModelInfo::Sglang(info) => ModelInfo::Sglang(info),
+        ZmqModelInfo::Trtllm(info) => ModelInfo::Trtllm(*info),
     }
 }
 
@@ -48,6 +52,7 @@ pub(crate) fn server_info(client: &ZmqEngineClient) -> ServerInfo {
         ZmqServerInfo::Vllm(info) => ServerInfo::Vllm(info),
         ZmqServerInfo::TokenSpeed(info) => ServerInfo::TokenSpeed(info),
         ZmqServerInfo::Sglang(info) => ServerInfo::Sglang(info),
+        ZmqServerInfo::Trtllm(info) => ServerInfo::Trtllm(*info),
     }
 }
 

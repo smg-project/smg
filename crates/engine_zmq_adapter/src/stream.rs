@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 
+use engine_zmq_client::protocol::sglang::output::{MatchedStop, SglangOutput};
 use futures::{stream::SelectAll, Stream, StreamExt};
 use smg_grpc_client::vllm_proto as vllm;
 use tokio::time::{Instant, Sleep};
@@ -16,7 +17,7 @@ use tracing::warn;
 
 use crate::{
     client::zmq_status, sglang::SglangGenerateStream, tokenspeed::TokenSpeedGenerateStream,
-    vllm::VllmGenerateStream,
+    trtllm::TrtllmGenerateStream, vllm::VllmGenerateStream,
 };
 
 /// Streaming generate output over ZMQ, presented as vLLM-proto
@@ -44,6 +45,8 @@ enum SubStreams {
     TokenSpeed(Subs<TokenSpeedGenerateStream>),
     /// SGLang outputs.
     Sglang(Subs<SglangGenerateStream>),
+    /// TensorRT-LLM outputs (the shim's slim records).
+    Trtllm(Subs<TrtllmGenerateStream>),
 }
 
 /// The subs of one request: the one sub of a request without fan-out, polled
@@ -112,6 +115,7 @@ impl SubStreams {
             Self::Vllm(subs) => subs.poll_next(cx),
             Self::TokenSpeed(subs) => subs.poll_next(cx),
             Self::Sglang(subs) => subs.poll_next(cx),
+            Self::Trtllm(subs) => subs.poll_next(cx),
         }
     }
 
@@ -121,6 +125,7 @@ impl SubStreams {
             Self::Vllm(subs) => subs.ids(VllmGenerateStream::request_id),
             Self::TokenSpeed(subs) => subs.ids(TokenSpeedGenerateStream::request_id),
             Self::Sglang(subs) => subs.ids(SglangGenerateStream::request_id),
+            Self::Trtllm(subs) => subs.ids(TrtllmGenerateStream::request_id),
         }
     }
 
@@ -130,6 +135,7 @@ impl SubStreams {
             Self::Vllm(subs) => subs.clear(),
             Self::TokenSpeed(subs) => subs.clear(),
             Self::Sglang(subs) => subs.clear(),
+            Self::Trtllm(subs) => subs.clear(),
         }
     }
 }
@@ -187,6 +193,10 @@ impl ZmqGenerateStream {
 
     pub(crate) fn sglang(subs: Vec<SglangGenerateStream>) -> Self {
         Self::new(SubStreams::Sglang(Subs::new(subs)))
+    }
+
+    pub(crate) fn trtllm(subs: Vec<TrtllmGenerateStream>) -> Self {
+        Self::new(SubStreams::Trtllm(Subs::new(subs)))
     }
 
     fn new(subs: SubStreams) -> Self {
@@ -396,6 +406,95 @@ impl StreamState {
             response: Some(response),
         }
     }
+}
+
+/// A slim record's matched stop in the vLLM-proto shape.
+pub(crate) fn matched_stop_of(matched: MatchedStop) -> vllm::generate_complete::MatchedStop {
+    match matched {
+        MatchedStop::TokenId(id) => vllm::generate_complete::MatchedStop::MatchedTokenId(id),
+        MatchedStop::Text(text) => vllm::generate_complete::MatchedStop::MatchedStopStr(text),
+    }
+}
+
+/// One tick of the slim record, mapped the way every wire that answers with
+/// it maps it: the per-request counts (reported directly, cumulative for the
+/// completion), the sampled and ranked logprob columns (this tick's on the
+/// chunk, accumulated for the `Complete`), the prompt-logprob columns (on
+/// the prefill tick, once per request, chunked prefill may split them), then
+/// the tick as a response with the prompt logprobs attached where the proto
+/// carries them. `finish` is the terminal verdict the wire's module resolved
+/// first (each applies its own abort policy before this; an abort never
+/// reaches here).
+pub(crate) fn map_slim_output(
+    state: &mut StreamState,
+    index: u32,
+    output: SglangOutput,
+    finish: Option<(String, Option<vllm::generate_complete::MatchedStop>)>,
+    pending: &mut Option<vllm::GenerateResponse>,
+    input_logprobs_emitted: &mut bool,
+) -> vllm::GenerateResponse {
+    if output.prompt_tokens > 0 {
+        state.prompt_tokens = output.prompt_tokens;
+    }
+    if output.cached_tokens > 0 {
+        state.cached_tokens = output.cached_tokens;
+    }
+    state.completion_tokens = output.completion_tokens;
+    state.output_ids.extend(output.output_ids.iter().copied());
+    if !output.input_logprobs_val.is_empty() {
+        state
+            .prompt_logprobs
+            .extend(
+                output
+                    .input_logprobs_val
+                    .iter()
+                    .map(|lp| vllm::InputTokenLogProb {
+                        value: lp.map(|lp| lp as f32),
+                    }),
+            );
+        state
+            .prompt_token_ids
+            .extend(output.input_logprobs_idx.iter().copied());
+        state.prompt_top_logprobs.extend(
+            output
+                .input_top_logprobs_val
+                .iter()
+                .zip(&output.input_top_logprobs_idx)
+                .map(|(values, token_ids)| vllm::TopLogProbs {
+                    values: values.iter().map(|&lp| lp as f32).collect(),
+                    token_ids: token_ids.clone(),
+                }),
+        );
+    }
+    // Ranked candidates per position, as the engine reports them.
+    let tick_top_logprobs: Vec<vllm::TopLogProbs> = output
+        .output_top_logprobs_val
+        .iter()
+        .zip(&output.output_top_logprobs_idx)
+        .map(|(values, token_ids)| vllm::TopLogProbs {
+            values: values.iter().map(|&lp| lp as f32).collect(),
+            token_ids: token_ids.clone(),
+        })
+        .collect();
+    let chunk_logprobs = (!output.output_logprobs_val.is_empty()).then(|| vllm::OutputLogProbs {
+        token_logprobs: output
+            .output_logprobs_val
+            .iter()
+            .map(|&lp| lp as f32)
+            .collect(),
+        token_ids: output.output_logprobs_idx.clone(),
+        top_logprobs: tick_top_logprobs.clone(),
+    });
+    state
+        .output_logprobs_val
+        .extend(output.output_logprobs_val.iter().map(|&lp| lp as f32));
+    state
+        .output_logprobs_idx
+        .extend(output.output_logprobs_idx.iter().copied());
+    state.output_top_logprobs.extend(tick_top_logprobs);
+    let mut response = state.emit_tick(index, output.output_ids, chunk_logprobs, finish, pending);
+    state.attach_input_logprobs(pending, input_logprobs_emitted, &mut response);
+    response
 }
 
 /// The per-dialect half of a ZMQ generate stream: the wire stream, the parked

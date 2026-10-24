@@ -14,7 +14,7 @@ use engine_zmq_client::{
     connector::SglangStream,
     protocol::sglang::{
         multimodal::{SglangWireMmInputs, SglangWireMmItem, SglangWireModality, SglangWireTensor},
-        output::{MatchedStop, SglangOutput},
+        output::SglangOutput,
         request::{TokenizedEmbeddingReqInput, TokenizedGenerateReqInput},
         sampling::SamplingParams as SglangSamplingParams,
     },
@@ -27,7 +27,7 @@ use crate::{
     abort_status::engine_abort_status,
     context_window::admit_prompt,
     fanout::fan_out_n,
-    stream::{poll_mapped, MappedGenerateStream, StreamState},
+    stream::{map_slim_output, matched_stop_of, poll_mapped, MappedGenerateStream, StreamState},
     structured_outputs::ConstraintRef,
 };
 
@@ -307,28 +307,20 @@ impl MappedGenerateStream for SglangGenerateStream {
 
     fn map_output(
         &mut self,
-        output: SglangOutput,
+        mut output: SglangOutput,
     ) -> Result<vllm::GenerateResponse, tonic::Status> {
-        if let Some(error) = output.selected_logprobs_error {
-            return Err(tonic::Status::internal(error));
+        if let Some(error) = &output.selected_logprobs_error {
+            return Err(tonic::Status::internal(error.clone()));
         }
-        let state = &mut self.state;
-        // The scheduler reports per-request counts directly (cumulative for
-        // completions).
-        if output.prompt_tokens > 0 {
-            state.prompt_tokens = output.prompt_tokens;
-        }
-        if output.cached_tokens > 0 {
-            state.cached_tokens = output.cached_tokens;
-        }
-        state.completion_tokens = output.completion_tokens;
-        state.output_ids.extend(output.output_ids.iter().copied());
         self.reasoning_tokens = output.reasoning_tokens;
         // The plugin sends the rows the tick added (the prompt positions the
         // prefill computed, then a decode step's rows): the chunk carries
         // them, the completion the whole list.
         self.hidden_states_sent = self.hidden_states.len();
-        self.hidden_states.extend(output.output_hidden_states);
+        self.hidden_states
+            .extend(std::mem::take(&mut output.output_hidden_states));
+        // Selected candidate rows have no slot in the vLLM-proto intermediate:
+        // this tick's as the delta, every tick's for the completion.
         self.selected_logprobs_delta = output
             .output_token_ids_logprobs_val
             .iter()
@@ -340,63 +332,6 @@ impl MappedGenerateStream for SglangGenerateStream {
             .collect();
         self.selected_logprobs
             .extend(self.selected_logprobs_delta.iter().cloned());
-        // Prompt logprobs ride the prefill tick (once per request; chunked
-        // prefill may split them), in SGLang's shape: no value for the first
-        // prompt token, ranked candidates per position when asked.
-        if !output.input_logprobs_val.is_empty() {
-            state
-                .prompt_logprobs
-                .extend(
-                    output
-                        .input_logprobs_val
-                        .iter()
-                        .map(|lp| vllm::InputTokenLogProb {
-                            value: lp.map(|lp| lp as f32),
-                        }),
-                );
-            state
-                .prompt_token_ids
-                .extend(output.input_logprobs_idx.iter().copied());
-            state.prompt_top_logprobs.extend(
-                output
-                    .input_top_logprobs_val
-                    .iter()
-                    .zip(&output.input_top_logprobs_idx)
-                    .map(|(values, token_ids)| vllm::TopLogProbs {
-                        values: values.iter().map(|&lp| lp as f32).collect(),
-                        token_ids: token_ids.clone(),
-                    }),
-            );
-        }
-
-        // Ranked candidates per position, as the scheduler reports them (the
-        // gRPC servicer forwards the same lists unchanged).
-        let tick_top_logprobs: Vec<vllm::TopLogProbs> = output
-            .output_top_logprobs_val
-            .iter()
-            .zip(&output.output_top_logprobs_idx)
-            .map(|(values, token_ids)| vllm::TopLogProbs {
-                values: values.iter().map(|&lp| lp as f32).collect(),
-                token_ids: token_ids.clone(),
-            })
-            .collect();
-        let chunk_logprobs =
-            (!output.output_logprobs_val.is_empty()).then(|| vllm::OutputLogProbs {
-                token_logprobs: output
-                    .output_logprobs_val
-                    .iter()
-                    .map(|&lp| lp as f32)
-                    .collect(),
-                token_ids: output.output_logprobs_idx.clone(),
-                top_logprobs: tick_top_logprobs.clone(),
-            });
-        state
-            .output_logprobs_val
-            .extend(output.output_logprobs_val.iter().map(|&lp| lp as f32));
-        state
-            .output_logprobs_idx
-            .extend(output.output_logprobs_idx.iter().copied());
-        state.output_top_logprobs.extend(tick_top_logprobs);
 
         // SGLang has no separate error finish: a request it could not serve
         // (rejected by the plugin's validation, refused at admission, dropped
@@ -426,32 +361,21 @@ impl MappedGenerateStream for SglangGenerateStream {
             }
             return Err(engine_abort_status(output.finish_status, message));
         }
-        let finish = output.finish_reason.map(|reason| {
+        let finish = output.finish_reason.clone().map(|reason| {
             (
                 normalize_finish_reason(&reason).to_string(),
-                output.matched_stop.map(|matched| match matched {
-                    MatchedStop::TokenId(id) => {
-                        vllm::generate_complete::MatchedStop::MatchedTokenId(id)
-                    }
-                    MatchedStop::Text(text) => {
-                        vllm::generate_complete::MatchedStop::MatchedStopStr(text)
-                    }
-                }),
+                output.matched_stop.clone().map(matched_stop_of),
             )
         });
-        let mut response = state.emit_tick(
+        // The columns every slim wire shares, mapped once for all of them.
+        Ok(map_slim_output(
+            &mut self.state,
             self.index,
-            output.output_ids,
-            chunk_logprobs,
+            output,
             finish,
             &mut self.pending,
-        );
-        self.state.attach_input_logprobs(
-            &mut self.pending,
             &mut self.input_logprobs_emitted,
-            &mut response,
-        );
-        Ok(response)
+        ))
     }
 }
 
@@ -1009,8 +933,8 @@ pub(crate) fn constraint_ref(sp: &sglang_proto::SamplingParams) -> Option<Constr
 /// (`smg_grpc_servicer.sglang`) stamps it, this wire reads it.
 pub(crate) const GRAMMAR_REJECTED_ERR_TYPE: &str = "GrammarRejectedToken";
 
-/// Normalize an SGLang finish reason into the canonical set the gateway's
-/// response layer exact-matches (`stop`, `length`, `abort`).
+/// Normalize a slim record's finish reason into the canonical set the
+/// gateway's response layer exact-matches (`stop`, `length`, `abort`).
 pub(crate) fn normalize_finish_reason(reason: &str) -> &'static str {
     match reason {
         "stop" => "stop",
@@ -1019,7 +943,7 @@ pub(crate) fn normalize_finish_reason(reason: &str) -> &'static str {
         other => {
             warn!(
                 finish_reason = other,
-                "unknown SGLang finish_reason; defaulting to \"stop\""
+                "unknown finish_reason on the slim wire; defaulting to \"stop\""
             );
             "stop"
         }
@@ -1032,7 +956,7 @@ mod tests {
         codec::{decode_msgpack, encode_msgpack},
         mock_engine::default_ready_response,
         protocol::sglang::{
-            output::BatchTokenIDSlimOutput,
+            output::{BatchTokenIDSlimOutput, MatchedStop},
             request::{SglangRequestType, TokenizedGenerateReqInput as WireRequest},
         },
     };
