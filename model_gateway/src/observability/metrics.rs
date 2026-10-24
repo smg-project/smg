@@ -102,7 +102,7 @@ mod handles {
         pub(super) tpot: OnceCell<Histogram>,
         /// `smg_router_time_to_first_token_seconds`.
         pub(super) first_token: OnceCell<Histogram>,
-        /// `smg_router_time_per_output_token_seconds`.
+        /// `smg_router_request_time_per_output_token_seconds`.
         pub(super) per_output_token: OnceCell<Histogram>,
         /// `smg_router_generation_duration_seconds`.
         pub(super) generation: OnceCell<Histogram>,
@@ -328,8 +328,11 @@ pub(crate) const CACHE_AWARE_MATCH_RATIO_BUCKETS: &[f64] =
 pub(crate) const TIME_TO_FIRST_TOKEN_SECONDS: &str = "smg_router_time_to_first_token_seconds";
 /// Per-request mean time per output token on edges that resolve it. The
 /// same observation as `smg_router_tpot_seconds`, which keeps the
-/// request-duration buckets.
-pub(crate) const TIME_PER_OUTPUT_TOKEN_SECONDS: &str = "smg_router_time_per_output_token_seconds";
+/// request-duration buckets; named like the servicer's per-request mean
+/// (`request_time_per_output_token`), as the per-interval gap is another
+/// family's quantity.
+pub(crate) const REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS: &str =
+    "smg_router_request_time_per_output_token_seconds";
 
 /// Histogram buckets for `smg_router_time_to_first_token_seconds`: six per
 /// decade (1, 1.5, 2, 3, 5, 7.5) from 10 ms to 10 s, where a first-token
@@ -341,11 +344,11 @@ pub(crate) const TIME_TO_FIRST_TOKEN_BUCKETS: &[f64] = &[
     7.5, 10.0, 20.0, 30.0, 60.0, 120.0,
 ];
 
-/// Histogram buckets for `smg_router_time_per_output_token_seconds`: six per
+/// Histogram buckets for `smg_router_request_time_per_output_token_seconds`: six per
 /// decade (1, 1.5, 2, 3, 5, 7.5) from 1 ms to 1 s, where a per-token objective
 /// lives, then two edges for stalled decodes. The request-duration list has
 /// four edges between 5 ms and 50 ms; this one has seven.
-pub(crate) const TIME_PER_OUTPUT_TOKEN_BUCKETS: &[f64] = &[
+pub(crate) const REQUEST_TIME_PER_OUTPUT_TOKEN_BUCKETS: &[f64] = &[
     0.001, 0.0015, 0.002, 0.003, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15,
     0.2, 0.3, 0.5, 0.75, 1.0, 2.5, 10.0,
 ];
@@ -582,8 +585,8 @@ pub(crate) fn init_metrics() {
         "Time to first token by router_type, backend_type, model, endpoint (gRPC only): the observations of smg_router_ttft_seconds on buckets that resolve them (six per decade from 10 ms to 10 s; the request-duration bucket flag does not apply)"
     );
     describe_histogram!(
-        TIME_PER_OUTPUT_TOKEN_SECONDS,
-        "Time per output token by router_type, backend_type, model, endpoint (gRPC only): the observations of smg_router_tpot_seconds on buckets that resolve them (six per decade from 1 ms to 1 s; the request-duration bucket flag does not apply)"
+        REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS,
+        "Per-request mean time per output token by router_type, backend_type, model, endpoint (gRPC only): the observations of smg_router_tpot_seconds on buckets that resolve them (six per decade from 1 ms to 1 s; the request-duration bucket flag does not apply); a per-request mean, as the servicer's request_time_per_output_token family, not the per-interval gap"
     );
     describe_counter!(
         "smg_router_tokens_total",
@@ -1320,7 +1323,8 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
     // The first-token and per-output-token families: their own log-spaced
     // edges, which `--prometheus-duration-buckets` does not replace.
     let first_token_matcher = Matcher::Full(String::from(TIME_TO_FIRST_TOKEN_SECONDS));
-    let per_output_token_matcher = Matcher::Full(String::from(TIME_PER_OUTPUT_TOKEN_SECONDS));
+    let per_output_token_matcher =
+        Matcher::Full(String::from(REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS));
 
     // The cache-aware match ratio is a dimensionless 0..1 value: no `_seconds`
     // matcher applies, so it also needs its own buckets or it renders as a
@@ -1352,7 +1356,7 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
         (first_token_matcher, TIME_TO_FIRST_TOKEN_BUCKETS.to_vec()),
         (
             per_output_token_matcher,
-            TIME_PER_OUTPUT_TOKEN_BUCKETS.to_vec(),
+            REQUEST_TIME_PER_OUTPUT_TOKEN_BUCKETS.to_vec(),
         ),
         (
             canary_matcher,
@@ -1955,7 +1959,7 @@ impl Metrics {
         };
         let per_output_token_histogram = || {
             histogram!(
-                TIME_PER_OUTPUT_TOKEN_SECONDS,
+                REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS,
                 "router_type" => router_type,
                 "backend_type" => backend_type,
                 "model" => model(),

@@ -400,8 +400,8 @@ fn first_token_and_per_output_token_families_render_on_their_own_edges() {
 
     let labels = "router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"";
     for (family, le, count) in [
-        (TIME_PER_OUTPUT_TOKEN_SECONDS, "0.015", "0"),
-        (TIME_PER_OUTPUT_TOKEN_SECONDS, "0.02", "1"),
+        (REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS, "0.015", "0"),
+        (REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS, "0.02", "1"),
         (TIME_TO_FIRST_TOKEN_SECONDS, "0.1", "0"),
         (TIME_TO_FIRST_TOKEN_SECONDS, "0.15", "1"),
         ("smg_router_tpot_seconds", "0.01", "0"),
@@ -425,7 +425,10 @@ fn first_token_and_per_output_token_families_render_on_their_own_edges() {
             "{edge} is not a request-duration edge; rendered:\n{rendered}"
         );
     }
-    for family in [TIME_TO_FIRST_TOKEN_SECONDS, TIME_PER_OUTPUT_TOKEN_SECONDS] {
+    for family in [
+        TIME_TO_FIRST_TOKEN_SECONDS,
+        REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS,
+    ] {
         let count = format!("{family}_count{{{labels}}} 1");
         assert!(
             rendered.lines().any(|l| l == count),
@@ -469,7 +472,10 @@ fn duration_bucket_override_leaves_the_token_timing_families_alone() {
     );
     for (family, edges) in [
         (TIME_TO_FIRST_TOKEN_SECONDS, TIME_TO_FIRST_TOKEN_BUCKETS),
-        (TIME_PER_OUTPUT_TOKEN_SECONDS, TIME_PER_OUTPUT_TOKEN_BUCKETS),
+        (
+            REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS,
+            REQUEST_TIME_PER_OUTPUT_TOKEN_BUCKETS,
+        ),
     ] {
         let matcher = Matcher::Full(String::from(family));
         assert_eq!(defaults[&matcher], edges, "{family}");
@@ -482,7 +488,10 @@ fn duration_bucket_override_leaves_the_token_timing_families_alone() {
     let within =
         |edges: &[f64], lo: f64, hi: f64| edges.iter().filter(|e| (lo..=hi).contains(*e)).count();
     assert_eq!(within(duration, 0.005, 0.05), 4);
-    assert_eq!(within(TIME_PER_OUTPUT_TOKEN_BUCKETS, 0.005, 0.05), 7);
+    assert_eq!(
+        within(REQUEST_TIME_PER_OUTPUT_TOKEN_BUCKETS, 0.005, 0.05),
+        7
+    );
     assert_eq!(within(duration, 0.05, 0.5), 4);
     assert_eq!(within(TIME_TO_FIRST_TOKEN_BUCKETS, 0.05, 0.5), 7);
 }
@@ -1137,7 +1146,7 @@ fn the_stream_timing_set_renders_the_same_through_kept_handles() {
         "smg_router_ttft_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 2",
         "smg_router_tpot_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 1",
         "smg_router_time_to_first_token_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 2",
-        "smg_router_time_per_output_token_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 1",
+        "smg_router_request_time_per_output_token_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 1",
         "smg_router_generation_duration_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 3",
         "smg_router_generation_duration_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\",endpoint=\"generate\"} 1",
     ] {
@@ -1150,7 +1159,7 @@ fn the_stream_timing_set_renders_the_same_through_kept_handles() {
         "smg_router_ttft_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\"",
         "smg_router_tpot_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\"",
         "smg_router_time_to_first_token_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\"",
-        "smg_router_time_per_output_token_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\"",
+        "smg_router_request_time_per_output_token_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\"",
         "model=\"m2\",endpoint=\"generate\",token_type=\"input\"",
         "model=\"m2\",endpoint=\"generate\",token_type=\"cached\"",
     ] {
