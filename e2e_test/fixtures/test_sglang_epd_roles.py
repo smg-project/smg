@@ -40,7 +40,7 @@ def fleet(monkeypatch):
 
     def create(engine, topology=(1, 1, 1)):
         backend = setup._setup_epd(
-            MODEL, MODEL, engine, ConnectionMode.GRPC, topology, {}, gateway, None
+            MODEL, MODEL, engine, ConnectionMode.GRPC, topology, {**setup._GW_DEFAULTS}, gateway, None
         )
         try:
             next(backend)
