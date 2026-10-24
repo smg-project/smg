@@ -368,6 +368,125 @@ fn cache_aware_decision_metrics_render_counter_and_bucketed_histogram() {
     );
 }
 
+/// The first-token and per-output-token families render on their own edges
+/// once the buckets are registered the way `start_prometheus` does: an 18 ms
+/// per-token time lands under the 20 ms edge there and under the 25 ms edge
+/// of the request-duration list `smg_router_tpot_seconds` keeps; a 120 ms
+/// first token under 150 ms there and under 250 ms on `smg_router_ttft_seconds`.
+#[test]
+fn first_token_and_per_output_token_families_render_on_their_own_edges() {
+    let mut builder = PrometheusBuilder::new();
+    for (matcher, buckets) in histogram_bucket_overrides(None) {
+        builder = builder
+            .set_buckets_for_metric(matcher, &buckets)
+            .expect("bucket override");
+    }
+    let recorder = builder.build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: metrics_labels::BACKEND_REGULAR,
+            model_id: "m1",
+            endpoint: metrics_labels::ENDPOINT_CHAT,
+            ttft: Some(Duration::from_millis(120)),
+            generation_duration: Duration::from_millis(156),
+            input_tokens: Some(10),
+            cached_tokens: None,
+            output_tokens: 3,
+        });
+    });
+    let rendered = handle.render();
+
+    let labels = "router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"";
+    for (family, le, count) in [
+        (TIME_PER_OUTPUT_TOKEN_SECONDS, "0.015", "0"),
+        (TIME_PER_OUTPUT_TOKEN_SECONDS, "0.02", "1"),
+        (TIME_TO_FIRST_TOKEN_SECONDS, "0.1", "0"),
+        (TIME_TO_FIRST_TOKEN_SECONDS, "0.15", "1"),
+        ("smg_router_tpot_seconds", "0.01", "0"),
+        ("smg_router_tpot_seconds", "0.025", "1"),
+        ("smg_router_ttft_seconds", "0.1", "0"),
+        ("smg_router_ttft_seconds", "0.25", "1"),
+    ] {
+        let series = format!("{family}_bucket{{{labels},le=\"{le}\"}} {count}");
+        assert!(
+            rendered.lines().any(|l| l == series),
+            "{series} missing; rendered:\n{rendered}"
+        );
+    }
+    for (family, le) in [
+        ("smg_router_tpot_seconds", "0.015"),
+        ("smg_router_ttft_seconds", "0.15"),
+    ] {
+        let edge = format!("{family}_bucket{{{labels},le=\"{le}\"}}");
+        assert!(
+            !rendered.contains(&edge),
+            "{edge} is not a request-duration edge; rendered:\n{rendered}"
+        );
+    }
+    for family in [TIME_TO_FIRST_TOKEN_SECONDS, TIME_PER_OUTPUT_TOKEN_SECONDS] {
+        let count = format!("{family}_count{{{labels}}} 1");
+        assert!(
+            rendered.lines().any(|l| l == count),
+            "{count} missing; rendered:\n{rendered}"
+        );
+        let summary = format!("{family}{{");
+        assert!(
+            !rendered.contains(&summary),
+            "{family} rendered as a summary; rendered:\n{rendered}"
+        );
+    }
+}
+
+/// An operator's `--prometheus-duration-buckets` list replaces the
+/// request-duration edges, the ones `smg_router_ttft_seconds` and
+/// `smg_router_tpot_seconds` share with it, and leaves the first-token and
+/// per-output-token families on their own edges.
+#[test]
+fn duration_bucket_override_leaves_the_token_timing_families_alone() {
+    let custom = vec![0.5, 1.0];
+    let overridden = histogram_bucket_overrides(Some(custom.clone()));
+    for suffix in ["duration_seconds", "ttft_seconds", "tpot_seconds"] {
+        assert_eq!(
+            overridden[&Matcher::Suffix(String::from(suffix))],
+            custom,
+            "{suffix}"
+        );
+    }
+    let defaults = histogram_bucket_overrides(None);
+    let duration = &defaults[&Matcher::Suffix(String::from("duration_seconds"))];
+    assert_eq!(duration.len(), 29);
+    assert_eq!(duration.first(), Some(&0.001));
+    assert_eq!(duration.last(), Some(&7200.0));
+    assert_eq!(
+        &defaults[&Matcher::Suffix(String::from("ttft_seconds"))],
+        duration
+    );
+    assert_eq!(
+        &defaults[&Matcher::Suffix(String::from("tpot_seconds"))],
+        duration
+    );
+    for (family, edges) in [
+        (TIME_TO_FIRST_TOKEN_SECONDS, TIME_TO_FIRST_TOKEN_BUCKETS),
+        (TIME_PER_OUTPUT_TOKEN_SECONDS, TIME_PER_OUTPUT_TOKEN_BUCKETS),
+    ] {
+        let matcher = Matcher::Full(String::from(family));
+        assert_eq!(defaults[&matcher], edges, "{family}");
+        assert_eq!(overridden[&matcher], edges, "{family} under the override");
+        assert!(
+            edges[0] > 0.0 && edges.windows(2).all(|w| w[0] < w[1]),
+            "{family}: edges ascend strictly from above zero"
+        );
+    }
+    let within =
+        |edges: &[f64], lo: f64, hi: f64| edges.iter().filter(|e| (lo..=hi).contains(*e)).count();
+    assert_eq!(within(duration, 0.005, 0.05), 4);
+    assert_eq!(within(TIME_PER_OUTPUT_TOKEN_BUCKETS, 0.005, 0.05), 7);
+    assert_eq!(within(duration, 0.05, 0.5), 4);
+    assert_eq!(within(TIME_TO_FIRST_TOKEN_BUCKETS, 0.05, 0.5), 7);
+}
+
 #[test]
 fn test_prometheus_config_default() {
     let config = PrometheusConfig::default();
@@ -1017,6 +1136,8 @@ fn the_stream_timing_set_renders_the_same_through_kept_handles() {
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\",endpoint=\"generate\",token_type=\"output\"} 1",
         "smg_router_ttft_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 2",
         "smg_router_tpot_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 1",
+        "smg_router_time_to_first_token_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 2",
+        "smg_router_time_per_output_token_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 1",
         "smg_router_generation_duration_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 3",
         "smg_router_generation_duration_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\",endpoint=\"generate\"} 1",
     ] {
@@ -1028,6 +1149,8 @@ fn the_stream_timing_set_renders_the_same_through_kept_handles() {
     for absent in [
         "smg_router_ttft_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\"",
         "smg_router_tpot_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\"",
+        "smg_router_time_to_first_token_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\"",
+        "smg_router_time_per_output_token_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\"",
         "model=\"m2\",endpoint=\"generate\",token_type=\"input\"",
         "model=\"m2\",endpoint=\"generate\",token_type=\"cached\"",
     ] {

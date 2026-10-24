@@ -100,6 +100,10 @@ mod handles {
         pub(super) ttft: OnceCell<Histogram>,
         /// `smg_router_tpot_seconds`.
         pub(super) tpot: OnceCell<Histogram>,
+        /// `smg_router_time_to_first_token_seconds`.
+        pub(super) first_token: OnceCell<Histogram>,
+        /// `smg_router_time_per_output_token_seconds`.
+        pub(super) per_output_token: OnceCell<Histogram>,
         /// `smg_router_generation_duration_seconds`.
         pub(super) generation: OnceCell<Histogram>,
         /// `smg_router_tokens_total{token_type="input"}`.
@@ -317,6 +321,34 @@ pub(crate) const UPKEEP_INTERVAL_SECS: u64 = 5 * 60;
 /// duration buckets; `le="0"` isolates requests with no cached prefix at all.
 pub(crate) const CACHE_AWARE_MATCH_RATIO_BUCKETS: &[f64] =
     &[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
+
+/// Time to first token on edges that resolve it. The same observation as
+/// `smg_router_ttft_seconds`, which keeps the request-duration buckets (and
+/// so the `le` values recording rules were written against).
+pub(crate) const TIME_TO_FIRST_TOKEN_SECONDS: &str = "smg_router_time_to_first_token_seconds";
+/// Per-request mean time per output token on edges that resolve it. The
+/// same observation as `smg_router_tpot_seconds`, which keeps the
+/// request-duration buckets.
+pub(crate) const TIME_PER_OUTPUT_TOKEN_SECONDS: &str = "smg_router_time_per_output_token_seconds";
+
+/// Histogram buckets for `smg_router_time_to_first_token_seconds`: six per
+/// decade (1, 1.5, 2, 3, 5, 7.5) from 10 ms to 10 s, where a first-token
+/// objective lives, then coarser to two minutes; a first token later than that
+/// is a timeout class and lands in `+Inf`. The request-duration list has four
+/// edges between 50 ms and 500 ms; this one has seven.
+pub(crate) const TIME_TO_FIRST_TOKEN_BUCKETS: &[f64] = &[
+    0.01, 0.015, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0,
+    7.5, 10.0, 20.0, 30.0, 60.0, 120.0,
+];
+
+/// Histogram buckets for `smg_router_time_per_output_token_seconds`: six per
+/// decade (1, 1.5, 2, 3, 5, 7.5) from 1 ms to 1 s, where a per-token objective
+/// lives, then two edges for stalled decodes. The request-duration list has
+/// four edges between 5 ms and 50 ms; this one has seven.
+pub(crate) const TIME_PER_OUTPUT_TOKEN_BUCKETS: &[f64] = &[
+    0.001, 0.0015, 0.002, 0.003, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15,
+    0.2, 0.3, 0.5, 0.75, 1.0, 2.5, 10.0,
+];
 
 /// Histogram buckets for `smg_kv_index_lookup_seconds` and
 /// `smg_kv_event_apply_seconds`: a lookup takes microseconds and a batch
@@ -544,6 +576,14 @@ pub(crate) fn init_metrics() {
     describe_histogram!(
         "smg_router_tpot_seconds",
         "Time per output token by router_type, backend_type, model, endpoint (gRPC only)"
+    );
+    describe_histogram!(
+        TIME_TO_FIRST_TOKEN_SECONDS,
+        "Time to first token by router_type, backend_type, model, endpoint (gRPC only): the observations of smg_router_ttft_seconds on buckets that resolve them (six per decade from 10 ms to 10 s; the request-duration bucket flag does not apply)"
+    );
+    describe_histogram!(
+        TIME_PER_OUTPUT_TOKEN_SECONDS,
+        "Time per output token by router_type, backend_type, model, endpoint (gRPC only): the observations of smg_router_tpot_seconds on buckets that resolve them (six per decade from 1 ms to 1 s; the request-duration bucket flag does not apply)"
     );
     describe_counter!(
         "smg_router_tokens_total",
@@ -1270,11 +1310,17 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
 
     // TTFT and TPOT (per-request mean inter-token latency) end in `_seconds`
     // but NOT `duration_seconds`, so without explicit buckets the recorder
-    // renders them as summaries (quantile lines only) — not heatmap-able. Reuse
-    // the request-latency buckets: they span 0.001-7200s, fine for both the
-    // sub-second-to-seconds TTFT and the tens-of-ms TPOT.
+    // renders them as summaries (quantile lines only) — not heatmap-able. They
+    // keep the request-latency buckets (0.001-7200s, an operator's list with
+    // them), so recording rules on their `le` values hold; the same
+    // observations on edges that resolve them are the two families below.
     let ttft_matcher = Matcher::Suffix(String::from("ttft_seconds"));
     let tpot_matcher = Matcher::Suffix(String::from("tpot_seconds"));
+
+    // The first-token and per-output-token families: their own log-spaced
+    // edges, which `--prometheus-duration-buckets` does not replace.
+    let first_token_matcher = Matcher::Full(String::from(TIME_TO_FIRST_TOKEN_SECONDS));
+    let per_output_token_matcher = Matcher::Full(String::from(TIME_PER_OUTPUT_TOKEN_SECONDS));
 
     // The cache-aware match ratio is a dimensionless 0..1 value: no `_seconds`
     // matcher applies, so it also needs its own buckets or it renders as a
@@ -1303,6 +1349,11 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
         (duration_matcher, duration_bucket.clone()),
         (ttft_matcher, duration_bucket.clone()),
         (tpot_matcher, duration_bucket),
+        (first_token_matcher, TIME_TO_FIRST_TOKEN_BUCKETS.to_vec()),
+        (
+            per_output_token_matcher,
+            TIME_PER_OUTPUT_TOKEN_BUCKETS.to_vec(),
+        ),
         (
             canary_matcher,
             super::runtime_metrics::EVENT_LOOP_DELAY_BUCKETS.to_vec(),
@@ -1893,6 +1944,24 @@ impl Metrics {
                 "endpoint" => endpoint
             )
         };
+        let first_token_histogram = || {
+            histogram!(
+                TIME_TO_FIRST_TOKEN_SECONDS,
+                "router_type" => router_type,
+                "backend_type" => backend_type,
+                "model" => model(),
+                "endpoint" => endpoint
+            )
+        };
+        let per_output_token_histogram = || {
+            histogram!(
+                TIME_PER_OUTPUT_TOKEN_SECONDS,
+                "router_type" => router_type,
+                "backend_type" => backend_type,
+                "model" => model(),
+                "endpoint" => endpoint
+            )
+        };
         let generation_histogram = || {
             histogram!(
                 "smg_router_generation_duration_seconds",
@@ -1935,10 +2004,14 @@ impl Metrics {
 
         if !handles::keep_handles() {
             if let Some(ttft) = ttft {
-                ttft_histogram().record(ttft.as_secs_f64());
+                let seconds = ttft.as_secs_f64();
+                ttft_histogram().record(seconds);
+                first_token_histogram().record(seconds);
             }
             if let Some(tpot) = tpot {
-                tpot_histogram().record(tpot.as_secs_f64());
+                let seconds = tpot.as_secs_f64();
+                tpot_histogram().record(seconds);
+                per_output_token_histogram().record(seconds);
             }
             generation_histogram().record(generation_duration.as_secs_f64());
             if let Some(input) = input_tokens {
@@ -1963,14 +2036,18 @@ impl Metrics {
                 |_label| handles::StreamHandles::default(),
                 |kept| {
                     if let Some(ttft) = ttft {
-                        kept.ttft
-                            .get_or_init(ttft_histogram)
-                            .record(ttft.as_secs_f64());
+                        let seconds = ttft.as_secs_f64();
+                        kept.ttft.get_or_init(ttft_histogram).record(seconds);
+                        kept.first_token
+                            .get_or_init(first_token_histogram)
+                            .record(seconds);
                     }
                     if let Some(tpot) = tpot {
-                        kept.tpot
-                            .get_or_init(tpot_histogram)
-                            .record(tpot.as_secs_f64());
+                        let seconds = tpot.as_secs_f64();
+                        kept.tpot.get_or_init(tpot_histogram).record(seconds);
+                        kept.per_output_token
+                            .get_or_init(per_output_token_histogram)
+                            .record(seconds);
                     }
                     kept.generation
                         .get_or_init(generation_histogram)

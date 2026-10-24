@@ -1036,6 +1036,8 @@ fn a_collected_answer_records_its_token_and_generation_families() {
     for absent in [
         "smg_router_ttft_seconds",
         "smg_router_tpot_seconds",
+        "smg_router_time_to_first_token_seconds",
+        "smg_router_time_per_output_token_seconds",
         "endpoint=\"generate\",token_type=\"input\"",
         "endpoint=\"generate\",token_type=\"cached\"",
     ] {
