@@ -15,6 +15,17 @@ import zipfile
 
 SPEC_SHA = "40bb0378fa335481ec5870fd898726f2e64642dde19d62673c8ee505673f2644"
 
+# Exact cached749f OpenCV bootstrap; this directory must remain absent.
+CV2_LOADER_ROOT = Path("/usr/local/lib/python3.12/dist-packages/cv2")
+CV2_LOADER_PREFIX = "/usr/local/lib/python3.12/dist-packages/cv2/../../lib64"
+CV2_LOADER_RESOLVED = "/usr/local/lib/python3.12/lib64"
+CV2_LOADER_SOURCES = {
+    "__init__.py": (6630, "69192904dead3ada37c8b305ee850ac7474924730881a9d5e0b2390944eb5aae"),
+    "config.py": (111, "974e2d4096ee1a9a9a341df1bf33e16973683bf1ac733006de27ff2f23bc584d"),
+    "config-3.py": (724, "9a7aadf724b822001f5e963b01fd4e375d45e2cbbe328d2ca7b42a440c083a1c"),
+    "version.py": (91, "e718587212508acdcb296839c287c7fa346edb621005ffb199c26397592544ed"),
+}
+
 
 def require(value, message):
     if not value:
@@ -24,6 +35,33 @@ def require(value, message):
 def identity(path):
     with path.open("rb") as stream:
         return {"bytes": path.stat().st_size, "sha256": hashlib.file_digest(stream, "sha256").hexdigest()}
+
+
+def comparable_private_state(raw):
+    """Compare unchanged loader order, allowing one proven-inert cv2 prepend.
+
+    Keep every raw state/plan byte: this is comparison only, never an env reset.
+    A /proc environment still describes launch state, not a child import trace.
+    """
+    current = dict(raw)
+    value = current["LD_LIBRARY_PATH"]
+    require(isinstance(value, str), "private loader path is not a string")
+    if value.startswith(CV2_LOADER_PREFIX + ":"):
+        for name, (size, digest) in CV2_LOADER_SOURCES.items():
+            path = CV2_LOADER_ROOT / name
+            require(path.is_file() and not path.is_symlink() and path.resolve() == path,
+                    "cv2 loader source origin changed")
+            require(identity(path) == {"bytes": size, "sha256": digest},
+                    "cv2 loader source changed: " + name)
+        require(os.path.realpath(CV2_LOADER_PREFIX) == CV2_LOADER_RESOLVED,
+                "cv2 loader directory resolution changed")
+        require(not os.path.lexists(CV2_LOADER_PREFIX) and not os.path.lexists(CV2_LOADER_RESOLVED),
+                "cv2 loader directory is no longer inert")
+        value = value[len(CV2_LOADER_PREFIX) + 1:]
+    require(value.split(":")[:3] == ["/work/prefix/usr/lib/x86_64-linux-gnu", "/work/prefix/usr/lib", "/opt/rocm/lib"],
+            "private loader path changed")
+    current["LD_LIBRARY_PATH"] = value
+    return current
 
 
 def spec():
@@ -117,7 +155,7 @@ def verify(stage):
                 require({"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()} == item, "wheel member differs")
         subprocess.run([sys.executable, "-m", "pip", "--isolated", "--disable-pip-version-check", "install", "--no-index", "--no-deps", "--no-cache-dir", "--no-compile", "--retries", "0", "--target", str(target), str(wheel)], check=True, timeout=60)
     require(target.is_dir() and str(target) == os.environ["PYTHONPATH"].split(":")[0], "private import path changed")
-    require(os.environ["LD_LIBRARY_PATH"].split(":")[:3] == ["/work/prefix/usr/lib/x86_64-linux-gnu", "/work/prefix/usr/lib", "/opt/rocm/lib"], "private loader path changed")
+    comparable_private_state({"LD_LIBRARY_PATH": os.environ["LD_LIBRARY_PATH"]})
     dist_info = target / ("mooncake_transfer_engine_rocm-" + config["version"] + ".dist-info")
     dist = metadata.distribution("mooncake-transfer-engine-rocm")
     require(Path(dist._path).resolve() == dist_info and dist.version == config["version"], "active private metadata origin/version differs")
@@ -134,7 +172,7 @@ def verify(stage):
         with plan.open("x") as stream:
             stream.write(json.dumps(current, indent=2) + "\n")
     else:
-        require(json.loads(plan.read_text()) == current, "private installed state changed")
+        require(comparable_private_state(json.loads(plan.read_text())) == comparable_private_state(current), "private installed state changed")
     (root / (stage + "-private-mooncake.json")).write_text(json.dumps(current, indent=2) + "\n")
     return config, target
 
@@ -153,7 +191,7 @@ def require_mapped(children):
             require(not core, "owned EngineCore lacks private Mooncake mapping")
             continue
         require(mooncake == [str(engine)], "owned role loaded a different Mooncake engine")
-        require(child["private_environment"] == {name: os.environ[name] for name in ("PYTHONPATH", "LD_LIBRARY_PATH")}, "transport process private environment differs")
+        require(comparable_private_state(child["private_environment"]) == comparable_private_state({name: os.environ[name] for name in ("PYTHONPATH", "LD_LIBRARY_PATH")}), "transport process private environment differs")
         expected = {str(target / "mooncake" / name): item for name, item in config["raw_native"].items() if name != "nvlink_allocator.so"}
         expected.update({"/work/prefix/usr/lib/x86_64-linux-gnu/" + name: {key: item[key] for key in ("bytes", "sha256")} for name, item in config["runtime_libraries"].items()})
         require(all(libraries.get(name) == item for name, item in expected.items()), "owned Mooncake process lacks exact private runtime mappings")
