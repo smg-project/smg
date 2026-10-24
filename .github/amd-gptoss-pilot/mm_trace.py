@@ -143,9 +143,16 @@ def wire(rid, mm, model_path, module, path):
     observe(rid, "wire_cpu", module, path, fields)
 
 
-def positions(reqs, mm_inputs, values, prefixes, lengths, model_path, module, path):
+def positions(*args):
     if not enabled():
         return
+    try:
+        _positions(*args)
+    except Exception as error:
+        emit("UNASSOCIATED", "positions_cpu", dict(error=type(error).__name__ + ":" + str(error)[:160]))
+
+
+def _positions(reqs, mm_inputs, values, prefixes, lengths, model_path, module, path):
     current = state()
     current["batch"] += 1
     _local.batch, _local.items = current["batch"], {}
@@ -161,7 +168,9 @@ def positions(reqs, mm_inputs, values, prefixes, lengths, model_path, module, pa
                 raise ValueError("ITEM_CAP")
             items = [item_info(item) for item in mm.mm_items]
             for item in items:
-                _local.items[item["item_id"]] = (rid, item)
+                previous = _local.items.get(item["item_id"])
+                owner = rid if previous is None or previous[0] == rid else None
+                _local.items[item["item_id"]] = (owner, item)
             return dict(batch=_local.batch, model_path=str(model_path)[:256], items=items,
                         prefix=prefix, extend=length, table=tensor(value),
                         delta=tensor(mm.mrope_position_delta))
@@ -177,7 +186,7 @@ def selection(items, key, cached, expected_rows, branch, module, path):
     try:
         infos = [item_info(item) for item in items[:4]]
         links = [getattr(_local, "items", {}).get(info["item_id"]) for info in infos]
-        if len(items) > 4 or not links or any(link is None for link in links):
+        if len(items) > 4 or not links or any(link is None or link[0] is None for link in links):
             raise ValueError("NO_CURRENT_BATCH_ITEM_LINK")
         if any(link[1] != info for link, info in zip(links, infos)):
             raise ValueError("CURRENT_ITEM_IDENTITY_CHANGED")
