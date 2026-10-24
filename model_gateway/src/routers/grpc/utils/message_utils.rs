@@ -9,7 +9,7 @@ use std::{borrow::Cow, collections::HashMap, fmt::Display, sync::Arc};
 use axum::response::Response;
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
-    chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
+    chat_template::{ChatTemplateContentFormat, ChatTemplateParams, PreparedTools},
     traits::{MediaHandling, PromptEncoding, RendererCapabilities, Tokenizer},
 };
 use openai_protocol::{
@@ -22,7 +22,7 @@ use openai_protocol::{
 use serde_json::{json, Value};
 use tracing::error;
 
-use super::chat_utils;
+use super::{chat_utils, prepared_tools::prepare_tools};
 use crate::{
     observability::metrics::Metrics,
     routers::{
@@ -171,16 +171,10 @@ pub(crate) fn process_messages_prompt(
         chat_utils::process_tool_call_arguments(&mut transformed_messages);
     }
 
-    // Step 4: Serialize tools to JSON values for template processing
-    let tools_json: Option<Vec<Value>> = chat_tools
-        .map(|tools| {
-            tools
-                .iter()
-                .map(serde_json::to_value)
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .transpose()
-        .map_err(|e| format!("Failed to serialize tools: {e}"))?;
+    // Step 4: the tools as the template reads them, prepared once per
+    // distinct tool set and shared by every request that carries the same
+    // tools.
+    let prepared_tools = chat_tools.map(prepare_tools).transpose()?;
 
     // Step 5: the thinking preference the request states, or its provider
     // profile reads from the effort, as for Chat.
@@ -229,7 +223,8 @@ pub(crate) fn process_messages_prompt(
     let params = ChatTemplateParams {
         add_generation_prompt: !native_continuation,
         continue_final_message: native_continuation,
-        tools: tools_json.as_deref(),
+        tools: prepared_tools.as_deref().map(PreparedTools::tools),
+        prepared_tools: prepared_tools.as_deref(),
         template_kwargs: template_kwargs.as_ref(),
         thinking,
         ..Default::default()

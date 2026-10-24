@@ -856,6 +856,45 @@ pub struct ChatTemplateParams<'a> {
     /// (`ChatTemplateOutput::continued_final_message` says which happened),
     /// and a message that also has `reasoning_content` is refused.
     pub continue_final_message: bool,
+    /// `tools` converted for the render once ([`PreparedTools::new`] of these
+    /// same values): the render takes it instead of converting `tools` again,
+    /// so a caller that keeps one per distinct tool set spares every request
+    /// that carries the same tools the conversion. It must be made of
+    /// `tools`: one made of other values is not read, and the render converts
+    /// `tools` as without it.
+    pub prepared_tools: Option<&'a PreparedTools>,
+}
+
+/// The tools of a request converted for the render once, so a caller can keep
+/// the conversion per distinct tool set and hand it to every request that
+/// carries the same tools instead of having the render convert the values
+/// again ([`ChatTemplateParams::prepared_tools`]). The conversion is the one
+/// the render makes of [`ChatTemplateParams::tools`], so a render with the
+/// prepared value is the render without it, byte for byte.
+pub struct PreparedTools {
+    tools: Vec<JsonValue>,
+    value: Value,
+}
+
+impl PreparedTools {
+    /// Converts `tools` as a render converts [`ChatTemplateParams::tools`].
+    pub fn new(tools: Vec<JsonValue>) -> Self {
+        let value = Value::from_serialize(tools.as_slice());
+        Self { tools, value }
+    }
+
+    /// The values this was made of: what a caller passes as
+    /// [`ChatTemplateParams::tools`] beside it.
+    pub fn tools(&self) -> &[JsonValue] {
+        &self.tools
+    }
+
+    /// The render's value of `tools`, when they are the values this was made
+    /// of (the same slice).
+    fn value_of(&self, tools: &[JsonValue]) -> Option<Value> {
+        (std::ptr::eq(self.tools.as_ptr(), tools.as_ptr()) && self.tools.len() == tools.len())
+            .then(|| self.value.clone())
+    }
 }
 
 /// The initial size of a `tojson` output buffer: room for a function schema
@@ -2211,10 +2250,15 @@ fn render_messages<'a>(
     // request carries none: the names are defined and hold none. A template
     // may test them either way (`tools is none`, `tools is defined and tools`,
     // `tools is iterable`); undefined would send a template that tests
-    // `is none` down its tools branch with nothing to write.
-    let tools_value = params
-        .tools
-        .map_or_else(|| Value::from(()), Value::from_serialize);
+    // `is none` down its tools branch with nothing to write. A caller that
+    // converted the tools once hands the value in; else they are converted here.
+    let tools_value = match params.tools {
+        Some(tools) => params
+            .prepared_tools
+            .and_then(|prepared| prepared.value_of(tools))
+            .unwrap_or_else(|| Value::from_serialize(tools)),
+        None => Value::from(()),
+    };
     let documents_value = params
         .documents
         .map_or_else(|| Value::from(()), Value::from_serialize);
@@ -3272,6 +3316,71 @@ mod tests {
             !ConfigChatTemplates::read(Some(&serde_json::json!({"name": "default"}))).is_some()
         );
         assert!(!ConfigChatTemplates::read(None).is_some());
+    }
+
+    /// A tool set converted once renders as the values it was made of, with
+    /// and without a continued final message; one made of other values is not
+    /// read, and the render converts the values it was given.
+    #[test]
+    fn prepared_tools_render_as_the_values_they_were_made_of() {
+        let state = ChatTemplateState::new(Some(
+            "{% for tool in tools %}{{ tool | tojson }};{% endfor %}{{ tools | length }}:\
+             {% for message in messages %}{{ message['content'] }}{% endfor %}"
+                .to_string(),
+        ))
+        .unwrap();
+        let messages = [
+            serde_json::json!({"role": "user", "content": "Hi"}),
+            serde_json::json!({"role": "assistant", "content": "The answer is"}),
+        ];
+        let tools = vec![
+            serde_json::json!({"type": "function", "function": {"name": "f", "description": "first",
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}}}),
+            serde_json::json!({"type": "function", "function": {"name": "g", "parameters": {}}}),
+        ];
+        let prepared = PreparedTools::new(tools.clone());
+        assert_eq!(prepared.tools(), tools.as_slice());
+        fn params<'a>(
+            tools: &'a [serde_json::Value],
+            prepared_tools: Option<&'a PreparedTools>,
+            continue_final_message: bool,
+        ) -> ChatTemplateParams<'a> {
+            ChatTemplateParams {
+                tools: Some(tools),
+                prepared_tools,
+                add_generation_prompt: !continue_final_message,
+                continue_final_message,
+                ..Default::default()
+            }
+        }
+        for continued in [false, true] {
+            let plain = state
+                .apply(&messages, params(&tools, None, continued))
+                .unwrap();
+            assert!(plain.contains("\"name\": \"f\""), "{plain}");
+            assert_eq!(
+                state
+                    .apply(
+                        &messages,
+                        params(prepared.tools(), Some(&prepared), continued)
+                    )
+                    .unwrap(),
+                plain,
+                "the prepared value renders as the values it was made of"
+            );
+            let others = [serde_json::json!({"type": "function", "function": {"name": "h"}})];
+            let mismatched = state
+                .apply(&messages, params(&others, Some(&prepared), continued))
+                .unwrap();
+            assert_eq!(
+                mismatched,
+                state
+                    .apply(&messages, params(&others, None, continued))
+                    .unwrap(),
+                "a prepared value made of other tools is not read"
+            );
+            assert_ne!(mismatched, plain);
+        }
     }
 
     /// A checkpoint's processor template renders the requests that declare no
