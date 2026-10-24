@@ -112,7 +112,7 @@ class Original167:
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_call(self, item):
-        before = None
+        before, record = None, None
         try:
             before = self.snapshot(item)
         except Exception as error:
@@ -122,10 +122,11 @@ class Original167:
             try:
                 after = self.snapshot(item)
                 require(before == after, "owned worker/gateway changed inside original case")
-                self.records.append({"nodeid": canonical(item.nodeid), "before": before, "after": after})
+                record = {"nodeid": canonical(item.nodeid), "before": before, "after": after}
+                self.records.append(record)
             except Exception as error:
                 self.errors.append({"nodeid": canonical(item.nodeid), "stage": "after", "error": str(error)})
-        if self.lane == "rust" and before is not None:
+        if self.lane == "rust" and record is not None:
             try:
                 from fixtures.mock_answers import _CLASS_WORKERS
                 log = Path(_CLASS_WORKERS[0].log_path)
@@ -134,7 +135,7 @@ class Original167:
                 require(0 < len(raw) <= 16 * 1024**2, "original Rust worker log cap")
                 lines = [line for line in raw.decode(errors="replace").splitlines() if "Rust vLLM servicer listening on " in line]
                 require(lines, "actual Rust constructor/listener log missing")
-                self.records[-1]["Rust_listener"] = {"path": str(log), "sha256_observed": hashlib.sha256(raw).hexdigest(), "lines": lines}
+                record["Rust_listener"] = {"path": str(log), "sha256_observed": hashlib.sha256(raw).hexdigest(), "lines": lines}
             except Exception as error:
                 self.errors.append({"nodeid": canonical(item.nodeid), "stage": "Rust-listener", "error": str(error)})
         self.save()
