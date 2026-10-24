@@ -1,0 +1,10 @@
+[
+  [
+    "import logging\n",
+    "import logging\n\nfrom sglang.srt.disaggregation._smg_epd_position_trace import emit as _smg_epd_trace\n"
+  ],
+  [
+    "        if last_chunk:\n            self.disagg_metadata_buffers.set_buf(req)\n",
+    "        if last_chunk:\n            _smg_epd_trace(\n                \"prefill_send\", \"prefill\", req, __name__, __file__, scheduler=self,\n                lengths={\"transfer\": transfer_input_len, \"start\": start_idx, \"end\": end_idx},\n            )\n            self.disagg_metadata_buffers.set_buf(req)\n"
+  ]
+]

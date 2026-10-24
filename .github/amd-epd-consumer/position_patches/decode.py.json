@@ -1,0 +1,18 @@
+[
+  [
+    "import logging\n",
+    "import logging\n\nfrom sglang.srt.disaggregation._smg_epd_position_trace import emit as _smg_epd_trace\n"
+  ],
+  [
+    "            origin_input_len = self._rebootstrap_prefill_len(decode_req.req)\n",
+    "            origin_input_len = self._rebootstrap_prefill_len(decode_req.req)\n            _smg_epd_trace(\n                \"decode_allocate\", \"decode\", decode_req.req, __name__, __file__,\n                scheduler=self.scheduler, lengths={\"allocation\": origin_input_len},\n            )\n"
+  ],
+  [
+    "        idx = decode_req.metadata_buffer_index\n        if self.scheduler.kv_checksum_computer is not None:\n",
+    "        idx = decode_req.metadata_buffer_index\n        _smg_epd_trace(\n            \"decode_commit_before\", \"decode\", decode_req.req, __name__, __file__,\n            scheduler=self.scheduler,\n        )\n        if self.scheduler.kv_checksum_computer is not None:\n"
+  ],
+  [
+    "        decode_req.kv_receiver.clear()\n        decode_req.kv_receiver = None\n        decode_req.req.time_stats.set_wait_queue_entry_time()\n",
+    "        _smg_epd_trace(\n            \"decode_commit_after\", \"decode\", decode_req.req, __name__, __file__,\n            scheduler=self.scheduler,\n        )\n        decode_req.kv_receiver.clear()\n        decode_req.kv_receiver = None\n        decode_req.req.time_stats.set_wait_queue_entry_time()\n"
+  ]
+]

@@ -1,0 +1,14 @@
+[
+  [
+    "import logging\n",
+    "import logging\n\nfrom sglang.srt.disaggregation._smg_epd_position_trace import emit as _smg_epd_trace\n"
+  ],
+  [
+    "        mm_inputs = self.mm_processor.get_validated_mm_data(\n",
+    "        _smg_epd_trace(\n            \"receiver_before\", \"prefill\", self.recv_req, __name__, __file__,\n            embedding=recv_embedding, processor=self.mm_processor,\n        )\n        mm_inputs = self.mm_processor.get_validated_mm_data(\n"
+  ],
+  [
+    "        self.recv_req.input_ids = array(\"q\", mm_inputs.input_ids)\n        self.status = WaitingMMRequestStatus.SUCCESS\n",
+    "        self.recv_req.input_ids = array(\"q\", mm_inputs.input_ids)\n        _smg_epd_trace(\n            \"receiver_after\", \"prefill\", self.recv_req, __name__, __file__,\n            embedding=recv_embedding, processor=self.mm_processor,\n        )\n        self.status = WaitingMMRequestStatus.SUCCESS\n"
+  ]
+]

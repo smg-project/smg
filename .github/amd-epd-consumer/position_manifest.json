@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "model_id": "Qwen/Qwen3.5-9B",
+  "root": "/sgl-workspace/sglang/python/sglang",
+  "helper": {
+    "module": "sglang.srt.disaggregation._smg_epd_position_trace",
+    "path": "srt/disaggregation/_smg_epd_position_trace.py",
+    "source": "position_trace.py",
+    "sha256": "2c192f6088656168c8070e425f4a1158f8e586ddbee5b5ca11a990078cb1748c"
+  },
+  "modules": [
+    {
+      "module": "sglang.srt.disaggregation.encoder.receiver",
+      "path": "srt/disaggregation/encoder/receiver.py",
+      "original_sha256": "7c2f095a69420bdbd77ba3f2b0d19cee96602f0d279b3caa78d60e00e518b77d",
+      "patched_sha256": "107a9b0ea601c185e86086821992a3fee147ddccd72d65fe46135686ff919831",
+      "patch": "position_patches/receiver.py.json",
+      "patch_sha256": "bcfc3d06beac4d95ad698927398fb477ead132cacb65a38cec7a66f1803d0d1c"
+    },
+    {
+      "module": "sglang.srt.disaggregation.prefill",
+      "path": "srt/disaggregation/prefill.py",
+      "original_sha256": "50bec634f895b09f835d0a3c67e9a73288db046cb9eb7b8e8540fc9d00a684bd",
+      "patched_sha256": "8414a4d38d7d6303fac8b0d7ab57290d8e9c0094a1fbcdf1dd41a0c3d97b1ab8",
+      "patch": "position_patches/prefill.py.json",
+      "patch_sha256": "b09808454751d81f77ab9c312f32293db66493e3697fd96dad66de260fc2d090"
+    },
+    {
+      "module": "sglang.srt.disaggregation.decode",
+      "path": "srt/disaggregation/decode.py",
+      "original_sha256": "136f7b95152d6f3e1631dde8e5e2770af229cd5bfdd3c217dec7a3461b006d33",
+      "patched_sha256": "e3c8e3b2c6aebf1fa5ee4941b8d047bf7d8cb4272dea55a4b79626936c616ed5",
+      "patch": "position_patches/decode.py.json",
+      "patch_sha256": "b2517c2e5cf8dcec68dddeb5fa97aa6da2b5e1ef477afef434c90e688910c7c5"
+    }
+  ]
+}
