@@ -383,6 +383,15 @@ def rbac_kinds(documents: list[dict]) -> set[str]:
     return {document["kind"] for document in documents} & (ROLE | CLUSTER_ROLE)
 
 
+def rbac_namespaces(documents: list[dict]) -> set[str | None]:
+    """The namespace each RBAC document names, None for the release's."""
+    return {
+        document["metadata"].get("namespace")
+        for document in documents
+        if document["kind"] in ROLE | CLUSTER_ROLE
+    }
+
+
 def named(entries: list[dict], name: str) -> dict:
     (entry,) = [entry for entry in entries if entry["name"] == name]
     return entry
@@ -447,6 +456,43 @@ def test_kubernetes_provider_takes_the_service_discovery_settings():
     assert parsed.service_discovery_namespace == "team-a"
     assert parsed.model_id_from == "label:model"
     assert rbac_kinds(documents) == ROLE
+    assert rbac_namespaces(documents) == {"team-a"}
+
+
+@needs_helm
+@pytest.mark.parametrize(
+    ("settings", "namespace"),
+    [
+        (("rbac.create=true",), None),
+        (PROVIDERS["kubernetes"], None),
+        ((*PROVIDERS["kubernetes"], "router.discovery.kubernetes.namespace=default"), None),
+        ((*PROVIDERS["kubernetes"], "router.discovery.kubernetes.namespace=team-a"), "team-a"),
+        (("router.serviceDiscovery.enabled=true",), None),
+        (
+            ("router.serviceDiscovery.enabled=true", "router.serviceDiscovery.namespace=team-a"),
+            "team-a",
+        ),
+        (MESH, None),
+    ],
+    ids=[
+        "rbac.create",
+        "kubernetes",
+        "kubernetes, release namespace",
+        "kubernetes, team-a",
+        "legacy",
+        "legacy, team-a",
+        "mesh",
+    ],
+)
+def test_the_role_is_in_the_namespace_discovery_reads_pods_from(settings, namespace):
+    """A Role grants nothing outside its own namespace, so it follows the
+    namespace discovery watches; the binding's subject stays the release's
+    service account."""
+    _, documents = render(*settings)
+    assert rbac_kinds(documents) == ROLE
+    assert rbac_namespaces(documents) == {namespace}
+    (binding,) = [d for d in documents if d["kind"] == "RoleBinding"]
+    assert binding["subjects"][0]["namespace"] == "default"
 
 
 @needs_helm
@@ -617,6 +663,16 @@ def test_check_interval_reaches_the_selected_provider(provider):
 
 
 @needs_helm
+def test_check_interval_reaches_the_legacy_kubernetes_spelling():
+    _, documents = render(
+        "router.serviceDiscovery.enabled=true", "router.discovery.checkIntervalSecs=15"
+    )
+    parsed = launcher_args(router_container(documents)["args"])
+    assert parsed.service_discovery
+    assert parsed.discovery_check_interval_secs == 15
+
+
+@needs_helm
 def test_check_interval_without_a_provider_is_not_passed():
     """The gateway refuses the interval without a provider."""
     _, documents = render("router.discovery.checkIntervalSecs=15")
@@ -678,7 +734,11 @@ def test_mesh_under_the_kubernetes_provider_adds_its_router_selector_to_it():
     assert "--service-discovery" not in args
     parsed = launcher_args(args)
     assert parsed.selected_discovery_provider() == "kubernetes"
-    assert parsed.router_selector == {"app.kubernetes.io/component": "router"}
+    # The release's own routers only, not another release's in the namespace.
+    assert parsed.router_selector == {
+        "app.kubernetes.io/component": "router",
+        "app.kubernetes.io/instance": "smg",
+    }
     assert parsed.selector == {"app": "sglang"}
     assert parsed.service_discovery_namespace == "default"
     assert rbac_kinds(documents) == ROLE

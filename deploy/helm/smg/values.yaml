@@ -400,7 +400,8 @@ rbac:
   #    worker discovery (router.serviceDiscovery.enabled or
   #    router.discovery.provider=kubernetes), or mesh without peerUrls, which
   #    finds its peers among the router pods. The file, Slurm and Consul
-  #    providers need none.
+  #    providers need none. Created in the namespace Kubernetes discovery
+  #    watches, the release's unless its namespace setting names another.
   create: false
 
 # =============================================================================

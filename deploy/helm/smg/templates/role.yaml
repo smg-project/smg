@@ -10,6 +10,11 @@ kind: Role
 {{- end }}
 metadata:
   name: {{ include "smg.fullname" . }}
+  {{- /* In the namespace discovery reads pods from, when that is not the
+       release's: a Role grants nothing outside its own namespace. */}}
+  {{- if and (not (include "smg.discoveryClusterWide" .)) (ne (include "smg.discoveryNamespace" .) .Release.Namespace) }}
+  namespace: {{ include "smg.discoveryNamespace" . }}
+  {{- end }}
   labels:
     {{- include "smg.labels" . | nindent 4 }}
 rules:

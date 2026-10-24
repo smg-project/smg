@@ -8,6 +8,9 @@ kind: RoleBinding
 {{- end }}
 metadata:
   name: {{ include "smg.fullname" . }}
+  {{- if and (not (include "smg.discoveryClusterWide" .)) (ne (include "smg.discoveryNamespace" .) .Release.Namespace) }}
+  namespace: {{ include "smg.discoveryNamespace" . }}
+  {{- end }}
   labels:
     {{- include "smg.labels" . | nindent 4 }}
 roleRef:

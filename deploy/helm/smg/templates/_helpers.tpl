@@ -111,6 +111,23 @@ router.serviceDiscovery.clusterWide counts on its own, as it always has.
 {{- end }}
 
 {{/*
+Discovery namespace -- the namespace Kubernetes discovery watches when it is
+not cluster-wide: router.discovery.kubernetes.namespace under the provider,
+router.serviceDiscovery.namespace under the legacy spelling, the release's
+otherwise (mesh router discovery alone watches the release's). The Role and
+RoleBinding are created there, so they cover the pods the router reads.
+*/}}
+{{- define "smg.discoveryNamespace" -}}
+{{- if eq (.Values.router.discovery.provider | default "") "kubernetes" -}}
+{{- .Values.router.discovery.kubernetes.namespace | default .Release.Namespace -}}
+{{- else if .Values.router.serviceDiscovery.enabled -}}
+{{- .Values.router.serviceDiscovery.namespace | default .Release.Namespace -}}
+{{- else -}}
+{{- .Release.Namespace -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Discovery file path -- the manifest the file provider reads: file.path, else
 the ConfigMap's key under /etc/smg/discovery, where the router pod mounts it.
 */}}
@@ -226,9 +243,11 @@ Called from the router Deployment template.
 {{- /* The Kubernetes worker provider is on (below) and router discovery runs
      inside it, in its namespace (the release's, smg.validateDiscovery), so
      only the router selector is added; --service-discovery would conflict
-     with --discovery-provider. */}}
+     with --discovery-provider. The selector names the release, so another
+     release's routers in the namespace are not taken for peers. */}}
 - "--router-selector"
 - "app.kubernetes.io/component=router"
+- "app.kubernetes.io/instance={{ .Release.Name }}"
 {{- else }}
 {{/* Use K8s service discovery to find other router pods by label.
      Each router pod is annotated with the mesh port so peers can connect.
@@ -289,10 +308,6 @@ Called from the router Deployment template.
 {{- if .provider }}
 - "--discovery-provider"
 - {{ .provider | quote }}
-{{- if .checkIntervalSecs }}
-- "--discovery-check-interval-secs"
-- {{ int .checkIntervalSecs | quote }}
-{{- end }}
 {{- if eq .provider "kubernetes" }}
 {{- with .kubernetes }}
 {{- if .selector }}
@@ -367,6 +382,11 @@ Called from the router Deployment template.
 {{- end }}
 {{- end }}
 {{- end }}
+{{- end }}
+{{- /* Under either spelling of Kubernetes discovery, as under any provider. */}}
+{{- if and (include "smg.discoveryProvider" .) .Values.router.discovery.checkIntervalSecs }}
+- "--discovery-check-interval-secs"
+- {{ int .Values.router.discovery.checkIntervalSecs | quote }}
 {{- end }}
 {{- if .Values.router.model }}
 - "--model-path"
