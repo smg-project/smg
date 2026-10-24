@@ -1,0 +1,69 @@
+{
+  "DP": 1,
+  "TP": 1,
+  "acceptance_pending": true,
+  "admitted_lane": null,
+  "cases_sha256": "e03ef5c081e79658b2d4a1c85e8af392e0491ba35058a2d8751faf6a5bc3a6de",
+  "common_setup_skips": {
+    "chat_completions/test_function_calling.py::TestOpenAIServerFunctionCalling::test_function_call_strict[openai-grpc]": "strict mode is not supported yet",
+    "chat_completions/test_function_calling.py::TestOpenAIServerFunctionCalling::test_function_call_strict[smg-grpc]": "strict mode is not supported yet",
+    "chat_completions/test_openai_server.py::TestChatCompletionGptOss::test_regex[openai-grpc]": "gpt-oss models don't support regex constraints",
+    "chat_completions/test_openai_server.py::TestChatCompletionGptOss::test_regex[smg-grpc]": "gpt-oss models don't support regex constraints",
+    "chat_completions/test_openai_server.py::TestChatCompletionGptOss::test_response_prefill[openai-grpc]": "gpt-oss Harmony pipeline doesn't implement continue_final_message",
+    "chat_completions/test_openai_server.py::TestChatCompletionGptOss::test_response_prefill[smg-grpc]": "gpt-oss Harmony pipeline doesn't implement continue_final_message"
+  },
+  "default_execution": "FULL173_REQUIRED_NO_HISTORICAL_CASE_SPLICE",
+  "min_expected_passes": 167,
+  "models": {
+    "Qwen/Qwen3-4B-Instruct-2507": 31,
+    "meta-llama/Llama-3.1-8B-Instruct": 52,
+    "meta-llama/Llama-3.2-1B-Instruct": 54,
+    "openai/gpt-oss-20b": 36
+  },
+  "original_modules_sha256": {
+    "e2e_test/chat_completions/test_function_calling.py": "400b765b0707caffc0232f9062a02348a853dce6740cdd2a3d4037fd83e8b30b",
+    "e2e_test/chat_completions/test_openai_server.py": "daad88ba81d2c64b813c949a9291be81a752d7204e4d845d134b99fd92b8fcc5",
+    "e2e_test/chat_completions/test_structured_output.py": "189c718fd7889261c2732a27dd01e944e231ad623bbf34846b09ad5a5753e8a6",
+    "e2e_test/chat_completions/test_validation.py": "a7f43cb835b11139c644c0e4830ca93e8d5d415d09999bc2ef2bf49fda04e25a",
+    "e2e_test/router/test_admin_ops.py": "26ec5e1b3e87dd7850186d9a34a9bbb637a0896b3fe06b781a08e93881cb8f11",
+    "e2e_test/router/test_loads.py": "9ffe2a2e77dce8d452ad7c673800d993f67ebe1d857cb8b3cb991f154c775115"
+  },
+  "original_reference": "e9157e32ef87c74f38c7d0f165b4a35fffd4eb57",
+  "revision": "amd-functional-tokenspeed-python173-vllm-v1",
+  "selected": 173,
+  "source_only": true,
+  "strict_TS_credit": 0,
+  "reference_id": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat[3]/tokenspeed/nvidia",
+  "reference_contract_sha256": "53b40557856a51d8b21d226a063b6aed9c5810dd4e472de5ba82be4b6c3ad2f1",
+  "reference_to_candidate": {},
+  "connection": "grpc",
+  "servicer": "python",
+  "floor": 114,
+  "job_minutes": 56,
+  "pytest_minutes": 26,
+  "reruns": 2,
+  "new_native": null,
+  "new_producer": null,
+  "production_profile_optin": "SMG_VLLM_REQUEST_PROFILE=1",
+  "worker_extension": "smg_grpc_servicer.vllm.request_profile_worker.RequestProfileWorkerExtension",
+  "runtime_scope": "same vLLM Python backend for all chat/admin/load; 32-request load burst and per-request actual trace oracle unchanged",
+  "selection_note": "All original173 IDs are preserved; exact four original TS admin methods are admitted only by the explicit Python173 vLLM gRPC selector. No inherited-class alias.",
+  "source_origins": {
+    "smg_grpc_servicer.vllm.admin": {
+      "path": "grpc_servicer/smg_grpc_servicer/vllm/admin.py",
+      "sha256": "7c84d4c13e51c84f0dc88922f29b6134176ce7a3ac0a756154095fa9089d2725"
+    },
+    "smg_grpc_servicer.vllm.request_profile": {
+      "path": "grpc_servicer/smg_grpc_servicer/vllm/request_profile.py",
+      "sha256": "0979e86e333bd0cb82c812f945b82d40f41989c961a3e672897450ca02158964"
+    },
+    "smg_grpc_servicer.vllm.request_profile_worker": {
+      "path": "grpc_servicer/smg_grpc_servicer/vllm/request_profile_worker.py",
+      "sha256": "abf4c15cb1d8779db6dc1143e7aeb8095fb94bd2054e75638123f14546191e51"
+    },
+    "smg_grpc_servicer.vllm.servicer": {
+      "path": "grpc_servicer/smg_grpc_servicer/vllm/servicer.py",
+      "sha256": "081e58ba0f5775b3559c3a8ff128d73c3a9cc73c91177c1762f92ffd9cf2dc3a"
+    }
+  }
+}
