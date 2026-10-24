@@ -23,6 +23,7 @@ import os
 import time
 
 import anthropic
+import httpx
 import openai
 import pytest
 from infra import (
@@ -44,6 +45,7 @@ from infra import (
 )
 from infra.constants import vllm_kv_backend
 from infra.model_specs import get_model_spec
+from infra.process_utils import ProcessExitedError
 from infra.worker import stop_workers
 from infra.worker_pool import get_pool
 
@@ -766,6 +768,105 @@ def _setup_pd(
 # ---------------------------------------------------------------------------
 
 
+def _register_sglang_epd_encoders(gateway, workers, model_id, model_path, timeout):
+    """Register native encoders, which expose no scheduler discovery RPCs."""
+    for worker in workers:
+        if (
+            worker.engine != "sglang"
+            or worker.mode != ConnectionMode.GRPC
+            or worker.model_id != model_id
+            or get_model_spec(worker.model_id)["model"] != model_path
+        ):
+            raise ValueError("SG EPD workers must use the same configured model and gRPC runtime")
+        if worker.worker_type == WorkerType.ENCODE:
+            cmd = worker._build_cmd()
+            paths = [i for i, arg in enumerate(cmd) if arg == "--model-path"]
+            if (
+                len(paths) != 1
+                or cmd[paths[0] + 1] != model_path
+                or any(arg.startswith("--model-path=") for arg in cmd)
+            ):
+                raise ValueError("SG encoder command must use the configured EPD model path")
+    deadline = time.perf_counter() + timeout
+    expected_roles = {worker.base_url: worker.worker_type.value for worker in workers}
+    expected_urls = set(expected_roles)
+    encoder_ids = {}
+    reason = "registration not checked"
+
+    def remaining():
+        seconds = deadline - time.perf_counter()
+        if seconds <= 0:
+            raise TimeoutError(
+                f"SG EPD expected healthy URLs {sorted(expected_urls)} not ready: {reason}"
+            )
+        return seconds
+
+    def check_processes():
+        if gateway.process is not None and gateway.process.poll() is not None:
+            raise ProcessExitedError(f"Gateway exited with code {gateway.process.returncode}")
+        for worker in workers:
+            worker.raise_if_exited()
+
+    for worker in workers:
+        if worker.worker_type == WorkerType.ENCODE:
+            check_processes()
+            ok, detail = gateway.add_worker(
+                worker.base_url,
+                worker_type="encode",
+                bootstrap_port=worker.bootstrap_port,
+                labels={"model_path": model_path},
+                spec={
+                    "connection_mode": "grpc",
+                    "runtime_type": "sglang",
+                    "models": [{"id": model_path}],
+                },
+                wait_ready=False,
+                timeout=min(10.0, remaining()),
+            )
+            if not ok or not isinstance(detail, str) or not detail:
+                raise RuntimeError(f"Registering SG encoder {worker.base_url} failed: {detail}")
+            encoder_ids[worker.base_url] = detail
+    while True:
+        check_processes()
+        try:
+            resp = httpx.get(
+                f"{gateway.base_url}/workers",
+                params={"model": model_path},
+                timeout=min(5.0, remaining()),
+            )
+            resp.raise_for_status()
+            listed = resp.json()["workers"]
+            matching = {
+                row["url"]
+                for row in listed
+                if row.get("is_healthy") is True
+                and row.get("model_id") == model_path
+                and row.get("runtime_type") == "sglang"
+                and row.get("connection_mode") == "grpc"
+                and row.get("worker_type") == expected_roles.get(row.get("url"))
+                and (row["url"] not in encoder_ids or row.get("id") == encoder_ids[row["url"]])
+            }
+            missing = expected_urls - matching
+            reason = f"missing or unhealthy: {sorted(missing)}"
+            if not missing:
+                resp = httpx.get(f"{gateway.base_url}/readiness", timeout=min(5.0, remaining()))
+                data = resp.json()
+                reason = f"readiness: {data.get('reason') or data.get('status')}"
+                healthy = data.get("healthy_workers", 0)
+                if (
+                    resp.status_code == 200
+                    and data.get("status") == "ready"
+                    and isinstance(healthy, int)
+                    and healthy >= len(workers)
+                ):
+                    check_processes()
+                    remaining()
+                    return
+        except (httpx.HTTPError, KeyError, ValueError) as exc:
+            reason = str(exc)
+        time.sleep(min(0.1, remaining()))
+
+
 def _setup_epd(
     model_id,
     model_path,
@@ -844,10 +945,15 @@ def _setup_epd(
         _start_gateway(
             gateway,
             gateway_config,
-            encode_workers=encode_workers,
+            encode_workers=[] if engine == "sglang" else encode_workers,
             prefill_workers=prefill_workers,
             decode_workers=decode_workers,
         )
+        if engine == "sglang":
+            _register_sglang_epd_encoders(
+                gateway, all_workers, model_id, model_path, gateway_config["timeout"]
+            )
+            gateway.encode_workers = list(encode_workers)
         logger.info("%s EPD backend ready at %s", runtime_label, gateway.base_url)
         yield backend_name, model_path, _make_openai_client(gateway), gateway
     finally:
