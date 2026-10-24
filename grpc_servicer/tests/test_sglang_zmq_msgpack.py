@@ -655,17 +655,33 @@ def test_relay_failures_abort_in_the_scheduler_too(caplog, monkeypatch):
 
 
 def test_slim_output_carries_hidden_states_as_rows_per_position():
-    """A request that asked for hidden states gets the scheduler's cumulative
-    list as rows, one per token position: the engine appends the prefill's
-    block (one element, a row per prompt position) and then a row per decoded
-    token, and the slim wire flattens that into rows so the Rust decoder and
-    the Python request manager read the same thing. A request that asked for
-    none rides as None; an older sender without the column decodes as None."""
+    """A request that asked for hidden states gets the rows its output ADDED,
+    one per position a forward ran on: the engine keeps the list cumulative
+    (the prefill's block as one element, a row per prompt position computed,
+    then a row per decode step), the relay remembers what it sent per request
+    and the slim wire carries the rest, flattened into rows, so the Rust
+    decoder reads the step's rows. A request that asked for none rides as
+    None; a finished request is forgotten; an older sender without the column
+    decodes as None."""
     full = _full_output()
     prefill_block = [[0.5, 1.5], [2.5, 3.5]]  # two prompt positions
     full.output_hidden_states = [None, [prefill_block, [4.5, 5.5]]]
-    slim = wire.BatchTokenIDSlimOutput.from_full(full, engine_index=1)
+    rows = wire.HiddenStateRows()
+    slim = wire.BatchTokenIDSlimOutput.from_full(
+        full, engine_index=1, hidden_rows=rows.column(full)
+    )
     assert slim.output_hidden_states == [None, [[0.5, 1.5], [2.5, 3.5], [4.5, 5.5]]]
+    # The next output of the same request carries only the row the step added;
+    # once it finishes, the relay forgets it; without the column, nothing rides.
+    full.output_hidden_states = [None, [prefill_block, [4.5, 5.5], [6.5, 7.5]]]
+    assert rows.column(full) == [None, [[6.5, 7.5]]]
+    finished_before = list(full.finished_reasons)
+    full.finished_reasons = [None, {"type": "length"}]
+    assert rows.column(full) == [None, []]
+    full.finished_reasons = finished_before
+    assert rows.column(full) == [None, [*prefill_block, [4.5, 5.5], [6.5, 7.5]]]
+    assert wire.BatchTokenIDSlimOutput.from_full(full).output_hidden_states == [None, None]
+    full.output_hidden_states = [None, [prefill_block, [4.5, 5.5]]]
     encoded = msgspec.msgpack.encode(slim)
     arr = msgspec.msgpack.decode(encoded)
     assert arr[-1] == [None, [[0.5, 1.5], [2.5, 3.5], [4.5, 5.5]]]

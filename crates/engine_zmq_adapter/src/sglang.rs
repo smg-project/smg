@@ -52,12 +52,14 @@ pub struct SglangGenerateStream {
     selected_logprobs: Vec<sglang_proto::TopLogProbs>,
     selected_logprobs_delta: Vec<sglang_proto::TopLogProbs>,
     /// The final hidden layer's vectors the scheduler reported for this
-    /// choice, when the request asked for them: the cumulative rows (one per
-    /// token position, the prompt's first) and the rows new in the last tick.
-    /// The vLLM-proto intermediate has no slot for them either: the chunk
-    /// carries the tick's rows, the completion the whole list.
+    /// choice, when the request asked for them: the rows accumulated from
+    /// what each tick added (the plugin sends only the new rows: the prompt
+    /// positions the prefill computed, then one per decode step), and how
+    /// many of them the chunks before the current tick carried. The
+    /// vLLM-proto intermediate has no slot for them either: the chunk carries
+    /// the tick's rows, the completion the whole list with absolute positions.
     hidden_states: Vec<Vec<f32>>,
-    hidden_states_delta: Vec<Vec<f32>>,
+    hidden_states_sent: usize,
 }
 
 impl SglangGenerateStream {
@@ -72,7 +74,7 @@ impl SglangGenerateStream {
             selected_logprobs: Vec::new(),
             selected_logprobs_delta: Vec::new(),
             hidden_states: Vec::new(),
-            hidden_states_delta: Vec::new(),
+            hidden_states_sent: 0,
         }
     }
 
@@ -118,10 +120,18 @@ impl SglangGenerateStream {
         }
         match response.response.as_mut() {
             Some(Response::Chunk(chunk)) => {
-                chunk.hidden_states = flat_hidden_states(&self.hidden_states_delta);
+                chunk.hidden_states =
+                    flat_hidden_states(&self.hidden_states[self.hidden_states_sent..]);
             }
             Some(Response::Complete(complete)) => {
-                complete.all_hidden_states = all_hidden_states(&self.hidden_states);
+                complete.all_hidden_states = all_hidden_states(
+                    &self.hidden_states,
+                    first_hidden_position(
+                        self.state.prompt_tokens,
+                        self.state.completion_tokens,
+                        self.hidden_states.len(),
+                    ),
+                );
             }
             None => {}
         }
@@ -253,17 +263,28 @@ fn flat_hidden_states(rows: &[Vec<f32>]) -> Vec<f32> {
     rows.iter().flatten().copied().collect()
 }
 
+/// The absolute position of the first row a request carries, from the
+/// scheduler's own counters: the last row is always the last fed-back token
+/// (position `prompt + generated - 2`), whatever prefix the radix cache
+/// served without rows, so the first is that position less the rows after
+/// it. The Python servicer anchors the same way.
+fn first_hidden_position(prompt_tokens: u32, completion_tokens: u32, rows: usize) -> i32 {
+    let first = i64::from(prompt_tokens) + i64::from(completion_tokens) - 1 - rows as i64;
+    i32::try_from(first.max(0)).unwrap_or(i32::MAX)
+}
+
 /// `GenerateComplete.all_hidden_states`: one entry per position a forward
-/// ran on (the prompt's positions first, as the engine returns them, then
-/// each generated token fed back for the next; the last sampled token has no
-/// row), the final hidden layer, the position its index.
-fn all_hidden_states(rows: &[Vec<f32>]) -> Vec<sglang_proto::HiddenStates> {
+/// ran on (the prompt positions the prefill computed, as the engine returns
+/// them, then each generated token fed back for the next; the last sampled
+/// token has no row), the final hidden layer, the positions absolute from
+/// `first_position` ([`first_hidden_position`]).
+fn all_hidden_states(rows: &[Vec<f32>], first_position: i32) -> Vec<sglang_proto::HiddenStates> {
     rows.iter()
         .enumerate()
         .map(|(position, values)| sglang_proto::HiddenStates {
             values: values.clone(),
             layer: FINAL_HIDDEN_LAYER,
-            position: i32::try_from(position).unwrap_or(i32::MAX),
+            position: first_position.saturating_add(i32::try_from(position).unwrap_or(i32::MAX)),
         })
         .collect()
 }
@@ -299,16 +320,11 @@ impl MappedGenerateStream for SglangGenerateStream {
         state.completion_tokens = output.completion_tokens;
         state.output_ids.extend(output.output_ids.iter().copied());
         self.reasoning_tokens = output.reasoning_tokens;
-        // The scheduler ships the whole list of rows each tick: the rows past
-        // what this choice has seen are the tick's.
-        let seen = self.hidden_states.len();
-        let rows = output.output_hidden_states;
-        if rows.len() > seen {
-            self.hidden_states_delta = rows[seen..].to_vec();
-            self.hidden_states = rows;
-        } else {
-            self.hidden_states_delta.clear();
-        }
+        // The plugin sends the rows the tick added (the prompt positions the
+        // prefill computed, then one per decode step): the chunk carries
+        // them, the completion the whole list.
+        self.hidden_states_sent = self.hidden_states.len();
+        self.hidden_states.extend(output.output_hidden_states);
         self.selected_logprobs_delta = output
             .output_token_ids_logprobs_val
             .iter()
@@ -861,21 +877,32 @@ mod tests {
         assert!(params.stop_regex.is_none() && params.custom_params.is_none());
     }
 
-    /// The scheduler's cumulative rows become the proto's shapes: a tick's
-    /// rows flattened on the chunk, one `HiddenStates` per token position on
-    /// the completion, the final layer.
+    /// The rows become the proto's shapes: a tick's rows flattened on the
+    /// chunk, one `HiddenStates` per position on the completion, the final
+    /// layer, the positions absolute from the anchor the scheduler's counters
+    /// give (a prefix the radix cache served has no rows).
     #[test]
     fn hidden_state_rows_map_to_the_chunk_and_completion_shapes() {
         let rows = vec![vec![0.5, -0.5], vec![1.0, 2.0], vec![3.0, 4.0]];
         assert_eq!(flat_hidden_states(&rows[1..]), vec![1.0, 2.0, 3.0, 4.0]);
         assert!(flat_hidden_states(&[]).is_empty());
-        let all = all_hidden_states(&rows);
+        let all = all_hidden_states(&rows, 0);
         assert_eq!(all.len(), 3);
         assert_eq!(all[2].values, vec![3.0, 4.0]);
         assert!(all
             .iter()
             .enumerate()
             .all(|(i, hs)| hs.layer == -1 && hs.position == i32::try_from(i).unwrap()));
+        let anchored = all_hidden_states(&rows, 3);
+        assert_eq!(
+            anchored.iter().map(|hs| hs.position).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
+        // Three prompt rows and one fed-back token: the first row is position
+        // 0; a prompt of five with three served from the cache: position 3.
+        assert_eq!(first_hidden_position(3, 2, 4), 0);
+        assert_eq!(first_hidden_position(5, 2, 3), 3);
+        assert_eq!(first_hidden_position(0, 0, 0), 0);
     }
 
     #[test]

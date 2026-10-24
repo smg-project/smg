@@ -5,10 +5,12 @@ the way its own frontend keeps it, and the scheduler's cumulative rows become
 the proto's per-step delta (``GenerateStreamChunk.hidden_states``, the step's
 new rows flattened) and the whole list on completion
 (``GenerateComplete.all_hidden_states``, one ``HiddenStates`` per position a
-forward ran on: the prompt's, then each generated token fed back, the last
-sampled token having none; ``layer = -1`` for the final hidden layer). The Rust path maps the
-same wire the same way (``crates/engine_zmq_adapter/src/sglang.rs``); the two
-agree row for row.
+forward ran on: the prompt positions the prefill computed, then each generated
+token fed back, the last sampled token having none; ``layer = -1`` for the
+final hidden layer; the positions absolute, anchored from the engine's own
+counters because a prefix the radix cache served has no rows). The Rust path
+maps the same wire the same way (``crates/engine_zmq_adapter/src/sglang.rs``);
+the two agree row for row.
 """
 
 from __future__ import annotations
@@ -47,31 +49,40 @@ def refuse_hidden_states_above_server_mode() -> None:
     )
 
 
-def hidden_state_rows(value: Any) -> list[list[float]]:
-    """The scheduler's hidden states of one request as rows of floats, one per
-    position a forward ran on. The engine appends the prefill's block as ONE
-    element (a list of rows, one per prompt position) and then one row per
-    decode step, the generated token it fed back
-    (``batch_result_processor._append_prefill_hidden_states`` /
+def hidden_state_rows(value: Any, *, skip: int = 0) -> list[list[float]]:
+    """The scheduler's hidden states of one request as rows, one per position a
+    forward ran on, after the first ``skip`` rows (the ones already sent).
+
+    The engine appends the prefill's block as ONE element (a list of rows, one
+    per prompt position the forward computed: a prefix the radix cache served
+    has none) and then one row per decode step, the generated token it fed
+    back (``batch_result_processor._append_prefill_hidden_states`` /
     ``_append_decode_hidden_states``): the last sampled token is never fed
-    back, so a request has prompt + generated - 1 rows; the engine's
-    ``"last"`` mode keeps a single row.
-    Every element may be a list or a tensor-like with ``tolist``; None or an
-    empty value is no row."""
+    back, so a request has (prompt - cached prefix) + generated - 1 rows; the
+    engine's ``"last"`` mode keeps a single row. The values are the floats
+    ``tolist`` produced: the structure is reshaped, no element is converted
+    (this runs on the scheduler's loop, for every step of every request that
+    asked). Every element may be a list or a tensor-like with ``tolist``;
+    None or an empty value is no row."""
     if value is None:
         return []
     elements = _listed(value)
     rows: list[list[float]] = []
+    seen = 0
     for element in elements:
         element = _listed(element)
         if isinstance(element, (int, float)):
             # A bare vector given as its scalars: one row.
-            return [[float(x) for x in elements]]
+            return [] if skip else [list(elements)]
         if element and _is_vector(element[0]):
-            # A block of rows: the prefill's prompt positions.
-            rows.extend([float(x) for x in _listed(row)] for row in element)
+            # A block of rows: the prompt positions the prefill computed.
+            block = [_listed(row) for row in element]
+            rows.extend(block[max(0, skip - seen) :])
+            seen += len(block)
         else:
-            rows.append([float(x) for x in element])
+            if seen >= skip:
+                rows.append(element)
+            seen += 1
     return rows
 
 
@@ -83,10 +94,13 @@ def _is_vector(item: Any) -> bool:
     return isinstance(item, (list, tuple)) or hasattr(item, "tolist")
 
 
-def new_rows(cumulative: Sequence[Sequence[float]], already_sent: int) -> list[list[float]]:
-    """The rows a step adds: the scheduler ships the whole list so far, the
-    frontend emits what the client has not seen."""
-    return [list(row) for row in cumulative[already_sent:]]
+def first_hidden_position(prompt_tokens: int, completion_tokens: int, rows: int) -> int:
+    """The absolute position of the first row a request carries, from the
+    engine's own counters: the last row is always the last fed-back token
+    (position prompt + generated - 2), whatever prefix the radix cache served
+    without rows, so the first is that position less the rows after it. The
+    Rust servicer anchors the same way."""
+    return max(0, int(prompt_tokens) + int(completion_tokens) - 1 - int(rows))
 
 
 def flat_hidden_states(rows: Iterable[Sequence[float]] | None) -> list[float]:
@@ -94,21 +108,23 @@ def flat_hidden_states(rows: Iterable[Sequence[float]] | None) -> list[float]:
     client splits them by the hidden size)."""
     if not rows:
         return []
-    return [float(x) for row in rows for x in row]
+    return [x for row in rows for x in row]
 
 
-def all_hidden_states_proto(rows: Iterable[Sequence[float]] | None) -> list[Any]:
+def all_hidden_states_proto(
+    rows: Sequence[Sequence[float]] | None, first_position: int = 0
+) -> list[Any]:
     """``GenerateComplete.all_hidden_states``: one entry per position a forward
-    ran on (the prompt's positions first, as the engine returns them, then
-    each generated token fed back; the last sampled token has none), the
-    final layer, the position as its index."""
+    ran on (the prompt positions the prefill computed, then each generated
+    token fed back; the last sampled token has none), the final layer, the
+    positions absolute from ``first_position`` (``first_hidden_position``)."""
     from smg_grpc_proto import sglang_scheduler_pb2
 
     if not rows:
         return []
     return [
         sglang_scheduler_pb2.HiddenStates(
-            values=[float(x) for x in row], layer=FINAL_LAYER, position=position
+            values=row, layer=FINAL_LAYER, position=first_position + i
         )
-        for position, row in enumerate(rows)
+        for i, row in enumerate(rows)
     ]

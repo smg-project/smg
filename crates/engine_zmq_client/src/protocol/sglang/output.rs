@@ -98,13 +98,14 @@ pub struct BatchTokenIDSlimOutput {
     /// adapter); `None` for other finishes. Appended; empty from a plugin
     /// that predates the column.
     pub finished_err_types: Vec<Option<String>>,
-    /// The final hidden layer's vector per token position of a request that
-    /// asked for them (`return_hidden_states`): the scheduler's cumulative
-    /// rows so far (the prompt's positions first, then each generated token;
-    /// the plugin flattens the engine's prefill block), `None` for a request
-    /// that did not ask. Appended; empty from a plugin that predates the
-    /// column. Kept as `f32`, the proto's `float`, as the embedding vectors
-    /// are.
+    /// The final hidden layer's vectors a request that asked for them
+    /// (`return_hidden_states`) gained with this step: the rows new since the
+    /// plugin's last output for it (the prompt positions the prefill
+    /// computed, flattened from the engine's block, then one row per decode
+    /// step; the engine keeps the list cumulative, the plugin sends what is
+    /// new), `None` for a request that did not ask. Appended; empty from a
+    /// plugin that predates the column. Kept as `f32`, the proto's `float`,
+    /// as the embedding vectors are.
     pub output_hidden_states: Vec<Option<Vec<Vec<f32>>>>,
 }
 
@@ -283,9 +284,10 @@ pub struct SglangOutput {
     /// the routed output prevents isolated malformed batches being dropped
     /// by the connector and leaving their requests waiting indefinitely.
     pub selected_logprobs_error: Option<String>,
-    /// The final hidden layer's vector per token position so far (the
-    /// prompt's positions first), when the request asked for them; empty
-    /// otherwise. Cumulative: the scheduler ships the whole list each step.
+    /// The final hidden layer's vectors this step added (the prompt positions
+    /// the prefill computed first, then one per decode step), when the
+    /// request asked for them; empty otherwise. The plugin sends each step's
+    /// new rows; the adapter accumulates them.
     pub output_hidden_states: Vec<Vec<f32>>,
     /// The pooled vector of an embedding request (its one, finished, output).
     pub embedding: Option<Vec<f32>>,

@@ -109,6 +109,14 @@ def test_a_non_streaming_request_gets_the_whole_list_once_at_the_end(manager_mod
         complete = servicer._create_completion_response("score", last).complete
         assert len(complete.all_hidden_states) == 3
         assert list(servicer._create_chunk_response("score", last).chunk.hidden_states) == []
+        # The positions are anchored from the engine's counters: with a prompt
+        # of five of which the cache served three, the three rows sit at 3..5.
+        last["meta_info"].update(prompt_tokens=5, completion_tokens=2)
+        anchored = servicer._create_completion_response("score", last).complete
+        assert [h.position for h in anchored.all_hidden_states] == [3, 4, 5]
+        last["meta_info"].update(prompt_tokens=2, completion_tokens=2)
+        plain = servicer._create_completion_response("score", last).complete
+        assert [h.position for h in plain.all_hidden_states] == [0, 1, 2]
 
     asyncio.run(exercise())
 
@@ -181,9 +189,9 @@ def test_the_engines_launch_time_cap_is_kept_with_its_own_words(monkeypatch, mod
 def test_rows_flatten_the_engines_raw_shape():
     from smg_grpc_servicer.sglang.hidden_states import (
         all_hidden_states_proto,
+        first_hidden_position,
         flat_hidden_states,
         hidden_state_rows,
-        new_rows,
     )
 
     class Tensorish:
@@ -201,7 +209,16 @@ def test_rows_flatten_the_engines_raw_shape():
         FIRST_ROW,
     ]
     assert hidden_state_rows(FIRST_ROW) == [FIRST_ROW]  # the engine's "last" mode: one row
-    assert new_rows([*PREFILL_BLOCK, FIRST_ROW], 2) == [FIRST_ROW]
+    # The rows past what was already sent: part of the block, then whole rows.
+    assert hidden_state_rows([PREFILL_BLOCK, FIRST_ROW], skip=2) == [FIRST_ROW]
+    assert hidden_state_rows([PREFILL_BLOCK, FIRST_ROW], skip=1) == [PREFILL_BLOCK[1], FIRST_ROW]
+    assert hidden_state_rows([PREFILL_BLOCK, FIRST_ROW], skip=3) == []
+    assert hidden_state_rows(FIRST_ROW, skip=1) == []
+    # The anchor: the last row is the last fed-back token, whatever prefix the
+    # cache served without rows (prompt 5 with three cached, two generated).
+    assert first_hidden_position(3, 2, 4) == 0
+    assert first_hidden_position(5, 2, 3) == 3
+    assert first_hidden_position(0, 0, 0) == 0
     assert flat_hidden_states(None) == [] and flat_hidden_states([FIRST_ROW, SECOND_ROW]) == [
         4.5,
         5.5,
@@ -213,3 +230,4 @@ def test_rows_flatten_the_engines_raw_shape():
         (0, -1),
         (1, -1),
     ]
+    assert [h.position for h in all_hidden_states_proto([FIRST_ROW, SECOND_ROW], 3)] == [3, 4]

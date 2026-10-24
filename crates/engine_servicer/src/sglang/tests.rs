@@ -1374,12 +1374,14 @@ async fn prompt_logprobs_and_reasoning_tokens_pass_through() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// Hidden states ride the appended slim column as the scheduler's cumulative
-/// rows: each chunk carries the rows new in its tick, flattened (the prefill
-/// block on the first, a decode step's row on each later one); the `Complete`
-/// one entry per position a forward ran on (the prompt's positions, then each
+/// Hidden states ride the appended slim column as the rows each tick adds:
+/// each chunk carries them flattened (the prefill block on the first, a decode
+/// step's row on each later one); the `Complete` one entry per position a
+/// forward ran on (the prompt positions the prefill computed, then each
 /// generated token fed back; the last sampled token has none), the final
-/// layer; a request that did not ask carries none.
+/// layer, the positions absolute (a prefix the radix cache served has no
+/// rows: the anchor comes from the scheduler's counters); a request that did
+/// not ask carries none.
 #[tokio::test]
 async fn hidden_states_pass_through_as_tick_rows_and_positions() {
     let mut model = model_info();
@@ -1404,10 +1406,11 @@ async fn hidden_states_pass_through_as_tick_rows_and_positions() {
     let chunk1 = chunk(stream.message().bounded().await.unwrap().unwrap());
     assert_eq!(chunk1.hidden_states, vec![0.5, -0.5, 0.25, 0.75, 1.0, 0.0]);
     // The decode step that samples the second token fed the first one back:
-    // its row, and the request's last (prompt + generated - 1 = 4).
+    // its row, the only one this tick adds, and the request's last
+    // (prompt + generated - 1 = 4).
     rows.push(vec![3.0, 4.0]);
     let last = BatchTokenIDSlimOutput {
-        output_hidden_states: vec![Some(rows.clone())],
+        output_hidden_states: vec![Some(vec![vec![3.0, 4.0]])],
         ..batch("h1", vec![11], 2, Some("stop"), None)
     };
     send(&mut h.engine_out, &last).await;
@@ -1421,6 +1424,45 @@ async fn hidden_states_pass_through_as_tick_rows_and_positions() {
         assert_eq!(entry.layer, -1, "the final hidden layer");
         assert_eq!(entry.position, i32::try_from(position).unwrap());
     }
+    assert!(stream.message().bounded().await.unwrap().is_none());
+
+    // A prefix the radix cache served has no rows: the prefill block holds the
+    // computed positions only, and the positions stay absolute, anchored from
+    // the scheduler's counters (a prompt of five, three of them cached, two
+    // generated: rows at 3, 4 and 5).
+    let request = sg::GenerateRequest {
+        return_hidden_states: true,
+        ..generate_request("h2", true, Vec::new())
+    };
+    let mut stream = h.client.generate(request).await.unwrap().into_inner();
+    recv_add(&mut h.engine_in).await;
+    let first = BatchTokenIDSlimOutput {
+        prompt_tokens: vec![5],
+        cached_tokens: vec![3],
+        output_hidden_states: vec![Some(vec![vec![5.0, 5.5], vec![6.0, 6.5]])],
+        ..batch("h2", vec![10], 1, None, None)
+    };
+    send(&mut h.engine_out, &first).await;
+    let chunk1 = chunk(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(chunk1.hidden_states, vec![5.0, 5.5, 6.0, 6.5]);
+    let last = BatchTokenIDSlimOutput {
+        prompt_tokens: vec![5],
+        cached_tokens: vec![3],
+        output_hidden_states: vec![Some(vec![vec![7.0, 7.5]])],
+        ..batch("h2", vec![11], 2, Some("stop"), None)
+    };
+    send(&mut h.engine_out, &last).await;
+    let chunk2 = chunk(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(chunk2.hidden_states, vec![7.0, 7.5]);
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(
+        done.all_hidden_states
+            .iter()
+            .map(|entry| entry.position)
+            .collect::<Vec<_>>(),
+        vec![3, 4, 5]
+    );
+    assert_eq!(done.all_hidden_states[2].values, vec![7.0, 7.5]);
     assert!(stream.message().bounded().await.unwrap().is_none());
 
     // Without the flag nothing is asked and nothing rides the responses.
@@ -1453,6 +1495,11 @@ async fn hidden_states_are_kept_to_the_schedulers_launch_time_cap() {
     for (args, words) in [
         (
             r#"{"return_hidden_states_mode":"last","enable_return_hidden_states":false}"#,
+            "exceeds the server maximum `last`",
+        ),
+        (
+            // The engine's order: `last` wins over the legacy flag it sets itself.
+            r#"{"return_hidden_states_mode":"last","enable_return_hidden_states":true}"#,
             "exceeds the server maximum `last`",
         ),
         (

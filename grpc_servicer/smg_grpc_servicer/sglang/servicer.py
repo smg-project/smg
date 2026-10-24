@@ -52,6 +52,7 @@ from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.hidden_states import (
     all_hidden_states_proto,
+    first_hidden_position,
     flat_hidden_states,
     refuse_hidden_states_above_server_mode,
 )
@@ -1305,7 +1306,16 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 spec_draft_tokens=meta_info.get("spec_num_proposed_drafts", 0),
                 output_logprobs=output_logprobs_proto,
                 input_logprobs=input_logprobs_proto,
-                all_hidden_states=all_hidden_states_proto(output.get("all_hidden_states")),
+                # Positions absolute: anchored from the engine's counters (a
+                # prefix the radix cache served has no rows).
+                all_hidden_states=all_hidden_states_proto(
+                    output.get("all_hidden_states"),
+                    first_hidden_position(
+                        meta_info.get("prompt_tokens", 0),
+                        meta_info.get("completion_tokens", len(output.get("token_ids", []))),
+                        len(output.get("all_hidden_states") or []),
+                    ),
+                ),
                 index=output.get("index", 0),
                 **matched_stop_kwargs,
             ),

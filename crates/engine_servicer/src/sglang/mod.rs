@@ -179,9 +179,12 @@ pub(super) fn hidden_states_cap(model: &SglangModelInfo) -> Option<HiddenStatesC
     let legacy = args
         .get("enable_return_hidden_states")
         .and_then(serde_json::Value::as_bool);
+    // The engine's own order (`get_server_return_hidden_states_mode`): a
+    // `last` mode wins over the legacy flag, which the engine sets whenever a
+    // mode is given.
     match (mode, legacy) {
-        (Some("full"), _) | (_, Some(true)) => Some(HiddenStatesCap::Full),
         (Some("last"), _) => Some(HiddenStatesCap::Last),
+        (Some("full"), _) | (_, Some(true)) => Some(HiddenStatesCap::Full),
         (None, None) => None,
         _ => Some(HiddenStatesCap::Null),
     }
