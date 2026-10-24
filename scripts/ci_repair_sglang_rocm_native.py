@@ -17,6 +17,7 @@ from pathlib import Path
 IMAGE = "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d"
 CONSTRAINT = Path("/etc/sglang/constraints/torch-rocm.txt")
 CONSTRAINT_SHA = "7a425435d076500cf33b24dd8cf5a1f1b24e9954a15cae03e4ed708cd1d52ef3"
+TILELANG_ROOT = Path("/opt/tilelang")
 WHEELS = [
     "https://files.pythonhosted.org/packages/c8/2a/bff8d73841b49f196852edd8460241d3a363e6b0d64c3a9367542658394f/apache_tvm_ffi-0.1.12-cp312-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl#sha256=817af52916ca9987e019ae9c811406835c7f26c590b2a7bcfa9db0e3809f4228",
     "https://files.pythonhosted.org/packages/e2/79/a914539b4785f3e44f891aa012a886edb8bc10fe081c440981c57543ce21/torch_c_dlpack_ext-0.1.5-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl#sha256=e6f9da4bb9af70e27facc777458be62e10dbbbddda7672d16138db0553c5a524",
@@ -26,6 +27,24 @@ WHEELS = [
 def require(value, message):
     if not value:
         raise RuntimeError(message)
+
+
+def native_modules():
+    # TileLang.env exposes its bundled TVM before TileLang imports it itself.
+    importlib.import_module("tilelang")
+    modules = [
+        importlib.import_module(name)
+        for name in ["tvm_ffi.registry", "tvm", "tilelang", "xgrammar"]
+    ]
+    for module, relative in (
+        (modules[1], "3rdparty/tvm/python/tvm/__init__.py"),
+        (modules[2], "tilelang/__init__.py"),
+    ):
+        require(
+            Path(module.__file__).resolve() == (TILELANG_ROOT / relative).resolve(),
+            "unexpected native import origin: " + module.__name__,
+        )
+    return modules
 
 
 def sha(data):
@@ -138,10 +157,7 @@ def verify_only(output):
         )
         report["torch_native_dlpack_api"] = True
         # This CLI is a fresh process; these imports do not run GPU arithmetic or a model.
-        modules = [
-            importlib.import_module(name)
-            for name in ["tvm_ffi.registry", "tvm", "tilelang", "xgrammar"]
-        ]
+        modules = native_modules()
         report["imports"] = {m.__name__: m.__file__ for m in modules}
         require(
             sha(read(modules[0].__file__)) == plan[0]["fixed_sha256"], "loaded FFI registry changed"
@@ -195,8 +211,10 @@ def main():
         [
             sys.executable,
             "-c",
-            "import tvm_ffi, tvm, tilelang, xgrammar; "
+            "import runpy,sys; "
+            "runpy.run_path(sys.argv[1])['native_modules'](); "
             "print('SGLang ROCm native dependencies imported successfully')",
+            str(Path(__file__).resolve()),
         ],
         check=True,
     )
