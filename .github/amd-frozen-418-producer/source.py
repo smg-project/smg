@@ -37,7 +37,7 @@ def verify(inputs, environment, read=git):
         "build context differs",
     )
     base = inputs["source_base"]
-    require(base != environment["GITHUB_SHA"], "diagnostic head must not be labelled as the fixed418 base")
+    require(base != environment["GITHUB_SHA"], "diagnostic head must not be labelled as 418")
     read("merge-base", "--is-ancestor", base, "HEAD")
     compiled, producer = inputs["compiled_source_trees"], inputs["producer_source_trees"]
     require(len(compiled) == 37 and len(producer) == 14, "source scope differs")
