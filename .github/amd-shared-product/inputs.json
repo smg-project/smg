@@ -2,78 +2,13 @@
   "ready": false,
   "run_budget_admitted": false,
   "artifacts_pinned": false,
-  "artifacts": [
-    {
-      "name": "smg-wheel",
-      "id": 12539960818,
-      "bytes": 52386264,
-      "sha256": "51f4d219a9e691e94890ec267310e9d963a85ecc5c60ccba55c5d38a91ef049f",
-      "expires_at": "2026-10-24T23:54:34Z",
-      "files": {
-        "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl": {
-          "bytes": 52529349,
-          "sha256": "283ba6730ab1328332b1b61b2c692a2a28e0141b1987ae9422d07bd6c653512d"
-        }
-      }
-    },
-    {
-      "name": "go-ffi-library",
-      "id": 12539866422,
-      "bytes": 13837182,
-      "sha256": "beb1eb23135ba3ec036c296fea5c7abb96314fbd36dab8ad14b89efa6db2a329",
-      "expires_at": "2026-10-24T23:54:37Z",
-      "files": {
-        "libsmg_go.d": {
-          "bytes": 64539,
-          "sha256": "b46b20aad8202524bb156587ea51a3c8d66d25cec0cd554664418ac641bfad38"
-        },
-        "libsmg_go.so": {
-          "bytes": 35008576,
-          "sha256": "793946614a201c0658f9fc524a1307c0b15433a0ac8b709d5bf0e265b3b87b09"
-        }
-      }
-    },
-    {
-      "name": "python-client-types",
-      "id": 12539751694,
-      "bytes": 34373,
-      "sha256": "58f2a41f1455c7660a5594cfcfbeb6c4e696eb8ac76735501418899acd3d90e5",
-      "expires_at": "2026-10-24T23:54:39Z",
-      "files": {
-        "_generated.py": {
-          "bytes": 187180,
-          "sha256": "f2f808705287928f7a4095867bacaa3b1ffbc8eea6f038857dc3456529adeaf6"
-        }
-      }
-    },
-    {
-      "name": "wasm-test-fixtures",
-      "id": 12539567404,
-      "bytes": 56596,
-      "sha256": "a4df6f4b2f6bd3740aba28ddb1a081ce087475588ad03c72c6cdd47afdd5c4e5",
-      "expires_at": "2026-10-24T23:54:40Z",
-      "files": {
-        "storage_hook_guest.wasm": {
-          "bytes": 80680,
-          "sha256": "7e3a093e09bfe30244d128c1aaaf8558a1b13c05558cc81cff04021947445e11"
-        },
-        "storage_hook_passthrough.wasm": {
-          "bytes": 79153,
-          "sha256": "3a10ce115ea179026a00f3e85ce6b6a388bcc1f274bc7abfc074be876d7c3e55"
-        }
-      }
-    }
-  ],
-  "gateway_native": {
-    "name": "smg/smg_rs.abi3.so",
-    "bytes": 142443344,
-    "sha256": "143a28b8834bb16b01d87f4ba71b6f68254c71c52e5c7424ccf401b8ce9c29a9"
-  },
-  "run_id": 40038340532,
+  "artifacts": null,
+  "gateway_native": null,
+  "run_id": 40139189680,
   "run_attempt": 1,
-  "build_job_id": 120703217001,
-  "producer_sha": "445bb37bccb47e620b2b3aac12cd30b4ebd71a43",
-  "producer_branch": "ci/frozen-c9d-cpu-producer-20261023",
+  "build_job_id": 121007094597,
+  "producer_sha": "f93b547de753c96373988b60b1590638629b3568",
+  "producer_branch": "ci/frozen-legacy-c9d-refresh-producer-admitted-20261024",
   "producer_policy": "frozen_c9d_dispatch_build_only_all_18_steps_success_v1",
   "target_product_commit": "3b79acc59b68b84465e58a025850af2c93c96fe8",
   "source_trees": {
@@ -136,22 +71,7 @@
     "crates/grpc_client/src": "0068eacf800c1ca3dc8fd23d9658c0d4866ca266",
     "crates/grpc_client/tests": "1bfcdb65a82db071422c03fc4f70b19d143dde5c"
   },
-  "producer_source_trees": {
-    ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
-    "Cargo.toml": "1524dd4960a96dd3ae5069917324836dee979150",
-    "Cargo.lock": "658f9376c020bef5e29a3e5728b4931cee891427",
-    "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
-    "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
-    "bindings": "e97f000df477e928953b6bcb5a7927adf5ff88c1",
-    "clients": "03b0cbb722670d98b37b726af18c1796beef82d5",
-    "crates": "aa609afdadbb89b16d28d8763ec0d8a47672433a",
-    "model_gateway": "d1a181bfb1d16a661e16346d4eb8f257689701ce",
-    "grpc_servicer": "2cbef8f1440732b8034bfded7a9eba7e8e8d23ca",
-    "e2e_test": "ac24cbe1b88c3219bbe07b76dc4dd8370bf2ff1b",
-    "scripts": "a5f12792df38a4cb1f82ef724f8234360fddf99a",
-    ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
-    ".github/workflows": "01f44d96ef6820514539989da56df9c60c184790"
-  },
+  "producer_source_trees": null,
   "explicit_consumer_only_paths": [
     ".github/amd-shared-product/",
     ".github/workflows/pr-test-rust.yml",
@@ -172,7 +92,7 @@
   },
   "diagnostic_difference": "Only the original Mooncake4 topology recipe is prepared: e91517/current18/floor14/originalfilter/50job42pytest, main-global-extra Mooncake and mixed NIXL/Mooncake pairs retained. Inherited14unit/environment/private-constraint/owned-process gates stay; separate actual Mooncake and official ROCm NIXL canaries plus owned nominal2P2D logs are required. The reviewed exact3-file MC2 test overlay is inherited but its classes are not selected. No MC2/NIXL4 GPU/ABI/transfer result is transferred; actual counter/periodicflush success remains unverified.",
   "producer_binary_relabelled": false,
-  "producer_artifact_pins_status": "BOUND: root-accepted actual40038340532/445bb37 four archives and native143a; all admission flags remainfalse",
+  "producer_artifact_pins_status": "UNBOUND_REFRESH401391: actual four ZIPs/six payloads/native/actualproducer14 are null until independent actual artifact audit and root acceptance; old445/143a and19c1d22 are not consumed or relabelled.",
   "explicit_product_dependency": {
     "PR": 4266,
     "original_public_head": "3cef9af6a73610f501b920221c7232bf640219d0",
@@ -180,7 +100,7 @@
     "parent_stack": "0707d631cb6827789619ab96999f868044dc06db",
     "visible_churn": 43
   },
-  "producer_snapshot_note": "Rootaccepted40038340532/445bb37 four archives/native143a remain exact local pins, not API-refreshed. This independent Mooncake4 source route has no admitted budget, current runner availability, ABI or transfer acceptance.",
+  "producer_snapshot_note": "Known root-owned CPU run40139189680/f93b/build121007094597 is a new matching legacyc9d build. Its identity is saved, terminal artifacts/actual14/native are not accepted by this source packet. GHA source/relay cannot admit unbound inputs.",
   "source_base": "c9d5431db92aa2d35521889f6297c4c6f7b05b4a",
   "producer_base_source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
@@ -198,7 +118,7 @@
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows": "7c956a4ee89bdf800d48c63815d10a4dd568d90e"
   },
-  "producer_source_map_note": "Actual14 source trees remain exact accepted445bb37; compiled37c9d/native143a are unchanged. Consumer19/scripts is the actual Git tree with exactly two hash-bound default-off hooks relative to the product base; e2e_test retains the existing exact four-file overlay. Auxiliary proto/Cairo/tools provenance is separate from the actual445 four archives.",
+  "producer_source_map_note": "Consumer19 and compiled37 remain exactee1d/c9d code. Expected producer source13+admittedworkflowtree are a static source contract only; actual14 remainsnull until actualartifact acceptance.",
   "resource_precondition": {
     "requested_runner_label": "1-gpu-mi300x",
     "required_logical_devices_by_tier": {
@@ -227,7 +147,7 @@
     "unit_junit": "servicer-engine.xml in the existing unique AMD dependency artifact",
     "diagnostic_workflow_difference": "NIXL tier-select dispatch caller only; normal product tooling CPU jobs are not part of this diagnostic workflow."
   },
-  "source_identity_note": "Original MC4 current18 selection, models, requests, oracles, 50job/42pytest and floor14 remain fixed. Actual consumer19 includes the existing exact four-file e2e overlay and two exact default-off scripts hooks; compiled37 c9d/gateway143a and actual445 producer14 remain unchanged. The private MC4 branch normally installs the independently built exact8451 proto wheel (source39dea, eight current schemas), editable consumer servicer, pinned tools and separate Cairo inputs. It does not install the proto from the editable checkout or relabel the auxiliary wheel as a fifth445 archive. Both pooled-node auxiliary/private staging and all runtime validation are pending; no CPU result or prior GPU acceptance is transferred.",
+  "source_identity_note": "Original currentMC4 18/floor14/50job42pytest/reruns2/models/TP/connectors/oracles and ee1d normalsharedsetup/twohooks/observer stay unchanged. New matching401391 artifact fields are pendingnull, never old445/143a or19c1d22. Auxiliary8451/Cairo/tools, private710c wheel/HIP55leaf23dir, and the normally-resolved30wheel closure are separate read-only datasets, not producerarchives. Bothpoolnodes require actualstaging and matchingnative fullnormalcohort acceptance before GPU; existing node2CPU86f048 is old143a scoped evidence only.",
   "admitted_tier": null,
   "contracts": {
     "4": {
@@ -334,6 +254,24 @@
     "staging_accepted": false,
     "staging_receipt": null,
     "GPU_verified": false,
-    "servicer_source_manifest_sha256": "e79fde207845a729312197903c55b07d7912b5157db87d6d88ea02149a6eda86"
+    "servicer_source_manifest_sha256": "e79fde207845a729312197903c55b07d7912b5157db87d6d88ea02149a6eda86",
+    "separate_from_refreshed_four_archives": true
+  },
+  "consumer_gpu_ready": false,
+  "new_producer_binding": {
+    "policy": "root_accepted_frozen_legacyc9d_refresh_fourarchives_v1",
+    "known_run_binding": {
+      "run_id": 40139189680,
+      "head_sha": "f93b547de753c96373988b60b1590638629b3568",
+      "branch": "ci/frozen-legacy-c9d-refresh-producer-admitted-20261024",
+      "build_job_id": 121007094597,
+      "created_at": "2026-10-24T22:35:07Z"
+    },
+    "root_artifact_acceptance": null,
+    "independent_actual_peer": null,
+    "actual_producer14": null,
+    "actual_four_archives": null,
+    "actual_native": null,
+    "old_results_transferred": false
   }
 }
