@@ -59,6 +59,7 @@ class StartupControls(unittest.TestCase):
     def function(self, patched, result):
         item = next(v for k, v in CONTRACT["files"].items() if k.endswith("chip_info.py"))
         text = Path(item["actual_capture_path"]).read_text()
+        self.assertEqual(hashlib.sha256(text.encode()).hexdigest(), item["before_sha256"])
         if patched:
             for change in item["changes"]:
                 text = text.replace(change["before"], change["after"])
@@ -166,6 +167,7 @@ class StartupControls(unittest.TestCase):
                 return None if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) and node.value.func.id.startswith("_smg_sg2_") else node
         for item in CONTRACT["files"].values():
             before = Path(item["actual_capture_path"]).read_text()
+            self.assertEqual(hashlib.sha256(before.encode()).hexdigest(), item["before_sha256"])
             after = before
             for change in item["changes"]:
                 self.assertEqual(after.count(change["before"]), 1)
