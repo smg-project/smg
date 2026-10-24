@@ -1281,6 +1281,58 @@ livenessProbe:
 ```
 
 
+### TensorRT-LLM
+
+The engine's own Python servicer lives in the TensorRT-LLM tree
+(`tensorrt_llm.grpc.smg`, what `trtllm-serve <model> --grpc --grpc-protocol smg`
+runs, in-process over the LLM API). This package adds the Rust request path
+for it, behind one switch.
+
+#### Rust request path (`SMG_TRTLLM_SERVICER_IMPL=rust`)
+
+With `SMG_TRTLLM_SERVICER_IMPL=rust`, the engine's gRPC entrypoint hands the
+process to this package's `serve_rust_from_engine` before an LLM or a Python
+gRPC server exists, and `python -m smg_grpc_servicer.trtllm --servicer-impl
+rust` reaches the same path: the `trtllm.TrtllmService` contract is served by
+`smg.servicer.TrtllmGrpcServer` (the `smg` wheel) on a Rust-owned thread, and
+the engine runs behind the wire shim beside its LLM API
+(`tensorrt_llm.grpc.smg.shim` in the engine's tree, or the same package
+installed beside it as `trtllm_smg_shim`; the launcher finds it by import),
+started from this process as a spawned child that dials the servicer's
+same-host msgpack ZMQ handshake. The shim declares the field order of the
+structs it decodes in its ready response and the Rust servicer checks the
+prefixes it encodes against it once, at connect time. Python keeps the
+lifecycle only; the Router cannot tell the two implementations apart.
+
+```bash
+# Python (default): the engine's own servicer
+trtllm-serve org/model --grpc --grpc-protocol smg --port 50051
+
+# Rust request path, same entrypoint
+SMG_TRTLLM_SERVICER_IMPL=rust trtllm-serve org/model --grpc --grpc-protocol smg --port 50051
+
+# This package's launcher; --llm-args carries the LLM API's keywords (JSON text, or @file)
+python -m smg_grpc_servicer.trtllm --model org/model --port 50051 --servicer-impl rust \
+    --llm-args '{"tensor_parallel_size": 2}'
+```
+
+Text generation with sampled, ranked and prompt logprobs, string and token
+stops matched by the engine (`matched_stop` from its `stop_reason`), images as
+raw bytes decoded by the engine's own loader, guided decoding (the five kinds,
+refused before the engine when its `guided_decoding_backend` cannot enforce
+them), LoRA by task id and the disaggregated parameters pass through as the
+Python servicer forwards them; `num_return_sequences > 1` fans out to one
+engine request per sample with derived seeds. What the wire does not carry is
+refused by name instead of dropped: beam search, the logits-returning flags,
+KV-cache retention, prompt-tuning and lookahead configs. `Embed` and
+`SubscribeKvEvents` answer UNIMPLEMENTED, as the Python servicer answers them;
+`GetTokenizer` serves the local tokenizer directory. The launcher's knobs are
+the shared ones under the `SMG_TRTLLM_SERVICER_*` names (handshake port, drain,
+start-up and silence bounds, prefill allowance); `--metrics-port` (and
+`--metrics-host`, `SMG_TRTLLM_SERVICER_METRICS_PORT/_HOST`) serves the Rust
+servicer's Prometheus metrics, the families every engine's Rust servicer
+exposes (see the vLLM section above), with `wire="trtllm"`.
+
 ## Architecture
 
 ```
@@ -1288,12 +1340,13 @@ smg-grpc-servicer[vllm]    ──optional dep──>  vllm       (lazy import)
 smg-grpc-servicer[mlx]     ──optional dep──>  mlx-lm     (lazy import)
 smg-grpc-servicer          ──external runtime──>  tokenspeed (lazy import)
 smg-grpc-servicer[sglang]  ──optional dep──>  sglang     (lazy import)
+smg-grpc-servicer          ──external runtime──>  tensorrt_llm (the shim beside its LLM API, lazy)
 smg-grpc-servicer          ──depends on────>  smg-grpc-proto  (hard dependency)
 vllm                       ──optional──────>  smg-grpc-servicer (via vllm serve --grpc)
 sglang                     ──optional──────>  smg-grpc-servicer (via --grpc-mode)
 ```
 
-Backend dependencies are isolated via extras or runtime installs to avoid conflicts between vLLM, MLX, TokenSpeed, and SGLang.
+Backend dependencies are isolated via extras or runtime installs to avoid conflicts between vLLM, MLX, TokenSpeed, SGLang, and TensorRT-LLM.
 
 ## Development
 

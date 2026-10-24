@@ -27,7 +27,8 @@ use smg_auth as auth;
 
 mod servicer;
 use servicer::{
-    init_servicer_tracing, PySglangGrpcServer, PyTokenSpeedGrpcServer, PyVllmGrpcServer,
+    init_servicer_tracing, PySglangGrpcServer, PyTokenSpeedGrpcServer, PyTrtllmGrpcServer,
+    PyVllmGrpcServer,
 };
 
 // Define the enums with PyO3 bindings
@@ -2251,6 +2252,7 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyVllmGrpcServer>()?;
     m.add_class::<PyTokenSpeedGrpcServer>()?;
     m.add_class::<PySglangGrpcServer>()?;
+    m.add_class::<PyTrtllmGrpcServer>()?;
     m.add_function(wrap_pyfunction!(get_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(get_verbose_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(print_banner, m)?)?;

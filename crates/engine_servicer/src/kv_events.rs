@@ -173,6 +173,11 @@ pub(crate) const TOKENSPEED_DISABLED_MESSAGE: &str = "KV cache events not enable
      TokenSpeed with --kv-events-config '{\"enable_kv_cache_events\": true, \"publisher\": \
      \"zmq\"}'";
 
+/// The TensorRT-LLM servicer's refusal: its wire relays no KV events yet (the
+/// engine's Python servicer does not implement the RPC either).
+pub(crate) const TRTLLM_DISABLED_MESSAGE: &str = "KV cache events are not relayed for this \
+     engine yet: SubscribeKvEvents is not implemented by its servicer";
+
 /// When the relay subscribes to the publisher: at the servicer's start
 /// (default, any other value) or `lazy`, at the first `SubscribeKvEvents`.
 pub(crate) const RELAY_START_ENV: &str = "SMG_KV_EVENT_RELAY_START";
