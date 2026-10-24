@@ -31,6 +31,7 @@ pub(super) async fn connect_engine(state: Arc<State>, inputs: ConnectInputs) {
         |client| {
             client.adopt_tokenizer_eos(state.tokenizer());
             client.set_structured_outputs_support(super::structured_outputs_support(&state.model));
+            super::check_role_against_wire(state.encode_role.is_some(), client.engines())
         },
     )
     .await;

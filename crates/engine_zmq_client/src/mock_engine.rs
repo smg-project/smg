@@ -91,6 +91,7 @@ pub fn default_ready_response() -> EngineCoreReadyResponse {
         kv_events_config: None,
         cache_trace_epochs: Vec::new(),
         positional_layouts: std::collections::BTreeMap::new(),
+        request_types: Vec::new(),
     }
 }
 

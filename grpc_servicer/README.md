@@ -835,9 +835,13 @@ servicer places a disaggregated request on the rank of its room's residue,
 the engine's own dispatch rule, and an aggregated one on its
 `data_parallel_rank` pin. The EPD prefill side is served the same way (each
 item's `encode_bootstrap_info` entry rides on the item); the EPD encode role
-(`--disaggregation-mode encode`) is refused at launch under `--servicer-impl
-rust` and stays with the Python implementation, whose encode servicer feeds
-the encode worker over the engine's in-process channel. `SubscribeKvEvents` relays
+(`--disaggregation-mode encode`) is served on an engine whose handshake lists
+the encode request: the servicer mounts the encoder service next to the
+scheduler's discovery surface, hands each `Encode` to the worker over the wire
+(the worker's own rendezvous address rides in every request, as the Python
+encoder servicer fills it) and refuses `Generate` there; an engine that lists
+no encode request fails the start by name, and the Python servicer serves the
+role on it. `SubscribeKvEvents` relays
 TokenSpeed's ZMQ KV-event publisher, which the servicer turns on by itself, on
 this path as on the Python one, when the launcher is given no
 `--kv-events-config`, at a port found free on the host rather than

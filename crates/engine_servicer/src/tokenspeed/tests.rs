@@ -29,6 +29,7 @@ use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer};
 use prost_types::value::Kind;
 use smg_grpc_client::{
     common_proto as common,
+    tokenspeed_encoder_proto::{self as enc, token_speed_encoder_client::TokenSpeedEncoderClient},
     tokenspeed_proto::{self as ts, token_speed_scheduler_client::TokenSpeedSchedulerClient},
 };
 use tonic::{transport::Channel, Code};
@@ -138,6 +139,23 @@ struct Harness {
 }
 
 async fn harness(model: TokenSpeedModelInfo, tokenizer: Option<Arc<dyn Tokenizer>>) -> Harness {
+    harness_with_ready(
+        model,
+        tokenizer,
+        EngineCoreReadyResponse {
+            cache_trace_epochs: vec!["capture-epoch".to_string()],
+            ..default_ready_response()
+        },
+    )
+    .await
+}
+
+/// [`harness`] with the mock engine's own handshake facts (`ready`).
+async fn harness_with_ready(
+    model: TokenSpeedModelInfo,
+    tokenizer: Option<Arc<dyn Tokenizer>>,
+    ready: EngineCoreReadyResponse,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
     let config = config(dir.path(), &handshake, model);
@@ -146,16 +164,9 @@ async fn harness(model: TokenSpeedModelInfo, tokenizer: Option<Arc<dyn Tokenizer
         None => TokenSpeedServicerServer::start(config),
     }
     .expect("servicer starts");
-    let engine = connect_to_frontend(
-        &handshake,
-        EngineId::from_engine_index(0),
-        EngineCoreReadyResponse {
-            cache_trace_epochs: vec!["capture-epoch".to_string()],
-            ..default_ready_response()
-        },
-    )
-    .await
-    .expect("mock scheduler handshake");
+    let engine = connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready)
+        .await
+        .expect("mock scheduler handshake");
     wait_until(|| server.engine_ready()).await;
     let client = TokenSpeedSchedulerClient::new(grpc_channel(server.address()).await);
     let (engine_in, engine_out) = engine.split();
@@ -2582,4 +2593,240 @@ async fn the_listener_binds_before_the_engine_connects_and_answers_starting() {
     );
     drop(engine);
     server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+// ---------------------------------------------------------------------------
+// The disaggregated encode role
+// ---------------------------------------------------------------------------
+
+/// A launch for the encode role: the server args name the role, the worker's
+/// own rendezvous address (the launcher's fact) and the bootstrap port.
+fn encode_model_info() -> TokenSpeedModelInfo {
+    TokenSpeedModelInfo {
+        server_args_json: r#"{"model":"org/model","disaggregation_mode":"encode","encode_bootstrap_host":"10.0.0.9","disaggregation_bootstrap_port":8998}"#
+            .to_string(),
+        ..model_info()
+    }
+}
+
+/// An encode worker's handshake: no KV cache, the encode request listed alone.
+fn encode_ready() -> EngineCoreReadyResponse {
+    EngineCoreReadyResponse {
+        num_gpu_blocks: 0,
+        request_types: vec!["encode".to_string()],
+        ..default_ready_response()
+    }
+}
+
+fn inline_tensor(dtype: &str, shape: Vec<u32>, bytes: Vec<u8>) -> ts::TensorData {
+    ts::TensorData {
+        dtype: dtype.to_string(),
+        shape,
+        payload: Some(ts::tensor_data::Payload::Inline(bytes.into())),
+    }
+}
+
+/// One `Encode` as the gateway's EPD encode stage sends it: one item with
+/// its feature, one room assignment.
+fn encode_request(request_id: &str, room: i64) -> enc::EncodeRequest {
+    enc::EncodeRequest {
+        request_id: request_id.to_string(),
+        mm_inputs: Some(ts::MultimodalInputs {
+            items: vec![ts::MultimodalItem {
+                modality: common::Modality::Image as i32,
+                content_hash: 7u64.to_le_bytes().to_vec(),
+                encoder_input: Some(inline_tensor("bfloat16", vec![3, 2], (0u8..12).collect())),
+                model_specific_tensors: [(
+                    "vit_grid".to_string(),
+                    inline_tensor(
+                        "uint32",
+                        vec![1, 3],
+                        vec![1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0],
+                    ),
+                )]
+                .into_iter()
+                .collect(),
+                placeholders: vec![ts::PlaceholderRange {
+                    offset: 1,
+                    length: 3,
+                }],
+                placeholder_token_id: Some(9),
+            }],
+        }),
+        items: vec![enc::EncodeItemAssignment {
+            bootstrap_room: room,
+        }],
+    }
+}
+
+/// The link's failure, once it is reported (a generous bound: the handshake
+/// and the check behind it run on the servicer's own runtime, under whatever
+/// load the test host carries).
+async fn link_error(server: &TokenSpeedServicerServer) -> String {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(error) = server.last_error().unwrap() {
+            return error;
+        }
+        assert!(Instant::now() < deadline, "no link failure reported");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The encode role: the encoder service takes an `Encode`, the request
+/// reaches the worker under the wire's encode type as the engine's tagged
+/// `EncodeRequest` (the worker's own rendezvous, the room, the item with its
+/// feature), the RPC acks, health reports the encoder service, and
+/// `Generate` is refused with the gRPC servicer's words before anything
+/// reaches the worker.
+#[tokio::test]
+async fn an_encode_worker_takes_encode_requests_under_the_wires_encode_type() {
+    let mut h = harness_with_ready(encode_model_info(), None, encode_ready()).await;
+    let mut encoder = TokenSpeedEncoderClient::new(grpc_channel(h.server.address()).await);
+    let response = encoder
+        .encode(encode_request("e1", 41))
+        .await
+        .expect("encode acks")
+        .into_inner();
+    assert!(response.accepted);
+
+    let frames = h.engine_in.recv_frames().await.unwrap();
+    assert_eq!(
+        TokenSpeedRequestType::from_frame(frames[0].as_ref()),
+        Some(TokenSpeedRequestType::Encode)
+    );
+    assert_eq!(frames.len(), 2, "a small feature stays inline");
+    let payload = decode_value(frames[1].as_ref()).unwrap();
+    let array = payload.as_array().expect("a positional array");
+    assert_eq!(array.len(), 8);
+    assert_eq!(array[0].as_str(), Some("EncodeRequest"));
+    assert!(
+        array[1].is_nil() && array[2].is_nil(),
+        "the base's unset fields"
+    );
+    assert_eq!(array[3].as_str(), Some("e1"));
+    assert_eq!(array[4].as_str(), Some("10.0.0.9"));
+    assert_eq!(array[5].as_i64(), Some(8998));
+    assert_eq!(array[6].as_i64(), Some(41));
+    let items = array[7].as_array().expect("items");
+    let item = items[0].as_array().expect("an item");
+    assert_eq!(item.len(), 10);
+    assert_eq!(item[1].as_u64(), Some(7), "the content-hash fold");
+    assert_eq!(
+        item[3].as_array().map(Vec::len),
+        Some(1),
+        "the placeholder span as offsets"
+    );
+    assert!(!item[4].is_nil(), "the feature rides: {:?}", item[4]);
+    assert!(item[9].is_nil(), "no encode handshake on the encode side");
+
+    h.server.set_serving(true);
+    let mut health = HealthClient::new(grpc_channel(h.server.address()).await);
+    let status = health
+        .check(HealthCheckRequest {
+            service: ENCODER_SERVICE_NAME.to_string(),
+        })
+        .await
+        .expect("health")
+        .into_inner()
+        .status();
+    assert_eq!(status, ServingStatus::Serving);
+
+    let error = h
+        .client
+        .generate(generate_request("g-1", false, Vec::new()))
+        .await
+        .expect_err("refused");
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert_eq!(
+        error.message(),
+        "Generate is unavailable on TokenSpeed encode workers"
+    );
+    assert_scheduler_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).unwrap();
+}
+
+/// An `Encode` outside the gRPC servicer's rules is refused in its words,
+/// nothing sent: no `mm_inputs`, two items, no feature.
+#[tokio::test]
+async fn an_encode_request_outside_the_rules_is_refused_in_the_servicers_words() {
+    let mut h = harness_with_ready(encode_model_info(), None, encode_ready()).await;
+    let mut encoder = TokenSpeedEncoderClient::new(grpc_channel(h.server.address()).await);
+    let mut no_inputs = encode_request("e1", 1);
+    no_inputs.mm_inputs = None;
+    let mut two_items = encode_request("e2", 2);
+    let item = two_items.mm_inputs.as_ref().unwrap().items[0].clone();
+    two_items.mm_inputs.as_mut().unwrap().items.push(item);
+    let mut no_feature = encode_request("e3", 3);
+    no_feature.mm_inputs.as_mut().unwrap().items[0].encoder_input = None;
+    for (request, words) in [
+        (no_inputs, "EncodeRequest.mm_inputs is required"),
+        (
+            two_items,
+            "EncodeRequest must contain exactly one mm item and one room assignment",
+        ),
+        (no_feature, "encode MultimodalItem carried no encoder_input"),
+    ] {
+        let error = encoder.encode(request).await.expect_err("refused");
+        assert_eq!(error.code(), Code::InvalidArgument, "{words}");
+        assert_eq!(error.message(), words);
+    }
+    assert_scheduler_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).unwrap();
+}
+
+/// A servicer launched for `model` whose engine dials in with `ready`: the
+/// link's failure, with the servicer never ready.
+async fn link_failure_for(model: TokenSpeedModelInfo, ready: EngineCoreReadyResponse) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let server = TokenSpeedServicerServer::start(config(dir.path(), &handshake, model)).unwrap();
+    let _engine = connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready)
+        .await
+        .expect("the handshake completes before the role is judged");
+    let error = link_error(&server).await;
+    assert!(!server.engine_ready(), "{error}");
+    server.stop(Duration::from_secs(5)).unwrap();
+    error
+}
+
+/// An encode launch on an engine whose handshake lists no encode request
+/// (one before the wire carried it) fails the link by name, never SERVING.
+#[tokio::test]
+async fn an_encode_launch_on_an_engine_without_the_encode_request_fails_the_link_by_name() {
+    let error = link_failure_for(encode_model_info(), default_ready_response()).await;
+    assert!(
+        error.contains("needs the engine's encode request"),
+        "{error}"
+    );
+    assert!(error.contains("--servicer-impl python"), "{error}");
+}
+
+/// A language launch dialled by an encode worker (its handshake lists the
+/// encode request alone) fails the link by name the same way.
+#[tokio::test]
+async fn a_language_launch_dialled_by_an_encode_worker_fails_the_link_by_name() {
+    let error = link_failure_for(model_info(), encode_ready()).await;
+    assert!(error.contains("lists the encode request alone"), "{error}");
+    assert!(error.contains("--disaggregation-mode encode"), "{error}");
+}
+
+/// An encode launch without the worker's rendezvous address in its server
+/// args is refused before anything starts.
+#[test]
+fn an_encode_launch_without_its_rendezvous_address_is_refused_before_the_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let model = TokenSpeedModelInfo {
+        server_args_json:
+            r#"{"disaggregation_mode":"encode","disaggregation_bootstrap_port":8998}"#.to_string(),
+        ..model_info()
+    };
+    let Err(error) = TokenSpeedServicerServer::start(config(dir.path(), &handshake, model)) else {
+        panic!("an encode launch without its rendezvous address started");
+    };
+    assert!(
+        matches!(&error, ServicerError::InvalidConfig(message) if message.contains("encode_bootstrap_host")),
+        "{error:?}"
+    );
 }
