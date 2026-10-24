@@ -709,79 +709,40 @@ impl Tree {
 
         let curr = prev;
 
-        // Try cached tenant first (O(1)) before falling back to O(shards) DashMap iteration.
-        // The cache is valid if the tenant still exists in tenant_last_access_time.
-        let tenant: TenantId = {
-            let cached = curr.last_tenant.read();
-            if let Some(ref t) = *cached {
-                if curr.tenant_last_access_time.contains_key(t.as_ref()) {
-                    Arc::clone(t)
-                } else {
-                    drop(cached);
-                    // Cache stale, fall back to iteration and update cache
-                    let t = curr
-                        .tenant_last_access_time
-                        .iter()
-                        .next()
-                        .map(|kv| Arc::clone(kv.key()))
-                        .unwrap_or_else(|| intern_tenant("empty"));
-                    *curr.last_tenant.write() = Some(Arc::clone(&t));
-                    t
-                }
-            } else {
-                drop(cached);
-                // No cache, iterate and populate cache
-                let t = curr
-                    .tenant_last_access_time
-                    .iter()
-                    .next()
-                    .map(|kv| Arc::clone(kv.key()))
-                    .unwrap_or_else(|| intern_tenant("empty"));
-                *curr.last_tenant.write() = Some(Arc::clone(&t));
-                t
-            }
-        };
-
-        // Update timestamp probabilistically (1 in 8 matches) to reduce DashMap contention.
-        // LRU eviction doesn't need perfect accuracy - approximate timestamps suffice.
-        // Skip the update for the synthetic "empty" tenant to avoid polluting the tree
-        // with a tenant that was never inserted via insert_text.
-        let epoch = get_epoch();
-        if epoch & 0x7 == 0 && tenant.as_ref() != "empty" {
-            curr.tenant_last_access_time
-                .insert(Arc::clone(&tenant), epoch);
-        }
-
         // Compute input char count directly from input text.
         // This is equivalent to matched_chars + remaining.chars().count() but avoids
         // needing to track remaining precisely through the traversal.
         let input_char_count = text.chars().count();
 
-        PrefixMatchResult {
+        // The tenant pick (the `last_tenant` cache first, the tenant map on a
+        // miss), its cache populate on that slow path, the probabilistic
+        // timestamp touch and the result are the tail the fused walk shares
+        // with this match.
+        let (tenant, took_slow_path) = self.resolve_tenant_readonly(&curr);
+        self.finish_match(
+            &curr,
             tenant,
-            matched_char_count: matched_chars,
+            took_slow_path,
+            matched_chars,
             input_char_count,
-            matched_tenants: if matched_chars > 0 {
-                curr.matched_tenants()
-            } else {
-                Vec::new()
-            },
-        }
+        )
     }
 
-    /// Read-only resolution of a node's "owning" tenant, mirroring the tenant
-    /// pick in [`Self::match_prefix_with_counts`] **without** the cache-populate
-    /// or probabilistic timestamp side effects. Returns the tenant plus whether
-    /// the slow (iteration) path was taken — the caller replays the original's
-    /// single deferred side effect on the final node.
+    /// Read-only resolution of a node's "owning" tenant: the `last_tenant`
+    /// cache when it still names a tenant of the node, else the first tenant
+    /// of the node's map (the slow path), **without** the cache-populate or
+    /// probabilistic timestamp side effects. Returns the tenant plus whether
+    /// the slow path was taken; [`Self::finish_match`] replays the single
+    /// deferred side effect on the final node.
     ///
-    /// Used by [`Self::match_and_insert`] so the match tenant is resolved from a
-    /// node's state **before** the fused insert adds the inserting tenant to it,
-    /// reproducing the original "match runs fully before insert" ordering for the
-    /// (otherwise non-deterministic) slow-path tenant pick.
+    /// Both [`Self::match_prefix_with_counts`] and the fused walk behind
+    /// [`Self::match_and_insert_with`] resolve through it; the fused walk does
+    /// so **before** its insert adds the inserting tenant to the node, which
+    /// keeps the "match runs fully before insert" ordering for the (otherwise
+    /// non-deterministic) slow-path tenant pick.
     #[expect(
         clippy::unused_self,
-        reason = "method logically belongs to the tree; mirrors match_prefix_with_counts resolution"
+        reason = "method logically belongs to the tree; the match's tenant resolution"
     )]
     fn resolve_tenant_readonly(&self, node: &NodeRef) -> (TenantId, bool) {
         let cached = node.last_tenant.read();
@@ -913,9 +874,9 @@ impl Tree {
             (None, None) => &self.root,
         };
         let (match_tenant, match_slow) = self.resolve_tenant_readonly(match_curr);
-        let result = self.finish_match_and_insert(
+        let result = self.finish_match(
             match_curr,
-            &match_tenant,
+            match_tenant,
             match_slow,
             matched_chars,
             input_char_count,
@@ -1026,39 +987,43 @@ impl Tree {
         result
     }
 
-    /// Replay `match_prefix_with_counts`'s single deferred side effect (populate
-    /// the `last_tenant` cache on the slow path, then a probabilistic 1/8
-    /// timestamp touch) on the resolved final node, and build the match result.
-    /// Factored out so [`Self::match_and_insert_with`] applies it identically to
-    /// the standalone `match_prefix_with_counts` tail.
+    /// The match's tail, shared by [`Self::match_prefix_with_counts`] and the
+    /// fused walk behind [`Self::match_and_insert_with`]: replay the single
+    /// deferred side effect of the tenant resolution (populate the
+    /// `last_tenant` cache on the slow path), then the probabilistic 1-in-8
+    /// timestamp touch on the resolved final node, and build the match result,
+    /// which takes `tenant` as it is (the callers hand over the id they
+    /// resolved, so the tail costs what the inline one did).
     #[expect(
         clippy::unused_self,
-        reason = "method logically belongs to the tree; mirrors match_prefix_with_counts tail"
+        reason = "method logically belongs to the tree; the match's tail"
     )]
-    fn finish_match_and_insert(
+    fn finish_match(
         &self,
         match_node: &NodeRef,
-        tenant: &TenantId,
+        tenant: TenantId,
         took_slow_path: bool,
         matched_chars: usize,
         input_char_count: usize,
     ) -> PrefixMatchResult {
         // On the slow path the original resolution populates the cache.
         if took_slow_path {
-            *match_node.last_tenant.write() = Some(Arc::clone(tenant));
+            *match_node.last_tenant.write() = Some(Arc::clone(&tenant));
         }
 
-        // Probabilistic (1 in 8) timestamp touch on the resolved tenant, skipping
-        // the synthetic "empty" tenant — identical to match_prefix_with_counts.
+        // Probabilistic (1 in 8) timestamp touch on the resolved tenant, to keep
+        // the contention on the tenant map low (LRU eviction needs no exact
+        // timestamps), skipping the synthetic "empty" tenant so a tenant no
+        // insert ever named does not enter the tree.
         let epoch = get_epoch();
         if epoch & 0x7 == 0 && tenant.as_ref() != "empty" {
             match_node
                 .tenant_last_access_time
-                .insert(Arc::clone(tenant), epoch);
+                .insert(Arc::clone(&tenant), epoch);
         }
 
         PrefixMatchResult {
-            tenant: Arc::clone(tenant),
+            tenant,
             matched_char_count: matched_chars,
             input_char_count,
             matched_tenants: if matched_chars > 0 {
