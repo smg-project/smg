@@ -511,11 +511,14 @@ class UnservedRequest(RuntimeError):
     the same refusal (one of :data:`REFUSAL_STATUS_CODES`). A failed request
     in the pass's accounting, like any raised status; unlike one, no sign
     that the engine stopped taking requests: the engine answered. So a step
-    of these never counts toward the consecutive-failures stop
+    of these counts toward the consecutive-failures stop
     (:data:`CONSECUTIVE_FAILED_STEPS`), which exists for an engine that
-    answers nothing: an engine whose input bound sits below the plan's
-    longest prompts refuses those steps in a row and the pass still runs
-    everything after them."""
+    answers nothing, only while no step has been covered: an engine whose
+    input bound sits below the plan's longest prompts covers the shorter
+    shapes first, then refuses those steps in a row, and the pass still runs
+    everything after them; a servicer that refuses from the first request on
+    (a field the engine rejects on every call) stops the pass after three
+    steps as any failure does."""
 
 
 def unserved(finish_reason: str | None, output_tokens: int) -> UnservedRequest | None:
@@ -680,9 +683,14 @@ class _Pass:
         if errors:
             # A whole step of refusals (the engine answered every request
             # with an abort) is a failed step, not a step toward the stop:
-            # the stop is for an engine that answers nothing.
+            # the stop is for an engine that answers nothing. Only once some
+            # step has been covered, though: a servicer that refuses from the
+            # first request on is stopped as before, not warned about once
+            # per step over the whole plan.
             whole = len(errors) == len(step.requests)
-            answered = all(isinstance(error, UnservedRequest) for error in errors)
+            answered = self.report.covered > 0 and all(
+                isinstance(error, UnservedRequest) for error in errors
+            )
             if whole and not answered:
                 if self._failed_in_a_row == 0:
                     self._first_failed = index - 1

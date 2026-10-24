@@ -1139,6 +1139,36 @@ def test_a_run_of_refused_shapes_does_not_stop_the_pass(caplog):
     )
 
 
+def test_a_wire_refusing_from_the_first_request_on_still_stops_the_pass(caplog):
+    """A refusal holds the streak only once some step was covered. A
+    servicer that refuses every request from the first one on (a field the
+    engine rejects on every call, a version skew) is not the engine the rule
+    above was written for: the pass stops after three steps as it does for
+    any failure, instead of warning once per step over the whole plan."""
+    caplog.set_level(logging.INFO, logger="smg_grpc_servicer.warmup")
+    plan = plan_warmup(SMALL, "fast")
+
+    class RefusingAll(_Wire):
+        def generate(self, request, timeout):
+            super().generate(request, timeout)
+            raise warmup.unserved("abort", 0)
+
+    report = run_warmup(plan, RefusingAll(), budget_secs=30)
+    stop = warmup.CONSECUTIVE_FAILED_STEPS
+    assert len(report.results) == stop and report.covered == 0
+    assert report.errors == sum(len(step.requests) for step in plan.steps[:stop])
+    assert (
+        report.stopped
+        == f"{stop} steps failed in a row, from decode batch 4 down to 1 (4 requests)"
+    )
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and r.getMessage().startswith("Warm-up step ")
+    ]
+    assert len(warnings) == stop and all("finish_reason 'abort'" in w for w in warnings)
+
+
 @pytest.mark.parametrize(
     "add, engine, wire_of",
     [
