@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Apply the native compatibility fixes for the pinned AMD SGLang e2e image."""
 
+import argparse
 import base64
 import csv
 import hashlib
+import importlib
 import importlib.metadata as md
 import io
 import json
@@ -63,6 +65,94 @@ def update_record(dist, registry):
     record.write_text(stream.getvalue())
 
 
+FFI_FILES = {
+    "tvm_ffi/core.abi3.so": "48dbc71a92a0d134feaeb5f81d7e7760485e856404d1e26e776330fcc6cfea06",
+    "tvm_ffi/lib/libtvm_ffi.so": "4f3e1f951aa56d2047b3353e75d6cea112f3f4ecf29fb4910b7b6ca11ca93c90",
+    "tvm_ffi/lib/libtvm_ffi_testing.so": "b8edbbcd096553cdc5479df08ff4b010c1746266e0872bd7a5492fc1a5767230",
+    "apache_tvm_ffi-0.1.12.dist-info/METADATA": "2248b339aa5f78915a8d4ec9a13848e99b05195edba56e438c6b6d19d3974cdb",
+}
+
+
+def verify_files(plan, dist):
+    sources = {}
+    for spec in plan:
+        sources[spec["path"]] = sha(read(spec["path"]))
+        require(
+            sources[spec["path"]] == spec["fixed_sha256"], "native source changed: " + spec["path"]
+        )
+    files = {str(f): f for f in dist.files or ()}
+    expected = {**FFI_FILES, "tvm_ffi/registry.py": plan[0]["fixed_sha256"]}
+    identities = {}
+    for name, expected_sha in expected.items():
+        require(name in files, "FFI RECORD entry absent: " + name)
+        entry = files[name]
+        data = dist.locate_file(entry).read_bytes()
+        require(sha(data) == expected_sha, "FFI installed bytes changed: " + name)
+        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode().rstrip("=")
+        require(
+            entry.hash
+            and entry.hash.mode == "sha256"
+            and entry.hash.value == digest
+            and entry.size == len(data),
+            "FFI RECORD differs: " + name,
+        )
+        identities[name] = {"sha256": sha(data), "bytes": len(data)}
+    return {"fixed_sources": sources, "ffi_record_files": identities}
+
+
+def verify_only(output):
+    report = {"verified": False, "python": sys.executable, "prefix": sys.prefix}
+    code = 1
+    try:
+        require(os.environ.get("SMG_SGLANG_ROCM_IMAGE") == IMAGE, "unsupported SGLang image")
+        require(
+            str(CONSTRAINT) in os.environ.get("PIP_CONSTRAINT", "").split(),
+            "Torch constraint absent",
+        )
+        report["constraints"] = {
+            "environment": os.environ["PIP_CONSTRAINT"],
+            "path": str(CONSTRAINT),
+            "sha256": sha(read(CONSTRAINT)),
+        }
+        require(report["constraints"]["sha256"] == CONSTRAINT_SHA, "unexpected Torch constraints")
+        versions = {
+            "sglang": "0.5.21",
+            "tilelang": "0.1.7.post3+cuda.gita55a8230",
+            "apache-tvm-ffi": "0.1.12",
+            "torch-c-dlpack-ext": "0.1.5",
+            "torch": "2.11.0+rocm10.0.0",
+        }
+        report["versions"] = {name: md.version(name) for name in versions}
+        require(report["versions"] == versions, "native package version changed")
+        require(
+            "torch-c-dlpack-ext" in md.requires("tilelang"), "addon metadata requirement changed"
+        )
+        plan = json.loads(Path(__file__).with_name("sglang_rocm_native_patches.json").read_text())
+        report["files"] = verify_files(plan, md.distribution("apache-tvm-ffi"))
+        import torch
+
+        require(
+            hasattr(torch.Tensor, "__dlpack_c_exchange_api__"), "native Torch DLPack API required"
+        )
+        report["torch_native_dlpack_api"] = True
+        # This CLI is a fresh process; these imports do not run GPU arithmetic or a model.
+        modules = [
+            importlib.import_module(name)
+            for name in ["tvm_ffi.registry", "tvm", "tilelang", "xgrammar"]
+        ]
+        report["imports"] = {m.__name__: m.__file__ for m in modules}
+        require(
+            sha(read(modules[0].__file__)) == plan[0]["fixed_sha256"], "loaded FFI registry changed"
+        )
+        report["verified"] = True
+        code = 0
+    except Exception as exc:
+        report["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        print(str(exc), file=sys.stderr)
+    Path(output).write_text(json.dumps(report, indent=2) + "\n")
+    return code
+
+
 def main():
     require(os.environ.get("SMG_SGLANG_ROCM_IMAGE") == IMAGE, "unsupported SGLang image")
     require(
@@ -111,4 +201,9 @@ def main():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--verify-only", metavar="OUTPUT_JSON")
+    args = parser.parse_args()
+    if args.verify_only:
+        raise SystemExit(verify_only(args.verify_only))
     main()
