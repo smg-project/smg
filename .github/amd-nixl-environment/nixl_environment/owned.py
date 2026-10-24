@@ -42,7 +42,7 @@ def mapped_native(pid, words):
     found = {}
     for line in (Path("/proc") / str(pid) / "maps").read_text().splitlines():
         fields = line.split(maxsplit=5)
-        if len(fields) != 6 or not any(word in fields[5] for word in words):
+        if len(fields) != 6 or "x" not in fields[1] or not any(word in fields[5] for word in words):
             continue
         require(not fields[5].endswith(" (deleted)"), "deleted native mapping")
         path = Path(fields[5]).resolve()
