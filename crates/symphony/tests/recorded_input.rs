@@ -106,13 +106,20 @@ fn malformed_alignment_is_evidence_and_is_not_repaired_by_recording() {
 
 #[test]
 fn all_finish_reasons_survive_including_unknown_engine_text() {
-    for finish in [
-        EngineFinish::Stop,
-        EngineFinish::Length,
-        EngineFinish::Abort,
-        EngineFinish::Other("worker/停止\0".into()),
+    for (finish, expected) in [
+        (EngineFinish::Stop, json!("stop")),
+        (EngineFinish::Length, json!("length")),
+        (EngineFinish::Abort, json!("abort")),
+        (
+            EngineFinish::Other("worker/停止\0".into()),
+            json!({"other": "worker/停止\0"}),
+        ),
     ] {
-        round_trip(&Input::End { finish });
+        let recorded = round_trip(&Input::End { finish });
+        assert_eq!(
+            serde_json::to_value(recorded).expect("finish json"),
+            json!({"kind": "end", "finish": expected}),
+        );
     }
 }
 
