@@ -182,18 +182,45 @@ jobs:
             url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf \
             "https://github.com/"
 
+      - name: Download paired EPD proto wheel
+        if: inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'
+        uses: actions/download-artifact@v8
+        with:
+          name: epd-grpc-proto-wheel
+          path: epd-rpc-wheels/
+
+      - name: Download paired EPD servicer wheel
+        if: inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'
+        uses: actions/download-artifact@v8
+        with:
+          name: epd-grpc-servicer-wheel
+          path: epd-rpc-wheels/
+
+      - name: Retain EPD image runtime constraints
+        id: epd-rpc-evidence
+        if: inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'
+        shell: bash
+        run: |
+          NONCE="$(mktemp -d "$RUNNER_TEMP/epd-rpc.XXXXXXXXXX")"
+          DIRECTORY="$NONCE/state"
+          echo "directory=$DIRECTORY" >> "$GITHUB_OUTPUT"
+          echo "artifact=amd-epd-rpc-${NONCE##*.}" >> "$GITHUB_OUTPUT"
+          echo "E2E_EPD_RPC_PROOF_DIRECTORY=$DIRECTORY" >> "$GITHUB_ENV"
+          python3 .github/amd-epd-consumer/rpc_environment.py prepare "$DIRECTORY"
+
       # Engine-specific setup
       - name: Setup SGLang backend
         if: inputs.engine == 'sglang' && inputs.gpu_vendor != 'amd'
         uses: ./.github/actions/setup-sglang
 
       - name: Setup SGLang backend (in SGLang's ROCm image)
+        id: epd-rpc-setup
         if: inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'
         env:
           SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
         run: |
           python3 scripts/ci_repair_sglang_rocm_native.py
-          bash scripts/ci_setup_sglang_rocm_image.sh
+          python3 .github/amd-epd-consumer/rpc_environment.py install "$E2E_EPD_RPC_PROOF_DIRECTORY"
 
       - name: Setup vLLM backend
         if: inputs.engine == 'vllm' && inputs.gpu_vendor != 'amd'
@@ -258,6 +285,10 @@ jobs:
           fi
           exit "$status"
 
+      - name: Check installed EPD RPC wheel identity
+        if: always() && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd' && steps.epd-rpc-setup.conclusion == 'success'
+        run: python3 .github/amd-epd-consumer/rpc_environment.py installed "$E2E_EPD_RPC_PROOF_DIRECTORY"
+
       - name: Setup Oracle
         if: inputs.setup_agentic_deps
         run: |
@@ -321,6 +352,10 @@ jobs:
             ${{ inputs.test_filter }} \
             --reruns 2 --reruns-delay 5 \
             -s -vv "$@"
+
+      - name: Check actual EPD worker imports
+        if: always() && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd' && steps.epd-rpc-setup.conclusion == 'success'
+        run: python3 .github/amd-epd-consumer/audit_workers.py
 
       - name: Worker failure diagnostics
         if: failure() || cancelled()
@@ -415,6 +450,19 @@ jobs:
             "$DEPENDENCY_PYTHON" scripts/ci_repair_sglang_rocm_native.py --verify-only "$DEPENDENCY_DIRECTORY/final-native.json" || status=$?
           fi
           exit "$status"
+
+      - name: Check final EPD RPC wheel identity
+        if: always() && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd' && steps.epd-rpc-setup.conclusion == 'success'
+        run: python3 .github/amd-epd-consumer/rpc_environment.py final "$E2E_EPD_RPC_PROOF_DIRECTORY"
+
+      - name: Upload EPD RPC source and import evidence
+        if: always() && steps.epd-rpc-evidence.outputs.directory != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.epd-rpc-evidence.outputs.artifact }}
+          path: ${{ steps.epd-rpc-evidence.outputs.directory }}/
+          retention-days: 7
+          if-no-files-found: error
 
       - name: Upload AMD dependency evidence
         if: always() && inputs.gpu_vendor == 'amd' && steps.amd-dependencies.outputs.directory != ''
