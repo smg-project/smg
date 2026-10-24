@@ -926,10 +926,25 @@ def _never(prompt_len, max_tokens):
     return False
 
 
+def _refuse(context, shape, refusal):
+    """A stand-in's refusal in the status encoding (``refusal == "status"``,
+    the Python TokenSpeed servicer's and the Rust SGLang servicer's answer):
+    the call ends with INVALID_ARGUMENT and the engine's words, nothing is
+    streamed (``context.abort`` raises). In the completion encoding the
+    caller streams the abort finish itself."""
+    if refusal == "status":
+        context.abort(
+            grpc.StatusCode.INVALID_ARGUMENT,
+            f"Invalid request: the input ({shape[0]} tokens) exceeds the engine's maximum "
+            f"input length ({shape[0] - 1} tokens)",
+        )
+
+
 class _VllmEngine(vllm_grpc.VllmEngineServicer):
-    def __init__(self, seen, refuse=_never):
+    def __init__(self, seen, refuse=_never, refusal="complete"):
         self.seen = seen
         self.refuse = refuse
+        self.refusal = refusal
 
     def Generate(self, request, context):
         assert request.HasField("tokenized") and request.sampling_params.ignore_eos
@@ -940,9 +955,10 @@ class _VllmEngine(vllm_grpc.VllmEngineServicer):
         time.sleep(0.01)
         self.seen.leave()
         if self.refuse(*shape):
-            # An engine that ended the request at admission, as the Rust
-            # servicers answer it: a completion with the abort finish and no
-            # token.
+            # An engine that ended the request at admission, in either
+            # encoding a servicer answers it with: the status, or a
+            # completion with the abort finish and no token.
+            _refuse(context, shape, self.refusal)
             yield vllm_pb.GenerateResponse(complete=vllm_pb.GenerateComplete(finish_reason="abort"))
             return
         yield vllm_pb.GenerateResponse(complete=vllm_pb.GenerateComplete(finish_reason="length"))
@@ -953,9 +969,10 @@ class _VllmEngine(vllm_grpc.VllmEngineServicer):
 
 
 class _SglangEngine(sgl_grpc.SglangSchedulerServicer):
-    def __init__(self, seen, refuse=_never):
+    def __init__(self, seen, refuse=_never, refusal="complete"):
         self.seen = seen
         self.refuse = refuse
+        self.refusal = refusal
 
     def Generate(self, request, context):
         params = request.sampling_params
@@ -969,6 +986,7 @@ class _SglangEngine(sgl_grpc.SglangSchedulerServicer):
         time.sleep(0.01)
         self.seen.leave()
         if self.refuse(*shape):
+            _refuse(context, shape, self.refusal)
             yield sgl_pb.GenerateResponse(complete=sgl_pb.GenerateComplete(finish_reason="abort"))
             return
         yield sgl_pb.GenerateResponse(complete=sgl_pb.GenerateComplete())
@@ -978,9 +996,10 @@ class _SglangEngine(sgl_grpc.SglangSchedulerServicer):
 
 
 class _TokenSpeedEngine(ts_grpc.TokenSpeedSchedulerServicer):
-    def __init__(self, seen, refuse=_never):
+    def __init__(self, seen, refuse=_never, refusal="complete"):
         self.seen = seen
         self.refuse = refuse
+        self.refusal = refusal
 
     def Generate(self, request, context):
         assert request.sampling_params.ignore_eos and request.sampling_params.temperature == 0.0
@@ -989,6 +1008,7 @@ class _TokenSpeedEngine(ts_grpc.TokenSpeedSchedulerServicer):
         time.sleep(0.01)
         self.seen.leave()
         if self.refuse(*shape):
+            _refuse(context, shape, self.refusal)
             yield ts_pb.GenerateResponse(complete=ts_pb.GenerateComplete(finish_reason="abort"))
             return
         yield ts_pb.GenerateResponse(complete=ts_pb.GenerateComplete())
@@ -1132,17 +1152,29 @@ def test_a_run_of_refused_shapes_does_not_stop_the_pass(caplog):
     ],
     ids=["vllm", "sglang", "tokenspeed"],
 )
+@pytest.mark.parametrize(
+    "refusal, worded",
+    [
+        ("complete", "finish_reason 'abort' before any token"),
+        ("status", "INVALID_ARGUMENT: Invalid request: the input (8 tokens) exceeds"),
+    ],
+    ids=["as-a-completion", "as-a-status"],
+)
 def test_a_request_the_engine_ended_with_an_abort_is_a_failed_request_on_every_wire(
-    add, engine, wire_of, caplog
+    add, engine, wire_of, refusal, worded, caplog
 ):
-    """An engine that refuses a request at admission answers a completion
-    with the abort finish and no token (the servicer's gRPC call succeeds):
-    the step is a failed one, named in the warning with the finish, not a
+    """An engine that refuses a request at admission answers in one of two
+    encodings: a completion with the abort finish and no token (the
+    servicer's gRPC call succeeds), or the status its code means
+    (INVALID_ARGUMENT with the engine's words). Either way the step is a
+    failed one, named in the warning with the finish or the status, not a
     covered one; the pass goes on."""
     caplog.set_level(logging.INFO, logger="smg_grpc_servicer.warmup")
     seen = _Seen()
     refused = engine(
-        seen, refuse=lambda prompt_len, max_tokens: prompt_len == 8 and max_tokens == 1
+        seen,
+        refuse=lambda prompt_len, max_tokens: prompt_len == 8 and max_tokens == 1,
+        refusal=refusal,
     )
     server, target = _serve(add, refused)
     try:
@@ -1160,11 +1192,91 @@ def test_a_request_the_engine_ended_with_an_abort_is_a_failed_request_on_every_w
     assert sorted(seen.requests) == sorted(expected)  # the pass went on past the refusals
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any(
-        "prefill 8 tokens: 1 of 1 requests failed" in line
-        and "finish_reason 'abort' before any token" in line
-        for line in warnings
+        "prefill 8 tokens: 1 of 1 requests failed" in line and worded in line for line in warnings
     ), warnings
     assert "0 failed requests" not in report.summary() and "(2 failed requests)" in report.summary()
+
+
+@pytest.mark.parametrize(
+    "add, engine, wire_of",
+    [
+        (vllm_grpc.add_VllmEngineServicer_to_server, _VllmEngine, vllm_warmup.warmup_wire),
+        (sgl_grpc.add_SglangSchedulerServicer_to_server, _SglangEngine, sglang_warmup.warmup_wire),
+        (
+            ts_grpc.add_TokenSpeedSchedulerServicer_to_server,
+            _TokenSpeedEngine,
+            tokenspeed_warmup.warmup_wire,
+        ),
+    ],
+    ids=["vllm", "sglang", "tokenspeed"],
+)
+def test_a_run_of_refusals_answered_as_a_status_does_not_stop_the_pass_on_any_wire(
+    add, engine, wire_of
+):
+    """The in-process rule above, over the wire in the status encoding: an
+    engine whose input bound sits below the plan's three longest prompts
+    answers each of those steps with INVALID_ARGUMENT, in a row; they are
+    failed steps, and every step after them still runs."""
+    plan = plan_warmup(SMALL, "fast")
+    longest = sorted({len(r.token_ids) for s in plan.steps for r in s.requests})[-3:]
+    seen = _Seen()
+    refusing = engine(
+        seen,
+        refuse=lambda prompt_len, max_tokens: prompt_len in longest and max_tokens == 1,
+        refusal="status",
+    )
+    server, target = _serve(add, refusing)
+    try:
+        wire = wire_of(target)
+        try:
+            report = run_warmup(plan, wire, budget_secs=30, request_timeout_secs=10)
+        finally:
+            wire.close()
+    finally:
+        server.stop(0)
+    assert report.stopped is None and not report.budget_hit
+    assert len(report.results) == len(plan.steps)  # every step ran
+    refused = [r for r in report.results if r.errors]
+    assert len(refused) >= 3 and all(r.errors == len(r.step.requests) for r in refused)
+    assert report.covered == len(plan.steps) - len(refused)
+    assert len(seen.requests) == sum(len(s.requests) for s in plan.steps)
+
+
+class _RaisedStatus(grpc.RpcError):
+    """A raised status as the stub raises it: ``code()`` and ``details()``."""
+
+    def __init__(self, code, details=""):
+        self._code, self._details = code, details
+
+    def code(self):
+        return self._code
+
+    def details(self):
+        return self._details
+
+
+@pytest.mark.parametrize(
+    "error, words",
+    [
+        (
+            _RaisedStatus(grpc.StatusCode.INVALID_ARGUMENT, "the input exceeds the bound"),
+            "the engine refused the request: INVALID_ARGUMENT: the input exceeds the bound",
+        ),
+        (
+            _RaisedStatus(grpc.StatusCode.RESOURCE_EXHAUSTED),
+            "the engine refused the request: RESOURCE_EXHAUSTED: no details",
+        ),
+        (_RaisedStatus(grpc.StatusCode.UNAVAILABLE, "connection refused"), None),
+        (_RaisedStatus(grpc.StatusCode.DEADLINE_EXCEEDED), None),
+        (_RaisedStatus(grpc.StatusCode.INTERNAL, "boom"), None),
+        (RuntimeError("the request ended without a complete frame"), None),
+    ],
+    ids=["invalid-argument", "resource-exhausted", "unavailable", "deadline", "internal", "other"],
+)
+def test_a_raised_status_is_a_refusal_by_its_code_alone(error, words):
+    refusal = warmup.refused(error)
+    assert (None if refusal is None else str(refusal)) == words
+    assert refusal is None or isinstance(refusal, warmup.UnservedRequest)
 
 
 def test_the_in_process_wire_counts_a_request_the_engine_ended_with_an_abort_as_failed(monkeypatch):

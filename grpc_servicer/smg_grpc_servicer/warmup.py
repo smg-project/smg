@@ -506,14 +506,16 @@ UNSERVED_FINISHES = frozenset({"abort", "error"})
 
 
 class UnservedRequest(RuntimeError):
-    """A request the engine completed without serving it (one of
-    :data:`UNSERVED_FINISHES`). A failed request in the pass's accounting,
-    like a raised status; unlike one, no sign that the engine stopped taking
-    requests: the engine answered. So a step of these never counts toward
-    the consecutive-failures stop (:data:`CONSECUTIVE_FAILED_STEPS`), which
-    exists for an engine that answers nothing: an engine whose input bound
-    sits below the plan's longest prompts refuses those steps in a row and
-    the pass still runs everything after them."""
+    """A request the engine answered without serving it: a completion with
+    one of :data:`UNSERVED_FINISHES`, or the status a servicer raises for
+    the same refusal (one of :data:`REFUSAL_STATUS_CODES`). A failed request
+    in the pass's accounting, like any raised status; unlike one, no sign
+    that the engine stopped taking requests: the engine answered. So a step
+    of these never counts toward the consecutive-failures stop
+    (:data:`CONSECUTIVE_FAILED_STEPS`), which exists for an engine that
+    answers nothing: an engine whose input bound sits below the plan's
+    longest prompts refuses those steps in a row and the pass still runs
+    everything after them."""
 
 
 def unserved(finish_reason: str | None, output_tokens: int) -> UnservedRequest | None:
@@ -534,6 +536,34 @@ def unserved(finish_reason: str | None, output_tokens: int) -> UnservedRequest |
     return UnservedRequest(
         f"the engine ended the request with finish_reason {finish_reason!r} {produced}"
     )
+
+
+#: The gRPC status codes a servicer answers a request it refused with: the
+#: request's shape (``INVALID_ARGUMENT``: a prompt past the engine's input
+#: bound, a parameter its scheduler rejects) or no room for it now
+#: (``RESOURCE_EXHAUSTED``). The other encoding of the refusals above: the
+#: servicers that attribute an engine's abort raise its status instead of
+#: completing the request. The codes of a servicer that could not answer
+#: (``DEADLINE_EXCEEDED``, ``UNAVAILABLE``, ``INTERNAL``, ...) stay real
+#: failures.
+REFUSAL_STATUS_CODES = frozenset({"INVALID_ARGUMENT", "RESOURCE_EXHAUSTED"})
+
+
+def refused(error: BaseException) -> UnservedRequest | None:
+    """The :class:`UnservedRequest` a raised status that means a refusal
+    becomes (its code one of :data:`REFUSAL_STATUS_CODES`; the words carry
+    the code and the status' details), or ``None`` for any other error. A
+    wire raises it in place of the status, so the pass records the request
+    as failed and the step as not covered, without a step toward the stop.
+    The status is read as a gRPC call exposes it (``code()``, ``details()``),
+    without a gRPC import here."""
+    code = getattr(error, "code", None)
+    name = getattr(code() if callable(code) else code, "name", None)
+    if name not in REFUSAL_STATUS_CODES:
+        return None
+    details = getattr(error, "details", None)
+    details = details() if callable(details) else details
+    return UnservedRequest(f"the engine refused the request: {name}: {details or 'no details'}")
 
 
 @dataclasses.dataclass

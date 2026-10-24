@@ -47,6 +47,7 @@ from smg_grpc_servicer.warmup import (
     WarmupRequest,
     parse_setting,
     plan_for,
+    refused,
     run_warmup_async,
     unserved,
 )
@@ -99,6 +100,7 @@ class GrpcWire:
         self._stub = vllm_engine_pb2_grpc.VllmEngineStub(self._channel)
 
     def generate(self, request: WarmupRequest, timeout: float) -> None:
+        import grpc
         from smg_grpc_proto import vllm_engine_pb2
 
         message = vllm_engine_pb2.GenerateRequest(
@@ -117,8 +119,16 @@ class GrpcWire:
         if request.data_parallel_rank is not None:
             message.data_parallel_rank = request.data_parallel_rank
         last = None
-        for frame in self._stub.Generate(message, timeout=timeout):
-            last = frame
+        try:
+            for frame in self._stub.Generate(message, timeout=timeout):
+                last = frame
+        except grpc.RpcError as error:
+            if refusal := refused(error):
+                # The servicer answered the refusal as the status its code
+                # means: a failed request, not a covered step, and no step
+                # toward the stop.
+                raise refusal from error
+            raise
         if last is None or not last.HasField("complete"):
             raise RuntimeError("the request ended without a complete frame")
         if error := unserved(last.complete.finish_reason, len(last.complete.output_ids)):
