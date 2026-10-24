@@ -71,7 +71,7 @@ jobs:
     with:
       engine: vllm
       gpu_tier: '4'
-      runner: 8-gpu-mi300x
+      runner: 1-gpu-mi300x
       timeout: 30
       test_timeout: 25
       test_dirs: e2e_test/chat_completions

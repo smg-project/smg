@@ -124,7 +124,7 @@
     ],
     "original_skip_count": 4
   },
-  "diagnostic_difference": "caller sets SPT_NOENV=1 and runs full installed-engine servicer units (NV original four-GPU row leaves units off); shared workflow algorithms unchanged",
+  "diagnostic_difference": "caller sets SPT_NOENV=1 and runs full installed-engine servicer units (NV original four-GPU row leaves units off); shared workflow algorithms unchanged; AMD diagnostic runner route changed from 8-gpu-mi300x to the known 1-gpu-mi300x CI slot; gpu_tier=4/TP4 unchanged and the label does not reserve physical GPUs",
   "producer_binary_relabelled": false,
   "producer_artifact_pins_status": "EMPTY: no actual new successful dispatch producer or archives pinned",
   "explicit_product_dependency": {
@@ -154,11 +154,12 @@
   },
   "producer_source_map_note": "Expected 14 trees from reviewed diagnostic9841825, including its different workflow tree; actual admitted head/run unknown and must match exactly before relay",
   "resource_precondition": {
-    "requested_runner_label": "8-gpu-mi300x",
+    "requested_runner_label": "1-gpu-mi300x",
     "used_logical_devices": 4,
     "ranks": 4,
     "actual_four_VF_placement_or_availability_verified": false,
-    "physical_GPU_exclusivity_claimed": false
+    "physical_GPU_exclusivity_claimed": false,
+    "routing_scope_note": "Historical same-two-node CI route only; current registry403 cannot prove label exclusivity. Root admission/controller must verify actual runner amd-mi300x-1 or amd-mi300x-2, at least four driver-visible logical VF devices and no conflicting ownership before execution. No four-device availability is certified by this source preparation."
   },
   "explicit_lock_safety_dependency": {
     "product_commit": "a37083a4eb667c0d261de85cf464025a9a29e506",
