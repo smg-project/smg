@@ -279,6 +279,8 @@ impl Stream for TokenSpeedGenerateStream {
 /// through untouched. Seed handling matches [`fan_out_requests`]: omission
 /// delegates independent seed assignment to the engine, while explicit seed
 /// `s` derives deterministic per-sample seeds `s + i`.
+///
+/// [`fan_out_requests`]: crate::vllm::fan_out_requests
 pub(crate) fn fan_out_tokenspeed_requests(
     req: tokenspeed_proto::GenerateRequest,
 ) -> Vec<tokenspeed_proto::GenerateRequest> {
@@ -301,7 +303,7 @@ pub(crate) fn fan_out_tokenspeed_requests(
 pub enum GridTensors {
     /// The grid feeds the Qwen3.5 lineage's MRoPE positions, which this
     /// translation computes as the engine's input processor does on the path
-    /// this wire bypasses ([`mrope`]) and ships in the request's position
+    /// this wire bypasses (the `mrope` module) and ships in the request's position
     /// slots.
     Qwen35Positions(MropeLayout),
     /// A Qwen3.5-lineage checkpoint whose launcher shipped no layout facts:
@@ -908,7 +910,8 @@ pub(crate) fn constraint_ref(sp: &tokenspeed_proto::SamplingParams) -> Option<Co
 
 /// Normalize a TokenSpeed wire finish-reason string into the canonical set the
 /// gateway's response layer exact-matches (`stop`, `length`, `abort`, `error`) —
-/// the same set the vLLM path emits via [`finish_reason_str`]. TokenSpeed emits
+/// the same set the vLLM path emits via
+/// [`finish_reason_str`](crate::vllm::finish_reason_str). TokenSpeed emits
 /// `stop`/`length`/`abort`; an unknown value falls back to `stop` with a warning
 /// so a non-canonical string never mis-renders downstream.
 pub(crate) fn normalize_finish_reason(reason: &str) -> &'static str {
