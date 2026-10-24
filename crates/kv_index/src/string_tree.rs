@@ -1876,24 +1876,28 @@ impl Tree {
                         continue;
                     };
 
-                    // A virtual remote node with the trimmed edge; its children
-                    // are cloned under it with their parent pointers rewritten.
+                    // The remote continues below the local child's edge. Merge
+                    // the remainder as the one child of a tenant-less virtual
+                    // entry standing in for the local child: the children loop
+                    // then compares the remainder's edge against the local
+                    // child's own child under the same first char (exact,
+                    // prefix or diverging) and grafts it when there is none.
+                    // The two entries share that first char only, so they are
+                    // never merged as one path.
                     let trimmed_remote = Self::clone_subtree_as(
                         &remote_child,
                         NodeText::new(remote_remainder.to_string()),
                         None,
                     );
-
-                    if let Some(deeper_local) = local_child.children.get(&rem_first) {
-                        let deeper_local = deeper_local.value().clone();
-                        // Recurse: merge trimmed remote into the deeper local child
-                        self.merge_nodes(&deeper_local, &trimmed_remote);
-                    } else {
-                        // No local child at this position — graft remote subtree
-                        *trimmed_remote.parent.write() = Some(Arc::downgrade(&local_child));
-                        self.accumulate_tenant_counts(&trimmed_remote);
-                        local_child.children.insert(rem_first, trimmed_remote);
-                    }
+                    let below_local_child = Arc::new(Node {
+                        children: new_children_map(),
+                        text: RwLock::new(NodeText::empty()),
+                        tenant_last_access_time: new_tenant_map(),
+                        parent: RwLock::new(None),
+                        last_tenant: RwLock::new(None),
+                    });
+                    below_local_child.children.insert(rem_first, trimmed_remote);
+                    self.merge_nodes(&local_child, &below_local_child);
                 } else {
                     // Case 3: shared prefix shorter than at least one edge.
                     // Covers both "shorter than both" and "remote is prefix of local".
@@ -1943,6 +1947,13 @@ impl Tree {
                         .children
                         .insert(local_remainder_first, Arc::clone(&local_child));
 
+                    // Publish the split entry now: until it replaces the local
+                    // child under `local`, a walker through this edge finds the
+                    // truncated child re-parented elsewhere and spins on the
+                    // stale edge; the remote side below is grafted or merged
+                    // into the live split entry after this.
+                    local.children.insert(rc, Arc::clone(&split_node));
+
                     // Create remote remainder as another child of split node,
                     // its children cloned under it with their parent pointers
                     // rewritten.
@@ -1955,10 +1966,14 @@ impl Tree {
                         );
                         self.accumulate_tenant_counts(&remote_subtree);
                         split_node.children.insert(rem_first, remote_subtree);
+                    } else {
+                        // The remote edge ended at the split point (it is a
+                        // prefix of the local edge): its children belong under
+                        // the split entry, each compared against the local
+                        // remainder in the children loop; the tenants re-merge
+                        // as a no-op (same tenants, same epochs).
+                        self.merge_nodes(&split_node, &remote_child);
                     }
-
-                    // Replace local's child with the split node
-                    local.children.insert(rc, split_node);
                 }
             } else {
                 // No local child at this char — copy entire remote subtree

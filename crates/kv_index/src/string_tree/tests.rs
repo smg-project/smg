@@ -1349,6 +1349,124 @@ fn test_merge_disjoint_trees() {
     assert_eq!(r2.tenant.as_ref(), "worker-2");
 }
 
+/// A remote edge that continues below a local child's edge and shares only
+/// its first char with that child's own child is merged against it edge by
+/// edge (here: a diverging split), never as the same path.
+#[test]
+fn merge_keeps_a_remote_edge_that_shares_only_its_first_char_with_a_local_child() {
+    let local = Tree::new();
+    local.insert_text("Hello world", "w1");
+    local.insert_text("Hello there", "w1");
+    let remote = Tree::new();
+    remote.insert_text("Hello wonder", "w2");
+
+    local.merge_tree(&remote);
+
+    let wonder = local.match_prefix_with_counts("Hello wonder");
+    assert_eq!(wonder.matched_char_count, 12);
+    assert_eq!(wonder.tenant.as_ref(), "w2");
+    let world = local.match_prefix_with_counts("Hello world");
+    assert_eq!(world.matched_char_count, 11);
+    assert_eq!(world.tenant.as_ref(), "w1");
+    let counts = local.get_tenant_char_count();
+    assert_eq!(counts["w2"], 12, "w2 owns `Hello ` + `wo` + `nder`");
+    assert_eq!(
+        counts["w1"], 16,
+        "w1 owns `Hello ` + `wo` + `rld` + `there`"
+    );
+}
+
+/// A remote edge that ends at the split point of a longer local edge (the
+/// remote edge is a prefix of the local one) keeps its children under the
+/// split entry, at the top level and below a local child.
+#[test]
+fn merge_keeps_the_children_of_a_remote_edge_that_is_a_prefix_of_a_local_edge() {
+    let local = Tree::new();
+    local.insert_text("Hello world", "w1");
+    let remote = Tree::new();
+    remote.insert_text("Hello world", "w2");
+    remote.insert_text("Hello there", "w2");
+
+    local.merge_tree(&remote);
+
+    let there = local.match_prefix_with_counts("Hello there");
+    assert_eq!(there.matched_char_count, 11);
+    assert_eq!(there.tenant.as_ref(), "w2");
+    let world = local.match_prefix_with_counts("Hello world");
+    assert_eq!(world.matched_char_count, 11);
+    let counts = local.get_tenant_char_count();
+    assert_eq!(counts["w2"], 16, "w2 owns `Hello ` + `world` + `there`");
+    assert_eq!(counts["w1"], 11, "w1 owns `Hello ` + `world`");
+
+    let local = Tree::new();
+    local.insert_text("Hello world", "w1");
+    local.insert_text("Hello there", "w1");
+    let remote = Tree::new();
+    remote.insert_text("Hello wonder", "w2");
+    remote.insert_text("Hello wombat", "w2");
+
+    local.merge_tree(&remote);
+
+    for text in ["Hello wonder", "Hello wombat"] {
+        let r = local.match_prefix_with_counts(text);
+        assert_eq!(r.matched_char_count, 12, "{text} is kept below `wo`");
+        assert_eq!(r.tenant.as_ref(), "w2");
+    }
+    let counts = local.get_tenant_char_count();
+    assert_eq!(
+        counts["w2"], 16,
+        "w2 owns `Hello ` + `wo` + `nder` + `mbat`"
+    );
+    assert_eq!(
+        counts["w1"], 16,
+        "w1 owns `Hello ` + `wo` + `rld` + `there`"
+    );
+}
+
+/// Below a local child, a remote remainder with no local counterpart is
+/// grafted whole, and one that matches a local grandchild exactly merges
+/// into it without counting a char twice.
+#[test]
+fn merge_grafts_or_joins_a_remote_remainder_below_a_local_child() {
+    let local = Tree::new();
+    local.insert_text("Hello there", "w1");
+    local.insert_text("Hello you", "w1");
+    let remote = Tree::new();
+    remote.insert_text("Hello world", "w2");
+
+    local.merge_tree(&remote);
+
+    let world = local.match_prefix_with_counts("Hello world");
+    assert_eq!(world.matched_char_count, 11);
+    assert_eq!(world.tenant.as_ref(), "w2");
+    assert_eq!(
+        local.get_tenant_char_count()["w2"],
+        11,
+        "w2 owns `Hello ` + `world`"
+    );
+
+    // The remote holds `Hello world` as one edge: the local `Hello ` is a
+    // prefix of it and the remainder `world` meets the local `world` exactly,
+    // below the local child.
+    let local = Tree::new();
+    local.insert_text("Hello world", "w1");
+    local.insert_text("Hello there", "w1");
+    let remote = Tree::new();
+    remote.insert_text("Hello world", "w2");
+
+    local.merge_tree(&remote);
+
+    let world = local.match_prefix_with_counts("Hello world");
+    assert_eq!(world.matched_char_count, 11);
+    assert!(
+        world.matched_tenants.iter().any(|t| t.as_ref() == "w2"),
+        "w2 is on `world`"
+    );
+    let counts = local.get_tenant_char_count();
+    assert_eq!(counts["w2"], 11, "w2 owns `Hello ` + `world`, each once");
+    assert_eq!(counts["w1"], 16);
+}
+
 #[test]
 fn test_merge_overlapping_trees() {
     let tree1 = Tree::new();
