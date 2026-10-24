@@ -2,8 +2,9 @@
 //! and connector are generic over.
 //!
 //! vLLM's EngineCore protocol, TokenSpeed's native msgpack protocol (issues
-//! #2003/#2006) and SGLang's scheduler structs (spoken by the SMG plugin inside
-//! the scheduler) live alongside each other. All are msgpack-over-ZMQ with a
+//! #2003/#2006), SGLang's scheduler structs (spoken by the SMG plugin inside
+//! the scheduler) and the TensorRT-LLM shim's request (answered with that
+//! plugin's slim records) live alongside each other. All are msgpack-over-ZMQ with a
 //! single-byte request-type frame and share the same transport — only the
 //! message struct shapes differ, so the transport and connector are
 //! parameterized over the [`EngineProtocol`] trait and each engine family
@@ -18,6 +19,7 @@ pub mod handshake;
 pub(crate) mod positional;
 pub mod sglang;
 pub mod tokenspeed;
+pub mod trtllm;
 pub mod vllm;
 
 /// Engine-neutral per-rank load signal. Each protocol maps its native scheduler

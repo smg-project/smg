@@ -40,8 +40,9 @@ use crate::{
     codec::OpaqueValue,
     error::{Error, Result},
     protocol::{
-        sglang::SglangProtocol, tokenspeed::TokenSpeedProtocol, vllm::VllmProtocol, EngineBatch,
-        EngineLoad, EngineOutput, EngineProtocol, UtilityReply, WaveEvent,
+        sglang::SglangProtocol, tokenspeed::TokenSpeedProtocol, trtllm::TrtllmProtocol,
+        vllm::VllmProtocol, EngineBatch, EngineLoad, EngineOutput, EngineProtocol, UtilityReply,
+        WaveEvent,
     },
     transport::{run_output_loop, send_message, ConnectedEngine, ConnectedTransport, EngineId},
 };
@@ -58,6 +59,10 @@ pub type TokenSpeedStream = RequestStream<TokenSpeedProtocol>;
 pub type SglangClient = Client<SglangProtocol>;
 /// The per-request output stream for the SGLang connector.
 pub type SglangStream = RequestStream<SglangProtocol>;
+/// The TensorRT-LLM connector.
+pub type TrtllmClient = Client<TrtllmProtocol>;
+/// The per-request output stream for the TensorRT-LLM connector.
+pub type TrtllmStream = RequestStream<TrtllmProtocol>;
 
 /// Per-request output channels are unbounded on purpose. The dispatcher fans
 /// one engine tick out to every request in it while holding the registry lock,
