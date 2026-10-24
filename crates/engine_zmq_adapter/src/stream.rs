@@ -244,6 +244,53 @@ impl StreamState {
             top_logprobs: std::mem::take(&mut self.output_top_logprobs),
         })
     }
+
+    /// Attach the accumulated prompt logprobs to `response`: once on the first
+    /// token-bearing chunk (the proto carries them in the first chunk only;
+    /// `emitted` remembers it) and on every `Complete`, including one parked in
+    /// `pending`. Prefill precedes the first sampled token, so the set is whole
+    /// by the time a chunk carries tokens. Nothing happens when no prompt
+    /// logprobs were accumulated.
+    pub(crate) fn attach_input_logprobs(
+        &self,
+        pending: &mut Option<vllm::GenerateResponse>,
+        emitted: &mut bool,
+        response: &mut vllm::GenerateResponse,
+    ) {
+        if self.prompt_logprobs.is_empty() {
+            return;
+        }
+        // Built per attachment site rather than up front: with
+        // `prompt_logprobs` requested this runs on every decode tick, and the
+        // common tick (a later chunk) attaches nothing.
+        let build = || vllm::InputLogProbs {
+            token_logprobs: self.prompt_logprobs.clone(),
+            token_ids: self.prompt_token_ids.clone(),
+            top_logprobs: self.prompt_top_logprobs.clone(),
+        };
+        if let Some(vllm::generate_response::Response::Complete(parked)) = pending
+            .as_mut()
+            .and_then(|pending| pending.response.as_mut())
+        {
+            parked.input_logprobs = Some(build());
+        }
+        match response.response.as_mut() {
+            Some(vllm::generate_response::Response::Chunk(chunk))
+                if !*emitted && !chunk.token_ids.is_empty() =>
+            {
+                chunk.input_logprobs = Some(build());
+                *emitted = true;
+            }
+            // Later chunks never repeat them (the proto carries them in the
+            // first chunk only), and neither do token-less prefill chunks.
+            Some(vllm::generate_response::Response::Chunk(_)) => {}
+            Some(vllm::generate_response::Response::Complete(complete)) => {
+                complete.input_logprobs = Some(build());
+            }
+            None => {}
+        }
+    }
+
     /// Emit one engine tick as vLLM-proto responses. On a finish tick the
     /// `Complete` (with the engine-specific finish reason and matched stop) is
     /// returned directly — unless the tick also carried new tokens, in which
@@ -353,6 +400,91 @@ mod tests {
 
     use super::*;
     use crate::{client::ZmqEngineClient, test_support::connected_pair_in};
+
+    fn chunk(token_ids: Vec<u32>) -> vllm::GenerateResponse {
+        vllm::GenerateResponse {
+            response: Some(vllm::generate_response::Response::Chunk(
+                vllm::GenerateStreamChunk {
+                    token_ids,
+                    ..Default::default()
+                },
+            )),
+        }
+    }
+
+    fn complete() -> vllm::GenerateResponse {
+        vllm::GenerateResponse {
+            response: Some(vllm::generate_response::Response::Complete(
+                vllm::GenerateComplete::default(),
+            )),
+        }
+    }
+
+    fn input_logprobs_of(response: &vllm::GenerateResponse) -> Option<&vllm::InputLogProbs> {
+        match response.response.as_ref()? {
+            vllm::generate_response::Response::Chunk(chunk) => chunk.input_logprobs.as_ref(),
+            vllm::generate_response::Response::Complete(complete) => {
+                complete.input_logprobs.as_ref()
+            }
+        }
+    }
+
+    /// The accumulated prompt logprobs ride the first token-bearing chunk once,
+    /// every `Complete` (a parked one included), and nothing else.
+    #[test]
+    fn prompt_logprobs_attach_once_to_a_chunk_and_to_every_complete() {
+        let state = StreamState {
+            prompt_logprobs: vec![vllm::InputTokenLogProb::default()],
+            prompt_token_ids: vec![7],
+            ..Default::default()
+        };
+        let mut emitted = false;
+        let mut pending = None;
+
+        let mut empty_chunk = chunk(vec![]);
+        state.attach_input_logprobs(&mut pending, &mut emitted, &mut empty_chunk);
+        assert!(
+            input_logprobs_of(&empty_chunk).is_none(),
+            "a token-less chunk carries none"
+        );
+        assert!(!emitted);
+
+        let mut first = chunk(vec![10]);
+        state.attach_input_logprobs(&mut pending, &mut emitted, &mut first);
+        assert_eq!(
+            input_logprobs_of(&first).map(|l| l.token_ids.clone()),
+            Some(vec![7])
+        );
+        assert!(emitted);
+
+        let mut later = chunk(vec![11]);
+        state.attach_input_logprobs(&mut pending, &mut emitted, &mut later);
+        assert!(
+            input_logprobs_of(&later).is_none(),
+            "a later chunk never repeats them"
+        );
+
+        let mut pending = Some(complete());
+        let mut last = complete();
+        state.attach_input_logprobs(&mut pending, &mut emitted, &mut last);
+        assert!(
+            input_logprobs_of(&last).is_some(),
+            "every Complete carries them"
+        );
+        assert!(
+            pending.as_ref().and_then(input_logprobs_of).is_some(),
+            "a parked Complete carries them too"
+        );
+
+        let silent = StreamState::default();
+        let mut untouched = chunk(vec![10]);
+        let mut emitted = false;
+        silent.attach_input_logprobs(&mut None, &mut emitted, &mut untouched);
+        assert!(
+            input_logprobs_of(&untouched).is_none() && !emitted,
+            "nothing accumulated, nothing attached"
+        );
+    }
 
     /// A connected vLLM-dialect client over a throwaway ipc endpoint, its
     /// requests bounded by `request_timeout` when one is given, and the mock

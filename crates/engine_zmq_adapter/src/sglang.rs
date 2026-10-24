@@ -109,41 +109,6 @@ impl SglangGenerateStream {
         response
     }
 
-    /// Attach the accumulated prompt logprobs: once on the first token-bearing
-    /// chunk and on every `Complete`, including one parked in `pending`. The
-    /// scheduler reports them with the prefill tick, before any sampled token.
-    fn attach_input_logprobs(&mut self, response: &mut vllm::GenerateResponse) {
-        if self.state.prompt_logprobs.is_empty() {
-            return;
-        }
-        let state = &self.state;
-        let build = || vllm::InputLogProbs {
-            token_logprobs: state.prompt_logprobs.clone(),
-            token_ids: state.prompt_token_ids.clone(),
-            top_logprobs: state.prompt_top_logprobs.clone(),
-        };
-        if let Some(vllm::generate_response::Response::Complete(parked)) = self
-            .pending
-            .as_mut()
-            .and_then(|pending| pending.response.as_mut())
-        {
-            parked.input_logprobs = Some(build());
-        }
-        match response.response.as_mut() {
-            Some(vllm::generate_response::Response::Chunk(chunk))
-                if !self.input_logprobs_emitted && !chunk.token_ids.is_empty() =>
-            {
-                chunk.input_logprobs = Some(build());
-                self.input_logprobs_emitted = true;
-            }
-            Some(vllm::generate_response::Response::Chunk(_)) => {}
-            Some(vllm::generate_response::Response::Complete(complete)) => {
-                complete.input_logprobs = Some(build());
-            }
-            None => {}
-        }
-    }
-
     /// Whether the engine already finished this choice and its terminal
     /// `Complete` is parked behind the chunk just yielded (the finish tick
     /// carried new tokens).
@@ -170,7 +135,11 @@ impl SglangGenerateStream {
             Some(("abort".to_string(), None)),
             &mut pending,
         );
-        self.attach_input_logprobs(&mut response);
+        self.state.attach_input_logprobs(
+            &mut self.pending,
+            &mut self.input_logprobs_emitted,
+            &mut response,
+        );
         response
     }
 }
@@ -402,7 +371,11 @@ impl MappedGenerateStream for SglangGenerateStream {
             finish,
             &mut self.pending,
         );
-        self.attach_input_logprobs(&mut response);
+        self.state.attach_input_logprobs(
+            &mut self.pending,
+            &mut self.input_logprobs_emitted,
+            &mut response,
+        );
         Ok(response)
     }
 }

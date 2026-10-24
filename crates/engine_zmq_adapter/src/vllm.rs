@@ -182,50 +182,12 @@ impl VllmGenerateStream {
             Some((finish_reason, matched)),
             &mut pending,
         );
-        self.attach_input_logprobs(&mut response);
+        self.state.attach_input_logprobs(
+            &mut self.pending,
+            &mut self.input_logprobs_emitted,
+            &mut response,
+        );
         response
-    }
-
-    /// Attach the accumulated prompt logprobs: once on the first token-bearing
-    /// chunk (the proto puts them in the first chunk only) and on every
-    /// `Complete`, including one parked in `pending`. Prefill precedes the
-    /// first sampled token, so the set is whole by the time a chunk carries
-    /// tokens.
-    fn attach_input_logprobs(&mut self, response: &mut vllm::GenerateResponse) {
-        if self.state.prompt_logprobs.is_empty() {
-            return;
-        }
-        // Built per attachment site rather than up front: with
-        // `prompt_logprobs` requested this runs on every decode tick, and the
-        // common tick (a later chunk) attaches nothing.
-        let state = &self.state;
-        let build = || vllm::InputLogProbs {
-            token_logprobs: state.prompt_logprobs.clone(),
-            token_ids: state.prompt_token_ids.clone(),
-            top_logprobs: state.prompt_top_logprobs.clone(),
-        };
-        if let Some(vllm::generate_response::Response::Complete(parked)) = self
-            .pending
-            .as_mut()
-            .and_then(|pending| pending.response.as_mut())
-        {
-            parked.input_logprobs = Some(build());
-        }
-        match response.response.as_mut() {
-            Some(vllm::generate_response::Response::Chunk(chunk))
-                if !self.input_logprobs_emitted && !chunk.token_ids.is_empty() =>
-            {
-                chunk.input_logprobs = Some(build());
-                self.input_logprobs_emitted = true;
-            }
-            // Later chunks never repeat them (the proto carries them in the
-            // first chunk only), and neither do token-less prefill chunks.
-            Some(vllm::generate_response::Response::Chunk(_)) => {}
-            Some(vllm::generate_response::Response::Complete(complete)) => {
-                complete.input_logprobs = Some(build());
-            }
-            None => {}
-        }
     }
 }
 
@@ -347,7 +309,11 @@ impl MappedGenerateStream for VllmGenerateStream {
             finish,
             &mut self.pending,
         );
-        self.attach_input_logprobs(&mut response);
+        self.state.attach_input_logprobs(
+            &mut self.pending,
+            &mut self.input_logprobs_emitted,
+            &mut response,
+        );
         attach_kv_transfer_params(&mut response, &mut self.pending, output.kv_transfer_params);
         attach_spec_decode_counts(&mut response, &mut self.pending, output.spec_decode_metrics);
         Ok(response)
