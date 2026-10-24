@@ -22,6 +22,9 @@ class EnvironmentProof:
 
     @pytest.hookimpl(trylast=True)
     def pytest_sessionfinish(self, session, exitstatus):
+        if os.environ.get("SMG_SG2_STARTUP_DIAGNOSTIC") == "1":
+            from .startup_patch import verify as verify_startup
+            verify_startup(os.environ["AMD_DEPENDENCY_DIRECTORY"])
         if os.environ.get("SMG_SGLANG_PD_REGISTRATION_FAILFAST") == "1":
             from .registration_patch import verify
             verify(os.environ["AMD_DEPENDENCY_DIRECTORY"])
@@ -44,6 +47,9 @@ def pytest_configure(config):
     if os.environ.get("SMG_SGLANG_PD_REGISTRATION_FAILFAST") == "1":
         from .registration_patch import apply
         apply(os.environ["AMD_DEPENDENCY_DIRECTORY"])
+    if os.environ.get("SMG_SG2_STARTUP_DIAGNOSTIC") == "1":
+        from .startup_patch import apply as apply_startup
+        apply_startup(os.environ["AMD_DEPENDENCY_DIRECTORY"])
     from .runtime import RuntimeProof
 
     config.pluginmanager.register(EnvironmentProof(), "smg-sglang-pd-environment")

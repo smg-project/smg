@@ -268,5 +268,35 @@
     "observed_pytest_RLIMIT_MEMLOCK_bytes": 8388608,
     "RDMA_EINVAL22_resolved": false,
     "new_GPU_acceptance": false
+  },
+  "explicit_startup_diagnostic_dependency": {
+    "default_enabled": false,
+    "manual_dispatch_input": "startup_diagnostic",
+    "env": "SMG_SG2_STARTUP_DIAGNOSTIC",
+    "actual_image_digest": "sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d",
+    "manifest": "sglang_pd_observer/startup-overlay.json",
+    "manifest_sha256": "5ed4308e3922ae0e61906143b3bcd0e6ef0422019737d18094c069dc9fb2eb06",
+    "source_paths_and_before_after": {
+      "/sgl-workspace/aiter/aiter/jit/utils/chip_info.py": {
+        "actual_capture_path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T0300Z/SG2-AB-4420-source-canonical-root-933b80bb0c1547128659f28c5b42265a/2.py",
+        "before_sha256": "67b9b709ad95a7df5fdad1c49ad23b7374b5d2a1ec1c4a3d67b4d6c597c5f33d",
+        "after_sha256": "c6f094a6f6339fc92b2e0673c2ce9935440a30682662c22ea8a07e5fb4dc6348"
+      },
+      "/sgl-workspace/sglang/python/sglang/srt/arg_groups/memory_hook.py": {
+        "actual_capture_path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T0300Z/SG2-AB-4420-source-canonical-root-933b80bb0c1547128659f28c5b42265a/1.py",
+        "before_sha256": "5c0c2e479db6ea06dd6189f21765b17b2dd8a96396907493ed2e5a69017fda8f",
+        "after_sha256": "edfd9e77d7dd3ab2d20aa141932a6e5155841752bfb8478e8b97a1d89c79ebeb"
+      },
+      "/sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py": {
+        "actual_capture_path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T0300Z/SG2-AB-4420-source-followup-root-f1376ea255d7439cbda615e1d2d3db47/1.py",
+        "before_sha256": "b61df5b750adc748a99ceb381b8494c199fb3f704d793da5a0217bd6bbb606c4",
+        "after_sha256": "d6216ddea10a0d3360619179de914ef49c8da3b2da77d810be8cf61f216127f4"
+      }
+    },
+    "helper_sha256": "b71f52979b09f44c4d2935c796905834b0d658677b8256124237e3d54a1f36cc",
+    "artifact_directory": "AMD_DEPENDENCY_DIRECTORY/sglang-startup",
+    "runtime_origin": "HOLD until actual same-worker events match manifest hashes; installer file hashes alone do not close it.",
+    "no_CU_prime_or_parameter_change": true,
+    "GPU_or_model_or_RDMA_or_original20_passed": false
   }
 }

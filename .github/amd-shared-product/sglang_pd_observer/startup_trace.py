@@ -93,6 +93,8 @@ def _emit(kind, stage, module, file, values, raw=None):
 def cu(module, file, scope):
     if os.environ.get("SMG_SG2_STARTUP_DIAGNOSTIC") != "1":
         return
+    if _pid == os.getpid() and _cu_count >= 1:
+        return
     try:
         result, path = scope.get("result"), scope.get("rocminfo")
         executable = None
@@ -113,6 +115,8 @@ def cu(module, file, scope):
 
 def memory(stage, module, file, scope, namespace):
     if os.environ.get("SMG_SG2_STARTUP_DIAGNOSTIC") != "1":
+        return
+    if _pid == os.getpid() and _memory_count >= 12:
         return
     try:
         fields = {key: _scalar(scope[key]) for key in
