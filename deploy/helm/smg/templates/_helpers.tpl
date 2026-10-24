@@ -519,11 +519,12 @@ Expects a dict with keys: worker, defaults
 {{/*
 Worker metrics port -- the port the engine pod serves Prometheus metrics on,
 or empty when it serves none. A gRPC worker with `metrics.enabled` runs the
-engine behind the Rust servicer, whose own listener answers `GET /metrics`
+engine behind the Rust servicer (the launcher's default as well; `metrics.enabled`
+selects it explicitly), whose own listener answers `GET /metrics`
 with the `smg_servicer_*` families (requests by finish reason, refusals,
 errors, in-flight requests, token totals, the first-token / inter-token /
-end-to-end latency histograms, the servicer's lifecycle state); the Python
-servicer has no endpoint. An HTTP worker runs the engine's own server, which
+end-to-end latency histograms, the servicer's lifecycle state); the deprecated
+Python servicer has no endpoint. An HTTP worker runs the engine's own server, which
 the chart leaves as it is.
 Expects a dict with keys: worker
 */}}

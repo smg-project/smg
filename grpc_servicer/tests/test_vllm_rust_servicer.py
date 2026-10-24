@@ -13,6 +13,7 @@ import asyncio
 import dataclasses
 import inspect
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -59,7 +60,8 @@ def test_package_exposes_the_flag_and_the_rust_entry_points():
 
 
 def test_resolve_servicer_impl_prefers_the_launcher_flag_then_the_env():
-    assert rust.resolve_servicer_impl(environ={}) == "python"
+    assert rust.resolve_servicer_impl(environ={}) == "rust"
+    assert rust.resolve_servicer_impl(environ={"SMG_VLLM_SERVICER_IMPL": " Python "}) == "python"
     assert rust.resolve_servicer_impl(environ={"SMG_VLLM_SERVICER_IMPL": " Rust "}) == "rust"
     args = argparse.Namespace(servicer_impl="rust")
     assert rust.resolve_servicer_impl(args, environ={}) == "rust"
@@ -78,17 +80,34 @@ def test_a_launcher_flag_decision_is_written_back_for_the_python_guard():
     assert rust.resolve_servicer_impl(args, environ=environ) == "python"
     assert environ["SMG_VLLM_SERVICER_IMPL"] == "python"
     rust.require_python_impl(environ=environ)
-    # Without a flag in hand nothing is written.
+    # Without a flag in hand nothing is written: the default is rust.
     environ = {}
-    assert rust.resolve_servicer_impl(environ=environ) == "python"
+    assert rust.resolve_servicer_impl(environ=environ) == "rust"
     assert environ == {}
+    # The default on a launcher the switch cannot bind (the plugin's parse-time
+    # probe says so) is the Python servicer by fallback, written back for the
+    # guard and the engine processes.
+    assert rust.servicer_impl_source(environ=environ, unserved=lambda: "no launcher") == (
+        "python",
+        "fallback",
+    )
+    assert environ == {"SMG_VLLM_SERVICER_IMPL": "python"}
+    rust.require_python_impl(environ=environ)
 
 
-def test_python_servicer_refuses_to_start_when_the_flag_asks_for_rust():
-    rust.require_python_impl(environ={})
+def test_python_servicer_refuses_to_start_when_the_flag_asks_for_rust(caplog):
+    caplog.set_level(logging.INFO)
     rust.require_python_impl(environ={"SMG_VLLM_SERVICER_IMPL": "python"})
+    assert "Servicer implementation" not in caplog.text
     with pytest.raises(RuntimeError, match="never ran"):
         rust.require_python_impl(environ={"SMG_VLLM_SERVICER_IMPL": "rust"})
+    # Nothing selected: the default (rust) never reached this launcher, so the
+    # Python servicer serves the launch as the fallback the switch would have
+    # made, and says so.
+    rust.require_python_impl(environ={})
+    assert "did not consult the servicer switch" in caplog.text
+    assert "Servicer implementation: python (source=fallback)" in caplog.text
+    assert rust_lifecycle.DEPRECATION_LINE in caplog.text
 
 
 def test_upstream_hook_is_detected_in_the_launcher_source(tmp_path):
@@ -1925,7 +1944,9 @@ def test_the_switch_refuses_a_host_with_no_free_publisher_port_as_the_rust_path_
     """The default's endpoint is a port found free on the host; a host with no
     free block of them is a configuration error, and the switch answers it as
     the Rust path does: one ERROR line naming the knob and exit code 2, and
-    the launcher's coroutine never runs, not a traceback out of it."""
+    the launcher's coroutine never runs, not a traceback out of it. (The
+    Python servicer is selected: the Rust path, the default, applies the
+    default itself.)"""
     import logging
 
     from smg_grpc_servicer.vllm import launcher_switch
@@ -1949,7 +1970,9 @@ def test_the_switch_refuses_a_host_with_no_free_publisher_port_as_the_rust_path_
     caplog.set_level(logging.ERROR)
     with pytest.raises(SystemExit) as raised:
         asyncio.run(
-            switched(argparse.Namespace(servicer_impl=None, model="org/m", kv_events_config=None))
+            switched(
+                argparse.Namespace(servicer_impl="python", model="org/m", kv_events_config=None)
+            )
         )
     assert raised.value.code == 2 and served == []
     assert refusal in caplog.text and "--kv-events-config" in caplog.text
@@ -1976,11 +1999,12 @@ def test_the_switch_turns_the_kv_event_publisher_on_for_the_python_servicer_too(
     switched = launcher_switch.with_servicer_switch(serve_grpc)
     monkeypatch.delenv(rust.SERVICER_IMPL_ENV, raising=False)
     monkeypatch.delenv(rust.KV_EVENTS_ENV, raising=False)
-    # Nothing given: the launcher builds the engine from a namespace with the
-    # publisher on (in whichever form the engine takes it: the typed one once
-    # vllm.config is importable, the JSON form otherwise), and the operator
-    # reads why and how to decide otherwise.
-    args = argparse.Namespace(servicer_impl=None, model="org/m", kv_events_config=None)
+    # No KV-events configuration given, the Python servicer selected: the
+    # launcher builds the engine from a namespace with the publisher on (in
+    # whichever form the engine takes it: the typed one once vllm.config is
+    # importable, the JSON form otherwise), and the operator reads why and
+    # how to decide otherwise.
+    args = argparse.Namespace(servicer_impl="python", model="org/m", kv_events_config=None)
     with caplog.at_level(logging.INFO):
         asyncio.run(switched(args))
     assert served == [args]
@@ -1993,7 +2017,7 @@ def test_the_switch_turns_the_kv_event_publisher_on_for_the_python_servicer_too(
     # The opt-out: the namespace reaches the launcher as parsed, and nothing is said.
     caplog.clear()
     monkeypatch.setenv(rust.KV_EVENTS_ENV, "off")
-    args = argparse.Namespace(servicer_impl=None, model="org/m", kv_events_config=None)
+    args = argparse.Namespace(servicer_impl="python", model="org/m", kv_events_config=None)
     with caplog.at_level(logging.INFO):
         asyncio.run(switched(args))
     assert served[-1] is args and args.kv_events_config is None
@@ -2001,7 +2025,7 @@ def test_the_switch_turns_the_kv_event_publisher_on_for_the_python_servicer_too(
     # An explicit configuration is kept as given, off included.
     monkeypatch.delenv(rust.KV_EVENTS_ENV)
     given = {"enable_kv_cache_events": False, "publisher": "null"}
-    args = argparse.Namespace(servicer_impl=None, model="org/m", kv_events_config=given)
+    args = argparse.Namespace(servicer_impl="python", model="org/m", kv_events_config=given)
     asyncio.run(switched(args))
     assert served[-1] is args and args.kv_events_config is given
     # The Rust path: its launcher applies the default itself, so the switch

@@ -899,13 +899,14 @@ class Worker:
         rust_servicer_needs_hook = {"vllm"}
         if self.mode == ConnectionMode.GRPC and self.engine in servicer_impl:
             variable, lane_choice = servicer_impl[self.engine]
-            if lane_choice() == "rust":
-                if self.engine in rust_servicer_needs_hook:
-                    _require_rust_servicer_hook()
-                env[variable] = "rust"
-            else:
-                # The lane setting is authoritative over an inherited value.
-                env.pop(variable, None)
+            choice = lane_choice()
+            if choice == "rust" and self.engine in rust_servicer_needs_hook:
+                _require_rust_servicer_hook()
+            # The lane setting is authoritative over an inherited value, and
+            # it is spelled out either way: the servicer package's own
+            # default is the Rust servicer, so a lane that means the Python
+            # one has to say so.
+            env[variable] = choice
 
         if (
             self.engine == "vllm"

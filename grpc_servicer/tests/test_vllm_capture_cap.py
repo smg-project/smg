@@ -713,8 +713,12 @@ def test_the_decision_logged_at_a_parse_before_vllm_configures_logging_comes_out
 ):
     """vLLM 0.31: the launcher parses, then configures logging, then runs
     serve_grpc. The line logged at the parse has no handler then; it comes out
-    at the switch's first act, through vLLM's handlers, under its own file."""
+    at the switch's first act, through vLLM's handlers, under its own file.
+    (The parse selects an implementation through the variable: with nothing
+    selected, a launcher this process cannot bind takes the parse-time
+    fallback, which has lines of its own.)"""
     monkeypatch.delenv("VLLM_LOGGING_LEVEL", raising=False)
+    monkeypatch.setenv(rust.SERVICER_IMPL_ENV, "python")
     stream = io.StringIO()
     with _no_handlers_anywhere():
         parsed = _serve_parser(parser_class).parse_args(["--grpc", *DRILL])
@@ -723,20 +727,24 @@ def test_the_decision_logged_at_a_parse_before_vllm_configures_logging_comes_out
         _vllm_configures_logging(stream)
         _the_launcher_runs_serve_grpc(parsed, monkeypatch)
         lines = stream.getvalue().splitlines()
-    assert len(lines) == 1
+    # The held capture-cap line, then the switch's own implementation line.
+    assert len(lines) == 2
     assert lines[0].startswith("INFO [capture_cap.py:")
     assert (
         "CUDA-graph capture cap: 512, derived from the admission step (--max-num-batched-tokens 16384"
         in lines[0]
     )
+    assert "Servicer implementation: rust (source=flag)" in lines[1]
 
 
 def test_the_decision_prints_at_the_parse_where_vllm_configured_logging_before_it_and_never_twice(
     parser_class, monkeypatch
 ):
     """vLLM 0.28 through 0.30 configured logging at import: the line prints at
-    the parse, as before, and the switch's first act replays nothing."""
+    the parse, as before, and the switch's first act replays nothing (it
+    adds its own implementation line, nothing of the parse's)."""
     monkeypatch.delenv("VLLM_LOGGING_LEVEL", raising=False)
+    monkeypatch.setenv(rust.SERVICER_IMPL_ENV, "python")
     stream = io.StringIO()
     with _no_handlers_anywhere():
         _vllm_configures_logging(stream)
@@ -745,7 +753,8 @@ def test_the_decision_prints_at_the_parse_where_vllm_configured_logging_before_i
         _the_launcher_runs_serve_grpc(parsed, monkeypatch)
         lines = stream.getvalue().splitlines()
     assert len(at_the_parse) == 1 and "512, derived" in at_the_parse[0]
-    assert lines == at_the_parse
+    assert lines[:1] == at_the_parse and len(lines) == 2
+    assert "Servicer implementation: rust (source=flag)" in lines[1]
 
 
 def test_the_python_path_ends_a_hold_nothing_released_before_the_launchers_coroutine(
@@ -754,8 +763,13 @@ def test_the_python_path_ends_a_hold_nothing_released_before_the_launchers_corou
     """A launcher that configured no logging at all, Python servicer: the
     switch ends the hold before the launcher's own coroutine runs, so the
     package's warnings and errors reach stderr from there as without the hold
-    (the held INFO line has nowhere to go, as before)."""
+    (the held INFO lines have nowhere to go, as before; the deprecation
+    warning of the Python servicer, held with them, reaches stderr the same
+    way)."""
+    from smg_grpc_servicer.rust_lifecycle import DEPRECATION_LINE
+
     monkeypatch.delenv("VLLM_LOGGING_LEVEL", raising=False)
+    monkeypatch.setenv(rust.SERVICER_IMPL_ENV, "python")
     monkeypatch.setattr(rust, "require_python_media_mode", lambda args: None)
     monkeypatch.setattr(rust, "default_kv_events_config", lambda args: None)
     pkg_logger = logging.getLogger("smg_grpc_servicer")
@@ -771,4 +785,4 @@ def test_the_python_path_ends_a_hold_nothing_released_before_the_launchers_corou
         result = asyncio.run(launcher_switch.with_servicer_switch(serve_grpc)(parsed))
         assert result == "python ran"
         assert pkg_logger.handlers == []
-    assert capsys.readouterr().err == "from the launcher's coroutine\n"
+    assert capsys.readouterr().err == f"{DEPRECATION_LINE}\nfrom the launcher's coroutine\n"

@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -22,7 +23,10 @@ def _module(name, **attrs):
 
 @pytest.fixture
 def server_mod(monkeypatch):
-    """Load server.py with lightweight stand-ins for optional runtime deps."""
+    """Load server.py with lightweight stand-ins for optional runtime deps.
+    The tests of the Python path select it: the switch defaults to the Rust
+    servicer (a test of the switch itself unsets the variable)."""
+    monkeypatch.setenv("SMG_SGLANG_SERVICER_IMPL", "python")
 
     class PortArgs:
         @staticmethod
@@ -669,7 +673,7 @@ def test_request_tracing_initializes_after_the_runtime_context_is_published(
 
     monkeypatch.setattr(server_mod, "init_request_tracing", init_tracing)
     monkeypatch.setattr(server_mod, "_launch_scheduler_with_request_manager", stop_here)
-    monkeypatch.delenv("SMG_SGLANG_SERVICER_IMPL", raising=False)
+    monkeypatch.setenv("SMG_SGLANG_SERVICER_IMPL", "python")
     with pytest.raises(RuntimeError, match="stop here"):
         asyncio.run(server_mod.serve_grpc(SimpleNamespace(disaggregation_mode="null")))
     assert events == ["publish:tokenizer", "tracing", "launch"]
@@ -685,7 +689,7 @@ def test_the_python_servicer_turns_the_kv_event_publisher_on_by_default_too(
     and the same log line."""
     from smg_grpc_servicer.sglang import rust as sglang_rust
 
-    monkeypatch.delenv("SMG_SGLANG_SERVICER_IMPL", raising=False)
+    monkeypatch.setenv("SMG_SGLANG_SERVICER_IMPL", "python")
     monkeypatch.delenv(sglang_rust.KV_EVENTS_ENV, raising=False)
 
     def serve(configure):
@@ -742,7 +746,7 @@ def test_a_host_with_no_free_publisher_port_is_a_named_exit_on_the_python_path_t
     from smg_grpc_servicer import rust_lifecycle
     from smg_grpc_servicer.sglang import rust as sglang_rust
 
-    monkeypatch.delenv("SMG_SGLANG_SERVICER_IMPL", raising=False)
+    monkeypatch.setenv("SMG_SGLANG_SERVICER_IMPL", "python")
     monkeypatch.delenv(sglang_rust.KV_EVENTS_ENV, raising=False)
     refusal = "no block of 1 consecutive free ports for the KV event publishers"
 
@@ -761,3 +765,70 @@ def test_a_host_with_no_free_publisher_port_is_a_named_exit_on_the_python_path_t
     assert raised.value.code == 2
     assert refusal in caplog.text and "--kv-events-config" in caplog.text
     launched.assert_not_called()
+
+
+def test_a_disaggregated_launch_on_defaults_falls_back_to_the_python_servicer(
+    monkeypatch, server_mod, caplog
+):
+    """Nothing selected an implementation and the launch is a PD prefill side,
+    which the Rust path does not serve: the switch selects the Python servicer
+    by fallback, logs the gap, the implementation with its origin and the
+    deprecation, writes the decision into the environment the schedulers
+    inherit, and the Python path runs."""
+    from smg_grpc_servicer import rust_lifecycle
+
+    events = []
+    monkeypatch.delenv("SMG_SGLANG_SERVICER_IMPL", raising=False)
+    monkeypatch.setattr(server_mod, "publish", lambda _args, role: events.append(f"publish:{role}"))
+    monkeypatch.setattr(server_mod, "init_request_tracing", lambda: False)
+    monkeypatch.setattr(server_mod, "start_disagg_service", lambda: None)
+
+    async def stop_here(**_kwargs):
+        events.append("launch")
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(server_mod, "_launch_scheduler_with_request_manager", stop_here)
+    caplog.set_level(logging.INFO)
+    with pytest.raises(RuntimeError, match="stop here"):
+        asyncio.run(server_mod.serve_grpc(SimpleNamespace(disaggregation_mode="prefill")))
+    assert events == ["publish:tokenizer", "launch"]
+    assert os.environ["SMG_SGLANG_SERVICER_IMPL"] == "python"
+    assert (
+        "does not serve this launch yet (PD disaggregation (disaggregation_mode='prefill'))"
+        in caplog.text
+    )
+    assert "Servicer implementation: python (source=fallback)" in caplog.text
+    assert rust_lifecycle.DEPRECATION_LINE in caplog.text
+
+
+def test_the_sidecar_hook_is_declined_with_the_rust_servicers_own_endpoint_named(
+    monkeypatch, server_mod, caplog
+):
+    """SGLang's gRPC entrypoint hands every launch its HTTP sidecar hook; the
+    Rust path has no request manager for it, so the sidecar stays off and one
+    warning names the Rust servicer's own metrics endpoint and the Python
+    selection. The hook is not a fallback case: it would make every launch on
+    defaults one."""
+    monkeypatch.delenv("SMG_SGLANG_SERVICER_IMPL", raising=False)
+
+    async def rust_served(server_args):
+        return 0
+
+    monkeypatch.setattr(server_mod, "serve_rust", rust_served)
+    caplog.set_level(logging.INFO)
+    with pytest.raises(SystemExit) as exit_info:
+        asyncio.run(
+            server_mod.serve_grpc(
+                SimpleNamespace(enable_metrics=True),
+                on_request_manager_ready=lambda *_args: None,
+            )
+        )
+    assert exit_info.value.code == 0
+    assert "Servicer implementation: rust (source=default)" in caplog.text
+    assert (
+        "has no request manager for SGLang's HTTP sidecar, which stays off "
+        "(the --enable-metrics endpoint included)"
+    ) in caplog.text
+    assert server_mod.METRICS_PORT_ENV in caplog.text
+    assert "SMG_SGLANG_SERVICER_IMPL=python" in caplog.text
+    assert "does not serve this launch yet" not in caplog.text

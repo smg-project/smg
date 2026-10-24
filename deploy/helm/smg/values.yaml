@@ -412,10 +412,11 @@ workers: []
 #       tag: ""                         # engine-specific image tag (required)
 #     port: 8000                        # worker serving port
 #     metrics:                          # the engine pod's Prometheus endpoint (gRPC mode only)
-#       enabled: false                  # true: the worker runs the Rust servicer, which serves
-#                                       # GET /metrics (smg_servicer_*); the Python servicer has no
-#                                       # endpoint, and the SGLang Rust servicer serves neither
-#                                       # PD/EPD disaggregation nor image/video input yet
+#       enabled: false                  # true: the worker runs the Rust servicer (the launcher's
+#                                       # default as well), which serves GET /metrics (smg_servicer_*);
+#                                       # the deprecated Python servicer has no endpoint, and a launch
+#                                       # the Rust servicer does not serve yet (SGLang and TokenSpeed
+#                                       # PD/EPD, SGLang image/video input) keeps this off
 #       port: 29100                     # the metrics listener's port; must differ from `port`
 #     resources: {}
 #     extraArgs: []                     # extra engine CLI args

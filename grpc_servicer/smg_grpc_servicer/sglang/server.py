@@ -33,6 +33,7 @@ from smg_grpc_servicer.rust_lifecycle import (
     EXIT_GRACE_SECS,
     ServicerConfigError,
     announce_kv_events_default,
+    announce_servicer_impl,
     check_metrics_port_needs_rust,
     configuration_exit,
     guarded_exit,
@@ -135,12 +136,25 @@ async def serve_grpc(
     # ServerArgs flag stay the same, and the Router cannot tell them apart.
     try:
         impl, origin = servicer_impl_source(server_args)
-        logger.info("Servicer implementation: %s (source=%s)", impl, origin)
+        announce_servicer_impl(impl, origin, logger)
         if impl == "rust":
             if on_request_manager_ready is not None:
+                # SGLang's gRPC entrypoint hands every launch this hook; the
+                # Rust path has no request manager for it, so the sidecar
+                # stays off and the launch says where its endpoints went.
+                # Not a fallback case: it would make every launch one.
                 logger.warning(
-                    "%s=rust: SGLang's HTTP sidecar (metrics, profiling endpoints) stays off; "
-                    "the Rust servicer has no request manager to wire it to",
+                    "The Rust servicer (source=%s) has no request manager for SGLang's HTTP "
+                    "sidecar, which stays off%s; the Rust servicer's own Prometheus endpoint "
+                    "is --metrics-port / %s, and the sidecar's endpoints need the Python "
+                    "servicer (%s=python or --servicer-impl python)",
+                    origin,
+                    (
+                        " (the --enable-metrics endpoint included)"
+                        if getattr(server_args, "enable_metrics", False)
+                        else ""
+                    ),
+                    METRICS_PORT_ENV,
                     SERVICER_IMPL_ENV,
                 )
             raise SystemExit(await serve_rust(server_args))

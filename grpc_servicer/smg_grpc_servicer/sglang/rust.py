@@ -15,16 +15,26 @@ them), each with this package's SGLang plugin dialing the servicer's same-host
 msgpack ZMQ handshake. Python keeps the lifecycle only. The Router cannot tell
 the two implementations apart.
 
-What the msgpack wire does not carry, the Rust path reports rather than
-emulates: ``Embed``, ``FlushCache``, profiling, LoRA loading and the KV-event
-relay answer UNIMPLEMENTED, prompt logprobs, hidden states and multimodal
-inputs are refused, and PD/EPD disaggregation stays with the Python
-implementation.
+The Rust implementation is the default. What the msgpack wire does not carry,
+the Rust path reports rather than emulates: hidden states and multimodal
+inputs are refused, the LoRA-loading RPCs answer UNIMPLEMENTED (as on the
+Python servicer, which does not serve them either), and PD/EPD disaggregation
+stays with the Python implementation; ``Embed``, ``FlushCache``, profiling,
+the KV-event relay and sampled and prompt logprobs are served. A launch on
+defaults that asks for a mode or an input the Rust path does not serve (PD or
+EPD disaggregation, ``--enable-multimodal``) falls back to the Python servicer
+by itself with one log line naming the gap (:func:`unserved_on_rust`); a
+model's own modality is not read for that decision: a multimodal model
+launched without the flag serves text on the Rust path, the gateway refuses
+its image inputs per request (the worker advertises no vision), and the launch
+log says so once, naming the Python selection (:meth:`SglangLauncher.facts`).
+The Python servicer is deprecated and logs so whenever it serves.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import functools
 import json
 import logging
 import multiprocessing
@@ -64,6 +74,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     resolve_tokenizer_dir,
     servicer_switch,
 )
+from smg_grpc_servicer.servicer_impl_flag import SERVICER_IMPL_FLAG
 from smg_grpc_servicer.sglang import METRICS_HOST_ENV, METRICS_PORT_ENV
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.warmup import WARMUP_ENV, warmup_inputs, warmup_wire
@@ -94,7 +105,8 @@ def resolve_servicer_impl(args: Any = None, environ: Mapping[str, str] | None = 
     """Which implementation serves this process: the launcher's
     ``--servicer-impl`` when it carried one (``args.servicer_impl``, or the
     value this package's SGLang plugin parsed in this process), else
-    ``$SMG_SGLANG_SERVICER_IMPL``, else python."""
+    ``$SMG_SGLANG_SERVICER_IMPL``, else rust, unless the Rust path does not
+    serve the launch ``args`` describes (then python, by fallback)."""
     return servicer_impl_source(args, environ)[0]
 
 
@@ -102,14 +114,50 @@ def servicer_impl_source(
     args: Any = None, environ: Mapping[str, str] | None = None
 ) -> tuple[str, str]:
     """:func:`resolve_servicer_impl`'s answer with where it came from:
-    ``flag``, ``env`` or ``default`` (the shared
+    ``flag``, ``env``, ``default`` or ``fallback`` (the shared
     :func:`~smg_grpc_servicer.rust_lifecycle.servicer_switch`, which writes a
-    flag decision back to the environment the scheduler processes inherit).
-    SGLang's ``ServerArgs`` keeps only its own fields, so the flag travels as
-    the value this package's plugin parsed in this process."""
+    flag or fallback decision back to the environment the scheduler processes
+    inherit). SGLang's ``ServerArgs`` keeps only its own fields, so the flag
+    travels as the value this package's plugin parsed in this process. When
+    ``args`` is given (the launcher's server args) and the default would
+    select Rust, the launch is probed against what the Rust path serves
+    (:func:`unserved_on_rust`)."""
     from smg_grpc_servicer.sglang import plugin
 
-    return servicer_switch(SERVICER_IMPL_ENV, args, environ, parsed_flag=plugin.parsed_flag())
+    unserved = None if args is None else functools.partial(unserved_on_rust, args)
+    return servicer_switch(
+        SERVICER_IMPL_ENV,
+        args,
+        environ,
+        parsed_flag=plugin.parsed_flag(),
+        unserved=unserved,
+    )
+
+
+def unserved_on_rust(server_args: Any) -> str | None:
+    """Why the Rust path does not serve the launch ``server_args`` describes,
+    or ``None`` when it does: the switch's probe when the default would select
+    Rust. PD and EPD disaggregation (the msgpack wire carries no bootstrap
+    fields and this path starts no bootstrap server) and a launch that asks
+    for multimodal input with ``--enable-multimodal`` (this path carries no
+    media to the scheduler) stay with the Python servicer until the wire
+    carries them. Only the launch line is read, never the model's own
+    modality: SGLang's ``is_multimodal`` and its architecture list flag text
+    deployments of structurally multimodal families (the DeepSeek V4 family
+    among them), and a wrong answer here would put a text deployment on the
+    deprecated servicer without anyone asking. A multimodal model launched
+    without the flag serves text on the Rust path and the gateway refuses its
+    image inputs per request (the worker advertises no vision);
+    :meth:`SglangLauncher.facts` says so once at launch, naming the Python
+    selection."""
+    args = EngineConfigView(server_args).server_args
+    if args.disaggregation_mode != "null":
+        return f"PD disaggregation (disaggregation_mode={args.disaggregation_mode!r})"
+    if args.language_only or args.encoder_only:
+        return "EPD disaggregation (language_only / encoder_only)"
+    if args.enable_multimodal is True:
+        return "multimodal input (--enable-multimodal; this path carries no media to the scheduler)"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +483,23 @@ class SglangLauncher(RustLauncher):
         return default_kv_events_config(args)
 
     def facts(self, args: Any) -> dict[str, Any]:
-        return {**model_facts(args), **server_facts(args)}
+        facts = {**model_facts(args), **server_facts(args)}
+        if facts.get("supports_vision"):
+            # The Rust server advertises no vision whatever the engine reads in
+            # the checkpoint: the gateway refuses this worker's image and video
+            # inputs per request, and nothing in that refusal names the way
+            # out, so the launch does, once.
+            logger.warning(
+                "The engine reads this checkpoint as multimodal (%s): the Rust SGLang "
+                "servicer carries no media to the scheduler and advertises no vision, so "
+                "the gateway refuses image and video inputs to this worker per request; a "
+                "deployment that serves them selects the Python servicer (%s=python or "
+                "%s python)",
+                ", ".join(str(arch) for arch in facts["architectures"]) or facts["model_type"],
+                SERVICER_IMPL_ENV,
+                SERVICER_IMPL_FLAG,
+            )
+        return facts
 
     def tokenizer_dir(self, args: Any) -> str | None:
         return tokenizer_dir_for(args)

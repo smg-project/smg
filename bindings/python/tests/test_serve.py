@@ -797,19 +797,57 @@ class TestVllmWorkerLauncher:
         assert env["SMG_VLLM_SERVICER_IMPL"] == "rust"
         assert env["CUDA_VISIBLE_DEVICES"] == "3"
 
-    def test_python_servicer_clears_an_inherited_rust_flag(self):
-        """The CLI flag is authoritative: a `SMG_VLLM_SERVICER_IMPL=rust`
-        exported in the operator's shell must not survive `--servicer-impl
-        python` (the default) into the worker's environment."""
-        launcher = VllmWorkerLauncher()
-        for connection_mode, impl in [("grpc", "python"), ("http", "rust")]:
-            args = argparse.Namespace(
-                model="/tmp/model", connection_mode=connection_mode, servicer_impl=impl
+    def test_an_explicit_servicer_choice_reaches_each_grpc_backends_worker_as_its_own_variable(
+        self,
+    ):
+        """`--servicer-impl` is one flag for the backends whose gRPC workers run
+        the servicer package: an explicit choice reaches the worker as that
+        backend's `SMG_<ENGINE>_SERVICER_IMPL` (the package defaults to rust, so
+        python must be spelled out); unset, an inherited variable passes through
+        untouched and the package's own default applies; a non-gRPC worker and a
+        backend without the choice get nothing."""
+        for launcher, variable in (
+            (VllmWorkerLauncher(), "SMG_VLLM_SERVICER_IMPL"),
+            (SglangWorkerLauncher(), "SMG_SGLANG_SERVICER_IMPL"),
+        ):
+            assert launcher.servicer_impl_env == variable
+            inherited = {"CUDA_VISIBLE_DEVICES": "0", variable: "rust"}
+            for impl in ("python", "rust"):
+                args = argparse.Namespace(
+                    model="/tmp/model", connection_mode="grpc", servicer_impl=impl
+                )
+                env = launcher.gpu_env(args, 0, dict(inherited))
+                assert (env[variable], env["CUDA_VISIBLE_DEVICES"]) == (impl, "0")
+            unset = argparse.Namespace(
+                model="/tmp/model", connection_mode="grpc", servicer_impl=None
             )
-            inherited = {"CUDA_VISIBLE_DEVICES": "0", "SMG_VLLM_SERVICER_IMPL": "rust"}
-            env = launcher.gpu_env(args, 0, inherited)
-            assert "SMG_VLLM_SERVICER_IMPL" not in env
-            assert env["CUDA_VISIBLE_DEVICES"] == "0"
+            assert launcher.gpu_env(unset, 0, dict(inherited))[variable] == "rust"
+            assert variable not in launcher.gpu_env(unset, 0, {"CUDA_VISIBLE_DEVICES": "0"})
+            http = argparse.Namespace(
+                model="/tmp/model", connection_mode="http", servicer_impl="python"
+            )
+            assert variable not in launcher.gpu_env(http, 0, {"CUDA_VISIBLE_DEVICES": "0"})
+        for launcher in (TokenspeedWorkerLauncher(), TrtllmWorkerLauncher()):
+            assert launcher.servicer_impl_env is None
+            args = argparse.Namespace(
+                model="/tmp/model", connection_mode="grpc", servicer_impl="python"
+            )
+            env = launcher.gpu_env(args, 0, {"CUDA_VISIBLE_DEVICES": "0"})
+            assert not any(key.endswith("_SERVICER_IMPL") for key in env)
+
+    def test_the_servicer_flag_is_refused_where_no_worker_consumes_it(self, capsys):
+        """A backend whose workers here run no servicer package (TensorRT-LLM;
+        the TokenSpeed backend is ZMQ-only) or a non-gRPC connection mode has no
+        servicer choice: the flag, either value, is refused at the parse."""
+        for argv in (
+            ["--backend", "trtllm", "--connection-mode", "grpc", "--servicer-impl", "python"],
+            ["--backend", "sglang", "--connection-mode", "zmq", "--servicer-impl", "rust"],
+            ["--backend", "vllm", "--connection-mode", "http", "--servicer-impl", "python"],
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                parse_serve_args([*argv, "--model", "/tmp/model"])
+            assert exc_info.value.code == 2
+            assert "servicer-impl" in capsys.readouterr().err
 
     def test_build_zmq_command_defaults_to_single_engine(self):
         launcher = VllmWorkerLauncher()

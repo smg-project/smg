@@ -110,7 +110,7 @@ on:
         default: false
         description: "Also run grpc_servicer/tests here, where the importorskip('vllm') / importorskip('sglang') cases meet a real engine; set on one lane per engine"
       servicer_impl:
-        description: "Which gRPC servicer the workers of the job's engine run (rust or python), handed to that engine's harness flag; empty keeps the engine default"
+        description: "Which gRPC servicer the workers of the job's engine run (rust or python), handed to that engine's harness flag; empty keeps the harness's default (python, pinned in the worker's environment: the servicer package itself defaults to rust)"
         required: false
         type: string
         default: ""

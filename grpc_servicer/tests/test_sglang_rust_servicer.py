@@ -12,6 +12,7 @@ import argparse
 import asyncio
 import inspect
 import json
+import logging
 import os
 import signal
 import sys
@@ -113,7 +114,8 @@ def test_package_exposes_the_flag_and_the_rust_entry_points():
 
 
 def test_resolve_servicer_impl_prefers_the_launcher_flag_then_the_env(no_parsed_flag):
-    assert rust.resolve_servicer_impl(environ={}) == "python"
+    assert rust.resolve_servicer_impl(environ={}) == "rust"
+    assert rust.resolve_servicer_impl(environ={"SMG_SGLANG_SERVICER_IMPL": " Python "}) == "python"
     assert rust.resolve_servicer_impl(environ={"SMG_SGLANG_SERVICER_IMPL": " Rust "}) == "rust"
     args = argparse.Namespace(servicer_impl="rust")
     assert rust.resolve_servicer_impl(args, environ={}) == "rust"
@@ -135,9 +137,9 @@ def test_resolve_servicer_impl_prefers_the_launcher_flag_then_the_env(no_parsed_
 
 
 def test_servicer_impl_source_names_the_origin_and_writes_a_flag_back(no_parsed_flag):
-    assert rust.servicer_impl_source(environ={}) == ("python", "default")
-    assert rust.servicer_impl_source(environ={"SMG_SGLANG_SERVICER_IMPL": "rust"}) == (
-        "rust",
+    assert rust.servicer_impl_source(environ={}) == ("rust", "default")
+    assert rust.servicer_impl_source(environ={"SMG_SGLANG_SERVICER_IMPL": "python"}) == (
+        "python",
         "env",
     )
     # `--servicer-impl python` with `rust` still exported: the flag decides,
@@ -148,7 +150,7 @@ def test_servicer_impl_source_names_the_origin_and_writes_a_flag_back(no_parsed_
     assert environ == {"SMG_SGLANG_SERVICER_IMPL": "python"}
     # Without a flag in hand nothing is written.
     environ = {}
-    assert rust.servicer_impl_source(SimpleNamespace(), environ=environ) == ("python", "default")
+    assert rust.servicer_impl_source(SimpleNamespace(), environ=environ) == ("rust", "default")
     assert environ == {}
     # The flag the plugin parsed in this process counts as the launcher's:
     # SGLang's ServerArgs does not carry it.
@@ -1074,3 +1076,112 @@ def test_a_launch_that_fails_stops_the_already_bound_server(monkeypatch, tmp_pat
     with pytest.raises(RuntimeError, match="scheduler would not start"):
         asyncio.run(rust.serve_rust(_server_args()))
     assert events == ["serving:False", "stop:5.0"]
+
+
+def test_a_launch_the_rust_path_does_not_serve_falls_back_on_defaults(
+    no_parsed_flag, caplog, monkeypatch
+):
+    """Nothing selected an implementation and the launch is one the Rust path
+    does not serve (PD or EPD disaggregation, a launch that asks for
+    multimodal input): the switch selects the Python servicer by fallback,
+    logs the gap once and writes the decision where the schedulers inherit
+    it. An explicit selection is never second-guessed, and the model's own
+    modality is never read: SGLang flags text deployments of structurally
+    multimodal families, and a wrong answer would put a text deployment on
+    the deprecated servicer."""
+    caplog.set_level(logging.WARNING)
+
+    def no_config_read(server_args):
+        raise AssertionError("the probe read the model config")
+
+    monkeypatch.setattr(rust, "_model_config", no_config_read)
+    cases = [
+        (
+            _server_args(disaggregation_mode="prefill"),
+            "PD disaggregation (disaggregation_mode='prefill')",
+        ),
+        (_server_args(language_only=True), "EPD disaggregation"),
+        (_server_args(enable_multimodal=True), "multimodal input"),
+    ]
+    for args, gap in cases:
+        environ = {}
+        assert rust.servicer_impl_source(args, environ=environ) == ("python", "fallback")
+        assert environ == {"SMG_SGLANG_SERVICER_IMPL": "python"}
+        assert f"does not serve this launch yet ({gap}" in caplog.text
+        caplog.clear()
+        assert rust.servicer_impl_source(args, environ={"SMG_SGLANG_SERVICER_IMPL": "rust"}) == (
+            "rust",
+            "env",
+        )
+        assert rust.servicer_impl_source(
+            argparse.Namespace(servicer_impl="python"), environ={}
+        ) == ("python", "flag")
+        assert caplog.text == ""
+    # A launch the Rust path serves goes to it: one without the flag, whatever
+    # the model's architecture (the config was not read: see above), or one
+    # with its multimodal input turned off at launch.
+    assert rust.unserved_on_rust(_server_args()) is None
+    assert rust.unserved_on_rust(_server_args(enable_multimodal=None)) is None
+    assert rust.unserved_on_rust(_server_args(enable_multimodal=False)) is None
+    assert rust.servicer_impl_source(_server_args(), environ={}) == ("rust", "default")
+
+
+def test_a_text_launch_of_a_multimodal_capable_family_takes_the_rust_path(
+    no_parsed_flag, caplog, monkeypatch
+):
+    """The probe reads the launch line, never the checkpoint: a text launch of
+    a family the engine calls multimodal (a vision config in the checkpoint,
+    the architecture on the engine's multimodal list) keeps the Rust servicer
+    on defaults, as it served before the default moved; a launch that enables
+    multimodal input falls back with the line; the same launch with the field
+    off does not; and an explicit ``rust`` on the launch that enables it is
+    served, never refused (the launch-time refusal is PD/EPD only)."""
+    caplog.set_level(logging.WARNING)
+    vision_capable = _model_config(
+        is_multimodal=True,
+        hf_config=SimpleNamespace(
+            model_type="deepseek_v41",
+            architectures=["DeepseekV41ForCausalLM"],
+            vision_config=SimpleNamespace(),
+            image_token_id=5,
+            pad_token_id=0,
+            bos_token_id=1,
+            id2label=None,
+            num_labels=0,
+        ),
+    )
+    monkeypatch.setattr(rust, "_model_config", lambda server_args: vision_capable)
+    text_launch = _server_args()
+    assert rust.unserved_on_rust(text_launch) is None
+    assert rust.servicer_impl_source(text_launch, environ={}) == ("rust", "default")
+    assert caplog.text == ""
+    with_images = _server_args(enable_multimodal=True)
+    assert rust.servicer_impl_source(with_images, environ={}) == ("python", "fallback")
+    assert "does not serve this launch yet (multimodal input (--enable-multimodal" in caplog.text
+    caplog.clear()
+    without_images = _server_args(enable_multimodal=False)
+    assert rust.servicer_impl_source(without_images, environ={}) == ("rust", "default")
+    explicit = {"SMG_SGLANG_SERVICER_IMPL": "rust"}
+    assert rust.servicer_impl_source(with_images, environ=explicit) == ("rust", "env")
+    rust.refuse_disaggregation(with_images)
+    assert caplog.text == ""
+
+
+def test_the_launch_names_the_python_selection_for_a_checkpoint_the_engine_calls_multimodal(
+    monkeypatch, caplog
+):
+    """The Rust path serves a multimodal checkpoint's text and advertises no
+    vision, so the gateway refuses its image inputs per request and nothing
+    in that refusal names the way out: the launch says so once, naming the
+    Python selection; a text checkpoint gets no such line."""
+    caplog.set_level(logging.WARNING)
+    monkeypatch.setattr(rust, "server_facts", lambda args: {"server": "facts"})
+    monkeypatch.setattr(rust, "_model_config", lambda args: _model_config(is_multimodal=True))
+    facts = rust.SglangLauncher().facts(_server_args())
+    assert (facts["supports_vision"], facts["server"]) == (True, "facts")
+    assert "reads this checkpoint as multimodal (Qwen3ForCausalLM)" in caplog.text
+    assert "SMG_SGLANG_SERVICER_IMPL=python or --servicer-impl python" in caplog.text
+    caplog.clear()
+    monkeypatch.setattr(rust, "_model_config", lambda args: _model_config())
+    assert rust.SglangLauncher().facts(_server_args())["supports_vision"] is False
+    assert caplog.text == ""

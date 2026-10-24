@@ -122,7 +122,9 @@ def test_rust_servicer_impl_is_a_worker_env_flag(monkeypatch):
     monkeypatch.delenv(ENV_VLLM_SERVICER_IMPL, raising=False)
     monkeypatch.delenv("SMG_VLLM_SERVICER_IMPL", raising=False)
     assert "vllm.entrypoints.grpc_server" in w._build_vllm_grpc_cmd("/models/llama", 1, spec)
-    assert "SMG_VLLM_SERVICER_IMPL" not in w._build_env()
+    # The harness's default, the Python servicer, is pinned in the worker's
+    # environment: the servicer package itself defaults to rust.
+    assert w._build_env()["SMG_VLLM_SERVICER_IMPL"] == "python"
 
     monkeypatch.setenv(ENV_VLLM_SERVICER_IMPL, "rust")
     cmd = w._build_vllm_grpc_cmd("/models/llama", 1, spec)
@@ -137,7 +139,7 @@ def test_rust_servicer_impl_is_a_worker_env_flag(monkeypatch):
     # The lane setting wins over a flag inherited from the operator's shell.
     monkeypatch.delenv(ENV_VLLM_SERVICER_IMPL, raising=False)
     monkeypatch.setenv("SMG_VLLM_SERVICER_IMPL", "rust")
-    assert "SMG_VLLM_SERVICER_IMPL" not in w._build_env()
+    assert w._build_env()["SMG_VLLM_SERVICER_IMPL"] == "python"
 
     monkeypatch.setenv(ENV_VLLM_SERVICER_IMPL, "go")
     with pytest.raises(ValueError, match=ENV_VLLM_SERVICER_IMPL):
