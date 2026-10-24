@@ -885,19 +885,20 @@ impl JsonSeparators {
 
 /// Formatter matching Python's `json.dumps` separator and ASCII escaping rules.
 #[derive(Debug, Clone)]
-struct PythonJsonFormatter {
+struct PythonJsonFormatter<'a> {
     current_indent: usize,
     has_value: bool,
-    indent: Option<Vec<u8>>,
+    indent: Option<&'a [u8]>,
     separators: JsonSeparators,
     ensure_ascii: bool,
 }
 
-impl PythonJsonFormatter {
-    /// `indent` is the bytes written per level of nesting, `None` for compact
-    /// output; an empty indent breaks the lines and indents nothing, as
-    /// Python's `json.dumps(indent=0)` does.
-    fn new(indent: Option<Vec<u8>>, separators: JsonSeparators, ensure_ascii: bool) -> Self {
+impl<'a> PythonJsonFormatter<'a> {
+    /// `indent` is the bytes written per level of nesting, borrowed from the
+    /// filter call that owns them, `None` for compact output; an empty indent
+    /// breaks the lines and indents nothing, as Python's `json.dumps(indent=0)`
+    /// does.
+    fn new(indent: Option<&'a [u8]>, separators: JsonSeparators, ensure_ascii: bool) -> Self {
         Self {
             current_indent: 0,
             has_value: false,
@@ -933,7 +934,7 @@ where
     ])
 }
 
-impl Formatter for PythonJsonFormatter {
+impl Formatter for PythonJsonFormatter<'_> {
     fn write_string_fragment<W>(&mut self, writer: &mut W, fragment: &str) -> io::Result<()>
     where
         W: ?Sized + io::Write,
@@ -978,7 +979,7 @@ impl Formatter for PythonJsonFormatter {
     where
         W: ?Sized + io::Write,
     {
-        if let Some(indent) = self.indent.as_deref() {
+        if let Some(indent) = self.indent {
             self.current_indent -= 1;
             if self.has_value {
                 writer.write_all(b"\n")?;
@@ -992,7 +993,7 @@ impl Formatter for PythonJsonFormatter {
     where
         W: ?Sized + io::Write,
     {
-        if let Some(indent) = self.indent.as_deref() {
+        if let Some(indent) = self.indent {
             if first {
                 writer.write_all(b"\n")?;
             } else {
@@ -1030,7 +1031,7 @@ impl Formatter for PythonJsonFormatter {
     where
         W: ?Sized + io::Write,
     {
-        if let Some(indent) = self.indent.as_deref() {
+        if let Some(indent) = self.indent {
             self.current_indent -= 1;
             if self.has_value {
                 writer.write_all(b"\n")?;
@@ -1044,7 +1045,7 @@ impl Formatter for PythonJsonFormatter {
     where
         W: ?Sized + io::Write,
     {
-        if let Some(indent) = self.indent.as_deref() {
+        if let Some(indent) = self.indent {
             if first {
                 writer.write_all(b"\n")?;
             } else {
@@ -1155,7 +1156,7 @@ fn serialize_with_python_json<T: Serialize>(
     separators: JsonSeparators,
     ensure_ascii: bool,
 ) -> std::result::Result<String, MinijinjaError> {
-    let formatter = PythonJsonFormatter::new(indent.map(<[u8]>::to_vec), separators, ensure_ascii);
+    let formatter = PythonJsonFormatter::new(indent, separators, ensure_ascii);
     // Sized for a tool schema up front: a buffer grown from empty is
     // reallocated at every doubling on the way to the same size.
     let mut buf = Vec::with_capacity(TOJSON_BUFFER_BYTES);
