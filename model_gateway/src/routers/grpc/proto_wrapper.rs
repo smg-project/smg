@@ -2465,7 +2465,7 @@ mod tests {
         assert_eq!(MultimodalData::Vllm(image).inline_bytes(), 56);
     }
 
-    use super::{multimodal::tensor_bytes_to_tokenspeed, shm::tokenspeed_shm_path, *};
+    use super::{multimodal::tensor_bytes_to_tokenspeed, *};
 
     #[test]
     fn tokenspeed_image_into_proto_uses_itemized_payload() {
@@ -2615,6 +2615,8 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn tokenspeed_shm_writer_exposes_complete_mapped_payload() {
+        use super::shm::tokenspeed_shm_path;
+
         let expected = [0x12, 0x34, 0x56, 0x78];
         let handle = write_tokenspeed_shm_with(expected.len(), |output| {
             output.copy_from_slice(&expected);
