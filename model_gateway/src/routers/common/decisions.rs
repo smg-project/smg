@@ -22,7 +22,7 @@ use serde_json::{json, Map, Value};
 
 use crate::{
     observability::metrics::error_reason_from_status,
-    routers::{error, grpc::utils::mark_error_reason},
+    routers::{common::attempt_ledger::UpstreamAnswer, error, grpc::utils::mark_error_reason},
 };
 
 pub(crate) const UPSTREAM_ROUTE: &str = "/v1/systemone";
@@ -242,10 +242,12 @@ impl SglangDecisionAdapter {
                         .and_then(Value::as_str)
                         .unwrap_or("upstream_decisions_error");
                     let mut response = error::create_error(parts.status, code, message);
-                    // The answer is the worker's, re-minted under its own code
-                    // (or the relay's): the error counter's reason is the
-                    // worker's status, not the gateway's own processing.
-                    mark_error_reason(&mut response, error_reason_from_status(parts.status));
+                    // A worker's own answer (not the gateway's failed send or
+                    // body read), re-minted under its code or the relay's: the
+                    // error counter's reason is the worker's status.
+                    if parts.extensions.get::<UpstreamAnswer>().is_some() {
+                        mark_error_reason(&mut response, error_reason_from_status(parts.status));
+                    }
                     if let Some(value) = value.filter(|value| {
                         value
                             .pointer("/error/message")
@@ -760,7 +762,10 @@ mod tests {
             observability::metrics::metrics_labels::{
                 REASON_ENGINE_INTERNAL, REASON_INVALID_REQUEST, REASON_MODEL_NOT_FOUND,
             },
-            routers::grpc::utils::error_reason_for_response,
+            routers::{
+                common::attempt_ledger::mark_upstream_answer,
+                grpc::utils::error_reason_for_response,
+            },
         };
         for (status, fixture, reason) in [
             (
@@ -786,12 +791,35 @@ mod tests {
         ] {
             let adapter =
                 SglangDecisionAdapter::new(&request(json!("x"), all_questions())).unwrap();
-            let response = adapter
-                .convert_response((status, Json(fixture)).into_response(), 100_000)
-                .await;
+            let mut answer = (status, Json(fixture)).into_response();
+            mark_upstream_answer(&mut answer);
+            let response = adapter.convert_response(answer, 100_000).await;
             assert_eq!(response.status(), status);
             assert_eq!(error_reason_for_response(&response), reason, "{status}");
         }
+    }
+
+    /// The gateway's own failed send or body read reaches the adapter as an
+    /// error without the worker's answer marker: its code keeps naming the
+    /// reason (a transport fault stays one), the status does not take over.
+    #[tokio::test]
+    async fn a_gateway_own_error_keeps_the_reason_of_its_code() {
+        use crate::{
+            observability::metrics::metrics_labels::REASON_TRANSPORT_DISCONNECT,
+            routers::grpc::utils::error_reason_for_response,
+        };
+        let adapter = SglangDecisionAdapter::new(&request(json!("x"), all_questions())).unwrap();
+        let response = adapter
+            .convert_response(
+                error::internal_error("call_upstream_connection_failed", "refused"),
+                100_000,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error_reason_for_response(&response),
+            REASON_TRANSPORT_DISCONNECT
+        );
     }
 
     #[tokio::test]
