@@ -224,7 +224,7 @@ A changed credential rolls the router pods, as a changed store URL does: the pod
 
 #### Router Probes and Shutdown
 
-The router's liveness probe is `httpGet /health`, which answers 200 while the process serves. Its readiness probe is `httpGet /readiness`, which answers 503 while the gateway has no healthy worker, while a tokenizer is not yet registered and while the gateway drains after SIGTERM, so the Service stops sending new connections to a pod that cannot take them (`router.livenessProbe.path` and `router.readinessProbe.path` override the routes).
+The router's liveness probe is `httpGet /health`, which answers 200 while the process serves. Its readiness probe is `httpGet /readiness`, which answers 503 while the gateway has no healthy worker, while a tokenizer is not yet registered and while the gateway drains after SIGTERM, so the Service stops sending new connections to a pod that cannot take them (`router.livenessProbe.path` and `router.readinessProbe.path` override the routes). Both readiness bodies carry a `models` section, one entry per served model with the same predicates applied to that model's workers (`ready`, a `reason` when it is not, its healthy and registered worker counts), for a rollout or traffic switch that keys on one model while the status answers for the gateway as a whole.
 
 PD readiness defaults to one healthy prefill and one healthy decode worker. For some
 workloads, that remaining capacity is already insufficient: continued traffic can
