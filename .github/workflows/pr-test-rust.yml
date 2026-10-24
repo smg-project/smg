@@ -75,7 +75,7 @@ jobs:
       timeout: 20
       test_timeout: 16
       test_dirs: e2e_test/chat_completions/test_multimodal.py
-      test_filter: TestMultimodalQwen3VL
+      test_filter: '-k TestMultimodalQwen3VL'
       min_selected: 6
       servicer_unit_tests: false
       gpu_vendor: amd

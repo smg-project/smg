@@ -171,7 +171,7 @@
     "models": 1,
     "floor": 6,
     "test_dirs": "e2e_test/chat_completions/test_multimodal.py",
-    "test_filter": "TestMultimodalQwen3VL",
+    "test_filter": "-k TestMultimodalQwen3VL",
     "servicer_impl": "",
     "servicer_unit_tests": false,
     "engine_unit_junit": false,
