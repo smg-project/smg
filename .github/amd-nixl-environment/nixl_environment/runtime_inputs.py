@@ -95,6 +95,8 @@ def state():
 def constraints():
     value, _ = verify_bundle()
     path = state().with_name(state().name + "-cohort-constraints.txt")
+    with state().with_name(state().name + "-original-image-environment.json").open("x") as stream:
+        json.dump({name: os.environ.get(name) for name in ("PIP_CONSTRAINT", "LD_LIBRARY_PATH")}, stream)
     raw = "".join(name + "==" + item["version"] + "\n" for name, item in sorted(value["packages"].items()))
     with path.open("x") as stream:
         stream.write(raw)
@@ -176,6 +178,14 @@ def cairo_proof(value):
 
 def bootstrap():
     value, root = verify_bundle()
+    original = json.loads(state().with_name(state().name + "-original-image-environment.json").read_text())
+    original_constraint = original["PIP_CONSTRAINT"]
+    expected_constraint = (original_constraint + " " if original_constraint else "") + str(state().with_name(state().name + "-cohort-constraints.txt"))
+    require(json.loads((state() / "plan.json").read_text())["original_environment"] == expected_constraint, "original constraints were not preserved before prepare")
+    expected_ld = "/work/cairo-runtime:/input/private-five/usr/lib/x86_64-linux-gnu" + (":" + original["LD_LIBRARY_PATH"] if original["LD_LIBRARY_PATH"] else "")
+    require(os.environ.get("LD_LIBRARY_PATH") == expected_ld, "original image loader suffix changed before private prepare")
+    with (state() / "cohort-original-image-environment.json").open("x") as stream:
+        json.dump(original, stream, indent=2)
     for name, version in value["image_versions"].items():
         require(metadata.version(name) == version, "fixed image metadata differs: " + name)
     require(metadata.version("setuptools") == "79.0.1", "stock build frontend changed")
