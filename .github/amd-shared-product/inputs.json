@@ -86,7 +86,7 @@
     "crates": "ae100a0dd89846418c93c09861dd7f24b3222296",
     "model_gateway": "d1a181bfb1d16a661e16346d4eb8f257689701ce",
     "grpc_servicer": "a10bb7235d74ac91d8de4b3eafabd1ef7ed1344e",
-    "e2e_test": "86466acc9292a4b1b684b29ba3e07ed4038bd511",
+    "e2e_test": "58e7c8160f19706a9d19f09063847357df18c4c7",
     "scripts": "6b21b75245705e319d0334500e6f41b16d602e97",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows/e2e-gpu-job.yml": "c8daa461a9d5913bffa56b890505b6074776fb78",
@@ -170,7 +170,7 @@
   },
   "consumer_gpu_ready": false,
   "admitted_lane": null,
-  "target_product_commit": "d9b4c72778e2afd71132f710164086826c8f3997",
+  "target_product_commit": "f0f296911fe44a4895d797d2bfd507a4493b2c14",
   "reference_target_ids": {
     "rust": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat-rust-servicer[2]/tokenspeed/nvidia",
     "zmq": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat-zmq[1]/tokenspeed/nvidia"
@@ -214,5 +214,13 @@
   },
   "old_result_transfer": false,
   "source_note": "Compiled37 c9d equals actual445. Old bd43/native24d966 differs in six compiled entries; must execute all167 per new lane, no old160/6 splice.",
-  "actual_prior_GPU_for_this_contract": null
+  "actual_prior_GPU_for_this_contract": null,
+  "dispatch_contract": {
+    "manual_template": ".github/workflows/amd-ts-chat167-equivalent.yml",
+    "registered_workflow": ".github/workflows/pr-test-rust.yml",
+    "internal_admission_overlay_required": true,
+    "template_registered_on_default_branch_proven": false,
+    "future_root_admission_child_changes": "Only source inputs flags/admitted_lane/budget and exact manual template bytes over registered workflow; normal product workflow preserved in target_product_commit. No public PR/default NV/H100 activation.",
+    "one_selected_lane_per_run": true
+  }
 }
