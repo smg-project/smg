@@ -3,7 +3,6 @@
 //! Each migration is a function that generates Oracle DDL from [`SchemaConfig`],
 //! so it respects custom table/column names. PL/SQL exception handling ensures
 //! idempotency (safe to re-run if a previous attempt partially completed).
-#![cfg_attr(not(test), allow(dead_code))]
 
 use crate::{schema::SchemaConfig, versioning::Migration};
 
