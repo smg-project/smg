@@ -1,7 +1,7 @@
 {
-  "ready": false,
-  "run_budget_admitted": false,
-  "artifacts_pinned": false,
+  "ready": true,
+  "run_budget_admitted": true,
+  "artifacts_pinned": true,
   "artifacts": [
     {
       "name": "smg-wheel",
@@ -228,7 +228,7 @@
     "diagnostic_workflow_difference": "NIXL tier-select dispatch caller only; normal product tooling CPU jobs are not part of this diagnostic workflow."
   },
   "source_identity_note": "Actual consumer19 differs only in its e2e_test tree through the exact three owned-log test overlay files bound by test-overlay.json; the other18 source entries are unchanged. Compiled37c9d, actual445 producer14 and native143a are unchanged and are separate from the consumer test source. Original models, requests and positive oracles are retained; the transfer test body changes its log selection to the owned fixture paths.",
-  "admitted_tier": null,
+  "admitted_tier": "2",
   "contracts": {
     "2": {
       "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-2gpu-pd[2]/vllm/nvidia",
