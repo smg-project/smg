@@ -86,7 +86,7 @@
     "crates": "ae100a0dd89846418c93c09861dd7f24b3222296",
     "model_gateway": "d1a181bfb1d16a661e16346d4eb8f257689701ce",
     "grpc_servicer": "a10bb7235d74ac91d8de4b3eafabd1ef7ed1344e",
-    "e2e_test": "58e7c8160f19706a9d19f09063847357df18c4c7",
+    "e2e_test": "63e2431d9111f5f8beea0f53263d4471fbcb34b8",
     "scripts": "6b21b75245705e319d0334500e6f41b16d602e97",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows/e2e-gpu-job.yml": "c8daa461a9d5913bffa56b890505b6074776fb78",
@@ -170,7 +170,7 @@
   },
   "consumer_gpu_ready": false,
   "admitted_lane": null,
-  "target_product_commit": "f0f296911fe44a4895d797d2bfd507a4493b2c14",
+  "target_product_commit": "d61f5964595f6e596bf90880a915639e773bf5a8",
   "reference_target_ids": {
     "rust": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat-rust-servicer[2]/tokenspeed/nvidia",
     "zmq": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat-zmq[1]/tokenspeed/nvidia"
