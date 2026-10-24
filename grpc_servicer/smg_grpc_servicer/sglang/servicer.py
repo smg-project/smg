@@ -1105,20 +1105,26 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         stop = list(grpc_params.stop) if grpc_params.stop else None
         stop_token_ids = list(grpc_params.stop_token_ids) if grpc_params.stop_token_ids else None
 
+        # proto3 cannot tell an unset scalar from its zero, and the zeros of
+        # these three are never meant: top_p 0.0 keeps the top token only,
+        # top_k 0 is an empty candidate set, and a repetition factor of 0.0
+        # sends a repeated token's positive logit to infinity (the scheduler's
+        # own checks refuse all three where they run). An unset one means the
+        # neutral value: the whole distribution, every token, no penalty.
+        top_p = grpc_params.top_p if grpc_params.top_p != 0.0 else 1.0
+        top_k = grpc_params.top_k if grpc_params.top_k != 0 else -1
+        repetition_penalty = (
+            grpc_params.repetition_penalty if grpc_params.repetition_penalty != 0.0 else 1.0
+        )
+
         return SGLSamplingParams(
             temperature=grpc_params.temperature,
-            top_p=grpc_params.top_p,
-            top_k=grpc_params.top_k,
+            top_p=top_p,
+            top_k=top_k,
             min_p=grpc_params.min_p,
             frequency_penalty=grpc_params.frequency_penalty,
             presence_penalty=grpc_params.presence_penalty,
-            # proto3 cannot tell an unset float from 0.0, and a zero penalty
-            # factor is never meant (a repeated token's positive logit divided
-            # by it is infinite): an unset penalty is no penalty, as on the
-            # Rust servicer.
-            repetition_penalty=grpc_params.repetition_penalty
-            if grpc_params.repetition_penalty != 0.0
-            else 1.0,
+            repetition_penalty=repetition_penalty,
             max_new_tokens=max_new_tokens,
             min_new_tokens=grpc_params.min_new_tokens,
             stop=stop,

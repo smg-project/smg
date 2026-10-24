@@ -1,7 +1,8 @@
-"""The SGLang Python servicer's sampling conversion: an unset
-``repetition_penalty`` reaches the scheduler as 1.0 (no penalty), a set one
-as itself. proto3 cannot tell an unset float from 0.0, and a zero penalty
-factor is never meant; the Rust servicer applies the same rule."""
+"""The SGLang Python servicer's sampling conversion reads an unset sampling
+scalar as its neutral value. proto3 cannot tell an unset scalar from its zero,
+and the zeros of ``top_p`` (the top token only), ``top_k`` (an empty candidate
+set) and ``repetition_penalty`` (a repeated token's positive logit divided by
+zero) are never meant; a set value reaches the scheduler as itself."""
 
 from __future__ import annotations
 
@@ -24,28 +25,42 @@ def convert(monkeypatch, servicer_mod):
 
 
 @pytest.mark.parametrize(
-    ("penalty", "expected"),
+    ("sent", "field", "expected"),
     [
-        pytest.param({}, 1.0, id="unset-is-no-penalty"),
-        pytest.param({"repetition_penalty": 1.0}, 1.0, id="explicit-1.0"),
-        pytest.param({"repetition_penalty": 1.3}, 1.3, id="explicit-1.3"),
+        pytest.param({}, "repetition_penalty", 1.0, id="penalty-unset-is-no-penalty"),
+        pytest.param({"repetition_penalty": 1.0}, "repetition_penalty", 1.0, id="penalty-1.0"),
+        pytest.param({"repetition_penalty": 1.3}, "repetition_penalty", 1.3, id="penalty-1.3"),
+        pytest.param({}, "top_p", 1.0, id="top_p-unset-is-the-whole-distribution"),
+        pytest.param({"top_p": 1.0}, "top_p", 1.0, id="top_p-1.0"),
+        pytest.param({"top_p": 0.9}, "top_p", 0.9, id="top_p-0.9"),
+        pytest.param({}, "top_k", -1, id="top_k-unset-is-every-token"),
+        pytest.param({"top_k": -1}, "top_k", -1, id="top_k-minus-one"),
+        pytest.param({"top_k": 1}, "top_k", 1, id="top_k-1"),
+        pytest.param({"top_k": 40}, "top_k", 40, id="top_k-40"),
     ],
 )
-def test_an_unset_repetition_penalty_reaches_the_scheduler_as_one(convert, penalty, expected):
-    params = convert(pb.SamplingParams(temperature=0.0, top_p=1.0, top_k=-1, **penalty))
-    assert params.repetition_penalty == pytest.approx(expected)
+def test_an_unset_sampling_scalar_reaches_the_scheduler_as_its_neutral_value(
+    convert, sent, field, expected
+):
+    params = convert(pb.SamplingParams(temperature=0.0, **sent))
+    assert getattr(params, field) == pytest.approx(expected)
 
 
-def test_a_zero_repetition_penalty_is_not_expressible_on_the_wire():
+@pytest.mark.parametrize("field", ["top_p", "top_k", "repetition_penalty"])
+def test_a_zero_sampling_scalar_is_not_expressible_on_the_wire(field):
     # proto3 leaves a scalar at its default off the wire: a client that sets
-    # 0.0 sends the same bytes as one that leaves the field unset, so the
-    # conversion cannot tell them apart, and 0.0 is read as unset.
-    explicit_zero = pb.SamplingParams(repetition_penalty=0.0).SerializeToString()
+    # the zero sends the same bytes as one that leaves the field unset, so the
+    # conversion cannot tell them apart, and the zero is read as unset.
+    explicit_zero = pb.SamplingParams(**{field: 0}).SerializeToString()
     assert explicit_zero == pb.SamplingParams().SerializeToString()
 
 
 def test_the_other_sampling_scalars_pass_through_as_sent(convert):
-    # temperature, top_p, top_k and min_p are plain fields too; the scheduler
-    # reads them as sent (0.0 is greedy, -1 is every token), on both servicers.
-    params = convert(pb.SamplingParams(temperature=0.0, top_p=1.0, top_k=-1, min_p=0.0))
-    assert (params.temperature, params.top_p, params.top_k, params.min_p) == (0.0, 1.0, -1, 0.0)
+    # temperature and min_p are plain fields whose zero is a meaning of its
+    # own (greedy; no floor): they reach the scheduler as sent, as do the
+    # penalties whose neutral value is 0.
+    params = convert(
+        pb.SamplingParams(temperature=0.0, min_p=0.0, frequency_penalty=0.0, presence_penalty=0.5)
+    )
+    assert (params.temperature, params.min_p) == (0.0, 0.0)
+    assert (params.frequency_penalty, params.presence_penalty) == (0.0, 0.5)
