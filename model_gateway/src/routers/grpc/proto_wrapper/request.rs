@@ -135,18 +135,6 @@ impl ProtoGenerateRequest {
         }
     }
 
-    /// Get mutable vLLM variant (panics if not vLLM)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_vllm() check"
-    )]
-    pub fn as_vllm_mut(&mut self) -> &mut vllm::GenerateRequest {
-        match self {
-            Self::Vllm(req) => req,
-            _ => panic!("Expected vLLM GenerateRequest"),
-        }
-    }
-
     /// Get TensorRT-LLM variant (panics if not TensorRT-LLM)
     #[expect(
         clippy::panic,
@@ -159,36 +147,12 @@ impl ProtoGenerateRequest {
         }
     }
 
-    /// Get mutable TensorRT-LLM variant (panics if not TensorRT-LLM)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_trtllm() check"
-    )]
-    pub fn as_trtllm_mut(&mut self) -> &mut trtllm::GenerateRequest {
-        match self {
-            Self::Trtllm(req) => req,
-            _ => panic!("Expected TensorRT-LLM GenerateRequest"),
-        }
-    }
-
     /// Get TokenSpeed variant (panics if not TokenSpeed)
     #[expect(
         clippy::panic,
         reason = "typed accessor: caller guarantees variant via is_tokenspeed() check"
     )]
     pub fn as_tokenspeed(&self) -> &tokenspeed::GenerateRequest {
-        match self {
-            Self::TokenSpeed(req) => req,
-            _ => panic!("Expected TokenSpeed GenerateRequest"),
-        }
-    }
-
-    /// Get mutable TokenSpeed variant (panics if not TokenSpeed)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_tokenspeed() check"
-    )]
-    pub fn as_tokenspeed_mut(&mut self) -> &mut tokenspeed::GenerateRequest {
         match self {
             Self::TokenSpeed(req) => req,
             _ => panic!("Expected TokenSpeed GenerateRequest"),

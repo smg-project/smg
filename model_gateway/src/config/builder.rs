@@ -70,30 +70,8 @@ impl RouterConfigBuilder {
         self
     }
 
-    /// With separate policies
-    pub fn prefill_decode_mode_with_policies(
-        mut self,
-        prefill_urls: Vec<(String, Option<u16>)>,
-        decode_urls: Vec<String>,
-        prefill_policy: Option<PolicyConfig>,
-        decode_policy: Option<PolicyConfig>,
-    ) -> Self {
-        self.config.mode = RoutingMode::PrefillDecode {
-            prefill_urls,
-            decode_urls,
-            prefill_policy,
-            decode_policy,
-        };
-        self
-    }
-
     pub fn openai_mode(mut self, worker_urls: Vec<String>) -> Self {
         self.config.mode = RoutingMode::OpenAI { worker_urls };
-        self
-    }
-
-    pub fn gemini_mode(mut self, worker_urls: Vec<String>) -> Self {
-        self.config.mode = RoutingMode::Gemini { worker_urls };
         self
     }
 
@@ -179,11 +157,6 @@ impl RouterConfigBuilder {
 
     pub fn connection_mode(mut self, mode: ConnectionMode) -> Self {
         self.config.connection_mode = mode;
-        self
-    }
-
-    pub fn http_connection(mut self) -> Self {
-        self.config.connection_mode = ConnectionMode::Http;
         self
     }
 
@@ -499,12 +472,6 @@ impl RouterConfigBuilder {
         self
     }
 
-    /// Remove the in-flight bound entirely (`max_concurrent_requests = 0`).
-    pub fn disable_rate_limiting(mut self) -> Self {
-        self.config.max_concurrent_requests = 0;
-        self
-    }
-
     pub fn queue_size(mut self, size: usize) -> Self {
         self.config.queue_size = size;
         self
@@ -592,11 +559,6 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn add_cors_origin<S: Into<String>>(mut self, origin: S) -> Self {
-        self.config.cors_allowed_origins.push(origin.into());
-        self
-    }
-
     // ==================== Retry ====================
 
     pub fn retry_config(mut self, retry: RetryConfig) -> Self {
@@ -609,11 +571,6 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn enable_retries(mut self) -> Self {
-        self.config.disable_retries = false;
-        self
-    }
-
     // ==================== Circuit Breaker ====================
 
     pub fn circuit_breaker_config(mut self, circuit_breaker: CircuitBreakerConfig) -> Self {
@@ -623,11 +580,6 @@ impl RouterConfigBuilder {
 
     pub fn disable_circuit_breaker(mut self) -> Self {
         self.config.disable_circuit_breaker = true;
-        self
-    }
-
-    pub fn enable_circuit_breaker(mut self) -> Self {
-        self.config.disable_circuit_breaker = false;
         self
     }
 
@@ -667,14 +619,6 @@ impl RouterConfigBuilder {
         self.config.trace_config = Some(TraceConfig {
             enable_trace: true,
             otlp_traces_endpoint: endpoint.into(),
-        });
-        self
-    }
-
-    pub fn disable_trace(mut self) -> Self {
-        self.config.trace_config = Some(TraceConfig {
-            enable_trace: false,
-            otlp_traces_endpoint: String::new(),
         });
         self
     }
@@ -721,12 +665,6 @@ impl RouterConfigBuilder {
 
     pub fn enable_igw(mut self) -> Self {
         self.config.enable_igw = true;
-        self
-    }
-
-    /// Use proxy mode
-    pub fn disable_igw(mut self) -> Self {
-        self.config.enable_igw = false;
         self
     }
 
@@ -787,25 +725,9 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn memory_history(mut self) -> Self {
-        self.config.history_backend = HistoryBackend::Memory;
-        self
-    }
-
-    pub fn no_history(mut self) -> Self {
-        self.config.history_backend = HistoryBackend::None;
-        self
-    }
-
     pub fn oracle_history(mut self, oracle_config: OracleConfig) -> Self {
         self.config.history_backend = HistoryBackend::Oracle;
         self.config.oracle = Some(oracle_config);
-        self
-    }
-
-    pub fn redis_history(mut self, redis_config: RedisConfig) -> Self {
-        self.config.history_backend = HistoryBackend::Redis;
-        self.config.redis = Some(redis_config);
         self
     }
 
@@ -825,18 +747,6 @@ impl RouterConfigBuilder {
 
     pub fn tokenizer_cache(mut self, cache: TokenizerCacheConfig) -> Self {
         self.config.tokenizer_cache = cache;
-        self
-    }
-
-    // ==================== Data Parallelism ====================
-
-    pub fn enable_dp_aware(mut self) -> Self {
-        self.config.dp_aware = true;
-        self
-    }
-
-    pub fn disable_dp_aware(mut self) -> Self {
-        self.config.dp_aware = false;
         self
     }
 
@@ -938,13 +848,6 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn maybe_tenant_header_name(mut self, header_name: Option<impl Into<String>>) -> Self {
-        if let Some(header_name) = header_name {
-            self.config.tenant_resolution.tenant_header_name = header_name.into();
-        }
-        self
-    }
-
     pub fn maybe_rate_limit_tokens_per_second(mut self, tokens: Option<i32>) -> Self {
         self.config.rate_limit_tokens_per_second = tokens;
         self
@@ -1007,17 +910,6 @@ impl RouterConfigBuilder {
 
     // ==================== mTLS ====================
 
-    /// Both paths must be provided together. Files read during build()
-    pub fn client_cert_and_key<S1: Into<String>, S2: Into<String>>(
-        mut self,
-        cert_path: S1,
-        key_path: S2,
-    ) -> Self {
-        self.client_cert_path = Some(cert_path.into());
-        self.client_key_path = Some(key_path.into());
-        self
-    }
-
     /// Files read during build()
     pub fn maybe_client_cert_and_key(
         mut self,
@@ -1029,12 +921,6 @@ impl RouterConfigBuilder {
         self
     }
 
-    /// File read during build()
-    pub fn add_ca_certificate<S: Into<String>>(mut self, ca_cert_path: S) -> Self {
-        self.ca_cert_paths.push(ca_cert_path.into());
-        self
-    }
-
     /// Files read during build()
     pub fn add_ca_certificates<S: Into<String>>(mut self, ca_cert_paths: Vec<S>) -> Self {
         self.ca_cert_paths
@@ -1043,17 +929,6 @@ impl RouterConfigBuilder {
     }
 
     // ==================== Server TLS ====================
-
-    /// Both paths must be provided together. Files read during build()
-    pub fn server_cert_and_key<S1: Into<String>, S2: Into<String>>(
-        mut self,
-        cert_path: S1,
-        key_path: S2,
-    ) -> Self {
-        self.server_cert_path = Some(cert_path.into());
-        self.server_key_path = Some(key_path.into());
-        self
-    }
 
     /// Files read during build()
     pub fn maybe_server_cert_and_key(
