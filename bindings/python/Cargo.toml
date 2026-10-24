@@ -69,13 +69,6 @@ opencv-video = ["smg/opencv-video"]
 vendored-openssl = ["smg/vendored-openssl"]
 jemalloc-profiling = ["smg/jemalloc-profiling", "tikv-jemallocator/profiling"]
 
-[profile.ci]
-inherits = "release"
-opt-level = 2       # Lighter optimization (still fast runtime, much faster compile)
-lto = "thin"        # Thin LTO - good balance
-codegen-units = 16  # More parallelization for faster builds
-strip = true
-
 [lints]
 workspace = true
 
