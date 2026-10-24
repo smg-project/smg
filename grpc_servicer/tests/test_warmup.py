@@ -1318,7 +1318,8 @@ def test_the_hold_flips_health_alone_and_falls_back_on_an_older_binding():
 def test_the_real_server_classes_carry_the_health_only_setter():
     """The Rust servers of every engine expose ``set_ready`` beside
     ``set_serving`` (the semantics are pinned by the servers' own tests: held
-    = NOT_SERVING with admission open; drained = admission closed)."""
+    = NOT_SERVING, admitting the warm-up's own requests only; drained =
+    admission closed)."""
     servicer = pytest.importorskip("smg.servicer")
     for name in ("VllmGrpcServer", "SglangGrpcServer", "TokenSpeedGrpcServer"):
         cls = getattr(servicer, name)

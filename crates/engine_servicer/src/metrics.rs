@@ -828,8 +828,8 @@ fn describe(registrar: &Registrar) {
     registrar.describe_histogram(names::REQUEST_PARAMS_N, "The n parameter of requests.");
     registrar.describe_gauge(
         names::STATE,
-        "The servicer's lifecycle state, one-hot: starting, serving, warming_up (readiness held \
-         with admission open), draining (admission closed) or engine_down.",
+        "The servicer's lifecycle state, one-hot: starting, serving, warming_up (readiness held, \
+         admitting the warm-up's own requests only), draining (admission closed) or engine_down.",
     );
     registrar.describe_gauge(
         names::START_TIME_SECONDS,

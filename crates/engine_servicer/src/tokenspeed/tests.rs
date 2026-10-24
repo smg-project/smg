@@ -1921,7 +1921,7 @@ const GOLDEN_SCRAPE: &str = r#"
 # HELP smg_servicer_requests_refused_total Requests refused before they reached the engine, by reason.
 # HELP smg_servicer_requests_total Requests whose stream ended, by how they ended; a fan-out (n > 1) is one request with the reason of its last choice to end, an abort winning.
 # HELP smg_servicer_start_time_seconds When the servicer started, in seconds since the Unix epoch.
-# HELP smg_servicer_state The servicer's lifecycle state, one-hot: starting, serving, warming_up (readiness held with admission open), draining (admission closed) or engine_down.
+# HELP smg_servicer_state The servicer's lifecycle state, one-hot: starting, serving, warming_up (readiness held, admitting the warm-up's own requests only), draining (admission closed) or engine_down.
 # HELP smg_servicer_string_stops_total Requests this servicer ended on a stop string it matched itself.
 # HELP smg_servicer_time_to_first_token_seconds Seconds from a request's arrival at the servicer to its first output.
 # TYPE smg_servicer_e2e_request_latency_seconds histogram

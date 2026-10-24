@@ -53,8 +53,9 @@ pub(crate) struct Shared {
     pub(crate) metrics: Arc<ServicerMetrics>,
     pub(crate) registry: Arc<RequestRegistry>,
     /// Cleared by the lifecycle owner to drain (`set_serving`, admission
-    /// closed with it) or to hold readiness alone (`set_ready`, admission
-    /// open): health answers NOT_SERVING either way.
+    /// closed with it) or to hold readiness (`set_ready`, admission open to
+    /// the warm-up's own requests alone): health answers NOT_SERVING either
+    /// way.
     serving: AtomicBool,
     pub(crate) started: Instant,
     pub(crate) started_at: SystemTime,
@@ -228,8 +229,9 @@ impl Shared {
     }
 
     /// The lifecycle state a scrape reports: the drain is read off the
-    /// registry (admission closed); a cleared serving flag with admission
-    /// open is readiness held back, not a drain.
+    /// registry (admission closed); a cleared serving flag without a drain
+    /// is readiness held back (admitting the warm-up's own requests only),
+    /// not a drain.
     fn lifecycle_state(&self) -> ServicerState {
         if !self.registry.is_accepting() {
             return ServicerState::Draining;
@@ -490,7 +492,8 @@ mod tests {
     }
 
     /// The drain switch closes admission with health; the readiness switch
-    /// leaves admission open, so the owner's own warm-up requests still pass.
+    /// admits the owner's own warm-up requests alone, and its release admits
+    /// everyone again.
     #[test]
     fn the_two_switches_differ_in_admission() {
         let shared = shared();
@@ -502,9 +505,20 @@ mod tests {
         shared.set_ready(false);
         assert!(
             shared.registry.is_accepting(),
-            "readiness held, admission open"
+            "readiness held: a hold is not a drain"
         );
         assert_eq!(shared.health_message("healthy"), "Warming up");
+        let refused = shared
+            .registry
+            .register("chatcmpl-1")
+            .err()
+            .expect("a foreign request is refused while readiness is held");
+        assert_eq!(refused.message(), "servicer is warming up");
+        let (own, _cancel) = shared
+            .registry
+            .register("smg-warmup-1")
+            .expect("the warm-up's own request is admitted");
+        drop(own);
 
         shared.set_serving(false);
         assert!(!shared.registry.is_accepting(), "a drain closes admission");
@@ -514,6 +528,22 @@ mod tests {
         shared.set_serving(true);
         assert!(shared.registry.is_accepting());
         assert_eq!(shared.health_message("healthy"), "Engine is starting");
+        assert_eq!(
+            shared
+                .registry
+                .register("chatcmpl-2")
+                .err()
+                .expect("lifting the drain does not lift the readiness hold")
+                .message(),
+            "servicer is warming up"
+        );
+
+        shared.set_ready(true);
+        let (foreign, _cancel) = shared
+            .registry
+            .register("chatcmpl-2")
+            .expect("the release admits every request again");
+        drop(foreign);
     }
 
     /// Without a link the engine is "still connecting"; a recorded failure

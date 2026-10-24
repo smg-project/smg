@@ -1316,7 +1316,8 @@ async def supervise(
 
     A ``warmup`` (the planned warm-up over the servicer's own port, blocking;
     the caller held the server's health at NOT_SERVING with
-    :func:`hold_readiness`, admission open) runs on a thread once the engine
+    :func:`hold_readiness`, admission open to the warm-up's own requests only)
+    runs on a thread once the engine
     connected and the KV-event relay's subscription reached the engine's
     publisher (``kv_relay_subscribed``, waited for up to
     :data:`RELAY_JOIN_GRACE_SECS` so the warm-up's batches start the relay's
