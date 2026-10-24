@@ -658,10 +658,10 @@ fn wire_tensor_sglang(
 /// The scheduler rank a request's data-parallel pin routes it to, by the
 /// rule of SGLang's own frontend (`TokenizerManager`, where the API's pin
 /// becomes the request's `routed_dp_rank`): no pin leaves the placement to
-/// the dispatcher (here the connector's least-loaded selection); a pin on an
-/// engine of one rank is ignored, as the frontend logs and ignores it; a pin
-/// among several ranks must name one of them, else it is refused with the
-/// frontend's 400 wording. Each scheduler rank dials the connector with its
+/// the dispatcher (here the connector's least-loaded selection); on an
+/// engine of one rank any non-negative pin is ignored, as the frontend logs
+/// and ignores it; a pin among several ranks must name one of them, else it
+/// is refused with the frontend's 400 wording. Each scheduler rank dials the connector with its
 /// rank as its engine index, so the rank is the engine the request goes to.
 fn routed_dp_rank(pin: Option<i32>, ranks: usize) -> Result<Option<u32>, String> {
     let Some(pin) = pin else {
@@ -669,7 +669,7 @@ fn routed_dp_rank(pin: Option<i32>, ranks: usize) -> Result<Option<u32>, String>
     };
     let out_of_range = || format!("routed_dp_rank={pin} out of range [0, {ranks})");
     let rank = u32::try_from(pin).map_err(|_| out_of_range())?;
-    if ranks <= 1 && rank == 0 {
+    if ranks <= 1 {
         return Ok(None);
     }
     if usize::try_from(rank).is_ok_and(|rank| rank < ranks) {
@@ -1374,8 +1374,9 @@ mod tests {
             "routed_dp_rank=2 out of range [0, 2)"
         );
         assert_eq!(
-            translate_among(Some(1), 1).unwrap_err(),
-            "routed_dp_rank=1 out of range [0, 1)"
+            translate_among(Some(1), 1).unwrap().routed_dp_rank,
+            None,
+            "any non-negative pin on the only rank is ignored"
         );
         assert_eq!(
             translate_among(Some(-1), 2).unwrap_err(),
