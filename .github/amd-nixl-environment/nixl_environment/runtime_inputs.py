@@ -110,13 +110,14 @@ def installed_record(dist):
     rows = list(csv.reader(io.StringIO(record)))
     require(len(rows) == len({row[0] for row in rows}), "duplicate installed RECORD entry")
     base = Path(dist.locate_file("")).resolve()
-    self_record = Path(dist._path).resolve(strict=True) / "RECORD"
+    self_record = Path(dist._path) / "RECORD"
     for relative, digest, size in rows:
         require(relative and not Path(relative).is_absolute(), "absolute installed RECORD path")
-        path = Path(dist.locate_file(relative)).resolve(strict=True)
+        member = Path(dist.locate_file(relative))
+        path = member.resolve(strict=True)
         require(path.is_relative_to(Path(sys.prefix).resolve()) or path.is_relative_to(base), "RECORD escaped active installation")
-        if path == self_record:
-            require(digest == size == "", "installed RECORD self entry")
+        if member == self_record:
+            require(not member.is_symlink() and digest == size == "", "installed RECORD self entry")
         elif digest:
             found = identity(path)
             encoded = base64.urlsafe_b64encode(bytes.fromhex(found["sha256"])).rstrip(b"=").decode()
@@ -143,7 +144,8 @@ def distribution_proof(name, item, root):
             if member.is_dir():
                 continue  # Genuine setproctitle/PyYAML wheels include directory entries.
             path = Path(dist.locate_file(member.filename))
-            if path.resolve(strict=True) == Path(dist._path).resolve(strict=True) / "RECORD":
+            if path == Path(dist._path) / "RECORD":
+                require(not path.is_symlink(), "installed RECORD self symlink")
                 continue  # Only this distribution's outer RECORD is rewritten by pip.
             raw = wheel.read(member)
             require(not path.is_symlink() and identity(path) == {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}, "installed source wheel differs: " + name)
