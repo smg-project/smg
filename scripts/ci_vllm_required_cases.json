@@ -1,0 +1,16 @@
+[
+  "grpc_servicer.tests.test_vllm_error_codes::test_generate_aborts_with_invalid_argument_for_vllm_validation_error",
+  "grpc_servicer.tests.test_vllm_kv_events.TestServicerWiring::test_servicer_resolves_config_from_engine",
+  "grpc_servicer.tests.test_vllm_mm_processor.TestServicerWiring::test_a_servicer_built_without_settings_takes_the_launchers",
+  "grpc_servicer.tests.test_vllm_mm_processor.TestServicerWiring::test_default_off_keeps_processor_unset",
+  "grpc_servicer.tests.test_vllm_mm_processor.TestServicerWiring::test_launcher_settings_take_precedence_and_name_their_source",
+  "grpc_servicer.tests.test_vllm_mm_sidecar.TestFingerprintDerivation::test_resolved_limits_match_vllm",
+  "grpc_servicer.tests.test_vllm_package_init::test_servicer_attaches_logging_that_vllm_configured_after_its_import",
+  "grpc_servicer.tests.test_vllm_rust_servicer::test_plugin_adds_the_servicer_impl_flag_to_grpc_parsers",
+  "grpc_servicer.tests.test_vllm_rust_servicer::test_plugin_exports_the_parsed_flag_for_the_python_guard",
+  "grpc_servicer.tests.test_vllm_rust_servicer::test_plugin_parses_the_mm_flags_and_exports_them_for_the_python_servicer",
+  "grpc_servicer.tests.test_vllm_pd_media_identity::test_a_regular_request_answers_with_no_identity",
+  "grpc_servicer.tests.test_vllm_pd_media_identity::test_an_identity_that_cannot_be_built_does_not_fail_the_request",
+  "grpc_servicer.tests.test_vllm_pd_media_identity::test_decode_side_from_identity_never_touches_the_processor",
+  "grpc_servicer.tests.test_vllm_pd_media_identity::test_prefill_side_answers_with_the_media_identity"
+]
