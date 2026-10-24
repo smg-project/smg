@@ -227,40 +227,42 @@
     "unit_junit": "servicer-engine.xml in the existing unique AMD dependency artifact",
     "diagnostic_workflow_difference": "NIXL tier-select dispatch caller only; normal product tooling CPU jobs are not part of this diagnostic workflow."
   },
-  "source_identity_note": "Actual consumer19 differs only in its e2e_test tree through the exact three owned-log test overlay files bound by test-overlay.json; the other18 source entries are unchanged. Compiled37c9d, actual445 producer14 and native143a are unchanged and are separate from the consumer test source. Original models, requests and positive oracles are retained; the transfer test body changes its log selection to the owned fixture paths.",
+  "source_identity_note": "Actual consumer19 retains the reviewed exact3 owned-log test overlay from966; other18 source entries and compiled37c9d/actual445producer14/native143a are unchanged. The selected test_pd_topologies.py file is byte-identical to the product tree; originale91517 method ASTs and oracles are retained, with one current stream-death case added. This independent MC4 caller has no runtime acceptance or transferred MC2/NIXL4 credit.",
   "admitted_tier": null,
   "contracts": {
-    "2": {
-      "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-2gpu-pd[2]/vllm/nvidia",
-      "gpu_tier": "2",
+    "4": {
+      "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-4gpu-pd[3]/vllm/nvidia",
+      "gpu_tier": "4",
       "timeout": 50,
-      "test_timeout": 34,
-      "test_dirs": "e2e_test/router",
-      "test_filter": "",
-      "min_selected": 15,
+      "test_timeout": 42,
+      "test_dirs": "e2e_test/router/test_pd_topologies.py",
+      "test_filter": "-k \"(2p2d and not http) or AssembledAtRuntime or SmallWindow or MismatchedTransport or MismatchedProtocol\"",
+      "min_selected": 14,
+      "kv_backend": "mooncake",
       "vllm_kv_backend": "mooncake",
-      "vllm_extra_kv_backends": "",
-      "selected": 27,
-      "original_skip_count": 3,
-      "original_setup_skip_count": 2,
+      "vllm_extra_kv_backends": "mooncake",
+      "selected": 18,
+      "original_skip_count": 1,
+      "original_setup_skip_count": 0,
       "original_call_skip_count": 1
     }
   },
   "diagnostic_runtime_instrumentation": {
     "namespace": ".github/amd-nixl-environment/",
-    "scope": "Environment continuity plus existing Worker/Gateway lifecycle wrappers, original per-case before/after/exit, actual native mappings and full original terminal reports; no additional model requests.",
+    "scope": "Original MC4 Worker/Gateway role/lifecycle and18terminal reports; nominal2P2D owned log/counter gate plus per-case mixed NIXL/Mooncake mappings. No extra requests or timing/ACK claims.",
     "preinstall_hook_product": "3b79acc59b68b84465e58a025850af2c93c96fe8",
     "reusable_workflow_product": "03d34400c3561c9e2d00e449a5e5c4bcca8e0401",
-    "private_state": "/tmp/smg-mooncake-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}",
+    "private_state": "/tmp/smg-mooncake4-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}",
     "runtime_witnesses_complete": false,
     "remaining_witnesses": [
-      "Actual749f Mooncake ROCm.3.13.post1 engine.so import and role-bound loaded bytes must execute; saved package capture is integrity only",
-      "All original27 cases/4models and two NIXL setup skips plus one exact Mrope call skip must complete, with raw retry history",
-      "Original Mooncake fixture must show real minted params plus positive successful-transfer metrics tied to its owned P/D and router logs; no per-request ACK/peer/HBM or stability claim"
+      "All18current cases with original17projection: expected17pass/1exactcallskip if successful; floor14/50-42 and originalreruns unchanged",
+      "Actual nominal original long-prompt case: one owned2P2Dgateway/fourTP1roles/Mooncake connector/native and positive cumulative transfer counter in its own case-associated logs, plus minted marker; not per-request bytes or ACK",
+      "Original mixedcase uses bothNIXL/Mooncake P/D mappings; actual ROCm canaries for both, original12HTTP200/no-crosspairing oracle unchanged",
+      "Fullservicer/canonical14/two pipchecks/final pins/package continuity and cleanup; actual worker model/tokenizer identity and old model-weight-open limitations require evidence"
     ],
     "actual_GPU_or_coverage": false,
     "runtime_witnesses_source_connected": true,
-    "skip_contract": "Only2: original NIXL two exact setup skips; original Mrope worker-media call skip. Every other original case/phase/reason and teardown retained.",
+    "skip_contract": "Tier4 only: no setup skips; original sole-leg-outage[2p2d] exactcallskip reason only; all18terminal phases retained.",
     "mooncake_engine_identity": {
       "distribution": "mooncake-transfer-engine-rocm",
       "version": "0.3.13.post1",
@@ -278,8 +280,20 @@
       "final"
     ],
     "no_prior_GPU_acceptance_transferred": true,
-    "original_default_parser_connection_servicer_mm_overrides": "all empty; kv_backend empty; enginevllm with explicit vllm_kv_backend=mooncake and extra empty"
+    "original_default_parser_connection_servicer_mm_overrides": "all parser/connection/servicer/mm overrides empty; kv_backend=mooncake, vllm_kv_backend=mooncake, originalextra=mooncake"
   },
-  "future_four_gpu_scope": "Original Mooncake4 is a separate later caller/contract; no tier4 recipe or admission is provided here.",
-  "test_overlay_sha256": "27a341c95f13fe6ea2c4770ea6d0aa4dcf35dee8c35194833fa7764c353e492a"
+  "test_overlay_sha256": "27a341c95f13fe6ea2c4770ea6d0aa4dcf35dee8c35194833fa7764c353e492a",
+  "original_reference_scope": {
+    "reference_sha": "e9157e32ef87c74f38c7d0f165b4a35fffd4eb57",
+    "original_selected": 17,
+    "current_selected": 18,
+    "additional_current_case": "router/test_pd_topologies.py::TestPDTopology::test_decode_engine_death_under_streaming_traffic[2p2d]",
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "TP": 1,
+    "topology": "primary2P2D; original1P1Dsmallwindow/mismatch/API-assembled and mixed1NIXL+1Mooncake pair",
+    "floor": 14,
+    "case_body_changes_in_this_layer": false,
+    "runtime_proof": false,
+    "reference_contract": ".github/amd-shared-product/mooncake4-reference.json"
+  }
 }
