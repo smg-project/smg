@@ -44,26 +44,25 @@ impl StepExecutor<WorkerUpdateWorkflowData> for FindWorkerToUpdateStep {
             worker_url
         );
 
-        if context.data.refresh_discovered_labels {
-            // A refresh writes back against the registration found here, by
-            // id and revision captured once: the read that follows may be
-            // retried, and a worker updated, replaced, or removed and
-            // registered again at the same address in the meantime must not
-            // receive the stale rebuild. A worker gone before this line gets
-            // an id nothing matches.
-            let registry = std::sync::Arc::clone(&app_context.worker_registry);
-            context.data.snapshot = Some(
-                workers_to_update
-                    .iter()
-                    .map(|worker| {
-                        let id = registry
-                            .get_id_by_url(worker.url())
-                            .unwrap_or_else(|| WorkerId::from_string(String::new()));
-                        (id, worker.revision())
-                    })
-                    .collect(),
-            );
-        }
+        // The update writes back against the registration found here, by id
+        // and revision captured once: a worker updated, replaced (a provider
+        // registering its address included), or removed and registered again
+        // at the same address in the meantime must not receive a rebuild of
+        // what was found here. A refresh's engine read in between may be
+        // retried, which widens the window. A worker gone before this line
+        // gets an id nothing matches.
+        let registry = std::sync::Arc::clone(&app_context.worker_registry);
+        context.data.snapshot = Some(
+            workers_to_update
+                .iter()
+                .map(|worker| {
+                    let id = registry
+                        .get_id_by_url(worker.url())
+                        .unwrap_or_else(|| WorkerId::from_string(String::new()));
+                    (id, worker.revision())
+                })
+                .collect(),
+        );
 
         context.data.workers_to_update = Some(workers_to_update);
 

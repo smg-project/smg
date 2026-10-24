@@ -308,10 +308,9 @@ pub struct WorkerUpdateWorkflowData {
     /// the update step (transient).
     #[serde(skip, default)]
     pub fresh_engine_labels: Option<HashMap<String, String>>,
-    /// For a label refresh: each worker's registry id and revision as the
-    /// find step found it, in `workers_to_update` order, captured once before
-    /// any read so the write-back targets exactly that registration whatever
-    /// happens meanwhile (transient).
+    /// Each worker's registry id and revision as the find step found it, in
+    /// `workers_to_update` order, captured once so the write-back targets
+    /// exactly that registration whatever happens meanwhile (transient).
     #[serde(skip, default)]
     pub snapshot: Option<Vec<(WorkerId, u64)>>,
 }

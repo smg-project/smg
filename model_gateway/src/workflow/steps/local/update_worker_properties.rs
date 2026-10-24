@@ -353,36 +353,42 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             }
             let new_worker: Arc<dyn Worker> = Arc::new(new_worker);
 
-            // Replace the worker in the registry (overwrite-then-diff). A
-            // refresh writes back a snapshot taken before a network read,
+            // Replace the worker in the registry (overwrite-then-diff),
             // against the id and revision the find step captured: a worker
-            // updated or replaced meanwhile fails the guard and is left as it
-            // is, one removed (or removed and registered again at the same
-            // address, under a new id) is not touched; the next transition
-            // into service refreshes again.
-            let worker_id = if refresh {
-                match snapshot.as_ref().and_then(|entries| entries.get(index)) {
-                    Some((id, expected))
-                        if app_context.worker_registry.replace_claiming_local(
-                            id,
-                            new_worker.clone(),
-                            *expected,
-                        ) =>
-                    {
-                        id.clone()
-                    }
-                    _ => {
-                        debug!(
-                            worker_url = %worker.url(),
-                            "Worker changed or left during the label refresh; not rebuilt"
-                        );
-                        continue;
-                    }
+            // updated or replaced meanwhile (a provider registering its
+            // address included) fails the guard and is left as it is, and one
+            // removed (or removed and registered again at the same address,
+            // under a new id) is neither brought back nor touched. A refresh
+            // is dropped, and the next transition into service refreshes
+            // again; an update fails, rather than overwrite the newer
+            // registration with a rebuild of the one it found.
+            let worker_id = match snapshot.as_ref().and_then(|entries| entries.get(index)) {
+                Some((id, expected))
+                    if app_context.worker_registry.replace_claiming_local(
+                        id,
+                        new_worker.clone(),
+                        *expected,
+                    ) =>
+                {
+                    id.clone()
                 }
-            } else {
-                app_context
-                    .worker_registry
-                    .register_or_replace(new_worker.clone())
+                _ if refresh => {
+                    debug!(
+                        worker_url = %worker.url(),
+                        "Worker changed or left during the label refresh; not rebuilt"
+                    );
+                    continue;
+                }
+                _ => {
+                    return Err(WorkflowError::StepFailed {
+                        step_id: StepId::new("update_worker_properties"),
+                        message: format!(
+                            "worker {} was replaced or removed since this update found it, so \
+                             the update was dropped",
+                            worker.url()
+                        ),
+                    });
+                }
             };
 
             // Same-URL replace preserves the existing shared runtime. If the
@@ -707,6 +713,7 @@ mod tests {
         },
         worker::{
             circuit_breaker::{CircuitBreakerConfig, CircuitState},
+            registry::WorkerId,
             BasicWorker, ConnectionMode, RuntimeType,
         },
     };
@@ -784,11 +791,26 @@ mod tests {
         })
     }
 
+    /// Each worker's id and revision, as the find step captures them.
+    fn snapshot_of(app_context: &AppContext, workers: &[Arc<dyn Worker>]) -> Vec<(WorkerId, u64)> {
+        workers
+            .iter()
+            .map(|worker| {
+                let id = app_context
+                    .worker_registry
+                    .get_id_by_url(worker.url())
+                    .expect("the worker is registered");
+                (id, worker.revision())
+            })
+            .collect()
+    }
+
     fn make_context(
         app_context: Arc<AppContext>,
         worker: Arc<dyn Worker>,
         labels: HashMap<String, String>,
     ) -> WorkflowContext<WorkerUpdateWorkflowData> {
+        let snapshot = snapshot_of(&app_context, std::slice::from_ref(&worker));
         let data = WorkerUpdateWorkflowData {
             config: WorkerUpdateRequest {
                 priority: None,
@@ -803,7 +825,7 @@ mod tests {
             updated_workers: None,
             refresh_discovered_labels: false,
             fresh_engine_labels: None,
-            snapshot: None,
+            snapshot: Some(snapshot),
         };
         WorkflowContext::new(WorkflowInstanceId::new(), data)
     }
@@ -1571,6 +1593,57 @@ mod tests {
         assert_eq!(updated[0].priority(), 3);
     }
 
+    /// An update writes back against the registration its find step found:
+    /// one replaced since (a provider registering the address) keeps what
+    /// replaced it, and one removed since is not brought back. The update
+    /// fails instead.
+    #[tokio::test]
+    async fn an_update_is_dropped_for_a_worker_replaced_or_removed_since_it_was_found() {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w:8000")
+                .status(WorkerStatus::Ready)
+                .build(),
+        );
+        let app_ctx = make_app_context(std::slice::from_ref(&worker));
+        let registry = &app_ctx.worker_registry;
+        let id = registry.get_id_by_url("http://w:8000").unwrap();
+        let mut update = make_context(Arc::clone(&app_ctx), Arc::clone(&worker), HashMap::new());
+        update.data.config.labels = None;
+        update.data.config.priority = Some(7);
+        let discovered: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w:8000")
+                .status(WorkerStatus::Ready)
+                .label(DISCOVERY_PROVIDER_LABEL, "file")
+                .build(),
+        );
+        assert!(registry.replace(&id, discovered));
+        let err = UpdateWorkerPropertiesStep
+            .execute(&mut update)
+            .await
+            .expect_err("the worker was replaced since it was found");
+        assert!(err.to_string().contains("replaced or removed"), "{err}");
+        let current = registry.get_by_url("http://w:8000").unwrap();
+        assert_eq!(
+            current.metadata().spec.labels.get(DISCOVERY_PROVIDER_LABEL),
+            Some(&"file".to_string()),
+            "the provider's registration stands"
+        );
+        assert_ne!(current.priority(), 7);
+
+        let mut update = make_context(Arc::clone(&app_ctx), Arc::clone(&current), HashMap::new());
+        update.data.config.labels = None;
+        update.data.config.priority = Some(7);
+        registry.remove(&id);
+        UpdateWorkerPropertiesStep
+            .execute(&mut update)
+            .await
+            .expect_err("the worker was removed since it was found");
+        assert!(
+            registry.get_by_url("http://w:8000").is_none(),
+            "a removed worker is not brought back"
+        );
+    }
+
     #[tokio::test]
     async fn pd_update_preserves_connector_and_pair_descriptor() {
         for (connector, mode, protocol, transport, pair_key, expected_mode) in [
@@ -1988,7 +2061,10 @@ mod tests {
             updated_workers: None,
             refresh_discovered_labels: false,
             fresh_engine_labels: None,
-            snapshot: None,
+            snapshot: Some(snapshot_of(
+                &app_ctx,
+                &[Arc::clone(&first), Arc::clone(&second)],
+            )),
         };
         let mut context = WorkflowContext::new(WorkflowInstanceId::new(), data);
         let err = UpdateWorkerPropertiesStep
