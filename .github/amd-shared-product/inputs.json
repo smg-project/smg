@@ -2,16 +2,81 @@
   "ready": false,
   "run_budget_admitted": false,
   "artifacts_pinned": false,
-  "artifacts": [],
-  "gateway_native": null,
-  "run_id": null,
-  "run_attempt": null,
-  "build_job_id": null,
-  "producer_sha": null,
+  "artifacts": [
+    {
+      "name": "smg-wheel",
+      "id": 12539960818,
+      "bytes": 52386264,
+      "sha256": "51f4d219a9e691e94890ec267310e9d963a85ecc5c60ccba55c5d38a91ef049f",
+      "expires_at": "2026-10-24T23:54:34Z",
+      "files": {
+        "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl": {
+          "bytes": 52529349,
+          "sha256": "283ba6730ab1328332b1b61b2c692a2a28e0141b1987ae9422d07bd6c653512d"
+        }
+      }
+    },
+    {
+      "name": "go-ffi-library",
+      "id": 12539866422,
+      "bytes": 13837182,
+      "sha256": "beb1eb23135ba3ec036c296fea5c7abb96314fbd36dab8ad14b89efa6db2a329",
+      "expires_at": "2026-10-24T23:54:37Z",
+      "files": {
+        "libsmg_go.d": {
+          "bytes": 64539,
+          "sha256": "b46b20aad8202524bb156587ea51a3c8d66d25cec0cd554664418ac641bfad38"
+        },
+        "libsmg_go.so": {
+          "bytes": 35008576,
+          "sha256": "793946614a201c0658f9fc524a1307c0b15433a0ac8b709d5bf0e265b3b87b09"
+        }
+      }
+    },
+    {
+      "name": "python-client-types",
+      "id": 12539751694,
+      "bytes": 34373,
+      "sha256": "58f2a41f1455c7660a5594cfcfbeb6c4e696eb8ac76735501418899acd3d90e5",
+      "expires_at": "2026-10-24T23:54:39Z",
+      "files": {
+        "_generated.py": {
+          "bytes": 187180,
+          "sha256": "f2f808705287928f7a4095867bacaa3b1ffbc8eea6f038857dc3456529adeaf6"
+        }
+      }
+    },
+    {
+      "name": "wasm-test-fixtures",
+      "id": 12539567404,
+      "bytes": 56596,
+      "sha256": "a4df6f4b2f6bd3740aba28ddb1a081ce087475588ad03c72c6cdd47afdd5c4e5",
+      "expires_at": "2026-10-24T23:54:40Z",
+      "files": {
+        "storage_hook_guest.wasm": {
+          "bytes": 80680,
+          "sha256": "7e3a093e09bfe30244d128c1aaaf8558a1b13c05558cc81cff04021947445e11"
+        },
+        "storage_hook_passthrough.wasm": {
+          "bytes": 79153,
+          "sha256": "3a10ce115ea179026a00f3e85ce6b6a388bcc1f274bc7abfc074be876d7c3e55"
+        }
+      }
+    }
+  ],
+  "gateway_native": {
+    "name": "smg/smg_rs.abi3.so",
+    "bytes": 142443344,
+    "sha256": "143a28b8834bb16b01d87f4ba71b6f68254c71c52e5c7424ccf401b8ce9c29a9"
+  },
+  "run_id": 40038340532,
+  "run_attempt": 1,
+  "build_job_id": 120703217001,
+  "producer_sha": "445bb37bccb47e620b2b3aac12cd30b4ebd71a43",
   "producer_branch": "ci/frozen-c9d-cpu-producer-20261023",
   "producer_policy": "frozen_c9d_dispatch_build_only_all_18_steps_success_v1",
   "target_product_commit": "6332ac94e00a587e14e5e68faaaa3b83b442a714",
-  "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat[0]/sglang/nvidia",
+  "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-2gpu-pd[0]/sglang/nvidia",
   "source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
     "Cargo.toml": "1524dd4960a96dd3ae5069917324836dee979150",
@@ -94,41 +159,45 @@
   ],
   "budget": {
     "relay_hosted_cpu_minutes": 10,
-    "gpu_job_minutes": 36,
-    "pytest_minutes": 28,
+    "gpu_job_minutes": 40,
+    "pytest_minutes": 34,
     "cleanup_reserve_is_not_enforced_by_shared_workflow": true,
     "workflow_auto_retry": 0,
     "original_pytest_reruns": 2,
-    "original_reruns_delay_seconds": 5
+    "original_reruns_delay_seconds": 5,
+    "GPU_jobs_per_dispatch": 1,
+    "budget_admitted": false
   },
   "contract": {
-    "selected": 231,
-    "models": 9,
-    "floor": 204,
-    "test_dirs": "e2e_test/chat_completions",
+    "engine": "sglang",
+    "gpu_tier": "2",
+    "test_dirs": "e2e_test/router",
     "test_filter": "",
+    "min_selected": 15,
+    "timeout": 40,
+    "test_timeout": 34,
+    "kv_backend": "",
+    "vllm_kv_backend": "nixl",
+    "vllm_extra_kv_backends": "",
+    "parser": "",
+    "connection_mode": "",
     "servicer_impl": "",
+    "mm_processing": "",
     "servicer_unit_tests": false,
-    "engine_unit_junit": false,
-    "whole_pip_check_stages": [
-      "installed",
-      "final"
-    ],
-    "native_verification_stages": [
-      "installed",
-      "final"
-    ],
-    "no_prior_GPU_acceptance_transferred": true,
-    "engine_start_seconds": 300,
-    "warmup_budget_seconds": 300,
-    "default_startup_total_seconds": 600,
-    "shared_warmup_level": "fast",
-    "original_explicit_skip_markers": 8,
-    "original_conditional_skip_markers_evaluate_false": 4
+    "default_sglang_transfer_backend": "mooncake",
+    "original_reruns": 2,
+    "original_reruns_delay_seconds": 5,
+    "selected": null,
+    "setup_skips": null,
+    "call_skips": null,
+    "models": [
+      "meta-llama/Llama-3.1-8B-Instruct",
+      "meta-llama/Llama-3.2-1B-Instruct"
+    ]
   },
-  "diagnostic_difference": "caller container explicitly sets SPT_NOENV=1 for process cleanup ownership; normal product shared workflow does not. Engine AMD image/native repairs + wholepip/native post-install/final hard gates are AMD QA additions. NV test selection/models/assertions and original36/28 budget unchanged.",
+  "diagnostic_difference": "Only original SG2GPU default Mooncake PD is prepared, with all-router emptyfilter/floor15/40-34/rerun2 retained. A local pytest observer package records original SG HTTP/gRPC regular/P-D fixtures and their owned processes/native/logs; no vLLM14 unit gate, canary, GPT/Qwen overlay, EPD source or extra request is added.",
   "producer_binary_relabelled": false,
-  "producer_artifact_pins_status": "EMPTY: root must bind and independently admit actual completed445 producer/4archives/native identity; no GPU admission here",
+  "producer_artifact_pins_status": "BOUND_TO_SAVED_ACCEPTED445_PREVIEW_ONLY: actual4archives/native143a captured; no live expiry/metadata refreshed and all3admission flags remainfalse.",
   "explicit_product_dependency": {
     "PR": 4266,
     "original_public_head": "3cef9af6a73610f501b920221c7232bf640219d0",
@@ -136,7 +205,7 @@
     "parent_stack": "0707d631cb6827789619ab96999f868044dc06db",
     "visible_churn": 43
   },
-  "producer_snapshot_note": "Old normal c9d cancelled producer remains rejected; a new dispatch producer requires all18 steps and entire run success plus actual4archives/native audit",
+  "producer_snapshot_note": "Saved root-accepted40038340532/445 integrity bytes only; future root admission must GET actual artifact identity/expiry. Native143a has no SG2GPU PD result yet.",
   "source_base": "c9d5431db92aa2d35521889f6297c4c6f7b05b4a",
   "producer_base_source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
@@ -154,7 +223,7 @@
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows": "7c956a4ee89bdf800d48c63815d10a4dd568d90e"
   },
-  "producer_source_map_note": "Expected 14 trees from reviewed diagnostic9841825, including its different workflow tree; actual admitted head/run unknown and must match exactly before relay",
+  "producer_source_map_note": "Actual14 is copied from real445 producer capture and differs from source_base14 in its workflow tree. Compiled37 remains exactc9d. Expected984 source identities are not substituted for actual445.",
   "explicit_lock_safety_dependency": {
     "product_commit": "a37083a4eb667c0d261de85cf464025a9a29e506",
     "base_product_alias_leaf": "ee1b8f0f83186a0e33d805b4b2551d17322a80fb",
@@ -171,6 +240,9 @@
     "no_EPD_stage_or_schema": true,
     "tvm_bootstrap_commit": "7161e0d8f7fb34c93db374cd190a435dc1e72091",
     "tvm_bootstrap_shared_target": "6332ac94e00a587e14e5e68faaaa3b83b442a714",
-    "actual_no_device_canary": "ROOT_REPORTED_CPU_ONLY_9.87S_NONAUTHOR_AUDIT_PENDING_NO_MODEL_RESULT_TRANSFERRED"
-  }
+    "actual_no_device_canary": "Previously accepted no-device TVM/native helper import evidence only; no model, Mooncake transfer or SG2GPU result transferred."
+  },
+  "reference_contract_sha256": "f618f45a175495293f9832e81b92b9c396928cb0f0c36effad1d80a05b92bf93",
+  "selection_contract_verified": false,
+  "source_identity_note": "Consumer19 remains the exact ordinarySGef4 product source. Only the manual caller/recipe/observer namespace differs; compiled37c9d/actual44514 are unchanged and no EPDca46/a974 source is used."
 }

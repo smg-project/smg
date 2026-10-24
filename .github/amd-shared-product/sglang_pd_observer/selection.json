@@ -1,0 +1,14 @@
+{
+  "status": "PENDING_REAL_ORIGINAL_AND_CURRENT_COLLECTION",
+  "reference_source": "e9157e32ef87c74f38c7d0f165b4a35fffd4eb57",
+  "current_source": "ef4a8bf111215e74cdf9647bb1146745d69f64e1",
+  "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-2gpu-pd[0]/sglang/nvidia",
+  "reference_contract_sha256": "f618f45a175495293f9832e81b92b9c396928cb0f0c36effad1d80a05b92bf93",
+  "reference_cases": null,
+  "current_cases": null,
+  "setup_skips": null,
+  "allowed_call_skips": null,
+  "case_witnesses": null,
+  "actual_CPU_collection_result": null,
+  "runtime_accepted": false
+}

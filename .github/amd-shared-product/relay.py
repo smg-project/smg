@@ -9,6 +9,7 @@ from pathlib import Path
 import artifact_io as io
 import frozen_producer
 import source
+import recipe
 import wheel_record
 
 NAMES = {"smg-wheel", "python-client-types", "wasm-test-fixtures", "go-ffi-library"}
@@ -20,6 +21,10 @@ def admitted(inputs):
             inputs.get(key) is True for key in ("ready", "run_budget_admitted", "artifacts_pinned")
         ),
         "source, runner budget, and actual artifact pins must all be admitted",
+    )
+    recipe.verify(
+        inputs,
+        json.loads((Path(__file__).parent / "sglang_pd_observer/selection.json").read_text()),
     )
     artifacts = inputs["artifacts"]
     io.require(len(artifacts) == 4 and {a["name"] for a in artifacts} == NAMES, "four artifacts")

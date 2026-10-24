@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smg-sglang-pd-observer"
+version = "0.0.1"
+requires-python = ">=3.11"
+
+[project.entry-points.pytest11]
+smg-sglang-pd-observer = "sglang_pd_observer.plugin"
+
+[tool.setuptools.packages.find]
+include = ["sglang_pd_observer*"]
+
+[tool.setuptools.package-data]
+sglang_pd_observer = ["selection.json"]
