@@ -49,7 +49,7 @@ def prefix_leaves(prefix, declared, empty_directories=()):
     directories.update(Path(name) for name in empty_directories)
     entry_limit = 2 * (len(declared) + len(directories))
     depth_limit = max(len(Path(name).parts) for name in declared) + 2
-    leaves, pending, entries_seen = set(), [prefix], 0
+    leaves, pending, seen_directories, entries_seen = set(), [prefix], set(), 0
     while pending:
         with os.scandir(pending.pop()) as entries:
             for entry in entries:
@@ -59,10 +59,12 @@ def prefix_leaves(prefix, declared, empty_directories=()):
                 require(len(path.relative_to(prefix).parts) <= depth_limit, "private prefix walk depth cap")
                 if entry.is_dir(follow_symlinks=False):
                     require(path.relative_to(prefix) in directories, "unexpected private prefix directory")
+                    seen_directories.add(path.relative_to(prefix))
                     pending.append(path)
                 else:
                     leaves.add(path.relative_to(prefix).as_posix())
                     require(len(leaves) <= len(declared), "private prefix leaf cap")
+    require(seen_directories == directories, "private prefix directory set changed")
     return leaves
 
 
