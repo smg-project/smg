@@ -19,10 +19,12 @@ wfaas = { version = "1.1.0", path = "crates/workflow" }
 llm-tokenizer = { version = "1.10.0", path = "crates/tokenizer" }
 smg-auth = { version = "1.2.4", path = "crates/auth" }
 smg-mcp = { version = "2.3.5", path = "crates/mcp" }
+# Members build it with its default features (none); a member-side `default-features = false` is ignored for an entry without one.
 smg-external-router = { version = "0.3.0", path = "crates/external_router" }
 kv-index = { version = "2.0.0", path = "crates/kv_index" }
 smg-radix-tree = { version = "0.1.0", path = "crates/radix_tree" }
 smg-data-connector = { version = "2.4.0", path = "crates/data_connector", package = "data-connector" }
+# Members build it with its default features (`hf-hub`): the gateway asks for `hf-hub` itself and the Python binding reaches it through the gateway.
 llm-multimodal = { version = "1.14.0", path = "crates/multimodal" }
 smg-wasm = { version = "1.1.4", path = "crates/wasm", package = "smg-wasm" }
 smg-mesh = { version = "1.4.4", path = "crates/mesh", package = "smg-mesh" }

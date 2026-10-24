@@ -96,10 +96,10 @@ wfaas.workspace = true
 llm-tokenizer.workspace = true
 smg-auth.workspace = true
 smg-mcp.workspace = true
-smg-external-router = { workspace = true, default-features = false }
+smg-external-router.workspace = true
 kv-index.workspace = true
 smg-data-connector.workspace = true
-llm-multimodal = { workspace = true, default-features = false, features = ["hf-hub"] }
+llm-multimodal = { workspace = true, features = ["hf-hub"] }
 smg-mm-rdma.workspace = true
 smg-wasm = { workspace = true, features = ["storage-hooks"] }
 smg-mesh.workspace = true
@@ -167,7 +167,7 @@ smg = { path = ".", default-features = false, features = ["test-util"] }
 # The gateway's test harness (the mock workers, app builders and launch helpers the
 # integration tests share): a workspace member for tests only, compiled once.
 smg-test-harness = { path = "test_harness" }
-smg-external-router = { workspace = true, default-features = false }
+smg-external-router.workspace = true
 # Enable the mock engine for the ZMQ client's loopback tests.
 engine-zmq-client = { workspace = true, features = ["mock-engine"] }
 criterion = { version = "0.8", features = ["html_reports"] }

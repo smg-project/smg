@@ -25,7 +25,6 @@ workspace = true
 
 [dependencies.llm-multimodal]
 workspace = true
-default-features = false
 
 [dependencies.llm-tokenizer]
 workspace = true
