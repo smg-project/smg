@@ -411,4 +411,272 @@ mod tests {
         assert_eq!(ctx.data.connection_mode, Some(ConnectionMode::Http));
         assert_eq!(ctx.data.http2, Some(true));
     }
+    mod encoder_registration {
+        use std::{convert::Infallible, sync::Mutex, time::Duration};
+
+        use axum::{body::Body, http::HeaderMap, routing::post, Router};
+        use futures::stream;
+        use http_body::Frame;
+        use http_body_util::StreamBody;
+        use prost::Message;
+        use tokio::{net::TcpListener, task::JoinHandle};
+        use tokio_stream::wrappers::TcpListenerStream;
+        use tonic::{transport::Server, Code, Request, Response, Status};
+        use tonic_health::pb::{
+            health_check_response::ServingStatus,
+            health_server::{Health, HealthServer},
+            HealthCheckRequest, HealthCheckResponse,
+        };
+
+        use super::*;
+        use crate::workflow::steps::local::DetectBackendStep;
+
+        #[derive(Clone)]
+        struct EncoderHealth {
+            answer: Result<ServingStatus, Code>,
+            requests: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[tonic::async_trait]
+        impl Health for EncoderHealth {
+            async fn check(
+                &self,
+                request: Request<HealthCheckRequest>,
+            ) -> Result<Response<HealthCheckResponse>, Status> {
+                self.requests
+                    .lock()
+                    .unwrap()
+                    .push(request.into_inner().service);
+                let status = self
+                    .answer
+                    .map_err(|code| Status::new(code, "health fixture"))?;
+                Ok(Response::new(HealthCheckResponse {
+                    status: status as i32,
+                }))
+            }
+
+            type WatchStream = stream::Empty<Result<HealthCheckResponse, Status>>;
+
+            async fn watch(
+                &self,
+                _: Request<HealthCheckRequest>,
+            ) -> Result<Response<Self::WatchStream>, Status> {
+                Err(Status::unimplemented("unary health fixture"))
+            }
+        }
+
+        struct Peer {
+            url: String,
+            task: JoinHandle<()>,
+        }
+
+        impl Peer {
+            async fn stop(&mut self) {
+                self.task.abort();
+                let _ = (&mut self.task).await;
+            }
+        }
+
+        impl Drop for Peer {
+            fn drop(&mut self) {
+                self.task.abort();
+            }
+        }
+
+        async fn encoder(answer: Result<ServingStatus, Code>) -> (Peer, Arc<Mutex<Vec<String>>>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("grpc://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let service = EncoderHealth {
+                answer,
+                requests: Arc::clone(&requests),
+            };
+            let task = tokio::spawn(async move {
+                Server::builder()
+                    .add_service(HealthServer::new(service))
+                    .serve_with_incoming(TcpListenerStream::new(listener))
+                    .await
+                    .unwrap();
+            });
+            (Peer { url, task }, requests)
+        }
+
+        fn context(
+            url: &str,
+            runtime: RuntimeType,
+            role: WorkerType,
+        ) -> WorkflowContext<WorkerWorkflowData> {
+            let mut spec = WorkerSpec::new(url.to_string());
+            spec.runtime_type = runtime;
+            spec.worker_type = role;
+            spec.health.timeout_secs = Some(1);
+            local_context(app_context(false), spec)
+        }
+
+        async fn succeeds(
+            url: &str,
+            runtime: RuntimeType,
+            role: WorkerType,
+        ) -> WorkflowContext<WorkerWorkflowData> {
+            let mut ctx = context(url, runtime, role);
+            assert_eq!(
+                DetectConnectionModeStep.execute(&mut ctx).await.unwrap(),
+                StepResult::Success
+            );
+            assert_eq!(ctx.data.connection_mode, Some(ConnectionMode::Grpc));
+            ctx
+        }
+
+        #[tokio::test]
+        async fn epd_sglang_registration_standard_health_serving() {
+            let (mut peer, requests) = encoder(Ok(ServingStatus::Serving)).await;
+            let mut ctx = succeeds(&peer.url, RuntimeType::Sglang, WorkerType::Encode).await;
+            assert_eq!(
+                DetectBackendStep.execute(&mut ctx).await.unwrap(),
+                StepResult::Success
+            );
+            assert_eq!(ctx.data.detected_runtime_type.as_deref(), Some("sglang"));
+            assert_eq!(
+                *requests.lock().unwrap(),
+                ["sglang.grpc.encoder.SglangEncoder"]
+            );
+            // The same endpoint has no scheduler Health service.
+            assert!(try_grpc_reachable(&peer.url, 1).await.is_err());
+            peer.stop().await;
+        }
+
+        #[tokio::test]
+        async fn epd_sglang_registration_rejects_nonserving_and_rpc_errors() {
+            for answer in [
+                Ok(ServingStatus::NotServing),
+                Ok(ServingStatus::Unknown),
+                Ok(ServingStatus::ServiceUnknown),
+                Err(Code::Unimplemented),
+                Err(Code::NotFound),
+            ] {
+                let (mut peer, _) = encoder(answer).await;
+                let mut ctx = context(&peer.url, RuntimeType::Sglang, WorkerType::Encode);
+                let err = DetectConnectionModeStep
+                    .execute(&mut ctx)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(err, WorkflowError::StepFailed { .. }));
+                assert!(DetectConnectionModeStep.is_retryable(&err));
+                assert_eq!(ctx.data.connection_mode, None);
+                peer.stop().await;
+            }
+        }
+
+        #[tokio::test]
+        async fn epd_sglang_registration_standard_health_cannot_admit_other_roles() {
+            let (mut peer, requests) = encoder(Ok(ServingStatus::Serving)).await;
+            for (runtime, role) in [
+                (RuntimeType::Sglang, WorkerType::Regular),
+                (RuntimeType::Sglang, WorkerType::Prefill),
+                (RuntimeType::Sglang, WorkerType::Decode),
+                (RuntimeType::TokenSpeed, WorkerType::Encode),
+                (RuntimeType::Vllm, WorkerType::Encode),
+                (RuntimeType::Unspecified, WorkerType::Encode),
+            ] {
+                let mut ctx = context(&peer.url, runtime, role);
+                assert!(DetectConnectionModeStep.execute(&mut ctx).await.is_err());
+                assert_eq!(ctx.data.connection_mode, None);
+            }
+            assert!(requests.lock().unwrap().is_empty());
+            peer.stop().await;
+        }
+
+        #[tokio::test]
+        async fn epd_sglang_registration_stalled_transport_is_bounded() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("grpc://{}", listener.local_addr().unwrap());
+            let task = tokio::spawn(async move {
+                let (_socket, _) = listener.accept().await.unwrap();
+                std::future::pending::<()>().await;
+            });
+            let mut peer = Peer { url, task };
+            let mut ctx = context(&peer.url, RuntimeType::Sglang, WorkerType::Encode);
+            let started = tokio::time::Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                DetectConnectionModeStep.execute(&mut ctx),
+            )
+            .await;
+            peer.stop().await;
+            assert!(result.unwrap().is_err());
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert_eq!(ctx.data.connection_mode, None);
+        }
+
+        #[tokio::test]
+        async fn epd_sglang_registration_scheduler_roles_unchanged() {
+            // Serve a real protobuf/gRPC unary response on the original SG HealthCheck path.
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("grpc://{}", listener.local_addr().unwrap());
+            let route = Router::new().route(
+                "/sglang.grpc.scheduler.SglangScheduler/HealthCheck",
+                post(|| async {
+                    let message = smg_grpc_client::sglang_scheduler::proto::HealthCheckResponse {
+                        healthy: true,
+                        message: String::new(),
+                    }
+                    .encode_to_vec();
+                    let mut data = vec![0];
+                    data.extend_from_slice(&(message.len() as u32).to_be_bytes());
+                    data.extend(message);
+                    let mut trailers = HeaderMap::new();
+                    trailers.insert("grpc-status", "0".parse().unwrap());
+                    let body = StreamBody::new(stream::iter([
+                        Ok::<_, Infallible>(Frame::data(bytes::Bytes::from(data))),
+                        Ok(Frame::trailers(trailers)),
+                    ]));
+                    axum::response::Response::builder()
+                        .header("content-type", "application/grpc")
+                        .body(Body::new(body))
+                        .unwrap()
+                }),
+            );
+            let task = tokio::spawn(async move {
+                axum::serve(listener, route).await.unwrap();
+            });
+            let mut peer = Peer { url, task };
+            for role in [WorkerType::Regular, WorkerType::Prefill, WorkerType::Decode] {
+                succeeds(&peer.url, RuntimeType::Sglang, role).await;
+            }
+            peer.stop().await;
+        }
+
+        #[tokio::test]
+        async fn epd_sglang_registration_other_runtime_unchanged() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("grpc://{}", listener.local_addr().unwrap());
+            let config = Arc::new(mock_worker::config::Config::default());
+            let task = tokio::spawn(mock_worker::grpc::serve_with_listener_until(
+                config,
+                listener,
+                std::future::pending(),
+            ));
+            let mut peer = Peer { url, task };
+            succeeds(&peer.url, RuntimeType::TokenSpeed, WorkerType::Regular).await;
+            peer.stop().await;
+        }
+
+        #[tokio::test]
+        async fn epd_sglang_registration_keeps_http_and_bare_negotiation() {
+            for explicit in [true, false] {
+                let url = spawn_dual_protocol_server().await;
+                let url = if explicit {
+                    url
+                } else {
+                    url.trim_start_matches("http://").to_string()
+                };
+                let mut ctx = context(&url, RuntimeType::Sglang, WorkerType::Encode);
+                assert_eq!(
+                    DetectConnectionModeStep.execute(&mut ctx).await.unwrap(),
+                    StepResult::Success
+                );
+                assert_eq!(ctx.data.connection_mode, Some(ConnectionMode::Http));
+            }
+        }
+    }
 }
