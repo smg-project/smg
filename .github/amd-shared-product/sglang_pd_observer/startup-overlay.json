@@ -1,0 +1,78 @@
+{
+  "version": "sg2_startup_diagnostic_exact4420_v1",
+  "enabled_by_default": false,
+  "env": "SMG_SG2_STARTUP_DIAGNOSTIC",
+  "actual_image_digest": "sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d",
+  "files": {
+    "/sgl-workspace/aiter/aiter/jit/utils/chip_info.py": {
+      "actual_capture_path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T0300Z/SG2-AB-4420-source-canonical-root-933b80bb0c1547128659f28c5b42265a/2.py",
+      "before_sha256": "67b9b709ad95a7df5fdad1c49ad23b7374b5d2a1ec1c4a3d67b4d6c597c5f33d",
+      "after_sha256": "c6f094a6f6339fc92b2e0673c2ce9935440a30682662c22ea8a07e5fb4dc6348",
+      "changes": [
+        {
+          "before": "logger = logging.getLogger(\"aiter\")",
+          "after": "logger = logging.getLogger(\"aiter\")\nfrom smg_sg2_startup_trace import cu as _smg_sg2_cu"
+        },
+        {
+          "before": "        except Exception as e:  # noqa: BLE001  blanket catch is intentional here\n            raise RuntimeError(f\"Get GPU Compute Unit from rocminfo failed {e!s}\")",
+          "after": "        except Exception as e:  # noqa: BLE001  blanket catch is intentional here\n            _smg_sg2_cu(__name__, __file__, locals())\n            raise RuntimeError(f\"Get GPU Compute Unit from rocminfo failed {e!s}\")"
+        },
+        {
+          "before": "        assert len(set(gpu_compute_units)) == 1",
+          "after": "        _smg_sg2_cu(__name__, __file__, locals())\n        assert len(set(gpu_compute_units)) == 1"
+        }
+      ]
+    },
+    "/sgl-workspace/sglang/python/sglang/srt/arg_groups/memory_hook.py": {
+      "actual_capture_path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T0300Z/SG2-AB-4420-source-canonical-root-933b80bb0c1547128659f28c5b42265a/1.py",
+      "before_sha256": "5c0c2e479db6ea06dd6189f21765b17b2dd8a96396907493ed2e5a69017fda8f",
+      "after_sha256": "edfd9e77d7dd3ab2d20aa141932a6e5155841752bfb8478e8b97a1d89c79ebeb",
+      "changes": [
+        {
+          "before": "logger = logging.getLogger(__name__)",
+          "after": "logger = logging.getLogger(__name__)\nfrom smg_sg2_startup_trace import memory as _smg_sg2_memory"
+        },
+        {
+          "before": "    # ------------------------------------------------------------------\n    # Symmetric-memory preallocation",
+          "after": "    _smg_sg2_memory(\"resolved-memory\", __name__, __file__, locals(), globals())\n\n    # ------------------------------------------------------------------\n    # Symmetric-memory preallocation"
+        }
+      ]
+    },
+    "/sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py": {
+      "actual_capture_path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T0300Z/SG2-AB-4420-source-followup-root-f1376ea255d7439cbda615e1d2d3db47/1.py",
+      "before_sha256": "b61df5b750adc748a99ceb381b8494c199fb3f704d793da5a0217bd6bbb606c4",
+      "after_sha256": "d6216ddea10a0d3360619179de914ef49c8da3b2da77d810be8cf61f216127f4",
+      "changes": [
+        {
+          "before": "import torch\n",
+          "after": "import torch\nfrom smg_sg2_startup_trace import memory as _smg_sg2_memory\n"
+        },
+        {
+          "before": "        # Prepare KV cache pools for all workers\n        tic = time.perf_counter()",
+          "after": "        # Prepare KV cache pools for all workers\n        _smg_sg2_memory(\"pools-before\", __name__, __file__, locals(), globals())\n        tic = time.perf_counter()"
+        },
+        {
+          "before": "        self.kv_cache_allocation_time = time.perf_counter() - tic\n\n        self.init_all_attention_backends()",
+          "after": "        self.kv_cache_allocation_time = time.perf_counter() - tic\n        _smg_sg2_memory(\"pools-after\", __name__, __file__, locals(), globals())\n\n        self.init_all_attention_backends()"
+        },
+        {
+          "before": "        self.init_all_attention_backends()\n        self.init_all_cuda_graphs()",
+          "after": "        self.init_all_attention_backends()\n        _smg_sg2_memory(\"graphs-before\", __name__, __file__, locals(), globals())\n        self.init_all_cuda_graphs()\n        _smg_sg2_memory(\"graphs-after\", __name__, __file__, locals(), globals())"
+        },
+        {
+          "before": "        self.schedule_stream = None if use_mlx() else device_module.Stream(priority=0)",
+          "after": "        _smg_sg2_memory(\"stream-before\", __name__, __file__, locals(), globals())\n        self.schedule_stream = None if use_mlx() else device_module.Stream(priority=0)\n        _smg_sg2_memory(\"stream-after\", __name__, __file__, locals(), globals())"
+        },
+        {
+          "before": "            if self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream:\n                self.schedule_stream = allocate_distinct_stream(\n                    self.device_module, (self.forward_stream,)\n                )",
+          "after": "            _smg_sg2_memory(\"handle-before\", __name__, __file__, locals(), globals())\n            if self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream:\n                self.schedule_stream = allocate_distinct_stream(\n                    self.device_module, (self.forward_stream,)\n                )\n            _smg_sg2_memory(\"handle-after\", __name__, __file__, locals(), globals())"
+        }
+      ]
+    }
+  },
+  "helper": {
+    "path": "/opt/venv/lib/python3.12/site-packages/smg_sg2_startup_trace.py",
+    "sha256": "41701fbea335370f0987e99dbc7bcbad65140189fdab2a66b0a8eb8e53085c61"
+  },
+  "scope": "Only startup observations; no CU prime, computation/return/assertion, model, dtype, RDMA, memory fraction, pool, graph, stream handle, request or test changes."
+}
