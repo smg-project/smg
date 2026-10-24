@@ -778,11 +778,18 @@ struct WorkerArgs {
     /// idle spell, or since the gateway started), until that run has gone
     /// unanswered for the time the worker's backlog takes at its prefill
     /// rate (two minutes at most), keeping its decode admission room
-    /// meanwhile. On the parallel dispatch shape a prefill side's first
-    /// response also waits for the decode side (its bootstrap, and KV
-    /// pre-allocation under decode pressure), so the threshold must cover
-    /// that wait for a prefill worker with nothing else to answer
-    /// meanwhile. 0 disables both.
+    /// meanwhile. The decode side of a sequential dispatch, once the prefill
+    /// side has answered, has the same bound on its first token (the KV
+    /// handoff and the first decode step) and the same reprieve: it waits
+    /// on while its decode worker produces tokens for any side (handoffs
+    /// completing one after another on a slow transport, its running
+    /// generations stepping), for at most 120 seconds past its bound, and is
+    /// given up on sooner once the worker has produced nothing for the
+    /// threshold. On the parallel
+    /// dispatch shape a prefill side's first response also waits for the
+    /// decode side (its bootstrap, and KV pre-allocation under decode
+    /// pressure), so the threshold must cover that wait for a prefill
+    /// worker with nothing else to answer meanwhile. 0 disables both.
     #[arg(long, default_value_t = 3, help_heading = "Load Monitoring")]
     worker_wedge_secs: u64,
 

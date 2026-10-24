@@ -1022,6 +1022,12 @@ impl PrefillCachedTokens {
     }
 }
 
+/// How long a decode side its request gave up on is read for its first item
+/// before it is dropped unread (see
+/// [`ProtoStream::retire_abandoned_decode_side`]): the wait the stream's own
+/// deferred abort would give that item, taken in its place.
+const ABANDONED_SIDE_FIRST_ITEM_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A [`ProtoStream`] paired with the worker serving it, so each response it
 /// yields counts as token progress for that worker, and its prompt counts as
 /// pending prefill on the worker until the first response.
@@ -1039,6 +1045,11 @@ pub struct TrackedStream {
     /// still to be sampled, at the stream's first response (a disaggregated
     /// decode side: see [`ProtoStream::tracked_decode_side`]).
     samples_success: bool,
+    /// Whether the stream's first response is still to be stamped as its
+    /// worker's answer to a prompt no ticket booked there (a disaggregated
+    /// decode side, whose prompt the prefill worker computed: see
+    /// [`ProtoStream::tracked_decode_side`] and [`Worker::note_answered`]).
+    answers: bool,
     /// A response (or the stream's end) pulled ahead of the stream's reader
     /// by [`ProtoStream::first_response_within`], handed to the next `next`
     /// as it was: its bookkeeping ran when it was pulled.
@@ -1509,6 +1520,86 @@ mod tracked_tests {
         );
     }
 
+    /// A decode side its request gave up on is retired through its tracked
+    /// layer: its first item is its worker's answer (and the worker's
+    /// output while it is read) and no breaker success; a stream that ends
+    /// with nothing on it answers nothing.
+    #[tokio::test]
+    async fn a_retired_decode_sides_first_item_is_its_workers_answer_and_no_success() {
+        use std::time::Duration;
+
+        use crate::worker::circuit_breaker::{CircuitBreakerConfig, CircuitState};
+        let chunk = || {
+            let response = Some(vllm::generate_response::Response::Chunk(
+                vllm::GenerateStreamChunk::default(),
+            ));
+            Ok(ProtoGenerateResponse::Vllm(Box::new(
+                vllm::GenerateResponse { response },
+            )))
+        };
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:30000")
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 2,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        worker.record_outcome(504);
+        // A child holding one chunk (replayed by a tracked layer of its own,
+        // on an engine of its own), read through a fan-out: the item reaches
+        // the decode side's tracked layer as the engine's would.
+        let engine: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://e:30000").build());
+        let mut child = ProtoStream::Fanout(FanoutStream::new(Vec::new())).tracked(
+            Arc::clone(&engine),
+            0,
+            false,
+        );
+        if let ProtoStream::Tracked(tracked) = &mut child {
+            tracked.replay = Some(Some(chunk()));
+        }
+        let stream = ProtoStream::Fanout(FanoutStream::new(vec![child]))
+            .tracked_decode_side(Arc::clone(&worker));
+        assert!(
+            worker.prefill_answered_ago().is_none(),
+            "nothing answered yet"
+        );
+        stream.retire_abandoned_decode_side();
+        for _ in 0..100 {
+            if worker.prefill_answered_ago().is_some() && worker.output_silence().is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            worker
+                .prefill_answered_ago()
+                .is_some_and(|ago| ago < Duration::from_secs(1)),
+            "the retired side's first item is the worker's answer"
+        );
+        assert!(
+            worker.output_silence().is_none(),
+            "the stream was dropped after its item: nothing is produced for"
+        );
+        worker.record_outcome(504);
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::Open,
+            "no success was sampled between the two failures"
+        );
+
+        let quiet: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("grpc://decode:30001").build());
+        ProtoStream::Fanout(FanoutStream::new(Vec::new()))
+            .tracked_decode_side(Arc::clone(&quiet))
+            .retire_abandoned_decode_side();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            quiet.prefill_answered_ago().is_none(),
+            "an end is no answer"
+        );
+    }
+
     /// A decode side's first item is its prefill worker's handoff only when
     /// it is output: a chunk, or a complete that ended neither in an abort
     /// (an aborted choice, as the Rust servicers end one) nor in an error.
@@ -1641,6 +1732,7 @@ impl ProtoStream {
             progress,
             output: None,
             samples_success: false,
+            answers: false,
             replay: None,
         }))
     }
@@ -1675,6 +1767,7 @@ impl ProtoStream {
             progress: None,
             output: None,
             samples_success: false,
+            answers: false,
             replay: None,
         }))
     }
@@ -1689,14 +1782,60 @@ impl ProtoStream {
     /// stream fails at once, is one failure of its worker and not a success
     /// and then a failure, which reset the breaker's streak on every
     /// request; a stream that ends with nothing on it earns no success
-    /// either, as a prefill side's does not.
+    /// either, as a prefill side's does not. The first response is also the
+    /// worker's answer to the side ([`Worker::note_answered`]), the latest
+    /// answer a sequential decode side's silence verdict names; the side's
+    /// reprieve itself reads the worker's token progress, which the same
+    /// response advances ([`crate::worker::liveness::decode_side_reprieve`]).
     #[must_use]
     pub(crate) fn tracked_decode_side(self, worker: Arc<dyn Worker>) -> Self {
         let mut stream = self.tracked(worker, 0, false);
         if let Self::Tracked(tracked) = &mut stream {
             tracked.samples_success = true;
+            tracked.answers = true;
         }
         stream
+    }
+
+    /// Retire a tracked decode side its request gave up on (its first-token
+    /// bound passed while its worker produced nothing for any side, see
+    /// [`crate::worker::liveness::decode_side_reprieve`]): the side's first
+    /// item, if it comes within [`ABANDONED_SIDE_FIRST_ITEM_WAIT`], is read
+    /// through the tracked layer, so it is the worker's answer and its token
+    /// progress as any first item is (the KV handoff completed, which is
+    /// exactly what the sides queued behind it are reprieved on), and earns
+    /// no breaker success: the request charged its verdict already, and the
+    /// side's late result is neither sampled nor counted. The stream is then
+    /// dropped: an item was seen, so the abort deferred past the handoff
+    /// goes out at once; past the wait, the stream is marked to abort at
+    /// once ([`Self::abort_at_once`]), since the wait here was the
+    /// deferral's own, so one wait of its length stands between the verdict
+    /// and the abort, as it did before the side was read for its item. Read
+    /// below the tracked layer, as a dropped side's deferred abort reads it,
+    /// the item was invisible: once a transport's queue of handoffs was
+    /// deeper than the bound, every first token belonged to an abandoned
+    /// side, the worker read as silent for good and every new side was
+    /// given up on at its bound. A stream that is not tracked is dropped as
+    /// it is.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the abandoned side is retired off the request path; its wait for the first item is bounded"
+    )]
+    pub(crate) fn retire_abandoned_decode_side(mut self) {
+        if let Self::Tracked(tracked) = &mut self {
+            tracked.samples_success = false;
+        } else {
+            return;
+        }
+        tokio::spawn(async move {
+            if tokio::time::timeout(ABANDONED_SIDE_FIRST_ITEM_WAIT, self.next())
+                .await
+                .is_err()
+            {
+                self.abort_at_once();
+            }
+            drop(self);
+        });
     }
 
     /// Wait for the stream's first item, a response or its end, until
@@ -1813,6 +1952,9 @@ impl ProtoStream {
                 if std::mem::take(&mut tracked.samples_success) {
                     tracked.worker.record_outcome(200);
                 }
+                if std::mem::take(&mut tracked.answers) {
+                    tracked.worker.note_answered();
+                }
                 if tracked.output.is_none() {
                     tracked.output = Some(OutputTicket::open(&tracked.worker));
                 }
@@ -1922,6 +2064,7 @@ impl ProtoStream {
                     progress,
                     output,
                     samples_success,
+                    answers,
                     replay,
                 } = *stream;
                 Self::Tracked(Box::new(TrackedStream {
@@ -1931,6 +2074,7 @@ impl ProtoStream {
                     progress,
                     output,
                     samples_success,
+                    answers,
                     replay,
                 }))
             }
@@ -1950,6 +2094,25 @@ impl ProtoStream {
             }
         }
     }
+
+    /// Undo the deferral: the stream aborts on drop at once after all, for a
+    /// holder that waited out the deferral itself (see
+    /// [`Self::retire_abandoned_decode_side`]). No-op for ZMQ streams, as
+    /// the deferral is.
+    pub fn abort_at_once(&mut self) {
+        match self {
+            Self::Sglang(stream) => stream.abort_on_drop_at_once(),
+            Self::Vllm(stream) => stream.abort_on_drop_at_once(),
+            Self::Trtllm(stream) => stream.abort_on_drop_at_once(),
+            Self::Mlx(stream) => stream.abort_on_drop_at_once(),
+            Self::TokenSpeed(stream) => stream.abort_on_drop_at_once(),
+            Self::Zmq(_) => {}
+            Self::Fanout(stream) => stream.abort_at_once(),
+            Self::Tracked(stream) => stream.inner.abort_at_once(),
+            Self::DecodeSide(side) => side.inner.abort_at_once(),
+            Self::Ahead(ahead) => ahead.inner.abort_at_once(),
+        }
+    }
 }
 
 impl FanoutChild for ProtoStream {
@@ -1965,6 +2128,10 @@ impl FanoutChild for ProtoStream {
 
     fn defer_abort_until_first_item(self) -> Self {
         Self::defer_abort_until_first_item(self)
+    }
+
+    fn abort_at_once(&mut self) {
+        Self::abort_at_once(self);
     }
 
     fn worker(&self) -> Option<&Arc<dyn Worker>> {
@@ -1986,6 +2153,11 @@ pub trait FanoutChild: Send {
     /// Defer the child's abort-on-drop until its first response.
     #[must_use]
     fn defer_abort_until_first_item(self) -> Self;
+
+    /// Undo the deferral: the child aborts on drop at once after all (see
+    /// [`ProtoStream::abort_at_once`]). A child with no deferral has nothing
+    /// to undo.
+    fn abort_at_once(&mut self) {}
 
     /// The one worker the child was dispatched to, when it is tracked; a
     /// fan-out over several workers answers `None`.
@@ -2023,6 +2195,10 @@ impl<C: FanoutChild> FanoutChild for FanoutStream<C> {
 
     fn defer_abort_until_first_item(self) -> Self {
         Self::defer_abort_until_first_item(self)
+    }
+
+    fn abort_at_once(&mut self) {
+        Self::abort_at_once(self);
     }
 }
 
@@ -2101,6 +2277,13 @@ impl<C: FanoutChild> FanoutStream<C> {
                 .map(|child| child.map(FanoutChild::defer_abort_until_first_item))
                 .collect(),
             cursor: self.cursor,
+        }
+    }
+
+    /// Undo every open child's deferral (see [`FanoutChild::abort_at_once`]).
+    pub fn abort_at_once(&mut self) {
+        for child in self.children.iter_mut().flatten() {
+            child.abort_at_once();
         }
     }
 }

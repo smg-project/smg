@@ -56,6 +56,27 @@
 //! or return an empty stream after a prefill that answered at once, and
 //! expect 504 `decode_worker_silent` within the bound, one `timeout` on the
 //! decode worker and nothing on the prefill.
+//!
+//! That decode side's first token waits for the KV handoff, and the handoffs
+//! of the worker's other sides share the transport before it: on a slow
+//! transport the sides queue behind each other past the bound while the
+//! engines are healthy. A decode side past its bound is therefore given up on
+//! only while its worker has produced nothing within the bound, no first
+//! token of any side (a decode side's first token is its worker's answer) and
+//! no token on any stream it serves, as a prefill side is given up on only
+//! while its worker answers no side.
+//! Two cases queue the decode engine's answers at its gate (one every turn,
+//! five at once: the last answers well past the bound), in the first-response
+//! phase (the streams return at once) and in the dispatch phase (the headers
+//! held to the turn), and expect every request answered, nothing charged to
+//! the decode worker and its breaker closed. One more lets the decode answer
+//! its first call after a delay and leave the later streams empty, and
+//! expects those given up on a bound after that answer, not at their own
+//! bound and not never. One more sends a wave that is given up on (the
+//! decode's first answer comes past the bound) and a second wave two seconds
+//! behind it: the abandoned sides' first items, read as the worker's answers
+//! as they come one per turn, reprieve the second wave, which is answered in
+//! full.
 
 use std::{
     future::Future,
@@ -126,6 +147,21 @@ const HANDOFF: Duration = Duration::from_millis(2_500);
 /// How long after a burst the prefill answers its first call, in the
 /// handoff cases: past the bound, an engine step after the handoff.
 const LATE_ANSWER: Duration = Duration::from_secs(4);
+/// How long after the first call a decode answers it, in the abandoned-wave
+/// case: past the bound, so the first wave is given up on.
+const LATE_FIRST: Duration = Duration::from_millis(3_500);
+/// How long after the first wave the second wave is sent, in that case.
+const SECOND_WAVE_AFTER: Duration = Duration::from_secs(2);
+/// The second wave's size.
+const SECOND_WAVE: usize = 3;
+/// The gap between the tokens of a decode engine's long first generation, in
+/// the running-generation case: well within the bound.
+const TRICKLE: Duration = Duration::from_millis(400);
+/// That generation's length: it outlasts the sides behind it.
+const TRICKLE_TOKENS: u32 = 15;
+/// How long after their dispatch the sides behind that generation get their
+/// first tokens: past the bound, within the generation.
+const BEHIND_A_GENERATION: Duration = Duration::from_millis(4_500);
 
 type GenerateTx = mpsc::Sender<Result<proto::GenerateResponse, Status>>;
 
@@ -141,6 +177,21 @@ enum Behaviour {
     /// The call returns its stream when its turn comes at the engine's
     /// gate (one call every `TURN`), the tokens at once after that.
     Queued,
+    /// The stream is returned at once; the tokens come at the call's turn at
+    /// the engine's gate (one call every `TURN`): a decode engine whose
+    /// sides' KV handoffs complete one at a time on a slow transport.
+    QueuedStream,
+    /// The first call's tokens come after the delay, its stream returned at
+    /// once; every later call's stream is returned at once and stays empty
+    /// for good: a decode engine whose handoffs stopped completing after
+    /// one.
+    AnswerFirstThenEmpty(Duration),
+    /// The first call's stream trickles: [`TRICKLE_TOKENS`] tokens one every
+    /// [`TRICKLE`], the stream returned at once; every later call's stream
+    /// is returned at once and its tokens come after the delay: a decode
+    /// engine stepping a running generation while the handoffs of the sides
+    /// behind it take longer than the bound.
+    FirstTrickles(Duration),
     /// The call holds its headers for the delay, then fails.
     HoldHeadersThenFail(Duration),
 }
@@ -234,6 +285,43 @@ fn produce_after(tx: GenerateTx, delay: Duration) {
     });
 }
 
+/// Feed one generate stream a token every [`TRICKLE`], [`TRICKLE_TOKENS`] of
+/// them (the three words over and over), then the completion: a long
+/// generation the engine steps while other sides wait for their handoffs.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test mock; the producer task ends with its stream"
+)]
+fn produce_trickle(tx: GenerateTx) {
+    tokio::spawn(async move {
+        for n in 0..TRICKLE_TOKENS {
+            if tx.send(Ok(chunk(1 + n % OUTPUT_TOKENS))).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(TRICKLE).await;
+        }
+        let _ = tx.send(Ok(complete())).await;
+    });
+}
+
+/// Feed one generate stream once the call's turn at `gate` comes: the
+/// tokens, then the completion (the stream itself was returned at once).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test mock; the producer task ends with its stream"
+)]
+fn produce_at_gate(tx: GenerateTx, gate: Gate) {
+    tokio::spawn(async move {
+        gate.turn().await;
+        for id in 1..=OUTPUT_TOKENS {
+            if tx.send(Ok(chunk(id))).await.is_err() {
+                return;
+            }
+        }
+        let _ = tx.send(Ok(complete())).await;
+    });
+}
+
 #[tonic::async_trait]
 impl proto::vllm_engine_server::VllmEngine for Engine {
     async fn start_profile(
@@ -256,7 +344,7 @@ impl proto::vllm_engine_server::VllmEngine for Engine {
         &self,
         _request: Request<proto::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         let (tx, rx) = mpsc::channel(8);
         match self.behaviour {
             Behaviour::HoldHeaders => {
@@ -268,6 +356,11 @@ impl proto::vllm_engine_server::VllmEngine for Engine {
                 self.gate.turn().await;
                 produce_after(tx, Duration::ZERO);
             }
+            Behaviour::QueuedStream => produce_at_gate(tx, self.gate.clone()),
+            Behaviour::AnswerFirstThenEmpty(delay) if call == 1 => produce_after(tx, delay),
+            Behaviour::AnswerFirstThenEmpty(_) => produce_after(tx, FOREVER),
+            Behaviour::FirstTrickles(_) if call == 1 => produce_trickle(tx),
+            Behaviour::FirstTrickles(delay) => produce_after(tx, delay),
             Behaviour::HoldHeadersThenFail(delay) => {
                 tokio::time::sleep(delay).await;
                 return Err(Status::internal("the engine gave up on the request"));
@@ -1091,6 +1184,289 @@ fn a_sequential_decode_whose_stream_stays_empty_after_the_prefill_answered_is_gi
         worker_errors(&rendered, "prefill", "timeout"),
         0.0,
         "the prefill, which answered, is not charged:\n{rendered}"
+    );
+}
+
+/// Sequential dispatch, the prefill answers at once and the decode engine
+/// behaves as `decode` does: its answers come one call per turn at its gate
+/// (its sides' KV handoffs complete one at a time on a slow transport), so
+/// five requests at once put the last two answers past the decode side's
+/// bound. The sides wait on while the decode worker answers the others:
+/// every request is answered in full, nothing is charged to the decode
+/// worker and its breaker stays closed. Before the reprieve each side past
+/// its bound was a 504 `decode_worker_silent` and a breaker failure, and two
+/// of them took the only decode worker out of routing for every request.
+fn decode_sides_queued_behind_each_others_handoffs_case(decode: Behaviour) {
+    let prefill = Engine::new(Behaviour::Answer(Duration::ZERO));
+    let decode = Engine::new(decode);
+    let (prefill_calls, decode_calls) = (prefill.clone(), decode.clone());
+    let rendered = render_after(|| async move {
+        let prefill_port = start_mock_engine(prefill).await;
+        let decode_port = start_mock_engine(decode).await;
+        let (router, workers) = build_pd_router_with(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (decode_port, WorkerType::Decode),
+            ],
+            RuntimeType::Vllm,
+            CircuitBreakerConfig {
+                failure_threshold: 2,
+                ..Default::default()
+            },
+        )
+        .await;
+        let answers = concurrent_streaming_chats(router.as_ref(), QUEUED_CALLS).await;
+        assert_all_answered_past_the_bound(&answers);
+        for (_, body, _) in &answers {
+            assert_eq!(streamed_text(body), "Hello world test", "{body}");
+        }
+        assert_eq!(
+            workers[1].circuit_breaker_state(),
+            CircuitState::Closed,
+            "no side was charged to the decode worker"
+        );
+    });
+    assert_eq!(
+        prefill_calls.calls(),
+        QUEUED_CALLS,
+        "each prefill side once"
+    );
+    assert_eq!(
+        decode_calls.calls(),
+        QUEUED_CALLS,
+        "each decode side dispatched once, none replayed"
+    );
+    assert_eq!(
+        worker_errors(&rendered, "decode", "timeout"),
+        0.0,
+        "no decode side was given up on:\n{rendered}"
+    );
+    assert_eq!(
+        worker_errors(&rendered, "prefill", "timeout"),
+        0.0,
+        "{rendered}"
+    );
+}
+
+#[test]
+fn sequential_decode_sides_queued_behind_each_others_handoffs_are_not_given_up_on() {
+    decode_sides_queued_behind_each_others_handoffs_case(Behaviour::QueuedStream);
+}
+
+#[test]
+fn sequential_decode_sides_whose_calls_queue_at_the_engine_are_not_given_up_on_either() {
+    decode_sides_queued_behind_each_others_handoffs_case(Behaviour::Queued);
+}
+
+/// Sequential dispatch; the decode engine's first call streams a long
+/// generation, a token every [`TRICKLE`], and the sides behind it get their
+/// first tokens [`BEHIND_A_GENERATION`] after their dispatch, past the
+/// bound: a decode engine whose steps serve its running generation while
+/// the handoffs behind it complete. The worker produces the whole time, so
+/// the sides wait on and every request is answered in full; nothing is
+/// charged to the decode worker and its breaker stays closed. With the
+/// worker's first tokens alone as its answers, the sides behind the
+/// generation were given up on a bound after its first token, each a 504
+/// `decode_worker_silent` and a breaker failure, and two of them took the
+/// only decode worker out of routing.
+#[test]
+fn sequential_decode_sides_behind_a_running_generation_are_not_given_up_on() {
+    let prefill = Engine::new(Behaviour::Answer(Duration::ZERO));
+    let decode = Engine::new(Behaviour::FirstTrickles(BEHIND_A_GENERATION));
+    let (prefill_calls, decode_calls) = (prefill.clone(), decode.clone());
+    let rendered = render_after(|| async move {
+        let prefill_port = start_mock_engine(prefill).await;
+        let decode_port = start_mock_engine(decode).await;
+        let (router, workers) = build_pd_router_with(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (decode_port, WorkerType::Decode),
+            ],
+            RuntimeType::Vllm,
+            CircuitBreakerConfig {
+                failure_threshold: 2,
+                ..Default::default()
+            },
+        )
+        .await;
+        let answers = concurrent_streaming_chats(router.as_ref(), QUEUED_CALLS).await;
+        for (status, body, elapsed) in &answers {
+            assert_eq!(*status, http::StatusCode::OK, "{body} ({elapsed:?})");
+            assert!(body.contains("data: [DONE]"), "{body}");
+        }
+        let slowest = answers
+            .iter()
+            .map(|(_, _, elapsed)| *elapsed)
+            .max()
+            .unwrap_or_default();
+        assert!(
+            slowest >= BEHIND_A_GENERATION && slowest < TRICKLE * TRICKLE_TOKENS + SLACK,
+            "the sides behind the generation answered past the bound, the generation ran its length: {slowest:?}"
+        );
+        let behind = answers
+            .iter()
+            .filter(|(_, body, _)| streamed_text(body) == "Hello world test")
+            .count();
+        assert_eq!(
+            behind,
+            QUEUED_CALLS - 1,
+            "the sides behind the generation answered in full"
+        );
+        assert_eq!(
+            workers[1].circuit_breaker_state(),
+            CircuitState::Closed,
+            "no side was charged to the decode worker"
+        );
+    });
+    assert_eq!(
+        prefill_calls.calls(),
+        QUEUED_CALLS,
+        "each prefill side once"
+    );
+    assert_eq!(
+        decode_calls.calls(),
+        QUEUED_CALLS,
+        "each decode side dispatched once, none replayed"
+    );
+    assert_eq!(
+        worker_errors(&rendered, "decode", "timeout"),
+        0.0,
+        "no decode side was given up on:\n{rendered}"
+    );
+}
+
+/// The limit of the decode side's reprieve: the decode answers its first
+/// call [`LATE`] after the burst and leaves every later stream empty (its
+/// handoffs stopped completing). The later sides are given up on a bound
+/// after that answer: not at their own bound, which the answer reprieved,
+/// and not never. Each is a 504 `decode_worker_silent` naming the worker's
+/// silence, a `timeout` on the decode worker, nothing on the prefill.
+#[test]
+fn sequential_decode_sides_on_a_worker_that_stopped_answering_are_given_up_on_a_bound_after_its_last_answer(
+) {
+    let prefill = Engine::new(Behaviour::Answer(Duration::ZERO));
+    let decode = Engine::new(Behaviour::AnswerFirstThenEmpty(LATE));
+    let (prefill_calls, decode_calls) = (prefill.clone(), decode.clone());
+    let rendered = render_after(|| async move {
+        let prefill_port = start_mock_engine(prefill).await;
+        let decode_port = start_mock_engine(decode).await;
+        let router = build_pd_router(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (decode_port, WorkerType::Decode),
+            ],
+            RuntimeType::Vllm,
+        )
+        .await;
+        let answers = concurrent_streaming_chats(router.as_ref(), QUEUED_CALLS).await;
+        let answered = answers
+            .iter()
+            .filter(|(status, _, _)| *status == http::StatusCode::OK)
+            .count();
+        assert_eq!(answered, 1, "the one call the decode answered: {answers:?}");
+        for (status, body, elapsed) in &answers {
+            if *status == http::StatusCode::OK {
+                assert!(body.contains("data: [DONE]"), "{body}");
+                continue;
+            }
+            assert_eq!(*status, http::StatusCode::GATEWAY_TIMEOUT, "{body}");
+            assert!(body.contains("decode_worker_silent"), "{body}");
+            assert!(body.contains("its worker answered nothing for"), "{body}");
+            assert!(
+                *elapsed >= LATE + BOUND && *elapsed < LATE + BOUND + SLACK,
+                "given up on a bound after the worker's answer at {LATE:?}, not at its own bound ({BOUND:?}): {elapsed:?}"
+            );
+        }
+    });
+    assert_eq!(prefill_calls.calls(), QUEUED_CALLS);
+    assert_eq!(decode_calls.calls(), QUEUED_CALLS, "none replayed");
+    assert_eq!(
+        worker_errors(&rendered, "decode", "timeout"),
+        (QUEUED_CALLS - 1) as f64,
+        "one timeout per side given up on:\n{rendered}"
+    );
+    assert_eq!(
+        worker_errors(&rendered, "prefill", "timeout"),
+        0.0,
+        "{rendered}"
+    );
+}
+
+/// Sequential dispatch; the decode returns every stream at once and answers
+/// its first call [`LATE_FIRST`] after it, then one call per turn (a
+/// transport whose first pulls queue behind a slow start), the breaker kept
+/// out of the way. A first wave of five requests is given up on at the
+/// bound: no side had answered yet. A second wave of three, sent
+/// [`SECOND_WAVE_AFTER`] later, finds the worker answering the abandoned
+/// sides' first items one per turn: it is reprieved and answered in full,
+/// and only the first wave's verdicts are charged. Before this, an abandoned
+/// side's first item was read below the tracked layer (by its deferred
+/// abort), the worker read as silent, and the second wave was given up on
+/// as well: once a transport's queue of handoffs was deeper than the bound
+/// every first token belonged to an abandoned side.
+#[test]
+fn sequential_decode_sides_behind_abandoned_sides_are_reprieved_by_the_abandoned_sides_first_items()
+{
+    let prefill = Engine::new(Behaviour::Answer(Duration::ZERO));
+    let decode = Engine {
+        behaviour: Behaviour::QueuedStream,
+        gate: Gate {
+            first_turn_after: LATE_FIRST,
+            ..Gate::default()
+        },
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let (prefill_calls, decode_calls) = (prefill.clone(), decode.clone());
+    let rendered = render_after(|| async move {
+        let prefill_port = start_mock_engine(prefill).await;
+        let decode_port = start_mock_engine(decode).await;
+        let (router, workers) = build_pd_router_with(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (decode_port, WorkerType::Decode),
+            ],
+            RuntimeType::Vllm,
+            CircuitBreakerConfig {
+                failure_threshold: 100,
+                ..Default::default()
+            },
+        )
+        .await;
+        let router = router.as_ref();
+        let (first_wave, second_wave) =
+            futures::join!(concurrent_streaming_chats(router, QUEUED_CALLS), async {
+                tokio::time::sleep(SECOND_WAVE_AFTER).await;
+                concurrent_streaming_chats(router, SECOND_WAVE).await
+            });
+        for (status, body, elapsed) in &first_wave {
+            assert_decode_given_up_on(*status, body, *elapsed);
+        }
+        let turns = TURN * u32::try_from(QUEUED_CALLS + SECOND_WAVE).unwrap_or(u32::MAX);
+        for (status, body, elapsed) in &second_wave {
+            assert_eq!(*status, http::StatusCode::OK, "{body} ({elapsed:?})");
+            assert!(body.contains("data: [DONE]"), "{body}");
+            assert!(
+                *elapsed >= BOUND && *elapsed < LATE_FIRST + turns + SLACK,
+                "reprieved past its bound and answered at its turn: {elapsed:?}"
+            );
+        }
+        assert_eq!(workers[1].circuit_breaker_state(), CircuitState::Closed);
+    });
+    assert_eq!(prefill_calls.calls(), QUEUED_CALLS + SECOND_WAVE);
+    assert_eq!(
+        decode_calls.calls(),
+        QUEUED_CALLS + SECOND_WAVE,
+        "none replayed"
+    );
+    assert_eq!(
+        worker_errors(&rendered, "decode", "timeout"),
+        QUEUED_CALLS as f64,
+        "the first wave's verdicts, nothing of the second wave's:\n{rendered}"
+    );
+    assert_eq!(
+        worker_errors(&rendered, "prefill", "timeout"),
+        0.0,
+        "{rendered}"
     );
 }
 

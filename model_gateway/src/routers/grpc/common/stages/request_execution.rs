@@ -1377,7 +1377,9 @@ enum Retirement {
     /// written into it (the decode side of the sequential dispatch): charged
     /// as [`Self::Silent`] is, and its abort deferred as
     /// [`Self::PartnerSilent`]'s, since the handoff must not be torn down
-    /// mid-write.
+    /// mid-write. Its first item, if it comes, is its worker's answer (see
+    /// [`ProtoStream::retire_abandoned_decode_side`]): the handoff
+    /// completed, which is what the sides queued behind it are reprieved on.
     HandoffSilent,
 }
 
@@ -1411,12 +1413,15 @@ impl Retirement {
 /// arrives is the abort path the router already uses on a client disconnect,
 /// and it is the only thing that releases that room early. The abort is
 /// deferred only when a KV handoff may still be written into the side: the
-/// decode partner of a prefill that fell silent rather than failed; a peer
-/// that failed to start writes nothing. A late failure is sampled and
-/// counted only when it is the request's one word on the worker; a side
-/// given up on for its silence charged its worker when the bound passed.
-/// A late stream earns no success either way: the side is aborted before it
-/// produced anything.
+/// decode partner of a prefill that fell silent rather than failed, and the
+/// sequential decode side given up on at its first-token bound, whose first
+/// item is read as its worker's answer before the drop
+/// ([`ProtoStream::retire_abandoned_decode_side`]); a peer that failed to
+/// start writes nothing. A late failure is sampled and counted only when it
+/// is the request's one word on the worker; a side given up on for its
+/// silence charged its worker when the bound passed. A late stream earns no
+/// success either way: the side is aborted before it produced anything for
+/// its request.
 #[expect(
     clippy::disallowed_methods,
     reason = "the abandoned PD side is retired off the request path; its dispatch is bounded by the engine's own deadline"
@@ -1445,10 +1450,13 @@ fn retire_pd_side(
                     cause,
                     "Aborting the room of an abandoned PD side"
                 );
-                if retirement.defer_abort() {
-                    drop(stream.defer_abort_until_first_item());
-                } else {
-                    drop(stream);
+                match retirement {
+                    Retirement::HandoffSilent => stream
+                        .defer_abort_until_first_item()
+                        .tracked_decode_side(Arc::clone(&worker))
+                        .retire_abandoned_decode_side(),
+                    _ if retirement.defer_abort() => drop(stream.defer_abort_until_first_item()),
+                    _ => drop(stream),
                 }
             }
             Err(error) if retirement.charges() => {
@@ -1525,10 +1533,10 @@ impl PrefillBound {
     }
 }
 
-/// What a prefill side's silence verdict was judged on (see
+/// What a side's silence verdict was judged on (see
 /// [`liveness::SideReprieve::Silent`]).
 #[derive(Clone, Copy, Debug)]
-struct PrefillSilence {
+struct SideSilence {
     /// The side's own bound.
     bound: Duration,
     /// How long the side had waited since its dispatch.
@@ -1536,7 +1544,9 @@ struct PrefillSilence {
     /// How long its worker had answered nothing (`None`: never).
     silent: Option<Duration>,
     /// What that silence was judged against: the bound, or the time the
-    /// backlog of a run that had not answered takes.
+    /// backlog of a run that had not answered takes; or, for a decode side
+    /// given up on at the ceiling of its reprieve, that ceiling, which its
+    /// `silent` is then under (see [`liveness::decode_side_reprieve`]).
     window: Duration,
 }
 
@@ -1561,7 +1571,7 @@ fn prefill_side_silent(
     connection: &'static str,
     request_id: &str,
     prompt_tokens: u64,
-    silence: PrefillSilence,
+    silence: SideSilence,
     phase: &'static str,
 ) -> tonic::Status {
     let millis = |span: Duration| u64::try_from(span.as_millis()).unwrap_or(u64::MAX);
@@ -1589,21 +1599,28 @@ fn prefill_side_silent(
         connection,
         metrics_labels::ERROR_TIMEOUT,
     );
-    let PrefillSilence {
+    let SideSilence {
         bound,
         waited,
         silent,
         window,
     } = silence;
-    let worker_silent = match silent {
+    let worker_silent = worker_silence_clause(silent, window);
+    tonic::Status::deadline_exceeded(format!(
+        "{PREFILL_SILENCE_MESSAGE} {waited:.1?} of its dispatch ({phase}, bound {bound:.1?}): {worker_silent}"
+    ))
+}
+
+/// The clause of a side's silence verdict that names its worker's silence:
+/// how long the worker had answered nothing (`None`: never) against the
+/// window it was judged by.
+fn worker_silence_clause(silent: Option<Duration>, window: Duration) -> String {
+    match silent {
         Some(silent) => {
             format!("its worker answered nothing for {silent:.1?} of a {window:.1?} window")
         }
         None => format!("its worker never answered (a {window:.1?} window)"),
-    };
-    tonic::Status::deadline_exceeded(format!(
-        "{PREFILL_SILENCE_MESSAGE} {waited:.1?} of its dispatch ({phase}, bound {bound:.1?}): {worker_silent}"
-    ))
+    }
 }
 
 /// Whether `status` is a prefill side's silence verdict.
@@ -1795,7 +1812,7 @@ fn judge_prefill_side(
             connection,
             request_id,
             prompt_tokens,
-            PrefillSilence {
+            SideSilence {
                 bound: bound.bound,
                 waited,
                 silent,
@@ -1912,11 +1929,17 @@ async fn first_prefill_response_within(
 }
 
 /// The bound on a sequential decode side's first token, counted from its
-/// dispatch (see [`liveness::decode_side_bound`]).
-#[derive(Clone, Copy, Debug)]
+/// dispatch (see [`liveness::decode_side_bound`]), with what the side's
+/// reprieve past it reads (see [`liveness::decode_side_reprieve`]).
+#[derive(Clone, Debug)]
 struct DecodeBound {
+    dispatched: Instant,
     deadline: Instant,
     bound: Duration,
+    /// The decode worker's backlog, read the first time the side is judged
+    /// past its bound and kept (see [`liveness::decode_side_reprieve`]);
+    /// shared by the side's dispatch and first-response phases.
+    backlog: Arc<OnceLock<Duration>>,
 }
 
 impl DecodeBound {
@@ -1928,7 +1951,12 @@ impl DecodeBound {
         let bound = liveness::decode_side_bound(prefills, prompt_tokens)?;
         // A bound past the clock's range never expires: the side stays unbounded.
         let deadline = dispatched.checked_add(bound)?;
-        Some(Self { deadline, bound })
+        Some(Self {
+            dispatched,
+            deadline,
+            bound,
+            backlog: Arc::default(),
+        })
     }
 }
 
@@ -1956,41 +1984,105 @@ fn worker_prefilling_before_decode(
 
 /// The verdict on a sequential decode side that produced nothing within its
 /// first-token bound, in `phase` (`dispatch`: the call returned no stream;
-/// `first_response`: the stream yielded nothing): one WARN naming the
-/// worker and the request, the worker-error counter under the timeout
-/// class, and the status the side's failure is reported with. The prefill
-/// side has answered by then, so its silence bound no longer covers the
-/// request, and nothing else bounds this wait below the request's own
-/// timeout: the engines' health probes keep passing while the KV handoff
-/// waits on a prefill engine that stalled right after answering, and the
-/// admission gate only gated the dispatch. The attempt fails here; the
-/// retry layer takes the request to another decode worker when one is
-/// available (see [`decode_silence_response`]).
+/// `first_response`: the stream yielded nothing), while its decode worker
+/// produced nothing for any side for its window either, no first token and
+/// no token on a stream it serves, or once the side's wait reached the
+/// ceiling of its reprieve while the worker produced for its other sides
+/// (see [`liveness::decode_side_reprieve`]):
+/// one WARN naming the worker, the request, how long the side waited, how
+/// long the worker had produced nothing against which window and how long
+/// ago it last answered a side and last produced a token, the worker-error
+/// counter under the timeout class, and the status the side's
+/// failure is reported with. The prefill side has answered by then, so its
+/// silence bound no longer covers the request, and nothing else bounds this
+/// wait below the request's own timeout: the engines' health probes keep
+/// passing while the KV handoff waits on a prefill engine that stalled
+/// right after answering, and the admission gate only gated the dispatch.
+/// The attempt fails here; the retry layer takes the request to another
+/// decode worker when one is available (see [`decode_silence_response`]).
 fn decode_side_silent(
     worker: &Arc<dyn Worker>,
     connection: &'static str,
     request_id: &str,
     prompt_tokens: u64,
-    bound: Duration,
+    silence: SideSilence,
     phase: &'static str,
 ) -> tonic::Status {
+    let millis = |span: Duration| u64::try_from(span.as_millis()).unwrap_or(u64::MAX);
+    let worker_last_answer = worker
+        .prefill_answered_ago()
+        .map_or_else(|| "never".to_string(), |ago| format!("{ago:.1?} ago"));
+    // The verdict at the reprieve's ceiling: the worker produced within the
+    // window (see `liveness::decode_side_reprieve`); every other verdict
+    // names a silence of the window at least.
+    let at_ceiling = silence.silent.is_some_and(|silent| silent < silence.window);
     warn!(
         request_id = %request_id,
         worker = worker.url(),
         worker_type = metrics_labels::WORKER_DECODE,
         phase,
         prompt_tokens,
-        bound_ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
-        "PD decode side produced nothing within its first-token bound after the prefill side had answered (the handoff did not complete, or the decode engine never scheduled it); giving up on it"
+        bound_ms = millis(silence.bound),
+        waited_ms = millis(silence.waited),
+        worker_silent_ms = silence.silent.map(millis),
+        window_ms = millis(silence.window),
+        at_ceiling,
+        worker_last_answer = %worker_last_answer,
+        worker_last_token_ms = millis(worker.token_progress_age()),
+        "PD decode side produced nothing past its first-token bound after the prefill side had answered: its worker produced nothing for any side for the silence window, no first token and no token on a stream it serves (the handoff did not complete and the engine made no step, or it never scheduled the side), or the side's wait reached the ceiling of its reprieve while the worker produced for its other sides (at_ceiling: the side's own handoff is stuck); giving up on it"
     );
     Metrics::record_worker_error(
         metrics_labels::WORKER_DECODE,
         connection,
         metrics_labels::ERROR_TIMEOUT,
     );
+    let SideSilence {
+        bound,
+        waited,
+        silent,
+        window,
+    } = silence;
+    let worker_silent = match silent {
+        Some(silent) if at_ceiling => format!(
+            "its worker kept producing for its other sides (its latest token {silent:.1?} ago) while the side's wait reached the {window:.1?} ceiling of its reprieve"
+        ),
+        _ => worker_silence_clause(silent, window),
+    };
     tonic::Status::deadline_exceeded(format!(
-        "{DECODE_SIDE_SILENCE_MESSAGE} {bound:.1?} of its dispatch ({phase})"
+        "{DECODE_SIDE_SILENCE_MESSAGE} {waited:.1?} of its dispatch ({phase}, bound {bound:.1?}): {worker_silent}"
     ))
+}
+
+/// One check of a sequential decode side past its deadline, in `phase`: how
+/// much longer it waits (see [`liveness::decode_side_reprieve`]), or the
+/// verdict that takes its place, once its worker has produced nothing (no
+/// side's first token, no token on any stream) for its window, or once the
+/// side's wait reached the ceiling of its reprieve.
+fn judge_decode_side(
+    worker: &Arc<dyn Worker>,
+    bound: &DecodeBound,
+    connection: &'static str,
+    request_id: &str,
+    prompt_tokens: u64,
+    phase: &'static str,
+) -> Result<Duration, tonic::Status> {
+    let waited = bound.dispatched.elapsed();
+    match liveness::decode_side_reprieve(worker, bound.bound, waited, &bound.backlog) {
+        SideReprieve::WithinBound(more) | SideReprieve::FirstAnswerDue(more) => Ok(more),
+        SideReprieve::Silent { silent, window } => Err(decode_side_silent(
+            worker,
+            connection,
+            request_id,
+            prompt_tokens,
+            SideSilence {
+                bound: bound.bound,
+                waited,
+                silent,
+                window,
+            },
+            phase,
+        )),
+    }
 }
 
 /// Whether `status` is a sequential decode side's silence verdict. Its
@@ -2003,13 +2095,17 @@ fn is_decode_side_silence(status: &tonic::Status) -> bool {
 }
 
 /// Await a sequential decode side's dispatch within its bound. Past the
-/// deadline the still-pending call is retired off the request path (its
-/// room is aborted once the handoff it may be in the middle of has produced
-/// a first item, or the deferral's cap passes) and the silence verdict takes
-/// its place. Without a bound or a worker to charge, the call is awaited as
-/// it is. No reprieve: unlike a prefill side queued on a busy worker, a
-/// decode side was admitted to a room before its dispatch, so nothing of the
-/// worker's other sides stands between it and its first token.
+/// deadline the side waits on while its decode worker keeps producing for
+/// other sides (their first tokens, the KV handoffs before its own
+/// completing on the transport, or the tokens of its running generations;
+/// see [`judge_decode_side`]); once it is judged silent, the
+/// still-pending call is retired off the request path (its room is aborted
+/// once the handoff it may be in the middle of has produced a first item,
+/// or the deferral's cap passes) and the silence verdict takes its place.
+/// Without a bound or a worker to charge, the call is awaited as it is. The
+/// side was admitted to a room before its dispatch, so the engine's running
+/// window never stands between it and its first token; the worker's other
+/// handoffs on the transport do.
 async fn dispatch_decode_within(
     bound: Option<DecodeBound>,
     mut dispatch: SideDispatch,
@@ -2021,33 +2117,41 @@ async fn dispatch_decode_within(
     let (Some(bound), Some(worker)) = (bound, worker) else {
         return dispatch.await;
     };
-    match tokio::time::timeout_at(bound.deadline.into(), &mut dispatch).await {
-        Ok(result) => result,
-        Err(_) => {
-            retire_pd_side(
-                PdSide::Decode,
-                connection,
-                Arc::clone(&worker),
-                dispatch,
-                Retirement::HandoffSilent,
-            );
-            Err(decode_side_silent(
-                &worker,
-                connection,
-                &request_id,
-                prompt_tokens,
-                bound.bound,
-                "dispatch",
-            ))
+    let mut deadline = bound.deadline;
+    loop {
+        if let Ok(result) = tokio::time::timeout_at(deadline.into(), &mut dispatch).await {
+            return result;
+        }
+        match judge_decode_side(
+            &worker,
+            &bound,
+            connection,
+            &request_id,
+            prompt_tokens,
+            "dispatch",
+        ) {
+            Ok(more) => deadline = Instant::now() + more,
+            Err(verdict) => {
+                retire_pd_side(
+                    PdSide::Decode,
+                    connection,
+                    Arc::clone(&worker),
+                    dispatch,
+                    Retirement::HandoffSilent,
+                );
+                return Err(verdict);
+            }
         }
     }
 }
 
 /// Wait for a sequential decode side's first item within what is left of its
-/// bound, and say what it was. The item stays on the stream for its reader;
-/// past the bound, the silence verdict (the caller drops the side, whose
-/// abort is deferred past the handoff). Without a bound nothing is pulled
-/// ahead and the side counts as answered, as its dispatch did.
+/// bound, with the same reprieve as [`dispatch_decode_within`], and say what
+/// it was. The item stays on the stream for its reader; past the bound,
+/// with the worker silent, the silence verdict (the caller retires the side
+/// through its tracked layer, its abort deferred past the handoff). Without
+/// a bound nothing is pulled ahead and the side counts as answered, as its
+/// dispatch did.
 async fn first_decode_response_within(
     stream: &mut ProtoStream,
     bound: Option<DecodeBound>,
@@ -2059,16 +2163,20 @@ async fn first_decode_response_within(
     let (Some(bound), Some(worker)) = (bound, worker) else {
         return Ok(FirstItem::Response);
     };
-    match stream.first_response_within(bound.deadline).await {
-        Ok(first) => Ok(first),
-        Err(_) => Err(decode_side_silent(
+    let mut deadline = bound.deadline;
+    loop {
+        if let Ok(first) = stream.first_response_within(deadline).await {
+            return Ok(first);
+        }
+        let more = judge_decode_side(
             worker,
+            &bound,
             connection,
             request_id,
             prompt_tokens,
-            bound.bound,
             "first_response",
-        )),
+        )?;
+        deadline = Instant::now() + more;
     }
 }
 
@@ -2763,7 +2871,13 @@ async fn sequential_decode_side(
     // so its silence bound no longer covers the request, and nothing else
     // bounds this wait below the request's own timeout while the engines'
     // health probes keep passing (a prefill engine that stalls right after
-    // answering leaves the handoff waiting on it).
+    // answering leaves the handoff waiting on it). Past the bound the side
+    // waits on while the decode worker produces tokens for other sides
+    // (their handoffs completing before its own on a slow transport, its
+    // running generations stepping: back-pressure, see
+    // `liveness::decode_side_reprieve`), and is given up on once the worker
+    // has produced nothing for the bound, or at the ceiling of its reprieve
+    // (its own handoff stuck while the worker serves the rest).
     // The bound covers a streaming request only: a non-streaming side's first
     // item is its whole generation (the servicers send nothing of a
     // non-streaming request before it finishes), no first-token signal. Its
@@ -2777,7 +2891,7 @@ async fn sequential_decode_side(
     };
     let decode_worker = workers.decode_worker().cloned();
     let decode_stream = dispatch_decode_within(
-        decode_bound,
+        decode_bound.clone(),
         Box::pin(async move { decode_client.generate(decode_request).await }),
         decode_worker.clone(),
         sides.decode_label,
@@ -2816,6 +2930,10 @@ async fn sequential_decode_side(
     )
     .await
     {
+        // The side is retired through its tracked layer: its first item, if
+        // the handoff completes after all, is the worker's answer the sides
+        // behind it are reprieved on; the abort stays deferred past it.
+        decode_stream.retire_abandoned_decode_side();
         return Err(sequential_decode_failure(
             &e,
             workers,
@@ -4054,7 +4172,7 @@ mod tests {
             metrics_labels::CONNECTION_GRPC,
             "chatcmpl-both-prefill",
             256,
-            PrefillSilence {
+            SideSilence {
                 bound,
                 waited: bound,
                 silent: None,
@@ -4073,9 +4191,12 @@ mod tests {
     }
 
     fn three_second_decode_bound() -> DecodeBound {
+        let dispatched = Instant::now();
         DecodeBound {
-            deadline: Instant::now() + Duration::from_secs(3),
+            dispatched,
+            deadline: dispatched + Duration::from_secs(3),
             bound: Duration::from_secs(3),
+            backlog: Arc::default(),
         }
     }
 
@@ -4126,6 +4247,92 @@ mod tests {
         assert!(
             is_retryable_response(&response),
             "another decode worker may take the request"
+        );
+    }
+
+    /// A sequential decode call past its bound waits on while its worker
+    /// produces for other sides (their first tokens after the KV handoffs
+    /// before its own completed on the transport, or a token on a running
+    /// generation: the worker's token progress, stamped for every response
+    /// a tracked stream yields), and is given up on a bound after the
+    /// latest of them, the verdict naming the worker's silence. Real
+    /// time, at a short bound: the worker's tokens are stamped on the
+    /// liveness clock, which a paused runtime does not move.
+    #[tokio::test]
+    async fn a_sequential_decode_past_its_bound_waits_on_while_its_worker_answers_other_sides() {
+        const BOUND: Duration = Duration::from_millis(500);
+        /// Scheduling slack for a loaded machine.
+        const SLACK: Duration = Duration::from_millis(1_500);
+        let bound = || {
+            let dispatched = Instant::now();
+            DecodeBound {
+                dispatched,
+                deadline: dispatched + BOUND,
+                bound: BOUND,
+                backlog: Arc::default(),
+            }
+        };
+        let workers = tokenspeed_pair();
+        let decode = Arc::clone(workers.decode_worker().expect("a pair"));
+        // Another side's first token at 0.4 s: the side, past its bound at
+        // 0.5 s, waits until 0.9 s, and its own answer at 0.8 s comes first.
+        let producing = Arc::clone(&decode);
+        let answers_late: SideDispatch = Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            liveness::on_token_progress(&producing);
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            Err(tonic::Status::unavailable("late side"))
+        });
+        let started = Instant::now();
+        let status = failure(
+            dispatch_decode_within(
+                Some(bound()),
+                answers_late,
+                Some(Arc::clone(&decode)),
+                metrics_labels::CONNECTION_GRPC,
+                "chatcmpl-decode-reprieved".to_string(),
+                256,
+            )
+            .await,
+        );
+        let elapsed = started.elapsed();
+        assert_eq!(status.message(), "late side");
+        assert!(
+            elapsed >= Duration::from_millis(800) && elapsed < Duration::from_millis(800) + SLACK,
+            "waited on past the bound for its own answer: {elapsed:?}"
+        );
+
+        // A side whose worker produces for another side 0.2 s after its
+        // dispatch and nothing after that: reprieved at its bound, given up
+        // on a bound after that token (0.7 s), the worker's silence named.
+        let producing = Arc::clone(&decode);
+        let answers_once_then_never: SideDispatch = Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            liveness::on_token_progress(&producing);
+            std::future::pending().await
+        });
+        let started = Instant::now();
+        let status = failure(
+            dispatch_decode_within(
+                Some(bound()),
+                answers_once_then_never,
+                Some(Arc::clone(&decode)),
+                metrics_labels::CONNECTION_GRPC,
+                "chatcmpl-decode-silent-after-an-answer".to_string(),
+                256,
+            )
+            .await,
+        );
+        let elapsed = started.elapsed();
+        assert!(is_decode_side_silence(&status), "{status:?}");
+        assert!(
+            elapsed >= Duration::from_millis(700) && elapsed < Duration::from_millis(700) + SLACK,
+            "given up on a bound after the worker's latest answer, not at its own bound: {elapsed:?}"
+        );
+        assert!(
+            status.message().contains("its worker answered nothing for")
+                && status.message().contains("of a 500.0ms window"),
+            "{status:?}"
         );
     }
 

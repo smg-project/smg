@@ -384,6 +384,17 @@ impl PrefillBook {
             .then(|| Duration::from_millis(now_ms.saturating_sub(self.last_answer_ms)))
     }
 
+    /// A prompt the book does not hold was answered with its first token at
+    /// `now_ms` (the decode side of a disaggregated dispatch: its prompt is
+    /// the prefill worker's work, and nothing is pending here for it): the
+    /// latest answer, and the current run's. Nothing is released, nothing
+    /// timed, no shape shown; an older stamp never moves the latest back.
+    fn answered(&mut self, now_ms: u64) {
+        self.last_answer_ms = self.last_answer_ms.max(now_ms);
+        self.run_answered = true;
+        self.unanswered_ms = 0;
+    }
+
     /// A decode side showed a handoff at `now_ms`; an older stamp never
     /// moves the latest back.
     fn handed_off(&mut self, now_ms: u64) {
@@ -743,6 +754,18 @@ impl WorkerRuntime {
     /// [`Self::prefill_handed_off_ago`] as of `now_ms` on the gateway clock.
     pub fn prefill_handed_off_ago_at(&self, now_ms: u64) -> Option<Duration> {
         self.prefill.lock().handed_off_ago(now_ms)
+    }
+
+    /// A decode side dispatched to this worker got its first token (see
+    /// [`Worker::note_answered`]): the worker's latest answer, apart from
+    /// the prompts the prefill book holds.
+    pub fn note_answered(&self) {
+        self.note_answered_at(super::liveness::now_ms().max(1));
+    }
+
+    /// [`Self::note_answered`] at `now_ms` on the gateway clock.
+    pub fn note_answered_at(&self, now_ms: u64) {
+        self.prefill.lock().answered(now_ms);
     }
 
     pub fn prefill_cold_shape(&self, tokens: u64) -> bool {
@@ -1296,6 +1319,45 @@ mod tests {
             runtime.prefill_handed_off_ago_at(5_000),
             Some(Duration::from_secs(2)),
             "the answer leaves the handoff alone"
+        );
+    }
+
+    #[test]
+    fn a_decode_sides_first_token_is_its_workers_answer_and_nothing_else() {
+        // The decode side of a disaggregated dispatch books nothing on its
+        // worker (the prefill worker computed its prompt), but its first
+        // token is the worker's latest answer: the evidence a decode side
+        // past its bound is reprieved on. It releases no prompt, times
+        // nothing and shows no shape; an older stamp never moves it back.
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        assert_eq!(runtime.prefill_answered_ago_at(1_000), None);
+        runtime.note_answered_at(3_000);
+        assert_eq!(
+            runtime.prefill_answered_ago_at(4_000),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(runtime.prefill_backlog(), Duration::ZERO, "nothing booked");
+        assert_eq!(runtime.prefill_rate_tps(), 0, "nothing timed");
+        assert_eq!(runtime.prefill_unanswered_run_at(4_000), None, "no run");
+        assert!(!runtime.prefill_cold_shape(1 << 20), "no shape shown");
+        runtime.note_answered_at(2_000);
+        assert_eq!(
+            runtime.prefill_answered_ago_at(4_000),
+            Some(Duration::from_secs(1)),
+            "not back"
+        );
+        // A run of booked prompts still awaiting its first answer has it.
+        runtime.note_prefill_started_at(4_096, true, 5_000);
+        assert_eq!(
+            runtime.prefill_unanswered_run_at(6_000),
+            Some(Duration::from_secs(1))
+        );
+        runtime.note_answered_at(6_000);
+        assert_eq!(runtime.prefill_unanswered_run_at(7_000), None);
+        assert_eq!(
+            runtime.prefill_backlog(),
+            Duration::from_millis(409),
+            "the prompt stays pending: the answer released nothing"
         );
     }
 
