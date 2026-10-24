@@ -395,8 +395,9 @@ def test_epd_workers_are_refused_up_front_and_prefill_decode_ones_are_not():
     """The encode dispatch is not on the Rust path: an EPD role is a
     configuration error before the server binds. A prefill/decode role with
     one scheduler rank is served (the wire carries the bootstrap fields), so
-    it passes; with more than one rank it is refused, since a request is not
-    placed on its room's rank on the Rust path yet."""
+    it passes; with more than one rank (the pinned release's ``dp_size``, or
+    the newer releases' ``attn_dp_size`` beside ``dp_size=1``) it is refused,
+    since a request is not placed on its room's rank on the Rust path yet."""
     rust.refuse_epd_disaggregation(_server_args())
     rust.refuse_epd_disaggregation(_server_args(disaggregation_mode="null"))
     rust.refuse_epd_disaggregation(_server_args(dp_size=2))
@@ -406,6 +407,12 @@ def test_epd_workers_are_refused_up_front_and_prefill_decode_ones_are_not():
             rust_lifecycle.ServicerConfigError, match="more than one scheduler rank"
         ):
             rust.refuse_epd_disaggregation(_server_args(disaggregation_mode=mode, dp_size=2))
+        with pytest.raises(
+            rust_lifecycle.ServicerConfigError, match="more than one scheduler rank"
+        ):
+            rust.refuse_epd_disaggregation(
+                _server_args(disaggregation_mode=mode, dp_size=1, attn_dp_size=2)
+            )
     for role in ({"language_only": True}, {"encoder_only": True}):
         with pytest.raises(rust_lifecycle.ServicerConfigError, match="EPD disaggregation"):
             rust.refuse_epd_disaggregation(_server_args(**role))
