@@ -117,6 +117,8 @@ async fn send_one_request(
         &req_headers,
         &req_ctx.request,
         router.request_timeout,
+        model_id,
+        start_time,
     )
     .await?;
 

@@ -57,6 +57,8 @@ async fn execute_passthrough(router: &RouterContext, req_ctx: &RequestContext) -
         &req_headers,
         &req_ctx.request,
         router.request_timeout,
+        model_id,
+        start_time,
     )
     .await
     {
@@ -281,6 +283,7 @@ async fn send_streaming_request(
     router: &RouterContext,
     req_ctx: &RequestContext,
 ) -> Result<reqwest::Response, String> {
+    let start_time = Instant::now();
     worker::record_router_request(&req_ctx.model_id, true);
 
     let (url, req_headers) = worker::build_request(&*req_ctx.worker, req_ctx.headers.as_ref());
@@ -290,6 +293,8 @@ async fn send_streaming_request(
         &req_headers,
         &req_ctx.request,
         router.request_timeout,
+        &req_ctx.model_id,
+        start_time,
     )
     .await
     .map_err(|e| {

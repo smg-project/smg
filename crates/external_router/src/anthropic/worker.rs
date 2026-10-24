@@ -57,13 +57,18 @@ fn propagated_headers(headers: Option<&HeaderMap>, configured_key: Option<&Strin
     propagated
 }
 
-/// Send the HTTP request to the worker.
+/// Sends the HTTP request to the worker. A send that fails below HTTP is
+/// counted against the model before it becomes the caller's answer: a timeout
+/// under `timeout`/`deadline` with the 504, any other transport failure under
+/// `backend_error`/`transport_disconnect` with the 502.
 pub(crate) async fn send_request(
     http_client: &reqwest::Client,
     url: &str,
     headers: &HeaderMap,
     request: &CreateMessageRequest,
     timeout: Duration,
+    model_id: &str,
+    start_time: Instant,
 ) -> Result<reqwest::Response, Response> {
     debug!(url = %url, "Sending request to worker");
 
@@ -79,6 +84,19 @@ pub(crate) async fn send_request(
         }
         Err(e) => {
             warn!(url = %url, error = %e, "Request to worker failed");
+
+            let (kind, reason) = if e.is_timeout() {
+                (
+                    metrics_labels::ERROR_TIMEOUT,
+                    metrics_labels::REASON_DEADLINE,
+                )
+            } else {
+                (
+                    metrics_labels::ERROR_BACKEND,
+                    metrics_labels::REASON_TRANSPORT_DISCONNECT,
+                )
+            };
+            record_failure_metrics(model_id, start_time, kind, reason);
 
             if e.is_timeout() {
                 Err(error::gateway_timeout(
@@ -256,6 +274,7 @@ pub(crate) fn record_failure_metrics(
 #[cfg(test)]
 mod tests {
     use axum::{body::to_bytes, http::StatusCode};
+    use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
     use super::*;
 
@@ -280,6 +299,145 @@ mod tests {
         assert!(!text.contains("org-abc123"), "{text}");
         assert!(!text.contains("proj_xyz789"), "{text}");
         assert!(text.contains("Rate limit reached for model"), "{text}");
+    }
+
+    /// A client whose budget for a call is `timeout`, the process TLS crypto
+    /// provider installed first.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test binary's client factory; the process TLS crypto provider is installed first"
+    )]
+    fn client_with_timeout(timeout: Duration) -> reqwest::Client {
+        use rustls::crypto::ring::default_provider;
+        let _ = default_provider().install_default();
+        reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .expect("a client")
+    }
+
+    fn request() -> CreateMessageRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "q"}],
+        }))
+        .expect("a request")
+    }
+
+    /// The recorder's rendered line of `metric` carrying `model`, if any.
+    fn series_line(handle: &PrometheusHandle, metric: &str, model: &str) -> Option<String> {
+        let rendered = handle.render();
+        let model = format!("model=\"{model}\"");
+        rendered
+            .lines()
+            .find(|line| line.starts_with(&format!("{metric}{{")) && line.contains(&model))
+            .map(str::to_string)
+    }
+
+    /// The error series the failed send is counted under for `model`, as
+    /// `(error_type, reason, count)`, with the number of duration samples.
+    fn counted_failure(handle: &PrometheusHandle, model: &str) -> (String, String, u64, u64) {
+        let errors = series_line(handle, "smg_router_request_errors_total", model)
+            .expect("the failed send is counted");
+        let label = |name: &str| {
+            let key = format!("{name}=\"");
+            let start = errors.find(&key).expect(name) + key.len();
+            let end = errors[start..].find('"').expect(name) + start;
+            errors[start..end].to_string()
+        };
+        let count = |line: &str| -> u64 {
+            line.rsplit(' ')
+                .next()
+                .expect("a value")
+                .parse()
+                .expect("a count")
+        };
+        let durations = series_line(handle, "smg_router_request_duration_seconds_count", model)
+            .expect("the failed send has a duration");
+        (
+            label("error_type"),
+            label("reason"),
+            count(&errors),
+            count(&durations),
+        )
+    }
+
+    /// A send the request timeout cuts is the caller's 504 and one error
+    /// counted against the model under `timeout`/`deadline`, with a duration
+    /// sample; the upstream completes the handshake and never answers.
+    #[tokio::test]
+    async fn a_send_that_times_out_is_counted_as_a_deadline_against_the_model() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let url = format!(
+            "http://{}/v1/messages",
+            silent.local_addr().expect("an address")
+        );
+        let budget = Duration::from_millis(50);
+
+        let answer = send_request(
+            &client_with_timeout(budget),
+            &url,
+            &HeaderMap::new(),
+            &request(),
+            budget,
+            "silent-upstream",
+            Instant::now(),
+        )
+        .await;
+
+        let response = answer.expect_err("a failed send");
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            counted_failure(&handle, "silent-upstream"),
+            ("timeout".to_string(), "deadline".to_string(), 1, 1)
+        );
+    }
+
+    /// A send nothing answers (the port refuses the connection) is the
+    /// caller's 502 and one error counted against the model under
+    /// `backend_error`/`transport_disconnect`, with a duration sample.
+    #[tokio::test]
+    async fn a_refused_connection_is_counted_as_a_transport_disconnect_against_the_model() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let url = format!(
+            "http://{}/v1/messages",
+            closed.local_addr().expect("an address")
+        );
+        drop(closed);
+
+        let answer = send_request(
+            &client_with_timeout(Duration::from_secs(5)),
+            &url,
+            &HeaderMap::new(),
+            &request(),
+            Duration::from_secs(5),
+            "closed-port",
+            Instant::now(),
+        )
+        .await;
+
+        let response = answer.expect_err("a failed send");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            counted_failure(&handle, "closed-port"),
+            (
+                "backend_error".to_string(),
+                "transport_disconnect".to_string(),
+                1,
+                1
+            )
+        );
     }
 
     fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
