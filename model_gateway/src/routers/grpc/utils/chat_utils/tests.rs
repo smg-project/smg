@@ -1064,9 +1064,9 @@ fn thinking_disabled_projects_params_thinking_false() {
     );
 }
 
-/// Under the MiniMax profile no effort value switches thinking off and an
-/// explicit effort outranks `thinking.disabled`; the request renders the
-/// template's default (thinking on, the model's own depth).
+/// Under the MiniMax profile no effort value switches thinking off: the
+/// request renders the template's default (thinking on, the model's own
+/// depth). An explicit `thinking.disabled` wins over the effort there too.
 #[test]
 fn minimax_effort_keeps_thinking_on() {
     let minimax = |thinking: Option<Value>, reasoning_effort: Option<&str>| {
@@ -1083,8 +1083,8 @@ fn minimax_effort_keeps_thinking_on() {
         );
         assert_eq!(
             resolve_template_thinking(&minimax(Some(json!({"type": "disabled"})), Some(effort))),
-            None,
-            "{effort} outranks thinking.disabled"
+            Some(false),
+            "{effort}: thinking.disabled wins"
         );
     }
     assert_eq!(
