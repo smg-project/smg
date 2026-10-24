@@ -126,7 +126,11 @@ mod header_routing_hints_tests {
         let (ctx, recorders, model_id) = setup(TestRouterConfig::cache_aware(3171), 19453).await;
         let app = ctx.create_app();
 
-        // Prompts share no prefix, so the string tree never produces a cache hit.
+        // Prompts share no prefix (distinct first characters), so the string
+        // tree never produces a cache hit and every pick is a miss, broken
+        // among three idle workers by the scorer's fair tie draw. Twelve of
+        // them: the chance that a fair draw lands all on one worker is 3^-11,
+        // so a pile-up reads as a defect, not as a draw.
         for prompt in [
             "alpha wolves hunt at dusk",
             "borrow a cup of sugar",
@@ -134,6 +138,12 @@ mod header_routing_hints_tests {
             "delta flights leave early",
             "every engine hums a note",
             "frozen lakes crack loudly",
+            "gentle rivers carve the stone",
+            "harbor lights guide the boats",
+            "iron gates rust in the rain",
+            "jasmine blooms after midnight",
+            "kettles whistle before dawn",
+            "lanterns sway along the pier",
         ] {
             let response = app
                 .clone()
@@ -148,7 +158,7 @@ mod header_routing_hints_tests {
             served.iter().filter(|count| **count > 0).count() > 1,
             "without a hint, distinct prompts must not pile onto one worker, got {served:?}"
         );
-        assert_eq!(served.iter().sum::<usize>(), 6);
+        assert_eq!(served.iter().sum::<usize>(), 12);
 
         ctx.shutdown().await;
     }
