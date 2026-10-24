@@ -8,7 +8,7 @@ use std::{os::raw::c_char, sync::Arc, time::Duration};
 
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::chat::ChatCompletionRequest;
-use smg::routers::grpc::utils::process_chat_messages;
+use smg::routers::grpc::utils::{chat_reasoning_starts_in_rendered_prefill, process_chat_messages};
 use smg_grpc_client::sglang_scheduler::{SglangGenerateRequestOptions, SglangSchedulerClient};
 use uuid::Uuid;
 
@@ -19,7 +19,6 @@ use super::{
     runtime::RUNTIME,
     stream::SglangStreamHandle,
     tool_constraint::{tool_constraint_for, tools_keep_special_tokens},
-    utils::chat_requires_reasoning,
 };
 
 /// How long a client waits for the engine's model information at creation:
@@ -66,6 +65,11 @@ pub(crate) struct PreparedChat {
     /// The rendered prompt.
     pub(crate) text: String,
     pub(crate) token_ids: Vec<u32>,
+    /// What the rendered prompt did, which the reasoning decision reads
+    /// (`ProcessedMessages`): whether it carries the generation header and
+    /// whether it continues the final message.
+    pub(crate) generation_prompt: bool,
+    pub(crate) continued_final_message: bool,
 }
 
 /// Read, render and tokenize the caller's request; a failure is the entry
@@ -100,6 +104,8 @@ pub(crate) fn prepare_chat(
         request,
         text: processed.text,
         token_ids,
+        generation_prompt: processed.generation_prompt,
+        continued_final_message: processed.continued_final_message,
     })
 }
 
@@ -129,6 +135,8 @@ pub(crate) unsafe fn start_chat_stream(
         mut request,
         text,
         token_ids,
+        generation_prompt,
+        continued_final_message,
     } = prepared;
     let prompt_tokens = token_ids.len() as u32;
 
@@ -149,7 +157,15 @@ pub(crate) unsafe fn start_chat_stream(
     }
 
     let request_id = format!("chatcmpl-{}", Uuid::now_v7());
-    let require_reasoning = chat_requires_reasoning(&request, tokenizer.as_ref());
+    // Decided from the rendered prompt, as the gateway decides it: a renderer
+    // with an encoder of its own writes the generation header whatever the
+    // request asked, and its prompt starts the reasoning as before.
+    let require_reasoning = chat_reasoning_starts_in_rendered_prefill(
+        &request,
+        generation_prompt,
+        continued_final_message,
+        tokenizer.as_ref(),
+    );
     let proto_request = match client.build_generate_request_from_chat(
         request_id.clone(),
         &request,

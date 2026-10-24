@@ -346,6 +346,14 @@ pub struct ChatCompletionRequest {
     )]
     pub continue_final_message: bool,
 
+    /// Whether the prompt ends with the assistant's generation header, the
+    /// template's `add_generation_prompt`: absent is `true`, what the engines
+    /// apply without the field; `false` leaves the conversation closed for
+    /// the model to continue on its own. Serialized only when set. Set to
+    /// `true` beside `continue_final_message` it is refused, as the engine
+    /// that has the field refuses the pair.
+    pub add_generation_prompt: Option<bool>,
+
     /// Skip special tokens during detokenization. Serialized only when
     /// `false`, like `separate_reasoning`: `true` is what the engine applies
     /// without the field.
@@ -483,6 +491,12 @@ impl ChatCompletionRequest {
     pub fn continues_final_assistant(&self) -> bool {
         self.continue_final_message
             && matches!(self.messages.last(), Some(ChatMessage::Assistant { .. }))
+    }
+
+    /// Whether the prompt ends with the assistant's generation header: the
+    /// request's `add_generation_prompt`, `true` when absent.
+    pub fn adds_generation_prompt(&self) -> bool {
+        self.add_generation_prompt.unwrap_or(true)
     }
 
     /// Whether `parallel_tool_calls: false` asks for one tool call at most.
@@ -693,7 +707,17 @@ fn validate_chat_cross_parameters(
         ));
     }
 
-    // 10. Provider-profile contract rules, selected from the model id. Both
+    // 10. A continued final message and the generation header exclude each
+    //     other: the pair set together is refused, as the engine that has
+    //     the field refuses it; `continue_final_message` alone continues.
+    if req.continue_final_message && req.add_generation_prompt == Some(true) {
+        return Err(invalid(
+            "add_generation_prompt_conflicts_with_continue_final_message",
+            "Cannot set both `continue_final_message` and `add_generation_prompt` to True.",
+        ));
+    }
+
+    // 11. Provider-profile contract rules, selected from the model id. Both
     //     token limits at once are judged there: the request keeps whichever
     //     the client wrote and `output_token_cap` reads `max_completion_tokens`
     //     first, the precedence the serving engines apply themselves; only
@@ -1327,6 +1351,62 @@ mod tests {
             object.insert((*name).to_string(), field_value.clone());
         }
         serde_json::from_value(value).expect("request must deserialize")
+    }
+
+    /// `add_generation_prompt`: absent is none and reads as `true`, so a
+    /// request without the field serializes without it; `false` round-trips
+    /// as sent; null is absent.
+    #[test]
+    fn add_generation_prompt_is_read_only_when_sent_and_defaults_to_true() {
+        let absent = request_with_output_fields(&[]);
+        assert_eq!(absent.add_generation_prompt, None);
+        assert!(absent.adds_generation_prompt());
+        let value = serde_json::to_value(&absent).expect("serialize");
+        assert!(value.get("add_generation_prompt").is_none());
+
+        let off = request_with_output_fields(&[("add_generation_prompt", json!(false))]);
+        assert_eq!(off.add_generation_prompt, Some(false));
+        assert!(!off.adds_generation_prompt());
+        let value = serde_json::to_value(&off).expect("serialize");
+        assert_eq!(value["add_generation_prompt"], false);
+        let back: ChatCompletionRequest = serde_json::from_value(value).expect("roundtrip");
+        assert_eq!(back.add_generation_prompt, Some(false));
+
+        let nulled = request_with_output_fields(&[("add_generation_prompt", Value::Null)]);
+        assert_eq!(nulled.add_generation_prompt, None);
+    }
+
+    /// The generation header and a continued final message exclude each
+    /// other: both set is refused with the engine's wording;
+    /// `continue_final_message` alone, or beside `add_generation_prompt:
+    /// false`, passes, as does `false` alone.
+    #[test]
+    fn add_generation_prompt_true_is_refused_beside_continue_final_message() {
+        use validator::Validate;
+        let both = request_with_output_fields(&[
+            ("continue_final_message", json!(true)),
+            ("add_generation_prompt", json!(true)),
+        ]);
+        let error = both
+            .validate()
+            .expect_err("the pair is refused")
+            .to_string();
+        assert!(
+            error.contains(
+                "Cannot set both `continue_final_message` and `add_generation_prompt` to True."
+            ),
+            "{error}"
+        );
+        for passing in [
+            vec![("continue_final_message", json!(true))],
+            vec![
+                ("continue_final_message", json!(true)),
+                ("add_generation_prompt", json!(false)),
+            ],
+            vec![("add_generation_prompt", json!(false))],
+        ] {
+            assert!(request_with_output_fields(&passing).validate().is_ok());
+        }
     }
 
     #[test]

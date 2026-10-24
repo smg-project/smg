@@ -176,6 +176,7 @@ pub(crate) async fn prepare_chat_like(
             &processed_messages.text,
             utils::chat_reasoning_starts_in_rendered_prefill(
                 request,
+                processed_messages.generation_prompt,
                 processed_messages.continued_final_message,
                 tokenizer.as_ref(),
             ),

@@ -39,16 +39,18 @@ impl ChatRequestBuildingStage {
 
 /// [`reading::reasoning_decision`] with a chat request's tokenizer-driven
 /// switch (`utils::chat_reasoning_starts_in_rendered_prefill`);
-/// `continued_final_message` is the rendered prompt's.
+/// `generation_prompt` and `continued_final_message` are the rendered prompt's.
 fn reasoning_decision(
     ctx: &RequestContext,
     chat_request: &openai_protocol::chat::ChatCompletionRequest,
     processed_text: &str,
+    generation_prompt: bool,
     continued_final_message: bool,
 ) -> (bool, bool) {
     reading::reasoning_decision(ctx, &chat_request.model, processed_text, |tokenizer| {
         utils::chat_reasoning_starts_in_rendered_prefill(
             chat_request,
+            generation_prompt,
             continued_final_message,
             tokenizer,
         )
@@ -60,8 +62,8 @@ fn reasoning_decision(
 /// data, applies sampling defaults (from the chat request), finalizes stops,
 /// and injects PD/EPD metadata — returning the plan, attempt stamp and rendered
 /// reasoning state. The caller supplies the `ResponseSpec`.
-/// `continued_final_message` is the rendered prompt's
-/// (`ProcessedMessages::continued_final_message`). `table_tag` derives the
+/// `generation_prompt` and `continued_final_message` are the rendered
+/// prompt's (`ProcessedMessages`). `table_tag` derives the
 /// table's tag for a worker's grammar start when `tool_constraints` is one
 /// the table shapes by the start, the `auto` tag or a JSON answer's
 /// (`regular::symphony::constraint::WorkerConstraint::table_tag`).
@@ -70,6 +72,7 @@ pub(crate) async fn build_chat_backed_plan(
     ctx: &mut RequestContext,
     chat_request: &openai_protocol::chat::ChatCompletionRequest,
     processed_text: String,
+    generation_prompt: bool,
     continued_final_message: bool,
     token_ids: Vec<u32>,
     tool_constraints: Option<(String, String)>,
@@ -94,8 +97,13 @@ pub(crate) async fn build_chat_backed_plan(
 
     // The plan needs the decision alone; the prompt's closed thought shapes the
     // `auto` tag in `reading::decide`, which reads it with the decision.
-    let (require_reasoning, _thought_closed) =
-        reasoning_decision(ctx, chat_request, &processed_text, continued_final_message);
+    let (require_reasoning, _thought_closed) = reasoning_decision(
+        ctx,
+        chat_request,
+        &processed_text,
+        generation_prompt,
+        continued_final_message,
+    );
 
     // Now that the worker is known, a forced call's grammar takes the shape
     // its engine needs: the bare calls behind a reasoning parser's gate, the
@@ -232,6 +240,7 @@ impl ChatRequestBuildingStage {
                     ctx,
                     &chat_request,
                     &processed_messages.text,
+                    processed_messages.generation_prompt,
                     processed_messages.continued_final_message,
                 );
                 reading::Auto {
@@ -263,11 +272,13 @@ impl ChatRequestBuildingStage {
             Some(request) => request,
             None => chat_request.as_ref(),
         };
+        let generation_prompt = processed_messages.generation_prompt;
         let continued_final_message = processed_messages.continued_final_message;
         let (plan, stamp, reasoning_in_prefill) = build_chat_backed_plan(
             ctx,
             engine_request,
             processed_messages.text,
+            generation_prompt,
             continued_final_message,
             token_ids,
             tool_constraints,

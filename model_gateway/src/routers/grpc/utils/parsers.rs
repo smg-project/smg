@@ -447,26 +447,40 @@ pub fn reasoning_starts_in_prefill(
 
 /// `reasoning_starts_in_prefill` for a chat request, without its rendered
 /// prompt (the Go binding): a trailing assistant message is taken to be
-/// continued whenever the request asks for it. The gateway decides from the
+/// continued whenever the request asks for it, and the generation header to
+/// be rendered unless the request asks for none. The gateway decides from the
 /// rendered prompt with `chat_reasoning_starts_in_rendered_prefill`.
 pub fn chat_reasoning_starts_in_prefill(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
 ) -> bool {
+    let continues_final_assistant = request.continues_final_assistant();
     chat_reasoning_starts_in_rendered_prefill(
         request,
-        request.continues_final_assistant(),
+        request.adds_generation_prompt() || continues_final_assistant,
+        continues_final_assistant,
         tokenizer,
     )
 }
 
 /// [`reasoning_starts_in_prefill`] for a chat request whose prompt is
-/// rendered: `continued_final_message` is the rendered prompt's.
+/// rendered: `generation_prompt` and `continued_final_message` are the
+/// rendered prompt's (`ProcessedMessages`), not the request's. A renderer
+/// with an encoder of its own writes the generation header whatever the
+/// request asked, as the engines' own encoders do, and its prompt arms as
+/// before; a prompt rendered without the header (`add_generation_prompt:
+/// false`, honoured by the renderer, and no continued message) opens no
+/// `<think>`: the completion starts in content mode after the closed last
+/// message.
 pub fn chat_reasoning_starts_in_rendered_prefill(
     request: &ChatCompletionRequest,
+    generation_prompt: bool,
     continued_final_message: bool,
     tokenizer: &dyn Tokenizer,
 ) -> bool {
+    if !generation_prompt && !continued_final_message {
+        return false;
+    }
     reasoning_starts_in_prefill(
         request.chat_template_kwargs.as_ref(),
         request.effective_reasoning_effort(),
@@ -1338,6 +1352,50 @@ mod tests {
             &request(true, "user"),
             &tok
         ));
+        // Without a generation header nothing opens a `<think>`: a request
+        // with `add_generation_prompt: false` and no continued message is not
+        // armed; a continued message keeps the rule above.
+        let closed = |continue_final: bool, last_role: &str| -> ChatCompletionRequest {
+            let mut body = serde_json::to_value(request(continue_final, last_role)).expect("value");
+            body["add_generation_prompt"] = Value::Bool(false);
+            serde_json::from_value(body).expect("chat request")
+        };
+        assert!(!chat_reasoning_starts_in_prefill(
+            &closed(false, "user"),
+            &tok
+        ));
+        assert!(!chat_reasoning_starts_in_prefill(
+            &closed(false, "assistant"),
+            &tok
+        ));
+        assert!(!chat_reasoning_starts_in_prefill(
+            &closed(true, "assistant"),
+            &tok
+        ));
+        // The gateway decides from the rendered prompt, not the request: a
+        // renderer with an encoder of its own writes the header whatever the
+        // request asked (the DeepSeek ports, as the engine's own encoders
+        // do), so its prompt arms as before; one that honoured the request
+        // rendered no header and does not; a continued message keeps the
+        // native rule.
+        assert!(chat_reasoning_starts_in_rendered_prefill(
+            &closed(false, "user"),
+            true,
+            false,
+            &tok
+        ));
+        assert!(!chat_reasoning_starts_in_rendered_prefill(
+            &closed(false, "user"),
+            false,
+            false,
+            &tok
+        ));
+        assert!(!chat_reasoning_starts_in_rendered_prefill(
+            &closed(true, "assistant"),
+            false,
+            true,
+            &tok
+        ));
         // The request-level `high` is written over the kwargs `none`.
         assert!(should_mark_reasoning_started(
             resolve_user_thinking(
@@ -1506,6 +1564,7 @@ mod tests {
         assert!(!processed.continued_final_message);
         let armed = chat_reasoning_starts_in_rendered_prefill(
             &request,
+            processed.generation_prompt,
             processed.continued_final_message,
             &tokenizer,
         );

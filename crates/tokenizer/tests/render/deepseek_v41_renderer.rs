@@ -230,15 +230,13 @@ fn deepseek_v41_render_text_matches_reference_fixtures_and_vendor_token_ids() {
         let render = |kwargs: &HashMap<String, Value>| {
             let params = ChatTemplateParams {
                 // A case recorded with `wo_eos` on its final assistant message
-                // renders through `add_generation_prompt: false`, which the
-                // shim maps to `wo_eos` when the last message is an assistant
-                // turn (no EOS, no generation header). The gateway does not
-                // send that yet: it renders `continue_final_message` by
-                // popping the trailing assistant message and appending its
-                // content after the generation header; routing it through
-                // `add_generation_prompt: false` is a follow-up. Every other
-                // case appends the header.
+                // renders through `continue_final_message` with no generation
+                // header, the pair the gateway sends for a trailing assistant
+                // turn (`native_assistant_continuation`), which the shim maps
+                // to `wo_eos` (no EOS, no generation header). Every other case
+                // appends the header.
                 add_generation_prompt: !case.continue_final_message,
+                continue_final_message: case.continue_final_message,
                 tools: case.tools.as_deref(),
                 template_kwargs: Some(kwargs),
                 ..Default::default()

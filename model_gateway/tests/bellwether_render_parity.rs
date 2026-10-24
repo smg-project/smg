@@ -135,11 +135,6 @@ const LEGACY_FILE_PIPELINE: &str = "the render ids of this Llama-class checkpoin
 /// alone, an id of one of its cases among them.
 const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     (
-        "*/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is \
-         always appended (smg-project/smg#2780): one case of every model",
-    ),
-    (
         "*/render/text-developer-role",
         "the gateway renders a developer message as a system message when the template \
          has no developer branch, as the engine's renderer does (smg-project/smg#3022); \
@@ -251,6 +246,13 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          as the engines' tool chat templates do (smg-project/smg#3946)",
     ),
     (
+        "deepseek-v3.2-exp/render/no-generation-prompt",
+        "the native renderer writes the generation header whatever `add_generation_prompt` \
+         says, as the engine's own encoder for this family does (it reads neither that flag \
+         nor `continue_final_message`); the recorded template run leaves the conversation \
+         closed",
+    ),
+    (
         "deepseek-v3.2-exp/render/text-system-after-user",
         "the gateway renders this checkpoint through its port of the checkpoint's own \
          encoder, as the engines do, where the reference is the run of the Jinja \
@@ -286,6 +288,13 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          checkpoint's Jinja template cannot read JSON text and writes the string whole as a \
          single `arguments` parameter, so the reference is the template's own rendering of \
          a call history, not the encoder's (the cases without a call history match)",
+    ),
+    (
+        "deepseek-v4.1-flash/render/no-generation-prompt",
+        "the native renderer writes the generation header whatever `add_generation_prompt` \
+         says, as the engine's own encoder for this family does (it reads neither that flag \
+         nor `continue_final_message`); the recorded template run leaves the conversation \
+         closed",
     ),
     (
         "deepseek-v4.1-flash/render/tools-history-content-and-call",

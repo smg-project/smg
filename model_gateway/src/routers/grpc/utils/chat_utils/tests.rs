@@ -1374,6 +1374,136 @@ fn native_continuation_keeps_the_trailing_assistant_message_instead_of_prefixing
     assert_eq!(native["assistant_prefix"], json!(""));
 }
 
+/// `add_generation_prompt: false` renders the conversation without a
+/// generation header; absent, the header is rendered as before. A continued
+/// final message keeps its own rule: no header natively, the emulation's
+/// header and prefix otherwise, whatever the field says.
+#[test]
+fn add_generation_prompt_false_renders_the_conversation_without_a_header() {
+    let request = |fields: Value| -> ChatCompletionRequest {
+        let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "Hello"}]});
+        body.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        serde_json::from_value(body).unwrap()
+    };
+    let closed = render_with(
+        Default::default(),
+        &request(json!({"add_generation_prompt": false})),
+    );
+    assert_eq!(closed["add_generation_prompt"], json!(false));
+    assert_eq!(closed["messages"].as_array().unwrap().len(), 1);
+    let open = render_with(Default::default(), &request(json!({})));
+    assert_eq!(open["add_generation_prompt"], json!(true));
+
+    let pair = request(json!({
+        "continue_final_message": true,
+        "add_generation_prompt": false,
+        "messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Sure"}
+        ]
+    }));
+    let emulated = render_with(Default::default(), &pair);
+    assert_eq!(emulated["add_generation_prompt"], json!(true));
+    assert_eq!(emulated["assistant_prefix"], json!("Sure"));
+    let native = render_with(NATIVE_CONTINUATION, &pair);
+    assert_eq!(native["add_generation_prompt"], json!(false));
+    assert_eq!(native["messages"].as_array().unwrap().len(), 2);
+}
+
+/// Through a Jinja template: without the header the prompt ends at the last
+/// turn's end marker; with it (the field absent) the assistant header follows.
+/// The rendered prompt reports which, for the reasoning decisions. A
+/// `chat_template_kwargs` entry of that name does not override the request's
+/// field (the render context keeps the field's value), so the header stays
+/// and is reported as such.
+#[test]
+fn jinja_template_renders_no_header_when_add_generation_prompt_is_false() {
+    let mut tokenizer =
+        llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase).unwrap();
+    tokenizer
+        .set_chat_template(HEADER_TEMPLATE.to_string())
+        .unwrap();
+    let render = |add_generation_prompt: Value| {
+        let mut body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "Hello."}],
+            "add_generation_prompt": add_generation_prompt
+        });
+        if let Some(kwargs) = add_generation_prompt.get("chat_template_kwargs") {
+            body["chat_template_kwargs"] = kwargs.clone();
+            body["add_generation_prompt"] = Value::Null;
+        }
+        let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        process_chat_messages_with_placeholders(
+            &request,
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap()
+        .0
+    };
+    let closed = render(json!(false));
+    assert_eq!(closed.text, "<|turn|>user<|body|>Hello.<|end|>");
+    assert!(!closed.generation_prompt);
+    let open = render(Value::Null);
+    assert_eq!(
+        open.text,
+        "<|turn|>user<|body|>Hello.<|end|><|turn|>assistant"
+    );
+    assert!(open.generation_prompt);
+    let by_kwargs = render(json!({"chat_template_kwargs": {"add_generation_prompt": false}}));
+    assert_eq!(
+        by_kwargs.text,
+        "<|turn|>user<|body|>Hello.<|end|><|turn|>assistant"
+    );
+    assert!(by_kwargs.generation_prompt);
+}
+
+/// The rendered prompt reports whether it carries the generation header, as
+/// the reasoning decisions read it: the header the request asked for, none
+/// under `add_generation_prompt: false`, none for a natively continued
+/// message, and the emulation's header (the message's text after it)
+/// otherwise.
+#[test]
+fn the_rendered_prompt_reports_its_generation_header() {
+    let processed = |capabilities: RendererCapabilities, body: Value| -> ProcessedMessages {
+        let tokenizer = llm_tokenizer::MockTokenizer::new()
+            .with_renderer_capabilities(capabilities)
+            .with_json_chat_template();
+        let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        process_chat_messages_with_placeholders(
+            &request,
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap()
+        .0
+    };
+    let hello = json!({"model": "m", "messages": [{"role": "user", "content": "Hello"}]});
+    assert!(processed(Default::default(), hello.clone()).generation_prompt);
+    let mut closed = hello;
+    closed["add_generation_prompt"] = json!(false);
+    assert!(!processed(Default::default(), closed).generation_prompt);
+    let pair = json!({
+        "model": "m",
+        "continue_final_message": true,
+        "messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Sure"}
+        ]
+    });
+    let native = processed(NATIVE_CONTINUATION, pair.clone());
+    assert!(native.continued_final_message);
+    assert!(!native.generation_prompt);
+    let emulated = processed(Default::default(), pair);
+    assert!(!emulated.continued_final_message);
+    assert!(emulated.generation_prompt);
+}
+
 /// A text-rendered prompt reaches the tokenizer with each rendered marker
 /// already rewritten to its anchor; without placeholders it is left alone.
 /// The mock's JSON template writes no marker, so the one here is typed.
