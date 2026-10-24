@@ -140,6 +140,24 @@ pub struct RouterConfig {
     /// `0` disables the watchdog.
     #[serde(default = "default_stream_body_stall_timeout_secs")]
     pub stream_body_stall_timeout_secs: u64,
+    /// Close a connection whose client has stopped reading its response: a
+    /// write the client's socket has not taken for this many seconds fails
+    /// the connection, which ends the response body (the admission permit,
+    /// the in-flight entry and the worker's request go with it, as for a
+    /// client that disconnected). The clock starts once the client's receive
+    /// buffer and the gateway's send buffer are full, so the bound reads
+    /// "this many seconds after the output filled the transport's buffers":
+    /// a client that frees a share of the gateway's send buffer within the
+    /// bound is never cut, one that drains slower than that is, so choose
+    /// minutes rather than seconds. The bound watches the socket: it covers
+    /// HTTP/1.1 and an HTTP/2 client whose whole connection stopped
+    /// reading, not an HTTP/2 client that stops reading one stream while its
+    /// connection stays alive (that stream's window closes, nothing pends at
+    /// the socket); an upgraded connection (a WebSocket) is exempt. Counted
+    /// in `smg_http_connection_timeouts_total{timeout="write_stall"}`. `0`
+    /// (the default) leaves such a connection to the client.
+    #[serde(default)]
+    pub stream_write_stall_timeout_secs: u64,
     /// Close a connection that has not delivered a complete request head
     /// within this many seconds of being accepted, and a keep-alive
     /// connection whose next request head stalls for this long after its
@@ -1996,6 +2014,7 @@ impl Default for RouterConfig {
             max_payload_size: 536_870_912, // 512MB
             max_buffered_request_bytes: default_max_buffered_request_bytes(),
             stream_body_stall_timeout_secs: default_stream_body_stall_timeout_secs(),
+            stream_write_stall_timeout_secs: 0,
             header_read_timeout_secs: default_header_read_timeout_secs(),
             idle_connection_timeout_secs: default_idle_connection_timeout_secs(),
             max_connections: 0,
@@ -2498,6 +2517,27 @@ mod tests {
                 .build_unchecked();
             assert!(config.validate().is_err());
         }
+    }
+
+    #[test]
+    fn test_stream_write_stall_timeout_serde_default_and_roundtrip() {
+        // Config files predating the field deserialize to off.
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("stream_write_stall_timeout_secs")
+            .unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(without.stream_write_stall_timeout_secs, 0);
+
+        // A value round-trips.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .stream_write_stall_timeout_secs(300)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.stream_write_stall_timeout_secs, 300);
     }
 
     #[test]

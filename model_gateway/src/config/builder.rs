@@ -221,6 +221,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn stream_write_stall_timeout_secs(mut self, secs: u64) -> Self {
+        self.config.stream_write_stall_timeout_secs = secs;
+        self
+    }
+
     pub fn header_read_timeout_secs(mut self, secs: u64) -> Self {
         self.config.header_read_timeout_secs = secs;
         self

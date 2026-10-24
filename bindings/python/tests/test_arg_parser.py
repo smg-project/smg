@@ -1850,6 +1850,11 @@ class TestConnectionTimeouts:
         args = parse_router_args([])
         assert args.header_read_timeout_secs == 30
         assert args.idle_connection_timeout_secs == 90
+        assert args.stream_write_stall_timeout_secs == 0
+
+    def test_write_stall_flag_parses(self):
+        args = parse_router_args(["--stream-write-stall-timeout-secs", "300"])
+        assert args.stream_write_stall_timeout_secs == 300
 
     def test_flags_parse_and_zero_disables(self):
         args = parse_router_args(

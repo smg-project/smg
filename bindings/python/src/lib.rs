@@ -618,6 +618,7 @@ struct Router {
     storage_context_headers: HashMap<String, String>,
     storage_hook_wasm_path: Option<String>,
     stream_body_stall_timeout_secs: u64,
+    stream_write_stall_timeout_secs: u64,
     /// Per-tenant data-plane keys as `(tenant_id, key)` pairs; each resolves
     /// to its own tenant identity (`auth:<tenant_id>`) on top of `api_key`.
     tenant_api_keys: Vec<(String, String)>,
@@ -1256,6 +1257,7 @@ impl Router {
             .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
             .max_buffered_request_bytes(self.max_buffered_request_bytes)
             .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
+            .stream_write_stall_timeout_secs(self.stream_write_stall_timeout_secs)
             .header_read_timeout_secs(self.header_read_timeout_secs)
             .idle_connection_timeout_secs(self.idle_connection_timeout_secs)
             .max_connections(self.max_connections)
@@ -1494,6 +1496,7 @@ impl Router {
         storage_context_headers = HashMap::new(),
         storage_hook_wasm_path = None,
         stream_body_stall_timeout_secs = 300,
+        stream_write_stall_timeout_secs = 0,
         tenant_api_keys = vec![],
         tenant_header_name = String::from("x-smg-tenant-id"),
         tenant_rate_limit_config = None,
@@ -1715,6 +1718,7 @@ impl Router {
         storage_context_headers: HashMap<String, String>,
         storage_hook_wasm_path: Option<String>,
         stream_body_stall_timeout_secs: u64,
+        stream_write_stall_timeout_secs: u64,
         tenant_api_keys: Vec<(String, String)>,
         tenant_header_name: String,
         tenant_rate_limit_config: Option<String>,
@@ -1972,6 +1976,7 @@ impl Router {
             storage_context_headers,
             storage_hook_wasm_path,
             stream_body_stall_timeout_secs,
+            stream_write_stall_timeout_secs,
             tenant_api_keys,
             tenant_header_name,
             tenant_rate_limit_config,

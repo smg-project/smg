@@ -1,5 +1,6 @@
-//! Bounds on connections that carry no request: the HTTP edge's header-read
-//! timeout and idle keep-alive timeout.
+//! Bounds on connections that carry no request (the HTTP edge's header-read
+//! timeout and idle keep-alive timeout) and one on a connection whose peer
+//! stopped reading its response (the write-stall timeout).
 //!
 //! The server stack bounds request bodies (`--stream-body-stall-timeout-secs`)
 //! and whole requests (`--request-timeout-secs`), but nothing between
@@ -7,7 +8,7 @@
 //! the middle of a head, and a keep-alive connection that goes quiet after its
 //! last response are all held until the client closes them. hyper's own
 //! header-read timer is not wired by the server builder, and it would bound the
-//! half-open and the idle case with one value. This module adds the two bounds
+//! half-open and the idle case with one value. This module adds these bounds
 //! at the connection level, each with its own setting and counter:
 //!
 //! * header-read timeout: a connection that has not served a request yet must
@@ -16,9 +17,29 @@
 //!   head (HTTP/1 only: an idle HTTP/2 connection exchanges control frames
 //!   that are not the start of a request);
 //! * idle timeout: a keep-alive connection with no request in flight is closed
-//!   after this long without a new request.
+//!   after this long without a new request;
+//! * write-stall timeout: a write the peer's socket has not taken within this
+//!   long (the transport's buffers full behind a client that stopped reading
+//!   its response) fails, which hyper takes as the connection failing under
+//!   the write: it drops the connection, response bodies included. What
+//!   follows is the edge's own client-closed path: the permit, the in-flight
+//!   entry and the request span end as for a client that went away, a
+//!   streaming task's next frame finds no reader, and the worker's request
+//!   is aborted. The clock starts only once the peer's receive buffer and
+//!   this side's send buffer are full, so the bound reads "this long after
+//!   the output filled the transport's buffers". A completed write resets
+//!   the clock, and the kernel completes one only once about a third of the
+//!   queued bytes have drained: a peer that frees that share within the
+//!   bound is never cut, one that drains slower (below about
+//!   `send buffer / (3 × N)` per second) is, so N belongs in minutes rather
+//!   than seconds. The bound watches the socket: it covers HTTP/1.1 and an
+//!   HTTP/2 peer whose whole connection stopped reading, not an HTTP/2 peer
+//!   that stops reading one stream while its connection task keeps reading
+//!   (that stream's flow-control window closes and nothing pends at the
+//!   socket). Off by default.
 //!
-//! A connection with a request in flight is never closed here. "In flight"
+//! A connection with a request in flight is never closed by the first two
+//! bounds. "In flight"
 //! runs from the moment the request reaches the service until its response
 //! body has been written or dropped, so an open streaming response with a
 //! silent producer, a slowly uploaded body and a slow reader all count as
@@ -29,7 +50,8 @@
 //! The graceful drain is untouched: it disables keep-alive on every
 //! connection, which closes idle ones at once and lets in-flight requests
 //! finish. A connection that was upgraded (a WebSocket, after its `101`)
-//! is a bidirectional stream from then on and is exempt from both bounds.
+//! is a bidirectional stream from then on and is exempt from all three
+//! bounds.
 
 use std::{
     future::Future,
@@ -56,7 +78,7 @@ use tracing::debug;
 
 use crate::observability::metrics::Metrics;
 
-/// The two connection-level bounds, each `None` when disabled.
+/// The connection-level bounds, each `None` when disabled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectionTimeouts {
     /// A connection that has not served a request yet must deliver a complete
@@ -66,6 +88,9 @@ pub struct ConnectionTimeouts {
     /// A keep-alive connection with no request in flight is closed after this
     /// long without a new request.
     pub idle: Option<Duration>,
+    /// A write the peer's socket has not taken within this long fails the
+    /// connection: a client that stopped reading its response.
+    pub write_stall: Option<Duration>,
 }
 
 impl ConnectionTimeouts {
@@ -75,7 +100,15 @@ impl ConnectionTimeouts {
         Self {
             header_read: bound(header_read_secs),
             idle: bound(idle_secs),
+            write_stall: None,
         }
+    }
+
+    /// The write-stall bound of `secs` seconds on top; `0` leaves it off.
+    #[must_use]
+    pub fn with_write_stall_secs(mut self, secs: u64) -> Self {
+        self.write_stall = (secs > 0).then(|| Duration::from_secs(secs));
+        self
     }
 
     /// No bound at all: connections live until the client closes them.
@@ -83,6 +116,7 @@ impl ConnectionTimeouts {
         Self {
             header_read: None,
             idle: None,
+            write_stall: None,
         }
     }
 }
@@ -92,6 +126,7 @@ impl ConnectionTimeouts {
 enum Timeout {
     HeaderRead,
     Idle,
+    WriteStall,
 }
 
 impl Timeout {
@@ -100,6 +135,7 @@ impl Timeout {
         match self {
             Self::HeaderRead => "header_read",
             Self::Idle => "idle",
+            Self::WriteStall => "write_stall",
         }
     }
 }
@@ -110,6 +146,7 @@ impl Timeout {
 pub struct ConnectionTimeoutStats {
     header_read: AtomicU64,
     idle: AtomicU64,
+    write_stall: AtomicU64,
 }
 
 impl ConnectionTimeoutStats {
@@ -123,10 +160,17 @@ impl ConnectionTimeoutStats {
         self.idle.load(Ordering::Relaxed)
     }
 
+    /// Connections closed because their peer stopped taking what was written
+    /// to them.
+    pub fn closed_by_write_stall_timeout(&self) -> u64 {
+        self.write_stall.load(Ordering::Relaxed)
+    }
+
     fn record(&self, timeout: Timeout) {
         let counter = match timeout {
             Timeout::HeaderRead => &self.header_read,
             Timeout::Idle => &self.idle,
+            Timeout::WriteStall => &self.write_stall,
         };
         counter.fetch_add(1, Ordering::Relaxed);
         Metrics::record_http_connection_timeout(timeout.label());
@@ -168,7 +212,7 @@ impl InFlightGuard {
     }
 
     /// The response switched protocols: the connection is a stream from now
-    /// on, outside both bounds for the rest of its life.
+    /// on, outside all three bounds for the rest of its life.
     fn mark_upgraded(&self) {
         self.0.upgraded.store(true, Ordering::Release);
     }
@@ -276,7 +320,8 @@ struct HeadWait {
     first_byte: Option<Instant>,
 }
 
-/// The connection's stream with the two bounds applied on its read side.
+/// The connection's stream with the header-read and idle bounds applied on
+/// its read side and the write-stall bound on its write side.
 #[derive(Debug)]
 pub struct TimedConnection<I> {
     inner: I,
@@ -289,6 +334,10 @@ pub struct TimedConnection<I> {
     /// The deadline the sleep is armed for.
     armed: Option<Instant>,
     sleep: Option<Pin<Box<Sleep>>>,
+    /// The write-stall bound's deadline while a write is pending, and its
+    /// sleep (see [`Self::poll_write_stall`]).
+    write_deadline: Option<Instant>,
+    write_sleep: Option<Pin<Box<Sleep>>>,
     closed_by: Option<Timeout>,
 }
 
@@ -309,6 +358,8 @@ impl<I> TimedConnection<I> {
             wait: None,
             armed: None,
             sleep: None,
+            write_deadline: None,
+            write_sleep: None,
             closed_by: None,
         }
     }
@@ -359,7 +410,9 @@ impl<I> TimedConnection<I> {
 
     /// The bound that applies to a wait, and when it expires.
     fn deadline_for(&self, wait: &HeadWait) -> Option<(Instant, Timeout)> {
-        let ConnectionTimeouts { header_read, idle } = self.timeouts;
+        let ConnectionTimeouts {
+            header_read, idle, ..
+        } = self.timeouts;
         if !wait.keep_alive {
             // Nothing served yet: a complete request head is due within the
             // header-read bound of the accept, whatever the protocol.
@@ -432,6 +485,68 @@ impl<I> TimedConnection<I> {
         // peer goes away between requests.
         Poll::Ready(Ok(()))
     }
+
+    /// A write's result against the write-stall bound. A write the socket
+    /// took, or that failed on its own, disarms the bound; one still pending
+    /// arms it at its first pending poll (the sleep's waker sees to the poll
+    /// that follows), and once the bound has passed the write fails with
+    /// `TimedOut`, which hyper takes as the connection failing under it and
+    /// drops the connection. Off (`None`), the result passes through.
+    fn poll_write_stall<T>(
+        &mut self,
+        cx: &mut Context<'_>,
+        poll: Poll<io::Result<T>>,
+    ) -> Poll<io::Result<T>> {
+        let Some(bound) = self.timeouts.write_stall else {
+            return poll;
+        };
+        if poll.is_ready() {
+            self.write_deadline = None;
+            return poll;
+        }
+        if self.count.upgraded.load(Ordering::Acquire) {
+            // A bidirectional stream from the upgrade on (a WebSocket):
+            // exempt, like the other two bounds.
+            self.write_deadline = None;
+            return poll;
+        }
+        let now = Instant::now();
+        let deadline = match self.write_deadline {
+            Some(deadline) => deadline,
+            None => {
+                let deadline = now + bound;
+                self.write_deadline = Some(deadline);
+                match self.write_sleep.as_mut() {
+                    Some(sleep) => sleep.as_mut().reset(deadline),
+                    None => self.write_sleep = Some(Box::pin(tokio::time::sleep_until(deadline))),
+                }
+                deadline
+            }
+        };
+        let passed = now >= deadline
+            || self
+                .write_sleep
+                .as_mut()
+                .is_some_and(|sleep| sleep.as_mut().poll(cx).is_ready());
+        if !passed {
+            return Poll::Pending;
+        }
+        self.write_deadline = None;
+        self.closed_by = Some(Timeout::WriteStall);
+        self.stats.record(Timeout::WriteStall);
+        debug!(
+            timeout = Timeout::WriteStall.label(),
+            protocol = self.protocol.label(),
+            age_secs = now.duration_since(self.opened_at).as_secs_f64(),
+            requests = self.count.started.load(Ordering::Acquire),
+            in_flight = self.count.in_flight.load(Ordering::Acquire),
+            "closing a connection whose peer stopped reading: a write has been pending for the write-stall timeout"
+        );
+        Poll::Ready(Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the peer did not take the response within the write-stall timeout",
+        )))
+    }
 }
 
 impl<I: AsyncRead + Unpin> AsyncRead for TimedConnection<I> {
@@ -461,27 +576,33 @@ impl<I: AsyncRead + Unpin> AsyncRead for TimedConnection<I> {
 
 impl<I: AsyncWrite + Unpin> AsyncWrite for TimedConnection<I> {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
+        this.poll_write_stall(cx, poll)
     }
 
     fn poll_write_vectored(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
+        this.poll_write_stall(cx, poll)
     }
 
     fn is_write_vectored(&self) -> bool {
         self.inner.is_write_vectored()
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_flush(cx);
+        this.poll_write_stall(cx, poll)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -652,6 +773,17 @@ mod tests {
                 }),
             )
             .route(
+                "/flood",
+                get(|| async {
+                    // Frames without end, as fast as the peer takes them: a
+                    // reader that stops fills the transport's buffers.
+                    let frames = futures::stream::repeat_with(|| {
+                        Ok::<_, Infallible>(axum::body::Bytes::from_static(&[b'x'; 65536]))
+                    });
+                    axum::body::Body::from_stream(frames)
+                }),
+            )
+            .route(
                 "/ws",
                 get(|upgrade: WebSocketUpgrade| async {
                     upgrade.on_upgrade(|mut socket| async move {
@@ -695,6 +827,29 @@ mod tests {
 
     async fn connect(addr: SocketAddr) -> TcpStream {
         TcpStream::connect(addr).await.expect("connect")
+    }
+
+    /// Connects with a small receive buffer, so a peer that stops reading
+    /// fills the transport's buffers within a few frames of the flood.
+    async fn connect_small_window(addr: SocketAddr) -> TcpStream {
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket.set_recv_buffer_size(8192).expect("receive buffer");
+        socket.connect(addr).await.expect("connect")
+    }
+
+    /// Sends a request for the endless body and reads its head and first
+    /// frames, then stops reading.
+    async fn request_flood_and_stop_reading(stream: &mut TcpStream) {
+        stream
+            .write_all(b"GET /flood HTTP/1.1\r\nHost: test\r\n\r\n")
+            .await
+            .expect("request");
+        let mut buf = [0u8; 4096];
+        let n = timeout(WINDOW, stream.read(&mut buf))
+            .await
+            .expect("the head arrives")
+            .expect("read");
+        assert!(n > 0, "no head");
     }
 
     /// Waits up to `within` for the server to close the connection: the time
@@ -1054,7 +1209,250 @@ mod tests {
             ConnectionTimeouts {
                 header_read: Some(Duration::from_secs(30)),
                 idle: None,
+                write_stall: None,
             }
         );
+        assert_eq!(
+            ConnectionTimeouts::from_secs(0, 0).with_write_stall_secs(0),
+            ConnectionTimeouts::disabled()
+        );
+        assert_eq!(
+            ConnectionTimeouts::disabled()
+                .with_write_stall_secs(300)
+                .write_stall,
+            Some(Duration::from_secs(300))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_stops_reading_its_response_is_closed_at_the_write_stall_timeout() {
+        let stats = with_server(
+            ConnectionTimeouts::from_secs(LONG, LONG).with_write_stall_secs(SHORT),
+            |addr, _| async move {
+                let mut stalled = connect_small_window(addr).await;
+                request_flood_and_stop_reading(&mut stalled).await;
+                sleep(Duration::from_secs(SHORT) + Duration::from_secs(2)).await;
+                // Closed meanwhile: what the transport buffered drains, then
+                // the end (or a reset) instead of the endless body.
+                assert!(
+                    closed_within(&mut stalled, WINDOW).await.is_some(),
+                    "the connection was still open after the write-stall bound"
+                );
+            },
+        )
+        .await;
+        assert_eq!(stats.closed_by_write_stall_timeout(), 1);
+        assert_eq!(counts(&stats), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn without_the_write_stall_bound_a_peer_that_stops_reading_keeps_its_connection() {
+        let stats = with_server(
+            ConnectionTimeouts::from_secs(LONG, LONG),
+            |addr, _| async move {
+                let mut stalled = connect_small_window(addr).await;
+                request_flood_and_stop_reading(&mut stalled).await;
+                sleep(Duration::from_secs(SHORT) + Duration::from_secs(2)).await;
+                // Still open: the next read is bytes of the body, not its end.
+                let mut buf = [0u8; 4096];
+                let n = timeout(Duration::from_secs(1), stalled.read(&mut buf))
+                    .await
+                    .expect("bytes keep coming")
+                    .expect("read");
+                assert!(n > 0, "closed without the bound");
+            },
+        )
+        .await;
+        assert_eq!(stats.closed_by_write_stall_timeout(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_reads_what_it_is_sent_is_untouched_by_the_write_stall_bound() {
+        // The streaming route's producer is silent for longer than the bound;
+        // its reader is not, so no write is ever pending.
+        let stats = with_server(
+            ConnectionTimeouts::from_secs(LONG, LONG).with_write_stall_secs(SHORT),
+            |addr, _| async move {
+                let mut reading = connect(addr).await;
+                reading
+                    .write_all(b"GET /stream HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+                    .await
+                    .expect("request");
+                let mut all = Vec::new();
+                timeout(WINDOW + PRODUCER_SILENCE, reading.read_to_end(&mut all))
+                    .await
+                    .expect("the stream ends")
+                    .expect("read");
+                let text = String::from_utf8_lossy(&all);
+                assert!(text.contains("first") && text.contains("second"), "{text}");
+            },
+        )
+        .await;
+        assert_eq!(stats.closed_by_write_stall_timeout(), 0);
+    }
+
+    /// A peer that takes no bytes: every write stays pending.
+    struct StuckWrite;
+
+    impl AsyncRead for StuckWrite {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for StuckWrite {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A peer that takes a write only on its `ready_on`th poll.
+    struct LateWrite {
+        polls: usize,
+        ready_on: usize,
+    }
+
+    impl AsyncRead for LateWrite {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for LateWrite {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.polls += 1;
+            if self.polls == self.ready_on {
+                Poll::Ready(Ok(buf.len()))
+            } else {
+                Poll::Pending
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn timed<I>(
+        inner: I,
+        write_stall_secs: u64,
+    ) -> (TimedConnection<I>, Arc<ConnectionTimeoutStats>) {
+        let stats = Arc::new(ConnectionTimeoutStats::default());
+        let connection = TimedConnection::new(
+            inner,
+            Arc::new(RequestCount::default()),
+            ConnectionTimeouts::disabled().with_write_stall_secs(write_stall_secs),
+            Arc::clone(&stats),
+        );
+        (connection, stats)
+    }
+
+    async fn write<I: AsyncWrite + Unpin>(
+        connection: &mut TimedConnection<I>,
+    ) -> Poll<io::Result<usize>> {
+        std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut *connection).poll_write(cx, b"frame")))
+            .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_still_pending_at_the_write_stall_bound_fails_the_connection() {
+        let (mut connection, stats) = timed(StuckWrite, 1);
+        assert!(write(&mut connection).await.is_pending());
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!(
+            write(&mut connection).await.is_pending(),
+            "failed before the bound"
+        );
+        tokio::time::advance(Duration::from_millis(600)).await;
+        let Poll::Ready(Err(error)) = write(&mut connection).await else {
+            panic!("the write did not fail at the bound");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(stats.closed_by_write_stall_timeout(), 1);
+        // The read side reports the end of the stream from then on.
+        let mut buf = [0u8; 8];
+        let mut read_buf = ReadBuf::new(&mut buf);
+        let read =
+            std::future::poll_fn(|cx| Pin::new(&mut connection).poll_read(cx, &mut read_buf)).await;
+        assert!(read.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_write_the_peer_takes_before_the_bound_disarms_it() {
+        let (mut connection, stats) = timed(
+            LateWrite {
+                polls: 0,
+                ready_on: 2,
+            },
+            1,
+        );
+        assert!(write(&mut connection).await.is_pending());
+        tokio::time::advance(Duration::from_millis(900)).await;
+        // The second poll is taken: the clock is reset.
+        assert!(matches!(write(&mut connection).await, Poll::Ready(Ok(5))));
+        // A new stall counts from its own first pending poll.
+        assert!(write(&mut connection).await.is_pending());
+        tokio::time::advance(Duration::from_millis(900)).await;
+        assert!(
+            write(&mut connection).await.is_pending(),
+            "the old clock was not reset"
+        );
+        tokio::time::advance(Duration::from_millis(200)).await;
+        assert!(matches!(write(&mut connection).await, Poll::Ready(Err(_))));
+        assert_eq!(stats.closed_by_write_stall_timeout(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_the_write_stall_bound_a_pending_write_stays_pending() {
+        let (mut connection, stats) = timed(StuckWrite, 0);
+        assert!(write(&mut connection).await.is_pending());
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert!(write(&mut connection).await.is_pending());
+        assert_eq!(stats.closed_by_write_stall_timeout(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_write_on_an_upgraded_connection_is_not_cut() {
+        let stats = Arc::new(ConnectionTimeoutStats::default());
+        let count = Arc::new(RequestCount::default());
+        count.upgraded.store(true, Ordering::Release);
+        let mut connection = TimedConnection::new(
+            StuckWrite,
+            count,
+            ConnectionTimeouts::disabled().with_write_stall_secs(1),
+            Arc::clone(&stats),
+        );
+        assert!(write(&mut connection).await.is_pending());
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert!(write(&mut connection).await.is_pending());
+        assert_eq!(stats.closed_by_write_stall_timeout(), 0);
     }
 }

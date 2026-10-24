@@ -1214,6 +1214,25 @@ struct ServingArgs {
     #[arg(long, default_value_t = 300, help_heading = "Request Handling")]
     stream_body_stall_timeout_secs: u64,
 
+    /// Close a connection whose client has stopped reading its response: a
+    /// write the client's socket has not taken for this many seconds fails
+    /// the connection, which ends the response body (the admission permit,
+    /// the in-flight entry and the worker's request go with it, as for a
+    /// client that disconnected). The clock starts once the client's receive
+    /// buffer and the gateway's send buffer are full, so the bound reads
+    /// "this many seconds after the output filled the transport's buffers":
+    /// a client that frees a share of the gateway's send buffer within the
+    /// bound is never cut, one that drains slower than that is, so choose
+    /// minutes rather than seconds. The bound watches the socket: it covers
+    /// HTTP/1.1 and an HTTP/2 client whose whole connection stopped
+    /// reading, not an HTTP/2 client that stops reading one stream while its
+    /// connection stays alive (that stream's window closes, nothing pends at
+    /// the socket); an upgraded connection (a WebSocket) is exempt. Counted
+    /// in smg_http_connection_timeouts_total{timeout="write_stall"}. 0 (the
+    /// default) leaves such a connection to the client
+    #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
+    stream_write_stall_timeout_secs: u64,
+
     /// Close a connection that has not sent a complete request head within
     /// this many seconds of being accepted (and a keep-alive connection whose
     /// next request head stalls for this long after its first byte). 0
@@ -2902,6 +2921,7 @@ impl CliArgs {
             .max_payload_size(self.serving.max_payload_size)
             .max_buffered_request_bytes(self.serving.max_buffered_request_bytes)
             .stream_body_stall_timeout_secs(self.serving.stream_body_stall_timeout_secs)
+            .stream_write_stall_timeout_secs(self.serving.stream_write_stall_timeout_secs)
             .header_read_timeout_secs(self.serving.header_read_timeout_secs)
             .idle_connection_timeout_secs(self.serving.idle_connection_timeout_secs)
             .max_connections(self.serving.max_connections)
@@ -4310,6 +4330,18 @@ mod tests {
 
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.stream_body_stall_timeout_secs, 300);
+    }
+
+    /// The write-stall timeout is a router setting, off unless set, and must
+    /// flow into `RouterConfig`.
+    #[test]
+    fn stream_write_stall_timeout_flag_flows_into_router_config() {
+        let cli = cli_args_from(&["--stream-write-stall-timeout-secs", "120"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.stream_write_stall_timeout_secs, 120);
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.stream_write_stall_timeout_secs, 0);
     }
 
     /// The connection-level timeouts of the HTTP edge are router settings

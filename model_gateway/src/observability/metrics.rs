@@ -504,7 +504,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_http_connection_timeouts_total",
-        "HTTP connections closed for carrying no request, by the timeout that closed them (header_read, idle)"
+        "HTTP connections closed by one of the edge's connection timeouts: header_read and idle (a connection carrying no request), write_stall (a client that stopped reading its response)"
     );
     describe_counter!(
         "smg_http_connections_rejected_total",
@@ -1682,7 +1682,8 @@ impl Metrics {
     }
 
     /// Record a connection closed by one of the HTTP edge's connection
-    /// timeouts (`header_read` or `idle`).
+    /// timeouts: `header_read` and `idle` for a connection carrying no
+    /// request, `write_stall` for a client that stopped reading its response.
     pub fn record_http_connection_timeout(timeout: &'static str) {
         counter!(
             "smg_http_connection_timeouts_total",

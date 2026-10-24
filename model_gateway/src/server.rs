@@ -2352,14 +2352,18 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // Bounds on connections that carry no request (a head that never
     // arrives or stalls, an idle keep-alive connection); a request in flight,
-    // an open streaming response included, is never cut here.
+    // an open streaming response included, is never cut by those two. The
+    // write-stall bound is the one on a connection whose client stopped
+    // reading its response (off unless set).
     let connection_timeouts = ConnectionTimeouts::from_secs(
         config.router_config.header_read_timeout_secs,
         config.router_config.idle_connection_timeout_secs,
-    );
+    )
+    .with_write_stall_secs(config.router_config.stream_write_stall_timeout_secs);
     info!(
         header_read_timeout_secs = config.router_config.header_read_timeout_secs,
         idle_connection_timeout_secs = config.router_config.idle_connection_timeout_secs,
+        stream_write_stall_timeout_secs = config.router_config.stream_write_stall_timeout_secs,
         "HTTP connection timeouts (0 = disabled)"
     );
     // The bound on the connections open at once (see [`connection_limit`]):

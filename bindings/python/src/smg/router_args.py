@@ -633,6 +633,10 @@ class RouterArgs:
     # Storage hooks (WASM)
     storage_hook_wasm_path: str | None = None
     stream_body_stall_timeout_secs: int = 300
+    # HTTP edge: seconds a write the client's socket does not take may stay
+    # pending before the connection is closed (a client that stopped reading
+    # its response; 0 disables)
+    stream_write_stall_timeout_secs: int = 0
     # Per-tenant data-plane keys as (tenant_id, key) pairs (--tenant-api-key)
     tenant_api_keys: list[tuple] = dataclasses.field(default_factory=list)
     # The tenant header trust_tenant_header reads
@@ -2134,6 +2138,28 @@ class RouterArgs:
                 " within this many seconds of being accepted (and a keep-alive"
                 " connection whose next request head stalls for this long after"
                 " its first byte). 0 disables"
+            ),
+        )
+        request_group.add_argument(
+            f"--{prefix}stream-write-stall-timeout-secs",
+            type=int,
+            default=RouterArgs.stream_write_stall_timeout_secs,
+            help=(
+                "Close a connection whose client has stopped reading its"
+                " response: a write the client's socket has not taken for this"
+                " many seconds fails the connection, which ends the response"
+                " body (the admission permit, the in-flight entry and the"
+                " worker's request go with it, as for a client that"
+                " disconnected). The clock starts once the client's receive"
+                " buffer and the gateway's send buffer are full: a client that"
+                " frees a share of the gateway's send buffer within the bound"
+                " is never cut, one that drains slower than that is, so choose"
+                " minutes rather than seconds. The bound watches the socket:"
+                " it covers HTTP/1.1 and an HTTP/2 client whose whole"
+                " connection stopped reading, not an HTTP/2 client that stops"
+                " reading one stream while its connection stays alive; an"
+                " upgraded connection (a WebSocket) is exempt. 0 (the default)"
+                " leaves such a connection to the client"
             ),
         )
         request_group.add_argument(
