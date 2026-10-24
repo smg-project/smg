@@ -4,6 +4,7 @@
 // of parallel per-request columns. **Field order is the wire contract** — do
 // not reorder; the plugin appends only.
 
+use bytes::Bytes;
 use serde::{
     de::{SeqAccess, Visitor},
     ser::SerializeTuple,
@@ -14,11 +15,12 @@ use serde::{
 // place in this module's API.
 pub use crate::protocol::control::{ControlReplySlim, CONTROL_REPLY_SLIM_TAG};
 use crate::{
+    codec::decode_msgpack,
     error::{Error, Result},
     protocol::{
         control::read_control_reply_after_tag,
         positional::{drain_trailing, expect_tag, next_field},
-        EngineOutput,
+        EngineBatch, EngineLoad, EngineOutput, UtilityReply,
     },
 };
 
@@ -608,6 +610,82 @@ impl<'de> Deserialize<'de> for SglangWireOutput {
 
         deserializer.deserialize_seq(WireVisitor)
     }
+}
+
+/// Decode one output message of the slim wire (frame 0; aux frames are
+/// ignored, the slim records carry no tensor fields) into a batch: a token or
+/// embedding record becomes the per-request outputs plus the load tail, a
+/// control reply the batch's utility reply. Shared by every protocol whose
+/// engine side answers with these records.
+pub(crate) fn decode_slim_batch(frames: &[Bytes]) -> Result<EngineBatch<SglangOutput>> {
+    if frames.len() > 1 {
+        tracing::debug!(
+            aux_frames = frames.len() - 1,
+            "ignoring aux frames on a slim output (the slim records have no tensor fields)"
+        );
+    }
+    let payload = frames.first().map(AsRef::as_ref).unwrap_or_default();
+    let (engine_index, load, outputs) = match decode_msgpack::<SglangWireOutput>(payload)? {
+        SglangWireOutput::Tokens(batch) => (
+            batch.engine_index,
+            load_of(
+                batch.num_running,
+                batch.num_waiting,
+                batch.kv_used_tokens,
+                batch.kv_total_tokens,
+            ),
+            (*batch).into_outputs()?,
+        ),
+        SglangWireOutput::Embeddings(batch) => (
+            batch.engine_index,
+            load_of(
+                batch.num_running,
+                batch.num_waiting,
+                batch.kv_used_tokens,
+                batch.kv_total_tokens,
+            ),
+            batch.into_outputs()?,
+        ),
+        SglangWireOutput::ControlReply(reply) => {
+            return Ok(EngineBatch {
+                engine_index: reply.engine_index,
+                utility: Some(UtilityReply {
+                    call_id: reply.call_id,
+                    outcome: Ok(reply.into_outcome()),
+                }),
+                ..EngineBatch::default()
+            });
+        }
+    };
+    let finished_request_ids = outputs
+        .iter()
+        .filter(|output| output.finish_reason.is_some())
+        .map(|output| output.request_id.clone())
+        .collect();
+    Ok(EngineBatch {
+        engine_index,
+        outputs,
+        finished_request_ids,
+        load,
+        wave: None,
+        utility: None,
+    })
+}
+
+/// The load tail as a signal. A zero capacity marks a batch sent before the
+/// load probe was wired (or a probe that failed): report no load rather than
+/// an empty scheduler that least-loaded selection would trust.
+fn load_of(
+    num_running: u64,
+    num_waiting: u64,
+    kv_used_tokens: u64,
+    kv_total_tokens: u64,
+) -> Option<EngineLoad> {
+    (kv_total_tokens > 0).then(|| EngineLoad {
+        num_running,
+        num_waiting,
+        kv_cache_usage: kv_used_tokens as f64 / kv_total_tokens as f64,
+    })
 }
 
 #[cfg(test)]

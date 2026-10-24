@@ -12,7 +12,8 @@
 //!   serde, numpy dtype handling, and the zero-copy tensor aux-frame codec.
 //! - `protocol` — per-engine protocol modules (vLLM EngineCore and TokenSpeed
 //!   today, SGLang's scheduler through the SMG plugin that performs the
-//!   handshake inside it; each further ZMQ engine adds its own).
+//!   handshake inside it, TensorRT-LLM through the shim beside its LLM API;
+//!   each further ZMQ engine adds its own).
 //! - `transport` — the ZMQ socket topology (SMG binds; engines connect in).
 //! - `connector` — request submission, streaming output, and DP wave handling.
 //!
@@ -40,7 +41,7 @@ pub mod mock_engine;
 // else stays reachable through its own module path.
 pub use connector::{
     Client, EngineCoreClient, EngineCoreStream, RequestStream, SglangClient, SglangStream,
-    TokenSpeedClient, TokenSpeedStream, ENGINE_PREFILL_TOKENS_PER_SEC,
+    TokenSpeedClient, TokenSpeedStream, TrtllmClient, TrtllmStream, ENGINE_PREFILL_TOKENS_PER_SEC,
     ENGINE_SILENCE_DEATH_TIMEOUT,
 };
 pub use error::{Error, Result};

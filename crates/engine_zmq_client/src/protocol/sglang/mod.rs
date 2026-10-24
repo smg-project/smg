@@ -25,7 +25,9 @@
 //!
 //! The positional-array helpers (`next_field`, `expect_tag`, `drain_trailing`)
 //! are shared with the TokenSpeed dialect, whose structs follow the same
-//! `msgspec` convention.
+//! `msgspec` convention; the slim-output decoder
+//! ([`output::decode_slim_batch`]) with the TensorRT-LLM dialect, whose
+//! engine-side shim answers with the same records.
 
 pub mod multimodal;
 pub mod output;
@@ -35,7 +37,7 @@ pub mod sampling;
 use bytes::Bytes;
 
 use crate::{
-    codec::{decode_msgpack, encode_msgpack, OpaqueValue},
+    codec::{encode_msgpack, OpaqueValue},
     error::Result,
     protocol::{
         handshake::EngineCoreReadyResponse,
@@ -45,7 +47,7 @@ use crate::{
                 DATA_ITEM_WIRE_FIELDS, MULTIMODAL_DATA_ITEM_NAME, MULTIMODAL_PROCESSOR_OUTPUT_NAME,
                 PROCESSOR_OUTPUT_WIRE_FIELDS,
             },
-            output::{SglangOutput, SglangWireOutput},
+            output::{decode_slim_batch, SglangOutput},
             request::{
                 RequestMeta, SglangRequest, SglangRequestType, EMBEDDING_WIRE_FIELDS,
                 ENCODER_DISPATCH_ERROR_REQ_TAG, ENCODER_DISPATCH_ERROR_WIRE_FIELDS,
@@ -54,7 +56,7 @@ use crate::{
             },
             sampling::{SAMPLING_PARAMS_NAME, WIRE_FIELDS as SAMPLING_WIRE_FIELDS},
         },
-        EngineBatch, EngineLoad, EngineProtocol, UtilityReply,
+        EngineBatch, EngineProtocol,
     },
 };
 
@@ -209,82 +211,21 @@ impl EngineProtocol for SglangProtocol {
     }
 
     fn decode_batch(frames: &[Bytes], _layout: &()) -> Result<EngineBatch<Self::Output>> {
-        if frames.len() > 1 {
-            tracing::debug!(
-                aux_frames = frames.len() - 1,
-                "ignoring aux frames on an SGLang output (the slim batches have no tensor fields)"
-            );
-        }
-        let payload = frames.first().map(AsRef::as_ref).unwrap_or_default();
-        let (engine_index, load, outputs) = match decode_msgpack::<SglangWireOutput>(payload)? {
-            SglangWireOutput::Tokens(batch) => (
-                batch.engine_index,
-                load_of(
-                    batch.num_running,
-                    batch.num_waiting,
-                    batch.kv_used_tokens,
-                    batch.kv_total_tokens,
-                ),
-                (*batch).into_outputs()?,
-            ),
-            SglangWireOutput::Embeddings(batch) => (
-                batch.engine_index,
-                load_of(
-                    batch.num_running,
-                    batch.num_waiting,
-                    batch.kv_used_tokens,
-                    batch.kv_total_tokens,
-                ),
-                batch.into_outputs()?,
-            ),
-            SglangWireOutput::ControlReply(reply) => {
-                return Ok(EngineBatch {
-                    engine_index: reply.engine_index,
-                    utility: Some(UtilityReply {
-                        call_id: reply.call_id,
-                        outcome: Ok(reply.into_outcome()),
-                    }),
-                    ..EngineBatch::default()
-                });
-            }
-        };
-        let finished_request_ids = outputs
-            .iter()
-            .filter(|output| output.finish_reason.is_some())
-            .map(|output| output.request_id.clone())
-            .collect();
-        Ok(EngineBatch {
-            engine_index,
-            outputs,
-            finished_request_ids,
-            load,
-            wave: None,
-            utility: None,
-        })
+        decode_slim_batch(frames)
     }
-}
-
-/// The load tail as a signal. A zero capacity marks a batch sent before the
-/// load probe was wired (or a probe that failed): report no load rather than
-/// an empty scheduler that least-loaded selection would trust.
-fn load_of(
-    num_running: u64,
-    num_waiting: u64,
-    kv_used_tokens: u64,
-    kv_total_tokens: u64,
-) -> Option<EngineLoad> {
-    (kv_total_tokens > 0).then(|| EngineLoad {
-        num_running,
-        num_waiting,
-        kv_cache_usage: kv_used_tokens as f64 / kv_total_tokens as f64,
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::sglang::output::{
-        BatchEmbeddingSlimOutput, BatchTokenIDSlimOutput, ControlReplySlim, MatchedStop,
+    use crate::{
+        codec::decode_msgpack,
+        protocol::{
+            sglang::output::{
+                BatchEmbeddingSlimOutput, BatchTokenIDSlimOutput, ControlReplySlim, MatchedStop,
+            },
+            EngineLoad,
+        },
     };
 
     fn slim_batch() -> BatchTokenIDSlimOutput {
