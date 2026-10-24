@@ -488,19 +488,15 @@ impl RequestPipeline {
 
     /// Ingress phase: run the request-owning stages through request building.
     /// The worker selection step is timed under its `smg_router_stage_seconds`
-    /// stage (`mark` is read at its start and its end, a refusal or a failure
-    /// included: the time was spent); the other steps are the request's
-    /// remainder, its duration minus the timed stages.
-    async fn run_ingress(
-        &self,
-        ctx: &mut RequestContext,
-        mark: &mut Instant,
-    ) -> Result<BuildOutput, Response> {
+    /// stage (its clock is read at its start and its end, a refusal or a
+    /// failure included: the time was spent); the other steps are the
+    /// request's remainder, its duration minus the timed stages.
+    async fn run_ingress(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
         let streaming = ctx.is_streaming();
         macro_rules! step {
-            ($stage:expr, $name:expr, $result:expr) => {{
+            ($stage:expr, $clock:expr, $name:expr, $result:expr) => {{
                 let output = $result;
-                Metrics::record_stage_duration($stage, streaming, lap(mark));
+                Metrics::record_stage_duration($stage, streaming, lap($clock));
                 step!($name, output)
             }};
             // A check inside a stage's time (its clock is not read).
@@ -541,9 +537,10 @@ impl RequestPipeline {
             stages.rate_limit.name(),
             stages.rate_limit.execute(ctx).await
         )?;
-        *mark = Instant::now();
+        let mut mark = Instant::now();
         step!(
             RouterStage::WorkerSelection,
+            &mut mark,
             stages.worker_selection.name(),
             stages.worker_selection.execute(ctx).await
         )?;
@@ -587,7 +584,6 @@ impl RequestPipeline {
         spec: &mut Option<ResponseSpec>,
         stamp: &AttemptStamp,
         place: AttemptPlace,
-        mark: &mut Instant,
     ) -> Result<Option<Response>, Response> {
         let AttemptPlace {
             number: attempt,
@@ -595,11 +591,6 @@ impl RequestPipeline {
         } = place;
         dctx.attempt = attempt;
         let streaming = dctx.streaming;
-        if attempt > 0 {
-            // A retry's reselection is a worker selection, timed from here:
-            // the backoff before it is no stage.
-            *mark = Instant::now();
-        }
         let consumed = || {
             error!(function = "run_attempt", "Execution plan already consumed");
             error::internal_error("execution_plan_consumed", "Execution plan already consumed")
@@ -608,9 +599,12 @@ impl RequestPipeline {
             // Fresh worker selection per attempt; the retained plan is
             // re-stamped (engine ids, sampling defaults, the forced tool
             // call's shape, PD rooms) for the new workers. Buffered decode
-            // state from the failed attempt is reset.
+            // state from the failed attempt is reset. The reselection is a
+            // worker selection, timed from here: the backoff before it is no
+            // stage.
+            let mut mark = Instant::now();
             let reselected = self.stages.worker_selection.reselect(dctx).await;
-            Metrics::record_stage_duration(RouterStage::WorkerSelection, streaming, lap(mark));
+            Metrics::record_stage_duration(RouterStage::WorkerSelection, streaming, lap(&mut mark));
             reselected?;
             let workers = stage_output(dctx.workers.as_ref(), "run_attempt")?;
             let clients = acquire_clients(
@@ -649,18 +643,19 @@ impl RequestPipeline {
             dctx.workers.as_ref(),
         ));
 
-        // The execute stage's clock; the client acquisition, the build and
-        // the plan's stamping before it are the request's remainder.
-        *mark = Instant::now();
+        // The execute stage's clock, which response processing continues
+        // from; the client acquisition, the build boundary and the plan's
+        // stamping before it are the request's remainder.
+        let mut mark = Instant::now();
         let executed = execute_plan(dctx, attempt_plan, last_attempt).await;
-        Metrics::record_stage_duration(RouterStage::Execute, streaming, lap(mark));
+        Metrics::record_stage_duration(RouterStage::Execute, streaming, lap(&mut mark));
         executed?;
         let processed = self
             .stages
             .response_processing
             .process(dctx, attempt_spec)
             .await;
-        Metrics::record_stage_duration(RouterStage::ResponseProcessing, streaming, lap(mark));
+        Metrics::record_stage_duration(RouterStage::ResponseProcessing, streaming, lap(&mut mark));
         processed.inspect_err(|response| {
             error!(
                 "Stage {} failed with status {}",
@@ -716,14 +711,11 @@ impl RequestPipeline {
     ) -> impl Future<Output = Result<RunOutcome, Response>> + Send + 'a {
         async move {
             let mut attempt_start = Instant::now();
-            // The stage clock: the ingress moves it, the first attempt
-            // continues from it (the build boundary is in its first stage).
-            let mut mark = attempt_start;
             if let Some(endpoint) = metrics_endpoint {
                 self.record_request(endpoint, &ctx.input.model_id, ctx.is_streaming());
             }
 
-            let build = match self.run_ingress(&mut ctx, &mut mark).await {
+            let build = match self.run_ingress(&mut ctx).await {
                 Ok(build) => build,
                 Err(response) => {
                     self.record_error(metrics_endpoint, &ctx.input.model_id, &response);
@@ -768,7 +760,6 @@ impl RequestPipeline {
                             number: attempt,
                             last: last_attempt,
                         },
-                        &mut mark,
                     )
                     .await
                 {

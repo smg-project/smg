@@ -562,7 +562,7 @@ pub(crate) fn init_metrics() {
     );
     describe_histogram!(
         "smg_router_stage_seconds",
-        "Time a request spent in a timed stage of the pipeline, by stage and streaming: worker_selection (the policy, the index lookup and the selection queue; a retry's reselection records here too), execute (the build boundary, the admission wait, the send and the engine's acceptance, per attempt) and response_processing (the answer's processing to the response: for a request that does not stream this is the whole generation, collected before the answer; for a streaming one the body's construction); one observation per stage crossed, a refused or failed stage included. The rest of a request's time (its parse, tokenizer and template, the tenant reservation, the client acquisition, the request's build, a retry's backoff, the reservation's settlement after the answer) is its request duration minus the three"
+        "Time a request spent in a timed stage of the pipeline, by stage and streaming: worker_selection (the policy, the index lookup and the selection queue; a retry's reselection records here too), execute (the admission wait, the send and the engine's acceptance, per attempt) and response_processing (the answer's processing to the response: for a request that does not stream this is the whole generation, collected before the answer; for a streaming one the body's construction); one observation per stage crossed, a refused or failed stage included. The rest of a request's time (its parse, tokenizer and template, the tenant reservation, the client acquisition, the request's build and the build boundary, the dispatch plan's stamping, a retry's backoff, the reservation's settlement after the answer) is its request duration minus the three"
     );
     describe_histogram!(
         "smg_router_tpot_seconds",
@@ -1490,7 +1490,8 @@ pub struct StreamingMetricsParams<'a> {
 /// words of the pipeline's trace spans): the three a slow first token is
 /// read against. The rest of a request's time (its parse, tokenizer and
 /// template, the tenant reservation, the client acquisition, the request's
-/// build, a retry's backoff) is its request duration minus these; timing
+/// build and its boundary, the plan's stamping, a retry's backoff) is its
+/// request duration minus these; timing
 /// every boundary cost the shortest request path a percent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouterStage {
