@@ -78,6 +78,11 @@ class Controls(unittest.TestCase):
             with self.assertRaises(ValueError): delta.restore(row, req)
         for value in (2**31, -(2**31)-1, True):
             with self.assertRaises(ValueError): delta.scalar(value)
+        req.multimodal_inputs = NS(mrope_position_delta=torch.tensor([[2**31]]))
+        with self.assertRaises(ValueError): delta.write(row, req)
+        req.multimodal_inputs = NS(mrope_position_delta=torch.tensor([[-60.0]]))
+        with self.assertRaises(ValueError): delta.write(row, req)
+        with self.assertRaises(ValueError): delta.metadata_row(torch.zeros(16, dtype=torch.int64))
 
     def test_actual_metadata_write_and_original_tuple_shape(self):
         name = "sglang.srt.disaggregation.utils"
