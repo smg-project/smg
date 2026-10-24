@@ -21,6 +21,7 @@ use smg_grpc_client::{
     trtllm_service::AbortOnDropStream as TrtllmStream,
     vllm_engine::AbortOnDropStream as VllmStream,
     vllm_proto::{self as vllm, generate_complete::MatchedStop as VllmMatchedStop},
+    RequestDeadline,
 };
 use tokio::time::error::Elapsed;
 
@@ -1896,6 +1897,63 @@ impl ProtoStream {
         }
     }
 
+    /// Bound the stream by the request's `deadline` (`--request-timeout-secs`,
+    /// counted from the dispatch): polled at or past it, the transport stream
+    /// ends with the deadline's status and is released as a dropped one is,
+    /// so its abort reaches the engine at once (see
+    /// [`smg_grpc_client::AbortOnDropStream::with_deadline`]). Every wrapper
+    /// hands the deadline down to the transport stream(s) under it; a fan-out
+    /// bounds each child. The ZMQ wire's stream has no deadline hook and is
+    /// left as it is.
+    #[must_use]
+    pub fn with_deadline(self, deadline: RequestDeadline) -> Self {
+        match self {
+            Self::Sglang(stream) => Self::Sglang(stream.with_deadline(deadline)),
+            Self::Vllm(stream) => Self::Vllm(stream.with_deadline(deadline)),
+            Self::Trtllm(stream) => Self::Trtllm(stream.with_deadline(deadline)),
+            Self::Mlx(stream) => Self::Mlx(stream.with_deadline(deadline)),
+            Self::TokenSpeed(stream) => Self::TokenSpeed(stream.with_deadline(deadline)),
+            Self::Zmq(stream) => Self::Zmq(stream),
+            Self::Fanout(stream) => Self::Fanout(stream.with_deadline(deadline)),
+            Self::Tracked(stream) => {
+                let TrackedStream {
+                    inner,
+                    worker,
+                    prefill,
+                    progress,
+                    output,
+                    samples_success,
+                    replay,
+                } = *stream;
+                Self::Tracked(Box::new(TrackedStream {
+                    inner: inner.with_deadline(deadline),
+                    worker,
+                    prefill,
+                    progress,
+                    output,
+                    samples_success,
+                    replay,
+                }))
+            }
+            Self::DecodeSide(side) => {
+                let DecodeStream { inner, prefill } = *side;
+                Self::DecodeSide(Box::new(DecodeStream {
+                    inner: inner.with_deadline(deadline),
+                    prefill,
+                }))
+            }
+            // The item pulled ahead is already in hand; the stream under it
+            // is bounded.
+            Self::Ahead(ahead) => {
+                let AheadStream { inner, first } = *ahead;
+                Self::Ahead(Box::new(AheadStream {
+                    inner: inner.with_deadline(deadline),
+                    first,
+                }))
+            }
+        }
+    }
+
     /// Defer the abort-on-drop until the stream yields its first response.
     ///
     /// Used for the disaggregated decode side: aborting a decode request while
@@ -1967,6 +2025,10 @@ impl FanoutChild for ProtoStream {
         Self::defer_abort_until_first_item(self)
     }
 
+    fn with_deadline(self, deadline: RequestDeadline) -> Self {
+        Self::with_deadline(self, deadline)
+    }
+
     fn worker(&self) -> Option<&Arc<dyn Worker>> {
         ProtoStream::worker(self)
     }
@@ -1986,6 +2048,17 @@ pub trait FanoutChild: Send {
     /// Defer the child's abort-on-drop until its first response.
     #[must_use]
     fn defer_abort_until_first_item(self) -> Self;
+
+    /// Bound the child by the request's `deadline` (see
+    /// [`ProtoStream::with_deadline`]); a child with no transport stream
+    /// under it is left as it is.
+    #[must_use]
+    fn with_deadline(self, _deadline: RequestDeadline) -> Self
+    where
+        Self: Sized,
+    {
+        self
+    }
 
     /// The one worker the child was dispatched to, when it is tracked; a
     /// fan-out over several workers answers `None`.
@@ -2099,6 +2172,19 @@ impl<C: FanoutChild> FanoutStream<C> {
                 .children
                 .into_iter()
                 .map(|child| child.map(FanoutChild::defer_abort_until_first_item))
+                .collect(),
+            cursor: self.cursor,
+        }
+    }
+
+    /// Bound every open child by the request's `deadline`.
+    #[must_use]
+    pub fn with_deadline(self, deadline: RequestDeadline) -> Self {
+        Self {
+            children: self
+                .children
+                .into_iter()
+                .map(|child| child.map(|child| child.with_deadline(deadline)))
                 .collect(),
             cursor: self.cursor,
         }
