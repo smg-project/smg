@@ -54,6 +54,23 @@ pub(crate) struct EncodeItemBootstrapInfo {
     pub bootstrap_room: i64,
 }
 
+pub(crate) enum EncodeBootstrapInfo {
+    TokenSpeed(Vec<EncodeItemBootstrapInfo>),
+    Sglang(sglang::EncodeHandoff),
+}
+
+impl From<Vec<EncodeItemBootstrapInfo>> for EncodeBootstrapInfo {
+    fn from(items: Vec<EncodeItemBootstrapInfo>) -> Self {
+        Self::TokenSpeed(items)
+    }
+}
+
+impl From<sglang::EncodeHandoff> for EncodeBootstrapInfo {
+    fn from(handoff: sglang::EncodeHandoff) -> Self {
+        Self::Sglang(handoff)
+    }
+}
+
 // =====================
 // Multimodal Data
 // =====================

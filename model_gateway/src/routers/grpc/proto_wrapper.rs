@@ -55,7 +55,7 @@ pub use self::{
 };
 use self::{logprobs::convert_trtllm_output_logprobs, shm::vllm_mm_hash_identity};
 pub(crate) use self::{
-    multimodal::{stage_tokenspeed_tensor_rdma, EncodeItemBootstrapInfo},
+    multimodal::{stage_tokenspeed_tensor_rdma, EncodeBootstrapInfo, EncodeItemBootstrapInfo},
     request::VLLM_MROPE_GRID_KEYS,
     shm::{
         cleanup_tokenspeed_items_encoder_shm, finish_tokenspeed_request, finish_vllm_request,
@@ -2419,6 +2419,85 @@ mod engine_error_tests {
 mod tests {
     use prost::Message;
     use smg_grpc_client::common_proto as common;
+
+    fn sglang_encode_handoff() -> sglang::EncodeHandoff {
+        sglang::EncodeHandoff {
+            request_id: "epd-original".to_string(),
+            encoder_urls: vec![
+                "grpc://encoder-b:5002".to_string(),
+                "grpc://encoder-a:5001".to_string(),
+            ],
+            num_items_assigned: vec![2, 0],
+        }
+    }
+
+    #[test]
+    fn encode_handoff_sglang_roundtrip_preserves_id_order_and_zero_assignment() {
+        let mut request = ProtoGenerateRequest::Sglang(Box::new(sglang::GenerateRequest {
+            request_id: "epd-original".to_string(),
+            tokenized: Some(sglang::TokenizedInput {
+                original_text: "two images".to_string(),
+                input_ids: vec![1, 2],
+            }),
+            ..Default::default()
+        }));
+        let handoff = sglang_encode_handoff();
+        request.set_encode_bootstrap_info(handoff.clone()).unwrap();
+        let decoded =
+            sglang::GenerateRequest::decode(request.as_sglang().encode_to_vec().as_slice())
+                .unwrap();
+        assert_eq!(decoded.request_id, "epd-original");
+        assert_eq!(decoded.encode_handoff, Some(handoff));
+        assert_eq!(decoded.tokenized.unwrap().input_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn encode_handoff_rejects_mismatched_id_and_assignment_shape_without_mutation() {
+        let mut request = ProtoGenerateRequest::Sglang(Box::new(sglang::GenerateRequest {
+            request_id: "epd-original".to_string(),
+            ..Default::default()
+        }));
+        request
+            .set_encode_bootstrap_info(sglang_encode_handoff())
+            .unwrap();
+        let before = request.as_sglang().encode_to_vec();
+        let mut wrong_id = sglang_encode_handoff();
+        wrong_id.request_id = "another".to_string();
+        assert!(request.set_encode_bootstrap_info(wrong_id).is_err());
+        let mut wrong_shape = sglang_encode_handoff();
+        wrong_shape.num_items_assigned.pop();
+        assert!(request.set_encode_bootstrap_info(wrong_shape).is_err());
+        assert_eq!(request.as_sglang().encode_to_vec(), before);
+    }
+
+    #[test]
+    fn encode_handoff_keeps_tokenspeed_rooms_and_rejects_cross_backend_payloads() {
+        let mut tokenspeed = ProtoGenerateRequest::TokenSpeed(Box::default());
+        let item = EncodeItemBootstrapInfo {
+            item_index: 4,
+            bootstrap_host: "ts-encoder".to_string(),
+            bootstrap_port: 9000,
+            bootstrap_room: 17,
+        };
+        tokenspeed
+            .set_encode_bootstrap_info(vec![item.clone()])
+            .unwrap();
+        let rooms = tokenspeed.as_tokenspeed().encode_bootstrap_info.clone();
+        assert_eq!(rooms.as_ref().unwrap().items[0].bootstrap_room, 17);
+        assert!(tokenspeed
+            .set_encode_bootstrap_info(sglang_encode_handoff())
+            .is_err());
+        assert_eq!(tokenspeed.as_tokenspeed().encode_bootstrap_info, rooms);
+        let mut sglang = ProtoGenerateRequest::Sglang(Box::default());
+        assert!(sglang.set_encode_bootstrap_info(vec![item]).is_err());
+        assert!(sglang.as_sglang().encode_handoff.is_none());
+        tokenspeed.clear_encode_bootstrap_info();
+        assert!(tokenspeed.as_tokenspeed().encode_bootstrap_info.is_none());
+        let mut vllm = ProtoGenerateRequest::Vllm(Box::default());
+        assert!(vllm
+            .set_encode_bootstrap_info(sglang_encode_handoff())
+            .is_err());
+    }
 
     #[test]
     fn inline_bytes_counts_every_inline_tensor_and_raw_image() {

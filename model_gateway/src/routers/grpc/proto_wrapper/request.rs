@@ -10,7 +10,7 @@ use smg_grpc_client::{
     trtllm_proto as trtllm, vllm_proto as vllm,
 };
 
-use super::{vllm_mm_hash_identity, vllm_mm_identity, EncodeItemBootstrapInfo, ProtoEmbedRequest};
+use super::{vllm_mm_hash_identity, vllm_mm_identity, EncodeBootstrapInfo, ProtoEmbedRequest};
 
 /// Unified ProtoRequest
 #[derive(Clone)]
@@ -851,11 +851,13 @@ impl ProtoGenerateRequest {
         }
     }
 
-    /// Set encode->prefill bootstrap info for backends that receive multimodal embeddings
-    /// out-of-band from encode workers.
-    pub(crate) fn set_encode_bootstrap_info(&mut self, items: Vec<EncodeItemBootstrapInfo>) {
-        match self {
-            Self::TokenSpeed(req) => {
+    /// Attach the backend's own encode-to-prefill rendezvous format.
+    pub(crate) fn set_encode_bootstrap_info(
+        &mut self,
+        info: impl Into<EncodeBootstrapInfo>,
+    ) -> Result<(), &'static str> {
+        match (self, info.into()) {
+            (Self::TokenSpeed(req), EncodeBootstrapInfo::TokenSpeed(items)) => {
                 let items = items
                     .into_iter()
                     .map(|item| tokenspeed::EncodeItemBootstrapInfo {
@@ -867,19 +869,28 @@ impl ProtoGenerateRequest {
                     .collect();
                 req.encode_bootstrap_info = Some(tokenspeed::EncodeBootstrapInfo { items });
             }
-            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => {
-                tracing::warn!(
-                    "set_encode_bootstrap_info called on a backend without encode bootstrap info, ignoring"
-                );
+            (Self::Sglang(req), EncodeBootstrapInfo::Sglang(handoff)) => {
+                if req.request_id.is_empty() || handoff.request_id != req.request_id {
+                    return Err("SGLang encoder handoff request ID differs from Generate");
+                }
+                if handoff.encoder_urls.is_empty()
+                    || handoff.encoder_urls.len() != handoff.num_items_assigned.len()
+                {
+                    return Err("SGLang encoder handoff needs one assignment per encoder URL");
+                }
+                req.encode_handoff = Some(handoff);
             }
+            _ => return Err("encoder handoff payload does not match the request backend"),
         }
+        Ok(())
     }
 
-    /// Clear prefill-only encode bootstrap info from the decode-side request.
+    /// Clear prefill-only encode metadata from the decode-side request.
     pub(crate) fn clear_encode_bootstrap_info(&mut self) {
         match self {
             Self::TokenSpeed(req) => req.encode_bootstrap_info = None,
-            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => {}
+            Self::Sglang(req) => req.encode_handoff = None,
+            Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => {}
         }
     }
 
