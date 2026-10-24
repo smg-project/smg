@@ -131,6 +131,8 @@ def verify_only(output):
         report["files"] = verify_files(plan, md.distribution("apache-tvm-ffi"))
         import torch
 
+        report["torch_runtime_version"] = torch.__version__
+        require(torch.__version__ == versions["torch"], "loaded Torch version changed")
         require(
             hasattr(torch.Tensor, "__dlpack_c_exchange_api__"), "native Torch DLPack API required"
         )
