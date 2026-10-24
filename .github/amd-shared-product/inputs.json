@@ -227,7 +227,7 @@
     "unit_junit": "servicer-engine.xml in the existing unique AMD dependency artifact",
     "diagnostic_workflow_difference": "NIXL tier-select dispatch caller only; normal product tooling CPU jobs are not part of this diagnostic workflow."
   },
-  "source_identity_note": "Original shared reusable03d blob, consumer19 product source and compiled37c9d unchanged. Diagnostic-only Mooncake2 caller/canary/transfer witness does not relabel native143a or alter originalcase bodies. Actualconsumer e2e tree includes exact3 owned-log test overlays; test-overlay.json binds each file/hash/base. Producer14 andcompiled37 remain actual445/c9d, notconsumer test source.",
+  "source_identity_note": "Actual consumer19 differs only in its e2e_test tree through the exact three owned-log test overlay files bound by test-overlay.json; the other18 source entries are unchanged. Compiled37c9d, actual445 producer14 and native143a are unchanged and are separate from the consumer test source. Original models, requests and positive oracles are retained; the transfer test body changes its log selection to the owned fixture paths.",
   "admitted_tier": null,
   "contracts": {
     "2": {
