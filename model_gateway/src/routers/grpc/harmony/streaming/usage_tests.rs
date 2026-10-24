@@ -19,7 +19,9 @@ use crate::{
     routers::{
         common::sse::sse_channel,
         grpc::{
-            common::responses::streaming::ResponseStreamEventEmitter,
+            common::{
+                response_formatting::TokenCounts, responses::streaming::ResponseStreamEventEmitter,
+            },
             context,
             harmony::{
                 processor::{HarmonyResponseProcessor, ResponsesIterationResult},
@@ -266,17 +268,12 @@ fn iteration_usage(result: ResponsesIterationResult) -> Value {
     serde_json::to_value(usage).expect("a JSON usage")
 }
 
-#[tokio::test]
-async fn harmony_responses_iteration_usage_is_the_same_streamed_and_not() {
-    let counters = Counters {
-        prompt: 12,
-        cached: 4,
-        spec_accepted: 2,
-        spec_drafted: 3,
-    };
-    let tokens = harmony_tokens(Some("Think, then answer."), "Done.");
-
-    let (stream, server) = scripted_stream(frames(&tokens, 1, counters), "0").await;
+/// The streamed Responses iteration over `frames`: its result and the
+/// engine's counts the stream brought.
+async fn streamed_responses_iteration(
+    frames: Vec<proto::GenerateResponse>,
+) -> (ResponsesIterationResult, TokenCounts) {
+    let (stream, server) = scripted_stream(frames, "0").await;
     let mut emitter = ResponseStreamEventEmitter::new(
         "resp_harmony-usage".to_string(),
         "harmony-test".to_string(),
@@ -299,10 +296,16 @@ async fn harmony_responses_iteration_usage_is_the_same_streamed_and_not() {
         result
     };
     let (streamed, ()) = tokio::join!(iteration, drain);
-    let streamed = streamed.expect("the streamed iteration");
     server.abort();
+    streamed.expect("the streamed iteration")
+}
 
-    let (stream, server) = scripted_stream(frames(&tokens, 1, counters), "0").await;
+/// The non-streamed Responses iteration over `frames`: its result and the
+/// engine's counts of its terminal frame.
+async fn whole_responses_iteration(
+    frames: Vec<proto::GenerateResponse>,
+) -> (ResponsesIterationResult, TokenCounts) {
+    let (stream, server) = scripted_stream(frames, "0").await;
     let request: ResponsesRequest =
         serde_json::from_value(json!({"model": "harmony-test", "input": "hi"}))
             .expect("responses request");
@@ -315,6 +318,21 @@ async fn harmony_responses_iteration_usage_is_the_same_streamed_and_not() {
         .await
         .unwrap_or_else(|response| panic!("{}", response.status()));
     server.abort();
+    whole
+}
+
+#[tokio::test]
+async fn harmony_responses_iteration_usage_is_the_same_streamed_and_not() {
+    let counters = Counters {
+        prompt: 12,
+        cached: 4,
+        spec_accepted: 2,
+        spec_drafted: 3,
+    };
+    let tokens = harmony_tokens(Some("Think, then answer."), "Done.");
+
+    let (streamed, _) = streamed_responses_iteration(frames(&tokens, 1, counters)).await;
+    let (whole, _) = whole_responses_iteration(frames(&tokens, 1, counters)).await;
 
     let (streamed, whole) = (iteration_usage(streamed), iteration_usage(whole));
     assert_eq!(
@@ -334,6 +352,43 @@ async fn harmony_responses_iteration_usage_is_the_same_streamed_and_not() {
     assert_eq!(
         streamed["completion_tokens_details"]["accepted_prediction_tokens"], 2,
         "{streamed}"
+    );
+}
+
+/// The settlement of a Harmony Responses iteration carries the engine's
+/// counts, streamed and not, as a chat request's does: the prompt and its
+/// cache hit, the completion, and the engine's own reasoning count, zero
+/// here (the terminal frame carries none) though the parser counted the
+/// analysis channel and the usage object shows that count.
+#[tokio::test]
+async fn harmony_responses_iteration_settlement_carries_the_engines_counts_streamed_and_not() {
+    let counters = Counters {
+        prompt: 12,
+        cached: 4,
+        spec_accepted: 2,
+        spec_drafted: 3,
+    };
+    let tokens = harmony_tokens(Some("Think, then answer."), "Done.");
+    let expected = UsageSettlement {
+        actual_input_tokens: 12,
+        completion_tokens: tokens.len() as u32,
+        cached_input_tokens: 4,
+        reasoning_tokens: 0,
+    };
+
+    let (streamed, streamed_counts) =
+        streamed_responses_iteration(frames(&tokens, 1, counters)).await;
+    let (_, whole_counts) = whole_responses_iteration(frames(&tokens, 1, counters)).await;
+
+    assert_eq!(streamed_counts.settlement(), expected);
+    assert_eq!(whole_counts.settlement(), expected);
+    assert_eq!(streamed_counts, whole_counts);
+    let usage = iteration_usage(streamed);
+    assert!(
+        usage["completion_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .is_some_and(|reasoning| reasoning > 0),
+        "the usage shows the parser's count, the settlement the engine's: {usage}"
     );
 }
 

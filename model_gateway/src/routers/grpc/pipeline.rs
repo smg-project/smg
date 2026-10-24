@@ -971,15 +971,12 @@ impl RequestPipeline {
     }
 
     /// Settle a non-streaming success's reservation with real usage, if this
-    /// logical request reserved one. No-op if the cell is unset (feature
-    /// disabled or endpoint opted out) or was never admitted (e.g. prep
-    /// failed before the reserve stage ran). Idempotent -- `settle_success`
-    /// is a no-op if the handle was already resolved.
+    /// logical request reserved one ([`RateLimitCell::settle`]; no-op when
+    /// the caller set no cell).
     async fn settle_reservation(cell: Option<&RateLimitCell>, usage: UsageSettlement) {
-        let Some(RateLimitOutcome::Admitted(handle)) = cell.and_then(RateLimitCell::peek) else {
-            return;
-        };
-        handle.settle_success(usage).await;
+        if let Some(cell) = cell {
+            cell.settle(usage).await;
+        }
     }
 
     /// The settlement of a non-streamed chat or messages answer: the engine's
@@ -1475,8 +1472,12 @@ impl RequestPipeline {
 
     /// Execute chat pipeline for responses endpoint
     ///
-    /// Used by ALL non-streaming /v1/responses requests.
-    /// Same stages as execute_chat(), with two differences:
+    /// Used by ALL non-streaming /v1/responses requests, once per iteration
+    /// of a tool loop. Same stages as execute_chat(), the tenant rate-limit
+    /// reservation included: every iteration is a generation of its own, so
+    /// each takes the reservation a chat request takes (reserved at ingress,
+    /// settled with the engine's counts, closed unsettled when the iteration
+    /// fails). Two differences:
     /// 1. Returns Result<ChatCompletionResponse, Response> for tool_loop composition
     /// 2. Disallows streaming (responses endpoint uses different SSE format)
     pub async fn execute_chat_for_responses(
@@ -1487,12 +1488,14 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
     ) -> Result<ChatCompletionResponse, Response> {
+        let rate_limit_cell = Arc::new(RateLimitCell::new());
         let run = {
             let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
             ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.rate_limit_cell = Some(rate_limit_cell.clone());
             self.run(ctx, None, None)
         };
-        match run.await {
+        let result = match run.await {
             Ok(RunOutcome::Early(_)) => {
                 // Streaming not supported for responses sync mode
                 error!(
@@ -1505,7 +1508,14 @@ impl RequestPipeline {
                 ))
             }
             Ok(RunOutcome::Final(mut dctx, _)) => match dctx.response.final_response.take() {
-                Some(FinalResponse::Chat(response)) => Ok(response),
+                Some(FinalResponse::Chat(response)) => {
+                    // The engine's counts the response stage recorded, as
+                    // `execute_chat` settles them.
+                    rate_limit_cell
+                        .settle(Self::recorded_settlement(&dctx.response))
+                        .await;
+                    Ok(response)
+                }
                 Some(_) => {
                     error!(
                         function = "execute_chat_for_responses",
@@ -1528,20 +1538,30 @@ impl RequestPipeline {
                 }
             },
             Err(response) => Err(response),
+        };
+        if result.is_err() {
+            // A failed iteration keeps its reserved debit, as a failed typed
+            // request does (`GrpcRouter::execute_reserved`).
+            rate_limit_cell.close_unsettled().await;
         }
+        result
     }
 
     /// Execute one Harmony Responses API iteration through the pipeline.
     ///
     /// Returns ToolCallsFound (continue serving) or Completed (final
     /// response); called by harmony::responses::serve_harmony_responses()
-    /// per iteration.
+    /// per iteration. Each iteration takes the tenant rate-limit reservation
+    /// a chat request takes: reserved at ingress, settled with the engine's
+    /// counts the response stage recorded, closed unsettled when the
+    /// iteration fails.
     pub async fn execute_harmony_responses(
         &self,
         request: &openai_protocol::responses::ResponsesRequest,
         harmony_ctx: &ResponsesContext,
         tenant_request_meta: Option<TenantRequestMeta>,
     ) -> Result<harmony::ResponsesIterationResult, Response> {
+        let rate_limit_cell = Arc::new(RateLimitCell::new());
         let run = {
             let mut ctx = RequestContext::for_responses(
                 Arc::new(request.clone()),
@@ -1550,47 +1570,63 @@ impl RequestPipeline {
                 harmony_ctx.components.clone(),
             );
             ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.rate_limit_cell = Some(rate_limit_cell.clone());
             self.run(ctx, None, None)
         };
-        let mut dctx = match run.await {
+        let result = match run.await {
             Ok(RunOutcome::Early(response)) => {
                 error!(
                     function = "execute_harmony_responses",
                     "Unexpected early response during Responses iteration"
                 );
-                return Err(response);
+                Err(response)
             }
-            Ok(RunOutcome::Final(dctx, _)) => dctx,
-            Err(response) => return Err(response),
+            Ok(RunOutcome::Final(mut dctx, _)) => {
+                match dctx.response.responses_iteration_result.take() {
+                    Some(iteration_result) => {
+                        rate_limit_cell
+                            .settle(Self::recorded_settlement(&dctx.response))
+                            .await;
+                        Ok(iteration_result)
+                    }
+                    None => {
+                        error!(
+                            function = "execute_harmony_responses",
+                            "No ResponsesIterationResult produced by pipeline"
+                        );
+                        Err(error::internal_error(
+                            "no_responses_iteration_result",
+                            "No ResponsesIterationResult produced by pipeline",
+                        ))
+                    }
+                }
+            }
+            Err(response) => Err(response),
         };
-
-        dctx.response
-            .responses_iteration_result
-            .take()
-            .ok_or_else(|| {
-                error!(
-                    function = "execute_harmony_responses",
-                    "No ResponsesIterationResult produced by pipeline"
-                );
-                error::internal_error(
-                    "no_responses_iteration_result",
-                    "No ResponsesIterationResult produced by pipeline",
-                )
-            })
+        if result.is_err() {
+            rate_limit_cell.close_unsettled().await;
+        }
+        result
     }
 
     /// Execute a Harmony Responses pipeline iteration with streaming support.
     ///
     /// Runs through dispatch and returns the raw ExecutionResult (with
-    /// stream) and LoadGuards for token-level streaming processing. The
-    /// caller keeps load_guards alive until stream processing completes.
+    /// stream) and LoadGuards for token-level streaming processing, with the
+    /// iteration's tenant rate-limit reservation. The caller keeps
+    /// load_guards alive until stream processing completes, then settles the
+    /// reservation with the counts the stream brought
+    /// ([`RateLimitCell::settle`]) or closes it when the stream broke
+    /// ([`RateLimitCell::close_unsettled`]); a cell dropped before either
+    /// (the client left) abandons the reservation, its debit kept.
     pub async fn execute_harmony_responses_streaming(
         &self,
         request: &openai_protocol::responses::ResponsesRequest,
         harmony_ctx: &ResponsesContext,
         tenant_request_meta: Option<TenantRequestMeta>,
         stream_start: Option<StreamStartupSender>,
-    ) -> Result<(ExecutionResult, Option<LoadGuards>), Response> {
+    ) -> Result<(ExecutionResult, Option<LoadGuards>, Arc<RateLimitCell>), Response> {
+        let rate_limit_cell = Arc::new(RateLimitCell::new());
         let run = {
             let mut ctx = RequestContext::for_responses(
                 Arc::new(request.clone()),
@@ -1599,34 +1635,39 @@ impl RequestPipeline {
                 harmony_ctx.components.clone(),
             );
             ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.rate_limit_cell = Some(rate_limit_cell.clone());
             self.run_signalling(ctx, None, None, stream_start)
         };
-        let mut dctx = match run.await {
+        let result = match run.await {
             Ok(RunOutcome::Early(response)) => {
                 error!(
                     function = "execute_harmony_responses_streaming",
                     "Unexpected early response during streaming Responses"
                 );
-                return Err(response);
+                Err(response)
             }
-            Ok(RunOutcome::Final(dctx, _)) => dctx,
-            Err(response) => return Err(response),
+            Ok(RunOutcome::Final(mut dctx, _)) => match dctx.response.execution_result.take() {
+                Some(execution_result) => {
+                    let load_guards = dctx.load_guards.take();
+                    Ok((execution_result, load_guards, rate_limit_cell.clone()))
+                }
+                None => {
+                    error!(
+                        function = "execute_harmony_responses_streaming",
+                        "No ExecutionResult produced by pipeline"
+                    );
+                    Err(error::internal_error(
+                        "no_execution_result_produced",
+                        "No ExecutionResult produced by pipeline",
+                    ))
+                }
+            },
+            Err(response) => Err(response),
         };
-
-        let execution_result = dctx.response.execution_result.take().ok_or_else(|| {
-            error!(
-                function = "execute_harmony_responses_streaming",
-                "No ExecutionResult produced by pipeline"
-            );
-            error::internal_error(
-                "no_execution_result_produced",
-                "No ExecutionResult produced by pipeline",
-            )
-        })?;
-
-        let load_guards = dctx.load_guards.take();
-
-        Ok((execution_result, load_guards))
+        if result.is_err() {
+            rate_limit_cell.close_unsettled().await;
+        }
+        result
     }
 }
 

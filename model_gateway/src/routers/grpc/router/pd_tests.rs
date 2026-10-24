@@ -30,6 +30,7 @@ use crate::{
     rate_limit::{
         RateLimitBackend, ReserveOutcome, ReserveRequest, SharedReservationHandle, UsageSettlement,
     },
+    routers::grpc::common::stages::RateLimitOutcome,
     tenant::TenantKey,
     worker::{BasicWorker, BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerRegistry},
     workflow::{
