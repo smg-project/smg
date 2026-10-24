@@ -43,21 +43,29 @@ def readonly_mount(path):
     require(any(row[4] == str(path) and "ro" in row[5].split(",") for row in matches), "required read-only bind mount: " + str(path))
 
 
-def prefix_leaves(prefix):
-    leaves, pending = set(), [prefix]
+def prefix_leaves(prefix, declared):
+    require(0 < len(declared) <= 55, "private prefix declaration cap")
+    directories = {parent for name in declared for parent in Path(name).parents if parent != Path(".")}
+    entry_limit = 2 * (len(declared) + len(directories))
+    depth_limit = max(len(Path(name).parts) for name in declared) + 2
+    leaves, pending, entries_seen = set(), [prefix], 0
     while pending:
         with os.scandir(pending.pop()) as entries:
             for entry in entries:
+                entries_seen += 1
+                require(entries_seen <= entry_limit, "private prefix walk entry cap")
                 path = Path(entry.path)
+                require(len(path.relative_to(prefix).parts) <= depth_limit, "private prefix walk depth cap")
                 if entry.is_dir(follow_symlinks=False):
                     pending.append(path)
                 else:
                     leaves.add(path.relative_to(prefix).as_posix())
+                    require(len(leaves) <= len(declared), "private prefix leaf cap")
     return leaves
 
 
 def verify_prefix(prefix, declared):
-    require(prefix_leaves(prefix) == set(declared), "private prefix leaf set changed")
+    require(prefix_leaves(prefix, declared) == set(declared), "private prefix leaf set changed")
     for name, item in declared.items():
         path = prefix / name
         require(path.resolve(strict=True).is_relative_to(prefix), "prefix symlink escaped")
