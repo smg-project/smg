@@ -20,6 +20,7 @@
 //! fan-out, the string-stop resolution helpers in [`stops`], and the pooling
 //! params an `Embed` request carries ([`translate_embed_request`]).
 
+mod abort_status;
 mod client;
 mod context_window;
 mod embed;

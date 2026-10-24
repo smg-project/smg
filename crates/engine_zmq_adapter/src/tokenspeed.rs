@@ -22,6 +22,7 @@ use smg_grpc_client::{common_proto as common, tokenspeed_proto, vllm_proto as vl
 use tracing::warn;
 
 use crate::{
+    abort_status::engine_abort_status,
     context_window::admit_prompt,
     fanout::fan_out_n,
     stream::{poll_mapped, MappedGenerateStream, StreamState},
@@ -235,17 +236,27 @@ impl MappedGenerateStream for TokenSpeedGenerateStream {
 
         // An engine-side failure must surface as an error, not a normal
         // completion with empty output — mirroring the vLLM stream's guard.
-        // The slim wire carries the finish type alone (no message, status or
-        // abort code), and the engine has no abort code for its grammar
-        // anyway: an `abort` the frontend did not ask for is a pause or a
-        // capacity abort, an `error` a transfer or numerical failure. So a
-        // constrained request's finishes keep the shapes every request has;
-        // the constraint-failure status is raised only by a wire whose engine
-        // attributes the failure (see the SGLang stream).
+        // An `error` is a transfer or numerical failure. An `abort` is the
+        // engine's, never the caller's (the caller's own abort is answered
+        // from the parked completion, see `complete_aborted`), and the stream
+        // ends as the engine's Python servicer ends the same finish: a status
+        // the engine attached (an admission refusal's 400, a full queue's
+        // 429) goes through the shared status table with the engine's words,
+        // both read off two columns an engine declares in its layout; an
+        // abort without a status is internal, with the words when they
+        // travel and a fixed sentence when the engine declares no such
+        // column. Before, every engine abort was an empty completion: a
+        // success the client could not tell from a served request. The
+        // engine has no abort code for its grammar, so the constraint-failure
+        // status is raised only by a wire whose engine attributes the failure
+        // (see the SGLang stream).
         if output.finish_reason.as_deref() == Some("error") {
             return Err(tonic::Status::internal(
                 "engine finished the request with an error (see engine logs)",
             ));
+        }
+        if output.finish_reason.as_deref() == Some("abort") {
+            return Err(engine_abort(output.finish_status, output.finish_message));
         }
         // No matched_stop on this wire: TokenSpeed reports the finish reason
         // only, and the router-side stop machinery owns string matching.
@@ -906,6 +917,26 @@ pub(crate) fn constraint_ref(sp: &tokenspeed_proto::SamplingParams) -> Option<Co
         Constraint::EbnfGrammar(grammar) => ConstraintRef::Ebnf(grammar),
         Constraint::StructuralTag(tag) => ConstraintRef::StructuralTag(tag),
     })
+}
+
+/// The words of an engine abort whose reason does not travel the wire: an
+/// engine that declares no finish-detail columns, or an abort the engine
+/// published without any.
+pub(crate) const BARE_ENGINE_ABORT: &str =
+    "the engine aborted the request (its reason stays in the engine's log on this wire)";
+
+/// The status an engine `abort` finish ends the stream with, as the engine's
+/// Python servicer answers the same finish: a status the engine attached goes
+/// through the shared table with the engine's words; an abort without one is
+/// internal, with the engine's words when the wire carries them and
+/// [`BARE_ENGINE_ABORT`] when it does not. The caller's own abort never comes
+/// this way: it is answered from the parked completion
+/// ([`TokenSpeedGenerateStream::complete_aborted`]).
+pub(crate) fn engine_abort(status: Option<u16>, message: Option<String>) -> tonic::Status {
+    engine_abort_status(
+        status,
+        message.unwrap_or_else(|| BARE_ENGINE_ABORT.to_string()),
+    )
 }
 
 /// Normalize a TokenSpeed wire finish-reason string into the canonical set the
@@ -2075,6 +2106,39 @@ mod tests {
     }
 
     #[test]
+    fn an_engine_abort_is_the_status_its_attribution_means() {
+        let rows = [
+            (
+                Some(400),
+                Some("Invalid request: too long"),
+                tonic::Code::InvalidArgument,
+                "Invalid request: too long",
+            ),
+            (
+                Some(429),
+                None,
+                tonic::Code::ResourceExhausted,
+                BARE_ENGINE_ABORT,
+            ),
+            (
+                None,
+                Some("Unknown error"),
+                tonic::Code::Internal,
+                "Unknown error",
+            ),
+            (None, None, tonic::Code::Internal, BARE_ENGINE_ABORT),
+        ];
+        for (status, words, code, message) in rows {
+            let got = engine_abort(status, words.map(str::to_string));
+            assert_eq!(
+                (got.code(), got.message()),
+                (code, message),
+                "{status:?} {words:?}"
+            );
+        }
+    }
+
+    #[test]
     fn tokenspeed_finish_reason_normalizes() {
         assert_eq!(normalize_finish_reason("stop"), "stop");
         assert_eq!(normalize_finish_reason("length"), "length");
@@ -2084,14 +2148,157 @@ mod tests {
         assert_eq!(normalize_finish_reason("garbage"), "stop");
     }
 
-    /// This wire carries the finish type alone and its engine has no abort
-    /// code for its grammar: an `abort` on a constrained request is as often
-    /// a pause aborting every request in flight (the finish an RL driver
-    /// resubmits on) as anything else, an `error` a transfer or numerical
-    /// failure. Both keep the shape every request has, the `abort` a
-    /// `Complete` with finish reason `abort` and the `error` the engine's own
-    /// report; neither is the constraint-failure status, which only an
-    /// engine's own attribution raises.
+    /// An engine abort ends the stream as the engine's Python servicer ends
+    /// the same finish. On an engine that declares the finish-detail columns:
+    /// a status goes through the shared table with the engine's words (a 400
+    /// at admission is INVALID_ARGUMENT, a full queue's 429
+    /// RESOURCE_EXHAUSTED), an abort without a status is INTERNAL with its
+    /// words. On an engine that declares no such column the same 400 frame
+    /// is INTERNAL with the fixed sentence: the columns are never read by a
+    /// pinned position, and the reason did not travel.
+    #[tokio::test]
+    async fn an_attributed_abort_ends_the_stream_with_the_engines_status_and_words() {
+        use engine_zmq_client::{
+            codec::encode_msgpack,
+            mock_engine::default_ready_response,
+            protocol::tokenspeed::output::{
+                BatchTokenIDOutSlim, BASE_COLUMN_NAMES, BATCH_TOKEN_ID_OUT_SLIM_TAG,
+                FINISHED_MESSAGES, FINISHED_STATUS_CODES,
+            },
+        };
+
+        use crate::test_support::connected_pair_declaring;
+
+        const REFUSAL: &str = "Invalid request: the input (8191 tokens) exceeds the engine's \
+                               maximum input length (8190 tokens)";
+        let mut declaring = default_ready_response();
+        declaring.positional_layouts.insert(
+            BATCH_TOKEN_ID_OUT_SLIM_TAG.to_string(),
+            BASE_COLUMN_NAMES
+                .iter()
+                .copied()
+                .chain([FINISHED_STATUS_CODES, FINISHED_MESSAGES])
+                .map(str::to_string)
+                .collect(),
+        );
+        /// One abort frame and what the client reads for it.
+        struct Case {
+            rid: &'static str,
+            status: Option<u16>,
+            words: Option<&'static str>,
+            /// Whether the engine declares the finish-detail columns.
+            declared: bool,
+            expected_code: tonic::Code,
+            expected_words: &'static str,
+        }
+        let cases = [
+            Case {
+                rid: "r1",
+                status: Some(400),
+                words: Some(REFUSAL),
+                declared: true,
+                expected_code: tonic::Code::InvalidArgument,
+                expected_words: REFUSAL,
+            },
+            Case {
+                rid: "r2",
+                status: Some(429),
+                words: None,
+                declared: true,
+                expected_code: tonic::Code::ResourceExhausted,
+                expected_words: BARE_ENGINE_ABORT,
+            },
+            Case {
+                rid: "r3",
+                status: None,
+                words: Some("Unknown error"),
+                declared: true,
+                expected_code: tonic::Code::Internal,
+                expected_words: "Unknown error",
+            },
+            Case {
+                rid: "r4",
+                status: Some(400),
+                words: Some(REFUSAL),
+                declared: false,
+                expected_code: tonic::Code::Internal,
+                expected_words: BARE_ENGINE_ABORT,
+            },
+        ];
+        for Case {
+            rid,
+            status,
+            words,
+            declared,
+            expected_code,
+            expected_words,
+        } in cases
+        {
+            let ready = if declared {
+                declaring.clone()
+            } else {
+                default_ready_response()
+            };
+            let (client, engine, _dir) =
+                connected_pair_declaring(RuntimeType::TokenSpeed, ready).await;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "engine task ends after responding"
+            )]
+            let engine_task = tokio::spawn(async move {
+                let (mut input, mut output) = engine.split();
+                let _ = input.recv_frames().await.unwrap();
+                let done = BatchTokenIDOutSlim {
+                    rids: vec![rid.into()],
+                    output_ids: vec![vec![]],
+                    finished_reasons: vec!["abort".into()],
+                    prompt_tokens: vec![8191],
+                    completion_tokens: vec![0],
+                    cached_tokens: vec![0],
+                    output_token_logprobs_val: vec![vec![]],
+                    output_token_logprobs_idx: vec![vec![]],
+                    finished_status_codes: vec![status],
+                    finished_messages: vec![words.map(str::to_string)],
+                    ..Default::default()
+                };
+                output
+                    .send_frames(vec![bytes::Bytes::from(encode_msgpack(&done).unwrap())])
+                    .await
+                    .unwrap();
+                (input, output)
+            });
+            let req = tokenspeed_proto::GenerateRequest {
+                request_id: rid.to_string(),
+                tokenized: Some(tokenspeed_proto::TokenizedInput {
+                    input_ids: vec![1, 2, 3],
+                    original_text: String::new(),
+                }),
+                sampling_params: Some(tokenspeed_proto::SamplingParams {
+                    max_new_tokens: Some(1),
+                    ..Default::default()
+                }),
+                stream: true,
+                ..Default::default()
+            };
+            let mut stream = client.generate_tokenspeed(req).await.expect("generate");
+            let item = stream.next().await.expect("an item");
+            let error = item.expect_err("the engine's abort is a status");
+            assert_eq!(error.code(), expected_code, "{rid}");
+            assert_eq!(error.message(), expected_words, "{rid}");
+            drop(stream);
+            let _ = engine_task.await.unwrap();
+        }
+    }
+
+    /// An engine has no abort code for its grammar: an `abort` the engine did
+    /// not attribute (no status on the frame, or an engine without the
+    /// finish-detail columns) on a constrained request is as often a pause
+    /// aborting every request in flight (the finish an RL driver resubmits
+    /// on) as anything else, an `error` a transfer or numerical failure. Both
+    /// keep the shape every request has, the `abort` the internal status
+    /// naming an engine abort and the `error` the engine's own report;
+    /// neither is the constraint-failure status, which only an engine's own
+    /// attribution raises.
     #[tokio::test]
     async fn an_abort_or_error_finish_of_a_constrained_request_keeps_the_engines_own_shape() {
         use engine_zmq_client::{
@@ -2166,15 +2373,14 @@ mod tests {
                 );
                 assert!(!is_constraint_failure(&error), "{rid}: {error}");
             } else {
-                match item.expect("a response").response {
-                    Some(vllm::generate_response::Response::Complete(complete)) => {
-                        assert_eq!(
-                            complete.finish_reason, "abort",
-                            "{rid} (constrained: {constrained})"
-                        );
-                    }
-                    other => panic!("{rid}: expected a Complete, got {other:?}"),
-                }
+                let error = item.expect_err("an engine abort");
+                assert_eq!(
+                    error.code(),
+                    tonic::Code::Internal,
+                    "{rid} (constrained: {constrained})"
+                );
+                assert_eq!(error.message(), BARE_ENGINE_ABORT, "{rid}");
+                assert!(!is_constraint_failure(&error), "{rid}: {error}");
             }
         }
         engine_task.await.unwrap();

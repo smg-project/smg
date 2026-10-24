@@ -116,6 +116,12 @@ pub trait EngineProtocol: Send + Sync + 'static {
     type Request: Send + 'static;
     /// The typed per-request output streamed back.
     type Output: EngineOutput + Send + 'static;
+    /// What this protocol reads off an engine's handshake and needs when it
+    /// decodes that engine's outputs: where the engine declared the optional
+    /// output columns this client knows (`()` for a protocol whose outputs
+    /// carry none). Read once per connection ([`EngineProtocol::read_layout`])
+    /// and handed to every [`EngineProtocol::decode_batch`].
+    type Layout: Clone + Default + PartialEq + std::fmt::Debug + Send + Sync + 'static;
 
     /// The single-byte request-type frame prepended to an add-request.
     fn add_frame() -> Bytes;
@@ -170,6 +176,15 @@ pub trait EngineProtocol: Send + Sync + 'static {
     fn check_layouts(_ready: &EngineCoreReadyResponse) -> Result<()> {
         Ok(())
     }
-    /// Decode one output message (frame 0 plus ordered aux frames) into a batch.
-    fn decode_batch(frames: &[Bytes]) -> Result<EngineBatch<Self::Output>>;
+    /// The connection's [`EngineProtocol::Layout`], read off the engine's
+    /// ready response: the positions the engine declares for the optional
+    /// output columns this protocol knows, unset (the default) for a column
+    /// it does not declare. Never an error: an undeclared column is an older
+    /// engine, whose outputs decode as they always did.
+    fn read_layout(_ready: &EngineCoreReadyResponse) -> Self::Layout {
+        Self::Layout::default()
+    }
+    /// Decode one output message (frame 0 plus ordered aux frames) into a
+    /// batch, reading the optional output columns where `layout` puts them.
+    fn decode_batch(frames: &[Bytes], layout: &Self::Layout) -> Result<EngineBatch<Self::Output>>;
 }
