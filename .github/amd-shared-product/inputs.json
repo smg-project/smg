@@ -75,7 +75,7 @@
   "producer_sha": "445bb37bccb47e620b2b3aac12cd30b4ebd71a43",
   "producer_branch": "ci/frozen-c9d-cpu-producer-20261023",
   "producer_policy": "frozen_c9d_dispatch_build_only_all_18_steps_success_v1",
-  "target_product_commit": "4894b70cf60ed0936739174d4465d6cddacfd04a",
+  "target_product_commit": "d0d88300ac7adf5b5538341d63b701d687d09f8a",
   "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat[0]/sglang/nvidia",
   "source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
@@ -192,7 +192,7 @@
     "original_conditional_skip_markers_evaluate_false": 0,
     "scope": "DIAGNOSTIC_SUBSET_NO231_ACCEPTANCE_NO_COVERAGE"
   },
-  "diagnostic_difference": "DIAGNOSTIC_SUBSET_ONLY: original TestMultimodalQwen3VL six IDs, one unchanged Qwen3-VL-8B-Instruct model and all original images/requests/assertions; no new skip or xfail. Explicit class filter/floor6 replaces full231 only in this isolated manual caller. Proposed20-minute job/16-minute pytest is a new diagnostic budget, not the original36/28 SG row. Original reruns2/delay5 and normal shared workflow remain unchanged. Opt-in bounded Qwen trace uses WARNING under the normal worker WARNING level. Source/CPU logging evidence is not actual scheduler origin or a semantic repair; root actual audit must require emitted source/rid/phase records. No full231, model quality, latestmain/stableCI or coverage credit.",
+  "diagnostic_difference": "DIAGNOSTIC_SUBSET_ONLY: original TestMultimodalQwen3VL six IDs, unchanged Qwen3-VL-8B-Instruct model/images/requests/assertions and floor6/20job/16pytest/reruns2/delay5. The exact Qwen3 VL missing-position fallback now receives a canonical unpadded-ID copy; other model/processor paths and bounded WARNING trace remain. This is an unexecuted source repair candidate, not a verified semantic/quality fix. Actual scheduler origin/newhash and original six assertions remain required; no full231/latestmain/stableCI or coverage credit.",
   "producer_binary_relabelled": false,
   "producer_artifact_pins_status": "LOCALLY_BOUND_ACCEPTED_445_ACTUAL4_NATIVE143A: three admission flags remain false; fresh API availability/expiry and runner/budget admission remain root-owned",
   "explicit_product_dependency": {
@@ -239,7 +239,7 @@
     "tvm_bootstrap_shared_target": "6332ac94e00a587e14e5e68faaaa3b83b442a714",
     "actual_no_device_canary": "Separate28e9.87sec device-freeCPU helper imports independently audited; not model/GPU proof or full231 acceptance"
   },
-  "pilot_namespace_oid": "5625f3b5076e3e62988435f5d663191a83afcee9",
+  "pilot_namespace_oid": "8feaf53f49152c1b7a8c935962d29da6f46eb28d",
   "explicit_gptoss_bf16_dependency": {
     "reviewed_engine_head": "858559b60ba8a0683b7761cb0dcd79dfa02721bc",
     "reviewed_pilot_source": "ebab1f763d37397c54584b0171cc17a06ad3ecad",
@@ -269,6 +269,16 @@
       "actual_source_function_diagnostic_peer": "gptoss-strictguard-source-functions-20261024/actual-attempt2-node2/peer-A.json",
       "new_source_runtime_regression_executed": false,
       "full_ModelConfig_hardware_weights_or_model_accepted": false
+    },
+    "qwen_mrope_canonical_input": {
+      "source_parent": "d7206b4bf52179f40e88552bfe122cdf1820dff2",
+      "overlay_source_commit": "d0d88300ac7adf5b5538341d63b701d687d09f8a",
+      "scheduler_before_sha256": "8a8fe8d68b2e6b1b55f019419229bfbf38e6c73725a97b7d0a6c37084d64efe6",
+      "scheduler_after_sha256": "9ffc3560b625bb3c28bcba61222456993de067779dd1c199bf11c5e88fdea64a",
+      "status": "SOURCE_ONLY_CPU_AND_GPU_PENDING",
+      "original_five_GPT_entries_unchanged": true,
+      "original_six_case_bodies_and_oracles_unchanged": true,
+      "unique_GPU_cause_or_quality_claim": false
     }
   },
   "full_contract_remains_separate": {
