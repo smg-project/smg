@@ -49,6 +49,13 @@ def verify(inputs, environment, read=git):
     compiled, producer = inputs["compiled_source_trees"], inputs["producer_source_trees"]
     consumer = inputs["consumer_source_trees"]
     require(len(compiled) == 37 and len(producer) == 14 and len(consumer) == 19, "source scope differs")
+    expected = inputs["expected_admitted_producer_source_trees"]
+    require(set(expected) == set(producer), "admitted producer source scope differs")
+    require(
+        {p: oid for p, oid in expected.items() if p != ".github/workflows"}
+        == {p: oid for p, oid in producer.items() if p != ".github/workflows"},
+        "only the registered workflow may differ in admitted producer14",
+    )
 
     def oid(revision, path):
         return read("rev-parse", f"{revision}:{path}")
