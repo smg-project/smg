@@ -187,9 +187,9 @@
     "default_sglang_transfer_backend": "mooncake",
     "original_reruns": 2,
     "original_reruns_delay_seconds": 5,
-    "selected": null,
-    "setup_skips": null,
-    "call_skips": null,
+    "selected": 20,
+    "setup_skips": 4,
+    "call_skips": 1,
     "models": [
       "meta-llama/Llama-3.1-8B-Instruct",
       "meta-llama/Llama-3.2-1B-Instruct"
@@ -243,6 +243,6 @@
     "actual_no_device_canary": "Previously accepted no-device TVM/native helper import evidence only; no model, Mooncake transfer or SG2GPU result transferred."
   },
   "reference_contract_sha256": "f618f45a175495293f9832e81b92b9c396928cb0f0c36effad1d80a05b92bf93",
-  "selection_contract_verified": false,
+  "selection_contract_verified": true,
   "source_identity_note": "Consumer19 remains the exact ordinarySGef4 product source. Only the manual caller/recipe/observer namespace differs; compiled37c9d/actual44514 are unchanged and no EPDca46/a974 source is used."
 }

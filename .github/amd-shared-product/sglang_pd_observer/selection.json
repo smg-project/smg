@@ -1,14 +1,148 @@
 {
-  "status": "PENDING_REAL_ORIGINAL_AND_CURRENT_COLLECTION",
+  "status": "CLOSED_REAL_ORIGINAL_AND_CURRENT_COLLECTION",
   "reference_source": "e9157e32ef87c74f38c7d0f165b4a35fffd4eb57",
-  "current_source": "ef4a8bf111215e74cdf9647bb1146745d69f64e1",
+  "current_source": "9f122cadd56ca9529b8459dd92f03d6a5473a515",
   "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-2gpu-pd[0]/sglang/nvidia",
   "reference_contract_sha256": "f618f45a175495293f9832e81b92b9c396928cb0f0c36effad1d80a05b92bf93",
-  "reference_cases": null,
-  "current_cases": null,
-  "setup_skips": null,
-  "allowed_call_skips": null,
-  "case_witnesses": null,
-  "actual_CPU_collection_result": null,
-  "runtime_accepted": false
+  "reference_cases": [
+    "router/test_context_length.py::TestPDContextLength::test_over_long_prompt_is_a_400_context_length_exceeded[1p1d]",
+    "router/test_context_length.py::TestPDContextLength::test_over_long_streaming_prompt_is_a_json_400[1p1d]",
+    "router/test_context_length.py::TestPDContextLength::test_prompt_within_the_window_is_served[1p1d]",
+    "router/test_context_length.py::TestPDContextLength::test_workers_still_healthy_after_rejection[1p1d]",
+    "router/test_loads.py::TestDisaggregatedWorkerLoadReports::test_prefill_and_decode_workers_report_load[pd_grpc]",
+    "router/test_pd_messages.py::TestPDMessagesGrpc::test_non_streaming_message[pd_grpc]",
+    "router/test_pd_messages.py::TestPDMessagesGrpc::test_streaming_message[pd_grpc]",
+    "router/test_pd_messages.py::TestPDMessagesHttp::test_non_streaming_message[pd_http]",
+    "router/test_pd_messages.py::TestPDMessagesHttp::test_streaming_message[pd_http]",
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_basic_response_creation[openai-pd_grpc]",
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_basic_response_creation[smg-pd_grpc]",
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_previous_response_id_chaining[openai-pd_grpc]",
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_previous_response_id_chaining[smg-pd_grpc]",
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_store_false_not_retrievable[openai-pd_grpc]",
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_store_false_not_retrievable[smg-pd_grpc]",
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_streaming_response[openai-pd_grpc]",
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_streaming_response[smg-pd_grpc]",
+    "router/test_pd_responses.py::TestPDResponsesHttp::test_basic_response_creation[pd_http]",
+    "router/test_pd_responses.py::TestPDResponsesHttp::test_streaming_response[pd_http]",
+    "router/test_worker_api.py::TestIGWMultiWorker::test_igw_multiple_workers"
+  ],
+  "current_cases": [
+    "router/test_context_length.py::TestPDContextLength::test_over_long_prompt_is_a_400_context_length_exceeded[1p1d]",
+    "router/test_context_length.py::TestPDContextLength::test_over_long_streaming_prompt_is_a_json_400[1p1d]",
+    "router/test_context_length.py::TestPDContextLength::test_prompt_within_the_window_is_served[1p1d]",
+    "router/test_context_length.py::TestPDContextLength::test_workers_still_healthy_after_rejection[1p1d]",
+    "router/test_loads.py::TestDisaggregatedWorkerLoadReports::test_prefill_and_decode_workers_report_load[pd_grpc]",
+    "router/test_pd_messages.py::TestPDMessagesGrpc::test_non_streaming_message[pd_grpc]",
+    "router/test_pd_messages.py::TestPDMessagesGrpc::test_streaming_message[pd_grpc]",
+    "router/test_pd_messages.py::TestPDMessagesHttp::test_non_streaming_message[pd_http]",
+    "router/test_pd_messages.py::TestPDMessagesHttp::test_streaming_message[pd_http]",
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_basic_response_creation[openai-pd_grpc]",
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_basic_response_creation[smg-pd_grpc]",
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_previous_response_id_chaining[openai-pd_grpc]",
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_previous_response_id_chaining[smg-pd_grpc]",
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_store_false_not_retrievable[openai-pd_grpc]",
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_store_false_not_retrievable[smg-pd_grpc]",
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_streaming_response[openai-pd_grpc]",
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_streaming_response[smg-pd_grpc]",
+    "router/test_pd_responses.py::TestPDResponsesHttp::test_basic_response_creation[pd_http]",
+    "router/test_pd_responses.py::TestPDResponsesHttp::test_streaming_response[pd_http]",
+    "router/test_worker_api.py::TestIGWMultiWorker::test_igw_multiple_workers"
+  ],
+  "setup_skips": {
+    "router/test_pd_messages.py::TestPDMessagesHttp::test_non_streaming_message[pd_http]": "SGLang's /v1/messages does not carry PD bootstrap fields through to the scheduler yet: the decode side rejects with 'Disaggregated request received without bootstrap room id'. Unskip when the engine forwards them.",
+    "router/test_pd_messages.py::TestPDMessagesHttp::test_streaming_message[pd_http]": "SGLang's /v1/messages does not carry PD bootstrap fields through to the scheduler yet: the decode side rejects with 'Disaggregated request received without bootstrap room id'. Unskip when the engine forwards them.",
+    "router/test_pd_responses.py::TestPDResponsesHttp::test_basic_response_creation[pd_http]": "SGLang's /v1/responses does not accept PD-disaggregated requests yet (bootstrap fields are not carried through to the scheduler). Unskip when the engine forwards them.",
+    "router/test_pd_responses.py::TestPDResponsesHttp::test_streaming_response[pd_http]": "SGLang's /v1/responses does not accept PD-disaggregated requests yet (bootstrap fields are not carried through to the scheduler). Unskip when the engine forwards them."
+  },
+  "allowed_call_skips": {
+    "router/test_worker_api.py::TestIGWMultiWorker::test_igw_multiple_workers": "Dynamic worker management not fully supported"
+  },
+  "case_witnesses": {
+    "router/test_worker_api.py::TestIGWMultiWorker::test_igw_multiple_workers": [
+      {"role": "regular","mode": "http","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1},
+      {"role": "regular","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1}
+    ],
+    "router/test_context_length.py::TestPDContextLength::test_over_long_prompt_is_a_400_context_length_exceeded[1p1d]": [
+      {"role": "prefill","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1},
+      {"role": "decode","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1}
+    ],
+    "router/test_context_length.py::TestPDContextLength::test_over_long_streaming_prompt_is_a_json_400[1p1d]": [
+      {"role": "prefill","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1},
+      {"role": "decode","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1}
+    ],
+    "router/test_context_length.py::TestPDContextLength::test_prompt_within_the_window_is_served[1p1d]": [
+      {"role": "prefill","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1},
+      {"role": "decode","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1}
+    ],
+    "router/test_context_length.py::TestPDContextLength::test_workers_still_healthy_after_rejection[1p1d]": [
+      {"role": "prefill","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1},
+      {"role": "decode","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1}
+    ],
+    "router/test_pd_messages.py::TestPDMessagesGrpc::test_non_streaming_message[pd_grpc]": [
+      {"role": "prefill","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1},
+      {"role": "decode","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1}
+    ],
+    "router/test_pd_messages.py::TestPDMessagesGrpc::test_streaming_message[pd_grpc]": [
+      {"role": "prefill","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1},
+      {"role": "decode","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1}
+    ],
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_basic_response_creation[openai-pd_grpc]": [
+      {"role": "prefill","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1},
+      {"role": "decode","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1}
+    ],
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_basic_response_creation[smg-pd_grpc]": [
+      {"role": "prefill","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1},
+      {"role": "decode","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1}
+    ],
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_previous_response_id_chaining[openai-pd_grpc]": [
+      {"role": "prefill","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1},
+      {"role": "decode","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1}
+    ],
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_previous_response_id_chaining[smg-pd_grpc]": [
+      {"role": "prefill","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1},
+      {"role": "decode","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1}
+    ],
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_store_false_not_retrievable[openai-pd_grpc]": [
+      {"role": "prefill","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1},
+      {"role": "decode","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1}
+    ],
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_store_false_not_retrievable[smg-pd_grpc]": [
+      {"role": "prefill","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1},
+      {"role": "decode","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1}
+    ],
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_streaming_response[openai-pd_grpc]": [
+      {"role": "prefill","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1},
+      {"role": "decode","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1}
+    ],
+    "router/test_pd_responses.py::TestPDResponsesGrpc::test_streaming_response[smg-pd_grpc]": [
+      {"role": "prefill","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1},
+      {"role": "decode","mode": "grpc","model_id": "meta-llama/Llama-3.1-8B-Instruct","min_instances": 1}
+    ],
+    "router/test_loads.py::TestDisaggregatedWorkerLoadReports::test_prefill_and_decode_workers_report_load[pd_grpc]": [
+      {"role": "prefill","mode": "grpc","model_id": "meta-llama/Llama-3.2-1B-Instruct","min_instances": 1},
+      {"role": "decode","mode": "grpc","model_id": "meta-llama/Llama-3.2-1B-Instruct","min_instances": 1}
+    ],
+    "router/test_pd_messages.py::TestPDMessagesHttp::test_non_streaming_message[pd_http]": [],
+    "router/test_pd_messages.py::TestPDMessagesHttp::test_streaming_message[pd_http]": [],
+    "router/test_pd_responses.py::TestPDResponsesHttp::test_basic_response_creation[pd_http]": [],
+    "router/test_pd_responses.py::TestPDResponsesHttp::test_streaming_response[pd_http]": []
+  },
+  "actual_CPU_collection_result": {
+    "scope": "Independent acceptance of actual selection metadata only; raw wrappers remain exit2 after refused urllib3 IPv6 capability bind; pytest_exit0 with fixtures0/runtest0/poolfalse.",
+    "cohorts": [
+      {"cohort": "original_e915","path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T0300Z/SG2-actual-collection-20261024T0927Z/original_e915.json","sha256": "6a1da3c2254d96d1a631e7d71e222da525a2e129fd2e223fe50137a072b8e7ab","selected": 20,"pytest_exit_code": 0,"wrapper_exit_code": 2},
+      {"cohort": "current_c9d","path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T0300Z/SG2-actual-collection-20261024T0927Z/current_c9d.json","sha256": "987d92aa280ee8de13bc9b2f3b85ac0bb804a1e541dbd56fd26632de9c2d174d","selected": 20,"pytest_exit_code": 0,"wrapper_exit_code": 2},
+      {"cohort": "candidate_SG2","path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T0300Z/SG2-actual-collection-20261024T0927Z/candidate_SG2.json","sha256": "2a479b43cbbb5f6c6760cf182b06e5c12974823b4b8743681988c9879013095c","selected": 20,"pytest_exit_code": 0,"wrapper_exit_code": 2}
+    ],
+    "independent_peer": {"path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T0300Z/SG2-actual-collection-20261024T0927Z/peer-D.json","sha256": "467365adc4ef9b13838d7c9d26fe95880b652841977f50b0716c686ed76dbb39"}
+  },
+  "runtime_accepted": false,
+  "skip_phase_scope": "Four original class-decorator HTTP setup skips. The IGW call skip is the original conditional body path, not an observed runtime skip or an added unconditional skip.",
+  "source_hashes": {
+    "e2e_test/router/test_context_length.py": {"sha256": "dff74c96b5a658368cc8f1f42a6d990671779523d4507a441f06d1ad1f400e5b","Git_blob": "99295f65f9b06a1077040b5a7d11682a69013389","original_e915_blob": "99295f65f9b06a1077040b5a7d11682a69013389"},
+    "e2e_test/router/test_loads.py": {"sha256": "9ffe2a2e77dce8d452ad7c673800d993f67ebe1d857cb8b3cb991f154c775115","Git_blob": "d53a5e618460d544733a5014ee14dbdcaf8fb24a","original_e915_blob": "d53a5e618460d544733a5014ee14dbdcaf8fb24a"},
+    "e2e_test/router/test_pd_messages.py": {"sha256": "5ef268b211e3633b008a91c8d5018b00f696d97712eed8efdae2ebcf5fb63325","Git_blob": "fb08214bc5ed62d41389803ec06291b64776681d","original_e915_blob": "fb08214bc5ed62d41389803ec06291b64776681d"},
+    "e2e_test/router/test_pd_responses.py": {"sha256": "06dea7a41717ab048dbe00f4db3eb354ce44a0f814c505f2707ce0035d29ec7a","Git_blob": "a2326db4f68aeccd21de0cff354dbc5d8cd73353","original_e915_blob": "a2326db4f68aeccd21de0cff354dbc5d8cd73353"},
+    "e2e_test/router/test_worker_api.py": {"sha256": "7804a0faecec35760f6606a61ed199fc3f958d48044ecc3ed6bebee569f54e72","Git_blob": "ed57b908c6f73a589375b15677589561d6bd55dc","original_e915_blob": "381ac20c8be8971b660257f873906c28ea084411"}
+  }
 }
