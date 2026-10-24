@@ -125,20 +125,9 @@ pub(crate) async fn parse_response(
         }
         Err(e) => {
             error!(model = %model_id, error = %e, "Failed to parse response");
-            Metrics::record_router_duration(
-                metrics_labels::ROUTER_HTTP,
-                metrics_labels::BACKEND_EXTERNAL,
-                metrics_labels::CONNECTION_HTTP,
+            record_failure_metrics(
                 model_id,
-                "messages",
-                start_time.elapsed(),
-            );
-            Metrics::record_router_error(
-                metrics_labels::ROUTER_HTTP,
-                metrics_labels::BACKEND_EXTERNAL,
-                metrics_labels::CONNECTION_HTTP,
-                model_id,
-                "messages",
+                start_time,
                 "parse_error",
                 metrics_labels::REASON_BAD_RESPONSE,
             );
@@ -185,20 +174,9 @@ pub(crate) async fn handle_error_response(
     );
     let body = error::sanitize_error_body(&body);
 
-    Metrics::record_router_duration(
-        metrics_labels::ROUTER_HTTP,
-        metrics_labels::BACKEND_EXTERNAL,
-        metrics_labels::CONNECTION_HTTP,
+    record_failure_metrics(
         model_id,
-        "messages",
-        start_time.elapsed(),
-    );
-    Metrics::record_router_error(
-        metrics_labels::ROUTER_HTTP,
-        metrics_labels::BACKEND_EXTERNAL,
-        metrics_labels::CONNECTION_HTTP,
-        model_id,
-        "messages",
+        start_time,
         metrics_labels::ERROR_BACKEND,
         error_reason_from_status(status),
     );
@@ -245,6 +223,33 @@ fn record_success_metrics(model_id: &str, message: &Message, start_time: Instant
         "messages",
         metrics_labels::TOKEN_OUTPUT,
         message.usage.output_tokens as u64,
+    );
+}
+
+/// Records a failed Messages request: its duration, then the error under
+/// `kind` and `reason`, with the route's fixed labels.
+pub(crate) fn record_failure_metrics(
+    model_id: &str,
+    start_time: Instant,
+    kind: &'static str,
+    reason: &'static str,
+) {
+    Metrics::record_router_duration(
+        metrics_labels::ROUTER_HTTP,
+        metrics_labels::BACKEND_EXTERNAL,
+        metrics_labels::CONNECTION_HTTP,
+        model_id,
+        "messages",
+        start_time.elapsed(),
+    );
+    Metrics::record_router_error(
+        metrics_labels::ROUTER_HTTP,
+        metrics_labels::BACKEND_EXTERNAL,
+        metrics_labels::CONNECTION_HTTP,
+        model_id,
+        "messages",
+        kind,
+        reason,
     );
 }
 

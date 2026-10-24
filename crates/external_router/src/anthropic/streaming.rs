@@ -116,20 +116,9 @@ async fn build_streaming_error_response(
     {
         warn!(model = %model_id, status = %status, "Streaming error response (SSE)");
 
-        Metrics::record_router_duration(
-            metrics_labels::ROUTER_HTTP,
-            metrics_labels::BACKEND_EXTERNAL,
-            metrics_labels::CONNECTION_HTTP,
+        worker::record_failure_metrics(
             model_id,
-            "messages",
-            start_time.elapsed(),
-        );
-        Metrics::record_router_error(
-            metrics_labels::ROUTER_HTTP,
-            metrics_labels::BACKEND_EXTERNAL,
-            metrics_labels::CONNECTION_HTTP,
-            model_id,
-            "messages",
+            start_time,
             "streaming_error",
             error_reason_from_status(status),
         );
