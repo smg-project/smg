@@ -88,7 +88,7 @@ def observe(directory, expected, role, model, launch):
 
     def checked_import(name, *args, **kwargs):
         result = original(name, *args, **kwargs)
-        package = (args[0] or {}).get("__package__", "") if args else ""
+        package = ((args[0] or {}).get("__package__") or "") if args else ""
         if name.startswith(prefix) or package.startswith(prefix) or name in engine:
             capture()
         return result
