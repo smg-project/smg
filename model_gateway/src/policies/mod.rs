@@ -25,6 +25,7 @@ mod prefix_hash;
 mod random;
 mod registry;
 mod round_robin;
+pub mod traffic_split;
 pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;

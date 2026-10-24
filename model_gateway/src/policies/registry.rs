@@ -20,15 +20,18 @@ use tracing::{debug, info, warn};
 use super::{
     get_healthy_worker_indices,
     manual::{ExecutionBranch, PinState},
-    normalize_model_key, BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy,
-    ManualConfig, ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerRole,
+    normalize_model_key,
+    traffic_split::{self, Split},
+    BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig,
+    ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerRole,
 };
 use crate::{
     config::types::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
     mesh::adapters::TreeSyncAdapter,
     observability::{cache_trace, metrics::Metrics},
     routers::common::header_utils::{
-        extract_routing_key_hint_named, parse_routing_tokens_hint, ROUTING_KEY_HINT_MAX_BYTES,
+        extract_routing_key_hint_named, extract_target_worker, parse_routing_tokens_hint,
+        ROUTING_KEY_HINT_MAX_BYTES,
     },
     worker::{load_state::LoadReceiver, KvEventMonitor, RequestCompletionSink, Worker, WorkerType},
 };
@@ -179,6 +182,9 @@ pub struct PolicyRegistry {
     routing_key_headers: Arc<Vec<HeaderName>>,
     /// How strictly PD placement pairs prefill and decode descriptors.
     pd_pairing_mode: PdPairingMode,
+    /// Whether the weighted traffic split across worker groups runs before
+    /// the policy (`--traffic-split`); see [`super::traffic_split`].
+    traffic_split: bool,
 }
 
 /// A sticky key with this many of its own requests already in flight on its
@@ -260,6 +266,7 @@ impl PolicyRegistry {
             routing_key_sticky,
             routing_key_headers: Arc::new(routing_key_headers),
             pd_pairing_mode: PdPairingMode::default(),
+            traffic_split: false,
         }
     }
 
@@ -273,6 +280,19 @@ impl PolicyRegistry {
     /// How strictly PD placement pairs prefill and decode descriptors.
     pub fn pd_pairing_mode(&self) -> PdPairingMode {
         self.pd_pairing_mode
+    }
+
+    /// Run the weighted traffic split across worker groups before every
+    /// selection (`--traffic-split`).
+    #[must_use]
+    pub fn with_traffic_split(mut self, enabled: bool) -> Self {
+        self.traffic_split = enabled;
+        self
+    }
+
+    /// Whether the weighted traffic split is on.
+    pub fn traffic_split_enabled(&self) -> bool {
+        self.traffic_split
     }
 
     /// Derive the session key from a request id: trailing `_r<n>` retry and
@@ -338,8 +358,10 @@ impl PolicyRegistry {
     /// Resolve the effective sticky key: a valid configured routing-key header
     /// wins, with the rid-derived key as fallback. Header keys get the same
     /// lineage stripping as rid keys, so a
-    /// proxy forwarding `conv_t2` as a header pins the entry `conv`.
-    fn effective_sticky_key<'a>(
+    /// proxy forwarding `conv_t2` as a header pins the entry `conv`. The
+    /// single-worker placement's all-vetoed fallback reads it too, to keep a
+    /// keyed request in one traffic group.
+    pub(crate) fn effective_sticky_key<'a>(
         &self,
         info: &SelectWorkerInfo<'a>,
     ) -> Option<(&'a str, &'static str)> {
@@ -349,13 +371,118 @@ impl PolicyRegistry {
             .or_else(|| info.rid_key.map(|key| (key, "rid")))
     }
 
-    /// Select a worker, applying the sticky routing-key override when it is
-    /// enabled, the request carries a key from the configured source, and the
-    /// configured policy does not already honor the key (`manual` /
-    /// `consistent_hashing`, which read `rid_key` and the header themselves
-    /// with the same header-first precedence). Otherwise delegates to `policy`.
-    /// `policy.name()` stays the real policy (for metrics).
+    /// Select a worker: under `--traffic-split`, first confine the choice to
+    /// one worker group picked by weight (see [`super::traffic_split`]), then
+    /// apply the sticky routing-key override when it is enabled, the request
+    /// carries a key from the configured source, and the configured policy
+    /// does not already honor the key (`manual` / `consistent_hashing`, which
+    /// read `rid_key` and the header themselves with the same header-first
+    /// precedence); otherwise delegate to `policy`. `policy.name()` stays the
+    /// real policy (for metrics). The returned index is into `workers`.
     pub fn select_worker_for_model(
+        &self,
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+    ) -> Option<usize> {
+        self.select_worker_for_model_split(policy, model_id, workers, info, None)
+            .map(|(selected, _)| selected)
+    }
+
+    /// [`Self::select_worker_for_model`] for one side of a request (its only
+    /// one when it is not disaggregated), reporting
+    /// the group the pick is in: the one the split confined it to, or, when
+    /// the split did not run (exempt, or one group among `workers`), the
+    /// pick's own group if it is a named one; `None` for the default group,
+    /// and whenever the split is off. `follow` is the group an earlier side
+    /// reported (the decode side after the prefill's): under `--traffic-split`
+    /// the choice stays in it while it has an available member of positive
+    /// weight among `workers`, so a prefill-decode pair never spans two
+    /// groups (two engine builds, which lenient pairing would otherwise
+    /// pair). A first side picked unsplit from the default group reports
+    /// `None`, and the later side then decides for itself, so a canary only
+    /// the decode pool carries keeps its share; one picked unsplit from a
+    /// named group (its slice shrunk to that group, the others unavailable
+    /// or at capacity) still pins the later side to it; a followed group
+    /// absent or drained among `workers` leaves the key or the draw to decide
+    /// as for a first side. A slice whose groups all weigh 0 (a drained group
+    /// left alone by availability or capacity) selects nothing under the
+    /// split, so the caller reports the miss rather than serve from the
+    /// drained build. Every confined selection counts in
+    /// `smg_traffic_split_selections_total`, one per side.
+    pub fn select_worker_for_model_split<'w>(
+        &self,
+        policy: &Arc<dyn LoadBalancingPolicy>,
+        model_id: &str,
+        workers: &'w [Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        follow: Option<&str>,
+    ) -> Option<(usize, Option<&'w str>)> {
+        if self.traffic_split && Self::traffic_split_applies(policy.name(), info) {
+            // The split admits what the selection admits (every veto but the
+            // overload one where the caller lifted it), so a pool placed with
+            // the veto lifted is split, followed and drained as any other.
+            let admits = |worker: &dyn Worker| info.admits(worker.routing_state());
+            if let Some(split) = Split::plan(workers, admits) {
+                // The group an earlier side was split into is followed;
+                // otherwise the same key the sticky override would pin by
+                // keeps a session in one group, and a keyless request draws
+                // at random.
+                let arm = match follow.and_then(|name| split.arm_named(name)) {
+                    Some(arm) => arm,
+                    None => match self.effective_sticky_key(info) {
+                        Some((key, _)) => split.arm_for_key(key),
+                        None => split.arm_at_random(&mut rand::rng()),
+                    },
+                };
+                Metrics::record_traffic_split_selection(model_id, arm.name);
+                let members: Vec<Arc<dyn Worker>> = arm
+                    .members
+                    .iter()
+                    .map(|&idx| Arc::clone(&workers[idx]))
+                    .collect();
+                let picked = self.select_within(policy, model_id, &members, info)?;
+                return Some((arm.members[picked], Some(arm.name)));
+            }
+            // Not split: one group, or every group drained. A slice whose
+            // groups all weigh 0 serves nothing: a weight of 0 drains a
+            // group also when it is the only one left open (the others
+            // unavailable or at capacity), and the caller reports the miss
+            // rather than use the drained build.
+            if traffic_split::drained(workers, admits) {
+                return None;
+            }
+        }
+        let selected = self.select_within(policy, model_id, workers, info)?;
+        // Not split: a pick in a named group still reports it, so a later
+        // side stays in that group when the slice shrank to it; a pick in the
+        // default group reports nothing and leaves the later side to decide
+        // for itself. Off, the labels are inert and nothing is reported.
+        let group = self
+            .traffic_split
+            .then(|| traffic_split::group_of(workers[selected].as_ref()))
+            .filter(|group| *group != traffic_split::DEFAULT_GROUP);
+        Some((selected, group))
+    }
+
+    /// Whether the traffic split may confine this selection: `bucket` places
+    /// prefill by request size over boundaries spanning its whole fleet,
+    /// which one group cannot represent; and an explicit
+    /// `X-SMG-Target-Worker` under `consistent_hashing`, the policy that
+    /// reads it, indexes the whole pool and outranks the split (as it
+    /// outranks the routing key). Every other policy ignores the header, so
+    /// the split holds there: a drained group takes nothing from a request
+    /// that carries it.
+    fn traffic_split_applies(policy_name: &str, info: &SelectWorkerInfo) -> bool {
+        policy_name != "bucket"
+            && !(policy_name == "consistent_hashing"
+                && extract_target_worker(info.headers).is_some())
+    }
+
+    /// The selection proper over `workers`: the sticky override when it
+    /// applies, else the policy.
+    fn select_within(
         &self,
         policy: &Arc<dyn LoadBalancingPolicy>,
         model_id: &str,
@@ -2919,6 +3046,435 @@ mod tests {
                 remaining[selected].url(),
                 "http://prefill-2:8000",
                 "size {size}"
+            );
+        }
+    }
+
+    /// The weighted traffic split (`--traffic-split`) runs before the policy
+    /// and the sticky override, inside [`PolicyRegistry::select_worker_for_model`].
+    mod traffic_split {
+        use openai_protocol::worker::WorkerStatus;
+
+        use super::*;
+        use crate::{
+            config::types::RoutingKeyOverrideConfig,
+            policies::traffic_split::{GROUP_LABEL, WEIGHT_LABEL},
+        };
+
+        fn grouped(url: &str, group: Option<&str>, weight: Option<&str>) -> Arc<dyn Worker> {
+            let mut labels = HashMap::new();
+            if let Some(group) = group {
+                labels.insert(GROUP_LABEL.to_string(), group.to_string());
+            }
+            if let Some(weight) = weight {
+                labels.insert(WEIGHT_LABEL.to_string(), weight.to_string());
+            }
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .labels(labels)
+                .build();
+            worker.set_status(WorkerStatus::Ready);
+            Arc::new(worker)
+        }
+
+        /// Two stable workers at weight 90 around one canary at weight 10:
+        /// indices 0 and 2 are stable, 1 is the canary.
+        fn fleet(canary_weight: &str) -> Vec<Arc<dyn Worker>> {
+            vec![
+                grouped("http://s1:8000", Some("stable"), Some("90")),
+                grouped("http://c1:8000", Some("canary"), Some(canary_weight)),
+                grouped("http://s2:8000", Some("stable"), Some("90")),
+            ]
+        }
+
+        fn registry(split: bool) -> PolicyRegistry {
+            PolicyRegistry::new(PolicyConfig::RoundRobin).with_traffic_split(split)
+        }
+
+        fn pick(
+            reg: &PolicyRegistry,
+            workers: &[Arc<dyn Worker>],
+            info: &SelectWorkerInfo,
+        ) -> usize {
+            reg.select_worker_for_model(&reg.get_default_policy(), "m", workers, info)
+                .expect("a worker is selected")
+        }
+
+        fn picks(reg: &PolicyRegistry, workers: &[Arc<dyn Worker>], n: usize) -> Vec<usize> {
+            let info = SelectWorkerInfo::default();
+            (0..n).map(|_| pick(reg, workers, &info)).collect()
+        }
+
+        #[test]
+        fn off_by_default_the_policy_runs_over_the_whole_pool() {
+            let reg = registry(false);
+            assert!(!reg.traffic_split_enabled());
+            assert_eq!(picks(&reg, &fleet("10"), 6), vec![0, 1, 2, 0, 1, 2]);
+        }
+
+        #[test]
+        fn one_group_runs_the_policy_over_the_whole_pool() {
+            let reg = registry(true);
+            let unlabelled = vec![
+                grouped("http://a:8000", None, None),
+                grouped("http://b:8000", None, None),
+                grouped("http://c:8000", None, None),
+            ];
+            assert_eq!(picks(&reg, &unlabelled, 6), vec![0, 1, 2, 0, 1, 2]);
+        }
+
+        #[test]
+        fn keyless_selections_follow_the_weights_and_the_policy_runs_inside_the_arm() {
+            let reg = registry(true);
+            let workers = fleet("10");
+            let n = 3_000;
+            let chosen = picks(&reg, &workers, n);
+            let canary = chosen.iter().filter(|&&idx| idx == 1).count();
+            // Mean 300, standard deviation 16.4: a 5-sigma band.
+            assert!((218..=382).contains(&canary), "canary took {canary} of {n}");
+            let s1 = chosen.iter().filter(|&&idx| idx == 0).count();
+            let s2 = chosen.iter().filter(|&&idx| idx == 2).count();
+            // Round robin alternates inside the stable arm.
+            assert!(s1.abs_diff(s2) <= 1, "stable arm split {s1} / {s2}");
+            assert_eq!(s1 + s2 + canary, n);
+        }
+
+        #[test]
+        fn a_routing_key_keeps_a_session_in_one_group() {
+            let reg = registry(true);
+            let workers = fleet("30");
+            let group_of = |idx: usize| if idx == 1 { "canary" } else { "stable" };
+            let mut seen_canary = false;
+            let mut seen_stable = false;
+            for i in 0..200 {
+                let headers = headers_with_key(&format!("conv-{i}"));
+                let info = SelectWorkerInfo {
+                    headers: Some(&headers),
+                    ..Default::default()
+                };
+                let first = group_of(pick(&reg, &workers, &info));
+                for _ in 0..5 {
+                    assert_eq!(group_of(pick(&reg, &workers, &info)), first, "conv-{i}");
+                }
+                seen_canary |= first == "canary";
+                seen_stable |= first == "stable";
+            }
+            assert!(seen_canary && seen_stable, "keys spread over both groups");
+        }
+
+        #[test]
+        fn a_drained_group_takes_nothing_until_its_weight_returns() {
+            let reg = registry(true);
+            let drained = fleet("0");
+            assert!(picks(&reg, &drained, 300).iter().all(|&idx| idx != 1));
+            let ramped = fleet("100");
+            let canary = picks(&reg, &ramped, 2_000)
+                .iter()
+                .filter(|&&idx| idx == 1)
+                .count();
+            // Weight 100 against 90: about 53 %.
+            assert!(
+                (900..=1_200).contains(&canary),
+                "canary took {canary} of 2000"
+            );
+        }
+
+        /// A drained group that is the only one left open (the others at
+        /// capacity or unavailable) takes nothing either: a weight of 0
+        /// drains a group whatever the slice around it, so the selection
+        /// misses and the caller reports that rather than use the drained
+        /// build. One member that weighs anything lifts the group; an
+        /// unlabelled slice weighs the default and serves; off, the labels
+        /// are inert and the slice serves.
+        #[test]
+        fn a_drained_group_alone_in_the_slice_takes_nothing() {
+            let reg = registry(true);
+            let policy = reg.get_default_policy();
+            let info = SelectWorkerInfo::default();
+            let drained = vec![
+                grouped("http://c1:8000", Some("canary"), Some("0")),
+                grouped("http://c2:8000", Some("canary"), Some("0")),
+            ];
+            assert_eq!(
+                reg.select_worker_for_model_split(&policy, "m", &drained, &info, None),
+                None
+            );
+            assert_eq!(
+                reg.select_worker_for_model(&policy, "m", &drained, &info),
+                None
+            );
+            let lifted = vec![
+                grouped("http://c1:8000", Some("canary"), Some("0")),
+                grouped("http://c2:8000", Some("canary"), Some("5")),
+            ];
+            let (_, group) = reg
+                .select_worker_for_model_split(&policy, "m", &lifted, &info, None)
+                .expect("a group that weighs something serves");
+            assert_eq!(group, Some("canary"));
+            let unlabelled: Vec<Arc<dyn Worker>> = (0..2)
+                .map(|i| grouped(&format!("http://d{i}:8000"), None, None))
+                .collect();
+            assert!(reg
+                .select_worker_for_model_split(&policy, "m", &unlabelled, &info, None)
+                .is_some());
+            let off = registry(false);
+            assert!(off
+                .select_worker_for_model_split(
+                    &off.get_default_policy(),
+                    "m",
+                    &drained,
+                    &info,
+                    None
+                )
+                .is_some());
+        }
+
+        /// The drained verdict weighs the default group as the split does:
+        /// one default member carrying a weight of 0 next to an unlabelled
+        /// one weighs the group 0 (the highest explicit weight wins, the
+        /// default applies only when no member carries one), so a slice of
+        /// such a default group and a drained canary serves nothing; and
+        /// with the canary lifted, the split runs and gives it everything.
+        #[test]
+        fn a_default_member_with_a_weight_of_zero_drains_the_default_group() {
+            let reg = registry(true);
+            let policy = reg.get_default_policy();
+            let info = SelectWorkerInfo::default();
+            let drained = vec![
+                grouped("http://d1:8000", None, Some("0")),
+                grouped("http://d2:8000", None, None),
+                grouped("http://c1:8000", Some("canary"), Some("0")),
+            ];
+            assert_eq!(
+                reg.select_worker_for_model_split(&policy, "m", &drained, &info, None),
+                None
+            );
+            let lifted = vec![
+                grouped("http://d1:8000", None, Some("0")),
+                grouped("http://d2:8000", None, None),
+                grouped("http://c1:8000", Some("canary"), Some("10")),
+            ];
+            assert!(picks(&reg, &lifted, 20).iter().all(|&idx| idx == 2));
+        }
+
+        #[test]
+        fn the_selected_index_is_into_the_callers_slice() {
+            let reg = registry(true);
+            // The canary is last, so an index into the arm's member list and
+            // an index into the caller's slice differ.
+            let workers = vec![
+                grouped("http://s1:8000", Some("stable"), Some("0")),
+                grouped("http://s2:8000", Some("stable"), Some("0")),
+                grouped("http://c1:8000", Some("canary"), Some("10")),
+            ];
+            assert!(picks(&reg, &workers, 20).iter().all(|&idx| idx == 2));
+        }
+
+        #[test]
+        fn an_explicit_target_worker_bypasses_the_split() {
+            let reg = PolicyRegistry::new(PolicyConfig::ConsistentHashing).with_traffic_split(true);
+            // The canary is drained; an explicit index still reaches it.
+            let workers = fleet("0");
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-target-worker", "1".parse().unwrap());
+            let info = SelectWorkerInfo {
+                headers: Some(&headers),
+                ..Default::default()
+            };
+            for _ in 0..10 {
+                assert_eq!(pick(&reg, &workers, &info), 1);
+            }
+            // Under round robin the policy does not read the header: the
+            // drained canary stays drained.
+            let round_robin = registry(true);
+            for _ in 0..30 {
+                assert_ne!(pick(&round_robin, &workers, &info), 1);
+            }
+        }
+
+        #[test]
+        fn bucket_and_targeted_requests_are_exempt() {
+            let plain = SelectWorkerInfo::default();
+            assert!(PolicyRegistry::traffic_split_applies("round_robin", &plain));
+            assert!(PolicyRegistry::traffic_split_applies("cache_aware", &plain));
+            assert!(!PolicyRegistry::traffic_split_applies("bucket", &plain));
+            let mut headers = HeaderMap::new();
+            headers.insert("x-smg-target-worker", "0".parse().unwrap());
+            let targeted = SelectWorkerInfo {
+                headers: Some(&headers),
+                ..Default::default()
+            };
+            // Only consistent hashing reads the header; every other policy
+            // ignores it, and the split holds.
+            assert!(!PolicyRegistry::traffic_split_applies(
+                "consistent_hashing",
+                &targeted
+            ));
+            assert!(PolicyRegistry::traffic_split_applies(
+                "round_robin",
+                &targeted
+            ));
+        }
+
+        #[test]
+        fn the_sticky_override_pins_inside_the_keys_group() {
+            let reg = PolicyRegistry::with_override(
+                PolicyConfig::RoundRobin,
+                RoutingKeyOverrideConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            )
+            .with_traffic_split(true);
+            let workers = fleet("50");
+            let group_of = |idx: usize| if idx == 1 { "canary" } else { "stable" };
+            let mut pinned_in_canary = 0;
+            for i in 0..100 {
+                let headers = headers_with_key(&format!("session-{i}"));
+                let info = SelectWorkerInfo {
+                    headers: Some(&headers),
+                    ..Default::default()
+                };
+                let first = pick(&reg, &workers, &info);
+                // The pin holds, and it lies in the key's group.
+                for _ in 0..4 {
+                    assert_eq!(pick(&reg, &workers, &info), first, "session-{i}");
+                }
+                if group_of(first) == "canary" {
+                    pinned_in_canary += 1;
+                }
+            }
+            assert!(
+                (10..=60).contains(&pinned_in_canary),
+                "{pinned_in_canary} of 100 keys pinned in the canary"
+            );
+        }
+
+        #[test]
+        fn an_unavailable_group_is_left_out_of_the_draw() {
+            let reg = registry(true);
+            let workers = fleet("100");
+            workers[1].set_status(WorkerStatus::Failed);
+            // Only the stable arm is live: the policy runs over the pool and
+            // never picks the failed canary.
+            assert!(picks(&reg, &workers, 50).iter().all(|&idx| idx != 1));
+        }
+
+        /// Under a disaggregated pair the decode side follows the group the
+        /// prefill side was split into: the pair never spans two groups while
+        /// the decode pool has that group live, and a group drained on the
+        /// decode side is not followed into.
+        #[test]
+        fn the_decode_leg_follows_the_prefills_group() {
+            use crate::policies::traffic_split::group_of;
+
+            let reg = registry(true);
+            let policy = reg.get_default_policy();
+            let prefill = fleet("50");
+            let decode = fleet("50");
+            let info = SelectWorkerInfo::default();
+            let mut canary_pairs = 0;
+            for _ in 0..400 {
+                let (prefill_idx, group) = reg
+                    .select_worker_for_model_split(&policy, "m", &prefill, &info, None)
+                    .expect("a prefill worker is selected");
+                let group = group.expect("the prefill side was split");
+                assert_eq!(group_of(prefill[prefill_idx].as_ref()), group);
+                let (decode_idx, followed) = reg
+                    .select_worker_for_model_split(&policy, "m", &decode, &info, Some(group))
+                    .expect("a decode worker is selected");
+                assert_eq!(group_of(decode[decode_idx].as_ref()), group);
+                assert_eq!(followed, Some(group));
+                if group == "canary" {
+                    canary_pairs += 1;
+                }
+            }
+            // Weight 50 against 90: about 36 % of the pairs, a wide band.
+            assert!(
+                (80..=220).contains(&canary_pairs),
+                "{canary_pairs} canary pairs of 400"
+            );
+            let drained = fleet("0");
+            for _ in 0..50 {
+                let (decode_idx, _) = reg
+                    .select_worker_for_model_split(&policy, "m", &drained, &info, Some("canary"))
+                    .expect("a decode worker is selected");
+                assert_ne!(decode_idx, 1, "a drained group was followed into");
+            }
+        }
+
+        /// A prefill slice that has shrunk to one named group (its other
+        /// groups unavailable or at capacity) is not split, yet still pins
+        /// the decode side to that group: a canary prefill keeps a canary
+        /// decode rather than pairing across two builds. Off, no group is
+        /// reported.
+        #[test]
+        fn a_prefill_slice_of_one_named_group_still_pins_the_decode_leg() {
+            let reg = registry(true);
+            let policy = reg.get_default_policy();
+            let prefill = vec![grouped("http://c1:8000", Some("canary"), Some("10"))];
+            let decode = fleet("10");
+            let info = SelectWorkerInfo::default();
+            for _ in 0..100 {
+                let (prefill_idx, group) = reg
+                    .select_worker_for_model_split(&policy, "m", &prefill, &info, None)
+                    .expect("a prefill worker is selected");
+                assert_eq!(prefill_idx, 0);
+                assert_eq!(group, Some("canary"), "an unsplit named group is reported");
+                let (decode_idx, followed) = reg
+                    .select_worker_for_model_split(&policy, "m", &decode, &info, group)
+                    .expect("a decode worker is selected");
+                assert_eq!(decode_idx, 1, "the decode side left the canary");
+                assert_eq!(followed, Some("canary"));
+            }
+            let off = registry(false);
+            let (_, group) = off
+                .select_worker_for_model_split(
+                    &off.get_default_policy(),
+                    "m",
+                    &prefill,
+                    &info,
+                    None,
+                )
+                .expect("a prefill worker is selected");
+            assert_eq!(group, None, "off, the labels are inert");
+        }
+
+        /// A prefill pool of the default group alone is not split and reports
+        /// no group, so the decode side decides for itself: a canary only the
+        /// decode pool carries keeps its share next to an unlabelled fleet.
+        #[test]
+        fn a_decode_only_canary_keeps_its_share_next_to_an_unsplit_prefill_pool() {
+            let reg = registry(true);
+            let policy = reg.get_default_policy();
+            let prefill: Vec<Arc<dyn Worker>> = (0..3)
+                .map(|i| grouped(&format!("http://p{i}:8000"), None, None))
+                .collect();
+            let decode = vec![
+                grouped("http://d1:8000", None, None),
+                grouped("http://c1:8000", Some("canary"), Some("50")),
+                grouped("http://d2:8000", None, None),
+            ];
+            let info = SelectWorkerInfo::default();
+            let mut canary_decodes = 0;
+            for _ in 0..400 {
+                let (_, group) = reg
+                    .select_worker_for_model_split(&policy, "m", &prefill, &info, None)
+                    .expect("a prefill worker is selected");
+                assert_eq!(group, None, "a single-group pool was split");
+                let (decode_idx, _) = reg
+                    .select_worker_for_model_split(&policy, "m", &decode, &info, group)
+                    .expect("a decode worker is selected");
+                if decode_idx == 1 {
+                    canary_decodes += 1;
+                }
+            }
+            // Weight 50 against the default group's 100: about a third of
+            // the decodes, a wide band.
+            assert!(
+                (70..=200).contains(&canary_decodes),
+                "{canary_decodes} canary decodes of 400"
             );
         }
     }

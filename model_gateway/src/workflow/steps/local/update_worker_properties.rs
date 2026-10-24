@@ -159,6 +159,17 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                     }
                     updated_labels
                 };
+                // The traffic-split pair is checked over the set the worker
+                // ends up with, whichever branch made it: a refresh that drops
+                // a discovery-owned `traffic_weight` while the engine keeps
+                // naming the group would otherwise rebuild the worker into a
+                // named group that weighs nothing.
+                super::create_worker::validate_traffic_split_labels(
+                    app_context.router_config.traffic_split,
+                    &updated_labels,
+                    worker.url(),
+                    "update_worker_properties",
+                )?;
                 let (models, card_fields) =
                     models_for_labels(worker.as_ref(), existing, &updated_labels);
                 // A parser override the labels now name is checked as at
@@ -728,8 +739,23 @@ mod tests {
         workers: &[Arc<dyn Worker>],
         tool_parser_factory: Option<tool_parser::ParserFactory>,
     ) -> Arc<AppContext> {
+        make_app_context_from(
+            workers,
+            tool_parser_factory,
+            crate::config::RouterConfig::builder()
+                .worker_startup_timeout_secs(1)
+                .build_unchecked(),
+        )
+    }
+
+    /// With the router configuration given: a test of a rule the
+    /// configuration switches on (the traffic split) builds its own.
+    fn make_app_context_from(
+        workers: &[Arc<dyn Worker>],
+        tool_parser_factory: Option<tool_parser::ParserFactory>,
+        router_config: crate::config::RouterConfig,
+    ) -> Arc<AppContext> {
         use crate::{
-            config::RouterConfig,
             middleware::TokenBucket,
             observability::inflight_tracker::InFlightRequestTracker,
             routers::{
@@ -739,9 +765,6 @@ mod tests {
             worker::{WorkerRegistry, WorkerService},
         };
 
-        let router_config = RouterConfig::builder()
-            .worker_startup_timeout_secs(1)
-            .build_unchecked();
         let registry = Arc::new(WorkerRegistry::new());
         for w in workers {
             registry.register(Arc::clone(w)).unwrap();
@@ -1175,6 +1198,63 @@ mod tests {
                 .get("constrained_decoding")
                 .map(String::as_str),
             Some("always")
+        );
+    }
+
+    /// A refresh that drops a discovery-owned `traffic_weight` while the
+    /// engine keeps naming the group is refused like the same set at
+    /// registration: a named group without a weight would weigh nothing from
+    /// then on. The worker keeps the labels it had.
+    #[tokio::test]
+    async fn a_label_refresh_that_drops_a_named_groups_weight_is_refused() {
+        let discovered = labels_of(&[
+            ("max_num_seqs", "256"),
+            ("traffic_group", "canary"),
+            ("traffic_weight", "5"),
+        ]);
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:8000")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .labels(discovered.clone())
+                .discovered_labels(discovered)
+                .status(WorkerStatus::Ready)
+                .build(),
+        );
+        let app_ctx = make_app_context_from(
+            std::slice::from_ref(&worker),
+            None,
+            crate::config::RouterConfig::builder()
+                .worker_startup_timeout_secs(1)
+                .traffic_split(true)
+                .build_unchecked(),
+        );
+        let revision = worker.revision();
+        let mut refresh = make_refresh_context(
+            Arc::clone(&app_ctx),
+            Arc::clone(&worker),
+            labels_of(&[("max_num_seqs", "256"), ("traffic_group", "canary")]),
+        );
+        let err = UpdateWorkerPropertiesStep
+            .execute(&mut refresh)
+            .await
+            .expect_err("a named group that lost its weight");
+        assert!(
+            err.to_string().contains("needs a 'traffic_weight'"),
+            "{err}"
+        );
+        let kept = app_ctx
+            .worker_registry
+            .get_by_url("grpc://decode:8000")
+            .expect("the worker stays registered");
+        assert_eq!(kept.revision(), revision, "the worker keeps its labels");
+        assert_eq!(
+            kept.metadata()
+                .spec
+                .labels
+                .get("traffic_weight")
+                .map(String::as_str),
+            Some("5")
         );
     }
 

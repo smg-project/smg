@@ -768,6 +768,12 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Weighted traffic split across worker groups (`--traffic-split`).
+    pub fn traffic_split(mut self, enable: bool) -> Self {
+        self.config.traffic_split = enable;
+        self
+    }
+
     /// Inverse of disable_retries field
     pub fn retries(mut self, enable: bool) -> Self {
         self.config.disable_retries = !enable;

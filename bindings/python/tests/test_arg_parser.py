@@ -2530,3 +2530,19 @@ class TestJwtRoleClaim:
     def test_default_reaches_the_jwt_configuration(self):
         kwargs = _rust_router_kwargs(jwt_issuer="https://issuer.example", jwt_audience="aud")
         assert kwargs["control_plane_auth"].jwt.role_claim == "roles"
+
+
+class TestTrafficSplit:
+    """`--traffic-split` is opt-in and reaches RouterArgs under both spellings."""
+
+    def test_traffic_split_is_off_by_default(self):
+        assert parse_router_args([]).traffic_split is False
+
+    def test_traffic_split_flag_turns_it_on(self):
+        assert parse_router_args(["--traffic-split"]).traffic_split is True
+
+    def test_prefixed_traffic_split_flag(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args(["--router-traffic-split"])
+        assert RouterArgs.from_cli_args(namespace, use_router_prefix=True).traffic_split is True

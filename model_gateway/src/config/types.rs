@@ -94,6 +94,10 @@ pub struct RouterConfig {
     /// transfer protocol; see [`PdPairingMode`].
     #[serde(default)]
     pub pd_pairing_mode: PdPairingMode,
+    /// Weighted traffic split across worker groups (`traffic_group` /
+    /// `traffic_weight` labels), run before the policy; off by default.
+    #[serde(default)]
+    pub traffic_split: bool,
     pub host: String,
     pub port: u16,
     /// Dedicated port for the isolated Kubernetes liveness/readiness/health
@@ -1985,6 +1989,7 @@ impl Default for RouterConfig {
             policy: PolicyConfig::Random,
             cache_boundaries: Vec::new(),
             routing_key_override: RoutingKeyOverrideConfig::default(),
+            traffic_split: false,
             pd_pairing_mode: PdPairingMode::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,

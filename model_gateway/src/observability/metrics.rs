@@ -15,8 +15,8 @@ use metrics_util::parse_quantiles;
 use once_cell::sync::Lazy;
 use smg_external_router::metrics::Metrics as RouterMetrics;
 pub use smg_external_router::metrics::{
-    bool_to_static_str, error_reason_from_status, intern_model_label, intern_tool_label,
-    metrics_labels, STREAMING_FALSE, STREAMING_TRUE,
+    bool_to_static_str, error_reason_from_status, intern_group_label, intern_model_label,
+    intern_tool_label, metrics_labels, STREAMING_FALSE, STREAMING_TRUE,
 };
 
 use super::worker_metrics::{self, WorkerSeries, WorkerSeriesRecorder};
@@ -727,6 +727,10 @@ pub(crate) fn init_metrics() {
     describe_counter!(
         "smg_worker_selection_total",
         "Worker selection events by worker_type, connection_mode, model, policy"
+    );
+    describe_counter!(
+        "smg_traffic_split_selections_total",
+        "Selections the traffic split confined to one worker group, by model and group (the worker label traffic_group; default for a worker without one); recorded under --traffic-split when a model's available candidates form two or more groups"
     );
     describe_counter!(
         "smg_worker_errors_total",
@@ -2492,6 +2496,19 @@ impl Metrics {
     /// Set manual policy cache entries count
     pub fn set_manual_policy_cache_entries(count: usize) {
         gauge!("smg_manual_policy_cache_entries").set(count as f64);
+    }
+
+    /// Record a selection the traffic split confined to one worker group:
+    /// `group` is the arm picked for `model_id` (interned, bounded).
+    pub fn record_traffic_split_selection(model_id: &str, group: &str) {
+        let model = intern_model_label(model_id);
+        let group = intern_group_label(group);
+        counter!(
+            "smg_traffic_split_selections_total",
+            "model" => model,
+            "group" => group
+        )
+        .increment(1);
     }
 
     /// Record which source supplied the sticky routing key for a keyed request
