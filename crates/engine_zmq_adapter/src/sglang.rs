@@ -820,13 +820,21 @@ pub(crate) fn translate_sampling_sglang(sp: sglang_proto::SamplingParams) -> Sgl
         stop: (!sp.stop.is_empty()).then_some(sp.stop),
         stop_token_ids: (!sp.stop_token_ids.is_empty()).then_some(sp.stop_token_ids),
         temperature: f64::from(sp.temperature),
-        top_p: f64::from(sp.top_p),
-        top_k: sp.top_k,
+        // proto3 cannot tell an unset scalar from its zero, and the zeros of
+        // these three are never meant: top_p 0.0 keeps the top token only,
+        // top_k 0 is an empty candidate set, and a repetition factor of 0.0
+        // sends a repeated token's positive logit to infinity (the
+        // scheduler's `verify()` refuses all three). An unset one means the
+        // neutral value: the whole distribution, every token, no penalty.
+        top_p: if sp.top_p == 0.0 {
+            1.0
+        } else {
+            f64::from(sp.top_p)
+        },
+        top_k: if sp.top_k == 0 { -1 } else { sp.top_k },
         min_p: f64::from(sp.min_p),
         frequency_penalty: f64::from(sp.frequency_penalty),
         presence_penalty: f64::from(sp.presence_penalty),
-        // proto3 cannot tell an unset float from 0.0; a zero penalty factor
-        // is never meant and would zero every logit.
         repetition_penalty: if sp.repetition_penalty == 0.0 {
             1.0
         } else {
@@ -1134,6 +1142,43 @@ mod tests {
         assert_eq!(params.json_schema.as_deref(), Some("{}"));
         assert_eq!(params.logit_bias.unwrap()["5"], 1.5);
         assert!(params.stop_regex.is_none() && params.custom_params.is_none());
+    }
+
+    #[test]
+    fn sglang_sampling_translation_reads_an_unset_scalar_as_its_neutral_value() {
+        // proto3 serializes an unset scalar as nothing and reads it back as
+        // its zero, so the wire cannot carry a zero for these three.
+        let unset = translate_sampling_sglang(sglang_proto::SamplingParams::default());
+        assert_eq!(unset.top_p, 1.0, "the whole distribution");
+        assert_eq!(unset.top_k, -1, "every token (the API sentinel)");
+        assert_eq!(unset.repetition_penalty, 1.0, "no penalty");
+        assert_eq!(
+            unset.temperature, 0.0,
+            "a zero the scheduler reads as greedy stays"
+        );
+        assert_eq!(unset.min_p, 0.0);
+
+        let set = translate_sampling_sglang(sglang_proto::SamplingParams {
+            top_p: 0.5,
+            top_k: 40,
+            repetition_penalty: 1.25,
+            ..Default::default()
+        });
+        assert_eq!(
+            (set.top_p, set.top_k, set.repetition_penalty),
+            (0.5, 40, 1.25)
+        );
+
+        let neutral = translate_sampling_sglang(sglang_proto::SamplingParams {
+            top_p: 1.0,
+            top_k: -1,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        });
+        assert_eq!(
+            (neutral.top_p, neutral.top_k, neutral.repetition_penalty),
+            (1.0, -1, 1.0)
+        );
     }
 
     /// The rows become the proto's shapes: a tick's rows flattened on the
