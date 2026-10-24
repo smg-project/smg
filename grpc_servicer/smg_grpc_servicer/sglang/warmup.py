@@ -29,7 +29,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
-from smg_grpc_servicer.warmup import WarmupInputs, WarmupRequest
+from smg_grpc_servicer.warmup import WarmupInputs, WarmupRequest, refused, unserved
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +111,7 @@ class GrpcWire:
         self._stub = sglang_scheduler_pb2_grpc.SglangSchedulerStub(self._channel)
 
     def generate(self, request: WarmupRequest, timeout: float) -> None:
+        import grpc
         from smg_grpc_proto import sglang_scheduler_pb2
 
         message = sglang_scheduler_pb2.GenerateRequest(
@@ -140,10 +141,23 @@ class GrpcWire:
                 )
             )
         last = None
-        for frame in self._stub.Generate(message, timeout=timeout):
-            last = frame
+        try:
+            for frame in self._stub.Generate(message, timeout=timeout):
+                last = frame
+        except grpc.RpcError as error:
+            if refusal := refused(error):
+                # The servicer answered the refusal as the status its code
+                # means: a failed request, not a covered step, and no step
+                # toward the stop.
+                raise refusal from error
+            raise
         if last is None or not last.HasField("complete"):
             raise RuntimeError("the request ended without a complete frame")
+        if error := unserved(last.complete.finish_reason, len(last.complete.output_ids)):
+            # The engine ended the request without serving it (an abort at
+            # admission arrives as a completion with no token): a failed
+            # request, not a covered step.
+            raise error
 
     def flush_cache(self) -> bool:
         from smg_grpc_proto.generated import common_pb2

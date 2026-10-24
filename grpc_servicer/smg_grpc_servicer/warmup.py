@@ -497,6 +497,75 @@ class WarmupWire(Protocol):
     def close(self) -> Any: ...
 
 
+#: The finishes with which an engine ends a request it did not run to its
+#: end: refused at admission (a prompt past its input bound, a parameter its
+#: scheduler rejects) or cut short (a pause, a failure). Whatever the reason,
+#: and whether or not the wire carries it, nothing of the step's shape is
+#: known to be warm: the pass counts such a request as failed.
+UNSERVED_FINISHES = frozenset({"abort", "error"})
+
+
+class UnservedRequest(RuntimeError):
+    """A request the engine answered without serving it: a completion with
+    one of :data:`UNSERVED_FINISHES`, or the status a servicer raises for
+    the same refusal (one of :data:`REFUSAL_STATUS_CODES`). A failed request
+    in the pass's accounting, like any raised status; unlike one, no sign
+    that the engine stopped taking requests: the engine answered. So a step
+    of these never counts toward the consecutive-failures stop
+    (:data:`CONSECUTIVE_FAILED_STEPS`), which exists for an engine that
+    answers nothing: an engine whose input bound sits below the plan's
+    longest prompts refuses those steps in a row and the pass still runs
+    everything after them."""
+
+
+def unserved(finish_reason: str | None, output_tokens: int) -> UnservedRequest | None:
+    """The :class:`UnservedRequest` a completion that was not served
+    raises, or ``None`` when it was served: the finish the engine ended it
+    with, when that finish is one of :data:`UNSERVED_FINISHES`, and how
+    many tokens came before it (none for a refusal at admission). A wire
+    raises it from ``generate`` so the pass records the request as failed
+    and the step as not covered. An empty or absent finish is not a refusal
+    (a completion a stand-in answers without one)."""
+    if (finish_reason or "") not in UNSERVED_FINISHES:
+        return None
+    produced = (
+        "before any token"
+        if output_tokens == 0
+        else f"after {output_tokens} token{'s' if output_tokens != 1 else ''}"
+    )
+    return UnservedRequest(
+        f"the engine ended the request with finish_reason {finish_reason!r} {produced}"
+    )
+
+
+#: The gRPC status codes a servicer answers a request it refused with: the
+#: request's shape (``INVALID_ARGUMENT``: a prompt past the engine's input
+#: bound, a parameter its scheduler rejects) or no room for it now
+#: (``RESOURCE_EXHAUSTED``). The other encoding of the refusals above: the
+#: servicers that attribute an engine's abort raise its status instead of
+#: completing the request. The codes of a servicer that could not answer
+#: (``DEADLINE_EXCEEDED``, ``UNAVAILABLE``, ``INTERNAL``, ...) stay real
+#: failures.
+REFUSAL_STATUS_CODES = frozenset({"INVALID_ARGUMENT", "RESOURCE_EXHAUSTED"})
+
+
+def refused(error: BaseException) -> UnservedRequest | None:
+    """The :class:`UnservedRequest` a raised status that means a refusal
+    becomes (its code one of :data:`REFUSAL_STATUS_CODES`; the words carry
+    the code and the status' details), or ``None`` for any other error. A
+    wire raises it in place of the status, so the pass records the request
+    as failed and the step as not covered, without a step toward the stop.
+    The status is read as a gRPC call exposes it (``code()``, ``details()``),
+    without a gRPC import here."""
+    code = getattr(error, "code", None)
+    name = getattr(code() if callable(code) else code, "name", None)
+    if name not in REFUSAL_STATUS_CODES:
+        return None
+    details = getattr(error, "details", None)
+    details = details() if callable(details) else details
+    return UnservedRequest(f"the engine refused the request: {name}: {details or 'no details'}")
+
+
 @dataclasses.dataclass
 class StepResult:
     step: WarmupStep
@@ -609,7 +678,12 @@ class _Pass:
         index = len(self.report.results)
         remainder = step.kind == "remainder"
         if errors:
-            if len(errors) == len(step.requests):
+            # A whole step of refusals (the engine answered every request
+            # with an abort) is a failed step, not a step toward the stop:
+            # the stop is for an engine that answers nothing.
+            whole = len(errors) == len(step.requests)
+            answered = all(isinstance(error, UnservedRequest) for error in errors)
+            if whole and not answered:
                 if self._failed_in_a_row == 0:
                     self._first_failed = index - 1
                 self._failed_in_a_row += 1
