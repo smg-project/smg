@@ -1873,31 +1873,9 @@ impl Tree {
 
     fn merge_nodes(&self, local: &NodeRef, remote: &NodeRef) {
         // Merge tenants at this node
-        for entry in &remote.tenant_last_access_time {
-            let tenant_id = Arc::clone(entry.key());
-            let remote_epoch = *entry.value();
-
-            let is_new = !local
-                .tenant_last_access_time
-                .contains_key(tenant_id.as_ref());
-
-            let should_update = local
-                .tenant_last_access_time
-                .get(tenant_id.as_ref())
-                .map(|local_epoch| remote_epoch > *local_epoch)
-                .unwrap_or(true);
-
-            if should_update {
-                local
-                    .tenant_last_access_time
-                    .insert(Arc::clone(&tenant_id), remote_epoch);
-
-                if is_new {
-                    let edge_chars = local.text.read().char_count();
-                    self.add_tenant_chars(&tenant_id, edge_chars);
-                }
-            }
-        }
+        self.merge_remote_tenants(local, &remote.tenant_last_access_time, || {
+            local.text.read().char_count()
+        });
 
         // Merge children
         for remote_entry in &remote.children {
@@ -1922,49 +1900,24 @@ impl Tree {
                     //
                     // First, merge remote tenants into local_child (the prefix node).
                     // The remote tenant owns the full path including this prefix.
-                    for entry in &remote_child.tenant_last_access_time {
-                        let tid = Arc::clone(entry.key());
-                        let epoch = *entry.value();
-                        let is_new = !local_child
-                            .tenant_last_access_time
-                            .contains_key(tid.as_ref());
-                        let should_update = local_child
-                            .tenant_last_access_time
-                            .get(tid.as_ref())
-                            .map(|e| epoch > *e)
-                            .unwrap_or(true);
-                        if should_update {
-                            local_child
-                                .tenant_last_access_time
-                                .insert(Arc::clone(&tid), epoch);
-                            if is_new {
-                                let edge_chars = local_edge.chars().count();
-                                self.add_tenant_chars(&tid, edge_chars);
-                            }
-                        }
-                    }
+                    self.merge_remote_tenants(
+                        &local_child,
+                        &remote_child.tenant_last_access_time,
+                        || local_edge.chars().count(),
+                    );
 
                     let remote_remainder = advance_by_chars(&remote_edge, shared);
                     let Some(rem_first) = remote_remainder.chars().next() else {
                         continue;
                     };
 
-                    // Create a virtual remote node with the trimmed edge.
-                    // Use clone_subtree for children to rewrite parent pointers.
-                    let trimmed_remote = Arc::new(Node {
-                        children: new_children_map(),
-                        text: RwLock::new(NodeText::new(remote_remainder.to_string())),
-                        tenant_last_access_time: remote_child.tenant_last_access_time.clone(),
-                        parent: RwLock::new(None),
-                        last_tenant: RwLock::new(remote_child.last_tenant.read().clone()),
-                    });
-                    for child_entry in &remote_child.children {
-                        let child_clone =
-                            Self::clone_subtree(child_entry.value(), Some(&trimmed_remote));
-                        trimmed_remote
-                            .children
-                            .insert(*child_entry.key(), child_clone);
-                    }
+                    // A virtual remote node with the trimmed edge; its children
+                    // are cloned under it with their parent pointers rewritten.
+                    let trimmed_remote = Self::clone_subtree_as(
+                        &remote_child,
+                        NodeText::new(remote_remainder.to_string()),
+                        None,
+                    );
 
                     if let Some(deeper_local) = local_child.children.get(&rem_first) {
                         let deeper_local = deeper_local.value().clone();
@@ -2007,26 +1960,11 @@ impl Tree {
                     // Union remote tenants into the split node, updating
                     // tenant_char_count for newly added tenants.
                     let split_chars = shared;
-                    for entry in &remote_child.tenant_last_access_time {
-                        let tid = Arc::clone(entry.key());
-                        let epoch = *entry.value();
-                        let is_new = !split_node
-                            .tenant_last_access_time
-                            .contains_key(tid.as_ref());
-                        let should_update = split_node
-                            .tenant_last_access_time
-                            .get(tid.as_ref())
-                            .map(|e| epoch > *e)
-                            .unwrap_or(true);
-                        if should_update {
-                            split_node
-                                .tenant_last_access_time
-                                .insert(Arc::clone(&tid), epoch);
-                            if is_new {
-                                self.add_tenant_chars(&tid, split_chars);
-                            }
-                        }
-                    }
+                    self.merge_remote_tenants(
+                        &split_node,
+                        &remote_child.tenant_last_access_time,
+                        || split_chars,
+                    );
 
                     // Push local child down as child of split node. Re-parent
                     // inside the same `text` write section as the truncation
@@ -2040,25 +1978,16 @@ impl Tree {
                         .children
                         .insert(local_remainder_first, Arc::clone(&local_child));
 
-                    // Create remote remainder as another child of split node
-                    // Use clone_subtree to rewrite parent pointers correctly
+                    // Create remote remainder as another child of split node,
+                    // its children cloned under it with their parent pointers
+                    // rewritten.
                     let remote_remainder = advance_by_chars(&remote_edge, shared);
                     if let Some(rem_first) = remote_remainder.chars().next() {
-                        let remote_subtree = Arc::new(Node {
-                            children: new_children_map(),
-                            text: RwLock::new(NodeText::new(remote_remainder.to_string())),
-                            tenant_last_access_time: remote_child.tenant_last_access_time.clone(),
-                            parent: RwLock::new(Some(Arc::downgrade(&split_node))),
-                            last_tenant: RwLock::new(remote_child.last_tenant.read().clone()),
-                        });
-                        // Clone remote children with correct parent pointers
-                        for child_entry in &remote_child.children {
-                            let child_clone =
-                                Self::clone_subtree(child_entry.value(), Some(&remote_subtree));
-                            remote_subtree
-                                .children
-                                .insert(*child_entry.key(), child_clone);
-                        }
+                        let remote_subtree = Self::clone_subtree_as(
+                            &remote_child,
+                            NodeText::new(remote_remainder.to_string()),
+                            Some(&split_node),
+                        );
                         self.accumulate_tenant_counts(&remote_subtree);
                         split_node.children.insert(rem_first, remote_subtree);
                     }
@@ -2071,6 +2000,41 @@ impl Tree {
                 let cloned = Self::clone_subtree(&remote_child, Some(local));
                 self.accumulate_tenant_counts(&cloned);
                 local.children.insert(rc, cloned);
+            }
+        }
+    }
+
+    /// Merge a remote node's tenants into `node`: a tenant the node does not
+    /// carry is attached with the remote epoch and credited the node's edge
+    /// (`edge_chars`, read only then); a tenant both carry keeps the newer
+    /// epoch.
+    fn merge_remote_tenants(
+        &self,
+        node: &NodeRef,
+        remote_tenants: &TenantMap<u64>,
+        edge_chars: impl Fn() -> usize,
+    ) {
+        for entry in remote_tenants {
+            let tenant_id = Arc::clone(entry.key());
+            let remote_epoch = *entry.value();
+
+            let is_new = !node
+                .tenant_last_access_time
+                .contains_key(tenant_id.as_ref());
+
+            let should_update = node
+                .tenant_last_access_time
+                .get(tenant_id.as_ref())
+                .map(|local_epoch| remote_epoch > *local_epoch)
+                .unwrap_or(true);
+
+            if should_update {
+                node.tenant_last_access_time
+                    .insert(Arc::clone(&tenant_id), remote_epoch);
+
+                if is_new {
+                    self.add_tenant_chars(&tenant_id, edge_chars());
+                }
             }
         }
     }
@@ -2091,9 +2055,17 @@ impl Tree {
 
     /// Deep clone a subtree, setting parent pointers correctly.
     fn clone_subtree(node: &NodeRef, parent: Option<&NodeRef>) -> NodeRef {
+        let text = node.text.read().clone_text();
+        Self::clone_subtree_as(node, text, parent)
+    }
+
+    /// Deep clone a subtree whose root carries `text` instead of the node's own
+    /// edge (a remote edge trimmed to the part below a local prefix), setting
+    /// parent pointers correctly.
+    fn clone_subtree_as(node: &NodeRef, text: NodeText, parent: Option<&NodeRef>) -> NodeRef {
         let new_node = Arc::new(Node {
             children: new_children_map(),
-            text: RwLock::new(node.text.read().clone_text()),
+            text: RwLock::new(text),
             tenant_last_access_time: node.tenant_last_access_time.clone(),
             parent: RwLock::new(parent.map(Arc::downgrade)),
             last_tenant: RwLock::new(node.last_tenant.read().clone()),
