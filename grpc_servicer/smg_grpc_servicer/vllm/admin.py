@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import math
+import os
 
 import grpc
 from smg_grpc_proto.generated import common_pb2
@@ -62,6 +63,10 @@ async def start_profile(engine, request, context) -> common_pb2.ProfileResponse:
     request: a start that sets any of them is refused (``INVALID_ARGUMENT``), so an
     operator is never told a trace went where, or how, it did not.
     """
+    if os.environ.get("SMG_VLLM_REQUEST_PROFILE") == "1":
+        from .request_profile import session
+
+        return await session(engine).run(True, request, context, PROFILE_TIMEOUT_S)
     named = _launch_time_options_set(request)
     if named:
         await context.abort(
@@ -76,6 +81,10 @@ async def start_profile(engine, request, context) -> common_pb2.ProfileResponse:
 
 async def stop_profile(engine, context) -> common_pb2.ProfileResponse:
     """Stop the profiler and export its traces (``AsyncLLM.stop_profile``)."""
+    if os.environ.get("SMG_VLLM_REQUEST_PROFILE") == "1":
+        from .request_profile import session
+
+        return await session(engine).run(False, None, context, PROFILE_TIMEOUT_S)
     return await _profile(engine.stop_profile, "Stop profiling", context)
 
 
