@@ -2,8 +2,73 @@
   "ready": false,
   "run_budget_admitted": false,
   "artifacts_pinned": false,
-  "artifacts": null,
-  "gateway_native": null,
+  "artifacts": [
+    {
+      "name": "smg-wheel",
+      "id": 12579435360,
+      "bytes": 52388362,
+      "sha256": "2957a4f6debcc0bf7ad6e79904adcc9cb5aeb6d45304131d9f6f2b11fd32b95b",
+      "expires_at": "2026-10-31T23:19:10Z",
+      "files": {
+        "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl": {
+          "bytes": 52529140,
+          "sha256": "2583bda41747126822ef9d1697fd88e68fc95e1cea394521e9703c24e0a7393a"
+        }
+      }
+    },
+    {
+      "name": "go-ffi-library",
+      "id": 12578519812,
+      "bytes": 13837182,
+      "sha256": "65ffa0a52908f2cfe34e3d50aaaaae670d3af8bde246a2b6ab9199658a67a442",
+      "expires_at": "2026-10-31T23:19:13Z",
+      "files": {
+        "libsmg_go.d": {
+          "bytes": 64539,
+          "sha256": "b46b20aad8202524bb156587ea51a3c8d66d25cec0cd554664418ac641bfad38"
+        },
+        "libsmg_go.so": {
+          "bytes": 35008576,
+          "sha256": "793946614a201c0658f9fc524a1307c0b15433a0ac8b709d5bf0e265b3b87b09"
+        }
+      }
+    },
+    {
+      "name": "python-client-types",
+      "id": 12579535141,
+      "bytes": 34374,
+      "sha256": "f17ad9810f28e882037dc7270493dbbd7d00ace289361e00fdf9173f2e1c68c7",
+      "expires_at": "2026-10-31T23:19:15Z",
+      "files": {
+        "_generated.py": {
+          "bytes": 187180,
+          "sha256": "2bf54fb6b78b00ff833eddcd67943e11837b38202fa7fa84557b4c697f169f1b"
+        }
+      }
+    },
+    {
+      "name": "wasm-test-fixtures",
+      "id": 12578659886,
+      "bytes": 56596,
+      "sha256": "5a8f2bd048f899eb86f1ae8556a14cb0f584d45884c66b161f1052396e592fb8",
+      "expires_at": "2026-10-31T23:19:16Z",
+      "files": {
+        "storage_hook_guest.wasm": {
+          "bytes": 80680,
+          "sha256": "7e3a093e09bfe30244d128c1aaaf8558a1b13c05558cc81cff04021947445e11"
+        },
+        "storage_hook_passthrough.wasm": {
+          "bytes": 79153,
+          "sha256": "3a10ce115ea179026a00f3e85ce6b6a388bcc1f274bc7abfc074be876d7c3e55"
+        }
+      }
+    }
+  ],
+  "gateway_native": {
+    "name": "smg/smg_rs.abi3.so",
+    "bytes": 142443344,
+    "sha256": "e6d8073ed3484cf95403046875d6ba655d61d4bcb2860e62bd6df2aa9859be1c"
+  },
   "run_id": 40139189680,
   "run_attempt": 1,
   "build_job_id": 121007094597,
@@ -71,7 +136,22 @@
     "crates/grpc_client/src": "0068eacf800c1ca3dc8fd23d9658c0d4866ca266",
     "crates/grpc_client/tests": "1bfcdb65a82db071422c03fc4f70b19d143dde5c"
   },
-  "producer_source_trees": null,
+  "producer_source_trees": {
+    ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
+    "Cargo.toml": "1524dd4960a96dd3ae5069917324836dee979150",
+    "Cargo.lock": "658f9376c020bef5e29a3e5728b4931cee891427",
+    "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+    "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+    "bindings": "e97f000df477e928953b6bcb5a7927adf5ff88c1",
+    "clients": "03b0cbb722670d98b37b726af18c1796beef82d5",
+    "crates": "aa609afdadbb89b16d28d8763ec0d8a47672433a",
+    "model_gateway": "d1a181bfb1d16a661e16346d4eb8f257689701ce",
+    "grpc_servicer": "2cbef8f1440732b8034bfded7a9eba7e8e8d23ca",
+    "e2e_test": "ac24cbe1b88c3219bbe07b76dc4dd8370bf2ff1b",
+    "scripts": "a5f12792df38a4cb1f82ef724f8234360fddf99a",
+    ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
+    ".github/workflows": "2eeb29be8966ea74d0906a6ee860d2cd5ded6e5e"
+  },
   "explicit_consumer_only_paths": [
     ".github/amd-shared-product/",
     ".github/workflows/pr-test-rust.yml",
@@ -92,7 +172,7 @@
   },
   "diagnostic_difference": "Only the original Mooncake4 topology recipe is prepared: e91517/current18/floor14/originalfilter/50job42pytest, main-global-extra Mooncake and mixed NIXL/Mooncake pairs retained. Inherited14unit/environment/private-constraint/owned-process gates stay; separate actual Mooncake and official ROCm NIXL canaries plus owned nominal2P2D logs are required. The reviewed exact3-file MC2 test overlay is inherited but its classes are not selected. No MC2/NIXL4 GPU/ABI/transfer result is transferred; actual counter/periodicflush success remains unverified.",
   "producer_binary_relabelled": false,
-  "producer_artifact_pins_status": "UNBOUND_REFRESH401391: actual four ZIPs/six payloads/native/actualproducer14 are null until independent actual artifact audit and root acceptance; old445/143a and19c1d22 are not consumed or relabelled.",
+  "producer_artifact_pins_status": "BOUND_ACTUAL_REFRESH401391: four new ZIPs/six payloads/native e6d8073/actualproducer14 bind root integrity acceptance e1d5b35 and independent actual peer9e1550. All admission flags remain false; no old445/143a or19c1d22 result is transferred.",
   "explicit_product_dependency": {
     "PR": 4266,
     "original_public_head": "3cef9af6a73610f501b920221c7232bf640219d0",
@@ -100,7 +180,7 @@
     "parent_stack": "0707d631cb6827789619ab96999f868044dc06db",
     "visible_churn": 43
   },
-  "producer_snapshot_note": "Known root-owned CPU run40139189680/f93b/build121007094597 is a new matching legacyc9d build. Its identity is saved, terminal artifacts/actual14/native are not accepted by this source packet. GHA source/relay cannot admit unbound inputs.",
+  "producer_snapshot_note": "Fresh root-owned run40139189680/f93b/build121007094597 completed18 successful steps. Actual4ZIP/native e6d8073/14 are integrity-accepted and source-bound here; target normal shared CPU on both nodes and original18 GPU remain unaccepted.",
   "source_base": "c9d5431db92aa2d35521889f6297c4c6f7b05b4a",
   "producer_base_source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
@@ -118,7 +198,7 @@
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows": "7c956a4ee89bdf800d48c63815d10a4dd568d90e"
   },
-  "producer_source_map_note": "Consumer19 and compiled37 remain exactee1d/c9d code. Expected producer source13+admittedworkflowtree are a static source contract only; actual14 remainsnull until actualartifact acceptance.",
+  "producer_source_map_note": "Consumer19 remains exact0836/ee1d code and compiled37 equals c9d and actualf93b. Actualproducer14 is independently Git-verified; its workflow tree2eeb29be is the CPU build graph, distinct from the consumer private3job workflow. New ZIP/native source integrity does not prove target ABI or CPU/GPU behavior.",
   "resource_precondition": {
     "requested_runner_label": "1-gpu-mi300x",
     "required_logical_devices_by_tier": {
@@ -147,7 +227,7 @@
     "unit_junit": "servicer-engine.xml in the existing unique AMD dependency artifact",
     "diagnostic_workflow_difference": "NIXL tier-select dispatch caller only; normal product tooling CPU jobs are not part of this diagnostic workflow."
   },
-  "source_identity_note": "Original currentMC4 18/floor14/50job42pytest/reruns2/models/TP/connectors/oracles and ee1d normalsharedsetup/twohooks/observer stay unchanged. New matching401391 artifact fields are pendingnull, never old445/143a or19c1d22. Auxiliary8451/Cairo/tools, private710c wheel/HIP55leaf23dir, and the normally-resolved30wheel closure are separate read-only datasets, not producerarchives. Bothpoolnodes require actualstaging and matchingnative fullnormalcohort acceptance before GPU; existing node2CPU86f048 is old143a scoped evidence only.",
+  "source_identity_note": "Original currentMC4 18/floor14/50job42pytest/reruns2/models/TP/connectors/oracles and ee1d normalsharedsetup/twohooks/observer stay unchanged. Actualnew401391/e6d/4ZIP/14 binding is integrity-only. Auxiliary8451/Cairo/tools, private710c/HIP55leaf23dir and30normalresolver wheels remain separate read-only datasets. Both nodes still need freshstaging and matchinge6d fullnormalCPU acceptance; old143a CPU success is historical only.",
   "admitted_tier": null,
   "contracts": {
     "4": {
@@ -267,11 +347,97 @@
       "build_job_id": 121007094597,
       "created_at": "2026-10-24T22:35:07Z"
     },
-    "root_artifact_acceptance": null,
-    "independent_actual_peer": null,
-    "actual_producer14": null,
-    "actual_four_archives": null,
-    "actual_native": null,
+    "root_artifact_acceptance": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/frozen-legacy-c9d-refresh-cpu-producer-20261024/run-40139189680/root-producer-integrity-acceptance.json",
+      "sha256": "e1d5b35d2508e81f51ecb114abdb45dfe54fbdc0b2d785e74e69fdc303f290db"
+    },
+    "independent_actual_peer": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/frozen-legacy-c9d-refresh-cpu-producer-20261024/run-40139189680/peer-independent-native.json",
+      "sha256": "9e1550f1577e9b8f774bc6988f7a92c2b9cbdd6a432408af9a669c27c37a9e7a"
+    },
+    "actual_producer14": {
+      ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
+      "Cargo.toml": "1524dd4960a96dd3ae5069917324836dee979150",
+      "Cargo.lock": "658f9376c020bef5e29a3e5728b4931cee891427",
+      "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+      "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+      "bindings": "e97f000df477e928953b6bcb5a7927adf5ff88c1",
+      "clients": "03b0cbb722670d98b37b726af18c1796beef82d5",
+      "crates": "aa609afdadbb89b16d28d8763ec0d8a47672433a",
+      "model_gateway": "d1a181bfb1d16a661e16346d4eb8f257689701ce",
+      "grpc_servicer": "2cbef8f1440732b8034bfded7a9eba7e8e8d23ca",
+      "e2e_test": "ac24cbe1b88c3219bbe07b76dc4dd8370bf2ff1b",
+      "scripts": "a5f12792df38a4cb1f82ef724f8234360fddf99a",
+      ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
+      ".github/workflows": "2eeb29be8966ea74d0906a6ee860d2cd5ded6e5e"
+    },
+    "actual_four_archives": [
+      {
+        "name": "smg-wheel",
+        "id": 12579435360,
+        "bytes": 52388362,
+        "sha256": "2957a4f6debcc0bf7ad6e79904adcc9cb5aeb6d45304131d9f6f2b11fd32b95b",
+        "expires_at": "2026-10-31T23:19:10Z",
+        "files": {
+          "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl": {
+            "bytes": 52529140,
+            "sha256": "2583bda41747126822ef9d1697fd88e68fc95e1cea394521e9703c24e0a7393a"
+          }
+        }
+      },
+      {
+        "name": "go-ffi-library",
+        "id": 12578519812,
+        "bytes": 13837182,
+        "sha256": "65ffa0a52908f2cfe34e3d50aaaaae670d3af8bde246a2b6ab9199658a67a442",
+        "expires_at": "2026-10-31T23:19:13Z",
+        "files": {
+          "libsmg_go.d": {
+            "bytes": 64539,
+            "sha256": "b46b20aad8202524bb156587ea51a3c8d66d25cec0cd554664418ac641bfad38"
+          },
+          "libsmg_go.so": {
+            "bytes": 35008576,
+            "sha256": "793946614a201c0658f9fc524a1307c0b15433a0ac8b709d5bf0e265b3b87b09"
+          }
+        }
+      },
+      {
+        "name": "python-client-types",
+        "id": 12579535141,
+        "bytes": 34374,
+        "sha256": "f17ad9810f28e882037dc7270493dbbd7d00ace289361e00fdf9173f2e1c68c7",
+        "expires_at": "2026-10-31T23:19:15Z",
+        "files": {
+          "_generated.py": {
+            "bytes": 187180,
+            "sha256": "2bf54fb6b78b00ff833eddcd67943e11837b38202fa7fa84557b4c697f169f1b"
+          }
+        }
+      },
+      {
+        "name": "wasm-test-fixtures",
+        "id": 12578659886,
+        "bytes": 56596,
+        "sha256": "5a8f2bd048f899eb86f1ae8556a14cb0f584d45884c66b161f1052396e592fb8",
+        "expires_at": "2026-10-31T23:19:16Z",
+        "files": {
+          "storage_hook_guest.wasm": {
+            "bytes": 80680,
+            "sha256": "7e3a093e09bfe30244d128c1aaaf8558a1b13c05558cc81cff04021947445e11"
+          },
+          "storage_hook_passthrough.wasm": {
+            "bytes": 79153,
+            "sha256": "3a10ce115ea179026a00f3e85ce6b6a388bcc1f274bc7abfc074be876d7c3e55"
+          }
+        }
+      }
+    ],
+    "actual_native": {
+      "name": "smg/smg_rs.abi3.so",
+      "bytes": 142443344,
+      "sha256": "e6d8073ed3484cf95403046875d6ba655d61d4bcb2860e62bd6df2aa9859be1c"
+    },
     "old_results_transferred": false
   },
   "normal_resolver_closure": {
