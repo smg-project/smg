@@ -5,13 +5,78 @@
   "consumer_gpu_ready": false,
   "admitted_lane": null,
   "runtime_cohort_accepted": false,
-  "artifacts": [],
-  "gateway_native": null,
-  "producer_sha": null,
-  "run_id": null,
-  "run_attempt": null,
-  "build_job_id": null,
-  "producer_branch": null,
+  "artifacts": [
+    {
+      "name": "go-ffi-library",
+      "id": 12577085048,
+      "bytes": 13836995,
+      "sha256": "c7dc51d3e5c958ea6c683f4e295f51f4f4e8237e74d775082fb1f48754c54d11",
+      "expires_at": "2026-10-25T21:53:25Z",
+      "files": {
+        "libsmg_go.d": {
+          "bytes": 64858,
+          "sha256": "e3b903b76842ce0ca90b682d45e86ced66426196baf8aad720c12abfb3c9d8b4"
+        },
+        "libsmg_go.so": {
+          "bytes": 35013840,
+          "sha256": "ce2e4f8414cd2a2756bde8b166c20618d95fa4c2b7d723b93adeee9fbb913ffc"
+        }
+      }
+    },
+    {
+      "name": "python-client-types",
+      "id": 12576019776,
+      "bytes": 34557,
+      "sha256": "2b56b8c42dc0fe0be7526a2997fe4f30360900a98294a401f8b8d5a08aa4483a",
+      "expires_at": "2026-10-25T21:53:28Z",
+      "files": {
+        "_generated.py": {
+          "bytes": 187632,
+          "sha256": "6086eba214dc97311bbcda1a0c43d34eb2b1e7864eeee7eb9e974149417465b6"
+        }
+      }
+    },
+    {
+      "name": "smg-wheel",
+      "id": 12576990213,
+      "bytes": 52481714,
+      "sha256": "5699e646438895c6c7437b7b1f7d30bee551778537fb98126e9f7e083df225a5",
+      "expires_at": "2026-10-25T21:53:22Z",
+      "files": {
+        "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl": {
+          "bytes": 52623874,
+          "sha256": "e3f9bb03ff5062bdd5a8df979654ae0455b97fc4fe8235eabfcf283e59c40211"
+        }
+      }
+    },
+    {
+      "name": "wasm-test-fixtures",
+      "id": 12576249305,
+      "bytes": 56596,
+      "sha256": "6783892e26ef47488aab2616f3d1d36706d83f48a5bd350dfb810efd70ad598b",
+      "expires_at": "2026-10-25T21:53:29Z",
+      "files": {
+        "storage_hook_guest.wasm": {
+          "bytes": 80680,
+          "sha256": "7e3a093e09bfe30244d128c1aaaf8558a1b13c05558cc81cff04021947445e11"
+        },
+        "storage_hook_passthrough.wasm": {
+          "bytes": 79153,
+          "sha256": "3a10ce115ea179026a00f3e85ce6b6a388bcc1f274bc7abfc074be876d7c3e55"
+        }
+      }
+    }
+  ],
+  "gateway_native": {
+    "name": "smg/smg_rs.abi3.so",
+    "bytes": 142663760,
+    "sha256": "1d22cb0ad04ff252b09fe14fc44260808906b398953689f6ed038967f7ccf4c8"
+  },
+  "producer_sha": "c5596e27ac6e3d857477d9127c78d713c6df0371",
+  "run_id": 40132965389,
+  "run_attempt": 1,
+  "build_job_id": 120988439488,
+  "producer_branch": "ci/frozen-python173-main19c-producer-admitted-20261024",
   "producer_policy": "frozen_main19c_python173_build_only_all_18_steps_success_v1",
   "source_base": "740bd0c7e88bdfb57776785eaee16ff8e71f1833",
   "target_product_commit": "740bd0c7e88bdfb57776785eaee16ff8e71f1833",
@@ -75,7 +140,22 @@
     "crates/grpc_client/src": "29f6a377b334297582af8f01019192839a963b6a",
     "crates/grpc_client/tests": "61ce3e030a193e2f118cedd213edcd82622bdf56"
   },
-  "producer_source_trees": {},
+  "producer_source_trees": {
+    ".cargo": "8a9d55bb8edfa19d9f90b313fbdc24326d3f667b",
+    "Cargo.toml": "74bad7a60f31586e667b6ea84323f70ec477bddc",
+    "Cargo.lock": "7022fa76a1f1e4ef7aa812ee7f2d3ac159fd6aa4",
+    "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+    "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+    "bindings": "522d1a6b38a8271ced2ebf6ff1617f831d14a89b",
+    "clients": "599d7ce2727e5d6287825271f464a3b7b5e64ee9",
+    "crates": "84086855e0f09846092bcce34ecd7b7b43bdc29c",
+    "model_gateway": "e511dbc60efa61b550e70a8ccd749e79db6ab843",
+    "grpc_servicer": "01164131fca3a192bd6b56fc348ca004bccc78fe",
+    "e2e_test": "cfa4c5dc32edc060e4eb2cc6d3f554ccbc3c014c",
+    "scripts": "4dc8528e28fbbe38e9a2cdc966ab0dd70b89c158",
+    ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
+    ".github/workflows": "a56c0902b7f6f2278d09fc270a35e2d431bcd4b3"
+  },
   "producer_base_source_trees": {
     ".cargo": "8a9d55bb8edfa19d9f90b313fbdc24326d3f667b",
     "Cargo.toml": "74bad7a60f31586e667b6ea84323f70ec477bddc",
@@ -92,7 +172,7 @@
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows": "b9118239275e4cdb4118e56a792bf69ede7e8b93"
   },
-  "future_actual_producer14_required": true,
+  "future_actual_producer14_required": false,
   "prior_GPU_results_transferred": false,
   "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat[3]/tokenspeed/nvidia",
   "recipe": {
@@ -138,12 +218,12 @@
     "image_grpcio_exact": "1.78.0",
     "image_grpcio_reflection_exact": "1.78.0",
     "current_source_requires": ">=1.78.0; same-source private proto required",
-    "normal_resolution_intersection": "SOURCE_METADATA_INTERSECTION_ONLY_NEW_MAIN19C_VERSIONS_UNBUILT_UNINSTALLED",
-    "permitted_resolution": "Build both private main19c source wheels normally from all current eight schemas with grpcio-tools1.78.0, then normal paired resolver and all whole-pip/origin/descriptor/wire gates on unchanged stock vLLM/Torch. Historical f545 PhaseA/B are explicit method references, not acceptance for this source. No installed metadata edits, stale stubs, version-check bypass or --no-deps.",
+    "normal_resolution_intersection": "ACTUAL_PAIRED_NORMAL_INSTALL_THREE_WHOLEPIP_AND_INERT_GENERATED_RPC_CPU_ACCEPTED_ONLY_FOR_FROZEN3DE3; fullsharedCIdependencies/currentunits/productionengine/profile/original173 pending",
+    "permitted_resolution": "Use new actual g178 main19c wheels from the accepted build in a separate reviewed stage; normal shared CI same-source editable install remains unchanged and needs fresh provenance/full-dependency proof. No oldwheel substitution, metadata edit, stale stubs, version-check bypass or no-deps escape. Runtime-cohort admission remains false.",
     "wholepip_still_required": true
   },
-  "new_native_required": true,
-  "source_identity_note": "Independent exact main19c source retains all8 latest upstream paths byte-for-byte, in addition to the earlier main d6 changes. All reviewed complete173/profile/PID/g178 behavior is preserved from4aef; private versions identify main19c. Actual19/37/producer-base14 are recomputed on target_product_commit. Actual producer14/run/native/artifacts remain empty and all4flags false. Historical d6/60f packages or native identities are not bindings or runtime acceptance.",
+  "new_native_required": false,
+  "source_identity_note": "Frozen3de3/main19c consumer19/compiled37 remain byte-exact. Actual18-step producer40132965389/c5596e fourarchives/actual14/native1d22 are source-data bound; native integrity/hosted smoke accepted separately from target ABI/runtime. FreshRPC240a5/2c68 and target PhaseB CPU proof are joined in runtime-evidence.json. No143a/f545 artifacts or results are borrowed. All4flags and runtime_cohort_accepted remain false; fullcurrentunits/original173/currentmain qualification remain pending.",
   "grpc178_source_candidate": {
     "generator": "grpcio-tools==1.78.0",
     "proto_version": "0.4.28+smg.main19c.g178",
@@ -151,9 +231,14 @@
     "schema_count": 8,
     "schemas_unchanged_from_parent": "19c68a5527f61358a0e9a56a6ed4906dcfb1d1b5",
     "generated_code_version_checks_preserved": true,
-    "built": false,
-    "imported": false,
-    "wire_tested": false,
-    "stock_vllm_runtime_accepted": false
-  }
+    "built": true,
+    "imported": true,
+    "wire_tested": true,
+    "stock_vllm_runtime_accepted": false,
+    "generated16_imported_in_CPU": true,
+    "inert_fixture_wire_tested": true,
+    "actual_artifact_manifest": "runtime-evidence.json"
+  },
+  "new_native_artifact_bound": true,
+  "bound_runtime_evidence_manifest": "runtime-evidence.json"
 }

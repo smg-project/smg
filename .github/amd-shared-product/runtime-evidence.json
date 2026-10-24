@@ -1,0 +1,85 @@
+{
+  "revision": "frozen-main19c-native-and-RPC2-actual-bindings-v1",
+  "source_product": "3de3db0c41c30201aa202e7f293bdd40f088c07a",
+  "upstream_base": "19c68a5527f61358a0e9a56a6ed4906dcfb1d1b5",
+  "native_producer_integrity": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/frozen-python173-main19c-cpu-producer-20261024/run-40132965389/root-producer-integrity-acceptance.json",
+    "bytes": 3756,
+    "sha256": "930085ccb679da67e7bddad2da53cea771e1da55a8bff87947b1a59d414dac9f"
+  },
+  "native_independent_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/frozen-python173-main19c-cpu-producer-20261024/run-40132965389/peer-A-native.json",
+    "bytes": 10216,
+    "sha256": "9f4c8cc71bfeef2f2fafa0be24dac45e0f33e0abf460db4c9eb83682efef3a25"
+  },
+  "native_artifact_map": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/frozen-python173-main19c-cpu-producer-20261024/run-40132965389/peer-A-native-artifact-map.json",
+    "bytes": 33330,
+    "sha256": "291c00a619f7726561c5857735fc22674e0a83b03a67483dc605b8d6dcd7c9bd"
+  },
+  "native_run": 40132965389,
+  "native_head": "c5596e27ac6e3d857477d9127c78d713c6df0371",
+  "native_accepted_scope": "artifact integrity and hosted smoke only; targetnative load notyetverified",
+  "actual_RPC2_wheels": [
+    {
+      "name": "smg_grpc_proto-0.4.28+smg.main19c.g178-py3-none-any.whl",
+      "distribution": "smg-grpc-proto",
+      "version": "0.4.28+smg.main19c.g178",
+      "bytes": 110672,
+      "sha256": "40a5aedb6737a2e039e953fec67235a506fb5a3a73ad9b88770b729625496b6c",
+      "local_actual_artifact": {
+        "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/TS173-main19c-phaseB-root-5a45487a0dc74f379683dd965fd4f4e8/packet/wheels/smg_grpc_proto-0.4.28+smg.main19c.g178-py3-none-any.whl",
+        "bytes": 110672,
+        "sha256": "40a5aedb6737a2e039e953fec67235a506fb5a3a73ad9b88770b729625496b6c"
+      },
+      "not_a_native_producer_archive": true
+    },
+    {
+      "name": "smg_grpc_servicer-0.14.1+smg.main19c.py173.g178-py3-none-any.whl",
+      "distribution": "smg-grpc-servicer",
+      "version": "0.14.1+smg.main19c.py173.g178",
+      "bytes": 409379,
+      "sha256": "2c68b46ddb144ceb0cf5e697e4a1b4d37c2b20ee686763ba3d2debab1fac6039",
+      "local_actual_artifact": {
+        "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/TS173-main19c-phaseB-root-5a45487a0dc74f379683dd965fd4f4e8/packet/wheels/smg_grpc_servicer-0.14.1+smg.main19c.py173.g178-py3-none-any.whl",
+        "bytes": 409379,
+        "sha256": "2c68b46ddb144ceb0cf5e697e4a1b4d37c2b20ee686763ba3d2debab1fac6039"
+      },
+      "not_a_native_producer_archive": true
+    }
+  ],
+  "RPC2_build_acceptance": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/TS173-main19c-phaseB-root-5a45487a0dc74f379683dd965fd4f4e8/packet/accepted-build.json",
+    "bytes": 3287,
+    "sha256": "04b4bc609f4453425c92901eb57ff8124b21b454f05883c165edfeac5e5e6124"
+  },
+  "RPC2_target_CPU_acceptance": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/TS173-main19c-phaseB-root-5a45487a0dc74f379683dd965fd4f4e8/root-acceptance-target-cpu-only.json",
+    "bytes": 1482,
+    "sha256": "4df1435e182332b8058ba65d96e212968d8e2b918a5c7e61951241159c6b0c9b"
+  },
+  "RPC2_target_CPU_independent_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/TS173-main19c-phaseB-root-5a45487a0dc74f379683dd965fd4f4e8/actual-audit-A.json",
+    "bytes": 30480,
+    "sha256": "56509b442f79528e570adf4ddd9012317644c7f374a960d93055fe146a3562cb"
+  },
+  "RPC2_target_CPU_scope": "14commands/3wholepip/90source8schema16origins8descriptors/optional19-21Profile/inertRPC; no productionhandler/native/173/GPU",
+  "same_source_schema_and_servicer_proof": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/TS173-main19c-phaseB-root-5a45487a0dc74f379683dd965fd4f4e8/packet/inputs.json",
+    "bytes": 14328,
+    "sha256": "6a235df673a482f4bd8076756b4edd60c93b88a2983c88ca18579138251c32ff"
+  },
+  "runtime_pipeline_not_yet_closed": [
+    "current sharedsetup installs same-source editable proto/servicer normally; exactinstalledsource/metadata/direct_url/source baseline mustbe recaptured",
+    "fullcurrentunit collection/execution/canonical14 notyetdone; old1602 cannotdefine newcasecount",
+    "newnative1d22 targetnormalinstall/origin/maps/ABI/CLI notyetproved",
+    "original173 fourmodels sixsetupskip/profileadmin4/load2 samebackend notyetGPUdone",
+    "newrootbudget/freshnodes/cache/artifactexpiry/registeredWF-overlay/publisher/controller/solewatch admission required"
+  ],
+  "normal_shared_workflow_preserved": true,
+  "all4_admission_flags_false": true,
+  "runtime_cohort_accepted": false,
+  "GPU_admitted": false,
+  "reserved_runner_seconds": 0,
+  "coverage_increment": 0
+}
