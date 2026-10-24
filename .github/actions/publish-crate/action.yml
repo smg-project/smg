@@ -50,6 +50,15 @@ runs:
       with:
         repo-token: ${{ github.token }}
 
+    - name: Check public crate compatibility
+      if: >-
+        steps.check.outputs.changed == 'true' &&
+        contains(fromJSON('["llm-tokenizer", "tool-parser", "reasoning-parser", "llm-multimodal", "openai-protocol"]'), inputs.crate)
+      uses: ./.github/actions/check-crate-semver
+      with:
+        crate: ${{ inputs.crate }}
+        # No release-type override: the actual manifest bump must justify the API changes.
+
     - name: Publish to crates.io
       if: steps.check.outputs.changed == 'true'
       shell: bash

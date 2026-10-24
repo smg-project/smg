@@ -65,6 +65,35 @@ without the feature using `cargo clippy --workspace --all-targets -- -D warnings
 
 ---
 
+## Compatibility of published Rust libraries
+
+`llm-tokenizer`, `tool-parser`, `reasoning-parser`, `llm-multimodal`, and
+`openai-protocol` are consumed outside this workspace. The required `rust-semver`
+CI job checks their public APIs against their published crates.io versions using
+`cargo-semver-checks`. It checks default features, tokenizer's `tokenizers-v1`,
+multimodal without default features and with `opencv-video`, and protocol's `axum`.
+
+Ordinary PRs are checked as a prospective minor release: compatible additions do
+not need a version bump on every PR. Keep existing public APIs compatible; use
+deprecations and compatibility wrappers where possible. An intentional breaking
+change needs a reviewed major-release plan and a corresponding change to the
+development gate before it can merge. Bumping a manifest alone does not bypass
+the PR check. The publishing action checks the same configurations against the
+actual manifest version, without overriding the release type.
+
+To reproduce the default-feature check locally:
+
+```bash
+cargo install cargo-semver-checks --locked
+cargo semver-checks -p llm-tokenizer --default-features --release-type minor
+```
+
+`make check-versions` also rejects insufficient bumps suggested by conventional
+commits, even when a version was already edited. These checks do not cover every
+Rust API change or runtime behavior: review dependency types exposed in public
+APIs and preserve regression tests for tokenization, parsing, and preprocessing.
+Registry or build failures fail the compatibility check; they are not a pass.
+
 ## Commits
 
 We use [Conventional Commits](https://www.conventionalcommits.org/):

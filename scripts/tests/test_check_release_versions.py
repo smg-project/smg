@@ -359,6 +359,50 @@ def test_the_override_applies_to_the_gateway_only(mod, repo):
     assert "  ! chart (chart/Chart.yaml) — v1.0.0, expected v3.5.0" in out
 
 
+@pytest.mark.parametrize(
+    ("subject", "version", "required", "needs_bump"),
+    [
+        ("feat(beta)!: remove an API", "1.0.1", "2.0.0", True),
+        ("feat(beta)!: remove an API", "1.9.7", "2.0.0", True),
+        ("feat(beta)!: remove an API", "2.0.0", "2.0.0", False),
+        ("feat(beta): add an API", "1.0.1", "1.1.0", True),
+        ("feat(beta): add an API", "1.10.0", "1.1.0", False),
+        ("fix(beta): correct output", "0.9.9", "1.0.1", True),
+        ("fix(beta): correct output", "1.0.1", "1.0.1", False),
+    ],
+)
+def test_an_existing_bump_must_satisfy_the_commits(
+    mod, repo, subject, version, required, needs_bump
+):
+    put(repo, "crates/beta/Cargo.toml", manifest("beta", version))
+    put(repo, "crates/beta/src/lib.rs", "// a changed public API\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", subject)
+    component = mod.crate("beta", "crates/beta", "beta")
+    verdict = mod.check(mod.Repo(repo), "v1.0.0", component, root_manifest({"beta": version}))
+    assert verdict.needs_bump is needs_bump
+    assert mod.bumped(verdict.tag_version, verdict.level) == required
+
+
+def test_fixing_an_insufficient_bump_uses_the_tag_as_its_base(mod, repo):
+    put(repo, "crates/alpha/Cargo.toml", manifest("alpha", "1.0.1"))
+    code, out = run(mod, repo)
+    assert code == 1
+    assert "v1.0.0 → v1.0.1 is below required v1.1.0 [minor]" in out
+    code, out = run(mod, repo, mode="fix")
+    assert code == 0, out
+    assert mod.read_version("cargo", (repo / "crates/alpha/Cargo.toml").read_text(), "") == "1.1.0"
+    assert mod.workspace_dep_version((repo / "Cargo.toml").read_text(), "alpha") == "1.1.0"
+    assert run(mod, repo)[0] == 0
+
+
+def test_override_cannot_downgrade_the_required_gateway_bump(mod, repo):
+    before = (repo / "model_gateway/Cargo.toml").read_text()
+    with pytest.raises(mod.Fatal, match="below required gateway version 2.0.0"):
+        run(mod, repo, mode="fix", override="1.0.1")
+    assert (repo / "model_gateway/Cargo.toml").read_text() == before
+
+
 def test_a_bad_tag_or_override_is_refused(mod, repo):
     with pytest.raises(mod.Fatal, match="does not exist"):
         run(mod, repo, tag="v9.9.9")

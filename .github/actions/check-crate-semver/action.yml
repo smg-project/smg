@@ -1,0 +1,65 @@
+name: Check crate compatibility
+description: Check the supported API configurations against the published crate
+
+inputs:
+  crate:
+    description: Package to check
+    required: true
+  release-type:
+    description: Use minor during development; leave empty to validate the manifest version at release
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Check default features
+      uses: obi1kenobi/cargo-semver-checks-action@v2
+      with:
+        package: ${{ inputs.crate }}
+        rust-toolchain: '1.98.0'
+        feature-group: default-features
+        release-type: ${{ inputs.release-type }}
+
+    - name: Check tokenizer acceleration
+      if: inputs.crate == 'llm-tokenizer'
+      uses: obi1kenobi/cargo-semver-checks-action@v2
+      with:
+        package: ${{ inputs.crate }}
+        rust-toolchain: '1.98.0'
+        feature-group: default-features
+        features: tokenizers-v1
+        release-type: ${{ inputs.release-type }}
+
+    - name: Check multimodal without Hub downloads
+      if: inputs.crate == 'llm-multimodal'
+      uses: obi1kenobi/cargo-semver-checks-action@v2
+      with:
+        package: ${{ inputs.crate }}
+        rust-toolchain: '1.98.0'
+        feature-group: only-explicit-features
+        release-type: ${{ inputs.release-type }}
+
+    - name: Install OpenCV
+      if: inputs.crate == 'llm-multimodal'
+      shell: bash
+      run: AUTO_INSTALL=1 bash scripts/install_opencv.sh
+
+    - name: Check video support
+      if: inputs.crate == 'llm-multimodal'
+      uses: obi1kenobi/cargo-semver-checks-action@v2
+      with:
+        package: ${{ inputs.crate }}
+        rust-toolchain: '1.98.0'
+        feature-group: default-features
+        features: opencv-video
+        release-type: ${{ inputs.release-type }}
+
+    - name: Check protocol HTTP integration
+      if: inputs.crate == 'openai-protocol'
+      uses: obi1kenobi/cargo-semver-checks-action@v2
+      with:
+        package: ${{ inputs.crate }}
+        rust-toolchain: '1.98.0'
+        feature-group: default-features
+        features: axum
+        release-type: ${{ inputs.release-type }}
