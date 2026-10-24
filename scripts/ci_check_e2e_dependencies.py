@@ -56,6 +56,12 @@ def main():
             [sys.executable, ".github/amd-nixl-environment/nixl_environment/private_wheel.py", stage],
             check=False,
         ).returncode
+    cohort = 0
+    if os.environ.get("SMG_CI_MC4_RUNTIME_INPUTS") == "1":
+        cohort = subprocess.run(
+            [sys.executable, ".github/amd-nixl-environment/nixl_environment/runtime_inputs.py", "verify", stage],
+            check=False,
+        ).returncode
     if os.environ.get("SMG_CI_RUNTIME_STATE_DIR"):
         audit = subprocess.run(
             [
@@ -68,7 +74,11 @@ def main():
             ],
             check=False,
         )
+        if os.environ.get("SMG_CI_MC4_RUNTIME_INPUTS") == "1":
+            return result.returncode or audit.returncode or private or cohort
         return result.returncode or audit.returncode or private
+    if os.environ.get("SMG_CI_MC4_RUNTIME_INPUTS") == "1":
+        return result.returncode or private or cohort
     return result.returncode or private
 
 

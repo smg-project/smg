@@ -41,6 +41,10 @@ class EnvironmentProof:
             from .private_wheel import verify
 
             verify(self.stage + "-" + suffix)
+            if os.environ.get("SMG_CI_MC4_RUNTIME_INPUTS") == "1":
+                from .runtime_inputs import verify as verify_inputs
+
+                verify_inputs(self.stage + "-" + suffix)
         except Exception as error:
             (directory / (self.stage + "-" + suffix + "-error.json")).write_text(
                 json.dumps(error_context(error, self.stage + "-" + suffix)) + "\n"
