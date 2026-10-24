@@ -36,9 +36,9 @@ use tracing::warn;
 pub type EncodeFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 /// Where a dispatch failure goes once the request is on the wire: the
-/// scheduler rank that holds the request (see [`EncodeNotice`]). Callable
-/// from any thread; a failure reported before the request went out, or for
-/// a request that never did, is logged and dropped.
+/// scheduler rank that holds the request (see the crate-private
+/// `EncodeNotice`). Callable from any thread; a failure reported before the
+/// request went out, or for a request that never did, is logged and dropped.
 pub type EncodeDispatchErrorSink = Arc<dyn Fn(EncoderDispatchErrorReq) + Send + Sync>;
 
 /// One request's media, handed to the dispatcher: the scheduler-side request
