@@ -27,11 +27,33 @@ RECIPES = {
 }
 
 
+def auxiliary_staging(inputs):
+    value = inputs["runtime_auxiliary_inputs"]
+    if value["staging_accepted"] is not True:
+        raise ValueError("separate auxiliary runtime inputs are not staged")
+    receipt = value["staging_receipt"]
+    if not isinstance(receipt, dict) or set(receipt) != {"manifest_sha256", "nodes"}:
+        raise ValueError("auxiliary staging receipt schema")
+    if receipt["manifest_sha256"] != value["manifest_sha256"]:
+        raise ValueError("auxiliary staging manifest differs")
+    if set(receipt["nodes"]) != {"amd-mi300x-1", "amd-mi300x-2"}:
+        raise ValueError("both pooled runners require auxiliary staging")
+    for node in receipt["nodes"].values():
+        if (set(node) != {"accepted", "host_bundle", "manifest_sha256", "evidence_sha256"}
+                or node["accepted"] is not True or node["host_bundle"] != value["host_bundle"]
+                or node["manifest_sha256"] != value["manifest_sha256"]
+                or not isinstance(node["evidence_sha256"], str)
+                or len(node["evidence_sha256"]) != 64
+                or any(c not in "0123456789abcdef" for c in node["evidence_sha256"])):
+            raise ValueError("auxiliary node staging evidence differs")
+
+
 def select(inputs, tier):
     if any(inputs.get(key) is not True for key in ("ready", "run_budget_admitted")):
         raise ValueError("source and runner budget are not admitted")
     if inputs["private_mooncake_runtime"]["staging_accepted"] is not True:
         raise ValueError("exact private wheel and prefix staging is not accepted")
+    auxiliary_staging(inputs)
     if tier not in RECIPES or inputs.get("admitted_tier") != tier:
         raise ValueError("dispatch tier differs from the single admitted tier")
     recipe = RECIPES[tier]

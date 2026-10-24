@@ -8,6 +8,7 @@ from pathlib import Path
 
 import artifact_io as io
 import frozen_producer
+from recipe import auxiliary_staging
 import source
 import wheel_record
 
@@ -25,6 +26,8 @@ def admitted(inputs):
     io.require(len(artifacts) == 4 and {a["name"] for a in artifacts} == NAMES, "four artifacts")
     io.require(len({a["id"] for a in artifacts}) == 4, "duplicate artifact identity")
     io.require(isinstance(inputs["gateway_native"], dict), "actual native identity not pinned")
+    io.require(inputs["private_mooncake_runtime"]["staging_accepted"] is True, "private Mooncake staging")
+    auxiliary_staging(inputs)
 
 
 def metadata(meta, artifact, inputs):
@@ -123,7 +126,12 @@ def main(inputs, output):
                 "producer_source_trees": inputs["producer_source_trees"],
                 "producer_relabelled": False,
                 "prior_GPU_results_transferred": False,
-                "product_installs_editable_current_Python_grpc_packages": True,
+                "product_python_grpc": {
+                    "proto": "separate exact 8451 source39dea wheel; eight current schemas verified",
+                    "servicer": "normal editable install from the exact consumer checkout",
+                    "auxiliary_inputs": inputs["runtime_auxiliary_inputs"],
+                    "auxiliary_is_a_fifth_445_archive": False,
+                },
                 "native_or_wheel_installed_by_relay": False,
             },
             indent=2,

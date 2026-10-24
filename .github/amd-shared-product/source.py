@@ -23,14 +23,16 @@ def private_runtime_source(inputs, product_source):
     path = ROOT / ".github/amd-shared-product/private-runtime-overlay.json"
     require(hashlib.sha256(path.read_bytes()).hexdigest() == inputs["private_runtime_overlay_sha256"], "private runtime overlay manifest")
     overlay = json.loads(path.read_text())
-    require(overlay["policy"] == "fixed749f_private_mooncake_two_hooks_v1", "private runtime policy")
+    require(overlay["policy"] == "fixed749f_private_mooncake_runtime_inputs_v2", "private runtime policy")
+    auxiliary = ROOT / ".github/amd-shared-product/runtime-inputs.json"
+    require(hashlib.sha256(auxiliary.read_bytes()).hexdigest() == inputs["runtime_auxiliary_inputs"]["manifest_sha256"] == overlay["auxiliary_manifest_sha256"], "auxiliary input bytes")
     target = inputs["target_product_commit"]
     require(overlay["base_product_commit"] == target, "private runtime product base")
     require(set(overlay["scripts"]) == PRIVATE_RUNTIME_FILES, "exact two private runtime hooks")
     require(set(overlay["observers"]) == {
         ".github/amd-nixl-environment/pyproject.toml",
         *(".github/amd-nixl-environment/nixl_environment/" + name for name in
-          ("private_wheel.py", "private-wheel.json", "mooncake.py", "owned.py", "plugin.py")),
+          ("private_wheel.py", "private-wheel.json", "mooncake.py", "owned.py", "plugin.py", "runtime_inputs.py")),
     }, "exact private runtime observer files")
     require(set(git_output("diff", "--name-only", target, "HEAD", "--", "scripts").splitlines()) == PRIVATE_RUNTIME_FILES, "unlisted script change")
     for name, item in overlay["scripts"].items():
