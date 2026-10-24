@@ -101,6 +101,17 @@ RUN if [ "${ENGINE}" = "tokenspeed" ]; then \
 
 RUN bash /tmp/scripts/install-smg.sh /opt/smg-src
 
+# TokenSpeed ships flashinfer's prebuilt kernel cache (flashinfer-jit-cache) pinned to the exact flashinfer-python
+# version. When the two drift (an engine upgrade pulls a newer flashinfer-python and leaves the cache behind), flashinfer
+# ignores the cache with a warning and JIT-compiles every kernel at the worker's first start, one compiler job per host CPU:
+# on a 144-core node that start-up exceeded a 128 GiB container limit on both roles of a prefill/decode pair. The CI
+# carrier re-aligns the three flashinfer artifacts after the TokenSpeed install (scripts/ci_install_flashinfer.py); this
+# check turns any drift that reaches an engine image into a build failure instead of a start-up one.
+RUN if [ "${ENGINE}" = "tokenspeed" ]; then \
+      python3 -c "import importlib.metadata as m, importlib.util, sys; fi = m.version('flashinfer-python'); jc = m.version('flashinfer-jit-cache') if importlib.util.find_spec('flashinfer_jit_cache') else None; ok = jc is not None and (jc == fi or jc.startswith(fi + '+')); print('flashinfer-python', fi, 'flashinfer-jit-cache', jc, 'match' if ok else 'MISMATCH'); sys.exit(0 if ok else 1)" \
+      && python3 -c "import flashinfer.jit.env as env; ids = [p.provider_id for p in env.FLASHINFER_AOT_PROVIDERS]; print('flashinfer AOT providers accepted:', ids)" ; \
+    fi
+
 RUN case "${ENGINE}" in \
       vllm|sglang|trtllm|tgl|tokenspeed) ;; \
       *) echo "ERROR: Unknown ENGINE '${ENGINE}'" >&2; exit 1 ;; \
