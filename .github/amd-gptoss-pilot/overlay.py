@@ -49,7 +49,7 @@ def apply(root, manifest):
             data = text.encode()
         require(digest(data) == entry["new_sha256"], f"patch hash: {entry['path']}")
         pending.append((path, data, mode))
-    # All five original states and all resulting bytes are checked before any write.
+    # All original states and all resulting bytes are checked before any write.
     for path, data, mode in pending:
         with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
             temporary = Path(stream.name)
@@ -100,6 +100,22 @@ def package_record(root, manifest):
 def origins(root, manifest):
     records = []
     for entry in manifest["files"]:
+        if entry.get("defer_origin_to_qwen_trace"):
+            require(
+                entry["path"] == "srt/managers/scheduler.py"
+                and entry["module"] == "sglang.srt.managers.scheduler"
+                and entry["defer_origin_to_qwen_trace"] is True,
+                "only the exact diagnostic scheduler origin may be deferred",
+            )
+            records.append(
+                dict(
+                    module=entry["module"],
+                    origin=None,
+                    status="DEFERRED_NOT_YET_VERIFIED",
+                    expected_source_sha256=entry["new_sha256"],
+                )
+            )
+            continue
         module = importlib.import_module(entry["module"])
         origin = Path(module.__file__).resolve()
         require(origin == target(root, entry["path"]).resolve(), "import origin mismatch")
