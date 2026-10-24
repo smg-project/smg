@@ -1525,17 +1525,23 @@ fn test_string_match_and_insert_equiv_empty_and_unicode() {
     ]);
 }
 
+/// The `_with` closure form must behave like match-then-insert when the
+/// closure always returns the same tenant (the fixed-tenant entry is this
+/// closure form), and must skip the insert when it returns `None`.
 #[test]
 fn test_string_match_and_insert_with_select_and_skip() {
     let text = "the quick brown fox";
 
+    // Always-insert closure == match_prefix_with_counts + insert_text.
     let via_with = Tree::new();
-    via_with.match_and_insert_with(text, |_| Some("w1"));
-    let via_plain = Tree::new();
-    via_plain.match_and_insert(text, "w1");
+    let r = via_with.match_and_insert_with(text, |_| Some("w1"));
+    let pair = Tree::new();
+    let r2 = pair.match_prefix_with_counts(text);
+    pair.insert_text(text, "w1");
+    assert_eq!(r.matched_char_count, r2.matched_char_count);
     assert_eq!(
         via_with.get_tenant_char_count(),
-        via_plain.get_tenant_char_count()
+        pair.get_tenant_char_count()
     );
 
     // None selection must leave the tree untouched.

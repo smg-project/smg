@@ -1706,22 +1706,24 @@ fn test_match_and_insert_equiv_short_sequence() {
     assert_fused_matches_pair(&[(vec![1, 2, 3], "w1")]);
 }
 
-/// The `_with` closure form must behave like `match_and_insert` when the
-/// closure always returns the same tenant, and must skip the insert (leaving
-/// the tree unchanged) when it returns `None`.
+/// The `_with` closure form must behave like match-then-insert when the
+/// closure always returns the same tenant (the fixed-tenant entry is this
+/// closure form), and must skip the insert (leaving the tree unchanged) when
+/// it returns `None`.
 #[test]
 fn test_match_and_insert_with_select_and_skip() {
     let tokens = make_tokens(1, 3);
 
-    // Always-insert closure == match_and_insert(tokens, "w1").
+    // Always-insert closure == match_prefix_with_counts + insert_tokens.
     let via_with = TokenTree::new();
     let r = via_with.match_and_insert_with(&tokens, |_| Some("w1"));
-    let via_plain = TokenTree::new();
-    let r2 = via_plain.match_and_insert(&tokens, "w1");
+    let pair = TokenTree::new();
+    let r2 = pair.match_prefix_with_counts(&tokens);
+    pair.insert_tokens(&tokens, "w1");
     assert_eq!(r.matched_token_count, r2.matched_token_count);
     assert_eq!(
         via_with.get_tenant_token_counts(),
-        via_plain.get_tenant_token_counts()
+        pair.get_tenant_token_counts()
     );
 
     // Seed a tree, then a None-returning closure must NOT mutate it.
