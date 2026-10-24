@@ -71,6 +71,34 @@ impl PipelineStage for EncodeStage {
             return Ok(());
         };
 
+        if matches!(
+            ctx.state.clients.as_ref(),
+            Some(ClientSelection::Disaggregated {
+                prefill: BackendClient::Grpc(GrpcClient::Sglang(_)),
+                decode: BackendClient::Grpc(GrpcClient::Sglang(_)),
+            })
+        ) {
+            let plan = super::sglang_encode::SglangEncodePlan::prepare(intermediate)
+                .map_err(|e| assembly_error_response(&e))?;
+            let assignments = ctx
+                .state
+                .workers
+                .as_mut()
+                .and_then(|workers| match workers {
+                    WorkerSelection::Disaggregated {
+                        encode_assignments, ..
+                    } => encode_assignments.as_mut(),
+                    WorkerSelection::Single { .. } => None,
+                })
+                .ok_or_else(|| {
+                    assembly_error_response(&anyhow!("SGLang encoder assignments missing"))
+                })?;
+            *assignments = super::sglang_encode::contiguous(assignments)
+                .map_err(|e| assembly_error_response(&e))?;
+            ctx.state.encode_outputs = Some(EncodeOutputs::Sglang(plan));
+            return Ok(());
+        }
+
         let plan = build_plan(
             intermediate,
             ctx.state.clients.as_ref(),

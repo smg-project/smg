@@ -628,6 +628,19 @@ async fn execute_epd_dispatch(
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
+    if matches!(&proto_request, ProtoGenerateRequest::Sglang(_))
+        && workers.encode_assignments().is_some_and(|a| !a.is_empty())
+    {
+        return execute_sglang_epd_dispatch(
+            proto_request,
+            clients,
+            workers,
+            model,
+            prefill_guard,
+            ledger,
+        )
+        .await;
+    }
     if let Some(encode_dispatch) = encode_dispatch {
         spawn_encode_dispatch(encode_dispatch);
     }
@@ -640,6 +653,60 @@ async fn execute_epd_dispatch(
         prefill_guard,
         ledger,
     )
+    .await
+}
+
+async fn execute_sglang_epd_dispatch(
+    mut request: ProtoGenerateRequest,
+    clients: &mut ClientSelection,
+    workers: &WorkerSelection,
+    model: &str,
+    prefill_guard: PrefillLoadGuard,
+    ledger: &AttemptLedger,
+) -> Result<ExecutionResult, Response> {
+    if request.as_sglang().encode_handoff.is_none() {
+        return Err(error::bad_request(
+            "sglang_encode_handoff_missing",
+            "SGLang EPD needs its typed handoff",
+        ));
+    }
+    let assignments = workers.encode_assignments().ok_or_else(|| {
+        error::internal_error(
+            "encode_assignments_missing",
+            "SGLang encoder selection missing",
+        )
+    })?;
+    let handoff = super::sglang_encode::handoff(request.request_id(), assignments)
+        .map_err(|e| error::bad_request("sglang_encode_assignment_invalid", e.to_string()))?;
+    request
+        .set_encode_bootstrap_info(handoff.clone())
+        .map_err(|e| error::bad_request("sglang_encode_handoff_invalid", e))?;
+    let timeout = workers
+        .prefill_worker()
+        .and_then(|w| w.metadata().zmq_request_timeout)
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| {
+            error::bad_request(
+                "sglang_encode_timeout_missing",
+                "SGLang EPD requires a finite registered request timeout",
+            )
+        })?;
+    let ProtoGenerateRequest::Sglang(request) = request else {
+        return Err(error::bad_request(
+            "sglang_encode_backend_invalid",
+            "SGLang EPD requires a SGLang request",
+        ));
+    };
+    super::sglang_encode::dispatch(*request, timeout, |prefill| {
+        execute_pd_dispatch(
+            ProtoGenerateRequest::Sglang(Box::new(prefill)),
+            clients,
+            workers,
+            model,
+            prefill_guard,
+            ledger,
+        )
+    })
     .await
 }
 
