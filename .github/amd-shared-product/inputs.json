@@ -10,7 +10,7 @@
   "producer_sha": null,
   "producer_branch": "ci/frozen-c9d-cpu-producer-20261023",
   "producer_policy": "frozen_c9d_dispatch_build_only_all_18_steps_success_v1",
-  "target_product_commit": "a37083a4eb667c0d261de85cf464025a9a29e506",
+  "target_product_commit": "03d34400c3561c9e2d00e449a5e5c4bcca8e0401",
   "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-4gpu-chat[1]/vllm/nvidia",
   "source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
@@ -24,9 +24,9 @@
     "model_gateway": "d1a181bfb1d16a661e16346d4eb8f257689701ce",
     "grpc_servicer": "a10bb7235d74ac91d8de4b3eafabd1ef7ed1344e",
     "e2e_test": "35d5321770a24d3706a3c0730c465d3a0e11d437",
-    "scripts": "433407c093fb7e0f5b49b58a7c563b1639ce478f",
+    "scripts": "e97527dc45216c7468e50adebcc93ac3f301c0f7",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
-    ".github/workflows/e2e-gpu-job.yml": "26d9c12232fe4157cfed1dd2e5f0249acd550ff6",
+    ".github/workflows/e2e-gpu-job.yml": "c8daa461a9d5913bffa56b890505b6074776fb78",
     "README.md": "83b7df25632da03f0184bd5b4628b9c9a3ace803",
     "LICENSE": "9088c2872db9763b9e6533c6960e9adb0c9cb65f",
     "rustfmt.toml": "19e1ab31f8958c31292f0f568976a036af7e683b",
@@ -109,8 +109,8 @@
     "test_filter": "",
     "servicer_impl": "",
     "servicer_unit_tests": true,
-    "engine_unit_junit": false,
-    "required_14_units_need_post_audit_of_full_log": true,
+    "engine_unit_junit": true,
+    "required_14_units_need_post_audit_of_full_log": false,
     "whole_pip_check_stages": [
       "installed",
       "final"
@@ -122,9 +122,10 @@
       "openai/gpt-oss-120b",
       "meta-llama/Llama-4-Scout-17B-16E-Instruct"
     ],
-    "original_skip_count": 4
+    "original_skip_count": 4,
+    "required_14_units_hard_gate": true
   },
-  "diagnostic_difference": "caller sets SPT_NOENV=1 and runs full installed-engine servicer units (NV original four-GPU row leaves units off); shared workflow algorithms unchanged; AMD diagnostic runner route changed from 8-gpu-mi300x to the known 1-gpu-mi300x CI slot; gpu_tier=4/TP4 unchanged and the label does not reserve physical GPUs",
+  "diagnostic_difference": "caller sets SPT_NOENV=1 and runs full installed-engine servicer units (NV original four-GPU row leaves units off); shared workflow is byte-identical to product03d including unit JUnit and canonical14 hard gate; AMD diagnostic uses the known 1-gpu-mi300x CI slot with unchanged gpu_tier=4/TP4, not a physical GPU reservation",
   "producer_binary_relabelled": false,
   "producer_artifact_pins_status": "EMPTY: no actual new successful dispatch producer or archives pinned",
   "explicit_product_dependency": {
@@ -166,5 +167,15 @@
     "base_product_alias_leaf": "ee1b8f0f83186a0e33d805b4b2551d17322a80fb",
     "consumer_change": "scripts/ci_download_model.sh removes age-only cache lock deletion; three retries/30s/flock1800/models unchanged",
     "diagnostic_workflow_difference": "The normal a370 product retains its new tooling CPU test entry; this diagnostic replaces pr-test-rust.yml with the original3job shared caller only."
-  }
+  },
+  "explicit_engine_unit_evidence_dependency": {
+    "PR": 4381,
+    "product_commit": "03d34400c3561c9e2d00e449a5e5c4bcca8e0401",
+    "required_cases_manifest": "scripts/ci_vllm_required_cases.json",
+    "canonical_manifest_blob": "c86975b7562abfa1672f1f09b7c027981da2544a",
+    "required_case_count": 14,
+    "unit_junit": "servicer-engine.xml in the existing unique AMD dependency artifact",
+    "diagnostic_workflow_difference": "Retains the exact prior four-GPU registered dispatch caller; the product normal tooling CPU job is not part of this diagnostic workflow."
+  },
+  "source_identity_note": "Consumer19 refreshed to product03d; compiled37 remains exact c9d. No runtime witness, artifact/native pin or prior GPU credit transferred."
 }
