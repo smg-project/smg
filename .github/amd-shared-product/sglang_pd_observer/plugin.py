@@ -22,6 +22,9 @@ class EnvironmentProof:
 
     @pytest.hookimpl(trylast=True)
     def pytest_sessionfinish(self, session, exitstatus):
+        if os.environ.get("SMG_SGLANG_PD_REGISTRATION_FAILFAST") == "1":
+            from .registration_patch import verify
+            verify(os.environ["AMD_DEPENDENCY_DIRECTORY"])
         after = self.snapshot()
         (Path(os.environ["AMD_DEPENDENCY_DIRECTORY"]) / "sglang-pd-environment-after.json").write_text(
             json.dumps(after, indent=2) + "\n")
@@ -38,6 +41,9 @@ def pytest_configure(config):
         raise pytest.UsageError("SG2 observer is scoped to the one original SG2 row")
     if not os.environ.get("AMD_DEPENDENCY_DIRECTORY"):
         raise pytest.UsageError("same-job AMD dependency evidence directory missing")
+    if os.environ.get("SMG_SGLANG_PD_REGISTRATION_FAILFAST") == "1":
+        from .registration_patch import apply
+        apply(os.environ["AMD_DEPENDENCY_DIRECTORY"])
     from .runtime import RuntimeProof
 
     config.pluginmanager.register(EnvironmentProof(), "smg-sglang-pd-environment")

@@ -1,0 +1,11 @@
+{
+  "scope": "SG2 caller-only critical KV/aux/state initial-registration fail-fast; not an RDMA repair",
+  "image_digest": "sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d",
+  "path": "/sgl-workspace/sglang/python/sglang/srt/disaggregation/mooncake/conn.py",
+  "before_sha256": "c298ff9ad6fca2a2f4959d0ba43414598ce454edc1d688636af17666a3b7cfd5",
+  "after_sha256": "d7acf1a5db40de6d74bc9c5f28a5e20cabcb519dc65f9063de761aec6727aa10",
+  "before": "            self.engine.batch_register(list(ptrs), list(lens))\n",
+  "after": "            result = self.engine.batch_register(list(ptrs), list(lens))\n            if result != 0:\n                raise RuntimeError(f\"Mooncake KV/aux memory registration failed (ret={result})\")\n",
+  "native_batch_register_api": "0 succeeds; actual wrapper returns nonzero including -1 on registration exceptions",
+  "source_receipt": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T0300Z/SG-PD4420-real-editable-backend-source-20261024T1009Z/result.json"
+}

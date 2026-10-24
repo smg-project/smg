@@ -253,5 +253,13 @@
     "actual_visibility_receipt": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T0300Z/SG2-RDMA-visibility-actual-20261024T141434Z/result.json",
     "actual_visibility_sha256": "2942a58520f09b5804871cfbbd5e0844fddf18616c543fae13c9f9eb89f9ffc7",
     "actual_scope": "Both authorized nodes: original detect_ib_device returns None without HCA mapping and mlx5_0 with mapping; no engine constructor, QP, GPU or transfer proof."
+  },
+  "explicit_registration_failfast_dependency": {
+    "scope": "SG2 caller-only exact4420 source overlay; failure visibility, not RDMA repair",
+    "env": "SMG_SGLANG_PD_REGISTRATION_FAILFAST=1",
+    "actual_conn_before_sha256": "c298ff9ad6fca2a2f4959d0ba43414598ce454edc1d688636af17666a3b7cfd5",
+    "patched_conn_sha256": "d7acf1a5db40de6d74bc9c5f28a5e20cabcb519dc65f9063de761aec6727aa10",
+    "required_result": 0,
+    "new_GPU_acceptance": false
   }
 }
