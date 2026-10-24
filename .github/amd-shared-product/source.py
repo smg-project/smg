@@ -26,7 +26,7 @@ def verify(inputs):
     check_map(read_oid, "HEAD", inputs["compiled_source_trees"])
     check_map(read_oid, producer, inputs["compiled_source_trees"])
     check_map(read_oid, producer, inputs["producer_source_trees"])
-    # Only the dispatch caller and its relay may differ from the product tree.
+    # Only the caller, relay and explicit P4 observer may differ from the product tree.
     subprocess.check_call(
         ["git", "-c", f"safe.directory={ROOT}", "merge-base", "--is-ancestor", target, "HEAD"],
         cwd=ROOT,
@@ -34,6 +34,7 @@ def verify(inputs):
     for path in git_output("diff", "--name-only", target, "HEAD").splitlines():
         require(
             path.startswith(".github/amd-shared-product/")
+            or path.startswith(".github/amd-p4-proof/")
             or path == ".github/workflows/pr-test-rust.yml",
             f"unexpected product modification: {path}",
         )

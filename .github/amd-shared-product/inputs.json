@@ -10,7 +10,7 @@
   "producer_sha": null,
   "producer_branch": "ci/frozen-c9d-cpu-producer-20261023",
   "producer_policy": "frozen_c9d_dispatch_build_only_all_18_steps_success_v1",
-  "target_product_commit": "03d34400c3561c9e2d00e449a5e5c4bcca8e0401",
+  "target_product_commit": "3b79acc59b68b84465e58a025850af2c93c96fe8",
   "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-4gpu-chat[1]/vllm/nvidia",
   "source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
@@ -24,7 +24,7 @@
     "model_gateway": "d1a181bfb1d16a661e16346d4eb8f257689701ce",
     "grpc_servicer": "a10bb7235d74ac91d8de4b3eafabd1ef7ed1344e",
     "e2e_test": "35d5321770a24d3706a3c0730c465d3a0e11d437",
-    "scripts": "e97527dc45216c7468e50adebcc93ac3f301c0f7",
+    "scripts": "6b21b75245705e319d0334500e6f41b16d602e97",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows/e2e-gpu-job.yml": "c8daa461a9d5913bffa56b890505b6074776fb78",
     "README.md": "83b7df25632da03f0184bd5b4628b9c9a3ace803",
@@ -90,7 +90,8 @@
   },
   "explicit_consumer_only_paths": [
     ".github/amd-shared-product/",
-    ".github/workflows/pr-test-rust.yml"
+    ".github/workflows/pr-test-rust.yml",
+    ".github/amd-p4-proof/"
   ],
   "budget": {
     "relay_hosted_cpu_minutes": 10,
@@ -177,5 +178,34 @@
     "unit_junit": "servicer-engine.xml in the existing unique AMD dependency artifact",
     "diagnostic_workflow_difference": "Retains the exact prior four-GPU registered dispatch caller; the product normal tooling CPU job is not part of this diagnostic workflow."
   },
-  "source_identity_note": "Consumer19 refreshed to product03d; compiled37 remains exact c9d. No runtime witness, artifact/native pin or prior GPU credit transferred."
+  "source_identity_note": "Original reusable workflow remains byte-identical to03d; product target is the separate183-line opt-in constraint-hook child3b79. Consumer19/scripts refreshed; compiled37 remains exactc9d. No native/archive/runtime acceptance transferred.",
+  "diagnostic_runtime_instrumentation": {
+    "namespace": ".github/amd-p4-proof/",
+    "installed_via": "existing extra_deps local package pytest11 entry point",
+    "unit_scope": "environment before/after only; no process/model/original39 gate",
+    "e2e_scope": "original39 IDs and four call-phase skips, each originalcall/rerun with owned gateway+worker/native/TP4 ranks/modelcache metadata; shutdown warnings recorded",
+    "preinstall_hook_product": "3b79acc59b68b84465e58a025850af2c93c96fe8",
+    "reusable_workflow_product": "03d34400c3561c9e2d00e449a5e5c4bcca8e0401",
+    "private_state": "/tmp/smg-p4-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}",
+    "protected_original_packages": [
+      "torch",
+      "vllm",
+      "grpcio",
+      "grpcio-reflection",
+      "protobuf",
+      "pygobject"
+    ],
+    "health_companion": "If absent in image, pin reflection version and require job-venv origin; first added metadata/origin becomes immutable for later stages. If present, preserve original.",
+    "not_frozen": [
+      "smg",
+      "smg-grpc-proto",
+      "smg-grpc-servicer",
+      "mcp",
+      "fastapi",
+      "starlette",
+      "pycairo"
+    ],
+    "actual_GPU_or_coverage": false,
+    "physical_GPU_exclusivity_or_per_rank_request_id_claim": false
+  }
 }
