@@ -58,16 +58,19 @@ use crate::{
         },
         error,
         grpc::{
-            common::responses::{
-                await_stream_startup, build_sse_response, persist_response_if_needed,
-                signal_stream_startup, stored_foreground, stream_startup_channel,
-                streaming::{
-                    attach_mcp_server_label, ResponseStreamEventEmitter, StreamStartupSender,
+            common::{
+                responses::{
+                    await_stream_startup, build_sse_response, persist_response_if_needed,
+                    signal_stream_startup, stored_foreground, stream_startup_channel,
+                    streaming::{
+                        attach_mcp_server_label, ResponseStreamEventEmitter, StreamStartupSender,
+                    },
+                    utils::{
+                        function_call_status, generation_failure_error, resolve_function_identity,
+                    },
+                    BackgroundStream, ResponsesContext,
                 },
-                utils::{
-                    function_call_status, generation_failure_error, resolve_function_identity,
-                },
-                BackgroundStream, ResponsesContext,
+                stages::RateLimitCell,
             },
             utils,
         },
@@ -97,7 +100,11 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     let response_id = params.response_id;
     let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
 
-    // Get chat streaming response
+    // Get chat streaming response, under the request's tenant rate-limit
+    // reservation: the chat stream settles it with the engine's counts as
+    // it ends (the handoff to the body), a refused or failed start closes
+    // it with its debit kept.
+    let reservation = Arc::new(RateLimitCell::new());
     let chat_response = ctx
         .pipeline
         .execute_chat(
@@ -106,10 +113,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
             params.model_id,
             ctx.components.clone(),
             Some(params.tenant_request_meta),
-            // Responses endpoint hasn't opted into tenant rate limiting yet
-            // (out of scope for this phase; see RequestPipeline::build's
-            // stage-insertion comment).
-            None,
+            Some(reservation.clone()),
             // Tool-loop iterations are not retried.
             None,
             // No startup barrier: the status is checked below before the
@@ -119,6 +123,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
         .await;
 
     if !chat_response.status().is_success() {
+        reservation.close_unsettled().await;
         return chat_response;
     }
 
@@ -951,8 +956,12 @@ async fn execute_tool_loop_streaming_internal(
         state.iteration += 1;
         Metrics::record_mcp_tool_iteration(&current_request.model);
 
-        // Execute chat streaming
+        // Execute chat streaming, under the iteration's own tenant rate-limit
+        // reservation (every iteration is a generation): the chat stream
+        // settles it with the engine's counts as it ends, a refused or
+        // failed start closes it with its debit kept.
         let startup_pending = startup.is_some();
+        let reservation = Arc::new(RateLimitCell::new());
         let response = ctx
             .pipeline
             .execute_chat(
@@ -961,8 +970,7 @@ async fn execute_tool_loop_streaming_internal(
                 params.model_id.clone(),
                 ctx.components.clone(),
                 Some(params.tenant_request_meta.clone()),
-                // Responses endpoint hasn't opted into tenant rate limiting yet.
-                None,
+                Some(reservation.clone()),
                 // Tool-loop iterations are not retried.
                 None,
                 startup.take(),
@@ -970,6 +978,7 @@ async fn execute_tool_loop_streaming_internal(
             .await;
 
         if !response.status().is_success() {
+            reservation.close_unsettled().await;
             if startup_pending {
                 return Ok(());
             }

@@ -71,7 +71,11 @@ pub(crate) use context_length::{
 };
 pub(crate) use dispatch_metadata::prepare_dispatch_metadata;
 pub(crate) use encode::EncodeStage;
-pub(crate) use rate_limit::{RateLimitCell, RateLimitOutcome, RateLimitReserveStage};
+/// The outcome the pipeline's reserve tests place in a cell; the resolvers
+/// of a cell are its own methods.
+#[cfg(test)]
+pub(crate) use rate_limit::RateLimitOutcome;
+pub(crate) use rate_limit::{RateLimitCell, RateLimitReserveStage};
 pub(crate) use request_execution::execute_plan;
 pub(crate) use worker_selection::{
     WorkerSelectionMode, WorkerSelectionStage, SELECTION_QUEUE_TIMEOUT_ERROR_CODE,

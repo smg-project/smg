@@ -269,13 +269,16 @@ impl HarmonyResponseProcessor {
     ///
     /// # Returns
     ///
-    /// ResponsesIterationResult indicating whether to continue loop or return
+    /// ResponsesIterationResult indicating whether to continue loop or return,
+    /// with the engine's counts of the iteration (the usage the result
+    /// carries is built from them; the settlement of the iteration's
+    /// reservation takes them as they are).
     pub async fn process_responses_iteration(
         &self,
         execution_result: ExecutionResult,
         responses_request: Arc<ResponsesRequest>,
         dispatch: DispatchMetadata,
-    ) -> Result<ResponsesIterationResult, Response> {
+    ) -> Result<(ResponsesIterationResult, response_formatting::TokenCounts), Response> {
         let request_logprobs = responses_request.top_logprobs.is_some();
 
         // Collect all completed responses
@@ -336,23 +339,25 @@ impl HarmonyResponseProcessor {
             );
         }
 
-        // The usage of the iteration, as the streamed iteration builds it
-        // (needed for both ToolCallsFound and Completed).
-        let usage = iteration_usage(
-            response_formatting::TokenCounts::of(std::slice::from_ref(complete)),
-            parsed.reasoning_token_count,
-        );
+        // The engine's counts of the iteration and the usage they make, as
+        // the streamed iteration builds it (needed for both ToolCallsFound
+        // and Completed).
+        let counts = response_formatting::TokenCounts::of(std::slice::from_ref(complete));
+        let usage = iteration_usage(counts, parsed.reasoning_token_count);
 
         // Check for tool calls in commentary channel
         if let Some(tool_calls) = parsed.commentary {
             // Tool calls found - return for MCP loop execution
-            return Ok(ResponsesIterationResult::ToolCallsFound {
-                tool_calls,
-                analysis: parsed.analysis,
-                partial_text: parsed.final_text,
-                usage,
-                request_id: dispatch.request_id.clone(),
-            });
+            return Ok((
+                ResponsesIterationResult::ToolCallsFound {
+                    tool_calls,
+                    analysis: parsed.analysis,
+                    partial_text: parsed.final_text,
+                    usage,
+                    request_id: dispatch.request_id.clone(),
+                },
+                counts,
+            ));
         }
 
         // No tool calls - build final ResponsesResponse
@@ -401,10 +406,13 @@ impl HarmonyResponseProcessor {
             .usage(ResponsesUsage::Modern(ResponseUsage::from(&usage)))
             .build();
 
-        Ok(ResponsesIterationResult::Completed {
-            response: Box::new(response),
-            usage,
-        })
+        Ok((
+            ResponsesIterationResult::Completed {
+                response: Box::new(response),
+                usage,
+            },
+            counts,
+        ))
     }
 }
 

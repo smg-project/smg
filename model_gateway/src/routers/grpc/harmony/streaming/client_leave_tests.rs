@@ -181,7 +181,7 @@ async fn a_client_that_stays_reads_the_answer_to_its_end() {
     assert!(
         matches!(
             outcome,
-            Ok(super::ResponsesIterationResult::Completed { .. })
+            Ok((super::ResponsesIterationResult::Completed { .. }, _))
         ),
         "the iteration completes"
     );

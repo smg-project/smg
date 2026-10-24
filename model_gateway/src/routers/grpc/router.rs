@@ -33,7 +33,7 @@ use super::{
         },
         stages::{
             context_length_exceeded, helpers::resolve_request_id_stamp, smallest_context_length,
-            RateLimitCell, RateLimitOutcome,
+            RateLimitCell,
         },
     },
     context::{RequestType, SharedComponents},
@@ -278,30 +278,15 @@ impl GrpcRouter {
             .to_string()
     }
 
-    /// Close a reservation that a non-2xx final response never got the
-    /// chance to settle (prep failure repeated across every attempt,
-    /// retries exhausted, a non-retryable dispatch failure). No-op if
-    /// nothing was ever reserved. Safe to call unconditionally alongside a
-    /// success path's own inline `settle_success`/streaming `settle_success`+
-    /// `ReservationAttachment` -- `close_reserved_only` is CAS-guarded, only
-    /// the first resolution of a handle wins.
-    async fn close_reservation_if_unsettled(cell: &RateLimitCell, status: StatusCode) {
-        if status.is_success() {
-            return;
-        }
-        if let Some(RateLimitOutcome::Admitted(handle)) = cell.peek() {
-            handle.close_reserved_only().await;
-        }
-    }
-
     /// Run a pipeline call for the canonical `model_id` under a tenant
     /// rate-limit reservation: the cell the pipeline reserves into, the
     /// model's retry config (keyed by the canonical id, see
     /// [`Self::resolve_retry_config_for_canonical`]), `run` with those and
     /// the id, then the close of a reservation a non-2xx answer never
-    /// settled. Every typed route runs its pipeline through here; the
-    /// Responses iterations, which reserve nothing today, call theirs
-    /// directly (see `common/stages/rate_limit.rs`).
+    /// settled (a 2xx settled it inline or handed it to its stream). Every
+    /// typed route runs its pipeline through here; a Responses request's
+    /// iterations take a reservation each inside the pipeline's Responses
+    /// entry points (see `common/stages/rate_limit.rs`).
     async fn execute_reserved<Fut>(
         &self,
         model_id: String,
@@ -313,7 +298,9 @@ impl GrpcRouter {
         let rate_limit_cell = Arc::new(RateLimitCell::new());
         let retry_config = self.resolve_retry_config_for_canonical(&model_id);
         let response = run(model_id, rate_limit_cell.clone(), retry_config).await;
-        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
+        if !response.status().is_success() {
+            rate_limit_cell.close_unsettled().await;
+        }
         response
     }
 
