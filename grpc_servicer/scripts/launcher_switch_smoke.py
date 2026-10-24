@@ -8,9 +8,9 @@ For every launcher module the installation has (``vllm.entrypoints.launchers
 itself on 0.28 and 0.29, a shim importing the new module from 0.30) and every
 entry form (``python -m <module>``, which runs the module as ``__main__``, and
 ``vllm serve <model> --grpc``, which imports ``serve_grpc`` after its parse),
-a fresh interpreter runs the launcher with the Rust implementation selected
-(the environment variable, as a deployment sets it, or ``--servicer-impl
-rust``) and with the default Python one:
+a fresh interpreter runs the launcher with nothing selected (the Rust
+default) and with each implementation selected the way asked for (the
+environment variable, as a deployment sets it, or ``--servicer-impl``):
 
 * Rust: the launcher must hand the process to ``serve_rust`` before any
   engine is built. ``serve_rust`` is a stand-in that prints a marker and
@@ -86,9 +86,10 @@ class Case:
 
     @property
     def label(self) -> str:
-        how = {"env": "SMG_VLLM_SERVICER_IMPL=rust", "flag": "--servicer-impl rust"}.get(
-            self.selection, "default"
-        )
+        how = {
+            "env": f"SMG_VLLM_SERVICER_IMPL={self.impl}",
+            "flag": f"--servicer-impl {self.impl}",
+        }.get(self.selection, "default")
         entry = f"python -m {self.launcher}" if self.form == "module" else "vllm serve --grpc"
         return f"{entry} [{how}]"
 
@@ -124,16 +125,17 @@ def launcher_modules_installed() -> list[str]:
 def cases_for(launchers: list[str], selections: tuple[str, ...]) -> list[Case]:
     """The matrix: ``python -m`` on every launcher module present, and the
     CLI's import of the newest one (what ``vllm serve --grpc`` imports on that
-    release), each with the Rust selections asked for and the Python default."""
+    release), each with the Rust default and with both implementations
+    selected the ways asked for."""
     cases = []
-    for launcher in launchers:
-        for selection in selections:
-            cases.append(Case("module", launcher, "rust", selection))
-        cases.append(Case("module", launcher, "python", "default"))
+    forms = [("module", launcher) for launcher in launchers]
     if launchers:
+        forms.append(("cli", launchers[0]))
+    for form, launcher in forms:
+        cases.append(Case(form, launcher, "rust", "default"))
         for selection in selections:
-            cases.append(Case("cli", launchers[0], "rust", selection))
-        cases.append(Case("cli", launchers[0], "python", "default"))
+            cases.append(Case(form, launcher, "rust", selection))
+            cases.append(Case(form, launcher, "python", selection))
     return cases
 
 

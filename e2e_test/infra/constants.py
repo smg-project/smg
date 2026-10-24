@@ -70,15 +70,12 @@ ENV_CONNECTION_MODE = (
 ENV_ZMQ_ENGINE_COUNT = (
     "E2E_ZMQ_ENGINE_COUNT"  # DP engines per ZMQ worker (grouped vLLM launch; empty = 1)
 )
-ENV_VLLM_SERVICER_IMPL = (
-    "E2E_VLLM_SERVICER_IMPL"  # vLLM gRPC servicer implementation: python (default) or rust
-)
-ENV_SGLANG_SERVICER_IMPL = (
-    "E2E_SGLANG_SERVICER_IMPL"  # SGLang gRPC servicer implementation: python (default) or rust
-)
-ENV_TOKENSPEED_SERVICER_IMPL = (
-    "E2E_TOKENSPEED_SERVICER_IMPL"  # TokenSpeed gRPC servicer implementation: python or rust
-)
+# The servicer implementation of a lane's gRPC workers: python (the harness's
+# default, pinned in the worker's environment since the servicer package
+# itself defaults to rust) or rust.
+ENV_VLLM_SERVICER_IMPL = "E2E_VLLM_SERVICER_IMPL"
+ENV_SGLANG_SERVICER_IMPL = "E2E_SGLANG_SERVICER_IMPL"
+ENV_TOKENSPEED_SERVICER_IMPL = "E2E_TOKENSPEED_SERVICER_IMPL"
 ENV_MM_PROCESSING = (
     "E2E_MM_PROCESSING"  # Per-lane multimodal processing location — see get_mm_processing
 )
@@ -248,7 +245,8 @@ def get_vllm_servicer_impl() -> str:
     Rust servicer: the worker command stays upstream's gRPC entrypoint and the
     flag travels to it as ``SMG_VLLM_SERVICER_IMPL`` in the worker's
     environment. The Router and every test case stay the same. Unset/blank
-    means python.
+    means python, pinned in the worker's environment the same way (the
+    servicer package's own default is rust).
     """
     value = os.environ.get(ENV_VLLM_SERVICER_IMPL, "").strip().lower()
     if not value:
@@ -268,7 +266,9 @@ def get_tokenspeed_servicer_impl() -> str:
     with the Rust servicer: the worker command stays
     ``python -m smg_grpc_servicer.tokenspeed`` and the flag travels to it as
     ``SMG_TOKENSPEED_SERVICER_IMPL`` in the worker's environment. The Router
-    and every test case stay the same. Unset/blank means python.
+    and every test case stay the same. Unset/blank means python, pinned in
+    the worker's environment the same way (the servicer package's own
+    default is rust).
     """
     value = os.environ.get(ENV_TOKENSPEED_SERVICER_IMPL, "").strip().lower()
     if not value:
@@ -289,7 +289,8 @@ def get_sglang_servicer_impl() -> str:
     ``sglang.launch_server --grpc-mode`` and the flag travels to it as
     ``SMG_SGLANG_SERVICER_IMPL`` in the worker's environment, read at the
     smg entry that mode calls. The Router and every test case stay the
-    same. Unset/blank means python.
+    same. Unset/blank means python, pinned in the worker's environment the
+    same way (the servicer package's own default is rust).
     """
     value = os.environ.get(ENV_SGLANG_SERVICER_IMPL, "").strip().lower()
     if not value:

@@ -14,10 +14,15 @@ runs, starts them), dialing the servicer's same-host msgpack ZMQ handshake.
 Python keeps the lifecycle only. The Router cannot tell the two
 implementations apart.
 
-What the msgpack wire does not carry, the Rust path reports rather than
-emulates: ``FlushCache`` and profiling answer UNIMPLEMENTED, ranked
-``top_logprobs`` and prompt logprobs are refused, and PD/EPD disaggregation
-(bootstrap fields) stays with the Python implementation.
+The Rust implementation is the default. What the msgpack wire does not carry,
+the Rust path reports rather than emulates: ``FlushCache`` and profiling
+answer UNIMPLEMENTED, ranked ``top_logprobs`` and prompt logprobs are
+refused, and PD/EPD disaggregation (bootstrap fields; the encode role) stays
+with the Python implementation. A launch on defaults that asks for a mode the
+Rust path does not serve (PD or EPD disaggregation) falls back to the Python
+servicer by itself with one log line naming the gap
+(:func:`unserved_on_rust`); the Python servicer is deprecated and logs so
+whenever it serves.
 """
 
 from __future__ import annotations
@@ -26,6 +31,7 @@ import argparse
 import contextlib
 import copy
 import dataclasses
+import functools
 import json
 import logging
 import multiprocessing
@@ -58,6 +64,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     FaultLatch,
     RustLauncher,
     SchedulerProcesses,
+    ServicerConfigError,
     apply_kv_events_default,
     ensure_spawn_start_method,
     on_fault_signal,
@@ -107,9 +114,11 @@ def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
     return _add_servicer_impl_argument(
         parser,
         help=(
-            "Which implementation serves the gRPC contract: the Python servicer (default) "
-            "or the Rust one (smg.servicer.TokenSpeedGrpcServer, with the scheduler(s) "
-            f"headless). Unset falls back to ${SERVICER_IMPL_ENV}."
+            "Which implementation serves the gRPC contract: the Rust servicer "
+            "(smg.servicer.TokenSpeedGrpcServer, with the scheduler(s) headless; the "
+            "default) or the Python one (deprecated; a launch the Rust servicer does not "
+            "serve yet, PD/EPD disaggregation, falls back to it on its own). Unset falls "
+            f"back to ${SERVICER_IMPL_ENV}."
         ),
     )
 
@@ -129,18 +138,51 @@ def add_metrics_arguments(parser: argparse.ArgumentParser) -> bool:
 def resolve_servicer_impl(args: Any = None, environ: Mapping[str, str] | None = None) -> str:
     """Which implementation serves this process: ``args.servicer_impl`` when
     the launcher carried the flag, else ``$SMG_TOKENSPEED_SERVICER_IMPL``, else
-    python."""
+    rust."""
     return servicer_impl_source(args, environ)[0]
 
 
 def servicer_impl_source(
-    args: Any = None, environ: Mapping[str, str] | None = None
+    args: Any = None,
+    environ: Mapping[str, str] | None = None,
+    *,
+    engine_args: Any = None,
 ) -> tuple[str, str]:
     """:func:`resolve_servicer_impl`'s answer with where it came from:
-    ``flag``, ``env`` or ``default`` (the shared
+    ``flag``, ``env``, ``default`` or ``fallback`` (the shared
     :func:`~smg_grpc_servicer.rust_lifecycle.servicer_switch`, which writes a
-    flag decision back to the environment the scheduler processes inherit)."""
-    return servicer_switch(SERVICER_IMPL_ENV, args, environ)
+    flag or fallback decision back to the environment the scheduler processes
+    inherit). ``args`` carries this package's flag; ``engine_args``, when
+    given (TokenSpeed's ``ServerArgs``), is probed against what the Rust path
+    serves when the default would select Rust (:func:`unserved_on_rust`)."""
+    unserved = None if engine_args is None else functools.partial(unserved_on_rust, engine_args)
+    return servicer_switch(SERVICER_IMPL_ENV, args, environ, unserved=unserved)
+
+
+def unserved_on_rust(server_args: Any) -> str | None:
+    """Why the Rust path does not serve the launch ``server_args`` describes,
+    or ``None`` when it does: PD and EPD disaggregation stay with the Python
+    servicer (the msgpack wire carries no bootstrap fields, and the encode
+    role is the Python encode servicer), so a prefill, decode or encode
+    worker is such a launch."""
+    mode = EngineConfigView(server_args).server_args.disaggregation_mode
+    if mode == "encode":
+        return "EPD disaggregation (the encode role)"
+    if mode != "null":
+        return f"PD disaggregation (disaggregation_mode={mode!r})"
+    return None
+
+
+def refuse_disaggregation(server_args: Any) -> None:
+    """PD/EPD stays with the Python servicer: the msgpack wire carries no
+    bootstrap fields, so such a worker must not start under an explicit
+    ``rust`` rather than report SERVING and run its requests without their
+    bootstrap."""
+    gap = unserved_on_rust(server_args)
+    if gap:
+        raise ServicerConfigError(
+            f"{SERVICER_IMPL_ENV}=rust does not support {gap}; unset it for this worker"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -591,4 +633,5 @@ async def serve_rust(server_args: Any) -> int:
     start the scheduler ranks against its handshake, and supervise both
     until a signal or a failure (:class:`TokenSpeedLauncher`). Returns the
     process exit code."""
+    refuse_disaggregation(server_args)
     return await TokenSpeedLauncher().serve(server_args)

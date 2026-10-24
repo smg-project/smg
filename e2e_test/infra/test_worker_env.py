@@ -33,7 +33,9 @@ def test_a_grpc_worker_carries_the_lanes_servicer_choice(
     )
     monkeypatch.setenv(variable, "rust")  # inherited: the lane's choice wins over it
     monkeypatch.delenv(lane_setting, raising=False)
-    assert variable not in _worker(engine, ConnectionMode.GRPC)._build_env()
+    # The harness's default is the Python servicer, spelled out: the servicer
+    # package's own default is rust.
+    assert _worker(engine, ConnectionMode.GRPC)._build_env()[variable] == "python"
     assert hook_checks == []
 
     monkeypatch.setenv(lane_setting, "rust")

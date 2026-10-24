@@ -23,6 +23,7 @@ from tokenspeed.runtime.utils.server_args import prepare_server_args
 
 from smg_grpc_servicer.rust_lifecycle import (
     ServicerConfigError,
+    announce_servicer_impl,
     check_metrics_port_needs_rust,
     configuration_exit,
 )
@@ -76,12 +77,13 @@ def main(argv: list[str] | None = None) -> None:
     server_args = prepare_server_args(rest)
     if uvloop is not None:
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    # One flag selects the Rust request path (--servicer-impl, else the
-    # environment); the entrypoint and every ServerArgs flag stay the same,
-    # and the Router cannot tell them apart.
+    # One flag selects the request path (--servicer-impl, else the
+    # environment, else the Rust servicer where it serves the launch); the
+    # entrypoint and every ServerArgs flag stay the same, and the Router
+    # cannot tell them apart.
     try:
-        impl, origin = servicer_impl_source(ours)
-        logger.info("Servicer implementation: %s (source=%s)", impl, origin)
+        impl, origin = servicer_impl_source(ours, engine_args=server_args)
+        announce_servicer_impl(impl, origin, logger)
         if impl == "rust":
             raise SystemExit(asyncio.run(serve_rust(server_args)))
         # A metrics port under the Python servicer is a port nobody serves.

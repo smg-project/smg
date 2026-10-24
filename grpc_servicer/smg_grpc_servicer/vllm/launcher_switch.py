@@ -152,6 +152,7 @@ def with_servicer_switch(
         from smg_grpc_servicer.rust_lifecycle import (
             ServicerConfigError,
             announce_kv_events_default,
+            announce_servicer_impl,
             configuration_exit,
         )
         from smg_grpc_servicer.vllm.rust import (
@@ -159,12 +160,14 @@ def with_servicer_switch(
             configure_logging,
             default_kv_events_config,
             require_python_media_mode,
-            resolve_servicer_impl,
             serve_rust,
+            servicer_impl_source,
         )
 
         try:
-            if resolve_servicer_impl(args) == "rust":
+            impl, origin = servicer_impl_source(args)
+            announce_servicer_impl(impl, origin, logger)
+            if impl == "rust":
                 raise SystemExit(await serve_rust(args))
             # The Python servicer's media mode is known here, from the flags
             # and the environment: one it cannot serve is refused now, before

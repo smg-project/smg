@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import logging
 import os
 import sys
 from typing import Any
@@ -47,6 +48,8 @@ from smg_grpc_servicer.vllm.launcher_switch import (
     SUPPORTED_VLLM_RELEASES,
     install_launcher_switch,
 )
+
+logger = logging.getLogger(__name__)
 
 SERVICER_IMPL_FLAG = servicer_impl_flag.SERVICER_IMPL_FLAG
 SERVICER_IMPL_CHOICES = servicer_impl_flag.IMPLS
@@ -61,13 +64,14 @@ def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
         parser,
         applies=serves_grpc,
         help=(
-            "Which implementation serves the gRPC contract under --grpc: the Python "
-            "servicer (default) or the Rust one (smg.servicer.VllmGrpcServer, with the "
-            f"engine headless). Unset falls back to ${SERVICER_IMPL_ENV}. The Rust one needs "
-            "a launcher the switch binds (`vllm serve <model> --grpc`, or `python -m` on the "
+            "Which implementation serves the gRPC contract under --grpc: the Rust servicer "
+            "(smg.servicer.VllmGrpcServer, with the engine headless; the default) or the "
+            "Python one (deprecated; a launcher the switch cannot bind falls back to it on "
+            f"its own). Unset falls back to ${SERVICER_IMPL_ENV}. The Rust one needs a "
+            "launcher the switch binds (`vllm serve <model> --grpc`, or `python -m` on the "
             f"launcher module; vLLM {SUPPORTED_VLLM_RELEASES} checked) or one that carries "
-            "the check in its own source; any other launcher is refused at this parse, "
-            "before the engine is built."
+            "the check in its own source; an explicit rust on any other launcher is refused "
+            "at this parse, before the engine is built."
         ),
     )
 
@@ -168,17 +172,32 @@ def check_servicer_impl(parser: argparse.ArgumentParser, parsed: Any) -> str | N
     if not serves_grpc(parser) or getattr(parsed, "grpc", None) is False:
         return None
     from smg_grpc_servicer.rust_lifecycle import (
+        SOURCE_FALLBACK,
         ServicerConfigError,
+        announce_servicer_impl,
         check_metrics_port_needs_rust,
         configuration_exit,
     )
     from smg_grpc_servicer.vllm.launcher_switch import require_launcher_hook
-    from smg_grpc_servicer.vllm.rust import configure_logging, resolve_servicer_impl
+    from smg_grpc_servicer.vllm.rust import (
+        configure_logging,
+        launcher_unserved,
+        servicer_impl_source,
+    )
 
     try:
-        impl = resolve_servicer_impl(parsed)
+        # The default selects Rust where the switch binds the launcher; on a
+        # launcher it cannot bind the default falls back to the Python
+        # servicer (the launch keeps working, the log names the gap, the
+        # environment carries the decision for the launcher's own guard),
+        # where an explicit rust is refused.
+        impl, origin = servicer_impl_source(parsed, unserved=launcher_unserved)
         if impl == "rust":
             require_launcher_hook()
+        elif origin == SOURCE_FALLBACK:
+            # The switch over the launcher's serving coroutine, which
+            # announces the choice on a launcher it binds, never runs here.
+            announce_servicer_impl(impl, origin, logger)
         # A metrics port under the Python servicer is a port nobody serves:
         # refused here, with the other configuration errors.
         check_metrics_port_needs_rust(impl, parsed, METRICS_PORT_ENV)

@@ -28,6 +28,12 @@ from smg_grpc_servicer.config_view import (
 )
 
 
+def _tristate(value: Any) -> bool | None:
+    """A flag as the launch gave it: ``None`` when it left the choice to the
+    engine, else the value as a bool."""
+    return None if value is None else bool(value)
+
+
 @dataclasses.dataclass(frozen=True)
 class ServerArgsSection:
     """``ServerArgs``: the model's names and the knobs the servicers read."""
@@ -61,6 +67,12 @@ class ServerArgsSection:
     disaggregation_mode: str
     language_only: bool
     encoder_only: bool
+    # ``--enable-multimodal`` as given (``True``), ``False`` when a launch
+    # record turns the field off, or ``None`` when the launch left the choice
+    # to the engine: the pinned release's launch line carries only the
+    # enabling flag, so a text launch of a checkpoint the engine calls
+    # multimodal reads ``None`` here.
+    enable_multimodal: bool | None
 
     @classmethod
     def read(cls, server_args: Any) -> ServerArgsSection:
@@ -83,6 +95,7 @@ class ServerArgsSection:
             disaggregation_mode=getattr(server_args, "disaggregation_mode", "null") or "null",
             language_only=bool(getattr(server_args, "language_only", False)),
             encoder_only=bool(getattr(server_args, "encoder_only", False)),
+            enable_multimodal=_tristate(getattr(server_args, "enable_multimodal", None)),
         )
 
     @property

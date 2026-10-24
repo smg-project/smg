@@ -31,7 +31,11 @@ processing (``media_refs``, through the same ``--mm-processor`` backends as
 the Python servicer, see :mod:`smg_grpc_servicer.vllm.rust_media`, or through
 smg's own pipeline with ``--mm-processor smg``, see :func:`smg_media_options`),
 ``Embed``, ``FlushCache``, ``GetTokenizer`` and ``SubscribeKvEvents``. The
-Python implementation stays the default.
+Rust implementation is the default; ``--servicer-impl python`` or
+``SMG_VLLM_SERVICER_IMPL=python`` selects the Python servicer, which is
+deprecated and logs so whenever it serves. A launcher the switch cannot bind
+(see :func:`launcher_unserved`) falls back to the Python servicer on
+defaults with one log line naming the gap.
 """
 
 from __future__ import annotations
@@ -46,7 +50,7 @@ import json
 import logging
 import multiprocessing
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 # The lifecycle's defaults and the switch's choices, re-exported: this
@@ -58,10 +62,13 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     DEFAULT_STARTUP_CEILING_SECS,
     DEFAULT_STARTUP_TIMEOUT_SECS,
     IMPLS,
+    SOURCE_DEFAULT,
+    SOURCE_FALLBACK,
     EngineProcess,
     EngineProcessGroup,
     RustLauncher,
     ServicerConfigError,
+    announce_servicer_impl,
     apply_kv_events_default,
     resolve_tokenizer_dir,
     servicer_switch,
@@ -641,20 +648,58 @@ def resolve_servicer_impl(
     args: argparse.Namespace | None = None, environ: Mapping[str, str] | None = None
 ) -> str:
     """Which implementation serves this process: ``args.servicer_impl`` when the
-    launcher exposes the flag, else ``$SMG_VLLM_SERVICER_IMPL``, else python
+    launcher exposes the flag, else ``$SMG_VLLM_SERVICER_IMPL``, else rust
     (the shared :func:`~smg_grpc_servicer.rust_lifecycle.servicer_switch`). A
     decision made with the flag in hand is written back to the environment,
     so :func:`require_python_impl` (which has no flag) agrees with it when
     ``--servicer-impl python`` overrides an exported ``rust``."""
-    return servicer_switch(SERVICER_IMPL_ENV, args, environ)[0]
+    return servicer_impl_source(args, environ)[0]
 
 
-def require_python_impl(environ: Mapping[str, str] | None = None) -> None:
-    """Refuse to start the Python servicer when the flag asks for Rust. A
-    launcher that gets this far ran without the switch; a silent fallback
-    would report Rust coverage that never ran."""
-    impl = resolve_servicer_impl(environ=environ)
-    if impl != "python":
+def servicer_impl_source(
+    args: argparse.Namespace | None = None,
+    environ: Mapping[str, str] | None = None,
+    *,
+    unserved: Callable[[], str | None] | None = None,
+) -> tuple[str, str]:
+    """:func:`resolve_servicer_impl`'s answer with where it came from:
+    ``flag``, ``env``, ``default`` or ``fallback``. ``unserved`` is the probe
+    the switch asks when the default would select Rust
+    (:func:`launcher_unserved` at the plugin's parse step: a launcher the
+    switch cannot bind runs the Python servicer by fallback, with the
+    decision written to the environment for the launcher's own guard)."""
+    return servicer_switch(SERVICER_IMPL_ENV, args, environ, unserved=unserved)
+
+
+def launcher_unserved() -> str | None:
+    """Why the Rust path cannot serve this process's launch, or ``None``: the
+    Rust path needs a launcher the switch binds, or one that carries the
+    check in its own source (``launcher_switch.require_launcher_hook``); on
+    any other launcher the switch never runs, so the default selects the
+    Python servicer and the log says why, where an explicit ``rust`` is
+    refused at the parse."""
+    from smg_grpc_servicer.vllm.launcher_switch import require_launcher_hook
+
+    try:
+        require_launcher_hook()
+    except ServicerConfigError as error:
+        return str(error)
+    return None
+
+
+def require_python_impl(
+    environ: Mapping[str, str] | None = None, log: logging.Logger = logger
+) -> None:
+    """Refuse to start the Python servicer when the flag or the variable asks
+    for Rust: a launcher that gets this far ran without the switch, and a
+    silent fallback would report Rust coverage that never ran. A launch that
+    asked for nothing is served: the default (Rust) cannot reach a launcher
+    the switch never bound, so the Python servicer serves it as the fallback
+    the switch would have made, announced here with the gap."""
+    impl, origin = servicer_impl_source(environ=environ)
+    if impl == "python":
+        return
+    if origin != SOURCE_DEFAULT:
         raise RuntimeError(
             f"{SERVICER_IMPL_ENV}={impl}, but this process is starting the Python "
             "servicer: the switch this package installs over vLLM's gRPC launcher "
@@ -662,9 +707,16 @@ def require_python_impl(environ: Mapping[str, str] | None = None) -> None:
             "left out of VLLM_PLUGINS, or one that did not import "
             "smg_grpc_servicer.vllm.servicer before defining serve_grpc). Start "
             "through `vllm serve <model> --grpc` or `python -m` on the launcher "
-            f"module (vLLM {SUPPORTED_VLLM_RELEASES}), or unset the flag; a silent "
+            f"module (vLLM {SUPPORTED_VLLM_RELEASES}), or select python; a silent "
             "Python fallback would report Rust coverage that never ran."
         )
+    log.warning(
+        "The Rust servicer does not serve this launch yet (this launcher did not consult "
+        "the servicer switch: one run as a file path, with this package's plugin left out "
+        "of VLLM_PLUGINS, or one that did not import smg_grpc_servicer.vllm.servicer "
+        "before defining serve_grpc): the Python servicer serves it"
+    )
+    announce_servicer_impl("python", SOURCE_FALLBACK, log)
 
 
 def require_python_media_mode(

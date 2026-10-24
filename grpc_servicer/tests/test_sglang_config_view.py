@@ -24,6 +24,7 @@ def _server_args(**overrides):
         disaggregation_mode="prefill",
         language_only=False,
         encoder_only=True,
+        enable_multimodal=True,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -70,6 +71,14 @@ def test_the_server_args_section_reads_every_knob():
         False,
         True,
     )
+    assert args.enable_multimodal is True
+    # The flag is kept as given: off, or left to the engine.
+    assert (
+        EngineConfigView(_server_args(enable_multimodal=0)).server_args.enable_multimodal is False
+    )
+    assert (
+        EngineConfigView(_server_args(enable_multimodal=None)).server_args.enable_multimodal is None
+    )
 
 
 def test_bare_server_args_read_as_the_defaults():
@@ -87,6 +96,7 @@ def test_bare_server_args_read_as_the_defaults():
         False,
         False,
     )
+    assert args.enable_multimodal is None
 
 
 @pytest.mark.parametrize("value", [None, 0, -1, True, "64"])

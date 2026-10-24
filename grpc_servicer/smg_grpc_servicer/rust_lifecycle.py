@@ -461,6 +461,17 @@ def configuration_exit(error: ServicerConfigError, log: logging.Logger = logger)
 SOURCE_FLAG = "flag"
 SOURCE_ENV = "env"
 SOURCE_DEFAULT = "default"
+# The default asked for the Rust servicer, which does not serve this launch
+# yet: the Python servicer serves it, and the log names the gap.
+SOURCE_FALLBACK = "fallback"
+# The implementation a launcher runs when neither the flag nor the variable
+# selects one.
+DEFAULT_IMPL = "rust"
+# The line every start of the Python servicer logs, however it was selected.
+DEPRECATION_LINE = (
+    "the Python gRPC servicer is deprecated; the Rust servicer is the default; the Python "
+    "servicer will be removed in a later release"
+)
 
 
 def servicer_switch(
@@ -469,23 +480,34 @@ def servicer_switch(
     environ: Mapping[str, str] | None = None,
     *,
     parsed_flag: str | None = None,
+    unserved: Callable[[], str | None] | None = None,
 ) -> tuple[str, str]:
     """Which implementation serves this process and where the choice came
     from, as ``(impl, origin)``: the launcher's ``--servicer-impl``
     (``args.servicer_impl``, else ``parsed_flag``, the value a launcher's
     plugin kept when the engine's namespace carries only the engine's own
-    fields), else ``environ[env_name]``, else ``python``; the origin is
-    ``flag``, ``env`` or ``default``. A value outside :data:`IMPLS` is a
-    :class:`ServicerConfigError` naming the variable.
+    fields), else ``environ[env_name]``, else :data:`DEFAULT_IMPL`
+    (``rust``); the origin is ``flag``, ``env``, ``default`` or ``fallback``.
+    A value outside :data:`IMPLS` is a :class:`ServicerConfigError` naming
+    the variable.
 
-    A decision made with the flag in hand is written back to the
-    environment, so the engine processes this process starts and anything
-    that reads only the variable (the Python servicer's guard against a
-    switch that never ran) agree with it when ``--servicer-impl python``
-    overrides an exported ``rust``. A value that came from the environment
-    or from the default is not written: what the engine inherits there is
-    what the operator exported, spelled as they exported it, and nothing
-    when they exported nothing."""
+    ``unserved`` is the launcher's probe of this launch against what its Rust
+    path serves, asked only when the default would select Rust: a reason it
+    returns (a mode or an input the Rust path does not serve for this engine
+    yet) selects the Python servicer with the origin ``fallback``, logged
+    here in one line naming the gap, so a launch on defaults keeps working
+    while the gap closes. An explicit ``rust`` is never second-guessed: the
+    Rust path refuses what it cannot serve, as before.
+
+    A decision made with the flag in hand, or by the fallback, is written
+    back to the environment, so the engine processes this process starts and
+    anything that reads only the variable (the Python servicer's guard
+    against a switch that never ran) agree with it when ``--servicer-impl
+    python`` overrides an exported ``rust``, or when the fallback selected
+    Python. A value that came from the environment or from the default is
+    not written: what the engine inherits there is what the operator
+    exported, spelled as they exported it, and nothing when they exported
+    nothing."""
     source = os.environ if environ is None else environ
     value = getattr(args, "servicer_impl", None) if args is not None else None
     value = value or parsed_flag
@@ -493,12 +515,34 @@ def servicer_switch(
     if not value:
         value = source.get(env_name)
         origin = SOURCE_ENV if value else SOURCE_DEFAULT
-    value = str(value or "python").strip().lower()
+    value = str(value or DEFAULT_IMPL).strip().lower()
     if value not in IMPLS:
         raise ServicerConfigError(f"{env_name} must be one of {IMPLS}, got {value!r}")
-    if origin == SOURCE_FLAG and isinstance(source, MutableMapping):
+    if origin == SOURCE_DEFAULT and value == "rust" and unserved is not None:
+        gap = unserved()
+        if gap:
+            logger.warning(
+                "The Rust servicer does not serve this launch yet (%s): the Python servicer "
+                "serves it; an explicit %s=rust or %s rust takes the Rust path regardless, "
+                "which refuses what it does not serve",
+                gap,
+                env_name,
+                SERVICER_IMPL_FLAG,
+            )
+            value, origin = "python", SOURCE_FALLBACK
+    if origin in (SOURCE_FLAG, SOURCE_FALLBACK) and isinstance(source, MutableMapping):
         source[env_name] = value
     return value, origin
+
+
+def announce_servicer_impl(impl: str, origin: str, log: logging.Logger = logger) -> None:
+    """The start-up log of a launcher's implementation choice: the
+    implementation and its origin in one line and, whenever the Python
+    servicer serves (by flag, variable or fallback), :data:`DEPRECATION_LINE`
+    as a warning."""
+    log.info("Servicer implementation: %s (source=%s)", impl, origin)
+    if impl == "python":
+        log.warning(DEPRECATION_LINE)
 
 
 # The values of a launcher's KV-events variable (``RustLauncher.kv_events_env``)

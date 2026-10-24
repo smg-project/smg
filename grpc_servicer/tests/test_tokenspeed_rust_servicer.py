@@ -105,6 +105,7 @@ class FakeServerArgs:
     data_parallel_address: str = "127.0.0.1"
     data_parallel_rpc_port: int = 30500
     zmq_engine_index: int = 0
+    disaggregation_mode: str = "null"
 
 
 def test_package_exposes_the_flag_and_the_rust_entry_points():
@@ -116,7 +117,10 @@ def test_package_exposes_the_flag_and_the_rust_entry_points():
 
 
 def test_resolve_servicer_impl_prefers_the_launcher_flag_then_the_env():
-    assert rust.resolve_servicer_impl(environ={}) == "python"
+    assert rust.resolve_servicer_impl(environ={}) == "rust"
+    assert (
+        rust.resolve_servicer_impl(environ={"SMG_TOKENSPEED_SERVICER_IMPL": " Python "}) == "python"
+    )
     assert rust.resolve_servicer_impl(environ={"SMG_TOKENSPEED_SERVICER_IMPL": " Rust "}) == "rust"
     args = argparse.Namespace(servicer_impl="rust")
     assert rust.resolve_servicer_impl(args, environ={}) == "rust"
@@ -142,9 +146,9 @@ def test_resolve_servicer_impl_prefers_the_launcher_flag_then_the_env():
 
 
 def test_servicer_impl_source_names_the_origin_and_writes_a_flag_back():
-    assert rust.servicer_impl_source(environ={}) == ("python", "default")
-    assert rust.servicer_impl_source(environ={"SMG_TOKENSPEED_SERVICER_IMPL": "rust"}) == (
-        "rust",
+    assert rust.servicer_impl_source(environ={}) == ("rust", "default")
+    assert rust.servicer_impl_source(environ={"SMG_TOKENSPEED_SERVICER_IMPL": "python"}) == (
+        "python",
         "env",
     )
     # `--servicer-impl python` with `rust` still exported: the flag decides,
@@ -155,7 +159,7 @@ def test_servicer_impl_source_names_the_origin_and_writes_a_flag_back():
     assert environ == {"SMG_TOKENSPEED_SERVICER_IMPL": "python"}
     # Without a flag in hand nothing is written.
     environ = {}
-    assert rust.servicer_impl_source(SimpleNamespace(), environ=environ) == ("python", "default")
+    assert rust.servicer_impl_source(SimpleNamespace(), environ=environ) == ("rust", "default")
     assert environ == {}
 
 
@@ -184,7 +188,10 @@ def launcher(monkeypatch):
         if any(arg in ("-h", "--help") for arg in argv):
             print("usage: tokenspeed [--model MODEL] (TokenSpeed's own help)")
             raise SystemExit(0)
-        return FakeServerArgs(model=argv[argv.index("--model") + 1])
+        mode = "null"
+        if "--disaggregation-mode" in argv:
+            mode = argv[argv.index("--disaggregation-mode") + 1]
+        return FakeServerArgs(model=argv[argv.index("--model") + 1], disaggregation_mode=mode)
 
     _install(
         monkeypatch,
@@ -226,30 +233,74 @@ def test_the_launcher_takes_the_flag_ahead_of_tokenspeeds_args(launcher, monkeyp
     assert os.environ[rust.SERVICER_IMPL_ENV] == "rust"
 
 
-def test_the_launcher_falls_back_to_the_environment_then_python(launcher, monkeypatch, caplog):
+def test_the_launcher_falls_back_to_the_environment_then_rust(launcher, monkeypatch, caplog):
     module, calls = launcher
-    monkeypatch.setenv(rust.SERVICER_IMPL_ENV, "rust")
+    monkeypatch.setenv(rust.SERVICER_IMPL_ENV, "python")
+    with caplog.at_level("INFO", logger=module.logger.name):
+        module.main(["--model", "org/m"])
+    assert calls["served"][0] == "python" and calls["argv"] == ["--model", "org/m"]
+    assert "Servicer implementation: python (source=env)" in caplog.text
+    # Every start of the Python servicer says it is deprecated.
+    assert rust_lifecycle.DEPRECATION_LINE in caplog.text
+    # `--servicer-impl rust` overrides the exported `python`, environment included.
+    caplog.clear()
+    with caplog.at_level("INFO", logger=module.logger.name):
+        with pytest.raises(SystemExit) as raised:
+            module.main(["--servicer-impl=rust", "--model", "org/m"])
+    assert raised.value.code == 3 and calls["served"][0] == "rust"
+    assert "Servicer implementation: rust (source=flag)" in caplog.text
+    assert rust_lifecycle.DEPRECATION_LINE not in caplog.text
+    assert os.environ[rust.SERVICER_IMPL_ENV] == "rust"
+    # Neither: the Rust servicer, and the environment is left alone.
+    monkeypatch.delenv(rust.SERVICER_IMPL_ENV)
+    caplog.clear()
     with caplog.at_level("INFO", logger=module.logger.name):
         with pytest.raises(SystemExit) as raised:
             module.main(["--model", "org/m"])
     assert raised.value.code == 3 and calls["served"][0] == "rust"
-    assert calls["argv"] == ["--model", "org/m"]
-    assert "Servicer implementation: rust (source=env)" in caplog.text
-    # `--servicer-impl python` overrides the exported `rust`, environment included.
-    caplog.clear()
-    with caplog.at_level("INFO", logger=module.logger.name):
-        module.main(["--servicer-impl=python", "--model", "org/m"])
-    assert calls["served"][0] == "python" and calls["argv"] == ["--model", "org/m"]
-    assert "Servicer implementation: python (source=flag)" in caplog.text
-    assert os.environ[rust.SERVICER_IMPL_ENV] == "python"
-    # Neither: the Python servicer, and the environment is left alone.
-    monkeypatch.delenv(rust.SERVICER_IMPL_ENV)
-    caplog.clear()
-    with caplog.at_level("INFO", logger=module.logger.name):
-        module.main(["--model", "org/m"])
-    assert calls["served"][0] == "python"
-    assert "Servicer implementation: python (source=default)" in caplog.text
+    assert "Servicer implementation: rust (source=default)" in caplog.text
     assert rust.SERVICER_IMPL_ENV not in os.environ
+
+
+def test_a_disaggregated_launch_on_defaults_falls_back_to_the_python_servicer(
+    launcher, monkeypatch, caplog
+):
+    """Nothing selected an implementation and the launch is a PD prefill side,
+    which the Rust path does not serve: the Python servicer serves it, the log
+    names the gap, the implementation with its origin and the deprecation, and
+    the environment the scheduler ranks inherit carries the decision."""
+    module, calls = launcher
+    monkeypatch.delenv(rust.SERVICER_IMPL_ENV, raising=False)
+    with caplog.at_level("INFO", logger=module.logger.name):
+        module.main(["--model", "org/m", "--disaggregation-mode", "prefill"])
+    assert calls["served"][0] == "python"
+    assert calls["served"][1].disaggregation_mode == "prefill"
+    assert (
+        "does not serve this launch yet (PD disaggregation (disaggregation_mode='prefill'))"
+        in caplog.text
+    )
+    assert "Servicer implementation: python (source=fallback)" in caplog.text
+    assert rust_lifecycle.DEPRECATION_LINE in caplog.text
+    assert os.environ[rust.SERVICER_IMPL_ENV] == "python"
+
+
+def test_a_disaggregated_worker_is_refused_under_an_explicit_rust():
+    """An explicit rust is never second-guessed: a PD or EPD worker is a
+    configuration error before any scheduler starts, as on SGLang, rather
+    than a servicer that reports SERVING and runs requests without their
+    bootstrap."""
+    rust.refuse_disaggregation(FakeServerArgs())
+    assert rust.unserved_on_rust(FakeServerArgs()) is None
+    assert rust.unserved_on_rust(FakeServerArgs(disaggregation_mode="decode")) == (
+        "PD disaggregation (disaggregation_mode='decode')"
+    )
+    assert rust.unserved_on_rust(FakeServerArgs(disaggregation_mode="encode")) == (
+        "EPD disaggregation (the encode role)"
+    )
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="PD disaggregation"):
+        rust.refuse_disaggregation(FakeServerArgs(disaggregation_mode="prefill"))
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="EPD disaggregation"):
+        asyncio.run(rust.serve_rust(FakeServerArgs(disaggregation_mode="encode")))
 
 
 def test_the_launcher_lists_the_flag_ahead_of_tokenspeeds_help(launcher, capsys):

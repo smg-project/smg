@@ -155,6 +155,12 @@ class WorkerLauncher(ABC):
         """Return tensor-parallel size for GPU assignment. Default 1."""
         return 1
 
+    # The worker environment variable that selects this backend's gRPC servicer
+    # implementation (`SMG_<ENGINE>_SERVICER_IMPL`, read by the engine's gRPC
+    # entrypoint before any engine work), or None for a backend whose workers
+    # here run no servicer package.
+    servicer_impl_env: str | None = None
+
     def gpu_env(self, args: argparse.Namespace, dp_rank: int, env: dict | None = None) -> dict:
         """Build env dict with CUDA_VISIBLE_DEVICES for this worker's dp_rank.
 
@@ -185,6 +191,15 @@ class WorkerLauncher(ABC):
 
         env["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
         env["PYTHONUNBUFFERED"] = "1"
+        # An explicit `--servicer-impl` reaches a gRPC worker as its backend's
+        # variable; the worker command line stays the engine's. Unset, the
+        # environment passes through untouched and the servicer package's own
+        # default applies (the Rust servicer, which falls back to the Python
+        # one on a launch it does not serve). The parse refuses the flag for a
+        # backend or connection mode without the choice.
+        impl = getattr(args, "servicer_impl", None)
+        if impl and self.servicer_impl_env and getattr(args, "connection_mode", "grpc") == "grpc":
+            env[self.servicer_impl_env] = impl
         return env
 
     def _filter_backend_args(self, backend_args: list[str], filter_args: list[str]) -> list[str]:
@@ -243,6 +258,8 @@ class WorkerLauncher(ABC):
 
 class SglangWorkerLauncher(WorkerLauncher):
     """Launcher for sglang inference workers."""
+
+    servicer_impl_env = "SMG_SGLANG_SERVICER_IMPL"
 
     def _get_tp_size(self, args: argparse.Namespace) -> int:
         return getattr(args, "tensor_parallel_size", 1)
@@ -329,20 +346,7 @@ class SglangWorkerLauncher(WorkerLauncher):
 class VllmWorkerLauncher(WorkerLauncher):
     """Launcher for vLLM inference workers."""
 
-    def gpu_env(self, args: argparse.Namespace, dp_rank: int, env: dict | None = None) -> dict:
-        env = super().gpu_env(args, dp_rank, env)
-        # The servicer implementation is a flag inside the smg servicer package
-        # (`SMG_VLLM_SERVICER_IMPL`), read by upstream vLLM's gRPC entrypoint
-        # before it builds an AsyncLLM; the worker command line stays upstream's.
-        if (
-            getattr(args, "connection_mode", "grpc") == "grpc"
-            and getattr(args, "servicer_impl", "python") == "rust"
-        ):
-            env["SMG_VLLM_SERVICER_IMPL"] = "rust"
-        else:
-            # The flag is authoritative: an inherited value must not outlive it.
-            env.pop("SMG_VLLM_SERVICER_IMPL", None)
-        return env
+    servicer_impl_env = "SMG_VLLM_SERVICER_IMPL"
 
     def _get_tp_size(self, args: argparse.Namespace) -> int:
         return getattr(args, "tensor_parallel_size", 1)
@@ -845,14 +849,17 @@ def add_serve_args(parser: argparse.ArgumentParser) -> None:
     )
     group.add_argument(
         "--servicer-impl",
-        default="python",
+        default=None,
         choices=["python", "rust"],
         help=(
-            "gRPC servicer implementation for vllm workers (default: python). "
-            "rust keeps the same vLLM gRPC contract but serves it from Rust over "
-            "a same-host ZMQ engine connection, selected through "
-            "SMG_VLLM_SERVICER_IMPL in the worker's environment; requires "
-            "--backend vllm --connection-mode grpc"
+            "gRPC servicer implementation for the vllm and sglang workers of "
+            "--connection-mode grpc, handed to each worker as SMG_<ENGINE>_SERVICER_IMPL "
+            "(default: the environment as inherited, else the servicer package's own "
+            "default, rust, which serves the gRPC contract from Rust over a same-host ZMQ "
+            "engine connection and falls back to the deprecated Python servicer on a "
+            "launch it does not serve); refused for a backend or connection mode without "
+            "a servicer choice; an explicit rust is checked against the installed vLLM "
+            "before the workers start"
         ),
     )
     # Router host/port - may be overridden by backend (e.g. sglang)
@@ -954,18 +961,24 @@ def parse_serve_args(
             "connection-mode zmq is only supported for the vllm, tokenspeed and sglang "
             f"backends, not {backend}"
         )
-    if getattr(serve_router_args, "servicer_impl", "python") == "rust":
-        if backend != "vllm" or serve_router_args.connection_mode != "grpc":
+    impl = getattr(serve_router_args, "servicer_impl", None)
+    if impl is not None:
+        if (
+            serve_router_args.connection_mode != "grpc"
+            or BACKEND_LAUNCHERS[backend].servicer_impl_env is None
+        ):
             pre_parser.error(
-                "servicer-impl rust is only available for --backend vllm with "
-                f"--connection-mode grpc, not {backend}/{serve_router_args.connection_mode}"
+                f"servicer-impl {impl} selects the gRPC servicer of a vllm or sglang worker "
+                f"(--connection-mode grpc), which {backend}/{serve_router_args.connection_mode} "
+                "does not run"
             )
-        # The flag is read by upstream vLLM's gRPC entrypoint; a vLLM without
-        # the hook would start Python workers while reporting Rust ones.
-        try:
-            _require_rust_servicer_hook()
-        except RuntimeError as error:
-            pre_parser.error(str(error))
+        if impl == "rust" and backend == "vllm":
+            # The flag is read by upstream vLLM's gRPC entrypoint; a vLLM without
+            # the hook would start Python workers while reporting Rust ones.
+            try:
+                _require_rust_servicer_hook()
+            except RuntimeError as error:
+                pre_parser.error(str(error))
 
     # Pass 2: full parser with backend-specific args; resolve so backend can override
     parser = argparse.ArgumentParser(

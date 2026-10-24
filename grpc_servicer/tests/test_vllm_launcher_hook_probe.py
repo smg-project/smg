@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import types
 from types import SimpleNamespace
@@ -307,6 +308,22 @@ def test_the_plugins_parse_step_refuses_before_the_engine(vllm_package, monkeypa
         plugin.check_servicer_impl(parser, argparse.Namespace(grpc=True, servicer_impl="go"))
     assert raised.value.code == rust_lifecycle.CONFIG_ERROR_EXIT_CODE
     assert "must be one of" in caplog.text
+    # Nothing selected: the default (rust) cannot reach this launcher, so the
+    # parse step falls back to the Python servicer, says why and what it is
+    # falling back to, and writes the decision where the launcher's own guard
+    # and the engine processes read it, instead of exiting.
+    monkeypatch.delenv(rust.SERVICER_IMPL_ENV, raising=False)
+    caplog.clear()
+    caplog.set_level(logging.INFO)
+    assert (
+        plugin.check_servicer_impl(parser, argparse.Namespace(grpc=True, servicer_impl=None))
+        == "python"
+    )
+    assert os.environ[rust.SERVICER_IMPL_ENV] == "python"
+    assert "The Rust servicer does not serve this launch yet" in caplog.text
+    assert f"{LAUNCHER} defines no serve_grpc" in caplog.text
+    assert "Servicer implementation: python (source=fallback)" in caplog.text
+    assert rust_lifecycle.DEPRECATION_LINE in caplog.text
 
 
 def test_the_plugins_parse_step_passes_a_bound_launcher(vllm_package, monkeypatch):

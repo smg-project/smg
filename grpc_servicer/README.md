@@ -231,10 +231,11 @@ cap is answered as a 400 `media_too_large` instead of being pushed, and a result
 Redis refuses is reported to the worker at once; a sidecar timeout is not
 retried by the router, since the worker already spent the whole budget on it.
 
-#### Rust request path (`SMG_VLLM_SERVICER_IMPL=rust`)
+#### Rust request path (the default; `SMG_VLLM_SERVICER_IMPL=python` selects the Python servicer)
 
-The same `vllm.grpc.engine.VllmEngine` contract can be served from Rust, with
-Python keeping only the lifecycle. The switch is a flag inside this package,
+The `vllm.grpc.engine.VllmEngine` contract is served from Rust by default, with
+Python keeping only the lifecycle; the Python servicer is deprecated (every
+start of it logs a deprecation line) and will be removed in a later release. The switch is a flag inside this package,
 not a second server, and it needs no vLLM change: vLLM's gRPC launcher imports
 this package's servicer classes before it defines `serve_grpc`, and that
 import installs the switch over `serve_grpc` (`launcher_switch.py`), so the
@@ -243,21 +244,23 @@ AsyncLLM and hands the process to `smg_grpc_servicer.vllm.serve_rust` when
 the answer is `rust`. That function launches the engine headless (`vllm serve
 --headless`), which dials a same-host ZMQ handshake, and serves the gRPC
 contract from `smg.servicer.VllmGrpcServer` on a Rust-owned thread. The
-Router cannot tell the two apart.
+Router cannot tell the two apart. The answer is `rust` unless the flag or the
+variable says `python`, or the launcher is one the switch cannot bind: then the
+Python servicer serves the launch by fallback, with one log line naming the gap.
 
 ```bash
-# Python (default): upstream's gRPC server, AsyncLLM in-process.
+# Rust request path (the default): the same entrypoint, the engine headless.
 vllm serve Qwen/Qwen3-0.6B --grpc --port 50051
 
-# Rust request path, same entrypoint. The flag is this package's: vLLM loads
-# it as a general plugin while it builds the parser (smg_grpc_servicer/vllm/plugin.py);
-# the stock launcher's own parser (`python -m` below) takes it too.
-vllm serve Qwen/Qwen3-0.6B --grpc --port 50051 --servicer-impl rust
+# The Python servicer (deprecated): upstream's gRPC server, AsyncLLM in-process. The flag is
+# this package's: vLLM loads it as a general plugin while it builds the parser
+# (smg_grpc_servicer/vllm/plugin.py); the stock launcher's own parser (`python -m` below) takes it too.
+vllm serve Qwen/Qwen3-0.6B --grpc --port 50051 --servicer-impl python
 
 # The environment form, as a deployment sets it, works for every entry: `vllm serve --grpc`,
 # and `python -m` on the launcher module (`vllm.entrypoints.grpc_server` is the launcher itself
 # on vLLM 0.28 and 0.29, and from 0.30 a shim importing `vllm.entrypoints.launchers.grpc_server`).
-SMG_VLLM_SERVICER_IMPL=rust python -m vllm.entrypoints.grpc_server --model Qwen/Qwen3-0.6B --port 50051
+SMG_VLLM_SERVICER_IMPL=python python -m vllm.entrypoints.grpc_server --model Qwen/Qwen3-0.6B --port 50051
 ```
 
 What the switch runs ahead of `serve_grpc` is the check a launcher could also
@@ -318,12 +321,13 @@ launcher's own parse. A main-branch build between two releases carries the
 next release's layout under the earlier version; the binding goes by what is
 loaded, never by the version. A launcher run as a file path, or with the
 plugin left out of `VLLM_PLUGINS`, is not reached; the Python servicer then
-refuses the flag with one line.
+refuses an explicit `rust` with one line, and serves a launch that selected
+nothing (the default cannot reach it) with the fallback's lines.
 
 The CPU smoke behind that table (`scripts/launcher_switch_smoke.py`) runs each
 launcher through to the servicer construction against a stub engine, in a
-fresh interpreter per case, and checks that Rust takes the process before any
-engine exists and that the Python default still constructs the servicer:
+fresh interpreter per case, and checks that Rust takes the process by default
+before any engine exists and that a Python selection still constructs the servicer:
 
 ```bash
 # The vendored upstream launchers (tests/launchers/, one per layout); no vLLM needed.
@@ -345,8 +349,13 @@ with one ERROR line naming the installed vLLM version and the launchers the
 switch binds, exit code 2, before the engine is built, rather than by the
 Python servicer's guard after the model has loaded.
 
-`smg serve --backend vllm --connection-mode grpc --servicer-impl rust` sets
-the flag in each worker's environment, after checking that the installed
+`smg serve --connection-mode grpc --servicer-impl rust|python` sets the
+backend's variable in each gRPC worker's environment, for vLLM and SGLang
+alike (the TokenSpeed backend of `smg serve` is ZMQ-only and TensorRT-LLM has
+no servicer choice: the flag is refused there, as for a non-gRPC connection
+mode; unset, `smg serve` leaves the environment untouched and the choice to
+this package, whose default is rust); for vLLM an explicit rust is checked
+first: that the installed
 vLLM's launcher will consult it (`smg_grpc_servicer.vllm.rust.upstream_hook_installed`:
 a launcher at a module path the switch binds imports this package at module
 level, or a launcher anywhere carries the check itself); the
@@ -784,14 +793,14 @@ python -m smg_grpc_servicer.mlx --model meta-llama/Llama-2-7b-hf --host 0.0.0.0 
 ### TokenSpeed
 
 ```bash
-# Python (default)
+# Rust request path (the default)
 python -m smg_grpc_servicer.tokenspeed --model meta-llama/Llama-2-7b-hf --host 0.0.0.0 --port 50051
 
-# Rust request path, same entrypoint
-python -m smg_grpc_servicer.tokenspeed --model meta-llama/Llama-2-7b-hf --host 0.0.0.0 --port 50051 --servicer-impl rust
+# The Python servicer (deprecated), same entrypoint
+python -m smg_grpc_servicer.tokenspeed --model meta-llama/Llama-2-7b-hf --host 0.0.0.0 --port 50051 --servicer-impl python
 
 # The environment form, overridden by the flag when both are given
-SMG_TOKENSPEED_SERVICER_IMPL=rust python -m smg_grpc_servicer.tokenspeed --model meta-llama/Llama-2-7b-hf --port 50051
+SMG_TOKENSPEED_SERVICER_IMPL=python python -m smg_grpc_servicer.tokenspeed --model meta-llama/Llama-2-7b-hf --port 50051
 ```
 
 Without `--kv-events-config`, the servicer turns TokenSpeed's ZMQ KV-event
@@ -811,8 +820,11 @@ State group, the servicer leaves the publisher off and logs why once
 This is the process `ts serve` spawns for its gRPC worker; `--servicer-impl`
 is this package's flag (listed first by `--help`, ahead of TokenSpeed's own
 flags), and `SMG_TOKENSPEED_SERVICER_IMPL` is the fallback the flag overrides
-(flag, then the environment, then `python`; the launcher logs which one
-decided). With `--servicer-impl rust` the same process serves the
+(flag, then the environment, then `rust`; the launcher logs which one
+decided; a launch the Rust path does not serve, PD/EPD disaggregation, falls
+back to the Python servicer on defaults with one line naming the gap, and the
+Python servicer, deprecated, logs so whenever it serves). Under `rust` the same
+process serves the
 `tokenspeed.grpc.scheduler.TokenSpeedScheduler` contract from Rust
 (`smg.servicer.TokenSpeedGrpcServer`, which needs the `smg` wheel): the
 launcher computes the model and server facts from TokenSpeed's own config,
@@ -1038,30 +1050,34 @@ subscription from zero while it is complete, and a state snapshot
 replay is conservatively reset because it cannot distinguish an idle publisher
 from a restarted one.
 
-#### Rust request path (`--servicer-impl rust`)
+#### Rust request path (the default; `--servicer-impl python` selects the Python servicer)
 
 `sglang serve --grpc-mode` (`python -m sglang.launch_server --grpc-mode`)
-hands the process to this package's `serve_grpc`. With `--servicer-impl rust`
-that entry serves the `sglang.grpc.scheduler.SglangScheduler` contract from
-Rust (`smg.servicer.SglangGrpcServer`, which needs the `smg` wheel) instead:
+hands the process to this package's `serve_grpc`. By default (or with
+`--servicer-impl rust`) that entry serves the `sglang.grpc.scheduler.SglangScheduler`
+contract from Rust (`smg.servicer.SglangGrpcServer`, which needs the `smg` wheel):
 the scheduler runs headless in a spawned child over the msgpack ZMQ wire
 below, the Rust server speaks the gRPC contract on top of it, and Python keeps
 the lifecycle only. The flag is this package's, as it is for vLLM: SGLang
 loads it as an `sglang.srt.plugins` entry point while it builds its parser
 (`smg_grpc_servicer/sglang/plugin.py`), and `SMG_SGLANG_SERVICER_IMPL` is the
-fallback the flag overrides (flag, then the environment, then `python`; the
-servicer logs which one decided). A `SGLANG_PLUGINS` whitelist without
+fallback the flag overrides (flag, then the environment, then `rust`; the
+servicer logs which one decided; a launch the Rust path does not serve, PD/EPD
+disaggregation or `--enable-multimodal`, falls back to the Python servicer on
+defaults with one line naming the gap, while a multimodal model launched without
+that flag serves text on the Rust path and has its image inputs refused per
+request; the Python servicer, deprecated, logs so whenever it serves). A `SGLANG_PLUGINS` whitelist without
 `smg-servicer` removes the flag, not the environment form.
 
 ```bash
-# Python (default)
+# Rust request path (the default)
 sglang serve --model-path Qwen/Qwen3-0.6B --grpc-mode --port 30000
 
-# Rust request path, same entrypoint
-sglang serve --model-path Qwen/Qwen3-0.6B --grpc-mode --port 30000 --servicer-impl rust
+# The Python servicer (deprecated), same entrypoint
+sglang serve --model-path Qwen/Qwen3-0.6B --grpc-mode --port 30000 --servicer-impl python
 
 # The environment form, overridden by the flag when both are given
-SMG_SGLANG_SERVICER_IMPL=rust sglang serve --model-path Qwen/Qwen3-0.6B --grpc-mode --port 30000
+SMG_SGLANG_SERVICER_IMPL=python sglang serve --model-path Qwen/Qwen3-0.6B --grpc-mode --port 30000
 ```
 
 `python -m sglang.launch_server --help` lists the flag; `sglang serve --help`
