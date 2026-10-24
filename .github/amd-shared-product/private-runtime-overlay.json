@@ -23,7 +23,7 @@
       "sha256": "8be4d44a13d9c1dc5d76c2319d4bdea966816950bd837d31ec96e4cf870a7ae8"
     },
     ".github/amd-nixl-environment/nixl_environment/owned.py": {
-      "sha256": "9dc233f900b5dab4c8c85efd9027bfec4179735b788f6369a1f3134ab3aec2fd"
+      "sha256": "75c8c005cf86907afa97f3c1ca21db56c6208847c79688afb63324bb7a782582"
     },
     ".github/amd-nixl-environment/nixl_environment/plugin.py": {
       "sha256": "8c54d2074368351c6ed101dfdb85691fec7a5b5c347643117f559a0db151c2a1"

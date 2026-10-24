@@ -296,7 +296,7 @@
     "runtime_proof": false,
     "reference_contract": ".github/amd-shared-product/mooncake4-reference.json"
   },
-  "private_runtime_overlay_sha256": "e3da06adb46a022271d78cd54942dde0da73ef74b87272a74664e61d3f98494d",
+  "private_runtime_overlay_sha256": "243509c9ee32d68806478bd614929a77d1220a630205b5fcf17d5b173f505cd2",
   "private_mooncake_runtime": {
     "wheel": {
       "bytes": 4203741,

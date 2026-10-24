@@ -102,11 +102,15 @@ def worker(worker):
     mask = env.get(b"CUDA_VISIBLE_DEVICES", b"").decode()
     require(mask == ",".join(map(str, worker.gpu_ids)), "actual logical device mask differs")
     require(env.get(b"SPT_NOENV") == b"1", "marker preservation missing")
-    from .private_wheel import comparable_private_state
+    if os.environ.get("SMG_CI_PRIVATE_MOONCAKE") == "1":
+        from .private_wheel import comparable_private_state
 
-    actual = {name: env.get(name.encode(), b"").decode() for name in ("PYTHONPATH", "LD_LIBRARY_PATH")}
-    expected = {name: os.environ[name] for name in ("PYTHONPATH", "LD_LIBRARY_PATH")}
-    require(comparable_private_state(actual) == comparable_private_state(expected), "worker private environment differs")
+        actual = {name: env.get(name.encode(), b"").decode() for name in ("PYTHONPATH", "LD_LIBRARY_PATH")}
+        expected = {name: os.environ[name] for name in ("PYTHONPATH", "LD_LIBRARY_PATH")}
+        require(comparable_private_state(actual) == comparable_private_state(expected), "worker private environment differs")
+    else:
+        for name in ("PYTHONPATH", "LD_LIBRARY_PATH"):
+            require(env.get(name.encode()) == os.environ[name].encode(), "worker private environment differs: " + name)
     from infra.model_specs import get_model_spec
 
     require(
