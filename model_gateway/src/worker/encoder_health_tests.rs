@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use futures::stream;
+use openai_protocol::worker::HealthCheckConfig;
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{transport::Server, Request, Response, Status};
