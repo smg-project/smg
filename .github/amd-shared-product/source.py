@@ -11,6 +11,7 @@ TEST_OVERLAY_FILES = {
     "e2e_test/infra/pd_logs.py",
     "e2e_test/infra/test_pd_logs.py",
     "e2e_test/router/test_pd_mooncake.py",
+    "e2e_test/router/test_pd_topologies.py",
 }
 
 
@@ -23,8 +24,8 @@ def product_test_source(inputs):
         "overlay manifest",
     )
     overlay = json.loads(path.read_text())
-    require(overlay["policy"] == "mooncake_owned_logs_exact3_v1", "overlay policy")
-    require(set(overlay["files"]) == TEST_OVERLAY_FILES, "exact three test overlays")
+    require(overlay["policy"] == "mooncake_owned_logs_and_rocm_transport_exact4_v1", "overlay policy")
+    require(set(overlay["files"]) == TEST_OVERLAY_FILES, "exact four test overlays")
     target = inputs["target_product_commit"]
     require(overlay["base_product_commit"] == target, "overlay product base")
     changed = set(git_output("diff", "--name-only", target, "HEAD", "--", "e2e_test").splitlines())
@@ -71,7 +72,7 @@ def verify(inputs):
             or path.startswith(".github/amd-nixl-environment/")
             or path == ".github/workflows/pr-test-rust.yml"
             or path in test_overlay,
-            # Only the three hash-bound test files may differ within e2e_test.
+            # Only the four hash-bound test files may differ within e2e_test.
             f"unexpected product modification: {path}",
         )
     require(not git_output("status", "--porcelain", "--untracked-files=all"), "dirty relay source")

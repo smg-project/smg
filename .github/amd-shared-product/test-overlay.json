@@ -1,5 +1,5 @@
 {
-  "policy": "mooncake_owned_logs_exact3_v1",
+  "policy": "mooncake_owned_logs_and_rocm_transport_exact4_v1",
   "base_product_commit": "3b79acc59b68b84465e58a025850af2c93c96fe8",
   "base_e2e_tree": "35d5321770a24d3706a3c0730c465d3a0e11d437",
   "port_from_source": "5366d8e04504a3e39834ff9186719cd6f74ad6a8",
@@ -15,7 +15,11 @@
     "e2e_test/router/test_pd_mooncake.py": {
       "base_ls_tree": "100644 blob 85a89f7c7e053060446ece8a0a1fcd37e312be0e\te2e_test/router/test_pd_mooncake.py",
       "sha256": "4da368fc5e599484221d240faec1f65b36eff44a388e1fcc46cdbc8651a1ac3e"
+    },
+    "e2e_test/router/test_pd_topologies.py": {
+      "base_ls_tree": "100644 blob 5e44766c38580dbb461315cca9b7aef254dde9bb\te2e_test/router/test_pd_topologies.py",
+      "sha256": "80e27a01b98b9b20d02a865cbcad947d3376e7ccf48d2bdf4764a38e8fcb7e9a"
     }
   },
-  "scope": "Only these exact three test-source files differ; other e2e source unchanged. No80e3 compiled source or binary relabelling."
+  "scope": "Exactly the original three owned-log files plus the platform module-discovery helper in test_pd_topologies.py differ; the original case methods, oracles, selection and connector startup gates are unchanged. No compiled source or binary is relabelled."
 }
