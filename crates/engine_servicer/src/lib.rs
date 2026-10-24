@@ -53,7 +53,7 @@ use std::{pin::Pin, time::Duration};
 
 pub use engine_zmq_adapter::{
     EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
-    EncoderDispatchErrorReq, SglangEncodeDispatcher,
+    EncodeRelease, EncoderDispatchErrorReq, SglangEncodeDispatcher,
 };
 pub use error::ServicerError;
 use futures::Stream;

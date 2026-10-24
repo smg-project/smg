@@ -141,22 +141,30 @@ class EncodeDispatchBridge:
                 str(getattr(error, "error_msg", error)), int(getattr(error, "error_code", 502))
             ),
         )
-        assigned = getattr(request, "num_items_assigned", None)
-        num_items_assigned = (
-            {
-                int(getattr(modality, "value", modality)): [int(count) for count in counts]
-                for modality, counts in assigned.items()
-            }
-            if assigned
-            else None
-        )
-        encoder_urls = getattr(request, "encoder_urls", None)
-        return (
-            bool(getattr(request, "need_wait_for_mm_inputs", False)),
-            num_items_assigned,
-            list(encoder_urls) if encoder_urls is not None else None,
-            dispatch_ready.set if dispatch_ready is not None else None,
-        )
+        try:
+            assigned = getattr(request, "num_items_assigned", None)
+            num_items_assigned = (
+                {
+                    int(getattr(modality, "value", modality)): [int(count) for count in counts]
+                    for modality, counts in assigned.items()
+                }
+                if assigned
+                else None
+            )
+            encoder_urls = getattr(request, "encoder_urls", None)
+            return (
+                bool(getattr(request, "need_wait_for_mm_inputs", False)),
+                num_items_assigned,
+                list(encoder_urls) if encoder_urls is not None else None,
+                dispatch_ready.set if dispatch_ready is not None else None,
+            )
+        except BaseException:
+            # The receiver's thread is parked on the event from the send on; an
+            # answer that never reaches Rust releases it here, so the thread
+            # reports instead of waiting forever.
+            if dispatch_ready is not None:
+                dispatch_ready.set()
+            raise
 
     def shutdown(self) -> None:
         """Stop the bootstrap server; the receiver has nothing to stop (its

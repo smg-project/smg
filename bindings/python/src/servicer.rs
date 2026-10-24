@@ -22,12 +22,13 @@ use std::{
 use bytes::Bytes;
 use engine_servicer::{
     BoxFuture, EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
-    EncoderDispatchErrorReq, MediaError, MediaFeatures, MediaProcessor, MediaRequest,
-    ProcessedMedia, ServicerConfig, ServicerError, SglangEncodeDispatcher, SglangModelInfo,
-    SglangServicerConfig, SglangServicerServer, TokenSpeedModelInfo, TokenSpeedServicerConfig,
-    TokenSpeedServicerServer, VllmModelInfo, VllmServicerConfig, VllmServicerServer,
-    ALL_MODALITIES, DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC, DEFAULT_ENGINE_SILENCE_TIMEOUT,
-    DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT, PIXEL_MODALITIES,
+    EncodeRelease, EncoderDispatchErrorReq, MediaError, MediaFeatures, MediaProcessor,
+    MediaRequest, ProcessedMedia, ServicerConfig, ServicerError, SglangEncodeDispatcher,
+    SglangModelInfo, SglangServicerConfig, SglangServicerServer, TokenSpeedModelInfo,
+    TokenSpeedServicerConfig, TokenSpeedServicerServer, VllmModelInfo, VllmServicerConfig,
+    VllmServicerServer, ALL_MODALITIES, DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC,
+    DEFAULT_ENGINE_SILENCE_TIMEOUT, DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT,
+    PIXEL_MODALITIES,
 };
 use llm_multimodal::{jpeg_turbo::TurboJpegPolicy, Modality};
 use prost::Message;
@@ -1196,6 +1197,25 @@ type DispatchAnswer = (
     Option<Py<PyAny>>,
 );
 
+/// The bridge's answer converted with its release slot taken out first: the
+/// receiver's thread is parked on that release from the moment the bridge
+/// returns, so an answer that does not convert runs it here before the error
+/// is reported, never dropping it unrun.
+fn dispatch_answer(py: Python<'_>, answer: &Bound<'_, PyAny>) -> PyResult<DispatchAnswer> {
+    let release = answer
+        .get_item(3)
+        .ok()
+        .and_then(|slot| slot.extract::<Option<Py<PyAny>>>().ok())
+        .flatten();
+    answer.extract::<DispatchAnswer>().inspect_err(|_| {
+        if let Some(release) = release {
+            if let Err(release_error) = release.call0(py) {
+                tracing::warn!(%release_error, "encode dispatch release failed after a malformed answer");
+            }
+        }
+    })
+}
+
 /// The encode dispatch of an SGLang language-side worker behind a Python
 /// object (see `smg_grpc_servicer.sglang.rust_encode.EncodeDispatchBridge`):
 /// `dispatch(rid, image_urls, on_error)` runs SGLang's own receiver for the
@@ -1221,51 +1241,59 @@ impl SglangEncodeDispatcher for PythonEncodeDispatcher {
                 image_urls,
                 on_error,
             } = request;
+            // The release becomes its guard inside the blocking task: a
+            // handler gone before this task ends drops the task's output
+            // with it, and the guard still releases the receiver's thread.
+            let runtime = tokio::runtime::Handle::current();
             let answer = tokio::task::spawn_blocking(move || {
-                Python::attach(|py| -> PyResult<DispatchAnswer> {
-                    let on_error = Py::new(
-                        py,
-                        DispatchError {
-                            rid: rid.clone(),
-                            sink: on_error,
-                        },
-                    )?;
-                    bridge
-                        .call_method1(py, "dispatch", (rid, image_urls, on_error))?
-                        .extract(py)
+                let (need_wait_for_mm_inputs, num_items_assigned, encoder_urls, release) =
+                    Python::attach(|py| -> PyResult<DispatchAnswer> {
+                        let on_error = Py::new(
+                            py,
+                            DispatchError {
+                                rid: rid.clone(),
+                                sink: on_error,
+                            },
+                        )?;
+                        let answer =
+                            bridge.call_method1(py, "dispatch", (rid, image_urls, on_error))?;
+                        dispatch_answer(py, answer.bind(py))
+                    })?;
+                let sent = release.map(|release| {
+                    EncodeRelease::new(
+                        Box::new(move || {
+                            Box::pin(async move {
+                                let released = tokio::task::spawn_blocking(move || {
+                                    Python::attach(|py| release.call0(py).map(|_| ()))
+                                })
+                                .await;
+                                match released {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(error)) => {
+                                        tracing::warn!(%error, "encode dispatch release failed");
+                                    }
+                                    Err(join) => {
+                                        tracing::warn!(%join, "encode dispatch release did not run");
+                                    }
+                                }
+                            })
+                        }),
+                        runtime,
+                    )
+                });
+                Ok::<_, PyErr>(EncodeDispatchOutcome {
+                    need_wait_for_mm_inputs,
+                    num_items_assigned,
+                    encoder_urls,
+                    sent,
                 })
             })
             .await;
-            let (need_wait_for_mm_inputs, num_items_assigned, encoder_urls, sent) = match answer {
-                Ok(Ok(answer)) => answer,
-                Ok(Err(error)) => return Err(error.to_string()),
-                Err(join) => return Err(format!("encode dispatch did not run: {join}")),
-            };
-            let sent = sent.map(|release| -> Box<dyn FnOnce() -> EncodeFuture<()> + Send> {
-                Box::new(move || {
-                    Box::pin(async move {
-                        let released = tokio::task::spawn_blocking(move || {
-                            Python::attach(|py| release.call0(py).map(|_| ()))
-                        })
-                        .await;
-                        match released {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => {
-                                tracing::warn!(%error, "encode dispatch release failed")
-                            }
-                            Err(join) => {
-                                tracing::warn!(%join, "encode dispatch release did not run")
-                            }
-                        }
-                    })
-                })
-            });
-            Ok(EncodeDispatchOutcome {
-                need_wait_for_mm_inputs,
-                num_items_assigned,
-                encoder_urls,
-                sent,
-            })
+            match answer {
+                Ok(Ok(outcome)) => Ok(outcome),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(join) => Err(format!("encode dispatch did not run: {join}")),
+            }
         })
     }
 }

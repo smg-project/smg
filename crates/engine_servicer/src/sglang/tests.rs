@@ -42,7 +42,7 @@ use super::*;
 use crate::{
     testing::{assert_bucket_edges, assert_golden, http_get, servicer_config, Bounded},
     EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
-    EncoderDispatchErrorReq, ServicerError, SglangEncodeDispatcher,
+    EncodeRelease, EncoderDispatchErrorReq, ServicerError, SglangEncodeDispatcher,
 };
 
 fn model_info() -> SglangModelInfo {
@@ -1286,24 +1286,31 @@ impl SglangEncodeDispatcher for ScriptedDispatcher {
             .push((request.rid, request.image_urls));
         self.sinks.lock().unwrap().push(request.on_error);
         let released = Arc::clone(&self.released);
-        let sent: Box<dyn FnOnce() -> EncodeFuture<()> + Send> = Box::new(move || {
-            Box::pin(async move {
-                released.fetch_add(1, Ordering::SeqCst);
-            })
-        });
+        // Built only where the dispatch answers: the guard runs on drop, and a
+        // failed dispatch hands out no release.
+        let sent = move || {
+            EncodeRelease::new(
+                Box::new(move || {
+                    Box::pin(async move {
+                        released.fetch_add(1, Ordering::SeqCst);
+                    })
+                }),
+                tokio::runtime::Handle::current(),
+            )
+        };
         let answer = match &self.answer {
             DispatchAnswer::Failure(message) => Err((*message).to_string()),
             DispatchAnswer::Encoders => Ok(EncodeDispatchOutcome {
                 need_wait_for_mm_inputs: true,
                 num_items_assigned: Some(BTreeMap::from([(1, vec![1, 0])])),
                 encoder_urls: Some(ENCODERS.iter().map(ToString::to_string).collect()),
-                sent: Some(sent),
+                sent: Some(sent()),
             }),
             DispatchAnswer::NoEncoder => Ok(EncodeDispatchOutcome {
                 need_wait_for_mm_inputs: false,
                 num_items_assigned: None,
                 encoder_urls: None,
-                sent: Some(sent),
+                sent: Some(sent()),
             }),
         };
         Box::pin(std::future::ready(answer))

@@ -970,7 +970,7 @@ impl ZmqEngineClient {
                         // locally; a language-side worker has no encoder of
                         // its own and this servicer never pretends to.
                         if let Some(sent) = outcome.sent {
-                            sent().await;
+                            sent.run().await;
                         }
                         return Err(tonic::Status::failed_precondition(
                             "no encoder is registered with this language-only worker: the \
@@ -995,7 +995,7 @@ impl ZmqEngineClient {
                     }
                 }
                 if let Some(sent) = sent {
-                    sent().await;
+                    sent.run().await;
                 }
             }
             let stream = submitted.map_err(zmq_status)?;

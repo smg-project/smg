@@ -56,15 +56,53 @@ pub struct EncodeDispatchRequest {
 /// when no encoder is registered: the frontend then leaves the request
 /// alone), how many items each encoder got per modality (the modality's enum
 /// value to the per-encoder counts, in the encoder list's order), the
-/// encoder list that assignment indexes, and `sent`: what to run once the
-/// request is on the wire (or will never be), after which the dispatcher may
-/// report failures through the sink. The dispatcher's encode work itself
+/// encoder list that assignment indexes, and `sent`: the release to run once
+/// the request is on the wire (or will never be), after which the dispatcher
+/// may report failures through the sink. The dispatcher's encode work itself
 /// runs in the background; nothing here waits for the encoders.
 pub struct EncodeDispatchOutcome {
     pub need_wait_for_mm_inputs: bool,
     pub num_items_assigned: Option<BTreeMap<u32, Vec<u32>>>,
     pub encoder_urls: Option<Vec<String>>,
-    pub sent: Option<Box<dyn FnOnce() -> EncodeFuture<()> + Send>>,
+    pub sent: Option<EncodeRelease>,
+}
+
+/// The dispatcher's release, a guard: the engine's receiver waits on it
+/// without a timeout before it reports a failed encode, so a handler dropped
+/// while its submit or its dispatch was pending (the client gone, its
+/// deadline passed) must still release. Run by the handler once the request
+/// is on the wire (or never will be); dropped unrun, it runs on the runtime.
+pub struct EncodeRelease {
+    release: Option<Box<dyn FnOnce() -> EncodeFuture<()> + Send>>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl EncodeRelease {
+    /// A release that runs on `runtime` if it is dropped before [`Self::run`].
+    pub fn new(
+        release: Box<dyn FnOnce() -> EncodeFuture<()> + Send>,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            release: Some(release),
+            runtime,
+        }
+    }
+
+    /// Run the release here and wait for it.
+    pub async fn run(mut self) {
+        if let Some(release) = self.release.take() {
+            release().await;
+        }
+    }
+}
+
+impl Drop for EncodeRelease {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            self.runtime.spawn(release());
+        }
+    }
 }
 
 /// The dispatcher the lifecycle owner supplies for a language-side worker:
@@ -142,5 +180,94 @@ impl EncodeNotice {
                 warn!(rid, rank, %send_error, "encode dispatch notice could not reach the scheduler");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::mpsc, time::Duration};
+
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    fn release_signalling(tx: oneshot::Sender<()>) -> EncodeRelease {
+        EncodeRelease::new(
+            Box::new(move || {
+                Box::pin(async move {
+                    let _ = tx.send(());
+                })
+            }),
+            tokio::runtime::Handle::current(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_release_run_by_the_handler_runs_there() {
+        let (tx, rx) = oneshot::channel();
+        release_signalling(tx).run().await;
+        assert!(rx.await.is_ok(), "the release ran");
+    }
+
+    #[tokio::test]
+    async fn a_release_dropped_unrun_runs_on_the_runtime() {
+        let (tx, rx) = oneshot::channel();
+        drop(release_signalling(tx));
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("the dropped release ran within the timeout")
+            .expect("the release sent its signal");
+    }
+
+    #[tokio::test]
+    async fn a_handler_cancelled_during_its_dispatch_still_releases() {
+        // The handler is cancelled while its dispatch's blocking work runs;
+        // that work ends after the handler is gone: the runtime drops the
+        // task's output, outcome and release with it, and the release still
+        // runs.
+        let (tx, rx) = oneshot::channel();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let runtime = tokio::runtime::Handle::current();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the handler is cancelled by the test"
+        )]
+        let handler = tokio::spawn(async move {
+            let outcome = tokio::task::spawn_blocking(move || {
+                let _ = started_tx.send(());
+                gate_rx.recv().ok();
+                EncodeDispatchOutcome {
+                    need_wait_for_mm_inputs: true,
+                    num_items_assigned: None,
+                    encoder_urls: None,
+                    sent: Some(EncodeRelease::new(
+                        Box::new(move || {
+                            Box::pin(async move {
+                                let _ = tx.send(());
+                            })
+                        }),
+                        runtime,
+                    )),
+                }
+            })
+            .await
+            .expect("the dispatch ran");
+            if let Some(sent) = outcome.sent {
+                sent.run().await;
+            }
+        });
+        started_rx
+            .await
+            .expect("the dispatch started before the handler was cancelled");
+        handler.abort();
+        let _ = handler.await;
+        gate_tx
+            .send(())
+            .expect("the blocking dispatch is still waiting");
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("the release ran after the handler was cancelled")
+            .expect("the release sent its signal");
     }
 }

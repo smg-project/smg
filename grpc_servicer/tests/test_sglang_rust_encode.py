@@ -188,6 +188,38 @@ def test_dispatch_hands_rust_what_the_receiver_set_and_the_release(sglang):
     assert errors == [("encoder down", 502)]
 
 
+def test_dispatch_releases_the_receivers_thread_when_the_answer_does_not_build(sglang):
+    """A failure after ``send_encode_request`` (here an assignment keyed by a
+    modality whose value is not a number) re-raises with the release run, so
+    the receiver's thread, parked on it since the send, reports instead of
+    waiting forever."""
+
+    class Drifted(Enum):
+        IMAGE = "image"
+
+    class DriftedReceiver(FakeReceiver):
+        def send_encode_request(self, obj, time_stats_json=None, on_dispatch_error=None):
+            ready = super().send_encode_request(obj, time_stats_json, on_dispatch_error)
+            obj.num_items_assigned = {Drifted.IMAGE: [len(obj.image_data)]}
+            return ready
+
+    sglang["receiver"] = DriftedReceiver(
+        encode_urls=["grpc://10.0.0.8:30001"],
+        fail_with=SimpleNamespace(rid="r3", error_msg="encoder down", error_code=502),
+    )
+    bridge = rust_encode.EncodeDispatchBridge(_args())
+    bridge.start()
+    errors = []
+    with pytest.raises(ValueError):
+        bridge.dispatch(
+            "r3",
+            ["https://example.test/a.png"],
+            lambda message, code: errors.append((message, code)),
+        )
+    sglang["receiver"].threads[0].join(timeout=5)
+    assert errors == [("encoder down", 502)], "the thread passed the release"
+
+
 def test_dispatch_with_no_encoder_registered_leaves_the_wait_flag_off(sglang):
     """The receiver's own rule: no encoder, no dispatch, the flag off (its
     warning says why); nothing to release."""
