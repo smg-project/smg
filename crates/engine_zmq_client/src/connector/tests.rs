@@ -2112,9 +2112,6 @@ async fn a_blocked_input_refuses_add_requests_past_the_frame_bound() {
     assert!(stream.next().await.unwrap().unwrap().finished());
 }
 
-/// The bound in bytes: behind a blocked frame a small add-request within
-/// it still waits its window (and reaches the engine on resume), while
-/// one that would take the waiting payload past it is refused at once.
 /// A typed frame (an encode worker's request, the largest payload) is admitted
 /// against the same bound as an add frame: past it, refused at once.
 #[tokio::test]
@@ -2142,6 +2139,9 @@ async fn a_blocked_input_refuses_typed_frames_past_the_byte_bound() {
     drop(engine);
 }
 
+/// The bound in bytes: behind a blocked frame a small add-request within
+/// it still waits its window (and reaches the engine on resume), while
+/// one that would take the waiting payload past it is refused at once.
 #[tokio::test]
 async fn a_blocked_input_refuses_add_requests_past_the_byte_bound() {
     let (client, mut engine, _ns) = connect().await;
