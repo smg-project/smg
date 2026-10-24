@@ -1,0 +1,26 @@
+[
+  {
+    "path": "/opt/venv/lib/python3.12/site-packages/tvm_ffi/registry.py",
+    "old_sha256": "f0378d38c7738281c21b7100d9cafa037ed421c118ede8a1484214a414d5c395",
+    "fixed_sha256": "68e9cd4017191fb00bf9193e751b0d79b27047005dea5c01ff2babd7a527f902",
+    "old": "        if name not in type_cls.__dict__:  # skip attributes defined directly on this class\n",
+    "new": "        # type.__dict__ is read-only even when absent from the class body.\n        if name == \"__dict__\":\n            continue\n        if name not in type_cls.__dict__:  # skip attributes defined directly on this class\n",
+    "reason": "Skip the read-only type.__dict__ field; retain inherited-field overrides from FFI #575."
+  },
+  {
+    "path": "/opt/tilelang/3rdparty/tvm/python/tvm/runtime/support.py",
+    "old_sha256": "f1c96958d39466a5bf00d7c31326ccb3d4eac6941dbf7126642460b7d0a1f702",
+    "fixed_sha256": "a1c63f6919c1c53646b882ee6c5b3f4dd1139c67e3a92c6b55537fef64894afe",
+    "old": "    class TVMDerivedObject(metadata[\"cls\"]):  # type: ignore\n        \"\"\"The derived object to avoid cyclic dependency.\"\"\"\n\n",
+    "new": "    class TVMDerivedObject(metadata[\"cls\"]):  # type: ignore\n        \"\"\"The derived object to avoid cyclic dependency.\"\"\"\n\n        __slots__ = (\"__dict__\", \"__weakref__\",)\n\n",
+    "upstream": "https://github.com/apache/tvm/commit/44dbd138d51314309955fba8c3d1294e4a89da35"
+  },
+  {
+    "path": "/opt/tilelang/tilelang/jit/adapter/wrapper.py",
+    "old_sha256": "0a1efc3ce996827456ae24d7efd1dffb39b07401cb7e1c170b5fc1826e663206",
+    "fixed_sha256": "e3f7c0a7eebee40038f61d67f3c237a2c1e9ea6af1f58d4a2bd0d6d47ff4e64d",
+    "old": "                index = host_code.index(f'T.call_packed(\"{function_name}\"')\n",
+    "new": "                try:\n                    index = host_code.index(f'T.call_packed(\"{function_name}\"')\n                except ValueError:\n                    index = host_code.index(f'value=\"{function_name}\"')\n",
+    "upstream": "https://github.com/tile-ai/tilelang/commit/046b1bdc698623efef4d45afd9b0ce4d41ff0982"
+  }
+]
