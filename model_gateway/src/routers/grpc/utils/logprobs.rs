@@ -91,7 +91,7 @@ fn truncate_top_logprobs(logprobs: &mut ChatLogProbs, requested: usize) {
     }
 }
 
-/// Convert OutputLogProbs to Generate format Vec<Vec<Option<f64>>>
+/// Convert OutputLogProbs to Generate format `Vec<Vec<Option<f64>>>`
 ///
 /// Generate format: [[logprob, token_id, ...], [logprob, token_id, ...], ...]
 /// Each inner vec contains [logprob (f64), token_id (u32), ...]
@@ -106,7 +106,7 @@ pub(crate) fn convert_generate_output_logprobs(
         .collect()
 }
 
-/// Convert InputLogProbs to Generate format Vec<Vec<Option<f64>>>
+/// Convert InputLogProbs to Generate format `Vec<Vec<Option<f64>>>`
 ///
 /// Generate format: [[logprob, token_id, ...], [logprob, token_id, ...], ...]
 /// First token has null logprob: [[null, token_id], [logprob, token_id], ...]
