@@ -805,17 +805,19 @@ class _Seen:
     def __init__(self):
         self.requests: list[tuple[int, int]] = []
         self.ranks: list[int | None] = []
+        self.bootstraps: list[tuple[str, int] | None] = []
         self.flushes = 0
         self.inflight = 0
         self.max_inflight = 0
         self.lock = threading.Lock()
 
-    def enter(self, prompt_len, max_tokens, rank=None):
+    def enter(self, prompt_len, max_tokens, rank=None, bootstrap=None):
         with self.lock:
             self.inflight += 1
             self.max_inflight = max(self.max_inflight, self.inflight)
             self.requests.append((prompt_len, max_tokens))
             self.ranks.append(rank)
+            self.bootstraps.append(bootstrap)
 
     def leave(self):
         with self.lock:
@@ -847,7 +849,13 @@ class _SglangEngine(sgl_grpc.SglangSchedulerServicer):
     def Generate(self, request, context):
         params = request.sampling_params
         assert params.ignore_eos and params.top_k == 1 and params.top_p == 1.0 and params.n == 1
-        self.seen.enter(len(request.tokenized.input_ids), params.max_new_tokens)
+        bootstrap = None
+        if request.HasField("disaggregated_params"):
+            disaggregated = request.disaggregated_params
+            bootstrap = (disaggregated.bootstrap_host, disaggregated.bootstrap_room)
+        self.seen.enter(
+            len(request.tokenized.input_ids), params.max_new_tokens, bootstrap=bootstrap
+        )
         time.sleep(0.01)
         self.seen.leave()
         yield sgl_pb.GenerateResponse(complete=sgl_pb.GenerateComplete())
@@ -918,6 +926,28 @@ def test_each_wire_drives_the_plan_through_the_engines_own_service(add, engine, 
     assert report.flushed is flushable and seen.flushes == (1 if flushable else 0)
     # A refusal over the wire reaches the end line as the status' details.
     assert report.flush_refusal == (None if flushable else "no cache flush on this wire")
+
+
+def test_the_sglang_wire_carries_a_lone_legs_stand_in_bootstrap():
+    """A prefill or decode leg's plan runs without its peer: every request
+    carries the engine's stand-in bootstrap (the host and room 0) the way the
+    engine's own warm-up sends it; a single engine's requests carry none."""
+    seen = _Seen()
+    server, target = _serve(sgl_grpc.add_SglangSchedulerServicer_to_server, _SglangEngine(seen))
+    try:
+        wire = sglang_warmup.warmup_wire(target)
+        try:
+            lone = plan_warmup(dataclasses.replace(SMALL, lone_leg_bootstrap="2.2.2.2"), "fast")
+            report = run_warmup(lone, wire, budget_secs=30, request_timeout_secs=10)
+            carried = len(seen.requests)
+            run_warmup(plan_warmup(SMALL, "fast"), wire, budget_secs=30, request_timeout_secs=10)
+        finally:
+            wire.close()
+    finally:
+        server.stop(0)
+    assert report.covered == len(lone.steps) and report.errors == 0
+    assert carried >= 2 and set(seen.bootstraps[:carried]) == {("2.2.2.2", 0)}
+    assert set(seen.bootstraps[carried:]) == {None}
 
 
 def test_the_vllm_wire_pins_each_request_to_its_rank_over_the_servicers_port():
@@ -991,7 +1021,16 @@ def test_the_vllm_inputs_come_from_the_resolved_configuration():
     assert vllm_warmup.warmup_inputs_from_config(config) is None
 
 
-def test_the_sglang_inputs_come_from_the_server_arguments_and_the_facts():
+def test_a_lone_legs_plan_marks_every_request_and_says_so():
+    lone = plan_warmup(dataclasses.replace(SMALL, lone_leg_bootstrap="2.2.2.2"), "fast")
+    assert {r.lone_leg_bootstrap for s in lone.steps for r in s.requests} == {"2.2.2.2"}
+    assert "the requests carrying the lone leg's stand-in bootstrap" in lone.describe()
+    plain = plan_warmup(SMALL, "fast")
+    assert {r.lone_leg_bootstrap for s in plain.steps for r in s.requests} == {None}
+    assert "stand-in bootstrap" not in plain.describe()
+
+
+def test_the_sglang_inputs_come_from_the_server_arguments_and_the_facts(monkeypatch):
     args = SimpleNamespace(max_running_requests=64, chunked_prefill_size=8192, context_length=None)
     facts = {"is_generation": True, "max_context_length": 32768, "vocab_size": 151936}
     inputs = sglang_warmup.warmup_inputs(args, facts)
@@ -1014,10 +1053,21 @@ def test_the_sglang_inputs_come_from_the_server_arguments_and_the_facts():
     )
     assert sglang_warmup.warmup_inputs(SimpleNamespace(), facts).max_num_seqs == 0
     assert sglang_warmup.warmup_inputs(args, {**facts, "is_generation": False}) is None
-    assert (
-        sglang_warmup.warmup_inputs(SimpleNamespace(disaggregation_mode="prefill"), facts) is None
+    # A prefill or decode leg plans as a single engine does, its requests
+    # bound for nobody: the engine's own stand-in bootstrap host rides along.
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.disaggregation.utils",
+        SimpleNamespace(FAKE_BOOTSTRAP_HOST="2.2.2.2"),
     )
+    for role in ("prefill", "decode"):
+        leg = sglang_warmup.warmup_inputs(SimpleNamespace(disaggregation_mode=role), facts)
+        assert leg.lone_leg_bootstrap == "2.2.2.2"
+        assert leg.max_num_batched_tokens == sglang_warmup.DEFAULT_STEP_TOKENS
+    assert sglang_warmup.warmup_inputs(SimpleNamespace(), facts).lone_leg_bootstrap is None
+    # The EPD roles take none: their requests need multimodal inputs.
     assert sglang_warmup.warmup_inputs(SimpleNamespace(language_only=True), facts) is None
+    assert sglang_warmup.warmup_inputs(SimpleNamespace(encoder_only=True), facts) is None
 
 
 def test_the_tokenspeed_inputs_come_from_the_server_arguments_and_the_facts():

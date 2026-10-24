@@ -119,14 +119,14 @@ impl SglangRequestType {
 /// `input_embeds`, `mm_inputs`, `token_type_ids`, `sampling_params`,
 /// `return_logprob`, `logprob_start_len`, `top_logprobs_num`,
 /// `token_ids_logprob`, `stream`, then the 19 defaulted fields up to
-/// `require_reasoning` (session, LoRA, PD and routing slots SMG leaves at the
-/// scheduler's defaults) so that flag lands in its slot. The encoder emits
-/// the shortest valid prefix: 14 elements (tag + 13 fields) through `stream`,
-/// or 34 when a later field this wire fills (`return_hidden_states`,
-/// `lora_id`, `custom_logit_processor`, `require_reasoning`) is set; every
-/// other later field keeps its `msgspec` default. Token ids go as a plain
-/// integer array; the plugin widens the scheduler's `array('q')` decode hook
-/// to accept it.
+/// `require_reasoning`, of which this side fills `return_hidden_states`, the
+/// LoRA id, the logit processor and the prefill/decode bootstrap triple (the
+/// session and routing slots stay at the scheduler's defaults), so that flag
+/// lands in its slot. The encoder emits the shortest valid prefix: 14 elements
+/// (tag + 13 fields) through `stream`, or 34 when a later field is set; every
+/// field after the prefix keeps its `msgspec` default. Token ids go as a
+/// plain integer array; the plugin widens the scheduler's `array('q')`
+/// decode hook to accept it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TokenizedGenerateReqInput {
     /// Request id (the routing/registry key).
@@ -157,6 +157,15 @@ pub struct TokenizedGenerateReqInput {
     pub lora_id: Option<String>,
     /// Serialized custom logit processor (`--enable-custom-logit-processor`).
     pub custom_logit_processor: Option<String>,
+    /// A disaggregated request's rendezvous, in the scheduler's own slots:
+    /// the prefill side's bootstrap server (`host`, `port`) and the room both
+    /// sides meet in. A prefill scheduler registers the request's KV there
+    /// under the room, a decode scheduler asks there for it. `None` leaves
+    /// the scheduler's defaults (a request outside prefill/decode
+    /// disaggregation, or a side the frontend hands no server for).
+    pub bootstrap_host: Option<String>,
+    pub bootstrap_port: Option<i32>,
+    pub bootstrap_room: Option<i64>,
     /// Hybrid-reasoning request: the scheduler tracks the reasoning phase and
     /// accounts its tokens separately.
     pub require_reasoning: bool,
@@ -199,6 +208,9 @@ impl TokenizedGenerateReqInput {
             || self.return_hidden_states
             || self.lora_id.is_some()
             || self.custom_logit_processor.is_some()
+            || self.bootstrap_host.is_some()
+            || self.bootstrap_port.is_some()
+            || self.bootstrap_room.is_some()
     }
 }
 
@@ -217,6 +229,9 @@ impl Default for TokenizedGenerateReqInput {
             return_hidden_states: false,
             lora_id: None,
             custom_logit_processor: None,
+            bootstrap_host: None,
+            bootstrap_port: None,
+            bootstrap_room: None,
             require_reasoning: false,
             trace_headers: None,
         }
@@ -227,7 +242,7 @@ impl Serialize for TokenizedGenerateReqInput {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         const NIL: Option<()> = None;
         // The shortest valid prefix: through `stream` unless a later field
-        // (`return_hidden_states`, `lora_id`, `custom_logit_processor`,
+        // (`return_hidden_states`, `lora_id`, `custom_logit_processor`, the bootstrap triple,
         // `require_reasoning`) has to reach its slot past the defaulted ones.
         let len = if self.needs_extended_form() {
             GENERATE_WIRE_FIELDS.len() + 1
@@ -251,12 +266,14 @@ impl Serialize for TokenizedGenerateReqInput {
         tuple.serialize_element(&self.stream)?;
         if self.needs_extended_form() {
             // The fields between `stream` and `require_reasoning`, at the
-            // scheduler's own defaults except the three this wire carries:
+            // scheduler's own defaults except the six this wire carries:
             // return_sampling_mask, return_flat_raw_top_logprobs,
             // return_hidden_states, return_routed_experts,
             // routed_experts_start_len, return_indexer_topk, session_id,
-            // session_params, lora_id, custom_logit_processor, then
-            // positional_embed_overrides .. routing_key (9 optionals).
+            // session_params, lora_id, custom_logit_processor,
+            // positional_embed_overrides, then the bootstrap triple
+            // (bootstrap_host, bootstrap_port, bootstrap_room), then
+            // bootstrap_pair_key .. routing_key (5 optionals).
             tuple.serialize_element(&false)?; // return_sampling_mask
             tuple.serialize_element(&false)?; // return_flat_raw_top_logprobs
             tuple.serialize_element(&self.return_hidden_states)?;
@@ -267,12 +284,49 @@ impl Serialize for TokenizedGenerateReqInput {
             tuple.serialize_element(&NIL)?;
             tuple.serialize_element(&self.lora_id)?;
             tuple.serialize_element(&self.custom_logit_processor)?;
-            for _ in 0..9 {
+            tuple.serialize_element(&NIL)?; // positional_embed_overrides
+            tuple.serialize_element(&self.bootstrap_host)?;
+            tuple.serialize_element(&self.bootstrap_port)?;
+            tuple.serialize_element(&self.bootstrap_room)?;
+            for _ in 0..5 {
                 tuple.serialize_element(&NIL)?;
             }
             tuple.serialize_element(&self.require_reasoning)?;
         }
         tuple.end()
+    }
+}
+
+/// The defaulted tail of a positional array past its required prefix: reads
+/// the next slot when the array still has one and remembers when it ran
+/// out, so a shorter array (a frontend that stopped at an earlier field)
+/// leaves every later field unset instead of failing the decode.
+struct Tail<'a, A> {
+    seq: &'a mut A,
+    ended: bool,
+}
+
+impl<'de, A: SeqAccess<'de>> Tail<'_, A> {
+    /// The next slot's value; `None` for a nil slot or an ended array.
+    fn next<T: Deserialize<'de>>(&mut self) -> Result<Option<T>, A::Error> {
+        if self.ended {
+            return Ok(None);
+        }
+        match self.seq.next_element::<Option<T>>()? {
+            Some(value) => Ok(value),
+            None => {
+                self.ended = true;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Skip `count` slots this side leaves at the scheduler's defaults.
+    fn skip(&mut self, count: usize) -> Result<(), A::Error> {
+        for _ in 0..count {
+            self.next::<IgnoredAny>()?;
+        }
+        Ok(())
     }
 }
 
@@ -307,33 +361,27 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                 let stream = next_field(&mut seq, "stream")?;
                 // The slots after `stream`: two defaulted flags, then
                 // `return_hidden_states`, five more defaulted slots, then
-                // `lora_id` and `custom_logit_processor`, 9 more defaulted
-                // ones, then `require_reasoning`. A shorter array (a frontend
-                // that stopped at `stream`) leaves them all unset.
-                let mut present = skip_slots(&mut seq, 2)? == 2;
-                let return_hidden_states = match seq.next_element::<HiddenStatesSlot>()? {
-                    Some(slot) if present => slot.asked(),
-                    _ => {
-                        present = false;
-                        false
-                    }
+                // `lora_id` and `custom_logit_processor`,
+                // `positional_embed_overrides`, the bootstrap triple, 5 more
+                // defaulted ones, then `require_reasoning`. A shorter array (a
+                // frontend that stopped at `stream`) leaves them all unset.
+                let mut tail = Tail {
+                    seq: &mut seq,
+                    ended: false,
                 };
-                present = present && skip_slots(&mut seq, 5)? == 5;
-                let (lora_id, custom_logit_processor) = if present {
-                    (
-                        seq.next_element::<Option<String>>()?.flatten(),
-                        seq.next_element::<Option<String>>()?.flatten(),
-                    )
-                } else {
-                    (None, None)
-                };
-                let require_reasoning = if present && skip_slots(&mut seq, 9)? == 9 {
-                    seq.next_element::<Option<bool>>()?
-                        .flatten()
-                        .unwrap_or(false)
-                } else {
-                    false
-                };
+                tail.skip(2)?;
+                let return_hidden_states = tail
+                    .next::<HiddenStatesSlot>()?
+                    .is_some_and(HiddenStatesSlot::asked);
+                tail.skip(5)?;
+                let lora_id = tail.next::<String>()?;
+                let custom_logit_processor = tail.next::<String>()?;
+                tail.skip(1)?;
+                let bootstrap_host = tail.next::<String>()?;
+                let bootstrap_port = tail.next::<i32>()?;
+                let bootstrap_room = tail.next::<i64>()?;
+                tail.skip(5)?;
+                let require_reasoning = tail.next::<bool>()?.unwrap_or(false);
                 drain_trailing(&mut seq)?;
                 Ok(TokenizedGenerateReqInput {
                     rid,
@@ -348,6 +396,9 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                     return_hidden_states,
                     lora_id,
                     custom_logit_processor,
+                    bootstrap_host,
+                    bootstrap_port,
+                    bootstrap_room,
                     require_reasoning,
                     trace_headers: None,
                 })
@@ -928,6 +979,62 @@ mod tests {
         let bytes = rmp_serde::to_vec(&Value::Array(last)).unwrap();
         let decoded: TokenizedGenerateReqInput = decode_msgpack(&bytes).unwrap();
         assert!(!decoded.return_hidden_states && decoded.require_reasoning);
+    }
+
+    /// A prefill/decode request carries its rendezvous in the scheduler's own
+    /// slots: the bootstrap triple takes the extended form, lands at the
+    /// struct's indices, and round-trips; room 0 is a room (the fake-transfer
+    /// probe's), and a partial triple leaves the other slots nil.
+    #[test]
+    fn a_disaggregated_request_fills_the_bootstrap_slots() {
+        let request = TokenizedGenerateReqInput {
+            rid: "pd".into(),
+            input_ids: vec![1, 2],
+            bootstrap_host: Some("10.0.0.7".into()),
+            bootstrap_port: Some(8998),
+            bootstrap_room: Some(41),
+            ..Default::default()
+        };
+        let encoded = encode_msgpack(&request).unwrap();
+        let array: Vec<Value> = decode_msgpack(&encoded).unwrap();
+        assert_eq!(
+            array.len(),
+            34,
+            "the extended form through require_reasoning"
+        );
+        assert!(
+            array[22].is_nil() && array[23].is_nil(),
+            "no LoRA, no processor"
+        );
+        assert!(array[24].is_nil(), "positional_embed_overrides at 24");
+        assert_eq!(array[25].as_str(), Some("10.0.0.7"), "bootstrap_host at 25");
+        assert_eq!(array[26].as_i64(), Some(8998), "bootstrap_port at 26");
+        assert_eq!(array[27].as_i64(), Some(41), "bootstrap_room at 27");
+        assert!(
+            array[28..33].iter().all(Value::is_nil),
+            "bootstrap_pair_key .. routing_key nil"
+        );
+        assert_eq!(array[33], Value::Boolean(false), "require_reasoning at 33");
+        let back: TokenizedGenerateReqInput = decode_msgpack(&encoded).unwrap();
+        assert_eq!(back, request);
+
+        let partial = TokenizedGenerateReqInput {
+            rid: "probe".into(),
+            bootstrap_room: Some(0),
+            ..Default::default()
+        };
+        let encoded = encode_msgpack(&partial).unwrap();
+        let array: Vec<Value> = decode_msgpack(&encoded).unwrap();
+        assert_eq!(array.len(), 34);
+        assert!(array[25].is_nil() && array[26].is_nil());
+        assert_eq!(array[27].as_i64(), Some(0), "room 0 is sent, not dropped");
+        let back: TokenizedGenerateReqInput = decode_msgpack(&encoded).unwrap();
+        assert_eq!(back, partial);
+        // The slots sit inside the prefix the handshake check compares.
+        assert_eq!(
+            &GENERATE_WIRE_FIELDS[24..27],
+            ["bootstrap_host", "bootstrap_port", "bootstrap_room"]
+        );
     }
 
     #[test]

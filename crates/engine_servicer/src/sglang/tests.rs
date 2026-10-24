@@ -610,6 +610,94 @@ async fn streaming_generate_maps_steps_to_chunks_and_a_complete() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// A prefill/decode request's rendezvous reaches the scheduler in its own
+/// slots, as the Python servicer forwards it (an empty host and a zero port
+/// unset, the room kept as given, 0 included); a plain request writes none;
+/// the response path is the same either way.
+#[tokio::test]
+async fn a_disaggregated_request_carries_its_bootstrap_to_the_scheduler() {
+    let mut h = harness(model_info()).await;
+    let mut request = generate_request("pd1", false, Vec::new());
+    request.disaggregated_params = Some(sg::DisaggregatedParams {
+        bootstrap_host: "10.0.0.7".to_string(),
+        bootstrap_port: 8998,
+        bootstrap_room: 41,
+    });
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut h.engine_in).await;
+    assert_eq!(add.rid, "pd1");
+    assert_eq!(add.bootstrap_host.as_deref(), Some("10.0.0.7"));
+    assert_eq!(add.bootstrap_port, Some(8998));
+    assert_eq!(add.bootstrap_room, Some(41));
+    // A prefill side answers its one token and finishes on length once the
+    // KV is handed over; the servicer relays it as any completion.
+    send(
+        &mut h.engine_out,
+        &batch("pd1", vec![10], 1, Some("length"), None),
+    )
+    .await;
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "length");
+    assert_eq!(done.output_ids, vec![10]);
+    assert!(stream.message().bounded().await.unwrap().is_none());
+
+    // The fake-transfer probe: a host, no port, room 0 (kept).
+    let mut probe = generate_request("probe", false, Vec::new());
+    probe.disaggregated_params = Some(sg::DisaggregatedParams {
+        bootstrap_host: "2.2.2.2".to_string(),
+        bootstrap_port: 0,
+        bootstrap_room: 0,
+    });
+    let mut stream = h
+        .client
+        .generate(probe)
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut h.engine_in).await;
+    assert_eq!(add.bootstrap_host.as_deref(), Some("2.2.2.2"));
+    assert_eq!((add.bootstrap_port, add.bootstrap_room), (None, Some(0)));
+    send(
+        &mut h.engine_out,
+        &batch("probe", vec![11], 1, Some("length"), None),
+    )
+    .await;
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "length"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+
+    let mut stream = h
+        .client
+        .generate(generate_request("plain", false, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut h.engine_in).await;
+    assert_eq!(
+        (add.bootstrap_host, add.bootstrap_port, add.bootstrap_room),
+        (None, None, None)
+    );
+    send(
+        &mut h.engine_out,
+        &batch("plain", vec![12], 1, Some("stop"), None),
+    )
+    .await;
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "stop"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    wait_until(|| h.server.active_requests() == 0).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// A score-only scheduler result must survive the wire and proto conversion,
 /// even though no sampled-token logprobs exist to carry it.
 #[tokio::test]

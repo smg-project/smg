@@ -485,12 +485,12 @@ pub(crate) fn fan_out_sglang_requests(
 /// `TokenizedGenerateReqInput`. ZMQ mode requires pre-tokenized input (SMG
 /// tokenizes upstream). The slim output carries sampled and prompt logprobs
 /// with their ranked and selected candidates, and the hidden states a request
-/// asks for; what the wire does not carry (multimodal payloads, PD bootstrap
-/// fields) is refused rather than silently dropped. `max_model_len` is the
-/// context window the scheduler reported at the handshake: an empty prompt,
-/// or one
-/// that fills the window, is refused before it reaches the scheduler
-/// ([`admit_prompt`]).
+/// asks for; what the wire does not carry (multimodal payloads) is refused
+/// rather than silently dropped. A disaggregated request's bootstrap fields
+/// ride the scheduler's own slots, as the Python servicer forwards them.
+/// `max_model_len` is the context window the scheduler reported at the
+/// handshake: an empty prompt, or one that fills the window, is refused
+/// before it reaches the scheduler ([`admit_prompt`]).
 pub(crate) fn translate_request_sglang(
     req: sglang_proto::GenerateRequest,
     max_model_len: u64,
@@ -511,15 +511,19 @@ pub(crate) fn translate_request_sglang(
             "multimodal inputs are not supported over the SGLang ZMQ backend yet".to_string(),
         );
     }
-    // The bootstrap slots stay at the scheduler's defaults on this wire;
-    // refuse rather than run without the PD bootstrap the request asked for.
-    if req.disaggregated_params.is_some() {
-        return Err(
-            "PD disaggregation (disaggregated_params) is not supported over the SGLang ZMQ \
-             backend"
-                .to_string(),
-        );
-    }
+    // The prefill/decode rendezvous (the prefill side's bootstrap server and
+    // the room both sides meet in), forwarded as the Python servicer forwards
+    // it: an empty host and a zero port are unset, the room is kept as given
+    // (0 is a room: the fake-transfer probe's) whenever the message is
+    // present, and an absent message leaves the scheduler's defaults.
+    let (bootstrap_host, bootstrap_port, bootstrap_room) = match req.disaggregated_params {
+        Some(params) => (
+            (!params.bootstrap_host.is_empty()).then_some(params.bootstrap_host),
+            (params.bootstrap_port != 0).then_some(params.bootstrap_port),
+            Some(i64::from(params.bootstrap_room)),
+        ),
+        None => (None, None, None),
+    };
     Ok(TokenizedGenerateReqInput {
         rid: req.request_id,
         input_ids,
@@ -540,6 +544,9 @@ pub(crate) fn translate_request_sglang(
         lora_id: (!req.lora_id.is_empty()).then_some(req.lora_id),
         custom_logit_processor: (!req.custom_logit_processor.is_empty())
             .then_some(req.custom_logit_processor),
+        bootstrap_host,
+        bootstrap_port,
+        bootstrap_room,
         require_reasoning: req.require_reasoning,
         ..TokenizedGenerateReqInput::default()
     })
@@ -938,11 +945,6 @@ mod tests {
             .return_hidden_states,
             "hidden states ride the wire"
         );
-        assert!(translate(sglang_proto::GenerateRequest {
-            disaggregated_params: Some(sglang_proto::DisaggregatedParams::default()),
-            ..base.clone()
-        })
-        .is_err());
         // Forwarded as the Python servicer forwards them.
         let forwarded = translate(sglang_proto::GenerateRequest {
             lora_id: "adapter".into(),
@@ -993,6 +995,70 @@ mod tests {
         .unwrap();
         assert_eq!(ok.rid, "r");
         assert!(ok.return_logprob && ok.stream && ok.require_reasoning);
+    }
+
+    /// A disaggregated request's bootstrap fields reach the scheduler's own
+    /// slots with the Python servicer's rules: an empty host and a zero port
+    /// are unset, the room is kept as given (0 included) whenever the message
+    /// is present, and no message leaves all three unset.
+    #[test]
+    fn sglang_translation_forwards_the_pd_bootstrap_as_the_python_servicer_does() {
+        let base = sglang_proto::GenerateRequest {
+            request_id: "pd".into(),
+            tokenized: Some(sglang_proto::TokenizedInput {
+                input_ids: vec![1, 2],
+                original_text: String::new(),
+            }),
+            ..Default::default()
+        };
+        let rendezvous = translate(sglang_proto::GenerateRequest {
+            disaggregated_params: Some(sglang_proto::DisaggregatedParams {
+                bootstrap_host: "10.0.0.7".into(),
+                bootstrap_port: 8998,
+                bootstrap_room: 41,
+            }),
+            ..base.clone()
+        })
+        .unwrap();
+        assert_eq!(rendezvous.bootstrap_host.as_deref(), Some("10.0.0.7"));
+        assert_eq!(rendezvous.bootstrap_port, Some(8998));
+        assert_eq!(rendezvous.bootstrap_room, Some(41));
+        // The fake-transfer probe: a host, room 0, no port.
+        let probe = translate(sglang_proto::GenerateRequest {
+            disaggregated_params: Some(sglang_proto::DisaggregatedParams {
+                bootstrap_host: "2.2.2.2".into(),
+                bootstrap_port: 0,
+                bootstrap_room: 0,
+            }),
+            ..base.clone()
+        })
+        .unwrap();
+        assert_eq!(probe.bootstrap_host.as_deref(), Some("2.2.2.2"));
+        assert_eq!(probe.bootstrap_port, None);
+        assert_eq!(probe.bootstrap_room, Some(0));
+        // An empty message is present: the room is 0, the rest unset.
+        let empty = translate(sglang_proto::GenerateRequest {
+            disaggregated_params: Some(sglang_proto::DisaggregatedParams::default()),
+            ..base.clone()
+        })
+        .unwrap();
+        assert_eq!(
+            (
+                empty.bootstrap_host,
+                empty.bootstrap_port,
+                empty.bootstrap_room
+            ),
+            (None, None, Some(0))
+        );
+        let plain = translate(base).unwrap();
+        assert_eq!(
+            (
+                plain.bootstrap_host,
+                plain.bootstrap_port,
+                plain.bootstrap_room
+            ),
+            (None, None, None)
+        );
     }
 
     /// Prompt bounds apply before the scheduler, with or without an output

@@ -15,12 +15,21 @@ them), each with this package's SGLang plugin dialing the servicer's same-host
 msgpack ZMQ handshake. Python keeps the lifecycle only. The Router cannot tell
 the two implementations apart.
 
-What the msgpack wire does not carry, the Rust path reports rather than
-emulates: multimodal inputs are refused, PD/EPD disaggregation stays with the
-Python implementation, and LoRA loading answers UNIMPLEMENTED, as on the
-Python servicer; ``Embed``, ``FlushCache``, profiling, the KV-event relay,
-prompt logprobs and hidden states are served (hidden states on this path
-only: the Python servicer refuses them by name).
+Prefill/decode disaggregation is served as on the Python servicer: a request's
+bootstrap fields (host, port, room) ride the scheduler's own request struct
+over the wire, and the prefill side's bootstrap server starts in this process
+before the ranks, where the Python servicer starts it; the planned warm-up
+runs on a prefill or decode leg as on a single engine, its requests carrying
+the engine's stand-in bootstrap, so the leg warms up without its peer and no
+first request of a prompt-length class pays a kernel compile under the
+Router's prefill-liveness bound. What the msgpack wire
+does not carry, the Rust path reports rather than emulates: LoRA loading
+answers UNIMPLEMENTED (as on the Python servicer), multimodal
+inputs are refused, and EPD disaggregation (``language_only`` /
+``encoder_only``) stays with the Python implementation until the encode
+dispatch is on this path; ``Embed``, ``FlushCache``, profiling, the KV-event relay, prompt logprobs and
+hidden states are served (hidden states on this path only: the Python
+servicer refuses them by name).
 """
 
 from __future__ import annotations
@@ -362,6 +371,9 @@ def launch_scheduler_ranks(
     # This process fills the tokenizer manager's role for argument resolution
     # only; the ranks publish their own records when they start.
     publish(server_args, role="tokenizer")
+    # A prefill side's bootstrap server, before the ranks that register with
+    # it; the ranks' handle holds it for their lifetime.
+    bootstrap_server = start_bootstrap_server(server_args)
     port_args = PortArgs.init_new(server_args)
     # The fault handler goes in before the spawner starts a rank: a rank that
     # fails during its start signals its parent at once.
@@ -370,7 +382,11 @@ def launch_scheduler_ranks(
     init, processes = Engine._launch_scheduler_processes(
         server_args, port_args, run_scheduler_process
     )
-    ranks = SchedulerProcesses(list(processes or []), ready=init.wait_for_ready)
+    ranks = SchedulerProcesses(
+        list(processes or []),
+        ready=init.wait_for_ready,
+        holding=[bootstrap_server] if bootstrap_server is not None else (),
+    )
     engine = latch.attach(EngineProcessGroup(ranks))
     ranks.watch_ready("SGLang scheduler", on_failure=engine.fault)
     logger.info(
@@ -392,21 +408,45 @@ def tokenizer_dir_for(server_args: Any) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def refuse_disaggregation(server_args: Any) -> None:
-    """PD/EPD stays with the Python servicer: the msgpack wire carries no
-    bootstrap fields and this path starts no bootstrap server, so such a
-    worker must not start rather than report SERVING and hang requests."""
+def refuse_epd_disaggregation(server_args: Any) -> None:
+    """EPD disaggregation stays with the Python servicer: a ``language_only``
+    worker dispatches each request's images to the encoders from the servicer
+    process (the receiver's encode request), which this path does not run
+    yet, so such a worker must not start rather than report SERVING and
+    refuse every image. Prefill/decode disaggregation is served (the wire
+    carries the bootstrap fields; :func:`start_bootstrap_server`)."""
     args = EngineConfigView(server_args).server_args
-    if args.disaggregation_mode != "null":
-        raise ServicerConfigError(
-            f"{SERVICER_IMPL_ENV}=rust does not support PD disaggregation "
-            f"(disaggregation_mode={args.disaggregation_mode!r}); unset it for this worker"
-        )
     if args.language_only or args.encoder_only:
         raise ServicerConfigError(
-            f"{SERVICER_IMPL_ENV}=rust does not support EPD disaggregation "
-            "(language_only / encoder_only); unset it for this worker"
+            f"{SERVICER_IMPL_ENV}=rust does not serve EPD disaggregation yet "
+            "(language_only / encoder_only: the encode dispatch is not on the Rust path); "
+            "run this worker on the Python servicer"
         )
+
+
+def start_bootstrap_server(server_args: Any) -> Any | None:
+    """The prefill side's KV bootstrap server, started where the Python
+    servicer starts it (``serve_grpc``, before the schedulers): SGLang's
+    ``start_disagg_service`` builds the transfer backend's server on the
+    launcher's ``--host`` and ``--disaggregation-bootstrap-port`` in the
+    process that fills the tokenizer manager's role, so the runtime context
+    must be published first. The prefill ranks register their KV senders with
+    it as they start and the decode ranks' receivers query it by room.
+    ``None`` for every other role (a decode side starts none); otherwise the
+    server, to be held for the ranks' lifetime (it serves on a daemon
+    thread)."""
+    if EngineConfigView(server_args).server_args.disaggregation_mode != "prefill":
+        return None
+    from sglang.srt.managers.disagg_service import start_disagg_service
+
+    bootstrap_server = start_disagg_service()
+    if bootstrap_server is not None:
+        logger.info(
+            "Bootstrap server started for disaggregation mode on %s:%s",
+            getattr(server_args, "host", None),
+            getattr(server_args, "disaggregation_bootstrap_port", None),
+        )
+    return bootstrap_server
 
 
 class SglangLauncher(RustLauncher):
@@ -456,5 +496,5 @@ async def serve_rust(server_args: Any) -> int:
     start the scheduler ranks against its handshake, and supervise both
     until a signal or a failure (:class:`SglangLauncher`). Returns the
     process exit code."""
-    refuse_disaggregation(server_args)
+    refuse_epd_disaggregation(server_args)
     return await SglangLauncher().serve(server_args)

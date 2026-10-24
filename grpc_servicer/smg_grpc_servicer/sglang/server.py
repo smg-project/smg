@@ -641,6 +641,12 @@ def _planned_warmup(server_args: ServerArgs, model_info: Any, channel: Any) -> A
     except ValueError as error:
         logger.warning("%s; the planned warm-up is skipped", error)
         return None
+    if server_args.disaggregation_mode != DisaggregationMode.NULL.value:
+        # This servicer's own warm-up request above carried the stand-in
+        # bootstrap already; the planned pass on a prefill or decode leg is
+        # the Rust launcher's (this servicer's start-up is kept as it is).
+        logger.info("Planned warm-up: none on a disaggregation role on this servicer")
+        return None
     facts = {
         "is_generation": bool(getattr(model_info, "is_generation", True)),
         "max_context_length": getattr(model_info, "max_context_length", 0),

@@ -391,15 +391,54 @@ def test_server_facts_carry_the_kv_events_publisher(monkeypatch):
     assert rust.kv_events_publisher(_server_args(kv_events_config="not json")) == ("", "", "")
 
 
-def test_disaggregated_workers_are_refused_up_front():
-    rust.refuse_disaggregation(_server_args())
-    rust.refuse_disaggregation(_server_args(disaggregation_mode="null"))
-    with pytest.raises(ValueError, match="PD disaggregation"):
-        rust.refuse_disaggregation(_server_args(disaggregation_mode="prefill"))
-    with pytest.raises(ValueError, match="EPD"):
-        rust.refuse_disaggregation(_server_args(language_only=True))
-    with pytest.raises(ValueError, match="PD disaggregation"):
-        asyncio.run(rust.serve_rust(_server_args(disaggregation_mode="decode")))
+def test_epd_workers_are_refused_up_front_and_prefill_decode_ones_are_not():
+    """The encode dispatch is not on the Rust path: an EPD role is a
+    configuration error before the server binds. A prefill/decode role is
+    served (the wire carries the bootstrap fields), so it passes."""
+    rust.refuse_epd_disaggregation(_server_args())
+    rust.refuse_epd_disaggregation(_server_args(disaggregation_mode="null"))
+    for mode in ("prefill", "decode"):
+        rust.refuse_epd_disaggregation(_server_args(disaggregation_mode=mode))
+    for role in ({"language_only": True}, {"encoder_only": True}):
+        with pytest.raises(rust_lifecycle.ServicerConfigError, match="EPD disaggregation"):
+            rust.refuse_epd_disaggregation(_server_args(**role))
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="EPD disaggregation"):
+        asyncio.run(rust.serve_rust(_server_args(language_only=True)))
+
+
+def test_the_prefill_side_starts_its_bootstrap_server_before_the_ranks(
+    monkeypatch, caplog, restore_fault_signals
+):
+    """A prefill worker's KV bootstrap server starts in this process after
+    the runtime context is published and before the ranks, which register
+    with it, where the Python servicer starts it; the ranks' handle holds it
+    for their lifetime. A decode or single worker starts none."""
+    recorded = _stub_rank_launch(monkeypatch)
+    server = SimpleNamespace(name="bootstrap")
+
+    def start_disagg_service():
+        recorded["calls"].append("bootstrap")
+        return server
+
+    _install(
+        monkeypatch,
+        "sglang.srt.managers.disagg_service",
+        start_disagg_service=start_disagg_service,
+    )
+    args = _preparable_args(
+        recorded, disaggregation_mode="prefill", disaggregation_bootstrap_port=8998
+    )
+    with caplog.at_level("INFO"):
+        engine = rust.launch_scheduler_ranks(args, handshake_port=24321)
+    assert recorded["calls"][-4:] == ["publish:tokenizer", "bootstrap", "port_args", "launch"]
+    assert engine._manager.holding == [server]
+    assert "Bootstrap server started for disaggregation mode on 127.0.0.1:8998" in caplog.text
+    for mode in ("decode", "null"):
+        recorded["calls"].clear()
+        engine = rust.launch_scheduler_ranks(
+            _preparable_args(recorded, disaggregation_mode=mode), handshake_port=24321
+        )
+        assert "bootstrap" not in recorded["calls"] and engine._manager.holding == []
 
 
 def test_server_facts_refuse_non_finite_floats():
@@ -768,7 +807,7 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
     assert published["endpoint"].startswith("tcp://*:") and published["endpoint"] != "tcp://*:5557"
 
 
-def _run_serve_rust(monkeypatch, tmp_path, *, real_facts: bool = False) -> dict:
+def _run_serve_rust(monkeypatch, tmp_path, *, real_facts: bool = False, args=None) -> dict:
     """``serve_rust`` against a recording fake server, the scheduler launch and
     the supervisor stubbed; the keywords the server was constructed with. With
     ``real_facts`` the launcher's own fact producers run, over a fake model
@@ -815,7 +854,7 @@ def _run_serve_rust(monkeypatch, tmp_path, *, real_facts: bool = False) -> dict:
         return 0
 
     monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
-    assert asyncio.run(rust.serve_rust(_server_args())) == 0
+    assert asyncio.run(rust.serve_rust(_server_args() if args is None else args)) == 0
     _run_serve_rust.recorded = recorded
     return created
 
@@ -837,6 +876,33 @@ def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_pat
     recorded = _run_serve_rust.recorded
     assert recorded["server"].ready == [] and recorded["server"].serving == []
     assert recorded["supervise_kwargs"] == {}
+
+
+def test_a_disaggregation_role_plans_its_warm_up_without_a_peer(monkeypatch, tmp_path):
+    """A prefill or decode leg plans the warm-up as a single engine does and
+    holds readiness for it; the plan's inputs carry the engine's stand-in
+    bootstrap host, so the requests are bound for nobody and the leg warms up
+    before its peer is there."""
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.disaggregation.utils",
+        SimpleNamespace(FAKE_BOOTSTRAP_HOST="2.2.2.2"),
+    )
+    planned = {}
+    plan_for = rust_lifecycle.plan_for
+
+    def spying_plan_for(setting, inputs, *, knob):
+        planned["inputs"] = inputs
+        return plan_for(setting, inputs, knob=knob)
+
+    monkeypatch.setattr(rust_lifecycle, "plan_for", spying_plan_for)
+    for mode in ("prefill", "decode"):
+        args = _server_args(disaggregation_mode=mode)
+        _run_serve_rust(monkeypatch, tmp_path, real_facts=True, args=args)
+        recorded = _run_serve_rust.recorded
+        assert planned.pop("inputs").lone_leg_bootstrap == "2.2.2.2"
+        assert recorded["server"].ready == [False] and recorded["server"].serving == []
+        assert callable(recorded["supervise_kwargs"]["warmup"])
 
 
 def test_serve_rust_hands_the_server_both_startup_bounds(monkeypatch, tmp_path):
@@ -1033,9 +1099,52 @@ def test_serve_rust_refuses_a_socket_dir_that_is_a_file_before_the_server_binds(
     assert created == {}
 
 
-def test_a_disaggregated_worker_is_refused_as_a_configuration_error():
-    with pytest.raises(rust_lifecycle.ServicerConfigError, match="PD disaggregation"):
-        rust.refuse_disaggregation(_server_args(disaggregation_mode="prefill"))
+def test_an_epd_worker_is_refused_as_a_configuration_error():
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="EPD disaggregation"):
+        rust.refuse_epd_disaggregation(_server_args(encoder_only=True))
+
+
+def test_serve_rust_serves_a_prefill_decode_launch(monkeypatch, tmp_path):
+    """A disaggregated role is no longer a configuration error on the Rust
+    path: the server binds and the ranks start as for a single engine."""
+    created = {}
+
+    class FakeServer:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+            self.address = kwargs["bind_address"]
+
+    _install_fake_servicer(monkeypatch, FakeServer)
+    monkeypatch.setenv(rust.HANDSHAKE_PORT_ENV, "24321")
+    monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
+    monkeypatch.setattr(rust, "model_facts", lambda args: {"model_path": args.model_path})
+    monkeypatch.setattr(
+        rust, "server_facts", lambda args: {"data_parallel_size": 1, "sglang_version": "x"}
+    )
+    monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: "/tok")
+    launched = {}
+    monkeypatch.setattr(
+        rust,
+        "launch_scheduler_ranks",
+        lambda server_args, *, handshake_port: launched.setdefault("args", server_args),
+    )
+
+    async def fake_supervise(server, engine, *, drain_secs):
+        return 0
+
+    monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
+    # The warm-up planner reads the engine's stand-in bootstrap host on a
+    # disaggregation role (the facts here carry no vocabulary: nothing planned).
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.disaggregation.utils",
+        SimpleNamespace(FAKE_BOOTSTRAP_HOST="2.2.2.2"),
+    )
+    for mode in ("prefill", "decode"):
+        args = _server_args(disaggregation_mode=mode)
+        assert asyncio.run(rust.serve_rust(args)) == 0
+        assert launched.pop("args") is args
+    assert created["bind_address"] == "127.0.0.1:30011"
 
 
 def test_a_launch_that_fails_stops_the_already_bound_server(monkeypatch, tmp_path):

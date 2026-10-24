@@ -34,7 +34,7 @@ import socket
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Mapping, MutableMapping
+from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from typing import Any
 
 from smg_grpc_servicer.hostport import host_port, loopback_target
@@ -926,7 +926,9 @@ class SchedulerProcesses:
     it was given, or raises; :meth:`watch_ready` runs it on a thread, so the
     reports are drained (a process never blocks on its report) and a failed
     start is logged at once, while the supervisor keeps polling the
-    processes themselves.
+    processes themselves. ``holding`` is what lives as long as the processes
+    do (a prefill side's bootstrap server, which the ranks register with):
+    referenced here, and shut down with them where it has a ``shutdown``.
     """
 
     def __init__(
@@ -935,10 +937,12 @@ class SchedulerProcesses:
         *,
         ready: Callable[[], Any] | None = None,
         grace_secs: float = SCHEDULER_GRACE_SECS,
+        holding: Iterable[Any] = (),
     ):
         self.processes = list(processes)
         self._ready = ready
         self._grace_secs = grace_secs
+        self.holding = list(holding)
         self.ready_thread: threading.Thread | None = None
         self.ready_error: Exception | None = None
 
@@ -990,6 +994,11 @@ class SchedulerProcesses:
                 )
                 process.kill()
                 process.join(SCHEDULER_KILL_SECS)
+        for held in self.holding:
+            shutdown = getattr(held, "shutdown", None)
+            if callable(shutdown) and not asyncio.iscoroutinefunction(shutdown):
+                with contextlib.suppress(Exception):
+                    shutdown()
 
 
 def wait_for_ready_reports(

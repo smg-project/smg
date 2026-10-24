@@ -12,6 +12,14 @@ The plan keeps to the length classes (:attr:`WarmupInputs.every_prefill_length`
 stays off): the first use of a prefill length between two classes has only
 cost this engine a kernel search, never a hang, and at its default step of
 16,384 tokens a pass over every length would take an hour.
+
+A prefill or decode leg of a disaggregated pair plans as a single engine
+does: its requests carry the engine's own stand-in bootstrap (what the
+engine's warm-up sets in disaggregation mode: the fake-transfer host and room
+0), a transfer to nobody on either side, so the leg warms up without its peer
+and no first request of a prompt-length class pays a kernel compile under the
+Router's prefill-liveness bound. The EPD roles take no plan: their requests
+need multimodal inputs a warm-up does not carry.
 """
 
 from __future__ import annotations
@@ -38,17 +46,26 @@ def warmup_inputs(server_args: Any, facts: Mapping[str, Any]) -> WarmupInputs | 
     model facts (``is_generation``, ``max_context_length``, ``vocab_size``):
     the running window (``--max-running-requests``; unknown when the scheduler
     sizes it itself), the step budget (the chunk size under chunked prefill,
-    else the prefill budget, else the engine's default), the context. ``None``
-    for a model that generates nothing and for a disaggregation role, whose
-    requests need bootstrap fields a warm-up does not carry. The plan is one
-    rank's: the servicer routes this engine's requests to the least-loaded
-    scheduler rank and reads no rank off a request, so under data parallelism
-    each prefill shape reaches one rank (a WARNING line says so)."""
+    else the prefill budget, else the engine's default), the context, and on
+    a prefill or decode leg the engine's stand-in bootstrap host for the
+    requests to carry. ``None`` for a model that generates nothing and for the
+    EPD roles (``--language-only`` / ``--encoder-only``), whose requests need
+    multimodal inputs a warm-up does not carry. The plan is one rank's: the
+    servicer routes this engine's requests to the least-loaded scheduler rank
+    and reads no rank off a request, so under data parallelism each prefill
+    shape reaches one rank (a WARNING line says so)."""
     if not facts.get("is_generation", True):
         return None
     args = EngineConfigView(server_args).server_args
-    if args.disaggregation_mode != "null" or args.language_only or args.encoder_only:
+    if args.language_only or args.encoder_only:
         return None
+    lone_leg_bootstrap = None
+    if args.disaggregation_mode != "null":
+        # The engine's own warm-up convention for a disaggregation role: a
+        # request bound for this host is a transfer to nobody on either leg.
+        from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+
+        lone_leg_bootstrap = FAKE_BOOTSTRAP_HOST
     if args.scheduler_count > 1:
         logger.warning(
             "The engine runs %d scheduler ranks and the servicer routes a warm-up request to the "
@@ -63,6 +80,7 @@ def warmup_inputs(server_args: Any, facts: Mapping[str, Any]) -> WarmupInputs | 
         max_model_len=args.context_length or int(facts.get("max_context_length") or 0),
         vocab_size=int(facts.get("vocab_size") or 0),
         source="window and step from the server arguments (the engine's default step when unset)",
+        lone_leg_bootstrap=lone_leg_bootstrap,
     )
 
 
@@ -106,6 +124,14 @@ class GrpcWire:
             ),
             stream=False,
         )
+        if request.lone_leg_bootstrap is not None:
+            # As the engine's own warm-up sends it in disaggregation mode:
+            # the stand-in host and room 0.
+            message.disaggregated_params.CopyFrom(
+                sglang_scheduler_pb2.DisaggregatedParams(
+                    bootstrap_host=request.lone_leg_bootstrap, bootstrap_room=0
+                )
+            )
         last = None
         for frame in self._stub.Generate(message, timeout=timeout):
             last = frame

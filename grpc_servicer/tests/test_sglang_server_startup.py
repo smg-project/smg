@@ -281,6 +281,32 @@ def test_generation_warmup_sends_valid_sampling_defaults(monkeypatch, server_mod
     channel.close.assert_called_once()
 
 
+def test_the_planned_warm_up_stays_off_on_a_disaggregation_role(monkeypatch, server_mod, caplog):
+    """This servicer's own warm-up request carried the stand-in bootstrap
+    already; the planned pass on a prefill or decode leg is the Rust
+    launcher's, so the planner is never asked here, and a single engine still
+    plans."""
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(
+        server_mod, "DisaggregationMode", SimpleNamespace(NULL=SimpleNamespace(value="null"))
+    )
+    never = Mock(side_effect=AssertionError("the planner must not be asked on a leg"))
+    monkeypatch.setattr(server_mod, "warmup_inputs", never)
+    for mode in ("prefill", "decode"):
+        leg = SimpleNamespace(disaggregation_mode=mode)
+        assert server_mod._planned_warmup(leg, SimpleNamespace(), channel=None) is None
+    never.assert_not_called()
+    assert any(
+        "Planned warm-up: none on a disaggregation role on this servicer" in r.getMessage()
+        for r in caplog.records
+    )
+    asked = Mock(return_value=None)
+    monkeypatch.setattr(server_mod, "warmup_inputs", asked)
+    single = SimpleNamespace(disaggregation_mode="null")
+    assert server_mod._planned_warmup(single, SimpleNamespace(), channel=None) is None
+    asked.assert_called_once()
+
+
 def test_a_failed_planned_warm_up_never_ends_the_server(monkeypatch, server_mod, caplog):
     """The planned pass is an optimisation: when it raises past its own
     guards, the first warm-up request still counts and the process stays up

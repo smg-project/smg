@@ -4,6 +4,12 @@
 //! scheduler speaks to the Router's direct lane). The Router cannot tell the
 //! two implementations apart; Python keeps the lifecycle, launching the
 //! headless scheduler and driving this server through the binding.
+//!
+//! Prefill/decode disaggregation works as on the Python servicer: a request's
+//! bootstrap fields (host, port, room) ride the scheduler's own request struct
+//! over the wire, the launcher starts the prefill side's bootstrap server
+//! before the ranks, and `GetServerInfo` carries the server args the Router
+//! pairs on.
 
 mod admin;
 mod embed;

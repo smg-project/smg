@@ -200,6 +200,11 @@ class WarmupInputs:
     #: ``full`` level alone: a ``fast`` start plans the classes and leaves the
     #: hazard open, and :func:`plan_for` warns so.
     every_prefill_length: bool = False
+    #: The bootstrap host the engine's scheduler takes as a transfer to
+    #: nobody (its own warm-up's stand-in), when the engine is one leg of a
+    #: disaggregated pair: every request carries it, so the leg warms up
+    #: without its peer. ``None`` for a single engine.
+    lone_leg_bootstrap: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -218,6 +223,9 @@ class WarmupRequest:
     #: The data-parallel rank the request is pinned to; ``None`` leaves the
     #: servicer's own routing to pick the engine (one rank, or no pinning).
     data_parallel_rank: int | None = None
+    #: A lone leg's stand-in bootstrap host
+    #: (:attr:`WarmupInputs.lone_leg_bootstrap`), for the wire to carry.
+    lone_leg_bootstrap: str | None = None
 
     @property
     def token_ids(self) -> tuple[int, ...]:
@@ -273,6 +281,11 @@ class WarmupPlan:
             f"a window of {self.inputs.max_num_seqs} and a step of "
             f"{self.inputs.max_num_batched_tokens}"
             + (f" on each of {ranks} data-parallel ranks" if ranks > 1 else "")
+            + (
+                ", the requests carrying the lone leg's stand-in bootstrap"
+                if self.inputs.lone_leg_bootstrap
+                else ""
+            )
         )
 
 
@@ -346,8 +359,9 @@ def token_ids(count: int, seed: int, vocab_size: int) -> tuple[int, ...]:
 class _Requests:
     """The requests of one plan, numbered: the ordinal seeds the token ids."""
 
-    def __init__(self, vocab_size: int) -> None:
+    def __init__(self, vocab_size: int, lone_leg_bootstrap: str | None = None) -> None:
         self._vocab_size = vocab_size
+        self._lone_leg_bootstrap = lone_leg_bootstrap
         self._next = 0
 
     def one(self, prompt_tokens: int, max_tokens: int, rank: int | None = None) -> WarmupRequest:
@@ -363,6 +377,7 @@ class _Requests:
             seed=ordinal,
             vocab_size=self._vocab_size,
             data_parallel_rank=rank,
+            lone_leg_bootstrap=self._lone_leg_bootstrap,
         )
 
 
@@ -382,7 +397,7 @@ def plan_warmup(inputs: WarmupInputs, level: str = DEFAULT_LEVEL) -> WarmupPlan:
     steps: list[WarmupStep] = []
     if inputs.max_num_batched_tokens <= 0 or inputs.vocab_size <= 0:
         return WarmupPlan(level, inputs, ())
-    requests = _Requests(inputs.vocab_size)
+    requests = _Requests(inputs.vocab_size, inputs.lone_leg_bootstrap)
     window = inputs.max_num_seqs if inputs.max_num_seqs > 0 else DEFAULT_WINDOW
     # The longest prompt a one-token request may carry.
     context = (

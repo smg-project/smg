@@ -1091,10 +1091,16 @@ step's rows on each later one and the whole list on the completion, within the
 scheduler's `--return-hidden-states-mode` cap, which both servicers keep ahead
 of the scheduler with the engine's own words; the Python servicer then refuses
 the request by name (`INVALID_ARGUMENT`, pointing at `--servicer-impl rust`),
-where it once accepted the flag and returned nothing. What the wire does not
-carry is reported, not emulated: multimodal inputs are refused, PD/EPD
-disaggregation stays with the Python implementation (the worker refuses to
-start on the Rust path in those modes), and LoRA loading answers UNIMPLEMENTED,
+where it once accepted the flag and returned nothing.
+Prefill/decode disaggregation (`--disaggregation-mode prefill|decode`) works as
+on the Python servicer: a request's bootstrap fields (host, port, room) ride
+the scheduler's own request struct over the wire, the prefill side's bootstrap
+server starts in the servicer process before the ranks, and `GetServerInfo`
+carries the server args the Router pairs on. What the wire does not carry is
+reported, not emulated: multimodal inputs are refused, EPD
+disaggregation (`--language-only` / `--encoder-only`) stays with the Python
+implementation (the worker refuses to start on the Rust path in those modes:
+the encode dispatch is not on it yet), and LoRA loading answers UNIMPLEMENTED,
 as it does on the Python servicer.
 `SubscribeKvEvents` relays SGLang's ZMQ KV-event publisher, which the servicer
 turns on by itself, on this path as on the Python one, when the launcher is
@@ -1109,8 +1115,11 @@ above: `full` by default, `fast`, `off`, a budget in seconds or
 `<level>:<seconds>`; planned from `--max-running-requests` and
 `--chunked-prefill-size` or `--max-prefill-tokens`, the engine's defaults
 where unset; the Python servicer runs the same plan over its own port after
-its first warm-up request, and both skip it on a disaggregation role; under
-data parallelism the servicer routes a request by load, not by rank, so each
+its first warm-up request and skips it on a disaggregation role; the Rust
+path plans a prefill or decode leg as a single engine, its requests carrying
+the engine's stand-in bootstrap so the leg warms up without its peer, and the
+EPD roles take none; under data parallelism the servicer routes a request by
+load, not by rank, so each
 prefill shape warms one rank and the log says so),
 `SMG_SGLANG_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and
 `SMG_SGLANG_SERVICER_STARTUP_CEILING_SECS` (default 14400; the two startup

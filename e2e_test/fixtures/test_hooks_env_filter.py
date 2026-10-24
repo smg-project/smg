@@ -334,6 +334,10 @@ def test_sglang_rust_lane_drops_only_what_the_msgpack_wire_lacks():
         "e2e_test/chat_completions/test_pd.py::test_pd[pd_mooncake]",
         params={"setup_backend": "pd_mooncake"},
     )
+    epd = _FakeItem(
+        "e2e_test/chat_completions/test_epd.py::test_epd[1e1p1d]",
+        params={"setup_backend": ("epd_grpc", (1, 1, 1))},
+    )
     mm = _FakeItem(
         "e2e_test/chat_completions/test_multimodal.py::test_image[grpc]",
         params={"setup_backend": "grpc"},
@@ -345,7 +349,8 @@ def test_sglang_rust_lane_drops_only_what_the_msgpack_wire_lacks():
     embed = _FakeItem(
         "e2e_test/embeddings/test_basic.py::test_embed[grpc]", params={"setup_backend": "grpc"}
     )
-    kept, deselected = hooks._filter_sglang_rust_items([chat, pd, mm, admin, embed])
-    # Admin ops and embeddings ride the wire (control calls, embedding
-    # requests); PD topologies and multimodal payloads do not.
-    assert kept == [chat, admin, embed] and deselected == [pd, mm]
+    kept, deselected = hooks._filter_sglang_rust_items([chat, pd, epd, mm, admin, embed])
+    # Admin ops, embeddings and the prefill/decode bootstrap fields ride the
+    # wire (control calls, embedding requests, the scheduler's own slots);
+    # EPD topologies (the encode dispatch) and multimodal payloads do not.
+    assert kept == [chat, pd, admin, embed] and deselected == [epd, mm]
