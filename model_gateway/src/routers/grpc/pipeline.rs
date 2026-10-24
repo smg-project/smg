@@ -202,7 +202,8 @@ impl PipelineDeps {
             self.tool_parser_factory.clone(),
             self.reasoning_parser_factory.clone(),
             parser_resolver.clone(),
-        );
+        )
+        .with_backend(backend);
         let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
             self.tool_parser_factory.clone(),
             self.reasoning_parser_factory.clone(),
@@ -224,7 +225,8 @@ impl PipelineDeps {
             ToolParserFactory::default(),
             ReasoningParserFactory::default(),
             utils::ParserResolver::disabled(),
-        );
+        )
+        .with_backend(backend);
         let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
             ToolParserFactory::default(),
             ReasoningParserFactory::default(),

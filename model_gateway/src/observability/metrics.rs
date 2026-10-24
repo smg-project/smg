@@ -1846,10 +1846,11 @@ impl Metrics {
         .increment(tail_tokens);
     }
 
-    /// Record all streaming metrics in a single batch call.
-    ///
-    /// This consolidates TTFT, TPOT, generation duration, and token metrics
-    /// into one function, handling TPOT calculation internally.
+    /// Record an answer's token and latency families in a single batch call:
+    /// TTFT, TPOT, generation duration and the token counters, with the TPOT
+    /// computed here. A streamed answer records at its end; a collected one
+    /// when its response is built, with no TTFT (no first token is seen on
+    /// that path) and so no TPOT.
     pub fn record_streaming_metrics(params: StreamingMetricsParams<'_>) {
         let StreamingMetricsParams {
             router_type,

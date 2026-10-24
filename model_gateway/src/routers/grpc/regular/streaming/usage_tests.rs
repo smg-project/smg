@@ -944,3 +944,85 @@ async fn messages_settlement_carries_the_engines_counts_streamed_and_not() {
         assert_eq!(message.usage.cache_read_input_tokens, Some(0), "{name}");
     }
 }
+
+/// The token and generation families of a collected answer are recorded as
+/// a streamed answer's are: the chat, completion, generate and messages
+/// shapes each render their counts and one generation observation under
+/// their own endpoint; no TTFT or TPOT, which a collected answer has no
+/// first token for; and no prompt figures for generate, whose streamed
+/// answer counts none either.
+#[test]
+fn a_collected_answer_records_its_token_and_generation_families() {
+    use crate::observability::metrics::test_support::render_with_recorder;
+
+    let counters = Counters {
+        prompt: 12,
+        cached: 4,
+        spec_accepted: 0,
+        spec_drafted: 0,
+    };
+    let chat_request: ChatCompletionRequest =
+        serde_json::from_value(json!({"model": "eof-test", "messages": [], "n": 1}))
+            .expect("chat request");
+    let completion_request: CompletionRequest =
+        serde_json::from_value(json!({"model": "eof-test", "prompt": "hi", "n": 1}))
+            .expect("completion request");
+    // The recorder is thread-local: a current-thread runtime keeps every
+    // record on this thread.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let rendered = render_with_recorder(|| {
+        runtime.block_on(async {
+            non_streamed_chat(
+                engine_stream(frames(&["ab", "c"], 1, counters)).await,
+                &chat_request,
+            )
+            .await;
+            non_streamed_completion(
+                engine_stream(frames(&["ok"], 1, counters)).await,
+                &completion_request,
+            )
+            .await;
+            non_streamed_generate(engine_stream(frames(&["abcd"], 1, counters)).await).await;
+            non_streamed_messages(
+                engine_stream(frames(&["hi"], 1, counters)).await,
+                messages_spec(false),
+            )
+            .await;
+        });
+    });
+    for expected in [
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"chat\",token_type=\"input\"} 12",
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"chat\",token_type=\"cached\"} 4",
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"chat\",token_type=\"output\"} 3",
+        "smg_router_generation_duration_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"chat\"} 1",
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"completions\",token_type=\"input\"} 12",
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"completions\",token_type=\"cached\"} 4",
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"completions\",token_type=\"output\"} 2",
+        "smg_router_generation_duration_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"completions\"} 1",
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"generate\",token_type=\"output\"} 4",
+        "smg_router_generation_duration_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"generate\"} 1",
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"messages\",token_type=\"input\"} 12",
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"messages\",token_type=\"cached\"} 4",
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"messages\",token_type=\"output\"} 2",
+        "smg_router_generation_duration_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"messages\"} 1",
+    ] {
+        assert!(
+            rendered.lines().any(|line| line == expected),
+            "missing {expected} in:\n{rendered}"
+        );
+    }
+    for absent in [
+        "smg_router_ttft_seconds",
+        "smg_router_tpot_seconds",
+        "endpoint=\"generate\",token_type=\"input\"",
+        "endpoint=\"generate\",token_type=\"cached\"",
+    ] {
+        assert!(
+            !rendered.contains(absent),
+            "unexpected {absent} in:\n{rendered}"
+        );
+    }
+}

@@ -1,6 +1,6 @@
 //! Harmony response processor for non-streaming responses
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use axum::response::Response;
 use openai_protocol::{
@@ -18,11 +18,14 @@ use super::{
     stop::TextStopScanner,
     HarmonyParserAdapter,
 };
-use crate::routers::{
-    error,
-    grpc::{
-        common::{response_collection, response_formatting},
-        context::{DispatchMetadata, ExecutionResult},
+use crate::{
+    observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
+    routers::{
+        error,
+        grpc::{
+            common::{response_collection, response_formatting},
+            context::{DispatchMetadata, ExecutionResult},
+        },
     },
 };
 
@@ -79,6 +82,7 @@ impl HarmonyResponseProcessor {
         dispatch: DispatchMetadata,
         router_stop_strings: &[String],
     ) -> Result<(ChatCompletionResponse, response_formatting::TokenCounts), Response> {
+        let started = Instant::now();
         let request_logprobs = chat_request.logprobs;
 
         // Collect all completed responses (one per choice)
@@ -217,6 +221,19 @@ impl HarmonyResponseProcessor {
             .usage(usage)
             .maybe_system_fingerprint(dispatch.weight_version.as_deref())
             .build();
+        // The records the streamed answer makes at its end; a collected
+        // answer shows no first token.
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: metrics_labels::BACKEND_HARMONY,
+            model_id: &chat_request.model,
+            endpoint: metrics_labels::ENDPOINT_CHAT,
+            ttft: None,
+            generation_duration: started.elapsed(),
+            input_tokens: Some(u64::from(counts.prompt)),
+            cached_tokens: Some(u64::from(counts.cached)),
+            output_tokens: u64::from(counts.completion),
+        });
         Ok((response, counts))
     }
 }

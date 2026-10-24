@@ -22,19 +22,22 @@ use symphony::{adapt, Events};
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{error, warn};
 
-use crate::routers::{
-    error,
-    grpc::{
-        common::{response_collection, response_formatting},
-        context::{DispatchMetadata, ExecutionResult},
-        proto_wrapper::ProtoGenerateComplete,
-        regular::symphony::{
-            engine_finish, finished,
-            telemetry::{self, Who},
-            Assignment, Delta, Reader, SymphonyError,
+use crate::{
+    observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
+    routers::{
+        error,
+        grpc::{
+            common::{response_collection, response_formatting},
+            context::{DispatchMetadata, ExecutionResult},
+            proto_wrapper::ProtoGenerateComplete,
+            regular::symphony::{
+                engine_finish, finished,
+                telemetry::{self, Who},
+                Assignment, Delta, Reader, SymphonyError,
+            },
+            spec::{ChatResponseSpec, CompletionResponseSpec, MessagesResponseSpec},
+            utils,
         },
-        spec::{ChatResponseSpec, CompletionResponseSpec, MessagesResponseSpec},
-        utils,
     },
 };
 
@@ -45,6 +48,9 @@ pub(crate) struct ResponseProcessor {
     pub reasoning_parser_factory: ReasoningParserFactory,
     /// Per-request parser-name resolution (model-card override → configured).
     pub parser_resolver: utils::ParserResolver,
+    /// The `backend_type` label of the answers' token and generation
+    /// records, the one the streaming processor beside it carries.
+    backend_type: &'static str,
 }
 
 impl ResponseProcessor {
@@ -57,7 +63,14 @@ impl ResponseProcessor {
             tool_parser_factory,
             reasoning_parser_factory,
             parser_resolver,
+            backend_type: metrics_labels::BACKEND_REGULAR,
         }
+    }
+
+    /// The processor with its records labeled `backend_type`.
+    pub fn with_backend(mut self, backend_type: &'static str) -> Self {
+        self.backend_type = backend_type;
+        self
     }
 
     /// Process a single choice from GenerateComplete response
@@ -403,6 +416,7 @@ impl ResponseProcessor {
         request_logprobs: bool,
     ) -> Result<(ChatCompletionResponse, response_formatting::TokenCounts), axum::response::Response>
     {
+        let started = generation_start(&execution_result, Instant::now());
         let model = &dispatch.model;
         let reasoning_parser_name = self.parser_resolver.reasoning_parser(model);
         let tool_parser_name = self.parser_resolver.tool_parser(model);
@@ -503,6 +517,19 @@ impl ResponseProcessor {
             .usage(usage)
             .maybe_system_fingerprint(dispatch.weight_version.clone())
             .build();
+        // The answer's token and generation records, the ones a streamed
+        // answer makes at its end; a collected answer shows no first token.
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: self.backend_type,
+            model_id: &dispatch.model,
+            endpoint: metrics_labels::ENDPOINT_CHAT,
+            ttft: None,
+            generation_duration: started.elapsed(),
+            input_tokens: Some(u64::from(counts.prompt)),
+            cached_tokens: Some(u64::from(counts.cached)),
+            output_tokens: u64::from(counts.completion),
+        });
         Ok((response, counts))
     }
 
@@ -675,6 +702,7 @@ impl ResponseProcessor {
         request_logprobs: bool,
         start_time: Instant,
     ) -> Result<Vec<GenerateResponse>, axum::response::Response> {
+        let started = generation_start(&execution_result, start_time);
         // Collect all responses from the execution result
         let all_responses =
             response_collection::collect_responses(execution_result, request_logprobs).await?;
@@ -739,6 +767,22 @@ impl ResponseProcessor {
             });
         }
 
+        // The records a streamed generate answer makes at its end, which
+        // counts no prompt figures either.
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: self.backend_type,
+            model_id: &dispatch.model,
+            endpoint: metrics_labels::ENDPOINT_GENERATE,
+            ttft: None,
+            generation_duration: started.elapsed(),
+            input_tokens: None,
+            cached_tokens: None,
+            output_tokens: result_array
+                .iter()
+                .map(|response| u64::from(response.meta_info.completion_tokens))
+                .sum(),
+        });
         Ok(result_array)
     }
 
@@ -758,6 +802,7 @@ impl ResponseProcessor {
         tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<(Message, response_formatting::TokenCounts), axum::response::Response> {
+        let started = Instant::now();
         let model = &dispatch.model;
         let reasoning_parser_name = self.parser_resolver.reasoning_parser(model);
         let tool_parser_name = self.parser_resolver.tool_parser(model);
@@ -993,6 +1038,20 @@ impl ResponseProcessor {
             thinking_requested.then_some(complete.reasoning_tokens().max(thinking_tokens)),
         );
 
+        // The records a streamed message makes at its end; a collected one
+        // shows no first token.
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: self.backend_type,
+            model_id: &dispatch.model,
+            endpoint: metrics_labels::ENDPOINT_MESSAGES,
+            ttft: None,
+            generation_duration: started.elapsed(),
+            input_tokens: Some(u64::from(counts.prompt)),
+            cached_tokens: Some(u64::from(counts.cached)),
+            output_tokens: u64::from(counts.completion),
+        });
+
         // Step 6: Build Message
         let message = Message {
             id: dispatch.request_id,
@@ -1022,6 +1081,7 @@ impl ResponseProcessor {
         dispatch: DispatchMetadata,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<CompletionResponse, axum::response::Response> {
+        let started = Instant::now();
         let request_logprobs = completion_req.logprobs;
         let per_prompt_results = match execution_result {
             ExecutionResult::Batch { results } => results,
@@ -1110,6 +1170,20 @@ impl ResponseProcessor {
             total_cached += cached_tokens;
         }
 
+        // The records a streamed completion makes at its end; a collected
+        // one shows no first token.
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: self.backend_type,
+            model_id: &dispatch.model,
+            endpoint: metrics_labels::ENDPOINT_COMPLETIONS,
+            ttft: None,
+            generation_duration: started.elapsed(),
+            input_tokens: Some(u64::from(total_prompt)),
+            cached_tokens: Some(u64::from(total_cached)),
+            output_tokens: u64::from(total_completion),
+        });
+
         Ok(CompletionResponse {
             id: dispatch.request_id.clone(),
             object: "text_completion".to_string(),
@@ -1130,6 +1204,17 @@ impl ResponseProcessor {
             ),
             system_fingerprint: dispatch.weight_version.clone(),
         })
+    }
+}
+
+/// Where a collected answer's generation clock starts, as its streamed
+/// twin's does: at the prefill dispatch of a disaggregated pair (whose
+/// prefill may already have run when the answer is collected), else at
+/// `start`, the processor's entry or the stage's.
+fn generation_start(execution_result: &ExecutionResult, start: Instant) -> Instant {
+    match execution_result {
+        ExecutionResult::PrefillDecode { pd_timing, .. } => pd_timing.prefill_start,
+        _ => start,
     }
 }
 
