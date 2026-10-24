@@ -1270,9 +1270,11 @@ def test_an_encode_launch_runs_on_the_rust_path_with_its_rendezvous_fact(launche
     assert raised.value.code == 0 and served == {"mode": "encode"}
 
 
-def test_the_engines_way_of_reading_the_rendezvous_host_is_used_when_importable(monkeypatch):
-    """The host is the engine's own reading (``get_local_ip_by_remote``); the
-    launch's ``--host`` stands in only where the engine is not importable."""
+def test_the_rendezvous_host_is_the_engines_reading_or_empty(monkeypatch):
+    """The host is the engine's own reading (``get_local_ip_by_remote``); a
+    helper that yields nothing, or an engine that cannot be imported, gives
+    an empty host, which the Rust servicer refuses by name (never the
+    launch's ``--host``, an unspecified address no peer can reach)."""
     import sys
     import types
 
@@ -1280,9 +1282,11 @@ def test_the_engines_way_of_reading_the_rendezvous_host_is_used_when_importable(
     network.get_local_ip_by_remote = lambda: "192.0.2.7"
     monkeypatch.setitem(sys.modules, "tokenspeed.runtime.utils.network", network)
     assert rust.encode_bootstrap_host(FakeServerArgs(host="0.0.0.0")) == "192.0.2.7"
+    network.get_local_ip_by_remote = lambda: None
+    assert rust.encode_bootstrap_host(FakeServerArgs(host="10.1.2.3")) == ""
     monkeypatch.delitem(sys.modules, "tokenspeed.runtime.utils.network")
     monkeypatch.setitem(sys.modules, "tokenspeed.runtime.utils", None)
-    assert rust.encode_bootstrap_host(FakeServerArgs(host="10.1.2.3")) == "10.1.2.3"
+    assert rust.encode_bootstrap_host(FakeServerArgs(host="10.1.2.3")) == ""
 
 
 def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_path):

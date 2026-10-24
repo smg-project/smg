@@ -2939,18 +2939,26 @@ async fn a_language_launch_dialled_by_an_encode_worker_fails_the_link_by_name() 
 /// args is refused before anything starts.
 #[test]
 fn an_encode_launch_without_its_rendezvous_address_is_refused_before_the_start() {
-    let dir = tempfile::tempdir().unwrap();
-    let handshake = handshake_address(dir.path());
-    let model = TokenSpeedModelInfo {
-        server_args_json:
-            r#"{"disaggregation_mode":"encode","disaggregation_bootstrap_port":8998}"#.to_string(),
-        ..model_info()
-    };
-    let Err(error) = TokenSpeedServicerServer::start(config(dir.path(), &handshake, model)) else {
-        panic!("an encode launch without its rendezvous address started");
-    };
-    assert!(
-        matches!(&error, ServicerError::InvalidConfig(message) if message.contains("encode_bootstrap_host")),
-        "{error:?}"
-    );
+    // "None" never reaches here: the launcher turns the helper's None into "".
+    for host in [None, Some(""), Some("0.0.0.0"), Some("::")] {
+        let dir = tempfile::tempdir().unwrap();
+        let handshake = handshake_address(dir.path());
+        let host_field = host.map_or(String::new(), |host| {
+            format!(r#","encode_bootstrap_host":"{host}""#)
+        });
+        let model = TokenSpeedModelInfo {
+            server_args_json: format!(
+                r#"{{"disaggregation_mode":"encode","disaggregation_bootstrap_port":8998{host_field}}}"#
+            ),
+            ..model_info()
+        };
+        let Err(error) = TokenSpeedServicerServer::start(config(dir.path(), &handshake, model))
+        else {
+            panic!("an encode launch with the rendezvous address {host:?} started");
+        };
+        assert!(
+            matches!(&error, ServicerError::InvalidConfig(message) if message.contains("encode_bootstrap_host")),
+            "{host:?}: {error:?}"
+        );
+    }
 }

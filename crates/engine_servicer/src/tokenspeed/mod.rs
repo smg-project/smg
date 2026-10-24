@@ -193,11 +193,12 @@ pub(super) fn encode_role(
         .get("encode_bootstrap_host")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
-        .filter(|host| !host.is_empty())
+        .filter(|host| !host.is_empty() && !is_unspecified_address(host))
         .ok_or_else(|| {
             ServicerError::InvalidConfig(
-                "the encode role needs encode_bootstrap_host in the server args (the worker's \
-                 own address, which the launcher adds)"
+                "the encode role needs encode_bootstrap_host in the server args: the worker's \
+                 own address, one the prefill side can reach, which the launcher adds (it read \
+                 none, or an unspecified one)"
                     .to_string(),
             )
         })?
@@ -217,6 +218,13 @@ pub(super) fn encode_role(
         bootstrap_host,
         bootstrap_port,
     }))
+}
+
+/// An address no peer can dial (`0.0.0.0`, `::`): a launch's `--host`, never
+/// a rendezvous.
+fn is_unspecified_address(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_unspecified())
 }
 
 /// The role this servicer was launched for against what the engines'

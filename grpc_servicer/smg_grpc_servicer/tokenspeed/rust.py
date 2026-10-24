@@ -624,13 +624,17 @@ def encode_bootstrap_host(server_args: Any) -> str:
     """The encode worker's own address, which every encode request names as
     the host the prefill side pulls the embedding from: the engine's own
     reading of it (``get_local_ip_by_remote``), as the Python encoder
-    servicer fills it; the launch's ``--host`` when the engine is not
-    importable (the launcher's unit tests)."""
+    servicer fills it. Empty when the engine's helper yields no address or
+    cannot be imported: the Rust servicer refuses the launch by name then,
+    rather than sending the worker a rendezvous no peer can reach (the
+    launch's ``--host`` is usually an unspecified address)."""
+    del server_args  # the address is the engine's reading, not the launch's --host
     try:
         from tokenspeed.runtime.utils.network import get_local_ip_by_remote
     except ImportError:
-        return str(getattr(server_args, "host", "") or "")
-    return str(get_local_ip_by_remote())
+        return ""
+    host = get_local_ip_by_remote()
+    return str(host) if host else ""
 
 
 # ---------------------------------------------------------------------------

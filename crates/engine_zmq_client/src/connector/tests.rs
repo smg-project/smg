@@ -2115,6 +2115,33 @@ async fn a_blocked_input_refuses_add_requests_past_the_frame_bound() {
 /// The bound in bytes: behind a blocked frame a small add-request within
 /// it still waits its window (and reaches the engine on resume), while
 /// one that would take the waiting payload past it is refused at once.
+/// A typed frame (an encode worker's request, the largest payload) is admitted
+/// against the same bound as an add frame: past it, refused at once.
+#[tokio::test]
+async fn a_blocked_input_refuses_typed_frames_past_the_byte_bound() {
+    let (client, engine, _ns) = connect().await;
+    client.set_send_timeout(SEND_WINDOW);
+    client.set_input_queue_limit(usize::MAX, 1 << 20);
+    saturate_input(&client).await;
+    // The writer has been stuck for its window: the input counts as blocked.
+    tokio::time::sleep(SEND_WINDOW).await;
+    let engine_id = client.engines()[0].engine_id.clone();
+    let started = std::time::Instant::now();
+    let error = client
+        .send_typed(
+            &engine_id,
+            Bytes::from_static(b"\x03"),
+            vec![0u8; 8],
+            vec![Bytes::from(vec![0u8; 2 << 20])],
+        )
+        .await
+        .expect_err("the waiting payload would pass the bound");
+    assert!(matches!(error, Error::EngineInputFull { .. }), "{error:?}");
+    assert!(started.elapsed() < SEND_WINDOW / 2, "refused at once");
+    assert!(client.is_alive());
+    drop(engine);
+}
+
 #[tokio::test]
 async fn a_blocked_input_refuses_add_requests_past_the_byte_bound() {
     let (client, mut engine, _ns) = connect().await;
