@@ -273,5 +273,27 @@
     "actual_four_archives": null,
     "actual_native": null,
     "old_results_transferred": false
+  },
+  "normal_resolver_closure": {
+    "manifest_sha256": "f2aeb81b1a0b8768ced64fe9539b088feee40c0e121f42d15a7baf62ad42164d",
+    "host_bundle": "/tmp/smg-mc4-resolver-3d5c5ae805a0",
+    "read_only_mount": "/resolver-wheels",
+    "normal_dependency_resolver_enabled": true,
+    "no_index": true,
+    "find_links": "/input/mc4-cohort/wheels /resolver-wheels",
+    "staging_accepted": false,
+    "staging_receipt": null,
+    "not_a_fifth_producer_archive": true
+  },
+  "same_source_CPU_prerequisite": {
+    "accepted": false,
+    "code_parent": "ee1df083a60ce4a075e433c8e95c6a60ef8856fe",
+    "normal_shared_setup_and_complete_deps": true,
+    "node_receipts": null,
+    "old_node2_receipt_sha256": "86f048d563b59a1875d59a21fe92b9d6bb62a827be5280cf62035bfcb277cd2b",
+    "old_node2_native_sha256": "143a28b8834bb16b01d87f4ba71b6f68254c71c52e5c7424ccf401b8ce9c29a9",
+    "old_node2_native_not_fresh_accepted": true,
+    "node1_pending": true,
+    "old_source_CPU_acceptance_is_not_GPU_acceptance": true
   }
 }

@@ -54,6 +54,36 @@ def select(inputs, tier):
     if inputs["private_mooncake_runtime"]["staging_accepted"] is not True:
         raise ValueError("exact private wheel and prefix staging is not accepted")
     auxiliary_staging(inputs)
+    closure = inputs["normal_resolver_closure"]
+    receipt = closure["staging_receipt"]
+    if (closure["staging_accepted"] is not True or not isinstance(receipt, dict)
+            or receipt.get("manifest_sha256") != closure["manifest_sha256"]
+            or set(receipt.get("nodes", {})) != {"amd-mi300x-1", "amd-mi300x-2"}):
+        raise ValueError("both pooled nodes require the exact normal-resolver data")
+    for row in receipt["nodes"].values():
+        if (row.get("accepted") is not True or row.get("host_bundle") != closure["host_bundle"]
+                or row.get("manifest_sha256") != closure["manifest_sha256"]
+                or row.get("regular_files") != 31 or row.get("wheel_count") != 30
+                or not isinstance(row.get("evidence_sha256"), str)
+                or len(row["evidence_sha256"]) != 64):
+            raise ValueError("normal-resolver node data proof differs")
+    cpu = inputs["same_source_CPU_prerequisite"]
+    rows = cpu["node_receipts"]
+    if (cpu["accepted"] is not True or not isinstance(rows, dict)
+            or set(rows) != {"amd-mi300x-1", "amd-mi300x-2"}):
+        raise ValueError("both pooled nodes require matching normal shared-CI CPU proof")
+    for row in rows.values():
+        if (row.get("accepted") is not True
+                or row.get("gateway_native_sha256") != inputs["gateway_native"]["sha256"]
+                or row.get("consumer19") != inputs["source_trees"]
+                or row.get("compiled37") != inputs["compiled_source_trees"]
+                or row.get("original_unit_cases") != 1602 or row.get("passed") != 1594
+                or row.get("exact_original_skips") != 8 or row.get("canonical14_once") != 14
+                or row.get("wholepip_passes") != 3 or row.get("normal_shared_install") is not True
+                or row.get("full_SOURCE_RECORD_direct_url_postflight") is not True
+                or not isinstance(row.get("root_acceptance_sha256"), str)
+                or len(row["root_acceptance_sha256"]) != 64):
+            raise ValueError("CPU proof is not this source/native complete normal cohort")
     if tier not in RECIPES or inputs.get("admitted_tier") != tier:
         raise ValueError("dispatch tier differs from the single admitted tier")
     recipe = RECIPES[tier]
