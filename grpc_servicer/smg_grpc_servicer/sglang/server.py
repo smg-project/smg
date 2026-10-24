@@ -29,19 +29,21 @@ from sglang.utils import get_exception_traceback
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 
 from smg_grpc_servicer.hostport import host_port, loopback_target
+from smg_grpc_servicer.metrics import ENGINE_DOWN, SERVING, WARMING_UP
 from smg_grpc_servicer.rust_lifecycle import (
     EXIT_GRACE_SECS,
     ServicerConfigError,
     announce_kv_events_default,
-    check_metrics_port_needs_rust,
     configuration_exit,
     guarded_exit,
+    start_metrics_endpoint,
 )
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager, init_request_tracing
 from smg_grpc_servicer.sglang.rust import (
     KV_EVENTS_ENV,
+    METRICS_HOST_ENV,
     METRICS_PORT_ENV,
     SERVICER_IMPL_ENV,
     default_kv_events_config,
@@ -112,6 +114,18 @@ async def _cleanup_failed_startup(
         logger.exception("Failed to shut down request manager after startup failure")
 
 
+def _servicer_state(health_servicer: SGLangHealthServicer, scheduler_procs: list) -> str:
+    """What a metrics scrape reads of this servicer: a scheduler process
+    gone (``engine_down``), readiness held until the warm-up ran
+    (``warming_up``), else ``serving``; the shutdown is the endpoint's own
+    word (``note_draining``, where the health service flips)."""
+    if any(not process.is_alive() for process in scheduler_procs):
+        return ENGINE_DOWN
+    if not health_servicer.serving:
+        return WARMING_UP
+    return SERVING
+
+
 async def serve_grpc(
     server_args: ServerArgs,
     model_info: dict | None = None,
@@ -144,8 +158,21 @@ async def serve_grpc(
                     SERVICER_IMPL_ENV,
                 )
             raise SystemExit(await serve_rust(server_args))
-        # A metrics port under the Python servicer is a port nobody serves.
-        check_metrics_port_needs_rust(impl, server_args, METRICS_PORT_ENV)
+        # The Python servicer's metrics endpoint (--metrics-port, else
+        # SMG_SGLANG_SERVICER_METRICS_PORT; the same families as the Rust
+        # servicer's), bound now, before the schedulers start: a scrape
+        # during the model load reads `starting`, and a port the listener
+        # cannot bind is refused here. The engine's facts complete it below.
+        args_view = EngineConfigView(server_args).server_args
+        metrics_endpoint = start_metrics_endpoint(
+            server_args,
+            port_env=METRICS_PORT_ENV,
+            host_env=METRICS_HOST_ENV,
+            # The `model` label as the Rust servicer carries it: the served
+            # name, else the model path.
+            model=args_view.served_model_name or args_view.model_path,
+            wire="sglang",
+        )
         # The Python servicer gets the Rust path's KV-events default too:
         # server args without --kv-events-config have SGLang's ZMQ publisher
         # on, at a port found free on this host, before the schedulers and the
@@ -207,6 +234,8 @@ async def serve_grpc(
         # failed start: there is no engine to serve, so the servicer exits
         # (code 1) instead of waiting on it, and says why without a traceback.
         logger.error("The scheduler process(es) did not start: %s", error)
+        if metrics_endpoint is not None:
+            metrics_endpoint.stop()
         raise guarded_exit(1) from None
 
     server = None
@@ -277,8 +306,17 @@ async def serve_grpc(
             model_info=model_info,
             scheduler_info=scheduler_info,
             health_servicer=health_servicer,
+            metrics=None if metrics_endpoint is None else metrics_endpoint.metrics,
         )
         sglang_scheduler_pb2_grpc.add_SglangSchedulerServicer_to_server(servicer, server)
+        if metrics_endpoint is not None:
+            metrics_endpoint.metrics.engine_facts(
+                ranks=args_view.dp_size or 1,
+                max_model_len=int(model_info.get("max_context_length") or 0),
+                # The scheduler matches string stops itself.
+                matches_string_stops=False,
+            )
+            metrics_endpoint.serve_from(lambda: _servicer_state(health_servicer, scheduler_procs))
 
         # Enable reflection
         SERVICE_NAMES = (
@@ -416,6 +454,8 @@ async def serve_grpc(
             request_manager,
             scheduler_procs,
         )
+        if metrics_endpoint is not None:
+            metrics_endpoint.stop()
         raise
 
     warmup_thread = None
@@ -452,6 +492,8 @@ async def serve_grpc(
         # Mark unhealthy first so probes and load balancers stop routing new
         # requests before we drain.
         health_servicer.set_not_serving()
+        if metrics_endpoint is not None:
+            metrics_endpoint.note_draining()
 
         # Drain in-flight RPCs with the request manager's ZMQ sockets still
         # open, then tear it down. Closing ZMQ before server.stop() drops the
@@ -468,6 +510,8 @@ async def serve_grpc(
         # Terminate scheduler processes before exiting to avoid atexit hang
         # The scheduler processes have SIGINT ignored, so they won't get KeyboardInterrupt
         terminate_scheduler_processes(scheduler_procs)
+        if metrics_endpoint is not None:
+            metrics_endpoint.stop()
 
     if scheduler_exit is not None:
         logger.error("A scheduler process exited on its own; the servicer exits with code 1")

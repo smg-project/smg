@@ -522,9 +522,10 @@ or empty when it serves none. A gRPC worker with `metrics.enabled` runs the
 engine behind the Rust servicer, whose own listener answers `GET /metrics`
 with the `smg_servicer_*` families (requests by finish reason, refusals,
 errors, in-flight requests, token totals, the first-token / inter-token /
-end-to-end latency histograms, the servicer's lifecycle state); the Python
-servicer has no endpoint. An HTTP worker runs the engine's own server, which
-the chart leaves as it is.
+end-to-end latency histograms, the servicer's lifecycle state); a worker
+that keeps the Python servicer (`--servicer-impl python` in extraArgs) serves
+the same families on the same port. An HTTP worker runs the engine's own
+server, which the chart leaves as it is.
 Expects a dict with keys: worker
 */}}
 {{- define "smg.workerMetricsPort" -}}

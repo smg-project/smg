@@ -127,13 +127,14 @@ the engine connects, so a scrape during start-up answers
 `smg_servicer_state{state="starting"} 1`.
 
 Off (the default), nothing changes: the launcher's own servicer choice stands
-and the pod exposes no metrics port. The Python servicer has no endpoint, so
-`extraArgs: ["--servicer-impl", "python"]` together with `metrics.enabled`
-is refused by the launcher before the engine starts. The SGLang Rust servicer
-serves neither PD/EPD disaggregation nor image and video input yet (it
+and the pod exposes no metrics port. On, the chart selects the Rust servicer
+through the engine's variable; a worker that keeps the Python servicer
+(`extraArgs: ["--servicer-impl", "python"]`, which overrides the variable)
+serves the same families from the same port, so a deployment the SGLang Rust
+servicer does not serve yet (PD/EPD disaggregation, image and video input: it
 advertises no vision support, so the gateway refuses media for that worker at
-its gate), so a disaggregated or multimodal SGLang worker keeps `metrics` off.
-A `metrics.port` equal to the serving port is refused when the chart renders.
+its gate) keeps its metrics by keeping the Python servicer. A `metrics.port`
+equal to the serving port is refused when the chart renders.
 An HTTP worker runs the engine's own server, which has its own `/metrics`; the
 setting is ignored there.
 

@@ -1,6 +1,7 @@
 """The ``--metrics-port`` and ``--metrics-host`` flags the engine launchers
-register for the Rust servicer's Prometheus endpoint: their names and the one
-registration the three launchers share.
+register for the servicer's Prometheus endpoint (the Rust servicer's own
+listener, or the Python servicer's: the same ``smg_servicer_*`` families):
+their names and the one registration the three launchers share.
 
 Stdlib only on purpose, like the servicer-implementation flag: the engine
 plugins that add the flags are loaded in every engine process and import
@@ -69,10 +70,11 @@ def add_metrics_arguments(
         action=_EnvStoreAction,
         env_name=port_env,
         help=(
-            "Serve Prometheus metrics (GET /metrics) of the Rust servicer "
-            f"({server_class}) on this port, on a listener of its own; 0 binds an "
+            "Serve the servicer's Prometheus metrics (GET /metrics, the smg_servicer_* "
+            "families; the same from either servicer implementation, the Python one or "
+            f"{server_class}) on this port, on a listener of its own; 0 binds an "
             f"ephemeral one. Unset falls back to ${port_env}; unset there too, no "
-            "endpoint. Needs the Rust implementation; must differ from the gRPC port."
+            "endpoint. Must differ from the gRPC port."
         ),
     )
     parser.add_argument(

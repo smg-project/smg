@@ -169,8 +169,8 @@ def check_servicer_impl(parser: argparse.ArgumentParser, parsed: Any) -> str | N
         return None
     from smg_grpc_servicer.rust_lifecycle import (
         ServicerConfigError,
-        check_metrics_port_needs_rust,
         configuration_exit,
+        metrics_bind_address,
     )
     from smg_grpc_servicer.vllm.launcher_switch import require_launcher_hook
     from smg_grpc_servicer.vllm.rust import configure_logging, resolve_servicer_impl
@@ -179,9 +179,10 @@ def check_servicer_impl(parser: argparse.ArgumentParser, parsed: Any) -> str | N
         impl = resolve_servicer_impl(parsed)
         if impl == "rust":
             require_launcher_hook()
-        # A metrics port under the Python servicer is a port nobody serves:
-        # refused here, with the other configuration errors.
-        check_metrics_port_needs_rust(impl, parsed, METRICS_PORT_ENV)
+        # The metrics endpoint's address (either implementation serves it),
+        # checked here with the other configuration errors: a value the
+        # servicer cannot use, or a port equal to the gRPC port.
+        metrics_bind_address(parsed, port_env=METRICS_PORT_ENV, host_env=METRICS_HOST_ENV)
     except ServicerConfigError as error:
         configure_logging()
         raise configuration_exit(error) from None

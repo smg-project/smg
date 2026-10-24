@@ -23,11 +23,9 @@ from tokenspeed.runtime.utils.server_args import prepare_server_args
 
 from smg_grpc_servicer.rust_lifecycle import (
     ServicerConfigError,
-    check_metrics_port_needs_rust,
     configuration_exit,
 )
 from smg_grpc_servicer.tokenspeed.rust import (
-    METRICS_PORT_ENV,
     add_metrics_arguments,
     add_servicer_impl_argument,
     serve_rust,
@@ -84,8 +82,8 @@ def main(argv: list[str] | None = None) -> None:
         logger.info("Servicer implementation: %s (source=%s)", impl, origin)
         if impl == "rust":
             raise SystemExit(asyncio.run(serve_rust(server_args)))
-        # A metrics port under the Python servicer is a port nobody serves.
-        check_metrics_port_needs_rust(impl, ours, METRICS_PORT_ENV)
+        # The Python servicer serves the same metrics endpoint from the same
+        # flags (their actions exported them; `serve_grpc` binds it).
     except ServicerConfigError as error:
         # A knob the servicer cannot use: one named ERROR line and exit code
         # 2, before any engine work, not a traceback.

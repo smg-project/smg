@@ -134,6 +134,12 @@ def server_mod(monkeypatch):
             TokenSpeedSchedulerServicer=SchedulerServicer,
         ),
     }
+    # The server module imports the Rust-path module, which reads `grpc` at
+    # import time: imported with the real `grpc` first, so the stand-in below
+    # does not meet it (the whole test set has it cached by now; this file
+    # alone would not).
+    import smg_grpc_servicer.tokenspeed.rust  # noqa: F401
+
     for name, module in stubs.items():
         monkeypatch.setitem(sys.modules, name, module)
     path = Path(__file__).parents[1] / "smg_grpc_servicer" / "tokenspeed" / "server.py"

@@ -19,17 +19,25 @@ from smg_grpc_proto.generated import tokenspeed_scheduler_pb2
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 from smg_grpc_servicer.hostport import host_port, loopback_target
+from smg_grpc_servicer.metrics import ENGINE_DOWN, SERVING, WARMING_UP
 from smg_grpc_servicer.rust_lifecycle import (
     EXIT_GRACE_SECS,
     ServicerConfigError,
     announce_kv_events_default,
     configuration_exit,
     guarded_exit,
+    start_metrics_endpoint,
 )
 from smg_grpc_servicer.tokenspeed import engine_watchdog
+from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
 from smg_grpc_servicer.tokenspeed.engine_watchdog import EngineProcessWatch
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
-from smg_grpc_servicer.tokenspeed.rust import KV_EVENTS_ENV, default_kv_events_config
+from smg_grpc_servicer.tokenspeed.rust import (
+    KV_EVENTS_ENV,
+    METRICS_HOST_ENV,
+    METRICS_PORT_ENV,
+    default_kv_events_config,
+)
 from smg_grpc_servicer.tokenspeed.scheduler_launcher import launch_engine
 from smg_grpc_servicer.tokenspeed.servicer import TokenSpeedSchedulerServicer
 from smg_grpc_servicer.tokenspeed.warmup import (
@@ -116,6 +124,18 @@ class TokenSpeedEncodeDiscoveryServicer(TokenSpeedSchedulerServicer):
         yield tokenspeed_scheduler_pb2.GenerateResponse()
 
 
+def _servicer_state(health_servicer: TokenSpeedHealthServicer, engine_exit: dict) -> str:
+    """What a metrics scrape reads of this servicer: its engine gone
+    (``engine_down``: an engine process exited), readiness held until the
+    warm-up ran (``warming_up``), else ``serving``; the shutdown is the
+    endpoint's own word (``note_draining``, where the health service flips)."""
+    if engine_exit:
+        return ENGINE_DOWN
+    if not health_servicer.serving:
+        return WARMING_UP
+    return SERVING
+
+
 async def serve_grpc(server_args: ServerArgs) -> None:
     """Run the TokenSpeed gRPC server until a shutdown signal is received, or
     until the engine dies: then the servicer exits with code 1."""
@@ -137,6 +157,23 @@ async def serve_grpc(server_args: ServerArgs) -> None:
     try:
         if not encode_worker and default_kv_events_config(server_args) is not None:
             announce_kv_events_default("TokenSpeed", KV_EVENTS_ENV, logger)
+        # The Python servicer's metrics endpoint (--metrics-port, else
+        # SMG_TOKENSPEED_SERVICER_METRICS_PORT; the same families as the Rust
+        # servicer's), bound now, before the engine loads: a scrape during
+        # the load reads `starting`, and a port the listener cannot bind is
+        # refused here. Its clock is the one Generate stamps arrivals with;
+        # the engine's facts complete it once the engine is up.
+        args_view = EngineConfigView(server_args).server_args
+        metrics_endpoint = start_metrics_endpoint(
+            server_args,
+            port_env=METRICS_PORT_ENV,
+            host_env=METRICS_HOST_ENV,
+            # The `model` label as the Rust servicer carries it: the served
+            # name, else the model.
+            model=args_view.served_model_name or args_view.model,
+            wire="tokenspeed",
+            clock=time.perf_counter,
+        )
     except ServicerConfigError as error:
         raise configuration_exit(error, logger) from None
 
@@ -181,6 +218,8 @@ async def serve_grpc(server_args: ServerArgs) -> None:
         watch.stop()
         watch.terminate_seen()
         logger.error("The TokenSpeed engine did not start", exc_info=True)
+        if metrics_endpoint is not None:
+            metrics_endpoint.stop()
         raise guarded_exit(1) from None
     launched.set()
     # The engine's processes are all up by now: later children (a process
@@ -245,6 +284,7 @@ async def serve_grpc(server_args: ServerArgs) -> None:
             server_args=server_args,
             scheduler_info=scheduler_info,
             health_servicer=health_servicer,
+            metrics=None if metrics_endpoint is None else metrics_endpoint.metrics,
         )
         tokenspeed_scheduler_pb2_grpc.add_TokenSpeedSchedulerServicer_to_server(servicer, server)
         primary_service = tokenspeed_scheduler_pb2.DESCRIPTOR.services_by_name[
@@ -254,6 +294,16 @@ async def serve_grpc(server_args: ServerArgs) -> None:
         # long before it ends the engine processes; the exit guard's grace
         # covers it.
         servicer_shutdown_kwargs = {"drain_timeout_secs": SHUTDOWN_DRAIN_SECS}
+
+    if metrics_endpoint is not None:
+        metrics_endpoint.metrics.engine_facts(
+            ranks=args_view.attention_dp_size or 1,
+            # The context length as GetModelInfo reports it.
+            max_model_len=int(getattr(async_llm, "context_len", 0) or 0),
+            # The engine matches string stops itself.
+            matches_string_stops=False,
+        )
+        metrics_endpoint.serve_from(lambda: _servicer_state(health_servicer, engine_exit))
 
     service_names = (
         primary_service,
@@ -292,6 +342,8 @@ async def serve_grpc(server_args: ServerArgs) -> None:
     finally:
         watch.stop()
         logger.info("Shutting down TokenSpeed gRPC server")
+        if metrics_endpoint is not None:
+            metrics_endpoint.note_draining()
         try:
             await servicer.shutdown(**servicer_shutdown_kwargs)
         except Exception:  # noqa: BLE001
@@ -304,6 +356,8 @@ async def serve_grpc(server_args: ServerArgs) -> None:
         await server.stop(5.0)
         if warmup_thread.is_alive():
             warmup_thread.join(timeout=5.0)
+        if metrics_endpoint is not None:
+            metrics_endpoint.stop()
 
     if engine_exit:
         # The engine ended on its own: the servicer exits with it, non-zero,

@@ -33,6 +33,14 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
 from smg_grpc_servicer.kv_relay import Engine, relay
+from smg_grpc_servicer.metrics import (
+    ENGINE_DOWN,
+    NO_METRICS,
+    SERVING,
+    WARMING_UP,
+    launcher_endpoint,
+    rank_among,
+)
 from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
 from smg_grpc_servicer.trace_context import trace_headers
 from smg_grpc_servicer.vllm import attach_vllm_logging, settle_logging
@@ -57,6 +65,7 @@ from smg_grpc_servicer.vllm.media_refs import parse_media_refs, validate_schemes
 from smg_grpc_servicer.vllm.mm_processor import (
     ENV_PROCESSOR,
     PROCESSOR_FLAG,
+    MmFetchFailed,
     MmProcessorUnavailable,
     MmSettings,
     build_mm_processor,
@@ -78,7 +87,7 @@ from smg_grpc_servicer.vllm.model_info import (
     running_window,
     server_facts,
 )
-from smg_grpc_servicer.vllm.warmup import WARMUP_ENV, start_engine_warmup
+from smg_grpc_servicer.vllm.warmup import WARMUP_ENV, start_engine_warmup, warmup_in_progress
 
 from .mm_keys import (
     batches_missing_pixels,
@@ -106,6 +115,23 @@ def _prompt_length(prompt) -> int:
         ids = prompt.get("prompt_token_ids")
         return len(ids) if ids is not None else 0
     return 0
+
+
+def _refusal(code: grpc.StatusCode) -> str | None:
+    """What a request that never reached the engine counts under in the
+    metrics, by its status as the Rust servicer reads it: an invalid request
+    is a refusal; anything else is an error under its code."""
+    if code is grpc.StatusCode.INVALID_ARGUMENT:
+        return "invalid_argument"
+    return None
+
+
+def _media_refusal(error: MmProcessorUnavailable) -> str | None:
+    """What a media-processing failure counts under: the request's own fetch
+    failure is the media refusal (the Rust servicer's media-fault trailer);
+    a shed, a sidecar failure or the processor's own error is the worker's,
+    an error under ``unavailable``."""
+    return "media" if isinstance(error, MmFetchFailed) else None
 
 
 def _kv_capacity_tokens(engine) -> int:
@@ -254,6 +280,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
     - GetTokenizer: Stream tokenizer artifacts
     """
 
+    # The metrics Generate records into; the constructor replaces it with the
+    # launcher's endpoint's (a servicer built without the constructor records nothing).
+    _metrics = NO_METRICS
+
     def __init__(
         self,
         async_llm: EngineClient,
@@ -291,6 +321,31 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # carry none); an unpinned request's queued prompt counts on the rank
         # the engine routes it to, read once it has.
         self._loads = LoadTracker(rank_of=lambda request_id: _routed_rank(async_llm, request_id))
+        # The metrics endpoint the launcher bound before the engine loaded
+        # (`--metrics-port` / SMG_VLLM_SERVICER_METRICS_PORT; upstream's
+        # launcher builds this servicer without its namespace, so the endpoint
+        # is read the way the `--mm-*` settings are): the engine's facts
+        # complete its families, and it reads this servicer's state at every
+        # scrape. Without one nothing is recorded. One series set per rank
+        # this servicer serves (its managed slice under external or hybrid
+        # load balancing, the ranks GetLoads reports), labelled by the place
+        # in that slice; a request's rank label is its pin's place, and an
+        # unpinned request counts on the one rank when the slice has one.
+        # The engine's own choice among several is not visible before the
+        # first output, so such a request counts under rank "other".
+        endpoint = launcher_endpoint()
+        self._metrics = NO_METRICS if endpoint is None else endpoint.metrics
+        self._metrics_ranks = _managed_ranks(async_llm)
+        if endpoint is not None:
+            model_config = getattr(async_llm, "model_config", None)
+            endpoint.metrics.engine_facts(
+                ranks=len(self._metrics_ranks),
+                max_model_len=getattr(model_config, "max_model_len", 0) or 0,
+                # The engine matches string stops itself (detokenization is
+                # on for a request that carries any).
+                matches_string_stops=False,
+            )
+            endpoint.serve_from(self._lifecycle_state)
         # Flag > env > default, resolved once so each value names its source.
         self._mm_settings = (mm_settings or launcher_settings() or MmSettings()).resolve()
         # The engine's encoder budget, derived once (vLLM's helper builds the
@@ -376,6 +431,17 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         running.add_done_callback(finished)
         return await shielded
 
+    def _lifecycle_state(self) -> str:
+        """What a metrics scrape reads of this servicer: its engine gone
+        (``engine_down``), readiness held for the planned warm-up
+        (``warming_up``), else ``serving``; the drain is the health
+        service's word (its ``set_not_serving``)."""
+        if getattr(self.engine, "errored", False):
+            return ENGINE_DOWN
+        if warmup_in_progress():
+            return WARMING_UP
+        return SERVING
+
     async def Generate(
         self,
         request: vllm_engine_pb2.GenerateRequest,
@@ -420,6 +486,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # What a PD prefill side learned about its media, for the decode side.
         media_identity = None
         engine_started = False
+        # The request's observation in the metrics, from its submission on.
+        observed = None
         try:
             arrival_time = time.time()
             kv_transfer_params = params_from_request(request)
@@ -547,7 +615,15 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             # routed on its own); a non-streamed request's only output comes
             # once the engine has retired it, so the tracker's reading is
             # what names its rank then.
-            self._loads.submitted(request_id, _prompt_length(prompt), rank=pinned_rank)
+            prompt_length = _prompt_length(prompt)
+            self._loads.submitted(request_id, prompt_length, rank=pinned_rank)
+            observed = self._metrics.request(
+                rank=rank_among(self._metrics_ranks, pinned_rank),
+                prompt_tokens=prompt_length,
+                max_tokens=sampling_params.max_tokens,
+                n=sampling_params.n,
+                arrival=arrival_time,
+            )
             ranks: dict[int, int] = {}
             remembered: int | None = None
 
@@ -572,19 +648,28 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 trace_headers=trace_headers(context.invocation_metadata()),
                 data_parallel_rank=pinned_rank,
             ):
+                # The prompt's figures ride the first output (the metrics
+                # count them once); the outputs after it pass none.
+                prompt_tokens = cached_tokens = 0
                 if not engine_started:
                     # The prompt's cached count is the reporting choice's
                     # (the first output of an n > 1 request is whichever
                     # choice stepped first).
+                    prompt_tokens = len(output.prompt_token_ids or ())
+                    cached_tokens = getattr(output, "num_cached_tokens", 0) or 0
                     self._loads.first_output(
                         request_id,
-                        len(output.prompt_token_ids or ()),
-                        getattr(output, "num_cached_tokens", 0) or 0,
+                        prompt_tokens,
+                        cached_tokens,
                         rank=rank_of(output.outputs[0].index if output.outputs else 0),
                     )
                 engine_started = True
                 for completion in output.outputs:
-                    self._loads.generated(len(completion.token_ids), rank=rank_of(completion.index))
+                    tokens = len(completion.token_ids)
+                    self._loads.generated(tokens, rank=rank_of(completion.index))
+                    observed.chunk(tokens, prompt_tokens, cached_tokens, completion.index)
+                    if completion.finish_reason:
+                        observed.complete(completion.finish_reason, index=completion.index)
                 # For streaming, send chunks for EACH completion output (n outputs)
                 if request.stream:
                     for completion in output.outputs:
@@ -633,6 +718,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         except MmProcessorUnavailable as e:
             # Retryable: the router re-selects a worker on UNAVAILABLE.
             logger.warning("Media processing unavailable for request %s: %s", request_id, e)
+            self._metrics.failed(observed, grpc.StatusCode.UNAVAILABLE, refusal=_media_refusal(e))
             await self._notify_kv_transfer_rejected(request_id, kv_transfer_params, engine_started)
             await context.abort(grpc.StatusCode.UNAVAILABLE, str(e))
         except Exception as e:
@@ -641,10 +727,13 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 logger.exception("Error in Generate for request %s", request_id)
             else:
                 logger.warning("Generate request %s rejected (%s): %s", request_id, code.name, e)
+            self._metrics.failed(observed, code, refusal=_refusal(code))
             await self._notify_kv_transfer_rejected(request_id, kv_transfer_params, engine_started)
             await context.abort(code, str(e))
         finally:
             self._loads.finished(request_id)
+            if observed is not None:
+                observed.end()
 
     async def _notify_kv_transfer_rejected(
         self,

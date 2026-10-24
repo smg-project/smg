@@ -48,6 +48,7 @@ from smg_grpc_proto.generated import common_pb2
 
 from smg_grpc_servicer.engine_status import abort_for_constraint_failure
 from smg_grpc_servicer.health_probe import await_probe
+from smg_grpc_servicer.metrics import NO_METRICS, ServicerMetrics
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.kv_events import subscribe_kv_events
@@ -142,11 +143,29 @@ def _scheduler_abort_detail(finish_reason: dict) -> str:
     )
 
 
+def _observation_of(request: sglang_scheduler_pb2.GenerateRequest) -> dict:
+    """What the metrics record of a request at its submission: its prompt
+    length, its ``max_new_tokens`` and ``n``. No rank: this servicer forwards
+    no rank pin (the request's field is a plain integer, 0 when unset), and
+    the scheduler's own choice is not visible on this path."""
+    params = request.sampling_params
+    return {
+        "rank": None,
+        "prompt_tokens": len(request.tokenized.input_ids) if request.HasField("tokenized") else 0,
+        "max_tokens": params.max_new_tokens if params.HasField("max_new_tokens") else None,
+        "n": params.n or 1,
+    }
+
+
 class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer):
     """
     Standalone gRPC service implementation using GrpcRequestManager.
     Fully separated from HTTP server with its own process and no shared globals.
     """
+
+    # The metrics Generate records into; the constructor's `metrics` replaces
+    # it (a servicer built without the constructor records nothing).
+    _metrics = NO_METRICS
 
     # The running window the schedulers computed, once every rank's load
     # snapshot has shown its bound (the bound does not change for the
@@ -161,6 +180,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         model_info: dict,
         scheduler_info: dict,
         health_servicer: SGLangHealthServicer | None = None,
+        metrics: ServicerMetrics | None = None,
     ):
         """Initialize the standalone gRPC service."""
         self.request_manager = request_manager
@@ -170,6 +190,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         self.scheduler_info = scheduler_info
         self.start_time = time.time()
         self.health_servicer = health_servicer
+        # The metrics the server's endpoint renders (`--metrics-port`), fed
+        # at the points Generate already passes; without one nothing is recorded.
+        self._metrics = NO_METRICS if metrics is None else metrics
         # SamplingParams.normalize requires a tokenizer whenever string stops
         # are used; the scheduler matches them with its own tokenizer.
         if server_args.skip_tokenizer_init:
@@ -221,8 +244,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         context: grpc.aio.ServicerContext,
     ) -> AsyncIterator[sglang_scheduler_pb2.GenerateResponse]:
         """Handle generation requests with streaming responses."""
+        # The request's arrival, on the registry's clock: its latencies count
+        # this servicer's own conversion of the request, as the other wires'.
+        arrival = time.monotonic()
         logger.info(f"Receive generation request: {request.request_id}")
 
+        # The request's observation in the metrics, from its arrival on.
+        observed = None
         try:
             # Convert gRPC request to internal format
             tokenized_req = self._convert_generate_request(request)
@@ -234,40 +262,46 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 request_id=request.request_id,
                 grpc_context=context,
             )
+            observed = self._metrics.request(arrival=arrival, **_observation_of(request))
 
             async for output in response_generator:
                 # Handle batch responses (for n>1 non-streaming)
                 if isinstance(output, list):
                     for batch_output in output:
                         if "error" in batch_output:
-                            await context.abort(
-                                abort_code_from_output(batch_output),
-                                batch_output["error"],
-                            )
+                            code = abort_code_from_output(batch_output)
+                            observed.failed(code)
+                            await context.abort(code, batch_output["error"])
                         elif (grammar := grammar_abort(batch_output)) is not None:
                             # The one abort the scheduler attributes to the
                             # request's grammar (named before its status: a PD
                             # decode side stamps a 500 on it too).
+                            observed.failed(grpc.StatusCode.FAILED_PRECONDITION)
                             await abort_for_constraint_failure(
                                 context, _scheduler_abort_detail(grammar)
                             )
                         elif (aborted := scheduler_abort(batch_output)) is not None:
                             # The scheduler's own abort, with its status: the
                             # caller's error or the worker's, never a completion.
+                            code = abort_code_from_output(batch_output)
+                            observed.failed(code)
                             await context.abort(
-                                abort_code_from_output(batch_output),
+                                code,
                                 aborted.get("message") or "aborted by the scheduler",
                             )
                         else:
                             # All non-error batch outputs are final responses
-                            yield self._create_completion_response(request.request_id, batch_output)
+                            response = self._create_completion_response(
+                                request.request_id, batch_output
+                            )
+                            observed.complete_of(response, with_output=True)
+                            yield response
                 else:
                     # Handle single response (for streaming or n=1 non-streaming)
                     if "error" in output:
-                        await context.abort(
-                            abort_code_from_output(output),
-                            output["error"],
-                        )
+                        code = abort_code_from_output(output)
+                        observed.failed(code)
+                        await context.abort(code, output["error"])
                     elif (grammar := grammar_abort(output)) is not None:
                         # The one abort the scheduler itself attributes to the
                         # request's grammar (the plugin's name on its finish):
@@ -275,6 +309,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                         # never a `Complete(finish_reason = "abort")` a client
                         # reads as an empty success. Named before its status:
                         # a PD decode side stamps a 500 on it too.
+                        observed.failed(grpc.StatusCode.FAILED_PRECONDITION)
                         await abort_for_constraint_failure(
                             context, _scheduler_abort_detail(grammar)
                         )
@@ -284,29 +319,44 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                         # ends with that status and the scheduler's message, as
                         # the TokenSpeed servicer ends it, not with a
                         # `Complete(finish_reason = "abort")` that drops both.
+                        code = abort_code_from_output(output)
+                        observed.failed(code)
                         await context.abort(
-                            abort_code_from_output(output),
+                            code,
                             aborted.get("message") or "aborted by the scheduler",
                         )
                     elif request.stream:
-                        yield self._create_chunk_response(request.request_id, output)
+                        response = self._create_chunk_response(request.request_id, output)
+                        observed.chunk_of(response)
+                        yield response
                         if output.get("finished", False):
-                            yield self._create_completion_response(request.request_id, output)
+                            response = self._create_completion_response(request.request_id, output)
+                            observed.complete_of(response)
+                            yield response
                     else:
                         # Non-streaming n=1: single completion response
-                        yield self._create_completion_response(request.request_id, output)
+                        response = self._create_completion_response(request.request_id, output)
+                        observed.complete_of(response, with_output=True)
+                        yield response
 
         except grpc.aio.AbortError:
             raise
         except ValueError as e:
             logger.warning(f"Generate invalid request {request.request_id}: {e}")
+            self._metrics.failed(
+                observed, grpc.StatusCode.INVALID_ARGUMENT, refusal="invalid_argument"
+            )
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
         except Exception as e:
             logger.error(
                 f"Generate failed for request {request.request_id}: {e}\n"
                 f"{get_exception_traceback()}"
             )
+            self._metrics.failed(observed, grpc.StatusCode.INTERNAL)
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
+        finally:
+            if observed is not None:
+                observed.end()
 
     async def Embed(
         self,

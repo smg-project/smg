@@ -56,6 +56,7 @@ import importlib.metadata
 import logging
 import re
 import sys
+import time
 import types
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -149,11 +150,14 @@ def with_servicer_switch(
         # parse step logged (the capture-cap decision) comes out now, through
         # vLLM's handlers, ahead of everything the launch logs from here.
         attach_vllm_logging()
+        from smg_grpc_servicer.metrics import remember_launcher_endpoint
         from smg_grpc_servicer.rust_lifecycle import (
             ServicerConfigError,
             announce_kv_events_default,
             configuration_exit,
+            start_metrics_endpoint,
         )
+        from smg_grpc_servicer.vllm import METRICS_HOST_ENV, METRICS_PORT_ENV
         from smg_grpc_servicer.vllm.rust import (
             KV_EVENTS_ENV,
             configure_logging,
@@ -163,6 +167,7 @@ def with_servicer_switch(
             serve_rust,
         )
 
+        endpoint = None
         try:
             if resolve_servicer_impl(args) == "rust":
                 raise SystemExit(await serve_rust(args))
@@ -171,6 +176,24 @@ def with_servicer_switch(
             # the launcher's own coroutine builds the engine and loads the
             # model (the servicer's own refusal would come after that load).
             require_python_media_mode(args)
+            # The Python servicer's metrics endpoint (--metrics-port, else
+            # SMG_VLLM_SERVICER_METRICS_PORT; the same families as the Rust
+            # servicer's), bound now, before the launcher's coroutine loads
+            # the model: a scrape during the load reads `starting`, and a
+            # port the listener cannot bind is refused here. The launcher
+            # builds the servicer without this namespace, so the servicer
+            # finds the endpoint through `launcher_endpoint` and completes
+            # its families with the engine's facts. Its clock is the wall
+            # clock: the arrival stamp the servicer reads already is one.
+            endpoint = start_metrics_endpoint(
+                args,
+                port_env=METRICS_PORT_ENV,
+                host_env=METRICS_HOST_ENV,
+                model=served_model_name(args),
+                wire="vllm",
+                clock=time.time,
+            )
+            remember_launcher_endpoint(endpoint)
             # The Python servicer gets the Rust path's KV-events default too:
             # a namespace without --kv-events-config has vLLM's ZMQ publisher
             # on, at a port found free on this host, before the launcher
@@ -191,10 +214,24 @@ def with_servicer_switch(
         # package's warnings and errors reach stderr as they do without it.
         # (The Rust path's configure_logging ended it above.)
         settle_logging()
-        return await serve_grpc(args, *rest, **kwargs)
+        try:
+            return await serve_grpc(args, *rest, **kwargs)
+        finally:
+            if endpoint is not None:
+                endpoint.stop()
 
     setattr(serve_grpc_with_switch, _SWITCH_MARK, True)
     return serve_grpc_with_switch
+
+
+def served_model_name(args: Any) -> str:
+    """The served model name of a launcher namespace (the first of
+    ``--served-model-name``, else ``--model``): the ``model`` label of its
+    metrics, as the Rust servicer labels them."""
+    served = getattr(args, "served_model_name", None)
+    if isinstance(served, (list, tuple)):
+        served = served[0] if served else None
+    return str(served or getattr(args, "model", "") or "")
 
 
 def _rebind(namespace: dict[str, Any]) -> None:

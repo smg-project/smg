@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from vllm.logger import init_logger
 
 from smg_grpc_servicer.health_frame import NOT_SERVING, SERVING, HealthFrame
+from smg_grpc_servicer.metrics import launcher_endpoint
 
 # The launcher imports this module before it defines serve_grpc: the moment
 # the servicer switch has to be in place (see launcher_switch).
@@ -59,8 +60,13 @@ class VllmHealthServicer(HealthFrame):
         logger.info("Standard gRPC health service initialized")
 
     def set_not_serving(self):
-        """Mark all services as NOT_SERVING during graceful shutdown."""
+        """Mark all services as NOT_SERVING during graceful shutdown; the
+        metrics endpoint, if the launcher bound one, reads ``draining`` from
+        here on."""
         self._shutting_down = True
+        endpoint = launcher_endpoint()
+        if endpoint is not None:
+            endpoint.note_draining()
         logger.info("Health service status set to NOT_SERVING")
 
     def shutting_down(self) -> bool:

@@ -42,6 +42,7 @@ from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
 from smg_grpc_servicer import mm_shm
 from smg_grpc_servicer.engine_status import grpc_code_for_http_status
 from smg_grpc_servicer.health_probe import await_probe
+from smg_grpc_servicer.metrics import NO_METRICS, ServicerMetrics
 from smg_grpc_servicer.mm_rdma import RdmaPixelPuller
 from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
 from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
@@ -116,6 +117,23 @@ def _lazy_generate_req_input():
     return GenerateReqInput
 
 
+def _observation_of(request: tokenspeed_scheduler_pb2.GenerateRequest) -> dict[str, Any]:
+    """What the metrics record of a request at its submission: the rank it
+    pins (where the installed stubs carry the field), its prompt length, its
+    ``max_new_tokens`` and ``n``."""
+    params = request.sampling_params
+    pinned = None
+    if "data_parallel_rank" in tokenspeed_scheduler_pb2.GenerateRequest.DESCRIPTOR.fields_by_name:
+        if request.HasField("data_parallel_rank"):
+            pinned = request.data_parallel_rank
+    return {
+        "rank": pinned,
+        "prompt_tokens": len(request.tokenized.input_ids) if request.HasField("tokenized") else 0,
+        "max_tokens": params.max_new_tokens if params.HasField("max_new_tokens") else None,
+        "n": params.n or 1,
+    }
+
+
 @functools.cache
 def _engine_supports_dp_rank_pin() -> bool:
     """Capability probe: can this engine honor an attention-DP hard pin?
@@ -178,18 +196,26 @@ def _finish_reason_to_dict(reason: Any) -> dict | None:
 class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedulerServicer):
     """gRPC servicer exposing TokenSpeed's AsyncLLM over the dedicated TokenSpeed proto."""
 
+    # The metrics Generate records into; the constructor's `metrics` replaces
+    # it (a servicer built without the constructor records nothing).
+    _metrics = NO_METRICS
+
     def __init__(
         self,
         async_llm: AsyncLLM,
         server_args: ServerArgs,
         scheduler_info: dict,
         health_servicer: TokenSpeedHealthServicer | None = None,
+        metrics: ServicerMetrics | None = None,
     ):
         self.async_llm = async_llm
         self.server_args = server_args
         self.scheduler_info = scheduler_info
         self.health_servicer = health_servicer
         self.start_time = time.time()
+        # The metrics the server's endpoint renders (`--metrics-port`), fed
+        # at the points Generate already passes; without one nothing is recorded.
+        self._metrics = NO_METRICS if metrics is None else metrics
 
         # Resolved ZMQ KV-events endpoint, or None when the worker was not
         # launched with --kv-events-config (SubscribeKvEvents → UNIMPLEMENTED).
@@ -248,10 +274,14 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                     has_mm,
                 )
         except ValueError as e:
+            self._metrics.request_not_started(
+                grpc.StatusCode.INVALID_ARGUMENT, refusal="invalid_argument"
+            )
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
             return
         except Exception as e:  # noqa: BLE001
             logger.exception("Failed to build generate request for %s", rid)
+            self._metrics.request_not_started(grpc.StatusCode.INTERNAL)
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
             return
 
@@ -287,6 +317,9 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         # close releases what it holds there now, not in asyncio's generator
         # finalizer later.
         engine_outputs = self.async_llm.generate_request(req_obj)
+        # The request's observation in the metrics, from its submission on;
+        # its arrival is the stamp read before the request was built.
+        observed = self._metrics.request(arrival=build_started, **_observation_of(request))
         # Choices that have sent a Chunk; only their empty terminal delta is skipped.
         indices_with_chunks: set[int] = set()
         try:
@@ -311,13 +344,16 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                     for r in item_reasons:
                         if r and r.get("type") == "abort":
                             code = _abort_status_code(r)
+                            observed.failed(code)
                             await context.abort(code, r.get("message") or "aborted")
                             return
                     for idx, (item, item_reason) in enumerate(zip(output, item_reasons)):
                         ci = int(item.get("index", idx))
-                        yield self._complete_response(
+                        response = self._complete_response(
                             rid, item, item_reason, ci, no_stop_trim=no_stop_trim
                         )
+                        observed.complete_of(response, with_output=True)
+                        yield response
                     return
 
                 meta = output.get("meta_info", {})
@@ -326,6 +362,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
                 if reason_dict is not None and reason_dict.get("type") == "abort":
                     code = _abort_status_code(reason_dict)
+                    observed.failed(code)
                     await context.abort(code, reason_dict.get("message") or "aborted")
                     return
 
@@ -335,6 +372,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                     chunk_response = self._chunk_response(
                         rid, output, reason_dict, choice_index, no_stop_trim=no_stop_trim
                     )
+                    observed.chunk_of(chunk_response)
                     # A matched stop token may be the whole final engine delta;
                     # trimmed, it leaves no client-visible payload, and an empty
                     # Chunk before Complete would hold a streaming client at the
@@ -346,13 +384,17 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                         indices_with_chunks.add(choice_index)
                         yield chunk_response
                     if is_finished:
-                        yield self._complete_response(
+                        response = self._complete_response(
                             rid, output, reason_dict, choice_index, no_stop_trim=no_stop_trim
                         )
+                        observed.complete_of(response)
+                        yield response
                 elif is_finished:
-                    yield self._complete_response(
+                    response = self._complete_response(
                         rid, output, reason_dict, choice_index, no_stop_trim=no_stop_trim
                     )
+                    observed.complete_of(response, with_output=True)
+                    yield response
 
                 if is_finished:
                     completed_indices.add(choice_index)
@@ -361,6 +403,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
         except ValueError as e:
             logger.warning("Generate invalid request %s: %s", rid, e)
+            observed.failed(grpc.StatusCode.INVALID_ARGUMENT)
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
         except asyncio.CancelledError:
             # Client disconnected — sweep every scheduler-side rid we minted
@@ -377,8 +420,10 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             raise
         except Exception as e:
             logger.exception("Generate failed for request %s", rid)
+            observed.failed(grpc.StatusCode.INTERNAL)
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
         finally:
+            observed.end()
             # The engine's iterator first: closing it runs the engine's own
             # exit (the model-update reader lock it holds across yields) now
             # rather than in asyncio's generator finalizer. Its per-request

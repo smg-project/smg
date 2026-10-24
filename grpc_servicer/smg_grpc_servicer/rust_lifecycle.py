@@ -254,9 +254,10 @@ def env_port(name: str, *, environ: Mapping[str, str] | None = None) -> int | No
 def metrics_port(
     args: Any, env_name: str, *, environ: Mapping[str, str] | None = None
 ) -> int | None:
-    """The port the Rust servicer serves Prometheus metrics on, or ``None``
-    for no endpoint: ``--metrics-port`` when the launcher's namespace carries
-    it (``args.metrics_port``), else ``environ[env_name]``, else none. The
+    """The port the servicer serves Prometheus metrics on (either
+    implementation), or ``None`` for no endpoint: ``--metrics-port`` when
+    the launcher's namespace carries it (``args.metrics_port``), else
+    ``environ[env_name]``, else none. The
     flag's action exports its value under the variable on every launcher, so
     a launcher whose namespace keeps only the engine's own fields reads the
     flag through the variable too. 0 binds an ephemeral port (tests); any
@@ -286,7 +287,8 @@ def metrics_bind_address(
     host_env: str,
     environ: Mapping[str, str] | None = None,
 ) -> str | None:
-    """Where the Rust servicer serves ``GET /metrics``, as ``host:port`` (an
+    """Where the servicer serves ``GET /metrics`` (the Rust one's own
+    listener, or the Python one's: the same families), as ``host:port`` (an
     IPv6 host bracketed), or ``None`` for no endpoint: the port from
     :func:`metrics_port`; the host from ``--metrics-host``
     (``args.metrics_host``), else ``environ[host_env]``, else the gRPC
@@ -312,19 +314,39 @@ def metrics_bind_address(
     return host_port(host, port)
 
 
-def check_metrics_port_needs_rust(
-    impl: str, args: Any, env_name: str, *, environ: Mapping[str, str] | None = None
-) -> None:
-    """A metrics port given (the flag or its variable) with the Python
-    servicer selected is a :class:`ServicerConfigError`: the Python servicer
-    exposes no metrics endpoint, and a port nobody will serve is a
-    misconfiguration best refused before the engine starts."""
-    if impl == "rust" or metrics_port(args, env_name, environ=environ) is None:
-        return
-    raise ServicerConfigError(
-        f"{METRICS_PORT_FLAG} (or {env_name}) needs {SERVICER_IMPL_FLAG} rust: the Python "
-        "servicer exposes no metrics endpoint"
-    )
+def start_metrics_endpoint(
+    args: Any,
+    *,
+    port_env: str,
+    host_env: str,
+    model: str,
+    wire: str,
+    clock: Callable[[], float] = time.monotonic,
+    environ: Mapping[str, str] | None = None,
+) -> Any | None:
+    """The Python servicer's metrics endpoint
+    (:class:`smg_grpc_servicer.metrics.MetricsEndpoint`) for a launcher's
+    arguments, bound now, before the engine starts, as the Rust servicer's
+    listener is: a scrape during the engine's load answers ``starting``, and
+    a port the listener cannot bind is a :class:`ServicerConfigError` here,
+    not a failure after the model loaded. ``None`` when no endpoint was asked
+    for (:func:`metrics_bind_address`: the flag, else ``environ[port_env]``,
+    else none). ``model`` and ``wire`` label every series; ``clock`` is the
+    one the servicer's request path stamps arrivals with."""
+    address = metrics_bind_address(args, port_env=port_env, host_env=host_env, environ=environ)
+    if address is None:
+        return None
+    from smg_grpc_servicer.metrics import MetricsEndpoint
+
+    endpoint = MetricsEndpoint(address, model=model, wire=wire, clock=clock)
+    try:
+        endpoint.start()
+    except OSError as error:
+        raise ServicerConfigError(
+            f"{METRICS_PORT_FLAG} (or {port_env}): the metrics listener cannot bind {address}: "
+            f"{error.strerror or error}"
+        ) from None
+    return endpoint
 
 
 def free_port() -> int:

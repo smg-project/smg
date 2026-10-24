@@ -68,6 +68,12 @@ class TokenSpeedHealthServicer(HealthFrame):
     def shutting_down(self) -> bool:
         return self.async_llm.gracefully_exit
 
+    @property
+    def serving(self) -> bool:
+        """Whether the engine's service answers SERVING by its base status
+        (the warm-up ran, and nothing flipped it back)."""
+        return self._serving_status.get(self.TOKENSPEED_SERVICE) == SERVING
+
     async def engine_status(self, service_name: str) -> int:
         logger.debug("Health check request for service=%r", service_name)
         if service_name == self.OVERALL_SERVER:

@@ -92,6 +92,12 @@ class MmProcessorUnavailable(Exception):
     """Retryable backend failure (sidecar down, overloaded, timed out)."""
 
 
+class MmFetchFailed(MmProcessorUnavailable):
+    """A reference the request named could not be fetched: the request's own
+    failure (the metrics count it as a media refusal, as the Rust servicer's
+    media-fault trailer does), still retryable on another worker."""
+
+
 def resolve_mm_processor_mode(env: Mapping[str, str] = os.environ) -> str:
     raw = (env.get(ENV_PROCESSOR) or MODE_OFF).strip().lower()
     if raw not in VALID_MODES:
@@ -418,7 +424,7 @@ class InProcessMediaProcessor:
             ):
                 raise ValueError(f"media_refs[{index}]: {e}") from e
             logger.warning("media_refs[%d]: fetch failed for %s: %s", index, item.modality, e)
-            raise MmProcessorUnavailable(f"media_refs[{index}]: fetch failed: {e}") from e
+            raise MmFetchFailed(f"media_refs[{index}]: fetch failed: {e}") from e
         raise ValueError(f"unsupported media modality {item.modality!r}")
 
 

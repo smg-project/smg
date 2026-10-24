@@ -1,8 +1,8 @@
-"""The Rust servicer's metrics endpoint on the three launchers: one flag pair
+"""The servicer's metrics endpoint on the three launchers: one flag pair
 (``--metrics-port``, ``--metrics-host``) with one precedence (the flag, else
 the engine's variable, else no endpoint), one refusal of a clash with the gRPC
-port before the engine starts, one refusal under the Python servicer, and the
-bind address handed to the Rust server."""
+port before the engine starts, and the bind address handed to the Rust server
+(the Python servicer serves the same address itself: ``test_metrics.py``)."""
 
 from __future__ import annotations
 
@@ -104,18 +104,6 @@ def test_metrics_port_equal_to_grpc_port_is_refused_before_the_engine_starts(
         )
         == "127.0.0.1:0"
     )
-
-
-def test_a_metrics_port_under_the_python_servicer_is_refused():
-    check = rust_lifecycle.check_metrics_port_needs_rust
-    env = "X_SERVICER_METRICS_PORT"
-    check("python", SimpleNamespace(), env, environ={})
-    check("rust", SimpleNamespace(metrics_port=29100), env, environ={})
-    check("rust", SimpleNamespace(), env, environ={env: "29100"})
-    with pytest.raises(rust_lifecycle.ServicerConfigError, match="needs --servicer-impl rust"):
-        check("python", SimpleNamespace(metrics_port=29100), env, environ={})
-    with pytest.raises(rust_lifecycle.ServicerConfigError, match="needs --servicer-impl rust"):
-        check("python", SimpleNamespace(), env, environ={env: "29100"})
 
 
 def test_the_flags_join_a_parser_once_and_export_their_variables(monkeypatch):
