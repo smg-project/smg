@@ -1192,7 +1192,7 @@ pub(crate) fn compact_python_json(value: &JsonValue) -> Result<String> {
 /// - `sort_keys` (bool): Whether to sort dictionary keys
 ///
 /// This is necessary for compatibility with chat templates from HuggingFace Hub models.
-/// See: https://github.com/huggingface/transformers/blob/main/src/transformers/utils/chat_template_utils.py
+/// See: <https://github.com/huggingface/transformers/blob/main/src/transformers/utils/chat_template_utils.py>
 fn tojson_filter(value: Value, kwargs: Kwargs) -> std::result::Result<Value, MinijinjaError> {
     let ensure_ascii: Option<bool> = kwargs.get("ensure_ascii")?;
     let indent: Option<Value> = kwargs.get("indent")?;

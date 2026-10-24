@@ -17,7 +17,7 @@
 //! replacement declares its feature ranges. Images and frames travel as patch
 //! rows with per-item grids (see [`crate::vision::processors::muse_spark`]);
 //! audio as the clip's padded samples, `[samples, 1]` rows flat over the
-//! batch (see [`crate::audio::processors::muse_spark`]).
+//! batch (see [`crate::audio::processors::MuseSparkAudioProcessor`]).
 
 use std::collections::HashMap;
 

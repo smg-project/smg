@@ -213,7 +213,7 @@ fn ipv6_class(address: Ipv6Addr) -> Option<&'static str> {
 pub(crate) struct MediaHostResolver {
     pins: Mutex<HashMap<String, Pin>>,
     /// The answers a test gives for names nothing resolves where it runs
-    /// ([`Self::answer`]); empty otherwise, and the system resolver answers.
+    /// (the test-only `answer`); empty otherwise, and the system resolver answers.
     answers: Mutex<HashMap<String, Vec<IpAddr>>>,
 }
 

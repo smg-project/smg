@@ -267,7 +267,7 @@ struct Node {
     children: DashMap<char, NodeRef, CharHasherBuilder>,
     /// Node text with cached character count
     text: RwLock<NodeText>,
-    /// Per-tenant last access epoch for LRU ordering. Using TenantId (Arc<str>) for cheap cloning.
+    /// Per-tenant last access epoch for LRU ordering. Using TenantId (`Arc<str>`) for cheap cloning.
     tenant_last_access_time: TenantMap<u64>,
     /// Parent pointer for upward traversal during timestamp updates.
     /// Uses Weak to avoid Arc reference cycles (parent -> child -> parent).
@@ -422,7 +422,7 @@ fn shared_prefix_count_chars(a: &str, b: &str) -> usize {
 }
 
 /// Intern tenant ID to avoid repeated allocations.
-/// Returns cached Arc<str> if tenant was seen before.
+/// Returns cached `Arc<str>` if tenant was seen before.
 #[inline]
 fn intern_tenant(tenant: &str) -> TenantId {
     // Fast path: check if already interned

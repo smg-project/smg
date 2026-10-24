@@ -17,10 +17,10 @@ struct ChainData {
     /// Trie edge: (parent chain, absolute position of the parent
     /// block). `None` = a root chain (base_pos == 0).
     parent: Option<(u32, u32)>,
-    /// Absolute position of contents[0].
+    /// Absolute position of `contents[0]`.
     base_pos: u32,
     contents: Vec<ContentHash>,
-    /// Lineage fingerprint at contents[0] (audit + canonical iden).
+    /// Lineage fingerprint at `contents[0]` (audit + canonical iden).
     start_lineage: u64,
     /// Lineage at the last position (extension cache).
     end_lineage: u64,

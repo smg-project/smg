@@ -13,14 +13,14 @@
 //!     The first non-empty `msg.peer_id` is written into
 //!     `learned_peer: Arc<RwLock<Option<String>>>` and later frames are
 //!     held to it. Each frame is handled by
-//!     [`handle_frame`](crate::transport::peer_stream::handle_frame), the
+//!     [`handle_frame`], the
 //!     same way the dialer handles its own; the idle timeout around
 //!     `incoming.next()` lives in
-//!     [`next_frame`](crate::transport::peer_stream::next_frame).
+//!     [`next_frame`].
 //!   - **Inbound-sender task** — every 1 Hz, reads the shared
 //!     [`RoundBatch`](crate::kv::RoundBatch) slot produced by
 //!     [`gossip_controller`](crate::gossip_controller)'s event loop and
-//!     runs [`send_round`](crate::transport::peer_stream::send_round)
+//!     runs [`send_round`]
 //!     for the learned peer.
 //!
 //! Asymmetry with the outbound side: the dialer (gossip_controller)

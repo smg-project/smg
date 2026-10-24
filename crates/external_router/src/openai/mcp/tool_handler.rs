@@ -152,7 +152,7 @@ pub(crate) struct StreamingToolHandler {
     /// item type that the MCP-dispatch registry does NOT track (i.e. upstream
     /// emitted a native hosted-tool item directly — `image_generation_call`,
     /// `web_search_call`, `code_interpreter_call`, `file_search_call` — rather
-    /// than wrapping it as a `function_call` that [`handle_output_item_added`]
+    /// than wrapping it as a `function_call` that [`Self::handle_output_item_added`]
     /// would register in `pending_calls`). Recorded so the
     /// `output_item.done` gate can recognise the R6.7c "native passthrough"
     /// path and drop the duplicate/mis-ordered umbrella without kicking the

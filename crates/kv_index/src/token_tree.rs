@@ -179,7 +179,7 @@ static TENANT_INTERN_POOL: Lazy<DashMap<Arc<str>, (), FxBuildHasher>> =
     Lazy::new(|| DashMap::with_hasher(FxBuildHasher));
 
 /// Intern tenant ID to avoid repeated allocations.
-/// Returns cached Arc<str> if tenant was seen before.
+/// Returns cached `Arc<str>` if tenant was seen before.
 fn intern_tenant(tenant: &str) -> TenantId {
     // Fast path: check if already interned
     if let Some(entry) = TENANT_INTERN_POOL.get(tenant) {
