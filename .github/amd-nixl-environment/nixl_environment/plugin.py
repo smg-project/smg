@@ -22,6 +22,9 @@ class EnvironmentProof:
         spec.loader.exec_module(module)
         try:
             module.verify(directory, self.stage + "-" + suffix)
+            from .private_wheel import verify
+
+            verify(self.stage + "-" + suffix)
         except Exception as error:
             (directory / (self.stage + "-" + suffix + "-error.json")).write_text(
                 json.dumps({"error": str(error)}) + "\n"

@@ -102,6 +102,8 @@ def worker(worker):
     mask = env.get(b"CUDA_VISIBLE_DEVICES", b"").decode()
     require(mask == ",".join(map(str, worker.gpu_ids)), "actual logical device mask differs")
     require(env.get(b"SPT_NOENV") == b"1", "marker preservation missing")
+    for name in ("PYTHONPATH", "LD_LIBRARY_PATH"):
+        require(env.get(name.encode()) == os.environ[name].encode(), "worker private environment differs: " + name)
     from infra.model_specs import get_model_spec
 
     require(
@@ -160,7 +162,7 @@ def transport_mappings(process):
     for pid in sorted(selected):
         try:
             loaded = mapped_native(
-                pid, ["nixl", "mooncake", "libucp", "libucs", "libuct", "libucm"]
+                pid, ["nixl", "mooncake", "/work/prefix/", "libucp", "libucs", "libuct", "libucm"]
             )
             if loaded:
                 require(
@@ -177,6 +179,11 @@ def transport_mappings(process):
                         "pid": pid,
                         "parent_pid": parents[pid][0],
                         "start_ticks": parents[pid][1],
+                        "argv": [value.decode() for value in (Path("/proc") / str(pid) / "cmdline").read_bytes().split(b"\0") if value],
+                        "private_environment": {
+                            name: next((value.split(b"=", 1)[1].decode() for value in (Path("/proc") / str(pid) / "environ").read_bytes().split(b"\0") if value.startswith(name.encode() + b"=")), None)
+                            for name in ("PYTHONPATH", "LD_LIBRARY_PATH")
+                        },
                         "loaded_native": loaded,
                     }
                 )

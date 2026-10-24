@@ -10,23 +10,16 @@ from importlib.metadata import distribution
 from pathlib import Path
 
 from .owned import require
+from . import private_wheel
 
 ENGINE = {
-    "bytes": 4826641,
-    "sha256": "18e5b44278f92388e0465398fe490619342646e93cc80f1d07fdbbb7f388134d",
+    "bytes": 3740816,
+    "sha256": "710c03c60a8937a5a0bfbee14062c565715cd0bd886c0c4ca4c82c30b0325bc3",
 }
 
 
 def require_engine_mapped(children):
-    require(
-        any(
-            value == ENGINE
-            for child in children
-            for path, value in child["loaded_native"].items()
-            if path.endswith("/mooncake/engine.so")
-        ),
-        "owned Mooncake role lacks the accepted actual ROCm engine mapping",
-    )
+    private_wheel.require_mapped(children)
 
 
 def capture(out):
@@ -34,19 +27,22 @@ def capture(out):
     from vllm.platforms import current_platform
 
     require(torch.version.hip and current_platform.is_rocm(), "ROCm runtime required")
+    config, target = private_wheel.verify("canary")
     dist = distribution("mooncake-transfer-engine-rocm")
-    require(dist.version == "0.3.13.post1", "Mooncake ROCm version differs")
+    require(dist.version == config["version"], "private Mooncake version differs")
     record = dist.read_text("RECORD")
     metadata = dist.read_text("METADATA")
     require(record and metadata, "Mooncake distribution evidence missing")
     (out / "mooncake.RECORD").write_text(record)
     (out / "mooncake.METADATA").write_text(metadata)
-    path = Path(dist.locate_file("mooncake/engine.so")).resolve()
+    relative = "mooncake/engine.cpython-312-x86_64-linux-gnu.so"
+    path = Path(dist.locate_file(relative)).resolve()
+    require(path == target / relative, "private Mooncake engine origin differs")
     require(path.stat().st_size == ENGINE["bytes"], "Mooncake engine size differs")
     raw = path.read_bytes()
     identity = {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
     require(identity == ENGINE, "Mooncake engine differs from captured749f bytes")
-    rows = [row for row in csv.reader(io.StringIO(record)) if row[0] == "mooncake/engine.so"]
+    rows = [row for row in csv.reader(io.StringIO(record)) if row[0] == relative]
     digest = "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(raw).digest()).decode().rstrip("=")
     require(
         len(rows) == 1 and rows[0][1:] == [digest, str(len(raw))], "Mooncake engine RECORD differs"

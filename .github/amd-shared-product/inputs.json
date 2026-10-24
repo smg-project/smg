@@ -88,7 +88,7 @@
     "model_gateway": "d1a181bfb1d16a661e16346d4eb8f257689701ce",
     "grpc_servicer": "a10bb7235d74ac91d8de4b3eafabd1ef7ed1344e",
     "e2e_test": "3408fbe66433940953c4399e03f5ff148c248ac8",
-    "scripts": "6b21b75245705e319d0334500e6f41b16d602e97",
+    "scripts": "6003dbf64901f523a7204ec675da40df907b2f0b",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows/e2e-gpu-job.yml": "c8daa461a9d5913bffa56b890505b6074776fb78",
     "README.md": "83b7df25632da03f0184bd5b4628b9c9a3ace803",
@@ -166,7 +166,7 @@
     "original_pytest_reruns": 2,
     "original_reruns_delay_seconds": 5,
     "pytest_minutes_by_tier": {
-      "2": 34
+      "4": 42
     },
     "GPU_jobs_per_dispatch": 1
   },
@@ -202,7 +202,7 @@
   "resource_precondition": {
     "requested_runner_label": "1-gpu-mi300x",
     "required_logical_devices_by_tier": {
-      "2": 2
+      "4": 4
     },
     "current_availability_verified": false,
     "physical_GPU_exclusivity_claimed": false,
@@ -227,7 +227,7 @@
     "unit_junit": "servicer-engine.xml in the existing unique AMD dependency artifact",
     "diagnostic_workflow_difference": "NIXL tier-select dispatch caller only; normal product tooling CPU jobs are not part of this diagnostic workflow."
   },
-  "source_identity_note": "Consumer19 binds the original three owned-log overlays plus exactly one platform module-discovery helper change in test_pd_topologies.py. All original case methods/oracles and selected18/original17 projection, mixed connector startup hard gates, model/filter/50-42 remain unchanged. No NIXL/Mooncake ABI, transfer, GPU or coverage acceptance is implied.",
+  "source_identity_note": "Original f470 tests/caller selection and compiled37 c9d/gateway143a/actual445 producer14 remain fixed. Consumer19/scripts changes only two exact hash-bound default-off private-wheel setup/audit hooks; namespace observers verify the genuine local version/RECORD/private-prefix and each owned TP1 EngineCore. No GPU, cleanup-fix or prior MC4 acceptance is transferred.",
   "admitted_tier": null,
   "contracts": {
     "4": {
@@ -265,11 +265,11 @@
     "skip_contract": "Tier4 only: no setup skips; original sole-leg-outage[2p2d] exactcallskip reason only; all18terminal phases retained.",
     "mooncake_engine_identity": {
       "distribution": "mooncake-transfer-engine-rocm",
-      "version": "0.3.13.post1",
-      "path": "mooncake/engine.so",
-      "bytes": 4826641,
-      "sha256": "18e5b44278f92388e0465398fe490619342646e93cc80f1d07fdbbb7f388134d",
-      "source": "Root accepted749f cap64 package capture; byte integrity only until actual imports/owned mappings/original transfer oracles execute"
+      "version": "0.3.13.post1+amd.hip723.g26b0229.curl30.teonly",
+      "path": "mooncake/engine.cpython-312-x86_64-linux-gnu.so",
+      "bytes": 3740816,
+      "sha256": "710c03c60a8937a5a0bfbee14062c565715cd0bd886c0c4ca4c82c30b0325bc3",
+      "source": "Source26b/HIP723 fixed749f private local wheel; actual no-device CPU load accepted only. New per-role EngineCore maps, HIP init/transfer/restart/cleanup and original18 remain pending."
     }
   },
   "environment_contract": {
@@ -295,5 +295,24 @@
     "case_body_changes_in_this_layer": false,
     "runtime_proof": false,
     "reference_contract": ".github/amd-shared-product/mooncake4-reference.json"
+  },
+  "private_runtime_overlay_sha256": "7f0873baecb1a5e769e36deb8511f879bfa2cdcd199ab9ccdff9c1f5de365878",
+  "private_mooncake_runtime": {
+    "wheel": {
+      "bytes": 4203741,
+      "name": "mooncake_transfer_engine_rocm-0.3.13.post1+amd.hip723.g26b0229.curl30.teonly-cp312-cp312-linux_x86_64.whl",
+      "sha256": "1f2ded97f9a0bad2ff5ba0010b2a84c00007f63f49e9d590136ae19e1500707f"
+    },
+    "version": "0.3.13.post1+amd.hip723.g26b0229.curl30.teonly",
+    "source_commit": "26b0229eb0ba36bbffe9c6fb175ec7baf610fc75",
+    "specification_sha256": "096bbb75e08bfe73024862f4e920b57535cb8ec37e314bf973515fd32915a4f3",
+    "cpu_acceptance_sha256": "7e9164824f414d23b8488a0f5f9c49b4930f99c6921a4265c19187da724bd1eb",
+    "host_bundle": "/tmp/smg-mooncake-hip723-1f2ded97f9a0",
+    "read_only_prefix_mount": "/work/prefix",
+    "read_only_wheel_mount": "/work/mooncake_transfer_engine_rocm-0.3.13.post1+amd.hip723.g26b0229.curl30.teonly-cp312-cp312-linux_x86_64.whl",
+    "staging_accepted": false,
+    "staging_receipt": null,
+    "GPU_verified": false,
+    "base_image_installation_preserved": true
   }
 }

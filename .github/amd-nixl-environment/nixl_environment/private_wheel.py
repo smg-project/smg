@@ -8,11 +8,12 @@ import io
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import subprocess
 import sys
 import zipfile
 
-SPEC_SHA = "ad88b22a4258b1410d4d5382d31a402285fbc323fd744b975e4d72e56716825a"
+SPEC_SHA = "096bbb75e08bfe73024862f4e920b57535cb8ec37e314bf973515fd32915a4f3"
 
 
 def require(value, message):
@@ -111,18 +112,23 @@ def verify(stage):
 def require_mapped(children):
     config, target = spec(), state()[1]
     engine = target / "mooncake/engine.cpython-312-x86_64-linux-gnu.so"
-    mapped = []
+    mapped, cores = [], []
     for child in children:
         libraries = child["loaded_native"]
+        core = any(re.fullmatch(r"VLLM::EngineCore(?:_DP\d+)?", value) for value in child["argv"])
+        if core:
+            cores.append(child["pid"])
         mooncake = [name for name in libraries if "/mooncake/engine" in name]
         if not mooncake:
+            require(not core, "owned EngineCore lacks private Mooncake mapping")
             continue
         require(mooncake == [str(engine)], "owned role loaded a different Mooncake engine")
+        require(child["private_environment"] == {name: os.environ[name] for name in ("PYTHONPATH", "LD_LIBRARY_PATH")}, "transport process private environment differs")
         expected = {str(target / "mooncake" / name): item for name, item in config["raw_native"].items() if name != "nvlink_allocator.so"}
         expected.update({"/work/prefix/usr/lib/x86_64-linux-gnu/" + name: {key: item[key] for key in ("bytes", "sha256")} for name, item in config["runtime_libraries"].items()})
         require(all(libraries.get(name) == item for name, item in expected.items()), "owned Mooncake process lacks exact private runtime mappings")
         mapped.append(child["pid"])
-    require(mapped, "owned Mooncake role lacks the private native runtime")
+    require(len(cores) == 1 and set(cores).issubset(mapped), "TP1 role lacks exactly one mapped owned EngineCore")
     return mapped
 
 

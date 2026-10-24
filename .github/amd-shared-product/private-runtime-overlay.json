@@ -1,0 +1,35 @@
+{
+  "policy": "fixed749f_private_mooncake_two_hooks_v1",
+  "base_product_commit": "3b79acc59b68b84465e58a025850af2c93c96fe8",
+  "base_scripts_tree": "6b21b75245705e319d0334500e6f41b16d602e97",
+  "scripts": {
+    "scripts/ci_setup_vllm_rocm_image.sh": {
+      "base_ls_tree": "100755 blob c8a18b3da2439d7a021ae3d79ceb20127e84ff3b\tscripts/ci_setup_vllm_rocm_image.sh",
+      "sha256": "e1869e4d6bfd68f0cb07fabf1b5f973118d629474364fe1e71f0a502663a0429"
+    },
+    "scripts/ci_check_e2e_dependencies.py": {
+      "base_ls_tree": "100644 blob 88398565ba46230b44b822e3ecb517adc1581025\tscripts/ci_check_e2e_dependencies.py",
+      "sha256": "d84d032c4e7d1c6e700fd04b1cb8cf3bb1dfb68487a1ea66f6e2326c4331b843"
+    }
+  },
+  "observers": {
+    ".github/amd-nixl-environment/nixl_environment/private_wheel.py": {
+      "sha256": "47d1ead516a596bf530e814b143dbebce0a7317938a01c1d56d1d8063ce268a5"
+    },
+    ".github/amd-nixl-environment/nixl_environment/private-wheel.json": {
+      "sha256": "096bbb75e08bfe73024862f4e920b57535cb8ec37e314bf973515fd32915a4f3"
+    },
+    ".github/amd-nixl-environment/nixl_environment/mooncake.py": {
+      "sha256": "8be4d44a13d9c1dc5d76c2319d4bdea966816950bd837d31ec96e4cf870a7ae8"
+    },
+    ".github/amd-nixl-environment/nixl_environment/owned.py": {
+      "sha256": "6231f2b4985b5d86b78abf6ecf2d17ad8d2c9e5526da3eed82f3289a32bdfac3"
+    },
+    ".github/amd-nixl-environment/nixl_environment/plugin.py": {
+      "sha256": "86fdc703dfcd7dcb376cb06f49c7cf03c626d49b3cc3413f876ee48a1ed8f92a"
+    },
+    ".github/amd-nixl-environment/pyproject.toml": {
+      "sha256": "8efa558454e7fd15799b1debd2243e88e781fb2231183198084f6296f2d65d04"
+    }
+  }
+}

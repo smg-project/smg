@@ -13,6 +13,31 @@ TEST_OVERLAY_FILES = {
     "e2e_test/router/test_pd_mooncake.py",
     "e2e_test/router/test_pd_topologies.py",
 }
+PRIVATE_RUNTIME_FILES = {
+    "scripts/ci_setup_vllm_rocm_image.sh",
+    "scripts/ci_check_e2e_dependencies.py",
+}
+
+
+def private_runtime_source(inputs, product_source):
+    path = ROOT / ".github/amd-shared-product/private-runtime-overlay.json"
+    require(hashlib.sha256(path.read_bytes()).hexdigest() == inputs["private_runtime_overlay_sha256"], "private runtime overlay manifest")
+    overlay = json.loads(path.read_text())
+    require(overlay["policy"] == "fixed749f_private_mooncake_two_hooks_v1", "private runtime policy")
+    target = inputs["target_product_commit"]
+    require(overlay["base_product_commit"] == target, "private runtime product base")
+    require(set(overlay["scripts"]) == PRIVATE_RUNTIME_FILES, "exact two private runtime hooks")
+    require(set(overlay["observers"]) == {
+        ".github/amd-nixl-environment/pyproject.toml",
+        *(".github/amd-nixl-environment/nixl_environment/" + name for name in
+          ("private_wheel.py", "private-wheel.json", "mooncake.py", "owned.py", "plugin.py")),
+    }, "exact private runtime observer files")
+    require(set(git_output("diff", "--name-only", target, "HEAD", "--", "scripts").splitlines()) == PRIVATE_RUNTIME_FILES, "unlisted script change")
+    for name, item in overlay["scripts"].items():
+        require(git_output("ls-tree", target, "--", name).strip() == item["base_ls_tree"], "runtime hook base: " + name)
+    for name, item in (overlay["scripts"] | overlay["observers"]).items():
+        require(hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == item["sha256"], "private runtime bytes: " + name)
+    return product_source | {"scripts": overlay["base_scripts_tree"]}, PRIVATE_RUNTIME_FILES
 
 
 def product_test_source(inputs):
@@ -56,6 +81,7 @@ def verify(inputs):
 
     check_map(read_oid, "HEAD", inputs["source_trees"])
     product_source, test_overlay = product_test_source(inputs)
+    product_source, private_runtime = private_runtime_source(inputs, product_source)
     check_map(read_oid, target, product_source)
     check_map(read_oid, "HEAD", inputs["compiled_source_trees"])
     check_map(read_oid, producer, inputs["compiled_source_trees"])
@@ -71,7 +97,9 @@ def verify(inputs):
             or path.startswith(".github/amd-p4-proof/")
             or path.startswith(".github/amd-nixl-environment/")
             or path == ".github/workflows/pr-test-rust.yml"
-            or path in test_overlay,
+            or path in test_overlay
+            or path in private_runtime,
+            # Two exact hash-bound setup/audit hooks accompany this private wheel.
             # Only the four hash-bound test files may differ within e2e_test.
             f"unexpected product modification: {path}",
         )

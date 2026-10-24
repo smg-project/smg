@@ -30,6 +30,8 @@ RECIPES = {
 def select(inputs, tier):
     if any(inputs.get(key) is not True for key in ("ready", "run_budget_admitted")):
         raise ValueError("source and runner budget are not admitted")
+    if inputs["private_mooncake_runtime"]["staging_accepted"] is not True:
+        raise ValueError("exact private wheel and prefix staging is not accepted")
     if tier not in RECIPES or inputs.get("admitted_tier") != tier:
         raise ValueError("dispatch tier differs from the single admitted tier")
     recipe = RECIPES[tier]
