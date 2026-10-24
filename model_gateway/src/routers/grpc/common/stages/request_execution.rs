@@ -3092,7 +3092,7 @@ mod tests {
             context::AttemptStamp,
         };
 
-        let worker = |url, role| -> Arc<dyn Worker> {
+        let worker = |url: &str, role| -> Arc<dyn Worker> {
             Arc::new(
                 BasicWorkerBuilder::new(url)
                     .worker_type(role)
@@ -3136,11 +3136,19 @@ mod tests {
                 id,
                 sampling_mask: None,
                 sampling_baseline: None,
-                inject_pd_metadata: true,
+                inject_pd_metadata: crate::routers::grpc::mode::Mode::EncodePrefillDecode
+                    .inject_pd_metadata(),
                 tool_constraint: None,
             };
-            for _ in 0..2 {
+            for attempt in 0..2 {
                 let previous = plan.clone();
+                let prefill_url = format!("grpc://retry-prefill-{attempt}:30000");
+                let workers = WorkerSelection::Disaggregated {
+                    encode_assignments: None,
+                    prefill: worker(&prefill_url, WorkerType::Prefill),
+                    decode: workers.decode_worker().unwrap().clone(),
+                    runtime_type: RuntimeType::Sglang,
+                };
                 restamp_plan_for_attempt(&mut plan, &stamp, &workers, &ToolParserFactory::new())
                     .unwrap();
                 let ExecutionPlan::EncodePrefillDecode { request } = &plan else {
@@ -3151,8 +3159,30 @@ mod tests {
                 assert_eq!(handoff.request_id, request.request_id());
                 assert_eq!(handoff.encoder_urls, urls);
                 assert_eq!(handoff.num_items_assigned, [1, 0, 2]);
+                let bootstrap = request.as_sglang().disaggregated_params.as_ref().unwrap();
+                assert_eq!(
+                    bootstrap.bootstrap_host,
+                    workers
+                        .prefill_worker()
+                        .unwrap()
+                        .metadata()
+                        .bootstrap_host()
+                );
+                assert_eq!(
+                    bootstrap.bootstrap_port,
+                    crate::worker::DEFAULT_BOOTSTRAP_PORT as i32
+                );
+                assert!(bootstrap.bootstrap_room >= 0);
                 let (mut prefill, decode) = parallel_pd_requests(request.clone(), &workers);
                 assert_eq!(prefill.request_id(), decode.request_id());
+                assert_eq!(
+                    prefill.as_sglang().disaggregated_params.as_ref(),
+                    Some(bootstrap)
+                );
+                assert_eq!(
+                    decode.as_sglang().disaggregated_params.as_ref(),
+                    Some(bootstrap)
+                );
                 assert_eq!(prefill.as_sglang().encode_handoff.as_ref(), Some(handoff));
                 assert!(decode.as_sglang().encode_handoff.is_none());
                 prefill.clear_encode_bootstrap_info();

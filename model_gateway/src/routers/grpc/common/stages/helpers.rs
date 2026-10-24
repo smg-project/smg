@@ -2302,7 +2302,8 @@ mod epd_restamp_tests {
             id: IdStamp::Exact,
             sampling_mask: None,
             sampling_baseline: None,
-            inject_pd_metadata: false,
+            inject_pd_metadata: crate::routers::grpc::mode::Mode::EncodePrefillDecode
+                .inject_pd_metadata(),
             tool_constraint: None,
         };
         let retry_pair = tokenspeed_pd_pair("grpc://retry-prefill:30000", "grpc://decode:30000");
@@ -2331,6 +2332,30 @@ mod epd_restamp_tests {
             kv.bootstrap_host, new_prefill_host,
             "KV rendezvous names the newly selected prefill"
         );
+    }
+
+    #[test]
+    fn epd_pd_metadata_does_not_touch_other_runtime_requests() {
+        for runtime in [
+            RuntimeType::TokenSpeed,
+            RuntimeType::Vllm,
+            RuntimeType::Trtllm,
+            RuntimeType::Mlx,
+            RuntimeType::Generic,
+            RuntimeType::External,
+            RuntimeType::Unspecified,
+        ] {
+            let mut workers = tokenspeed_pd_pair("grpc://prefill:30000", "grpc://decode:30000");
+            if let WorkerSelection::Disaggregated { runtime_type, .. } = &mut workers {
+                *runtime_type = runtime;
+            }
+            // Even an SGLang-shaped request must stay untouched unless the
+            // selected runtime actually uses its bootstrap wire protocol.
+            let mut request = ProtoGenerateRequest::Sglang(Box::default());
+            let before = request.as_sglang().clone();
+            maybe_inject_pd_metadata(&mut request, &workers);
+            assert_eq!(*request.as_sglang(), before, "runtime {runtime:?}");
+        }
     }
 }
 
