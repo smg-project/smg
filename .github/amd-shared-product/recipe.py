@@ -1,4 +1,4 @@
-"""Select exactly one original NIXL row before any relay API call."""
+"""Select only the original Mooncake2 row before any relay API call."""
 
 import argparse
 import json
@@ -6,38 +6,20 @@ from pathlib import Path
 
 RECIPES = {
     "2": {
-        "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-2gpu-pd[1]/vllm/nvidia",
+        "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-2gpu-pd[2]/vllm/nvidia",
         "gpu_tier": "2",
         "timeout": 50,
         "test_timeout": 34,
         "test_dirs": "e2e_test/router",
         "test_filter": "",
         "min_selected": 15,
-        "vllm_kv_backend": "nixl",
+        "vllm_kv_backend": "mooncake",
         "vllm_extra_kv_backends": "",
         "selected": 27,
         "original_skip_count": 3,
         "original_setup_skip_count": 2,
         "original_call_skip_count": 1,
-    },
-    "4": {
-        "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-4gpu-pd[1]/vllm/nvidia",
-        "gpu_tier": "4",
-        "timeout": 50,
-        "test_timeout": 42,
-        "test_dirs": "e2e_test/router/test_pd_topologies.py",
-        "test_filter": (
-            '-k "(2p2d and not http) or AssembledAtRuntime or SmallWindow'
-            ' or MismatchedTransport or MismatchedProtocol"'
-        ),
-        "min_selected": 14,
-        "vllm_kv_backend": "nixl",
-        "vllm_extra_kv_backends": "mooncake",
-        "selected": 18,
-        "original_skip_count": 1,
-        "original_setup_skip_count": 0,
-        "original_call_skip_count": 1,
-    },
+    }
 }
 
 

@@ -166,12 +166,11 @@
     "original_pytest_reruns": 2,
     "original_reruns_delay_seconds": 5,
     "pytest_minutes_by_tier": {
-      "2": 34,
-      "4": 42
+      "2": 34
     },
     "GPU_jobs_per_dispatch": 1
   },
-  "diagnostic_difference": "One selected tier per dispatch; known 1-gpu-mi300x CI slot routes a multi-device suite, without claiming physical GPU reservation. Caller enables full installed-engine units and canonical14 gate (original two NIXL rows leave units off), SPT_NOENV=1 and pre-install private constraints. The original product reusable workflow is unchanged.",
+  "diagnostic_difference": "Only original Mooncake2 may dispatch; original27/4models/router emptyfilter/floor15/50job34pytest retained. Inherited14unit/environment/private-constraint/owned-process gates stay; Mooncake canary and fixture log proof replace any NIXL requirement. No GPU/ABI/transfer result is transferred.",
   "producer_binary_relabelled": false,
   "producer_artifact_pins_status": "BOUND: root-accepted actual40038340532/445bb37 four archives and native143a; all admission flags remainfalse",
   "explicit_product_dependency": {
@@ -181,7 +180,7 @@
     "parent_stack": "0707d631cb6827789619ab96999f868044dc06db",
     "visible_churn": 43
   },
-  "producer_snapshot_note": "Rootaccepted producer integrity only: exact40038340532/attempt1/build120703217001/445bb37 and actual four archives are locally bound. TargetROCm/model, fresh runner ownership/budget/tier admission and actual27/18 contract execution are not accepted.",
+  "producer_snapshot_note": "Rootaccepted40038340532/445bb37 four archives/native143a remain exact. Only the frozen original Mooncake2 source route is prepared; no budget, current runner availability, ABI or transfer accepted.",
   "source_base": "c9d5431db92aa2d35521889f6297c4c6f7b05b4a",
   "producer_base_source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
@@ -203,8 +202,7 @@
   "resource_precondition": {
     "requested_runner_label": "1-gpu-mi300x",
     "required_logical_devices_by_tier": {
-      "2": 2,
-      "4": 4
+      "2": 2
     },
     "current_availability_verified": false,
     "physical_GPU_exclusivity_claimed": false,
@@ -229,37 +227,22 @@
     "unit_junit": "servicer-engine.xml in the existing unique AMD dependency artifact",
     "diagnostic_workflow_difference": "NIXL tier-select dispatch caller only; normal product tooling CPU jobs are not part of this diagnostic workflow."
   },
-  "source_identity_note": "Original reusable workflow remains byte-identical to03d; product target remains opt-in constraint-hook3b79. Consumer19/scripts and compiled37 exactc9d are unchanged. Actual accepted445bb37 fourarchives/native143a are integrity-bound; no prior GPU/runtime acceptance transferred.",
+  "source_identity_note": "Original shared reusable03d blob, consumer19 product source and compiled37c9d unchanged. Diagnostic-only Mooncake2 caller/canary/transfer witness does not relabel native143a or alter originalcase bodies.",
   "admitted_tier": null,
   "contracts": {
     "2": {
-      "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-2gpu-pd[1]/vllm/nvidia",
+      "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-2gpu-pd[2]/vllm/nvidia",
       "gpu_tier": "2",
       "timeout": 50,
       "test_timeout": 34,
       "test_dirs": "e2e_test/router",
       "test_filter": "",
       "min_selected": 15,
-      "vllm_kv_backend": "nixl",
+      "vllm_kv_backend": "mooncake",
       "vllm_extra_kv_backends": "",
       "selected": 27,
       "original_skip_count": 3,
       "original_setup_skip_count": 2,
-      "original_call_skip_count": 1
-    },
-    "4": {
-      "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-4gpu-pd[1]/vllm/nvidia",
-      "gpu_tier": "4",
-      "timeout": 50,
-      "test_timeout": 42,
-      "test_dirs": "e2e_test/router/test_pd_topologies.py",
-      "test_filter": "-k \"(2p2d and not http) or AssembledAtRuntime or SmallWindow or MismatchedTransport or MismatchedProtocol\"",
-      "min_selected": 14,
-      "vllm_kv_backend": "nixl",
-      "vllm_extra_kv_backends": "mooncake",
-      "selected": 18,
-      "original_skip_count": 1,
-      "original_setup_skip_count": 0,
       "original_call_skip_count": 1
     }
   },
@@ -268,17 +251,24 @@
     "scope": "Environment continuity plus existing Worker/Gateway lifecycle wrappers, original per-case before/after/exit, actual native mappings and full original terminal reports; no additional model requests.",
     "preinstall_hook_product": "3b79acc59b68b84465e58a025850af2c93c96fe8",
     "reusable_workflow_product": "03d34400c3561c9e2d00e449a5e5c4bcca8e0401",
-    "private_state": "/tmp/smg-nixl-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}",
+    "private_state": "/tmp/smg-mooncake-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}",
     "runtime_witnesses_complete": false,
     "remaining_witnesses": [
-      "Actual producer/archive/native integrity is bound; fresh source/runner/budget and exactlyone tier admission remain absent",
-      "The new observer and official ROCm NIXL loader must execute in the actual749f image; CPU stand-ins do not prove native SDK or GPU compatibility",
-      "Original27 or18 cases including mixed Mooncake/NIXL pairing, transfer, cancellation, outage and restart must complete with exact original skips/phases and full raw retry history",
-      "Mapped libraries/configuration alone do not prove KV bytes, ABORT/ACK, peer/HBM release or long-term stability; original assertions/logs and independent actual audit determine scope"
+      "Actual749f Mooncake ROCm.3.13.post1 engine.so import and role-bound loaded bytes must execute; saved package capture is integrity only",
+      "All original27 cases/4models and two NIXL setup skips plus one exact Mrope call skip must complete, with raw retry history",
+      "Original Mooncake fixture must show real minted params plus positive successful-transfer metrics tied to its owned P/D and router logs; no per-request ACK/peer/HBM or stability claim"
     ],
     "actual_GPU_or_coverage": false,
     "runtime_witnesses_source_connected": true,
-    "skip_contract": "Tier2:2 exact setup skips plus1 exact original call skip in router-side media mode. Tier4:1 exact original call skip for sole-leg outage in2p2d. Other skip/phase/reason and missing teardown rejected."
+    "skip_contract": "Only2: original NIXL two exact setup skips; original Mrope worker-media call skip. Every other original case/phase/reason and teardown retained.",
+    "mooncake_engine_identity": {
+      "distribution": "mooncake-transfer-engine-rocm",
+      "version": "0.3.13.post1",
+      "path": "mooncake/engine.so",
+      "bytes": 4826641,
+      "sha256": "18e5b44278f92388e0465398fe490619342646e93cc80f1d07fdbbb7f388134d",
+      "source": "Root accepted749f cap64 package capture; byte integrity only until actual imports/owned mappings/original transfer oracles execute"
+    }
   },
   "environment_contract": {
     "required_14_units_hard_gate": true,
@@ -288,6 +278,7 @@
       "final"
     ],
     "no_prior_GPU_acceptance_transferred": true,
-    "original_default_parser_connection_servicer_mm_overrides": "all empty; kv_backend empty; engine vllm with explicit vllm_kv_backend=nixl"
-  }
+    "original_default_parser_connection_servicer_mm_overrides": "all empty; kv_backend empty; enginevllm with explicit vllm_kv_backend=mooncake and extra empty"
+  },
+  "future_four_gpu_scope": "Original Mooncake4 is a separate later caller/contract; no tier4 recipe or admission is provided here."
 }

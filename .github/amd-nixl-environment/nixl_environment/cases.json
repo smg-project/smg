@@ -30,37 +30,11 @@
       "router/test_pd_multimodal.py::TestPDMultimodalKvIsolation::test_different_images_same_prefix_do_not_alias[pd_grpc]"
     ],
     "setup_skips": {
-      "router/test_pd_mooncake.py::TestPDMooncakeKvTransfer::test_minted_params_injected[pd_grpc]": "mooncake PD leg only",
-      "router/test_pd_mooncake.py::TestPDMooncakeKvTransfer::test_workers_transferred_kv[pd_grpc]": "mooncake PD leg only"
+      "router/test_pd_nixl.py::TestPDNixlKvTransfer::test_decode_worker_performed_nixl_handshake[pd_grpc]": "nixl PD leg only",
+      "router/test_pd_nixl.py::TestPDNixlKvTransfer::test_kv_transfer_params_relayed[pd_grpc]": "nixl PD leg only"
     },
     "call_skips": {
       "router/test_pd_multimodal.py::TestPDMultimodalMrope::test_worker_media_is_processed_once_on_the_prefill_side[pd_grpc]": "router-side lane: the workers receive preprocessed tensors"
-    }
-  },
-  "4": {
-    "cases": [
-      "router/test_pd_topologies.py::TestPDAssembledAtRuntime::test_workers_added_through_the_api_route_as_pd",
-      "router/test_pd_topologies.py::TestPDSmallWindow::test_burst_beyond_decode_window_is_shed_not_stalled[1p1d-window4]",
-      "router/test_pd_topologies.py::TestPDMismatchedProtocol::test_workers_with_different_protocols_are_refused[1p1d-protocol-mismatch]",
-      "router/test_pd_topologies.py::TestPDMismatchedTransport::test_request_is_refused_at_placement[1p1d-kv-mismatch]",
-      "router/test_pd_topologies.py::TestPDTopology::test_abandoned_streams_free_both_sides[2p2d]",
-      "router/test_pd_topologies.py::TestPDTopology::test_aborts_during_prefill_free_both_sides[2p2d]",
-      "router/test_pd_topologies.py::TestPDTopology::test_batched_completion_serves_every_choice[2p2d]",
-      "router/test_pd_topologies.py::TestPDTopology::test_concurrent_requests_do_not_alias[2p2d]",
-      "router/test_pd_topologies.py::TestPDTopology::test_decode_engine_death_under_streaming_traffic[2p2d]",
-      "router/test_pd_topologies.py::TestPDTopology::test_decode_pool_survives_losing_one_worker[2p2d]",
-      "router/test_pd_topologies.py::TestPDTopology::test_every_worker_takes_traffic[2p2d]",
-      "router/test_pd_topologies.py::TestPDTopology::test_long_prompt_context_reaches_decode[2p2d]",
-      "router/test_pd_topologies.py::TestPDTopology::test_prefill_pool_survives_losing_one_worker[2p2d]",
-      "router/test_pd_topologies.py::TestPDTopology::test_second_turn_sees_the_first[2p2d]",
-      "router/test_pd_topologies.py::TestPDTopology::test_sole_leg_outage_is_reported_promptly[2p2d]",
-      "router/test_pd_topologies.py::TestPDTopology::test_stream_completes_with_usage[2p2d]",
-      "router/test_pd_topologies.py::TestPDTopology::test_workers_registered_by_role[2p2d]",
-      "router/test_pd_topologies.py::TestPDMixedTransport::test_every_request_lands_on_a_matching_pair[2p2d-mixed-kv]"
-    ],
-    "setup_skips": {},
-    "call_skips": {
-      "router/test_pd_topologies.py::TestPDTopology::test_sole_leg_outage_is_reported_promptly[2p2d]": "both pools have more than one worker"
     }
   }
 }

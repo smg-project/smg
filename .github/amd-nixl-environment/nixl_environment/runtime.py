@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from . import canary, owned
+from . import canary, mooncake, mooncake_transfer, owned
 
 
 def canonical(nodeid):
@@ -86,11 +86,12 @@ def verify_mixed_native(recipe, events):
 
 class RuntimeProof:
     def __init__(self):
-        self.directory = Path(os.environ["SMG_CI_RUNTIME_STATE_DIR"]) / "nixl-runtime"
+        self.directory = Path(os.environ["SMG_CI_RUNTIME_STATE_DIR"]) / "mooncake-runtime"
         self.directory.mkdir()
         self.recipe = json.loads(Path(__file__).with_name("cases.json").read_text())[
             os.environ["E2E_GPU_TIER"]
         ]
+        owned.require(os.environ["E2E_VLLM_KV_BACKEND"] == "mooncake", "Mooncake-only caller")
         root = Path(os.environ["GITHUB_WORKSPACE"])
         self.native = json.loads((root / ".github/amd-shared-product/inputs.json").read_text())[
             "gateway_native"
@@ -142,6 +143,8 @@ class RuntimeProof:
                             ),
                             "ready role lacks actual " + word + " native mapping",
                         )
+                        if word == "mooncake":
+                            mooncake.require_engine_mapped(row["transport_native"])
             paths = []
             if obj.log_path:
                 paths.append(Path(obj.log_path))
@@ -150,6 +153,7 @@ class RuntimeProof:
             for path in paths:
                 if path.is_file():
                     self.logs[str(path)] = path
+            row["log_sources"] = [str(path) for path in paths if path.is_file()]
             self.record(row)
         except Exception as error:
             self.errors.append({"nodeid": self.nodeid, "stage": stage, "error": str(error)})
@@ -227,7 +231,7 @@ class RuntimeProof:
 
         owned.require(self.native is not None, "actual producer native not bound")
         owned.require(os.environ.get("SPT_NOENV") == "1", "marker preservation missing")
-        canary.capture(self.directory)
+        canary.capture(self.directory, os.environ["E2E_VLLM_KV_BACKEND"])
         for cls, kind, names in [
             (Worker, "worker", ("start", "wait_ready", "stop", "kill_engine")),
             (Gateway, "gateway", ("start", "shutdown", "add_worker", "remove_worker")),
@@ -238,7 +242,7 @@ class RuntimeProof:
     def pytest_collection_finish(self, session):
         owned.require(
             sorted(canonical(x.nodeid) for x in session.items) == sorted(self.recipe["cases"]),
-            "original NIXL selection changed",
+            "original Mooncake2 selection changed",
         )
 
     @pytest.hookimpl(hookwrapper=True)
@@ -267,6 +271,7 @@ class RuntimeProof:
             owned.require(not self.errors, "runtime observations failed")
             verify_reports(self.recipe, self.reports)
             verify_mixed_native(self.recipe, self.events)
+            mooncake_transfer.verify(self.recipe, self.events, self.directory)
             for nodeid in set(self.recipe["cases"]) - set(self.recipe["setup_skips"]):
                 events = [e for e in self.events if e["nodeid"] == nodeid and e.get("identity")]
                 owned.require(
