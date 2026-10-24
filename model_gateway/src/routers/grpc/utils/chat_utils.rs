@@ -76,8 +76,8 @@ struct SseErrorBody<'a, M: fmt::Display> {
     #[serde(rename = "type")]
     error_type: &'a str,
     /// The code the HTTP answer to the same failure carries, for a failure
-    /// that has one (`constraint_failed`); absent otherwise, so the frames
-    /// clients have been reading do not change.
+    /// that has one (`constraint_failed`, `reader_panicked`); absent
+    /// otherwise, so the frames clients have been reading do not change.
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<&'a str>,
 }

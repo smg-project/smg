@@ -39,7 +39,11 @@ use crate::{
 };
 
 /// The spec with Symphony assigned `format`, replaying `prompt`.
-fn assigned(mut spec: ChatResponseSpec, format: Format, prompt: &str) -> ChatResponseSpec {
+pub(super) fn assigned(
+    mut spec: ChatResponseSpec,
+    format: Format,
+    prompt: &str,
+) -> ChatResponseSpec {
     spec.symphony = Some(Assignment {
         format: Arc::new(format),
         prompt: prompt.to_string(),
@@ -640,7 +644,11 @@ fn lookup_tools() -> Vec<Tool> {
 }
 
 /// A Messages spec with Symphony assigned `format`, replaying `prompt`, with the `lookup` tool.
-fn assigned_message(format: Format, prompt: &str, thinking: bool) -> MessagesResponseSpec {
+pub(super) fn assigned_message(
+    format: Format,
+    prompt: &str,
+    thinking: bool,
+) -> MessagesResponseSpec {
     MessagesResponseSpec {
         first_tool_call_only: false,
         thinking_requested: thinking,
@@ -1047,7 +1055,7 @@ async fn a_message_whose_tool_use_input_cannot_carry_the_arguments_is_refused() 
 
 /// The scrape of a recorder of this test's own after `read` ran on this thread (the test
 /// runtime is single-threaded, so the local recorder sees every record of the future).
-async fn scraped<F: std::future::Future>(read: F) -> (F::Output, String) {
+pub(super) async fn scraped<F: std::future::Future>(read: F) -> (F::Output, String) {
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
     let guard = metrics::set_default_local_recorder(&recorder);
@@ -1057,7 +1065,7 @@ async fn scraped<F: std::future::Future>(read: F) -> (F::Output, String) {
 }
 
 /// The line of `scrape` for the series `name` with every label in `labels`.
-fn series_line<'a>(scrape: &'a str, name: &str, labels: &[&str]) -> Option<&'a str> {
+pub(super) fn series_line<'a>(scrape: &'a str, name: &str, labels: &[&str]) -> Option<&'a str> {
     scrape
         .lines()
         .find(|line| line.starts_with(name) && labels.iter().all(|label| line.contains(label)))

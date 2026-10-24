@@ -25,6 +25,10 @@
 //! engine could not continue the request under its constraint is the
 //! request's outcome, counted under its own `error_type`, charged to no
 //! worker, and the event names it by the `code` the HTTP answer carries.
+//! A reading that panicked in the gateway, caught at the request's boundary
+//! (`utils::isolation`), is the request's own failure: an `internal_error`
+//! event under `reader_panicked`, charged to no worker, counted under the
+//! table that read the output ([`Panicked::record`]).
 
 use std::{fmt, sync::Arc};
 
@@ -34,6 +38,7 @@ use tracing::{error, warn};
 
 use super::{
     chat_utils::{send_error_sse_with_code, SseSender},
+    isolation::{Panicked, READER_PANICKED_CODE},
     metrics::error_type_from_status,
     pd_bootstrap::{account_pd_side_failure, dead_rendezvous_of, DeadRendezvous},
     tonic_ext::{is_the_engines_own_report, TonicStatusExt, CONSTRAINT_FAILED_CODE},
@@ -216,6 +221,10 @@ pub(crate) enum StreamFailure {
     },
     /// The gateway's own processing failed.
     Internal(String),
+    /// The gateway's reading of the response panicked, caught at the
+    /// request's boundary (`utils::isolation`): the request's failure, not
+    /// the task's.
+    Panicked(Panicked),
 }
 
 impl StreamFailure {
@@ -244,7 +253,7 @@ impl StreamFailure {
     pub(crate) fn class(&self) -> Option<UpstreamClass> {
         match self {
             Self::Upstream { status, .. } => Some(UpstreamClass::of(status)),
-            Self::Internal(_) => None,
+            Self::Internal(_) | Self::Panicked(_) => None,
         }
     }
 
@@ -269,14 +278,22 @@ impl StreamFailure {
     /// The `code` of the SSE error event that ends the response, when the
     /// failure has one of its own: `constraint_failed` for a worker's report
     /// that the engine could not continue the request under its constraint,
-    /// the code the HTTP answer to the same report carries. `None` otherwise.
+    /// `reader_panicked` for a reading that panicked; each the code the HTTP
+    /// answer to the same failure carries. `None` otherwise.
     pub(crate) fn code(&self) -> Option<&'static str> {
         match self {
             Self::Upstream { status, .. } if is_constraint_failure(status) => {
                 Some(CONSTRAINT_FAILED_CODE)
             }
+            Self::Panicked(_) => Some(READER_PANICKED_CODE),
             Self::Upstream { .. } | Self::Internal(_) => None,
         }
+    }
+}
+
+impl From<Panicked> for StreamFailure {
+    fn from(panicked: Panicked) -> Self {
+        Self::Panicked(panicked)
     }
 }
 
@@ -316,6 +333,7 @@ impl fmt::Display for StreamFailure {
                 ..
             } => write!(f, "Prefill stream error: {}", status.message()),
             Self::Internal(message) => f.write_str(message),
+            Self::Panicked(panicked) => write!(f, "{panicked}"),
         }
     }
 }
@@ -402,8 +420,14 @@ impl StreamSource {
     /// and one WARN names the worker, its side, the request, the class and how
     /// far the response had come (and the pair's dead bootstrap port, when
     /// the failure was explained by one). A failure of the gateway's own
-    /// processing leaves the worker's record alone.
+    /// processing leaves the worker's record alone; a reading that panicked
+    /// is recorded as the isolation records it ([`Panicked::record`]): the
+    /// table's outcome and one ERROR line naming the request.
     pub(crate) fn account(&self, failure: &StreamFailure) {
+        if let StreamFailure::Panicked(panicked) = failure {
+            panicked.record(&self.request_id, &self.model);
+            return;
+        }
         let StreamFailure::Upstream {
             status,
             completion_tokens,
@@ -1374,5 +1398,48 @@ mod tests {
         .unwrap_or_else(|| panic!("counted under the worker's labels:\n{rendered}"));
         assert_eq!(label(line, "error_type"), "engine_error");
         assert!(line.ends_with(" 1"), "{line}");
+    }
+
+    /// A reading that panicked is the gateway's own failure: an
+    /// `internal_error` event under `reader_panicked`, the worker uncharged,
+    /// the output counted under the table that read it.
+    #[test]
+    fn a_reading_that_panicked_is_an_internal_error_under_its_code_and_charges_no_worker() {
+        let panicked: Result<(), _> =
+            super::super::isolation::isolated_sync(|| panic!("the reader slipped"));
+        let failure = StreamFailure::from(panicked.expect_err("the panic").read_by(Some("qwen3")));
+        assert_eq!(failure.error_type(), INTERNAL_ERROR_TYPE);
+        assert_eq!(failure.messages_error_type(), MESSAGES_API_ERROR_TYPE);
+        assert_eq!(failure.code(), Some(READER_PANICKED_CODE));
+        // The client's text names the failure; the message is the log line's.
+        assert_eq!(
+            failure.to_string(),
+            "the gateway's reader of the response panicked"
+        );
+        assert!(failure.class().is_none());
+        // Accounted: the table's outcome, nothing of the worker's record.
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let worker = worker();
+        let selection = WorkerSelection::Single {
+            worker: Arc::clone(&worker),
+        };
+        let source =
+            StreamSource::new(Some(&selection), &dispatch(), metrics_labels::ENDPOINT_CHAT);
+        metrics::with_local_recorder(&recorder, || source.account(&failure));
+        let rendered = handle.render();
+        let outputs = sample(
+            &rendered,
+            "smg_symphony_outputs_total",
+            &["table=\"qwen3\"", "outcome=\"panicked\""],
+        )
+        .unwrap_or_else(|| panic!("the table's outcome:\n{rendered}"));
+        assert!(outputs.ends_with(" 1"), "{outputs}");
+        assert!(worker_error_type(&rendered).is_none(), "{rendered}");
+        assert!(
+            sample(&rendered, "smg_router_request_errors_total", &[]).is_none(),
+            "{rendered}"
+        );
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
     }
 }

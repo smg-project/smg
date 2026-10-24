@@ -36,8 +36,7 @@
 //! of it reaches the conversation and history side.
 
 use std::{
-    any::Any, collections::HashMap, future::Future, panic::AssertUnwindSafe, sync::Arc,
-    time::Duration,
+    collections::HashMap, future::Future, panic::AssertUnwindSafe, sync::Arc, time::Duration,
 };
 
 use axum::{
@@ -65,6 +64,7 @@ use crate::routers::{
         sse::{sse_channel, SseSender},
     },
     error,
+    grpc::utils::isolation::panic_message,
 };
 
 /// Runs `fut`, a storage operation, under the request's storage context
@@ -919,17 +919,6 @@ async fn watch_stored_status(
                 debug!(response_id = %id, error = %e, "Failed to read the background response record");
             }
         }
-    }
-}
-
-/// The text of a panic's payload.
-fn panic_message(payload: &(dyn Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_string()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "unknown panic".to_string()
     }
 }
 

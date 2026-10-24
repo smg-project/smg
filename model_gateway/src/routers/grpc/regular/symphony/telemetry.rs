@@ -6,6 +6,12 @@
 //!
 //! - `failed`: output the table could not read at all: the engine refused (`ParseError`); the
 //!   request answers with an error;
+//! - `panicked`: output whose reading panicked in the gateway (the reader, or the step that
+//!   carried its events), caught at the request's boundary
+//!   (`routers::grpc::utils::isolation`): the request answers with an error under
+//!   `reader_panicked`, and the line that names the request is the isolation's own, at ERROR,
+//!   with the panic's message sanitized of the bytes it quotes; a defect of the reader, never
+//!   the output's doing, so it is told apart from `failed`;
 //! - `malformed`: a call region the table read but gave up on, or a marker of the table where no
 //!   row leads, kept as content text (`Event::Malformed`), by its reason; the bytes reach the
 //!   client as content, or, where the syntax's block is never prose, are dropped behind an event of
@@ -92,7 +98,7 @@ use tracing::warn;
 use super::names::Fallback;
 
 /// Outputs read to their end, by `table` and `outcome` (`clean`, `malformed`, `failed`,
-/// `empty`, `unknown_tool`).
+/// `empty`, `unknown_tool`, `panicked`).
 pub(crate) const OUTPUTS: &str = "smg_symphony_outputs_total";
 /// Malformed runs, by `table` and `reason`.
 pub(crate) const MALFORMED: &str = "smg_symphony_malformed_total";
@@ -161,7 +167,14 @@ const REASONS: [&str; 31] = [
 /// The place of `other` in [`REASONS`]: a reason the match below does not know.
 const OTHER_REASON: usize = REASONS.len() - 1;
 /// The `outcome` labels, in the order of [`Series::outputs`].
-const OUTCOMES: [&str; 5] = ["clean", "malformed", "failed", "empty", "unknown_tool"];
+const OUTCOMES: [&str; 6] = [
+    "clean",
+    "malformed",
+    "failed",
+    "empty",
+    "unknown_tool",
+    "panicked",
+];
 /// The `reason` labels of [`FALLBACK`], in the order of [`fallback_index`]: the four decisions
 /// that leave a model to the legacy parsers, and the table that has no tag for a forced call.
 const FALLBACK_REASONS: [&str; 5] = [
@@ -178,6 +191,7 @@ const MALFORMED_OUTCOME: usize = 1;
 const FAILED: usize = 2;
 const EMPTY: usize = 3;
 const UNKNOWN_TOOL: usize = 4;
+const PANICKED: usize = 5;
 /// The place of `unknown_tool` in [`REASONS`]: the runs that are calls to functions the request
 /// did not declare, which decide between the `malformed` and the `unknown_tool` outcome.
 const UNKNOWN_TOOL_REASON: usize = 2;
@@ -663,6 +677,12 @@ pub(crate) fn record_failed(table: &'static str) {
 /// whatever outcome the read gave it; this one is the fold's, by its reason.
 pub(crate) fn record_refused(table: &'static str) {
     increment(&series(table).refused, 1);
+}
+
+/// Records an output whose reading panicked under `table`, caught at the request's boundary
+/// (`routers::grpc::utils::isolation`): the request fails with it. The line is the isolation's.
+pub(crate) fn record_panicked(table: &'static str) {
+    increment(&series(table).outputs[PANICKED], 1);
 }
 
 /// Records a request Symphony was configured for that the legacy parsers read, for `why`: under

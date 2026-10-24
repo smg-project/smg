@@ -155,10 +155,17 @@ class Gateway:
         extra_args: list[str] | None = None,
         log_level: str | None = None,
         log_dir: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> None:
-        """Start the gateway in exactly one mode (regular, PD, IGW, or cloud)."""
+        """Start the gateway in exactly one mode (regular, PD, IGW, or cloud).
+
+        ``env`` adds variables to the gateway process's environment (over the
+        test process's own), for a test that arms a gateway-side test hook.
+        """
         if self._started:
             raise RuntimeError("Gateway already started")
+        if env:
+            self._env = {**os.environ, **env}
 
         is_epd_mode = encode_workers is not None
         is_pd_mode = (prefill_workers is not None or decode_workers is not None) and not is_epd_mode
@@ -497,7 +504,7 @@ class Gateway:
         if not api_key:
             raise ValueError(f"{api_key_env} environment variable required")
 
-        self._env = os.environ.copy()
+        self._env = dict(self._env or os.environ)
         self._env[api_key_env] = api_key
 
         actual_history_backend = history_backend

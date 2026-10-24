@@ -22,7 +22,10 @@ use super::{
     template::Templates,
     SymphonyError,
 };
-use crate::{config::ParserChoice, routers::grpc::utils::ModelNames};
+use crate::{
+    config::ParserChoice,
+    routers::grpc::utils::{isolation, ModelNames},
+};
 
 /// Symphony's assignment to a response: the table that reads it, as the request's asks make it
 /// ([`assign`]), and the part of the rendered prompt the engine replays.
@@ -31,6 +34,13 @@ pub(crate) struct Assignment {
     /// The table, shared with every reader of the response and every request it reads for.
     pub format: Arc<Format>,
     pub prompt: String,
+}
+
+impl Assignment {
+    /// The `table` label of the format, for the counters and the lines.
+    pub(crate) fn table(&self) -> &'static str {
+        telemetry::table_label(self.format.name())
+    }
 }
 
 /// The assignment of `format` to a response, with the part of `prompt` the engine replays.
@@ -274,6 +284,11 @@ pub(crate) struct Reader {
     refused_spans: Vec<(usize, usize)>,
     /// The ranges of the bytes released at the end, once released.
     released_spans: Vec<(usize, usize)>,
+    /// The text the test trap springs on, when this process runs with one
+    /// ([`isolation::test_trap`]): a step whose delta carries it panics the reader, so the
+    /// request's isolation is driven end to end. `None` in every other process: one branch per
+    /// step.
+    trap: Option<&'static str>,
 }
 
 impl Reader {
@@ -287,7 +302,7 @@ impl Reader {
         out: &mut Events<'_>,
     ) -> Result<Self, SymphonyError> {
         let mut reader = Self {
-            table: telemetry::table_label(assignment.format.name()),
+            table: assignment.table(),
             engine: Engine::shared(Arc::clone(&assignment.format), Declared::shared(tools)),
             tally: Tally::default(),
             last_token: None,
@@ -303,6 +318,7 @@ impl Reader {
             unshown_spans: Vec::new(),
             refused_spans: Vec::new(),
             released_spans: Vec::new(),
+            trap: isolation::test_trap(),
         };
         // The prompt's events carry no text of the prompt (a thought it opens or closes), so they
         // move from the replay's own buffer into the caller's, whatever delta that one borrows.
@@ -365,6 +381,11 @@ impl Reader {
             }
         }
         self.read += delta.text.len();
+        if let Some(marker) = self.trap {
+            if delta.text.contains(marker) {
+                isolation::spring_test_trap(marker);
+            }
+        }
         self.feed(delta.input(), out)?;
         Ok(stopped)
     }

@@ -34,10 +34,10 @@ use serde_json::{json, Value};
 use symphony::{adapt, EngineFinish, Event, Events};
 use tokio_stream::wrappers::ReceiverStream;
 use tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, warn, Instrument, Span};
 
 use super::symphony::{
-    engine_finish, finished, reasoning_text_tokens, telemetry::Who, Delta, Reader,
+    engine_finish, finished, reasoning_text_tokens, telemetry::Who, Assignment, Delta, Reader,
 };
 use crate::{
     observability::metrics::{metrics_labels, LocalStopAbort, Metrics, StreamingMetricsParams},
@@ -67,7 +67,7 @@ use crate::{
                 MessagesResponseSpec,
             },
             utils,
-            utils::message_utils,
+            utils::{isolation::isolated, message_utils},
         },
     },
     worker::{GuardedStream, PrefillLoadGuard},
@@ -243,25 +243,34 @@ impl StreamingProcessor {
                 let processor = self.clone();
                 let dispatch_clone = dispatch.clone();
                 let tokenizer_clone = tokenizer.clone();
+                let table = chat_request.symphony.as_ref().map(Assignment::table);
+                // The request's span, for the line a failure writes: the
+                // task runs outside it.
+                let span = Span::current();
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "streaming task is fire-and-forget; client disconnect terminates it"
                 )]
                 tokio::spawn(async move {
-                    let result = processor
-                        .process_streaming_chunks(
-                            stream,
-                            dispatch_clone,
-                            tokenizer_clone,
-                            stop_params,
-                            chat_request,
-                            &tx,
-                            reservation,
-                        )
-                        .await;
+                    // The request's reading, isolated: a panic in it ends
+                    // this response with an error event and `[DONE]`, not
+                    // the task (see `utils::isolation`).
+                    let result = isolated(processor.process_streaming_chunks(
+                        stream,
+                        dispatch_clone,
+                        tokenizer_clone,
+                        stop_params,
+                        chat_request,
+                        &tx,
+                        reservation,
+                    ))
+                    .await
+                    .unwrap_or_else(|panicked| Err(panicked.read_by(table).into()));
 
                     if let Err(failure) = result {
-                        utils::send_stream_failure(&tx, &failure, &source).await;
+                        utils::send_stream_failure(&tx, &failure, &source)
+                            .instrument(span)
+                            .await;
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
@@ -277,28 +286,32 @@ impl StreamingProcessor {
             } => {
                 let processor = self.clone();
                 let tokenizer_clone = tokenizer.clone();
+                let table = chat_request.symphony.as_ref().map(Assignment::table);
+                let span = Span::current();
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "streaming task is fire-and-forget; client disconnect terminates it"
                 )]
                 tokio::spawn(async move {
-                    let result = processor
-                        .process_prefill_decode_streaming_chunks(
-                            prefill,
-                            *decode,
-                            dispatch,
-                            tokenizer_clone,
-                            stop_params,
-                            chat_request,
-                            &tx,
-                            pd_timing,
-                            prefill_guards,
-                            reservation,
-                        )
-                        .await;
+                    let result = isolated(processor.process_prefill_decode_streaming_chunks(
+                        prefill,
+                        *decode,
+                        dispatch,
+                        tokenizer_clone,
+                        stop_params,
+                        chat_request,
+                        &tx,
+                        pd_timing,
+                        prefill_guards,
+                        reservation,
+                    ))
+                    .await
+                    .unwrap_or_else(|panicked| Err(panicked.read_by(table).into()));
 
                     if let Err(failure) = result {
-                        utils::send_stream_failure(&tx, &failure, &source).await;
+                        utils::send_stream_failure(&tx, &failure, &source)
+                            .instrument(span)
+                            .await;
                     }
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await;
@@ -1622,25 +1635,32 @@ impl StreamingProcessor {
                 let processor = self.clone();
                 let dispatch_clone = dispatch.clone();
                 let tokenizer_clone = tokenizer.clone();
+                let table = messages_request.symphony.as_ref().map(Assignment::table);
+                // The request's span, for the line a failure writes: the
+                // task runs outside it.
+                let span = Span::current();
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "streaming task is fire-and-forget; client disconnect terminates it"
                 )]
                 tokio::spawn(async move {
-                    let result = processor
-                        .process_messages_streaming_chunks(
-                            stream,
-                            dispatch_clone,
-                            tokenizer_clone,
-                            stop_params,
-                            messages_request,
-                            &tx,
-                            reservation,
-                        )
-                        .await;
+                    // The request's reading, isolated: a panic in it ends
+                    // this message with an error event, not the task (see
+                    // `utils::isolation`).
+                    let result = isolated(processor.process_messages_streaming_chunks(
+                        stream,
+                        dispatch_clone,
+                        tokenizer_clone,
+                        stop_params,
+                        messages_request,
+                        &tx,
+                        reservation,
+                    ))
+                    .await
+                    .unwrap_or_else(|panicked| Err(panicked.read_by(table).into()));
 
                     if let Err(failure) = result {
-                        source.account(&failure);
+                        span.in_scope(|| source.account(&failure));
                         let error_event = MessageStreamEvent::Error {
                             error: messages::ErrorResponse {
                                 error_type: failure.messages_error_type().to_string(),
@@ -1662,13 +1682,15 @@ impl StreamingProcessor {
             } => {
                 let processor = self.clone();
                 let tokenizer_clone = tokenizer.clone();
+                let table = messages_request.symphony.as_ref().map(Assignment::table);
+                let span = Span::current();
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "streaming task is fire-and-forget; client disconnect terminates it"
                 )]
                 tokio::spawn(async move {
-                    let result = processor
-                        .process_prefill_decode_messages_streaming_chunks(
+                    let result =
+                        isolated(processor.process_prefill_decode_messages_streaming_chunks(
                             prefill,
                             *decode,
                             dispatch,
@@ -1678,8 +1700,9 @@ impl StreamingProcessor {
                             &tx,
                             prefill_guards,
                             reservation,
-                        )
-                        .await;
+                        ))
+                        .await
+                        .unwrap_or_else(|panicked| Err(panicked.read_by(table).into()));
 
                     if let Err(failure) = result {
                         // A decode side the engine failed without a reason is read against
@@ -1687,7 +1710,7 @@ impl StreamingProcessor {
                         // `StreamSource::explain`), so the event names a dead rendezvous.
                         let explained = source.explain(&failure).await;
                         let failure = explained.as_ref().unwrap_or(&failure);
-                        source.account(failure);
+                        span.in_scope(|| source.account(failure));
                         let error_event = MessageStreamEvent::Error {
                             error: messages::ErrorResponse {
                                 error_type: failure.messages_error_type().to_string(),
@@ -4614,6 +4637,8 @@ impl<'a> MessagesStream<'a> {
 pub(crate) mod eof_tests;
 #[cfg(test)]
 mod failure_tests;
+#[cfg(test)]
+mod isolation_tests;
 #[cfg(test)]
 mod local_stop_tests;
 #[cfg(test)]
