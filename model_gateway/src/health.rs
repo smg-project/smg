@@ -143,7 +143,8 @@ pub struct ModelReadiness {
 }
 
 impl ModelReadiness {
-    /// The entry for `model` from its workers, under the gateway's mode and
+    /// The entry for `model` from its workers (at least one: a model with
+    /// none is not served and gets no entry), under the gateway's mode and
     /// tokenizer rule.
     fn derive(
         model: String,
@@ -161,13 +162,26 @@ impl ModelReadiness {
         };
         let healthy_workers = healthy_of(None);
         // The roles the mode needs a healthy worker of, with the reason a
-        // model that lacks one reports.
+        // model that lacks one reports. Under encode-prefill-decode the
+        // encode role is asked of a model that has an encode worker
+        // registered: routing asks for one only when a request carries
+        // media, so a text-only model on that pipeline serves all of its
+        // traffic on prefill and decode alone, and a model whose encode
+        // pool is down still serves its text requests but is not whole.
         const PREFILL: (WorkerType, &str) = (WorkerType::Prefill, "no_healthy_prefill_worker");
         const DECODE: (WorkerType, &str) = (WorkerType::Decode, "no_healthy_decode_worker");
         const ENCODE: (WorkerType, &str) = (WorkerType::Encode, "no_healthy_encode_worker");
+        let has_encode_worker = || {
+            workers
+                .iter()
+                .any(|worker| *worker.worker_type() == WorkerType::Encode)
+        };
         let roles_needed: &[(WorkerType, &'static str)] = match &router_config.mode {
             RoutingMode::PrefillDecode { .. } => &[PREFILL, DECODE],
-            RoutingMode::EncodePrefillDecode { .. } => &[ENCODE, PREFILL, DECODE],
+            RoutingMode::EncodePrefillDecode { .. } if has_encode_worker() => {
+                &[ENCODE, PREFILL, DECODE]
+            }
+            RoutingMode::EncodePrefillDecode { .. } => &[PREFILL, DECODE],
             RoutingMode::Regular { .. }
             | RoutingMode::OpenAI { .. }
             | RoutingMode::Anthropic { .. }
@@ -390,15 +404,19 @@ impl ProbeState {
 
         // The per-model section, from the registry's model index (a worker
         // that serves several models counts for each); the gateway's own
-        // wildcard id is not a model.
+        // wildcard id is not a model, and a model whose last worker left
+        // between the two reads has no entry (the removal's own recompute
+        // follows).
         let mut model_ids = worker_registry.get_models();
         model_ids.sort_unstable();
         let models = model_ids
             .into_iter()
             .filter(|model| model != UNKNOWN_MODEL_ID)
-            .map(|model| {
+            .filter_map(|model| {
                 let of_model = worker_registry.get_by_model(&model);
-                ModelReadiness::derive(model, &of_model, router_config, &tokenizer_registered)
+                (!of_model.is_empty()).then(|| {
+                    ModelReadiness::derive(model, &of_model, router_config, &tokenizer_registered)
+                })
             })
             .collect();
         {
@@ -1455,6 +1473,84 @@ mod tests {
                 {"model": "m1", "ready": true, "healthy_workers": 2, "total_workers": 2},
                 {"model": "m2", "ready": false, "reason": "no_healthy_decode_worker",
                  "healthy_workers": 1, "total_workers": 1},
+            ])
+        );
+    }
+
+    /// Under encode-prefill-decode the encode role counts for a model that
+    /// has an encode worker: a text-only model serves on prefill and decode
+    /// alone and reads ready; a model whose encode pool is not healthy names
+    /// it. The entry's roles follow the workers the model has, not the mode.
+    #[tokio::test]
+    async fn epd_readiness_asks_encode_of_a_model_with_an_encode_worker() {
+        async fn body_of(response: Response) -> serde_json::Value {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+        let state = probe_state();
+        let registry = WorkerRegistry::new();
+        let router_config = config(RoutingMode::EncodePrefillDecode {
+            encode_urls: vec![],
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            encode_policy: None,
+            prefill_policy: None,
+            decode_policy: None,
+        });
+        for (url, model, role, status) in [
+            (
+                "http://e1:8080",
+                "vision",
+                WorkerType::Encode,
+                WorkerStatus::NotReady,
+            ),
+            (
+                "http://p1:8080",
+                "vision",
+                WorkerType::Prefill,
+                WorkerStatus::Ready,
+            ),
+            (
+                "http://d1:8080",
+                "vision",
+                WorkerType::Decode,
+                WorkerStatus::Ready,
+            ),
+            (
+                "http://e2:8080",
+                "other-vision",
+                WorkerType::Encode,
+                WorkerStatus::Ready,
+            ),
+            (
+                "http://p2:8080",
+                "text",
+                WorkerType::Prefill,
+                WorkerStatus::Ready,
+            ),
+            (
+                "http://d2:8080",
+                "text",
+                WorkerType::Decode,
+                WorkerStatus::Ready,
+            ),
+        ] {
+            registry
+                .register(worker(url, model, role, ConnectionMode::Http, status))
+                .unwrap();
+        }
+        recompute(&state, &registry, &router_config);
+        let body = body_of(state.readiness_response()).await;
+        assert_eq!(
+            body["models"],
+            json!([
+                {"model": "other-vision", "ready": false, "reason": "no_healthy_prefill_worker",
+                 "healthy_workers": 1, "total_workers": 1},
+                {"model": "text", "ready": true, "healthy_workers": 2, "total_workers": 2},
+                {"model": "vision", "ready": false, "reason": "no_healthy_encode_worker",
+                 "healthy_workers": 2, "total_workers": 3},
             ])
         );
     }
