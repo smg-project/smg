@@ -160,18 +160,17 @@
   ],
   "budget": {
     "relay_hosted_cpu_minutes": 10,
-    "gpu_job_minutes": 50,
+    "gpu_job_minutes": 40,
     "cleanup_reserve_is_not_enforced_by_shared_workflow": true,
     "workflow_auto_retry": 0,
     "original_pytest_reruns": 2,
     "original_reruns_delay_seconds": 5,
     "pytest_minutes_by_tier": {
-      "2": 34,
-      "4": 42
+      "2": 34
     },
     "GPU_jobs_per_dispatch": 1
   },
-  "diagnostic_difference": "One selected tier per dispatch; known 1-gpu-mi300x CI slot routes a multi-device suite, without claiming physical GPU reservation. Caller enables full installed-engine units and canonical14 gate (original two NIXL rows leave units off), SPT_NOENV=1 and pre-install private constraints. The original product reusable workflow is unchanged.",
+  "diagnostic_difference": "Independent original worker-media PD row only: fixed tier2/worker/7 exact cases/floor4/40job34pytest. Known1-gpu-mi300x CI slot routes two logical devices without claiming physical reservation. Full installed-engine units/canonical14, SPT_NOENV=1 and pre-install private constraints are diagnostic additions; the reusable product workflow is unchanged.",
   "producer_binary_relabelled": false,
   "producer_artifact_pins_status": "BOUND: root-accepted actual40038340532/445bb37 four archives and native143a; all admission flags remainfalse",
   "explicit_product_dependency": {
@@ -181,7 +180,7 @@
     "parent_stack": "0707d631cb6827789619ab96999f868044dc06db",
     "visible_churn": 43
   },
-  "producer_snapshot_note": "Rootaccepted producer integrity only: exact40038340532/attempt1/build120703217001/445bb37 and actual four archives are locally bound. TargetROCm/model, fresh runner ownership/budget/tier admission and actual27/18 contract execution are not accepted.",
+  "producer_snapshot_note": "Actual rootaccepted40038340532/445bb37 four archives/native143a retained as historical integrity binding. Fresh artifact validity, runner ownership, new budget and original7-case worker-media execution remain unaccepted.",
   "source_base": "c9d5431db92aa2d35521889f6297c4c6f7b05b4a",
   "producer_base_source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
@@ -203,8 +202,7 @@
   "resource_precondition": {
     "requested_runner_label": "1-gpu-mi300x",
     "required_logical_devices_by_tier": {
-      "2": 2,
-      "4": 4
+      "2": 2
     },
     "current_availability_verified": false,
     "physical_GPU_exclusivity_claimed": false,
@@ -212,7 +210,7 @@
       "amd-mi300x-1",
       "amd-mi300x-2"
     ],
-    "ownership_gate": "Root must admit exact one tier and fresh placement/device/ownership; label alone is not proof."
+    "ownership_gate": "Root must admit this exact tier2 worker-media row with fresh two-device/runner ownership; label alone is not proof."
   },
   "explicit_lock_safety_dependency": {
     "product_commit": "a37083a4eb667c0d261de85cf464025a9a29e506",
@@ -227,40 +225,26 @@
     "canonical_manifest_blob": "c86975b7562abfa1672f1f09b7c027981da2544a",
     "required_case_count": 14,
     "unit_junit": "servicer-engine.xml in the existing unique AMD dependency artifact",
-    "diagnostic_workflow_difference": "NIXL tier-select dispatch caller only; normal product tooling CPU jobs are not part of this diagnostic workflow."
+    "diagnostic_workflow_difference": "Only fixed worker-media PD caller; normal product tooling CPU jobs are absent from this diagnostic."
   },
   "source_identity_note": "Original reusable workflow remains byte-identical to03d; product target remains opt-in constraint-hook3b79. Consumer19/scripts and compiled37 exactc9d are unchanged. Actual accepted445bb37 fourarchives/native143a are integrity-bound; no prior GPU/runtime acceptance transferred.",
   "admitted_tier": null,
   "contracts": {
     "2": {
-      "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-2gpu-pd[1]/vllm/nvidia",
+      "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-2gpu-pd-mm-worker[0]/vllm/nvidia",
       "gpu_tier": "2",
-      "timeout": 50,
+      "timeout": 40,
       "test_timeout": 34,
-      "test_dirs": "e2e_test/router",
+      "test_dirs": "e2e_test/router/test_pd_multimodal.py",
       "test_filter": "",
-      "min_selected": 15,
+      "min_selected": 4,
       "vllm_kv_backend": "nixl",
       "vllm_extra_kv_backends": "",
-      "selected": 27,
-      "original_skip_count": 3,
-      "original_setup_skip_count": 2,
-      "original_call_skip_count": 1
-    },
-    "4": {
-      "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-4gpu-pd[1]/vllm/nvidia",
-      "gpu_tier": "4",
-      "timeout": 50,
-      "test_timeout": 42,
-      "test_dirs": "e2e_test/router/test_pd_topologies.py",
-      "test_filter": "-k \"(2p2d and not http) or AssembledAtRuntime or SmallWindow or MismatchedTransport or MismatchedProtocol\"",
-      "min_selected": 14,
-      "vllm_kv_backend": "nixl",
-      "vllm_extra_kv_backends": "mooncake",
-      "selected": 18,
-      "original_skip_count": 1,
+      "mm_processing": "worker",
+      "selected": 7,
+      "original_skip_count": 0,
       "original_setup_skip_count": 0,
-      "original_call_skip_count": 1
+      "original_call_skip_count": 0
     }
   },
   "diagnostic_runtime_instrumentation": {
@@ -268,17 +252,17 @@
     "scope": "Environment continuity plus existing Worker/Gateway lifecycle wrappers, original per-case before/after/exit, actual native mappings and full original terminal reports; no additional model requests.",
     "preinstall_hook_product": "3b79acc59b68b84465e58a025850af2c93c96fe8",
     "reusable_workflow_product": "03d34400c3561c9e2d00e449a5e5c4bcca8e0401",
-    "private_state": "/tmp/smg-nixl-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}",
+    "private_state": "/tmp/smg-pd-mm-worker-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}",
     "runtime_witnesses_complete": false,
     "remaining_witnesses": [
-      "Actual producer/archive/native integrity is bound; fresh source/runner/budget and exactlyone tier admission remain absent",
-      "The new observer and official ROCm NIXL loader must execute in the actual749f image; CPU stand-ins do not prove native SDK or GPU compatibility",
-      "Original27 or18 cases including mixed Mooncake/NIXL pairing, transfer, cancellation, outage and restart must complete with exact original skips/phases and full raw retry history",
-      "Mapped libraries/configuration alone do not prove KV bytes, ABORT/ACK, peer/HBM release or long-term stability; original assertions/logs and independent actual audit determine scope"
+      "Historical actual producer/archive/native integrity retained; fresh runner/resource/budget admission absent",
+      "Official ROCm NIXL canary, role process/native witness and original seven worker-media cases must execute in actual749f",
+      "Exact worker-media path: Qwen prefill once/decode identity, Phi fallback, original grid/no-yes-no isolation and language-only400 assertions; no new skips allowed",
+      "Native mappings/argv are not KV transfer ACK, peer/HBM release or long-term stability proof"
     ],
     "actual_GPU_or_coverage": false,
     "runtime_witnesses_source_connected": true,
-    "skip_contract": "Tier2:2 exact setup skips plus1 exact original call skip in router-side media mode. Tier4:1 exact original call skip for sole-leg outage in2p2d. Other skip/phase/reason and missing teardown rejected."
+    "skip_contract": "All original7 worker-media cases require setup/call/teardown passed. No setup or call skip is allowed; router-only skip of media-once case is rejected."
   },
   "environment_contract": {
     "required_14_units_hard_gate": true,
@@ -288,6 +272,6 @@
       "final"
     ],
     "no_prior_GPU_acceptance_transferred": true,
-    "original_default_parser_connection_servicer_mm_overrides": "all empty; kv_backend empty; engine vllm with explicit vllm_kv_backend=nixl"
+    "original_default_parser_connection_servicer_mm_overrides": "parser/connection/servicer empty; kv_backend empty; vLLM with explicit NIXL and original mm_processing=worker (default inprocess processor)"
   }
 }
