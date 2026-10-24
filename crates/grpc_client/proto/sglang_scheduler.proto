@@ -156,8 +156,9 @@ message GenerateRequest {
   // LoRA adapter ID (if pre-loaded)
   string lora_id = 15;
 
-  // Data parallel routing
-  int32 data_parallel_rank = 16;
+  // Data parallel routing: the rank the request is pinned to, when it is
+  // pinned (explicit presence, so a pin to rank 0 is told from no pin).
+  optional int32 data_parallel_rank = 16;
 
   // Whether client wants streaming response
   bool stream = 17;

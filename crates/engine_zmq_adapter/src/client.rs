@@ -932,6 +932,9 @@ impl ZmqEngineClient {
             .map_err(tonic::Status::invalid_argument)?;
         }
         let max_model_len = self.prompt_bound()?;
+        // The connected scheduler ranks: a data-parallel pin is placed among
+        // them as the engine's own frontend would place it.
+        let ranks = client.engines().len();
         let mut streams = Vec::new();
         for (index, sub) in fan_out_sglang_requests(req).into_iter().enumerate() {
             let image_refs = sub
@@ -941,7 +944,7 @@ impl ZmqEngineClient {
                 .transpose()
                 .map_err(tonic::Status::invalid_argument)?
                 .flatten();
-            let mut request = translate_request_sglang(sub, max_model_len)
+            let mut request = translate_request_sglang(sub, max_model_len, ranks)
                 .map_err(tonic::Status::invalid_argument)?;
             request.trace_headers.clone_from(&trace_headers);
             let dispatched = match (image_refs, dispatcher) {

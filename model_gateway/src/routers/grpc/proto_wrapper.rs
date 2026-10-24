@@ -2685,7 +2685,7 @@ mod tests {
         sglang_req.set_data_parallel_rank(3);
         assert!(matches!(
             &sglang_req,
-            ProtoGenerateRequest::Sglang(req) if req.data_parallel_rank == 3
+            ProtoGenerateRequest::Sglang(req) if req.data_parallel_rank == Some(3)
         ));
 
         let mut ts_req = ProtoGenerateRequest::TokenSpeed(Box::default());

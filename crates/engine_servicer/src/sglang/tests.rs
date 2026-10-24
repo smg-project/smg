@@ -19,10 +19,16 @@ use engine_zmq_client::{
         connect_to_frontend, default_ready_response, hello, MockEngineInput, MockEngineOutput,
         MOCK_DEADLINE,
     },
-    protocol::sglang::{
-        output::{BatchEmbeddingSlimOutput, BatchTokenIDSlimOutput, ControlReplySlim, MatchedStop},
-        request::{
-            RequestMeta, SglangRequestType, TokenizedEmbeddingReqInput, TokenizedGenerateReqInput,
+    protocol::{
+        handshake::EngineCoreReadyResponse,
+        sglang::{
+            output::{
+                BatchEmbeddingSlimOutput, BatchTokenIDSlimOutput, ControlReplySlim, MatchedStop,
+            },
+            request::{
+                RequestMeta, SglangRequestType, TokenizedEmbeddingReqInput,
+                TokenizedGenerateReqInput,
+            },
         },
     },
     EngineId,
@@ -167,6 +173,48 @@ async fn harness_with(
         client,
         _dir: dir,
     }
+}
+
+/// A bound servicer over two data-parallel scheduler ranks (two handshaken
+/// mock schedulers, each dialing with its rank as its engine index, as the
+/// plugin does) and a gRPC client: the harness holds rank 0, the pair
+/// returned with it is rank 1.
+async fn two_rank_harness(model: SglangModelInfo) -> (Harness, MockEngineInput, MockEngineOutput) {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let mut config = config(dir.path(), &handshake, model);
+    config.servicer.engine_count = 2;
+    let server = SglangServicerServer::start(config).expect("servicer starts");
+    let rank = |index: u32| {
+        connect_to_frontend(
+            &handshake,
+            EngineId::from_engine_index(index),
+            EngineCoreReadyResponse {
+                data_parallel_size: 2,
+                data_parallel_rank: index,
+                ..default_ready_response()
+            },
+        )
+    };
+    let (rank0, rank1) = tokio::join!(rank(0), rank(1));
+    let rank0 = rank0.expect("rank 0 handshake");
+    let rank1 = rank1.expect("rank 1 handshake");
+    wait_until(|| server.engine_ready()).await;
+    let client = SglangSchedulerClient::new(grpc_channel(server.address()).await);
+    let (engine_in, engine_out) = rank0.split();
+    let (rank1_in, rank1_out) = rank1.split();
+    (
+        Harness {
+            server,
+            engine_in,
+            engine_out,
+            client,
+            more_ranks: Vec::new(),
+            _dir: dir,
+        },
+        rank1_in,
+        rank1_out,
+    )
 }
 
 /// One scheduler step for `rid`: `tokens` generated, finished with `finish`
@@ -722,6 +770,79 @@ async fn a_disaggregated_request_carries_its_bootstrap_to_the_scheduler() {
         "stop"
     );
     assert!(stream.message().bounded().await.unwrap().is_none());
+    wait_until(|| h.server.active_requests() == 0).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A request the Router pins to a data-parallel rank reaches that rank's
+/// scheduler, with the rank in the request's own `routed_dp_rank` slot, the
+/// way the engine's data-parallel controller dispatches a pinned request for
+/// its frontend; a pin past the connected ranks is the caller's error, in
+/// the frontend's words, and reaches no scheduler.
+#[tokio::test]
+async fn a_pinned_request_reaches_its_data_parallel_rank() {
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    let (mut h, mut rank1_in, mut rank1_out) = two_rank_harness(model).await;
+
+    let mut request = generate_request("dp1", false, Vec::new());
+    request.data_parallel_rank = Some(1);
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank1_in).await;
+    assert_eq!(add.rid, "dp1");
+    assert_eq!(add.routed_dp_rank, Some(1));
+    rank1_out
+        .send_frames(vec![Bytes::from(
+            encode_msgpack(&BatchTokenIDSlimOutput {
+                engine_index: 1,
+                ..batch("dp1", vec![10], 1, Some("stop"), None)
+            })
+            .unwrap(),
+        )])
+        .await
+        .unwrap();
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "stop");
+    assert_eq!(done.output_ids, vec![10]);
+    assert!(stream.message().bounded().await.unwrap().is_none());
+
+    let mut request = generate_request("dp0", false, Vec::new());
+    request.data_parallel_rank = Some(0);
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut h.engine_in).await;
+    assert_eq!((add.rid.as_str(), add.routed_dp_rank), ("dp0", Some(0)));
+    send(
+        &mut h.engine_out,
+        &batch("dp0", vec![11], 1, Some("stop"), None),
+    )
+    .await;
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "stop"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+
+    let mut request = generate_request("dp2", false, Vec::new());
+    request.data_parallel_rank = Some(2);
+    let status = h
+        .client
+        .generate(request)
+        .await
+        .expect_err("a pin past the connected ranks is refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_eq!(status.message(), "routed_dp_rank=2 out of range [0, 2)");
+    assert_scheduler_idle(&mut h.engine_in).await;
+    assert_scheduler_idle(&mut rank1_in).await;
     wait_until(|| h.server.active_requests() == 0).await;
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

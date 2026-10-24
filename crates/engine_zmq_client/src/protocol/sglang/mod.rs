@@ -106,11 +106,17 @@ impl EngineProtocol for SglangProtocol {
         request.rid()
     }
 
-    fn data_parallel_rank(_request: &Self::Request) -> Option<u32> {
-        // Rank routing is by ZMQ identity: each attention-DP leader dials in
-        // with its own engine index and the connector picks one by load. The
-        // request's own `routed_dp_rank` slot stays unset.
-        None
+    fn data_parallel_rank(request: &Self::Request) -> Option<u32> {
+        // Rank routing is by ZMQ identity: each scheduler rank dials in with
+        // its rank as its engine index, so a request routed to a rank goes
+        // out on that engine's socket, the dispatch the engine's own
+        // data-parallel controller does for its frontend; the request's
+        // `routed_dp_rank` slot carries the same value. Unrouted, the
+        // connector picks a rank by load.
+        match request {
+            SglangRequest::Generate(request) => request.routed_dp_rank,
+            SglangRequest::Embed(_) => None,
+        }
     }
 
     fn validate(_request: &Self::Request) -> Result<()> {

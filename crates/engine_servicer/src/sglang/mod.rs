@@ -9,7 +9,10 @@
 //! bootstrap fields (host, port, room) ride the scheduler's own request struct
 //! over the wire, the launcher starts the prefill side's bootstrap server
 //! before the ranks, and `GetServerInfo` carries the server args the Router
-//! pairs on.
+//! pairs on. A request the Router pins to a data-parallel rank goes to that
+//! rank's scheduler (the connector sends it on that rank's socket, the
+//! dispatch the engine's data-parallel controller does behind its own
+//! frontend), with the rank in the request's `routed_dp_rank` slot.
 //!
 //! The language side of encode/prefill disaggregation (`--language-only`)
 //! works as behind the engine's own frontend: a request's image references
