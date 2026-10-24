@@ -1,18 +1,11 @@
-name: AMD shared product vLLM NIXL PD validation
+name: AMD shared product vLLM worker-media PD validation
 on:
   workflow_dispatch:
-    inputs:
-      tier:
-        description: Original NIXL GPU tier (must match root admission)
-        type: choice
-        required: true
-        default: '2'
-        options: ['2', '4']
 permissions:
   contents: read
   actions: read
 concurrency:
-  group: amd-shared-product-vllm-nixl-pd
+  group: amd-shared-product-vllm-pd-mm-worker
   cancel-in-progress: false
 jobs:
   artifact-relay:
@@ -33,7 +26,7 @@ jobs:
           fetch-depth: 0
       - name: Require exactly the admitted original row
         id: recipe
-        run: python3 .github/amd-shared-product/recipe.py --tier '${{ inputs.tier }}' --outputs "$GITHUB_OUTPUT"
+        run: python3 .github/amd-shared-product/recipe.py --tier 2 --outputs "$GITHUB_OUTPUT"
       - name: Verify external producer and relay payloads
         id: relay
         env:
@@ -82,34 +75,35 @@ jobs:
           path: ${{ steps.relay.outputs.directory }}/evidence/
           if-no-files-found: ignore
           retention-days: 7
-  amd-product-nixl-pd:
+  amd-product-pd-mm-worker:
     needs: artifact-relay
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: vllm
       gpu_tier: ${{ needs.artifact-relay.outputs.gpu_tier }}
       runner: 1-gpu-mi300x
-      timeout: 50
+      timeout: 40
       test_timeout: ${{ fromJSON(needs.artifact-relay.outputs.test_timeout) }}
       test_dirs: ${{ needs.artifact-relay.outputs.test_dirs }}
       test_filter: ${{ needs.artifact-relay.outputs.test_filter }}
       min_selected: ${{ fromJSON(needs.artifact-relay.outputs.min_selected) }}
       vllm_kv_backend: nixl
+      mm_processing: worker
       vllm_extra_kv_backends: ${{ needs.artifact-relay.outputs.vllm_extra_kv_backends }}
       servicer_unit_tests: true
       extra_deps: ./.github/amd-nixl-environment
       gpu_vendor: amd
       container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
-      container_options: --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN --env SPT_NOENV=1 --env SMG_CI_RUNTIME_STATE_DIR=/tmp/smg-nixl-runtime-${{ github.run_id }}-${{ github.run_attempt }}
+      container_options: --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN --env SPT_NOENV=1 --env SMG_CI_RUNTIME_STATE_DIR=/tmp/smg-pd-mm-worker-runtime-${{ github.run_id }}-${{ github.run_attempt }}
     secrets: inherit
   finish:
     if: always()
-    needs: [artifact-relay, amd-product-nixl-pd]
+    needs: [artifact-relay, amd-product-pd-mm-worker]
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     steps:
       - name: Require the actual shared workflow to finish successfully
         env:
           RELAY: ${{ needs.artifact-relay.result }}
-          PD: ${{ needs.amd-product-nixl-pd.result }}
+          PD: ${{ needs.amd-product-pd-mm-worker.result }}
         run: test "$RELAY" = success && test "$PD" = success
