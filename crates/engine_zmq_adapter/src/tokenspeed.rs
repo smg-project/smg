@@ -544,7 +544,11 @@ pub(crate) fn translate_request_tokenspeed_for(
             }),
         return_logprob: req.return_logprob,
         // The ranked-candidate count reaches a scheduler that carries the
-        // rows back; a count of 0/1 is the sampled-token case on any wire.
+        // rows back, count 1 included, under that scheduler's own ingress
+        // rules (the one-token rule reads any count above 0; the Python
+        // servicer meets the same rule in-process against the same
+        // scheduler); a wire without the columns gets 0, the sampled-token
+        // case it has always served.
         top_logprobs_num: if wire.top_logprobs {
             u32::try_from(req.top_logprobs_num).unwrap_or(0)
         } else {
@@ -1606,6 +1610,9 @@ mod tests {
                          are computed for the prompt and the token a prefill samples, not for \
                          decode steps.";
         assert_eq!(translate(asking(3, Some(8))).unwrap_err(), one_token);
+        // Count 1 too: the scheduler's rule reads any count above 0, so the
+        // request the Python servicer sees refused there is refused here.
+        assert_eq!(translate(asking(1, Some(8))).unwrap_err(), one_token);
         // Unset means unbounded on this wire: refused as the scheduler does.
         assert_eq!(translate(asking(3, None)).unwrap_err(), one_token);
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());

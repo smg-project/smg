@@ -36,7 +36,10 @@ use crate::{
         handshake::EngineCoreReadyResponse,
         positional::check_prefix,
         tokenspeed::{
-            output::{TokenSpeedOutput, TokenSpeedWireOutput},
+            output::{
+                check_slim_output_layout, BatchTokenIDOutSlim, TokenSpeedOutput,
+                TokenSpeedWireOutput,
+            },
             request::{TokenSpeedRequestType, TokenizedGenerateReqInput},
         },
         EngineBatch, EngineLoad, EngineProtocol, UtilityReply,
@@ -71,14 +74,20 @@ impl EngineProtocol for TokenSpeedProtocol {
     /// A scheduler that declares the control reply declares its field order
     /// too (a tagged struct's tag, element 0, is not a field): a reordered
     /// or renamed reply fails here, naming the field, instead of decoding
-    /// wrong and leaving the caller to wait out its deadline. A scheduler
-    /// that declares nothing (today's) passes: it takes no control calls.
+    /// wrong and leaving the caller to wait out its deadline. A declared slim
+    /// output must carry the ranked-candidate columns where the decoder reads
+    /// them, or stop before those slots: anything else there would break
+    /// every batch, so it fails the connect by its slot
+    /// ([`output::check_slim_output_layout`]). A scheduler that declares
+    /// nothing (today's) passes: it takes no control calls and carries no
+    /// candidates.
     fn check_layouts(ready: &EngineCoreReadyResponse) -> Result<()> {
         check_prefix(
             CONTROL_REPLY_SLIM_TAG,
             &CONTROL_REPLY_WIRE_FIELDS,
             &ready.positional_layouts,
-        )
+        )?;
+        check_slim_output_layout(&ready.positional_layouts)
     }
 
     fn prompt_tokens(request: &Self::Request) -> u64 {

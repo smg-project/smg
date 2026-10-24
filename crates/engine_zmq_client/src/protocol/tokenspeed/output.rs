@@ -32,19 +32,62 @@ pub const BATCH_TOKEN_ID_OUT_SLIM_TAG: &str = "BatchTokenIDOutSlim";
 /// carries those.
 pub const TOP_LOGPROB_COLUMNS: [&str; 2] = ["output_top_logprobs_val", "output_top_logprobs_idx"];
 
+/// Where the declared layout must carry the two columns: the decoder reads
+/// them at the two slots right after `kv_total_pages` (the 14th and 15th
+/// wire elements; a layout lists fields without the tag, so indices 13 and
+/// 14), whatever a newer scheduler appends behind them.
+pub const TOP_LOGPROB_COLUMN_INDEX: usize = 13;
+
 /// Whether the engine's handshake declared the ranked-candidate columns on
-/// its slim output (`positional_layouts["BatchTokenIDOutSlim"]` names both of
-/// [`TOP_LOGPROB_COLUMNS`]): the adapter then forwards a `top_logprobs_num`
-/// above one, which it refuses on a wire without them. A scheduler that
-/// declares no layout at all (today's) has none.
+/// its slim output where the decoder reads them
+/// (`positional_layouts["BatchTokenIDOutSlim"]` names [`TOP_LOGPROB_COLUMNS`]
+/// at [`TOP_LOGPROB_COLUMN_INDEX`] and the slot after it): the adapter then
+/// forwards a `top_logprobs_num` above one, which it refuses on a wire
+/// without them. A layout that carries the columns elsewhere reads as a wire
+/// without them (and fails the connect: [`check_slim_output_layout`]); a
+/// scheduler that declares no layout at all (today's) has none.
 pub fn wire_carries_top_logprobs(layouts: &BTreeMap<String, Vec<String>>) -> bool {
     layouts
         .get(BATCH_TOKEN_ID_OUT_SLIM_TAG)
         .is_some_and(|fields| {
             TOP_LOGPROB_COLUMNS
                 .iter()
-                .all(|column| fields.iter().any(|field| field == column))
+                .enumerate()
+                .all(|(offset, column)| {
+                    fields
+                        .get(TOP_LOGPROB_COLUMN_INDEX + offset)
+                        .map(String::as_str)
+                        == Some(*column)
+                })
         })
+}
+
+/// A declared slim-output layout that lists something else where the decoder
+/// reads the ranked-candidate columns would break every batch (the decoder
+/// reads those slots whether or not the request asked for candidates): refused
+/// at connect, naming the slot. A layout that stops before the slots (today's
+/// 13 fields) or lists the columns there passes.
+pub fn check_slim_output_layout(layouts: &BTreeMap<String, Vec<String>>) -> Result<()> {
+    let Some(fields) = layouts.get(BATCH_TOKEN_ID_OUT_SLIM_TAG) else {
+        return Ok(());
+    };
+    for (offset, column) in TOP_LOGPROB_COLUMNS.iter().enumerate() {
+        let index = TOP_LOGPROB_COLUMN_INDEX + offset;
+        match fields.get(index) {
+            None => return Ok(()),
+            Some(theirs) if theirs == column => continue,
+            Some(theirs) => {
+                return Err(Error::WireLayoutMismatch {
+                    message: format!(
+                        "`{BATCH_TOKEN_ID_OUT_SLIM_TAG}` field {index} is `{theirs}` on the \
+                         engine's side where this side reads `{column}` (the ranked-candidate \
+                         columns must sit right after `kv_total_pages`)"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A batch of per-request token outputs from one engine step. Mirrors Python
@@ -516,9 +559,28 @@ mod tests {
         .collect();
         layouts.insert(BATCH_TOKEN_ID_OUT_SLIM_TAG.to_string(), fields.clone());
         assert!(!wire_carries_top_logprobs(&layouts), "today's layout");
+        assert!(check_slim_output_layout(&layouts).is_ok());
+        // The columns elsewhere (something else appended first) read as a wire
+        // without them, and the connect refuses the layout by its slot.
+        let mut elsewhere = fields.clone();
+        elsewhere.push("something_else".to_string());
+        elsewhere.extend(TOP_LOGPROB_COLUMNS.iter().map(ToString::to_string));
+        layouts.insert(BATCH_TOKEN_ID_OUT_SLIM_TAG.to_string(), elsewhere);
+        assert!(
+            !wire_carries_top_logprobs(&layouts),
+            "the columns elsewhere"
+        );
+        let error = check_slim_output_layout(&layouts).unwrap_err().to_string();
+        assert!(error.contains("field 13 is `something_else`"), "{error}");
         fields.extend(TOP_LOGPROB_COLUMNS.iter().map(ToString::to_string));
+        layouts.insert(BATCH_TOKEN_ID_OUT_SLIM_TAG.to_string(), fields.clone());
+        assert!(wire_carries_top_logprobs(&layouts));
+        assert!(check_slim_output_layout(&layouts).is_ok());
+        // Columns a newer scheduler appends behind the two pass as before.
+        fields.push("a_newer_column".to_string());
         layouts.insert(BATCH_TOKEN_ID_OUT_SLIM_TAG.to_string(), fields);
         assert!(wire_carries_top_logprobs(&layouts));
+        assert!(check_slim_output_layout(&layouts).is_ok());
     }
 
     /// The pinned cross-language vector — the exact bytes the engine sends —
