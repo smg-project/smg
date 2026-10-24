@@ -65,6 +65,7 @@ def _clean_env(monkeypatch):
         "E2E_RUNTIME",
         "E2E_ZMQ_ENGINE_COUNT",
         "E2E_MIN_SELECTED",
+        "E2E_AMD_VLLM_ALWAYS_GRAMMAR_EQUIVALENT",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -117,6 +118,83 @@ def test_env_filter_by_vendor():
     )
     assert selected == [openai]
     assert deselected_by["vendor"] == [xai]
+
+
+def _always_grammar_item(nodeid=hooks._ALWAYS_GRAMMAR_CASE):
+    return _FakeItem(
+        nodeid,
+        params={"setup_backend": "grpc", "api_client": "openai"},
+        markers={
+            "engine": pytest.mark.engine("tokenspeed").mark,
+            "gpu": pytest.mark.gpu(1).mark,
+            "model": pytest.mark.model("Qwen/Qwen3-4B-Instruct-2507").mark,
+        },
+    )
+
+
+def _arm_always_grammar(monkeypatch):
+    from infra import constants
+
+    monkeypatch.setattr(constants, "_RUNTIME_CACHE", None)
+    monkeypatch.setenv("E2E_RUNTIME", "vllm")
+    monkeypatch.setenv("E2E_ENGINE", "vllm")
+    monkeypatch.setenv("E2E_GPU_TIER", "1")
+    monkeypatch.setenv(hooks._AMD_ALWAYS_GRAMMAR_ENV, "1")
+
+
+def test_always_grammar_default_keeps_tokenspeed_selection():
+    item = _always_grammar_item()
+    assert hooks._filter_env_items([item], "tokenspeed", None, "1")[0] == [item]
+    assert hooks._filter_env_items([item], "vllm", None, "1")[0] == []
+
+
+@pytest.mark.parametrize("wire,impl", [("grpc", "python"), ("grpc", "rust"), ("zmq", "python")])
+def test_always_grammar_opt_in_uses_real_vllm_runtime(monkeypatch, wire, impl):
+    _arm_always_grammar(monkeypatch)
+    monkeypatch.setenv("E2E_CONNECTION_MODE", wire)
+    monkeypatch.setenv("E2E_VLLM_SERVICER_IMPL", impl)
+    item = _always_grammar_item()
+    assert _run(_FakeConfig(), [item]) == [item]
+    assert hooks.get_runtime() == "vllm"
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("E2E_RUNTIME", "tokenspeed"),
+        ("E2E_ENGINE", "tokenspeed"),
+        ("E2E_GPU_TIER", "2"),
+        ("E2E_CONNECTION_MODE", "http"),
+        ("E2E_ZMQ_ENGINE_COUNT", "2"),
+        (hooks._AMD_ALWAYS_GRAMMAR_ENV, "yes"),
+    ],
+)
+def test_always_grammar_opt_in_rejects_wrong_lane(monkeypatch, key, value):
+    _arm_always_grammar(monkeypatch)
+    monkeypatch.setenv(key, value)
+    with pytest.raises(pytest.UsageError):
+        _run(_FakeConfig(), [_always_grammar_item()])
+
+
+def test_always_grammar_opt_in_cannot_expand_other_tokenspeed_cases(monkeypatch):
+    _arm_always_grammar(monkeypatch)
+    other = _always_grammar_item("other.py::TestConstrainedDecodingAlways::test_auto[openai-grpc]")
+    assert _run(_FakeConfig(), [other]) == []
+
+
+@pytest.mark.parametrize("change", ["model", "wire", "vendor"])
+def test_always_grammar_opt_in_keeps_model_wire_and_vendor_guards(monkeypatch, change):
+    _arm_always_grammar(monkeypatch)
+    item = _always_grammar_item()
+    if change == "model":
+        item._markers["model"] = pytest.mark.model(
+            "Qwen/Qwen3-4B-Instruct-2507", vllm="other-model"
+        ).mark
+    elif change == "wire":
+        item.callspec.params["setup_backend"] = "pd_grpc"
+    else:
+        monkeypatch.setenv("E2E_VENDOR", "openai")
+    assert _run(_FakeConfig(), [item]) == []
 
 
 # ---------------------------------------------------------------------------
