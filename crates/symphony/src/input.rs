@@ -1,5 +1,7 @@
 //! What a parser is fed: the prompt, decoded deltas, and the end of the stream.
 
+use serde::{Deserialize, Serialize};
+
 /// Where some bytes of the decoded text of a delta came from, as byte offsets into that text.
 ///
 /// The spans of a delta partition its text: they are in order, contiguous, and together cover
@@ -18,7 +20,8 @@
 /// Bytes the decoder releases later than the token that produced them appear in the later delta
 /// under a span with `continued == true` and the same `token_id`. Such a span is never counted
 /// as a token. A character completed by a later token belongs to that later token.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TokenSpan {
     /// The engine's token id.
     pub token_id: u32,
@@ -48,7 +51,7 @@ impl TokenSpan {
 }
 
 /// How the engine said the stream ended.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EngineFinish {
     /// The model stopped on its own, or a stop sequence matched.
     Stop,
@@ -88,6 +91,78 @@ pub enum Input<'a> {
         /// The engine's finish reason, which the parser may refine (for example to `tool_calls`).
         finish: EngineFinish,
     },
+}
+
+/// An owned snapshot of exactly one [`Input`], for diagnostic storage and replay.
+///
+/// Constructing this value copies the input's borrowed text, token ids and spans. Normal
+/// parsing does not construct it. Empty prompt token lists, zero-width spans and continued
+/// spans are preserved as supplied; recording does not validate, normalize or repair them.
+/// A malformed input can be the evidence a caller needs to retain.
+///
+/// This is an input record, not a complete replay bundle. The caller must separately retain
+/// the exact source revision, format and its request-specific configuration, declared tools,
+/// call-id nonce, input order and adapter consumption boundaries. The caller also owns size
+/// limits and capture completeness; deserializing this type does not establish either.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RecordedInput {
+    /// The prompt text and token ids actually passed to the parser.
+    Prompt { token_ids: Vec<u32>, text: String },
+    /// One decoded delta, with its exact token alignment, including held and released bytes.
+    Delta {
+        token_ids: Vec<u32>,
+        text: String,
+        spans: Vec<TokenSpan>,
+    },
+    /// The finish reason actually passed to the parser.
+    End { finish: EngineFinish },
+}
+
+impl From<&Input<'_>> for RecordedInput {
+    fn from(input: &Input<'_>) -> Self {
+        match input {
+            Input::Prompt { token_ids, text } => Self::Prompt {
+                token_ids: token_ids.to_vec(),
+                text: (*text).to_owned(),
+            },
+            Input::Delta {
+                token_ids,
+                text,
+                spans,
+            } => Self::Delta {
+                token_ids: token_ids.to_vec(),
+                text: (*text).to_owned(),
+                spans: spans.to_vec(),
+            },
+            Input::End { finish } => Self::End {
+                finish: finish.clone(),
+            },
+        }
+    }
+}
+
+impl RecordedInput {
+    /// Feedable input borrowing this record's prompt/delta storage. An `Other` finish reason
+    /// is cloned because [`Input::End`] owns its string. The record remains available for
+    /// another replay and must outlive any events borrowing its text.
+    pub fn as_input(&self) -> Input<'_> {
+        match self {
+            Self::Prompt { token_ids, text } => Input::Prompt { token_ids, text },
+            Self::Delta {
+                token_ids,
+                text,
+                spans,
+            } => Input::Delta {
+                token_ids,
+                text,
+                spans,
+            },
+            Self::End { finish } => Input::End {
+                finish: finish.clone(),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
