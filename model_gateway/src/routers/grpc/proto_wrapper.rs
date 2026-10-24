@@ -2465,7 +2465,9 @@ mod tests {
         assert_eq!(MultimodalData::Vllm(image).inline_bytes(), 56);
     }
 
-    use super::{multimodal::tensor_bytes_to_tokenspeed, shm::tokenspeed_shm_path, *};
+    #[cfg(target_os = "linux")]
+    use super::shm::tokenspeed_shm_path;
+    use super::{multimodal::tensor_bytes_to_tokenspeed, *};
 
     #[test]
     fn tokenspeed_image_into_proto_uses_itemized_payload() {
