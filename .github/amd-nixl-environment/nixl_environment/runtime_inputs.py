@@ -48,21 +48,23 @@ def exact_tree(root, declared_files, declared_links, declared_dirs, limits):
     pending = [root]
     while pending:
         directory = pending.pop()
-        for path in directory.iterdir():
-            count += 1
-            relative = path.relative_to(root).as_posix()
-            require(count <= limits["entries"] and len(Path(relative).parts) <= limits["depth"], "bundle walk limit")
-            if path.is_symlink():
-                require(relative in declared_links and os.readlink(path) == declared_links[relative], "unknown/changed bundle link")
-                require(not Path(os.readlink(path)).is_absolute() and path.resolve(strict=True).is_relative_to(root), "bundle link escaped")
-                links.add(relative)
-            elif path.is_dir():
-                require(relative in declared_dirs, "unknown bundle directory")
-                directories.add(relative)
-                pending.append(path)
-            else:
-                require(relative in declared_files and identity(path) == declared_files[relative], "unknown/changed bundle file")
-                files.add(relative)
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                count += 1
+                relative = path.relative_to(root).as_posix()
+                require(count <= limits["entries"] and len(Path(relative).parts) <= limits["depth"], "bundle walk limit")
+                if entry.is_symlink():
+                    require(relative in declared_links and os.readlink(path) == declared_links[relative], "unknown/changed bundle link")
+                    require(not Path(os.readlink(path)).is_absolute() and path.resolve(strict=True).is_relative_to(root), "bundle link escaped")
+                    links.add(relative)
+                elif entry.is_dir(follow_symlinks=False):
+                    require(relative in declared_dirs, "unknown bundle directory")
+                    directories.add(relative)
+                    pending.append(path)
+                else:
+                    require(relative in declared_files and entry.is_file(follow_symlinks=False) and identity(path) == declared_files[relative], "unknown/changed bundle file")
+                    files.add(relative)
     require(files == set(declared_files) and links == set(declared_links) and directories == set(declared_dirs), "bundle exact set differs")
 
 
@@ -183,7 +185,17 @@ def bootstrap():
                           "grpcio-health-checking==1.78.0", str(root / value["packages"]["smg-grpc-proto"]["wheel"]), "-e", str(ROOT / "grpc_servicer")])]
     for name, argv in commands:
         with (state() / ("cohort-" + name + ".stdout")).open("xb") as stdout, (state() / ("cohort-" + name + ".stderr")).open("xb") as stderr:
-            subprocess.run(argv, check=True, timeout=120, env=env, stdout=stdout, stderr=stderr)
+            try:
+                subprocess.run(argv, check=True, timeout=120, env=env, stdout=stdout, stderr=stderr)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                stdout.flush()
+                stderr.flush()
+                for suffix in ("stdout", "stderr"):
+                    with (state() / ("cohort-" + name + "." + suffix)).open("rb") as stream:
+                        stream.seek(max(0, os.fstat(stream.fileno()).st_size - 65536))
+                        raw = stream.read(65536)
+                    print(name + ":" + suffix + " (last 64KiB):\n" + raw.decode(errors="replace"), file=sys.stderr)
+                raise
     sys.dont_write_bytecode = True
     result = {"spec_sha256": SPEC_SHA, "helper_sha256": identity(Path(__file__))["sha256"], "packages": package_proofs(value, root), "generated_origins16": generated_origins(), "cairo": cairo_proof(value), "PIP_CONSTRAINT": os.environ.get("PIP_CONSTRAINT"), "bootstrap_LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH")}
     require(not any(x.split(".")[0] in {"torch", "vllm", "sglang", "mooncake"} for x in sys.modules), "Cairo proof imported an engine")
