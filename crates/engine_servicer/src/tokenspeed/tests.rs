@@ -1721,6 +1721,164 @@ async fn an_epd_prefill_items_rendezvous_reaches_the_scheduler() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// A Qwen3.5-lineage checkpoint's image request reaches the scheduler with
+/// the MRoPE position table the engine's own input processor would have
+/// written (slots 3-5 of the request's multimodal inputs: the `(3, L)` int64
+/// table, the `(1, 1)` delta, the scalar), computed from the launcher's
+/// layout facts; the same checkpoint without those facts refuses the item
+/// before the scheduler, so the engine never takes 1-D positions for it.
+#[tokio::test]
+async fn a_qwen35_image_request_carries_the_position_table_the_engine_would_compute() {
+    const IMAGE_TOKEN: u32 = 248056;
+    let qwen35 = TokenSpeedModelInfo {
+        model_type: "qwen3_5".to_string(),
+        architectures: vec!["Qwen3_5ForConditionalGeneration".to_string()],
+        mrope_positions: Some(true),
+        spatial_merge_size: Some(2),
+        image_token_id: Some(IMAGE_TOKEN),
+        video_token_id: Some(248057),
+        supports_vision: true,
+        supports_multimodal: true,
+        supported_modalities: vec![1],
+        ..model_info()
+    };
+    let image_request = |id: &str| {
+        let mut request = generate_request(id, false, Vec::new());
+        // The engine's own image case: text, vision start, a (1, 4, 6) grid's
+        // six merged positions, text.
+        let mut ids = vec![10, 248053];
+        ids.extend([IMAGE_TOKEN; 6]);
+        ids.push(11);
+        request.tokenized.as_mut().unwrap().input_ids = ids;
+        request.mm_inputs = Some(ts::MultimodalInputs {
+            items: vec![ts::MultimodalItem {
+                modality: common::Modality::Image as i32,
+                content_hash: 7u64.to_le_bytes().to_vec(),
+                encoder_input: Some(ts::TensorData {
+                    shape: vec![6, 4],
+                    dtype: "bfloat16".to_string(),
+                    payload: Some(ts::tensor_data::Payload::Inline(vec![0u8; 48].into())),
+                }),
+                model_specific_tensors: [(
+                    "image_grid_thw".to_string(),
+                    ts::TensorData {
+                        shape: vec![1, 3],
+                        dtype: "int64".to_string(),
+                        payload: Some(ts::tensor_data::Payload::Inline(
+                            [1i64, 4, 6]
+                                .iter()
+                                .flat_map(|v| v.to_le_bytes())
+                                .collect::<Vec<u8>>()
+                                .into(),
+                        )),
+                    },
+                )]
+                .into(),
+                placeholders: vec![ts::PlaceholderRange {
+                    offset: 2,
+                    length: 6,
+                }],
+                placeholder_token_id: Some(IMAGE_TOKEN),
+            }],
+        });
+        request
+    };
+
+    let mut h = harness(qwen35.clone(), None).await;
+    let mut stream = h
+        .client
+        .generate(image_request("mrope-1"))
+        .await
+        .expect("generate")
+        .into_inner();
+    let frames = h.engine_in.recv_frames().await.unwrap();
+    let payload = decode_value(frames[1].as_ref()).unwrap();
+    let array = payload.as_array().expect("a positional array");
+    let mm = array[22].as_array().expect("multimodal inputs");
+    assert_eq!(mm.len(), 7);
+    let table = mm[3].as_array().expect("the position table tuple");
+    assert_eq!(table[0].as_str(), Some("int64"));
+    assert_eq!(
+        table[1]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![3, 9]
+    );
+    let raw_view = |value: &rmpv::Value| -> Vec<u8> {
+        match value {
+            rmpv::Value::Ext(_, bytes) => bytes.clone(),
+            other => panic!("expected the raw-view ext, got {other:?}"),
+        }
+    };
+    let values: Vec<i64> = raw_view(&table[2])
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| i64::from_le_bytes(*c))
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            0, 1, 2, 2, 2, 2, 2, 2, 5, // time
+            0, 1, 2, 2, 2, 3, 3, 3, 5, // height
+            0, 1, 2, 3, 4, 2, 3, 4, 5, // width
+        ]
+    );
+    let delta = mm[4].as_array().expect("the delta tuple");
+    assert_eq!(
+        delta[1]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 1]
+    );
+    assert_eq!(
+        i64::from_le_bytes(raw_view(&delta[2]).as_chunks::<8>().0[0]),
+        -3
+    );
+    assert_eq!(mm[5].as_i64(), Some(-3));
+    assert!(mm[6].is_nil());
+    send(
+        &mut h.engine_out,
+        &batch("mrope-1", vec![10], 1, Some("stop"), None),
+    )
+    .await;
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "stop");
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert_scheduler_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    // The same checkpoint whose launcher shipped no layout facts: refused
+    // before the scheduler, never empty position slots.
+    let without_facts = TokenSpeedModelInfo {
+        spatial_merge_size: None,
+        image_token_id: None,
+        video_token_id: None,
+        ..qwen35
+    };
+    let mut h = harness(without_facts, None).await;
+    let status = h
+        .client
+        .generate(image_request("mrope-2"))
+        .await
+        .expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status.message().contains("did not provide"),
+        "{}",
+        status.message()
+    );
+    assert_scheduler_idle(&mut h.engine_in).await;
+    assert_eq!(h.server.active_requests(), 0);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// Under attention data parallelism a disaggregated request goes to the
 /// rank of its room's residue, the engine's own dispatch rule on both sides
 /// (the decode receiver looks for the KV on the prefill rank of that

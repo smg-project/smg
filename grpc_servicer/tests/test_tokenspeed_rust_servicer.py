@@ -306,6 +306,9 @@ def test_model_facts_mirror_the_python_servicer(monkeypatch):
         "supports_multimodal": True,
         "supported_modalities": [1, 3],
         "mrope_positions": None,
+        "spatial_merge_size": None,
+        "image_token_id": None,
+        "video_token_id": None,
         "model_dtype": "bfloat16",
         "multimodal_encoder_dtype": "bfloat16",
         "constrained_decoding": "",
@@ -1552,6 +1555,40 @@ def test_model_facts_carry_the_engines_constrained_decoding_policy(monkeypatch):
     args = SimpleNamespace(model="org/m", constrained_decoding="requested")
     assert rust.model_facts(args, model_config=declared)["constrained_decoding"] == "requested"
     assert "constrained_decoding" not in rust.server_facts(FakeServerArgs())
+
+
+def test_mrope_layout_facts_are_read_as_the_engines_input_processor_reads_them():
+    # A Qwen3.5 checkpoint: the merge size on the vision config, the
+    # placeholder ids at the top level (the engine's compute_mrope_positions
+    # reads hf_config.vision_config.spatial_merge_size and hf_config.image_token_id).
+    qwen35 = SimpleNamespace(
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+        image_token_id=248056,
+        video_token_id=248057,
+    )
+    assert rust.mrope_layout(qwen35) == {
+        "spatial_merge_size": 2,
+        "image_token_id": 248056,
+        "video_token_id": 248057,
+    }
+    # A dict-shaped config reads the same; a checkpoint without a vision
+    # config or the ids ships None for each (the Rust rule then refuses the
+    # item instead of guessing).
+    assert rust.mrope_layout({"vision_config": {"spatial_merge_size": 2}, "image_token_id": 5}) == {
+        "spatial_merge_size": 2,
+        "image_token_id": 5,
+        "video_token_id": None,
+    }
+    assert rust.mrope_layout(SimpleNamespace(image_token_id="x")) == {
+        "spatial_merge_size": None,
+        "image_token_id": None,
+        "video_token_id": None,
+    }
+    assert rust.mrope_layout(None) == {
+        "spatial_merge_size": None,
+        "image_token_id": None,
+        "video_token_id": None,
+    }
 
 
 def test_mrope_positions_are_read_off_the_text_rope_config():

@@ -23,7 +23,12 @@ bootstrap server here as the engine's own frontend does
 (:func:`kv_bootstrap_server`). The EPD prefill side is served the same way;
 the EPD encode role is not (:func:`refuse_encode_role`): its worker takes
 its requests over the engine's in-process channel only, which this path
-does not have, so it stays with the Python implementation.
+does not have, so it stays with the Python implementation. Multimodal items
+of the Qwen3.5 lineage (an MRoPE family) are served: the Rust servicer
+computes the engine's MRoPE position table itself from the checkpoint facts
+:func:`mrope_layout` ships (the wire bypasses the engine's input processor,
+which computes it on the Python path); items of other MRoPE families are
+refused by name.
 """
 
 from __future__ import annotations
@@ -218,6 +223,34 @@ def mrope_positions(hf_config: Any) -> bool | None:
     return False if found else None
 
 
+def _optional_int(value: Any) -> int | None:
+    """``int(value)`` for a config scalar, ``None`` when absent or not one."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return int(value)
+
+
+def mrope_layout(hf_config: Any) -> dict[str, int | None]:
+    """The checkpoint facts the Rust servicer's MRoPE position rule reads
+    besides the request, as the engine's own input processor reads them:
+    ``vision_config.spatial_merge_size`` (patches per position along each
+    axis) and the top-level ``image_token_id`` / ``video_token_id`` every
+    placeholder span is checked against. Each is ``None`` when the checkpoint
+    has none; the rule needs all three and refuses the item otherwise."""
+    vision = _config_section(hf_config, "vision_config") if hf_config is not None else None
+    return {
+        "spatial_merge_size": _optional_int(
+            _config_section(vision, "spatial_merge_size") if vision is not None else None
+        ),
+        "image_token_id": _optional_int(
+            _config_section(hf_config, "image_token_id") if hf_config is not None else None
+        ),
+        "video_token_id": _optional_int(
+            _config_section(hf_config, "video_token_id") if hf_config is not None else None
+        ),
+    }
+
+
 def model_facts(server_args: Any, model_config: Any | None = None) -> dict[str, Any]:
     """``TokenSpeedGrpcServer`` keyword arguments for ``GetModelInfo``: the
     Python servicer's ``GetModelInfo`` fields, computed up front."""
@@ -249,6 +282,7 @@ def model_facts(server_args: Any, model_config: Any | None = None) -> dict[str, 
         "supports_multimodal": bool(supported_modalities),
         "supported_modalities": [int(modality) for modality in supported_modalities],
         "mrope_positions": mrope_positions(model.hf_config),
+        **mrope_layout(model.hf_config),
         "model_dtype": dtype,
         "multimodal_encoder_dtype": dtype,
     }

@@ -2509,6 +2509,7 @@ fn large_tagged_request(request_id: &str) -> TaggedWireRequest {
             }],
             im_token_id: Some(9),
             video_token_id: None,
+            ..Default::default()
         }),
         ..TaggedWireRequest::default()
     }

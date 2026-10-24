@@ -421,6 +421,7 @@ mod tests {
             }],
             im_token_id: Some(9),
             video_token_id: None,
+            ..Default::default()
         });
 
         let encoded = encode_msgpack(&request).unwrap();

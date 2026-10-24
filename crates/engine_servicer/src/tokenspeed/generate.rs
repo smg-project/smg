@@ -12,8 +12,7 @@ use std::{
 };
 
 use engine_zmq_adapter::{
-    stops::take_tokenspeed_string_stops, to_tokenspeed_response, GridTensors,
-    TokenSpeedGenerateStream,
+    stops::take_tokenspeed_string_stops, to_tokenspeed_response, TokenSpeedGenerateStream,
 };
 use futures::{stream::SelectAll, Stream};
 use llm_tokenizer::stop::StopSequenceDecoder;
@@ -67,10 +66,7 @@ pub(super) async fn generate(
         .as_ref()
         .map_or((None, 1), |params| (params.max_new_tokens, params.n));
     let subs = client
-        .generate_tokenspeed_streams_for_model(
-            req,
-            GridTensors::for_model(state.model.mrope_positions),
-        )
+        .generate_tokenspeed_streams_for_model(req, state.model.grid_tensors())
         .await?;
     let metrics = state.shared.metrics.request(
         arrival,

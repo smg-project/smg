@@ -16,7 +16,8 @@ mod tests;
 use std::{sync::Arc, time::Duration};
 
 use engine_zmq_adapter::{
-    StructuredOutputBackend, StructuredOutputsBackendConfig, StructuredOutputsSupport,
+    GridTensors, MropeLayout, StructuredOutputBackend, StructuredOutputsBackendConfig,
+    StructuredOutputsSupport,
 };
 use llm_tokenizer::traits::Tokenizer;
 use smg_grpc_client::tokenspeed_proto::token_speed_scheduler_server::TokenSpeedSchedulerServer;
@@ -61,10 +62,20 @@ pub struct TokenSpeedModelInfo {
     pub supported_modalities: Vec<i32>,
     /// Whether the language model's rotary positions are MRoPE (the text rope
     /// config carries an `mrope_section`), which the launcher reads off the
-    /// checkpoint: a multimodal item's grid tensors then feed positions this
-    /// wire cannot derive and are refused; `Some(false)` lets a patch-layout
-    /// grid through; `None` (a launcher that does not say) refuses as before.
+    /// checkpoint: a multimodal item's grid tensors then feed a position
+    /// table the adapter computes for the families whose rule it has (from
+    /// `architectures` / `model_type` and the three layout facts below) and
+    /// refuses for the rest; `Some(false)` lets a patch-layout grid through;
+    /// `None` (a launcher that does not say) refuses as before.
     pub mrope_positions: Option<bool>,
+    /// The vision tower's spatial merge size (`vision_config.spatial_merge_size`),
+    /// one of the position rule's inputs; `None` when the checkpoint has none.
+    pub spatial_merge_size: Option<u32>,
+    /// The checkpoint's image placeholder token id (`image_token_id`), which
+    /// the position rule checks each image span against.
+    pub image_token_id: Option<u32>,
+    /// The checkpoint's video placeholder token id (`video_token_id`).
+    pub video_token_id: Option<u32>,
     pub model_dtype: String,
     pub multimodal_encoder_dtype: String,
     /// TokenSpeed's `ServerArgs` as a JSON object, reported as
@@ -94,6 +105,34 @@ pub struct TokenSpeedModelInfo {
     /// and for the batches published before its subscription joined.
     pub kv_events_replay_endpoint: String,
     pub kv_events_topic: String,
+}
+
+impl TokenSpeedModelInfo {
+    /// What a multimodal item's grid tensors are for this model
+    /// ([`GridTensors`]): the position rule's layout facts travel together,
+    /// so a launcher that shipped only some of them ships none.
+    pub(super) fn grid_tensors(&self) -> GridTensors {
+        let layout = match (
+            self.spatial_merge_size,
+            self.image_token_id,
+            self.video_token_id,
+        ) {
+            (Some(spatial_merge_size), Some(image_token_id), Some(video_token_id)) => {
+                Some(MropeLayout {
+                    spatial_merge_size,
+                    image_token_id,
+                    video_token_id,
+                })
+            }
+            _ => None,
+        };
+        GridTensors::for_model(
+            &self.architectures,
+            &self.model_type,
+            self.mrope_positions,
+            layout,
+        )
+    }
 }
 
 /// What the scheduler enforces of a structured request, read off the

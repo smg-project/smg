@@ -53,5 +53,7 @@ pub use structured_outputs::{
     refuse_unenforceable_constraint, ConstraintKinds, ConstraintRef,
     StructuredOutputsBackendConfig, StructuredOutputsSupport,
 };
-pub use tokenspeed::{to_tokenspeed_response, GridTensors, TokenSpeedGenerateStream};
+pub use tokenspeed::{
+    qwen35_lineage, to_tokenspeed_response, GridTensors, MropeLayout, TokenSpeedGenerateStream,
+};
 pub use vllm::{structured_outputs_backend_from_config, ProcessedMedia, VllmGenerateStream};
