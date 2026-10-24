@@ -7,10 +7,13 @@
 //! sampling params SMG sends, and slices each step's output to the slim
 //! batch decoded here).
 
+use std::collections::BTreeMap;
+
 use engine_zmq_client::{
     codec::OpaqueValue,
     connector::SglangStream,
     protocol::sglang::{
+        multimodal::{SglangWireMmInputs, SglangWireMmItem, SglangWireModality, SglangWireTensor},
         output::{MatchedStop, SglangOutput},
         request::{TokenizedEmbeddingReqInput, TokenizedGenerateReqInput},
         sampling::SamplingParams as SglangSamplingParams,
@@ -485,12 +488,12 @@ pub(crate) fn fan_out_sglang_requests(
 /// `TokenizedGenerateReqInput`. ZMQ mode requires pre-tokenized input (SMG
 /// tokenizes upstream). The slim output carries sampled and prompt logprobs
 /// with their ranked and selected candidates, and the hidden states a request
-/// asks for; what the wire does not carry (multimodal payloads) is refused
-/// rather than silently dropped. A disaggregated request's bootstrap fields
-/// ride the scheduler's own slots, as the Python servicer forwards them.
-/// `max_model_len` is the context window the scheduler reported at the
-/// handshake: an empty prompt, or one that fills the window, is refused
-/// before it reaches the scheduler ([`admit_prompt`]).
+/// asks for. Multimodal inputs become the scheduler's processor output
+/// ([`translate_sglang_multimodal`]), and a disaggregated request's
+/// bootstrap fields ride the scheduler's own slots, as the Python servicer
+/// forwards them. `max_model_len` is the context window the scheduler
+/// reported at the handshake: an empty prompt, or one that fills the window,
+/// is refused before it reaches the scheduler ([`admit_prompt`]).
 pub(crate) fn translate_request_sglang(
     req: sglang_proto::GenerateRequest,
     max_model_len: u64,
@@ -506,11 +509,10 @@ pub(crate) fn translate_request_sglang(
     // `max_new_tokens` stays unset: the scheduler caps it at the remaining
     // context itself.
     admit_prompt(input_ids.len(), max_model_len)?;
-    if req.mm_inputs.is_some() {
-        return Err(
-            "multimodal inputs are not supported over the SGLang ZMQ backend yet".to_string(),
-        );
-    }
+    let mm_inputs = req
+        .mm_inputs
+        .map(|mm| translate_sglang_multimodal(mm, input_ids.len()))
+        .transpose()?;
     // The prefill/decode rendezvous (the prefill side's bootstrap server and
     // the room both sides meet in), forwarded as the Python servicer forwards
     // it: an empty host and a zero port are unset, the room is kept as given
@@ -527,6 +529,7 @@ pub(crate) fn translate_request_sglang(
     Ok(TokenizedGenerateReqInput {
         rid: req.request_id,
         input_ids,
+        mm_inputs,
         sampling_params: req
             .sampling_params
             .map(translate_sampling_sglang)
@@ -552,10 +555,106 @@ pub(crate) fn translate_request_sglang(
     })
 }
 
+/// The request's multimodal payload as the scheduler's processor output, by
+/// the Python servicer's rules (`_parse_mm_inputs`): one image item whose
+/// feature is `pixel_values`, the model-specific tensors beside it, the
+/// placeholder ranges as inclusive `[start, end]` offsets (none at all leaves
+/// the slot unset, with the same warning), and the image token id. Nothing
+/// is derived here: the scheduler hashes the feature, pads the prompt with
+/// its model's pattern and computes the position tensors it needs, as it
+/// does behind the Python servicer. What that servicer would mis-tag or
+/// silently drop is refused instead: a payload naming another modality
+/// (every item is tagged an image), one of media references without tensors
+/// (the scheduler's encode path, which this wire does not drive), a tensor
+/// of a dtype the wire does not carry or of the wrong length, and a
+/// placeholder outside the prompt or of zero length.
+pub(crate) fn translate_sglang_multimodal(
+    mm: sglang_proto::MultimodalInputs,
+    prompt_len: usize,
+) -> Result<SglangWireMmInputs, String> {
+    if let Some(other) = mm.modalities.iter().find(|modality| *modality != "image") {
+        return Err(format!(
+            "multimodal modality {other:?} is not carried over the SGLang ZMQ backend; the \
+             scheduler takes preprocessed image tensors on this wire"
+        ));
+    }
+    let Some(pixel_values) = mm.pixel_values else {
+        return Err(
+            if mm.image_urls.is_empty() && mm.video_urls.is_empty() && mm.audio_urls.is_empty() {
+                "multimodal payload carries no pixel_values".to_string()
+            } else {
+                "multimodal payload carries media references but no preprocessed tensors; the \
+                 scheduler's encode path is not served over the SGLang ZMQ backend"
+                    .to_string()
+            },
+        );
+    };
+    let feature = wire_tensor_sglang("pixel_values", pixel_values)?;
+    let mut model_specific_data = BTreeMap::new();
+    for (key, tensor) in mm.model_specific_tensors {
+        let tensor = wire_tensor_sglang(&key, tensor)?;
+        model_specific_data.insert(key, tensor);
+    }
+    let mut offsets = Vec::with_capacity(mm.mm_placeholders.len());
+    for range in &mm.mm_placeholders {
+        let (start, length) = (u64::from(range.offset), u64::from(range.length));
+        if length == 0 {
+            return Err(format!(
+                "multimodal placeholder at offset {start} has zero length"
+            ));
+        }
+        let end = start + length - 1;
+        if end >= prompt_len as u64 {
+            return Err(format!(
+                "multimodal placeholder {start}..={end} lies outside the prompt of {prompt_len} \
+                 tokens"
+            ));
+        }
+        offsets.push((start, end));
+    }
+    let offsets = if offsets.is_empty() {
+        // The Python servicer's warning, word for word in substance.
+        warn!(
+            "multimodal payload carries no mm_placeholders: the prompt's placeholder expansion \
+             may have missed the image token; check that the placeholder token id matches the \
+             tokenized image token"
+        );
+        None
+    } else {
+        Some(offsets)
+    };
+    Ok(SglangWireMmInputs {
+        mm_items: vec![SglangWireMmItem {
+            modality: SglangWireModality::Image,
+            offsets,
+            feature: Some(feature),
+            model_specific_data,
+        }],
+        im_token_id: mm.im_token_id,
+    })
+}
+
+/// A proto tensor as the wire carries it: the bytes are viewed, not copied;
+/// the dtype name and the length are checked as the Python servicer's reader
+/// checks them.
+fn wire_tensor_sglang(
+    name: &str,
+    tensor: sglang_proto::TensorData,
+) -> Result<SglangWireTensor, String> {
+    SglangWireTensor::new(
+        tensor.dtype,
+        tensor.shape.into_iter().map(u64::from).collect(),
+        tensor.data,
+    )
+    .map_err(|error| format!("multimodal tensor {name:?}: {error}"))
+}
+
 /// Translate an SGLang proto `EmbedRequest` into the scheduler's
 /// `TokenizedEmbeddingReqInput`, as the Python servicer does: the tokenized
 /// prompt with `max_new_tokens = 0` (the scheduler pools, nothing samples),
-/// token type ids for cross-encoder inputs. Multimodal payloads are refused.
+/// token type ids for cross-encoder inputs. A multimodal payload is refused
+/// (the Python servicer drops it without a word, which no embedding model it
+/// serves depends on).
 pub(crate) fn translate_embed_request_sglang(
     req: sglang_proto::EmbedRequest,
 ) -> Result<TokenizedEmbeddingReqInput, String> {
@@ -570,7 +669,9 @@ pub(crate) fn translate_embed_request_sglang(
     }
     if req.mm_inputs.is_some() {
         return Err(
-            "multimodal inputs are not supported over the SGLang ZMQ backend yet".to_string(),
+            "multimodal inputs on an embedding request are not served over the SGLang ZMQ \
+             backend"
+                .to_string(),
         );
     }
     let mut sampling_params = req
@@ -830,6 +931,157 @@ mod tests {
     /// The translation under the mock scheduler's context window.
     fn translate(req: sglang_proto::GenerateRequest) -> Result<WireRequest, String> {
         translate_request_sglang(req, default_ready_response().max_model_len)
+    }
+
+    fn tensor(dtype: &str, shape: Vec<u32>, data: Vec<u8>) -> sglang_proto::TensorData {
+        sglang_proto::TensorData {
+            data: data.into(),
+            shape,
+            dtype: dtype.to_string(),
+        }
+    }
+
+    /// The payload the gateway assembles for this wire: the pixel tensor,
+    /// one grid tensor, the placeholder ranges and the image token.
+    fn media_payload() -> sglang_proto::MultimodalInputs {
+        let pixels: Vec<u8> = (0..8)
+            .flat_map(|i| (i as f32 * 0.5).to_le_bytes())
+            .collect();
+        let grid: Vec<u8> = [1i64, 2, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+        sglang_proto::MultimodalInputs {
+            modalities: vec!["image".to_string()],
+            pixel_values: Some(tensor("float32", vec![2, 4], pixels)),
+            model_specific_tensors: [(
+                "image_grid_thw".to_string(),
+                tensor("int64", vec![1, 3], grid),
+            )]
+            .into_iter()
+            .collect(),
+            im_token_id: Some(7),
+            mm_placeholders: vec![sglang_proto::PlaceholderRange {
+                offset: 1,
+                length: 3,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn media_request(mm: sglang_proto::MultimodalInputs) -> sglang_proto::GenerateRequest {
+        sglang_proto::GenerateRequest {
+            request_id: "mm".into(),
+            tokenized: Some(sglang_proto::TokenizedInput {
+                input_ids: vec![1, 7, 7, 7, 2],
+                original_text: String::new(),
+            }),
+            mm_inputs: Some(mm),
+            ..Default::default()
+        }
+    }
+
+    /// The gateway's preprocessed media becomes the scheduler's processor
+    /// output by the Python servicer's rules: one image item, the pixel
+    /// tensor as its feature (bytes viewed, not copied), the grid beside it,
+    /// inclusive offsets, the image token id; the hash and pad slots are left
+    /// to the scheduler.
+    #[test]
+    fn multimodal_inputs_become_the_schedulers_processor_output() {
+        let payload = media_payload();
+        let pixel_ptr = payload.pixel_values.as_ref().unwrap().data.as_ptr();
+        let request = translate(media_request(payload)).unwrap();
+        let media = request.mm_inputs.expect("the processor output");
+        assert_eq!(media.im_token_id, Some(7));
+        assert_eq!(media.mm_items.len(), 1);
+        let item = &media.mm_items[0];
+        assert_eq!(item.modality, SglangWireModality::Image);
+        assert_eq!(item.offsets, Some(vec![(1, 3)]));
+        let feature = item.feature.as_ref().unwrap();
+        assert_eq!(feature.dtype, "float32");
+        assert_eq!(feature.shape, vec![2, 4]);
+        assert_eq!(
+            feature.data.as_ptr(),
+            pixel_ptr,
+            "the proto bytes are viewed"
+        );
+        let grid = &item.model_specific_data["image_grid_thw"];
+        assert_eq!(
+            (grid.dtype.as_str(), grid.shape.as_slice()),
+            ("int64", &[1, 3][..])
+        );
+        // The prompt is handed over as it came: the scheduler pads it.
+        assert_eq!(request.input_ids, vec![1, 7, 7, 7, 2]);
+        // No placeholders: the slot is left unset, as the Python servicer
+        // leaves it (with its warning).
+        let mut bare = media_payload();
+        bare.mm_placeholders.clear();
+        let request = translate(media_request(bare)).unwrap();
+        assert_eq!(request.mm_inputs.unwrap().mm_items[0].offsets, None);
+        // A text request carries none.
+        let mut text = media_request(media_payload());
+        text.mm_inputs = None;
+        assert_eq!(translate(text).unwrap().mm_inputs, None);
+    }
+
+    /// What the Python servicer would mis-tag or drop is refused by name:
+    /// another modality, references without tensors, a dtype the wire does
+    /// not carry, a wrong byte length, a placeholder outside the prompt or
+    /// of zero length; and a media payload on an embedding request.
+    #[test]
+    fn malformed_multimodal_inputs_are_refused_before_the_scheduler() {
+        let refused = |mm: sglang_proto::MultimodalInputs, needle: &str| {
+            let error = translate(media_request(mm)).unwrap_err();
+            assert!(error.contains(needle), "{error}");
+        };
+        let mut video = media_payload();
+        video.modalities = vec!["video".to_string()];
+        refused(video, "modality \"video\" is not carried");
+        let mut references = media_payload();
+        references.pixel_values = None;
+        references.image_urls = vec!["http://example.test/a.png".to_string()];
+        refused(references, "media references but no preprocessed tensors");
+        let mut empty = media_payload();
+        empty.pixel_values = None;
+        refused(empty, "carries no pixel_values");
+        let mut wide = media_payload();
+        wide.pixel_values = Some(tensor("float64", vec![1], vec![0; 8]));
+        refused(
+            wide,
+            "multimodal tensor \"pixel_values\": unsupported tensor dtype \"float64\"",
+        );
+        let mut short = media_payload();
+        short.model_specific_tensors.insert(
+            "image_grid_thw".to_string(),
+            tensor("int64", vec![1, 3], vec![0; 8]),
+        );
+        refused(
+            short,
+            "multimodal tensor \"image_grid_thw\": TensorData byte length mismatch",
+        );
+        let mut outside = media_payload();
+        outside.mm_placeholders = vec![sglang_proto::PlaceholderRange {
+            offset: 3,
+            length: 3,
+        }];
+        refused(
+            outside,
+            "placeholder 3..=5 lies outside the prompt of 5 tokens",
+        );
+        let mut zero = media_payload();
+        zero.mm_placeholders = vec![sglang_proto::PlaceholderRange {
+            offset: 1,
+            length: 0,
+        }];
+        refused(zero, "placeholder at offset 1 has zero length");
+        let embed = sglang_proto::EmbedRequest {
+            request_id: "e".into(),
+            tokenized: Some(sglang_proto::TokenizedInput {
+                input_ids: vec![1, 2],
+                original_text: String::new(),
+            }),
+            mm_inputs: Some(media_payload()),
+            ..Default::default()
+        };
+        let error = translate_embed_request_sglang(embed).unwrap_err();
+        assert!(error.contains("embedding request"), "{error}");
     }
 
     #[test]

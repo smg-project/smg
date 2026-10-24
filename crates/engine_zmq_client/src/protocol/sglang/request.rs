@@ -15,7 +15,7 @@ use serde::{
 
 use crate::protocol::{
     positional::{drain_trailing, expect_tag, next_field},
-    sglang::sampling::SamplingParams,
+    sglang::{multimodal::SglangWireMmInputs, sampling::SamplingParams},
 };
 
 /// The msgspec tag for [`TokenizedGenerateReqInput`] (element 0 on the wire).
@@ -116,7 +116,8 @@ impl SglangRequestType {
 ///
 /// Models the Python class's prefix through `require_reasoning`: the base
 /// `rid` / `http_worker_ipc`, the required `input_text`, `input_ids`,
-/// `input_embeds`, `mm_inputs`, `token_type_ids`, `sampling_params`,
+/// `input_embeds`, `mm_inputs` (the scheduler's own processor output, see
+/// [`SglangWireMmInputs`]), `token_type_ids`, `sampling_params`,
 /// `return_logprob`, `logprob_start_len`, `top_logprobs_num`,
 /// `token_ids_logprob`, `stream`, then the 19 defaulted fields up to
 /// `require_reasoning`, of which this side fills `return_hidden_states`, the
@@ -135,6 +136,10 @@ pub struct TokenizedGenerateReqInput {
     pub input_text: Option<String>,
     /// Pre-tokenized prompt token ids (SMG tokenizes upstream).
     pub input_ids: Vec<u32>,
+    /// The request's multimodal payload, the scheduler's processor output:
+    /// the preprocessed tensors and their placeholder offsets, as the Python
+    /// servicer hands them over. `None` for a text request.
+    pub mm_inputs: Option<SglangWireMmInputs>,
     /// Sampling parameters (nested untagged positional array).
     pub sampling_params: SamplingParams,
     /// Whether to return the sampled token's logprob per output token.
@@ -220,6 +225,7 @@ impl Default for TokenizedGenerateReqInput {
             rid: String::new(),
             input_text: None,
             input_ids: Vec::new(),
+            mm_inputs: None,
             sampling_params: SamplingParams::default(),
             return_logprob: false,
             logprob_start_len: -1,
@@ -256,7 +262,7 @@ impl Serialize for TokenizedGenerateReqInput {
         tuple.serialize_element(&self.input_text)?;
         tuple.serialize_element(&self.input_ids)?;
         tuple.serialize_element(&NIL)?; // input_embeds
-        tuple.serialize_element(&NIL)?; // mm_inputs
+        tuple.serialize_element(&self.mm_inputs)?;
         tuple.serialize_element(&NIL)?; // token_type_ids
         tuple.serialize_element(&self.sampling_params)?;
         tuple.serialize_element(&self.return_logprob)?;
@@ -351,7 +357,7 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                 let input_text = next_field(&mut seq, "input_text")?;
                 let input_ids = next_field(&mut seq, "input_ids")?;
                 let _input_embeds: IgnoredAny = next_field(&mut seq, "input_embeds")?;
-                let _mm_inputs: IgnoredAny = next_field(&mut seq, "mm_inputs")?;
+                let mm_inputs = next_field(&mut seq, "mm_inputs")?;
                 let _token_type_ids: IgnoredAny = next_field(&mut seq, "token_type_ids")?;
                 let sampling_params = next_field(&mut seq, "sampling_params")?;
                 let return_logprob = next_field(&mut seq, "return_logprob")?;
@@ -387,6 +393,7 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                     rid,
                     input_text,
                     input_ids,
+                    mm_inputs,
                     sampling_params,
                     return_logprob,
                     logprob_start_len,
@@ -1072,6 +1079,89 @@ mod tests {
         let decoded: TokenizedGenerateReqInput = decode_msgpack(&payload).unwrap();
         assert_eq!(decoded.trace_headers, None);
         assert!(RequestMeta::for_request(&decoded).is_none());
+    }
+
+    /// The multimodal payload rides slot 6 (`mm_inputs`), nil for a text
+    /// request, and round-trips; nothing else of the array moves.
+    #[test]
+    fn multimodal_inputs_ride_their_slot() {
+        use crate::protocol::sglang::multimodal::{
+            SglangWireMmItem, SglangWireModality, SglangWireTensor, PROCESSOR_OUTPUT_WIRE_FIELDS,
+        };
+        let text = TokenizedGenerateReqInput {
+            rid: "m".into(),
+            input_ids: vec![1, 7, 7, 7, 2],
+            ..TokenizedGenerateReqInput::default()
+        };
+        let media = TokenizedGenerateReqInput {
+            mm_inputs: Some(SglangWireMmInputs {
+                mm_items: vec![SglangWireMmItem {
+                    modality: SglangWireModality::Image,
+                    offsets: Some(vec![(1, 3)]),
+                    feature: Some(
+                        SglangWireTensor::new("uint8", vec![3, 2], Bytes::from(vec![9u8; 6]))
+                            .unwrap(),
+                    ),
+                    model_specific_data: BTreeMap::new(),
+                }],
+                im_token_id: Some(7),
+            }),
+            ..text.clone()
+        };
+        let text_array: Vec<Value> = decode_msgpack(&encode_msgpack(&text).unwrap()).unwrap();
+        let media_array: Vec<Value> = decode_msgpack(&encode_msgpack(&media).unwrap()).unwrap();
+        assert_eq!(text_array.len(), 14);
+        assert_eq!(media_array.len(), 14);
+        assert_eq!(text_array[6], Value::Nil);
+        // The processor output rides as the prefix this side fills.
+        let slots_sent = PROCESSOR_OUTPUT_WIRE_FIELDS.len();
+        assert!(matches!(&media_array[6], Value::Array(slots) if slots.len() == slots_sent));
+        for index in (0..14).filter(|index| *index != 6) {
+            assert_eq!(text_array[index], media_array[index], "element {index}");
+        }
+        let back: TokenizedGenerateReqInput =
+            decode_msgpack(&encode_msgpack(&media).unwrap()).unwrap();
+        assert_eq!(back, media);
+    }
+
+    /// The `ADD` payload the plugin's own test decodes through the scheduler's
+    /// real classes (`grpc_servicer/tests/test_sglang_zmq_msgpack.py`,
+    /// `RUST_MM_REQUEST`): rid `mm`, ids `[1, 7, 7, 7, 2]`, the default
+    /// sampling params, one image item whose feature is
+    /// `torch.arange(8, dtype=torch.float32).reshape(2, 4) * 0.5` with
+    /// `image_grid_thw = [[1, 2, 2]]` (int64), offsets `[(1, 3)]` and
+    /// `im_token_id = 7`. The two pins are one constant: a change here is a
+    /// change there.
+    #[test]
+    fn the_payload_the_plugins_test_decodes_is_pinned() {
+        use crate::protocol::sglang::multimodal::{
+            SglangWireMmItem, SglangWireModality, SglangWireTensor,
+        };
+        const PLUGIN_TEST_PAYLOAD: &str = "9eb9546f6b656e697a656447656e6572617465526571496e707574a26d6dc0c0950107070702c094919901c0c09192010301c734020000001093920204a7666c6f61743332a3637075000000000000003f0000803f0000c03f00000040000020400000404000006040c0c281ae696d6167655f677269645f746877c72a020000000e93920103a5696e743634a3637075010000000000000002000000000000000200000000000000c0c007c0dc001acc80c0c0c0cb3ff0000000000000cb3ff0000000000000ffcb0000000000000000cb0000000000000000cb0000000000000000cb3ff00000000000000001c0c0c0c0c0c2c3c3c2c0c0c0c0c2ff00c0c2";
+        let pixels: Vec<u8> = (0..8)
+            .flat_map(|i| (i as f32 * 0.5).to_le_bytes())
+            .collect();
+        let grid: Vec<u8> = [1i64, 2, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let request = TokenizedGenerateReqInput {
+            rid: "mm".into(),
+            input_ids: vec![1, 7, 7, 7, 2],
+            mm_inputs: Some(SglangWireMmInputs {
+                mm_items: vec![SglangWireMmItem {
+                    modality: SglangWireModality::Image,
+                    offsets: Some(vec![(1, 3)]),
+                    feature: Some(
+                        SglangWireTensor::new("float32", vec![2, 4], Bytes::from(pixels)).unwrap(),
+                    ),
+                    model_specific_data: BTreeMap::from([(
+                        "image_grid_thw".to_string(),
+                        SglangWireTensor::new("int64", vec![1, 3], Bytes::from(grid)).unwrap(),
+                    )]),
+                }],
+                im_token_id: Some(7),
+            }),
+            ..TokenizedGenerateReqInput::default()
+        };
+        assert_eq!(encode_msgpack(&request).unwrap(), hex(PLUGIN_TEST_PAYLOAD));
     }
 
     #[test]

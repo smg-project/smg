@@ -27,6 +27,7 @@
 //! are shared with the TokenSpeed dialect, whose structs follow the same
 //! `msgspec` convention.
 
+pub mod multimodal;
 pub mod output;
 pub mod request;
 pub mod sampling;
@@ -40,6 +41,10 @@ use crate::{
         handshake::EngineCoreReadyResponse,
         positional::check_prefix,
         sglang::{
+            multimodal::{
+                DATA_ITEM_WIRE_FIELDS, MULTIMODAL_DATA_ITEM_NAME, MULTIMODAL_PROCESSOR_OUTPUT_NAME,
+                PROCESSOR_OUTPUT_WIRE_FIELDS,
+            },
             output::{SglangOutput, SglangWireOutput},
             request::{
                 RequestMeta, SglangRequest, SglangRequestType, EMBEDDING_WIRE_FIELDS,
@@ -129,17 +134,31 @@ impl EngineProtocol for SglangProtocol {
             SAMPLING_PARAMS_NAME,
             &SAMPLING_WIRE_FIELDS,
             &ready.positional_layouts,
+        )?;
+        // The multimodal payload's structs: the processor output's prefix through
+        // `im_token_id`, the data item whole; a plugin that declares them has
+        // them compared too.
+        check_prefix(
+            MULTIMODAL_PROCESSOR_OUTPUT_NAME,
+            &PROCESSOR_OUTPUT_WIRE_FIELDS,
+            &ready.positional_layouts,
+        )?;
+        check_prefix(
+            MULTIMODAL_DATA_ITEM_NAME,
+            &DATA_ITEM_WIRE_FIELDS,
+            &ready.positional_layouts,
         )
     }
 
     fn encode_add(request: &Self::Request) -> Result<(Vec<u8>, Vec<Bytes>)> {
         let payload = encode_msgpack(request)?;
         // The request's metadata (the caller's trace context) rides as one
-        // more frame: the positional array is the scheduler's own struct.
-        // No tensor rides this wire yet (`mm_inputs` is refused upstream of
-        // it); the day one does, its frames go behind the metadata frame,
-        // which the plugin reads at a fixed position, or their indices skip
-        // it, and the plugin resolves them (`codec::tensor::TensorFields`).
+        // more frame: the positional array is the scheduler's own struct. Its
+        // tensors (`mm_inputs`) ride inline, as SGLang's own encoder writes
+        // them: the plugin's decoder resolves no auxiliary frames on this
+        // wire. The day it does, their frames go behind the metadata frame,
+        // which the plugin reads at a fixed position
+        // (`codec::tensor::TensorFields`).
         let meta = match request {
             SglangRequest::Generate(request) => RequestMeta::for_request(request),
             SglangRequest::Embed(_) => None,
@@ -486,6 +505,61 @@ mod tests {
             error.contains(
                 "`TokenizedGenerateReqInput` field 21 is `lora_id` on this side and \
                  `session_rank` on the engine's"
+            ),
+            "{error}"
+        );
+    }
+
+    /// The multimodal structs at the handshake: the processor output is
+    /// compared as the prefix this side sends (a field a release adds after
+    /// `im_token_id` passes), the data item whole; a field moved or inserted
+    /// inside what is sent is refused by name.
+    #[test]
+    fn check_layouts_reads_the_multimodal_structs_as_sent() {
+        use std::collections::BTreeMap;
+
+        use crate::{
+            mock_engine::default_ready_response,
+            protocol::sglang::multimodal::recorded as multimodal,
+        };
+        let names = |fields: &[&str]| fields.iter().map(|f| f.to_string()).collect::<Vec<_>>();
+        let ready = |output: &[&str], item: &[&str]| EngineCoreReadyResponse {
+            positional_layouts: BTreeMap::from([
+                (MULTIMODAL_PROCESSOR_OUTPUT_NAME.to_string(), names(output)),
+                (MULTIMODAL_DATA_ITEM_NAME.to_string(), names(item)),
+            ]),
+            ..default_ready_response()
+        };
+        let output = multimodal::PROCESSOR_OUTPUT_FIELDS_0_5_22;
+        let item = multimodal::DATA_ITEM_FIELDS_0_5_22;
+        assert!(SglangProtocol::check_layouts(&ready(&output, &item)).is_ok());
+        // A release that adds a token id after `im_end_id`: past the prefix.
+        let mut appended = output.to_vec();
+        appended.insert(6, "video_start_id");
+        assert!(SglangProtocol::check_layouts(&ready(&appended, &item)).is_ok());
+        // A release that put a field before `input_ids`: inside the prefix.
+        let mut inserted = output.to_vec();
+        inserted.insert(1, "input_embeds");
+        let error = SglangProtocol::check_layouts(&ready(&inserted, &item))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "`MultimodalProcessorOutput` field 1 is `input_ids` on this side and \
+                 `input_embeds` on the engine's"
+            ),
+            "{error}"
+        );
+        // A release that moved the item's feature.
+        let mut moved = item.to_vec();
+        moved.swap(5, 6);
+        let error = SglangProtocol::check_layouts(&ready(&output, &moved))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "`MultimodalDataItem` field 5 is `feature` on this side and \
+                 `precomputed_embeddings` on the engine's"
             ),
             "{error}"
         );

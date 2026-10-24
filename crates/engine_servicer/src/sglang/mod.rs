@@ -28,7 +28,6 @@ use engine_zmq_adapter::{
 };
 use smg_grpc_client::sglang_proto::sglang_scheduler_server::SglangSchedulerServer;
 use tonic::service::Routes;
-use tracing::info;
 
 use crate::{
     engine_link::EngineLink,
@@ -72,9 +71,11 @@ pub struct SglangModelInfo {
     /// The model's generation-config sampling defaults merged with the
     /// preferred ones, as JSON text, or empty.
     pub default_sampling_params_json: String,
-    /// Whether the model takes multimodal input, as the launcher reports it.
-    /// Not advertised until this servicer carries media to the scheduler
-    /// (see `info`): the wire refuses `mm_inputs` today.
+    /// Whether the model takes multimodal input, as the launcher reports it:
+    /// SGLang's own `ModelConfig.is_multimodal` for the checkpoint and the
+    /// launch, the decision the scheduler itself runs under. Advertised by
+    /// `GetModelInfo`; the gateway's media pipeline preprocesses for such a
+    /// worker and the wire carries the tensors to the scheduler.
     pub supports_vision: bool,
     /// Classification heads: `id2label` as JSON text and the label count.
     pub id2label_json: String,
@@ -263,14 +264,6 @@ impl SglangServicerServer {
             if !json.trim().is_empty() && !proto_json::is_json_object(json) {
                 return Err(invalid(&format!("{name} must be a JSON object")));
             }
-        }
-        if config.model.supports_vision {
-            info!(
-                served_model_name = %config.model.served_model_name,
-                "the model takes multimodal input, but this servicer does not carry media to \
-                 the scheduler yet: it advertises supports_vision=false, so the gateway refuses \
-                 image and video input at its gate instead of after fetching it"
-            );
         }
         // One publisher per data-parallel rank: the launcher's width (the
         // handshake's figure, which may differ, is not known yet).

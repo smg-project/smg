@@ -165,9 +165,12 @@ def test_sglang_rust_lane_drops_epd_and_foreign_wires(param):
     assert deselected == [item, encode_workers]
 
 
-def test_sglang_rust_lane_drops_multimodal_cases_except_http():
+def test_sglang_rust_lane_keeps_multimodal_cases():
+    """The Rust servicer carries the preprocessed media to the scheduler: the
+    multimodal cases run on its lane over the servicer and over SGLang's own
+    server alike."""
     grpc = _item("chat_completions/test_multimodal.py::test_x[grpc]", setup_backend="grpc")
     http = _item("chat_completions/test_multimodal.py::test_x[http]", setup_backend="http")
     kept, deselected = hooks._filter_sglang_rust_items([grpc, http])
-    assert kept == [http]
-    assert deselected == [grpc]
+    assert kept == [grpc, http]
+    assert deselected == []

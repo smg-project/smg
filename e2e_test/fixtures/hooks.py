@@ -355,11 +355,10 @@ def _filter_sglang_rust_items(
     workers run the Rust servicer.
 
     The Rust servicer reaches the scheduler over the msgpack wire, which
-    carries no multimodal payloads, and runs no encode dispatch. The
-    multimodal cases and the EPD topologies stay with the Python servicer, so
-    they are dropped here rather than failing on a known gap; everything else
-    (the prefill/decode topologies, admin ops, embeddings, data-parallel
-    workers) runs.
+    runs no encode dispatch. The EPD topologies stay with the Python servicer,
+    so they are dropped here rather than failing on a known gap; everything
+    else (multimodal payloads, the prefill/decode topologies, admin ops,
+    embeddings, data-parallel workers) runs.
     """
     kept: list[pytest.Item] = []
     deselected: list[pytest.Item] = []
@@ -370,10 +369,7 @@ def _filter_sglang_rust_items(
         unserved_wire = (
             param is not None and param not in _ZMQ_LOCAL_WIRES and not _is_pd_param(param)
         )
-        module = item.nodeid.split("::", 1)[0]
-        # An HTTP case talks to SGLang's own server, never to the servicer.
-        multimodal = module.endswith("test_multimodal.py") and param != "http"
-        if unserved_wire or _is_epd_worker_set(item) or multimodal:
+        if unserved_wire or _is_epd_worker_set(item):
             deselected.append(item)
         else:
             kept.append(item)

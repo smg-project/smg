@@ -1096,14 +1096,17 @@ Prefill/decode disaggregation (`--disaggregation-mode prefill|decode`) works as
 on the Python servicer: a request's bootstrap fields (host, port, room) ride
 the scheduler's own request struct over the wire, the prefill side's bootstrap
 server starts in the servicer process before the ranks, and `GetServerInfo`
-carries the server args the Router pairs on. What the wire does not carry is
-reported, not emulated: multimodal inputs are refused, EPD
-disaggregation (`--language-only` / `--encoder-only`) stays with the Python
-implementation (the worker refuses to start on the Rust path in those modes:
-the encode dispatch is not on it yet), a prefill or decode leg with more than
-one scheduler rank refuses to start the same way (a request is not yet placed
-on its room's rank on the Rust path), and LoRA loading answers UNIMPLEMENTED,
-as it does on the Python servicer.
+carries the server args the Router pairs on. Multimodal inputs reach the
+scheduler as its own processor output: the preprocessed tensors the Router's
+media pipeline sends ride the wire as SGLang's own tensor encoding, and the
+scheduler hashes, pads and positions them as it does behind the Python
+servicer; `supports_vision` is advertised as SGLang's model config decides it.
+What the wire does not carry is reported, not emulated: EPD disaggregation (`--language-only` / `--encoder-only`) stays with
+the Python implementation (the worker refuses to start on the Rust path in
+those modes: the encode dispatch is not on it yet), a prefill or decode leg
+with more than one scheduler rank refuses to start the same way (a request is
+not yet placed on its room's rank on the Rust path), and LoRA loading answers
+UNIMPLEMENTED, as it does on the Python servicer.
 `SubscribeKvEvents` relays SGLang's ZMQ KV-event publisher, which the servicer
 turns on by itself, on this path as on the Python one, when the launcher is
 given no `--kv-events-config`, at a port found free on the host rather than

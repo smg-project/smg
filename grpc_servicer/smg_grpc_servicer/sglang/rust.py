@@ -22,14 +22,14 @@ before the ranks, where the Python servicer starts it; the planned warm-up
 runs on a prefill or decode leg as on a single engine, its requests carrying
 the engine's stand-in bootstrap, so the leg warms up without its peer and no
 first request of a prompt-length class pays a kernel compile under the
-Router's prefill-liveness bound. What the msgpack wire
+Router's prefill-liveness bound. Multimodal inputs reach the scheduler as its
+own processor output over the wire. What the msgpack wire
 does not carry, the Rust path reports rather than emulates: LoRA loading
-answers UNIMPLEMENTED (as on the Python servicer), multimodal
-inputs are refused, and EPD disaggregation (``language_only`` /
-``encoder_only``) stays with the Python implementation until the encode
-dispatch is on this path; ``Embed``, ``FlushCache``, profiling, the KV-event relay, prompt logprobs and
-hidden states are served (hidden states on this path only: the Python
-servicer refuses them by name).
+answers UNIMPLEMENTED (as on the Python servicer), and EPD disaggregation
+(``language_only`` / ``encoder_only``) stays with the Python implementation
+until the encode dispatch is on this path; ``Embed``, ``FlushCache``,
+profiling, the KV-event relay, prompt logprobs and hidden states are served
+(hidden states on this path only: the Python servicer refuses them by name).
 """
 
 from __future__ import annotations

@@ -1052,15 +1052,14 @@ async fn a_scheduler_refusal_is_the_callers_error() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// A model that takes multimodal input is advertised without vision until
-/// this servicer carries media to the scheduler (the wire refuses
-/// `mm_inputs`): `GetModelInfo.supports_vision` is false whatever the
-/// launcher reported, and `GetServerInfo.server_args` carries the same
-/// `false` on purpose, where the Router reads a non-vLLM servicer's verdict
-/// (a proto3 `false` in `GetModelInfo` is no verdict there). The Router then
-/// refuses image and video input at its gate instead of after fetching it.
+/// A model that takes multimodal input is advertised as the launcher reports
+/// it (`GetModelInfo.supports_vision`, SGLang's own verdict for the launch),
+/// and `GetServerInfo.server_args` stays the launcher's: no verdict of the
+/// servicer's own there (the Python servicer writes none either), so the
+/// gateway's media pipeline preprocesses for the worker and the wire carries
+/// the tensors.
 #[tokio::test]
-async fn a_multimodal_model_is_advertised_without_vision_until_media_is_carried() {
+async fn a_multimodal_model_is_advertised_with_the_launchers_vision_verdict() {
     let mut vision = model_info();
     vision.model_type = "qwen3_vl".to_string();
     vision.architectures = vec!["Qwen3VLForConditionalGeneration".to_string()];
@@ -1072,10 +1071,7 @@ async fn a_multimodal_model_is_advertised_without_vision_until_media_is_carried(
         .await
         .unwrap()
         .into_inner();
-    assert!(
-        !info.supports_vision,
-        "no media reaches the scheduler over this wire yet"
-    );
+    assert!(info.supports_vision, "the launcher's verdict, as reported");
     let server = h
         .client
         .get_server_info(sg::GetServerInfoRequest {})
@@ -1083,10 +1079,9 @@ async fn a_multimodal_model_is_advertised_without_vision_until_media_is_carried(
         .unwrap()
         .into_inner();
     let args = server.server_args.expect("server_args");
-    assert_eq!(
-        args.fields["supports_vision"].kind,
-        Some(Kind::BoolValue(false)),
-        "the servicer's own verdict, where the Router reads it"
+    assert!(
+        !args.fields.contains_key("supports_vision"),
+        "no verdict of the servicer's own in server_args"
     );
     assert_eq!(
         args.fields["tp_size"].kind,
@@ -1095,7 +1090,7 @@ async fn a_multimodal_model_is_advertised_without_vision_until_media_is_carried(
     );
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 
-    // A text model reads the same: no vision served, whatever the field says.
+    // A text model reads as the launcher reported it too.
     let mut h = harness(model_info()).await;
     let info = h
         .client
@@ -1104,6 +1099,89 @@ async fn a_multimodal_model_is_advertised_without_vision_until_media_is_carried(
         .unwrap()
         .into_inner();
     assert!(!info.supports_vision);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The request's preprocessed media reaches the scheduler as its own
+/// processor output: one image item with the pixel tensor as its feature,
+/// the model-specific tensors beside it, the placeholder ranges as inclusive
+/// offsets and the image token id; every choice of an `n > 1` fan-out
+/// carries it (shared bytes).
+#[tokio::test]
+async fn multimodal_inputs_reach_the_scheduler_as_its_processor_output() {
+    use engine_zmq_client::protocol::sglang::multimodal::SglangWireModality;
+    let mut vision = model_info();
+    vision.supports_vision = true;
+    let mut h = harness(vision).await;
+    let pixels: Vec<u8> = (0..8)
+        .flat_map(|i| (i as f32 * 0.5).to_le_bytes())
+        .collect();
+    let grid: Vec<u8> = [1i64, 2, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mut request = generate_request("mm", true, Vec::new());
+    request.tokenized = Some(sg::TokenizedInput {
+        original_text: String::new(),
+        input_ids: vec![1, 7, 7, 7, 2, 3, 4, 5, 6],
+    });
+    request.sampling_params.as_mut().unwrap().n = 2;
+    request.mm_inputs = Some(sg::MultimodalInputs {
+        modalities: vec!["image".to_string()],
+        pixel_values: Some(sg::TensorData {
+            data: pixels.clone().into(),
+            shape: vec![2, 4],
+            dtype: "float32".to_string(),
+        }),
+        model_specific_tensors: [(
+            "image_grid_thw".to_string(),
+            sg::TensorData {
+                data: grid.clone().into(),
+                shape: vec![1, 3],
+                dtype: "int64".to_string(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        im_token_id: Some(7),
+        mm_placeholders: vec![sg::PlaceholderRange {
+            offset: 1,
+            length: 3,
+        }],
+        ..Default::default()
+    });
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let mut rids = Vec::new();
+    for _ in 0..2 {
+        let engine_request = recv_add(&mut h.engine_in).await;
+        let media = engine_request
+            .mm_inputs
+            .as_ref()
+            .expect("the processor output on every choice");
+        assert_eq!(media.im_token_id, Some(7));
+        assert_eq!(media.mm_items.len(), 1);
+        let item = &media.mm_items[0];
+        assert_eq!(item.modality, SglangWireModality::Image);
+        assert_eq!(item.offsets, Some(vec![(1, 3)]));
+        let feature = item.feature.as_ref().expect("the pixel tensor");
+        assert_eq!(
+            (feature.dtype.as_str(), feature.shape.as_slice()),
+            ("float32", &[2, 4][..])
+        );
+        assert_eq!(feature.data.as_ref(), pixels.as_slice());
+        let grid_tensor = &item.model_specific_data["image_grid_thw"];
+        assert_eq!(
+            (grid_tensor.dtype.as_str(), grid_tensor.shape.as_slice()),
+            ("int64", &[1, 3][..])
+        );
+        assert_eq!(grid_tensor.data.as_ref(), grid.as_slice());
+        assert_eq!(engine_request.input_ids, vec![1, 7, 7, 7, 2, 3, 4, 5, 6]);
+        rids.push(engine_request.rid);
+    }
+    rids.sort();
+    assert_eq!(rids, vec!["mm-0".to_string(), "mm-1".to_string()]);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 

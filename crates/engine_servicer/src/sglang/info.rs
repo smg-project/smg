@@ -9,7 +9,7 @@ use tonic::Status;
 use super::{State, HEALTHY};
 use crate::{
     load_report::{rank_ids, Aggregate, RankFigures, RankLoad},
-    proto_json::{boolean, insert_capacity, struct_from_json},
+    proto_json::{insert_capacity, struct_from_json},
 };
 
 /// `HealthCheck`: SERVING only with the engine link up and no drain announced.
@@ -45,11 +45,7 @@ pub(super) fn model_info(state: &State) -> sg::GetModelInfoResponse {
         served_model_name: model.served_model_name.clone(),
         max_context_length,
         vocab_size: model.vocab_size,
-        // Not the model's capability: this servicer carries no media to the
-        // scheduler yet (the wire refuses `mm_inputs`), so it serves none,
-        // whatever the launcher reported; see `server_info`, which says so
-        // where the Router reads a verdict.
-        supports_vision: false,
+        supports_vision: model.supports_vision,
         model_type: model.model_type.clone(),
         eos_token_ids: model
             .eos_token_ids
@@ -73,18 +69,7 @@ pub(super) fn server_info(state: &State) -> sg::GetServerInfoResponse {
     let model = &state.model;
     let ready = state.shared.ready();
     let max_total_num_tokens = state.shared.kv_capacity_tokens();
-    let mut server_args = struct_from_json(&model.server_args_json);
-    // This servicer does not carry media to the scheduler yet (the wire
-    // refuses `mm_inputs`), so it advertises no vision, on purpose and where
-    // the Router reads it: `GetModelInfo.supports_vision` is a proto3 bool
-    // whose `false` the Router drops as no verdict for this runtime, while a
-    // `false` written here is the servicer's own, and the Router refuses
-    // image and video input for the worker at its gate instead of after
-    // fetching it. The label follows the model's capability again once the
-    // wire carries media.
-    server_args
-        .fields
-        .insert("supports_vision".to_string(), boolean(false));
+    let server_args = struct_from_json(&model.server_args_json);
     let mut scheduler_info = struct_from_json(&model.scheduler_info_json);
     if let Some(ready) = ready {
         insert_capacity(

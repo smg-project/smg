@@ -350,7 +350,7 @@ def test_sglang_rust_lane_drops_only_what_the_msgpack_wire_lacks():
         "e2e_test/embeddings/test_basic.py::test_embed[grpc]", params={"setup_backend": "grpc"}
     )
     kept, deselected = hooks._filter_sglang_rust_items([chat, pd, epd, mm, admin, embed])
-    # Admin ops, embeddings and the prefill/decode bootstrap fields ride the
-    # wire (control calls, embedding requests, the scheduler's own slots);
-    # EPD topologies (the encode dispatch) and multimodal payloads do not.
-    assert kept == [chat, pd, admin, embed] and deselected == [epd, mm]
+    # Prefill/decode topologies, multimodal payloads, admin ops and embeddings
+    # ride the wire (the bootstrap slots, the scheduler's processor output,
+    # control calls, embedding requests); the EPD encode dispatch does not.
+    assert kept == [chat, pd, mm, admin, embed] and deselected == [epd]

@@ -1095,19 +1095,30 @@ def _parallel_rank(state: Any, name: str) -> int | None:
 
 
 def request_layouts() -> dict[str, list[str]]:
-    """The field order of the structs an ``ADD`` decodes into and of the
-    sampling params nested in them, from the running release's own classes
-    (``__struct_fields__``: declaration order, base classes first, the tag
-    not counted), by class name."""
+    """The field order of the structs an ``ADD`` decodes into, of the sampling
+    params nested in them and of the multimodal payload's two structs (the
+    processor output in the ``mm_inputs`` slot and its items), from the
+    running release's own classes (``__struct_fields__``: declaration order,
+    base classes first, the tag not counted), by class name."""
     from sglang.srt.managers.io_struct import (
         TokenizedEmbeddingReqInput,
         TokenizedGenerateReqInput,
+    )
+    from sglang.srt.managers.schedule_batch import (
+        MultimodalDataItem,
+        MultimodalProcessorOutput,
     )
     from sglang.srt.sampling.sampling_params import SamplingParams
 
     return {
         cls.__name__: list(cls.__struct_fields__)
-        for cls in (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, SamplingParams)
+        for cls in (
+            TokenizedGenerateReqInput,
+            TokenizedEmbeddingReqInput,
+            SamplingParams,
+            MultimodalProcessorOutput,
+            MultimodalDataItem,
+        )
     }
 
 

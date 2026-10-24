@@ -62,6 +62,19 @@ impl Serialize for ByteSlice<'_> {
     }
 }
 
+/// Write `payload` as a msgpack extension value of type `code` (the
+/// `_ExtStruct` newtype is how `rmp_serde` spells one).
+pub(crate) fn serialize_ext<S>(
+    code: i8,
+    payload: &[u8],
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    MsgpackExtRef((code, ByteSlice(payload))).serialize(serializer)
+}
+
 /// Python ndarray/tensor wire tuple encoded as `(dtype, shape, data)`.
 #[derive(Debug, Clone, PartialEq, Serialize_tuple, Deserialize_tuple)]
 pub struct WireNdArray {
@@ -266,9 +279,7 @@ impl Serialize for WireArrayData {
     {
         match self {
             Self::AuxIndex(index) => serializer.serialize_u64(*index as u64),
-            Self::RawView(bytes) => {
-                MsgpackExtRef((CUSTOM_TYPE_RAW_VIEW, ByteSlice(bytes))).serialize(serializer)
-            }
+            Self::RawView(bytes) => serialize_ext(CUSTOM_TYPE_RAW_VIEW, bytes, serializer),
         }
     }
 }

@@ -52,13 +52,6 @@ pub(crate) fn number(value: i32) -> Value {
     }
 }
 
-/// A boolean as a proto `Value`.
-pub(crate) fn boolean(value: bool) -> Value {
-    Value {
-        kind: Some(Kind::BoolValue(value)),
-    }
-}
-
 /// The handshake's capacity figures a scheduler servicer adds to the
 /// launcher's `scheduler_info` once the engine is linked, under the keys the
 /// Python servicer reports them by.

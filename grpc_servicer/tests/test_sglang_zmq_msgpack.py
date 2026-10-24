@@ -133,6 +133,70 @@ def test_the_ready_response_declares_the_request_structs_field_order():
     assert layouts["TokenizedGenerateReqInput"].index("lora_id") == 21
     assert layouts["TokenizedGenerateReqInput"].index("require_reasoning") == 32
     assert layouts["TokenizedEmbeddingReqInput"].index("dimensions") == 11
+    # The multimodal payload's structs, every slot of which SMG writes.
+    assert layouts["MultimodalProcessorOutput"][:4] == [
+        "mm_items",
+        "input_ids",
+        "padded_input_ids",
+        "im_token_id",
+    ]
+    assert layouts["MultimodalDataItem"] == [
+        "modality",
+        "hash",
+        "pad_value",
+        "offsets",
+        "format",
+        "feature",
+        "precomputed_embeddings",
+        "keep_device_embedding",
+        "model_specific_data",
+    ]
+
+
+# The `ADD` payload the Rust servicer sends for a request carrying one image:
+# rid `mm`, ids `[1, 7, 7, 7, 2]`, default sampling params, and in the
+# `mm_inputs` slot the scheduler's processor output of one item whose feature
+# is `torch.arange(8, dtype=torch.float32).reshape(2, 4) * 0.5`, with
+# `image_grid_thw = [[1, 2, 2]]` (int64), offsets `[(1, 3)]` and
+# `im_token_id = 7`; the same constant is pinned in `protocol/sglang/request.rs`
+# (`the_payload_the_plugins_test_decodes_is_pinned`), so a change there is a
+# change here.
+RUST_MM_REQUEST = (
+    "9eb9546f6b656e697a656447656e6572617465526571496e707574a26d6dc0c0950107070702c094919901c0c091"
+    "92010301c734020000001093920204a7666c6f61743332a3637075000000000000003f0000803f0000c03f0000004000"
+    "0020400000404000006040c0c281ae696d6167655f677269645f746877c72a020000000e93920103a5696e743634a363"
+    "7075010000000000000002000000000000000200000000000000c0c007c0dc001acc"
+    "80c0c0c0cb3ff0000000000000cb3ff0000000000000ffcb0000000000000000cb0000000000000000cb000000000000"
+    "0000cb3ff00000000000000001c0c0c0c0c0c2c3c3c2c0c0c0c0c2ff00c0c2"
+)
+
+
+def test_the_rust_servicers_media_decodes_as_the_schedulers_processor_output():
+    """The slot decodes through the scheduler's own hooks into the object the
+    Python servicer builds for the same request: the tensors bitwise, the
+    offsets, the token id, the modality, and the slots neither side fills at
+    the scheduler's defaults (its hash and pad value are its own to derive)."""
+    torch = pytest.importorskip("torch")
+    from sglang.srt.managers.schedule_batch import (
+        Modality,
+        MultimodalInputFormat,
+        MultimodalProcessorOutput,
+    )
+
+    (req,) = wire.decode_request_frames([wire.REQ_TYPE_ADD, bytes.fromhex(RUST_MM_REQUEST)])
+    assert req.rid == "mm" and list(req.input_ids) == [1, 7, 7, 7, 2]
+    media = req.mm_inputs
+    assert isinstance(media, MultimodalProcessorOutput)
+    assert media.im_token_id == 7 and media.padded_input_ids is None
+    (item,) = media.mm_items
+    assert item.modality is Modality.IMAGE and item.format is MultimodalInputFormat.NORMAL
+    assert item.hash is None and item.pad_value is None
+    assert item.offsets == [(1, 3)]
+    expected = torch.arange(8, dtype=torch.float32).reshape(2, 4) * 0.5
+    assert item.feature.dtype is torch.float32 and item.feature.device.type == "cpu"
+    assert torch.equal(item.feature, expected)
+    grid = item.model_specific_data["image_grid_thw"]
+    assert grid.dtype is torch.int64 and torch.equal(grid, torch.tensor([[1, 2, 2]]))
 
 
 def test_abort_frame_fans_out_one_abort_per_rid():
