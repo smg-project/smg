@@ -1,7 +1,8 @@
 """Hidden states on the Python SGLang servicer (#1083 parity): the request's
 flag is forwarded under the engine's launch-time cap, the scheduler's
-cumulative rows (the prefill's block of prompt rows, then one row per decoded
-token) become the per-step delta of a stream and the whole list on completion,
+cumulative rows (the prefill's block of prompt rows, then one row per
+generated token fed back; the last sampled token has none) become the
+per-step delta of a stream and the whole list on completion,
 and the proto fields carry them the way the Rust path fills the same fields.
 Reuses the request-manager stand-ins of the selected-logprob tests: only the
 engine imports are replaced, no manager behaviour is mocked."""
@@ -61,30 +62,31 @@ def _step(*, cumulative, tokens, finished):
 def test_a_stream_gets_each_steps_new_rows_and_the_whole_list_on_completion(manager_mod, servicer):
     async def exercise():
         manager, state = _hidden_manager_and_state(manager_mod, stream=True)
-        # Step 1: the scheduler ships the prefill block and the first token's row.
+        # Step 1: the prefill's tick ships its block (one row per prompt
+        # position); the first token is sampled from the last row.
         await manager._handle_batch_output(
-            _step(cumulative=[PREFILL_BLOCK, FIRST_ROW], tokens=[10], finished=False)
+            _step(cumulative=[PREFILL_BLOCK], tokens=[10], finished=False)
         )
         first = await state.out_queue.get()
-        # Step 2: the cumulative list grew by one row; the request finished.
+        # Step 2: the decode step fed the first token back (its row); the
+        # request finished on the second token, which is never fed back.
         await manager._handle_batch_output(
-            _step(cumulative=[PREFILL_BLOCK, FIRST_ROW, SECOND_ROW], tokens=[11], finished=True)
+            _step(cumulative=[PREFILL_BLOCK, FIRST_ROW], tokens=[11], finished=True)
         )
         last = await state.out_queue.get()
 
-        assert first["hidden_states"] == [*PREFILL_BLOCK, FIRST_ROW]
+        assert first["hidden_states"] == PREFILL_BLOCK
         assert "all_hidden_states" not in first
-        assert last["hidden_states"] == [SECOND_ROW]
-        assert last["all_hidden_states"] == [*PREFILL_BLOCK, FIRST_ROW, SECOND_ROW]
+        assert last["hidden_states"] == [FIRST_ROW]
+        assert last["all_hidden_states"] == [*PREFILL_BLOCK, FIRST_ROW]
 
         chunk = servicer._create_chunk_response("score", first).chunk
-        assert list(chunk.hidden_states) == [0.5, 1.5, 2.5, 3.5, 4.5, 5.5]
+        assert list(chunk.hidden_states) == [0.5, 1.5, 2.5, 3.5]
         complete = servicer._create_completion_response("score", last).complete
         assert [(h.position, h.layer, list(h.values)) for h in complete.all_hidden_states] == [
             (0, -1, [0.5, 1.5]),
             (1, -1, [2.5, 3.5]),
             (2, -1, [4.5, 5.5]),
-            (3, -1, [6.5, 7.5]),
         ]
 
     asyncio.run(exercise())
@@ -94,18 +96,18 @@ def test_a_non_streaming_request_gets_the_whole_list_once_at_the_end(manager_mod
     async def exercise():
         manager, state = _hidden_manager_and_state(manager_mod, stream=False)
         await manager._handle_batch_output(
-            _step(cumulative=[PREFILL_BLOCK, FIRST_ROW], tokens=[10], finished=False)
+            _step(cumulative=[PREFILL_BLOCK], tokens=[10], finished=False)
         )
         first = await state.out_queue.get()
         await manager._handle_batch_output(
-            _step(cumulative=[PREFILL_BLOCK, FIRST_ROW, SECOND_ROW], tokens=[11], finished=True)
+            _step(cumulative=[PREFILL_BLOCK, FIRST_ROW], tokens=[11], finished=True)
         )
         last = await state.out_queue.get()
         assert "hidden_states" not in first and "all_hidden_states" not in first
         assert "hidden_states" not in last
-        assert last["all_hidden_states"] == [*PREFILL_BLOCK, FIRST_ROW, SECOND_ROW]
+        assert last["all_hidden_states"] == [*PREFILL_BLOCK, FIRST_ROW]
         complete = servicer._create_completion_response("score", last).complete
-        assert len(complete.all_hidden_states) == 4
+        assert len(complete.all_hidden_states) == 3
         assert list(servicer._create_chunk_response("score", last).chunk.hidden_states) == []
 
     asyncio.run(exercise())

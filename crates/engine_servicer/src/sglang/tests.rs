@@ -1375,9 +1375,11 @@ async fn prompt_logprobs_and_reasoning_tokens_pass_through() {
 }
 
 /// Hidden states ride the appended slim column as the scheduler's cumulative
-/// rows: each chunk carries the rows new in its tick, flattened; the
-/// `Complete` one entry per token position (the prompt's positions first, the
-/// final layer); a request that did not ask carries none.
+/// rows: each chunk carries the rows new in its tick, flattened (the prefill
+/// block on the first, a decode step's row on each later one); the `Complete`
+/// one entry per position a forward ran on (the prompt's positions, then each
+/// generated token fed back; the last sampled token has none), the final
+/// layer; a request that did not ask carries none.
 #[tokio::test]
 async fn hidden_states_pass_through_as_tick_rows_and_positions() {
     let mut model = model_info();
@@ -1390,23 +1392,19 @@ async fn hidden_states_pass_through_as_tick_rows_and_positions() {
     let mut stream = h.client.generate(request).await.unwrap().into_inner();
     let sent = recv_add(&mut h.engine_in).await;
     assert!(sent.return_hidden_states);
-    // The prefill's three prompt rows and the first token's row, hidden size 2.
-    let mut rows = vec![
-        vec![0.5, -0.5],
-        vec![0.25, 0.75],
-        vec![1.0, 0.0],
-        vec![-1.0, 2.0],
-    ];
+    // The prefill block: one row per prompt position (three), hidden size 2.
+    // The first token is sampled from the last of them, so the prefill's tick
+    // carries no row of its own.
+    let mut rows = vec![vec![0.5, -0.5], vec![0.25, 0.75], vec![1.0, 0.0]];
     let first = BatchTokenIDSlimOutput {
         output_hidden_states: vec![Some(rows.clone())],
         ..batch("h1", vec![10], 1, None, None)
     };
     send(&mut h.engine_out, &first).await;
     let chunk1 = chunk(stream.message().bounded().await.unwrap().unwrap());
-    assert_eq!(
-        chunk1.hidden_states,
-        vec![0.5, -0.5, 0.25, 0.75, 1.0, 0.0, -1.0, 2.0]
-    );
+    assert_eq!(chunk1.hidden_states, vec![0.5, -0.5, 0.25, 0.75, 1.0, 0.0]);
+    // The decode step that samples the second token fed the first one back:
+    // its row, and the request's last (prompt + generated - 1 = 4).
     rows.push(vec![3.0, 4.0]);
     let last = BatchTokenIDSlimOutput {
         output_hidden_states: vec![Some(rows.clone())],

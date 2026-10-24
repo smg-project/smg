@@ -253,9 +253,10 @@ fn flat_hidden_states(rows: &[Vec<f32>]) -> Vec<f32> {
     rows.iter().flatten().copied().collect()
 }
 
-/// `GenerateComplete.all_hidden_states`: one entry per token position (the
-/// prompt's positions first, as the engine returns them, then the generated
-/// tokens), the final hidden layer, the position its index.
+/// `GenerateComplete.all_hidden_states`: one entry per position a forward
+/// ran on (the prompt's positions first, as the engine returns them, then
+/// each generated token fed back for the next; the last sampled token has no
+/// row), the final hidden layer, the position its index.
 fn all_hidden_states(rows: &[Vec<f32>]) -> Vec<sglang_proto::HiddenStates> {
     rows.iter()
         .enumerate()

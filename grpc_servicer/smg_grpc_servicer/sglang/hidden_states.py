@@ -4,8 +4,9 @@ engine's ``"last"`` mode is not asked for), the engine's launch-time cap is kept
 the way its own frontend keeps it, and the scheduler's cumulative rows become
 the proto's per-step delta (``GenerateStreamChunk.hidden_states``, the step's
 new rows flattened) and the whole list on completion
-(``GenerateComplete.all_hidden_states``, one ``HiddenStates`` per token
-position, ``layer = -1`` for the final hidden layer). The Rust path maps the
+(``GenerateComplete.all_hidden_states``, one ``HiddenStates`` per position a
+forward ran on: the prompt's, then each generated token fed back, the last
+sampled token having none; ``layer = -1`` for the final hidden layer). The Rust path maps the
 same wire the same way (``crates/engine_zmq_adapter/src/sglang.rs``); the two
 agree row for row.
 """
@@ -48,10 +49,13 @@ def refuse_hidden_states_above_server_mode() -> None:
 
 def hidden_state_rows(value: Any) -> list[list[float]]:
     """The scheduler's hidden states of one request as rows of floats, one per
-    token position. The engine appends the prefill's block as ONE element (a
-    list of rows, one per prompt position) and then one row per decoded token
+    position a forward ran on. The engine appends the prefill's block as ONE
+    element (a list of rows, one per prompt position) and then one row per
+    decode step, the generated token it fed back
     (``batch_result_processor._append_prefill_hidden_states`` /
-    ``_append_decode_hidden_states``); its ``"last"`` mode keeps a single row.
+    ``_append_decode_hidden_states``): the last sampled token is never fed
+    back, so a request has prompt + generated - 1 rows; the engine's
+    ``"last"`` mode keeps a single row.
     Every element may be a list or a tensor-like with ``tolist``; None or an
     empty value is no row."""
     if value is None:
@@ -94,9 +98,10 @@ def flat_hidden_states(rows: Iterable[Sequence[float]] | None) -> list[float]:
 
 
 def all_hidden_states_proto(rows: Iterable[Sequence[float]] | None) -> list[Any]:
-    """``GenerateComplete.all_hidden_states``: one entry per token position (the
-    prompt's positions first, as the engine returns them, then the generated
-    tokens), the final layer, the position as its index."""
+    """``GenerateComplete.all_hidden_states``: one entry per position a forward
+    ran on (the prompt's positions first, as the engine returns them, then
+    each generated token fed back; the last sampled token has none), the
+    final layer, the position as its index."""
     from smg_grpc_proto import sglang_scheduler_pb2
 
     if not rows:
