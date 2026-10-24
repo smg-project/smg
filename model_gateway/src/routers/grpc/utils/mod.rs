@@ -7,6 +7,7 @@ pub(crate) mod message_utils;
 mod metrics;
 mod parsers;
 mod pd_bootstrap;
+mod prepared_tools;
 pub(crate) mod stream_failure;
 pub(crate) mod tonic_ext;
 

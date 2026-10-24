@@ -15,7 +15,7 @@ use axum::{
 use bytes::Bytes;
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
-    chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
+    chat_template::{ChatTemplateContentFormat, ChatTemplateParams, PreparedTools},
     stop::StopSequenceDecoderBuilder,
     traits::{Encoding, PromptEncoding, RendererCapabilities, Tokenizer},
     StopSequenceDecoder,
@@ -35,6 +35,7 @@ use tool_parser::types::ToolCallItem;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
+use super::prepared_tools::prepare_tools;
 use crate::{
     middleware::ReportedRefusal,
     observability::log_throttle::KeyedLogThrottle,
@@ -840,18 +841,9 @@ pub(crate) fn process_chat_messages_with_placeholders(
             process_tool_call_arguments(&mut transformed_messages);
         }
 
-        // Convert tools to JSON values for template processing
-        let tools_json: Option<Vec<Value>> = request
-            .tools
-            .as_ref()
-            .map(|tools| {
-                tools
-                    .iter()
-                    .map(serde_json::to_value)
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()
-            .map_err(|e| format!("Failed to serialize tools: {e}"))?;
+        // The tools as the template reads them, prepared once per distinct
+        // tool set and shared by every request that carries the same tools.
+        let prepared_tools = request.tools.as_deref().map(prepare_tools).transpose()?;
 
         let combined_template_kwargs = build_chat_template_kwargs(request);
 
@@ -876,7 +868,8 @@ pub(crate) fn process_chat_messages_with_placeholders(
         let params = ChatTemplateParams {
             add_generation_prompt: !native_continuation,
             continue_final_message: native_continuation,
-            tools: tools_json.as_deref(),
+            tools: prepared_tools.as_deref().map(PreparedTools::tools),
+            prepared_tools: prepared_tools.as_deref(),
             template_kwargs: final_template_kwargs,
             // The tokenizer applies the toggle under the template's own key.
             thinking: resolve_template_thinking(request),
