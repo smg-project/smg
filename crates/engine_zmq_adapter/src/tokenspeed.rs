@@ -831,13 +831,16 @@ mod tests {
         });
         assert_eq!(mapped.top_k, 40);
 
-        // A near-zero temperature collapses to greedy on the wire.
+        // A near-zero temperature collapses to greedy on the wire, with the
+        // seed pinned to 0 as the engine pins it (a request seed included).
         let mapped = translate_sampling_tokenspeed(tokenspeed_proto::SamplingParams {
             temperature: Some(0.0),
+            sampling_seed: Some(1_234),
             ..Default::default()
         });
         assert_eq!(mapped.temperature, 1.0);
         assert_eq!(mapped.top_k, 1);
+        assert_eq!(mapped.seed, Some(0));
 
         // Empty stop_token_ids ride as None (the normalized encoding).
         let mapped = translate_sampling_tokenspeed(tokenspeed_proto::SamplingParams::default());

@@ -140,7 +140,8 @@ impl SamplingParams {
     /// would otherwise compute, and mark the struct normalized so the engine
     /// skips re-derivation on decode. Mirrors the Python semantics exactly:
     /// empty `stop_token_ids` collapses to `None`, a near-zero temperature
-    /// collapses to greedy, and `top_k = -1` becomes [`TOP_K_DISABLED`].
+    /// collapses to greedy, a greedy request pins its seed to 0, and
+    /// `top_k = -1` becomes [`TOP_K_DISABLED`].
     pub fn normalize(&mut self) {
         if self.is_normalized {
             return;
@@ -151,6 +152,15 @@ impl SamplingParams {
         if self.temperature < SAMPLING_EPS {
             self.temperature = 1.0;
             self.top_k = 1;
+        }
+        if self.top_k == 1 {
+            // Greedy sampling (from the temperature or asked for directly)
+            // ignores randomness by definition, so the engine pins the seed:
+            // its sampler breaks exact-tie logits with the request's random
+            // stream, and the seed it would otherwise derive from the request
+            // id makes two identical greedy requests disagree on tied tokens.
+            // A sender that skips the engine's derivation has to pin it too.
+            self.seed = Some(0);
         }
         if self.top_k == -1 {
             self.top_k = TOP_K_DISABLED;
@@ -227,14 +237,38 @@ mod tests {
         assert_eq!(params.top_k, TOP_K_DISABLED);
         assert!(params.is_normalized);
 
-        // Near-zero temperature collapses to greedy.
+        // Near-zero temperature collapses to greedy, and greedy pins the seed
+        // (the engine's rule: ties are broken by the request's random stream).
         let mut params = SamplingParams {
             temperature: 0.0,
+            seed: Some(7),
             ..SamplingParams::default()
         };
         params.normalize();
         assert_eq!(params.temperature, 1.0);
         assert_eq!(params.top_k, 1);
+        assert_eq!(params.seed, Some(0));
+
+        // An explicit top_k = 1 is greedy too and pins the seed the same way.
+        let mut params = SamplingParams {
+            top_k: 1,
+            ..SamplingParams::default()
+        };
+        params.normalize();
+        assert_eq!(params.seed, Some(0));
+
+        // A sampling request keeps its seed (or its None, which the engine
+        // derives from the request id).
+        let mut params = SamplingParams {
+            temperature: 0.7,
+            seed: Some(7),
+            ..SamplingParams::default()
+        };
+        params.normalize();
+        assert_eq!(params.seed, Some(7));
+        let mut params = SamplingParams::default();
+        params.normalize();
+        assert_eq!(params.seed, None);
 
         // Empty stop_token_ids collapses to None.
         let mut params = SamplingParams {
