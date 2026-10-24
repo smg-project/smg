@@ -125,9 +125,19 @@ pub struct ParserRegistry {
     pool: Arc<RwLock<HashMap<String, PooledParser>>>,
     /// Model pattern to parser name mappings
     model_mapping: Arc<RwLock<HashMap<String, String>>>,
+    /// What [`Self::resolve_model_to_parser`] answered per model id, so a
+    /// model is matched against the patterns once, not on every request
+    /// (the match lowercases every pattern: 86 allocations per request on a
+    /// tool-heavy chat, 2026-10-21). Cleared when a mapping is added.
+    resolved: Arc<RwLock<HashMap<String, Option<String>>>>,
     /// Default parser name
     default_parser: Arc<RwLock<String>>,
 }
+
+/// How many model ids [`ParserRegistry::resolve_model_to_parser`] remembers
+/// before it starts over: a fleet serves a few models; a stream of unknown
+/// ids (a probe per request id) must not grow the map without bound.
+const RESOLVED_MODELS_KEPT: usize = 1024;
 
 impl ParserRegistry {
     /// Create a new empty registry.
@@ -136,6 +146,7 @@ impl ParserRegistry {
             entries: Arc::new(RwLock::new(HashMap::new())),
             pool: Arc::new(RwLock::new(HashMap::new())),
             model_mapping: Arc::new(RwLock::new(HashMap::new())),
+            resolved: Arc::new(RwLock::new(HashMap::new())),
             default_parser: Arc::new(RwLock::new("passthrough".to_string())),
         }
     }
@@ -284,6 +295,7 @@ impl ParserRegistry {
     pub fn map_model(&self, model: impl Into<String>, parser: impl Into<String>) {
         let mut mapping = self.model_mapping.write();
         mapping.insert(model.into(), parser.into());
+        self.resolved.write().clear();
     }
 
     /// Get a pooled parser by exact name.
@@ -417,6 +429,22 @@ impl ParserRegistry {
     /// Resolve model name to parser name via model mappings.
     /// Returns None if no mapping matches (caller decides fallback).
     pub fn resolve_model_to_parser(&self, model: &str) -> Option<String> {
+        if let Some(answer) = self.resolved.read().get(model) {
+            return answer.clone();
+        }
+        let answer = self.match_model_to_parser(model);
+        let mut resolved = self.resolved.write();
+        if resolved.len() >= RESOLVED_MODELS_KEPT {
+            resolved.clear();
+        }
+        resolved.insert(model.to_string(), answer.clone());
+        answer
+    }
+
+    /// [`Self::resolve_model_to_parser`]'s match against the mappings: the
+    /// exact model id, else the longest case-insensitive `prefix*` pattern
+    /// the id contains.
+    fn match_model_to_parser(&self, model: &str) -> Option<String> {
         let mapping = self.model_mapping.read();
         // Try exact match
         if let Some(parser_name) = mapping.get(model) {
