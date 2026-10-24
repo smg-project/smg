@@ -83,7 +83,7 @@ jobs:
       servicer_unit_tests: false
       gpu_vendor: amd
       container_image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
-      container_options: --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN --env SPT_NOENV=1 --env SMG_SGLANG_PD_PROOF=1 --env SMG_SGLANG_PD_REGISTRATION_FAILFAST=1 --env E2E_SGLANG_TRANSFER_BACKEND=mooncake
+      container_options: --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband --ulimit memlock=-1:-1 --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN --env SPT_NOENV=1 --env SMG_SGLANG_PD_PROOF=1 --env SMG_SGLANG_PD_REGISTRATION_FAILFAST=1 --env E2E_SGLANG_TRANSFER_BACKEND=mooncake
     secrets: inherit
   finish:
     if: always()

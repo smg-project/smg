@@ -261,5 +261,12 @@
     "patched_conn_sha256": "d7acf1a5db40de6d74bc9c5f28a5e20cabcb519dc65f9063de761aec6727aa10",
     "required_result": 0,
     "new_GPU_acceptance": false
+  },
+  "explicit_memlock_dependency": {
+    "container_option": "--ulimit memlock=-1:-1",
+    "scope": "Remove the observed8MiB inherited locked-memory limit for the same RDMA protocol; not a GPU peer-memory/DMA-BUF or transfer proof",
+    "observed_pytest_RLIMIT_MEMLOCK_bytes": 8388608,
+    "RDMA_EINVAL22_resolved": false,
+    "new_GPU_acceptance": false
   }
 }
