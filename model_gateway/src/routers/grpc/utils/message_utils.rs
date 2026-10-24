@@ -3,7 +3,6 @@
 //!
 //! Parallel to `chat_utils.rs` but works with `CreateMessageRequest` / `InputMessage`
 //! instead of `ChatCompletionRequest` / `ChatMessage`.
-#![allow(dead_code)] // wired in follow-up PR (pipeline factory)
 
 use std::{borrow::Cow, collections::HashMap, fmt::Display, sync::Arc};
 
