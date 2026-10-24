@@ -21,22 +21,30 @@
 
 use std::{sync::Arc, time::Duration};
 
-use common::grpc_harness::{
-    grpc_router, grpc_router_config, grpc_test_context_with_tokenizer, grpc_worker,
-    serve_canned_worker, serve_engine, Canned,
+use common::{
+    grpc_harness::{
+        grpc_router, grpc_router_config, grpc_test_context_with_tokenizer, grpc_worker,
+        serve_canned_worker, serve_engine, Canned,
+    },
+    mock_mcp_server::MockMCPServer,
+    scripted_tokenizer::ScriptedTokenizer,
+    scripted_worker::ScriptedWorker,
 };
 use llm_tokenizer::{
     traits::{MediaHandling, RendererCapabilities, Tokenizer},
     MockTokenizer,
 };
 use openai_protocol::{
+    chat::ChatCompletionRequest,
     classify::ClassifyRequest,
     completion::CompletionRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     model_card::ModelCard,
+    responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
+use serde_json::{json, Value};
 use smg::{
     config::RouterConfig,
     middleware::TenantRequestMeta,
@@ -44,7 +52,11 @@ use smg::{
     tenant::TenantKey,
     worker::{RuntimeType, Worker, WorkerType},
 };
-use smg_grpc_client::vllm_proto as proto;
+use smg_grpc_client::{
+    tokenspeed_scheduler::tokenspeed_proto::token_speed_scheduler_server::TokenSpeedSchedulerServer,
+    vllm_proto as proto,
+};
+use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
@@ -68,17 +80,39 @@ async fn start_mock_grpc_worker(output_tokens: u32) -> u16 {
     .await
 }
 
+/// The tenant's budget of a test, the one the policy's other limit never
+/// decides: `Tokens` is the tokens per minute under 1000 requests per
+/// minute, `Requests` the requests per minute under a token budget nothing
+/// here can spend.
+#[derive(Clone, Copy)]
+enum Budget {
+    Tokens(u32),
+    Requests(u32),
+}
+
+impl Budget {
+    fn policy_yaml(self) -> String {
+        let (tokens_per_minute, requests_per_minute) = match self {
+            Budget::Tokens(tokens) => (tokens, 1000),
+            Budget::Requests(requests) => (1_000_000, requests),
+        };
+        format!(
+            "default_policy:\n  tokens_per_minute: {tokens_per_minute}\n  \
+             requests_per_minute: {requests_per_minute}\n"
+        )
+    }
+}
+
 /// The router configuration of these tests: tenant rate limiting against a
-/// tiny in-memory budget when `tokens_per_minute` is given (1000 requests
-/// per minute, so the token budget alone decides), none otherwise. Returns
-/// the config and its backing tempdir (must outlive the call -- the YAML is
-/// read synchronously during router construction, but keeping it bound for
-/// the caller's whole test avoids any doubt about timing).
+/// tiny in-memory [`Budget`] when one is given, none otherwise. Returns the
+/// config and its backing tempdir (must outlive the call -- the YAML is read
+/// synchronously during router construction, but keeping it bound for the
+/// caller's whole test avoids any doubt about timing).
 #[expect(
     clippy::unwrap_used,
     reason = "test helper - panicking on failure is intentional"
 )]
-fn router_config(tokens_per_minute: Option<u32>) -> (RouterConfig, Option<tempfile::TempDir>) {
+fn router_config(budget: Option<Budget>) -> (RouterConfig, Option<tempfile::TempDir>) {
     let mut builder = grpc_router_config()
         .regular_mode(vec![])
         .random_policy()
@@ -88,14 +122,10 @@ fn router_config(tokens_per_minute: Option<u32>) -> (RouterConfig, Option<tempfi
         .max_concurrent_requests(64)
         .queue_timeout_secs(60);
 
-    let dir = if let Some(tpm) = tokens_per_minute {
+    let dir = if let Some(budget) = budget {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rate_limit.yaml");
-        std::fs::write(
-            &path,
-            format!("default_policy:\n  tokens_per_minute: {tpm}\n  requests_per_minute: 1000\n"),
-        )
-        .unwrap();
+        std::fs::write(&path, budget.policy_yaml()).unwrap();
         builder = builder
             .tenant_rate_limit_enabled(true)
             .tenant_rate_limit_config(Some(path.to_str().unwrap().to_string()));
@@ -109,12 +139,12 @@ fn router_config(tokens_per_minute: Option<u32>) -> (RouterConfig, Option<tempfi
 /// A real gRPC router over `worker`, serving `model` with `tokenizer`, under
 /// [`router_config`].
 async fn build_router_over(
-    tokens_per_minute: Option<u32>,
+    budget: Option<Budget>,
     worker: Arc<dyn Worker>,
     model: &str,
     tokenizer: Arc<dyn Tokenizer>,
 ) -> (Box<dyn RouterTrait>, Option<tempfile::TempDir>) {
-    let (config, dir) = router_config(tokens_per_minute);
+    let (config, dir) = router_config(budget);
     let app_context = grpc_test_context_with_tokenizer(config, model, tokenizer).await;
     (grpc_router(&app_context, vec![worker]).await, dir)
 }
@@ -122,7 +152,7 @@ async fn build_router_over(
 /// Build a real gRPC router with tenant rate limiting configured against a
 /// tiny in-memory budget, and a real mock gRPC worker registered.
 async fn build_router(
-    tokens_per_minute: Option<u32>,
+    budget: Option<Budget>,
     grpc_port: u16,
 ) -> (Box<dyn RouterTrait>, Option<tempfile::TempDir>) {
     let worker = grpc_worker(
@@ -133,7 +163,7 @@ async fn build_router(
     )
     .build();
     build_router_over(
-        tokens_per_minute,
+        budget,
         Arc::new(worker),
         MODEL,
         Arc::new(MockTokenizer::new()),
@@ -141,14 +171,20 @@ async fn build_router(
     .await
 }
 
+fn generate_request() -> GenerateRequest {
+    generate_request_for(MODEL, PROMPT_TEXT)
+}
+
+/// A generate request of `text` to `model`; the reserve estimate is the
+/// number of `text`'s words the mock vocabulary knows.
 #[expect(
     clippy::unwrap_used,
     reason = "test helper - panicking on failure is intentional"
 )]
-fn generate_request() -> GenerateRequest {
-    serde_json::from_value(serde_json::json!({
-        "model": MODEL,
-        "text": PROMPT_TEXT,
+fn generate_request_for(model: &str, text: &str) -> GenerateRequest {
+    serde_json::from_value(json!({
+        "model": model,
+        "text": text,
         "stream": false,
     }))
     .unwrap()
@@ -180,7 +216,7 @@ fn fresh_tenant() -> TenantRequestMeta {
 #[tokio::test]
 async fn denial_returns_429_with_retry_after() {
     let grpc_port = start_mock_grpc_worker(4).await;
-    let (router, _dir) = build_router(Some(6), grpc_port).await;
+    let (router, _dir) = build_router(Some(Budget::Tokens(6)), grpc_port).await;
     let request = generate_request();
 
     let first = router
@@ -210,7 +246,7 @@ async fn denial_returns_429_with_retry_after() {
 async fn impossible_request_denies_without_retry_after() {
     let grpc_port = start_mock_grpc_worker(4).await;
     // 1 token/minute can never admit this request's 2-token reserve, ever.
-    let (router, _dir) = build_router(Some(1), grpc_port).await;
+    let (router, _dir) = build_router(Some(Budget::Tokens(1)), grpc_port).await;
 
     let request = generate_request();
     let response = router
@@ -240,7 +276,7 @@ async fn impossible_request_denies_without_retry_after() {
 async fn non_streaming_settle_uses_real_usage_not_just_the_estimate() {
     const OUTPUT_TOKENS: u32 = 4;
     let grpc_port = start_mock_grpc_worker(OUTPUT_TOKENS).await;
-    let (router, _dir) = build_router(Some(6), grpc_port).await;
+    let (router, _dir) = build_router(Some(Budget::Tokens(6)), grpc_port).await;
 
     let request = generate_request();
 
@@ -303,7 +339,7 @@ async fn feature_disabled_is_a_no_op() {
 #[tokio::test]
 async fn completion_denial_reaches_the_client() {
     let grpc_port = start_mock_grpc_worker(4).await;
-    let (router, _dir) = build_router(Some(1), grpc_port).await;
+    let (router, _dir) = build_router(Some(Budget::Tokens(1)), grpc_port).await;
 
     let request = completion_request();
     let response = router
@@ -439,7 +475,7 @@ impl proto::vllm_engine_server::VllmEngine for EmbedEngine {
 
 /// A router over one [`EmbedEngine`] serving [`MODEL`] on the vLLM wire.
 async fn build_embed_router(
-    tokens_per_minute: Option<u32>,
+    budget: Option<Budget>,
     engine: EmbedEngine,
 ) -> (Box<dyn RouterTrait>, Option<tempfile::TempDir>) {
     let port = serve_engine(proto::vllm_engine_server::VllmEngineServer::new(engine)).await;
@@ -451,7 +487,7 @@ async fn build_embed_router(
     )
     .build();
     build_router_over(
-        tokens_per_minute,
+        budget,
         Arc::new(worker),
         MODEL,
         Arc::new(MockTokenizer::new()),
@@ -494,7 +530,7 @@ const ASR_MODEL: &str = "qwen3-asr-tenant-rl-test-model";
 /// caller's prompt: "Hello world" = the 2-token reserve estimate again. The
 /// canned answer's ids (100 up) are given words, so the transcript is text.
 async fn build_transcription_router(
-    tokens_per_minute: Option<u32>,
+    budget: Option<Budget>,
     output_tokens: u32,
 ) -> (Box<dyn RouterTrait>, Option<tempfile::TempDir>) {
     let port = serve_canned_worker(Canned {
@@ -521,13 +557,7 @@ async fn build_transcription_router(
             ("heard", 102),
             ("here", 103),
         ]);
-    build_router_over(
-        tokens_per_minute,
-        Arc::new(worker),
-        ASR_MODEL,
-        Arc::new(tokenizer),
-    )
-    .await
+    build_router_over(budget, Arc::new(worker), ASR_MODEL, Arc::new(tokenizer)).await
 }
 
 /// The status of `response` and, for the failure message, its body.
@@ -562,7 +592,7 @@ async fn transcribe(router: &dyn RouterTrait) -> axum::response::Response {
 #[tokio::test]
 async fn embeddings_denial_reaches_the_client() {
     let (router, _dir) = build_embed_router(
-        Some(1),
+        Some(Budget::Tokens(1)),
         EmbedEngine {
             prompt_tokens: 1,
             fail: false,
@@ -584,7 +614,7 @@ async fn embeddings_denial_reaches_the_client() {
 #[tokio::test]
 async fn classify_denial_reaches_the_client() {
     let (router, _dir) = build_embed_router(
-        Some(1),
+        Some(Budget::Tokens(1)),
         EmbedEngine {
             prompt_tokens: 1,
             fail: false,
@@ -605,7 +635,7 @@ async fn classify_denial_reaches_the_client() {
 /// The same through the transcription endpoint.
 #[tokio::test]
 async fn transcription_denial_reaches_the_client() {
-    let (router, _dir) = build_transcription_router(Some(1), 4).await;
+    let (router, _dir) = build_transcription_router(Some(Budget::Tokens(1)), 4).await;
 
     let response = transcribe(router.as_ref()).await;
     assert_eq!(
@@ -623,7 +653,7 @@ async fn transcription_denial_reaches_the_client() {
 #[tokio::test]
 async fn embeddings_settle_the_engine_prompt_count() {
     let (router, _dir) = build_embed_router(
-        Some(6),
+        Some(Budget::Tokens(6)),
         EmbedEngine {
             prompt_tokens: 5,
             fail: false,
@@ -650,7 +680,7 @@ async fn embeddings_settle_the_engine_prompt_count() {
 #[tokio::test]
 async fn classify_settles_the_engine_prompt_count() {
     let (router, _dir) = build_embed_router(
-        Some(6),
+        Some(Budget::Tokens(6)),
         EmbedEngine {
             prompt_tokens: 5,
             fail: false,
@@ -679,7 +709,7 @@ async fn classify_settles_the_engine_prompt_count() {
 /// and refuses the second.
 #[tokio::test]
 async fn transcription_settles_the_engine_counts() {
-    let (router, _dir) = build_transcription_router(Some(6), 4).await;
+    let (router, _dir) = build_transcription_router(Some(Budget::Tokens(6)), 4).await;
 
     let (status, body) = status_and_body(transcribe(router.as_ref()).await).await;
     assert_eq!(status, http::StatusCode::OK, "{body}");
@@ -699,7 +729,7 @@ async fn transcription_settles_the_engine_counts() {
 #[tokio::test]
 async fn a_failed_embeddings_request_keeps_its_reservation_debit() {
     let (router, _dir) = build_embed_router(
-        Some(3),
+        Some(Budget::Tokens(3)),
         EmbedEngine {
             prompt_tokens: 1,
             fail: true,
@@ -724,4 +754,309 @@ async fn a_failed_embeddings_request_keeps_its_reservation_debit() {
         http::StatusCode::TOO_MANY_REQUESTS,
         "a failed request's reservation keeps its debit"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The Responses iterations take the same reservation, one per iteration.
+// ---------------------------------------------------------------------------
+
+/// A chat request of [`PROMPT_TEXT`]: through the mock tokenizer's
+/// `role: content` template, the 2-token reserve estimate again.
+#[expect(
+    clippy::unwrap_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+fn chat_request() -> ChatCompletionRequest {
+    serde_json::from_value(json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": PROMPT_TEXT}],
+        "stream": false,
+    }))
+    .unwrap()
+}
+
+/// A Responses request of [`PROMPT_TEXT`] to `model` with `tools` (a mock
+/// MCP server's, or none), streamed or not, never stored.
+#[expect(
+    clippy::unwrap_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+fn responses_request(model: &str, stream: bool, tools: Value) -> ResponsesRequest {
+    serde_json::from_value(json!({
+        "model": model,
+        "input": PROMPT_TEXT,
+        "stream": stream,
+        "store": false,
+        "max_output_tokens": 16,
+        "tools": tools,
+    }))
+    .unwrap()
+}
+
+/// One Responses request through `router`, within the test's patience: its
+/// status and body (the final object, or the whole SSE stream).
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+async fn responses(
+    router: &dyn RouterTrait,
+    request: ResponsesRequest,
+    model: &str,
+) -> (http::StatusCode, String) {
+    let response = timeout(
+        Duration::from_secs(30),
+        router.route_responses(None, &fresh_tenant(), request, model),
+    )
+    .await
+    .expect("the Responses request answers");
+    status_and_body(response).await
+}
+
+/// The model of the tool-loop cases, served by the scripted engine.
+const TOOL_LOOP_MODEL: &str = "tenant-rl-tool-loop-model";
+
+/// The answer the scripted engine's tokens decode to once a tool result is
+/// in the prompt: the loop's second and last iteration.
+const FINAL_ANSWER: &str = "Final answer after tools";
+
+/// Twelve words the mock vocabulary knows: a generate request of this text
+/// reserves a 12-token estimate.
+const PROBE_TEXT: &str = "Hello world Hello world Hello world Hello world Hello world Hello world";
+
+/// A router over a scripted engine whose every generation is `output_tokens`
+/// tokens decoded as one `brave_web_search` call (and as [`FINAL_ANSWER`]
+/// once a tool result is in the prompt), with a mock MCP server that
+/// executes the call: a Responses request with the server's tools runs two
+/// iterations, the call and then the answer. The engine reports
+/// `prompt_tokens: 1` and `completion_tokens: output_tokens` per generation.
+/// The caller stops the MCP server.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+async fn build_tool_loop_router(
+    budget: Option<Budget>,
+    output_tokens: u32,
+) -> (
+    Box<dyn RouterTrait>,
+    Option<tempfile::TempDir>,
+    MockMCPServer,
+) {
+    let port = serve_engine(TokenSpeedSchedulerServer::new(ScriptedWorker {
+        output_tokens,
+        finish_reasons: vec!["stop"],
+        generation: Default::default(),
+        requests: Default::default(),
+    }))
+    .await;
+    let worker = grpc_worker(
+        port,
+        WorkerType::Regular,
+        RuntimeType::TokenSpeed,
+        ModelCard::new(TOOL_LOOP_MODEL),
+    )
+    .build();
+    let tokenizer = ScriptedTokenizer::new(
+        "<tool_call>\n{\"name\":\"brave_web_search\",\"arguments\":{\"query\":\"Hello world\"}}\n</tool_call>",
+    )
+    .with_final_answer(1, FINAL_ANSWER);
+    let (mut config, dir) = router_config(budget);
+    config.tool_call_parser = Some("qwen".into());
+    let app_context =
+        grpc_test_context_with_tokenizer(config, TOOL_LOOP_MODEL, Arc::new(tokenizer)).await;
+    let router = grpc_router(&app_context, vec![Arc::new(worker)]).await;
+    let mcp = MockMCPServer::start()
+        .await
+        .expect("the mock MCP server starts");
+    (router, dir, mcp)
+}
+
+/// The tools of a Responses request that runs the tool loop over `mcp`.
+fn mcp_tools(mcp: &MockMCPServer) -> Value {
+    json!([{
+        "type": "mcp",
+        "server_label": "test-tools",
+        "server_url": mcp.url(),
+        "require_approval": "never",
+    }])
+}
+
+/// A Responses request counts against the tenant's request budget as a chat
+/// request does: two chat requests spend a budget of two, and the third
+/// request is refused whether it is a chat or a Responses request, streamed
+/// or not (the denial, a finite wait, carries `Retry-After`).
+#[tokio::test]
+async fn responses_take_the_tenant_request_budget_as_chat_does() {
+    for stream in [false, true] {
+        let grpc_port = start_mock_grpc_worker(4).await;
+        let (router, _dir) = build_router(Some(Budget::Requests(2)), grpc_port).await;
+
+        for _ in 0..2 {
+            let response = router
+                .route_chat(None, &fresh_tenant(), chat_request(), MODEL)
+                .await;
+            assert_eq!(response.status(), http::StatusCode::OK);
+        }
+
+        let request = responses_request(MODEL, stream, json!([]));
+        let response = timeout(
+            Duration::from_secs(30),
+            router.route_responses(None, &fresh_tenant(), request, MODEL),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("stream={stream}: the Responses request answers"));
+        assert_eq!(
+            response.status(),
+            http::StatusCode::TOO_MANY_REQUESTS,
+            "stream={stream}: the third request of a budget of two is refused on the Responses path too"
+        );
+        assert!(
+            response.headers().get(http::header::RETRY_AFTER).is_some(),
+            "stream={stream}: a finite-wait denial carries Retry-After"
+        );
+    }
+}
+
+/// A Responses tool loop takes one reservation per iteration: its two
+/// iterations (the call, then the answer) spend a request budget of two, so
+/// the tenant's next request is refused; a budget of three has one left.
+#[tokio::test]
+async fn a_responses_tool_loop_reserves_once_per_iteration() {
+    for stream in [false, true] {
+        for (budget, probe_status) in [
+            (2, http::StatusCode::TOO_MANY_REQUESTS),
+            (3, http::StatusCode::OK),
+        ] {
+            let (router, _dir, mut mcp) =
+                build_tool_loop_router(Some(Budget::Requests(budget)), 2).await;
+            let (status, body) = responses(
+                router.as_ref(),
+                responses_request(TOOL_LOOP_MODEL, stream, mcp_tools(&mcp)),
+                TOOL_LOOP_MODEL,
+            )
+            .await;
+            mcp.stop().await;
+            assert_eq!(
+                status,
+                http::StatusCode::OK,
+                "stream={stream} budget={budget}: {body}"
+            );
+            assert!(
+                body.contains(FINAL_ANSWER),
+                "stream={stream} budget={budget}: the loop ran to its answer: {body}"
+            );
+
+            let probe = router
+                .route_generate(
+                    None,
+                    &fresh_tenant(),
+                    generate_request_for(TOOL_LOOP_MODEL, PROMPT_TEXT),
+                    TOOL_LOOP_MODEL,
+                )
+                .await;
+            assert_eq!(
+                probe.status(),
+                probe_status,
+                "stream={stream} budget={budget}: the loop's two iterations took two of the budget's requests"
+            );
+        }
+    }
+}
+
+/// Each iteration of a Responses tool loop settles its reservation with the
+/// engine's counts, as a chat request does. The engine reports 1 prompt and
+/// 20 completion tokens per generation: the loop's two iterations spend 42
+/// of a token budget of 44 and the 12-token probe is refused; one generation
+/// alone leaves 23 and the probe fits. Had an iteration reserved nothing, or
+/// settled its 2-token estimate instead of the engine's 21, the probe would
+/// fit after the loop as well.
+#[tokio::test]
+async fn a_responses_tool_loop_settles_each_iteration_with_the_engine_counts() {
+    for stream in [false, true] {
+        let (router, _dir, mut mcp) = build_tool_loop_router(Some(Budget::Tokens(44)), 20).await;
+        let (status, body) = responses(
+            router.as_ref(),
+            responses_request(TOOL_LOOP_MODEL, stream, mcp_tools(&mcp)),
+            TOOL_LOOP_MODEL,
+        )
+        .await;
+        mcp.stop().await;
+        assert_eq!(status, http::StatusCode::OK, "stream={stream}: {body}");
+        assert!(
+            body.contains(FINAL_ANSWER),
+            "stream={stream}: the loop ran to its answer: {body}"
+        );
+
+        let probe = router
+            .route_generate(
+                None,
+                &fresh_tenant(),
+                generate_request_for(TOOL_LOOP_MODEL, PROBE_TEXT),
+                TOOL_LOOP_MODEL,
+            )
+            .await;
+        assert_eq!(
+            probe.status(),
+            http::StatusCode::TOO_MANY_REQUESTS,
+            "stream={stream}: 2 of 44 tokens are left once both iterations settled 1 + 20"
+        );
+    }
+
+    // The control: one settled generation leaves 23 of 44, the probe fits.
+    let (router, _dir, mut mcp) = build_tool_loop_router(Some(Budget::Tokens(44)), 20).await;
+    mcp.stop().await;
+    let first = router
+        .route_generate(
+            None,
+            &fresh_tenant(),
+            generate_request_for(TOOL_LOOP_MODEL, PROMPT_TEXT),
+            TOOL_LOOP_MODEL,
+        )
+        .await;
+    assert_eq!(first.status(), http::StatusCode::OK);
+    let probe = router
+        .route_generate(
+            None,
+            &fresh_tenant(),
+            generate_request_for(TOOL_LOOP_MODEL, PROBE_TEXT),
+            TOOL_LOOP_MODEL,
+        )
+        .await;
+    assert_eq!(
+        probe.status(),
+        http::StatusCode::OK,
+        "23 of 44 tokens are left after one settled generation"
+    );
+}
+
+/// Without a tenant policy a Responses request is served as before, the tool
+/// loop included.
+#[tokio::test]
+async fn responses_without_a_tenant_policy_are_unchanged() {
+    for stream in [false, true] {
+        let grpc_port = start_mock_grpc_worker(4).await;
+        let (router, _dir) = build_router(None, grpc_port).await;
+        let (status, body) = responses(
+            router.as_ref(),
+            responses_request(MODEL, stream, json!([])),
+            MODEL,
+        )
+        .await;
+        assert_eq!(status, http::StatusCode::OK, "stream={stream}: {body}");
+
+        let (router, _dir, mut mcp) = build_tool_loop_router(None, 2).await;
+        let (status, body) = responses(
+            router.as_ref(),
+            responses_request(TOOL_LOOP_MODEL, stream, mcp_tools(&mcp)),
+            TOOL_LOOP_MODEL,
+        )
+        .await;
+        mcp.stop().await;
+        assert_eq!(status, http::StatusCode::OK, "stream={stream}: {body}");
+        assert!(
+            body.contains(FINAL_ANSWER),
+            "stream={stream}: the loop ran to its answer: {body}"
+        );
+    }
 }

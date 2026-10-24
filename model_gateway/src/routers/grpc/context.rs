@@ -79,10 +79,10 @@ pub(crate) struct RequestInput {
     /// Captured at construction so it survives the request drop at build.
     pub streaming: bool,
     pub tenant_request_meta: Option<TenantRequestMeta>,
-    /// Holds the reservation outcome for the whole request (settle on
-    /// success, denial check, streaming handoff). `None` for endpoints that
-    /// haven't opted into tenant rate limiting yet (Responses, embeddings,
-    /// classify).
+    /// Holds the reservation outcome for the whole logical request (settle on
+    /// success, denial check, streaming handoff): one per typed request, one
+    /// per iteration of a Responses request. `None` only where no caller set
+    /// one (a unit test's context).
     pub rate_limit_cell: Option<Arc<RateLimitCell>>,
 }
 

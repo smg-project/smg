@@ -486,13 +486,17 @@ impl HarmonyStreamingProcessor {
     /// - Other tools → `function_call.*` events
     ///
     /// When no MCP context is provided, all tool calls are treated as function calls.
+    ///
+    /// Answers the iteration's result with the engine's counts the stream
+    /// brought: the usage the result carries is built from them, and the
+    /// caller settles the iteration's reservation with them as they are.
     pub async fn process_responses_iteration_stream(
         execution_result: context::ExecutionResult,
         emitter: &mut ResponseStreamEventEmitter,
         tx: &SseSender,
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
-    ) -> Result<ResponsesIterationResult, String> {
+    ) -> Result<(ResponsesIterationResult, TokenCounts), String> {
         match execution_result {
             context::ExecutionResult::Single { stream } => {
                 debug!("Processing Responses API single stream mode");
@@ -535,7 +539,7 @@ impl HarmonyStreamingProcessor {
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
-    ) -> Result<ResponsesIterationResult, String> {
+    ) -> Result<(ResponsesIterationResult, TokenCounts), String> {
         // Phase 1: Drain prefill stream. The client's prompt-side usage is the
         // prefill side's prefix-cache hit: the decode side counts the KV it was
         // handed as cached, so its responses are restamped with the prefill
@@ -561,7 +565,7 @@ impl HarmonyStreamingProcessor {
         tx: &SseSender,
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
-    ) -> Result<ResponsesIterationResult, String> {
+    ) -> Result<(ResponsesIterationResult, TokenCounts), String> {
         let mut decode = ResponsesDecode::new()?;
         while let Some(result) = decode_stream.next().await {
             decode.frames += 1;
@@ -583,7 +587,8 @@ impl HarmonyStreamingProcessor {
         // Mark stream as completed successfully to prevent abort on drop
         decode_stream.mark_completed();
 
-        Ok(decode.result(emitter))
+        let counts = decode.counts();
+        Ok((decode.result(emitter), counts))
     }
 }
 
@@ -992,21 +997,23 @@ impl ResponsesDecode {
         self.close_calls(emitter, tx, session).await;
     }
 
+    /// The engine's counts the stream brought (the terminal frame's counters).
+    fn counts(&self) -> TokenCounts {
+        TokenCounts {
+            prompt: self.prompt_tokens,
+            completion: self.completion_tokens,
+            cached: self.cached_tokens,
+            reasoning: self.engine_reasoning_tokens,
+            spec_accepted: self.spec_accepted,
+            spec_drafted: self.spec_drafted,
+        }
+    }
+
     /// The iteration's result: the calls found, with the analysis and the text so far, or the
     /// completed response; either with the iteration's usage, as the non-streamed iteration
     /// builds it.
     fn result(self, emitter: &ResponseStreamEventEmitter) -> ResponsesIterationResult {
-        let usage = iteration_usage(
-            TokenCounts {
-                prompt: self.prompt_tokens,
-                completion: self.completion_tokens,
-                cached: self.cached_tokens,
-                reasoning: self.engine_reasoning_tokens,
-                spec_accepted: self.spec_accepted,
-                spec_drafted: self.spec_drafted,
-            },
-            self.reasoning_token_count,
-        );
+        let usage = iteration_usage(self.counts(), self.reasoning_token_count);
         if let Some(tool_calls) = self.tool_calls.filter(|calls| !calls.is_empty()) {
             return ResponsesIterationResult::ToolCallsFound {
                 tool_calls,

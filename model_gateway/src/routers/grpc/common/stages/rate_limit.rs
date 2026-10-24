@@ -3,9 +3,12 @@
 //!
 //! Ingress runs once per logical request (retries re-dispatch the retained
 //! plan without re-running this stage), so the reservation is naturally
-//! single-shot. [`RateLimitCell`] is threaded in from the router and holds
-//! the outcome for the paths that resolve it later: non-streaming settle,
-//! the streaming handoff, and the router's close-if-unsettled.
+//! single-shot. [`RateLimitCell`] is threaded in from the router (one per
+//! typed request) or from the pipeline's Responses entry points (one per
+//! iteration of a Responses request: every chat turn of a tool loop is a
+//! generation of its own) and holds the outcome for the paths that resolve
+//! it later: the settle of a buffered answer, the streaming handoff, and the
+//! close of a reservation a failed answer never settled.
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -21,7 +24,7 @@ use super::PipelineStage;
 use crate::{
     rate_limit::{
         rejection_response, RateLimitManager, Reservation, ReservationAttachment, ReserveRequest,
-        SharedReservationHandle,
+        SharedReservationHandle, UsageSettlement,
     },
     routers::grpc::context::{stage_output, RequestContext},
 };
@@ -95,6 +98,30 @@ impl RateLimitCell {
             _ => None,
         }
     }
+
+    /// Settle a buffered success's reservation with the engine's counts, if
+    /// this logical request reserved one. No-op if nothing was reserved
+    /// (feature disabled) or the request was never admitted (preparation
+    /// failed before the reserve stage ran). Idempotent: `settle_success` is
+    /// a no-op once the handle is resolved.
+    pub(crate) async fn settle(&self, usage: UsageSettlement) {
+        if let Some(RateLimitOutcome::Admitted(handle)) = self.peek() {
+            handle.settle_success(usage).await;
+        }
+    }
+
+    /// Close a reservation that a failed answer never got the chance to
+    /// settle (a preparation failure repeated across every attempt, retries
+    /// exhausted, a non-retryable dispatch failure, a stream that broke):
+    /// the reserved debit is kept. No-op if nothing was reserved. Safe to
+    /// call alongside a success path's own settle or streaming attachment:
+    /// `close_reserved_only` is CAS-guarded, the first resolution of a
+    /// handle wins.
+    pub(crate) async fn close_unsettled(&self) {
+        if let Some(RateLimitOutcome::Admitted(handle)) = self.peek() {
+            handle.close_reserved_only().await;
+        }
+    }
 }
 
 impl Drop for RateLimitCell {
@@ -115,8 +142,8 @@ impl Drop for RateLimitCell {
 
 /// Reserve tenant rate-limit budget once per logical request. No-ops when
 /// the feature is disabled (`manager: None`) or the caller set no cell
-/// (`ctx.input.rate_limit_cell: None` -- the Responses iterations today;
-/// every typed route sets one).
+/// (`ctx.input.rate_limit_cell: None`; every typed route and every
+/// Responses iteration sets one, so that is a unit test's context).
 pub(crate) struct RateLimitReserveStage {
     manager: Option<Arc<RateLimitManager>>,
 }
@@ -192,7 +219,9 @@ mod cell_drop_tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::rate_limit::{RateLimitBackend, ReserveOutcome, UsageSettlement};
+    use crate::rate_limit::{
+        test_support::RecordingBackend, RateLimitBackend, ReserveOutcome, UsageSettlement,
+    };
 
     #[derive(Default)]
     struct CountingBackend {
@@ -280,5 +309,60 @@ mod cell_drop_tests {
         tokio::task::yield_now().await;
 
         assert_eq!(backend.abandon_calls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    /// The cell of an admitted reservation, on a backend that records what
+    /// the cell does with it.
+    fn recorded_cell() -> (RateLimitCell, Arc<RecordingBackend>) {
+        let (handle, backend) = RecordingBackend::reservation();
+        let cell = RateLimitCell::new();
+        cell.set(RateLimitOutcome::Admitted(handle));
+        (cell, backend)
+    }
+
+    /// `settle` resolves an admitted reservation with the counts it is
+    /// given, once: a second settle and the cell's own `Drop` change
+    /// nothing. An empty cell (feature off) settles nothing.
+    #[tokio::test]
+    async fn settle_resolves_an_admitted_reservation_once() {
+        let (cell, backend) = recorded_cell();
+        let usage = UsageSettlement {
+            actual_input_tokens: 7,
+            completion_tokens: 3,
+            cached_input_tokens: 0,
+            reasoning_tokens: 0,
+        };
+
+        cell.settle(usage).await;
+        cell.settle(usage).await;
+        drop(cell);
+        tokio::task::yield_now().await;
+
+        assert_eq!(backend.settlements(), vec![usage]);
+        assert_eq!(backend.closes(), 0);
+
+        RateLimitCell::new().settle(usage).await;
+    }
+
+    /// `close_unsettled` closes an admitted reservation with its debit kept,
+    /// once, and leaves nothing for `Drop` to abandon; a cell that was never
+    /// admitted has nothing to close.
+    #[tokio::test]
+    async fn close_unsettled_closes_an_admitted_reservation_once() {
+        let (cell, backend) = recorded_cell();
+
+        cell.close_unsettled().await;
+        cell.close_unsettled().await;
+        cell.settle(UsageSettlement::default()).await;
+        drop(cell);
+        tokio::task::yield_now().await;
+
+        assert_eq!(backend.closes(), 1);
+        assert!(backend.settlements().is_empty());
+
+        let denied = RateLimitCell::new();
+        denied.set(RateLimitOutcome::Denied);
+        denied.close_unsettled().await;
+        RateLimitCell::new().close_unsettled().await;
     }
 }
