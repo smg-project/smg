@@ -572,8 +572,9 @@ mod discovery_ownership_tests {
 
     /// Through the HTTP API a worker can neither be handed to discovery nor
     /// edited behind its provider's back: a label under the reserved prefix
-    /// is a 400 on POST, PUT and PATCH; a PUT or PATCH of a discovered worker
-    /// is a 409 naming its provider; a DELETE of one is taken and removes it.
+    /// is a 400 on POST, PUT and PATCH; a PUT, or a PATCH of labels, of a
+    /// discovered worker is a 409 naming its provider; a PATCH of what no
+    /// provider publishes is applied, and a DELETE is taken and removes it.
     #[tokio::test]
     async fn the_worker_api_stays_out_of_discovery_ownership() {
         let context = create_test_context(RouterConfig {
@@ -649,7 +650,7 @@ mod discovery_ownership_tests {
                 "PUT",
                 json!({"url": "http://discovered:30000", "priority": 7}),
             ),
-            ("PATCH", json!({"priority": 7})),
+            ("PATCH", json!({"labels": {"env": "prod"}})),
         ] {
             let (status, body) = send(&app, method, &discovered, Some(body)).await;
             assert_eq!(status, StatusCode::CONFLICT, "{method}: {body}");
@@ -660,6 +661,24 @@ mod discovery_ownership_tests {
                 "{method}: {body}"
             );
         }
+
+        let (status, body) = send(&app, "PATCH", &discovered, Some(json!({"priority": 7}))).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "PATCH of the priority: {body}"
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while context
+                .worker_registry
+                .get_by_url("http://discovered:30000")
+                .is_none_or(|worker| worker.priority() != 7)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("an accepted PATCH of a discovered worker's priority applies it");
 
         let (status, body) = send(&app, "DELETE", &discovered, None).await;
         assert_eq!(status, StatusCode::ACCEPTED, "DELETE: {body}");

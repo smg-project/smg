@@ -14,6 +14,7 @@ use super::create_worker::{
     warn_on_conflicting_parser_overrides, DP_WIDTH_LABELS,
 };
 use crate::{
+    service_discovery::DISCOVERY_PROVIDER_LABEL,
     worker::{
         overload::OverloadThresholds, service::MAX_WORKER_LABELS, worker::merge_labels,
         BasicWorker, BasicWorkerBuilder, RuntimeType, Worker,
@@ -113,7 +114,25 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                     // A window set here is the worker's only window, as at
                     // registration (see `create_worker::merge_labels`).
                     let updated_labels = match request.labels {
-                        Some(ref new_labels) => merge_labels(existing, new_labels),
+                        Some(ref new_labels) => {
+                            // The admin check refused labels for a discovered
+                            // worker when the request arrived, but a provider
+                            // can register the URL between then and this job
+                            // (its upsert queued first): held again against
+                            // the worker the update would change.
+                            if let Some(provider) = existing.get(DISCOVERY_PROVIDER_LABEL) {
+                                return Err(WorkflowError::StepFailed {
+                                    step_id: StepId::new("update_worker_properties"),
+                                    message: format!(
+                                        "worker {} is owned by the '{provider}' discovery provider \
+                                         since this update was accepted; its labels come from its \
+                                         discovery source",
+                                        worker.url()
+                                    ),
+                                });
+                            }
+                            merge_labels(existing, new_labels)
+                        }
                         None => existing.clone(),
                     };
                     // A `constrained_decoding` label sent in the update must name a
@@ -1510,6 +1529,46 @@ mod tests {
                 .unwrap(),
             StepResult::Success
         );
+    }
+
+    /// A worker a provider registered after its update was accepted keeps
+    /// its labels: the step refuses them against the worker it would change.
+    /// An update of what no provider publishes still applies to it.
+    #[tokio::test]
+    async fn an_update_of_labels_is_refused_for_a_worker_discovered_since_it_was_accepted() {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w:8000")
+                .status(WorkerStatus::Ready)
+                .label(DISCOVERY_PROVIDER_LABEL, "kubernetes")
+                .build(),
+        );
+        let app_ctx = make_app_context(std::slice::from_ref(&worker));
+        let mut labels = make_context(
+            Arc::clone(&app_ctx),
+            Arc::clone(&worker),
+            HashMap::from([("env".to_string(), "prod".to_string())]),
+        );
+        let err = UpdateWorkerPropertiesStep
+            .execute(&mut labels)
+            .await
+            .expect_err("labels for a discovered worker");
+        assert!(
+            err.to_string()
+                .contains("owned by the 'kubernetes' discovery provider"),
+            "{err}"
+        );
+        let mut priority = make_context(Arc::clone(&app_ctx), Arc::clone(&worker), HashMap::new());
+        priority.data.config.labels = None;
+        priority.data.config.priority = Some(3);
+        assert_eq!(
+            UpdateWorkerPropertiesStep
+                .execute(&mut priority)
+                .await
+                .unwrap(),
+            StepResult::Success
+        );
+        let updated = priority.data.updated_workers.expect("the updated worker");
+        assert_eq!(updated[0].priority(), 3);
     }
 
     #[tokio::test]

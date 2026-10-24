@@ -213,11 +213,13 @@ fn validate_labels(labels: &HashMap<String, String>) -> Result<(), WorkerService
     Ok(())
 }
 
-/// A worker a discovery provider registered is changed at its discovery
-/// source, which is authoritative: an edit made here would hold only until
-/// the provider next registers the worker, and disagree with the source until
-/// then. A DELETE stays allowed; the provider adds the worker back while it
-/// still publishes it.
+/// A worker a discovery provider registered takes its spec and labels from
+/// its discovery source, which is authoritative: a PUT, or a PATCH of its
+/// labels, would disagree with the source until the source next changes the
+/// worker and overwrites the edit. What no provider publishes (priority,
+/// cost, API key, health checks) is still a PATCH's to change, and a DELETE
+/// stays allowed; the provider adds the worker back while it still
+/// publishes it.
 fn refuse_discovery_owned(worker: &dyn Worker) -> Result<(), WorkerServiceError> {
     match worker.metadata().spec.labels.get(DISCOVERY_PROVIDER_LABEL) {
         Some(provider) => Err(WorkerServiceError::DiscoveryOwned {
@@ -241,7 +243,8 @@ pub enum WorkerServiceError {
     Conflict { url: String, worker_id: WorkerId },
     /// A create for this URL is still in flight (concurrent POST)
     CreateInProgress { url: String, worker_id: WorkerId },
-    /// A discovery provider owns the worker (PUT/PATCH of a discovered worker)
+    /// A discovery provider owns the worker (a PUT, or a PATCH of labels, of a
+    /// discovered worker)
     DiscoveryOwned { url: String, provider: String },
     /// The spec targets a provider whose router this build does not carry
     ProviderNotCompiled {
@@ -315,8 +318,8 @@ impl std::fmt::Display for WorkerServiceError {
             Self::DiscoveryOwned { url, provider } => write!(
                 f,
                 "Worker '{url}' is owned by the '{provider}' discovery provider. \
-                PUT and PATCH are not supported for discovered workers. \
-                Change it at its discovery source instead."
+                Its spec and labels come from its discovery source: change them there, \
+                not with a PUT or a PATCH of labels."
             ),
             Self::ProviderNotCompiled {
                 url,
@@ -757,8 +760,10 @@ impl WorkerService {
                 worker_id: worker_id_raw.to_string(),
             })?;
         let worker = self.worker_registry.get_by_url(&url);
-        // Before the body is read, as for a PUT.
-        if let Some(worker) = &worker {
+        // Only a PATCH of labels edits what a provider publishes. Decided
+        // before the body is validated, as for a PUT, so reserved labels sent
+        // to a discovered worker are told where to make the change.
+        if let (Some(_), Some(worker)) = (&update.labels, &worker) {
             refuse_discovery_owned(worker.as_ref())?;
         }
         validate_update(&update)?;
@@ -1221,12 +1226,14 @@ mod tests {
         ));
     }
 
-    /// A discovered worker is changed at its discovery source: a PUT or PATCH
-    /// of it is a 409 naming its provider, whatever the body — the worker's
-    /// own spec sent back included — while a DELETE is taken (the provider
-    /// adds it back while it still publishes it).
+    /// A discovered worker's spec and labels are changed at its discovery
+    /// source: a PUT of it is a 409 naming its provider, whatever the body —
+    /// the worker's own spec sent back included — and so is a PATCH that
+    /// carries labels, reserved ones included. A PATCH of what no provider
+    /// publishes, and a DELETE, are taken (the provider adds a deleted
+    /// worker back while it still publishes it).
     #[tokio::test]
-    async fn put_and_patch_of_a_discovered_worker_are_refused_naming_its_provider() {
+    async fn put_and_a_label_patch_of_a_discovered_worker_are_refused_naming_its_provider() {
         let registry = Arc::new(WorkerRegistry::new());
         let url = "grpc://10.0.0.10:8000";
         let worker = BasicWorkerBuilder::new(url)
@@ -1255,8 +1262,8 @@ mod tests {
             );
         }
         for body in [
-            json!({"priority": 5}),
             json!({"labels": {"env": "prod"}}),
+            json!({"priority": 5, "labels": {"env": "prod"}}),
             json!({"labels": {DISCOVERY_PROVIDER_LABEL: "file"}}),
         ] {
             let patch: WorkerUpdateRequest = serde_json::from_value(body).expect("an update");
@@ -1265,6 +1272,22 @@ mod tests {
                     .update_worker(id.as_str(), patch)
                     .await
                     .expect_err("PATCH"),
+            );
+        }
+        for body in [
+            json!({"priority": 5}),
+            json!({"cost": 2.0}),
+            json!({"api_key": "rotated"}),
+            json!({"health": {"timeout_secs": 9}}),
+        ] {
+            let patch: WorkerUpdateRequest =
+                serde_json::from_value(body.clone()).expect("an update");
+            assert!(
+                matches!(
+                    service.update_worker(id.as_str(), patch).await,
+                    Err(WorkerServiceError::QueueNotInitialized)
+                ),
+                "{body} reaches the queue"
             );
         }
         assert!(matches!(
