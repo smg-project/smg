@@ -43,6 +43,30 @@ def readonly_mount(path):
     require(any(row[4] == str(path) and "ro" in row[5].split(",") for row in matches), "required read-only bind mount: " + str(path))
 
 
+def prefix_leaves(prefix):
+    leaves, pending = set(), [prefix]
+    while pending:
+        with os.scandir(pending.pop()) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(path)
+                else:
+                    leaves.add(path.relative_to(prefix).as_posix())
+    return leaves
+
+
+def verify_prefix(prefix, declared):
+    require(prefix_leaves(prefix) == set(declared), "private prefix leaf set changed")
+    for name, item in declared.items():
+        path = prefix / name
+        require(path.resolve(strict=True).is_relative_to(prefix), "prefix symlink escaped")
+        if item["kind"] == "symlink":
+            require(path.is_symlink() and os.readlink(path) == item["target"], "prefix symlink changed")
+        else:
+            require(path.is_file() and not path.is_symlink() and identity(path) == {key: item[key] for key in ("bytes", "sha256")}, "prefix bytes changed: " + name)
+
+
 def record_files(root, record):
     rows = list(csv.reader(io.StringIO(record)))
     require(len({row[0] for row in rows}) == len(rows), "duplicate RECORD entry")
@@ -67,13 +91,7 @@ def verify(stage):
     readonly_mount(wheel)
     readonly_mount(prefix)
     require(identity(wheel) == {key: config["wheel"][key] for key in ("bytes", "sha256")}, "wheel differs")
-    for name, item in config["private_prefix"].items():
-        path = prefix / name
-        require(path.resolve(strict=True).is_relative_to(prefix), "prefix symlink escaped")
-        if item["kind"] == "symlink":
-            require(path.is_symlink() and os.readlink(path) == item["target"], "prefix symlink changed")
-        else:
-            require(path.is_file() and not path.is_symlink() and identity(path) == {key: item[key] for key in ("bytes", "sha256")}, "prefix bytes changed: " + name)
+    verify_prefix(prefix, config["private_prefix"])
     for item in config["base_files"]:
         require(identity(Path(item["path"])) == {key: item[key] for key in ("bytes", "sha256")}, "image installation changed")
     curl = [block for block in Path("/var/lib/dpkg/status").read_text().split("\n\n") if "Package: libcurl4\n" in block + "\n"]

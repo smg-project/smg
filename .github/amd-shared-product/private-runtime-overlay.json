@@ -14,7 +14,7 @@
   },
   "observers": {
     ".github/amd-nixl-environment/nixl_environment/private_wheel.py": {
-      "sha256": "47d1ead516a596bf530e814b143dbebce0a7317938a01c1d56d1d8063ce268a5"
+      "sha256": "45fafc5c7a2ee049c5e26fc03b0eb734b1907c0c8587c559803c7d8871bfd2d8"
     },
     ".github/amd-nixl-environment/nixl_environment/private-wheel.json": {
       "sha256": "096bbb75e08bfe73024862f4e920b57535cb8ec37e314bf973515fd32915a4f3"
