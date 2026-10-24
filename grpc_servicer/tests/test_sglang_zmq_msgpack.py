@@ -118,6 +118,42 @@ def test_request_decodes_the_bootstrap_triple_from_its_slots():
     assert req.require_reasoning is False and req.lora_id is None
 
 
+def test_request_decodes_the_routed_dp_rank_from_its_slot():
+    """A request the Router pins to a data-parallel rank carries the rank in
+    the scheduler's own ``routed_dp_rank`` slot (the extended prefix, the
+    defaulted slots around it at their defaults): the plugin decodes it as
+    SGLang's tokenizer manager would have set it from the API's pin."""
+    fields = list(TokenizedGenerateReqInput.__struct_fields__)
+    request = _positional_request(rid="dp") + [
+        False,  # return_sampling_mask
+        False,  # return_flat_raw_top_logprobs
+        False,  # return_hidden_states
+        False,  # return_routed_experts
+        0,  # routed_experts_start_len
+        False,  # return_indexer_topk
+        None,  # session_id
+        None,  # session_params
+        None,  # lora_id
+        None,  # custom_logit_processor
+        None,  # positional_embed_overrides
+        None,  # bootstrap_host
+        None,  # bootstrap_port
+        None,  # bootstrap_room
+        None,  # bootstrap_pair_key
+        None,  # decode_tp_size
+        1,  # routed_dp_rank
+        None,  # disagg_prefill_dp_rank
+        None,  # routing_key
+        False,  # require_reasoning
+    ]
+    assert len(request) == fields.index("require_reasoning") + 2  # the tag at element 0
+    assert request[fields.index("routed_dp_rank") + 1] == 1
+    (req,) = wire.decode_request_frames([wire.REQ_TYPE_ADD, msgspec.msgpack.encode(request)])
+    assert req.routed_dp_rank == 1
+    assert (req.bootstrap_host, req.bootstrap_port, req.bootstrap_room) == (None, None, None)
+    assert req.disagg_prefill_dp_rank is None and req.require_reasoning is False
+
+
 def test_the_ready_response_declares_the_request_structs_field_order():
     """The field order SMG checks the prefixes it encodes against: the
     installed release's own declaration, which pins where the prefixes end."""

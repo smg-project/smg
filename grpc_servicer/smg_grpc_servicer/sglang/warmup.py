@@ -50,10 +50,10 @@ def warmup_inputs(server_args: Any, facts: Mapping[str, Any]) -> WarmupInputs | 
     a prefill or decode leg the engine's stand-in bootstrap host for the
     requests to carry. ``None`` for a model that generates nothing and for the
     EPD roles (``--language-only`` / ``--encoder-only``), whose requests need
-    multimodal inputs a warm-up does not carry. The plan is one rank's: the
-    servicer routes this engine's requests to the least-loaded scheduler rank
-    and reads no rank off a request, so under data parallelism each prefill
-    shape reaches one rank (a WARNING line says so)."""
+    multimodal inputs a warm-up does not carry. The plan is one rank's: its
+    requests carry no data-parallel pin, so the servicer places each on the
+    least-loaded scheduler rank and under data parallelism each prefill shape
+    reaches one rank (a WARNING line says so)."""
     if not facts.get("is_generation", True):
         return None
     args = EngineConfigView(server_args).server_args
@@ -68,9 +68,10 @@ def warmup_inputs(server_args: Any, facts: Mapping[str, Any]) -> WarmupInputs | 
         lone_leg_bootstrap = FAKE_BOOTSTRAP_HOST
     if args.scheduler_count > 1:
         logger.warning(
-            "The engine runs %d scheduler ranks and the servicer routes a warm-up request to the "
-            "least-loaded one: each prefill shape of the planned warm-up reaches one rank; the "
-            "other ranks pay its first-time cost at their first request of that shape",
+            "The engine runs %d scheduler ranks and a warm-up request carries no rank pin, so the "
+            "servicer places it on the least-loaded one: each prefill shape of the planned warm-up "
+            "reaches one rank; the other ranks pay its first-time cost at their first request of "
+            "that shape",
             args.scheduler_count,
         )
     step = args.chunked_prefill_size or args.max_prefill_tokens or DEFAULT_STEP_TOKENS

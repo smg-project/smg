@@ -401,7 +401,7 @@ impl ProtoGenerateRequest {
     pub fn set_data_parallel_rank(&mut self, rank: i32) {
         match self {
             Self::Vllm(req) => req.data_parallel_rank = Some(rank),
-            Self::Sglang(req) => req.data_parallel_rank = rank,
+            Self::Sglang(req) => req.data_parallel_rank = Some(rank),
             Self::TokenSpeed(req) => req.data_parallel_rank = Some(rank),
             Self::Trtllm(_) | Self::Mlx(_) => {}
         }
