@@ -2,105 +2,14 @@
   "ready": false,
   "run_budget_admitted": false,
   "artifacts_pinned": false,
-  "artifacts": [
-    {
-      "name": "python-client-types",
-      "id": 12551135032,
-      "bytes": 34374,
-      "sha256": "83176cb20e66a0270eb99d95f2f53f23f42102d934c0fd08d5e698271ff72032",
-      "expires_at": "2026-10-25T06:19:22Z",
-      "files": {
-        "_generated.py": {
-          "bytes": 187180,
-          "sha256": "3cdb0a2f55707dab8e61795e44a518f40444e81b1a16719129026d8622c932ba"
-        }
-      }
-    },
-    {
-      "name": "epd-grpc-proto-wheel",
-      "id": 12550941279,
-      "bytes": 102412,
-      "sha256": "482b0f99810bb7408b62e203f6352b54b511f7aa256bd9b7596f8278c6dd565f",
-      "expires_at": "2026-10-25T06:19:44Z",
-      "files": {
-        "smg_grpc_proto-0.4.29-py3-none-any.whl": {
-          "bytes": 106259,
-          "sha256": "54b378c260d34da696df188a767cc4576e152a3a6eff8ca5303612ddbb146943"
-        }
-      }
-    },
-    {
-      "name": "smg-wheel",
-      "id": 12550796028,
-      "bytes": 52452845,
-      "sha256": "69c20b9dc51280b129a68284b92c7af443b8d6d375b79dd00e55029e06a9781f",
-      "expires_at": "2026-10-25T06:19:17Z",
-      "files": {
-        "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl": {
-          "bytes": 52592825,
-          "sha256": "991e96bd30ccac01b78b9fd2b20423f7482b7921512b73904bd7219e4996138b"
-        }
-      }
-    },
-    {
-      "name": "epd-grpc-servicer-wheel",
-      "id": 12550628216,
-      "bytes": 379288,
-      "sha256": "2d36565a753bb545a8af87d48c25bf6b381b09bf167c3fc826b1c61b6ee26ea2",
-      "expires_at": "2026-10-25T06:19:46Z",
-      "files": {
-        "smg_grpc_servicer-0.14.2-py3-none-any.whl": {
-          "bytes": 386799,
-          "sha256": "e7339352a1ee80940fa92b24da5b6a34b6616601687140c1c8c9beadfe97f394"
-        }
-      }
-    },
-    {
-      "name": "wasm-test-fixtures",
-      "id": 12550249898,
-      "bytes": 56596,
-      "sha256": "4bdde331894cadc6f32546dc477454dfe0f5d2fcd2bb1a4b5fd400a64468cc53",
-      "expires_at": "2026-10-25T06:19:23Z",
-      "files": {
-        "storage_hook_passthrough.wasm": {
-          "bytes": 79153,
-          "sha256": "3a10ce115ea179026a00f3e85ce6b6a388bcc1f274bc7abfc074be876d7c3e55"
-        },
-        "storage_hook_guest.wasm": {
-          "bytes": 80680,
-          "sha256": "7e3a093e09bfe30244d128c1aaaf8558a1b13c05558cc81cff04021947445e11"
-        }
-      }
-    },
-    {
-      "name": "go-ffi-library",
-      "id": 12549759726,
-      "bytes": 13838990,
-      "sha256": "838aa5afc5979db5131f74e0ca5d4d246d466a5b4b6c85e436a6199b6bc01590",
-      "expires_at": "2026-10-25T06:19:20Z",
-      "files": {
-        "libsmg_go.d": {
-          "bytes": 64889,
-          "sha256": "59a7bc22318a635f52ca4ef4b4ba3c5f1e445d3042c13b3e005088024a67d66e"
-        },
-        "libsmg_go.so": {
-          "bytes": 35015504,
-          "sha256": "564afa75459247c2bc802b1ad5be2700c0067c2a4c77cbf358f9ec9a4a44c37e"
-        }
-      }
-    }
-  ],
-  "gateway_native": {
-    "name": "smg/smg_rs.abi3.so",
-    "bytes": 142576528,
-    "sha256": "a974650d1e691f9308d2fea40d6d21be6e68914763f4d59ad2cc484fb84646e1"
-  },
-  "run_id": 40067318180,
-  "run_attempt": 1,
-  "build_job_id": 120793180028,
-  "producer_sha": "1cff3e64e921344d423fabec5ce3a821882dd51f",
-  "source_base": "a4c1e7f7a82e846d828f6f811f37eb25485aed59",
-  "producer_branch": "ci/frozen-epd-registration-producer-20261024",
+  "artifacts": [],
+  "gateway_native": null,
+  "run_id": null,
+  "run_attempt": null,
+  "build_job_id": null,
+  "producer_sha": null,
+  "source_base": "ca46bed750965c8edf21bacd62f451ab78958304",
+  "producer_branch": "ci/frozen-epd-bootstrap-import-producer-20261024",
   "producer_policy": "frozen_epd_registration_dispatch_22_steps_six_archives_v1",
   "compiled_source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
@@ -110,7 +19,7 @@
     "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
     "bindings": "e97f000df477e928953b6bcb5a7927adf5ff88c1",
     "clients": "03b0cbb722670d98b37b726af18c1796beef82d5",
-    "model_gateway": "640193a880f8487733890fdb4f8249cdda476019",
+    "model_gateway": "1a099499f3f7c30233552adb62dfddd563e1d3c7",
     "examples/wasm": "fc10fea21779371f9de247209af2028cf8173236",
     "crates/auth": "642cfcb069e7a56f0637909b6bf67365f4c48d07",
     "crates/data_connector": "0f2944404b40f9dc1abf7b681179db30ba01ccab",
@@ -148,7 +57,7 @@
     "GPU_jobs": 0,
     "workflow_auto_retry": 0
   },
-  "artifact_bytes_not_yet_available": false,
+  "artifact_bytes_not_yet_available": true,
   "consumer_archive_validation_required": "six actual safe ZIP/API digest-size-expiry archives; all payload hashes/complete wheel RECORD/native; future GPU must explicitly install the two source-bound RPC wheels and prove no editable shadow",
   "rpc_wheels": {
     "proto": {
@@ -161,19 +70,8 @@
       "version": "0.14.2",
       "artifact": "epd-grpc-servicer-wheel"
     },
-    "built_from_source_base": "a4c1e7f7a82e846d828f6f811f37eb25485aed59",
-    "actual_wheel_pins": [
-      {
-        "name": "smg_grpc_proto-0.4.29-py3-none-any.whl",
-        "bytes": 106259,
-        "sha256": "54b378c260d34da696df188a767cc4576e152a3a6eff8ca5303612ddbb146943"
-      },
-      {
-        "name": "smg_grpc_servicer-0.14.2-py3-none-any.whl",
-        "bytes": 386799,
-        "sha256": "e7339352a1ee80940fa92b24da5b6a34b6616601687140c1c8c9beadfe97f394"
-      }
-    ]
+    "built_from_source_base": "ca46bed750965c8edf21bacd62f451ab78958304",
+    "actual_wheel_pins": []
   },
   "producer_base_source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
@@ -184,29 +82,14 @@
     "bindings": "e97f000df477e928953b6bcb5a7927adf5ff88c1",
     "clients": "03b0cbb722670d98b37b726af18c1796beef82d5",
     "crates": "e0aca7a681eb08447f2080f46cea8e62404f4bda",
-    "model_gateway": "640193a880f8487733890fdb4f8249cdda476019",
+    "model_gateway": "1a099499f3f7c30233552adb62dfddd563e1d3c7",
     "grpc_servicer": "a72db571df575d5c33f0c8c38d9eab7693be208e",
     "e2e_test": "c4f69b0e9c2b92bc5dc152f08981aa58755aa863",
     "scripts": "6f2082a851689a51de9fd5211fd491a38c8ada8a",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows": "f1532cfd428cc00876907e54be05da22b8a45230"
   },
-  "producer_source_trees": {
-    ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
-    "Cargo.toml": "1524dd4960a96dd3ae5069917324836dee979150",
-    "Cargo.lock": "31974aea1e683d431b1b2430eb6c70ae817aae48",
-    "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
-    "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
-    "bindings": "e97f000df477e928953b6bcb5a7927adf5ff88c1",
-    "clients": "03b0cbb722670d98b37b726af18c1796beef82d5",
-    "crates": "e0aca7a681eb08447f2080f46cea8e62404f4bda",
-    "model_gateway": "640193a880f8487733890fdb4f8249cdda476019",
-    "grpc_servicer": "a72db571df575d5c33f0c8c38d9eab7693be208e",
-    "e2e_test": "c4f69b0e9c2b92bc5dc152f08981aa58755aa863",
-    "scripts": "6f2082a851689a51de9fd5211fd491a38c8ada8a",
-    ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
-    ".github/workflows": "512fe1ab2a8b70eac34b86318eaa805c23aed321"
-  },
+  "producer_source_trees": {},
   "consumer_source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
     "Cargo.toml": "1524dd4960a96dd3ae5069917324836dee979150",
@@ -216,7 +99,7 @@
     "bindings": "e97f000df477e928953b6bcb5a7927adf5ff88c1",
     "clients": "03b0cbb722670d98b37b726af18c1796beef82d5",
     "crates": "e0aca7a681eb08447f2080f46cea8e62404f4bda",
-    "model_gateway": "640193a880f8487733890fdb4f8249cdda476019",
+    "model_gateway": "1a099499f3f7c30233552adb62dfddd563e1d3c7",
     "grpc_servicer": "a72db571df575d5c33f0c8c38d9eab7693be208e",
     "e2e_test": "c4f69b0e9c2b92bc5dc152f08981aa58755aa863",
     "scripts": "6f2082a851689a51de9fd5211fd491a38c8ada8a",
@@ -228,7 +111,7 @@
     "clippy.toml": "cfb9e85a5074e6b02e603df8da9653ee18dbcca3",
     "examples/wasm": "fc10fea21779371f9de247209af2028cf8173236"
   },
-  "consumer_branch": "ci/sglang-epd-registration-actual-bound-20261024",
+  "consumer_branch": "ci/sglang-epd-bootstrap-import-consumer-unbound-20261024",
   "contract": {
     "model": "Qwen/Qwen3.5-9B",
     "test_dirs": "e2e_test/chat_completions/test_epd_multimodal.py",
@@ -269,6 +152,30 @@
   "worker_origin_witness_implemented": true,
   "consumer_workflow_implemented": true,
   "source_prepared": true,
-  "producer_artifact_pins_status": "BOUND actual40067318180/1cff successful22step sixarchives8payload and newnativea974; root integrity/hostedCPU-only accepted. All runtime admission flags remainfalse.",
-  "consumer_gpu_readiness_note": "Actual sixarchives/native/pairedRPC wheels bound to a4c/1cff; original8/fourtopologies/16requests/75job65pytest unchanged. Fresh capacity, explicit new phase and actual4420ROCm/native/model/registration/cleanup validation remain mandatory."
+  "producer_artifact_pins_status": "UNBOUND: no actual run/job/head, six-archive pins, paired RPC payload pins or native identity. Historical 40067318180/a974 artifacts do not match the changed model_gateway source.",
+  "consumer_gpu_readiness_note": "Source-only ca46 bootstrap/import repair template. Expected fe92 producer metadata is a local candidate preview, not an actual producer binding. New successful 22-step hosted CPU producer, six real archives/eight payloads, complete RECORD/source/native integrity acceptance, then separate root capacity/budget/GPU admission are required; actual EPD runtime remains unverified.",
+  "expected_producer": {
+    "candidate_head": "fe92dad851cff4d1bf5ec1fe3a06631a7900c3c3",
+    "source_base": "ca46bed750965c8edf21bacd62f451ab78958304",
+    "branch": "ci/frozen-epd-bootstrap-import-producer-20261024",
+    "policy": "frozen_epd_registration_dispatch_22_steps_six_archives_v1",
+    "producer_source_trees_preview": {
+      ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
+      "Cargo.toml": "1524dd4960a96dd3ae5069917324836dee979150",
+      "Cargo.lock": "31974aea1e683d431b1b2430eb6c70ae817aae48",
+      "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+      "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+      "bindings": "e97f000df477e928953b6bcb5a7927adf5ff88c1",
+      "clients": "03b0cbb722670d98b37b726af18c1796beef82d5",
+      "crates": "e0aca7a681eb08447f2080f46cea8e62404f4bda",
+      "model_gateway": "1a099499f3f7c30233552adb62dfddd563e1d3c7",
+      "grpc_servicer": "a72db571df575d5c33f0c8c38d9eab7693be208e",
+      "e2e_test": "c4f69b0e9c2b92bc5dc152f08981aa58755aa863",
+      "scripts": "6f2082a851689a51de9fd5211fd491a38c8ada8a",
+      ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
+      ".github/workflows": "74a286586963d5ca7031b9a039bb120569be4645"
+    },
+    "status": "EXPECTED_LOCAL_CANDIDATE_ONLY_NOT_ACTUAL_RUN_BINDING",
+    "binding_requirement": "Confirm the future actual admitted producer head/run/attempt/single build-wheel job and actual 14 source entries. This preview is never read as producer_source_trees by source.verify; preserve its actual-14 hard gate."
+  }
 }
