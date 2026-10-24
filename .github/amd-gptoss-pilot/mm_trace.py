@@ -104,7 +104,94 @@ def item_info(item):
 def observe(rid, stage, module, path, operation):
     if not enabled():
         return
+    current = state()
+    if ((str(rid) not in current["rids"] and len(current["rids"]) >= 9)
+            or current["records"] >= 64 or current["counts"].get(str(rid), 0) >= 8):
+        emit(rid, stage, {})
+        return
     try:
         emit(rid, stage, dict(source=origin(module, path), **operation()))
     except Exception as error:
         emit(rid, stage, dict(error=type(error).__name__ + ":" + str(error)[:160]))
+
+
+def wire(rid, mm, model_path, module, path):
+    def fields():
+        if len(mm.mm_items) > 4:
+            raise ValueError("ITEM_CAP")
+        result = []
+        for item in mm.mm_items:
+            info = item_info(item)
+            feature = item.feature
+            if feature.device.type != "cpu":
+                raise ValueError("WIRE_PIXELS_NOT_CPU")
+            offset, slices = 0, []
+            if len(info["grid"]) != len(info["offsets"]):
+                raise ValueError("GRID_OFFSET_COUNT")
+            for ordinal, (t, h, width) in enumerate(info["grid"]):
+                length = t * h * width
+                if min(t, h, width) <= 0 or offset + length > feature.shape[0]:
+                    raise ValueError("GRID_PIXEL_RANGE")
+                slices.append(dict(ordinal=ordinal, start=offset, rows=length,
+                                   tensor=tensor(feature.narrow(0, offset, length))))
+                offset += length
+            if offset != feature.shape[0]:
+                raise ValueError("GRID_PIXEL_TOTAL")
+            result.append(dict(info, feature_shape=list(feature.shape),
+                               feature_dtype=str(feature.dtype), ordinals=slices))
+        return dict(model_path=str(model_path)[:256], items=result)
+    observe(rid, "wire_cpu", module, path, fields)
+
+
+def positions(reqs, mm_inputs, values, prefixes, lengths, model_path, module, path):
+    if not enabled():
+        return
+    current = state()
+    current["batch"] += 1
+    _local.batch, _local.items = current["batch"], {}
+    if not (len(reqs) == len(mm_inputs) == len(values) == len(prefixes) == len(lengths)):
+        emit("UNASSOCIATED", "positions_cpu", dict(error="BATCH_LENGTHS"))
+        return
+    for req, mm, value, prefix, length in zip(reqs[:9], mm_inputs, values, prefixes, lengths):
+        if mm is None:
+            continue
+        rid = req.rid
+        def fields():
+            if len(mm.mm_items) > 4:
+                raise ValueError("ITEM_CAP")
+            items = [item_info(item) for item in mm.mm_items]
+            for item in items:
+                _local.items[item["item_id"]] = (rid, item)
+            return dict(batch=_local.batch, model_path=str(model_path)[:256], items=items,
+                        prefix=prefix, extend=length, table=tensor(value),
+                        delta=tensor(mm.mrope_position_delta))
+        observe(rid, "positions_cpu", module, path, fields)
+    if len(reqs) > 9:
+        emit("UNASSOCIATED", "positions_cpu", dict(error="BATCH_CAP"))
+
+
+def selection(items, key, cached, expected_rows, branch, module, path):
+    if not enabled():
+        return
+    rid = "UNASSOCIATED"
+    try:
+        infos = [item_info(item) for item in items[:4]]
+        links = [getattr(_local, "items", {}).get(info["item_id"]) for info in infos]
+        if len(items) > 4 or not links or any(link is None for link in links):
+            raise ValueError("NO_CURRENT_BATCH_ITEM_LINK")
+        if any(link[1] != info for link, info in zip(links, infos)):
+            raise ValueError("CURRENT_ITEM_IDENTITY_CHANGED")
+        rids = {str(link[0]) for link in links}
+        if len(rids) != 1:
+            raise ValueError("MULTIPLE_REQUEST_LINKS")
+        rid = next(iter(rids))
+        def fields():
+            emb = cached.embedding if cached is not None else None
+            shape = list(emb.shape) if emb is not None else None
+            return dict(batch=_local.batch, branch=branch, key=key, hit=cached is not None,
+                        expected_rows=expected_rows, items=infos, embedding_shape=shape,
+                        embedding_device=str(emb.device) if emb is not None else None,
+                        embedding_values="NOT_READ", association="current_thread_batch_items")
+        observe(rid, "cache_selection", module, path, fields)
+    except Exception as error:
+        emit(rid, "cache_selection", dict(error=type(error).__name__ + ":" + str(error)[:160]))
