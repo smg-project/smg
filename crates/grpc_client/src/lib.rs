@@ -45,7 +45,7 @@ pub use constraint_failure::{
 pub use h2;
 pub use media_fault::{media_code, stamp_media_code, WorkerMediaFault, MEDIA_CODE_METADATA_KEY};
 pub use mlx_engine::{proto as mlx_proto, MlxEngineClient};
-pub use sglang_encoder::{proto as sglang_encoder_proto, SglangEncoderClient};
+pub use sglang_encoder::{encode_with_prefill, proto as sglang_encoder_proto, SglangEncoderClient};
 pub use sglang_scheduler::{
     proto as sglang_proto, SglangGenerateRequestOptions, SglangSchedulerClient,
 };
