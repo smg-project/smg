@@ -1,7 +1,7 @@
 {
-  "ready": false,
-  "run_budget_admitted": false,
-  "artifacts_pinned": false,
+  "ready": true,
+  "run_budget_admitted": true,
+  "artifacts_pinned": true,
   "artifacts": [
     {
       "name": "smg-wheel",
@@ -228,7 +228,7 @@
     "diagnostic_workflow_difference": "NIXL tier-select dispatch caller only; normal product tooling CPU jobs are not part of this diagnostic workflow."
   },
   "source_identity_note": "Original shared reusable03d blob, consumer19 product source and compiled37c9d unchanged. Diagnostic-only Mooncake2 caller/canary/transfer witness does not relabel native143a or alter originalcase bodies.",
-  "admitted_tier": null,
+  "admitted_tier": "2",
   "contracts": {
     "2": {
       "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-2gpu-pd[2]/vllm/nvidia",
