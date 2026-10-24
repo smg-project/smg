@@ -1,22 +1,39 @@
-name: AMD shared product vLLM four-GPU chat validation
+name: AMD shared product vLLM NIXL PD validation
 on:
   workflow_dispatch:
+    inputs:
+      tier:
+        description: Original NIXL GPU tier (must match root admission)
+        type: choice
+        required: true
+        default: '2'
+        options: ['2', '4']
 permissions:
   contents: read
   actions: read
 concurrency:
-  group: amd-shared-product-vllm-four-gpu-chat
+  group: amd-shared-product-vllm-nixl-pd
   cancel-in-progress: false
 jobs:
   artifact-relay:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    outputs:
+      gpu_tier: ${{ steps.recipe.outputs.gpu_tier }}
+      test_timeout: ${{ steps.recipe.outputs.test_timeout }}
+      test_dirs: ${{ steps.recipe.outputs.test_dirs }}
+      test_filter: ${{ steps.recipe.outputs.test_filter }}
+      min_selected: ${{ steps.recipe.outputs.min_selected }}
+      vllm_extra_kv_backends: ${{ steps.recipe.outputs.vllm_extra_kv_backends }}
     env:
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      - name: Require exactly the admitted original row
+        id: recipe
+        run: python3 .github/amd-shared-product/recipe.py --tier '${{ inputs.tier }}' --outputs "$GITHUB_OUTPUT"
       - name: Verify external producer and relay payloads
         id: relay
         env:
@@ -65,31 +82,34 @@ jobs:
           path: ${{ steps.relay.outputs.directory }}/evidence/
           if-no-files-found: ignore
           retention-days: 7
-  amd-product-four-gpu-chat:
+  amd-product-nixl-pd:
     needs: artifact-relay
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: vllm
-      gpu_tier: '4'
+      gpu_tier: ${{ needs.artifact-relay.outputs.gpu_tier }}
       runner: 1-gpu-mi300x
-      timeout: 30
-      test_timeout: 25
-      test_dirs: e2e_test/chat_completions
-      min_selected: 32
+      timeout: 50
+      test_timeout: ${{ fromJSON(needs.artifact-relay.outputs.test_timeout) }}
+      test_dirs: ${{ needs.artifact-relay.outputs.test_dirs }}
+      test_filter: ${{ needs.artifact-relay.outputs.test_filter }}
+      min_selected: ${{ fromJSON(needs.artifact-relay.outputs.min_selected) }}
+      vllm_kv_backend: nixl
+      vllm_extra_kv_backends: ${{ needs.artifact-relay.outputs.vllm_extra_kv_backends }}
       servicer_unit_tests: true
-      extra_deps: ./.github/amd-p4-proof
+      extra_deps: ./.github/amd-nixl-environment
       gpu_vendor: amd
       container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
-      container_options: --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN --env SPT_NOENV=1 --env SMG_CI_RUNTIME_STATE_DIR=/tmp/smg-p4-runtime-${{ github.run_id }}-${{ github.run_attempt }}
+      container_options: --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN --env SPT_NOENV=1 --env SMG_CI_RUNTIME_STATE_DIR=/tmp/smg-nixl-runtime-${{ github.run_id }}-${{ github.run_attempt }}
     secrets: inherit
   finish:
     if: always()
-    needs: [artifact-relay, amd-product-four-gpu-chat]
+    needs: [artifact-relay, amd-product-nixl-pd]
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     steps:
       - name: Require the actual shared workflow to finish successfully
         env:
           RELAY: ${{ needs.artifact-relay.result }}
-          CHAT: ${{ needs.amd-product-four-gpu-chat.result }}
-        run: test "$RELAY" = success && test "$CHAT" = success
+          PD: ${{ needs.amd-product-nixl-pd.result }}
+        run: test "$RELAY" = success && test "$PD" = success

@@ -11,7 +11,6 @@
   "producer_branch": "ci/frozen-c9d-cpu-producer-20261023",
   "producer_policy": "frozen_c9d_dispatch_build_only_all_18_steps_success_v1",
   "target_product_commit": "3b79acc59b68b84465e58a025850af2c93c96fe8",
-  "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-4gpu-chat[1]/vllm/nvidia",
   "source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
     "Cargo.toml": "1524dd4960a96dd3ae5069917324836dee979150",
@@ -91,42 +90,23 @@
   "explicit_consumer_only_paths": [
     ".github/amd-shared-product/",
     ".github/workflows/pr-test-rust.yml",
-    ".github/amd-p4-proof/"
+    ".github/amd-p4-proof/",
+    ".github/amd-nixl-environment/"
   ],
   "budget": {
     "relay_hosted_cpu_minutes": 10,
-    "gpu_job_minutes": 30,
-    "pytest_minutes": 25,
+    "gpu_job_minutes": 50,
     "cleanup_reserve_is_not_enforced_by_shared_workflow": true,
     "workflow_auto_retry": 0,
     "original_pytest_reruns": 2,
-    "original_reruns_delay_seconds": 5
+    "original_reruns_delay_seconds": 5,
+    "pytest_minutes_by_tier": {
+      "2": 34,
+      "4": 42
+    },
+    "GPU_jobs_per_dispatch": 1
   },
-  "contract": {
-    "selected": 39,
-    "models": 2,
-    "floor": 32,
-    "test_dirs": "e2e_test/chat_completions",
-    "test_filter": "",
-    "servicer_impl": "",
-    "servicer_unit_tests": true,
-    "engine_unit_junit": true,
-    "required_14_units_need_post_audit_of_full_log": false,
-    "whole_pip_check_stages": [
-      "installed",
-      "final"
-    ],
-    "no_prior_GPU_acceptance_transferred": true,
-    "gpu_tier": 4,
-    "tensor_parallel_size": 4,
-    "required_model_ids": [
-      "openai/gpt-oss-120b",
-      "meta-llama/Llama-4-Scout-17B-16E-Instruct"
-    ],
-    "original_skip_count": 4,
-    "required_14_units_hard_gate": true
-  },
-  "diagnostic_difference": "caller sets SPT_NOENV=1 and runs full installed-engine servicer units (NV original four-GPU row leaves units off); shared workflow is byte-identical to product03d including unit JUnit and canonical14 hard gate; AMD diagnostic uses the known 1-gpu-mi300x CI slot with unchanged gpu_tier=4/TP4, not a physical GPU reservation",
+  "diagnostic_difference": "One selected tier per dispatch; known 1-gpu-mi300x CI slot routes a multi-device suite, without claiming physical GPU reservation. Caller enables full installed-engine units and canonical14 gate (original two NIXL rows leave units off), SPT_NOENV=1 and pre-install private constraints. The original product reusable workflow is unchanged.",
   "producer_binary_relabelled": false,
   "producer_artifact_pins_status": "EMPTY: no actual new successful dispatch producer or archives pinned",
   "explicit_product_dependency": {
@@ -136,7 +116,7 @@
     "parent_stack": "0707d631cb6827789619ab96999f868044dc06db",
     "visible_churn": 43
   },
-  "producer_snapshot_note": "Root reports CPU-only producer40038340532/head445bb37 admitted, but this preparation has no actual terminal producer or archive audit; all identity/artifact/native pins stay empty",
+  "producer_snapshot_note": "No actual producer/API/native/archive identities are bound in this source preparation; all pins remain empty. Actual root review required before dispatch.",
   "source_base": "c9d5431db92aa2d35521889f6297c4c6f7b05b4a",
   "producer_base_source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
@@ -157,11 +137,17 @@
   "producer_source_map_note": "Expected 14 trees from reviewed diagnostic9841825, including its different workflow tree; actual admitted head/run unknown and must match exactly before relay",
   "resource_precondition": {
     "requested_runner_label": "1-gpu-mi300x",
-    "used_logical_devices": 4,
-    "ranks": 4,
-    "actual_four_VF_placement_or_availability_verified": false,
+    "required_logical_devices_by_tier": {
+      "2": 2,
+      "4": 4
+    },
+    "current_availability_verified": false,
     "physical_GPU_exclusivity_claimed": false,
-    "routing_scope_note": "Historical same-two-node CI route only; current registry403 cannot prove label exclusivity. Root admission/controller must verify actual runner amd-mi300x-1 or amd-mi300x-2, at least four driver-visible logical VF devices and no conflicting ownership before execution. No four-device availability is certified by this source preparation."
+    "actual_runner_allowlist": [
+      "amd-mi300x-1",
+      "amd-mi300x-2"
+    ],
+    "ownership_gate": "Root must admit exact one tier and fresh placement/device/ownership; label alone is not proof."
   },
   "explicit_lock_safety_dependency": {
     "product_commit": "a37083a4eb667c0d261de85cf464025a9a29e506",
@@ -176,36 +162,61 @@
     "canonical_manifest_blob": "c86975b7562abfa1672f1f09b7c027981da2544a",
     "required_case_count": 14,
     "unit_junit": "servicer-engine.xml in the existing unique AMD dependency artifact",
-    "diagnostic_workflow_difference": "Retains the exact prior four-GPU registered dispatch caller; the product normal tooling CPU job is not part of this diagnostic workflow."
+    "diagnostic_workflow_difference": "NIXL tier-select dispatch caller only; normal product tooling CPU jobs are not part of this diagnostic workflow."
   },
   "source_identity_note": "Original reusable workflow remains byte-identical to03d; product target is the separate183-line opt-in constraint-hook child3b79. Consumer19/scripts refreshed; compiled37 remains exactc9d. No native/archive/runtime acceptance transferred.",
+  "admitted_tier": null,
+  "contracts": {
+    "2": {
+      "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-2gpu-pd[1]/vllm/nvidia",
+      "gpu_tier": "2",
+      "timeout": 50,
+      "test_timeout": 34,
+      "test_dirs": "e2e_test/router",
+      "test_filter": "",
+      "min_selected": 15,
+      "vllm_kv_backend": "nixl",
+      "vllm_extra_kv_backends": "",
+      "selected": 27,
+      "original_skip_count": 2
+    },
+    "4": {
+      "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-4gpu-pd[1]/vllm/nvidia",
+      "gpu_tier": "4",
+      "timeout": 50,
+      "test_timeout": 42,
+      "test_dirs": "e2e_test/router/test_pd_topologies.py",
+      "test_filter": "-k \"(2p2d and not http) or AssembledAtRuntime or SmallWindow or MismatchedTransport or MismatchedProtocol\"",
+      "min_selected": 14,
+      "vllm_kv_backend": "nixl",
+      "vllm_extra_kv_backends": "mooncake",
+      "selected": 18,
+      "original_skip_count": 0
+    }
+  },
   "diagnostic_runtime_instrumentation": {
-    "namespace": ".github/amd-p4-proof/",
-    "installed_via": "existing extra_deps local package pytest11 entry point",
-    "unit_scope": "environment before/after only; no process/model/original39 gate",
-    "e2e_scope": "original39 IDs and four call-phase skips, each originalcall/rerun with owned gateway+worker/native/TP4 ranks/modelcache metadata; shutdown warnings recorded",
+    "namespace": ".github/amd-nixl-environment/",
+    "scope": "Private constraint identity before/after installed-engine unit and original e2e pytest sessions only. No P4 process/rank observer is installed.",
     "preinstall_hook_product": "3b79acc59b68b84465e58a025850af2c93c96fe8",
     "reusable_workflow_product": "03d34400c3561c9e2d00e449a5e5c4bcca8e0401",
-    "private_state": "/tmp/smg-p4-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}",
-    "protected_original_packages": [
-      "torch",
-      "vllm",
-      "grpcio",
-      "grpcio-reflection",
-      "protobuf",
-      "pygobject"
+    "private_state": "/tmp/smg-nixl-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}",
+    "runtime_witnesses_complete": false,
+    "remaining_witnesses": [
+      "Actual owned gateway and all role worker PID/start/marker/native identities for heterogeneous PD and DP cases",
+      "ROCm vLLM official NIXL resolver/native connector and mandatory Mooncake mixed transport; package metadata is insufficient",
+      "Actual original request transfer, cancellation/outage/restart outcomes from original tests and corresponding logs/JUnit; HTTP success alone is insufficient",
+      "Exact per-case selection/skip/phase/rerun terminal audit of27 or18 IDs; configured floor alone is insufficient"
     ],
-    "health_companion": "If absent in image, pin reflection version and require job-venv origin; first added metadata/origin becomes immutable for later stages. If present, preserve original.",
-    "not_frozen": [
-      "smg",
-      "smg-grpc-proto",
-      "smg-grpc-servicer",
-      "mcp",
-      "fastapi",
-      "starlette",
-      "pycairo"
+    "actual_GPU_or_coverage": false
+  },
+  "environment_contract": {
+    "required_14_units_hard_gate": true,
+    "unit_junit": "servicer-engine.xml",
+    "whole_pip_check_stages": [
+      "installed",
+      "final"
     ],
-    "actual_GPU_or_coverage": false,
-    "physical_GPU_exclusivity_or_per_rank_request_id_claim": false
+    "no_prior_GPU_acceptance_transferred": true,
+    "original_default_parser_connection_servicer_mm_overrides": "all empty; kv_backend empty; engine vllm with explicit vllm_kv_backend=nixl"
   }
 }
