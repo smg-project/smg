@@ -22,6 +22,7 @@ def state():
         _state.clear()
         _state.update(pid=os.getpid(), rids=[], counts={}, records=0, hash_bytes=0,
                       batch=0, limit=False)
+        _local.items, _local.batch = {}, 0
     return _state
 
 
@@ -182,6 +183,7 @@ def _positions(reqs, mm_inputs, values, prefixes, lengths, model_path, module, p
 def selection(items, key, cached, expected_rows, branch, module, path):
     if not enabled():
         return
+    state()  # A fork cannot reuse its parent's current-batch association.
     rid = "UNASSOCIATED"
     try:
         infos = [item_info(item) for item in items[:4]]

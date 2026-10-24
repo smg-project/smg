@@ -7,7 +7,7 @@
       "path": "srt/managers/_smg_qwen_mm_trace.py",
       "module": "sglang.srt.managers._smg_qwen_mm_trace",
       "old_sha256": null,
-      "new_sha256": "ffc34dedb2294cd56cec486203ff7ef6b4e5afe4ce10df860afd775bfedb9791",
+      "new_sha256": "daa18f680ff59d9f4af262104c13d9f56ca6a3c428468339ce52f6ac2898d398",
       "edits": [],
       "new_content": null,
       "source": "mm_trace.py"
