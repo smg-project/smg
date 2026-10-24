@@ -983,7 +983,8 @@ class _SglangEngine(sgl_grpc.SglangSchedulerServicer):
             disaggregated = request.disaggregated_params
             bootstrap = (disaggregated.bootstrap_host, disaggregated.bootstrap_room)
         shape = (len(request.tokenized.input_ids), params.max_new_tokens)
-        self.seen.enter(*shape, bootstrap=bootstrap)
+        rank = request.data_parallel_rank if request.HasField("data_parallel_rank") else None
+        self.seen.enter(*shape, rank, bootstrap=bootstrap)
         time.sleep(0.01)
         self.seen.leave()
         if self.refuse(*shape):
@@ -1070,7 +1071,10 @@ def test_each_wire_drives_the_plan_through_the_engines_own_service(add, engine, 
 def test_the_sglang_wire_carries_a_lone_legs_stand_in_bootstrap():
     """A prefill or decode leg's plan runs without its peer: every request
     carries the engine's stand-in bootstrap (the host and room 0) the way the
-    engine's own warm-up sends it; a single engine's requests carry none."""
+    engine's own warm-up sends it; a single engine's requests carry none. Over
+    two ranks each request is pinned to its rank and its stand-in room is that
+    rank, so a prefill leg, which places a disaggregated request by its room's
+    residue, runs the request where the plan pinned it."""
     seen = _Seen()
     server, target = _serve(sgl_grpc.add_SglangSchedulerServicer_to_server, _SglangEngine(seen))
     try:
@@ -1080,13 +1084,25 @@ def test_the_sglang_wire_carries_a_lone_legs_stand_in_bootstrap():
             report = run_warmup(lone, wire, budget_secs=30, request_timeout_secs=10)
             carried = len(seen.requests)
             run_warmup(plan_warmup(SMALL, "fast"), wire, budget_secs=30, request_timeout_secs=10)
+            plain = len(seen.requests)
+            two = plan_warmup(
+                dataclasses.replace(SMALL, lone_leg_bootstrap="2.2.2.2", data_parallel_size=2),
+                "fast",
+            )
+            two_report = run_warmup(two, wire, budget_secs=30, request_timeout_secs=10)
         finally:
             wire.close()
     finally:
         server.stop(0)
     assert report.covered == len(lone.steps) and report.errors == 0
     assert carried >= 2 and set(seen.bootstraps[:carried]) == {("2.2.2.2", 0)}
-    assert set(seen.bootstraps[carried:]) == {None}
+    assert set(seen.ranks[:carried]) == {None}  # one rank: no pin
+    assert set(seen.bootstraps[carried:plain]) == {None}
+    assert two_report.covered == len(two.steps) and two_report.errors == 0
+    assert set(zip(seen.ranks[plain:], seen.bootstraps[plain:])) == {
+        (0, ("2.2.2.2", 0)),
+        (1, ("2.2.2.2", 1)),
+    }
 
 
 @pytest.mark.parametrize(
@@ -1538,7 +1554,7 @@ def test_a_lone_legs_plan_marks_every_request_and_says_so():
     assert "stand-in bootstrap" not in plain.describe()
 
 
-def test_the_sglang_inputs_come_from_the_server_arguments_and_the_facts(monkeypatch):
+def test_the_sglang_inputs_come_from_the_server_arguments_and_the_facts(monkeypatch, caplog):
     args = SimpleNamespace(max_running_requests=64, chunked_prefill_size=8192, context_length=None)
     facts = {"is_generation": True, "max_context_length": 32768, "vocab_size": 151936}
     inputs = sglang_warmup.warmup_inputs(args, facts)
@@ -1572,7 +1588,22 @@ def test_the_sglang_inputs_come_from_the_server_arguments_and_the_facts(monkeypa
         leg = sglang_warmup.warmup_inputs(SimpleNamespace(disaggregation_mode=role), facts)
         assert leg.lone_leg_bootstrap == "2.2.2.2"
         assert leg.max_num_batched_tokens == sglang_warmup.DEFAULT_STEP_TOKENS
+        # A leg of two ranks plans both, each request pinned to its rank.
+        two = sglang_warmup.warmup_inputs(
+            SimpleNamespace(disaggregation_mode=role, dp_size=2), facts
+        )
+        assert (two.data_parallel_size, two.lone_leg_bootstrap) == (2, "2.2.2.2")
     assert sglang_warmup.warmup_inputs(SimpleNamespace(), facts).lone_leg_bootstrap is None
+    # An aggregated engine of two ranks plans both on the wire that pins; on
+    # the Python servicer's wire, which forwards no pin, the plan is one
+    # rank's and a WARNING says the other rank pays the first-time cost.
+    caplog.set_level(logging.WARNING, logger="smg_grpc_servicer.sglang.warmup")
+    assert sglang_warmup.warmup_inputs(SimpleNamespace(dp_size=2), facts).data_parallel_size == 2
+    assert not caplog.records
+    one = sglang_warmup.warmup_inputs(SimpleNamespace(dp_size=2), facts, pins_ranks=False)
+    assert one.data_parallel_size == 1
+    assert [r.levelno for r in caplog.records] == [logging.WARNING]
+    assert "2 scheduler ranks and this servicer's warm-up requests carry no" in caplog.text
     # The language side of an encode-disaggregated deployment plans as a
     # plain worker (its warm-up requests carry no media, so the encoders see
     # nothing of them); the encoder-only role is the engine's own server.
@@ -1606,23 +1637,30 @@ def test_the_tokenspeed_inputs_come_from_the_server_arguments_and_the_facts():
     )
 
 
-def test_the_sglang_and_tokenspeed_inputs_say_when_the_pass_spreads_over_ranks(caplog):
+def test_the_sglang_inputs_cover_every_rank_and_the_tokenspeed_ones_say_when_they_do_not(
+    caplog,
+):
     caplog.set_level(logging.WARNING, logger="smg_grpc_servicer")
     facts = {"is_generation": True, "max_context_length": 32768, "vocab_size": 151936}
     sglang = sglang_warmup.warmup_inputs(SimpleNamespace(dp_size=4, max_running_requests=64), facts)
     tokenspeed = tokenspeed_warmup.warmup_inputs(
         SimpleNamespace(mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=2))), facts
     )
-    # One rank's plan: the servicer routes these engines' requests by load.
-    assert sglang.data_parallel_size == 1 and tokenspeed.data_parallel_size == 1
+    # SGLang's wire pins a rank: every rank's plan, nothing to warn about.
+    # The newer releases' attention-DP width counts too (dp_size=1 beside it).
+    assert sglang.data_parallel_size == 4
+    assert (
+        sglang_warmup.warmup_inputs(
+            SimpleNamespace(dp_size=1, attn_dp_size=2), facts
+        ).data_parallel_size
+        == 2
+    )
+    # One rank's plan on TokenSpeed: the servicer routes its requests by load.
+    assert tokenspeed.data_parallel_size == 1
     spread = [r.getMessage() for r in caplog.records if "reaches one rank" in r.getMessage()]
-    assert [line.split(" scheduler ranks")[0] for line in spread] == [
-        "The engine runs 4",
-        "The engine runs 2",
-    ]
+    assert [line.split(" scheduler ranks")[0] for line in spread] == ["The engine runs 2"]
     # TokenSpeed's remainders answer a hazard, and reach one rank each too.
-    assert "chunk remainders, when the plan runs them (the full level), reach one rank" in spread[1]
-    assert "chunk remainders" not in spread[0]
+    assert "chunk remainders, when the plan runs them (the full level), reach one rank" in spread[0]
     caplog.clear()
     sglang_warmup.warmup_inputs(SimpleNamespace(max_running_requests=64), facts)
     tokenspeed_warmup.warmup_inputs(SimpleNamespace(), facts)

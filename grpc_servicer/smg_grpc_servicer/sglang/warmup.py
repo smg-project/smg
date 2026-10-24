@@ -73,7 +73,9 @@ CONTEXT_RESERVE_TOKENS = 6
 _MAX_MESSAGE_BYTES = 1024 * 1024 * 256
 
 
-def warmup_inputs(server_args: Any, facts: Mapping[str, Any]) -> WarmupInputs | None:
+def warmup_inputs(
+    server_args: Any, facts: Mapping[str, Any], *, pins_ranks: bool = True
+) -> WarmupInputs | None:
     """What the planner needs, off the server arguments and the advertised
     model facts (``is_generation``, ``max_context_length``, ``vocab_size``):
     the running window (``--max-running-requests``; unknown when the scheduler
@@ -83,10 +85,14 @@ def warmup_inputs(server_args: Any, facts: Mapping[str, Any]) -> WarmupInputs | 
     requests to carry. ``None`` for a model that generates nothing and for the
     encoder-only role, which the engine runs on its own server; the language
     side of an encode-disaggregated deployment plans as a single engine (its
-    warm-up requests carry no media). The plan is one rank's: its requests
-    carry no data-parallel pin, so the servicer places each on the
-    least-loaded scheduler rank and under data parallelism each prefill shape
-    reaches one rank (a WARNING line says so)."""
+    warm-up requests carry no media). On a wire that carries the rank pin
+    (``pins_ranks``: the Rust servicer's) the plan covers every scheduler
+    rank: each request is pinned to its rank, where the servicer places it (on
+    a prefill leg by the stand-in room, whose residue is that rank), so under
+    data parallelism every prefill shape reaches every rank before the Router
+    sends anything. On the Python servicer's wire, which forwards no pin, the
+    plan is one rank's, placed by the engine's own load balancing, and under
+    data parallelism a WARNING line says so."""
     if not facts.get("is_generation", True):
         return None
     args = EngineConfigView(server_args).server_args
@@ -99,14 +105,16 @@ def warmup_inputs(server_args: Any, facts: Mapping[str, Any]) -> WarmupInputs | 
         from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 
         lone_leg_bootstrap = FAKE_BOOTSTRAP_HOST
-    if args.scheduler_count > 1:
+    ranks = args.scheduler_count
+    if ranks > 1 and not pins_ranks:
         logger.warning(
-            "The engine runs %d scheduler ranks and a warm-up request carries no rank pin, so the "
-            "servicer places it on the least-loaded one: each prefill shape of the planned warm-up "
-            "reaches one rank; the other ranks pay its first-time cost at their first request of "
-            "that shape",
-            args.scheduler_count,
+            "The engine runs %d scheduler ranks and this servicer's warm-up requests carry no "
+            "rank pin, so the engine's own load balancing places each: each prefill shape of the "
+            "planned warm-up reaches one rank; the other ranks pay its first-time cost at their "
+            "first request of that shape",
+            ranks,
         )
+        ranks = 1
     step = args.chunked_prefill_size or args.max_prefill_tokens or DEFAULT_STEP_TOKENS
     return WarmupInputs(
         max_num_seqs=args.max_running_requests or 0,
@@ -115,6 +123,7 @@ def warmup_inputs(server_args: Any, facts: Mapping[str, Any]) -> WarmupInputs | 
         vocab_size=int(facts.get("vocab_size") or 0),
         context_reserve_tokens=CONTEXT_RESERVE_TOKENS,
         source="window and step from the server arguments (the engine's default step when unset)",
+        data_parallel_size=ranks,
         lone_leg_bootstrap=lone_leg_bootstrap,
     )
 
@@ -234,12 +243,18 @@ class GrpcWire:
             ),
             stream=False,
         )
+        if request.data_parallel_rank is not None:
+            message.data_parallel_rank = request.data_parallel_rank
         if request.lone_leg_bootstrap is not None:
-            # As the engine's own warm-up sends it in disaggregation mode:
-            # the stand-in host and room 0.
+            # As the engine's own warm-up sends it in disaggregation mode: the
+            # stand-in host and a room, which is the request's rank (0 on one
+            # rank, as the engine sends it): a prefill leg places a
+            # disaggregated request on the rank of its room's residue, so the
+            # request runs on the rank the plan pinned it to.
             message.disaggregated_params.CopyFrom(
                 sglang_scheduler_pb2.DisaggregatedParams(
-                    bootstrap_host=request.lone_leg_bootstrap, bootstrap_room=0
+                    bootstrap_host=request.lone_leg_bootstrap,
+                    bootstrap_room=request.data_parallel_rank or 0,
                 )
             )
         if request.media:

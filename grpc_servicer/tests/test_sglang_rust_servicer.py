@@ -392,7 +392,7 @@ def test_server_facts_carry_the_kv_events_publisher(monkeypatch):
     assert rust.kv_events_publisher(_server_args(kv_events_config="not json")) == ("", "", "")
 
 
-def test_epd_roles_this_process_cannot_serve_are_refused_up_front():
+def test_epd_roles_this_process_cannot_serve_are_refused_up_front(monkeypatch):
     """An encoder-only launch is refused before the server binds (SGLang's
     entrypoint runs that role on its own encoder server, never on a
     servicer), and so is a language-only launch on the transfer backend
@@ -400,25 +400,39 @@ def test_epd_roles_this_process_cannot_serve_are_refused_up_front():
     language-only launch on a backend the scheduler ranks receive on passes
     (the encode dispatch runs in this process), as do the prefill/decode
     roles with one scheduler rank (the wire carries the bootstrap fields)
-    and a plain worker; a prefill/decode leg with more than one rank (the
-    pinned release's ``dp_size``, or the newer releases' ``attn_dp_size``
-    beside ``dp_size=1``) is refused, since a request is not placed on its
-    room's rank on the Rust path yet."""
+    and a plain worker; a prefill/decode leg with more than one rank passes
+    too (the servicer places a prefill leg's request on the rank of its room
+    and a decode leg's on its pin) but for the one shape the engine cannot
+    serve: a prefill leg of several plain data-parallel replicas, whose KV
+    sender fails every request of a non-zero room residue (every replica is
+    attention-DP rank 0). Attention DP passes (the newer releases'
+    ``attn_dp_size`` beside ``dp_size=1``, the pinned release's ``dp_size``
+    under ``enable_dp_attention``); the plain shape is refused whatever its
+    load-balance method and whether the engine's force-query switch is set
+    (its sender registers rank 0 then and the decode side bootstraps against
+    replica 0)."""
     rust.refuse_epd_disaggregation(_server_args())
     rust.refuse_epd_disaggregation(_server_args(disaggregation_mode="null"))
     rust.refuse_epd_disaggregation(_server_args(dp_size=2))
     for mode in ("prefill", "decode"):
         rust.refuse_epd_disaggregation(_server_args(disaggregation_mode=mode))
-        with pytest.raises(
-            rust_lifecycle.ServicerConfigError, match="more than one scheduler rank"
-        ):
-            rust.refuse_epd_disaggregation(_server_args(disaggregation_mode=mode, dp_size=2))
-        with pytest.raises(
-            rust_lifecycle.ServicerConfigError, match="more than one scheduler rank"
-        ):
+        rust.refuse_epd_disaggregation(
+            _server_args(disaggregation_mode=mode, dp_size=1, attn_dp_size=2)
+        )
+        rust.refuse_epd_disaggregation(
+            _server_args(disaggregation_mode=mode, dp_size=2, enable_dp_attention=True)
+        )
+    rust.refuse_epd_disaggregation(_server_args(disaggregation_mode="decode", dp_size=2))
+    monkeypatch.delenv("SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK", raising=False)
+    for method in (None, "auto", "follow_bootstrap_room", "round_robin"):
+        with pytest.raises(rust_lifecycle.ServicerConfigError, match="2 plain data-parallel"):
             rust.refuse_epd_disaggregation(
-                _server_args(disaggregation_mode=mode, dp_size=1, attn_dp_size=2)
+                _server_args(disaggregation_mode="prefill", dp_size=2, load_balance_method=method)
             )
+    monkeypatch.setenv("SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK", "1")
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="2 plain data-parallel"):
+        rust.refuse_epd_disaggregation(_server_args(disaggregation_mode="prefill", dp_size=2))
+    monkeypatch.delenv("SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK")
     for backend in ("zmq_to_scheduler", "mooncake"):
         rust.refuse_epd_disaggregation(
             _server_args(language_only=True, encoder_transfer_backend=backend)

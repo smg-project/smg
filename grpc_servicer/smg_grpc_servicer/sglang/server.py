@@ -652,7 +652,9 @@ def _planned_warmup(server_args: ServerArgs, model_info: Any, channel: Any) -> A
         "max_context_length": getattr(model_info, "max_context_length", 0),
         "vocab_size": getattr(model_info, "vocab_size", 0),
     }
-    plan = plan_for(setting, warmup_inputs(server_args, facts), knob=WARMUP_ENV)
+    # This servicer's generate path forwards no rank pin, so the plan is one
+    # rank's (the engine's own load balancing places its requests).
+    plan = plan_for(setting, warmup_inputs(server_args, facts, pins_ranks=False), knob=WARMUP_ENV)
     if plan is None:
         return None
     return run_warmup(plan, warmup_wire("", channel=channel), budget_secs=setting.budget_secs)
