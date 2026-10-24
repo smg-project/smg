@@ -2,12 +2,77 @@
   "ready": false,
   "run_budget_admitted": false,
   "artifacts_pinned": false,
-  "artifacts": [],
-  "gateway_native": null,
-  "run_id": null,
-  "run_attempt": null,
-  "build_job_id": null,
-  "producer_sha": null,
+  "artifacts": [
+    {
+      "name": "smg-wheel",
+      "id": 12539960818,
+      "bytes": 52386264,
+      "sha256": "51f4d219a9e691e94890ec267310e9d963a85ecc5c60ccba55c5d38a91ef049f",
+      "expires_at": "2026-10-24T23:54:34Z",
+      "files": {
+        "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl": {
+          "bytes": 52529349,
+          "sha256": "283ba6730ab1328332b1b61b2c692a2a28e0141b1987ae9422d07bd6c653512d"
+        }
+      }
+    },
+    {
+      "name": "go-ffi-library",
+      "id": 12539866422,
+      "bytes": 13837182,
+      "sha256": "beb1eb23135ba3ec036c296fea5c7abb96314fbd36dab8ad14b89efa6db2a329",
+      "expires_at": "2026-10-24T23:54:37Z",
+      "files": {
+        "libsmg_go.d": {
+          "bytes": 64539,
+          "sha256": "b46b20aad8202524bb156587ea51a3c8d66d25cec0cd554664418ac641bfad38"
+        },
+        "libsmg_go.so": {
+          "bytes": 35008576,
+          "sha256": "793946614a201c0658f9fc524a1307c0b15433a0ac8b709d5bf0e265b3b87b09"
+        }
+      }
+    },
+    {
+      "name": "python-client-types",
+      "id": 12539751694,
+      "bytes": 34373,
+      "sha256": "58f2a41f1455c7660a5594cfcfbeb6c4e696eb8ac76735501418899acd3d90e5",
+      "expires_at": "2026-10-24T23:54:39Z",
+      "files": {
+        "_generated.py": {
+          "bytes": 187180,
+          "sha256": "f2f808705287928f7a4095867bacaa3b1ffbc8eea6f038857dc3456529adeaf6"
+        }
+      }
+    },
+    {
+      "name": "wasm-test-fixtures",
+      "id": 12539567404,
+      "bytes": 56596,
+      "sha256": "a4df6f4b2f6bd3740aba28ddb1a081ce087475588ad03c72c6cdd47afdd5c4e5",
+      "expires_at": "2026-10-24T23:54:40Z",
+      "files": {
+        "storage_hook_guest.wasm": {
+          "bytes": 80680,
+          "sha256": "7e3a093e09bfe30244d128c1aaaf8558a1b13c05558cc81cff04021947445e11"
+        },
+        "storage_hook_passthrough.wasm": {
+          "bytes": 79153,
+          "sha256": "3a10ce115ea179026a00f3e85ce6b6a388bcc1f274bc7abfc074be876d7c3e55"
+        }
+      }
+    }
+  ],
+  "gateway_native": {
+    "name": "smg/smg_rs.abi3.so",
+    "bytes": 142443344,
+    "sha256": "143a28b8834bb16b01d87f4ba71b6f68254c71c52e5c7424ccf401b8ce9c29a9"
+  },
+  "run_id": 40038340532,
+  "run_attempt": 1,
+  "build_job_id": 120703217001,
+  "producer_sha": "445bb37bccb47e620b2b3aac12cd30b4ebd71a43",
   "producer_branch": "ci/frozen-c9d-cpu-producer-20261023",
   "producer_policy": "frozen_c9d_dispatch_build_only_all_18_steps_success_v1",
   "target_product_commit": "3b79acc59b68b84465e58a025850af2c93c96fe8",
@@ -108,7 +173,7 @@
   },
   "diagnostic_difference": "One selected tier per dispatch; known 1-gpu-mi300x CI slot routes a multi-device suite, without claiming physical GPU reservation. Caller enables full installed-engine units and canonical14 gate (original two NIXL rows leave units off), SPT_NOENV=1 and pre-install private constraints. The original product reusable workflow is unchanged.",
   "producer_binary_relabelled": false,
-  "producer_artifact_pins_status": "EMPTY: no actual new successful dispatch producer or archives pinned",
+  "producer_artifact_pins_status": "BOUND: root-accepted actual40038340532/445bb37 four archives and native143a; all admission flags remainfalse",
   "explicit_product_dependency": {
     "PR": 4266,
     "original_public_head": "3cef9af6a73610f501b920221c7232bf640219d0",
@@ -116,7 +181,7 @@
     "parent_stack": "0707d631cb6827789619ab96999f868044dc06db",
     "visible_churn": 43
   },
-  "producer_snapshot_note": "No actual producer/API/native/archive identities are bound in this source preparation; all pins remain empty. Actual root review required before dispatch.",
+  "producer_snapshot_note": "Rootaccepted producer integrity only: exact40038340532/attempt1/build120703217001/445bb37 and actual four archives are locally bound. TargetROCm/model, fresh runner ownership/budget/tier admission and actual27/18 contract execution are not accepted.",
   "source_base": "c9d5431db92aa2d35521889f6297c4c6f7b05b4a",
   "producer_base_source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
@@ -134,7 +199,7 @@
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows": "7c956a4ee89bdf800d48c63815d10a4dd568d90e"
   },
-  "producer_source_map_note": "Expected 14 trees from reviewed diagnostic9841825, including its different workflow tree; actual admitted head/run unknown and must match exactly before relay",
+  "producer_source_map_note": "Actual14source trees match accepted445bb37 and localGit; its diagnosticworkflow tree remains explicit. Consumer19 and compiled37 remain unchanged; no binary is relabelled.",
   "resource_precondition": {
     "requested_runner_label": "1-gpu-mi300x",
     "required_logical_devices_by_tier": {
@@ -164,7 +229,7 @@
     "unit_junit": "servicer-engine.xml in the existing unique AMD dependency artifact",
     "diagnostic_workflow_difference": "NIXL tier-select dispatch caller only; normal product tooling CPU jobs are not part of this diagnostic workflow."
   },
-  "source_identity_note": "Original reusable workflow remains byte-identical to03d; product target is the separate183-line opt-in constraint-hook child3b79. Consumer19/scripts refreshed; compiled37 remains exactc9d. No native/archive/runtime acceptance transferred.",
+  "source_identity_note": "Original reusable workflow remains byte-identical to03d; product target remains opt-in constraint-hook3b79. Consumer19/scripts and compiled37 exactc9d are unchanged. Actual accepted445bb37 fourarchives/native143a are integrity-bound; no prior GPU/runtime acceptance transferred.",
   "admitted_tier": null,
   "contracts": {
     "2": {
@@ -206,7 +271,7 @@
     "private_state": "/tmp/smg-nixl-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}",
     "runtime_witnesses_complete": false,
     "remaining_witnesses": [
-      "Actual accepted producer/archive/native pins and source/runner budget admission remain absent",
+      "Actual producer/archive/native integrity is bound; fresh source/runner/budget and exactlyone tier admission remain absent",
       "The new observer and official ROCm NIXL loader must execute in the actual749f image; CPU stand-ins do not prove native SDK or GPU compatibility",
       "Original27 or18 cases including mixed Mooncake/NIXL pairing, transfer, cancellation, outage and restart must complete with exact original skips/phases and full raw retry history",
       "Mapped libraries/configuration alone do not prove KV bytes, ABORT/ACK, peer/HBM release or long-term stability; original assertions/logs and independent actual audit determine scope"
