@@ -296,7 +296,7 @@
     "runtime_proof": false,
     "reference_contract": ".github/amd-shared-product/mooncake4-reference.json"
   },
-  "private_runtime_overlay_sha256": "dcbd9d63dbc158ca7e946311cb7bb5a2966cdc234124e2b79d5d20c77edfd6a7",
+  "private_runtime_overlay_sha256": "691616b31f501740779e38227895a21049ee70f93f780f247ed433c8938ffaf9",
   "private_mooncake_runtime": {
     "wheel": {
       "bytes": 4203741,
@@ -305,7 +305,7 @@
     },
     "version": "0.3.13.post1+amd.hip723.g26b0229.curl30.teonly",
     "source_commit": "26b0229eb0ba36bbffe9c6fb175ec7baf610fc75",
-    "specification_sha256": "096bbb75e08bfe73024862f4e920b57535cb8ec37e314bf973515fd32915a4f3",
+    "specification_sha256": "40bb0378fa335481ec5870fd898726f2e64642dde19d62673c8ee505673f2644",
     "cpu_acceptance_sha256": "7e9164824f414d23b8488a0f5f9c49b4930f99c6921a4265c19187da724bd1eb",
     "host_bundle": "/tmp/smg-mooncake-hip723-1f2ded97f9a0",
     "read_only_prefix_mount": "/work/prefix",

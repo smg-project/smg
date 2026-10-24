@@ -6,6 +6,7 @@
   "source_commit": "26b0229eb0ba36bbffe9c6fb175ec7baf610fc75",
   "cpu_acceptance_sha256": "7e9164824f414d23b8488a0f5f9c49b4930f99c6921a4265c19187da724bd1eb",
   "runtime_prefix": "/work/prefix",
+  "private_prefix_empty_directories": ["lib"],
   "wheel_mount": "/work/mooncake_transfer_engine_rocm-0.3.13.post1+amd.hip723.g26b0229.curl30.teonly-cp312-cp312-linux_x86_64.whl",
   "private_prefix": {
     "usr/bin/curl-config": {"bytes": 6675, "kind": "file", "mode": 493, "sha256": "7942d151ccfc2e5431ac63d4c96c702121c5edab62972d2ab3e9c92cb2118a7f"},

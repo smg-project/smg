@@ -13,7 +13,7 @@ import subprocess
 import sys
 import zipfile
 
-SPEC_SHA = "096bbb75e08bfe73024862f4e920b57535cb8ec37e314bf973515fd32915a4f3"
+SPEC_SHA = "40bb0378fa335481ec5870fd898726f2e64642dde19d62673c8ee505673f2644"
 
 
 def require(value, message):
@@ -43,9 +43,10 @@ def readonly_mount(path):
     require(any(row[4] == str(path) and "ro" in row[5].split(",") for row in matches), "required read-only bind mount: " + str(path))
 
 
-def prefix_leaves(prefix, declared):
+def prefix_leaves(prefix, declared, empty_directories=()):
     require(0 < len(declared) <= 55, "private prefix declaration cap")
     directories = {parent for name in declared for parent in Path(name).parents if parent != Path(".")}
+    directories.update(Path(name) for name in empty_directories)
     entry_limit = 2 * (len(declared) + len(directories))
     depth_limit = max(len(Path(name).parts) for name in declared) + 2
     leaves, pending, entries_seen = set(), [prefix], 0
@@ -57,6 +58,7 @@ def prefix_leaves(prefix, declared):
                 path = Path(entry.path)
                 require(len(path.relative_to(prefix).parts) <= depth_limit, "private prefix walk depth cap")
                 if entry.is_dir(follow_symlinks=False):
+                    require(path.relative_to(prefix) in directories, "unexpected private prefix directory")
                     pending.append(path)
                 else:
                     leaves.add(path.relative_to(prefix).as_posix())
@@ -64,8 +66,8 @@ def prefix_leaves(prefix, declared):
     return leaves
 
 
-def verify_prefix(prefix, declared):
-    require(prefix_leaves(prefix, declared) == set(declared), "private prefix leaf set changed")
+def verify_prefix(prefix, declared, empty_directories=()):
+    require(prefix_leaves(prefix, declared, empty_directories) == set(declared), "private prefix leaf set changed")
     for name, item in declared.items():
         path = prefix / name
         require(path.resolve(strict=True).is_relative_to(prefix), "prefix symlink escaped")
@@ -99,7 +101,7 @@ def verify(stage):
     readonly_mount(wheel)
     readonly_mount(prefix)
     require(identity(wheel) == {key: config["wheel"][key] for key in ("bytes", "sha256")}, "wheel differs")
-    verify_prefix(prefix, config["private_prefix"])
+    verify_prefix(prefix, config["private_prefix"], config["private_prefix_empty_directories"])
     for item in config["base_files"]:
         require(identity(Path(item["path"])) == {key: item[key] for key in ("bytes", "sha256")}, "image installation changed")
     curl = [block for block in Path("/var/lib/dpkg/status").read_text().split("\n\n") if "Package: libcurl4\n" in block + "\n"]
