@@ -10,6 +10,9 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
 };
 
+// The control reply is the same message on every slim wire; it keeps its
+// place in this module's API.
+pub use crate::protocol::control::{ControlReplySlim, CONTROL_REPLY_SLIM_TAG};
 use crate::{
     error::{Error, Result},
     protocol::{
@@ -18,10 +21,6 @@ use crate::{
         EngineOutput,
     },
 };
-
-// The control reply is the same message on every slim wire; it keeps its
-// place in this module's API.
-pub use crate::protocol::control::{ControlReplySlim, CONTROL_REPLY_SLIM_TAG};
 
 /// The msgspec tag for [`BatchTokenIDSlimOutput`] (element 0 on the wire).
 pub const BATCH_TOKEN_ID_SLIM_OUTPUT_TAG: &str = "BatchTokenIDSlimOutput";

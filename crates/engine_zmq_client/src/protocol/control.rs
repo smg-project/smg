@@ -17,8 +17,8 @@ use crate::{
 pub const CONTROL_REPLY_SLIM_TAG: &str = "ControlReplySlim";
 /// The reply's field order as this side decodes it (after the tag): what a
 /// scheduler that declares the reply must list, in this order, for the
-/// decoder to read its replies ([`check_prefix`](crate::protocol::positional::check_prefix)
-/// at connect time).
+/// decoder to read its replies (checked at connect time by
+/// [`check_layouts`](crate::protocol::EngineProtocol::check_layouts)).
 pub const CONTROL_REPLY_WIRE_FIELDS: [&str; 4] = ["call_id", "success", "message", "engine_index"];
 
 /// The answer to a control call (`ControlReplySlim`) on a slim wire: the
