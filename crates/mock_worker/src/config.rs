@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
-use crate::engine::{Calibration, EngineParams, LoadsLike, TimingModel};
+use crate::engine::{Calibration, EngineParams, LoadsLike, OutputSeed, TimingModel};
 
 /// Configuration shared by every mocked HTTP and gRPC worker in the process.
 #[derive(Debug, Clone)]
@@ -266,6 +266,17 @@ impl Config {
                     cfg.engine.request_overhead_ms = parse(value(&mut args, &flag)?, &flag)?;
                     overhead_given = true;
                 }
+                "--output-seed" => {
+                    cfg.engine.output_seed = match value(&mut args, &flag)?.as_str() {
+                        "request-id" => OutputSeed::RequestId,
+                        "prompt" => OutputSeed::Prompt,
+                        other => {
+                            return Err(format!(
+                                "--output-seed must be request-id|prompt, got {other}"
+                            ))
+                        }
+                    };
+                }
                 "--prefill-first" => {
                     cfg.engine.prefill_first = parse(value(&mut args, &flag)?, &flag)?;
                 }
@@ -416,6 +427,8 @@ pub fn usage() -> String {
      \n\
      Realistic engine simulator (vLLM pass loop over a block-level KV pool; opt-in):\n\
        --engine <canned|realistic>  engine mode (default canned)\n\
+       --output-seed <request-id|prompt>  synthetic output identity (default request-id);\n\
+                                prompt ignores transport IDs for repeatable cross-router output\n\
        --timing <polynomial|linear|fit:<path>>  pass duration model (default polynomial);\n\
                                 fit:<path> reads a hardware calibration JSON (polynomials, KV capacity,\n\
                                 block size, per-request overhead; flags given explicitly win)\n\
@@ -462,6 +475,26 @@ mod tests {
 
     fn parse(flags: &[&str]) -> Result<Config, String> {
         Config::parse(flags.iter().map(|flag| (*flag).to_string()))
+    }
+
+    #[test]
+    fn output_seed_is_explicit_and_rejects_unknown_modes() {
+        let grpc = ["--grpc-base-port", "19000", "--grpc-count", "1"];
+        assert_eq!(
+            parse(&grpc).expect("defaults").engine.output_seed,
+            OutputSeed::RequestId
+        );
+        for (flag, expected) in [
+            ("prompt", OutputSeed::Prompt),
+            ("request-id", OutputSeed::RequestId),
+        ] {
+            let cfg =
+                parse(&[&grpc[..], &["--output-seed", flag]].concat()).expect("valid seed mode");
+            assert_eq!(cfg.engine.output_seed, expected);
+        }
+        assert!(parse(&[&grpc[..], &["--output-seed", "random"]].concat())
+            .expect_err("unknown seed mode")
+            .contains("--output-seed must be request-id|prompt"));
     }
 
     #[test]
