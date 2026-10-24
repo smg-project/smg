@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import runpy
+import secrets
 import sys
 from pathlib import Path
 
@@ -16,6 +17,13 @@ from rpc_environment import verify
 def observe(directory, expected, role, model, launch):
     seen = set()
     launcher_pid = os.getpid()
+    position_anchor = None
+    if os.environ.get("SMG_EPD_POSITION_DIAGNOSTIC") == "1":
+        fields = Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()
+        position_anchor = {"pid": launcher_pid, "start_ticks": fields[19], "role": role,
+                           "model_id": model, "job_marker": os.environ["E2E_JOB_MARKER"],
+                           "nonce": secrets.token_hex(16)}
+        os.environ["SMG_EPD_POSITION_ANCHOR"] = json.dumps(position_anchor, separators=(",", ":"))
     engine = {
         "sglang.srt.disaggregation.encoder.grpc_server": (
             "b071f28e2c204505a4e5efa207c9886a32b157e6329899f1ffdc50bd6816d8c3"
@@ -51,6 +59,7 @@ def observe(directory, expected, role, model, launch):
                             "job_marker": marker,
                             "original_launcher": launch,
                             "launcher_pid": launcher_pid,
+                            "position_anchor": position_anchor,
                         }
                     )
                     + "\n"

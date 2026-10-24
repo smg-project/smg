@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import struct
+import sys
 import threading
 import time
 from array import array
@@ -18,6 +19,86 @@ if not LOGGER.handlers:
     LOGGER.addHandler(logging.StreamHandler())
 LOCK = threading.RLock()
 PID, REQUESTS, ORIGINS, USED, DROPPED = None, {}, {}, 0, False
+IDENTITY = None
+
+
+def bounded(path, cap):
+    with Path(path).open("rb") as stream:
+        raw = stream.read(cap + 1)
+    if len(raw) > cap:
+        raise ValueError("position identity read cap")
+    return raw
+
+
+def process(pid):
+    raw = bounded(f"/proc/{pid}/stat", 8192).decode()
+    fields = raw.rsplit(")", 1)[1].split()
+    if int(raw.split("(", 1)[0]) != pid or not fields[19].isdigit():
+        raise ValueError("position process identity")
+    return {"pid": pid, "parent_pid": int(fields[1]), "start_ticks": fields[19]}
+
+
+def loaded(module, path, expected_hash):
+    actual = sys.modules.get(module)
+    filename = getattr(actual, "__file__", None)
+    if not filename or Path(filename).resolve() != path:
+        raise ValueError("position actual loaded module path")
+    if hashlib.sha256(bounded(path, 512 * 1024)).hexdigest() != expected_hash:
+        raise ValueError("position actual loaded module hash")
+    return {"module": module, "path": str(path), "sha256": expected_hash}
+
+
+def child_identity(role, first_origin):
+    manifest = json.loads(bounded(Path(__file__).with_name("_smg_epd_position_manifest.json"), 16384))
+    anchor_raw = os.environ["SMG_EPD_POSITION_ANCHOR"]
+    if len(anchor_raw) > 2048:
+        raise ValueError("position launcher anchor cap")
+    anchor = json.loads(anchor_raw)
+    marker = os.environ["E2E_JOB_MARKER"]
+    if (not re.fullmatch(r"[0-9a-f]{32}", anchor["nonce"])
+            or not 1 <= len(marker) <= 256 or anchor["job_marker"] != marker
+            or anchor["role"] != role or anchor["model_id"] != "Qwen/Qwen3.5-9B"
+            or type(anchor["pid"]) is not int or anchor["pid"] <= 0
+            or not re.fullmatch(r"[0-9]+", anchor["start_ticks"])):
+        raise ValueError("position launcher anchor identity")
+    me = process(os.getpid())
+    if me["parent_pid"] != os.getppid():
+        raise ValueError("position parent changed")
+    chain, current = [], me
+    for _ in range(16):
+        chain.append(current)
+        env = bounded(f"/proc/{current['pid']}/environ", 65536).split(b"\0")
+        if ("E2E_JOB_MARKER=" + marker).encode() not in env:
+            raise ValueError("position proc marker missing")
+        if current["pid"] == anchor["pid"]:
+            if current["start_ticks"] != anchor["start_ticks"]:
+                raise ValueError("position launcher PID reused")
+            break
+        if current["parent_pid"] <= 1 or current["parent_pid"] in {r["pid"] for r in chain}:
+            raise ValueError("position launcher ancestry missing")
+        current = process(current["parent_pid"])
+    else:
+        raise ValueError("position ancestry depth cap")
+    if process(me["pid"]) != me:
+        raise ValueError("position emitting process changed")
+    helper = manifest["helper"]
+    helper_origin = loaded(helper["module"], Path(manifest["root"]) / helper["path"], helper["sha256"])
+    if getattr(sys.modules[helper["module"]], "emit", None) is not emit:
+        raise ValueError("position loaded helper binding")
+    return {"kind": "smg_epd_position_identity_v2", **me, "role": role,
+            "model_id": anchor["model_id"], "job_marker": marker, "launcher": anchor,
+            "ancestry": chain, "helper": helper_origin, "first_origin": first_origin,
+            "wall_time_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns()}
+
+
+def log_row(row):
+    global USED
+    text = json.dumps(row, separators=(",", ":"), allow_nan=False)
+    size = len(text.encode()) + 1
+    if size > 4096 or USED + size > 256 * 1024 - 512:
+        raise ValueError("position diagnostic byte cap")
+    USED += size
+    LOGGER.warning("%s", text)
 
 
 def ids(value):
@@ -61,16 +142,12 @@ def origin(module, filename):
         source = Path(filename).resolve()
         if source != Path(manifest["root"]) / expected["path"]:
             raise ValueError("position diagnostic origin path")
-        with source.open("rb") as stream:
-            raw = stream.read(512 * 1024 + 1)
-        if len(raw) > 512 * 1024 or hashlib.sha256(raw).hexdigest() != expected["patched_sha256"]:
-            raise ValueError("position diagnostic origin hash")
-        ORIGINS[key] = {"module": module, "path": str(source), "sha256": expected["patched_sha256"]}
+        ORIGINS[key] = loaded(module, source, expected["patched_sha256"])
     return ORIGINS[key]
 
 
 def emit(stage, role, req, module, filename, *, embedding=None, scheduler=None, processor=None, lengths=None):
-    global PID, REQUESTS, ORIGINS, USED, DROPPED
+    global PID, REQUESTS, ORIGINS, USED, DROPPED, IDENTITY
     if (os.environ.get("SMG_EPD_POSITION_DIAGNOSTIC") != "1"
             or os.environ.get("SMG_EPD_POSITION_MODEL") != "Qwen/Qwen3.5-9B"):
         return
@@ -78,7 +155,9 @@ def emit(stage, role, req, module, filename, *, embedding=None, scheduler=None, 
         with LOCK:
             pid = os.getpid()
             if PID != pid:
-                PID, REQUESTS, ORIGINS, USED, DROPPED = pid, {}, {}, 0, False
+                PID, REQUESTS, ORIGINS, USED, DROPPED, IDENTITY = pid, {}, {}, 0, False, None
+            if DROPPED:
+                return
             rid = str(req.rid)
             if len(rid) > 4096:
                 raise ValueError("position diagnostic RID cap")
@@ -92,12 +171,18 @@ def emit(stage, role, req, module, filename, *, embedding=None, scheduler=None, 
                 raise ValueError("position diagnostic request/event cap")
             if role not in {"prefill", "decode"}:
                 raise ValueError("position diagnostic role")
+            actual_origin = origin(module, filename)
+            if IDENTITY is None:
+                identity = child_identity(role, actual_origin)
+                log_row(identity)
+                IDENTITY = {"start_ticks": identity["start_ticks"], "identity_sha256":
+                            hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()}
             cfg = getattr(scheduler, "model_config", None)
             mm = getattr(req, "mm_inputs", None) or getattr(req, "multimodal_inputs", None)
-            row = {"kind": "smg_epd_position_v1", "stage": stage, "role": role, "pid": pid,
+            row = {"kind": "smg_epd_position_v2", "stage": stage, "role": role, "pid": pid, **IDENTITY,
                    "rid": rid if re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", rid) else "sha256:" + hashlib.sha256(rid.encode()).hexdigest(),
                    "wall_time_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
-                   "origin": origin(module, filename), "event": len(events) + 1,
+                   "origin": actual_origin, "event": len(events) + 1,
                    "input_ids": ids(getattr(req, "input_ids", None)),
                    "origin_ids": ids(getattr(req, "origin_input_ids", None)),
                    "unpadded_ids": ids(getattr(req, "origin_input_ids_unpadded", None)),
@@ -108,19 +193,15 @@ def emit(stage, role, req, module, filename, *, embedding=None, scheduler=None, 
             row["bootstrap_room"] = room if type(room) is int else None
             row["processor_class"] = (type(processor).__module__ + "." + type(processor).__qualname__) if processor is not None else None
             row["lengths"] = {key: value for key, value in (lengths or {}).items() if type(value) is int}
-            text = json.dumps(row, separators=(",", ":"), allow_nan=False)
-            size = len(text.encode()) + 1  # Include the JSONL newline; dedicated handler has no prefix.
-            if size > 4096 or USED + size > 256 * 1024 - 512:
-                raise ValueError("position diagnostic byte cap")
             REQUESTS[rid] = events | {stage}
-            USED += size
-            LOGGER.warning("%s", text)
-    except Exception:
+            log_row(row)
+    except Exception as error:
         # Only diagnostic work is caught. Original validation/compute/transfer remains outside.
         with LOCK:
             if not DROPPED:
                 DROPPED = True
                 try:
-                    LOGGER.warning('{"kind":"smg_epd_position_drop","pid":%d}', os.getpid())
+                    LOGGER.warning('{"kind":"smg_epd_position_drop_v2","pid":%d,"reason":"%s"}',
+                                   os.getpid(), type(error).__name__)
                 except Exception:
                     pass

@@ -6,7 +6,7 @@
     "module": "sglang.srt.disaggregation._smg_epd_position_trace",
     "path": "srt/disaggregation/_smg_epd_position_trace.py",
     "source": "position_trace.py",
-    "sha256": "d121463f88c18d3aafeeb29117266f7f469539d382324eef36a2e99b153f7ef0"
+    "sha256": "609749af6f37c402c73d1c7d6fdb1103220a052cc17fd07f644cb3e6ce39cac8"
   },
   "modules": [
     {

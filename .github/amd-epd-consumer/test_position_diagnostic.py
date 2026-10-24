@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 import tempfile
 import types
 import unittest
@@ -51,9 +52,20 @@ class Fixture(unittest.TestCase):
     def helper(self):
         overlay.apply(self.out)
         path = self.root / self.manifest["helper"]["path"]
-        spec = importlib.util.spec_from_file_location("private_position_control", path)
+        name = self.manifest["helper"]["module"]
+        spec = importlib.util.spec_from_file_location(name, path)
         module = importlib.util.module_from_spec(spec)
+        patch.dict(sys.modules, {name: module}).start()
         spec.loader.exec_module(module)
+        # CPU fixture modules carry the saved source paths; their engine code is not imported.
+        for row in self.manifest["modules"]:
+            loaded = types.ModuleType(row["module"])
+            loaded.__file__ = str(self.root / row["path"])
+            patch.dict(sys.modules, {row["module"]: loaded}).start()
+        anchor = {"pid": os.getpid(), "start_ticks": module.process(os.getpid())["start_ticks"],
+                  "role": "prefill", "model_id": self.manifest["model_id"],
+                  "job_marker": os.environ["E2E_JOB_MARKER"], "nonce": "12" * 16}
+        patch.dict(os.environ, SMG_EPD_POSITION_ANCHOR=json.dumps(anchor)).start()
         self.stream = io.StringIO()
         logger = module.LOGGER
         old = logger.handlers[:], logger.propagate, logger.level
@@ -72,8 +84,9 @@ class Fixture(unittest.TestCase):
         row = self.manifest["modules"][0]
         helper.emit(stage, "prefill", req, row["module"], str(self.root / row["path"]))
 
-    def records(self):
-        return [json.loads(line) for line in self.stream.getvalue().splitlines()]
+    def records(self, include_identity=False):
+        rows = [json.loads(line) for line in self.stream.getvalue().splitlines()]
+        return rows if include_identity else [r for r in rows if r["kind"] != "smg_epd_position_identity_v2"]
 
 
 class OverlayControls(Fixture):
@@ -97,7 +110,7 @@ class OverlayControls(Fixture):
         receiver.write_bytes(receiver.read_bytes() + b"\n# tamper\n")
         helper.ORIGINS.clear()
         self.emit(helper, self.request("bad-origin"))
-        self.assertEqual(self.records()[-1]["kind"], "smg_epd_position_drop")
+        self.assertEqual(self.records()[-1]["kind"], "smg_epd_position_drop_v2")
 
 
 class LoggerControls(Fixture):
@@ -141,8 +154,8 @@ class BoundControls(Fixture):
             for _ in range(20):
                 self.emit(helper, req)
         records = self.records()
-        self.assertEqual(sum(row["kind"] == "smg_epd_position_v1" for row in records), 8)
-        self.assertEqual(sum(row["kind"] == "smg_epd_position_drop" for row in records), 1)
+        self.assertEqual(sum(row["kind"] == "smg_epd_position_v2" for row in records), 8)
+        self.assertEqual(sum(row["kind"] == "smg_epd_position_drop_v2" for row in records), 1)
         self.assertTrue(all(len(line.encode()) <= 4096 for line in self.stream.getvalue().splitlines()))
         self.assertLessEqual(len(self.stream.getvalue().encode()), 256 * 1024)
         self.assertEqual(helper.ids([1] * 16385)["status"], "OVER_CAP_NOT_HASHED")
@@ -151,7 +164,7 @@ class BoundControls(Fixture):
         self.stream.seek(0)
         self.stream.truncate()
         self.emit(helper, self.request("byte-cap"))
-        self.assertEqual([r["kind"] for r in self.records()], ["smg_epd_position_drop"])
+        self.assertEqual([r["kind"] for r in self.records()], ["smg_epd_position_drop_v2"])
 
 
 class ReceiverFlowControls(Fixture):
