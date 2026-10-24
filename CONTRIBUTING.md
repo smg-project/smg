@@ -70,8 +70,15 @@ without the feature using `cargo clippy --workspace --all-targets -- -D warnings
 `llm-tokenizer`, `tool-parser`, `reasoning-parser`, `llm-multimodal`, and
 `openai-protocol` are consumed outside this workspace. The required `rust-semver`
 CI job checks their public APIs against their published crates.io versions using
-`cargo-semver-checks`. It checks default features, tokenizer's `tokenizers-v1`,
-multimodal without default features and with `opencv-video`, and protocol's `axum`.
+`cargo-semver-checks` 0.51.0 on PRs selected by the Rust change filter. It checks
+default features, multimodal without default features and with `opencv-video`,
+and protocol's `axum`.
+
+The tokenizer's `tokenizers-v1` feature is not yet covered by this API gate:
+fresh resolution of its `tokenizers` prerelease dependency currently fails to
+build. Enable its compatibility check once both the current crate and a
+published baseline build with that feature. The existing Rust tests still
+exercise it with the workspace lockfile.
 
 Ordinary PRs are checked as a prospective minor release: compatible additions do
 not need a version bump on every PR. Keep existing public APIs compatible; use
@@ -84,14 +91,18 @@ actual manifest version, without overriding the release type.
 To reproduce the default-feature check locally:
 
 ```bash
-cargo install cargo-semver-checks --locked
+cargo install cargo-semver-checks --version 0.51.0 --locked
 cargo semver-checks -p llm-tokenizer --default-features --release-type minor
 ```
 
 `make check-versions` also rejects insufficient bumps suggested by conventional
-commits, even when a version was already edited. These checks do not cover every
-Rust API change or runtime behavior: review dependency types exposed in public
-APIs and preserve regression tests for tokenization, parsing, and preprocessing.
+commits, even when a version was already edited. For Rust crates before 1.0,
+the minimum follows Cargo's compatibility rules: breaking changes need a minor
+bump at `0.y.z` or a patch bump at `0.0.z`; compatible changes may use a patch.
+Python packages retain the conventional major/minor/patch policy.
+These checks do not cover every Rust API change or runtime behavior: review
+dependency types exposed in public APIs and preserve regression tests for
+tokenization, parsing, and preprocessing.
 Registry or build failures fail the compatibility check; they are not a pass.
 
 ## Commits

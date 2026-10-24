@@ -12,22 +12,20 @@ inputs:
 runs:
   using: composite
   steps:
+    # Keep the checker compatible with the pinned toolchain's rustdoc JSON format.
+    # The semver action reuses this binary instead of installing its latest release.
+    - name: Install compatibility checker
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-semver-checks@0.51.0
+        fallback: none
+
     - name: Check default features
       uses: obi1kenobi/cargo-semver-checks-action@v2
       with:
         package: ${{ inputs.crate }}
         rust-toolchain: '1.98.0'
         feature-group: default-features
-        release-type: ${{ inputs.release-type }}
-
-    - name: Check tokenizer acceleration
-      if: inputs.crate == 'llm-tokenizer'
-      uses: obi1kenobi/cargo-semver-checks-action@v2
-      with:
-        package: ${{ inputs.crate }}
-        rust-toolchain: '1.98.0'
-        feature-group: default-features
-        features: tokenizers-v1
         release-type: ${{ inputs.release-type }}
 
     - name: Check multimodal without Hub downloads

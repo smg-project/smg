@@ -6,7 +6,8 @@ whether its files changed, whether its version was bumped sufficiently, and, for
 a crate, whether the workspace root's dependency entry agrees. Then the files that
 must mirror the gateway's version. Issues are listed with the bump conventional commits ask for
 (``feat!:`` or ``BREAKING CHANGE``: major; ``feat:``: minor; otherwise patch) and,
-on request, applied.
+on request, applied. Minimum bumps for Rust crates before 1.0 follow Cargo's
+first-nonzero-component compatibility rule.
 
 Usage:
     check_release_versions.py [tag] [--check | --fix]
@@ -324,9 +325,19 @@ class Verdict:
         return self.tag_version is not None and self.tag_version == self.version
 
     @property
+    def minimum_version(self) -> str:
+        """The minimum bump, using Cargo's first-nonzero-component rule for 0.x crates."""
+        baseline = self.tag_version or self.version
+        major, minor, _ = version_tuple(baseline)
+        level = self.level or "patch"
+        if self.component.kind == "crate" and major == 0:
+            level = "minor" if level == "major" and minor > 0 else "patch"
+        return bumped(baseline, level)
+
+    @property
     def needs_bump(self) -> bool:
         return self.tag_version is not None and version_tuple(self.version) < version_tuple(
-            bumped(self.tag_version, self.level or "patch")
+            self.minimum_version
         )
 
 
@@ -430,6 +441,9 @@ class Plan:
     def new_version(self, verdict: Verdict) -> str:
         if self.override and verdict.component.name == GATEWAY:
             return self.override
+        # A breaking change to a 0.x crate does not imply readiness for 1.0.
+        if verdict.component.kind == "crate" and verdict.level == "major":
+            return verdict.minimum_version
         return bumped(verdict.tag_version or verdict.version, verdict.level or "patch")
 
 
@@ -444,7 +458,7 @@ def report(verdict: Verdict, out: Out) -> None:
             f"  {warn} {name} {where} — {n} but version not bumped (v{verdict.version}) [{out.level(verdict.level)}]"
         )
     elif verdict.needs_bump:
-        required = bumped(verdict.tag_version, verdict.level or "patch")
+        required = verdict.minimum_version
         out.line(
             f"  {bad} {name} {where} — v{verdict.tag_version} → v{verdict.version}"
             f" is below required v{required} [{out.level(verdict.level)}]"
@@ -482,7 +496,7 @@ def examine(
     )
     plan = Plan(verdicts, [], target, override)
     if gateway is not None and gateway.needs_bump:
-        required = bumped(gateway.tag_version, gateway.level or "patch")
+        required = gateway.minimum_version
         if override and version_tuple(override) < version_tuple(required):
             raise Fatal(f"VERSION_OVERRIDE {override} is below required gateway version {required}")
         plan.gateway_target = plan.new_version(gateway)

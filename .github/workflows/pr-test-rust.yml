@@ -29,6 +29,15 @@ env:
 
 jobs:
   rust-semver:
+    needs: [detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.detect-changes.result == 'success'
+      && (
+        github.event_name != 'pull_request'
+        || needs.detect-changes.outputs.rust-ci == 'true'
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -743,6 +752,7 @@ jobs:
             rust-ci:
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'rust-toolchain.toml'
               - 'rustfmt.toml'
               - 'clippy.toml'
               - 'crates/**'
@@ -757,9 +767,13 @@ jobs:
               - 'clients/openapi-gen/**'
               - '.cargo/**'
               - '.github/actions/setup-rust/**'
+              - '.github/actions/check-crate-semver/**'
+              - '.github/actions/publish-crate/**'
               - 'scripts/ci_install_rust.sh'
               - 'scripts/ci_apt_mirror.sh'
+              - 'scripts/install_opencv.sh'
               - '.github/workflows/pr-test-rust.yml'
+              - '.github/workflows/release-crates.yml'
               - 'scripts/ci_rust_tests.sh'
               - 'examples/wasm/wasm-guest-storage-hook/**'
               - 'examples/wasm/wasm-guest-storage-hook-passthrough/**'
@@ -986,6 +1000,7 @@ jobs:
               (".github/actions/setup-gh/**",                    NONE),
               (".github/actions/export-pod-api-key/**",          NONE),
               (".github/actions/publish-crate/**",               NONE),
+              (".github/actions/check-crate-semver/**",          NONE),
               (".github/actions/**",                             FULL),
               (".github/versions/tokenspeed.ref",                TOKENSPEED),
               (".github/versions/tokenspeed-nightly.txt",        TOKENSPEED),
@@ -2190,7 +2205,7 @@ jobs:
                 "${{ needs.python-unit-tests.result }}" =~ $bad || \
                 "${{ needs.rust-lint.result }}" =~ $bad || \
                 "${{ needs.rust-tests.result }}" =~ $bad || \
-                "${{ needs.rust-semver.result }}" != "success" || \
+                "${{ needs.rust-semver.result }}" =~ $bad || \
                 "${{ needs.cargo-audit.result }}" =~ $bad || \
                 "${{ needs.rust-aarch64.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat.result }}" =~ $bad || \

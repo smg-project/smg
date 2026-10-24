@@ -8,6 +8,8 @@
 # a bump changes this file, `rust-version` in Cargo.toml and every one of
 # those (grep for the release). rustfmt runs on nightly (`cargo +nightly fmt`),
 # which this pin does not affect.
+# Also validate the cargo-semver-checks pin in check-crate-semver against the
+# new toolchain's rustdoc JSON format when upgrading Rust.
 [toolchain]
 channel = "1.98.0"
 components = ["clippy", "rustfmt"]
