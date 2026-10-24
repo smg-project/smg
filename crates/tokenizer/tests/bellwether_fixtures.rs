@@ -84,7 +84,8 @@ use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
 
 use crate::common::hub_fetch::{
-    cached_download, fetch, rate_limit_wait, RATE_LIMITED_TRIES, RATE_LIMIT_WINDOW,
+    answered, cached_download, fetch, rate_limit_wait, RATE_LIMITED_TRIES, RATE_LIMIT_WINDOW,
+    TRANSPORT_ERROR_RETRIES, TRANSPORT_ERROR_WAIT,
 };
 
 mod common;
@@ -1567,15 +1568,15 @@ fn download(
         return Ok(None);
     }
     let url = format!("{hub}/{model}/resolve/{revision}/{file}");
-    let response = fetch(client, &url)?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
+    let answer = fetch(client, &url).map_err(|e| format!("GET {url}: {e}"))?;
+    if answer.status == reqwest::StatusCode::NOT_FOUND {
         fs::write(&absent, b"").map_err(|e| format!("cannot write {}: {e}", absent.display()))?;
         return Ok(None);
     }
-    if !response.status().is_success() {
-        return Err(format!("GET {url}: HTTP {}", response.status()));
+    if !answer.status.is_success() {
+        return Err(format!("GET {url}: HTTP {}", answer.status));
     }
-    let bytes = response.bytes().map_err(|e| format!("GET {url}: {e}"))?;
+    let bytes = answer.body;
     if bytes.len() < min_bytes {
         return Err(format!(
             "{url}: {} bytes, expected at least {min_bytes}",
@@ -2478,17 +2479,29 @@ fn an_error_in_the_fan_out_leaves_the_other_threads_their_item_in_flight_and_no_
     );
 }
 
-/// A loopback server for the loaders' tests: it answers its connections with `heads` in order
-/// (each a response head whole; the body is `ok`), then stops, so a request past the last answer
-/// is refused; the count is the requests read, bumped before the answer goes out. A failure on
-/// the server's side ends it, and the test reads it in the count or in a refused connection.
-fn loopback(heads: &'static [&'static str]) -> io::Result<(String, Arc<AtomicUsize>)> {
+/// What the loopback server does with one connection once it has read the request: answers
+/// with the head and the body `ok`; closes it before any answer, as a connection the hub
+/// dropped does (the client reads `error sending request`); or announces a long body and cuts
+/// it short (the client reads `error decoding response body`).
+#[derive(Clone, Copy)]
+enum Reply {
+    Head(&'static str),
+    NoAnswer,
+    CutBody,
+}
+
+/// A loopback server for the loaders' tests: it answers its connections with `replies` in order
+/// (each a response head whole with the body `ok`, or a connection broken below HTTP), then
+/// stops, so a request past the last answer is refused; the count is the requests read, bumped
+/// before the answer goes out. A failure on the server's side ends it, and the test reads it in
+/// the count or in a refused connection.
+fn loopback(replies: &'static [Reply]) -> io::Result<(String, Arc<AtomicUsize>)> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let url = format!("http://{}", listener.local_addr()?);
     let served = Arc::new(AtomicUsize::new(0));
     let count = Arc::clone(&served);
     std::thread::spawn(move || {
-        for head in heads {
+        for reply in replies {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
@@ -2498,7 +2511,16 @@ fn loopback(heads: &'static [&'static str]) -> io::Result<(String, Arc<AtomicUsi
                 request.push(byte[0]);
             }
             count.fetch_add(1, Ordering::SeqCst);
-            let answer = format!("{head}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            let answer = match reply {
+                Reply::Head(head) => {
+                    format!("{head}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                }
+                Reply::NoAnswer => continue,
+                Reply::CutBody => {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nConnection: close\r\n\r\nok"
+                        .to_string()
+                }
+            };
             if stream.write_all(answer.as_bytes()).is_err() {
                 return;
             }
@@ -2511,25 +2533,25 @@ fn loopback(heads: &'static [&'static str]) -> io::Result<(String, Arc<AtomicUsi
 /// past the limit is the one returned; after the last try, the limit itself is.
 #[test]
 fn a_rate_limited_get_is_sent_again_after_the_retry_after_wait() {
-    const LIMITED: &str = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0";
-    const LIMITED_EVERY_TIME: &[&str] = &[LIMITED; RATE_LIMITED_TRIES as usize];
+    const LIMITED: Reply = Reply::Head("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0");
+    const LIMITED_EVERY_TIME: &[Reply] = &[LIMITED; RATE_LIMITED_TRIES as usize];
     let client = common::http_client();
-    let (url, served) = loopback(&[LIMITED, "HTTP/1.1 200 OK"]).unwrap();
-    let response = fetch(
+    let (url, served) = loopback(&[LIMITED, Reply::Head("HTTP/1.1 200 OK")]).unwrap();
+    let answer = fetch(
         &client,
         &format!("{url}/org/m/resolve/r/tokenizer_config.json"),
     )
     .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert_eq!(response.text().unwrap(), "ok");
+    assert_eq!(answer.status, reqwest::StatusCode::OK);
+    assert_eq!(answer.body, b"ok");
     assert_eq!(served.load(Ordering::SeqCst), 2);
     let (url, served) = loopback(LIMITED_EVERY_TIME).unwrap();
-    let response = fetch(
+    let answer = fetch(
         &client,
         &format!("{url}/org/m/resolve/r/tokenizer_config.json"),
     )
     .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(answer.status, reqwest::StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(served.load(Ordering::SeqCst), RATE_LIMITED_TRIES as usize);
 }
 
@@ -2581,8 +2603,8 @@ fn the_wait_after_a_rate_limit_is_what_the_answer_says_and_a_window_at_most() {
 /// failing on the poison.
 #[test]
 fn a_cached_download_outlives_a_rate_limit_and_a_failed_download_before_it() {
-    const LIMITED: &str = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0";
-    const LIMITED_EVERY_TIME: &[&str] = &[LIMITED; RATE_LIMITED_TRIES as usize];
+    const LIMITED: Reply = Reply::Head("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0");
+    const LIMITED_EVERY_TIME: &[Reply] = &[LIMITED; RATE_LIMITED_TRIES as usize];
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tokenizer.json");
     let (url, served) = loopback(LIMITED_EVERY_TIME).unwrap();
@@ -2597,7 +2619,7 @@ fn a_cached_download_outlives_a_rate_limit_and_a_failed_download_before_it() {
     );
     assert_eq!(served.load(Ordering::SeqCst), RATE_LIMITED_TRIES as usize);
     assert!(!path.exists(), "a failed download leaves no file");
-    let (url, served) = loopback(&[LIMITED, "HTTP/1.1 200 OK"]).unwrap();
+    let (url, served) = loopback(&[LIMITED, Reply::Head("HTTP/1.1 200 OK")]).unwrap();
     cached_download(&common::http_client(), &url, &path, 2);
     assert_eq!(fs::read(&path).unwrap(), b"ok");
     assert_eq!(served.load(Ordering::SeqCst), 2);
@@ -2614,7 +2636,7 @@ fn a_cached_download_outlives_a_rate_limit_and_a_failed_download_before_it() {
 #[test]
 fn a_file_the_checkpoint_does_not_serve_is_asked_for_once() {
     let client = common::http_client();
-    let (url, served) = loopback(&["HTTP/1.1 404 Not Found"]).unwrap();
+    let (url, served) = loopback(&[Reply::Head("HTTP/1.1 404 Not Found")]).unwrap();
     let dir = tempfile::tempdir().unwrap();
     for _ in 0..2 {
         let got = download(&client, &url, "org/m", "r", dir.path(), "config.json", 2).unwrap();
@@ -2622,4 +2644,137 @@ fn a_file_the_checkpoint_does_not_serve_is_asked_for_once() {
     }
     assert!(dir.path().join("config.json.absent").is_file());
     assert_eq!(served.load(Ordering::SeqCst), 1);
+}
+
+/// A GET whose body breaks below HTTP is sent again after a short wait and the file lands whole
+/// on the second try; a whole first answer costs one request and no wait.
+#[test]
+#[expect(
+    clippy::print_stdout,
+    reason = "the requests counted and the times measured are test diagnostic output"
+)]
+fn a_download_whose_body_breaks_is_sent_again_and_lands_on_the_second_try() {
+    let client = common::http_client();
+    let dir = tempfile::tempdir().unwrap();
+    let (url, served) = loopback(&[Reply::CutBody, Reply::Head("HTTP/1.1 200 OK")]).unwrap();
+    let started = Instant::now();
+    let path = download(&client, &url, "org/m", "r", dir.path(), "tokenizer.json", 2)
+        .unwrap()
+        .expect("the file lands on the second try");
+    let elapsed = started.elapsed();
+    assert_eq!(fs::read(&path).unwrap(), b"ok");
+    assert_eq!(served.load(Ordering::SeqCst), 2);
+    assert!(
+        elapsed >= TRANSPORT_ERROR_WAIT,
+        "the wait before the second try was {elapsed:?}"
+    );
+    assert!(
+        !dir.path().join("tokenizer.json.part").exists(),
+        "no part is left behind"
+    );
+    println!("a body broken once: 2 requests, the file landed after {elapsed:?}");
+    let (url, served) = loopback(&[Reply::Head("HTTP/1.1 200 OK")]).unwrap();
+    let started = Instant::now();
+    download(&client, &url, "org/m", "r", dir.path(), "config.json", 2)
+        .unwrap()
+        .expect("the file lands on the first try");
+    let elapsed = started.elapsed();
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        1,
+        "a whole first answer is one request"
+    );
+    println!("a whole first answer: 1 request, the file landed after {elapsed:?}");
+}
+
+/// `answered` is what decides whether a loader fails or skips: a body the hub cut under the read
+/// on every try is an answered error; a hub that never answers is not; and a try that fails to
+/// connect after answered tries does not turn them into a skip, since `fetch` keeps the first
+/// answered error.
+#[test]
+fn a_broken_body_reads_as_answered_and_no_answer_does_not() {
+    const CUT_EVERY_TIME: &[Reply] = &[
+        Reply::CutBody,
+        Reply::CutBody,
+        Reply::CutBody,
+        Reply::CutBody,
+    ];
+    const NO_ANSWER_EVER: &[Reply] = &[
+        Reply::NoAnswer,
+        Reply::NoAnswer,
+        Reply::NoAnswer,
+        Reply::NoAnswer,
+    ];
+    const ANSWERED_THEN_NOT: &[Reply] = &[
+        Reply::CutBody,
+        Reply::NoAnswer,
+        Reply::NoAnswer,
+        Reply::NoAnswer,
+    ];
+    assert_eq!(CUT_EVERY_TIME.len(), TRANSPORT_ERROR_RETRIES as usize + 1);
+    let client = common::http_client();
+    let fetch_error = |replies: &'static [Reply]| {
+        let (url, served) = loopback(replies).unwrap();
+        let error = fetch(&client, &format!("{url}/org/m/resolve/r/tokenizer.json")).unwrap_err();
+        assert_eq!(served.load(Ordering::SeqCst), replies.len());
+        error
+    };
+    assert!(
+        answered(&fetch_error(CUT_EVERY_TIME)),
+        "a body cut under the read is an answer"
+    );
+    assert!(
+        !answered(&fetch_error(NO_ANSWER_EVER)),
+        "no connection is no answer"
+    );
+    assert!(
+        answered(&fetch_error(ANSWERED_THEN_NOT)),
+        "the first answered error is kept past later tries that never connected"
+    );
+}
+
+/// A GET that breaks below HTTP at every try (the connection closed before any answer, then the
+/// body cut short) fails after the bounded retries with the waits honoured, no file and no part
+/// left behind: the loader reports the model as not loaded instead of hanging.
+#[test]
+#[expect(
+    clippy::print_stdout,
+    reason = "the requests counted and the times measured are test diagnostic output"
+)]
+fn a_download_that_breaks_at_every_try_fails_after_the_bounded_retries() {
+    const BROKEN_EVERY_TIME: &[Reply] = &[
+        Reply::NoAnswer,
+        Reply::CutBody,
+        Reply::CutBody,
+        Reply::CutBody,
+    ];
+    assert_eq!(
+        BROKEN_EVERY_TIME.len(),
+        TRANSPORT_ERROR_RETRIES as usize + 1
+    );
+    let client = common::http_client();
+    let dir = tempfile::tempdir().unwrap();
+    let (url, served) = loopback(BROKEN_EVERY_TIME).unwrap();
+    let started = Instant::now();
+    let error = download(&client, &url, "org/m", "r", dir.path(), "tokenizer.json", 2).unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(
+        error.starts_with(&format!("GET {url}/org/m/resolve/r/tokenizer.json: ")),
+        "{error}"
+    );
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        TRANSPORT_ERROR_RETRIES as usize + 1
+    );
+    let waits = TRANSPORT_ERROR_WAIT * (2u32.pow(TRANSPORT_ERROR_RETRIES) - 1);
+    assert!(
+        elapsed >= waits,
+        "the waits of {waits:?} in all were honoured: {elapsed:?}"
+    );
+    assert!(!dir.path().join("tokenizer.json").exists());
+    assert!(!dir.path().join("tokenizer.json.part").exists());
+    println!(
+        "broken at every try: {} requests, failed after {elapsed:?}: {error}",
+        served.load(Ordering::SeqCst)
+    );
 }

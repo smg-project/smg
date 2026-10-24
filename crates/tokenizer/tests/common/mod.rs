@@ -106,14 +106,14 @@ pub fn ensure_kimi_k3_cached() -> PathBuf {
         }
         println!("Downloading Kimi-K3 {file} from HuggingFace...");
         let client = http_client();
-        let response = hub_fetch::fetch(&client, &format!("{KIMI_K3_REPO}/{file}"))
+        let answer = hub_fetch::fetch(&client, &format!("{KIMI_K3_REPO}/{file}"))
             .unwrap_or_else(|e| panic!("Failed to download {file}: {e}"));
         assert!(
-            response.status().is_success(),
+            answer.status.is_success(),
             "Failed to download {file}: HTTP {}",
-            response.status()
+            answer.status
         );
-        let content = response.bytes().expect("Failed to read download");
+        let content = answer.body;
         assert!(
             content.len() >= min_bytes,
             "Downloaded {file} too small: {} bytes",
@@ -147,11 +147,13 @@ const DEEPSEEK_V41_CACHE_DIR: &str = ".tokenizer_cache/deepseek_v41";
 /// Downloads one tokenizer file of the model `label` from `base` into
 /// `dir/file`, mirroring the Kimi-K3 helper's approach: write to a `.part`
 /// file and rename into place, so a failed write never leaves a short file
-/// that a later run would trust. Only a transport failure (no connection,
-/// TLS, timeout) returns `false` so the caller can skip when offline; a
-/// reachable but wrong response (non-success status, short body) or an
-/// unwritable cache panics with the reason, so a moved or gated file fails
-/// loudly instead of silently disabling the parity gate.
+/// that a later run would trust. Only a transport failure that no try got
+/// past (no connection, TLS, a timeout before the answer; the GET is sent
+/// again a few times first) returns `false` so the caller can skip when
+/// offline; a reachable but wrong response (non-success status, short body,
+/// a body broken at every try) or an unwritable cache panics with the reason,
+/// so a moved or gated file fails loudly instead of silently disabling the
+/// parity gate.
 #[expect(
     clippy::print_stdout,
     clippy::panic,
@@ -167,21 +169,20 @@ fn download_tokenizer_file(
     println!("Downloading {label} {file} from HuggingFace...");
     let client = http_client();
     let url = format!("{base}/{file}");
-    let response = match hub_fetch::fetch(&client, &url) {
-        Ok(response) => response,
-        Err(error) => {
+    let answer = match hub_fetch::fetch(&client, &url) {
+        Ok(answer) => answer,
+        Err(error) if !hub_fetch::answered(&error) => {
             println!("{label} download skipped (transport error): {error}");
             return false;
         }
+        Err(error) => panic!("{label} {file} download body error: {error}"),
     };
-    let status = response.status();
+    let status = answer.status;
     assert!(
         status.is_success(),
         "{label} {file} download failed: HTTP {status} from {url}"
     );
-    let content = response
-        .bytes()
-        .unwrap_or_else(|error| panic!("{label} {file} download body error: {error}"));
+    let content = answer.body;
     assert!(
         content.len() >= min_bytes,
         "{label} {file} download is {} bytes, expected at least {min_bytes}",
