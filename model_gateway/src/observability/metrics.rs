@@ -372,6 +372,16 @@ pub(crate) const WORKER_RETRY_BACKOFF_BUCKETS: &[f64] = &[
     0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
 
+/// Histogram buckets for `smg_router_stage_seconds`: the ingress stages take
+/// tens of microseconds and the engine's execute seconds, so the edges run
+/// from ten microseconds to a minute. Without explicit buckets the recorder
+/// renders the family as a summary, whose quantiles cannot be aggregated
+/// across gateways or time windows and whose sketch costs every record.
+pub(crate) const ROUTER_STAGE_BUCKETS: &[f64] = &[
+    0.000_01, 0.000_025, 0.000_05, 0.000_1, 0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025,
+    0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+];
+
 /// Jemalloc's run-time options for a long-running gateway, for every final
 /// artifact (the `smg` executable, the Python extension, the Go FFI library)
 /// to export as
@@ -1309,6 +1319,11 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
     // answer: their own buckets, or the recorder renders them as a summary.
     let malformed_bytes_matcher = Matcher::Full(String::from(symphony_telemetry::MALFORMED_BYTES));
 
+    // The pipeline's stage times run from tens of microseconds (the ingress
+    // stages) to seconds (the engine's execute): their own buckets, or the
+    // recorder renders the family as a summary.
+    let stage_matcher = Matcher::Full(String::from("smg_router_stage_seconds"));
+
     HashMap::from([
         (duration_matcher, duration_bucket.clone()),
         (ttft_matcher, duration_bucket.clone()),
@@ -1325,6 +1340,7 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
         (kv_apply_matcher, KV_INDEX_MICRO_BUCKETS.to_vec()),
         (kv_lag_matcher, KV_EVENT_LAG_BUCKETS.to_vec()),
         (retry_backoff_matcher, WORKER_RETRY_BACKOFF_BUCKETS.to_vec()),
+        (stage_matcher, ROUTER_STAGE_BUCKETS.to_vec()),
         (
             malformed_bytes_matcher,
             symphony_telemetry::MALFORMED_BYTES_BUCKETS.to_vec(),

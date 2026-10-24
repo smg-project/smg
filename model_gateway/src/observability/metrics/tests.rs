@@ -1361,3 +1361,44 @@ fn time_per_router_record_contended() {
     time("keys built per record", false);
     time("handles kept per worker", true);
 }
+
+/// The stage series renders as a real histogram (`_bucket{le=...}` lines)
+/// under the bucket map `start_prometheus` installs: a family the map does
+/// not name falls back to a summary, whose quantiles cannot be aggregated
+/// and whose sketch costs every record.
+#[test]
+fn the_stage_series_renders_as_a_bucketed_histogram_under_the_installed_map() {
+    let mut builder = PrometheusBuilder::new();
+    for (matcher, buckets) in histogram_bucket_overrides(None) {
+        builder = builder
+            .set_buckets_for_metric(matcher, &buckets)
+            .expect("bucket override");
+    }
+    let recorder = builder.build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, || {
+        Metrics::record_stage_duration(
+            RouterStage::WorkerSelection,
+            false,
+            Duration::from_micros(40),
+        );
+        Metrics::record_stage_duration(RouterStage::Execute, true, Duration::from_millis(80));
+    });
+    let rendered = handle.render();
+    for expected in [
+        "smg_router_stage_seconds_bucket{stage=\"worker_selection\",streaming=\"false\",le=\"0.00005\"} 1",
+        "smg_router_stage_seconds_bucket{stage=\"worker_selection\",streaming=\"false\",le=\"0.000025\"} 0",
+        "smg_router_stage_seconds_bucket{stage=\"execute\",streaming=\"true\",le=\"0.1\"} 1",
+        "smg_router_stage_seconds_bucket{stage=\"execute\",streaming=\"true\",le=\"0.05\"} 0",
+        "smg_router_stage_seconds_count{stage=\"execute\",streaming=\"true\"} 1",
+    ] {
+        assert!(
+            rendered.lines().any(|line| line == expected),
+            "missing {expected} in:\n{rendered}"
+        );
+    }
+    assert!(
+        !rendered.contains("smg_router_stage_seconds{"),
+        "a summary's quantile lines rendered:\n{rendered}"
+    );
+}
