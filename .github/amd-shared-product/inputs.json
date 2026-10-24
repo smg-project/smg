@@ -1,7 +1,7 @@
 {
-  "ready": false,
-  "run_budget_admitted": false,
-  "artifacts_pinned": false,
+  "ready": true,
+  "run_budget_admitted": true,
+  "artifacts_pinned": true,
   "artifacts": [
     {
       "name": "smg-wheel",
@@ -228,7 +228,7 @@
     "diagnostic_workflow_difference": "NIXL tier-select dispatch caller only; normal product tooling CPU jobs are not part of this diagnostic workflow."
   },
   "source_identity_note": "Original f470 tests/caller selection and compiled37 c9d/gateway143a/actual445 producer14 remain fixed. Consumer19/scripts changes only two exact hash-bound default-off private-wheel setup/audit hooks; namespace observers verify the genuine local version/RECORD/private-prefix and each owned TP1 EngineCore. No GPU, cleanup-fix or prior MC4 acceptance is transferred.",
-  "admitted_tier": null,
+  "admitted_tier": "4",
   "contracts": {
     "4": {
       "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-4gpu-pd[3]/vllm/nvidia",
@@ -310,8 +310,11 @@
     "host_bundle": "/tmp/smg-mooncake-hip723-1f2ded97f9a0",
     "read_only_prefix_mount": "/work/prefix",
     "read_only_wheel_mount": "/work/mooncake_transfer_engine_rocm-0.3.13.post1+amd.hip723.g26b0229.curl30.teonly-cp312-cp312-linux_x86_64.whl",
-    "staging_accepted": false,
-    "staging_receipt": null,
+    "staging_accepted": true,
+    "staging_receipt": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T0300Z/mooncake4-private-hip723-new3000-source-proposal-A-solewatch-v2/root-launch-v3-two-idle-source-only/root-launch-actual/root-private-bundle-staging-acceptance.json",
+      "sha256": "cdf777b143958df36f5e079c5e55c36cea6a5739a3df6bc4cf603c5912b63c45"
+    },
     "GPU_verified": false,
     "base_image_installation_preserved": true
   }
