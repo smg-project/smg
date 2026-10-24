@@ -47,6 +47,7 @@ fn context(
             detected_runtime_type: None,
             discovered_labels: Default::default(),
             dp_info: None,
+            symphony_table: None,
             model_cards: Vec::new(),
             workers: None,
             final_labels: Default::default(),
