@@ -63,7 +63,7 @@
     },
     "smg_grpc_servicer.vllm.servicer": {
       "path": "grpc_servicer/smg_grpc_servicer/vllm/servicer.py",
-      "sha256": "081e58ba0f5775b3559c3a8ff128d73c3a9cc73c91177c1762f92ffd9cf2dc3a"
+      "sha256": "cd3aeaa0408ebf4f32a7fdf9602711b083d202ee8533af11f3c4f3e3e8089ecb"
     }
   }
 }

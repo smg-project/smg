@@ -5,7 +5,7 @@ import re
 
 from source import WORKFLOW, require
 
-POLICY = "frozen_main60f_python173_build_only_all_18_steps_success_v1"
+POLICY = "frozen_main19c_python173_build_only_all_18_steps_success_v1"
 EXPLICIT_STEPS = [
     "Run actions/checkout@v7",
     "Verify frozen build source",

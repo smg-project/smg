@@ -312,9 +312,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         self._mm_waiting = 0
         self._unhealthy_logged = False
         logger.info(
-            "VllmEngineServicer initialized (mm_processor=%s, source=%s)",
+            "VllmEngineServicer initialized (mm_processor=%s, source=%s, pid=%s)",
             self._mm_processor.name if self._mm_processor is not None else "off",
             self._mm_settings.source,
+            os.getpid(),
         )
         # The planned warm-up (:mod:`smg_grpc_servicer.vllm.warmup`): in a
         # launcher's process (the plugin kept its parse, the serving coroutine
