@@ -62,7 +62,6 @@ def native_mapping(pid, expected):
 class Original173:
     def __init__(self, root, directory):
         self.root, self.directory = root, directory
-        self.launch_original = install()
         package = Path(__file__).parent
         self.contract = json.loads((package / "contract.json").read_text())
         raw = (package / "cases.json").read_bytes()
@@ -70,6 +69,7 @@ class Original173:
         self.cases = json.loads(raw)
         self.records, self.reports, self.errors = [], {}, []
         self.native = json.loads((root / ".github/amd-shared-product/inputs.json").read_text())["gateway_native"]
+        self.launch_original = install()
 
     def save(self):
         (self.directory / "ts-python173-proof.json").write_text(json.dumps({"lane": "python",
