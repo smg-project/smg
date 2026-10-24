@@ -48,6 +48,12 @@ class ServerArgsSection:
     reasoning_parser: Any
     # The attention-DP width (``mapping.attn.dp_size``) when the args carry one.
     attention_dp_size: int | None
+    # The engine's process count (``mapping.world_size``, else ``world_size``)
+    # when the args carry one.
+    world_size: int | None
+    # Speculative decoding: the algorithm when one is set, and its draft window.
+    speculative_algorithm: Any
+    speculative_num_draft_tokens: int | None
     # The admission window, under TokenSpeed's spelling or the frontend's; 0 when unset.
     running_window: int
     # The scheduler's step budget in prompt tokens, when the args carry one as
@@ -87,6 +93,12 @@ class ServerArgsSection:
             reasoning_parser=getattr(server_args, "reasoning_parser", None),
             attention_dp_size=positive_int(
                 getattr(getattr(mapping, "attn", None), "dp_size", None)
+            ),
+            world_size=positive_int(getattr(mapping, "world_size", None))
+            or positive_int(getattr(server_args, "world_size", None)),
+            speculative_algorithm=getattr(server_args, "speculative_algorithm", None) or None,
+            speculative_num_draft_tokens=positive_int(
+                getattr(server_args, "speculative_num_draft_tokens", None)
             ),
             running_window=int(
                 getattr(server_args, "max_num_seqs", 0)

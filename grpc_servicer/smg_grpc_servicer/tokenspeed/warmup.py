@@ -23,7 +23,19 @@ serving. The remainders run last, in an order whose every prefix is a
 uniform spread of the range, so the budget cuts evenly if it cuts at all.
 They run at the ``full`` level alone (the shipped default): a start at
 ``fast`` takes the length classes and leaves the hazard open, which the
-start log says.
+start log says. They are asked for when the engine runs more than one
+process (its parallel layout, off the server arguments): the hang needs a
+collective waiting on a peer, and a one-process engine pays a count's first
+use as a pause, so it plans the length classes alone, as the other engines
+do, and an 8k window is a few hundred steps rather than eight thousand. An
+unknown layout keeps them.
+
+The plan's longest prompt leaves the engine's scheduler what it keeps back
+(:func:`context_reserve_tokens`): its request handler clamps a request's
+output budget to ``(max_model_len - 1) - prompt - 1`` and its scheduler
+refuses a negative clamp, so a prompt one below the context, which the
+shared plan would otherwise end on, is a request this engine refuses
+(and, today, exits on).
 
 Under attention data parallelism the servicer routes by load and the wire
 pins no rank, so a remainder, like every prefill shape, reaches one rank: the
@@ -55,6 +67,10 @@ DEFAULT_STEP_TOKENS = 8192
 #: and the budget cuts the pass about halfway, evenly (the spread order): a
 #: chunk size, or a larger budget on the knob, covers every count.
 DEFAULT_BUDGET_SECS = 900.0
+#: The positions the engine's scheduler keeps back beyond a request's prompt
+#: and its output budget: the one its request handler takes off the context
+#: for the request length, and the one it takes off the output clamp.
+SCHEDULER_RESERVE_TOKENS = 2
 _MAX_MESSAGE_BYTES = 1024 * 1024 * 256
 
 
@@ -89,9 +105,24 @@ def warmup_inputs(server_args: Any, facts: Mapping[str, Any]) -> WarmupInputs | 
         max_model_len=args.max_model_len or int(facts.get("max_context_length") or 0),
         vocab_size=int(facts.get("vocab_size") or 0),
         source="window and step from the server arguments (the engine's default step when unset)",
-        # Every count a chunk can hold, once, before serving (the module's doc).
-        every_prefill_length=True,
+        context_reserve_tokens=context_reserve_tokens(args),
+        # Every count a chunk can hold, once, before serving (the module's
+        # doc), where a count's first use can meet a collective in flight:
+        # an engine of more than one process. An unknown layout keeps them.
+        every_prefill_length=args.world_size != 1,
     )
+
+
+def context_reserve_tokens(args: Any) -> int:
+    """The positions of the context this engine keeps back beyond a request's
+    prompt and its output, as the engine computes them off its server
+    arguments: the scheduler's two (:data:`SCHEDULER_RESERVE_TOKENS`), or the
+    frontend's input reserve when it is wider: under speculative decoding the
+    engine keeps the draft window (``speculative_num_draft_tokens``) behind
+    the prompt, one position otherwise, which the one-token output of a
+    warm-up request already covers."""
+    draft = args.speculative_num_draft_tokens if args.speculative_algorithm else None
+    return max(SCHEDULER_RESERVE_TOKENS, (draft or 1) - 1)
 
 
 class GrpcWire:

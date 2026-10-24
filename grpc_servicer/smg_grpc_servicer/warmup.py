@@ -186,6 +186,15 @@ class WarmupInputs:
     capture_sizes: tuple[int, ...] = ()
     #: Where the figures came from, for the start line.
     source: str = ""
+    #: How many positions of the context the engine's scheduler keeps back
+    #: beyond a request's prompt and its output budget: a planned prompt is
+    #: at most the context less the request's output less this many tokens.
+    #: The engines differ (one admits a prompt and an output budget that
+    #: together fill the context; the others keep one or more positions back
+    #: and refuse, or clamp the output of, a request that reaches them), so
+    #: an engine module states what its scheduler's own admission computes,
+    #: read off the engine's configuration.
+    context_reserve_tokens: int = 0
     #: How many data-parallel ranks the servicer fronts, each a scheduler of
     #: its own with the window and the step above. Above one, the plan runs
     #: every shape on every rank, each request pinned to its rank; an engine
@@ -389,9 +398,12 @@ def plan_warmup(inputs: WarmupInputs, level: str = DEFAULT_LEVEL) -> WarmupPlan:
     :func:`spread_order` at the ``full`` level (the ``fast`` level keeps the
     merged ladder: a test leg or a quick start takes the classes alone, and
     the shipped default is ``full``). A prompt never exceeds the admission
-    step nor the context less its output. Under data parallelism (``inputs.data_parallel_size`` above
-    one) the staircase runs once per rank and every prefill shape goes to
-    every rank at once, each request pinned to its rank."""
+    step, nor the context less its output and the positions the engine's
+    scheduler keeps back (:attr:`WarmupInputs.context_reserve_tokens`), so
+    no step reaches a shape the engine refuses. Under data parallelism
+    (``inputs.data_parallel_size`` above one) the staircase runs once per
+    rank and every prefill shape goes to every rank at once, each request
+    pinned to its rank."""
     if level not in LEVELS:
         raise ValueError(f"unknown warm-up level {level!r}; expected one of {LEVELS}")
     steps: list[WarmupStep] = []
@@ -399,11 +411,14 @@ def plan_warmup(inputs: WarmupInputs, level: str = DEFAULT_LEVEL) -> WarmupPlan:
         return WarmupPlan(level, inputs, ())
     requests = _Requests(inputs.vocab_size, inputs.lone_leg_bootstrap)
     window = inputs.max_num_seqs if inputs.max_num_seqs > 0 else DEFAULT_WINDOW
-    # The longest prompt a one-token request may carry.
+    # The longest prompt a one-token request may carry: the context less the
+    # token and the positions the engine keeps back (the step alone when the
+    # configuration states no context).
     context = (
         inputs.max_model_len if inputs.max_model_len > 0 else inputs.max_num_batched_tokens + 1
     )
-    limit = min(inputs.max_num_batched_tokens, context - 1)
+    reserve = max(inputs.context_reserve_tokens, 0) if inputs.max_model_len > 0 else 0
+    limit = min(inputs.max_num_batched_tokens, context - 1 - reserve)
     if limit < 1:
         return WarmupPlan(level, inputs, ())
     ranks: tuple[int | None, ...] = (
@@ -415,7 +430,7 @@ def plan_warmup(inputs: WarmupInputs, level: str = DEFAULT_LEVEL) -> WarmupPlan:
     # first token comes out of the prefill step; the decode batch holds the
     # requests still generating after it).
     count = min(window, inputs.max_num_batched_tokens // STAIRCASE_PROMPT_TOKENS)
-    count = min(count, max(context - 1 - STAIRCASE_PROMPT_TOKENS, 0))
+    count = min(count, max(context - 1 - reserve - STAIRCASE_PROMPT_TOKENS, 0))
     for rank in ranks if count >= 1 else ():
         on_rank = f" on rank {rank}" if rank is not None else ""
         steps.append(
@@ -544,6 +559,10 @@ class _Pass:
         self.report = WarmupReport(plan)
         self._started = time.monotonic()
         self._failed_in_a_row = 0
+        # The step that opened the current run of whole failures: the one the
+        # end line names. A partly failed step neither extends nor ends the
+        # run, so the run's length does not locate its first step.
+        self._first_failed: int | None = None
         self._remainders = sum(1 for step in plan.steps if step.kind == "remainder")
         self._remainders_done = 0
         self._remainder_secs = 0.0
@@ -563,7 +582,13 @@ class _Pass:
             self.report.budget_hit = True
             return None
         if self._failed_in_a_row >= CONSECUTIVE_FAILED_STEPS:
-            self.report.stopped = f"{CONSECUTIVE_FAILED_STEPS} steps failed in a row"
+            # The end line names the first of them: the shape the engine
+            # refused, or the step at which it stopped answering.
+            opener = (
+                done - self._failed_in_a_row if self._first_failed is None else self._first_failed
+            )
+            first = self.plan.steps[opener].name
+            self.report.stopped = f"{CONSECUTIVE_FAILED_STEPS} steps failed in a row, from {first}"
             return None
         return self.plan.steps[done]
 
@@ -584,7 +609,10 @@ class _Pass:
         index = len(self.report.results)
         remainder = step.kind == "remainder"
         if errors:
-            self._failed_in_a_row += 1 if len(errors) == len(step.requests) else 0
+            if len(errors) == len(step.requests):
+                if self._failed_in_a_row == 0:
+                    self._first_failed = index - 1
+                self._failed_in_a_row += 1
             self.log.warning(
                 "Warm-up step %d/%d %s: %d of %d requests failed in %.0f ms (first: %s)",
                 index,
@@ -597,6 +625,7 @@ class _Pass:
             )
         else:
             self._failed_in_a_row = 0
+            self._first_failed = None
             # A chunk remainder is one of thousands of one-token requests: its
             # own line is DEBUG, and the remainders' progress is one INFO line
             # every so many (:data:`REMAINDER_PROGRESS_EVERY`) and at their end.

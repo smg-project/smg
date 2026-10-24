@@ -253,6 +253,75 @@ def test_a_prompt_never_exceeds_the_step_nor_the_context_less_its_output():
     assert max(lengths) == 999  # the context's bound stands in for the step
 
 
+# The window/step pairs the plans are built from on the test legs and the
+# fleet's recipes: an 8k context at the engine's default 8k step (the pair
+# that reached the context's edge), a 16k context at a 16k step, a long
+# context at a 16k step, a 4k chunk under a long context, a 1k chunk under an
+# 8k context, and two tight ones.
+WINDOW_STEP_PAIRS = [
+    (8192, 8192),
+    (16384, 16384),
+    (196608, 16384),
+    (1 << 20, 4096),
+    (8192, 1024),
+    (1000, 4096),
+    (256, 64),
+]
+
+
+@pytest.mark.parametrize("context, step", WINDOW_STEP_PAIRS)
+@pytest.mark.parametrize("reserve", [0, 2, 3, 6])
+def test_the_longest_prompt_leaves_the_engine_the_positions_it_keeps_back(context, step, reserve):
+    inputs = WarmupInputs(
+        max_num_seqs=8,
+        max_num_batched_tokens=step,
+        max_model_len=context,
+        vocab_size=100,
+        context_reserve_tokens=reserve,
+        every_prefill_length=True,
+    )
+    plan = plan_warmup(inputs, "full")
+    assert plan.steps
+    for s in plan.steps:
+        for request in s.requests:
+            assert request.prompt_tokens <= step
+            # Prompt and output together leave the engine its positions.
+            assert request.prompt_tokens + request.max_tokens <= context - reserve
+    prefills = [s.requests[0].prompt_tokens for s in plan.steps if s.kind != "decode"]
+    # The longest prompt is the step, or the context less the output token
+    # and the reserve: one below the context is planned only where the
+    # engine admits it (a reserve of zero).
+    assert max(prefills) == min(step, context - 1 - reserve)
+    if reserve:
+        assert context - 1 not in prefills
+    # Every count up to that bound is still visited once (the measured second
+    # pass repeats the grid by design).
+    visited = [
+        s.requests[0].prompt_tokens for s in plan.steps if s.kind in ("prefill", "remainder")
+    ]
+    assert sorted(visited) == list(range(1, min(step, context - 1 - reserve) + 1))
+
+
+def test_a_reserve_of_zero_keeps_the_tables_as_they_were():
+    # The default reserve plans what the planner planned before it existed:
+    # the same step names on the issue's engine, the small one and a tight one.
+    for inputs in (ISSUE, SMALL, WarmupInputs(8, 4096, 1000, 100)):
+        for level in ("fast", "full"):
+            with_default = plan_warmup(inputs, level)
+            explicit = plan_warmup(dataclasses.replace(inputs, context_reserve_tokens=0), level)
+            assert [s.name for s in with_default.steps] == [s.name for s in explicit.steps]
+    # A reserve on an unknown context changes nothing: the step is the bound.
+    assert [
+        s.name for s in plan_warmup(WarmupInputs(8, 64, 0, 100, context_reserve_tokens=6)).steps
+    ] == [s.name for s in plan_warmup(WarmupInputs(8, 64, 0, 100)).steps]
+    # A tight context: the staircase keeps inside the reserve too.
+    tight = plan_warmup(WarmupInputs(8, 64, 20, 100, context_reserve_tokens=6))
+    staircase = [s for s in tight.steps if s.kind == "decode"]
+    assert staircase and all(
+        warmup.STAIRCASE_PROMPT_TOKENS + r.max_tokens <= 20 - 6 for r in staircase[0].requests
+    )
+
+
 def test_a_small_engine_gets_a_small_plan_in_the_same_order():
     plan = plan_warmup(SMALL, "full")
     assert [step.name for step in plan.steps] == [
@@ -567,7 +636,36 @@ def test_three_failed_steps_in_a_row_stop_the_pass():
     wire = _Wire(fail=lambda request: True)
     report = run_warmup(plan, wire, budget_secs=30)
     assert len(report.results) == warmup.CONSECUTIVE_FAILED_STEPS
-    assert report.stopped == f"{warmup.CONSECUTIVE_FAILED_STEPS} steps failed in a row"
+    # The end line names the first of them: the shape the engine refused.
+    assert report.stopped == (
+        f"{warmup.CONSECUTIVE_FAILED_STEPS} steps failed in a row, from "
+        "decode batch 4 down to 1 (4 requests)"
+    )
+    assert "from decode batch 4 down to 1 (4 requests)" in report.summary()
+
+
+def test_the_end_line_names_the_step_that_opened_the_run_past_a_partly_failed_one():
+    """A partly failed step neither extends nor ends a run of whole failures,
+    so the run's length does not locate its first step: the four-request
+    decode step, moved second, fails one request between whole failures of
+    the steps around it, and the line names the first step, not the decode
+    step the old arithmetic landed on."""
+    small = plan_warmup(SMALL, "fast")
+    decode, first, *rest = small.steps
+    assert len(decode.requests) == 4 and len(first.requests) == 1
+    plan = dataclasses.replace(small, steps=(first, decode, *rest))
+    # The first step fails; of the decode step's four only the first (the
+    # step's requests go out on four threads at once, so the spared ones are
+    # named by id, not counted on arrival); then every request fails: two
+    # more whole steps make three.
+    spared = {request.request_id for request in decode.requests[1:]}
+    assert len(spared) == 3, "the decode step's requests carry distinct ids"
+    wire = _Wire(fail=lambda request: request.request_id not in spared)
+    report = run_warmup(plan, wire, budget_secs=30)
+    assert [r.errors for r in report.results] == [1, 1, 1, 1]
+    assert report.stopped == (
+        f"{warmup.CONSECUTIVE_FAILED_STEPS} steps failed in a row, from {first.name}"
+    )
 
 
 def test_a_flush_the_engine_refuses_is_a_line_not_a_failure(caplog):
@@ -1114,6 +1212,104 @@ def test_the_sglang_and_tokenspeed_inputs_say_when_the_pass_spreads_over_ranks(c
     sglang_warmup.warmup_inputs(SimpleNamespace(max_running_requests=64), facts)
     tokenspeed_warmup.warmup_inputs(SimpleNamespace(), facts)
     assert not caplog.records
+
+
+def test_the_tokenspeed_inputs_leave_the_engine_its_two_positions_or_its_draft_window():
+    facts = {"max_context_length": 8192, "vocab_size": 248320}
+    # The engine's scheduler keeps two positions beyond prompt and output
+    # (its request length is the context less one, its output clamp one less
+    # again); a prompt one below the context, with one output token, is a
+    # request it refuses, and the plan no longer ends on it.
+    one = tokenspeed_warmup.warmup_inputs(
+        SimpleNamespace(max_num_seqs=64, max_model_len=8192), facts
+    )
+    assert one.context_reserve_tokens == tokenspeed_warmup.SCHEDULER_RESERVE_TOKENS == 2
+    prefills = [s.requests[0].prompt_tokens for s in plan_warmup(one).steps if s.kind != "decode"]
+    assert max(prefills) == 8189 and 8191 not in prefills and 8190 not in prefills
+    # Under speculative decoding the engine keeps its draft window behind the
+    # prompt: the wider of the two bounds holds.
+    spec = tokenspeed_warmup.warmup_inputs(
+        SimpleNamespace(
+            max_num_seqs=64,
+            max_model_len=8192,
+            speculative_algorithm="EAGLE",
+            speculative_num_draft_tokens=4,
+        ),
+        facts,
+    )
+    assert spec.context_reserve_tokens == 3
+    assert max(s.requests[0].prompt_tokens for s in plan_warmup(spec).steps) == 8188
+    # A draft window of two or less, or no algorithm, is inside the scheduler's two.
+    narrow = SimpleNamespace(speculative_algorithm="EAGLE", speculative_num_draft_tokens=2)
+    assert tokenspeed_warmup.warmup_inputs(narrow, facts).context_reserve_tokens == 2
+    unset = SimpleNamespace(speculative_algorithm=None, speculative_num_draft_tokens=8)
+    assert tokenspeed_warmup.warmup_inputs(unset, facts).context_reserve_tokens == 2
+
+
+def test_a_one_process_engine_plans_the_ladder_and_a_wider_layout_the_remainders():
+    facts = {"is_generation": True, "max_context_length": 8192, "vocab_size": 248320}
+
+    def tokenspeed(world_size):
+        mapping = SimpleNamespace(world_size=world_size, attn=SimpleNamespace(dp_size=1))
+        return tokenspeed_warmup.warmup_inputs(
+            SimpleNamespace(max_num_seqs=64, max_model_len=8192, mapping=mapping), facts
+        )
+
+    # One process: no collective to deadlock against, so the length classes
+    # alone, and the same step count as the other engines plan for the window.
+    one = tokenspeed(1)
+    assert one.every_prefill_length is False
+    plan = plan_warmup(one)
+    assert not any(s.kind == "remainder" for s in plan.steps)
+    sglang = plan_warmup(
+        sglang_warmup.warmup_inputs(
+            SimpleNamespace(
+                max_running_requests=64, chunked_prefill_size=8192, context_length=8192
+            ),
+            facts,
+        )
+    )
+    assert len(plan.steps) == len(sglang.steps) == 109
+    assert plan.prompt_tokens < 400_000  # not the 33 million of every count
+    # More than one process, or a layout the arguments do not state: every
+    # count up to the step, as before, with the edge bounded.
+    for inputs in (tokenspeed(2), tokenspeed(8)):
+        assert inputs.every_prefill_length is True
+    unknown = tokenspeed_warmup.warmup_inputs(
+        SimpleNamespace(max_num_seqs=64, max_model_len=8192), facts
+    )
+    assert unknown.every_prefill_length is True
+    wide = plan_warmup(tokenspeed(2))
+    assert len(wide.steps) == 8211
+    assert {s.requests[0].prompt_tokens for s in wide.steps if s.kind != "decode"} == set(
+        range(1, 8190)
+    )
+    # The four-process 4,096-token chunk under a long context plans as before.
+    chunk = tokenspeed_warmup.warmup_inputs(
+        SimpleNamespace(
+            max_num_seqs=8,
+            chunked_prefill_size=4096,
+            max_model_len=1 << 20,
+            mapping=SimpleNamespace(world_size=4, attn=SimpleNamespace(dp_size=1)),
+        ),
+        facts,
+    )
+    assert len(plan_warmup(chunk).steps) == 4117
+
+
+def test_the_sglang_inputs_leave_the_engine_its_six_positions():
+    facts = {"is_generation": True, "max_context_length": 8192, "vocab_size": 151936}
+    inputs = sglang_warmup.warmup_inputs(
+        SimpleNamespace(max_running_requests=64, chunked_prefill_size=8192, context_length=8192),
+        facts,
+    )
+    assert inputs.context_reserve_tokens == sglang_warmup.CONTEXT_RESERVE_TOKENS == 6
+    prefills = [
+        s.requests[0].prompt_tokens for s in plan_warmup(inputs).steps if s.kind != "decode"
+    ]
+    # Below the engine's admitted request length (the context less one, less
+    # five more), never at or above it.
+    assert max(prefills) == 8185 and not {8186, 8191} & set(prefills)
 
 
 def test_only_the_tokenspeed_inputs_ask_for_every_prefill_length():

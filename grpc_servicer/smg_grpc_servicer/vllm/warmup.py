@@ -27,7 +27,10 @@ every rank runs every shape, and the log's count is per rank.
 The plan keeps to the length classes (:attr:`WarmupInputs.every_prefill_length`
 stays off): the first use of a prefill length between two classes has only
 cost this engine a kernel search, never a hang, and at its default step of
-16,384 tokens a pass over every length would take an hour.
+16,384 tokens a pass over every length would take an hour. Its longest
+prompt is the context less the one output token: this engine admits a
+prompt and an output budget that together fill the context
+(:attr:`WarmupInputs.context_reserve_tokens` stays zero).
 """
 
 from __future__ import annotations

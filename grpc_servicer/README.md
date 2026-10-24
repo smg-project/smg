@@ -472,9 +472,13 @@ graph-capture sizes, lengths one above the tuners' bucket grid), a second
 pass over the bucket grid whose timings show what the first pass paid, and,
 where the engine's module asks for it (TokenSpeed, below), every remaining
 prompt length up to the step, last, in an order whose every prefix is a
-uniform spread of the range, so a budget cut leaves an even coverage. Every
-request carries its own token ids, so prefix caching never hides a prefill,
-and the engine's prefix cache is flushed at the end. One INFO line per shape
+uniform spread of the range, so a budget cut leaves an even coverage. The
+longest prompt is what the engine's scheduler admits with one output token:
+the context less the positions the engine keeps back (none on vLLM, where a
+prompt and an output budget may fill the context; two on TokenSpeed, or its
+speculative draft window when wider; six on SGLang), never the context
+itself. Every request carries its own token ids, so prefix caching never
+hides a prefill, and the engine's prefix cache is flushed at the end. One INFO line per shape
 with its time (a chunk remainder's at DEBUG, with an INFO progress line every
 500 remainders and one at their end); readiness (the gRPC health service, so the startup and
 readiness probes) stays NOT_SERVING until the pass ran, and flips SERVING
@@ -846,7 +850,10 @@ free port), `SMG_TOKENSPEED_SERVICER_DRAIN_SECS` (default 5),
 `SMG_TOKENSPEED_SERVICER_WARMUP` (the planned warm-up before SERVING, as for
 vLLM above: `full` by default, `fast`, `off`, a budget in seconds or
 `<level>:<seconds>`; planned from `--max-num-seqs` and the chunk size or
-`--max-prefill-tokens`; at the `full` level this engine's plan also visits
+`--max-prefill-tokens`; at the `full` level, on an engine of more than one
+process (its parallel layout off the server arguments; a one-process engine
+plans the classes alone, like the other engines, since the hang below needs
+a collective waiting on a peer), this engine's plan also visits
 every prompt length up to the chunk size the class ladder leaves out, last,
 in an order whose every prefix is a uniform spread (`fast` plans the classes
 alone and leaves the hazard below open, which the start log says): a chunked prefill's last chunk is any count

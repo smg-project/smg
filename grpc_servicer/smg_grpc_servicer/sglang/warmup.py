@@ -37,6 +37,12 @@ WARMUP_ENV = "SMG_SGLANG_SERVICER_WARMUP"
 #: The engine's own prefill budget when the arguments carry neither a chunk
 #: size nor a prefill budget as a count.
 DEFAULT_STEP_TOKENS = 16384
+#: The positions the engine's scheduler keeps back beyond a request's prompt
+#: and its output budget: it admits a prompt below its ``max_req_input_len``
+#: (the context less one, less five more) and answers one at or above it
+#: with an error, so a prompt and a one-token output fill at most the
+#: context less six; the plan's longest prompt stops there.
+CONTEXT_RESERVE_TOKENS = 6
 # The engine's own gRPC server sends messages up to this size.
 _MAX_MESSAGE_BYTES = 1024 * 1024 * 256
 
@@ -79,6 +85,7 @@ def warmup_inputs(server_args: Any, facts: Mapping[str, Any]) -> WarmupInputs | 
         max_num_batched_tokens=step,
         max_model_len=args.context_length or int(facts.get("max_context_length") or 0),
         vocab_size=int(facts.get("vocab_size") or 0),
+        context_reserve_tokens=CONTEXT_RESERVE_TOKENS,
         source="window and step from the server arguments (the engine's default step when unset)",
         lone_leg_bootstrap=lone_leg_bootstrap,
     )
