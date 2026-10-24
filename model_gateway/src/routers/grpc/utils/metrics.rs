@@ -162,13 +162,19 @@ pub(crate) fn error_reason_for_response(response: &Response) -> &'static str {
         REQUEST_TIMEOUT_CODE => REASON_DEADLINE,
         // The HTTP router's codes for a worker connection that failed before
         // the call (a connect fault), under it (a reset or a close before the
-        // head, filed by the client as a request fault) or under the body.
+        // head, filed by the client as a request fault) or under the body
+        // (the client's body fault, or the capped read of a buffered answer
+        // that ended before the body did).
         "call_upstream_connection_failed"
         | "call_upstream_request_error"
-        | "call_upstream_body_error" => REASON_TRANSPORT_DISCONNECT,
+        | "call_upstream_body_error"
+        | "read_response_body_failed" => REASON_TRANSPORT_DISCONNECT,
         // The decisions route's code for an answer it could not read, the
-        // HTTP router's for one it could not decode.
-        "invalid_decisions_response" | "call_upstream_decode_error" => REASON_BAD_RESPONSE,
+        // HTTP router's for one it could not decode or one over the payload
+        // limit.
+        "invalid_decisions_response"
+        | "call_upstream_decode_error"
+        | "upstream_response_too_large" => REASON_BAD_RESPONSE,
         "" => error_reason_from_status(status),
         // Another code of the gateway's own: a 429 under it is a shed of the
         // gateway's (a budget or a cap it holds), never a worker's pushback.
@@ -392,6 +398,17 @@ mod tests {
             (
                 error::internal_error("call_upstream_body_error", "cut"),
                 REASON_TRANSPORT_DISCONNECT,
+            ),
+            // The capped read of a buffered answer: a body that ended before
+            // it was whole is the connection's fault, one over the limit the
+            // answer's.
+            (
+                error::internal_error("read_response_body_failed", "cut"),
+                REASON_TRANSPORT_DISCONNECT,
+            ),
+            (
+                error::bad_gateway("upstream_response_too_large", "big"),
+                REASON_BAD_RESPONSE,
             ),
             (
                 error::bad_gateway("invalid_decisions_response", "unreadable"),

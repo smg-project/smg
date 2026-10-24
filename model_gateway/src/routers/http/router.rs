@@ -1592,6 +1592,13 @@ impl RouteOutcome<'_> {
     /// The router's terminal metric of an answered request: its duration on
     /// a success, else the error class of its status.
     fn answered(&self, status: StatusCode, start: Instant) {
+        self.answered_as(status, error_reason_from_status(status), start);
+    }
+
+    /// [`Self::answered`] with the error counter's reason given: the
+    /// buffered transcription answer names the gateway's own read failure
+    /// by its code, not by the worker-style reason of its status.
+    fn answered_as(&self, status: StatusCode, reason: &'static str, start: Instant) {
         if status.is_success() {
             Metrics::record_router_duration(
                 metrics_labels::ROUTER_HTTP,
@@ -1609,7 +1616,7 @@ impl RouteOutcome<'_> {
                 &self.model_label,
                 self.endpoint,
                 error_type_from_status(status),
-                error_reason_from_status(status),
+                reason,
             );
         }
     }
@@ -1755,15 +1762,22 @@ async fn buffer_transcription_response(
     // body above the ingress payload limit is a misbehaving worker
     // and ends as a 502 before memory grows, and the request's own
     // timeout ends the request as it does before the head.
-    let mut response =
+    let (mut response, reason) =
         match Router::read_worker_body_capped(res.bytes_stream(), max_payload_size).await {
             Ok(body) => {
                 let mut response = Response::new(Body::from(body));
                 *response.status_mut() = status;
                 *response.headers_mut() = response_headers;
-                response
+                // The worker's own answer: its status names the reason.
+                (response, error_reason_from_status(status))
             }
-            Err(error_response) => error_response,
+            // The gateway's own answer for a read that failed (a body cut
+            // short, one over the limit, the request's timeout): its code
+            // names the reason, not the worker-style reason of its status.
+            Err(error_response) => {
+                let reason = error_reason_for_response(&error_response);
+                (error_response, reason)
+            }
         };
     // The routed worker's id on the error answers too, as the typed
     // routes' buffered arm sets it.
@@ -1775,7 +1789,7 @@ async fn buffer_transcription_response(
     // that. Streaming outcomes are owned by `relay_transcription_stream`.
     let final_status = response.status();
     worker_outcome(worker, final_status);
-    outcome.answered(final_status, start);
+    outcome.answered_as(final_status, reason, start);
 
     response
 }
@@ -3270,6 +3284,68 @@ mod tests {
             .await
             .unwrap()
             .bytes_stream()
+    }
+
+    /// The buffered transcription answer's outcome names the reason from
+    /// what the client sees: a body the gateway could not read whole (cut
+    /// under the read) is the gateway's own 500 under its code, counted as
+    /// the worker's connection failing (`transport_disconnect`), not as the
+    /// worker-style reason of a 500; a body that arrives whole is the
+    /// worker's answer, recorded by its status.
+    #[tokio::test]
+    async fn a_buffered_transcription_read_failure_names_the_gateways_reason() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let client = crate::clients::http_client();
+        let worker = BasicWorkerBuilder::new("http://worker:8080").build();
+        let outcome = RouteOutcome {
+            model_label: Cow::Borrowed("m"),
+            endpoint: "transcriptions",
+        };
+
+        let cut = spawn_cut_stub("/body", "application/json", &["abc"], true).await;
+        let res = client.post(format!("{cut}/body")).send().await.unwrap();
+        let status = res.status();
+        let answer =
+            buffer_transcription_response(res, status, &worker, 1 << 20, &outcome, Instant::now())
+                .await;
+        assert_eq!(answer.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            extract_error_code_from_response(&answer),
+            "read_response_body_failed"
+        );
+        let rendered = handle.render();
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("smg_router_request_errors_total{")
+                    && line.contains("endpoint=\"transcriptions\"")
+                    && line.contains("reason=\"transport_disconnect\"")
+                    && line.ends_with(" 1")
+            }),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("reason=\"engine_internal\""),
+            "{rendered}"
+        );
+
+        let whole = spawn_cut_stub("/body", "application/json", &["abc"], false).await;
+        let res = client.post(format!("{whole}/body")).send().await.unwrap();
+        let status = res.status();
+        let answer =
+            buffer_transcription_response(res, status, &worker, 1 << 20, &outcome, Instant::now())
+                .await;
+        assert_eq!(answer.status(), StatusCode::OK);
+        let rendered = handle.render();
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("smg_router_request_duration_seconds_count{")
+                    && line.contains("endpoint=\"transcriptions\"")
+                    && line.ends_with(" 1")
+            }),
+            "{rendered}"
+        );
     }
 
     #[tokio::test]
