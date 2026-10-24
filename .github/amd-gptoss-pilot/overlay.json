@@ -6,11 +6,15 @@
     {
       "path": "srt/configs/model_config.py",
       "old_sha256": "be3a0168bdd3b4a6b1f7778420b83f95c315535812b44e9422e1b48dd856a11e",
-      "new_sha256": "e994b55e5543ee9a674ce427118fa7f509189a7c0bf0bafc200bb9e367d116a8",
+      "new_sha256": "1d0f4201df130dd3d1b77e03b7174e6fa83327a85d1bf2918dda6106a0ef16e1",
       "edits": [
         {
           "old": "                        f\"({self.quantization}).\"\n                    )\n\n        if self.quantization is not None:\n            if self.quantization not in supported_quantization:\n                raise ValueError(\n",
           "new": "                        f\"({self.quantization}).\"\n                    )\n\n        from sglang.srt.utils.gpt_oss_bf16 import gpt_oss_bf16_enabled\n\n        if gpt_oss_bf16_enabled(\n            self.hf_config, self.quantization, self.dtype,\n            is_draft=self.is_draft_model,\n        ):\n            logger.warning(\"GPT-OSS: retaining MXFP4 checkpoint identity and expanding experts to BF16 on gfx942\")\n            return\n\n        if self.quantization is not None:\n            if self.quantization not in supported_quantization:\n                raise ValueError(\n"
+        },
+        {
+          "old": "        self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)\n",
+          "new": "        if dtype == \"auto\" and os.environ.get(\"SGLANG_GPT_OSS_MXFP4_BF16\", \"0\") == \"1\":\n            from sglang.srt.utils.gpt_oss_bf16 import gpt_oss_bf16_enabled\n\n            if gpt_oss_bf16_enabled(\n                self.hf_config, self.quantization, dtype,\n                is_draft=self.is_draft_model,\n            ):\n                dtype = \"bfloat16\"\n        self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)\n"
         }
       ],
       "new_content": null,
@@ -71,5 +75,12 @@
       "new_content": null,
       "module": "sglang.srt.model_loader.loader"
     }
-  ]
+  ],
+  "early_dtype_resolution": {
+    "change": "Explicit opt-in GPTOSS auto is resolved to BF16 before the first ModelConfig dtype conversion; existing strict guard and later TP1/loader gates are unchanged.",
+    "scope": "Source candidate only; no CPU/ModelConfig/GPU execution yet.",
+    "historical_overlay_engine_base": "858559b60ba8a0683b7761cb0dcd79dfa02721bc",
+    "original_model_config_overlay_sha256": "e994b55e5543ee9a674ce427118fa7f509189a7c0bf0bafc200bb9e367d116a8",
+    "strict_guard_file_sha256_unchanged": "61c041f78fa6c68c3fb458389ae35b19b80dd1148c516f53ad65938ceb575a4c"
+  }
 }
