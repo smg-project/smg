@@ -1,5 +1,5 @@
 {
-  "version": "sg2_startup_diagnostic_exact4420_v1",
+  "version": "sg2_startup_exact4420_existing_runtime_CU_optin_v2",
   "enabled_by_default": false,
   "env": "SMG_SG2_STARTUP_DIAGNOSTIC",
   "actual_image_digest": "sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d",
@@ -7,19 +7,15 @@
     "/sgl-workspace/aiter/aiter/jit/utils/chip_info.py": {
       "actual_capture_path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T0300Z/SG2-AB-4420-source-canonical-root-933b80bb0c1547128659f28c5b42265a/2.py",
       "before_sha256": "67b9b709ad95a7df5fdad1c49ad23b7374b5d2a1ec1c4a3d67b4d6c597c5f33d",
-      "after_sha256": "c6f094a6f6339fc92b2e0673c2ce9935440a30682662c22ea8a07e5fb4dc6348",
+      "after_sha256": "4e59719bbf622106270d4d83a182e2d8a10ffe93354e794681993dbbe5f0a3d5",
       "changes": [
         {
           "before": "logger = logging.getLogger(\"aiter\")",
           "after": "logger = logging.getLogger(\"aiter\")\nfrom smg_sg2_startup_trace import cu as _smg_sg2_cu"
         },
         {
-          "before": "        except Exception as e:  # noqa: BLE001  blanket catch is intentional here\n            raise RuntimeError(f\"Get GPU Compute Unit from rocminfo failed {e!s}\")",
-          "after": "        except Exception as e:  # noqa: BLE001  blanket catch is intentional here\n            _smg_sg2_cu(__name__, __file__, locals())\n            raise RuntimeError(f\"Get GPU Compute Unit from rocminfo failed {e!s}\")"
-        },
-        {
-          "before": "        assert len(set(gpu_compute_units)) == 1",
-          "after": "        _smg_sg2_cu(__name__, __file__, locals())\n        assert len(set(gpu_compute_units)) == 1"
+          "before": "def get_cu_num_custom_op() -> int:\n    cu_num = int(os.getenv(\"CU_NUM\", \"0\"))\n    if cu_num == 0:\n        try:\n            rocminfo = executable_path(\"rocminfo\")\n            result = subprocess.run(\n                [rocminfo], capture_output=True, text=True, check=False\n            )\n            output = result.stdout\n            devices = re.split(r\"Agent\\s*\\d+\", output)\n            gpu_compute_units = []\n            for device in devices:\n                for line in device.split(\"\\n\"):\n                    if \"Device Type\" in line and line.find(\"GPU\") != -1:\n                        match = re.search(r\"Compute Unit\\s*:\\s*(\\d+)\", device)\n                        if match:\n                            gpu_compute_units.append(int(match.group(1)))\n                        break\n        except Exception as e:  # noqa: BLE001  blanket catch is intentional here\n            raise RuntimeError(f\"Get GPU Compute Unit from rocminfo failed {e!s}\")\n        assert len(set(gpu_compute_units)) == 1\n        cu_num = gpu_compute_units[0]\n    return cu_num",
+          "after": "def get_cu_num_custom_op() -> int:\n    cu_num = int(os.getenv(\"CU_NUM\", \"0\"))\n    if cu_num == 0:\n        use_existing = os.getenv(\"SMG_SG2_CU_EXISTING_RUNTIME\") == \"1\"\n        query_source = \"rocminfo\"\n        if use_existing:\n            try:\n                import torch\n\n                if torch.version.hip is None:\n                    raise RuntimeError(\"existing HIP runtime required\")\n                if torch.cuda.is_initialized():\n                    query_source = \"existing-hip-runtime\"\n                    visible_count = torch.cuda.device_count()\n                    logical_device = torch.cuda.current_device()\n                    if type(visible_count) is not int or visible_count < 1:\n                        raise RuntimeError(\"no process-visible HIP devices\")\n                    if type(logical_device) is not int or not 0 <= logical_device < visible_count:\n                        raise RuntimeError(\"invalid current logical HIP device\")\n                    gpu_compute_units = [\n                        torch.cuda.get_device_properties(i).multi_processor_count\n                        for i in range(visible_count)\n                    ]\n                    if any(type(cu) is not int or cu <= 0 for cu in gpu_compute_units):\n                        raise RuntimeError(\"invalid HIP compute-unit property\")\n                    if len(set(gpu_compute_units)) != 1:\n                        raise RuntimeError(\"heterogeneous process-visible HIP compute units\")\n                    _smg_sg2_cu(__name__, __file__, locals())\n                    return gpu_compute_units[logical_device]\n            except Exception as e:  # No subprocess fallback after a runtime property failure.\n                _smg_sg2_cu(__name__, __file__, locals())\n                raise RuntimeError(f\"Get GPU Compute Unit from existing HIP runtime failed {e!s}\") from e\n        try:\n            rocminfo = executable_path(\"rocminfo\")\n            result = subprocess.run(\n                [rocminfo], capture_output=True, text=True, check=False\n            )\n            if use_existing and result.returncode != 0:\n                raise RuntimeError(f\"rocminfo returned {result.returncode}\")\n            output = result.stdout\n            devices = re.split(r\"Agent\\s*\\d+\", output)\n            gpu_compute_units = []\n            for device in devices:\n                for line in device.split(\"\\n\"):\n                    if \"Device Type\" in line and line.find(\"GPU\") != -1:\n                        match = re.search(r\"Compute Unit\\s*:\\s*(\\d+)\", device)\n                        if match:\n                            gpu_compute_units.append(int(match.group(1)))\n                        break\n        except Exception as e:  # noqa: BLE001  blanket catch is intentional here\n            _smg_sg2_cu(__name__, __file__, locals())\n            raise RuntimeError(f\"Get GPU Compute Unit from rocminfo failed {e!s}\")\n        _smg_sg2_cu(__name__, __file__, locals())\n        if use_existing and (not gpu_compute_units or any(cu <= 0 for cu in gpu_compute_units)):\n            raise RuntimeError(\"rocminfo returned no positive GPU compute units\")\n        assert len(set(gpu_compute_units)) == 1\n        cu_num = gpu_compute_units[0]\n    return cu_num"
         }
       ]
     },
@@ -72,7 +68,7 @@
   },
   "helper": {
     "path": "/opt/venv/lib/python3.12/site-packages/smg_sg2_startup_trace.py",
-    "sha256": "abc2453262fae93964033391f7347a3eeddecca43116f0b0338de551d7c5525e"
+    "sha256": "1e2bd0397da0230194ef462f501cbb16ad9fdf6ac145ae1a53a6318af389c934"
   },
-  "scope": "Only startup observations; no CU prime, computation/return/assertion, model, dtype, RDMA, memory fraction, pool, graph, stream handle, request or test changes."
+  "scope": "Startup observations plus separately opt-in automatic CU discovery from already-initialized HIP/PyTorch metadata; all process-visible logical devices must have positive equal CU counts. No new rocminfo process on that initialized path, no fallback after property errors, no CU prime/hardcode/tensor allocation/synchronization or model/memory/graph/RDMA/request/test changes. Uninitialized HIP retains a strict return-code-checked rocminfo fallback. Explicit CU_NUM override and feature-off legacy behavior are preserved."
 }

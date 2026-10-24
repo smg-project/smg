@@ -108,6 +108,9 @@ def cu(module, file, scope):
         values = scope.get("gpu_compute_units", [])
         _emit("cu", "original-query-result", module, file,
               {"executable": executable, "returncode": getattr(result, "returncode", None),
+               "query_source": scope.get("query_source", "rocminfo"),
+               "visible_device_count": _scalar(scope.get("visible_count")),
+               "current_logical_device": _scalar(scope.get("logical_device")),
                "parsed_CU_list": values[:32], "parsed_count": len(values),
                "exception_type": type(scope["e"]).__name__ if "e" in scope else None},
               {"stdout": getattr(result, "stdout", "") or "", "stderr": getattr(result, "stderr", "") or ""})
