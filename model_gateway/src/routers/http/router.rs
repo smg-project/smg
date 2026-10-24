@@ -101,8 +101,8 @@ use crate::{
     },
     wasm::module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
     worker::{
-        ConnectionMode, GuardedStream, RoutingPool, RuntimeType, Worker, WorkerLoadGuard,
-        WorkerRegistry, WorkerType,
+        endpoint::Endpoint, ConnectionMode, GuardedStream, RoutingPool, RuntimeType, Worker,
+        WorkerLoadGuard, WorkerRegistry, WorkerType,
     },
 };
 
@@ -265,7 +265,7 @@ impl Router {
                     }
                     Err(e) => {
                         error!(
-                            worker = worker.url(),
+                            worker = Endpoint::redacted_str(worker.url()),
                             endpoint, "Failed to proxy GET request: {e}"
                         );
                         convert_reqwest_error(e)
@@ -861,7 +861,7 @@ impl Router {
                         .await
                         .map_err(|e| {
                             error!(
-                                worker = worker.url(),
+                                worker = Endpoint::redacted_str(worker.url()),
                                 endpoint, "Failed to send request: {e}"
                             );
                             convert_reqwest_error(e)
@@ -1090,7 +1090,7 @@ impl Router {
             Err(e) => {
                 error!(
                     "Failed to send multipart transcription request worker_url={} route={} error={}",
-                    worker.url(),
+                    Endpoint::redacted_str(worker.url()),
                     route,
                     e
                 );
@@ -1195,7 +1195,7 @@ impl Router {
             Err(e) => {
                 error!(
                     "Failed to send typed request worker_url={} route={} error={}",
-                    worker.url(),
+                    Endpoint::redacted_str(worker.url()),
                     route,
                     e
                 );
@@ -1377,7 +1377,7 @@ impl Router {
             Err(e) => {
                 error!(
                     "Failed to send streamed request worker_url={} route={} error={}",
-                    worker.url(),
+                    Endpoint::redacted_str(worker.url()),
                     route,
                     e
                 );
