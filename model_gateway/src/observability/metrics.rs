@@ -2776,6 +2776,16 @@ impl Metrics {
         }
     }
 
+    /// Count the batches of a gap no replay will bring: the resume the
+    /// subscriber asked for was refused (the server's history is gone), and
+    /// the pending gap goes with the worker's state.
+    pub fn record_kv_event_missed_batches(worker_url: &str, missed: u64) {
+        if missed > 0 {
+            counter!("smg_kv_event_missed_batches_total", "worker" => intern_string(worker_url))
+                .increment(missed);
+        }
+    }
+
     /// Count a rank resync (its index state dropped) by reason.
     pub fn record_kv_event_resync(worker_url: &str, reason: &'static str) {
         counter!(

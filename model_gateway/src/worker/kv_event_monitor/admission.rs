@@ -136,7 +136,9 @@ impl KvEventMonitor {
                 degraded_changed = true;
             }
             Admission::Replay { expected } => {
-                Metrics::record_kv_event_gap(worker_url, "replay_requested", seq - expected);
+                // Nothing is known to be lost yet: the replay may bring every
+                // batch. The missed count moves on the unrecovered outcomes.
+                Metrics::record_kv_event_gap(worker_url, "replay_requested", 0);
                 return BatchOutcome::Gap {
                     expected,
                     received: seq,
@@ -325,6 +327,8 @@ impl KvEventMonitor {
 
     /// The server declared its history gone: drop the worker's index state
     /// and every cursor, so the next stream is taken from wherever it starts.
+    /// A replay that was pending is lost with them: its batches count as
+    /// missed, once.
     pub(super) fn reset_worker(
         indexer: &KvIndex,
         worker_id: u32,
@@ -333,10 +337,12 @@ impl KvEventMonitor {
         reason: ResyncReason,
     ) {
         Self::apply_cleared(worker_id, indexer, &mut state.index);
+        let pending: u64 = state.ranks.values().map(RankState::pending_gap).sum();
         for cursor in state.ranks.values_mut() {
             cursor.reset();
         }
         state.snapshot = None;
+        Metrics::record_kv_event_missed_batches(worker_url, pending);
         Metrics::record_kv_event_resync(worker_url, reason.as_str());
         Metrics::set_kv_event_degraded_ranks(worker_url, 0);
         Metrics::set_kv_index_blocks(worker_url, indexer.worker_block_count(worker_id));
@@ -752,64 +758,127 @@ mod tests {
         sim.assert_matches_reference();
     }
 
+    /// What a per-worker counter reads for the simulated worker, `None`
+    /// while the series does not exist.
+    fn counter(handle: &metrics_exporter_prometheus::PrometheusHandle, name: &str) -> Option<f64> {
+        let prefix = format!("{name}{{worker=\"grpc://w1:9000\"}} ");
+        handle
+            .render()
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix.as_str()))
+            .and_then(|value| value.parse().ok())
+    }
+
     #[test]
     fn recovery_gap_filled_by_replay_matches_reference() {
-        let mut sim = Sim::new();
-        sim.deliver(&batch(1, None, vec![stored(None, &[1, 2])]));
-        sim.deliver(&batch(2, None, vec![stored(Some(2), &[3])]));
-        // Batch 3 is lost on the wire; 4 arrives: one replay is asked for.
-        let b3 = batch(3, None, vec![removed(&[3])]);
-        let b4 = batch(4, None, vec![stored(Some(2), &[7])]);
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let mut sim = Sim::new();
+            sim.deliver(&batch(1, None, vec![stored(None, &[1, 2])]));
+            sim.deliver(&batch(2, None, vec![stored(Some(2), &[3])]));
+            // Batch 3 is lost on the wire; 4 arrives: one replay is asked for.
+            let b3 = batch(3, None, vec![removed(&[3])]);
+            let b4 = batch(4, None, vec![stored(Some(2), &[7])]);
+            assert_eq!(
+                sim.feed(&b4),
+                BatchOutcome::Gap {
+                    expected: 3,
+                    received: 4
+                }
+            );
+            assert_eq!(sim.state.resume_sequence(), 2);
+            // Resuming after 2, the server replays 3 and continues live.
+            assert_eq!(sim.deliver(&b3), BatchOutcome::Applied);
+            assert_eq!(sim.deliver(&b4), BatchOutcome::Applied);
+            assert_eq!(
+                sim.deliver(&batch(5, None, vec![stored(Some(7), &[8])])),
+                BatchOutcome::Applied
+            );
+            assert!(!sim.state.ranks[&0].is_degraded());
+            sim.assert_matches_reference();
+        });
+        // The replay brought every batch: none was missed.
         assert_eq!(
-            sim.feed(&b4),
-            BatchOutcome::Gap {
-                expected: 3,
-                received: 4
-            }
+            counter(&handle, "smg_kv_event_missed_batches_total").unwrap_or(0.0),
+            0.0
         );
-        assert_eq!(sim.state.resume_sequence(), 2);
-        // Resuming after 2, the server replays 3 and continues live.
-        assert_eq!(sim.deliver(&b3), BatchOutcome::Applied);
-        assert_eq!(sim.deliver(&b4), BatchOutcome::Applied);
-        assert_eq!(
-            sim.deliver(&batch(5, None, vec![stored(Some(7), &[8])])),
-            BatchOutcome::Applied
-        );
-        assert!(!sim.state.ranks[&0].is_degraded());
-        sim.assert_matches_reference();
     }
 
     #[test]
     fn recovery_gap_without_replay_keeps_state_and_continues() {
-        let mut sim = Sim::new();
-        sim.deliver(&batch(1, None, vec![stored(None, &[1, 2])]));
-        sim.deliver(&batch(2, None, vec![stored(Some(2), &[3])]));
-        // Batches 3 and 4 are lost; the server has no history (the Rust
-        // relay): after the replay request it streams 5 again.
-        let b5 = batch(5, None, vec![stored(Some(3), &[9])]);
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let mut sim = Sim::new();
+            sim.deliver(&batch(1, None, vec![stored(None, &[1, 2])]));
+            sim.deliver(&batch(2, None, vec![stored(Some(2), &[3])]));
+            // Batches 3 and 4 are lost; the server has no history (the Rust
+            // relay): after the replay request it streams 5 again.
+            let b5 = batch(5, None, vec![stored(Some(3), &[9])]);
+            assert_eq!(
+                sim.feed(&b5),
+                BatchOutcome::Gap {
+                    expected: 3,
+                    received: 5
+                }
+            );
+            assert_eq!(sim.deliver(&b5), BatchOutcome::Applied);
+            assert!(sim.state.ranks[&0].is_degraded());
+            // Everything after keeps applying; no reconnect loop.
+            assert_eq!(
+                sim.deliver(&batch(6, None, vec![stored(Some(9), &[10])])),
+                BatchOutcome::Applied
+            );
+            // The reference saw the same stream minus the lost batches.
+            sim.assert_matches_reference();
+            // A later gap starts a fresh single replay attempt.
+            assert_eq!(
+                sim.feed(&batch(8, None, vec![])),
+                BatchOutcome::Gap {
+                    expected: 7,
+                    received: 8
+                }
+            );
+        });
+        // Batches 3 and 4 were lost once; the open replay of 7 counts nothing yet.
         assert_eq!(
-            sim.feed(&b5),
-            BatchOutcome::Gap {
-                expected: 3,
-                received: 5
-            }
+            counter(&handle, "smg_kv_event_missed_batches_total").unwrap_or(0.0),
+            2.0
         );
-        assert_eq!(sim.deliver(&b5), BatchOutcome::Applied);
-        assert!(sim.state.ranks[&0].is_degraded());
-        // Everything after keeps applying; no reconnect loop.
+    }
+
+    #[test]
+    fn recovery_replay_the_server_refuses_counts_the_gap_as_missed() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let mut sim = Sim::new();
+            sim.deliver(&batch(1, None, vec![stored(None, &[1, 2])]));
+            sim.deliver(&batch(2, None, vec![stored(Some(2), &[3])]));
+            // Batches 3 to 5 are lost; 6 arrives and a replay from 3 is asked for.
+            assert_eq!(
+                sim.feed(&batch(6, None, vec![stored(Some(3), &[9])])),
+                BatchOutcome::Gap {
+                    expected: 3,
+                    received: 6
+                }
+            );
+            // The server no longer holds 3 and refuses the resume
+            // (OUT_OF_RANGE): the subscriber drops the worker's state.
+            KvEventMonitor::reset_worker(
+                &sim.indexer,
+                sim.worker,
+                &mut sim.state,
+                "grpc://w1:9000",
+                ResyncReason::OutOfRange,
+            );
+            assert_eq!(sim.state.ranks[&0].replay_pending(), None);
+        });
+        // The three batches the refused replay would have brought are missed, once.
         assert_eq!(
-            sim.deliver(&batch(6, None, vec![stored(Some(9), &[10])])),
-            BatchOutcome::Applied
-        );
-        // The reference saw the same stream minus the lost batches.
-        sim.assert_matches_reference();
-        // A later gap starts a fresh single replay attempt.
-        assert_eq!(
-            sim.feed(&batch(8, None, vec![])),
-            BatchOutcome::Gap {
-                expected: 7,
-                received: 8
-            }
+            counter(&handle, "smg_kv_event_missed_batches_total").unwrap_or(0.0),
+            3.0
         );
     }
 
@@ -1250,16 +1319,7 @@ mod tests {
     /// content arrives detached (where the chain index fragments first).
     #[test]
     fn parentless_stores_are_counted_per_worker() {
-        use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-
-        fn counter(handle: &PrometheusHandle, name: &str) -> Option<f64> {
-            handle
-                .render()
-                .lines()
-                .find(|line| line.starts_with(&format!("{name}{{worker=\"grpc://w1:9000\"}}")))
-                .and_then(|line| line.rsplit(' ').next())
-                .and_then(|value| value.parse().ok())
-        }
+        use metrics_exporter_prometheus::PrometheusBuilder;
 
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
@@ -1297,16 +1357,7 @@ mod tests {
     /// holds what the full blocks made it.
     #[test]
     fn sub_block_stores_are_counted_and_not_indexed() {
-        use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-
-        fn counter(handle: &PrometheusHandle, name: &str) -> Option<f64> {
-            handle
-                .render()
-                .lines()
-                .find(|line| line.starts_with(&format!("{name}{{worker=\"grpc://w1:9000\"}}")))
-                .and_then(|line| line.rsplit(' ').next())
-                .and_then(|value| value.parse().ok())
-        }
+        use metrics_exporter_prometheus::PrometheusBuilder;
 
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();

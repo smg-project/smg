@@ -146,6 +146,14 @@ impl RankState {
         self.replay
     }
 
+    /// The batches a pending replay was asked for (`received - expected`),
+    /// 0 when none is pending. Read before a reset drops the replay, so a
+    /// resume the server refused still counts what it skipped.
+    pub(crate) fn pending_gap(&self) -> u64 {
+        self.replay
+            .map_or(0, |replay| replay.received - replay.expected)
+    }
+
     /// Decide what to do with a batch carrying `seq`; `clears` says whether
     /// it carries the engine's own cache clear.
     pub(crate) fn admit(&mut self, seq: u64, clears: bool) -> Admission {
