@@ -18,10 +18,11 @@ use tracing::warn;
 use crate::{
     config::{validate_worker_url, RouterConfig},
     routers::provider_support,
+    service_discovery::{DISCOVERY_LABEL_PREFIX, DISCOVERY_PROVIDER_LABEL},
     worker::{
         registry::WorkerId,
         worker::{merge_labels, worker_to_info},
-        WorkerRegistry, WorkerType,
+        Worker, WorkerRegistry, WorkerType,
     },
     workflow::{Job, JobQueue, WorkerRegistrationMode},
 };
@@ -61,11 +62,12 @@ fn bad_request(message: String) -> WorkerServiceError {
 }
 
 /// The bounds a registration body must satisfy before any job is queued:
-/// the URL's length; the labels' count, charset and size and the shape of
-/// the labels the routers read as numbers or booleans; the fields the routers
-/// rely on (a positive, finite cost; a KV block size and a data-parallel size
-/// of at least 1; a rank only with a size and below it; a bootstrap port
-/// that is a port). A violation is a `400 Bad Request` naming the field.
+/// the URL's length; the labels' count, charset and size, the shape of the
+/// labels the routers read as numbers or booleans and none under the prefix
+/// reserved for discovery; the fields the routers rely on (a positive,
+/// finite cost; a KV block size and a data-parallel size of at least 1; a
+/// rank only with a size and below it; a bootstrap port that is a port). A
+/// violation is a `400 Bad Request` naming the field.
 fn validate_spec(spec: &WorkerSpec) -> Result<(), WorkerServiceError> {
     if spec.url.len() > MAX_WORKER_URL_BYTES {
         return Err(bad_request(format!(
@@ -176,6 +178,15 @@ fn validate_labels(labels: &HashMap<String, String>) -> Result<(), WorkerService
                 shown_key(key)
             )));
         }
+        // Discovery decides which workers it owns, and the health checker
+        // which it may remove, by these labels: one set here would hand a
+        // manual worker to a provider, or forge a discovered worker's record.
+        if key.starts_with(DISCOVERY_LABEL_PREFIX) {
+            return Err(bad_request(format!(
+                "label '{key}' is under '{DISCOVERY_LABEL_PREFIX}', a prefix reserved for \
+                 worker discovery"
+            )));
+        }
         if value.len() > MAX_LABEL_VALUE_BYTES || value.chars().any(char::is_control) {
             return Err(bad_request(format!(
                 "label '{key}' must be at most {MAX_LABEL_VALUE_BYTES} bytes without control \
@@ -202,6 +213,21 @@ fn validate_labels(labels: &HashMap<String, String>) -> Result<(), WorkerService
     Ok(())
 }
 
+/// A worker a discovery provider registered is changed at its discovery
+/// source, which is authoritative: an edit made here would hold only until
+/// the provider next registers the worker, and disagree with the source until
+/// then. A DELETE stays allowed; the provider adds the worker back while it
+/// still publishes it.
+fn refuse_discovery_owned(worker: &dyn Worker) -> Result<(), WorkerServiceError> {
+    match worker.metadata().spec.labels.get(DISCOVERY_PROVIDER_LABEL) {
+        Some(provider) => Err(WorkerServiceError::DiscoveryOwned {
+            url: worker.url().to_string(),
+            provider: provider.clone(),
+        }),
+        None => Ok(()),
+    }
+}
+
 /// Error types for worker service operations
 #[derive(Debug)]
 pub enum WorkerServiceError {
@@ -215,6 +241,8 @@ pub enum WorkerServiceError {
     Conflict { url: String, worker_id: WorkerId },
     /// A create for this URL is still in flight (concurrent POST)
     CreateInProgress { url: String, worker_id: WorkerId },
+    /// A discovery provider owns the worker (PUT/PATCH of a discovered worker)
+    DiscoveryOwned { url: String, provider: String },
     /// The spec targets a provider whose router this build does not carry
     ProviderNotCompiled {
         url: String,
@@ -235,6 +263,7 @@ impl WorkerServiceError {
             Self::BadRequest { .. } => "BAD_REQUEST",
             Self::Conflict { .. } => "WORKER_ALREADY_EXISTS",
             Self::CreateInProgress { .. } => "WORKER_CREATE_IN_PROGRESS",
+            Self::DiscoveryOwned { .. } => "WORKER_DISCOVERY_OWNED",
             Self::ProviderNotCompiled { .. } => "PROVIDER_NOT_COMPILED",
             Self::QueueNotInitialized => "INTERNAL_SERVER_ERROR",
             Self::QueueSubmitFailed { .. } => "INTERNAL_SERVER_ERROR",
@@ -248,6 +277,7 @@ impl WorkerServiceError {
             Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
             Self::Conflict { .. } => StatusCode::CONFLICT,
             Self::CreateInProgress { .. } => StatusCode::CONFLICT,
+            Self::DiscoveryOwned { .. } => StatusCode::CONFLICT,
             Self::ProviderNotCompiled { .. } => StatusCode::BAD_REQUEST,
             Self::QueueNotInitialized => StatusCode::INTERNAL_SERVER_ERROR,
             Self::QueueSubmitFailed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -282,6 +312,12 @@ impl std::fmt::Display for WorkerServiceError {
                     Poll GET /workers/{id}."
                 )
             }
+            Self::DiscoveryOwned { url, provider } => write!(
+                f,
+                "Worker '{url}' is owned by the '{provider}' discovery provider. \
+                PUT and PATCH are not supported for discovered workers. \
+                Change it at its discovery source instead."
+            ),
             Self::ProviderNotCompiled {
                 url,
                 family,
@@ -552,6 +588,10 @@ impl WorkerService {
                 .ok_or_else(|| WorkerServiceError::NotFound {
                     worker_id: worker_id_raw.to_string(),
                 })?;
+        // Before the body is read: a discovered worker's own spec, sent back,
+        // carries the reserved labels, and the useful answer is where to make
+        // the change, not which labels to strip.
+        refuse_discovery_owned(existing.as_ref())?;
         let url = existing.url().to_string();
         validate_spec(&config)?;
         Self::require_provider_router(&config)?;
@@ -709,7 +749,6 @@ impl WorkerService {
         update: WorkerUpdateRequest,
     ) -> Result<UpdateWorkerResult, WorkerServiceError> {
         let worker_id = Self::parse_worker_id(worker_id_raw)?;
-        validate_update(&update)?;
 
         let url = self
             .worker_registry
@@ -717,9 +756,13 @@ impl WorkerService {
             .ok_or_else(|| WorkerServiceError::NotFound {
                 worker_id: worker_id_raw.to_string(),
             })?;
-        if let (Some(labels), Some(worker)) =
-            (&update.labels, self.worker_registry.get_by_url(&url))
-        {
+        let worker = self.worker_registry.get_by_url(&url);
+        // Before the body is read, as for a PUT.
+        if let Some(worker) = &worker {
+            refuse_discovery_owned(worker.as_ref())?;
+        }
+        validate_update(&update)?;
+        if let (Some(labels), Some(worker)) = (&update.labels, &worker) {
             validate_merged_labels(&worker.metadata().spec.labels, labels)?;
         }
 
@@ -1110,6 +1153,127 @@ mod tests {
             matches!(&err, WorkerServiceError::BadRequest { message } if message.contains("149 labels on the worker") && message.contains("1 new")),
             "{err}"
         );
+    }
+
+    /// No request can write the labels discovery reads ownership from: a
+    /// key under the reserved prefix is a 400 naming it on a POST, on a PUT
+    /// and on a PATCH of a manual worker, before any job is queued; a key
+    /// that only resembles the prefix passes.
+    #[tokio::test]
+    async fn a_label_under_the_discovery_prefix_is_refused_on_post_put_and_patch() {
+        let registry = Arc::new(WorkerRegistry::new());
+        register_worker(&registry, "grpc://10.0.0.8:8000", Some("m"));
+        let id = registry.reserve_id_for_url("grpc://10.0.0.8:8000");
+        let service = make_service(Arc::clone(&registry));
+        let refused = |err: WorkerServiceError, key: &str| {
+            assert!(
+                matches!(&err, WorkerServiceError::BadRequest { message }
+                    if message.contains(&format!("'{key}'"))
+                        && message.contains("reserved for worker discovery")),
+                "{key}: {err}"
+            );
+        };
+        for key in [
+            "smg.ai/discovery-provider",
+            "smg.ai/discovery-id",
+            "smg.ai/discovery-spec-hash",
+            "smg.ai/discovery-anything",
+        ] {
+            let labels = json!({ key: "file" });
+            let post: WorkerSpec =
+                serde_json::from_value(json!({"url": "grpc://10.0.0.9:8000", "labels": labels}))
+                    .expect("a spec");
+            refused(service.create_worker(post).await.expect_err("POST"), key);
+            let put: WorkerSpec =
+                serde_json::from_value(json!({"url": "grpc://10.0.0.8:8000", "labels": labels}))
+                    .expect("a spec");
+            refused(
+                service
+                    .replace_worker(id.as_str(), put)
+                    .await
+                    .expect_err("PUT"),
+                key,
+            );
+            let patch: WorkerUpdateRequest =
+                serde_json::from_value(json!({ "labels": labels })).expect("an update");
+            refused(
+                service
+                    .update_worker(id.as_str(), patch)
+                    .await
+                    .expect_err("PATCH"),
+                key,
+            );
+        }
+        let lookalikes = json!({
+            "smg.ai/discovery": "v",
+            "smg.ai/discoveryid": "v",
+            "x/smg.ai/discovery-id": "v",
+        });
+        let post: WorkerSpec =
+            serde_json::from_value(json!({"url": "grpc://10.0.0.9:8000", "labels": lookalikes}))
+                .expect("a spec");
+        assert!(matches!(
+            service
+                .create_worker(post)
+                .await
+                .expect_err("queue is uninitialized"),
+            WorkerServiceError::QueueNotInitialized
+        ));
+    }
+
+    /// A discovered worker is changed at its discovery source: a PUT or PATCH
+    /// of it is a 409 naming its provider, whatever the body — the worker's
+    /// own spec sent back included — while a DELETE is taken (the provider
+    /// adds it back while it still publishes it).
+    #[tokio::test]
+    async fn put_and_patch_of_a_discovered_worker_are_refused_naming_its_provider() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let url = "grpc://10.0.0.10:8000";
+        let worker = BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Regular)
+            .model(ModelCard::new("m"))
+            .label(DISCOVERY_PROVIDER_LABEL, "consul")
+            .label("smg.ai/discovery-id", "node-1:8000")
+            .build();
+        registry.register(Arc::new(worker)).unwrap();
+        let id = registry.reserve_id_for_url(url);
+        let service = make_service(Arc::clone(&registry));
+        let owned = |err: WorkerServiceError| {
+            assert_eq!(err.status_code(), StatusCode::CONFLICT, "{err}");
+            assert_eq!(err.error_code(), "WORKER_DISCOVERY_OWNED");
+            let message = err.to_string();
+            assert!(message.contains("'consul' discovery provider"), "{message}");
+            assert!(message.contains("discovery source"), "{message}");
+        };
+        let own_spec = (*registry.get(&id).expect("registered").metadata().spec).clone();
+        for put in [worker_spec(url), own_spec] {
+            owned(
+                service
+                    .replace_worker(id.as_str(), put)
+                    .await
+                    .expect_err("PUT"),
+            );
+        }
+        for body in [
+            json!({"priority": 5}),
+            json!({"labels": {"env": "prod"}}),
+            json!({"labels": {DISCOVERY_PROVIDER_LABEL: "file"}}),
+        ] {
+            let patch: WorkerUpdateRequest = serde_json::from_value(body).expect("an update");
+            owned(
+                service
+                    .update_worker(id.as_str(), patch)
+                    .await
+                    .expect_err("PATCH"),
+            );
+        }
+        assert!(matches!(
+            service
+                .delete_worker(id.as_str())
+                .await
+                .expect_err("queue is uninitialized"),
+            WorkerServiceError::QueueNotInitialized
+        ));
     }
 
     /// A rejected key is not echoed whole: a key the size of the payload

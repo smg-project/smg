@@ -35,7 +35,8 @@ use crate::{
 };
 
 /// Prefix reserved for discovery provenance. Only this module writes labels
-/// under it; a provider's compatibility labels may not.
+/// under it; a provider's compatibility labels may not, and neither may the
+/// worker API (`WorkerService` refuses them).
 pub const DISCOVERY_LABEL_PREFIX: &str = "smg.ai/discovery-";
 /// Which provider owns the worker: `kubernetes`, `file`, `slurm` or `consul`.
 pub const DISCOVERY_PROVIDER_LABEL: &str = "smg.ai/discovery-provider";

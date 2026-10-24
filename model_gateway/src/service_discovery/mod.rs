@@ -44,6 +44,8 @@ pub use kubernetes::start_service_discovery_with_client;
 pub use kubernetes::{
     ModelIdSource, PodInfo, PodType, ServiceDiscoveryConfig, POD_NAME_LABEL, POD_UID_LABEL,
 };
-pub use reconciler::{DISCOVERY_ID_LABEL, DISCOVERY_PROVIDER_LABEL, DISCOVERY_SPEC_HASH_LABEL};
+pub use reconciler::{
+    DISCOVERY_ID_LABEL, DISCOVERY_LABEL_PREFIX, DISCOVERY_PROVIDER_LABEL, DISCOVERY_SPEC_HASH_LABEL,
+};
 pub use runtime::{start_service_discovery, RuntimeDiscoveryConfig};
 pub use slurm::SlurmProviderConfig;
