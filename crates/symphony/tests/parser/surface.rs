@@ -11,7 +11,7 @@ use symphony::{
         Bound, Grammar, GrammarStart, Output, OutputAnswer, OutputChoice, OutputPosition,
         OutputSpelling, Tag, Turn,
     },
-    input::{EngineFinish, Input, TokenSpan},
+    input::{EngineFinish, Input, RecordedInput, TokenSpan},
     parser::{ParseError, Parser},
     shape::{Inferred, ValueRead},
 };
@@ -59,7 +59,10 @@ const RE_EXPORTS: [(&str, &[&str]); 9] = [
         ],
     ),
     ("ids", &["CallIds"]),
-    ("input", &["EngineFinish", "Input", "TokenSpan"]),
+    (
+        "input",
+        &["EngineFinish", "Input", "RecordedInput", "TokenSpan"],
+    ),
     ("parser", &["ParseError", "Parser"]),
     ("shape", &["Inferred", "ValueRead"]),
 ];
@@ -135,7 +138,7 @@ fn every_pinned_name_resolves_under_its_module() {
         OutputChoice,
     )>();
     named::<(OutputPosition, OutputSpelling, Tag, Turn)>();
-    named::<(EngineFinish, Input, TokenSpan, ParseError)>();
+    named::<(EngineFinish, Input, RecordedInput, TokenSpan, ParseError)>();
     named::<Inferred>();
     reads::<Inferred>();
     parses::<Engine>();
@@ -176,7 +179,12 @@ mod at_the_root {
             symphony::Tag,
             symphony::Turn,
         )>();
-        named::<(symphony::EngineFinish, symphony::Input, symphony::TokenSpan)>();
+        named::<(
+            symphony::EngineFinish,
+            symphony::Input,
+            symphony::RecordedInput,
+            symphony::TokenSpan,
+        )>();
         named::<(symphony::ParseError, symphony::Inferred)>();
         fn parses<P: symphony::Parser>() {}
         parses::<symphony::Engine>();
