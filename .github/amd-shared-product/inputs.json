@@ -75,7 +75,7 @@
   "producer_sha": "445bb37bccb47e620b2b3aac12cd30b4ebd71a43",
   "producer_branch": "ci/frozen-c9d-cpu-producer-20261023",
   "producer_policy": "frozen_c9d_dispatch_build_only_all_18_steps_success_v1",
-  "target_product_commit": "f0ac56196c8c5178ae0d062f0441c00ad01522d8",
+  "target_product_commit": "26160dd1cee2228577de492a65334039266dcc45",
   "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat[0]/sglang/nvidia",
   "source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
@@ -239,7 +239,7 @@
     "tvm_bootstrap_shared_target": "6332ac94e00a587e14e5e68faaaa3b83b442a714",
     "actual_no_device_canary": "Separate28e9.87sec device-freeCPU helper imports independently audited; not model/GPU proof or full231 acceptance"
   },
-  "pilot_namespace_oid": "4d6b662d64d0b218ba05ac032d792b574ad32186",
+  "pilot_namespace_oid": "5b5b801bdaa8928b86d8702617612e6cf074f0fe",
   "explicit_gptoss_bf16_dependency": {
     "reviewed_engine_head": "858559b60ba8a0683b7761cb0dcd79dfa02721bc",
     "reviewed_pilot_source": "ebab1f763d37397c54584b0171cc17a06ad3ecad",
@@ -282,11 +282,11 @@
     },
     "qwen_mm_identity_observation": {
       "source_parent": "60f767549f07218a62c1217164e65d7c0193a80d",
-      "source_commit": "f0ac56196c8c5178ae0d062f0441c00ad01522d8",
+      "source_commit": "26160dd1cee2228577de492a65334039266dcc45",
       "optin": "SMG_QWEN_MM_TRACE=1 and SMG_QWEN_MM_MODEL=Qwen/Qwen3-VL-8B-Instruct; caller does not set these",
       "manifest_path": ".github/amd-gptoss-pilot/mm_overlay.json",
-      "manifest_sha256": "eb417f87d9717a588a92b84d9856e4835085c91557d8a3c1a3edad044db37d74",
-      "helper_sha256": "ffc34dedb2294cd56cec486203ff7ef6b4e5afe4ce10df860afd775bfedb9791",
+      "manifest_sha256": "c268d11a6790289a145ad31d14b38eacdb517a3ab86b6e690c733128f86e0824",
+      "helper_sha256": "daa18f680ff59d9f4af262104c13d9f56ca6a3c428468339ce52f6ac2898d398",
       "status": "SOURCE_ONLY_DEFAULT_OFF_NO_EXECUTION",
       "native_or_model_quality_proof": false,
       "missing_or_error_or_limit_observation": "HOLD; original six API outcomes do not substitute for required actual observation",
