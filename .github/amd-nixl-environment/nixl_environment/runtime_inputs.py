@@ -14,6 +14,7 @@ import sys
 import zipfile
 
 SPEC_SHA = "f3519bade67f15b8bf0fe30f60b84313128175b14ca12d5c431168e3c1e50e7f"
+SERVICER_SOURCE_SHA = "e79fde207845a729312197903c55b07d7912b5157db87d6d88ea02149a6eda86"
 ROOT = Path(os.environ["GITHUB_WORKSPACE"]).resolve(strict=True)
 
 
@@ -103,22 +104,38 @@ def constraints():
     print(path)  # The caller appends it before the existing prepare snapshot.
 
 
-def distribution_proof(name, item, root):
-    dist = metadata.distribution(name)
-    require(dist.version == item["version"], "active auxiliary version: " + name)
+def installed_record(dist):
     record = dist.read_text("RECORD")
-    require(record, "installed RECORD missing: " + name)
+    require(record, "installed RECORD missing")
+    rows = list(csv.reader(io.StringIO(record)))
+    require(len(rows) == len({row[0] for row in rows}), "duplicate installed RECORD entry")
     base = Path(dist.locate_file("")).resolve()
-    for relative, digest, size in csv.reader(io.StringIO(record)):
+    for relative, digest, size in rows:
         require(relative and not Path(relative).is_absolute(), "absolute installed RECORD path")
         path = Path(dist.locate_file(relative)).resolve(strict=True)
         require(path.is_relative_to(Path(sys.prefix).resolve()) or path.is_relative_to(base), "RECORD escaped active installation")
-        if digest:
+        if relative.endswith(".dist-info/RECORD"):
+            require(digest == size == "", "installed RECORD self entry")
+        elif digest:
             found = identity(path)
             encoded = base64.urlsafe_b64encode(bytes.fromhex(found["sha256"])).rstrip(b"=").decode()
             require(digest == "sha256=" + encoded and size == str(found["bytes"]), "installed RECORD bytes changed")
         else:
-            require(relative.endswith(".dist-info/RECORD") or ("__pycache__" in Path(relative).parts and relative.endswith(".pyc")), "unhashed installed RECORD member")
+            require("__pycache__" in Path(relative).parts and relative.endswith(".pyc"), "unhashed installed RECORD member")
+    return record
+
+
+def distribution_proof(name, item, root):
+    dist = metadata.distribution(name)
+    require(dist.version == item["version"], "active auxiliary version: " + name)
+    record = installed_record(dist)
+    direct = None
+    if name == "smg-grpc-proto":
+        direct = json.loads(dist.read_text("direct_url.json") or "null")
+        require(isinstance(direct, dict) and set(direct) == {"url", "archive_info"}, "proto direct URL schema")
+        require(direct["url"] == (root / item["wheel"]).as_uri(), "proto exact wheel file URI")
+        require(direct["archive_info"].get("hashes", {}).get("sha256") == identity(root / item["wheel"])["sha256"], "proto direct archive SHA")
+        require(Path(dist._path).resolve().is_relative_to(Path(sys.prefix).resolve()), "proto active metadata is outside the job venv")
     with zipfile.ZipFile(root / item["wheel"]) as wheel:
         for member in wheel.infolist():
             require(not Path(member.filename).is_absolute() and ".." not in Path(member.filename).parts, "wheel member path")
@@ -131,7 +148,34 @@ def distribution_proof(name, item, root):
             require(not path.is_symlink() and identity(path) == {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}, "installed source wheel differs: " + name)
             if name == "smg-grpc-proto" and member.filename.startswith("smg_grpc_proto/proto/") and member.filename.endswith(".proto"):
                 require((ROOT / "crates/grpc_client/proto" / Path(member.filename).name).read_bytes() == raw, "current eight-schema source differs")
-    return {"version": dist.version, "metadata_origin": str(dist._path), "RECORD_sha256": hashlib.sha256(record.encode()).hexdigest(), "wheel": item["wheel"]}
+    return {"version": dist.version, "metadata_origin": str(dist._path), "RECORD_sha256": hashlib.sha256(record.encode()).hexdigest(), "wheel": item["wheel"], "direct_url": direct}
+
+
+def editable_servicer():
+    declaration = ROOT / ".github/amd-shared-product/editable-servicer-source.json"
+    require(identity(declaration)["sha256"] == SERVICER_SOURCE_SHA, "editable servicer source declaration changed")
+    value = json.loads(declaration.read_text())
+    require(value["policy"] == "legacy_c2ac_same_root_editable_servicer_exact89_v1" and len(value["files"]) == 89, "legacy editable source scope")
+    source = ROOT / "grpc_servicer"
+    hashes = {}
+    for name, item in value["files"].items():
+        path = source / name
+        if "symlink" in item:
+            require(name == "LICENSE" and path.is_symlink() and os.readlink(path) == "../LICENSE" and path.resolve(strict=True) == ROOT / "LICENSE", "editable LICENSE target changed")
+        else:
+            require(not path.is_symlink() and path.resolve(strict=True).is_relative_to(source), "editable source escaped")
+        found = identity(path)
+        require(found == {k: item[k] for k in ("bytes", "sha256")}, "editable source bytes changed: " + name)
+        hashes[name] = found
+    dist = metadata.distribution(value["distribution"])
+    require(dist.version == value["version"] and Path(dist._path).resolve().is_relative_to(Path(sys.prefix).resolve()), "editable active metadata/version changed")
+    direct = json.loads(dist.read_text("direct_url.json") or "null")
+    require(isinstance(direct, dict) and set(direct) == {"url", "dir_info"} and direct["dir_info"] == {"editable": True} and direct["url"] == source.as_uri(), "same-root editable direct URL changed")
+    record = installed_record(dist)
+    module = importlib.import_module("smg_grpc_servicer")  # Frozen __init__ is only a docstring.
+    require(Path(module.__file__).resolve(strict=True) == source / "smg_grpc_servicer/__init__.py", "editable active package origin changed")
+    require([str(Path(p).resolve(strict=True)) for p in module.__path__] == [str(source / "smg_grpc_servicer")], "editable package search path changed")
+    return {"manifest_sha256": SERVICER_SOURCE_SHA, "source89": hashes, "metadata_origin": str(dist._path), "version": dist.version, "direct_url": direct, "RECORD_sha256": hashlib.sha256(record.encode()).hexdigest(), "active_module": module.__name__, "active_origin": module.__file__}
 
 
 def package_proofs(value, root):
@@ -209,7 +253,7 @@ def bootstrap():
                     print(name + ":" + suffix + " (last 64KiB):\n" + raw.decode(errors="replace"), file=sys.stderr)
                 raise
     sys.dont_write_bytecode = True
-    result = {"spec_sha256": SPEC_SHA, "helper_sha256": identity(Path(__file__))["sha256"], "packages": package_proofs(value, root), "generated_origins16": generated_origins(), "cairo": cairo_proof(value), "PIP_CONSTRAINT": os.environ.get("PIP_CONSTRAINT"), "bootstrap_LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH")}
+    result = {"spec_sha256": SPEC_SHA, "helper_sha256": identity(Path(__file__))["sha256"], "packages": package_proofs(value, root), "editable_servicer": editable_servicer(), "generated_origins16": generated_origins(), "cairo": cairo_proof(value), "PIP_CONSTRAINT": os.environ.get("PIP_CONSTRAINT"), "bootstrap_LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH")}
     require(not any(x.split(".")[0] in {"torch", "vllm", "sglang", "mooncake"} for x in sys.modules), "Cairo proof imported an engine")
     with (state() / "cohort-whole-pip-before-private.log").open("xb") as output:
         subprocess.run([sys.executable, "-m", "pip", "check"], check=True, timeout=30, env=env, stdout=output, stderr=subprocess.STDOUT)
@@ -221,7 +265,7 @@ def verify(stage):
     require(stage in {"installed", "final", "unit-before", "unit-after", "pytest-before", "pytest-after"}, "unknown cohort stage")
     value, root = verify_bundle()
     baseline = json.loads((state() / "cohort-baseline.json").read_text())
-    current = {"spec_sha256": SPEC_SHA, "helper_sha256": identity(Path(__file__))["sha256"], "packages": package_proofs(value, root), "PIP_CONSTRAINT": os.environ.get("PIP_CONSTRAINT")}
+    current = {"spec_sha256": SPEC_SHA, "helper_sha256": identity(Path(__file__))["sha256"], "packages": package_proofs(value, root), "editable_servicer": editable_servicer(), "PIP_CONSTRAINT": os.environ.get("PIP_CONSTRAINT")}
     require(all(current[k] == baseline[k] for k in current), "auxiliary input provenance changed")
     require(identity(state() / "cairo-2x2.png")["sha256"] == baseline["cairo"]["PNG_sha256"], "Cairo proof bytes changed")
     current["helper_origin"] = str(Path(__file__).resolve())

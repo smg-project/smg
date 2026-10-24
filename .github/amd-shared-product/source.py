@@ -26,6 +26,8 @@ def private_runtime_source(inputs, product_source):
     require(overlay["policy"] == "fixed749f_private_mooncake_runtime_inputs_v2", "private runtime policy")
     auxiliary = ROOT / ".github/amd-shared-product/runtime-inputs.json"
     require(hashlib.sha256(auxiliary.read_bytes()).hexdigest() == inputs["runtime_auxiliary_inputs"]["manifest_sha256"] == overlay["auxiliary_manifest_sha256"], "auxiliary input bytes")
+    servicer = ROOT / ".github/amd-shared-product/editable-servicer-source.json"
+    require(hashlib.sha256(servicer.read_bytes()).hexdigest() == inputs["runtime_auxiliary_inputs"]["servicer_source_manifest_sha256"] == overlay["servicer_source_manifest_sha256"], "editable servicer source bytes")
     target = inputs["target_product_commit"]
     require(overlay["base_product_commit"] == target, "private runtime product base")
     require(set(overlay["scripts"]) == PRIVATE_RUNTIME_FILES, "exact two private runtime hooks")

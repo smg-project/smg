@@ -296,7 +296,7 @@
     "runtime_proof": false,
     "reference_contract": ".github/amd-shared-product/mooncake4-reference.json"
   },
-  "private_runtime_overlay_sha256": "dd7091c81d42cbdc3452601013df0b0130d805aa47d27570979b19d6620c2c20",
+  "private_runtime_overlay_sha256": "ccb969fb01cdd0087663abaa7eda34c2a9caceb22f4a7b4013fa94fd904b3072",
   "private_mooncake_runtime": {
     "wheel": {
       "bytes": 4203741,
@@ -333,6 +333,7 @@
     ],
     "staging_accepted": false,
     "staging_receipt": null,
-    "GPU_verified": false
+    "GPU_verified": false,
+    "servicer_source_manifest_sha256": "e79fde207845a729312197903c55b07d7912b5157db87d6d88ea02149a6eda86"
   }
 }
