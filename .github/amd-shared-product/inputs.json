@@ -275,7 +275,7 @@
     "env": "SMG_SG2_STARTUP_DIAGNOSTIC",
     "actual_image_digest": "sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d",
     "manifest": "sglang_pd_observer/startup-overlay.json",
-    "manifest_sha256": "f4b7bf8b08eda237823642c707e3d52d68716fa7d050c9e3f23c25b6721842fa",
+    "manifest_sha256": "a733c51e963a8f472af9323e7bbfc880b6bb8e8200c52c5aec29816310cf1e7f",
     "source_paths_and_before_after": {
       "/sgl-workspace/aiter/aiter/jit/utils/chip_info.py": {
         "actual_capture_path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T0300Z/SG2-AB-4420-source-canonical-root-933b80bb0c1547128659f28c5b42265a/2.py",
@@ -290,7 +290,7 @@
       "/sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py": {
         "actual_capture_path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T0300Z/SG2-AB-4420-source-followup-root-f1376ea255d7439cbda615e1d2d3db47/1.py",
         "before_sha256": "b61df5b750adc748a99ceb381b8494c199fb3f704d793da5a0217bd6bbb606c4",
-        "after_sha256": "d6216ddea10a0d3360619179de914ef49c8da3b2da77d810be8cf61f216127f4"
+        "after_sha256": "def3a3f1024aaa61c5949f24fbd33963d4ed55a9253bd2c3cbd98003075fff94"
       }
     },
     "helper_sha256": "1e2bd0397da0230194ef462f501cbb16ad9fdf6ac145ae1a53a6318af389c934",
@@ -306,8 +306,8 @@
         "registration-overlay.json",
         "startup-overlay.json"
       ],
-      "startup_manifest_sha256": "f4b7bf8b08eda237823642c707e3d52d68716fa7d050c9e3f23c25b6721842fa",
-      "scope": "All three JSON resources remain packaged; new startup-manifest and helper bytes need fresh normal-wheel installed-resource verification. Old7de packaging CPU evidence does not prove this candidate installed."
+      "startup_manifest_sha256": "a733c51e963a8f472af9323e7bbfc880b6bb8e8200c52c5aec29816310cf1e7f",
+      "scope": "All three JSON resources remain packaged; new stream-manifest bytes need fresh normal-wheel installed-resource verification. Prior package-data/CU CPU evidence does not prove this candidate installed or HIP startup repaired."
     }
   },
   "explicit_existing_runtime_CU_dependency": {
@@ -322,6 +322,26 @@
     "uninitialized_path": "Legacy rocminfo lookup only before PyTorch HIP initialization, with strict nonzero-exit and empty/nonpositive rejection when this opt-in is set.",
     "CU_NUM_override": "Existing nonzero explicit override is preserved, not used by this candidate caller.",
     "actual_CPU_or_GPU_verified": false,
+    "prefill_async_OOM_resolved": false,
+    "original20_or_RDMA_accepted": false
+  },
+  "explicit_prefill_stream_budget_dependency": {
+    "default_enabled": false,
+    "manual_dispatch_input": "prefill_stream_budget",
+    "requires_manual_startup_diagnostic": true,
+    "env": "SMG_SG2_PREFILL_STREAM_BUDGET",
+    "scope": "HIP and disaggregation_mode=prefill only; other roles/platforms/default-off retain the original allocation path.",
+    "same_objects": "Existing model_runner.forward_stream is materialized, never replaced. The schedule stream returned by existing allocate_distinct_stream is retained in self.schedule_stream and reused after graphs.",
+    "allocation_order": "After target/draft runner construction and its pre-model baseline B; before init_memory_pools -> KVCacheConfigurator current-free sample F.",
+    "budget_formula": "KV bytes=int((F-B*(1-mem_fraction_static)-MMreserve)*2**30), with original Mamba special cases unchanged. Native stream usage is charged through F; B/fraction/graph settings are not modified.",
+    "bounded_distinct_selection": "Use the exact existing managers/utils.py allocate_distinct_stream(priority0,65 draws); preserve original later event-loop alias check unchanged.",
+    "scheduler_before_sha256": "b61df5b750adc748a99ceb381b8494c199fb3f704d793da5a0217bd6bbb606c4",
+    "scheduler_after_sha256": "def3a3f1024aaa61c5949f24fbd33963d4ed55a9253bd2c3cbd98003075fff94",
+    "actual_source_formula_sha256": "27ea278a26c178e28b2af5a1bd14db8bae2d7bde6383cec4e6f3a5d8ca965623",
+    "actual_source_helper_sha256": "9315ebed347a1fabd9fe6e4d1ce31562fdb50c2e92efaa98af33cf190bd428fd",
+    "native_source_ref": "c9ab269368d46a826d64705192fef55594c8b698",
+    "native_source_limit": "Reported Git and actual header differ only stable-only wrapper; installed torch binary implementation equivalence and actual HIP allocation cause not independently proved.",
+    "CPU_or_GPU_verified": false,
     "prefill_async_OOM_resolved": false,
     "original20_or_RDMA_accepted": false
   }

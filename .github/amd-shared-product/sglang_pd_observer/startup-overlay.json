@@ -1,5 +1,5 @@
 {
-  "version": "sg2_startup_exact4420_existing_runtime_CU_optin_v2",
+  "version": "sg2_startup_exact4420_existing_runtime_CU_and_prefill_stream_budget_optins_v3",
   "enabled_by_default": false,
   "env": "SMG_SG2_STARTUP_DIAGNOSTIC",
   "actual_image_digest": "sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d",
@@ -37,7 +37,7 @@
     "/sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py": {
       "actual_capture_path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T0300Z/SG2-AB-4420-source-followup-root-f1376ea255d7439cbda615e1d2d3db47/1.py",
       "before_sha256": "b61df5b750adc748a99ceb381b8494c199fb3f704d793da5a0217bd6bbb606c4",
-      "after_sha256": "d6216ddea10a0d3360619179de914ef49c8da3b2da77d810be8cf61f216127f4",
+      "after_sha256": "def3a3f1024aaa61c5949f24fbd33963d4ed55a9253bd2c3cbd98003075fff94",
       "changes": [
         {
           "before": "import torch\n",
@@ -45,7 +45,7 @@
         },
         {
           "before": "        # Prepare KV cache pools for all workers\n        tic = time.perf_counter()",
-          "after": "        # Prepare KV cache pools for all workers\n        _smg_sg2_memory(\"pools-before\", __name__, __file__, locals(), globals())\n        tic = time.perf_counter()"
+          "after": "        _smg_sg2_stream_budget = (\n            os.environ.get(\"SMG_SG2_PREFILL_STREAM_BUDGET\") == \"1\"\n            and _is_hip\n            and get_disagg().disaggregation_mode == \"prefill\"\n        )\n        if _smg_sg2_stream_budget:\n            # B is fixed; charge persistent native streams to F before KV sizing.\n            model_runner = self.tp_worker.model_runner\n            device_module = torch.get_device_module(model_runner.device)\n            _smg_sg2_memory(\"persistent-streams-before\", __name__, __file__, locals(), globals())\n            _ = model_runner.forward_stream.cuda_stream\n            self.schedule_stream = allocate_distinct_stream(\n                device_module, (model_runner.forward_stream,)\n            )\n            _ = self.schedule_stream.cuda_stream\n            _smg_sg2_memory(\"persistent-streams-after\", __name__, __file__, locals(), globals())\n\n        # Prepare KV cache pools for all workers\n        _smg_sg2_memory(\"pools-before\", __name__, __file__, locals(), globals())\n        tic = time.perf_counter()"
         },
         {
           "before": "        self.kv_cache_allocation_time = time.perf_counter() - tic\n\n        self.init_all_attention_backends()",
@@ -57,7 +57,7 @@
         },
         {
           "before": "        self.schedule_stream = None if use_mlx() else device_module.Stream(priority=0)",
-          "after": "        _smg_sg2_memory(\"stream-before\", __name__, __file__, locals(), globals())\n        self.schedule_stream = None if use_mlx() else device_module.Stream(priority=0)\n        _smg_sg2_memory(\"stream-after\", __name__, __file__, locals(), globals())"
+          "after": "        _smg_sg2_memory(\"stream-before\", __name__, __file__, locals(), globals())\n        if not _smg_sg2_stream_budget:\n            self.schedule_stream = None if use_mlx() else device_module.Stream(priority=0)\n        _smg_sg2_memory(\"stream-after\", __name__, __file__, locals(), globals())"
         },
         {
           "before": "            if self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream:\n                self.schedule_stream = allocate_distinct_stream(\n                    self.device_module, (self.forward_stream,)\n                )",
@@ -70,5 +70,5 @@
     "path": "/opt/venv/lib/python3.12/site-packages/smg_sg2_startup_trace.py",
     "sha256": "1e2bd0397da0230194ef462f501cbb16ad9fdf6ac145ae1a53a6318af389c934"
   },
-  "scope": "Startup observations plus separately opt-in automatic CU discovery from already-initialized HIP/PyTorch metadata; all process-visible logical devices must have positive equal CU counts. No new rocminfo process on that initialized path, no fallback after property errors, no CU prime/hardcode/tensor allocation/synchronization or model/memory/graph/RDMA/request/test changes. Uninitialized HIP retains a strict return-code-checked rocminfo fallback. Explicit CU_NUM override and feature-off legacy behavior are preserved."
+  "scope": "Startup observations and independent default-off CU discovery plus HIP-prefill persistent-stream accounting. The stream opt-in materializes the existing forward stream and a distinct retained priority0 schedule stream after the pre-model baseline B and before currently-free-memory sample F/KV sizing. Later schedule assignment reuses that object; original event-loop alias gate remains byte-identical. No fraction/precision/model/graph/RDMA/request/test changes; real HIP/P-OOM/original20 validation remains pending."
 }
