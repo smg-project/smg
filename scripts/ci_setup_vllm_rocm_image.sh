@@ -67,3 +67,11 @@ fi
 if [ -n "${GITHUB_ENV:-}" ]; then
     echo "SMG_CI_GRPC_COMPANION_VERSION=${SMG_CI_GRPC_COMPANION_VERSION}" >> "$GITHUB_ENV"
 fi
+
+# Internal fixed-image MC4 candidate only; never overwrite the image package.
+if [[ "${SMG_CI_PRIVATE_MOONCAKE:-}" == 1 ]]; then
+    export PYTHONPATH="$SMG_CI_RUNTIME_STATE_DIR/private-mooncake-site${PYTHONPATH:+:$PYTHONPATH}"
+    export LD_LIBRARY_PATH="/work/prefix/usr/lib/x86_64-linux-gnu:/work/prefix/usr/lib:/opt/rocm/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    python3 .github/amd-nixl-environment/nixl_environment/private_wheel.py prepare
+    printf '%s\n' "PYTHONPATH=$PYTHONPATH" "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+fi

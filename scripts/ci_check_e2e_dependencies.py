@@ -50,6 +50,12 @@ def main():
     ]
     (directory / f"{stage}-packages.json").write_text(json.dumps(packages, indent=2) + "\n")
     print(result.stdout, end="")
+    private = 0
+    if os.environ.get("SMG_CI_PRIVATE_MOONCAKE") == "1":
+        private = subprocess.run(
+            [sys.executable, ".github/amd-nixl-environment/nixl_environment/private_wheel.py", stage],
+            check=False,
+        ).returncode
     if os.environ.get("SMG_CI_RUNTIME_STATE_DIR"):
         audit = subprocess.run(
             [
@@ -62,8 +68,8 @@ def main():
             ],
             check=False,
         )
-        return result.returncode or audit.returncode
-    return result.returncode
+        return result.returncode or audit.returncode or private
+    return result.returncode or private
 
 
 if __name__ == "__main__":
