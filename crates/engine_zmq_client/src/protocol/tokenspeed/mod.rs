@@ -32,7 +32,9 @@ use crate::{
     codec::{decode_msgpack, encode_msgpack, tensor::encode_with_aux_frames, OpaqueValue},
     error::Result,
     protocol::{
-        control::CONTROL_REPLY_SLIM_TAG,
+        control::{CONTROL_REPLY_SLIM_TAG, CONTROL_REPLY_WIRE_FIELDS},
+        handshake::EngineCoreReadyResponse,
+        positional::check_prefix,
         tokenspeed::{
             output::{TokenSpeedOutput, TokenSpeedWireOutput},
             request::{TokenSpeedRequestType, TokenizedGenerateReqInput},
@@ -51,7 +53,7 @@ pub fn wire_carries_control_calls(layouts: &BTreeMap<String, Vec<String>>) -> bo
 }
 
 /// The TokenSpeed engine protocol: drives [`TokenizedGenerateReqInput`] over
-/// the shared ZMQ transport and decodes [`BatchTokenIDOutSlim`] back.
+/// the shared ZMQ transport and decodes [`output::BatchTokenIDOutSlim`] back.
 pub struct TokenSpeedProtocol;
 
 impl EngineProtocol for TokenSpeedProtocol {
@@ -64,6 +66,19 @@ impl EngineProtocol for TokenSpeedProtocol {
 
     fn abort_frame() -> Bytes {
         TokenSpeedRequestType::Abort.to_frame()
+    }
+
+    /// A scheduler that declares the control reply declares its field order
+    /// too (a tagged struct's tag, element 0, is not a field): a reordered
+    /// or renamed reply fails here, naming the field, instead of decoding
+    /// wrong and leaving the caller to wait out its deadline. A scheduler
+    /// that declares nothing (today's) passes: it takes no control calls.
+    fn check_layouts(ready: &EngineCoreReadyResponse) -> Result<()> {
+        check_prefix(
+            CONTROL_REPLY_SLIM_TAG,
+            &CONTROL_REPLY_WIRE_FIELDS,
+            &ready.positional_layouts,
+        )
     }
 
     fn prompt_tokens(request: &Self::Request) -> u64 {
@@ -477,14 +492,10 @@ mod tests {
             Some(TokenSpeedRequestType::Control)
         );
         assert_eq!(TokenSpeedRequestType::Control.to_frame().as_ref(), b"\x02");
-        assert_eq!(TokenSpeedRequestType::from_frame(b"\x03"), None);
+        // 3 is the encode worker's request type (its own change); 9 is unclaimed.
+        assert_eq!(TokenSpeedRequestType::from_frame(b"\x09"), None);
     }
 
-    /// A control call rides the `CONTROL` frame as the positional triple the
-    /// SGLang plugin takes; the reply comes back on the output socket as a
-    /// utility reply under the call id; and the handshake's layout
-    /// declaration is what tells a scheduler that takes control calls from
-    /// one that does not.
     /// `[7, "flush_cache", [1.5]]` as the scheduler's msgspec decoder of the
     /// control triple takes it.
     const FLUSH_CALL_VECTOR: &str = "9307ab666c7573685f636163686591cb3ff8000000000000";
@@ -496,6 +507,11 @@ mod tests {
     const CONTROL_REPLY_REFUSED_VECTOR: &str =
         "95b0436f6e74726f6c5265706c79536c696d09c2b36e6f2070726f66696c65722072756e6e696e6701";
 
+    /// A control call rides the `CONTROL` frame as the positional triple the
+    /// SGLang plugin takes; the reply comes back on the output socket as a
+    /// utility reply under the call id; and the handshake's layout
+    /// declaration is what tells a scheduler that takes control calls from
+    /// one that does not.
     #[test]
     fn control_calls_ride_the_control_frame_and_replies_resolve_by_call_id() {
         use crate::protocol::{control::ControlReplySlim, positional::vector_bytes};
@@ -596,5 +612,36 @@ mod tests {
         let payload = TokenSpeedProtocol::encode_abort("req-1").unwrap();
         let decoded: Vec<String> = decode_msgpack(&payload).unwrap();
         assert_eq!(decoded, vec!["req-1".to_string()]);
+    }
+
+    /// The declared control reply pins its field order: the scheduler's own
+    /// order passes, a reordered one fails at connect naming the field, and
+    /// a scheduler that declares nothing passes (it takes no control calls).
+    #[test]
+    fn check_layouts_pins_the_control_replys_field_order() {
+        use crate::mock_engine::default_ready_response;
+
+        let ready = |fields: &[&str]| {
+            let mut ready = default_ready_response();
+            ready.positional_layouts.insert(
+                CONTROL_REPLY_SLIM_TAG.to_string(),
+                fields.iter().map(ToString::to_string).collect(),
+            );
+            ready
+        };
+        assert!(TokenSpeedProtocol::check_layouts(&default_ready_response()).is_ok());
+        assert!(TokenSpeedProtocol::check_layouts(&ready(&CONTROL_REPLY_WIRE_FIELDS)).is_ok());
+        let error = TokenSpeedProtocol::check_layouts(&ready(&[
+            "call_id",
+            "message",
+            "success",
+            "engine_index",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("`ControlReplySlim` field 1 is `success` on this side and `message`"),
+            "{error}"
+        );
     }
 }

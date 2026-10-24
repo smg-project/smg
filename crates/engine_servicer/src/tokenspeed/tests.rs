@@ -1251,6 +1251,21 @@ async fn control_rpcs_report_what_the_wire_cannot_carry() {
         .await
         .expect_err("no control wire");
     assert_eq!(profile.code(), Code::Unimplemented);
+    let stopped = h
+        .client
+        .stop_profile(common::StopProfileRequest::default())
+        .await
+        .expect_err("no control wire");
+    assert_eq!(stopped.code(), Code::Unimplemented);
+    // "Nothing reaches it": the adapter's gate is the only thing between a
+    // control frame and a scheduler that declared no reply, so the mock's
+    // input must stay silent after the three RPCs.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), h.engine_in.recv_frames())
+            .await
+            .is_err(),
+        "no control frame may reach a scheduler that declared no control reply"
+    );
     let events = h
         .client
         .subscribe_kv_events(common::SubscribeKvEventsRequest::default())

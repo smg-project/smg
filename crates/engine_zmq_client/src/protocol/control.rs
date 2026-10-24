@@ -15,6 +15,11 @@ use crate::{
 
 /// The msgspec tag for [`ControlReplySlim`] (element 0 on the wire).
 pub const CONTROL_REPLY_SLIM_TAG: &str = "ControlReplySlim";
+/// The reply's field order as this side decodes it (after the tag): what a
+/// scheduler that declares the reply must list, in this order, for the
+/// decoder to read its replies ([`check_prefix`](crate::protocol::positional::check_prefix)
+/// at connect time).
+pub const CONTROL_REPLY_WIRE_FIELDS: [&str; 4] = ["call_id", "success", "message", "engine_index"];
 
 /// The answer to a control call (`ControlReplySlim`) on a slim wire: the
 /// scheduler's `success`/`message` for the call id SMG issued. The SGLang

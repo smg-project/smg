@@ -24,6 +24,8 @@ pub const TOKENIZED_GENERATE_REQ_INPUT_TAG: &str = "TokenizedGenerateReqInput";
 /// Request types are single-byte protocol constants sent as a raw ZMQ frame
 /// ahead of the msgpack payload (TokenSpeed's `REQ_TYPE_ADD`/`REQ_TYPE_ABORT`),
 /// so the receiver can dispatch without decoding first.
+/// The wire's full set: add 0, abort 1, control 2 (the scheduler's control
+/// call), encode 3 (a disaggregated encode worker's request, its own change).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TokenSpeedRequestType {

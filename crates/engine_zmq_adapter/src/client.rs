@@ -1439,8 +1439,6 @@ fn zmq_status_of(error: &engine_zmq_client::Error) -> tonic::Status {
     }
 }
 
-/// A utility call's error as a status: the wait expiring is the caller's
-/// deadline, everything else is the engine failing.
 /// `method(*args)` on every rank of `client`, each rank's `(success,
 /// message)` in engine order; the wait is per rank.
 async fn control_on_every_rank<P: EngineProtocol>(
@@ -1459,6 +1457,8 @@ async fn control_on_every_rank<P: EngineProtocol>(
     Ok(replies.iter().map(control_outcome).collect())
 }
 
+/// A utility call's error as a status: the wait expiring is the caller's
+/// deadline, everything else is the engine failing.
 fn utility_status(error: engine_zmq_client::Error) -> tonic::Status {
     match error {
         engine_zmq_client::Error::UtilityTimeout { .. } => {
