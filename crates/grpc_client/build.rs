@@ -2,6 +2,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Rebuild triggers
     println!("cargo:rerun-if-changed=proto/common.proto");
     println!("cargo:rerun-if-changed=proto/sglang_scheduler.proto");
+    println!("cargo:rerun-if-changed=proto/sglang_encoder.proto");
     println!("cargo:rerun-if-changed=proto/tokenspeed_scheduler.proto");
     println!("cargo:rerun-if-changed=proto/tokenspeed_encoder.proto");
     println!("cargo:rerun-if-changed=proto/vllm_engine.proto");
@@ -68,6 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compile_protos(
             &[
                 "proto/sglang_scheduler.proto",
+                "proto/sglang_encoder.proto",
                 "proto/vllm_engine.proto",
                 "proto/trtllm_service.proto",
                 "proto/mlx_engine.proto",
