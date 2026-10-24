@@ -1,4 +1,4 @@
-"""Bind the EPD consumer and its new producer independently to compiled dbc4."""
+"""Bind the EPD consumer and registration producer to the repaired source base."""
 
 import subprocess
 
@@ -40,7 +40,7 @@ def verify(inputs):
         )
     for path in git_output("diff", "--name-only", base, producer).splitlines():
         require(
-            path == WORKFLOW or path.startswith(".github/amd-epd-dbc4-producer/"),
+            path == WORKFLOW or path.startswith(".github/amd-epd-registration-producer/"),
             "producer: " + path,
         )
     require(not git_output("status", "--porcelain", "--untracked-files=all"), "dirty source")

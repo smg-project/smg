@@ -5,7 +5,7 @@ import re
 
 from source import WORKFLOW, require
 
-POLICY = "frozen_epd_dbc4_dispatch_22_steps_six_archives_v1"
+POLICY = "frozen_epd_registration_dispatch_22_steps_six_archives_v1"
 EXPLICIT_STEPS = [
     "Run actions/checkout@v7",
     "Verify frozen build source",
