@@ -190,7 +190,7 @@ pub enum FrameSampling {
     /// truncated to integers where the walk took too many (the usual case) or
     /// by `linspace(first, last, count)` where too few; a clip with fewer
     /// frames than the count takes `floor(i x n / count)`; each distinct pick
-    /// once, in order ([`rate_walk_frame_indices`]). The rule of the GLM-5
+    /// once, in order (`rate_walk_frame_indices`). The rule of the GLM-5
     /// family's own video loader, which samples a clip before its processor
     /// sees it; the processor pads an odd count by repeating the last frame.
     RateWalk {
