@@ -1,7 +1,7 @@
 {
-  "ready": false,
-  "run_budget_admitted": false,
-  "artifacts_pinned": false,
+  "ready": true,
+  "run_budget_admitted": true,
+  "artifacts_pinned": true,
   "artifacts": [
     {
       "name": "smg-wheel",
@@ -228,7 +228,7 @@
     "diagnostic_workflow_difference": "NIXL tier-select dispatch caller only; normal product tooling CPU jobs are not part of this diagnostic workflow."
   },
   "source_identity_note": "Consumer19 binds the original three owned-log overlays plus exactly one platform module-discovery helper change in test_pd_topologies.py. All original case methods/oracles and selected18/original17 projection, mixed connector startup hard gates, model/filter/50-42 remain unchanged. No NIXL/Mooncake ABI, transfer, GPU or coverage acceptance is implied.",
-  "admitted_tier": null,
+  "admitted_tier": "4",
   "contracts": {
     "4": {
       "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-4gpu-pd[3]/vllm/nvidia",
