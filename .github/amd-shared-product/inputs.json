@@ -196,18 +196,19 @@
   },
   "diagnostic_runtime_instrumentation": {
     "namespace": ".github/amd-nixl-environment/",
-    "scope": "Private constraint identity before/after installed-engine unit and original e2e pytest sessions only. No P4 process/rank observer is installed.",
+    "scope": "Environment continuity plus existing Worker/Gateway lifecycle wrappers, original per-case before/after/exit, actual native mappings and full original terminal reports; no additional model requests.",
     "preinstall_hook_product": "3b79acc59b68b84465e58a025850af2c93c96fe8",
     "reusable_workflow_product": "03d34400c3561c9e2d00e449a5e5c4bcca8e0401",
     "private_state": "/tmp/smg-nixl-runtime-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}",
     "runtime_witnesses_complete": false,
     "remaining_witnesses": [
-      "Actual owned gateway and all role worker PID/start/marker/native identities for heterogeneous PD and DP cases",
-      "ROCm vLLM official NIXL resolver/native connector and mandatory Mooncake mixed transport; package metadata is insufficient",
-      "Actual original request transfer, cancellation/outage/restart outcomes from original tests and corresponding logs/JUnit; HTTP success alone is insufficient",
-      "Exact per-case selection/skip/phase/rerun terminal audit of27 or18 IDs; configured floor alone is insufficient"
+      "Actual accepted producer/archive/native pins and source/runner budget admission remain absent",
+      "The new observer and official ROCm NIXL loader must execute in the actual749f image; CPU stand-ins do not prove native SDK or GPU compatibility",
+      "Original27 or18 cases including mixed Mooncake/NIXL pairing, transfer, cancellation, outage and restart must complete with exact original skips/phases and full raw retry history",
+      "Mapped libraries/configuration alone do not prove KV bytes, ABORT/ACK, peer/HBM release or long-term stability; original assertions/logs and independent actual audit determine scope"
     ],
-    "actual_GPU_or_coverage": false
+    "actual_GPU_or_coverage": false,
+    "runtime_witnesses_source_connected": true
   },
   "environment_contract": {
     "required_14_units_hard_gate": true,

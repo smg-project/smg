@@ -12,3 +12,6 @@ smg-nixl-environment-proof = "nixl_environment.plugin"
 
 [tool.setuptools.packages.find]
 include = ["nixl_environment*"]
+
+[tool.setuptools.package-data]
+nixl_environment = ["cases.json"]

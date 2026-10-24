@@ -48,3 +48,8 @@ def pytest_configure(config):
         config.pluginmanager.register(
             EnvironmentProof("pytest" if e2e else "unit"), "smg-nixl-environment"
         )
+
+    if e2e:
+        from .runtime import RuntimeProof
+
+        config.pluginmanager.register(RuntimeProof(), "smg-nixl-runtime")
