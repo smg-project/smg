@@ -32,6 +32,7 @@ def verify(inputs):
         ".github/workflows/e2e-gpu-job.yml",
         "e2e_test/infra/worker.py",
         "e2e_test/fixtures/setup_backend.py",
+        "scripts/ci_repair_sglang_rocm_native.py",
     }
     for path in git_output("diff", "--name-only", base, "HEAD").splitlines():
         require(

@@ -1,7 +1,7 @@
 {
   "ready": false,
   "run_budget_admitted": false,
-  "artifacts_pinned": true,
+  "artifacts_pinned": false,
   "artifacts": [
     {
       "name": "wasm-test-fixtures",
@@ -221,7 +221,7 @@
     "model_gateway": "32ff23450f38201e81f6a56209ce9b3ef6a449ec",
     "grpc_servicer": "a72db571df575d5c33f0c8c38d9eab7693be208e",
     "e2e_test": "c4f69b0e9c2b92bc5dc152f08981aa58755aa863",
-    "scripts": "0f65e05d51346101f6d7a0c586c25d00f7b4ca36",
+    "scripts": "6f2082a851689a51de9fd5211fd491a38c8ada8a",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows/e2e-gpu-job.yml": "b726dc181389b172bbeb9eb5dff8a7ff7fb663a8",
     "README.md": "83b7df25632da03f0184bd5b4628b9c9a3ace803",
