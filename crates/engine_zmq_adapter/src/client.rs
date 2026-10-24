@@ -11,13 +11,15 @@ use std::{
 
 use engine_zmq_client::{
     check_engine_layouts,
-    codec::OpaqueValue,
+    codec::{tensor::encode_with_aux_frames, OpaqueValue},
     connect_handshake,
     connector::{Client, EngineCoreClient, SglangClient, TokenSpeedClient},
     protocol::{
-        handshake::EngineCoreReadyResponse,
+        handshake::{EngineCoreReadyResponse, REQUEST_KIND_ENCODE},
         sglang::{request::SglangRequest, SglangProtocol},
-        tokenspeed::{wire_carries_control_calls, TokenSpeedProtocol},
+        tokenspeed::{
+            request::TokenSpeedRequestType, wire_carries_control_calls, TokenSpeedProtocol,
+        },
         vllm::{request::EngineCoreRequest, sampling::EngineCoreSamplingParams, VllmProtocol},
         EngineLoad, EngineProtocol,
     },
@@ -45,7 +47,8 @@ use crate::{
     },
     tokenspeed::{
         constraint_ref as tokenspeed_constraint_ref, fan_out_tokenspeed_requests,
-        translate_request_tokenspeed_for, GridTensors, RankIndices, TokenSpeedGenerateStream,
+        translate_encode_request, translate_request_tokenspeed_for, EncodeRendezvous, GridTensors,
+        RankIndices, TokenSpeedGenerateStream,
     },
     vllm::{
         fan_out_requests, has_media, kv_transfer_params, now_secs, ranked_candidate_count,
@@ -541,8 +544,8 @@ impl ZmqEngineClient {
     }
 
     /// The engines connected on the shared transport (same handshake for both
-    /// protocols).
-    fn engines(&self) -> &[ConnectedEngine] {
+    /// protocols), each with the facts its handshake declared.
+    pub fn engines(&self) -> &[ConnectedEngine] {
         match &self.backend {
             ZmqBackend::Vllm(client) => client.engines(),
             ZmqBackend::TokenSpeed(client) => client.engines(),
@@ -851,6 +854,17 @@ impl ZmqEngineClient {
                 "vLLM ZMQ backend expects a vLLM generate request",
             ));
         };
+        // A disaggregated encode worker lists `encode` alone: it runs no
+        // language model, so the gRPC servicer's words for its Generate.
+        if !client
+            .engines()
+            .iter()
+            .any(|engine| engine.ready_response.takes_generate())
+        {
+            return Err(tonic::Status::failed_precondition(
+                "Generate is unavailable on TokenSpeed encode workers",
+            ));
+        }
         // A constraint the engine's grammar backend cannot enforce is refused
         // here, before anything reaches the engine, as on every wire.
         if let Some(sp) = req.sampling_params.as_ref() {
@@ -875,6 +889,57 @@ impl ZmqEngineClient {
             streams.push(TokenSpeedGenerateStream::new(stream, index as u32));
         }
         Ok(streams)
+    }
+
+    /// Hand an `Encode` RPC to a TokenSpeed encode worker: the request
+    /// translated with the gRPC servicer's rules
+    /// ([`translate_encode_request`]), sent under the wire's encode request
+    /// type to an engine whose handshake lists `encode` (by the room's
+    /// residue when several do: the embedding's rendezvous is per room, any
+    /// encode worker serves it), with its large tensors as auxiliary frames.
+    /// Nothing answers it: the worker ships the embedding to the prefill
+    /// peer over the transfer engine, as the gRPC servicer's `Encode` acks
+    /// after its send. An engine that lists no encode request (one before
+    /// the wire carried it) is refused by name, nothing sent.
+    pub async fn encode_tokenspeed(
+        &self,
+        req: smg_grpc_client::tokenspeed_encoder_proto::EncodeRequest,
+        rendezvous: &EncodeRendezvous,
+    ) -> Result<(), tonic::Status> {
+        let ZmqBackend::TokenSpeed(client) = &self.backend else {
+            return Err(tonic::Status::internal(
+                "vLLM ZMQ backend expects a vLLM encode request",
+            ));
+        };
+        let encoders: Vec<&ConnectedEngine> = client
+            .engines()
+            .iter()
+            .filter(|engine| {
+                engine
+                    .ready_response
+                    .lists_request_kind(REQUEST_KIND_ENCODE)
+            })
+            .collect();
+        if encoders.is_empty() {
+            return Err(tonic::Status::failed_precondition(
+                "Encode is not served by this engine: its handshake lists no encode request on \
+                 the msgpack wire (an engine before the encode role rode it); a newer engine, \
+                 or the Python servicer (--servicer-impl python), serves this worker",
+            ));
+        }
+        let request =
+            translate_encode_request(req, rendezvous).map_err(tonic::Status::invalid_argument)?;
+        let (payload, aux_frames) = encode_with_aux_frames(&request).map_err(zmq_status)?;
+        let residue = request.bootstrap_room.rem_euclid(encoders.len() as i64) as usize;
+        client
+            .send_typed(
+                &encoders[residue].engine_id,
+                TokenSpeedRequestType::Encode.to_frame(),
+                payload,
+                aux_frames,
+            )
+            .await
+            .map_err(zmq_status)
     }
 
     /// [`Self::generate_vllm`] for an SGLang backend and request.

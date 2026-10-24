@@ -1234,29 +1234,55 @@ def test_a_decode_or_aggregated_launch_starts_no_bootstrap_server(
     assert "Bootstrap server started" not in caplog.text
 
 
-def test_an_encode_launch_is_refused_under_the_rust_path(launcher, monkeypatch, caplog):
-    """The EPD encode role takes its requests over the engine's in-process
-    channel, which this path does not build: such a launch under an explicit
-    rust is a configuration error before any scheduler starts (exit code 2,
-    one line naming the way out), never a servicer that reports SERVING and
-    encodes nothing. The prefill and decode roles pass."""
-    with pytest.raises(rust_lifecycle.ServicerConfigError, match="EPD encode role"):
-        rust.refuse_encode_role(FakeServerArgs(disaggregation_mode="encode"))
+def test_an_encode_launch_runs_on_the_rust_path_with_its_rendezvous_fact(launcher, monkeypatch):
+    """The EPD encode role runs on the Rust path: the launch is not refused,
+    the facts carry the worker's own rendezvous address (the host every
+    encode request names, read the engine's way, next to the bootstrap port
+    the server args already carry) for the encode role only, and the
+    KV-events default stays off for it (a vision tower has no KV cache to
+    publish from), as the Python server leaves it."""
+    _stub_servicer_module(monkeypatch)
+    monkeypatch.setattr(rust, "encode_bootstrap_host", lambda args: "10.0.0.9")
+    encode = FakeServerArgs(disaggregation_mode="encode", disaggregation_bootstrap_port=8998)
+    facts = rust.server_facts(encode)
+    args = json.loads(facts["server_args_json"])
+    assert args["encode_bootstrap_host"] == "10.0.0.9"
+    assert args["disaggregation_bootstrap_port"] == 8998
     for mode in ("null", "prefill", "decode"):
-        rust.refuse_encode_role(FakeServerArgs(disaggregation_mode=mode))
-    with pytest.raises(rust_lifecycle.ServicerConfigError, match="EPD encode role"):
-        asyncio.run(rust.serve_rust(FakeServerArgs(disaggregation_mode="encode")))
+        other = json.loads(
+            rust.server_facts(FakeServerArgs(disaggregation_mode=mode))["server_args_json"]
+        )
+        assert "encode_bootstrap_host" not in other
+    assert rust.TokenSpeedLauncher().kv_events_default(encode) is None
 
     module, calls = launcher
-    caplog.set_level(logging.ERROR)
-    monkeypatch.setattr(module, "serve_rust", rust.serve_rust)
+    served = {}
+
+    async def fake_serve_rust(server_args):
+        served["mode"] = server_args.disaggregation_mode
+        return 0
+
+    monkeypatch.setattr(module, "serve_rust", fake_serve_rust)
     with pytest.raises(SystemExit) as raised:
         module.main(
             ["--servicer-impl", "rust", "--model", "org/m", "--disaggregation-mode", "encode"]
         )
-    assert raised.value.code == 2 and calls["served"] is None
-    assert "does not serve the EPD encode role" in caplog.text
-    assert "--servicer-impl python" in caplog.text
+    assert raised.value.code == 0 and served == {"mode": "encode"}
+
+
+def test_the_engines_way_of_reading_the_rendezvous_host_is_used_when_importable(monkeypatch):
+    """The host is the engine's own reading (``get_local_ip_by_remote``); the
+    launch's ``--host`` stands in only where the engine is not importable."""
+    import sys
+    import types
+
+    network = types.ModuleType("tokenspeed.runtime.utils.network")
+    network.get_local_ip_by_remote = lambda: "192.0.2.7"
+    monkeypatch.setitem(sys.modules, "tokenspeed.runtime.utils.network", network)
+    assert rust.encode_bootstrap_host(FakeServerArgs(host="0.0.0.0")) == "192.0.2.7"
+    monkeypatch.delitem(sys.modules, "tokenspeed.runtime.utils.network")
+    monkeypatch.setitem(sys.modules, "tokenspeed.runtime.utils", None)
+    assert rust.encode_bootstrap_host(FakeServerArgs(host="10.1.2.3")) == "10.1.2.3"
 
 
 def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_path):

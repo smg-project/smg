@@ -3,7 +3,9 @@
 //! (`FlushCache`, profiling) ride the wire's control call when the
 //! scheduler's handshake declared its control reply (the control-wire
 //! revision), and answer UNIMPLEMENTED naming the gap on a scheduler whose
-//! wire carries generate and abort only.
+//! wire carries generate and abort only. In the encode role this service is
+//! the discovery surface (health, model and server facts) and `Generate` is
+//! refused: the encoder service (`encode.rs`) takes the requests.
 
 use std::sync::Arc;
 
@@ -31,6 +33,13 @@ impl TokenSpeedScheduler for TokenSpeedService {
         &self,
         request: Request<ts::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
+        // The encode role runs the vision tower alone: the gRPC servicer's
+        // words for its Generate, before the engine is even asked.
+        if self.state.encode_role.is_some() {
+            return Err(Status::failed_precondition(
+                "Generate is unavailable on TokenSpeed encode workers",
+            ));
+        }
         generate::generate(&self.state, request.into_inner())
             .await
             .inspect_err(|status| self.state.shared.metrics.request_not_started(status))

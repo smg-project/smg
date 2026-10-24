@@ -21,12 +21,14 @@ on one that does not; ranked ``top_logprobs`` and prompt logprobs are refused.
 Prefill/decode disaggregation is served: the request's bootstrap fields ride
 the wire as the Python servicer forwards them, and a prefill launch starts the
 engine's KV bootstrap server here as the engine's own frontend does
-(:func:`kv_bootstrap_server`). The EPD prefill side is served the same way; the
-EPD encode role is not (:func:`refuse_encode_role`): its worker takes its
-requests over the engine's in-process channel only, which this path does not
-have, so it stays with the Python implementation. Multimodal items of the
-Qwen3.5 lineage (an MRoPE family) are served: the Rust servicer computes the
-engine's MRoPE position table itself from the checkpoint facts
+(:func:`kv_bootstrap_server`). The EPD prefill side is served the same way,
+and the EPD encode role on an engine whose handshake lists the encode
+request: the Rust servicer mounts the encoder service and hands each
+``Encode`` to the worker over the wire, the launcher adds the worker's own
+rendezvous address to the facts (:func:`encode_bootstrap_host`), and an
+engine that lists no encode request fails the start by name. Multimodal items
+of the Qwen3.5 lineage (an MRoPE family) are served: the Rust servicer
+computes the engine's MRoPE position table itself from the checkpoint facts
 :func:`mrope_layout` ships (the wire bypasses the engine's input processor,
 which computes it on the Python path); items of other MRoPE families are
 refused by name.
@@ -314,6 +316,10 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     # servicer refuses a constraint that backend cannot enforce before the
     # scheduler, and judges nothing when the backend is not known.
     grammar_backend_entry(args_dict, tokenspeed_grammar_backend(server_args))
+    # The encode role's worker names its own address in every encode request
+    # (the Rust servicer reads it off these args, next to the bootstrap port).
+    if EngineConfigView(server_args).server_args.disaggregation_mode == "encode":
+        args_dict["encode_bootstrap_host"] = encode_bootstrap_host(server_args)
     kv_events = resolve_kv_events_config(server_args)
     try:
         from tokenspeed.version import __version__ as tokenspeed_version
@@ -614,20 +620,17 @@ def close_kv_bootstrap_server(server: Any) -> None:
         logger.exception("The KV bootstrap server did not stop cleanly")
 
 
-def refuse_encode_role(server_args: Any) -> None:
-    """The EPD encode role stays with the Python servicer: the encode worker
-    takes its requests over the engine's in-process channel, which this path
-    does not build, and the msgpack wire it dials carries no encode message.
-    Such a launch under the Rust path is a configuration error before any
-    scheduler starts, not a servicer that reports SERVING and never encodes.
-    The prefill and decode roles, and the EPD prefill side, are served."""
-    if EngineConfigView(server_args).server_args.disaggregation_mode == "encode":
-        raise ServicerConfigError(
-            f"{SERVICER_IMPL_ENV}=rust does not serve the EPD encode role "
-            "(disaggregation_mode='encode'): the encode worker takes its requests over the "
-            "engine's in-process channel only; run this worker on the Python servicer "
-            f"(unset {SERVICER_IMPL_ENV} or pass --servicer-impl python)"
-        )
+def encode_bootstrap_host(server_args: Any) -> str:
+    """The encode worker's own address, which every encode request names as
+    the host the prefill side pulls the embedding from: the engine's own
+    reading of it (``get_local_ip_by_remote``), as the Python encoder
+    servicer fills it; the launch's ``--host`` when the engine is not
+    importable (the launcher's unit tests)."""
+    try:
+        from tokenspeed.runtime.utils.network import get_local_ip_by_remote
+    except ImportError:
+        return str(getattr(server_args, "host", "") or "")
+    return str(get_local_ip_by_remote())
 
 
 # ---------------------------------------------------------------------------
@@ -671,9 +674,14 @@ class TokenSpeedLauncher(RustLauncher):
         return self._cached_model_config
 
     def kv_events_default(self, args: Any) -> str | None:
-        # The config is built here rather than in the facts: the facts need
-        # it a hook later in any case, so an explicit configuration or the
-        # opt-out, which do not read it, cost nothing extra.
+        # An encode worker runs the vision tower only, with no KV cache to
+        # publish from: its server args are left as given (the Python server's
+        # rule). Otherwise the config is built here rather than in the facts:
+        # the facts need it a hook later in any case, so an explicit
+        # configuration or the opt-out, which do not read it, cost nothing
+        # extra.
+        if EngineConfigView(args).server_args.disaggregation_mode == "encode":
+            return None
         return default_kv_events_config(args, model_config=self.model_config(args))
 
     def facts(self, args: Any) -> dict[str, Any]:
@@ -705,7 +713,7 @@ async def serve_rust(server_args: Any) -> int:
     """Serve this process's gRPC contract from Rust: start the Rust server,
     start the scheduler ranks against its handshake, and supervise both
     until a signal or a failure (:class:`TokenSpeedLauncher`). Returns the
-    process exit code. An EPD encode launch is refused first
-    (:func:`refuse_encode_role`)."""
-    refuse_encode_role(server_args)
+    process exit code. The EPD encode role runs here too: the Rust servicer
+    mounts the encoder service on an engine whose handshake lists the encode
+    request, and fails the start by name on one that does not."""
     return await TokenSpeedLauncher().serve(server_args)

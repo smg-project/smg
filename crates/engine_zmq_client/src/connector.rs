@@ -1429,6 +1429,24 @@ impl<P: EngineProtocol> Client<P> {
             .send_to_engine(engine_id, P::add_frame(), payload, Vec::new())
             .await
     }
+
+    /// [`notify`](Self::notify) under a request-type frame of the caller's
+    /// choosing, with `aux_frames` behind the payload: a message of the
+    /// engine's vocabulary outside the add/abort pair that the engine consumes
+    /// itself (an encode worker's encode request). Nothing answers it, no
+    /// stream is opened, no registration or in-flight slot is taken; the
+    /// frame is queued in order behind the frames before it.
+    pub async fn send_typed(
+        &self,
+        engine_id: &EngineId,
+        request_type: Bytes,
+        payload: Vec<u8>,
+        aux_frames: Vec<Bytes>,
+    ) -> Result<()> {
+        self.inner
+            .send_to_engine(engine_id, request_type, payload, aux_frames)
+            .await
+    }
 }
 
 impl<P: EngineProtocol> Drop for Client<P> {

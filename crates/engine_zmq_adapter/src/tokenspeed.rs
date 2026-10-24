@@ -12,7 +12,7 @@ use engine_zmq_client::{
             TokenSpeedWireModality,
         },
         output::TokenSpeedOutput,
-        request::TokenizedGenerateReqInput,
+        request::{TokenSpeedEncodeRequest, TokenizedGenerateReqInput},
         sampling::SamplingParams as TokenSpeedSamplingParams,
     },
     ConnectedEngine,
@@ -649,40 +649,10 @@ pub(crate) fn translate_tokenspeed_multimodal(
         // VIDEO=3; engine: VIDEO=2, AUDIO=3) — translate, never pass through.
         // Unknown values are rejected, mirroring the gRPC servicer's
         // `_modality_from_proto`.
-        let modality = match item.modality() {
-            common::Modality::Image => TokenSpeedWireModality::Image,
-            common::Modality::Video => TokenSpeedWireModality::Video,
-            common::Modality::Audio => TokenSpeedWireModality::Audio,
-            common::Modality::Unspecified => {
-                return Err("multimodal item carried an unspecified modality".to_string());
-            }
-        };
-        if item.content_hash.is_empty() {
-            return Err(
-                "multimodal item carried no content hash; the engine pad value derives from it"
-                    .to_string(),
-            );
-        }
-        // u64 little-endian fold of the leading hash bytes — the same fold the
-        // gRPC servicer applies (`int.from_bytes(content_hash[:8], "little")`),
-        // so an item hashes identically on both transports.
-        let mut hash_bytes = [0u8; 8];
-        for (dst, src) in hash_bytes.iter_mut().zip(item.content_hash.iter()) {
-            *dst = *src;
-        }
-        let hash = u64::from_le_bytes(hash_bytes);
-        let pad_value = mm_pad_value(modality, hash);
-
-        if item.placeholders.is_empty() {
-            return Err("multimodal item carried no placeholders".to_string());
-        }
-        let mut offsets = Vec::with_capacity(item.placeholders.len());
-        for placeholder in &item.placeholders {
-            if placeholder.length == 0 {
-                return Err("multimodal placeholder length must be > 0".to_string());
-            }
-            let start = placeholder.offset as usize;
-            let end = start + placeholder.length as usize - 1;
+        let (modality, hash, pad_value) = mm_item_identity(&item)?;
+        let offsets = mm_item_offsets(&item.placeholders)?;
+        for &(start, end) in &offsets {
+            let (start, end) = (start as usize, end as usize);
             if end >= input_ids.len() {
                 return Err(format!(
                     "multimodal placeholder [{start}, {end}] exceeds the {} prompt tokens",
@@ -692,7 +662,6 @@ pub(crate) fn translate_tokenspeed_multimodal(
             for id in &mut input_ids[start..=end] {
                 *id = pad_value;
             }
-            offsets.push((start as u64, end as u64));
         }
         match modality {
             TokenSpeedWireModality::Image => {
@@ -793,6 +762,125 @@ pub(crate) fn translate_tokenspeed_multimodal(
             mrope_position_delta_scalar,
         },
     ))
+}
+
+/// A multimodal item's wire identity: its modality (the proto and engine
+/// enums disagree, so it is translated, never passed through; an unknown value
+/// is refused as the gRPC servicer's `_modality_from_proto` refuses it), its
+/// hash (the u64 little-endian fold of the leading content-hash bytes, the
+/// fold the gRPC servicer applies with `int.from_bytes(content_hash[:8],
+/// "little")`, so an item hashes identically on both transports) and the pad
+/// value the engine derives from the hash.
+fn mm_item_identity(
+    item: &tokenspeed_proto::MultimodalItem,
+) -> Result<(TokenSpeedWireModality, u64, u32), String> {
+    let modality = match item.modality() {
+        common::Modality::Image => TokenSpeedWireModality::Image,
+        common::Modality::Video => TokenSpeedWireModality::Video,
+        common::Modality::Audio => TokenSpeedWireModality::Audio,
+        common::Modality::Unspecified => {
+            return Err("multimodal item carried an unspecified modality".to_string());
+        }
+    };
+    if item.content_hash.is_empty() {
+        return Err(
+            "multimodal item carried no content hash; the engine pad value derives from it"
+                .to_string(),
+        );
+    }
+    let mut hash_bytes = [0u8; 8];
+    for (dst, src) in hash_bytes.iter_mut().zip(item.content_hash.iter()) {
+        *dst = *src;
+    }
+    let hash = u64::from_le_bytes(hash_bytes);
+    Ok((modality, hash, mm_pad_value(modality, hash)))
+}
+
+/// An item's placeholder spans as the engine's inclusive `offsets`; an item
+/// without placeholders, or a placeholder of length 0, is refused as the gRPC
+/// servicer refuses it. The spans are not checked against a prompt here: the
+/// generate path checks them against its ids, an encode request has none.
+fn mm_item_offsets(
+    placeholders: &[tokenspeed_proto::PlaceholderRange],
+) -> Result<Vec<(u64, u64)>, String> {
+    if placeholders.is_empty() {
+        return Err("multimodal item carried no placeholders".to_string());
+    }
+    placeholders
+        .iter()
+        .map(|placeholder| {
+            if placeholder.length == 0 {
+                return Err("multimodal placeholder length must be > 0".to_string());
+            }
+            let start = u64::from(placeholder.offset);
+            Ok((start, start + u64::from(placeholder.length) - 1))
+        })
+        .collect()
+}
+
+/// The encode worker's own rendezvous, which every encode request names: the
+/// worker hosts the transfer the prefill side pulls the embedding from, at
+/// its host and `--disaggregation-bootstrap-port` (the gRPC servicer fills
+/// them the same way, from the launch).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodeRendezvous {
+    pub bootstrap_host: String,
+    pub bootstrap_port: i32,
+}
+
+/// Translate an `Encode` RPC into the encode worker's wire request, with the
+/// gRPC servicer's rules: `mm_inputs` is required and carries exactly one
+/// item with exactly one room assignment (the engine's request names one
+/// room), the item's feature is required (the worker runs the tower on it;
+/// SHM and remote payloads are refused as on the generate path), its hash,
+/// pad value and offsets are the generate path's. An empty request id is
+/// refused rather than invented: the id names the request in the worker's
+/// log and nothing answers it.
+pub fn translate_encode_request(
+    req: smg_grpc_client::tokenspeed_encoder_proto::EncodeRequest,
+    rendezvous: &EncodeRendezvous,
+) -> Result<TokenSpeedEncodeRequest, String> {
+    if req.request_id.is_empty() {
+        return Err("request_id is required".to_string());
+    }
+    let Some(mm) = req.mm_inputs else {
+        return Err("EncodeRequest.mm_inputs is required".to_string());
+    };
+    if mm.items.len() != 1 || req.items.len() != 1 {
+        return Err(
+            "EncodeRequest must contain exactly one mm item and one room assignment".to_string(),
+        );
+    }
+    let bootstrap_room = req.items[0].bootstrap_room;
+    let mut items = Vec::with_capacity(1);
+    for item in mm.items {
+        let (modality, hash, pad_value) = mm_item_identity(&item)?;
+        let offsets = mm_item_offsets(&item.placeholders)?;
+        let Some(encoder_input) = item.encoder_input else {
+            return Err("encode MultimodalItem carried no encoder_input".to_string());
+        };
+        let feature = Some(wire_tensor_tokenspeed(encoder_input)?);
+        let mut model_specific_data = BTreeMap::new();
+        for (name, tensor) in item.model_specific_tensors {
+            model_specific_data.insert(name, wire_tensor_tokenspeed(tensor)?);
+        }
+        items.push(TokenSpeedWireMmItem {
+            modality,
+            hash,
+            pad_value,
+            offsets,
+            feature,
+            model_specific_data,
+            encode_handshake: None,
+        });
+    }
+    Ok(TokenSpeedEncodeRequest {
+        request_id: req.request_id,
+        bootstrap_host: rendezvous.bootstrap_host.clone(),
+        bootstrap_port: rendezvous.bootstrap_port,
+        bootstrap_room,
+        items,
+    })
 }
 
 /// Convert an inline proto tensor to the wire `(dtype, shape, data)` tuple,
@@ -2192,5 +2280,104 @@ mod tests {
             }
         }
         engine_task.await.unwrap();
+    }
+
+    fn encode_proto(room: i64) -> smg_grpc_client::tokenspeed_encoder_proto::EncodeRequest {
+        use smg_grpc_client::tokenspeed_encoder_proto::{EncodeItemAssignment, EncodeRequest};
+
+        let tensor = |dtype: &str, shape: Vec<u32>, bytes: Vec<u8>| tokenspeed_proto::TensorData {
+            dtype: dtype.to_string(),
+            shape,
+            payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(bytes.into())),
+        };
+        EncodeRequest {
+            request_id: "e1".to_string(),
+            mm_inputs: Some(tokenspeed_proto::MultimodalInputs {
+                items: vec![tokenspeed_proto::MultimodalItem {
+                    modality: common::Modality::Image as i32,
+                    content_hash: 0xDEAD_BEEFu64.to_le_bytes().to_vec(),
+                    encoder_input: Some(tensor("bfloat16", vec![3, 2], (0u8..12).collect())),
+                    model_specific_tensors: [(
+                        "vit_grid".to_string(),
+                        tensor(
+                            "uint32",
+                            vec![1, 3],
+                            vec![1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0],
+                        ),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    placeholders: vec![tokenspeed_proto::PlaceholderRange {
+                        offset: 1,
+                        length: 3,
+                    }],
+                    placeholder_token_id: Some(9),
+                }],
+            }),
+            items: vec![EncodeItemAssignment {
+                bootstrap_room: room,
+            }],
+        }
+    }
+
+    /// An `Encode` translates with the gRPC servicer's rules: the worker's
+    /// own rendezvous and the room, the item's identity as the generate path
+    /// derives it (the content-hash fold, the pad value, the placeholder
+    /// spans as offsets), its feature and model-specific tensors; no
+    /// `mm_inputs`, two items, no room, no feature, an empty request id are
+    /// refused in the servicer's words.
+    #[test]
+    fn an_encode_request_translates_with_the_grpc_servicers_rules() {
+        let rendezvous = EncodeRendezvous {
+            bootstrap_host: "10.0.0.9".to_string(),
+            bootstrap_port: 8998,
+        };
+        let wire = translate_encode_request(encode_proto(41), &rendezvous).expect("translates");
+        assert_eq!(wire.request_id, "e1");
+        assert_eq!(wire.bootstrap_host, "10.0.0.9");
+        assert_eq!(wire.bootstrap_port, 8998);
+        assert_eq!(wire.bootstrap_room, 41);
+        assert_eq!(wire.items.len(), 1);
+        let item = &wire.items[0];
+        assert_eq!(item.modality, TokenSpeedWireModality::Image);
+        assert_eq!(item.hash, 0xDEAD_BEEF);
+        assert_eq!(
+            item.pad_value,
+            mm_pad_value(TokenSpeedWireModality::Image, 0xDEAD_BEEF)
+        );
+        assert_eq!(item.offsets, vec![(1, 3)]);
+        assert!(item.feature.is_some());
+        assert!(item.model_specific_data.contains_key("vit_grid"));
+        assert_eq!(item.encode_handshake, None);
+
+        let mut no_inputs = encode_proto(1);
+        no_inputs.mm_inputs = None;
+        let mut two_items = encode_proto(2);
+        let twin = two_items.mm_inputs.as_ref().unwrap().items[0].clone();
+        two_items.mm_inputs.as_mut().unwrap().items.push(twin);
+        let mut no_room = encode_proto(3);
+        no_room.items.clear();
+        let mut no_feature = encode_proto(4);
+        no_feature.mm_inputs.as_mut().unwrap().items[0].encoder_input = None;
+        let mut no_id = encode_proto(5);
+        no_id.request_id.clear();
+        for (request, words) in [
+            (no_inputs, "EncodeRequest.mm_inputs is required"),
+            (
+                two_items,
+                "EncodeRequest must contain exactly one mm item and one room assignment",
+            ),
+            (
+                no_room,
+                "EncodeRequest must contain exactly one mm item and one room assignment",
+            ),
+            (no_feature, "encode MultimodalItem carried no encoder_input"),
+            (no_id, "request_id is required"),
+        ] {
+            assert_eq!(
+                translate_encode_request(request, &rendezvous).unwrap_err(),
+                words
+            );
+        }
     }
 }
