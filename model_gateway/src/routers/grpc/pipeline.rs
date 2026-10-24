@@ -1500,9 +1500,9 @@ impl RequestPipeline {
     /// Used by ALL non-streaming /v1/responses requests, once per iteration
     /// of a tool loop. Same stages as execute_chat(), the tenant rate-limit
     /// reservation included: every iteration is a generation of its own, so
-    /// each takes the reservation a chat request takes (reserved at ingress,
-    /// settled with the engine's counts, closed unsettled when the iteration
-    /// fails). Two differences:
+    /// each takes the reservation a chat request takes (reserved at ingress
+    /// under a charge id of its own, settled with the engine's counts, closed
+    /// unsettled when the iteration fails). Two differences:
     /// 1. Returns Result<ChatCompletionResponse, Response> for tool_loop composition
     /// 2. Disallows streaming (responses endpoint uses different SSE format)
     pub async fn execute_chat_for_responses(
@@ -1516,7 +1516,7 @@ impl RequestPipeline {
         let rate_limit_cell = Arc::new(RateLimitCell::new());
         let run = {
             let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
-            ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.tenant_request_meta = tenant_request_meta.as_ref().map(iteration_charge);
             ctx.input.rate_limit_cell = Some(rate_limit_cell.clone());
             self.run(ctx, None, None)
         };
@@ -1577,9 +1577,9 @@ impl RequestPipeline {
     /// Returns ToolCallsFound (continue serving) or Completed (final
     /// response); called by harmony::responses::serve_harmony_responses()
     /// per iteration. Each iteration takes the tenant rate-limit reservation
-    /// a chat request takes: reserved at ingress, settled with the engine's
-    /// counts the response stage recorded, closed unsettled when the
-    /// iteration fails.
+    /// a chat request takes: reserved at ingress under a charge id of its own,
+    /// settled with the engine's counts the response stage recorded, closed
+    /// unsettled when the iteration fails.
     pub async fn execute_harmony_responses(
         &self,
         request: &openai_protocol::responses::ResponsesRequest,
@@ -1594,7 +1594,7 @@ impl RequestPipeline {
                 request.model.clone(), // Model ID from request
                 harmony_ctx.components.clone(),
             );
-            ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.tenant_request_meta = tenant_request_meta.as_ref().map(iteration_charge);
             ctx.input.rate_limit_cell = Some(rate_limit_cell.clone());
             self.run(ctx, None, None)
         };
@@ -1638,7 +1638,8 @@ impl RequestPipeline {
     ///
     /// Runs through dispatch and returns the raw ExecutionResult (with
     /// stream) and LoadGuards for token-level streaming processing, with the
-    /// iteration's tenant rate-limit reservation. The caller keeps
+    /// iteration's tenant rate-limit reservation (taken under a charge id of
+    /// its own). The caller keeps
     /// load_guards alive until stream processing completes, then settles the
     /// reservation with the counts the stream brought
     /// ([`RateLimitCell::settle`]) or closes it when the stream broke
@@ -1659,7 +1660,7 @@ impl RequestPipeline {
                 request.model.clone(),
                 harmony_ctx.components.clone(),
             );
-            ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.tenant_request_meta = tenant_request_meta.as_ref().map(iteration_charge);
             ctx.input.rate_limit_cell = Some(rate_limit_cell.clone());
             self.run_signalling(ctx, None, None, stream_start)
         };

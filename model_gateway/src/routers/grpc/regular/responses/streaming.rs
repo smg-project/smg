@@ -70,7 +70,7 @@ use crate::{
                     },
                     BackgroundStream, ResponsesContext,
                 },
-                stages::RateLimitCell,
+                stages::{iteration_charge, RateLimitCell},
             },
             utils,
         },
@@ -101,9 +101,9 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
 
     // Get chat streaming response, under the request's tenant rate-limit
-    // reservation: the chat stream settles it with the engine's counts as
-    // it ends (the handoff to the body), a refused or failed start closes
-    // it with its debit kept.
+    // reservation, taken under a charge id of the iteration's own: the chat
+    // stream settles it with the engine's counts as it ends (the handoff to
+    // the body), a refused or failed start closes it with its debit kept.
     let reservation = Arc::new(RateLimitCell::new());
     let chat_response = ctx
         .pipeline
@@ -112,7 +112,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
             params.headers,
             params.model_id,
             ctx.components.clone(),
-            Some(params.tenant_request_meta),
+            Some(iteration_charge(&params.tenant_request_meta)),
             Some(reservation.clone()),
             // Tool-loop iterations are not retried.
             None,
@@ -957,9 +957,9 @@ async fn execute_tool_loop_streaming_internal(
         Metrics::record_mcp_tool_iteration(&current_request.model);
 
         // Execute chat streaming, under the iteration's own tenant rate-limit
-        // reservation (every iteration is a generation): the chat stream
-        // settles it with the engine's counts as it ends, a refused or
-        // failed start closes it with its debit kept.
+        // reservation (every iteration is a generation, under a charge id of
+        // its own): the chat stream settles it with the engine's counts as
+        // it ends, a refused or failed start closes it with its debit kept.
         let startup_pending = startup.is_some();
         let reservation = Arc::new(RateLimitCell::new());
         let response = ctx
@@ -969,7 +969,7 @@ async fn execute_tool_loop_streaming_internal(
                 params.headers.clone(),
                 params.model_id.clone(),
                 ctx.components.clone(),
-                Some(params.tenant_request_meta.clone()),
+                Some(iteration_charge(&params.tenant_request_meta)),
                 Some(reservation.clone()),
                 // Tool-loop iterations are not retried.
                 None,

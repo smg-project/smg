@@ -75,7 +75,7 @@ pub(crate) use encode::EncodeStage;
 /// of a cell are its own methods.
 #[cfg(test)]
 pub(crate) use rate_limit::RateLimitOutcome;
-pub(crate) use rate_limit::{RateLimitCell, RateLimitReserveStage};
+pub(crate) use rate_limit::{iteration_charge, RateLimitCell, RateLimitReserveStage};
 pub(crate) use request_execution::execute_plan;
 pub(crate) use worker_selection::{
     WorkerSelectionMode, WorkerSelectionStage, SELECTION_QUEUE_TIMEOUT_ERROR_CODE,

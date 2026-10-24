@@ -9,6 +9,12 @@
 //! generation of its own) and holds the outcome for the paths that resolve
 //! it later: the settle of a buffered answer, the streaming handoff, and the
 //! close of a reservation a failed answer never settled.
+//!
+//! A charge id names one generation to the backend: `reserve` is idempotent
+//! per id (a retry of a generation reuses its reservation, and a backend may
+//! keep the id after its resolution), so the iterations of a Responses
+//! request, generations of their own, each reserve under a fresh id
+//! ([`iteration_charge`]).
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -19,9 +25,11 @@ use async_trait::async_trait;
 use axum::response::Response;
 use parking_lot::Mutex;
 use tracing::warn;
+use uuid::Uuid;
 
 use super::PipelineStage;
 use crate::{
+    middleware::TenantRequestMeta,
     rate_limit::{
         rejection_response, RateLimitManager, Reservation, ReservationAttachment, ReserveRequest,
         SharedReservationHandle, UsageSettlement,
@@ -140,6 +148,19 @@ impl Drop for RateLimitCell {
     }
 }
 
+/// The tenant meta one iteration of a Responses request reserves under: the
+/// request's tenant with a charge id of its own. A charge id names one
+/// generation to the backend (`reserve` is idempotent per id, so a retry of a
+/// generation reuses its reservation, and a backend may keep the id after its
+/// resolution); the iterations of a tool loop are generations of their own,
+/// so each reserves under a fresh id, whatever the backend remembers of the
+/// ones before.
+pub(crate) fn iteration_charge(meta: &TenantRequestMeta) -> TenantRequestMeta {
+    let mut iteration = meta.clone();
+    iteration.request_charge_id = Uuid::now_v7();
+    iteration
+}
+
 /// Reserve tenant rate-limit budget once per logical request. No-ops when
 /// the feature is disabled (`manager: None`) or the caller set no cell
 /// (`ctx.input.rate_limit_cell: None`; every typed route and every
@@ -216,7 +237,6 @@ mod cell_drop_tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use async_trait::async_trait;
-    use uuid::Uuid;
 
     use super::*;
     use crate::rate_limit::{
@@ -364,5 +384,27 @@ mod cell_drop_tests {
         denied.set(RateLimitOutcome::Denied);
         denied.close_unsettled().await;
         RateLimitCell::new().close_unsettled().await;
+    }
+}
+
+#[cfg(test)]
+mod iteration_charge_tests {
+    use super::*;
+    use crate::tenant::TenantKey;
+
+    /// Two iterations of one request reserve as the request's tenant under
+    /// charge ids of their own, distinct from each other and from the
+    /// request's.
+    #[test]
+    fn each_iteration_reserves_under_its_own_charge_id() {
+        let request = TenantRequestMeta::new(TenantKey::new("auth:tenant"));
+        let first = iteration_charge(&request);
+        let second = iteration_charge(&request);
+
+        assert_eq!(first.tenant_key, request.tenant_key);
+        assert_eq!(second.tenant_key, request.tenant_key);
+        assert_ne!(first.request_charge_id, request.request_charge_id);
+        assert_ne!(second.request_charge_id, request.request_charge_id);
+        assert_ne!(first.request_charge_id, second.request_charge_id);
     }
 }

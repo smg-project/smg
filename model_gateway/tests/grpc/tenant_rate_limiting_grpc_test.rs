@@ -19,12 +19,17 @@
 //! two numbers proves settle actually ran with real backend-reported usage,
 //! not just the initial reserve estimate.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
+use async_trait::async_trait;
 use common::{
     grpc_harness::{
-        grpc_router, grpc_router_config, grpc_test_context_with_tokenizer, grpc_worker,
-        serve_canned_worker, serve_engine, Canned,
+        grpc_router, grpc_router_config, grpc_test_context_with_rate_limiter,
+        grpc_test_context_with_tokenizer, grpc_worker, serve_canned_worker, serve_engine, Canned,
     },
     mock_mcp_server::MockMCPServer,
     scripted_tokenizer::ScriptedTokenizer,
@@ -44,10 +49,14 @@ use openai_protocol::{
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
+use parking_lot::Mutex;
 use serde_json::{json, Value};
 use smg::{
     config::RouterConfig,
     middleware::TenantRequestMeta,
+    rate_limit::{
+        RateLimitBackend, RateLimitManager, ReserveOutcome, ReserveRequest, UsageSettlement,
+    },
     routers::RouterTrait,
     tenant::TenantKey,
     worker::{RuntimeType, Worker, WorkerType},
@@ -59,6 +68,7 @@ use smg_grpc_client::{
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+use uuid::Uuid;
 
 use crate::common;
 
@@ -83,24 +93,87 @@ async fn start_mock_grpc_worker(output_tokens: u32) -> u16 {
 /// The tenant's budget of a test, the one the policy's other limit never
 /// decides: `Tokens` is the tokens per minute under 1000 requests per
 /// minute, `Requests` the requests per minute under a token budget nothing
-/// here can spend.
+/// here can spend, `KeptRequests` the requests per minute on a backend that
+/// keeps every charge id it admitted ([`KeepingBackend`]).
 #[derive(Clone, Copy)]
 enum Budget {
     Tokens(u32),
     Requests(u32),
+    KeptRequests(u32),
 }
 
 impl Budget {
-    fn policy_yaml(self) -> String {
+    /// The policy YAML of the in-memory backend; none for a backend of the
+    /// test's own.
+    fn policy_yaml(self) -> Option<String> {
         let (tokens_per_minute, requests_per_minute) = match self {
             Budget::Tokens(tokens) => (tokens, 1000),
             Budget::Requests(requests) => (1_000_000, requests),
+            Budget::KeptRequests(_) => return None,
         };
-        format!(
+        Some(format!(
             "default_policy:\n  tokens_per_minute: {tokens_per_minute}\n  \
              requests_per_minute: {requests_per_minute}\n"
-        )
+        ))
     }
+
+    /// The manager over a backend of the test's own; none for the in-memory
+    /// backend [`router_config`] configures.
+    fn rate_limit_manager(self) -> Option<Arc<RateLimitManager>> {
+        match self {
+            Budget::KeptRequests(requests) => Some(Arc::new(RateLimitManager::new(Arc::new(
+                KeepingBackend::new(requests),
+            )))),
+            Budget::Tokens(_) | Budget::Requests(_) => None,
+        }
+    }
+}
+
+/// A backend that keeps every charge id it admitted, resolved or not, as a
+/// backend with a durable idempotency record would: a repeated id is
+/// admitted again without a debit, and only a new id counts against the
+/// tenant's budget of `requests`; a settlement, a close or an abandon
+/// changes nothing here.
+struct KeepingBackend {
+    requests: u32,
+    seen: Mutex<HashSet<Uuid>>,
+    taken: Mutex<HashMap<String, u32>>,
+}
+
+impl KeepingBackend {
+    fn new(requests: u32) -> Self {
+        Self {
+            requests,
+            seen: Mutex::default(),
+            taken: Mutex::default(),
+        }
+    }
+}
+
+#[async_trait]
+impl RateLimitBackend for KeepingBackend {
+    async fn reserve(&self, request: ReserveRequest) -> ReserveOutcome {
+        if !self.seen.lock().insert(request.request_charge_id) {
+            return ReserveOutcome::Admitted;
+        }
+        let mut taken = self.taken.lock();
+        let count = taken
+            .entry(request.tenant_key.as_str().to_string())
+            .or_insert(0);
+        if *count >= self.requests {
+            return ReserveOutcome::Denied {
+                retry_after_secs: 60,
+            };
+        }
+        *count += 1;
+        ReserveOutcome::Admitted
+    }
+
+    async fn settle_success(&self, _request_charge_id: Uuid, _usage: UsageSettlement) {}
+
+    async fn close_reserved_only(&self, _request_charge_id: Uuid) {}
+
+    async fn abandon(&self, _request_charge_id: Uuid) {}
 }
 
 /// The router configuration of these tests: tenant rate limiting against a
@@ -122,10 +195,10 @@ fn router_config(budget: Option<Budget>) -> (RouterConfig, Option<tempfile::Temp
         .max_concurrent_requests(64)
         .queue_timeout_secs(60);
 
-    let dir = if let Some(budget) = budget {
+    let dir = if let Some(yaml) = budget.and_then(Budget::policy_yaml) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rate_limit.yaml");
-        std::fs::write(&path, budget.policy_yaml()).unwrap();
+        std::fs::write(&path, yaml).unwrap();
         builder = builder
             .tenant_rate_limit_enabled(true)
             .tenant_rate_limit_config(Some(path.to_str().unwrap().to_string()));
@@ -863,8 +936,20 @@ async fn build_tool_loop_router(
     .with_final_answer(1, FINAL_ANSWER);
     let (mut config, dir) = router_config(budget);
     config.tool_call_parser = Some("qwen".into());
-    let app_context =
-        grpc_test_context_with_tokenizer(config, TOOL_LOOP_MODEL, Arc::new(tokenizer)).await;
+    let app_context = match budget.and_then(Budget::rate_limit_manager) {
+        Some(manager) => {
+            grpc_test_context_with_rate_limiter(
+                config,
+                TOOL_LOOP_MODEL,
+                Arc::new(tokenizer),
+                manager,
+            )
+            .await
+        }
+        None => {
+            grpc_test_context_with_tokenizer(config, TOOL_LOOP_MODEL, Arc::new(tokenizer)).await
+        }
+    };
     let router = grpc_router(&app_context, vec![Arc::new(worker)]).await;
     let mcp = MockMCPServer::start()
         .await
@@ -961,6 +1046,45 @@ async fn a_responses_tool_loop_reserves_once_per_iteration() {
                 "stream={stream} budget={budget}: the loop's two iterations took two of the budget's requests"
             );
         }
+    }
+}
+
+/// The same on a backend that keeps its resolved charge ids
+/// ([`KeepingBackend`]): under one charge id for the whole loop the second
+/// iteration would be admitted free and the probe would fit; each iteration
+/// reserves under a charge id of its own, so the loop spends the budget of
+/// two and the probe is refused, streamed or not.
+#[tokio::test]
+async fn a_responses_tool_loop_reserves_under_a_charge_id_per_iteration() {
+    for stream in [false, true] {
+        let (router, _dir, mut mcp) =
+            build_tool_loop_router(Some(Budget::KeptRequests(2)), 2).await;
+        let (status, body) = responses(
+            router.as_ref(),
+            responses_request(TOOL_LOOP_MODEL, stream, mcp_tools(&mcp)),
+            TOOL_LOOP_MODEL,
+        )
+        .await;
+        mcp.stop().await;
+        assert_eq!(status, http::StatusCode::OK, "stream={stream}: {body}");
+        assert!(
+            body.contains(FINAL_ANSWER),
+            "stream={stream}: the loop ran to its answer: {body}"
+        );
+
+        let probe = router
+            .route_generate(
+                None,
+                &fresh_tenant(),
+                generate_request_for(TOOL_LOOP_MODEL, PROMPT_TEXT),
+                TOOL_LOOP_MODEL,
+            )
+            .await;
+        assert_eq!(
+            probe.status(),
+            http::StatusCode::TOO_MANY_REQUESTS,
+            "stream={stream}: the loop's two iterations took two of the budget's requests, each under its own charge id"
+        );
     }
 }
 

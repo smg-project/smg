@@ -37,7 +37,10 @@ pub struct RateLimitManager {
 }
 
 impl RateLimitManager {
-    fn new(backend: Arc<dyn RateLimitBackend>) -> Self {
+    /// A manager over `backend`: the in-memory backend [`Self::from_config`]
+    /// builds, or another implementation of the [`RateLimitBackend`]
+    /// contract (a test's, an external one's).
+    pub fn new(backend: Arc<dyn RateLimitBackend>) -> Self {
         Self { backend }
     }
 

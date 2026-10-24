@@ -298,7 +298,8 @@ async fn execute_mcp_tool_loop_streaming(
 
         // Process stream with token-level streaming; the reservation is
         // settled with the engine's counts the stream brought, or closed
-        // unsettled (its debit kept) when the stream broke.
+        // unsettled (its debit kept) when the stream broke or ended before
+        // its terminal frame.
         let iteration_result = match HarmonyStreamingProcessor::process_responses_iteration_stream(
             execution_result,
             emitter,
@@ -309,7 +310,13 @@ async fn execute_mcp_tool_loop_streaming(
         .await
         {
             Ok((result, counts)) => {
-                reservation.settle(counts.settlement()).await;
+                // The counts come with the terminal frame; a stream that
+                // ended before it brought none, and the reservation keeps
+                // its debit as the chat streams' does.
+                match counts {
+                    Some(counts) => reservation.settle(counts.settlement()).await,
+                    None => reservation.close_unsettled().await,
+                }
                 result
             }
             Err(err_msg) => {
@@ -580,7 +587,8 @@ async fn execute_without_mcp_streaming(
 
     // Process stream (no MCP context, all tools treated as function tools);
     // the reservation is settled with the engine's counts the stream
-    // brought, or closed unsettled (its debit kept) when the stream broke.
+    // brought, or closed unsettled (its debit kept) when the stream broke
+    // or ended before its terminal frame.
     let iteration_result = match HarmonyStreamingProcessor::process_responses_iteration_stream(
         execution_result,
         emitter,
@@ -591,7 +599,13 @@ async fn execute_without_mcp_streaming(
     .await
     {
         Ok((result, counts)) => {
-            reservation.settle(counts.settlement()).await;
+            // The counts come with the terminal frame; a stream that ended
+            // before it brought none, and the reservation keeps its debit
+            // as the chat streams' does.
+            match counts {
+                Some(counts) => reservation.settle(counts.settlement()).await,
+                None => reservation.close_unsettled().await,
+            }
             result
         }
         Err(err_msg) => {
