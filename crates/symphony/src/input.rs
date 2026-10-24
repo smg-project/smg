@@ -52,6 +52,7 @@ impl TokenSpan {
 
 /// How the engine said the stream ended.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EngineFinish {
     /// The model stopped on its own, or a stop sequence matched.
     Stop,
