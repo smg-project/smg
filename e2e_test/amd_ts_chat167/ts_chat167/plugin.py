@@ -79,7 +79,7 @@ class Original167:
         require(set(selected) == set(self.cases), "an original167 ID is absent after real runtime selection")
         require(sum(canonical(item.nodeid) in self.cases for item in items) == 167, "duplicate original case")
         deselected = [item for item in items if canonical(item.nodeid) not in selected]
-        items[:] = [selected[name] for name in self.cases]
+        items[:] = [item for item in items if canonical(item.nodeid) in selected]
         config.hook.pytest_deselected(items=deselected)
         for name, expected in self.contract["original_modules_sha256"].items():
             require(hashlib.sha256((self.root / name).read_bytes()).hexdigest() == expected, "original test module changed")
