@@ -583,54 +583,19 @@ impl TokenTree {
                         // Strategy: Create NEW intermediate node with prefix tokens,
                         // keep original child as suffix (preserving its children/tenants)
                         let common_len = align_to_page(remaining.len(), page_size);
-                        let prefix_tokens: Vec<TokenId> = child_tokens[..common_len].to_vec();
-                        let suffix_page_key = page_key_of(&child_tokens[common_len..], page_size);
-                        drop(child_tokens);
-
-                        // Truncate the child to its suffix, clone its tenant
-                        // map, and re-parent it under the intermediate in one
-                        // `tokens` write section: lock-free walkers read the
-                        // length and validate the parent pointer under a
-                        // `tokens` read guard, so they observe the pre-split
-                        // node or the post-split one — never a truncated text
-                        // still reachable through the stale edge (which would
-                        // silently shift their depth on self-similar content).
-                        // Replayers likewise credit the live length under the
-                        // read guard, so the clone inherits exactly the
-                        // tenants credited for the pre-split span.
-                        let mut child_tokens_write = child.tokens.write();
-                        let tenant_map = child.tenant_last_access_time.clone();
-                        let last_tenant = child.last_tenant.read().clone();
-                        let suffix_tokens: Vec<TokenId> = child_tokens_write[common_len..].to_vec();
-                        *child_tokens_write = suffix_tokens;
-
-                        // Create intermediate node with prefix
-                        // Intermediate inherits metadata from child (represents same prefix)
-                        let intermediate_node = Arc::new(Node {
-                            tokens: ParkingLotRwLock::new(prefix_tokens),
-                            children: new_children_map(),
-                            tenant_last_access_time: tenant_map,
-                            last_tenant: ParkingLotRwLock::new(last_tenant),
-                            parent: ParkingLotRwLock::new(Arc::downgrade(&current)),
-                            page_key: ParkingLotRwLock::new(Some(page_key)),
-                            hit_count: AtomicU64::new(child.hit_count.load(Ordering::Relaxed)),
-                            creation_time: child.creation_time,
-                            priority: AtomicI32::new(child.priority.load(Ordering::Relaxed)),
-                        });
-
-                        // Update child's parent to point to intermediate
-                        child.set_parent(&intermediate_node, suffix_page_key);
-                        drop(child_tokens_write);
-
-                        // Add original child (now suffix) as child of intermediate
-                        intermediate_node
-                            .children
-                            .insert(suffix_page_key, Arc::clone(&child));
+                        let intermediate_node = Self::split_child(
+                            &current,
+                            &child,
+                            child_tokens,
+                            page_key,
+                            common_len,
+                            page_size,
+                        );
 
                         // Attach before publication: the node is unreachable, so
                         // the return is authoritative and the prefix is credited
                         // exactly once even against a concurrent same-tenant
-                        // replay that raced the clone above.
+                        // replay that raced the clone in `split_child`.
                         let newly_attached =
                             intermediate_node.touch_tenant(&tenant_id, ts, track_lfu);
 
@@ -643,42 +608,14 @@ impl TokenTree {
                         // Partial match - need to split and add new branch at page boundary
                         // Strategy: Create NEW intermediate node with common prefix,
                         // keep original child as one suffix, create new node for other suffix
-                        let prefix_tokens: Vec<TokenId> = child_tokens[..common_len].to_vec();
-                        let child_suffix_page_key =
-                            page_key_of(&child_tokens[common_len..], page_size);
-                        drop(child_tokens);
-
-                        // Truncate + tenant-map clone + re-parent in one
-                        // `tokens` write section (see the prefix-split arm
-                        // above).
-                        let mut child_tokens_write = child.tokens.write();
-                        let tenant_map = child.tenant_last_access_time.clone();
-                        let last_tenant = child.last_tenant.read().clone();
-                        let child_suffix: Vec<TokenId> = child_tokens_write[common_len..].to_vec();
-                        *child_tokens_write = child_suffix;
-
-                        // Create intermediate node with common prefix
-                        // Intermediate inherits metadata from child (represents same prefix)
-                        let intermediate_node = Arc::new(Node {
-                            tokens: ParkingLotRwLock::new(prefix_tokens),
-                            children: new_children_map(),
-                            tenant_last_access_time: tenant_map,
-                            last_tenant: ParkingLotRwLock::new(last_tenant),
-                            parent: ParkingLotRwLock::new(Arc::downgrade(&current)),
-                            page_key: ParkingLotRwLock::new(Some(page_key)),
-                            hit_count: AtomicU64::new(child.hit_count.load(Ordering::Relaxed)),
-                            creation_time: child.creation_time,
-                            priority: AtomicI32::new(child.priority.load(Ordering::Relaxed)),
-                        });
-
-                        // Update child's parent to point to intermediate
-                        child.set_parent(&intermediate_node, child_suffix_page_key);
-                        drop(child_tokens_write);
-
-                        // Add original child (now suffix) as child of intermediate
-                        intermediate_node
-                            .children
-                            .insert(child_suffix_page_key, Arc::clone(&child));
+                        let intermediate_node = Self::split_child(
+                            &current,
+                            &child,
+                            child_tokens,
+                            page_key,
+                            common_len,
+                            page_size,
+                        );
 
                         // Create new node for the remaining input suffix
                         let new_remaining = &remaining[common_len..];
@@ -726,6 +663,66 @@ impl TokenTree {
         // The caller folds this into `tenant_token_count` (once, after any
         // matched-prefix re-attach in match_and_insert_with).
         tokens_added
+    }
+
+    /// Split `child`, the edge of `current` under `page_key`, at the page-aligned
+    /// `common_len`: the child keeps its suffix, a new intermediate node takes the
+    /// prefix, the child's tenants and metadata (it represents the same prefix)
+    /// and the child's place under `current`, and the child hangs under it.
+    /// `child_tokens` is the caller's read guard on the child, consumed here so
+    /// the prefix is copied before the write lock is taken.
+    ///
+    /// The truncation, the tenant map's clone and the re-parent happen in one
+    /// `tokens` write section: lock-free walkers read the length and validate
+    /// the parent pointer under a `tokens` read guard, so they observe the
+    /// pre-split node or the post-split one — never a truncated text still
+    /// reachable through the stale edge (which would silently shift their depth
+    /// on self-similar content). Replayers likewise credit the live length under
+    /// the read guard, so the clone inherits exactly the tenants credited for
+    /// the pre-split span.
+    ///
+    /// Returns the intermediate unpublished: nothing reaches it until the caller
+    /// replaces `current`'s entry with it, after attaching its tenant (and, for
+    /// a diverging input, the new branch), so the attach's return is
+    /// authoritative.
+    fn split_child(
+        current: &NodeRef,
+        child: &NodeRef,
+        child_tokens: parking_lot::RwLockReadGuard<'_, Vec<TokenId>>,
+        page_key: TokenPageKey,
+        common_len: usize,
+        page_size: usize,
+    ) -> NodeRef {
+        let prefix_tokens: Vec<TokenId> = child_tokens[..common_len].to_vec();
+        let suffix_page_key = page_key_of(&child_tokens[common_len..], page_size);
+        drop(child_tokens);
+
+        let mut child_tokens_write = child.tokens.write();
+        let tenant_map = child.tenant_last_access_time.clone();
+        let last_tenant = child.last_tenant.read().clone();
+        let suffix_tokens: Vec<TokenId> = child_tokens_write[common_len..].to_vec();
+        *child_tokens_write = suffix_tokens;
+
+        let intermediate_node = Arc::new(Node {
+            tokens: ParkingLotRwLock::new(prefix_tokens),
+            children: new_children_map(),
+            tenant_last_access_time: tenant_map,
+            last_tenant: ParkingLotRwLock::new(last_tenant),
+            parent: ParkingLotRwLock::new(Arc::downgrade(current)),
+            page_key: ParkingLotRwLock::new(Some(page_key)),
+            hit_count: AtomicU64::new(child.hit_count.load(Ordering::Relaxed)),
+            creation_time: child.creation_time,
+            priority: AtomicI32::new(child.priority.load(Ordering::Relaxed)),
+        });
+
+        child.set_parent(&intermediate_node, suffix_page_key);
+        drop(child_tokens_write);
+
+        intermediate_node
+            .children
+            .insert(suffix_page_key, Arc::clone(child));
+
+        intermediate_node
     }
 
     /// Find longest matching prefix with detailed counts.
