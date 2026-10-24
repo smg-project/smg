@@ -33,9 +33,9 @@ pub const BATCH_TOKEN_ID_OUT_SLIM_TAG: &str = "BatchTokenIDOutSlim";
 pub const TOP_LOGPROB_COLUMNS: [&str; 2] = ["output_top_logprobs_val", "output_top_logprobs_idx"];
 
 /// Where the declared layout must carry the two columns: the decoder reads
-/// them at the two slots right after `kv_total_pages` (the 14th and 15th
-/// wire elements; a layout lists fields without the tag, so indices 13 and
-/// 14), whatever a newer scheduler appends behind them.
+/// them at the two slots right after `kv_total_pages` (wire indices 14 and
+/// 15, with the tag at 0; a layout lists fields without the tag, so indices
+/// 13 and 14), whatever a newer scheduler appends behind them.
 pub const TOP_LOGPROB_COLUMN_INDEX: usize = 13;
 
 /// Whether the engine's handshake declared the ranked-candidate columns on
