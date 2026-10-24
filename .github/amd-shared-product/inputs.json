@@ -5,23 +5,23 @@
   "artifacts": [
     {
       "name": "smg-wheel",
-      "id": 12539960818,
-      "bytes": 52386264,
-      "sha256": "51f4d219a9e691e94890ec267310e9d963a85ecc5c60ccba55c5d38a91ef049f",
-      "expires_at": "2026-10-24T23:54:34Z",
+      "id": 12579435360,
+      "bytes": 52388362,
+      "sha256": "2957a4f6debcc0bf7ad6e79904adcc9cb5aeb6d45304131d9f6f2b11fd32b95b",
+      "expires_at": "2026-10-31T23:19:10Z",
       "files": {
         "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl": {
-          "bytes": 52529349,
-          "sha256": "283ba6730ab1328332b1b61b2c692a2a28e0141b1987ae9422d07bd6c653512d"
+          "bytes": 52529140,
+          "sha256": "2583bda41747126822ef9d1697fd88e68fc95e1cea394521e9703c24e0a7393a"
         }
       }
     },
     {
       "name": "go-ffi-library",
-      "id": 12539866422,
+      "id": 12578519812,
       "bytes": 13837182,
-      "sha256": "beb1eb23135ba3ec036c296fea5c7abb96314fbd36dab8ad14b89efa6db2a329",
-      "expires_at": "2026-10-24T23:54:37Z",
+      "sha256": "65ffa0a52908f2cfe34e3d50aaaaae670d3af8bde246a2b6ab9199658a67a442",
+      "expires_at": "2026-10-31T23:19:13Z",
       "files": {
         "libsmg_go.d": {
           "bytes": 64539,
@@ -35,23 +35,23 @@
     },
     {
       "name": "python-client-types",
-      "id": 12539751694,
-      "bytes": 34373,
-      "sha256": "58f2a41f1455c7660a5594cfcfbeb6c4e696eb8ac76735501418899acd3d90e5",
-      "expires_at": "2026-10-24T23:54:39Z",
+      "id": 12579535141,
+      "bytes": 34374,
+      "sha256": "f17ad9810f28e882037dc7270493dbbd7d00ace289361e00fdf9173f2e1c68c7",
+      "expires_at": "2026-10-31T23:19:15Z",
       "files": {
         "_generated.py": {
           "bytes": 187180,
-          "sha256": "f2f808705287928f7a4095867bacaa3b1ffbc8eea6f038857dc3456529adeaf6"
+          "sha256": "2bf54fb6b78b00ff833eddcd67943e11837b38202fa7fa84557b4c697f169f1b"
         }
       }
     },
     {
       "name": "wasm-test-fixtures",
-      "id": 12539567404,
+      "id": 12578659886,
       "bytes": 56596,
-      "sha256": "a4df6f4b2f6bd3740aba28ddb1a081ce087475588ad03c72c6cdd47afdd5c4e5",
-      "expires_at": "2026-10-24T23:54:40Z",
+      "sha256": "5a8f2bd048f899eb86f1ae8556a14cb0f584d45884c66b161f1052396e592fb8",
+      "expires_at": "2026-10-31T23:19:16Z",
       "files": {
         "storage_hook_guest.wasm": {
           "bytes": 80680,
@@ -67,13 +67,13 @@
   "gateway_native": {
     "name": "smg/smg_rs.abi3.so",
     "bytes": 142443344,
-    "sha256": "143a28b8834bb16b01d87f4ba71b6f68254c71c52e5c7424ccf401b8ce9c29a9"
+    "sha256": "e6d8073ed3484cf95403046875d6ba655d61d4bcb2860e62bd6df2aa9859be1c"
   },
-  "run_id": 40038340532,
+  "run_id": 40139189680,
   "run_attempt": 1,
-  "build_job_id": 120703217001,
-  "producer_sha": "445bb37bccb47e620b2b3aac12cd30b4ebd71a43",
-  "producer_branch": "ci/frozen-c9d-cpu-producer-20261023",
+  "build_job_id": 121007094597,
+  "producer_sha": "f93b547de753c96373988b60b1590638629b3568",
+  "producer_branch": "ci/frozen-legacy-c9d-refresh-producer-admitted-20261024",
   "producer_policy": "frozen_c9d_dispatch_build_only_all_18_steps_success_v1",
   "target_product_commit": "3535f7cf5f3ddcc9168c95b98d4d2b40be7e5888",
   "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-2gpu-pd[0]/sglang/nvidia",
@@ -151,7 +151,7 @@
     "e2e_test": "ac24cbe1b88c3219bbe07b76dc4dd8370bf2ff1b",
     "scripts": "a5f12792df38a4cb1f82ef724f8234360fddf99a",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
-    ".github/workflows": "01f44d96ef6820514539989da56df9c60c184790"
+    ".github/workflows": "2eeb29be8966ea74d0906a6ee860d2cd5ded6e5e"
   },
   "explicit_consumer_only_paths": [
     ".github/amd-shared-product/",
@@ -197,7 +197,7 @@
   },
   "diagnostic_difference": "Only original SG2GPU default Mooncake PD is prepared, with all-router emptyfilter/floor15/40-34/rerun2 retained. A local pytest observer package records original SG HTTP/gRPC regular/P-D fixtures and their owned processes/native/logs; no vLLM14 unit gate, canary, GPT/Qwen overlay, EPD source or extra request is added.",
   "producer_binary_relabelled": false,
-  "producer_artifact_pins_status": "BOUND_TO_SAVED_ACCEPTED445_PREVIEW_ONLY: actual4archives/native143a captured; no live expiry/metadata refreshed and all3admission flags remainfalse.",
+  "producer_artifact_pins_status": "BOUND_TO_ROOT_ACCEPTED_FRESH401391_INTEGRITY_ONLY: four actual archives and nativee6d8073; TTL5400 must be checked twice live at future root admission; all three flags remain false.",
   "explicit_product_dependency": {
     "PR": 4266,
     "original_public_head": "3cef9af6a73610f501b920221c7232bf640219d0",
@@ -205,7 +205,7 @@
     "parent_stack": "0707d631cb6827789619ab96999f868044dc06db",
     "visible_churn": 43
   },
-  "producer_snapshot_note": "Saved root-accepted40038340532/445 integrity bytes only; future root admission must GET actual artifact identity/expiry. Native143a has no SG2GPU PD result yet.",
+  "producer_snapshot_note": "Root-accepted40139189680/f93b actual integrity and hosted smoke only, acceptance SHAe1d5b35d2508e81f51ecb114abdb45dfe54fbdc0b2d785e74e69fdc303f290db. New nativee6d8073 requires separate normal target CPU and SG2 replay; no old143a/19c1d22 runtime credit.",
   "source_base": "c9d5431db92aa2d35521889f6297c4c6f7b05b4a",
   "producer_base_source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
@@ -223,7 +223,7 @@
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows": "7c956a4ee89bdf800d48c63815d10a4dd568d90e"
   },
-  "producer_source_map_note": "Actual14 is copied from real445 producer capture and differs from source_base14 in its workflow tree. Compiled37 remains exactc9d. Expected984 source identities are not substituted for actual445.",
+  "producer_source_map_note": "Actual14 independently resolved from real f93b producer Git; its workflow tree is2eeb29be8966ea74d0906a6ee860d2cd5ded6e5e. Only13 non-workflow producer objects equal old445; compiled37 remains exactc9d. Actual14 is not the c9d base14 or old44514.",
   "explicit_lock_safety_dependency": {
     "product_commit": "a37083a4eb667c0d261de85cf464025a9a29e506",
     "base_product_alias_leaf": "ee1b8f0f83186a0e33d805b4b2551d17322a80fb",
@@ -244,7 +244,7 @@
   },
   "reference_contract_sha256": "f618f45a175495293f9832e81b92b9c396928cb0f0c36effad1d80a05b92bf93",
   "selection_contract_verified": true,
-  "source_identity_note": "Consumer19 remains the exact ordinarySGef4 product source. Only the manual caller/recipe/observer namespace differs; compiled37c9d/actual44514 are unchanged and no EPDca46/a974 source is used.",
+  "source_identity_note": "Consumer19 remains exact c2f SG2 source. Compiled37 remains exactc9d; actual producer14 is real freshf93b, with13 non-workflow objects equal old445 and the distinct2eeb workflow tree. No currentmain19c or EPD source is transferred.",
   "explicit_RDMA_device_dependency": {
     "added_container_option": "--device=/dev/infiniband",
     "network": "unchanged_default_bridge",
