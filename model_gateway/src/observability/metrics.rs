@@ -1515,8 +1515,10 @@ impl RouterStage {
     }
 }
 
-// A stage's discriminant is its index in `ALL`: a stage added to the enum
-// without its row here, or out of order, does not compile.
+// A stage's discriminant is its index in `ALL`: a stage inserted out of
+// order does not compile. A stage appended without its row has no kept
+// slot and records through a key built per call (see
+// `Metrics::record_stage_duration`), so the row is a cost, not a panic.
 const _: () = {
     let mut i = 0;
     while i < RouterStage::COUNT {
@@ -1934,9 +1936,14 @@ impl Metrics {
             return;
         }
         handles::STAGES.with_borrow_mut(|kept| {
-            kept[stage as usize][usize::from(streaming)]
-                .get_or_insert_with(build)
-                .record(elapsed.as_secs_f64());
+            // A stage without its row in `RouterStage::ALL` has no slot:
+            // it records through a built key rather than panic here.
+            match kept.get_mut(stage as usize) {
+                Some(slot) => slot[usize::from(streaming)]
+                    .get_or_insert_with(build)
+                    .record(elapsed.as_secs_f64()),
+                None => build().record(elapsed.as_secs_f64()),
+            }
         });
     }
 
