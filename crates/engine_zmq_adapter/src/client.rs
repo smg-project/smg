@@ -17,7 +17,7 @@ use engine_zmq_client::{
     protocol::{
         handshake::EngineCoreReadyResponse,
         sglang::{request::SglangRequest, SglangProtocol},
-        tokenspeed::TokenSpeedProtocol,
+        tokenspeed::{output::wire_carries_top_logprobs, TokenSpeedProtocol},
         vllm::{request::EngineCoreRequest, sampling::EngineCoreSamplingParams, VllmProtocol},
         EngineLoad,
     },
@@ -842,12 +842,22 @@ impl ZmqEngineClient {
         // The ranks as the engine numbers them: a disaggregated request is
         // placed by its room's residue, a pinned one by its pin.
         let ranks = RankIndices::of(client.engines());
+
+        // What the schedulers' slim output carries beyond its base columns,
+        // as every rank declared it at the handshake (a rank that declares
+        // none sets the wire's shape).
+        let wire = crate::tokenspeed::TokenSpeedWireColumns {
+            top_logprobs: client
+                .engines()
+                .iter()
+                .all(|engine| wire_carries_top_logprobs(&engine.ready_response.positional_layouts)),
+        };
         // Sub-streams submitted before a mid-loop failure are dropped with the
         // error, which auto-aborts their engine-side requests.
         let mut streams = Vec::new();
         for (index, sub) in fan_out_tokenspeed_requests(req).into_iter().enumerate() {
             let request =
-                translate_request_tokenspeed_for(sub, grid_tensors, max_model_len, &ranks)
+                translate_request_tokenspeed_for(sub, grid_tensors, max_model_len, &ranks, wire)
                     .map_err(tonic::Status::invalid_argument)?;
             let stream = client.submit(request).await.map_err(zmq_status)?;
             streams.push(TokenSpeedGenerateStream::new(stream, index as u32));

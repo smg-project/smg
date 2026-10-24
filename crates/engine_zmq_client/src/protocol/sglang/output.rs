@@ -14,7 +14,7 @@ use crate::{
     codec::OpaqueValue,
     error::{Error, Result},
     protocol::{
-        positional::{drain_trailing, expect_tag, next_field},
+        positional::{appended_column, drain_trailing, expect_tag, next_field},
         EngineOutput,
     },
 };
@@ -186,16 +186,6 @@ impl<'de> Deserialize<'de> for BatchTokenIDSlimOutput {
 
         deserializer.deserialize_seq(BatchVisitor)
     }
-}
-
-/// An optional appended column: absent, or `None`, from an older plugin.
-fn appended_column<'de, A: SeqAccess<'de>, T: Deserialize<'de>>(
-    seq: &mut A,
-) -> std::result::Result<Vec<T>, A::Error> {
-    Ok(seq
-        .next_element::<Option<Vec<T>>>()?
-        .flatten()
-        .unwrap_or_default())
 }
 
 /// The token batch's columns after the tag; shared by the struct's own

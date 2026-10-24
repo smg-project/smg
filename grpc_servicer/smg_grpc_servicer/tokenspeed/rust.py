@@ -16,19 +16,20 @@ implementations apart.
 
 What the msgpack wire does not carry, the Rust path reports rather than
 emulates: ``FlushCache`` and profiling answer UNIMPLEMENTED, ranked
-``top_logprobs`` and prompt logprobs are refused. Prefill/decode
-disaggregation is served: the request's bootstrap fields ride the wire as the
-Python servicer forwards them, and a prefill launch starts the engine's KV
-bootstrap server here as the engine's own frontend does
-(:func:`kv_bootstrap_server`). The EPD prefill side is served the same way;
-the EPD encode role is not (:func:`refuse_encode_role`): its worker takes
-its requests over the engine's in-process channel only, which this path
-does not have, so it stays with the Python implementation. Multimodal items
-of the Qwen3.5 lineage (an MRoPE family) are served: the Rust servicer
-computes the engine's MRoPE position table itself from the checkpoint facts
-:func:`mrope_layout` ships (the wire bypasses the engine's input processor,
-which computes it on the Python path); items of other MRoPE families are
-refused by name.
+``top_logprobs`` ride the slim output's appended columns on a scheduler whose
+handshake declares them (refused on one that does not), and the selected
+candidates are refused as on the Python servicer. Prefill/decode disaggregation
+is served: the request's bootstrap fields ride the wire as the Python servicer
+forwards them, and a prefill launch starts the engine's KV bootstrap server
+here as the engine's own frontend does (:func:`kv_bootstrap_server`). The EPD
+prefill side is served the same way; the EPD encode role is not
+(:func:`refuse_encode_role`): its worker takes its requests over the engine's
+in-process channel only, which this path does not have, so it stays with the
+Python implementation. Multimodal items of the Qwen3.5 lineage (an MRoPE
+family) are served: the Rust servicer computes the engine's MRoPE position
+table itself from the checkpoint facts :func:`mrope_layout` ships (the wire
+bypasses the engine's input processor, which computes it on the Python path);
+items of other MRoPE families are refused by name.
 """
 
 from __future__ import annotations

@@ -822,8 +822,11 @@ decided). With `--servicer-impl rust` the same process serves the
 launcher computes the model and server facts from TokenSpeed's own config,
 runs the scheduler(s) headless in a spawned child over the msgpack ZMQ wire,
 and supervises both. What that wire does not carry is reported, not emulated:
-`FlushCache` and profiling answer UNIMPLEMENTED, ranked `top_logprobs` and
-prompt logprobs are refused, and the RL control-plane extras (the `rl.*`
+`FlushCache` and profiling answer UNIMPLEMENTED; ranked `top_logprobs` ride
+the slim output's appended columns on a scheduler whose handshake declares
+them and are refused on one that does not; the selected candidates
+(`token_ids_logprob`) are refused on both servicers, this engine's gRPC
+contract having no output for them; and the RL control-plane extras (the `rl.*`
 advertisement, the live `weight_version` on generate responses, `is_paused`)
 stay with the Python implementation; the Rust server redacts credentials from
 `server_args` the same way. Prefill/decode disaggregation is served on this
