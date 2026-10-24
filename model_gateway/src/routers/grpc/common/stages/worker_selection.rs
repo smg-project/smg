@@ -3630,6 +3630,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reselect_pins_sglang_epd_plan_and_replaces_encoder_without_cross_runtime_fallback() {
+        let model_id = "retained-sglang-epd-model";
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = |url: &str, role, runtime| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .model(ModelCard::new(model_id))
+                    .worker_type(role)
+                    .runtime_type(runtime)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .health_config(no_health_check())
+                    .build(),
+            )
+        };
+        // Complete competing cohorts must not change a retained SG plan's wire.
+        for (runtime, port) in [(RuntimeType::TokenSpeed, 9400), (RuntimeType::Vllm, 9410)] {
+            for (offset, role) in [WorkerType::Encode, WorkerType::Prefill, WorkerType::Decode]
+                .into_iter()
+                .enumerate()
+            {
+                let url = format!("grpc://127.0.0.1:{}", port + offset);
+                registry.register(worker(&url, role, runtime)).unwrap();
+            }
+        }
+        let first = worker(
+            "grpc://127.0.0.1:9420", WorkerType::Encode, RuntimeType::Sglang,
+        );
+        let prefill = worker(
+            "grpc://127.0.0.1:9421", WorkerType::Prefill, RuntimeType::Sglang,
+        );
+        let decode = worker(
+            "grpc://127.0.0.1:9422", WorkerType::Decode, RuntimeType::Sglang,
+        );
+        for worker in [first.clone(), prefill.clone(), decode.clone()] {
+            registry.register(worker).unwrap();
+        }
+        let stage = WorkerSelectionStage::new(
+            registry.clone(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::EncodePrefillDecode,
+            None,
+        );
+        let mut ctx = dispatch_ctx(
+            model_id,
+            WireConstraint {
+                runtime: RuntimeType::Sglang,
+                connection: ConnectionMode::Grpc,
+                requires_media_refs: false,
+                pipeline: PipelinePin::Any,
+            },
+        );
+        // Opaque retained URLs: retry selection does not decode or replace the media.
+        let images: Arc<[String]> = vec![
+            "data:image/png;base64,one".into(),
+            "data:image/png;base64,two".into(),
+        ].into();
+        ctx.encode_outputs = Some(EncodeOutputs::Sglang(
+            super::super::sglang_encode::SglangEncodePlan {
+                images: images.clone(),
+                hashes: vec![vec![1], vec![2]].into(),
+            },
+        ));
+        let assert_sg = |ctx: &DispatchContext, encoder: &dyn Worker| {
+            let WorkerSelection::Disaggregated {
+                encode_assignments, prefill: p, decode: d, runtime_type,
+            } = ctx.workers.as_ref().unwrap() else {
+                panic!("expected retained EPD selection");
+            };
+            assert_eq!(*runtime_type, RuntimeType::Sglang);
+            assert_eq!(p.url(), prefill.url());
+            assert_eq!(d.url(), decode.url());
+            let assignments = encode_assignments.as_ref().unwrap();
+            assert_eq!(assignments.len(), 2);
+            assert!(assignments.iter().all(|a| a.worker.url() == encoder.url()));
+            let Some(EncodeOutputs::Sglang(plan)) = &ctx.encode_outputs else {
+                panic!("retained native plan was lost");
+            };
+            assert!(Arc::ptr_eq(&plan.images, &images));
+        };
+        stage.reselect(&mut ctx).await.unwrap();
+        assert_sg(&ctx, first.as_ref());
+        first.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        let replacement = worker(
+            "grpc://127.0.0.1:9423", WorkerType::Encode, RuntimeType::Sglang,
+        );
+        registry.register(replacement.clone()).unwrap();
+        stage.reselect(&mut ctx).await.unwrap();
+        assert_sg(&ctx, replacement.as_ref());
+        for missing in [&prefill, &decode, &replacement] {
+            missing.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+            assert_eq!(
+                stage.reselect(&mut ctx).await.unwrap_err().status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "a missing SG role must not fall back to complete TS/vLLM pools"
+            );
+            missing.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        }
+    }
+
+    #[tokio::test]
     async fn reselect_pins_pd_pair_to_the_retained_runtime() {
         let model_id = "wire-pin-pd-model";
         let worker_registry = Arc::new(WorkerRegistry::new());
