@@ -376,6 +376,16 @@ impl Calibration {
     }
 }
 
+/// Identity used to select synthetic output tokens, independent of scheduling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OutputSeed {
+    /// Preserve the existing request-ID-based output sequence.
+    #[default]
+    RequestId,
+    /// Equal prompt token IDs produce equal outputs across transports and retries.
+    Prompt,
+}
+
 /// Tunable parameters of the simulated engine. The scheduler is vLLM's pass
 /// loop (a token budget per pass, running requests first, then FCFS waiting,
 /// LIFO preemption when KV runs out) over a block-level KV pool with
@@ -414,6 +424,8 @@ pub struct EngineParams {
     pub reserve_full_isl: bool,
     /// Output tokens to generate when a request does not specify `max_new_tokens`.
     pub max_new_default: u32,
+    /// Identity used for synthetic output. Does not change cancellation IDs or cache keys.
+    pub output_seed: OutputSeed,
     /// Fixed per-request overhead in ms (a calibration's intercept that the
     /// pass polynomials do not explain): every event of a request's stream is
     /// delivered that much later, so TTFT and e2e grow by it and ITL does not.
@@ -437,6 +449,7 @@ impl Default for EngineParams {
             prefill_first: false,
             reserve_full_isl: true,
             max_new_default: 128,
+            output_seed: OutputSeed::default(),
             request_overhead_ms: 0.0,
             kv_broadcast_capacity: 1024,
             kv_replay_capacity: 4096,
@@ -1382,7 +1395,7 @@ struct RunningReq {
     pending: Vec<u32>,
     /// FNV over every token of the sequence so far (the next block's key).
     rolling_hash: u64,
-    /// Per-request seed so decode blocks never collide across requests.
+    /// Output identity selected at first admission and preserved over preemption.
     token_seed: u32,
 }
 
@@ -1931,7 +1944,13 @@ impl SchedulerState {
                             0.0
                         };
                         self.cache_hit_ewma = ewma(self.cache_hit_ewma, sample, 0.2);
-                        (cached, 0, 0, Vec::new(), fnv_hash_str(&request_id) as u32)
+                        let seed = match p.output_seed {
+                            OutputSeed::RequestId => fnv_hash_str(&request_id),
+                            // Includes every original prompt token, including a partial tail,
+                            // and is independent of block size and the transport request ID.
+                            OutputSeed::Prompt => w.rolling_hash,
+                        };
+                        (cached, 0, 0, Vec::new(), seed as u32)
                     }
                 };
             let resolved_max_new = if max_new == 0 {
@@ -2399,9 +2418,8 @@ fn prompt_blocks(ids: &[u32], block_size: usize) -> (Vec<u64>, u64, Vec<u32>) {
     (keys, h, pending)
 }
 
-/// A synthetic, request-specific output token id. Decode blocks must never
-/// collide across requests (only shared *prompt* prefixes should match), so the
-/// id is derived from the request seed and position.
+/// A synthetic output token derived from the configured identity and position.
+/// Prompt-seeded requests can intentionally share both prompt and decode blocks.
 fn next_token(r: &RunningReq) -> u32 {
     let mixed = r
         .token_seed
@@ -2438,6 +2456,100 @@ mod tests {
             },
             rx,
         )
+    }
+
+    fn output_for(
+        state: &mut SchedulerState,
+        params: &EngineParams,
+        id: &str,
+        prompt: Vec<u32>,
+        preempt: bool,
+    ) -> (Vec<u32>, u32) {
+        let (request, mut rx) = req(id, prompt, 8);
+        state.enqueue(request, params);
+        let mut tokens = Vec::new();
+        let mut preempted = false;
+        for _ in 0..100 {
+            for (tx, event) in state.step(params).sends {
+                tx.send(event).expect("the receiver is alive");
+            }
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    GenEvent::Token { token_id, .. } => tokens.push(token_id),
+                    GenEvent::Done {
+                        finish_reason,
+                        completion_tokens,
+                        cached_tokens,
+                        ..
+                    } => {
+                        assert_eq!(finish_reason, "length");
+                        assert_eq!(completion_tokens, 8);
+                        assert_eq!(tokens.len(), 8, "preemption must not repeat output");
+                        assert_eq!(preempted, preempt);
+                        return (tokens, cached_tokens);
+                    }
+                }
+            }
+            if preempt && !preempted && !tokens.is_empty() {
+                state.preempt_last(params);
+                preempted = true;
+            }
+        }
+        panic!("request did not finish within the bounded pass count");
+    }
+
+    #[test]
+    fn prompt_seed_survives_transport_ids_cache_warmth_and_preemption() {
+        let params = EngineParams {
+            output_seed: OutputSeed::Prompt,
+            block_size: 4,
+            max_batched_tokens: 5,
+            ..Default::default()
+        };
+        let prompt: Vec<u32> = (1..18).collect();
+        let mut state = SchedulerState::new();
+        let (cold, cold_cached) = output_for(&mut state, &params, "smg", prompt.clone(), false);
+        let (warm, warm_cached) = output_for(&mut state, &params, "dynamo", prompt.clone(), false);
+        let (resumed, _) = output_for(&mut state, &params, "retry", prompt.clone(), true);
+        assert_eq!(cold_cached, 0);
+        assert!(warm_cached > 0);
+        assert_eq!(cold, warm);
+        assert_eq!(cold, resumed);
+
+        let other_worker = EngineParams {
+            block_size: 8,
+            prefix_cache: false,
+            ..params.clone()
+        };
+        let (other, _) = output_for(
+            &mut SchedulerState::new(),
+            &other_worker,
+            "another-worker",
+            prompt.clone(),
+            false,
+        );
+        assert_eq!(
+            cold, other,
+            "block size and worker placement do not select output"
+        );
+        let mut different_tail = prompt;
+        different_tail[16] = 99;
+        let (different, _) = output_for(&mut state, &params, "smg", different_tail, false);
+        assert_ne!(
+            cold, different,
+            "the partial tail participates in output identity"
+        );
+    }
+
+    #[test]
+    fn default_output_still_depends_on_transport_id() {
+        let params = EngineParams::default();
+        let mut state = SchedulerState::new();
+        let (first, _) = output_for(&mut state, &params, "first", vec![1; 16], false);
+        let (other_id, _) = output_for(&mut state, &params, "second", vec![1; 16], false);
+        let (other_prompt, _) = output_for(&mut state, &params, "first", vec![2; 16], false);
+        assert_ne!(first, other_id);
+        assert_eq!(first, other_prompt);
     }
 
     #[test]
