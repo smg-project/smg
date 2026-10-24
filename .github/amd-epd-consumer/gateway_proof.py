@@ -11,6 +11,38 @@ def require(condition, message):
         raise ValueError(message)
 
 
+def stdio_binding(process, log_path):
+    root = Path("/proc") / str(process.pid)
+
+    def identity(path):
+        stat = path.stat()
+        return {"device": stat.st_dev, "inode": stat.st_ino}
+
+    stdout = identity(root / "fd/1")
+    stderr = identity(root / "fd/2")
+    if log_path is not None:
+        require(stdout == identity(Path(log_path)), "gateway stdout/log differs")
+        return {
+            "stdio_mode": "captured_log",
+            "log": str(log_path),
+            "stdout": stdout,
+            "stderr": stderr,
+        }
+    parent = Path("/proc") / str(os.getpid())
+    parent_stdout = identity(parent / "fd/1")
+    parent_stderr = identity(parent / "fd/2")
+    require(stdout == parent_stdout, "gateway stdout/parent differs")
+    require(stderr == parent_stderr, "gateway stderr/parent differs")
+    return {
+        "stdio_mode": "inherited_parent",
+        "log": None,
+        "stdout": stdout,
+        "stderr": stderr,
+        "parent_stdout": parent_stdout,
+        "parent_stderr": parent_stderr,
+    }
+
+
 def verify(gateway, directory):
     process = gateway.process
     require(process is not None and process.poll() is None, "gateway is not alive")
@@ -40,11 +72,7 @@ def verify(gateway, directory):
         path.stat().st_size == expected["bytes"] and digest == expected["sha256"],
         "gateway native differs from new dbc4 producer",
     )
-    stdout = (root / "fd/1").stat()
-    log = Path(gateway.log_path).stat()
-    require(
-        (stdout.st_dev, stdout.st_ino) == (log.st_dev, log.st_ino), "gateway stdout/log differs"
-    )
+    stdio = stdio_binding(process, gateway.log_path)
     record = {
         "pid": process.pid,
         "parent_pid": int(fields[1]),
@@ -55,7 +83,7 @@ def verify(gateway, directory):
         "native_path": str(path),
         "native_bytes": path.stat().st_size,
         "native_sha256": digest,
-        "log": str(gateway.log_path),
+        **stdio,
     }
     target = directory / "gateways"
     target.mkdir(exist_ok=True)
