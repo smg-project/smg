@@ -21,6 +21,14 @@ def verify(inputs):
     def read_oid(revision, path):
         return git_output("rev-parse", f"{revision}:{path}").strip()
 
+    require(
+        read_oid("HEAD", ".github/amd-gptoss-pilot") == inputs["pilot_namespace_oid"],
+        "pilot source identity",
+    )
+    require(
+        read_oid(target, ".github/amd-gptoss-pilot") == inputs["pilot_namespace_oid"],
+        "pilot target identity",
+    )
     check_map(read_oid, "HEAD", inputs["source_trees"])
     check_map(read_oid, target, inputs["source_trees"])
     check_map(read_oid, "HEAD", inputs["compiled_source_trees"])
