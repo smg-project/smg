@@ -46,9 +46,12 @@ pub(crate) enum DpPlacement {
     /// The engine honors the per-request `data_parallel_rank` pin field, set
     /// on each side from its selected dp-aware virtual worker.
     PinField,
-    /// The room encodes the prefill rank so TokenSpeed's decode receiver can
-    /// locate its KV source. Each request also carries its selected rank pin;
-    /// TokenSpeed must support PD pins to honor independent decode placement.
+    /// The engine's prefill side places a disaggregated request on the rank
+    /// of its room's residue (`bootstrap_room % dp_size`) and its decode side
+    /// locates the KV source there, so the room is minted congruent to the
+    /// selected prefill rank and the residue is the placement carrier on
+    /// that side. Each request also carries its selected rank pin, which the
+    /// decode side honors where its placement is free.
     RoomResidue,
 }
 
@@ -65,10 +68,15 @@ impl PdProtocol {
     /// disaggregated mode.
     pub(crate) fn for_runtime(runtime: RuntimeType) -> Option<Self> {
         match runtime {
+            // SGLang's prefill side follows the room by default
+            // (`follow_bootstrap_room`: its KV sender fails a request placed
+            // on another rank than the room's residue) and its decode side
+            // looks for the KV on that rank; the decode side's own placement
+            // is free and honors the pin.
             RuntimeType::Sglang => Some(Self {
                 dispatch: PdDispatch::Parallel,
                 rendezvous: PdRendezvous::SglangBootstrap,
-                dp_placement: DpPlacement::PinField,
+                dp_placement: DpPlacement::RoomResidue,
             }),
             RuntimeType::Vllm => Some(Self {
                 dispatch: PdDispatch::Sequential,
@@ -98,7 +106,7 @@ mod tests {
         let sglang = PdProtocol::for_runtime(RuntimeType::Sglang).unwrap();
         assert_eq!(sglang.dispatch, PdDispatch::Parallel);
         assert_eq!(sglang.rendezvous, PdRendezvous::SglangBootstrap);
-        assert_eq!(sglang.dp_placement, DpPlacement::PinField);
+        assert_eq!(sglang.dp_placement, DpPlacement::RoomResidue);
 
         let vllm = PdProtocol::for_runtime(RuntimeType::Vllm).unwrap();
         assert_eq!(vllm.dispatch, PdDispatch::Sequential);
