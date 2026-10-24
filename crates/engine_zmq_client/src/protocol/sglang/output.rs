@@ -853,9 +853,9 @@ mod tests {
         );
     }
 
-    /// Hidden states ride the last appended column as the scheduler's
-    /// cumulative rows per request: the plugin's 28-element batch reads back
-    /// the rows for the request that asked and none for the other, the value
+    /// Hidden states ride the last appended column as the rows an output
+    /// added per request: the plugin's 28-element batch reads back the rows
+    /// for the request that asked and none for the other, the value
     /// round-trips (Python writes float64, this side keeps the proto's
     /// float32), the 27-element batches of earlier plugins decode with no
     /// rows, and a ragged column is a protocol bug.

@@ -49,41 +49,46 @@ def refuse_hidden_states_above_server_mode() -> None:
     )
 
 
-def hidden_state_rows(value: Any, *, skip: int = 0) -> list[list[float]]:
-    """The scheduler's hidden states of one request as rows, one per position a
-    forward ran on, after the first ``skip`` rows (the ones already sent).
+def hidden_state_rows(value: Any) -> list[list[float]]:
+    """All rows of one request's hidden states (``new_hidden_rows`` from the
+    first element)."""
+    rows, _ = new_hidden_rows(value, 0)
+    return rows
 
-    The engine appends the prefill's block as ONE element (a list of rows, one
-    per prompt position the forward computed: a prefix the radix cache served
-    has none) and then one row per decode step, the generated token it fed
-    back (``batch_result_processor._append_prefill_hidden_states`` /
+
+def new_hidden_rows(value: Any, consumed: int) -> tuple[list[list[float]], int]:
+    """The rows held by the elements of ``value`` past the first ``consumed``,
+    and the element count a caller remembers for the next step.
+
+    The engine keeps a request's hidden states cumulative and appends one
+    element per forward: the prefill's block (a list of rows, one per prompt
+    position the forward computed: a prefix the radix cache served has none),
+    then one row per decode step, the generated token it fed back
+    (``batch_result_processor._append_prefill_hidden_states`` /
     ``_append_decode_hidden_states``): the last sampled token is never fed
-    back, so a request has (prompt - cached prefix) + generated - 1 rows; the
-    engine's ``"last"`` mode keeps a single row. The values are the floats
-    ``tolist`` produced: the structure is reshaped, no element is converted
-    (this runs on the scheduler's loop, for every step of every request that
-    asked). Every element may be a list or a tensor-like with ``tolist``;
-    None or an empty value is no row."""
+    back, so a request has (prompt - cached prefix) + generated - 1 rows. A
+    caller that remembers the elements it consumed gets the rest reshaped,
+    O(new rows) per step (this runs on the scheduler's loop for every step of
+    every request that asked); the values are the floats ``tolist`` produced,
+    no element is converted. Every element may be a list or a tensor-like
+    with ``tolist``; None or an empty value adds no row. The engine's
+    ``"last"`` mode keeps a single row as a bare vector: one row, consumed
+    whole."""
     if value is None:
-        return []
+        return [], consumed
     elements = _listed(value)
+    if elements and isinstance(elements[0], (int, float)):
+        # A bare vector given as its scalars: one row.
+        return ([] if consumed else [list(elements)]), len(elements)
     rows: list[list[float]] = []
-    seen = 0
-    for element in elements:
+    for element in elements[consumed:]:
         element = _listed(element)
-        if isinstance(element, (int, float)):
-            # A bare vector given as its scalars: one row.
-            return [] if skip else [list(elements)]
         if element and _is_vector(element[0]):
             # A block of rows: the prompt positions the prefill computed.
-            block = [_listed(row) for row in element]
-            rows.extend(block[max(0, skip - seen) :])
-            seen += len(block)
+            rows.extend(_listed(row) for row in element)
         else:
-            if seen >= skip:
-                rows.append(element)
-            seen += 1
-    return rows
+            rows.append(element)
+    return rows, len(elements)
 
 
 def _listed(value: Any) -> Any:

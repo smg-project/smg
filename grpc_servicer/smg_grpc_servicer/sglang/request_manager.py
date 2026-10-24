@@ -42,7 +42,7 @@ from sglang.srt.utils import get_or_create_event_loop, kill_process_tree
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.utils import get_exception_traceback
 
-from smg_grpc_servicer.sglang.hidden_states import hidden_state_rows
+from smg_grpc_servicer.sglang.hidden_states import new_hidden_rows
 from smg_grpc_servicer.trace_context import trace_headers
 
 logger = logging.getLogger(__name__)
@@ -187,6 +187,9 @@ class GrpcReqState:
     # Hidden states: one final-layer vector per output token, as far as the
     # scheduler has shipped them (it ships the cumulative list each step).
     output_hidden_states: list[list[float]] = dataclasses.field(default_factory=list)
+    # The elements of the scheduler's cumulative hidden-state list this request
+    # has consumed (the prefill block is one; each decode step adds one).
+    hidden_elements_consumed: int = 0
 
     # Session state
     session_id: str | None = None
@@ -891,9 +894,9 @@ class GrpcRequestManager:
             # only the elements past what this request has seen are reshaped).
             if getattr(state.obj, "return_hidden_states", False):
                 hidden_column = getattr(batch_out, "output_hidden_states", None)
-                fresh = hidden_state_rows(
+                fresh, state.hidden_elements_consumed = new_hidden_rows(
                     hidden_column[i] if hidden_column and i < len(hidden_column) else None,
-                    skip=len(state.output_hidden_states),
+                    state.hidden_elements_consumed,
                 )
                 state.output_hidden_states.extend(fresh)
                 if state.obj.stream and fresh:

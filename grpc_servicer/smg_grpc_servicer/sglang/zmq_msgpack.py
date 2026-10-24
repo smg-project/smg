@@ -45,7 +45,7 @@ import msgspec
 import zmq
 
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
-from smg_grpc_servicer.sglang.hidden_states import hidden_state_rows
+from smg_grpc_servicer.sglang.hidden_states import new_hidden_rows
 from smg_grpc_servicer.sglang.request_traces import TRACE_HEADERS_KEY, RequestTraces
 
 if TYPE_CHECKING:
@@ -205,11 +205,11 @@ class BatchTokenIDSlimOutput(msgspec.Struct, tag=True, array_like=True):
     # see `zmq_plugin`); None for other finishes.
     finished_err_types: list[str | None] | None = None
     # Hidden states when the request asked for them (`return_hidden_states`):
-    # per request, the scheduler's cumulative list so far as rows, one
-    # final-layer vector per token position (the prompt's positions first, then
-    # each generated token; `hidden_states.hidden_state_rows` flattens the
-    # engine's prefill block); the frontends emit the delta per step. None for
-    # a request that did not ask, or a scheduler that captured none.
+    # per request, the final-layer rows this output ADDED (the prefill block
+    # once, flattened from the engine's element, then a decode step's rows; the
+    # engine keeps the list cumulative, `HiddenStateRows` sends what is new);
+    # the frontends accumulate. None for a request that did not ask, or a
+    # scheduler that captured none.
     output_hidden_states: list[list[list[float]] | None] | None = None
 
     @classmethod
@@ -316,12 +316,14 @@ class HiddenStateRows:
     The engine keeps a request's rows cumulative (``req.hidden_states``: the
     prefill's block, then one row per decode step), so relaying the list as
     it stands would re-encode and re-send the prompt's block on every decode
-    step. This side remembers how many rows it sent per rid and ships the
-    rest; a finished or aborted request is forgotten.
+    step. This side remembers how many of the list's elements it consumed per
+    rid (the prefill block is one, each decode step adds one) and reshapes
+    only the rest, O(new rows) per step; a finished or aborted request is
+    forgotten.
     """
 
     def __init__(self) -> None:
-        self._sent: dict[str, int] = {}
+        self._consumed: dict[str, int] = {}
 
     def column(self, out: Any) -> list[list[list[float]] | None] | None:
         """The slim column for ``out``: per request the rows new since the
@@ -338,17 +340,15 @@ class HiddenStateRows:
                 if value is None:
                     column.append(None)
                     continue
-                sent = self._sent.get(rid, 0)
-                fresh = hidden_state_rows(value, skip=sent)
-                self._sent[rid] = sent + len(fresh)
+                fresh, self._consumed[rid] = new_hidden_rows(value, self._consumed.get(rid, 0))
                 column.append(fresh)
         for i, rid in enumerate(rids):
             if i < len(finished) and finished[i]:
-                self._sent.pop(rid, None)
+                self._consumed.pop(rid, None)
         return column
 
     def forget(self, rid: str) -> None:
-        self._sent.pop(rid, None)
+        self._consumed.pop(rid, None)
 
 
 def _finish_columns(reasons: list) -> tuple[list[str], list[str | None], list[int | None]]:

@@ -192,6 +192,7 @@ def test_rows_flatten_the_engines_raw_shape():
         first_hidden_position,
         flat_hidden_states,
         hidden_state_rows,
+        new_hidden_rows,
     )
 
     class Tensorish:
@@ -209,11 +210,18 @@ def test_rows_flatten_the_engines_raw_shape():
         FIRST_ROW,
     ]
     assert hidden_state_rows(FIRST_ROW) == [FIRST_ROW]  # the engine's "last" mode: one row
-    # The rows past what was already sent: part of the block, then whole rows.
-    assert hidden_state_rows([PREFILL_BLOCK, FIRST_ROW], skip=2) == [FIRST_ROW]
-    assert hidden_state_rows([PREFILL_BLOCK, FIRST_ROW], skip=1) == [PREFILL_BLOCK[1], FIRST_ROW]
-    assert hidden_state_rows([PREFILL_BLOCK, FIRST_ROW], skip=3) == []
-    assert hidden_state_rows(FIRST_ROW, skip=1) == []
+    # The rows past the elements already consumed (the block is one element,
+    # each decode step adds one), and the count to remember for the next step.
+    assert new_hidden_rows([PREFILL_BLOCK, FIRST_ROW], 0) == ([*PREFILL_BLOCK, FIRST_ROW], 2)
+    assert new_hidden_rows([PREFILL_BLOCK, FIRST_ROW], 1) == ([FIRST_ROW], 2)
+    assert new_hidden_rows([PREFILL_BLOCK, FIRST_ROW], 2) == ([], 2)
+    assert new_hidden_rows([PREFILL_BLOCK, FIRST_ROW, SECOND_ROW], 2) == ([SECOND_ROW], 3)
+    assert new_hidden_rows(FIRST_ROW, 0) == (
+        [FIRST_ROW],
+        2,
+    )  # a bare vector: one row, consumed whole
+    assert new_hidden_rows(FIRST_ROW, 2) == ([], 2)
+    assert new_hidden_rows(None, 1) == ([], 1)
     # The anchor: the last row is the last fed-back token, whatever prefix the
     # cache served without rows (prompt 5 with three cached, two generated).
     assert first_hidden_position(3, 2, 4) == 0
