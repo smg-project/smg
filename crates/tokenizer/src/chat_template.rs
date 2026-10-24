@@ -2727,7 +2727,7 @@ impl ChatTemplateState {
     }
 
     /// The content format of the template a request renders through
-    /// ([`Self::template_for_tools`]): what the request's message content is
+    /// (`template_for_tools`): what the request's message content is
     /// shaped into before the render, as the engine's server detects it on
     /// the template it resolved for the request.
     pub fn content_format_for_tools(&self, has_tools: bool) -> ChatTemplateContentFormat {

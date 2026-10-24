@@ -100,7 +100,7 @@ impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
     }
 
     /// Bound the wait for the worker's own end of a dropped stream (default
-    /// [`RELEASE_DRAIN_MAX_WAIT`]) before it is released with a reset.
+    /// `RELEASE_DRAIN_MAX_WAIT`, 30 s) before it is released with a reset.
     #[must_use]
     pub fn with_release_drain_bound(mut self, bound: Duration) -> Self {
         self.release_drain_bound = bound;
