@@ -72,7 +72,7 @@
   },
   "helper": {
     "path": "/opt/venv/lib/python3.12/site-packages/smg_sg2_startup_trace.py",
-    "sha256": "b71f52979b09f44c4d2935c796905834b0d658677b8256124237e3d54a1f36cc"
+    "sha256": "abc2453262fae93964033391f7347a3eeddecca43116f0b0338de551d7c5525e"
   },
   "scope": "Only startup observations; no CU prime, computation/return/assertion, model, dtype, RDMA, memory fraction, pool, graph, stream handle, request or test changes."
 }

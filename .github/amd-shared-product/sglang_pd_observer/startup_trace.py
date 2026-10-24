@@ -70,13 +70,15 @@ def _emit(kind, stage, module, file, values, raw=None):
             if raw is not None:
                 row["raw"] = {}
                 for name, text in raw.items():
-                    data = text[:128 * 1024].encode("utf-8", errors="replace")[:128 * 1024]
+                    prefix = text[:128 * 1024 + 1].encode("utf-8", errors="replace")
+                    data = prefix[:128 * 1024]
                     target = directory / f"{pid}-{stat[19]}-cu-{name}.txt"
                     fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
                     with os.fdopen(fd, "wb") as stream:
                         stream.write(data)
                     row["raw"][name] = {"file": target.name, "saved_bytes": len(data),
-                                        "original_chars": len(text), "saved_sha256": hashlib.sha256(data).hexdigest()}
+                                        "original_chars": len(text), "truncated": len(text) > 128 * 1024 or len(prefix) > 128 * 1024,
+                                        "saved_sha256": hashlib.sha256(data).hexdigest()}
             line = json.dumps(row, ensure_ascii=True, allow_nan=False)
             if len(line.encode()) > 4096:
                 raise ValueError("startup event exceeds4096 bytes")

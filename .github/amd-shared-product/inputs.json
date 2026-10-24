@@ -275,7 +275,7 @@
     "env": "SMG_SG2_STARTUP_DIAGNOSTIC",
     "actual_image_digest": "sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d",
     "manifest": "sglang_pd_observer/startup-overlay.json",
-    "manifest_sha256": "5ed4308e3922ae0e61906143b3bcd0e6ef0422019737d18094c069dc9fb2eb06",
+    "manifest_sha256": "a622c1bd6f14701eb9fd71a924079e8ae3002b2736847f99edaff0abcf2bdb09",
     "source_paths_and_before_after": {
       "/sgl-workspace/aiter/aiter/jit/utils/chip_info.py": {
         "actual_capture_path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T0300Z/SG2-AB-4420-source-canonical-root-933b80bb0c1547128659f28c5b42265a/2.py",
@@ -293,7 +293,7 @@
         "after_sha256": "d6216ddea10a0d3360619179de914ef49c8da3b2da77d810be8cf61f216127f4"
       }
     },
-    "helper_sha256": "b71f52979b09f44c4d2935c796905834b0d658677b8256124237e3d54a1f36cc",
+    "helper_sha256": "abc2453262fae93964033391f7347a3eeddecca43116f0b0338de551d7c5525e",
     "artifact_directory": "AMD_DEPENDENCY_DIRECTORY/sglang-startup",
     "runtime_origin": "HOLD until actual same-worker events match manifest hashes; installer file hashes alone do not close it.",
     "no_CU_prime_or_parameter_change": true,

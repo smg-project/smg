@@ -46,7 +46,7 @@ class StartupControls(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.env = patch.dict(os.environ, SMG_SG2_STARTUP_DIAGNOSTIC="1",
+        self.env = patch.dict(os.environ, SMG_SG2_STARTUP_DIAGNOSTIC="1", CU_NUM="0",
                               AMD_DEPENDENCY_DIRECTORY=str(self.root), E2E_JOB_MARKER="e2e-123-1-amd-mi300x-2")
         self.env.start()
         self.addCleanup(self.env.stop)
