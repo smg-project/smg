@@ -1035,14 +1035,18 @@ fn the_stream_timing_set_renders_the_same_through_kept_handles() {
     }
 }
 
-/// A stage's time renders under its label, the same through a kept handle
-/// and through a key built per record, one observation per record.
+/// A stage's time renders under its stage and streaming labels, the same
+/// through a kept handle and through a key built per record, one
+/// observation per record; every stage of the table has its kept slot.
 #[test]
 fn a_stage_duration_renders_under_its_stage_label() {
     let records = || {
-        Metrics::record_stage_duration(RouterStage::Preparation, Duration::from_millis(250));
-        Metrics::record_stage_duration(RouterStage::Preparation, Duration::from_millis(500));
-        Metrics::record_stage_duration(RouterStage::Execute, Duration::from_millis(125));
+        Metrics::record_stage_duration(RouterStage::Preparation, false, Duration::from_millis(250));
+        Metrics::record_stage_duration(RouterStage::Preparation, false, Duration::from_millis(500));
+        Metrics::record_stage_duration(RouterStage::Execute, true, Duration::from_millis(125));
+        for stage in RouterStage::ALL {
+            Metrics::record_stage_duration(stage, true, Duration::from_millis(1));
+        }
     };
     let built = render_with_recorder(records);
     let kept = render_with_recorder(|| {
@@ -1052,16 +1056,25 @@ fn a_stage_duration_renders_under_its_stage_label() {
     });
     assert_eq!(sorted_series(&kept), sorted_series(&built));
     for expected in [
-        "smg_router_stage_seconds_count{stage=\"preparation\"} 2",
-        "smg_router_stage_seconds_sum{stage=\"preparation\"} 0.75",
-        "smg_router_stage_seconds_sum{stage=\"execute\"} 0.125",
-        "smg_router_stage_seconds_count{stage=\"execute\"} 1",
+        "smg_router_stage_seconds_count{stage=\"preparation\",streaming=\"false\"} 2",
+        "smg_router_stage_seconds_sum{stage=\"preparation\",streaming=\"false\"} 0.75",
+        "smg_router_stage_seconds_sum{stage=\"execute\",streaming=\"true\"} 0.126",
+        "smg_router_stage_seconds_count{stage=\"execute\",streaming=\"true\"} 2",
+        "smg_router_stage_seconds_count{stage=\"reselection\",streaming=\"true\"} 1",
     ] {
         assert!(
             kept.lines().any(|line| line == expected),
             "missing {expected} in:\n{kept}"
         );
     }
+    let streamed = kept
+        .lines()
+        .filter(|line| {
+            line.starts_with("smg_router_stage_seconds_count{")
+                && line.contains("streaming=\"true\"")
+        })
+        .count();
+    assert_eq!(streamed, RouterStage::COUNT, "{kept}");
 }
 
 /// The kept worker counters follow the worker set: a removal drops the

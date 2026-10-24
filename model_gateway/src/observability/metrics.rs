@@ -185,8 +185,9 @@ mod handles {
         pub(super) static HTTP_CONNECTIONS_ACTIVE: RefCell<Option<Gauge>> = const { RefCell::new(None) };
         /// The stream-timing set by its static labels, then the model.
         pub(super) static STREAMS: RefCell<ByLabels<StreamLabels, StreamHandles>> = RefCell::new(HashMap::new());
-        /// `smg_router_stage_seconds` by stage, at the stage's index.
-        pub(super) static STAGES: RefCell<[Option<Histogram>; RouterStage::COUNT]> = const { RefCell::new([const { None }; RouterStage::COUNT]) };
+        /// `smg_router_stage_seconds` by stage (the stage's index), then by
+        /// the streaming flag.
+        pub(super) static STAGES: RefCell<[[Option<Histogram>; 2]; RouterStage::COUNT]> = const { RefCell::new([const { [None, None] }; RouterStage::COUNT]) };
         /// `smg_worker_requests_total`.
         pub(super) static WORKER_REQUESTS: RefCell<WorkerRequests> = RefCell::new(WorkerRequests::default());
         /// `smg_worker_requests_active`.
@@ -204,7 +205,7 @@ mod handles {
         HTTP_DURATIONS.with_borrow_mut(HashMap::clear);
         HTTP_RESPONSES.with_borrow_mut(HashMap::clear);
         HTTP_RATE_LIMITS.with_borrow_mut(HashMap::clear);
-        STAGES.with_borrow_mut(|kept| *kept = [const { None }; RouterStage::COUNT]);
+        STAGES.with_borrow_mut(|kept| *kept = [const { [None, None] }; RouterStage::COUNT]);
         HTTP_CONNECTIONS_ACTIVE.set(None);
         STREAMS.with_borrow_mut(HashMap::clear);
         WORKER_REQUESTS.with_borrow_mut(|kept| *kept = WorkerRequests::default());
@@ -548,7 +549,7 @@ pub(crate) fn init_metrics() {
     );
     describe_histogram!(
         "smg_router_stage_seconds",
-        "Time a request spent in a stage of the pipeline, from the previous stage's end, by stage: preparation (the parse, the tokenizer and the template), rate_limit (the tenant reservation), worker_selection (the policy, the index lookup and the selection queue), client_acquisition (the context-length and output-budget checks and the client pool), encode (the multimodal encode step, where one runs), request_building, reselection (a retry's selection), execute (the admission wait, the send and the engine's acceptance, per attempt) and response_processing (the answer's processing to the response); one observation per stage crossed, a refused or failed stage included, so the stage series sum to the requests' time in the pipeline"
+        "Time a request spent in a stage of the pipeline, from the previous stage's end, by stage and streaming: preparation (the parse, the tokenizer and the template), rate_limit (the tenant reservation), worker_selection (the policy, the index lookup and the selection queue), client_acquisition (the context-length and output-budget checks and the client pool; on a retry the new workers' clients), encode (the multimodal encode step, where one runs), request_building, reselection (a retry's selection), execute (the build boundary, the admission wait, the send and the engine's acceptance, per attempt) and response_processing (the answer's processing to the response: for a request that does not stream this is the whole generation, collected before the answer; for a streaming one the body's construction); one observation per stage crossed, a refused or failed stage included; a retry's backoff and the reservation's settlement after the answer are outside the stages"
     );
     describe_histogram!(
         "smg_router_tpot_seconds",
@@ -1482,9 +1483,21 @@ pub enum RouterStage {
 }
 
 impl RouterStage {
-    /// How many stages there are: the kept handles are one per stage, at
-    /// the stage's index.
-    pub(crate) const COUNT: usize = Self::ResponseProcessing as usize + 1;
+    /// Every stage, in order: the kept handles are indexed by a stage's
+    /// position here, which the assertion below pins to its discriminant.
+    pub(crate) const ALL: [Self; 9] = [
+        Self::Preparation,
+        Self::RateLimit,
+        Self::WorkerSelection,
+        Self::ClientAcquisition,
+        Self::Encode,
+        Self::RequestBuilding,
+        Self::Reselection,
+        Self::Execute,
+        Self::ResponseProcessing,
+    ];
+    /// How many stages there are.
+    pub(crate) const COUNT: usize = Self::ALL.len();
 
     /// The stage's `stage` label value.
     pub const fn label(self) -> &'static str {
@@ -1501,6 +1514,16 @@ impl RouterStage {
         }
     }
 }
+
+// A stage's discriminant is its index in `ALL`: a stage added to the enum
+// without its row here, or out of order, does not compile.
+const _: () = {
+    let mut i = 0;
+    while i < RouterStage::COUNT {
+        assert!(RouterStage::ALL[i] as usize == i);
+        i += 1;
+    }
+};
 
 impl Metrics {
     pub fn record_router_request(
@@ -1895,17 +1918,23 @@ impl Metrics {
     }
 
     /// One stage of the request pipeline done for one request: `elapsed`
-    /// under `smg_router_stage_seconds{stage}`, through this thread's kept
-    /// handle for the stage (built on first sight) or a key built per call
-    /// when handles are not kept.
-    pub fn record_stage_duration(stage: RouterStage, elapsed: Duration) {
-        let build = || histogram!("smg_router_stage_seconds", "stage" => stage.label());
+    /// under `smg_router_stage_seconds{stage,streaming}`, through this
+    /// thread's kept handle for the pair (built on first sight) or a key
+    /// built per call when handles are not kept.
+    pub fn record_stage_duration(stage: RouterStage, streaming: bool, elapsed: Duration) {
+        let build = || {
+            histogram!(
+                "smg_router_stage_seconds",
+                "stage" => stage.label(),
+                "streaming" => bool_to_static_str(streaming)
+            )
+        };
         if !handles::keep_handles() {
             build().record(elapsed.as_secs_f64());
             return;
         }
         handles::STAGES.with_borrow_mut(|kept| {
-            kept[stage as usize]
+            kept[stage as usize][usize::from(streaming)]
                 .get_or_insert_with(build)
                 .record(elapsed.as_secs_f64());
         });
