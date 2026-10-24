@@ -44,10 +44,11 @@ impl Mode {
             Mode::EncodePrefillDecode => ExecutionPlanKind::EncodePrefillDecode,
         }
     }
-    /// PD only: EPD (TokenSpeed) injects encode bootstrap info instead, so this
-    /// must stay false there to avoid double injection.
+    /// Both PD and EPD need the selected runtime's P/D bootstrap metadata.
+    /// The helper injects only SGLang metadata; TokenSpeed's separate encode
+    /// handoff and KV room are handled by their own runtime-specific helpers.
     pub(crate) fn inject_pd_metadata(self) -> bool {
-        matches!(self, Mode::PrefillDecode)
+        matches!(self, Mode::PrefillDecode | Mode::EncodePrefillDecode)
     }
     /// Metrics/introspection label.
     pub(crate) fn router_type(self) -> &'static str {
@@ -115,7 +116,7 @@ mod tests {
                 Mode::EncodePrefillDecode,
                 WorkerSelectionMode::EncodePrefillDecode,
                 ExecutionPlanKind::EncodePrefillDecode,
-                false,
+                true,
                 "grpc_epd",
                 &[
                     RoutingPool::GrpcEncode,

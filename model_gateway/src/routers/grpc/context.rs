@@ -479,7 +479,8 @@ pub(crate) struct AttemptStamp {
     /// start; retry attempts re-shape it for the newly selected worker's
     /// engine, as the build did for the first.
     pub tool_constraint: Option<ToolConstraintStamp>,
-    /// Mode::PrefillDecode only (mirrors the build stage's flag).
+    /// PD and EPD bootstrap eligibility (mirrors the build stage's flag).
+    /// The metadata helper still guards the selected runtime's wire protocol.
     pub inject_pd_metadata: bool,
 }
 

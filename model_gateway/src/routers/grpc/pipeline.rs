@@ -1766,9 +1766,7 @@ mod build_parity_tests {
         let (selection, inject, plan, backend) = match mode {
             Mode::Regular => ("Regular", "false", "Single", REGULAR),
             Mode::PrefillDecode => ("PrefillDecode", "true", "PrefillDecode", PD),
-            Mode::EncodePrefillDecode => {
-                ("EncodePrefillDecode", "false", "EncodePrefillDecode", PD)
-            }
+            Mode::EncodePrefillDecode => ("EncodePrefillDecode", "true", "EncodePrefillDecode", PD),
         };
         let encode = matches!(mode, Mode::EncodePrefillDecode);
         let build = match endpoint {

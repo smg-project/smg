@@ -191,7 +191,33 @@ async fn epd_sglang_actual_stage_and_build_keep_inline_media_and_final_id() {
         }),
         ..Default::default()
     }));
-    helpers::finish_generate_request(&mut ctx, &mut request, false, "epd_sglang_test").unwrap();
+    helpers::finish_generate_request(
+        &mut ctx,
+        &mut request,
+        crate::routers::grpc::mode::Mode::EncodePrefillDecode.inject_pd_metadata(),
+        "epd_sglang_test",
+    )
+    .unwrap();
+    let bootstrap = request.as_sglang().disaggregated_params.as_ref().unwrap();
+    let prefill = ctx
+        .state
+        .workers
+        .as_ref()
+        .unwrap()
+        .prefill_worker()
+        .unwrap();
+    assert_eq!(
+        bootstrap.bootstrap_host,
+        prefill.metadata().bootstrap_host()
+    );
+    assert_eq!(
+        bootstrap.bootstrap_port,
+        prefill
+            .metadata()
+            .bootstrap_port()
+            .unwrap_or(crate::worker::DEFAULT_BOOTSTRAP_PORT) as i32
+    );
+    assert!(bootstrap.bootstrap_room >= 0);
     assert_eq!(
         request.as_sglang().mm_inputs.as_ref().unwrap().image_urls,
         expected
