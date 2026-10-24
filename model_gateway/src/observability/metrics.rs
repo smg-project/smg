@@ -29,7 +29,7 @@ use crate::routers::grpc::regular::symphony::telemetry as symphony_telemetry;
 /// Uses DashMap for lock-free concurrent access.
 static STRING_INTERNER: Lazy<DashMap<String, Arc<str>>> = Lazy::new(DashMap::new);
 
-/// Intern a string, returning a cheaply-cloneable Arc<str>.
+/// Intern a string, returning a cheaply-cloneable `Arc<str>`.
 ///
 /// This function is designed for high-throughput scenarios where the same
 /// strings (model IDs, worker URLs) appear repeatedly. The first call allocates,

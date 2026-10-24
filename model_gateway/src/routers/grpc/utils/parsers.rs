@@ -47,7 +47,7 @@ pub(crate) struct ParserResolver {
     flags: Names,
     /// The flags as the legacy parsers take them: each kind's when a legacy
     /// parser of the kind has the name ([`Self::new`]); the flags themselves
-    /// for the tests' [`Self::with_flags`].
+    /// for the tests' `with_flags`.
     legacy_flags: Names,
 }
 

@@ -83,7 +83,7 @@ pub(crate) fn labels_select_nothing(names: &Names) -> bool {
 /// Why the legacy parsers read a request Symphony was configured for, by the site that decided
 /// it: the precedence among the names and the registry ([`decision`]), or the table's missing
 /// tag ([`assign`](super::assign)). A request so read is counted once under its reason
-/// ([`telemetry::record_fallback`](super::telemetry::record_fallback)); its response's header
+/// ([`telemetry::record_fallback`]); its response's header
 /// says `legacy`, as before.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fallback {

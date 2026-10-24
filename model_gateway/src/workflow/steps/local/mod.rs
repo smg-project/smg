@@ -45,7 +45,7 @@ use crate::{
 
 /// Find the registered workers a query address selects.
 ///
-/// Matching is on [`EndpointKey`], so every spelling of one backend — bare
+/// Matching is on [`EndpointKey`](crate::worker::EndpointKey), so every spelling of one backend — bare
 /// `host:port`, any scheme, either IPv6 form — selects the same group. Two
 /// narrowings apply on top of the key:
 ///

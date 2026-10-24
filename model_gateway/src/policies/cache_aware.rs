@@ -1451,7 +1451,7 @@ enum Gather {
     All { cap: Option<usize> },
 }
 
-/// Pressure-tuning inputs for [`CacheAwarePolicy::overlap_candidates`]: the two
+/// Pressure-tuning inputs for [`CacheAwarePolicy::overlap_candidates_for_hashes`]: the two
 /// config knobs plus the immutable load snapshot captured from the load
 /// receiver at selection time, from which each worker's waiting-prefill
 /// backlog (queued uncached tokens, clamped non-negative) is derived at
