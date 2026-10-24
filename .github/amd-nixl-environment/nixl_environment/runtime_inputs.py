@@ -255,6 +255,14 @@ def bootstrap():
                         raw = stream.read(65536)
                     print(name + ":" + suffix + " (last 64KiB):\n" + raw.decode(errors="replace"), file=sys.stderr)
                 raise
+    subprocess.run([sys.executable, str(Path(__file__).resolve()), "bootstrap-proof"],
+                   check=True, timeout=30, env=env)
+
+
+def bootstrap_proof():
+    # A normal fresh startup processes the newly installed PEP660 .pth/finder.
+    value, root = verify_bundle()
+    env = dict(os.environ, PIP_CONFIG_FILE="/dev/null", PIP_NO_INDEX="1", PIP_DISABLE_PIP_VERSION_CHECK="1", PYTHONDONTWRITEBYTECODE="1")
     sys.dont_write_bytecode = True
     result = {"spec_sha256": SPEC_SHA, "helper_sha256": identity(Path(__file__))["sha256"], "packages": package_proofs(value, root), "editable_servicer": editable_servicer(), "generated_origins16": generated_origins(), "cairo": cairo_proof(value), "PIP_CONSTRAINT": os.environ.get("PIP_CONSTRAINT"), "bootstrap_LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH")}
     require(not any(x.split(".")[0] in {"torch", "vllm", "sglang", "mooncake"} for x in sys.modules), "Cairo proof imported an engine")
@@ -282,6 +290,8 @@ if __name__ == "__main__":
         constraints()
     elif mode == "bootstrap":
         bootstrap()
+    elif mode == "bootstrap-proof":
+        bootstrap_proof()
     elif mode == "verify":
         verify(*rest)
     else:
