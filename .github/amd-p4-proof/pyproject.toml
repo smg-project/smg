@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smg-p4-runtime-proof"
+version = "0.0.1"
+requires-python = ">=3.11"
+
+[project.entry-points.pytest11]
+smg-p4-runtime-proof = "p4_proof.plugin"
+
+[tool.setuptools.packages.find]
+include = ["p4_proof*"]
+
+[tool.setuptools.package-data]
+p4_proof = ["cases.json"]
