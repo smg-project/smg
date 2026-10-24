@@ -1,9 +1,7 @@
-# Cap grpcio-tools at 1.81.x so the bundled protoc emits protobuf-6 gencode.
-# 1.82.x emits protobuf-7 gencode, which the protobuf 6.x runtime (pinned via
-# grpcio-health-checking/reflection in ci_install_e2e_deps.sh) refuses to load.
-# Drop the cap once the whole stack moves to protobuf 7.
+# Keep generated stubs compatible with the gRPC runtime in ROCm vLLM images.
+# Pin protoc so a build cannot silently raise the generated runtime floor.
 [build-system]
-requires = ["setuptools>=77.0", "grpcio-tools>=1.81.1,<1.82"]
+requires = ["setuptools>=77.0", "grpcio-tools==1.78.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -12,8 +10,8 @@ version = "0.4.27"
 description = "SMG gRPC proto definitions for vLLM, TRT-LLM, MLX, TokenSpeed, and SGLang"
 requires-python = ">=3.10"
 dependencies = [
-    "grpcio>=1.81.1",
-    "protobuf>=5.26.0",
+    "grpcio>=1.78.0",
+    "protobuf>=6.31.1",
 ]
 readme = "README.md"
 license = "Apache-2.0"
