@@ -497,6 +497,32 @@ class WarmupWire(Protocol):
     def close(self) -> Any: ...
 
 
+#: The finishes with which an engine ends a request it did not run to its
+#: end: refused at admission (a prompt past its input bound, a parameter its
+#: scheduler rejects) or cut short (a pause, a failure). Whatever the reason,
+#: and whether or not the wire carries it, nothing of the step's shape is
+#: known to be warm: the pass counts such a request as failed.
+UNSERVED_FINISHES = frozenset({"abort", "error"})
+
+
+def unserved(finish_reason: str | None, output_tokens: int) -> str | None:
+    """Why a request that completed was not served, or ``None`` when it
+    was: the finish the engine ended it with, when that finish is one of
+    :data:`UNSERVED_FINISHES`, and how many tokens came before it (none for
+    a refusal at admission). A wire raises these words from ``generate`` so
+    the pass records the request as failed, next to a raised status, and
+    the step as not covered. An empty or absent finish is not a refusal (a
+    completion a stand-in answers without one)."""
+    if (finish_reason or "") not in UNSERVED_FINISHES:
+        return None
+    produced = (
+        "before any token"
+        if output_tokens == 0
+        else f"after {output_tokens} token{'s' if output_tokens != 1 else ''}"
+    )
+    return f"the engine ended the request with finish_reason {finish_reason!r} {produced}"
+
+
 @dataclasses.dataclass
 class StepResult:
     step: WarmupStep

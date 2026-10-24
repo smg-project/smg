@@ -48,6 +48,7 @@ from smg_grpc_servicer.warmup import (
     parse_setting,
     plan_for,
     run_warmup_async,
+    unserved,
 )
 
 logger = logging.getLogger(__name__)
@@ -120,6 +121,11 @@ class GrpcWire:
             last = frame
         if last is None or not last.HasField("complete"):
             raise RuntimeError("the request ended without a complete frame")
+        if reason := unserved(last.complete.finish_reason, len(last.complete.output_ids)):
+            # The engine ended the request without serving it (an abort at
+            # admission arrives as a completion with no token): a failed
+            # request, not a covered step.
+            raise RuntimeError(reason)
 
     def flush_cache(self) -> bool:
         from smg_grpc_proto.generated import common_pb2
@@ -165,13 +171,21 @@ class EngineWire:
         )
 
         async def consume() -> None:
-            async for _ in self._engine.generate(
+            last = None
+            async for last in self._engine.generate(
                 TokensPrompt(prompt_token_ids=list(request.token_ids)),
                 params,
                 request.request_id,
                 **pinned,
             ):
                 pass
+            if last is None or not last.outputs:
+                raise RuntimeError("the request ended without an output")
+            output = last.outputs[0]
+            if reason := unserved(output.finish_reason, len(output.token_ids)):
+                # The engine ended the request without serving it: a failed
+                # request, not a covered step.
+                raise RuntimeError(reason)
 
         await asyncio.wait_for(consume(), timeout)
 
