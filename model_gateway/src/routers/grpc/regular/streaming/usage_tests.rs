@@ -1268,9 +1268,16 @@ async fn a_watched_stream_whose_client_leaves_with_held_text_ends_its_read_at_th
                     .await
             }
         };
+        // The delta's own payload, not a character the frame envelope carries
+        // too: a Messages content block opens with `"type":"text"`.
+        let delta = if messages {
+            r#""text":"x""#
+        } else {
+            r#""content":"x""#
+        };
         let client = async {
             let mut text = String::new();
-            while !text.contains('x') {
+            while !text.contains(delta) {
                 let frame = rx.recv().await.expect("the first delta reaches the client");
                 text.push_str(std::str::from_utf8(&frame.expect("an SSE write")).expect("UTF-8"));
             }
@@ -1324,7 +1331,9 @@ async fn a_watched_completion_stream_whose_client_leaves_with_held_text_ends_at_
     );
     let client = async {
         let mut text = String::new();
-        while !text.contains('x') {
+        // The delta's own payload: every completion frame's envelope carries
+        // an `x` (`"object":"text_completion"`, the `"text"` key).
+        while !text.contains(r#""text":"x""#) {
             let frame = rx.recv().await.expect("the first delta reaches the client");
             text.push_str(std::str::from_utf8(&frame.expect("an SSE write")).expect("UTF-8"));
         }
