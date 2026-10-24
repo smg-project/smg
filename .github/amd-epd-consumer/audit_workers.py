@@ -6,9 +6,11 @@ from collections import defaultdict
 from pathlib import Path
 
 from artifact_io import require
+from position_overlay import HELPER, expected_engine
 
 
 def verify(directory):
+    position = expected_engine()
     groups = defaultdict(lambda: {"processes": [], "modules": set()})
     for path in sorted((directory / "workers").glob("*.jsonl")):
         with path.open("rb") as stream:
@@ -18,6 +20,11 @@ def verify(directory):
         process = [row for row in rows if row["kind"] == "process"]
         require(len(process) == 1, "worker process evidence missing/duplicated")
         identity = process[0]
+        for row in rows:
+            if row["kind"] == "import" and row["module"] in position:
+                expected = position[row["module"]]
+                require(row["path"] == expected["path"] and row["sha256"] == expected["sha256"],
+                        "actual position overlay import differs")
         require(identity["pid"] == int(path.stem), "worker evidence PID differs")
         require(identity["job_marker"] == os.environ["E2E_JOB_MARKER"], "worker marker differs")
         require(identity["model_id"] == "Qwen/Qwen3.5-9B", "worker model differs")
@@ -50,6 +57,10 @@ def verify(directory):
                 "smg_grpc_proto.generated.sglang_scheduler_pb2",
             }
         )
+        if position and role != "encode":
+            required |= {HELPER, "sglang.srt.disaggregation." + role}
+            if role == "prefill":
+                required.add("sglang.srt.disaggregation.encoder.receiver")
         require(
             required <= group["modules"],
             "worker actual imports missing: " + repr(required - group["modules"]),
@@ -64,6 +75,7 @@ def verify(directory):
         "launcher_counts": dict(counts),
         "group_count": len(groups),
         "proof": "actual imported module origins/hash checked inside worker processes",
+        "position_events": "per-RID WARNING records still require separate actual audit",
         "not_proven": [
             "buffer ACK/physical KV release",
             "HBM release",

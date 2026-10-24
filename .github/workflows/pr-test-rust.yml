@@ -98,7 +98,7 @@ jobs:
       extra_models: "Qwen/Qwen3.5-9B"
       gpu_vendor: amd
       container_image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
-      container_options: --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN --env SPT_NOENV=1 --env E2E_AMD_SGLANG_EPD_EQUIVALENT=1
+      container_options: --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN --env SPT_NOENV=1 --env E2E_AMD_SGLANG_EPD_EQUIVALENT=1 --env SMG_EPD_POSITION_DIAGNOSTIC=1
     secrets: inherit
   finish:
     if: always()

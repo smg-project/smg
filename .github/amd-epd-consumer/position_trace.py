@@ -80,7 +80,10 @@ def emit(stage, role, req, module, filename, *, embedding=None, scheduler=None, 
             room = getattr(req, "bootstrap_room", None)
             if stage != "receiver_before" and stage != "receiver_after" and not (type(room) is int and room > 0):
                 return  # Do not exhaust the bounded request sample on startup warmups.
-            if rid not in REQUESTS and len(REQUESTS) >= 8 or REQUESTS.get(rid, 0) >= 8:
+            events = REQUESTS.get(rid, set())
+            if stage in events:
+                return  # Repeated allocation polling must not hide the later commit.
+            if (rid not in REQUESTS and len(REQUESTS) >= 8) or len(events) >= 8:
                 raise ValueError("position diagnostic request/event cap")
             if role not in {"prefill", "decode"}:
                 raise ValueError("position diagnostic role")
@@ -89,7 +92,7 @@ def emit(stage, role, req, module, filename, *, embedding=None, scheduler=None, 
             row = {"kind": "smg_epd_position_v1", "stage": stage, "role": role, "pid": pid,
                    "rid": rid if re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", rid) else "sha256:" + hashlib.sha256(rid.encode()).hexdigest(),
                    "wall_time_ns": time.time_ns(), "monotonic_ns": time.monotonic_ns(),
-                   "origin": origin(module, filename), "event": REQUESTS.get(rid, 0) + 1,
+                   "origin": origin(module, filename), "event": len(events) + 1,
                    "input_ids": ids(getattr(req, "input_ids", None)),
                    "origin_ids": ids(getattr(req, "origin_input_ids", None)),
                    "unpadded_ids": ids(getattr(req, "origin_input_ids_unpadded", None)),
@@ -104,7 +107,7 @@ def emit(stage, role, req, module, filename, *, embedding=None, scheduler=None, 
             size = len(text.encode())
             if size > 4096 or USED + size > 256 * 1024 - 512:
                 raise ValueError("position diagnostic byte cap")
-            REQUESTS[rid] = row["event"]
+            REQUESTS[rid] = events | {stage}
             USED += size
             LOGGER.warning("%s", text)
     except Exception:

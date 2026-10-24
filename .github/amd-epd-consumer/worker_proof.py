@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from artifact_io import require
+from position_overlay import apply, expected_engine
 from rpc_environment import verify
 
 
@@ -20,6 +21,8 @@ def observe(directory, expected, role, model, launch):
             "b071f28e2c204505a4e5efa207c9886a32b157e6329899f1ffdc50bd6816d8c3"
         )
     }
+    position = expected_engine()
+    engine.update({name: value["sha256"] for name, value in position.items()})
     prefix = ("smg_grpc_proto", "smg_grpc_servicer")
     output = directory / "workers"
     output.mkdir(exist_ok=True)
@@ -63,6 +66,8 @@ def observe(directory, expected, role, model, launch):
             if getattr(getattr(module, "__spec__", None), "_initializing", False):
                 continue
             source = Path(module.__file__).resolve()
+            if name in position:
+                require(str(source) == position[name]["path"], "position module path differs")
             raw = source.read_bytes()
             expected_hash = engine.get(name) or expected.get(str(source), {}).get("sha256")
             require(
@@ -89,7 +94,9 @@ def observe(directory, expected, role, model, launch):
     def checked_import(name, *args, **kwargs):
         result = original(name, *args, **kwargs)
         package = ((args[0] or {}).get("__package__") or "") if args else ""
-        if name.startswith(prefix) or package.startswith(prefix) or name in engine:
+        if (name.startswith(prefix) or package.startswith(prefix) or name in engine
+                or position and (name.startswith("sglang.srt.disaggregation")
+                                 or package.startswith("sglang.srt.disaggregation"))):
             capture()
         return result
 
@@ -103,6 +110,8 @@ def main():
     require(role in {"encode", "prefill", "decode"}, "unsupported EPD worker role")
     require(model == "Qwen/Qwen3.5-9B", "original EPD model changed")
     require(launch[:2] == ["-m", "sglang.launch_server"], "original SGLang module changed")
+    os.environ["SMG_EPD_POSITION_MODEL"] = model
+    apply(directory)
     report = verify(directory, Path("epd-rpc-wheels"), f"worker-{os.getpid()}")
     expected = {
         p: value for package in report["packages"].values() for p, value in package["files"].items()
