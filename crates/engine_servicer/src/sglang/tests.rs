@@ -1376,7 +1376,7 @@ async fn prompt_logprobs_and_reasoning_tokens_pass_through() {
 
 /// Hidden states ride the appended slim column as the rows each tick adds:
 /// each chunk carries them flattened (the prefill block on the first, a decode
-/// step's row on each later one); the `Complete` one entry per position a
+/// step's rows on each later one); the `Complete` one entry per position a
 /// forward ran on (the prompt positions the prefill computed, then each
 /// generated token fed back; the last sampled token has none), the final
 /// layer, the positions absolute (a prefix the radix cache served has no

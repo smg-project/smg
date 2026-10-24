@@ -188,7 +188,7 @@ class GrpcReqState:
     # scheduler has shipped them (it ships the cumulative list each step).
     output_hidden_states: list[list[float]] = dataclasses.field(default_factory=list)
     # The elements of the scheduler's cumulative hidden-state list this request
-    # has consumed (the prefill block is one; each decode step adds one).
+    # has consumed (the prefill block is one; a decode step adds one or more).
     hidden_elements_consumed: int = 0
 
     # Session state

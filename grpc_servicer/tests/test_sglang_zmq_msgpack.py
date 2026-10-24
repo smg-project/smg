@@ -658,7 +658,8 @@ def test_slim_output_carries_hidden_states_as_rows_per_position():
     """A request that asked for hidden states gets the rows its output ADDED,
     one per position a forward ran on: the engine keeps the list cumulative
     (the prefill's block as one element, a row per prompt position computed,
-    then a row per decode step), the relay remembers what it sent per request
+    then a decode step's rows), the relay remembers the elements it consumed
+    per request
     and the slim wire carries the rest, flattened into rows, so the Rust
     decoder reads the step's rows. A request that asked for none rides as
     None; a finished request is forgotten; an older sender without the column

@@ -54,7 +54,7 @@ pub struct SglangGenerateStream {
     /// The final hidden layer's vectors the scheduler reported for this
     /// choice, when the request asked for them: the rows accumulated from
     /// what each tick added (the plugin sends only the new rows: the prompt
-    /// positions the prefill computed, then one per decode step), and how
+    /// positions the prefill computed, then a decode step's rows), and how
     /// many of them the chunks before the current tick carried. The
     /// vLLM-proto intermediate has no slot for them either: the chunk carries
     /// the tick's rows, the completion the whole list with absolute positions.
@@ -321,7 +321,7 @@ impl MappedGenerateStream for SglangGenerateStream {
         state.output_ids.extend(output.output_ids.iter().copied());
         self.reasoning_tokens = output.reasoning_tokens;
         // The plugin sends the rows the tick added (the prompt positions the
-        // prefill computed, then one per decode step): the chunk carries
+        // prefill computed, then a decode step's rows): the chunk carries
         // them, the completion the whole list.
         self.hidden_states_sent = self.hidden_states.len();
         self.hidden_states.extend(output.output_hidden_states);

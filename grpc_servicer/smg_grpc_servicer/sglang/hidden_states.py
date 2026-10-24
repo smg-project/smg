@@ -63,7 +63,8 @@ def new_hidden_rows(value: Any, consumed: int) -> tuple[list[list[float]], int]:
     The engine keeps a request's hidden states cumulative and appends one
     element per forward: the prefill's block (a list of rows, one per prompt
     position the forward computed: a prefix the radix cache served has none),
-    then one row per decode step, the generated token it fed back
+    then a decode step's rows, one per token it fed back (several at once
+    under speculative decoding)
     (``batch_result_processor._append_prefill_hidden_states`` /
     ``_append_decode_hidden_states``): the last sampled token is never fed
     back, so a request has (prompt - cached prefix) + generated - 1 rows. A

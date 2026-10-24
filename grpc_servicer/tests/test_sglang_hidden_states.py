@@ -211,7 +211,7 @@ def test_rows_flatten_the_engines_raw_shape():
     ]
     assert hidden_state_rows(FIRST_ROW) == [FIRST_ROW]  # the engine's "last" mode: one row
     # The rows past the elements already consumed (the block is one element,
-    # each decode step adds one), and the count to remember for the next step.
+    # a decode step adds one or more), and the count to remember for the next step.
     assert new_hidden_rows([PREFILL_BLOCK, FIRST_ROW], 0) == ([*PREFILL_BLOCK, FIRST_ROW], 2)
     assert new_hidden_rows([PREFILL_BLOCK, FIRST_ROW], 1) == ([FIRST_ROW], 2)
     assert new_hidden_rows([PREFILL_BLOCK, FIRST_ROW], 2) == ([], 2)

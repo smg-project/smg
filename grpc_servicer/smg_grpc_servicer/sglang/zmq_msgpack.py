@@ -314,10 +314,11 @@ class HiddenStateRows:
     """The hidden-state rows each output adds per request, for the wire.
 
     The engine keeps a request's rows cumulative (``req.hidden_states``: the
-    prefill's block, then one row per decode step), so relaying the list as
+    prefill's block, then a decode step's rows), so relaying the list as
     it stands would re-encode and re-send the prompt's block on every decode
     step. This side remembers how many of the list's elements it consumed per
-    rid (the prefill block is one, each decode step adds one) and reshapes
+    rid (the prefill block is one element, a decode step adds one or more:
+    several under speculative decoding) and reshapes
     only the rest, O(new rows) per step; a finished or aborted request is
     forgotten.
     """
@@ -654,8 +655,8 @@ class MsgpackSendSocket:
         # The traces of the requests in flight (started by the receiver from
         # the caller's context, ended here on the terminal output).
         self.traces = RequestTraces()
-        # The hidden-state rows already sent per request (the engine keeps
-        # them cumulative; the wire carries each output's new rows).
+        # The elements of each request's cumulative hidden-state list already
+        # consumed (the wire carries each output's new rows).
         self.hidden_rows = HiddenStateRows()
 
     def attach(

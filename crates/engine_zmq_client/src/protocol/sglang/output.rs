@@ -285,7 +285,7 @@ pub struct SglangOutput {
     /// by the connector and leaving their requests waiting indefinitely.
     pub selected_logprobs_error: Option<String>,
     /// The final hidden layer's vectors this step added (the prompt positions
-    /// the prefill computed first, then one per decode step), when the
+    /// the prefill computed first, then a decode step's rows), when the
     /// request asked for them; empty otherwise. The plugin sends each step's
     /// new rows; the adapter accumulates them.
     pub output_hidden_states: Vec<Vec<f32>>,

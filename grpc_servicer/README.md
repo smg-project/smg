@@ -1075,7 +1075,7 @@ Hidden states (`return_hidden_states`) answer as on the Python servicer: the
 final hidden layer's vector per position a forward ran on (the prompt positions
 the prefill computed, then each generated token fed back: (prompt - cached
 prefix) + generated - 1 rows, with absolute positions anchored from the
-engine's counters), the prefill block on the first chunk, a decode step's row
+engine's counters), the prefill block on the first chunk, a decode step's rows
 on each later one and the whole list on the completion, within the scheduler's
 `--return-hidden-states-mode` cap, which both servicers keep ahead of the
 scheduler with the engine's own words. What the wire does not carry is
