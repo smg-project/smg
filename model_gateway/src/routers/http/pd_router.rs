@@ -78,9 +78,9 @@ use crate::{
         PD_PREFILL_QUEUE_TIMEOUT,
     },
     worker::{
-        acquire_prefill, PdPairIndex, PdWire, PrefillAcquireError, PrefillAdmission,
-        PrefillAdmissionRejection, PrefillLoadGuard, PrefillSelectionContext, RoutingPool,
-        RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
+        acquire_prefill, endpoint::Endpoint, PdPairIndex, PdWire, PrefillAcquireError,
+        PrefillAdmission, PrefillAdmissionRejection, PrefillLoadGuard, PrefillSelectionContext,
+        RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
 };
 
@@ -1171,7 +1171,11 @@ impl PDRouter {
         what: &str,
         e: &reqwest::Error,
     ) -> Response {
-        error!("PD {what} timed out: {e}");
+        error!(
+            worker = Endpoint::redacted_str(worker.url()),
+            "PD {what} timed out: {}",
+            cause(e)
+        );
         Self::record_sequential_side(worker, role, StatusCode::GATEWAY_TIMEOUT);
         request_timeout_response(format!("{what} timed out: {}", cause(e)))
     }
@@ -1194,9 +1198,10 @@ impl PDRouter {
             return Self::side_timed_out(worker, side.name(), what, e);
         }
         error!(
-            worker = worker.url(),
+            worker = Endpoint::redacted_str(worker.url()),
             worker_type = side.name(),
-            "PD {what} failed below HTTP: {e}"
+            "PD {what} failed below HTTP: {}",
+            cause(e)
         );
         Self::record_sequential_side(worker, side.name(), StatusCode::BAD_GATEWAY);
         side.answer(phase, StatusCode::BAD_GATEWAY, cause(e))
@@ -2707,7 +2712,27 @@ impl RouterTrait for PDRouter {
         Metrics::record_worker_request(worker.url(), worker.model_id());
         let res = match send_with_stale_conn_retry(request).await {
             Ok(res) => res,
+            Err(e) if is_request_timeout(&e) => {
+                // The request's own timeout is a 504, as on every other
+                // path, and the worker records it as such.
+                error!(
+                    worker = Endpoint::redacted_str(worker.url()),
+                    endpoint = "/v1/messages/count_tokens",
+                    "PD count-tokens request timed out: {}",
+                    cause(&e)
+                );
+                worker.record_outcome(StatusCode::GATEWAY_TIMEOUT.as_u16());
+                return request_timeout_response(format!("count-tokens timed out: {}", cause(&e)));
+            }
             Err(e) => {
+                // The worker's address belongs in the log, not in the
+                // client's answer: it names the endpoint an operator reads.
+                error!(
+                    worker = Endpoint::redacted_str(worker.url()),
+                    endpoint = "/v1/messages/count_tokens",
+                    "PD count-tokens request failed below HTTP: {}",
+                    cause(&e)
+                );
                 worker.record_outcome(StatusCode::BAD_GATEWAY.as_u16());
                 return error::bad_gateway(
                     "prefill_count_tokens_failed",
@@ -2727,7 +2752,23 @@ impl RouterTrait for PDRouter {
                 *response.headers_mut() = response_headers;
                 response
             }
+            Err(e) if is_request_timeout(&e) => {
+                error!(
+                    worker = Endpoint::redacted_str(worker.url()),
+                    endpoint = "/v1/messages/count_tokens",
+                    "PD count-tokens response timed out: {}",
+                    cause(&e)
+                );
+                worker.record_outcome(StatusCode::GATEWAY_TIMEOUT.as_u16());
+                request_timeout_response(format!("count-tokens timed out: {}", cause(&e)))
+            }
             Err(e) => {
+                error!(
+                    worker = Endpoint::redacted_str(worker.url()),
+                    endpoint = "/v1/messages/count_tokens",
+                    "PD count-tokens response body could not be read: {}",
+                    cause(&e)
+                );
                 worker.record_outcome(StatusCode::BAD_GATEWAY.as_u16());
                 error::bad_gateway(
                     "prefill_count_tokens_failed",
@@ -3753,6 +3794,81 @@ mod tests {
             );
             assert_eq!(worker.load(), 0);
             assert_eq!(worker.circuit_breaker_can_execute(), !truncated);
+        }
+    }
+
+    /// The request's own timeout on the count-tokens route is a 504, as on
+    /// every other path, whether the worker holds back the head or the body:
+    /// the route answers the timeout, not a 502.
+    #[tokio::test]
+    async fn messages_count_tokens_answers_the_requests_own_timeout_as_504() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        for head_sent in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = Arc::new(
+                crate::clients::http_client_builder()
+                    .timeout(std::time::Duration::from_millis(100))
+                    .build()
+                    .unwrap(),
+            );
+            // One recorded failure opens the breaker: a timeout the route
+            // did not record against the worker leaves it closed.
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(format!("http://{}", listener.local_addr().unwrap()))
+                    .worker_type(WorkerType::Prefill)
+                    .http_client(client)
+                    .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                        failure_threshold: 1,
+                        ..Default::default()
+                    })
+                    .build(),
+            );
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            let router = create_test_pd_router();
+            router.worker_registry.register_or_replace(worker.clone());
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+            let body = serde_json::from_value(json!({"model": "m", "messages": []})).unwrap();
+            let (release_tx, release_rx) = oneshot::channel::<()>();
+            let server = async {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                socket.read_line(&mut line).await.unwrap();
+                if head_sent {
+                    // The head arrives whole; the body stops after one byte.
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{")
+                        .await
+                        .unwrap();
+                }
+                // The worker holds the rest until the route has answered.
+                let _ = release_rx.await;
+            };
+            let (response, ()) = tokio::time::timeout(ROUND_TRIP_GUARD, async {
+                tokio::join!(
+                    async {
+                        let response = router
+                            .route_messages_count_tokens(None, &tenant, body, UNKNOWN_MODEL_ID)
+                            .await;
+                        let _ = release_tx.send(());
+                        response
+                    },
+                    server,
+                )
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::GATEWAY_TIMEOUT,
+                "head sent: {head_sent}"
+            );
+            assert_eq!(worker.load(), 0);
+            assert!(
+                !worker.circuit_breaker_can_execute(),
+                "head sent: {head_sent}: the timeout was not recorded against the worker"
+            );
         }
     }
 

@@ -309,25 +309,49 @@ impl Endpoint {
         }
     }
 
-    /// A form safe to log: the secret half of any userinfo is masked.
+    /// A form safe to log: the secret half of any userinfo is masked, and the
+    /// address ends at its path (a query or fragment is no part of the
+    /// address and may carry a token).
     ///
     /// The username is kept, because it distinguishes two registrations at one
     /// address and is what makes a log line useful.
     pub fn redacted(&self) -> String {
-        let Some(userinfo) = self.userinfo.as_deref() else {
-            return self.render();
+        let address = Endpoint {
+            path: self
+                .path
+                .as_deref()
+                .map(|path| path.split(['?', '#']).next().unwrap_or_default())
+                .filter(|path| !path.is_empty() && *path != "/")
+                .map(str::to_string),
+            ..self.clone()
+        };
+        let Some(userinfo) = address.userinfo.as_deref() else {
+            return address.render();
         };
         let masked = match userinfo.split_once(':') {
             Some((user, _)) => format!("{user}:***"),
             None => userinfo.to_string(),
         };
-        let exact = self.render();
+        let exact = address.render();
         let Some((prefix, rest)) = exact.split_once(&format!("{userinfo}@")) else {
             // Unreachable while `render` emits the userinfo it was built from;
             // masking everything is the safe answer if that ever changes.
             return exact.replace(userinfo, "***");
         };
         format!("{prefix}{masked}@{rest}")
+    }
+
+    /// `redacted` for an address string, as a log line writes a worker's
+    /// address: parsed with the workflow's `@rank` suffix a DP-aware worker's
+    /// address carries and masked, the rank written back after the masked
+    /// address; one the parser refuses (no registered address is) is written
+    /// as a marker, never raw.
+    pub fn redacted_str(input: &str) -> String {
+        match Self::parse_with_rank(input) {
+            Ok((endpoint, Some(rank))) => format!("{}@{rank}", endpoint.redacted()),
+            Ok((endpoint, None)) => endpoint.redacted(),
+            Err(_) => "<unparsable address>".to_string(),
+        }
     }
 
     /// Render this endpoint with the workflow's rank suffix.
@@ -809,5 +833,43 @@ mod tests {
         unique.sort();
         unique.dedup();
         assert_eq!(unique.len(), keys.len(), "keys collided: {keys:?}");
+    }
+
+    /// A log line writes a worker's address through `redacted_str`: the
+    /// secret half of any userinfo masked, a plain address as it is, a
+    /// DP-aware worker's ranked address masked with its rank kept, a query or
+    /// fragment cut, and an address the parser refuses as a marker rather than
+    /// raw.
+    #[test]
+    fn redacted_str_masks_the_secret_and_never_writes_an_address_raw() {
+        let masked = Endpoint::redacted_str("http://user:secret@worker:3000");
+        assert!(!masked.contains("secret"), "{masked}");
+        assert!(masked.contains("user:***@"), "{masked}");
+        assert_eq!(
+            Endpoint::redacted_str("grpc://worker:30000"),
+            Endpoint::parse("grpc://worker:30000").unwrap().render()
+        );
+        // A DP-aware worker's address carries its rank: masked, the rank kept.
+        assert_eq!(
+            Endpoint::redacted_str("http://u:s@w:3000@2"),
+            "http://u:***@w:3000@2"
+        );
+        // A query or a fragment carries no address and may carry a token: cut.
+        assert_eq!(
+            Endpoint::redacted_str("http://u:s@w:3000/v1?token=secret"),
+            "http://u:***@w:3000/v1"
+        );
+        assert_eq!(
+            Endpoint::redacted_str("http://w:3000/v1#frag"),
+            "http://w:3000/v1"
+        );
+        assert_eq!(
+            Endpoint::redacted_str("http://w:3000/?x=1"),
+            "http://w:3000"
+        );
+        assert_eq!(
+            Endpoint::redacted_str("not an address"),
+            "<unparsable address>"
+        );
     }
 }
