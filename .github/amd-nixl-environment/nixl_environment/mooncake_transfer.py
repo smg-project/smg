@@ -23,10 +23,10 @@ def verify(recipe, events, directory):
                 "transfer fixture connector",
             )
             roles.add(identity["role"])
-            sources[identity["log"]] = "worker"
+            sources[str(Path(identity["log"]).resolve())] = "worker"
         elif event["kind"] == "gateway":
             for path in event["log_sources"]:
-                sources[path] = "gateway"
+                sources[str(Path(path).resolve())] = "gateway"
     require(roles == {"prefill", "decode"}, "Mooncake fixture lacks both owned roles")
     offsets, streams = {}, {}
     for event in events:
@@ -36,7 +36,8 @@ def verify(recipe, events, directory):
         require(Path(name).name == name, "unsafe log artifact")
         start = offsets.get(name, 0)
         offsets[name] = start + event["bytes"]
-        if event["nodeid"] not in cases or event["source"] not in sources:
+        source = str(Path(event["source"]).resolve())
+        if event["nodeid"] not in cases or source not in sources:
             continue
         require(0 < event["bytes"] <= 16 * 1024**2, "transfer log increment cap")
         with (directory / name).open("rb") as stream:
@@ -46,7 +47,7 @@ def verify(recipe, events, directory):
             len(raw) == event["bytes"] and hashlib.sha256(raw).hexdigest() == event["sha256"],
             "transfer log increment differs",
         )
-        data = streams.setdefault(event["source"], bytearray())
+        data = streams.setdefault(source, bytearray())
         data.extend(raw)
         require(len(data) <= 32 * 1024**2, "Mooncake fixture log cap")
     router = b"\n".join(bytes(v) for path, v in streams.items() if sources[path] == "gateway")
