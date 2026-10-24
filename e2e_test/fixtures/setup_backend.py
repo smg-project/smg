@@ -820,6 +820,12 @@ def _setup_epd(
             worker_type=WorkerType.PREFILL,
             log_dir=log_dir,
             gpu_offset=n_encode,
+            extra_engine_args=(
+                ["--language-only", "--encoder-transfer-backend", "zmq_to_scheduler"]
+                if engine == "sglang"
+                else None
+            ),
+            extra_env=({"SGLANG_ENCODER_MM_RECEIVER_MODE": "grpc"} if engine == "sglang" else None),
         )
         all_workers.extend(prefill_workers)
 
@@ -831,6 +837,7 @@ def _setup_epd(
             worker_type=WorkerType.DECODE,
             log_dir=log_dir,
             gpu_offset=n_encode + n_prefill * tp,
+            extra_engine_args=["--language-only"] if engine == "sglang" else None,
         )
         all_workers.extend(decode_workers)
 
