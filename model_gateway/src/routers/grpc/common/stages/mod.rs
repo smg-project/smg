@@ -61,6 +61,7 @@ pub(crate) mod helpers;
 pub(crate) mod pd_protocol;
 mod rate_limit;
 mod request_execution;
+pub(crate) mod sglang_encode;
 mod worker_selection;
 
 // Export stage implementations

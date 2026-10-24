@@ -207,6 +207,7 @@ pub(crate) struct MultimodalOutput {
 /// variant once the target backend is known (after worker selection).
 #[derive(Debug)]
 pub(crate) struct MultimodalIntermediate {
+    pub(crate) sglang_encoder_media: Option<MediaPlan>,
     /// Independently preprocessed modality batches sharing one expanded prompt.
     /// A single-modality request is represented by a one-element vector.
     batches: Vec<PrecomputedMultimodalIntermediate>,
@@ -234,6 +235,7 @@ impl MultimodalIntermediate {
             );
         }
         Ok(Self {
+            sglang_encoder_media: None,
             batches,
             encoder_input_format: EncoderInputFormat::Reference,
         })

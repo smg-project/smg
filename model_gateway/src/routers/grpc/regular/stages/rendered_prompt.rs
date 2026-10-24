@@ -20,7 +20,7 @@ use crate::{
             utils::{self, MediaContext},
         },
     },
-    worker::RoutingPool,
+    worker::{RoutingPool, RuntimeType},
 };
 
 /// A rendered prompt as the stages hand it on: the token ids, expanded for
@@ -111,6 +111,15 @@ pub(crate) async fn prepare_rendered_prompt(
                 multimodal::media_refs_pipeline_pin(&media_plan, &placeholders);
             multimodal_refs = Some(media_plan);
         } else {
+            let encoder_media = (wire_pools.contains(&RoutingPool::GrpcEncode)
+                && ctx
+                    .components
+                    .worker_registry
+                    .get_routing_snapshot(model_id)
+                    .pool(RoutingPool::GrpcEncode)
+                    .iter()
+                    .any(|worker| worker.metadata().spec.runtime_type == RuntimeType::Sglang))
+            .then(|| media_plan.clone());
             // The dtype every worker the selection can pick reads image
             // pixels in, when they agree (and the one-pass write is not
             // switched off, `SMG_MM_ONE_PASS_WIRE=0`): the preprocessor
@@ -155,7 +164,9 @@ pub(crate) async fn prepare_rendered_prompt(
                         "Multimodal processing complete"
                     );
                     token_ids = output.expanded_token_ids;
-                    multimodal_intermediate = Some(output.intermediate);
+                    let mut intermediate = output.intermediate;
+                    intermediate.sglang_encoder_media = encoder_media;
+                    multimodal_intermediate = Some(intermediate);
                 }
                 Err(e) => {
                     error!(
