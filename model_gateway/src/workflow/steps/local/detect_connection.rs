@@ -13,10 +13,10 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use crate::{
     app_context::AppContext,
-    worker::ConnectionMode,
+    worker::{ConnectionMode, RuntimeType, WorkerType},
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
-        steps::util::{try_grpc_reachable, try_http_reachable},
+        steps::util::{try_grpc_reachable, try_http_reachable, try_sglang_encoder_reachable},
     },
 };
 
@@ -145,6 +145,12 @@ impl StepExecutor<WorkerWorkflowData> for DetectConnectionModeStep {
                         }
                         Err(err) => Err(err),
                     }
+                }
+                ConnectionMode::Grpc
+                    if config.runtime_type == RuntimeType::Sglang
+                        && config.worker_type == WorkerType::Encode =>
+                {
+                    try_sglang_encoder_reachable(&url, timeout).await
                 }
                 ConnectionMode::Grpc => try_grpc_reachable(&url, timeout).await,
                 // SMG binds the ZMQ sockets and the engine dials in, so there is
