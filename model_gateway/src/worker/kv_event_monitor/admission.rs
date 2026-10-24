@@ -112,7 +112,11 @@ impl KvEventMonitor {
         let clears = batch.events.iter().any(|event| {
             matches!(&event.data, Some(kv_cache_event::Data::Cleared(cleared)) if cleared.ownership.is_none())
         });
-        let admission = state.ranks.entry(rank).or_default().admit(seq, clears);
+        let cursor = state.ranks.entry(rank).or_default();
+        // Read before `admit` can drop a pending replay: a restart the gateway
+        // notices here loses the replay's batches as a refused resume does.
+        let pending = cursor.pending_gap();
+        let admission = cursor.admit(seq, clears);
         let mut degraded_changed = false;
         match admission {
             Admission::Apply => {}
@@ -128,7 +132,12 @@ impl KvEventMonitor {
                     received = seq,
                     "KV event publisher restarted; clearing the worker's index state"
                 );
-                Self::clear_worker(worker_id, indexer, state, rank);
+                let dropped = Self::clear_worker(worker_id, indexer, state, rank);
+                // A replay that was pending went with the old publisher, on
+                // this rank or on another whose cursor the clear reset: its
+                // batches count as missed here, once, as they do when the
+                // relay reports the restart as `DATA_LOSS` (`reset_worker`).
+                Metrics::record_kv_event_missed_batches(worker_url, pending + dropped);
                 Metrics::record_kv_event_resync(
                     worker_url,
                     ResyncReason::PublisherRestart.as_str(),
@@ -136,7 +145,13 @@ impl KvEventMonitor {
                 degraded_changed = true;
             }
             Admission::Replay { expected } => {
-                Metrics::record_kv_event_gap(worker_url, "replay_requested", seq - expected);
+                // A sighting, not a loss: the replay may bring every batch of
+                // the gap, so nothing is counted missed at the request. The
+                // loss is counted once where it is known: on the unrecovered
+                // outcome, or where a pending replay is dropped (`reset_worker`
+                // when the resume is refused, `clear_worker` when a publisher
+                // starts over or a gap is cleared, on this rank or another).
+                Metrics::record_kv_event_gap(worker_url, "replay_requested", 0);
                 return BatchOutcome::Gap {
                     expected,
                     received: seq,
@@ -151,7 +166,11 @@ impl KvEventMonitor {
                     "KV event gap could not be replayed; continuing from the live stream"
                 );
                 if cleared {
-                    Self::clear_worker(worker_id, indexer, state, rank);
+                    // The other ranks' cursors start over with the index: a
+                    // replay pending on one of them counts as missed here,
+                    // beside this rank's own unrecovered gap below.
+                    let dropped = Self::clear_worker(worker_id, indexer, state, rank);
+                    Metrics::record_kv_event_missed_batches(worker_url, dropped);
                     Metrics::record_kv_event_resync(worker_url, ResyncReason::GapCleared.as_str());
                 }
                 Metrics::record_kv_event_gap(
@@ -296,14 +315,24 @@ impl KvEventMonitor {
     /// One rank's publisher lost its history (a restart, or an unreplayable
     /// gap too large to keep): the worker's pooled index state goes with it,
     /// and the other ranks' cursors start over so their next batch is taken
-    /// as a first one instead of clearing the index a second time.
-    fn clear_worker(worker_id: u32, indexer: &KvIndex, state: &mut WorkerStreamState, rank: i32) {
+    /// as a first one instead of clearing the index a second time. A replay
+    /// pending on one of those ranks goes with its cursor; the batches it was
+    /// asked for are returned for the caller to count as missed.
+    fn clear_worker(
+        worker_id: u32,
+        indexer: &KvIndex,
+        state: &mut WorkerStreamState,
+        rank: i32,
+    ) -> u64 {
         Self::apply_cleared(worker_id, indexer, &mut state.index);
+        let mut dropped = 0;
         for (other, cursor) in &mut state.ranks {
             if *other != rank {
+                dropped += cursor.pending_gap();
                 cursor.reset();
             }
         }
+        dropped
     }
 
     /// Publish the stores a batch placed without their parent and the
@@ -325,6 +354,8 @@ impl KvEventMonitor {
 
     /// The server declared its history gone: drop the worker's index state
     /// and every cursor, so the next stream is taken from wherever it starts.
+    /// A replay that was pending is lost with them: the batches it was asked
+    /// for count as missed, once, beside the resync.
     pub(super) fn reset_worker(
         indexer: &KvIndex,
         worker_id: u32,
@@ -333,10 +364,12 @@ impl KvEventMonitor {
         reason: ResyncReason,
     ) {
         Self::apply_cleared(worker_id, indexer, &mut state.index);
+        let pending: u64 = state.ranks.values().map(RankState::pending_gap).sum();
         for cursor in state.ranks.values_mut() {
             cursor.reset();
         }
         state.snapshot = None;
+        Metrics::record_kv_event_missed_batches(worker_url, pending);
         Metrics::record_kv_event_resync(worker_url, reason.as_str());
         Metrics::set_kv_event_degraded_ranks(worker_url, 0);
         Metrics::set_kv_index_blocks(worker_url, indexer.worker_block_count(worker_id));
@@ -811,6 +844,298 @@ mod tests {
                 received: 8
             }
         );
+    }
+
+    /// The value of one series of a local recorder: the line that starts
+    /// with `name{` and carries every label (the render's label order is
+    /// not part of the contract).
+    fn series_value(
+        handle: &metrics_exporter_prometheus::PrometheusHandle,
+        name: &str,
+        labels: &[&str],
+    ) -> Option<f64> {
+        handle
+            .render()
+            .lines()
+            .find(|line| {
+                line.starts_with(&format!("{name}{{"))
+                    && labels.iter().all(|label| line.contains(label))
+            })
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|value| value.parse().ok())
+    }
+
+    /// A gap the publisher replays in full loses no batch: the sighting is
+    /// counted under `outcome="replay_requested"` and
+    /// `smg_kv_event_missed_batches_total` stays at zero.
+    #[test]
+    fn a_replayed_gap_counts_no_missed_batches() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let worker = "worker=\"grpc://w1:9000\"";
+        let gaps = |outcome: &str| {
+            series_value(
+                &handle,
+                "smg_kv_event_gaps_total",
+                &[worker, &format!("outcome=\"{outcome}\"")],
+            )
+        };
+        let missed = || series_value(&handle, "smg_kv_event_missed_batches_total", &[worker]);
+        metrics::with_local_recorder(&recorder, || {
+            // The subscription start creates the worker's series at zero.
+            Metrics::init_kv_event_series("grpc://w1:9000");
+            let mut sim = Sim::new();
+            sim.deliver(&batch(1, None, vec![stored(None, &[1, 2])]));
+            sim.deliver(&batch(2, None, vec![stored(Some(2), &[3])]));
+            // Batch 3 is lost on the wire; 4 arrives: one replay is asked for.
+            let b3 = batch(3, None, vec![removed(&[3])]);
+            let b4 = batch(4, None, vec![stored(Some(2), &[7])]);
+            assert_eq!(
+                sim.feed(&b4),
+                BatchOutcome::Gap {
+                    expected: 3,
+                    received: 4
+                }
+            );
+            let at_request = missed();
+            // Resuming after 2, the server replays 3 and continues live.
+            assert_eq!(sim.deliver(&b3), BatchOutcome::Applied);
+            assert_eq!(sim.deliver(&b4), BatchOutcome::Applied);
+            assert_eq!(
+                sim.deliver(&batch(5, None, vec![stored(Some(7), &[8])])),
+                BatchOutcome::Applied
+            );
+            assert_eq!(gaps("replay_requested"), Some(1.0), "the sighting");
+            assert_eq!(gaps("unrecovered_kept"), Some(0.0));
+            assert_eq!(gaps("unrecovered_cleared"), Some(0.0));
+            assert_eq!(
+                [at_request, missed()],
+                [Some(0.0), Some(0.0)],
+                "missed batches at the request and after the replay"
+            );
+            sim.assert_matches_reference();
+        });
+    }
+
+    /// A gap the publisher cannot replay counts its lost batches once, on
+    /// the unrecovered outcome: neither the request before it nor a later
+    /// gap's request adds to `smg_kv_event_missed_batches_total`.
+    #[test]
+    fn an_unrecovered_gap_counts_its_missed_batches_once() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let worker = "worker=\"grpc://w1:9000\"";
+        let gaps = |outcome: &str| {
+            series_value(
+                &handle,
+                "smg_kv_event_gaps_total",
+                &[worker, &format!("outcome=\"{outcome}\"")],
+            )
+        };
+        let missed = || series_value(&handle, "smg_kv_event_missed_batches_total", &[worker]);
+        metrics::with_local_recorder(&recorder, || {
+            Metrics::init_kv_event_series("grpc://w1:9000");
+            let mut sim = Sim::new();
+            sim.deliver(&batch(1, None, vec![stored(None, &[1, 2])]));
+            sim.deliver(&batch(2, None, vec![stored(Some(2), &[3])]));
+            // Batches 3 and 4 are lost; the server has no history: after the
+            // replay request it streams 5 again.
+            let b5 = batch(5, None, vec![stored(Some(3), &[9])]);
+            assert_eq!(
+                sim.feed(&b5),
+                BatchOutcome::Gap {
+                    expected: 3,
+                    received: 5
+                }
+            );
+            let at_request = missed();
+            assert_eq!(sim.deliver(&b5), BatchOutcome::Applied);
+            let after_the_skip = missed();
+            assert_eq!(gaps("replay_requested"), Some(1.0));
+            assert_eq!(gaps("unrecovered_kept"), Some(1.0));
+            assert_eq!(gaps("unrecovered_cleared"), Some(0.0));
+            // A later gap is a sighting again: a fresh replay request, no loss yet.
+            assert_eq!(
+                sim.feed(&batch(7, None, vec![])),
+                BatchOutcome::Gap {
+                    expected: 6,
+                    received: 7
+                }
+            );
+            assert_eq!(gaps("replay_requested"), Some(2.0));
+            assert_eq!(
+                [at_request, after_the_skip, missed()],
+                [Some(0.0), Some(2.0), Some(2.0)],
+                "missed batches at the request, once the stream skipped ahead, after a later request"
+            );
+        });
+    }
+
+    /// A replay the server refuses (`OUT_OF_RANGE` on the resume, or
+    /// `DATA_LOSS` on the stream) never reaches an unrecovered outcome: the
+    /// subscriber drops the worker's state, and the batches the pending
+    /// replay was asked for count as missed there, once, beside the resync.
+    #[test]
+    fn a_refused_replay_counts_its_pending_gap_as_missed_once() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let worker = "worker=\"grpc://w1:9000\"";
+        let missed = || series_value(&handle, "smg_kv_event_missed_batches_total", &[worker]);
+        metrics::with_local_recorder(&recorder, || {
+            Metrics::init_kv_event_series("grpc://w1:9000");
+            let mut sim = Sim::new();
+            sim.deliver(&batch(1, None, vec![stored(None, &[1, 2])]));
+            sim.deliver(&batch(2, None, vec![stored(Some(2), &[3])]));
+            // Batches 3 to 5 are lost; 6 arrives and a replay from 3 is asked for.
+            assert_eq!(
+                sim.feed(&batch(6, None, vec![stored(Some(3), &[9])])),
+                BatchOutcome::Gap {
+                    expected: 3,
+                    received: 6
+                }
+            );
+            assert_eq!(missed(), Some(0.0), "nothing is known lost at the request");
+            // The server no longer holds 3 and refuses the resume: the
+            // subscriber drops the worker's state, the pending replay with it.
+            KvEventMonitor::reset_worker(
+                &sim.indexer,
+                sim.worker,
+                &mut sim.state,
+                "grpc://w1:9000",
+                ResyncReason::OutOfRange,
+            );
+            assert_eq!(sim.state.ranks[&0].replay_pending(), None);
+            assert_eq!(
+                series_value(
+                    &handle,
+                    "smg_kv_event_resyncs_total",
+                    &[worker, "reason=\"out_of_range\""]
+                ),
+                Some(1.0)
+            );
+            assert_eq!(
+                missed(),
+                Some(3.0),
+                "the three batches the refused replay would have brought, once"
+            );
+        });
+    }
+
+    /// A publisher restart the gateway notices itself (a sequence below the
+    /// cursor on a fresh connection) drops a pending replay as a refused
+    /// resume does: the batches it was asked for count as missed there, once,
+    /// beside the restart.
+    #[test]
+    fn a_restart_the_gateway_notices_counts_the_pending_gap_as_missed_once() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let worker = "worker=\"grpc://w1:9000\"";
+        let missed = || series_value(&handle, "smg_kv_event_missed_batches_total", &[worker]);
+        metrics::with_local_recorder(&recorder, || {
+            Metrics::init_kv_event_series("grpc://w1:9000");
+            let mut sim = Sim::new();
+            sim.deliver(&batch(1, None, vec![stored(None, &[1, 2])]));
+            sim.deliver(&batch(2, None, vec![stored(Some(2), &[3])]));
+            // Batches 3 to 5 are lost; 6 arrives and a replay from 3 is asked for.
+            assert_eq!(
+                sim.feed(&batch(6, None, vec![stored(Some(3), &[9])])),
+                BatchOutcome::Gap {
+                    expected: 3,
+                    received: 6
+                }
+            );
+            assert_eq!(missed(), Some(0.0), "nothing is known lost at the request");
+            // The worker came back before any replay: the stream reconnected
+            // and the new publisher counts from 1 with an empty cache.
+            sim.state.ranks.get_mut(&0).unwrap().reconnected();
+            let fresh = batch(1, None, vec![stored(None, &[7])]);
+            sim.reference_clear();
+            sim.reference_apply(&fresh);
+            assert_eq!(sim.feed(&fresh), BatchOutcome::Applied);
+            assert_eq!(sim.state.ranks[&0].replay_pending(), None);
+            assert_eq!(
+                series_value(
+                    &handle,
+                    "smg_kv_event_resyncs_total",
+                    &[worker, "reason=\"publisher_restart\""]
+                ),
+                Some(1.0)
+            );
+            assert_eq!(
+                missed(),
+                Some(3.0),
+                "the three batches the dropped replay would have brought, once"
+            );
+            sim.assert_matches_reference();
+        });
+    }
+
+    /// A restart one rank's stream shows (a sequence below its cursor on a
+    /// fresh connection) starts the other ranks' cursors over with the index;
+    /// a replay pending on one of them goes with its cursor, and the batches
+    /// it was asked for count as missed there, once, as the restarting rank's
+    /// own would.
+    #[test]
+    fn a_restart_another_rank_notices_counts_a_pending_gap_as_missed_once() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let worker = "worker=\"grpc://w1:9000\"";
+        let missed = || series_value(&handle, "smg_kv_event_missed_batches_total", &[worker]);
+        metrics::with_local_recorder(&recorder, || {
+            Metrics::init_kv_event_series("grpc://w1:9000");
+            let mut sim = Sim::new();
+            // Two publishers, each numbering from 1, interleaved on one stream.
+            sim.deliver(&batch(1, Some(0), vec![stored(None, &[1, 2])]));
+            sim.deliver(&batch(2, Some(0), vec![stored(Some(2), &[3])]));
+            sim.deliver(&batch(1, Some(1), vec![stored(None, &[101, 102])]));
+            sim.deliver(&batch(2, Some(1), vec![stored(Some(102), &[103])]));
+            // Rank 1's batches 3 to 5 are lost; 6 arrives and a replay from 3
+            // is asked for.
+            assert_eq!(
+                sim.feed(&batch(6, Some(1), vec![stored(Some(103), &[109])])),
+                BatchOutcome::Gap {
+                    expected: 3,
+                    received: 6
+                }
+            );
+            assert_eq!(missed(), Some(0.0), "nothing is known lost at the request");
+            // The engine came back before any replay: the stream reconnected
+            // and rank 0's new publisher counts from 1 with an empty cache.
+            sim.state.reconnected();
+            let fresh = batch(1, Some(0), vec![stored(None, &[7])]);
+            sim.reference_clear();
+            sim.reference_apply(&fresh);
+            assert_eq!(sim.feed(&fresh), BatchOutcome::Applied);
+            assert_eq!(
+                sim.state.ranks[&1].replay_pending(),
+                None,
+                "rank 1's cursor started over with the index"
+            );
+            assert_eq!(
+                series_value(
+                    &handle,
+                    "smg_kv_event_resyncs_total",
+                    &[worker, "reason=\"publisher_restart\""]
+                ),
+                Some(1.0)
+            );
+            assert_eq!(
+                missed(),
+                Some(3.0),
+                "the three batches rank 1's dropped replay would have brought, once"
+            );
+            sim.assert_matches_reference();
+        });
     }
 
     #[test]
