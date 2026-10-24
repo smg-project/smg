@@ -13,28 +13,7 @@ pub(crate) struct HarmonyMessage {
     pub content: String,
 }
 
-/// Some methods are kept for API completeness even if currently unused.
-#[expect(dead_code)]
 impl HarmonyMessage {
-    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
-        Self {
-            role: role.into(),
-            content: content.into(),
-        }
-    }
-
-    pub fn user(content: impl Into<String>) -> Self {
-        Self::new("user", content)
-    }
-
-    pub fn assistant(content: impl Into<String>) -> Self {
-        Self::new("assistant", content)
-    }
-
-    pub fn system(content: impl Into<String>) -> Self {
-        Self::new("system", content)
-    }
-
     /// Convert from openai_harmony::chat::Message to our simplified HarmonyMessage
     pub fn from_openai_harmony(msg: openai_harmony::chat::Message) -> Self {
         // Extract role as string
@@ -121,10 +100,6 @@ pub(crate) struct HarmonyChannelDelta {
 
     /// Delta for final text content
     pub final_delta: Option<String>,
-
-    /// Whether this is the final delta
-    #[expect(dead_code)]
-    pub is_final: bool,
 }
 
 /// Tool call delta for streaming

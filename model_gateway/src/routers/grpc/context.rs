@@ -1317,13 +1317,7 @@ impl RequestContext {
     }
 }
 
-/// Some methods are kept for API completeness even if currently unused.
-#[expect(dead_code)]
 impl WorkerSelection {
-    pub fn is_disaggregated(&self) -> bool {
-        matches!(self, Self::Disaggregated { .. })
-    }
-
     pub fn single(&self) -> Option<&Arc<dyn Worker>> {
         match self {
             Self::Single { worker } => Some(worker),
@@ -1409,6 +1403,9 @@ impl WorkerSelection {
         }
     }
 
+    /// The prefill and decode workers of a disaggregated selection, for the
+    /// tests that pin which side a dispatch addressed.
+    #[cfg(test)]
     #[expect(clippy::type_complexity)]
     pub fn disaggregated_pair(&self) -> Option<(&Arc<dyn Worker>, &Arc<dyn Worker>)> {
         match self {
@@ -1451,8 +1448,6 @@ impl WorkerSelection {
     }
 }
 
-/// Some methods are kept for API completeness even if currently unused.
-#[expect(dead_code)]
 impl ClientSelection {
     /// The client that builds the request: the single engine's, or the
     /// prefill's when disaggregated.
@@ -1516,20 +1511,6 @@ impl ClientSelection {
                 "Expected disaggregated clients but got single",
             )
         })
-    }
-
-    pub fn prefill_client(&self) -> Option<&BackendClient> {
-        match self {
-            Self::Disaggregated { prefill, .. } => Some(prefill),
-            Self::Single { .. } => None,
-        }
-    }
-
-    pub fn decode_client(&self) -> Option<&BackendClient> {
-        match self {
-            Self::Disaggregated { decode, .. } => Some(decode),
-            Self::Single { .. } => None,
-        }
     }
 }
 
