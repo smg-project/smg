@@ -454,6 +454,67 @@ legs on purpose; a production pair on one host wants a TTL of a few minutes,
 longer than any gap a busy pair leaves, shorter than the restart back-off a
 crashed leg would otherwise sit through.
 
+##### Prefill/decode over NIXL across hosts on TCP: the UCX segment size
+
+Legs on different hosts without an RDMA device move the KV over UCX's TCP
+transport, and the decode side's read of a remote block list is UCX's
+software-emulated GET: the data travels as active-message fragments of the
+TCP transport's send segment, 8 KiB by UCX's default, each one staged through
+host memory on both ends. For a hybrid checkpoint the per-request pull is
+large (the linear-attention state is moved whole; a 1,300-token prompt of a
+checkpoint with 34 linear-attention and 11 full-attention layers, TP 2 per
+leg, moves about 100 MB per rank), so the fragment count, not the link, sets
+the rate: the default moves about 2.2 Gbit/s per rank stream where a plain
+socket between the same pods moves 14 Gbit/s, pulls queue FIFO on the decode
+side, and one decode leg tops out near 2.7 requests/s with first tokens of
+30 s and more behind the queue. A 1 MiB segment on both legs removes most of
+the per-fragment cost and puts the stream at the single-socket rate, so the
+engine image ships it: `docker/ucx.conf`, copied to `/etc/ucx/ucx.conf` by
+the image build, holds
+
+```
+UCX_TCP_TX_SEG_SIZE=1m
+UCX_TCP_RX_SEG_SIZE=1m
+```
+
+(the receive segment must be at least the send segment; UCX refuses the
+pair otherwise). Measured on one prefill + one decode leg over TCP, text
+prompts of 1,000-1,500 tokens, 64-128 output tokens, open-loop arrivals,
+UCX 1.22 as bundled with NIXL 1.4:
+
+| offered | setting | completed req/s | first token p50 / p90 / p99 | per-rank pull, unqueued | pull wait p50 / p90 |
+|---|---|---|---|---|---|
+| 2 req/s | UCX's default (8 KiB) | 1.89 | 1.49 / 4.46 / 7.94 s | 0.36 s = 2.2 Gbit/s | 1.15 / 3.36 s |
+| 2 req/s | 1 MiB (the image's file) | 1.89 | 0.31 / 0.50 / 2.63 s | 0.073 s = 11 Gbit/s | 0.13 / 0.18 s |
+| 4 req/s | UCX's default (8 KiB) | 2.7 (the ceiling; 503 overload sheds) | 33.9 / 39.0 / 41.7 s | 0.37 s | 8.9 / 12.0 s |
+| 4 req/s | 1 MiB (the image's file) | 3.93 | 0.35 / 0.58 / 0.75 s | 0.074 s | 0.15 / 0.28 s |
+| ramp 1/2/4/8/12 req/s, 60 s each, image prompts, the router's default 3 s first-token bound | UCX's default (8 KiB) | 0.62 (181 first-token verdicts, 1,527 refusals from 4 req/s on) | - | 0.38 s | 1.13 / 3.82 s |
+| the same ramp | 1 MiB | 5.68 (steps served at 1.0 / 2.07 / 3.53 / 9.0 / 11.83; no verdict, no refusal) | 2.46 / 10.1 / 11.7 s over the whole ramp | 0.075 s | 0.76 / 2.10 s |
+
+Why a file and not an environment variable: UCX reads its settings in the
+process that creates the UCX context, that is the engine's tensor-parallel
+worker processes, and a deployment whose workers do not inherit the
+container's environment (the pair above was one: the workers saw a third of
+the container's variables, the `UCX_*` ones not among them) loses a pod-level
+`UCX_*` setting on the way. `/etc/ucx/ucx.conf` is the config directory
+compiled into the UCX that NIXL bundles, read by every process regardless of
+its environment or working directory. To override the shipped values, write
+the keys to a `ucx.conf` in the process's working directory
+(`/vllm-workspace` in the stock vLLM image) or in a directory named by
+`UCX_CONFIG_DIR`, or set the variables in the workers' environment: UCX reads
+the files in that order and the environment last, each layer overriding the
+one before, so the image's file is the lowest layer. `UCX_PROTO_INFO=y` in
+any of them prints UCX's protocol selection once per peer at the first
+transfer and is the quick check of what is in force. 256 KiB segments already
+give most of the gain and segments larger than 1 MiB buy nothing on one socket
+(the stream already sits at the socket's rate). The two keys configure the
+TCP transport only: a pair on one host over CUDA IPC, or over RDMA, does not
+use it and is not affected. The cost is host memory, not GPU memory: UCX
+stages TCP sends and receives through buffers of the segment size, pooled per
+process in chunks of eight (8 MiB of send and 16 MiB of receive buffers per
+chunk at 1 MiB segments, against 64 KiB and 1 MiB with the defaults), one
+send and one receive buffer in use per connected peer at a time.
+
 ##### Planned warm-up before SERVING (`SMG_VLLM_SERVICER_WARMUP`)
 
 The engine selects and compiles kernels lazily: the first scheduler step at a

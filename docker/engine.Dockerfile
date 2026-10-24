@@ -99,6 +99,17 @@ RUN if [ "${ENGINE}" = "tokenspeed" ]; then \
       pip uninstall -y tokenspeed-smg-grpc-proto tokenspeed-smg-grpc-servicer || true; \
     fi
 
+# UCX reads /etc/ucx/ucx.conf (its compiled-in config directory) in every
+# process that creates a UCX context, so a setting placed there reaches the
+# engine's tensor-parallel workers whatever they inherit of the container's
+# environment. The file raises the TCP transport's send and receive segment
+# from UCX's 8 KiB default to 1 MiB: a prefill/decode pair over NIXL across
+# hosts on TCP then pulls KV at the socket's rate instead of a fifth of it
+# (docker/ucx.conf has the measurement). Only the tcp transport reads the two
+# keys; RDMA and CUDA IPC paths are unchanged, and an image whose engine has no
+# UCX simply never opens the file.
+COPY docker/ucx.conf /etc/ucx/ucx.conf
+
 RUN bash /tmp/scripts/install-smg.sh /opt/smg-src
 
 RUN case "${ENGINE}" in \
