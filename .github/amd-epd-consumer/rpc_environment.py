@@ -43,7 +43,10 @@ def runtime():
     result = {}
     for name in RUNTIME:
         dist = md.distribution(name)
-        path = Path(dist._path) / "METADATA"
+        root = Path(dist._path)
+        path = root if root.is_file() else root / "METADATA"
+        if not path.is_file():
+            path = root / "PKG-INFO"
         result[name] = {
             "version": dist.version,
             "path": str(path.resolve()),
