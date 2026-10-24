@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smg-ts-chat167-proof"
+version = "0.0.1"
+requires-python = ">=3.11"
+
+[project.entry-points.pytest11]
+smg-ts-chat167-proof = "ts_chat167.plugin"
+
+[tool.setuptools.package-data]
+ts_chat167 = ["contract.json", "cases.json"]
