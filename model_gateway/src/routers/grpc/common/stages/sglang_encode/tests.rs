@@ -5,4 +5,5 @@ use super::media_tests as media;
 #[path = "../../../../../../../crates/grpc_client/tests/common/sglang_encoder.rs"]
 mod encoder_peer;
 
+mod stage;
 mod transport;
