@@ -5,7 +5,7 @@
 
 use bytes::Bytes;
 use serde::{
-    de::{SeqAccess, Visitor},
+    de::{IgnoredAny, SeqAccess, Visitor},
     ser::SerializeTuple,
     Deserialize, Deserializer, Serialize, Serializer,
 };
@@ -96,6 +96,24 @@ pub struct TokenizedGenerateReqInput {
     /// bypasses the engine's `InputProcessor`, which does that rewriting on
     /// other paths.
     pub multimodal_inputs: Option<TokenSpeedWireMmInputs>,
+    /// The prefill/decode rendezvous of a disaggregated request (wire indices
+    /// 16-18): the prefill side's bootstrap server and the room both sides
+    /// meet in, as the gateway hands them to each side. All `None` on an
+    /// aggregated request. The host is `None` for an empty string, the port
+    /// and the room ride as given (0 kept): the Python servicer's rule.
+    pub bootstrap_host: Option<String>,
+    pub bootstrap_port: Option<i32>,
+    pub bootstrap_room: Option<i64>,
+    /// The engine index this request goes out on (the connector's identity
+    /// of that engine): the attention data-parallel rank the sender decided
+    /// (a disaggregated request by its room's residue, the engine's own
+    /// dispatch rule; an aggregated one by its pin), already mapped through
+    /// `RankIndices`, the order the engines declared at their handshake. Not
+    /// a wire field (a scheduler rank reads no such slot of its own request)
+    /// and not the proto's `data_parallel_rank`: a rank written here unmapped
+    /// selects the wrong engine wherever the handshake order differs from
+    /// the rank order.
+    pub data_parallel_rank: Option<u32>,
 }
 
 impl Default for TokenizedGenerateReqInput {
@@ -115,6 +133,10 @@ impl Default for TokenizedGenerateReqInput {
             stream: false,
             input_ids_unpadded: None,
             multimodal_inputs: None,
+            bootstrap_host: None,
+            bootstrap_port: None,
+            bootstrap_room: None,
+            data_parallel_rank: None,
         }
     }
 }
@@ -134,12 +156,17 @@ impl Serialize for TokenizedGenerateReqInput {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         const NIL: Option<()> = None;
         // Text requests keep the historical 11-element prefix. Multimodal
-        // requests must reach wire index 22 (`multimodal_inputs`), emitting
-        // the engine's declared defaults for the unmodeled fields between
-        // `stream` (10) and `input_ids_unpadded` (21); msgspec fills fields
-        // after the last emitted element from defaults either way.
-        let multimodal = self.multimodal_inputs.is_some() || self.input_ids_unpadded.is_some();
-        let mut tuple = serializer.serialize_tuple(if multimodal { 23 } else { 11 })?;
+        // and disaggregated requests reach wire index 22 (`multimodal_inputs`),
+        // emitting the engine's declared defaults for the unmodeled fields
+        // between `stream` (10) and `input_ids_unpadded` (21) and the
+        // rendezvous in its slots (16-18); msgspec fills fields after the
+        // last emitted element from defaults either way.
+        let extended = self.multimodal_inputs.is_some()
+            || self.input_ids_unpadded.is_some()
+            || self.bootstrap_host.is_some()
+            || self.bootstrap_port.is_some()
+            || self.bootstrap_room.is_some();
+        let mut tuple = serializer.serialize_tuple(if extended { 23 } else { 11 })?;
         tuple.serialize_element(TOKENIZED_GENERATE_REQ_INPUT_TAG)?;
         tuple.serialize_element(&self.rid)?;
         tuple.serialize_element(&self.http_worker_ipc)?;
@@ -151,15 +178,15 @@ impl Serialize for TokenizedGenerateReqInput {
         tuple.serialize_element(&self.top_logprobs_num)?;
         tuple.serialize_element(&self.token_ids_logprob)?;
         tuple.serialize_element(&self.stream)?;
-        if multimodal {
+        if extended {
             tuple.serialize_element(&NIL)?; // input_embeds
             tuple.serialize_element(&NIL)?; // session_params
             tuple.serialize_element(&NIL)?; // custom_logit_processor
             tuple.serialize_element(&false)?; // return_hidden_states
             tuple.serialize_element(&0.0f64)?; // created_time
-            tuple.serialize_element(&NIL)?; // bootstrap_host
-            tuple.serialize_element(&NIL)?; // bootstrap_port
-            tuple.serialize_element(&NIL)?; // bootstrap_room
+            tuple.serialize_element(&self.bootstrap_host)?;
+            tuple.serialize_element(&self.bootstrap_port)?;
+            tuple.serialize_element(&self.bootstrap_room)?;
             tuple.serialize_element(&NIL)?; // input_multi_ids
             tuple.serialize_element(&NIL)?; // input_extra_infos
             tuple.serialize_element(&self.input_ids_unpadded)?;
@@ -182,7 +209,7 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
                 expect_tag(&mut seq, TOKENIZED_GENERATE_REQ_INPUT_TAG)?;
-                let request = TokenizedGenerateReqInput {
+                let mut request = TokenizedGenerateReqInput {
                     rid: next_field(&mut seq, "rid")?,
                     http_worker_ipc: next_field(&mut seq, "http_worker_ipc")?,
                     input_text: next_field(&mut seq, "input_text")?,
@@ -193,11 +220,27 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                     top_logprobs_num: next_field(&mut seq, "top_logprobs_num")?,
                     token_ids_logprob: next_field(&mut seq, "token_ids_logprob")?,
                     stream: next_field(&mut seq, "stream")?,
-                    // Send-only fields: the decoder models the text prefix and
-                    // drains everything after `stream`.
+                    // Send-only fields: the decoder models the text prefix,
+                    // reads the rendezvous slots when the array reaches them,
+                    // and drains the rest.
                     input_ids_unpadded: None,
                     multimodal_inputs: None,
+                    bootstrap_host: None,
+                    bootstrap_port: None,
+                    bootstrap_room: None,
+                    data_parallel_rank: None,
                 };
+                // Indices 11-15 (`input_embeds` .. `created_time`), then the
+                // rendezvous at 16-18; a short (text) array ends before them.
+                let mut skipped = 0;
+                while skipped < 5 && seq.next_element::<IgnoredAny>()?.is_some() {
+                    skipped += 1;
+                }
+                if skipped == 5 {
+                    request.bootstrap_host = seq.next_element::<Option<String>>()?.flatten();
+                    request.bootstrap_port = seq.next_element::<Option<i32>>()?.flatten();
+                    request.bootstrap_room = seq.next_element::<Option<i64>>()?.flatten();
+                }
                 drain_trailing(&mut seq)?;
                 Ok(request)
             }
@@ -368,8 +411,13 @@ mod tests {
                 hash: 0xDEAD_BEEF,
                 pad_value: pad,
                 offsets: vec![(1, 3)],
-                feature: WireTensor::from_raw("bfloat16", vec![3, 2], (0u8..12).collect()),
+                feature: Some(WireTensor::from_raw(
+                    "bfloat16",
+                    vec![3, 2],
+                    (0u8..12).collect(),
+                )),
                 model_specific_data,
+                encode_handshake: None,
             }],
             im_token_id: Some(9),
             video_token_id: None,
@@ -417,6 +465,76 @@ mod tests {
         assert_eq!(decoded.input_ids, request.input_ids);
         assert_eq!(decoded.input_ids_unpadded, None);
         assert_eq!(decoded.multimodal_inputs, None);
+    }
+
+    /// A disaggregated request reaches wire index 22 like a multimodal one,
+    /// with the rendezvous in the engine's own slots (`bootstrap_host` 16,
+    /// `bootstrap_port` 17, `bootstrap_room` 18) and the engine's defaults
+    /// around them; the decoder reads the three back, and a text request
+    /// still keeps the 11-element prefix.
+    #[test]
+    fn a_disaggregated_request_emits_its_rendezvous_in_the_engines_slots() {
+        let mut request = vector_request();
+        request.rid = "pd-1".to_string();
+        request.bootstrap_host = Some("10.0.0.7".to_string());
+        request.bootstrap_port = Some(8998);
+        request.bootstrap_room = Some(6_148_914_691_236_517_205);
+        request.data_parallel_rank = Some(1);
+        let encoded = encode_msgpack(&request).unwrap();
+
+        let Value::Array(array) = decode_value(&encoded).unwrap() else {
+            panic!("expected positional array");
+        };
+        assert_eq!(array.len(), 23);
+        assert_eq!(array[16], Value::from("10.0.0.7"));
+        assert_eq!(array[17], Value::from(8998));
+        assert_eq!(array[18], Value::from(6_148_914_691_236_517_205i64));
+        for nil_index in [11usize, 12, 13, 19, 20, 21, 22] {
+            assert_eq!(array[nil_index], Value::Nil, "index {nil_index}");
+        }
+        assert_eq!(array[14], Value::from(false)); // return_hidden_states
+        assert_eq!(array[15], Value::from(0.0f64)); // created_time
+
+        // The rendezvous decodes back; the placement is the sender's alone.
+        let decoded: TokenizedGenerateReqInput = decode_msgpack(&encoded).unwrap();
+        assert_eq!(decoded.bootstrap_host.as_deref(), Some("10.0.0.7"));
+        assert_eq!(decoded.bootstrap_port, Some(8998));
+        assert_eq!(decoded.bootstrap_room, Some(6_148_914_691_236_517_205));
+        assert_eq!(decoded.data_parallel_rank, None);
+        assert_eq!(decoded.input_ids, request.input_ids);
+
+        // The Python servicer's rule: a missing host is nil, a zero port or
+        // room is kept.
+        let mut zeroes = vector_request();
+        zeroes.bootstrap_port = Some(0);
+        zeroes.bootstrap_room = Some(0);
+        let encoded = encode_msgpack(&zeroes).unwrap();
+        let Value::Array(array) = decode_value(&encoded).unwrap() else {
+            panic!("expected positional array");
+        };
+        assert_eq!(array.len(), 23);
+        assert_eq!(array[16], Value::Nil);
+        assert_eq!(array[17], Value::from(0));
+        assert_eq!(array[18], Value::from(0i64));
+        let decoded: TokenizedGenerateReqInput = decode_msgpack(&encoded).unwrap();
+        assert_eq!(
+            (
+                decoded.bootstrap_host,
+                decoded.bootstrap_port,
+                decoded.bootstrap_room
+            ),
+            (None, Some(0), Some(0))
+        );
+
+        // A text request keeps the short prefix and decodes with no rendezvous.
+        let short = encode_msgpack(&vector_request()).unwrap();
+        let Value::Array(array) = decode_value(&short).unwrap() else {
+            panic!("expected positional array");
+        };
+        assert_eq!(array.len(), 11);
+        let decoded: TokenizedGenerateReqInput = decode_msgpack(&short).unwrap();
+        assert_eq!(decoded.bootstrap_room, None);
+        assert_eq!(decoded, vector_request());
     }
 
     #[test]

@@ -16,8 +16,14 @@ implementations apart.
 
 What the msgpack wire does not carry, the Rust path reports rather than
 emulates: ``FlushCache`` and profiling answer UNIMPLEMENTED, ranked
-``top_logprobs`` and prompt logprobs are refused, and PD/EPD disaggregation
-(bootstrap fields) stays with the Python implementation.
+``top_logprobs`` and prompt logprobs are refused. Prefill/decode
+disaggregation is served: the request's bootstrap fields ride the wire as the
+Python servicer forwards them, and a prefill launch starts the engine's KV
+bootstrap server here as the engine's own frontend does
+(:func:`kv_bootstrap_server`). The EPD prefill side is served the same way;
+the EPD encode role is not (:func:`refuse_encode_role`): its worker takes
+its requests over the engine's in-process channel only, which this path
+does not have, so it stays with the Python implementation.
 """
 
 from __future__ import annotations
@@ -58,6 +64,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     FaultLatch,
     RustLauncher,
     SchedulerProcesses,
+    ServicerConfigError,
     apply_kv_events_default,
     ensure_spawn_start_method,
     on_fault_signal,
@@ -528,6 +535,67 @@ def tokenizer_dir_for(server_args: Any) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Disaggregation: the prefill side's bootstrap server, the roles this path serves
+# ---------------------------------------------------------------------------
+
+
+def kv_bootstrap_server(server_args: Any) -> Any | None:
+    """Start the engine's KV bootstrap server for a prefill launch and return
+    it; ``None`` for any other role.
+
+    Under prefill/decode disaggregation the prefill side hosts the rendezvous
+    the decode side discovers its KV at (``--disaggregation-bootstrap-port``).
+    The engine's own frontend starts it when it is built, which the Python
+    servicer inherits; this path builds no frontend, so the launcher starts
+    the same class (the transfer backend's, through the engine's registry).
+    It must be up before the prefill ranks start: each rank registers with
+    it once, and a rank that misses it is a prefill no decode can find. The
+    server runs on its own thread and binds the port on every interface;
+    the launcher closes it when it ends."""
+    args = EngineConfigView(server_args).server_args
+    if args.disaggregation_mode != "prefill":
+        return None
+    from tokenspeed.runtime.pd.utils import KVClassType, TransferBackend, get_kv_class
+
+    backend = TransferBackend(args.disaggregation_transfer_backend)
+    server = get_kv_class(backend, KVClassType.BOOTSTRAP_SERVER)(args.disaggregation_bootstrap_port)
+    logger.info(
+        "Bootstrap server started for disaggregation mode on port %s (%s transfer)",
+        args.disaggregation_bootstrap_port,
+        backend.value,
+    )
+    return server
+
+
+def close_kv_bootstrap_server(server: Any) -> None:
+    """Stop a bootstrap server :func:`kv_bootstrap_server` started; a
+    failure to stop it is a logged line at the end of the launcher's life,
+    never the exit code."""
+    if server is None:
+        return
+    try:
+        server.close()
+    except Exception:  # noqa: BLE001 -- the process is ending; nothing to recover
+        logger.exception("The KV bootstrap server did not stop cleanly")
+
+
+def refuse_encode_role(server_args: Any) -> None:
+    """The EPD encode role stays with the Python servicer: the encode worker
+    takes its requests over the engine's in-process channel, which this path
+    does not build, and the msgpack wire it dials carries no encode message.
+    Such a launch under the Rust path is a configuration error before any
+    scheduler starts, not a servicer that reports SERVING and never encodes.
+    The prefill and decode roles, and the EPD prefill side, are served."""
+    if EngineConfigView(server_args).server_args.disaggregation_mode == "encode":
+        raise ServicerConfigError(
+            f"{SERVICER_IMPL_ENV}=rust does not serve the EPD encode role "
+            "(disaggregation_mode='encode'): the encode worker takes its requests over the "
+            "engine's in-process channel only; run this worker on the Python servicer "
+            f"(unset {SERVICER_IMPL_ENV} or pass --servicer-impl python)"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
 
@@ -558,6 +626,9 @@ class TokenSpeedLauncher(RustLauncher):
     # and kept for the hooks after it: the KV-events default reads the cache's
     # layer labels off it, the facts the rest.
     _cached_model_config: Any = None
+    # The prefill side's KV bootstrap server (:func:`kv_bootstrap_server`),
+    # started right before the ranks and closed when the launcher ends.
+    _bootstrap_server: Any = None
 
     def model_config(self, args: Any) -> Any:
         if self._cached_model_config is None:
@@ -577,7 +648,16 @@ class TokenSpeedLauncher(RustLauncher):
         return tokenizer_dir_for(args)
 
     def launch(self, args: Any, handshake_port: int, facts: Mapping[str, Any]) -> Any:
+        # Before the ranks: a prefill rank registers with the server once.
+        self._bootstrap_server = kv_bootstrap_server(args)
         return launch_scheduler_ranks(headless_server_args(args, handshake_port=handshake_port))
+
+    async def serve(self, args: Any) -> int:
+        try:
+            return await super().serve(args)
+        finally:
+            close_kv_bootstrap_server(self._bootstrap_server)
+            self._bootstrap_server = None
 
     def warmup_inputs(self, args: Any, facts: Mapping[str, Any]) -> Any:
         return warmup_inputs(args, facts)
@@ -590,5 +670,7 @@ async def serve_rust(server_args: Any) -> int:
     """Serve this process's gRPC contract from Rust: start the Rust server,
     start the scheduler ranks against its handshake, and supervise both
     until a signal or a failure (:class:`TokenSpeedLauncher`). Returns the
-    process exit code."""
+    process exit code. An EPD encode launch is refused first
+    (:func:`refuse_encode_role`)."""
+    refuse_encode_role(server_args)
     return await TokenSpeedLauncher().serve(server_args)

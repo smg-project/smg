@@ -105,6 +105,9 @@ class FakeServerArgs:
     data_parallel_address: str = "127.0.0.1"
     data_parallel_rpc_port: int = 30500
     zmq_engine_index: int = 0
+    disaggregation_mode: str = "null"
+    disaggregation_bootstrap_port: int = 8998
+    disaggregation_transfer_backend: str = "mooncake"
 
 
 def test_package_exposes_the_flag_and_the_rust_entry_points():
@@ -184,7 +187,10 @@ def launcher(monkeypatch):
         if any(arg in ("-h", "--help") for arg in argv):
             print("usage: tokenspeed [--model MODEL] (TokenSpeed's own help)")
             raise SystemExit(0)
-        return FakeServerArgs(model=argv[argv.index("--model") + 1])
+        mode = "null"
+        if "--disaggregation-mode" in argv:
+            mode = argv[argv.index("--disaggregation-mode") + 1]
+        return FakeServerArgs(model=argv[argv.index("--model") + 1], disaggregation_mode=mode)
 
     _install(
         monkeypatch,
@@ -1094,6 +1100,160 @@ def _run_serve_rust(monkeypatch, tmp_path) -> dict:
     assert asyncio.run(rust.serve_rust(FakeServerArgs(port=50123))) == 0
     _run_serve_rust.recorded = recorded
     return created
+
+
+class _FakeBootstrapServer:
+    """The engine's KV bootstrap server as the launcher drives it: built on a
+    port (which starts it), closed once."""
+
+    built: list[_FakeBootstrapServer] = []
+
+    def __init__(self, port: int) -> None:
+        self.port = port
+        self.closed = 0
+        _FakeBootstrapServer.built.append(self)
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+def _install_fake_pd_utils(monkeypatch) -> dict:
+    """``tokenspeed.runtime.pd.utils`` as the launcher reads it: the transfer
+    backend and class-type enums and the registry that hands out the
+    bootstrap server class; records what was asked for."""
+    import enum
+
+    asked: dict = {}
+
+    class TransferBackend(enum.Enum):
+        MOONCAKE = "mooncake"
+
+    class KVClassType(enum.Enum):
+        MANAGER_PREFILL = "manager_prefill"
+        BOOTSTRAP_SERVER = "bootstrap_server"
+
+    def get_kv_class(backend, class_type):
+        asked["backend"], asked["class_type"] = backend, class_type
+        assert class_type is KVClassType.BOOTSTRAP_SERVER
+        return _FakeBootstrapServer
+
+    _install(
+        monkeypatch,
+        "tokenspeed.runtime.pd.utils",
+        TransferBackend=TransferBackend,
+        KVClassType=KVClassType,
+        get_kv_class=get_kv_class,
+    )
+    _FakeBootstrapServer.built = []
+    return asked
+
+
+def _serve_rust_role(monkeypatch, tmp_path, caplog, mode: str) -> dict:
+    """``serve_rust`` for a launch in disaggregation ``mode`` against the
+    recording fakes: when the ranks were launched relative to the bootstrap
+    server, and the supervisor's end."""
+    recorded: dict = {"launched_with_servers": None}
+
+    class FakeServer:
+        def __init__(self, **kwargs):
+            self.address = kwargs["bind_address"]
+
+        def set_ready(self, ready: bool) -> None:
+            pass
+
+    _install_fake_servicer(monkeypatch, FakeServer)
+    monkeypatch.setattr(rust, "_model_config", lambda args: SimpleNamespace(hf_config=None))
+    monkeypatch.setattr(
+        rust, "model_facts", lambda args, model_config=None: {"model_path": args.model}
+    )
+    monkeypatch.setattr(
+        rust, "server_facts", lambda args: {"server_args_json": "{}", "data_parallel_size": 1}
+    )
+    monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: str(tmp_path))
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
+    monkeypatch.delenv("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", raising=False)
+
+    def fake_launch(headless):
+        # The ranks register with the bootstrap server when they start: it
+        # must already be up.
+        recorded["launched_with_servers"] = [
+            (server.port, server.closed) for server in _FakeBootstrapServer.built
+        ]
+        return "engine-handle"
+
+    async def fake_supervise(server, engine, *, drain_secs, **kwargs):
+        recorded["supervised"] = engine
+        return 0
+
+    monkeypatch.setattr(rust, "launch_scheduler_ranks", fake_launch)
+    monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
+    with caplog.at_level("INFO", logger=rust.logger.name):
+        recorded["exit"] = asyncio.run(
+            rust.serve_rust(FakeServerArgs(port=50123, disaggregation_mode=mode))
+        )
+    return recorded
+
+
+def test_a_prefill_launch_starts_the_engines_kv_bootstrap_server_before_the_ranks(
+    monkeypatch, tmp_path, caplog
+):
+    """The prefill side hosts the rendezvous the decode side discovers its KV
+    at. The engine's frontend starts it on the Python path; here the
+    launcher starts the same class, through the engine's registry for the
+    transfer backend, on the configured port, before the ranks (each
+    registers with it once), logs it, and closes it when it ends."""
+    asked = _install_fake_pd_utils(monkeypatch)
+    recorded = _serve_rust_role(monkeypatch, tmp_path, caplog, "prefill")
+    assert recorded["exit"] == 0 and recorded["supervised"] == "engine-handle"
+    assert recorded["launched_with_servers"] == [(8998, 0)]
+    assert asked["backend"].value == "mooncake"
+    assert asked["class_type"].value == "bootstrap_server"
+    (server,) = _FakeBootstrapServer.built
+    assert server.closed == 1
+    assert (
+        "Bootstrap server started for disaggregation mode on port 8998 (mooncake transfer)"
+        in caplog.text
+    )
+
+
+@pytest.mark.parametrize("mode", ["null", "decode"])
+def test_a_decode_or_aggregated_launch_starts_no_bootstrap_server(
+    monkeypatch, tmp_path, caplog, mode
+):
+    """Only the prefill side hosts the rendezvous: the other roles start
+    nothing and never reach for the engine's PD registry."""
+    _install_fake_pd_utils(monkeypatch)
+    recorded = _serve_rust_role(monkeypatch, tmp_path, caplog, mode)
+    assert recorded["exit"] == 0
+    assert recorded["launched_with_servers"] == []
+    assert _FakeBootstrapServer.built == []
+    assert "Bootstrap server started" not in caplog.text
+
+
+def test_an_encode_launch_is_refused_under_the_rust_path(launcher, monkeypatch, caplog):
+    """The EPD encode role takes its requests over the engine's in-process
+    channel, which this path does not build: such a launch under an explicit
+    rust is a configuration error before any scheduler starts (exit code 2,
+    one line naming the way out), never a servicer that reports SERVING and
+    encodes nothing. The prefill and decode roles pass."""
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="EPD encode role"):
+        rust.refuse_encode_role(FakeServerArgs(disaggregation_mode="encode"))
+    for mode in ("null", "prefill", "decode"):
+        rust.refuse_encode_role(FakeServerArgs(disaggregation_mode=mode))
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="EPD encode role"):
+        asyncio.run(rust.serve_rust(FakeServerArgs(disaggregation_mode="encode")))
+
+    module, calls = launcher
+    caplog.set_level(logging.ERROR)
+    monkeypatch.setattr(module, "serve_rust", rust.serve_rust)
+    with pytest.raises(SystemExit) as raised:
+        module.main(
+            ["--servicer-impl", "rust", "--model", "org/m", "--disaggregation-mode", "encode"]
+        )
+    assert raised.value.code == 2 and calls["served"] is None
+    assert "does not serve the EPD encode role" in caplog.text
+    assert "--servicer-impl python" in caplog.text
 
 
 def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_path):

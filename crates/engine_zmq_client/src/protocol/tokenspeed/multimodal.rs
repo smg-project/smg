@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::{ser::SerializeTuple, Serialize, Serializer};
+use serde::{ser::SerializeTuple, Deserialize, Serialize, Serializer};
 
 use crate::codec::tensor::{TensorFields, WireArrayData, WireTensor};
 
@@ -69,14 +69,30 @@ pub fn mm_pad_value(modality: TokenSpeedWireModality, hash: u64) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
+/// An item's encode-to-prefill rendezvous under EPD disaggregation: the
+/// encode worker that ships this item's embedding hosts the bootstrap server
+/// at `bootstrap_host:bootstrap_port`, and the prefill receives the embedding
+/// on `bootstrap_room`. Rides as the engine's `encode_handshake` dict (a
+/// msgpack map under these three keys), one per item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncodeHandshake {
+    pub bootstrap_host: String,
+    pub bootstrap_port: i32,
+    pub bootstrap_room: i64,
+}
+
 /// One multimodal item — `MultimodalDataItem`, a 10-slot positional array:
 /// `[modality, hash, pad_value, offsets, feature, feature_shm,
 /// model_specific_data, encoded, encoded_deepstack, encode_handshake]`.
 ///
 /// `encoded`/`encoded_deepstack` are scheduler-local ("always None on the
-/// wire"), `feature_shm` is a same-host optimization, and `encode_handshake`
-/// is EPD-only — this sender emits inline `feature` tensors and nil for all
-/// four.
+/// wire") and `feature_shm` is a same-host optimization — this sender emits
+/// inline `feature` tensors and nil for those three. `feature` itself is nil
+/// for an item whose embedding does not come from this worker's tower: an
+/// EPD prefill's item, which receives it from the encode worker named by
+/// `encode_handshake`, or a prefill/decode side's item, whose KV arrives from
+/// the prefill (the item keeps its metadata so the prompt pads and positions
+/// come out the same on both sides).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TokenSpeedWireMmItem {
     pub modality: TokenSpeedWireModality,
@@ -89,10 +105,13 @@ pub struct TokenSpeedWireMmItem {
     /// `input_ids`, one per placeholder span.
     pub offsets: Vec<(u64, u64)>,
     /// Primary encoder tensor. Kwarg naming (`pixel_values` vs `patches`) is
-    /// the engine model integration's concern; the slot is anonymous.
-    pub feature: WireTensor,
+    /// the engine model integration's concern; the slot is anonymous. `None`
+    /// when the embedding arrives out of band (see the struct doc).
+    pub feature: Option<WireTensor>,
     /// Side tensors (grids, types, per-item sizes) with wire dtype preserved.
     pub model_specific_data: BTreeMap<String, WireTensor>,
+    /// The EPD encode-to-prefill rendezvous of this item; `None` outside EPD.
+    pub encode_handshake: Option<EncodeHandshake>,
 }
 
 impl Serialize for TokenSpeedWireMmItem {
@@ -108,7 +127,7 @@ impl Serialize for TokenSpeedWireMmItem {
         tuple.serialize_element(&self.model_specific_data)?;
         tuple.serialize_element(&NIL)?; // encoded (scheduler-local)
         tuple.serialize_element(&NIL)?; // encoded_deepstack (scheduler-local)
-        tuple.serialize_element(&NIL)?; // encode_handshake (EPD only)
+        tuple.serialize_element(&self.encode_handshake)?;
         tuple.end()
     }
 }
@@ -183,8 +202,9 @@ mod tests {
             hash: 0xDEAD_BEEF,
             pad_value: mm_pad_value(TokenSpeedWireModality::Image, 0xDEAD_BEEF),
             offsets: vec![(2, 4)],
-            feature: WireTensor::from_raw("bfloat16", vec![3, 2], vec![0u8; 12]),
+            feature: Some(WireTensor::from_raw("bfloat16", vec![3, 2], vec![0u8; 12])),
             model_specific_data,
+            encode_handshake: None,
         }
     }
 
@@ -241,6 +261,48 @@ mod tests {
         assert_eq!(slots[7], Value::Nil);
         assert_eq!(slots[8], Value::Nil);
         assert_eq!(slots[9], Value::Nil);
+    }
+
+    /// An EPD prefill's item carries no feature (the embedding comes from the
+    /// encode worker) and its rendezvous in slot 9 as the engine's dict: a
+    /// map under the three keys, the metadata slots as on any item.
+    #[test]
+    fn an_epd_item_rides_its_handshake_map_and_no_feature() {
+        let mut item = image_item();
+        item.feature = None;
+        item.encode_handshake = Some(EncodeHandshake {
+            bootstrap_host: "10.0.0.9".to_string(),
+            bootstrap_port: 8998,
+            bootstrap_room: 41,
+        });
+        let encoded = encode_msgpack(&item).unwrap();
+        let Value::Array(slots) = decode_value(&encoded).unwrap() else {
+            panic!("expected positional array");
+        };
+        assert_eq!(slots.len(), 10);
+        assert_eq!(slots[4], Value::Nil); // feature
+        assert_eq!(slots[5], Value::Nil); // feature_shm
+        assert!(matches!(&slots[6], Value::Map(side) if side.len() == 1));
+        let Value::Map(handshake) = &slots[9] else {
+            panic!("expected the handshake map, got {:?}", slots[9]);
+        };
+        let mut entries: Vec<(String, Value)> = handshake
+            .iter()
+            .map(|(key, value)| (key.as_str().unwrap().to_string(), value.clone()))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            entries,
+            vec![
+                ("bootstrap_host".to_string(), Value::from("10.0.0.9")),
+                ("bootstrap_port".to_string(), Value::from(8998)),
+                ("bootstrap_room".to_string(), Value::from(41i64)),
+            ]
+        );
+        // A feature-less item has no tensor to lift into an auxiliary frame.
+        let mut visited = 0;
+        item.for_each_tensor(&mut |_| visited += 1);
+        assert_eq!(visited, 1, "the one side tensor");
     }
 
     /// The request-level payload is an untagged 7-slot array with the three

@@ -28,6 +28,8 @@ def _server_args(**overrides):
         max_total_num_tokens=65536,
         kv_events_config='{"enable_kv_cache_events": true, "publisher": "zmq"}',
         disaggregation_mode="prefill",
+        disaggregation_bootstrap_port=8998,
+        disaggregation_transfer_backend="mooncake",
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -61,6 +63,10 @@ def test_the_server_args_section_reads_every_knob():
     assert (args.running_window, args.page_size, args.max_total_num_tokens) == (64, 16, 65536)
     assert args.kv_events_config == '{"enable_kv_cache_events": true, "publisher": "zmq"}'
     assert args.disaggregation_mode == "prefill"
+    assert (args.disaggregation_bootstrap_port, args.disaggregation_transfer_backend) == (
+        8998,
+        "mooncake",
+    )
 
 
 def test_the_model_section_reads_the_hf_config_and_the_shape():
@@ -97,6 +103,7 @@ def test_bare_server_args_read_as_the_defaults():
     assert args.reasoning_parser is None and args.attention_dp_size is None
     assert (args.running_window, args.page_size, args.max_total_num_tokens) == (0, 0, 0)
     assert args.kv_events_config is None and args.disaggregation_mode == "null"
+    assert (args.disaggregation_bootstrap_port, args.disaggregation_transfer_backend) == (0, "")
     # A dtype read without a model config (the request path's lenient read).
     assert EngineConfigView(SimpleNamespace()).model_dtype is None
 

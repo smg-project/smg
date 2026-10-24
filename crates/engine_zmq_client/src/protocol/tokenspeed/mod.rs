@@ -72,12 +72,12 @@ impl EngineProtocol for TokenSpeedProtocol {
         &request.rid
     }
 
-    fn data_parallel_rank(_request: &Self::Request) -> Option<u32> {
-        // The TokenSpeed generate request carries no DP-rank field and needs
-        // none: rank routing is purely by ZMQ identity — the connector selects
-        // a rank and sends on that rank's socket identity. `None` means "never
-        // pinned", so every request goes through least-loaded selection.
-        None
+    fn data_parallel_rank(request: &Self::Request) -> Option<u32> {
+        // Rank routing is by ZMQ identity: the connector sends on the chosen
+        // rank's socket. The sender decides the rank as the engine's own
+        // dispatcher would (a disaggregated request by its room's residue, a
+        // pinned one by its pin); `None` is the least-loaded selection.
+        request.data_parallel_rank
     }
 
     fn validate(_request: &Self::Request) -> Result<()> {
@@ -175,11 +175,16 @@ mod tests {
             hash,
             pad_value: mm_pad_value(TokenSpeedWireModality::Image, hash),
             offsets: vec![(1, 2)],
-            feature: WireTensor::from_raw("uint8", vec![feature], vec![7; feature]),
+            feature: Some(WireTensor::from_raw(
+                "uint8",
+                vec![feature],
+                vec![7; feature],
+            )),
             model_specific_data: BTreeMap::from([(
                 "grid".to_string(),
                 WireTensor::from_raw("uint8", vec![side], vec![3; side]),
             )]),
+            encode_handshake: None,
         }
     }
 
@@ -307,6 +312,8 @@ mod tests {
         let mut request = media_request();
         request.multimodal_inputs.as_mut().unwrap().mm_items[1]
             .feature
+            .as_mut()
+            .unwrap()
             .data = WireArrayData::AuxIndex(1);
         let (payload, aux) = TokenSpeedProtocol::encode_add(&request).unwrap();
         assert!(aux.is_empty());

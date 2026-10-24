@@ -819,10 +819,21 @@ launcher computes the model and server facts from TokenSpeed's own config,
 runs the scheduler(s) headless in a spawned child over the msgpack ZMQ wire,
 and supervises both. What that wire does not carry is reported, not emulated:
 `FlushCache` and profiling answer UNIMPLEMENTED, ranked `top_logprobs` and
-prompt logprobs are refused, and PD/EPD disaggregation stays with the Python
-implementation, as do the RL control-plane extras (the `rl.*` advertisement,
-the live `weight_version` on generate responses, `is_paused`); the Rust server
-redacts credentials from `server_args` the same way. `SubscribeKvEvents` relays
+prompt logprobs are refused, and the RL control-plane extras (the `rl.*`
+advertisement, the live `weight_version` on generate responses, `is_paused`)
+stay with the Python implementation; the Rust server redacts credentials from
+`server_args` the same way. Prefill/decode disaggregation is served on this
+path: a request's `kv_bootstrap_info` rides the wire in the scheduler's own
+bootstrap slots as the Python servicer forwards it, a prefill launch starts
+the engine's KV bootstrap server in the launcher process before the ranks (as
+the engine's own frontend does), and under attention data parallelism the
+servicer places a disaggregated request on the rank of its room's residue,
+the engine's own dispatch rule, and an aggregated one on its
+`data_parallel_rank` pin. The EPD prefill side is served the same way (each
+item's `encode_bootstrap_info` entry rides on the item); the EPD encode role
+(`--disaggregation-mode encode`) is refused at launch under `--servicer-impl
+rust` and stays with the Python implementation, whose encode servicer feeds
+the encode worker over the engine's in-process channel. `SubscribeKvEvents` relays
 TokenSpeed's ZMQ KV-event publisher, which the servicer turns on by itself, on
 this path as on the Python one, when the launcher is given no
 `--kv-events-config`, at a port found free on the host rather than

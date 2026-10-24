@@ -59,7 +59,12 @@ class ServerArgsSection:
     page_size: int
     max_total_num_tokens: int
     kv_events_config: Any
+    # The disaggregation role (``null``, ``prefill``, ``decode``, ``encode``),
+    # the port the prefill side's bootstrap server binds and the KV transfer
+    # backend behind it (0 and "" when the args carry none).
     disaggregation_mode: str
+    disaggregation_bootstrap_port: int
+    disaggregation_transfer_backend: str
     # The engine's declared constrained-decoding policy, ``""`` when it declares none.
     constrained_decoding: str
 
@@ -95,6 +100,12 @@ class ServerArgsSection:
             max_total_num_tokens=int(getattr(server_args, "max_total_num_tokens", 0) or 0),
             kv_events_config=getattr(server_args, "kv_events_config", None),
             disaggregation_mode=getattr(server_args, "disaggregation_mode", "null") or "null",
+            disaggregation_bootstrap_port=int(
+                getattr(server_args, "disaggregation_bootstrap_port", 0) or 0
+            ),
+            disaggregation_transfer_backend=str(
+                getattr(server_args, "disaggregation_transfer_backend", "") or ""
+            ),
             constrained_decoding=constrained_decoding_policy(
                 getattr(server_args, "constrained_decoding", None)
             ),

@@ -10,7 +10,7 @@ use std::{
 
 use bytes::Bytes;
 use engine_zmq_client::{
-    codec::{decode_msgpack, encode_msgpack},
+    codec::{decode_msgpack, decode_value, encode_msgpack},
     mock_engine::{
         connect_to_frontend, default_ready_response, hello, MockEngineInput, MockEngineOutput,
         MOCK_DEADLINE,
@@ -1562,6 +1562,248 @@ async fn every_rank_of_a_data_parallel_publisher_reaches_the_gateway() {
     assert_eq!((batch.dp_rank, batch.sequence_number), (Some(1), 1));
     drop(stream);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A request of a prefill or decode side under PD disaggregation.
+fn disaggregated_request(id: &str, room: i64) -> ts::GenerateRequest {
+    let mut request = generate_request(id, false, Vec::new());
+    request.kv_bootstrap_info = Some(ts::KvBootstrapInfo {
+        bootstrap_host: "10.0.0.7".to_string(),
+        bootstrap_port: 8998,
+        bootstrap_room: room,
+    });
+    request
+}
+
+/// A disaggregated request's rendezvous reaches the scheduler in the
+/// request's own bootstrap slots, as the Python servicer forwards it, and
+/// its answer comes back as any request's; an aggregated request still
+/// carries no rendezvous.
+#[tokio::test]
+async fn a_disaggregated_requests_rendezvous_reaches_the_scheduler() {
+    let mut h = harness(model_info(), None).await;
+    let mut stream = h
+        .client
+        .generate(disaggregated_request("pd-1", 41))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut h.engine_in).await;
+    assert_eq!(add.rid, "pd-1");
+    assert_eq!(add.bootstrap_host.as_deref(), Some("10.0.0.7"));
+    assert_eq!(add.bootstrap_port, Some(8998));
+    assert_eq!(add.bootstrap_room, Some(41));
+    assert_eq!(add.input_ids, vec![1, 2, 3]);
+    send(
+        &mut h.engine_out,
+        &batch("pd-1", vec![10], 1, Some("stop"), None),
+    )
+    .await;
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "stop");
+    assert_eq!(done.output_ids, vec![10]);
+    assert!(stream.message().bounded().await.unwrap().is_none());
+
+    let mut stream = h
+        .client
+        .generate(generate_request("plain", false, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut h.engine_in).await;
+    assert_eq!(
+        (add.bootstrap_host, add.bootstrap_port, add.bootstrap_room),
+        (None, None, None)
+    );
+    send(
+        &mut h.engine_out,
+        &batch("plain", vec![10], 1, Some("stop"), None),
+    )
+    .await;
+    complete(stream.message().bounded().await.unwrap().unwrap());
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert_eq!(h.server.active_requests(), 0);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// An EPD prefill's item reaches the scheduler with its encode rendezvous
+/// in the item's own slot and no feature (the encode worker ships the
+/// embedding); an encode rendezvous that names no item is refused before
+/// the scheduler, in the Python servicer's words.
+#[tokio::test]
+async fn an_epd_prefill_items_rendezvous_reaches_the_scheduler() {
+    let mut h = harness(model_info(), None).await;
+    let mut request = generate_request("epd-1", false, Vec::new());
+    request.tokenized.as_mut().unwrap().input_ids = vec![1, 2, 3, 4, 5];
+    request.mm_inputs = Some(ts::MultimodalInputs {
+        items: vec![ts::MultimodalItem {
+            modality: common::Modality::Image as i32,
+            content_hash: 7u64.to_le_bytes().to_vec(),
+            encoder_input: None,
+            model_specific_tensors: Default::default(),
+            placeholders: vec![ts::PlaceholderRange {
+                offset: 1,
+                length: 3,
+            }],
+            placeholder_token_id: Some(9),
+        }],
+    });
+    request.encode_bootstrap_info = Some(ts::EncodeBootstrapInfo {
+        items: vec![ts::EncodeItemBootstrapInfo {
+            item_index: 0,
+            bootstrap_host: "10.0.0.9".to_string(),
+            bootstrap_port: 8998,
+            bootstrap_room: 41,
+        }],
+    });
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let frames = h.engine_in.recv_frames().await.unwrap();
+    assert_eq!(
+        TokenSpeedRequestType::from_frame(frames[0].as_ref()),
+        Some(TokenSpeedRequestType::Add)
+    );
+    let payload = decode_value(frames[1].as_ref()).unwrap();
+    let array = payload.as_array().expect("a positional array");
+    assert_eq!(
+        array.len(),
+        23,
+        "the extended form, through multimodal_inputs"
+    );
+    assert!(
+        array[16..=18].iter().all(rmpv::Value::is_nil),
+        "no KV rendezvous on an EPD prefill: {:?}",
+        &array[16..=18]
+    );
+    let items = array[22].as_array().expect("multimodal inputs")[0]
+        .as_array()
+        .expect("items");
+    let item = items[0].as_array().expect("an item");
+    assert_eq!(item.len(), 10);
+    assert!(item[4].is_nil(), "no feature: {:?}", item[4]);
+    let handshake = item[9].as_map().expect("the handshake map");
+    let field = |name: &str| {
+        handshake
+            .iter()
+            .find(|(key, _)| key.as_str() == Some(name))
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| panic!("{name} in the handshake"))
+    };
+    assert_eq!(field("bootstrap_host").as_str(), Some("10.0.0.9"));
+    assert_eq!(field("bootstrap_port").as_i64(), Some(8998));
+    assert_eq!(field("bootstrap_room").as_i64(), Some(41));
+    send(
+        &mut h.engine_out,
+        &batch("epd-1", vec![10], 1, Some("stop"), None),
+    )
+    .await;
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "stop");
+    assert!(stream.message().bounded().await.unwrap().is_none());
+
+    let mut refused = generate_request("epd-2", false, Vec::new());
+    refused.encode_bootstrap_info = Some(ts::EncodeBootstrapInfo { items: vec![] });
+    let status = h.client.generate(refused).await.expect_err("no items");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status
+            .message()
+            .contains("encode_bootstrap_info present but mm_inputs is missing"),
+        "{}",
+        status.message()
+    );
+    assert_scheduler_idle(&mut h.engine_in).await;
+    assert_eq!(h.server.active_requests(), 0);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Under attention data parallelism a disaggregated request goes to the
+/// rank of its room's residue, the engine's own dispatch rule on both sides
+/// (the decode receiver looks for the KV on the prefill rank of that
+/// residue), where "rank" is the one each scheduler declares at its
+/// handshake, not the order or the identity it dialled in with: here the
+/// scheduler that dialled in as identity 0 declares rank 1. An aggregated
+/// request goes where its pin says, under the same numbering, and a pin
+/// outside the ranks is refused as the engine refuses it.
+#[tokio::test]
+async fn a_disaggregated_request_is_placed_on_the_rank_of_its_rooms_residue() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_count = 2;
+    config.model.data_parallel_size = 2;
+    let server = TokenSpeedServicerServer::start(config).expect("servicer starts");
+    let ready = |rank: u32| EngineCoreReadyResponse {
+        data_parallel_rank: rank,
+        ..default_ready_response()
+    };
+    // Identity 0 is rank 1 and identity 1 is rank 0.
+    let (first, second) = tokio::join!(
+        connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready(1)),
+        connect_to_frontend(&handshake, EngineId::from_engine_index(1), ready(0)),
+    );
+    let (mut rank1_in, mut rank1_out) = first.expect("identity 0 handshake").split();
+    let (mut rank0_in, mut rank0_out) = second.expect("identity 1 handshake").split();
+    wait_until(|| server.engine_ready()).await;
+    let mut client = TokenSpeedSchedulerClient::new(grpc_channel(server.address()).await);
+
+    let mut odd = client
+        .generate(disaggregated_request("room-7", 7))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank1_in).await;
+    assert_eq!((add.rid.as_str(), add.bootstrap_room), ("room-7", Some(7)));
+    let mut even = client
+        .generate(disaggregated_request("room-8", 8))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank0_in).await;
+    assert_eq!((add.rid.as_str(), add.bootstrap_room), ("room-8", Some(8)));
+    let mut pinned_request = generate_request("pin-1", false, Vec::new());
+    pinned_request.data_parallel_rank = Some(1);
+    let mut pinned = client
+        .generate(pinned_request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank1_in).await;
+    assert_eq!((add.rid.as_str(), add.bootstrap_room), ("pin-1", None));
+
+    // Each scheduler answers under its own identity.
+    let answer = |rid: &str, identity: u32| BatchTokenIDOutSlim {
+        engine_index: identity,
+        ..batch(rid, vec![10], 1, Some("stop"), None)
+    };
+    send(&mut rank1_out, &answer("room-7", 0)).await;
+    send(&mut rank0_out, &answer("room-8", 1)).await;
+    send(&mut rank1_out, &answer("pin-1", 0)).await;
+    for stream in [&mut odd, &mut even, &mut pinned] {
+        let done = complete(stream.message().bounded().await.unwrap().unwrap());
+        assert_eq!(done.finish_reason, "stop");
+        assert!(stream.message().bounded().await.unwrap().is_none());
+    }
+
+    let mut outside = generate_request("pin-9", false, Vec::new());
+    outside.data_parallel_rank = Some(9);
+    let status = client.generate(outside).await.expect_err("out of range");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status
+            .message()
+            .contains("data_parallel_rank must be in [0, 2)"),
+        "{}",
+        status.message()
+    );
+    assert_scheduler_idle(&mut rank0_in).await;
+    assert_scheduler_idle(&mut rank1_in).await;
+    assert_eq!(server.active_requests(), 0);
+    server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
 /// What the scheduler enforces of a structured request, as the launcher's

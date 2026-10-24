@@ -294,6 +294,38 @@ def test_sglang_zmq_lane_keeps_multimodal_and_http_error_shapes_off_the_wire():
     assert kept == [text] and deselected == [mm, shape]
 
 
+def test_tokenspeed_rust_lane_keeps_prefill_decode_and_drops_encode_and_admin_ops():
+    """The TokenSpeed Rust servicer serves the prefill/decode topologies and
+    refuses the encode role: a Rust lane keeps the PD cases, drops the
+    encode-prefill-decode ones, the admin operations the wire has no control
+    message for, and a fleet of plain workers."""
+    workers = lambda **kwargs: SimpleNamespace(kwargs=kwargs)  # noqa: E731
+    pd = _FakeItem(
+        "router/test_pd_topologies.py::T::t[1p1d]", params={"setup_backend": ("pd_grpc", (1, 1))}
+    )
+    pd_workers = _FakeItem(
+        "router/test_pd_responses.py::t", markers={"workers": workers(prefill=1, decode=1)}
+    )
+    epd = _FakeItem(
+        "chat_completions/test_epd_multimodal.py::T::t[1e1p1d]",
+        params={"setup_backend": ("epd_grpc", (1, 1, 1))},
+    )
+    admin = _FakeItem("router/test_admin_ops.py::t", params={"setup_backend": "grpc"})
+    fleet = _FakeItem("router/test_loads.py::t", markers={"workers": workers(count=2)})
+    plain = _FakeItem("chat_completions/test_openai_server.py::t", params={"setup_backend": "grpc"})
+    other = _FakeItem("router/test_other_wire.py::t", params={"setup_backend": "mesh_grpc"})
+    kept, deselected = hooks._filter_tokenspeed_rust_items(
+        [pd, pd_workers, epd, admin, fleet, plain, other]
+    )
+    assert [item.nodeid for item in kept] == [pd.nodeid, pd_workers.nodeid, plain.nodeid]
+    assert [item.nodeid for item in deselected] == [
+        epd.nodeid,
+        admin.nodeid,
+        fleet.nodeid,
+        other.nodeid,
+    ]
+
+
 def test_sglang_rust_lane_drops_only_what_the_msgpack_wire_lacks():
     chat = _FakeItem(
         "e2e_test/chat_completions/test_basic.py::test_chat[grpc]", params={"setup_backend": "grpc"}

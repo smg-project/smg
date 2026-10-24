@@ -44,7 +44,7 @@ use crate::{
     },
     tokenspeed::{
         constraint_ref as tokenspeed_constraint_ref, fan_out_tokenspeed_requests,
-        translate_request_tokenspeed_for, GridTensors, TokenSpeedGenerateStream,
+        translate_request_tokenspeed_for, GridTensors, RankIndices, TokenSpeedGenerateStream,
     },
     vllm::{
         fan_out_requests, has_media, kv_transfer_params, now_secs, ranked_candidate_count,
@@ -838,12 +838,16 @@ impl ZmqEngineClient {
             .map_err(tonic::Status::invalid_argument)?;
         }
         let max_model_len = self.prompt_bound()?;
+        // The ranks as the engine numbers them: a disaggregated request is
+        // placed by its room's residue, a pinned one by its pin.
+        let ranks = RankIndices::of(client.engines());
         // Sub-streams submitted before a mid-loop failure are dropped with the
         // error, which auto-aborts their engine-side requests.
         let mut streams = Vec::new();
         for (index, sub) in fan_out_tokenspeed_requests(req).into_iter().enumerate() {
-            let request = translate_request_tokenspeed_for(sub, grid_tensors, max_model_len)
-                .map_err(tonic::Status::invalid_argument)?;
+            let request =
+                translate_request_tokenspeed_for(sub, grid_tensors, max_model_len, &ranks)
+                    .map_err(tonic::Status::invalid_argument)?;
             let stream = client.submit(request).await.map_err(zmq_status)?;
             streams.push(TokenSpeedGenerateStream::new(stream, index as u32));
         }
