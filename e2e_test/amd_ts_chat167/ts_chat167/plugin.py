@@ -38,6 +38,25 @@ class Environment:
             session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
+NATIVE_HASHES = {}
+
+
+def native_mapping(pid, expected):
+    paths = {Path(line.split(maxsplit=5)[5]).resolve() for line in
+             (Path("/proc") / str(pid) / "maps").read_text().splitlines()
+             if len(line.split(maxsplit=5)) == 6 and "/smg_rs" in line}
+    require(len(paths) == 1, "actual native mapping is missing/ambiguous")
+    path = paths.pop()
+    stat = path.stat()
+    require(stat.st_size == expected["bytes"], "loaded native size differs")
+    key = (str(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    if key not in NATIVE_HASHES:
+        with path.open("rb") as stream:
+            NATIVE_HASHES[key] = hashlib.file_digest(stream, "sha256").hexdigest()
+    require(NATIVE_HASHES[key] == expected["sha256"], "loaded native hash differs")
+    return str(path)
+
+
 class Original167:
     def __init__(self, root, directory, lane):
         self.root, self.directory, self.lane = root, directory, lane
@@ -76,6 +95,7 @@ class Original167:
         launch = wr["launch_argv_intent"]
         require(argument(gw["launch_argv_intent"], "--worker-urls") == worker.base_url, "gateway/worker URL identity differs")
         if self.lane == "rust":
+            require("--backend" not in gw["launch_argv_intent"], "original Rust auto-backend changed")
             require(argument(launch, "-m") == "vllm.entrypoints.grpc_server", "Rust gRPC launcher differs")
             require(argument(launch, "--tensor-parallel-size") == "1", "Rust TP differs")
             actual = (Path("/proc") / str(wr["pid"]) / "environ").read_bytes().split(b"\0")
@@ -86,13 +106,9 @@ class Original167:
             require(argument(launch, "--data-parallel-size") == argument(launch, "--data-parallel-size-local") == "1", "ZMQ DP1 differs")
             require(launch[launch.index("serve") + 1] == argument(gw["launch_argv_intent"], "--model-path"), "ZMQ model path differs")
             require(argument(gw["launch_argv_intent"], "--backend") == "vllm" and worker.base_url.startswith("ipc://"), "ZMQ backend differs")
-        maps = {Path(line.split(maxsplit=5)[5]).resolve() for line in
-                (Path("/proc") / str(gw["pid"]) / "maps").read_text().splitlines()
-                if len(line.split(maxsplit=5)) == 6 and "/smg_rs" in line}
-        require(len(maps) == 1, "actual gateway native is missing/ambiguous")
-        native = maps.pop()
-        require(native.stat().st_size == self.native["bytes"] and hashlib.sha256(native.read_bytes()).hexdigest() == self.native["sha256"], "loaded gateway native differs")
-        return {"gateway": gw, "worker": wr, "model": worker.model_id, "native": str(native), "native_sha256": self.native["sha256"], "model_path_intent": argument(gw["launch_argv_intent"], "--model-path")}
+        native = native_mapping(gw["pid"], self.native)
+        worker_native = native_mapping(wr["pid"], self.native) if self.lane == "rust" else None
+        return {"gateway": gw, "worker": wr, "model": worker.model_id, "native": native, "worker_native": worker_native, "native_sha256": self.native["sha256"], "model_path_intent": argument(gw["launch_argv_intent"], "--model-path")}
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_call(self, item):
