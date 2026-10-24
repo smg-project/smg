@@ -170,7 +170,7 @@
     },
     "GPU_jobs_per_dispatch": 1
   },
-  "diagnostic_difference": "Only original Mooncake2 may dispatch; original27/4models/router emptyfilter/floor15/50job34pytest retained. Inherited14unit/environment/private-constraint/owned-process gates stay; Mooncake canary and fixture log proof replace any NIXL requirement. No GPU/ABI/transfer result is transferred. Privatepath parser fix3685162 plus exact3 productiontest port5366d8e; only e2e testsource differs through narrow manifest, no80e3 compiled imports. Actualcounter/periodicflush success remains unverified.",
+  "diagnostic_difference": "Only the original Mooncake4 topology recipe is prepared: e91517/current18/floor14/originalfilter/50job42pytest, main-global-extra Mooncake and mixed NIXL/Mooncake pairs retained. Inherited14unit/environment/private-constraint/owned-process gates stay; separate actual Mooncake and official ROCm NIXL canaries plus owned nominal2P2D logs are required. The reviewed exact3-file MC2 test overlay is inherited but its classes are not selected. No MC2/NIXL4 GPU/ABI/transfer result is transferred; actual counter/periodicflush success remains unverified.",
   "producer_binary_relabelled": false,
   "producer_artifact_pins_status": "BOUND: root-accepted actual40038340532/445bb37 four archives and native143a; all admission flags remainfalse",
   "explicit_product_dependency": {
@@ -180,7 +180,7 @@
     "parent_stack": "0707d631cb6827789619ab96999f868044dc06db",
     "visible_churn": 43
   },
-  "producer_snapshot_note": "Rootaccepted40038340532/445bb37 four archives/native143a remain exact. Only the frozen original Mooncake2 source route is prepared; no budget, current runner availability, ABI or transfer accepted.",
+  "producer_snapshot_note": "Rootaccepted40038340532/445bb37 four archives/native143a remain exact local pins, not API-refreshed. This independent Mooncake4 source route has no admitted budget, current runner availability, ABI or transfer acceptance.",
   "source_base": "c9d5431db92aa2d35521889f6297c4c6f7b05b4a",
   "producer_base_source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
@@ -198,7 +198,7 @@
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows": "7c956a4ee89bdf800d48c63815d10a4dd568d90e"
   },
-  "producer_source_map_note": "Actual14source trees match accepted445bb37 and localGit; its diagnosticworkflow tree remains explicit. Consumer19 and compiled37 remain unchanged; no binary is relabelled.",
+  "producer_source_map_note": "Actual14source trees match accepted445bb37 and localGit; its diagnosticworkflow tree remains explicit. Consumer19 is unchanged from corrected966, including its exact3-file e2e overlay against product3b79; compiled37c9d remains unchanged. No binary is relabelled.",
   "resource_precondition": {
     "requested_runner_label": "1-gpu-mi300x",
     "required_logical_devices_by_tier": {
