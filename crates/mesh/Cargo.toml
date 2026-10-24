@@ -16,46 +16,33 @@ categories = ["network-programming", "data-structures"]
 # Workspace dependencies
 anyhow.workspace = true
 blake3.workspace = true
-lz4_flex.workspace = true
 async-trait.workspace = true
-axum.workspace = true
-chrono.workspace = true
 dashmap.workspace = true
 http.workspace = true
-num-traits.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
 serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
-thiserror.workspace = true
 tokio = { workspace = true, features = ["full", "sync", "time"] }
 tracing.workspace = true
 
 # Mesh-specific dependencies
 bincode = "1.3"
 bytes = "1"
-crdts = "7.3"
 futures = "0.3"
 metrics = "0.24.6"
-num-bigint = "0.4"
 prost = "0.14.4"
-prost-types = "0.14.4"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.2"
 tokio-stream = "0.1"
 tonic = { version = "0.14.6", features = ["gzip", "transport", "tls-ring"] }
+# The generated gossip service decodes with its codec.
 tonic-prost = "0.14.6"
 uuid = { workspace = true, features = ["v4"] }
 
-# Workspace crates
-kv-index.workspace = true
-
 [build-dependencies]
 tonic-prost-build = "0.14.6"
-prost-build = "0.14.4"
 
 [dev-dependencies]
-lazy_static = "1.5"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 openssl = "0.10.81"
 tempfile = "3"
