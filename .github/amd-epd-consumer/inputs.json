@@ -1,13 +1,104 @@
 {
   "ready": false,
   "run_budget_admitted": false,
-  "artifacts_pinned": false,
-  "artifacts": [],
-  "gateway_native": null,
-  "run_id": null,
-  "run_attempt": null,
-  "build_job_id": null,
-  "producer_sha": null,
+  "artifacts_pinned": true,
+  "artifacts": [
+    {
+      "name": "wasm-test-fixtures",
+      "id": 12544470223,
+      "bytes": 56596,
+      "sha256": "1c85793a6e4a356ce6423fcdff134f8ab6f130055c8a6c613e512ad3886b4323",
+      "expires_at": "2026-10-25T02:06:22Z",
+      "files": {
+        "storage_hook_guest.wasm": {
+          "bytes": 80680,
+          "sha256": "7e3a093e09bfe30244d128c1aaaf8558a1b13c05558cc81cff04021947445e11"
+        },
+        "storage_hook_passthrough.wasm": {
+          "bytes": 79153,
+          "sha256": "3a10ce115ea179026a00f3e85ce6b6a388bcc1f274bc7abfc074be876d7c3e55"
+        }
+      }
+    },
+    {
+      "name": "epd-grpc-servicer-wheel",
+      "id": 12544136948,
+      "bytes": 379288,
+      "sha256": "9542d25a52680ade962f9a6ca81db35f152024cd6849f4e15394ce2a1bc8d74c",
+      "expires_at": "2026-10-25T02:06:42Z",
+      "files": {
+        "smg_grpc_servicer-0.14.2-py3-none-any.whl": {
+          "bytes": 386799,
+          "sha256": "f56d3e9180849ae59710b46a30ed12f475e0abe8ff9416045b53f63cd3826a2b"
+        }
+      }
+    },
+    {
+      "name": "go-ffi-library",
+      "id": 12543883474,
+      "bytes": 13838174,
+      "sha256": "9b006b55dd1e6881f0fd52e753cbba1a57e01f405902f2fd27caa5ed35cdb561",
+      "expires_at": "2026-10-25T02:06:18Z",
+      "files": {
+        "libsmg_go.d": {
+          "bytes": 64889,
+          "sha256": "59a7bc22318a635f52ca4ef4b4ba3c5f1e445d3042c13b3e005088024a67d66e"
+        },
+        "libsmg_go.so": {
+          "bytes": 35011392,
+          "sha256": "ac29163afd572b81cc3735c7f0bf72e5900f566b849c70c35bac7b1e21de26e0"
+        }
+      }
+    },
+    {
+      "name": "epd-grpc-proto-wheel",
+      "id": 12543723919,
+      "bytes": 102418,
+      "sha256": "4b396744f350266a8ebf228c81b44eb81f6dd5e36a576ef5c92df944e9c2e47b",
+      "expires_at": "2026-10-25T02:06:41Z",
+      "files": {
+        "smg_grpc_proto-0.4.29-py3-none-any.whl": {
+          "bytes": 106259,
+          "sha256": "1da1173da561b691769ddc7c7f99363e946cf9a60201005fd3cb9218c06ad248"
+        }
+      }
+    },
+    {
+      "name": "python-client-types",
+      "id": 12543434781,
+      "bytes": 34373,
+      "sha256": "679ebe2bac363ea6af7a854c07e14dcaee24fb87a5463a7bca47408694e166aa",
+      "expires_at": "2026-10-25T02:06:21Z",
+      "files": {
+        "_generated.py": {
+          "bytes": 187180,
+          "sha256": "71d7e66706d0402e86d8285ece1cf4888f12a0a0be5ead263e7a3be521456c6e"
+        }
+      }
+    },
+    {
+      "name": "smg-wheel",
+      "id": 12543434770,
+      "bytes": 52525234,
+      "sha256": "335f0bab8a42e1afb652f9dbf53ee566e42841cb1dad9d5d35556276d262d31a",
+      "expires_at": "2026-10-25T02:06:14Z",
+      "files": {
+        "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl": {
+          "bytes": 52665355,
+          "sha256": "8ed652a44bfbb5e049812025c93ff37c77fa7d05c72672bc0c2a15445e8478e9"
+        }
+      }
+    }
+  ],
+  "gateway_native": {
+    "name": "smg/smg_rs.abi3.so",
+    "bytes": 142750544,
+    "sha256": "07cf2603d9aca57c1085eb91a2f54ec1e810f5d7682953cbd2292f05a2ebd2b9"
+  },
+  "run_id": 40049565738,
+  "run_attempt": 1,
+  "build_job_id": 120738960027,
+  "producer_sha": "cd402244f1167de4f66e037ac6aff5d7fb8b13bd",
   "source_base": "dbc4d041aa853a96edd633c1a348f4b9a7a2d23a",
   "producer_branch": "ci/frozen-epd-dbc4-producer-20261024",
   "producer_policy": "frozen_epd_dbc4_dispatch_22_steps_six_archives_v1",
@@ -57,7 +148,7 @@
     "GPU_jobs": 0,
     "workflow_auto_retry": 0
   },
-  "artifact_bytes_not_yet_available": true,
+  "artifact_bytes_not_yet_available": false,
   "consumer_archive_validation_required": "six actual safe ZIP/API digest-size-expiry archives; all payload hashes/complete wheel RECORD/native; future GPU must explicitly install the two source-bound RPC wheels and prove no editable shadow",
   "rpc_wheels": {
     "proto": {
@@ -71,7 +162,20 @@
       "artifact": "epd-grpc-servicer-wheel"
     },
     "built_from_source_base": "dbc4d041aa853a96edd633c1a348f4b9a7a2d23a",
-    "actual_wheel_pins": []
+    "actual_wheel_pins": [
+      {
+        "artifact": "epd-grpc-servicer-wheel",
+        "filename": "smg_grpc_servicer-0.14.2-py3-none-any.whl",
+        "bytes": 386799,
+        "sha256": "f56d3e9180849ae59710b46a30ed12f475e0abe8ff9416045b53f63cd3826a2b"
+      },
+      {
+        "artifact": "epd-grpc-proto-wheel",
+        "filename": "smg_grpc_proto-0.4.29-py3-none-any.whl",
+        "bytes": 106259,
+        "sha256": "1da1173da561b691769ddc7c7f99363e946cf9a60201005fd3cb9218c06ad248"
+      }
+    ]
   },
   "producer_base_source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
@@ -89,7 +193,22 @@
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows": "97fa29dc51ece8875f22082518ec7266cab49bbd"
   },
-  "producer_source_trees": {},
+  "producer_source_trees": {
+    ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
+    "Cargo.toml": "1524dd4960a96dd3ae5069917324836dee979150",
+    "Cargo.lock": "31974aea1e683d431b1b2430eb6c70ae817aae48",
+    "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+    "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+    "bindings": "e97f000df477e928953b6bcb5a7927adf5ff88c1",
+    "clients": "03b0cbb722670d98b37b726af18c1796beef82d5",
+    "crates": "e0aca7a681eb08447f2080f46cea8e62404f4bda",
+    "model_gateway": "32ff23450f38201e81f6a56209ce9b3ef6a449ec",
+    "grpc_servicer": "a72db571df575d5c33f0c8c38d9eab7693be208e",
+    "e2e_test": "a591122d561647a808313d61449f86dc38c5b7d6",
+    "scripts": "0f65e05d51346101f6d7a0c586c25d00f7b4ca36",
+    ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
+    ".github/workflows": "dd03c36115b3661ef755742f7cbc523b1e107842"
+  },
   "consumer_source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
     "Cargo.toml": "1524dd4960a96dd3ae5069917324836dee979150",
@@ -151,5 +270,7 @@
   "consumer_gpu_ready": false,
   "worker_origin_witness_implemented": true,
   "consumer_workflow_implemented": true,
-  "source_prepared": true
+  "source_prepared": true,
+  "producer_artifact_pins_status": "BOUND accepted successful40049565738/22steps/sixrawarchives/newnative07cf integrity only; GPU not admitted",
+  "consumer_gpu_readiness_note": "Target runtime remains unverified. This informational field grants no dispatch; actual ready/run_budget/artifacts guards are independent."
 }
