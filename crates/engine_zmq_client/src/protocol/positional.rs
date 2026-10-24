@@ -20,6 +20,17 @@ where
         .ok_or_else(|| A::Error::custom(format!("missing positional field `{name}`")))
 }
 
+/// An optional appended column of a per-step batch: absent, or `None`, from
+/// an engine that predates it decodes as the empty column.
+pub(crate) fn appended_column<'de, A: SeqAccess<'de>, T: Deserialize<'de>>(
+    seq: &mut A,
+) -> Result<Vec<T>, A::Error> {
+    Ok(seq
+        .next_element::<Option<Vec<T>>>()?
+        .flatten()
+        .unwrap_or_default())
+}
+
 /// Validate the msgspec tag string at element 0. A wrong tag means the payload
 /// is a different message type — fail loudly instead of misreading fields.
 pub(crate) fn expect_tag<'de, A>(seq: &mut A, expected: &'static str) -> Result<(), A::Error>

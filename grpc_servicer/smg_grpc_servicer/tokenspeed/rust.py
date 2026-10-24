@@ -17,8 +17,10 @@ implementations apart.
 What the msgpack wire does not carry, the Rust path reports rather than
 emulates: ``FlushCache`` and profiling ride the wire's control call on a
 scheduler whose handshake declares its control reply, and answer UNIMPLEMENTED
-on one that does not; ranked ``top_logprobs`` and prompt logprobs are refused.
-Prefill/decode disaggregation is served: the request's bootstrap fields ride
+on one that does not; ranked ``top_logprobs`` ride the slim output's appended
+columns on a scheduler whose handshake declares them (refused on one that does
+not); prompt logprobs and the selected candidates are refused as on the Python
+servicer. Prefill/decode disaggregation is served: the request's bootstrap fields ride
 the wire as the Python servicer forwards them, and a prefill launch starts the
 engine's KV bootstrap server here as the engine's own frontend does
 (:func:`kv_bootstrap_server`). The EPD prefill side is served the same way; the
