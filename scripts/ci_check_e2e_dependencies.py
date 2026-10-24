@@ -50,6 +50,19 @@ def main():
     ]
     (directory / f"{stage}-packages.json").write_text(json.dumps(packages, indent=2) + "\n")
     print(result.stdout, end="")
+    if os.environ.get("SMG_CI_RUNTIME_STATE_DIR"):
+        audit = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).with_name("ci_runtime_constraints.py")),
+                "verify",
+                os.environ["SMG_CI_RUNTIME_STATE_DIR"],
+                stage,
+                str(directory),
+            ],
+            check=False,
+        )
+        return result.returncode or audit.returncode
     return result.returncode
 
 
