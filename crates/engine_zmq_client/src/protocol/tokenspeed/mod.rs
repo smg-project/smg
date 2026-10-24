@@ -336,6 +336,7 @@ mod tests {
             num_waiting: 5,
             kv_active_pages: 100,
             kv_total_pages: 400,
+            ..Default::default()
         }
     }
 

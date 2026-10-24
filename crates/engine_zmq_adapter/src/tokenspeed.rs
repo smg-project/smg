@@ -216,6 +216,30 @@ impl MappedGenerateStream for TokenSpeedGenerateStream {
         // downcast the wire's `f64` values. Chunks carry this tick's increment;
         // the terminal `Complete` carries the cumulative set, so accumulate
         // into `state` and drain it on finish.
+        // The ranked candidates per emitted token, on a wire that carries them
+        // (the appended columns, see `TokenSpeedWireColumns`): one entry per
+        // token as the Python servicer emits them, an empty one where the
+        // engine gave none, so the per-token alignment holds; cumulative on
+        // the `Complete` as the sampled logprobs are.
+        let tick_top_logprobs: Vec<vllm::TopLogProbs> = if output.output_top_logprobs_val.is_empty()
+        {
+            Vec::new()
+        } else {
+            (0..output.output_logprobs_val.len())
+                .map(|position| vllm::TopLogProbs {
+                    values: output
+                        .output_top_logprobs_val
+                        .get(position)
+                        .map(|values| values.iter().map(|&lp| lp as f32).collect())
+                        .unwrap_or_default(),
+                    token_ids: output
+                        .output_top_logprobs_idx
+                        .get(position)
+                        .cloned()
+                        .unwrap_or_default(),
+                })
+                .collect()
+        };
         let chunk_logprobs =
             (!output.output_logprobs_val.is_empty()).then(|| vllm::OutputLogProbs {
                 token_logprobs: output
@@ -224,7 +248,7 @@ impl MappedGenerateStream for TokenSpeedGenerateStream {
                     .map(|&lp| lp as f32)
                     .collect(),
                 token_ids: output.output_logprobs_idx.clone(),
-                ..Default::default()
+                top_logprobs: tick_top_logprobs.clone(),
             });
         state
             .output_logprobs_val
@@ -232,6 +256,7 @@ impl MappedGenerateStream for TokenSpeedGenerateStream {
         state
             .output_logprobs_idx
             .extend(output.output_logprobs_idx.iter().copied());
+        state.output_top_logprobs.extend(tick_top_logprobs);
 
         // An engine-side failure must surface as an error, not a normal
         // completion with empty output — mirroring the vLLM stream's guard.
@@ -292,6 +317,16 @@ pub(crate) fn fan_out_tokenspeed_requests(
             sp.sampling_seed = sp.sampling_seed.map(|seed| seed.wrapping_add(u64::from(i)));
         }
     })
+}
+
+/// What the connected scheduler's slim output carries beyond its base
+/// columns, read off the handshake once per connection
+/// (`wire_carries_top_logprobs` on the READY layouts): the adapter forwards
+/// only the asks whose answers the wire can bring back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TokenSpeedWireColumns {
+    /// The ranked candidates per decoded token (`top_logprobs_num > 1`).
+    pub top_logprobs: bool,
 }
 
 /// What a multimodal item's `image_grid_thw` / `video_grid_thw` tensors are
@@ -369,6 +404,7 @@ pub(crate) fn translate_request_tokenspeed_for(
     grid_tensors: GridTensors,
     max_model_len: u64,
     ranks: &RankIndices,
+    wire: TokenSpeedWireColumns,
 ) -> Result<TokenizedGenerateReqInput, String> {
     let mut input_ids = match req.tokenized {
         Some(tokenized) => tokenized.input_ids,
@@ -465,13 +501,30 @@ pub(crate) fn translate_request_tokenspeed_for(
     // unset `max_new_tokens` stays unset: the scheduler caps it at the
     // remaining context itself.
     admit_prompt(input_ids.len(), max_model_len)?;
-    // Over the ZMQ wire TokenSpeed returns only the single sampled-token logprob
-    // per token: no top-k candidates (`top_logprobs_num > 1`) and no prompt
-    // logprobs (`token_ids_logprob`). Reject both rather than silently return
-    // fewer than asked. A bare `logprobs: true` (count 0/1) is the plain
-    // sampled-token logprob and is wired end-to-end via `return_logprob`.
-    if req.top_logprobs_num > 1 {
-        return Err("top_logprobs are not supported over the TokenSpeed ZMQ backend".to_string());
+    // Over the ZMQ wire TokenSpeed returns the single sampled-token logprob
+    // per token, and the ranked candidates (`top_logprobs_num > 0`) only on a
+    // scheduler whose handshake declared their columns
+    // ([`TokenSpeedWireColumns`]), under the scheduler's own ingress rules
+    // ([`top_logprobs_refusal`]); the selected candidates
+    // (`token_ids_logprob`) have no output on this engine's gRPC contract at
+    // all. Reject rather than silently return fewer than asked. On a
+    // scheduler without the columns a bare `logprobs: true` (count 0/1) is
+    // the plain sampled-token logprob and is wired end-to-end via
+    // `return_logprob`.
+    if wire.top_logprobs {
+        let max_new_tokens = req
+            .sampling_params
+            .as_ref()
+            .and_then(|sp| sp.max_new_tokens);
+        if let Some(reason) = top_logprobs_refusal(req.top_logprobs_num, max_new_tokens) {
+            return Err(reason);
+        }
+    } else if req.top_logprobs_num > 1 {
+        return Err(
+            "top_logprobs are not supported over the TokenSpeed ZMQ backend (the scheduler \
+             declares no ranked-candidate columns)"
+                .to_string(),
+        );
     }
     if !req.token_ids_logprob.is_empty() {
         return Err(
@@ -490,6 +543,13 @@ pub(crate) fn translate_request_tokenspeed_for(
                 params
             }),
         return_logprob: req.return_logprob,
+        // The ranked-candidate count reaches a scheduler that carries the
+        // rows back; a count of 0/1 is the sampled-token case on any wire.
+        top_logprobs_num: if wire.top_logprobs {
+            u32::try_from(req.top_logprobs_num).unwrap_or(0)
+        } else {
+            0
+        },
         stream: req.stream,
         input_ids_unpadded,
         multimodal_inputs,
@@ -610,6 +670,39 @@ pub(crate) fn rendezvous_rank(
             )),
         },
     }
+}
+
+/// Most ranked candidates a request may ask for per position: the
+/// scheduler's own bound (the OpenAI chat API's).
+const MAX_TOP_LOGPROBS: i32 = 20;
+
+/// Why the scheduler's ingress would refuse a ranked-candidate ask
+/// (`top_logprobs_num > 0`), in the scheduler's own words, or `None`: the
+/// count's bound, and the one-token rule (the candidates are computed where
+/// a forward runs eagerly, the prompt and the token a prefill samples, never
+/// a decode step, so only a request sampled entirely in its prefill is
+/// served: `max_new_tokens` set to 0 or 1; unset means unbounded on this
+/// wire and is refused too, as the scheduler reads it). Judged here because
+/// the slim wire's refusal carries no message; the launch-level rules
+/// (logprob order, pipeline parallelism, disaggregation) stay the
+/// scheduler's verdict.
+fn top_logprobs_refusal(top_logprobs_num: i32, max_new_tokens: Option<u32>) -> Option<String> {
+    if top_logprobs_num <= 0 {
+        return None;
+    }
+    if top_logprobs_num > MAX_TOP_LOGPROBS {
+        return Some(format!(
+            "top_logprobs_num must be between 1 and {MAX_TOP_LOGPROBS}, got {top_logprobs_num}."
+        ));
+    }
+    if max_new_tokens.is_none_or(|count| count > 1) {
+        return Some(
+            "top_logprobs_num > 0 needs max_new_tokens set to 0 or 1: top-k logprobs are \
+             computed for the prompt and the token a prefill samples, not for decode steps."
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// Map the proto multimodal payload onto the TokenSpeed wire structs, doing
@@ -938,7 +1031,8 @@ mod tests {
     use super::*;
     use crate::test_support::connected_pair;
 
-    /// The translation under the mock scheduler's context window, one rank.
+    /// The translation under the mock scheduler's context window, one rank, on
+    /// the wire of today (no appended columns declared).
     fn translate_for(
         req: tokenspeed_proto::GenerateRequest,
         grid_tensors: GridTensors,
@@ -948,6 +1042,7 @@ mod tests {
             grid_tensors,
             default_ready_response().max_model_len,
             &RankIndices::new(vec![0]),
+            TokenSpeedWireColumns::default(),
         )
     }
 
@@ -1165,21 +1260,29 @@ mod tests {
 
     #[test]
     fn tokenspeed_rejects_top_logprobs_and_prompt_logprobs() {
-        // Top-k logprobs (count > 1) cannot be honored over the wire.
+        // Top-k logprobs (count > 1) cannot be honored over the wire of a
+        // scheduler that declares no ranked-candidate columns.
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         req.top_logprobs_num = 5;
-        assert!(translate_for(req, GridTensors::Positions).is_err());
+        let error = translate_for(req, GridTensors::Positions).unwrap_err();
+        assert!(error.contains("ranked-candidate columns"), "{error}");
 
         // Prompt (input) logprobs cannot be produced.
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         req.token_ids_logprob = vec![1, 2];
         assert!(translate_for(req, GridTensors::Positions).is_err());
 
-        // A bare count of 0/1 is the plain sampled-token case: accepted.
+        // A bare count of 0/1 is the plain sampled-token case: accepted, and
+        // the neutral count goes to the scheduler.
         for count in [0, 1] {
             let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
             req.top_logprobs_num = count;
-            assert!(translate_for(req, GridTensors::Positions).is_ok());
+            assert_eq!(
+                translate_for(req, GridTensors::Positions)
+                    .unwrap()
+                    .top_logprobs_num,
+                0
+            );
         }
     }
 
@@ -1271,14 +1374,26 @@ mod tests {
         let reversed = RankIndices::new(vec![1, 0]);
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         req.data_parallel_rank = Some(1);
-        let wire = translate_request_tokenspeed_for(req, GridTensors::Positions, window, &reversed)
-            .expect("an in-range pin");
+        let wire = translate_request_tokenspeed_for(
+            req,
+            GridTensors::Positions,
+            window,
+            &reversed,
+            TokenSpeedWireColumns::default(),
+        )
+        .expect("an in-range pin");
         assert_eq!(wire.data_parallel_rank, Some(0), "rank 1 is index 0");
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         req.data_parallel_rank = Some(1);
         req.kv_bootstrap_info = Some(kv_bootstrap("10.0.0.7", 8998, 4));
-        let wire = translate_request_tokenspeed_for(req, GridTensors::Positions, window, &reversed)
-            .expect("a disaggregated request");
+        let wire = translate_request_tokenspeed_for(
+            req,
+            GridTensors::Positions,
+            window,
+            &reversed,
+            TokenSpeedWireColumns::default(),
+        )
+        .expect("a disaggregated request");
         assert_eq!(
             wire.data_parallel_rank,
             Some(1),
@@ -1286,9 +1401,14 @@ mod tests {
         );
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         req.data_parallel_rank = Some(2);
-        let error =
-            translate_request_tokenspeed_for(req, GridTensors::Positions, window, &reversed)
-                .expect_err("an out-of-range pin");
+        let error = translate_request_tokenspeed_for(
+            req,
+            GridTensors::Positions,
+            window,
+            &reversed,
+            TokenSpeedWireColumns::default(),
+        )
+        .expect_err("an out-of-range pin");
         assert!(
             error.contains("data_parallel_rank must be in [0, 2)"),
             "{error}"
@@ -1438,6 +1558,159 @@ mod tests {
         assert!(item.feature.is_none() && item.encode_handshake.is_none());
         assert_eq!(item.offsets, vec![(1, 3)]);
         assert_eq!(item.model_specific_data["vit_grid"].dtype, "uint32");
+    }
+
+    /// A scheduler whose handshake declared the ranked-candidate columns gets
+    /// the count forwarded under the scheduler's own ingress rules, in its
+    /// words: the count's bound, and the one-token rule (a request sampled
+    /// entirely in its prefill: `max_new_tokens` 0 or 1, never unset); the
+    /// selected candidates stay refused (the gRPC contract has no output for
+    /// them on any wire).
+    #[test]
+    fn a_wire_with_ranked_candidate_columns_takes_the_top_logprobs_count() {
+        let wire = TokenSpeedWireColumns { top_logprobs: true };
+        let translate = |req| {
+            translate_request_tokenspeed_for(
+                req,
+                GridTensors::Positions,
+                default_ready_response().max_model_len,
+                &RankIndices::new(vec![0]),
+                wire,
+            )
+        };
+        let asking = |count: i32, max_new_tokens: Option<u32>| {
+            let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams {
+                max_new_tokens,
+                ..Default::default()
+            });
+            req.return_logprob = true;
+            req.top_logprobs_num = count;
+            req
+        };
+        for (count, max_new_tokens) in [(5, Some(1)), (1, Some(1)), (20, Some(0))] {
+            let sent = translate(asking(count, max_new_tokens)).expect("forwarded");
+            assert!(sent.return_logprob);
+            assert_eq!(
+                sent.top_logprobs_num, count as u32,
+                "{count} {max_new_tokens:?}"
+            );
+        }
+        // No ranked ask: the one-token rule does not apply.
+        let sent = translate(asking(0, Some(64))).expect("forwarded");
+        assert_eq!(sent.top_logprobs_num, 0);
+        let sent = translate(asking(0, None)).expect("forwarded");
+        assert_eq!(sent.top_logprobs_num, 0);
+        let error = translate(asking(21, Some(1))).unwrap_err();
+        assert_eq!(error, "top_logprobs_num must be between 1 and 20, got 21.");
+        let one_token = "top_logprobs_num > 0 needs max_new_tokens set to 0 or 1: top-k logprobs \
+                         are computed for the prompt and the token a prefill samples, not for \
+                         decode steps.";
+        assert_eq!(translate(asking(3, Some(8))).unwrap_err(), one_token);
+        // Unset means unbounded on this wire: refused as the scheduler does.
+        assert_eq!(translate(asking(3, None)).unwrap_err(), one_token);
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        req.token_ids_logprob = vec![1, 2];
+        assert!(translate(req).is_err());
+    }
+
+    /// The ranked candidates a scheduler of the appended-columns revision
+    /// sends ride the chunk's `top_logprobs` one entry per emitted token (an
+    /// empty one where the engine gave none) and accumulate onto the
+    /// `Complete`, next to the sampled-token logprobs.
+    #[tokio::test]
+    async fn ranked_candidates_ride_the_appended_columns() {
+        use engine_zmq_client::{
+            codec::encode_msgpack, protocol::tokenspeed::output::BatchTokenIDOutSlim,
+        };
+
+        let (client, engine, _dir) = connected_pair(RuntimeType::TokenSpeed).await;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "engine task ends after responding"
+        )]
+        let engine_task = tokio::spawn(async move {
+            let (mut input, mut output) = engine.split();
+            let _frames = input.recv_frames().await.unwrap();
+            let chunk = BatchTokenIDOutSlim {
+                rids: vec!["t1".into()],
+                output_ids: vec![vec![10, 11]],
+                finished_reasons: vec![String::new()],
+                prompt_tokens: vec![3],
+                completion_tokens: vec![2],
+                cached_tokens: vec![0],
+                output_token_logprobs_val: vec![vec![-0.5, -1.25]],
+                output_token_logprobs_idx: vec![vec![10, 11]],
+                // Candidates for the first token only: the second gets an
+                // empty entry, as the Python servicer pads it.
+                output_top_logprobs_val: vec![vec![vec![-0.5, -2.0]]],
+                output_top_logprobs_idx: vec![vec![vec![10, 12]]],
+                ..Default::default()
+            };
+            let done = BatchTokenIDOutSlim {
+                rids: vec!["t1".into()],
+                output_ids: vec![vec![13]],
+                finished_reasons: vec!["length".into()],
+                prompt_tokens: vec![3],
+                completion_tokens: vec![3],
+                cached_tokens: vec![0],
+                output_token_logprobs_val: vec![vec![-0.75]],
+                output_token_logprobs_idx: vec![vec![13]],
+                output_top_logprobs_val: vec![vec![vec![-0.75, -3.0]]],
+                output_top_logprobs_idx: vec![vec![vec![13, 14]]],
+                ..Default::default()
+            };
+            for batch in [chunk, done] {
+                output
+                    .send_frames(vec![bytes::Bytes::from(encode_msgpack(&batch).unwrap())])
+                    .await
+                    .unwrap();
+            }
+            (input, output)
+        });
+
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams {
+            max_new_tokens: Some(1),
+            ..Default::default()
+        });
+        req.request_id = "t1".to_string();
+        req.return_logprob = true;
+        let mut stream = client.generate_tokenspeed(req).await.expect("generate");
+        let first = stream.next().await.expect("chunk").expect("ok");
+        let Some(vllm::generate_response::Response::Chunk(chunk)) = first.response else {
+            panic!("expected a chunk, got {first:?}");
+        };
+        let logprobs = chunk.output_logprobs.expect("chunk logprobs");
+        assert_eq!(logprobs.token_ids, vec![10, 11]);
+        assert_eq!(
+            logprobs.top_logprobs.len(),
+            2,
+            "one entry per emitted token"
+        );
+        assert_eq!(logprobs.top_logprobs[0].token_ids, vec![10, 12]);
+        assert_eq!(logprobs.top_logprobs[0].values, vec![-0.5, -2.0]);
+        assert!(logprobs.top_logprobs[1].token_ids.is_empty(), "padded");
+        let second = stream.next().await.expect("chunk").expect("ok");
+        let Some(vllm::generate_response::Response::Chunk(chunk)) = second.response else {
+            panic!("expected a chunk, got {second:?}");
+        };
+        assert_eq!(
+            chunk.output_logprobs.expect("chunk logprobs").top_logprobs[0].token_ids,
+            vec![13, 14]
+        );
+        let third = stream.next().await.expect("complete").expect("ok");
+        let Some(vllm::generate_response::Response::Complete(complete)) = third.response else {
+            panic!("expected a complete, got {third:?}");
+        };
+        let logprobs = complete.output_logprobs.expect("complete logprobs");
+        assert_eq!(logprobs.token_ids, vec![10, 11, 13]);
+        assert_eq!(
+            logprobs.top_logprobs.len(),
+            3,
+            "cumulative, parallel to the ids"
+        );
+        assert_eq!(logprobs.top_logprobs[2].token_ids, vec![13, 14]);
+        drop(stream);
+        let _ = engine_task.await;
     }
 
     #[test]
@@ -1590,6 +1863,7 @@ mod tests {
                     GridTensors::Positions,
                     max_model_len,
                     &RankIndices::new(vec![0]),
+                    TokenSpeedWireColumns::default(),
                 );
                 assert_eq!(
                     result.is_ok(),
@@ -1623,6 +1897,7 @@ mod tests {
             GridTensors::Positions,
             5,
             &RankIndices::new(vec![0]),
+            TokenSpeedWireColumns::default(),
         )
         .expect_err("the prompt fills the window");
         assert!(error.contains("length 5"), "{error}");
@@ -1632,6 +1907,7 @@ mod tests {
             GridTensors::Positions,
             6,
             &RankIndices::new(vec![0]),
+            TokenSpeedWireColumns::default(),
         )
         .expect("one position left for output");
         assert_eq!(wire.input_ids.len(), 5);

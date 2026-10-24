@@ -1252,6 +1252,16 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 request.data_parallel_rank if request.HasField("data_parallel_rank") else None
             )
 
+        # The gRPC contract of this engine carries no output for the selected
+        # candidates' logprobs (its `OutputLogProbs` has token, id and ranked
+        # rows only), so an ask for them is refused rather than forwarded to
+        # an engine whose answer nothing could return; the Rust servicer
+        # refuses it the same way.
+        if request.token_ids_logprob:
+            raise ValueError(
+                "token_ids_logprob is not served on the TokenSpeed gRPC contract: its "
+                "responses carry sampled and ranked logprobs only"
+            )
         GenerateReqInput = _lazy_generate_req_input()
         obj = GenerateReqInput(
             input_ids=input_ids,
@@ -1264,9 +1274,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 request.logprob_start_len if request.HasField("logprob_start_len") else -1
             ),
             top_logprobs_num=int(request.top_logprobs_num or 0),
-            token_ids_logprob=(
-                list(request.token_ids_logprob) if request.token_ids_logprob else None
-            ),
+            token_ids_logprob=None,
             precomputed_multimodal_inputs=precomputed_mm,
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,

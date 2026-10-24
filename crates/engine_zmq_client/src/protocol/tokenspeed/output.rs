@@ -3,6 +3,8 @@
 // a positional msgpack array with the class-name tag string as element 0.
 // **Field order is the wire contract** — do not reorder.
 
+use std::collections::BTreeMap;
+
 use serde::{
     de::{SeqAccess, Visitor},
     ser::SerializeTuple,
@@ -12,13 +14,37 @@ use serde::{
 use crate::{
     error::{Error, Result},
     protocol::{
-        positional::{drain_trailing, expect_tag, next_field},
+        positional::{appended_column, drain_trailing, expect_tag, next_field},
         EngineOutput,
     },
 };
 
 /// The msgspec tag for [`BatchTokenIDOutSlim`] (element 0 on the wire).
 pub const BATCH_TOKEN_ID_OUT_SLIM_TAG: &str = "BatchTokenIDOutSlim";
+
+/// The columns a scheduler appends to [`BatchTokenIDOutSlim`] when its wire
+/// carries the ranked candidates per decoded token (`top_logprobs_num`), in
+/// their order on the wire. A scheduler that has them declares them in its
+/// READY layout of this struct ([`wire_carries_top_logprobs`]); the decoder
+/// reads them from any tuple long enough. The gRPC contract of this engine
+/// has no output for prompt or selected-candidate logprobs, so no column
+/// carries those.
+pub const TOP_LOGPROB_COLUMNS: [&str; 2] = ["output_top_logprobs_val", "output_top_logprobs_idx"];
+
+/// Whether the engine's handshake declared the ranked-candidate columns on
+/// its slim output (`positional_layouts["BatchTokenIDOutSlim"]` names both of
+/// [`TOP_LOGPROB_COLUMNS`]): the adapter then forwards a `top_logprobs_num`
+/// above one, which it refuses on a wire without them. A scheduler that
+/// declares no layout at all (today's) has none.
+pub fn wire_carries_top_logprobs(layouts: &BTreeMap<String, Vec<String>>) -> bool {
+    layouts
+        .get(BATCH_TOKEN_ID_OUT_SLIM_TAG)
+        .is_some_and(|fields| {
+            TOP_LOGPROB_COLUMNS
+                .iter()
+                .all(|column| fields.iter().any(|field| field == column))
+        })
+}
 
 /// A batch of per-request token outputs from one engine step. Mirrors Python
 /// `BatchTokenIDOutSlim`: the per-request slice of an engine step for a
@@ -69,11 +95,26 @@ pub struct BatchTokenIDOutSlim {
     pub kv_active_pages: u64,
     /// Usable KV pages on the rank (the usage ratio's denominator).
     pub kv_total_pages: u64,
+    /// Ranked candidates per newly decoded token (`top_logprobs_num` of
+    /// them) per request, parallel to the sampled-token logprob columns.
+    /// Appended by the ranked-candidates wire revision
+    /// ([`TOP_LOGPROB_COLUMNS`]); empty from a scheduler without it, and
+    /// empty per request when not asked.
+    pub output_top_logprobs_val: Vec<Vec<Vec<f64>>>,
+    pub output_top_logprobs_idx: Vec<Vec<Vec<u32>>>,
 }
 
 impl Serialize for BatchTokenIDOutSlim {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        let mut tuple = serializer.serialize_tuple(14)?;
+        // A batch of the ranked-candidates revision carries both columns.
+        let with_top_logprobs =
+            !self.output_top_logprobs_val.is_empty() || !self.output_top_logprobs_idx.is_empty();
+        let len = if with_top_logprobs {
+            14 + TOP_LOGPROB_COLUMNS.len()
+        } else {
+            14
+        };
+        let mut tuple = serializer.serialize_tuple(len)?;
         tuple.serialize_element(BATCH_TOKEN_ID_OUT_SLIM_TAG)?;
         tuple.serialize_element(&self.rids)?;
         tuple.serialize_element(&self.output_ids)?;
@@ -88,6 +129,10 @@ impl Serialize for BatchTokenIDOutSlim {
         tuple.serialize_element(&self.num_waiting)?;
         tuple.serialize_element(&self.kv_active_pages)?;
         tuple.serialize_element(&self.kv_total_pages)?;
+        if with_top_logprobs {
+            tuple.serialize_element(&self.output_top_logprobs_val)?;
+            tuple.serialize_element(&self.output_top_logprobs_idx)?;
+        }
         tuple.end()
     }
 }
@@ -126,6 +171,10 @@ impl<'de> Deserialize<'de> for BatchTokenIDOutSlim {
                     num_waiting: seq.next_element::<u64>()?.unwrap_or(0),
                     kv_active_pages: seq.next_element::<u64>()?.unwrap_or(0),
                     kv_total_pages: seq.next_element::<u64>()?.unwrap_or(0),
+                    // Appended by the ranked-candidates revision; today's
+                    // 14-element batch decodes with them empty.
+                    output_top_logprobs_val: appended_column(&mut seq)?,
+                    output_top_logprobs_idx: appended_column(&mut seq)?,
                 };
                 drain_trailing(&mut seq)?;
                 Ok(batch)
@@ -158,6 +207,10 @@ pub struct TokenSpeedOutput {
     /// Token id each logprob in `output_logprobs_val` belongs to. Empty when
     /// logprobs were not requested.
     pub output_logprobs_idx: Vec<u32>,
+    /// Ranked candidates per newly decoded token this step, when asked and
+    /// the wire carries them ([`TOP_LOGPROB_COLUMNS`]); empty otherwise.
+    pub output_top_logprobs_val: Vec<Vec<f64>>,
+    pub output_top_logprobs_idx: Vec<Vec<u32>>,
 }
 
 impl EngineOutput for TokenSpeedOutput {
@@ -201,6 +254,26 @@ impl BatchTokenIDOutSlim {
             });
         }
 
+        // The appended columns are optional as a whole (a scheduler without
+        // the revision sends none); one that is there is a column like any.
+        for (name, len) in [
+            (
+                "output_top_logprobs_val",
+                self.output_top_logprobs_val.len(),
+            ),
+            (
+                "output_top_logprobs_idx",
+                self.output_top_logprobs_idx.len(),
+            ),
+        ] {
+            if len > 0 && len != n {
+                return Err(Error::Decode {
+                    target_type: "BatchTokenIDOutSlim",
+                    message: format!("column `{name}` has {len} entries for {n} rids"),
+                });
+            }
+        }
+
         let BatchTokenIDOutSlim {
             rids,
             output_ids,
@@ -217,7 +290,11 @@ impl BatchTokenIDOutSlim {
             num_waiting: _,
             kv_active_pages: _,
             kv_total_pages: _,
+            output_top_logprobs_val,
+            output_top_logprobs_idx,
         } = self;
+        let mut top_val = output_top_logprobs_val.into_iter();
+        let mut top_idx = output_top_logprobs_idx.into_iter();
 
         Ok(rids
             .into_iter()
@@ -243,6 +320,8 @@ impl BatchTokenIDOutSlim {
                         cached_tokens: cached,
                         output_logprobs_val: logprobs_val,
                         output_logprobs_idx: logprobs_idx,
+                        output_top_logprobs_val: top_val.next().unwrap_or_default(),
+                        output_top_logprobs_idx: top_idx.next().unwrap_or_default(),
                     }
                 },
             )
@@ -279,6 +358,16 @@ mod tests {
         "99b34261746368546f6b656e49444f7574536c696d91a57665632d3191920a0b91a66c656e\
          6774689103910291019192cbbfe0000000000000cbbfd000000000000091920a0b";
 
+    /// The same batch from a scheduler that carries the ranked candidates:
+    /// the first token's three candidates (-0.5, -1.0, -2.0 for ids 10, 12,
+    /// 13) and the second's one (-0.25 for id 11) in the two appended
+    /// columns, captured from the Python msgspec encoder.
+    const PYTHON_OUTPUT_VECTOR_WITH_TOP_LOGPROBS: &str =
+        "dc0010b34261746368546f6b656e49444f7574536c696d91a57665632d3191920a0b91a66c65\
+         6e6774689103910291019192cbbfe0000000000000cbbfd000000000000091920a0b01020564\
+         cd0190919293cbbfe0000000000000cbbff0000000000000cbc00000000000000091cbbfd000\
+         00000000009192930a0c0d910b";
+
     fn vector_bytes(hex_vector: &str) -> Vec<u8> {
         let hex: String = hex_vector.chars().filter(|c| !c.is_whitespace()).collect();
         (0..hex.len())
@@ -306,7 +395,83 @@ mod tests {
             num_waiting: 5,
             kv_active_pages: 100,
             kv_total_pages: 400,
+            ..Default::default()
         }
+    }
+
+    /// The ranked-candidates revision appends two columns after the load
+    /// tail: a batch carrying them encodes 16 elements and splits per
+    /// request into the ranked rows (three candidates on the first token,
+    /// one on the second); today's 14-element batch decodes with them
+    /// empty and re-encodes byte for byte; a ragged appended column is a
+    /// protocol bug; and the READY layout tells the two schedulers apart.
+    #[test]
+    fn top_logprob_columns_are_appended_optional_and_declared() {
+        let batch = BatchTokenIDOutSlim {
+            output_top_logprobs_val: vec![vec![vec![-0.5, -1.0, -2.0], vec![-0.25]]],
+            output_top_logprobs_idx: vec![vec![vec![10, 12, 13], vec![11]]],
+            ..vector_batch()
+        };
+        let encoded = encode_msgpack(&batch).unwrap();
+        let Value::Array(array) = decode_value(&encoded).unwrap() else {
+            panic!("expected positional array");
+        };
+        assert_eq!(array.len(), 14 + TOP_LOGPROB_COLUMNS.len());
+        let decoded: BatchTokenIDOutSlim = decode_msgpack(&encoded).unwrap();
+        assert_eq!(decoded, batch);
+        // Byte for byte the 16-element batch the scheduler's own struct
+        // emits for these rows (the `dc 00 10` header, the two columns last).
+        assert_eq!(
+            encoded,
+            vector_bytes(PYTHON_OUTPUT_VECTOR_WITH_TOP_LOGPROBS)
+        );
+        let outputs = decoded.into_outputs().unwrap();
+        assert_eq!(
+            outputs[0].output_top_logprobs_val,
+            vec![vec![-0.5, -1.0, -2.0], vec![-0.25]]
+        );
+        assert_eq!(
+            outputs[0].output_top_logprobs_idx,
+            vec![vec![10, 12, 13], vec![11]]
+        );
+
+        let today: BatchTokenIDOutSlim = decode_msgpack(&python_output_bytes()).unwrap();
+        assert!(today.output_top_logprobs_val.is_empty());
+        assert_eq!(encode_msgpack(&today).unwrap(), python_output_bytes());
+        assert!(today.into_outputs().unwrap()[0]
+            .output_top_logprobs_val
+            .is_empty());
+
+        let mut ragged = batch;
+        ragged.output_top_logprobs_idx.push(vec![vec![9]]);
+        let error = ragged.into_outputs().unwrap_err().to_string();
+        assert!(error.contains("output_top_logprobs_idx"), "{error}");
+
+        let mut layouts = BTreeMap::new();
+        assert!(!wire_carries_top_logprobs(&layouts));
+        let mut fields: Vec<String> = [
+            "rids",
+            "output_ids",
+            "finished_reasons",
+            "prompt_tokens",
+            "completion_tokens",
+            "cached_tokens",
+            "output_token_logprobs_val",
+            "output_token_logprobs_idx",
+            "engine_index",
+            "num_running",
+            "num_waiting",
+            "kv_active_pages",
+            "kv_total_pages",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        layouts.insert(BATCH_TOKEN_ID_OUT_SLIM_TAG.to_string(), fields.clone());
+        assert!(!wire_carries_top_logprobs(&layouts), "today's layout");
+        fields.extend(TOP_LOGPROB_COLUMNS.iter().map(ToString::to_string));
+        layouts.insert(BATCH_TOKEN_ID_OUT_SLIM_TAG.to_string(), fields);
+        assert!(wire_carries_top_logprobs(&layouts));
     }
 
     /// The pinned cross-language vector — the exact bytes the engine sends —
@@ -404,11 +569,13 @@ mod tests {
 
     #[test]
     fn decode_tolerates_appended_trailing_columns() {
-        // TokenSpeed appends new fields at the end; the decoder skips them.
+        // TokenSpeed appends new fields at the end; the decoder skips what it
+        // does not model (past the ranked-candidate columns, nil here).
         let mut with_extra = match decode_value(&python_output_bytes()).unwrap() {
             Value::Array(array) => array,
             other => panic!("expected array, got {other:?}"),
         };
+        with_extra.extend([Value::Nil, Value::Nil]);
         with_extra.push(Value::Array(vec![Value::from(99)]));
         let mut bytes = Vec::new();
         rmpv::encode::write_value(&mut bytes, &Value::Array(with_extra)).unwrap();
