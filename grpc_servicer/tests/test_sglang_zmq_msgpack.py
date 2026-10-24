@@ -256,8 +256,10 @@ def test_slim_output_carries_the_schedulers_abort_err_type():
     assert encoded[27] == [None, None]
     # Pins for the Rust decoder (`protocol/sglang/output.rs`): PYTHON_SLIM27 is
     # this batch as an earlier plugin encoded it (27 fields, decoded with no
-    # rows); PYTHON_SLIM28 the 28-field form. The hex below is today's.
-    print("PIN_SLIM28", msgspec.msgpack.encode(slim).hex())
+    # rows). The hex below is its 28-field form today, which no Rust constant
+    # pins; PYTHON_SLIM28 pins a different batch (hidden-state rows, not these
+    # aborts).
+    print("PIN_SLIM27_AS_28", msgspec.msgpack.encode(slim).hex())
     # A PD decode side's grammar failure carries the name next to its 500.
     full.finished_reasons[1] = {
         "type": "abort",
