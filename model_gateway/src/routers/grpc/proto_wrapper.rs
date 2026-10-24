@@ -2500,6 +2500,22 @@ mod tests {
     }
 
     #[test]
+    fn sglang_encoder_inputs_preserve_url_bytes_without_local_pixels() {
+        let images = vec![
+            "data:image/png;base64,AA==".to_string(),
+            "https://example.test/image.png".to_string(),
+        ];
+        let data = MultimodalData::Sglang(SglangMultimodalData::for_encoder(images.clone()));
+        assert_eq!(data.inline_bytes(), images.iter().map(String::len).sum::<usize>());
+        let wire = SglangMultimodalData::for_encoder(images.clone()).into_proto();
+        assert_eq!(wire.image_urls, images);
+        assert_eq!(wire.modalities, ["image"]);
+        assert!(wire.pixel_values.is_none());
+        assert!(wire.image_data.is_empty());
+        assert!(wire.model_specific_tensors.is_empty());
+    }
+
+    #[test]
     fn inline_bytes_counts_every_inline_tensor_and_raw_image() {
         let trtllm = MultimodalData::Trtllm(TrtllmMultimodalData {
             image_data: vec![vec![0; 3], vec![0; 5]],
@@ -2507,6 +2523,7 @@ mod tests {
         assert_eq!(trtllm.inline_bytes(), 8);
 
         let sglang = MultimodalData::Sglang(SglangMultimodalData {
+            encoder_image_urls: None,
             image_data: vec![vec![0; 2]],
             pixel_values: vec![0; 16],
             pixel_values_shape: vec![4, 4],

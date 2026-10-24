@@ -37,8 +37,8 @@ use crate::{
             backend_client::BackendClient,
             common::stages::encode::EncodeDispatchPlan,
             context::{
-                stage_output, ClientSelection, DispatchContext, ExecutionPlan, ExecutionPlanKind,
-                ExecutionResult, LoadGuards, PdTiming, WorkerSelection,
+                stage_output, ClientSelection, DispatchContext, EncodeOutputs, ExecutionPlan,
+                ExecutionPlanKind, ExecutionResult, LoadGuards, PdTiming, WorkerSelection,
             },
             multimodal::worker_language_model_only,
             proto_wrapper::{
@@ -294,7 +294,14 @@ pub(crate) async fn execute_plan(
     // consumed it). Taking it transfers the encode jobs' SHM Drop guards
     // here: dispatch consumes them, while an early error before dispatch
     // drops them and reclaims the SHM.
-    let encode_dispatch = ctx.encode_outputs.take().map(|o| o.dispatch);
+    let encode_dispatch = if matches!(ctx.encode_outputs, Some(EncodeOutputs::Sglang(_))) {
+        None
+    } else {
+        ctx.encode_outputs.take().and_then(|outputs| match outputs {
+            EncodeOutputs::TokenSpeed { dispatch, .. } => Some(dispatch),
+            EncodeOutputs::Sglang(_) => None,
+        })
+    };
 
     let clients = stage_output(ctx.clients.as_mut(), "execute_plan")?;
 
