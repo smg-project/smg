@@ -12,7 +12,10 @@ use std::{
 };
 
 use futures::StreamExt;
-use smg_grpc_client::{is_request_timeout, vllm_proto as proto, RequestDeadline, VllmEngineClient};
+use smg_grpc_client::{
+    is_request_timeout, request_timeout_kind, vllm_proto as proto, RequestBounds, RequestDeadline,
+    TimeoutKind, VllmEngineClient,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{transport::Server, Request, Response, Status};
@@ -292,6 +295,208 @@ async fn a_stream_that_ends_before_the_deadline_is_unchanged_by_it() {
         state.aborted_ids().is_empty(),
         "a completed stream sends no abort"
     );
+}
+
+/// The silence bounds beside a total out of reach: the first-token bound
+/// cuts a stream that says nothing, under its own kind; the inter-token bound
+/// cuts one that went silent after a message, under its own; a stream whose
+/// messages keep coming inside the inter-token bound is untouched by it.
+const SILENCE: Duration = Duration::from_millis(300);
+const FAR_TOTAL: Duration = Duration::from_secs(60);
+
+fn bounds(first_token: Option<Duration>, inter_token: Option<Duration>) -> RequestDeadline {
+    RequestDeadline::from_dispatch(RequestBounds {
+        total: Some(FAR_TOTAL),
+        first_token,
+        inter_token,
+    })
+    // The total is set, so the bounds are never none.
+    .unwrap_or_else(|| RequestDeadline::after(FAR_TOTAL))
+}
+
+#[tokio::test]
+async fn a_stream_that_says_nothing_is_cut_by_the_first_token_bound_under_its_own_kind() {
+    let (endpoint, state) = spawn_mock().await.unwrap();
+    let client = VllmEngineClient::connect(&endpoint).await.unwrap();
+    let started = Instant::now();
+    let mut stream = client
+        .generate(generate_request("first-token-1"))
+        .await
+        .unwrap()
+        .with_deadline(bounds(Some(SILENCE), Some(Duration::from_secs(30))));
+    let _held_open = state.take_tx().expect("the mock opened a stream");
+
+    let status = tokio::time::timeout(Duration::from_secs(10), stream.next())
+        .await
+        .expect("the first-token bound ends the wait")
+        .expect("a message, not the end")
+        .expect_err("the bound's status");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= SILENCE && elapsed < SILENCE + Duration::from_secs(5),
+        "ended after {elapsed:?}"
+    );
+    assert!(is_request_timeout(&status), "{status:?}");
+    assert_eq!(request_timeout_kind(&status), Some(TimeoutKind::FirstToken));
+    assert!(
+        status.message().contains("no first token within 300ms"),
+        "{status:?}"
+    );
+    assert_eq!(wait_for_abort(&state).await, ["first-token-1"]);
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn a_stream_silent_after_a_message_is_cut_by_the_inter_token_bound_and_a_steady_one_is_not() {
+    let (endpoint, state) = spawn_mock().await.unwrap();
+    let client = VllmEngineClient::connect(&endpoint).await.unwrap();
+    let mut stream = client
+        .generate(generate_request("inter-token-1"))
+        .await
+        .unwrap()
+        .with_deadline(bounds(Some(Duration::from_secs(30)), Some(SILENCE)));
+    let tx = state.take_tx().expect("the mock opened a stream");
+
+    // Messages inside the bound keep the stream alive past several bounds'
+    // worth of time: the clock restarts at each.
+    for _ in 0..6 {
+        tokio::time::sleep(SILENCE / 3).await;
+        tx.send(Ok(proto::GenerateResponse::default()))
+            .await
+            .unwrap();
+        assert!(stream.next().await.unwrap().is_ok());
+    }
+    assert!(state.aborted_ids().is_empty());
+
+    // Then silence: the inter-token bound ends it, under its own kind.
+    let last = Instant::now();
+    let status = tokio::time::timeout(Duration::from_secs(10), stream.next())
+        .await
+        .expect("the inter-token bound ends the wait")
+        .expect("a message, not the end")
+        .expect_err("the bound's status");
+    let waited = last.elapsed();
+    assert!(
+        waited >= SILENCE && waited < SILENCE + Duration::from_secs(5),
+        "ended after {waited:?}"
+    );
+    assert_eq!(request_timeout_kind(&status), Some(TimeoutKind::InterToken));
+    assert!(
+        status.message().contains("no token for 300ms"),
+        "{status:?}"
+    );
+    assert_eq!(wait_for_abort(&state).await, ["inter-token-1"]);
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn a_first_token_bound_alone_leaves_the_silence_after_the_first_message_to_the_total() {
+    let (endpoint, state) = spawn_mock().await.unwrap();
+    let client = VllmEngineClient::connect(&endpoint).await.unwrap();
+    let mut stream = client
+        .generate(generate_request("first-only-1"))
+        .await
+        .unwrap()
+        .with_deadline(bounds(Some(SILENCE), None));
+    let tx = state.take_tx().expect("the mock opened a stream");
+    tx.send(Ok(proto::GenerateResponse::default()))
+        .await
+        .unwrap();
+    assert!(stream.next().await.unwrap().is_ok());
+
+    // Silent past the first-token bound, which no longer applies: the stream
+    // is still open and nothing was aborted.
+    let next = tokio::time::timeout(SILENCE * 3, stream.next()).await;
+    assert!(
+        next.is_err(),
+        "the first-token bound cut a stream past its first message: {next:?}"
+    );
+    assert!(state.aborted_ids().is_empty());
+    drop(stream);
+    assert_eq!(wait_for_abort(&state).await, ["first-only-1"]);
+}
+
+#[tokio::test]
+async fn a_reader_that_stops_polling_is_not_mistaken_for_a_silent_worker() {
+    let (endpoint, state) = spawn_mock().await.unwrap();
+    let client = VllmEngineClient::connect(&endpoint).await.unwrap();
+    let mut stream = client
+        .generate(generate_request("held-reader-1"))
+        .await
+        .unwrap()
+        .with_deadline(bounds(Some(Duration::from_secs(30)), Some(SILENCE)));
+    let tx = state.take_tx().expect("the mock opened a stream");
+    tx.send(Ok(proto::GenerateResponse::default()))
+        .await
+        .unwrap();
+    assert!(stream.next().await.unwrap().is_ok());
+
+    // The worker keeps sending while the reader does not poll for two and a
+    // half inter-token bounds (a slow client holding the read loop): its
+    // messages wait in the transport, and the next polls find them, not a
+    // silence of the worker's.
+    for _ in 0..4 {
+        tokio::time::sleep(SILENCE / 2).await;
+        tx.send(Ok(proto::GenerateResponse::default()))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(SILENCE / 2).await;
+    for _ in 0..4 {
+        let item = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("a buffered message")
+            .expect("a message, not the end");
+        assert!(
+            item.is_ok(),
+            "the reader's pause was charged to the worker: {item:?}"
+        );
+    }
+    assert!(state.aborted_ids().is_empty());
+
+    // The worker's own silence after the last message read is still cut.
+    let last = Instant::now();
+    let status = tokio::time::timeout(Duration::from_secs(10), stream.next())
+        .await
+        .expect("the inter-token bound ends the wait")
+        .expect("a message, not the end")
+        .expect_err("the bound's status");
+    assert!(
+        last.elapsed() >= SILENCE,
+        "ended after {:?}",
+        last.elapsed()
+    );
+    assert_eq!(request_timeout_kind(&status), Some(TimeoutKind::InterToken));
+    assert_eq!(wait_for_abort(&state).await, ["held-reader-1"]);
+}
+
+#[tokio::test]
+async fn a_stream_read_once_before_the_bounds_are_attached_starts_in_its_second_phase() {
+    let (endpoint, state) = spawn_mock().await.unwrap();
+    let client = VllmEngineClient::connect(&endpoint).await.unwrap();
+    let mut stream = client
+        .generate(generate_request("read-ahead-1"))
+        .await
+        .unwrap();
+    let tx = state.take_tx().expect("the mock opened a stream");
+    tx.send(Ok(proto::GenerateResponse::default()))
+        .await
+        .unwrap();
+    assert!(stream.next().await.unwrap().is_ok());
+
+    // The first message was read before the bounds (a side read ahead during
+    // the dispatch): the first-token bound does not apply to the second
+    // message, the silence after it is the inter-token bound's, and that one
+    // is off here.
+    let mut stream = stream.with_deadline(bounds(Some(SILENCE), None));
+    let waited = tokio::time::timeout(SILENCE * 3, stream.next()).await;
+    assert!(
+        waited.is_err(),
+        "the first-token bound cut a stream past its first message: {waited:?}"
+    );
+    assert!(state.aborted_ids().is_empty());
+    drop(stream);
+    assert_eq!(wait_for_abort(&state).await, ["read-ahead-1"]);
 }
 
 #[tokio::test]

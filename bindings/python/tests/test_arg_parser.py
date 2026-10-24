@@ -1850,6 +1850,15 @@ class TestConnectionTimeouts:
         args = parse_router_args([])
         assert args.header_read_timeout_secs == 30
         assert args.idle_connection_timeout_secs == 90
+        assert args.first_token_timeout_secs == 0
+        assert args.inter_token_timeout_secs == 0
+
+    def test_silence_bound_flags_parse(self):
+        args = parse_router_args(
+            ["--first-token-timeout-secs", "120", "--inter-token-timeout-secs", "30"]
+        )
+        assert args.first_token_timeout_secs == 120
+        assert args.inter_token_timeout_secs == 30
 
     def test_flags_parse_and_zero_disables(self):
         args = parse_router_args(

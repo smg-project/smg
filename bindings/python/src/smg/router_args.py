@@ -578,6 +578,10 @@ class RouterArgs:
     # Request timeout in seconds: the read of the body overall, and each
     # request to a worker, HTTP or gRPC, from its dispatch to its last message
     request_timeout_secs: int = 1800
+    # Worker call silence bounds (0 disables): dispatch to the first message, and
+    # between one message and the next
+    first_token_timeout_secs: int = 0
+    inter_token_timeout_secs: int = 0
     # Retries (disable_retries switches them off)
     retry_backoff_multiplier: float = 1.5
     retry_initial_backoff_ms: int = 50
@@ -2124,6 +2128,35 @@ class RouterArgs:
                 "its last message (504 call_upstream_timeout past it, the "
                 "request's answer on any worker; an HTTP worker's own pool "
                 "timeout_secs takes this value's place)"
+            ),
+        )
+        request_group.add_argument(
+            f"--{prefix}first-token-timeout-secs",
+            type=int,
+            default=RouterArgs.first_token_timeout_secs,
+            help=(
+                "Seconds a gRPC worker may take from an attempt's dispatch to its"
+                " first message (the call that opens the stream included); past it the"
+                " attempt ends as at --request-timeout-secs (504"
+                " call_upstream_timeout, the worker's request aborted), counted"
+                " under the error reason first_token_timeout. 0 (the default)"
+                " leaves the wait for the first message to the request timeout."
+                " gRPC workers only: an HTTP worker's pool timeout is its bound,"
+                " and the direct engine wire bounds the dispatch, not the stream"
+            ),
+        )
+        request_group.add_argument(
+            f"--{prefix}inter-token-timeout-secs",
+            type=int,
+            default=RouterArgs.inter_token_timeout_secs,
+            help=(
+                "Seconds a gRPC worker's stream may go silent between one message"
+                " and the next; past it the stream ends as at --request-timeout-secs"
+                " (the error event that ends it, the worker's request aborted),"
+                " counted under the error reason inter_token_timeout. 0 (the"
+                " default) leaves a silence mid-stream to the request timeout."
+                " gRPC workers only: an HTTP worker's pool timeout is its bound,"
+                " and the direct engine wire bounds the dispatch, not the stream"
             ),
         )
         request_group.add_argument(

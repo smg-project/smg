@@ -34,7 +34,7 @@ use tokio::time::Sleep;
 use tonic::Streaming;
 use tracing::{debug, warn};
 
-use crate::request_deadline::RequestDeadline;
+use crate::request_deadline::{far_future, RequestDeadline, TimeoutKind};
 
 /// Upper bound on how long a deferred abort waits for the stream's first
 /// item before aborting anyway. Bounds the detached drain task when the
@@ -86,9 +86,9 @@ pub struct AbortOnDropStream<T: Send + 'static, C: AbortOnDropClient> {
     /// How long a drop waits for the worker to end the stream after the
     /// abort before releasing it with a reset (see `Drop`).
     release_drain_bound: Duration,
-    /// The request's deadline and its timer, when the stream is bounded by
-    /// one (see [`Self::with_deadline`]).
-    deadline: Option<(RequestDeadline, Pin<Box<Sleep>>)>,
+    /// The request's bounds and their one timer, when the stream is bounded
+    /// (see [`Self::with_deadline`]).
+    deadline: Option<Bounded>,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -109,15 +109,32 @@ impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
         }
     }
 
-    /// Bound the stream by the request's `deadline`: a poll at or past it
-    /// ends the stream, whatever the worker has sent since (as an HTTP
-    /// client's timeout ends a body), the stream is released as a dropped
-    /// one is (the abort goes to the worker at once, the deferral and the
-    /// drain apply as on a drop), and the reader meets the deadline's status
-    /// ([`RequestDeadline::status`]), then the end.
+    /// Bound the stream by the request's `deadline` (its total and, when
+    /// set, its first-token and inter-token bounds): a poll at or past the
+    /// total ends the stream, whatever the worker has sent since (as an HTTP
+    /// client's timeout ends a body); a poll past a silence bound ends it
+    /// only when the worker has nothing waiting. At the cut the stream is
+    /// released as a dropped one is (the abort goes to the worker at once,
+    /// the deferral and the drain apply as on a drop), and the reader meets
+    /// the bound's status ([`RequestDeadline::status`]), then the end. One
+    /// timer serves every bound: it is re-armed when a message moves the
+    /// next applicable instant (the first message, and each message under an
+    /// inter-token bound). A stream that yielded a message before the
+    /// bounds were attached starts in its second phase.
     #[must_use]
     pub fn with_deadline(mut self, deadline: RequestDeadline) -> Self {
-        self.deadline = Some((deadline, Box::pin(tokio::time::sleep_until(deadline.at()))));
+        // A stream whose first message was read before the bounds were
+        // attached (a side read ahead during the dispatch) is in its second
+        // phase: the silence after that message is the inter-token bound's,
+        // counted from here, not the first-token bound's.
+        let last = self.saw_item.then(tokio::time::Instant::now);
+        let armed = deadline.next_at(last);
+        let at = armed.map_or_else(far_future, |(at, _)| at);
+        self.deadline = Some(Bounded {
+            deadline,
+            armed,
+            sleep: Box::pin(tokio::time::sleep_until(at)),
+        });
         self
     }
 
@@ -301,35 +318,100 @@ impl<T: Send + 'static, C: AbortOnDropClient> futures::Stream for AbortOnDropStr
         if this.inner.is_none() {
             return Poll::Ready(None);
         }
-        // The deadline is read first: a stream polled at or past it ends
-        // here, a message the worker sent since included, and the timer's
-        // waker sees to the poll when the worker sends nothing at all. After
-        // `mark_completed` the request is done and the deadline does not
-        // speak again: a later poll reaches the stream's own end.
+        // The bound is read first, and the timer's waker sees to the poll
+        // when the worker sends nothing at all. The total ends a stream
+        // polled at or past it, a message the worker sent since included.
+        // A silence bound asks the worker first: a message already waiting
+        // in the transport is no silence of the worker's, whatever the
+        // reader's own pace (a slow client holds the read loop in the
+        // response channel while the worker's messages queue up), so it cuts
+        // only a stream that has nothing when its timer has fired. After
+        // `mark_completed` the request is done and no bound speaks again: a
+        // later poll reaches the stream's own end.
         let completed = this.aborted.load(Ordering::Acquire);
-        if let Some((deadline, sleep)) = this.deadline.as_mut().filter(|_| !completed) {
-            if sleep.as_mut().poll(cx).is_ready() {
-                let status = deadline.status();
-                warn!(
-                    request_id = %this.request_id,
-                    timeout = ?deadline.timeout(),
-                    "Request timed out: the worker did not finish it within the request timeout; aborting it on the worker"
-                );
-                this.release();
-                return Poll::Ready(Some(Err(status)));
-            }
+        let passed = this
+            .deadline
+            .as_mut()
+            .filter(|_| !completed)
+            .and_then(|bounded| bounded.passed(cx));
+        if matches!(passed, Some(TimeoutKind::Total)) {
+            return this.cut(TimeoutKind::Total);
         }
         let Some(inner) = this.inner.as_mut() else {
             return Poll::Ready(None);
         };
         let polled = Pin::new(inner).poll_next(cx);
-        if matches!(polled, Poll::Ready(Some(_))) {
-            // Any yielded item — data or error — ends the deferred
-            // window: the backend has responded, so its handoff
-            // state is resolved either way.
-            this.saw_item = true;
+        match polled {
+            Poll::Ready(Some(_)) => {
+                // Any yielded item — data or error — ends the deferred
+                // window: the backend has responded, so its handoff
+                // state is resolved either way.
+                this.saw_item = true;
+                if let Some(bounded) = this.deadline.as_mut() {
+                    bounded.item_arrived();
+                }
+            }
+            Poll::Pending => {
+                if let Some(kind) = passed {
+                    return this.cut(kind);
+                }
+            }
+            Poll::Ready(None) => {}
         }
         polled
+    }
+}
+
+impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
+    /// The bound `kind` passed: the stream ends here with the bound's status
+    /// and the worker's request is released (the abort at once).
+    fn cut(&mut self, kind: TimeoutKind) -> Poll<Option<Result<T, tonic::Status>>> {
+        let deadline = self
+            .deadline
+            .as_ref()
+            .map(|bounded| bounded.deadline)
+            .unwrap_or_else(|| RequestDeadline::after(Duration::ZERO));
+        let status = deadline.status(kind);
+        warn!(
+            request_id = %self.request_id,
+            bound = kind.label(),
+            timeout = ?deadline.timeout(kind),
+            "Request timed out: the worker did not answer within its bound; aborting it on the worker"
+        );
+        self.release();
+        Poll::Ready(Some(Err(status)))
+    }
+}
+
+/// A stream's bounds with their one timer (see
+/// [`AbortOnDropStream::with_deadline`]).
+struct Bounded {
+    deadline: RequestDeadline,
+    /// The instant the timer is armed for and the bound that passes there;
+    /// `None` when nothing bounds the current phase (the timer then sleeps
+    /// past any request's life).
+    armed: Option<(tokio::time::Instant, TimeoutKind)>,
+    sleep: Pin<Box<Sleep>>,
+}
+
+impl Bounded {
+    /// A message arrived: the next applicable bound is counted from it. The
+    /// timer moves only when the instant does (the total's never does), so a
+    /// stream under the total alone costs no re-arm per message.
+    fn item_arrived(&mut self) {
+        let next = self.deadline.next_at(Some(tokio::time::Instant::now()));
+        if next.map(|(at, _)| at) != self.armed.map(|(at, _)| at) {
+            let at = next.map_or_else(far_future, |(at, _)| at);
+            self.sleep.as_mut().reset(at);
+        }
+        self.armed = next;
+    }
+
+    /// Whether the armed bound has passed: polled, so its waker sees to the
+    /// next poll when the worker sends nothing at all.
+    fn passed(&mut self, cx: &mut Context<'_>) -> Option<TimeoutKind> {
+        let (_, kind) = self.armed?;
+        self.sleep.as_mut().poll(cx).is_ready().then_some(kind)
     }
 }
 

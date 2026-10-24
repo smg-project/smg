@@ -1181,6 +1181,27 @@ struct ServingArgs {
     #[arg(long, default_value_t = 1800, help_heading = "Request Handling")]
     request_timeout_secs: u64,
 
+    /// Seconds a gRPC worker may take from an attempt's dispatch to its
+    /// first message (the call that opens the stream included). Past it the
+    /// attempt ends as at --request-timeout-secs (504 call_upstream_timeout, the
+    /// worker's request aborted), counted under the error reason
+    /// first_token_timeout. 0 (the default) leaves the wait for the first
+    /// message to the request timeout. gRPC workers only: an HTTP worker's
+    /// pool timeout is its bound, and the direct engine wire bounds the
+    /// dispatch, not the stream
+    #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
+    first_token_timeout_secs: u64,
+
+    /// Seconds a gRPC worker's stream may go silent between one message and
+    /// the next. Past it the stream ends as at --request-timeout-secs (on a
+    /// stream, the error event that ends it; the worker's request aborted),
+    /// counted under the error reason inter_token_timeout. 0 (the default)
+    /// leaves a silence mid-stream to the request timeout. gRPC workers only:
+    /// an HTTP worker's pool timeout is its bound, and the direct engine wire
+    /// bounds the dispatch, not the stream
+    #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
+    inter_token_timeout_secs: u64,
+
     /// Seconds of upstream silence after which an open SSE stream carries a
     /// keep-alive frame (an SSE comment on the OpenAI-shaped endpoints, the
     /// `ping` event on /v1/messages), so an idle-timeout proxy does not cut
@@ -2916,6 +2937,8 @@ impl CliArgs {
             .idle_connection_timeout_secs(self.serving.idle_connection_timeout_secs)
             .max_connections(self.serving.max_connections)
             .request_timeout_secs(self.serving.request_timeout_secs)
+            .first_token_timeout_secs(self.serving.first_token_timeout_secs)
+            .inter_token_timeout_secs(self.serving.inter_token_timeout_secs)
             .sse_keepalive_secs(self.serving.sse_keepalive_secs)
             .upstream_pool_idle_timeout_secs(self.serving.upstream_pool_idle_timeout_secs)
             .worker_startup_timeout_secs(self.workers.worker_startup_timeout_secs)
@@ -4320,6 +4343,25 @@ mod tests {
 
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.stream_body_stall_timeout_secs, 300);
+    }
+
+    /// The silence bounds on a worker call are router settings, off unless
+    /// set, and must flow into `RouterConfig`.
+    #[test]
+    fn silence_bound_flags_flow_into_router_config() {
+        let cli = cli_args_from(&[
+            "--first-token-timeout-secs",
+            "120",
+            "--inter-token-timeout-secs",
+            "30",
+        ]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(router_config.first_token_timeout_secs, 120);
+        assert_eq!(router_config.inter_token_timeout_secs, 30);
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.first_token_timeout_secs, 0);
+        assert_eq!(defaults.inter_token_timeout_secs, 0);
     }
 
     /// The connection-level timeouts of the HTTP edge are router settings

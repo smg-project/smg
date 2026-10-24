@@ -178,6 +178,25 @@ pub struct RouterConfig {
     /// the request's answer, not replayed; for an HTTP worker, a worker's own
     /// pool `timeout_secs` takes this value's place. Must be > 0.
     pub request_timeout_secs: u64,
+    /// Seconds a gRPC worker may take from an attempt's dispatch to its
+    /// first message (the call that opens the stream included). Past it the
+    /// attempt ends as at `request_timeout_secs` (`504`
+    /// `call_upstream_timeout`, the worker's request aborted), counted under
+    /// the error reason `first_token_timeout`. `0` (the default) leaves the
+    /// wait for the first message to the request timeout. gRPC workers
+    /// only: an HTTP worker's pool timeout is its bound, and the direct
+    /// engine wire bounds the dispatch, not the stream.
+    #[serde(default)]
+    pub first_token_timeout_secs: u64,
+    /// Seconds a gRPC worker's stream may go silent between one message and
+    /// the next. Past it the stream ends as at `request_timeout_secs` (on a
+    /// stream, the error event that ends it; the worker's request aborted),
+    /// counted under the error reason `inter_token_timeout`. `0` (the
+    /// default) leaves a silence mid-stream to the request timeout. gRPC
+    /// workers only: an HTTP worker's pool timeout is its bound, and the
+    /// direct engine wire bounds the dispatch, not the stream.
+    #[serde(default)]
+    pub inter_token_timeout_secs: u64,
     /// Seconds of upstream silence after which an open SSE stream carries a
     /// keep-alive frame (an SSE comment; the `ping` event on the Messages
     /// API), so an idle-timeout proxy does not cut a stream that is waiting
@@ -2007,6 +2026,8 @@ impl Default for RouterConfig {
             idle_connection_timeout_secs: default_idle_connection_timeout_secs(),
             max_connections: 0,
             request_timeout_secs: 1800, // 30 minutes
+            first_token_timeout_secs: 0,
+            inter_token_timeout_secs: 0,
             sse_keepalive_secs: default_sse_keepalive_secs(),
             upstream_pool_idle_timeout_secs: default_upstream_pool_idle_timeout_secs(),
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
@@ -2505,6 +2526,29 @@ mod tests {
                 .build_unchecked();
             assert!(config.validate().is_err());
         }
+    }
+
+    #[test]
+    fn test_silence_bounds_serde_default_and_roundtrip() {
+        // Config files predating the fields deserialize to off.
+        let mut json: serde_json::Value = serde_json::to_value(RouterConfig::default()).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("first_token_timeout_secs").unwrap();
+        object.remove("inter_token_timeout_secs").unwrap();
+        let without: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(without.first_token_timeout_secs, 0);
+        assert_eq!(without.inter_token_timeout_secs, 0);
+
+        // Values round-trip.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .first_token_timeout_secs(120)
+            .inter_token_timeout_secs(30)
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.first_token_timeout_secs, 120);
+        assert_eq!(with.inter_token_timeout_secs, 30);
     }
 
     #[test]

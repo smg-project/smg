@@ -226,6 +226,16 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn first_token_timeout_secs(mut self, secs: u64) -> Self {
+        self.config.first_token_timeout_secs = secs;
+        self
+    }
+
+    pub fn inter_token_timeout_secs(mut self, secs: u64) -> Self {
+        self.config.inter_token_timeout_secs = secs;
+        self
+    }
+
     pub fn idle_connection_timeout_secs(mut self, secs: u64) -> Self {
         self.config.idle_connection_timeout_secs = secs;
         self
