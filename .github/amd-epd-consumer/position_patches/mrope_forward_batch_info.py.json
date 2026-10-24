@@ -1,0 +1,34 @@
+[
+  [
+    "import torch\n",
+    "import torch\n\nfrom sglang.srt.disaggregation._smg_epd_mrope_delta import (\n    decode_deltas as _smg_pd_mrope_deltas,\n    reject_spec as _smg_pd_mrope_reject_spec,\n    tail_delta as _smg_pd_mrope_tail_delta,\n)\n"
+  ],
+  [
+    "        # target_verify / draft_decode read spec_info.positions; draft_extend\n",
+    "        _smg_pd_mrope_reject_spec(batch.reqs)\n        # target_verify / draft_decode read spec_info.positions; draft_extend\n"
+  ],
+  [
+    "        seq_lens_int64 = self.seq_lens.to(torch.int64)\n\n        # Some multimodal models",
+    "        seq_lens_int64 = self.seq_lens.to(torch.int64)\n        pd_deltas = _smg_pd_mrope_deltas(batch.reqs)\n\n        # Some multimodal models"
+  ],
+  [
+    "        if rl_on_policy_target is not None or not has_multimodal_input:\n",
+    "        if rl_on_policy_target is not None or (not has_multimodal_input and pd_deltas is None):\n"
+  ],
+  [
+    "                deltas_list[i] = mm.mrope_position_delta.item() if mm is not None else 0\n",
+    "                deltas_list[i] = (mm.mrope_position_delta.item() if mm is not None\n                                  else (pd_deltas[i] if pd_deltas is not None else 0))\n"
+  ],
+  [
+    "                    seq_lens_cpu[batch_idx] - 1,\n",
+    "                    seq_lens_cpu[batch_idx] - 1 if pd_deltas is None\n                    else seq_lens_cpu[batch_idx] - 1 + pd_deltas[batch_idx],\n"
+  ],
+  [
+    "            extend_prefix_len = prefix_lens[batch_idx]\n            if mm_input is None or rl_on_policy_target is not None:\n",
+    "            extend_prefix_len = prefix_lens[batch_idx]\n            pd_delta = (_smg_pd_mrope_tail_delta(batch.reqs[batch_idx], extend_prefix_len, extend_seq_len)\n                        if mm_input is None and rl_on_policy_target is None else 0)\n            if mm_input is None or rl_on_policy_target is not None:\n"
+  ],
+  [
+    "                )\n            else:\n                mrope_positions = mm_input.mrope_positions[\n",
+    "                )\n                if pd_delta:\n                    mrope_positions += pd_delta\n            else:\n                mrope_positions = mm_input.mrope_positions[\n"
+  ]
+]
