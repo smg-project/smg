@@ -418,6 +418,7 @@ async fn byte_fallback_generate_mid_run_stop_reports_gateway_stop() {
             &mut decoder,
             false,
             Instant::now(),
+            metrics_labels::ENDPOINT_GENERATE,
         )
         .await
         .unwrap();
@@ -458,6 +459,7 @@ async fn byte_fallback_generate_stop_token_keeps_the_engine_matched_stop() {
             &mut decoder,
             false,
             Instant::now(),
+            metrics_labels::ENDPOINT_GENERATE,
         )
         .await
         .unwrap();
@@ -494,6 +496,7 @@ async fn byte_fallback_generate_eof_reports_gateway_stop() {
             &mut decoder,
             false,
             Instant::now(),
+            metrics_labels::ENDPOINT_GENERATE,
         )
         .await
         .unwrap();

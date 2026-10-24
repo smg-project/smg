@@ -694,6 +694,10 @@ impl ResponseProcessor {
     }
 
     /// Process non-streaming generate response (collects all responses and builds final response array)
+    ///
+    /// `metrics_endpoint` labels the answer's token and generation records:
+    /// the endpoint the request's own count carries (the transcription stage
+    /// decodes through this processor too).
     pub async fn process_non_streaming_generate_response(
         &self,
         execution_result: ExecutionResult,
@@ -701,6 +705,7 @@ impl ResponseProcessor {
         stop_decoder: &mut StopSequenceDecoder,
         request_logprobs: bool,
         start_time: Instant,
+        metrics_endpoint: &'static str,
     ) -> Result<Vec<GenerateResponse>, axum::response::Response> {
         let started = generation_start(&execution_result, start_time);
         // Collect all responses from the execution result
@@ -773,7 +778,7 @@ impl ResponseProcessor {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.backend_type,
             model_id: &dispatch.model,
-            endpoint: metrics_labels::ENDPOINT_GENERATE,
+            endpoint: metrics_endpoint,
             ttft: None,
             generation_duration: started.elapsed(),
             input_tokens: None,

@@ -151,6 +151,7 @@ impl GenerateResponseProcessingStage {
                 stop_decoder,
                 request_logprobs,
                 start_time,
+                metrics_labels::ENDPOINT_GENERATE,
             )
             .await?;
 

@@ -347,7 +347,10 @@ async fn streamed_generate(
     assert!(result.is_ok(), "{result:?}");
 }
 
-async fn non_streamed_generate((stream, server): Scripted) -> Vec<GenerateResponse> {
+async fn non_streamed_generate(
+    (stream, server): Scripted,
+    metrics_endpoint: &'static str,
+) -> Vec<GenerateResponse> {
     let tokenizer = tokenizer();
     let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
     let responses = response_processor()
@@ -357,6 +360,7 @@ async fn non_streamed_generate((stream, server): Scripted) -> Vec<GenerateRespon
             &mut decoder,
             false,
             Instant::now(),
+            metrics_endpoint,
         )
         .await
         .unwrap_or_else(|response| panic!("{}", response.status()));
@@ -876,7 +880,8 @@ async fn generate_settlement_carries_the_engines_counts_streamed_and_not() {
                 "{name}: streamed, input logprobs {with_input_logprobs}"
             );
         }
-        let responses = non_streamed_generate(scripted().await).await;
+        let responses =
+            non_streamed_generate(scripted().await, metrics_labels::ENDPOINT_GENERATE).await;
         assert_eq!(
             RequestPipeline::generate_settlement(&responses),
             expected,
@@ -948,8 +953,9 @@ async fn messages_settlement_carries_the_engines_counts_streamed_and_not() {
 /// The token and generation families of a collected answer are recorded as
 /// a streamed answer's are: the chat, completion, generate and messages
 /// shapes each render their counts and one generation observation under
-/// their own endpoint; no TTFT or TPOT, which a collected answer has no
-/// first token for; and no prompt figures for generate, whose streamed
+/// their own endpoint, a transcription (decoded through the generate
+/// processor) under its own; no TTFT or TPOT, which a collected answer has
+/// no first token for; and no prompt figures for generate, whose streamed
 /// answer counts none either.
 #[test]
 fn a_collected_answer_records_its_token_and_generation_families() {
@@ -985,7 +991,18 @@ fn a_collected_answer_records_its_token_and_generation_families() {
                 &completion_request,
             )
             .await;
-            non_streamed_generate(engine_stream(frames(&["abcd"], 1, counters)).await).await;
+            non_streamed_generate(
+                engine_stream(frames(&["abcd"], 1, counters)).await,
+                metrics_labels::ENDPOINT_GENERATE,
+            )
+            .await;
+            // A transcription decodes through the generate processor and
+            // records under its own endpoint, the one its request count has.
+            non_streamed_generate(
+                engine_stream(frames(&["hello"], 1, counters)).await,
+                metrics_labels::ENDPOINT_AUDIO_TRANSCRIPTIONS,
+            )
+            .await;
             non_streamed_messages(
                 engine_stream(frames(&["hi"], 1, counters)).await,
                 messages_spec(false),
@@ -1004,6 +1021,8 @@ fn a_collected_answer_records_its_token_and_generation_families() {
         "smg_router_generation_duration_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"completions\"} 1",
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"generate\",token_type=\"output\"} 4",
         "smg_router_generation_duration_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"generate\"} 1",
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"audio_transcriptions\",token_type=\"output\"} 5",
+        "smg_router_generation_duration_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"audio_transcriptions\"} 1",
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"messages\",token_type=\"input\"} 12",
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"messages\",token_type=\"cached\"} 4",
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"messages\",token_type=\"output\"} 2",
