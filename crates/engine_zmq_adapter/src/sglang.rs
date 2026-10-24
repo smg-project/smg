@@ -258,7 +258,7 @@ pub fn to_sglang_response(
 const FINAL_HIDDEN_LAYER: i32 = -1;
 
 /// `GenerateStreamChunk.hidden_states`: the rows a tick added, flattened (the
-/// client splits them by the hidden size), as the Python servicer sends them.
+/// client splits them by the hidden size).
 fn flat_hidden_states(rows: &[Vec<f32>]) -> Vec<f32> {
     rows.iter().flatten().copied().collect()
 }
@@ -267,7 +267,7 @@ fn flat_hidden_states(rows: &[Vec<f32>]) -> Vec<f32> {
 /// scheduler's own counters: the last row is always the last fed-back token
 /// (position `prompt + generated - 2`), whatever prefix the radix cache
 /// served without rows, so the first is that position less the rows after
-/// it. The Python servicer anchors the same way.
+/// it.
 fn first_hidden_position(prompt_tokens: u32, completion_tokens: u32, rows: usize) -> i32 {
     let first = i64::from(prompt_tokens) + i64::from(completion_tokens) - 1 - rows as i64;
     i32::try_from(first.max(0)).unwrap_or(i32::MAX)

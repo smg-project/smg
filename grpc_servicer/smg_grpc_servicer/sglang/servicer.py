@@ -51,10 +51,8 @@ from smg_grpc_servicer.health_probe import await_probe
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.hidden_states import (
-    all_hidden_states_proto,
-    first_hidden_position,
-    flat_hidden_states,
     refuse_hidden_states_above_server_mode,
+    refuse_hidden_states_on_this_servicer,
 )
 from smg_grpc_servicer.sglang.kv_events import subscribe_kv_events
 from smg_grpc_servicer.sglang.loads import (
@@ -981,9 +979,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
         # Create request
         require_reasoning = bool(grpc_req.require_reasoning)
-        return_hidden_states = bool(grpc_req.return_hidden_states)
-        if return_hidden_states:
+        if grpc_req.return_hidden_states:
+            # The engine's launch-time cap first, in its own words; then this
+            # servicer's own answer: hidden states are served by the Rust one.
             refuse_hidden_states_above_server_mode()
+            refuse_hidden_states_on_this_servicer()
 
         return TokenizedGenerateReqInput(
             rid=grpc_req.request_id,
@@ -1007,7 +1007,6 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
             require_reasoning=require_reasoning,
-            return_hidden_states=return_hidden_states,
         )
 
     @staticmethod
@@ -1240,8 +1239,6 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 reasoning_tokens=meta_info.get("reasoning_tokens", 0),
                 output_logprobs=output_logprobs_proto,
                 input_logprobs=input_logprobs_proto,
-                # The step's new vectors, flattened in token order.
-                hidden_states=flat_hidden_states(output.get("hidden_states")),
                 index=output.get("index", 0),
             ),
         )
@@ -1306,16 +1303,6 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 spec_draft_tokens=meta_info.get("spec_num_proposed_drafts", 0),
                 output_logprobs=output_logprobs_proto,
                 input_logprobs=input_logprobs_proto,
-                # Positions absolute: anchored from the engine's counters (a
-                # prefix the radix cache served has no rows).
-                all_hidden_states=all_hidden_states_proto(
-                    output.get("all_hidden_states"),
-                    first_hidden_position(
-                        meta_info.get("prompt_tokens", 0),
-                        meta_info.get("completion_tokens", len(output.get("token_ids", []))),
-                        len(output.get("all_hidden_states") or []),
-                    ),
-                ),
                 index=output.get("index", 0),
                 **matched_stop_kwargs,
             ),

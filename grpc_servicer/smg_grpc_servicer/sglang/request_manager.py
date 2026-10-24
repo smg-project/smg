@@ -42,7 +42,6 @@ from sglang.srt.utils import get_or_create_event_loop, kill_process_tree
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.utils import get_exception_traceback
 
-from smg_grpc_servicer.sglang.hidden_states import new_hidden_rows
 from smg_grpc_servicer.trace_context import trace_headers
 
 logger = logging.getLogger(__name__)
@@ -184,12 +183,6 @@ class GrpcReqState:
     output_top_logprobs_idx: list[list[int]] = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_val: list[list[float]] = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_idx: list[list[int]] = dataclasses.field(default_factory=list)
-    # Hidden states: one final-layer vector per output token, as far as the
-    # scheduler has shipped them (it ships the cumulative list each step).
-    output_hidden_states: list[list[float]] = dataclasses.field(default_factory=list)
-    # The elements of the scheduler's cumulative hidden-state list this request
-    # has consumed (the prefill block is one; a decode step adds one or more).
-    hidden_elements_consumed: int = 0
 
     # Session state
     session_id: str | None = None
@@ -888,21 +881,6 @@ class GrpcRequestManager:
                         "token_ids_logprobs_val": state.output_token_ids_logprobs_val,
                         "token_ids_logprobs_idx": state.output_token_ids_logprobs_idx,
                     }
-
-            # Hidden states: the step's new rows to a stream, the whole list
-            # on completion (the scheduler ships the cumulative list each step;
-            # only the elements past what this request has seen are reshaped).
-            if getattr(state.obj, "return_hidden_states", False):
-                hidden_column = getattr(batch_out, "output_hidden_states", None)
-                fresh, state.hidden_elements_consumed = new_hidden_rows(
-                    hidden_column[i] if hidden_column and i < len(hidden_column) else None,
-                    state.hidden_elements_consumed,
-                )
-                state.output_hidden_states.extend(fresh)
-                if state.obj.stream and fresh:
-                    output_data["hidden_states"] = fresh
-                if output_data["finished"] and state.output_hidden_states:
-                    output_data["all_hidden_states"] = list(state.output_hidden_states)
 
             # Update state for accumulation
             if output_data["token_ids"]:

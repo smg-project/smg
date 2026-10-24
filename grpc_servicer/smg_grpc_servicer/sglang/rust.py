@@ -19,7 +19,8 @@ What the msgpack wire does not carry, the Rust path reports rather than
 emulates: multimodal inputs are refused, PD/EPD disaggregation stays with the
 Python implementation, and LoRA loading answers UNIMPLEMENTED, as on the
 Python servicer; ``Embed``, ``FlushCache``, profiling, the KV-event relay,
-prompt logprobs and hidden states are served.
+prompt logprobs and hidden states are served (hidden states on this path
+only: the Python servicer refuses them by name).
 """
 
 from __future__ import annotations

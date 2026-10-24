@@ -1,24 +1,25 @@
-"""Hidden states on the Python SGLang servicer: the request's flag goes to the
-scheduler as it stands (full capture; the gRPC contract carries a bool, so the
-engine's ``"last"`` mode is not asked for), the engine's launch-time cap is kept
-the way its own frontend keeps it, and the scheduler's cumulative rows become
-the proto's per-step delta (``GenerateStreamChunk.hidden_states``, the step's
-new rows flattened) and the whole list on completion
-(``GenerateComplete.all_hidden_states``, one ``HiddenStates`` per position a
-forward ran on: the prompt positions the prefill computed, then each generated
-token fed back, the last sampled token having none; ``layer = -1`` for the
-final hidden layer; the positions absolute, anchored from the engine's own
-counters because a prefix the radix cache served has no rows). The Rust path
-maps the same wire the same way (``crates/engine_zmq_adapter/src/sglang.rs``);
-the two agree row for row.
+"""Hidden states and the Python SGLang servicer: a request's
+``return_hidden_states`` is refused here, ahead of the scheduler, as
+``INVALID_ARGUMENT``: first under the engine's launch-time cap, in its own
+frontend's words, then by name: hidden states are served by the Rust servicer
+(``crates/engine_servicer``; the worker runs it with ``--servicer-impl rust``
+or ``SMG_SGLANG_SERVICER_IMPL=rust``), and this servicer, which once accepted
+the flag and returned nothing, says so.
+
+``new_hidden_rows`` belongs to the scheduler-side plugin (``zmq_msgpack.py``):
+it turns the engine's cumulative per-request list into the rows a step added,
+the column the Rust servicer reads off the wire.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
 from typing import Any
 
-FINAL_LAYER = -1
+RUST_SERVICER_WORDS = (
+    "Hidden states are served by the Rust servicer: run the worker with "
+    "`--servicer-impl rust` (or SMG_SGLANG_SERVICER_IMPL=rust). The Python "
+    "servicer does not return them."
+)
 
 
 def refuse_hidden_states_above_server_mode() -> None:
@@ -49,11 +50,13 @@ def refuse_hidden_states_above_server_mode() -> None:
     )
 
 
-def hidden_state_rows(value: Any) -> list[list[float]]:
-    """All rows of one request's hidden states (``new_hidden_rows`` from the
-    first element)."""
-    rows, _ = new_hidden_rows(value, 0)
-    return rows
+def refuse_hidden_states_on_this_servicer() -> None:
+    """Raise ``ValueError`` (the servicer answers ``INVALID_ARGUMENT``) for a
+    request that asks for hidden states: this servicer does not return them,
+    the Rust one does, and the message names it. Called after the launch-time
+    cap, so an engine that cannot capture them says so first, in its own
+    words."""
+    raise ValueError(RUST_SERVICER_WORDS)
 
 
 def new_hidden_rows(value: Any, consumed: int) -> tuple[list[list[float]], int]:
@@ -98,39 +101,3 @@ def _listed(value: Any) -> Any:
 
 def _is_vector(item: Any) -> bool:
     return isinstance(item, (list, tuple)) or hasattr(item, "tolist")
-
-
-def first_hidden_position(prompt_tokens: int, completion_tokens: int, rows: int) -> int:
-    """The absolute position of the first row a request carries, from the
-    engine's own counters: the last row is always the last fed-back token
-    (position prompt + generated - 2), whatever prefix the radix cache served
-    without rows, so the first is that position less the rows after it. The
-    Rust servicer anchors the same way."""
-    return max(0, int(prompt_tokens) + int(completion_tokens) - 1 - int(rows))
-
-
-def flat_hidden_states(rows: Iterable[Sequence[float]] | None) -> list[float]:
-    """``GenerateStreamChunk.hidden_states``: the step's rows flattened (the
-    client splits them by the hidden size)."""
-    if not rows:
-        return []
-    return [x for row in rows for x in row]
-
-
-def all_hidden_states_proto(
-    rows: Sequence[Sequence[float]] | None, first_position: int = 0
-) -> list[Any]:
-    """``GenerateComplete.all_hidden_states``: one entry per position a forward
-    ran on (the prompt positions the prefill computed, then each generated
-    token fed back; the last sampled token has none), the final layer, the
-    positions absolute from ``first_position`` (``first_hidden_position``)."""
-    from smg_grpc_proto import sglang_scheduler_pb2
-
-    if not rows:
-        return []
-    return [
-        sglang_scheduler_pb2.HiddenStates(
-            values=row, layer=FINAL_LAYER, position=first_position + i
-        )
-        for i, row in enumerate(rows)
-    ]

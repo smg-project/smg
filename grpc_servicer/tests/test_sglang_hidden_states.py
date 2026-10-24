@@ -1,15 +1,15 @@
-"""Hidden states on the Python SGLang servicer (#1083 parity): the request's
-flag is forwarded under the engine's launch-time cap, the scheduler's
-cumulative rows (the prefill's block of prompt rows, then one row per
-generated token fed back; the last sampled token has none) become the
-per-step delta of a stream and the whole list on completion,
-and the proto fields carry them the way the Rust path fills the same fields.
-Reuses the request-manager stand-ins of the selected-logprob tests: only the
-engine imports are replaced, no manager behaviour is mocked."""
+"""Hidden states on the Python SGLang servicer: a request's flag is refused
+ahead of the scheduler, first under the engine's launch-time cap in its own
+words, then by name (hidden states are served by the Rust servicer), where the
+servicer once accepted the flag and returned nothing. The scheduler-side helper
+that turns the engine's cumulative list into a step's new rows (the plugin's
+column, which the Rust servicer reads) is covered here too. Reuses the servicer
+stand-in of the selected-logprob tests: only the engine imports are replaced;
+of the servicer, only the sampling-parameter conversion (it needs the engine's
+tokenizer) is stood in."""
 
 from __future__ import annotations
 
-import asyncio
 import importlib.util
 import sys
 from pathlib import Path
@@ -27,123 +27,10 @@ _spec.loader.exec_module(_selected)
 
 manager_mod = _selected.manager_mod
 servicer = _selected.servicer
-_manager_and_state = _selected._manager_and_state
-_output = _selected._output
 
 PREFILL_BLOCK = [[0.5, 1.5], [2.5, 3.5]]  # one row per prompt position
 FIRST_ROW = [4.5, 5.5]
 SECOND_ROW = [6.5, 7.5]
-
-
-def _hidden_manager_and_state(module, *, stream):
-    manager, state = _manager_and_state(module, stream=stream)
-    state.obj = SimpleNamespace(
-        return_logprob=False,
-        logprob_start_len=-1,
-        top_logprobs_num=0,
-        token_ids_logprob=None,
-        stream=stream,
-        return_hidden_states=True,
-    )
-    return manager, state
-
-
-def _step(*, cumulative, tokens, finished):
-    return _output(
-        values=[],
-        tokens=tokens,
-        finished=finished,
-        output_token_ids_logprobs_val=None,
-        output_token_ids_logprobs_idx=None,
-        output_hidden_states=[cumulative],
-    )
-
-
-def test_a_stream_gets_each_steps_new_rows_and_the_whole_list_on_completion(manager_mod, servicer):
-    async def exercise():
-        manager, state = _hidden_manager_and_state(manager_mod, stream=True)
-        # Step 1: the prefill's tick ships its block (one row per prompt
-        # position); the first token is sampled from the last row.
-        await manager._handle_batch_output(
-            _step(cumulative=[PREFILL_BLOCK], tokens=[10], finished=False)
-        )
-        first = await state.out_queue.get()
-        # Step 2: the decode step fed the first token back (its row); the
-        # request finished on the second token, which is never fed back.
-        await manager._handle_batch_output(
-            _step(cumulative=[PREFILL_BLOCK, FIRST_ROW], tokens=[11], finished=True)
-        )
-        last = await state.out_queue.get()
-
-        assert first["hidden_states"] == PREFILL_BLOCK
-        assert "all_hidden_states" not in first
-        assert last["hidden_states"] == [FIRST_ROW]
-        assert last["all_hidden_states"] == [*PREFILL_BLOCK, FIRST_ROW]
-
-        chunk = servicer._create_chunk_response("score", first).chunk
-        assert list(chunk.hidden_states) == [0.5, 1.5, 2.5, 3.5]
-        complete = servicer._create_completion_response("score", last).complete
-        assert [(h.position, h.layer, list(h.values)) for h in complete.all_hidden_states] == [
-            (0, -1, [0.5, 1.5]),
-            (1, -1, [2.5, 3.5]),
-            (2, -1, [4.5, 5.5]),
-        ]
-
-    asyncio.run(exercise())
-
-
-def test_a_non_streaming_request_gets_the_whole_list_once_at_the_end(manager_mod, servicer):
-    async def exercise():
-        manager, state = _hidden_manager_and_state(manager_mod, stream=False)
-        await manager._handle_batch_output(
-            _step(cumulative=[PREFILL_BLOCK], tokens=[10], finished=False)
-        )
-        first = await state.out_queue.get()
-        await manager._handle_batch_output(
-            _step(cumulative=[PREFILL_BLOCK, FIRST_ROW], tokens=[11], finished=True)
-        )
-        last = await state.out_queue.get()
-        assert "hidden_states" not in first and "all_hidden_states" not in first
-        assert "hidden_states" not in last
-        assert last["all_hidden_states"] == [*PREFILL_BLOCK, FIRST_ROW]
-        complete = servicer._create_completion_response("score", last).complete
-        assert len(complete.all_hidden_states) == 3
-        assert list(servicer._create_chunk_response("score", last).chunk.hidden_states) == []
-        # The positions are anchored from the engine's counters: with a prompt
-        # of five of which the cache served three, the three rows sit at 3..5.
-        last["meta_info"].update(prompt_tokens=5, completion_tokens=2)
-        anchored = servicer._create_completion_response("score", last).complete
-        assert [h.position for h in anchored.all_hidden_states] == [3, 4, 5]
-        last["meta_info"].update(prompt_tokens=2, completion_tokens=2)
-        plain = servicer._create_completion_response("score", last).complete
-        assert [h.position for h in plain.all_hidden_states] == [0, 1, 2]
-
-    asyncio.run(exercise())
-
-
-def test_a_request_that_did_not_ask_carries_nothing(manager_mod, servicer):
-    async def exercise():
-        manager, state = _hidden_manager_and_state(manager_mod, stream=True)
-        state.obj.return_hidden_states = False
-        await manager._handle_batch_output(
-            _output(
-                values=[],
-                tokens=[10],
-                finished=True,
-                output_token_ids_logprobs_val=None,
-                output_token_ids_logprobs_idx=None,
-                output_hidden_states=[None],
-            )
-        )
-        output = await state.out_queue.get()
-        assert "hidden_states" not in output and "all_hidden_states" not in output
-        assert list(servicer._create_chunk_response("score", output).chunk.hidden_states) == []
-        assert (
-            list(servicer._create_completion_response("score", output).complete.all_hidden_states)
-            == []
-        )
-
-    asyncio.run(exercise())
 
 
 def _fake_forward_batch_info(monkeypatch, mode_name):
@@ -186,14 +73,63 @@ def test_the_engines_launch_time_cap_is_kept_with_its_own_words(monkeypatch, mod
     hidden_states.refuse_hidden_states_above_server_mode()
 
 
-def test_rows_flatten_the_engines_raw_shape():
-    from smg_grpc_servicer.sglang.hidden_states import (
-        all_hidden_states_proto,
-        first_hidden_position,
-        flat_hidden_states,
-        hidden_state_rows,
-        new_hidden_rows,
+def test_the_python_servicer_refuses_hidden_states_by_name():
+    from smg_grpc_servicer.sglang import hidden_states
+
+    with pytest.raises(ValueError, match="served by the Rust servicer") as refusal:
+        hidden_states.refuse_hidden_states_on_this_servicer()
+    # The message names the switch, both spellings.
+    assert "--servicer-impl rust" in str(refusal.value)
+    assert "SMG_SGLANG_SERVICER_IMPL=rust" in str(refusal.value)
+
+
+def _generate_request(*, hidden):
+    from smg_grpc_proto import sglang_scheduler_pb2
+
+    return sglang_scheduler_pb2.GenerateRequest(
+        request_id="h",
+        tokenized=sglang_scheduler_pb2.TokenizedInput(original_text="hi", input_ids=[1, 2]),
+        return_hidden_states=hidden,
     )
+
+
+def test_the_conversion_refuses_under_the_cap_first_then_by_name(monkeypatch, servicer):
+    module = sys.modules[type(servicer).__module__]
+    calls = []
+
+    def cap():
+        calls.append("cap")
+
+    def by_name():
+        calls.append("name")
+        raise ValueError("Hidden states are served by the Rust servicer")
+
+    monkeypatch.setattr(module, "refuse_hidden_states_above_server_mode", cap)
+    monkeypatch.setattr(module, "refuse_hidden_states_on_this_servicer", by_name)
+    # The engine's request type is a stand-in here; record what it is built with.
+    monkeypatch.setattr(
+        module, "TokenizedGenerateReqInput", lambda **fields: SimpleNamespace(**fields)
+    )
+    # The sampling-parameter conversion needs the engine's tokenizer: stood in.
+    servicer._convert_sampling_params = lambda params: SimpleNamespace(
+        normalize=lambda tokenizer=None: None
+    )
+    servicer.tokenizer = None
+
+    with pytest.raises(ValueError, match="served by the Rust servicer"):
+        servicer._convert_generate_request(_generate_request(hidden=True))
+    assert calls == ["cap", "name"]
+
+    # A request without the flag reaches the scheduler, and the flag with it: never.
+    calls.clear()
+    built = servicer._convert_generate_request(_generate_request(hidden=False))
+    assert calls == []
+    assert built.rid == "h" and list(built.input_ids) == [1, 2]
+    assert not hasattr(built, "return_hidden_states")
+
+
+def test_new_rows_follow_the_engines_cumulative_elements():
+    from smg_grpc_servicer.sglang.hidden_states import new_hidden_rows
 
     class Tensorish:
         def __init__(self, data):
@@ -202,40 +138,19 @@ def test_rows_flatten_the_engines_raw_shape():
         def tolist(self):
             return self.data
 
-    assert hidden_state_rows(None) == []
-    assert hidden_state_rows([]) == []
-    assert hidden_state_rows([PREFILL_BLOCK, FIRST_ROW]) == [*PREFILL_BLOCK, FIRST_ROW]
-    assert hidden_state_rows([Tensorish(PREFILL_BLOCK), Tensorish(FIRST_ROW)]) == [
-        *PREFILL_BLOCK,
-        FIRST_ROW,
-    ]
-    assert hidden_state_rows(FIRST_ROW) == [FIRST_ROW]  # the engine's "last" mode: one row
     # The rows past the elements already consumed (the block is one element,
     # a decode step adds one or more), and the count to remember for the next step.
+    assert new_hidden_rows(None, 0) == ([], 0)
+    assert new_hidden_rows([], 0) == ([], 0)
     assert new_hidden_rows([PREFILL_BLOCK, FIRST_ROW], 0) == ([*PREFILL_BLOCK, FIRST_ROW], 2)
+    assert new_hidden_rows([Tensorish(PREFILL_BLOCK), Tensorish(FIRST_ROW)], 0) == (
+        [*PREFILL_BLOCK, FIRST_ROW],
+        2,
+    )
     assert new_hidden_rows([PREFILL_BLOCK, FIRST_ROW], 1) == ([FIRST_ROW], 2)
     assert new_hidden_rows([PREFILL_BLOCK, FIRST_ROW], 2) == ([], 2)
     assert new_hidden_rows([PREFILL_BLOCK, FIRST_ROW, SECOND_ROW], 2) == ([SECOND_ROW], 3)
-    assert new_hidden_rows(FIRST_ROW, 0) == (
-        [FIRST_ROW],
-        2,
-    )  # a bare vector: one row, consumed whole
+    # The engine's "last" mode keeps a bare vector: one row, consumed whole.
+    assert new_hidden_rows(FIRST_ROW, 0) == ([FIRST_ROW], 2)
     assert new_hidden_rows(FIRST_ROW, 2) == ([], 2)
     assert new_hidden_rows(None, 1) == ([], 1)
-    # The anchor: the last row is the last fed-back token, whatever prefix the
-    # cache served without rows (prompt 5 with three cached, two generated).
-    assert first_hidden_position(3, 2, 4) == 0
-    assert first_hidden_position(5, 2, 3) == 3
-    assert first_hidden_position(0, 0, 0) == 0
-    assert flat_hidden_states(None) == [] and flat_hidden_states([FIRST_ROW, SECOND_ROW]) == [
-        4.5,
-        5.5,
-        6.5,
-        7.5,
-    ]
-    pytest.importorskip("smg_grpc_proto")
-    assert [(h.position, h.layer) for h in all_hidden_states_proto([FIRST_ROW, SECOND_ROW])] == [
-        (0, -1),
-        (1, -1),
-    ]
-    assert [h.position for h in all_hidden_states_proto([FIRST_ROW, SECOND_ROW], 3)] == [3, 4]
