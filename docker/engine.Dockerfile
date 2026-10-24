@@ -106,10 +106,12 @@ RUN bash /tmp/scripts/install-smg.sh /opt/smg-src
 # ignores the cache with a warning and JIT-compiles every kernel at the worker's first start, one compiler job per host CPU:
 # on a 144-core node that start-up exceeded a 128 GiB container limit on both roles of a prefill/decode pair. The CI
 # carrier re-aligns the three flashinfer artifacts after the TokenSpeed install (scripts/ci_install_flashinfer.py); this
-# check turns any drift that reaches an engine image into a build failure instead of a start-up one.
+# check turns any drift that reaches an engine image into a build failure instead of a start-up one: the versions of the
+# three artifacts (flashinfer-cubin drifts the same silent way, with on-demand cubin downloads at first use) and then
+# flashinfer's own acceptance of every cache provider the shim offers (it drops a provider whose version differs).
 RUN if [ "${ENGINE}" = "tokenspeed" ]; then \
-      python3 -c "import importlib.metadata as m, importlib.util, sys; fi = m.version('flashinfer-python'); jc = m.version('flashinfer-jit-cache') if importlib.util.find_spec('flashinfer_jit_cache') else None; ok = jc is not None and (jc == fi or jc.startswith(fi + '+')); print('flashinfer-python', fi, 'flashinfer-jit-cache', jc, 'match' if ok else 'MISMATCH'); sys.exit(0 if ok else 1)" \
-      && python3 -c "import flashinfer.jit.env as env; ids = [p.provider_id for p in env.FLASHINFER_AOT_PROVIDERS]; print('flashinfer AOT providers accepted:', ids)" ; \
+      python3 -c "import importlib.metadata as m, importlib.util, sys; fi = m.version('flashinfer-python'); jc = m.version('flashinfer-jit-cache') if importlib.util.find_spec('flashinfer_jit_cache') else None; cb = m.version('flashinfer-cubin') if importlib.util.find_spec('flashinfer_cubin') else None; ok = jc is not None and (jc == fi or jc.startswith(fi + '+')) and (cb is None or cb == fi); print('flashinfer-python', fi, 'flashinfer-jit-cache', jc, 'flashinfer-cubin', cb, 'match' if ok else 'MISMATCH'); sys.exit(0 if ok else 1)" \
+      && python3 -c "import flashinfer.jit.env as env, flashinfer_jit_cache as jc, sys; ids = [p.provider_id for p in env.FLASHINFER_AOT_PROVIDERS]; n = len(list(jc.get_jit_cache_providers())); print('flashinfer AOT providers accepted:', ids, 'of', n); sys.exit(0 if ids and len(ids) == n else 1)" ; \
     fi
 
 RUN case "${ENGINE}" in \
