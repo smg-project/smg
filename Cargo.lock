@@ -7782,6 +7782,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tonic",
+ "tonic-health",
  "tonic-prost",
  "tool-parser",
  "tower",
