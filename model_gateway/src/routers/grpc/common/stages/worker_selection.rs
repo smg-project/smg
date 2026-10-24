@@ -2098,22 +2098,29 @@ fn shared_epd_runtime(
     all_decode: &[Arc<dyn Worker>],
     needs_encode: bool,
 ) -> Option<RuntimeType> {
-    all_prefill
-        .iter()
-        .map(|w| w.metadata().spec.runtime_type)
-        .find(|runtime| {
-            // The current EPD multimodal encoder adapter is TokenSpeed-
-            // specific. Do not select a shared SGLang/vLLM runtime only to
-            // reject it later during request building.
-            (!needs_encode || *runtime == RuntimeType::TokenSpeed)
-                && all_decode
+    let shared = |runtime: &RuntimeType| {
+        all_prefill
+            .iter()
+            .any(|w| w.metadata().spec.runtime_type == *runtime)
+            && all_decode
+                .iter()
+                .any(|w| w.metadata().spec.runtime_type == *runtime)
+            && (!needs_encode
+                || all_encode
                     .iter()
-                    .any(|w| w.metadata().spec.runtime_type == *runtime)
-                && (!needs_encode
-                    || all_encode
-                        .iter()
-                        .any(|w| w.metadata().spec.runtime_type == *runtime))
-        })
+                    .any(|w| w.metadata().spec.runtime_type == *runtime))
+    };
+    if needs_encode {
+        // Preserve the existing TS preference when its complete cohort is available.
+        [RuntimeType::TokenSpeed, RuntimeType::Sglang]
+            .into_iter()
+            .find(shared)
+    } else {
+        all_prefill
+            .iter()
+            .map(|w| w.metadata().spec.runtime_type)
+            .find(shared)
+    }
 }
 
 /// The candidates of `runtime` among a role's.
@@ -3080,6 +3087,88 @@ mod tests {
                 .is_some_and(|reason| reason.contains("No decode worker")),
             "the refusal names the missing role"
         );
+    }
+
+    #[test]
+    fn epd_sglang_runtime_gate_keeps_tokenspeed_and_rejects_vllm() {
+        for (runtime, expected) in [
+            (RuntimeType::Sglang, Some(RuntimeType::Sglang)),
+            (RuntimeType::TokenSpeed, Some(RuntimeType::TokenSpeed)),
+            (RuntimeType::Vllm, None),
+        ] {
+            let workers = |role| {
+                vec![Arc::new(
+                    BasicWorkerBuilder::new("grpc://localhost:5001")
+                        .runtime_type(runtime)
+                        .worker_type(role)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .health_config(no_health_check())
+                        .build(),
+                ) as Arc<dyn Worker>]
+            };
+            let encode = workers(WorkerType::Encode);
+            let prefill = workers(WorkerType::Prefill);
+            let decode = workers(WorkerType::Decode);
+            assert_eq!(
+                shared_epd_runtime(&encode, &prefill, &decode, true),
+                expected
+            );
+            assert_eq!(
+                shared_epd_runtime(&[], &prefill, &decode, false),
+                Some(runtime)
+            );
+        }
+    }
+
+    #[test]
+    fn epd_sglang_runtime_gate_preserves_mixed_tokenspeed_priority() {
+        let pool = |role, reversed| {
+            let mut workers = [RuntimeType::Sglang, RuntimeType::TokenSpeed]
+                .map(|runtime| {
+                    Arc::new(
+                        BasicWorkerBuilder::new("grpc://localhost:5001")
+                            .runtime_type(runtime)
+                            .worker_type(role)
+                            .connection_mode(ConnectionMode::Grpc)
+                            .health_config(no_health_check())
+                            .build(),
+                    ) as Arc<dyn Worker>
+                })
+                .to_vec();
+            if reversed {
+                workers.reverse();
+            }
+            workers
+        };
+        for reversed in [false, true] {
+            let pools = [
+                pool(WorkerType::Encode, reversed),
+                pool(WorkerType::Prefill, reversed),
+                pool(WorkerType::Decode, reversed),
+            ];
+            assert_eq!(
+                shared_epd_runtime(&pools[0], &pools[1], &pools[2], true),
+                Some(RuntimeType::TokenSpeed)
+            );
+            assert_eq!(
+                shared_epd_runtime(&[], &pools[1], &pools[2], false),
+                Some(if reversed {
+                    RuntimeType::TokenSpeed
+                } else {
+                    RuntimeType::Sglang
+                })
+            );
+            for missing_role in 0..3 {
+                let mut incomplete = pools.clone();
+                incomplete[missing_role]
+                    .retain(|w| w.metadata().spec.runtime_type != RuntimeType::TokenSpeed);
+                assert_eq!(
+                    shared_epd_runtime(&incomplete[0], &incomplete[1], &incomplete[2], true),
+                    Some(RuntimeType::Sglang),
+                    "SG fallback needs a complete cohort"
+                );
+            }
+        }
     }
 
     /// A retry context with a retained wire and no extra request constraints.
