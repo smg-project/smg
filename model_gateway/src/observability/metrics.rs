@@ -372,8 +372,8 @@ pub(crate) const WORKER_RETRY_BACKOFF_BUCKETS: &[f64] = &[
     0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
 
-/// Histogram buckets for `smg_router_stage_seconds`: the ingress stages take
-/// tens of microseconds, the engine's execute seconds, and the response
+/// Histogram buckets for `smg_router_stage_seconds`: the worker selection
+/// takes tens of microseconds, the engine's execute seconds, and the response
 /// processing of a request that does not stream is its whole generation,
 /// minutes for a long output or reasoning trace, so the edges run from ten
 /// microseconds to half an hour (the request-duration buckets reach two
@@ -562,7 +562,7 @@ pub(crate) fn init_metrics() {
     );
     describe_histogram!(
         "smg_router_stage_seconds",
-        "Time a request spent in a stage of the pipeline, from the previous stage's end, by stage and streaming: preparation (the parse, the tokenizer and the template), rate_limit (the tenant reservation), worker_selection (the policy, the index lookup and the selection queue), client_acquisition (the context-length and output-budget checks and the client pool; on a retry the new workers' clients), encode (the multimodal encode step, where one runs), request_building, reselection (a retry's selection), execute (the build boundary, the admission wait, the send and the engine's acceptance, per attempt) and response_processing (the answer's processing to the response: for a request that does not stream this is the whole generation, collected before the answer; for a streaming one the body's construction); one observation per stage crossed, a refused or failed stage included; a retry's backoff and the reservation's settlement after the answer are outside the stages"
+        "Time a request spent in a timed stage of the pipeline, by stage and streaming: worker_selection (the policy, the index lookup and the selection queue; a retry's reselection records here too), execute (the build boundary, the admission wait, the send and the engine's acceptance, per attempt) and response_processing (the answer's processing to the response: for a request that does not stream this is the whole generation, collected before the answer; for a streaming one the body's construction); one observation per stage crossed, a refused or failed stage included. The rest of a request's time (its parse, tokenizer and template, the tenant reservation, the client acquisition, the request's build, a retry's backoff, the reservation's settlement after the answer) is its request duration minus the three"
     );
     describe_histogram!(
         "smg_router_tpot_seconds",
@@ -1485,18 +1485,16 @@ pub struct StreamingMetricsParams<'a> {
     pub output_tokens: u64,
 }
 
-/// A stage of the request pipeline, the `stage` label of
+/// A timed stage of the request pipeline, the `stage` label of
 /// `smg_router_stage_seconds`, in the order a request crosses them (the
-/// words of the pipeline's trace spans).
+/// words of the pipeline's trace spans): the three a slow first token is
+/// read against. The rest of a request's time (its parse, tokenizer and
+/// template, the tenant reservation, the client acquisition, the request's
+/// build, a retry's backoff) is its request duration minus these; timing
+/// every boundary cost the shortest request path a percent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouterStage {
-    Preparation,
-    RateLimit,
     WorkerSelection,
-    ClientAcquisition,
-    Encode,
-    RequestBuilding,
-    Reselection,
     Execute,
     ResponseProcessing,
 }
@@ -1504,14 +1502,8 @@ pub enum RouterStage {
 impl RouterStage {
     /// Every stage, in order: the kept handles are indexed by a stage's
     /// position here, which the assertion below pins to its discriminant.
-    pub(crate) const ALL: [Self; 9] = [
-        Self::Preparation,
-        Self::RateLimit,
+    pub(crate) const ALL: [Self; 3] = [
         Self::WorkerSelection,
-        Self::ClientAcquisition,
-        Self::Encode,
-        Self::RequestBuilding,
-        Self::Reselection,
         Self::Execute,
         Self::ResponseProcessing,
     ];
@@ -1521,13 +1513,7 @@ impl RouterStage {
     /// The stage's `stage` label value.
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Preparation => "preparation",
-            Self::RateLimit => "rate_limit",
             Self::WorkerSelection => "worker_selection",
-            Self::ClientAcquisition => "client_acquisition",
-            Self::Encode => "encode",
-            Self::RequestBuilding => "request_building",
-            Self::Reselection => "reselection",
             Self::Execute => "execute",
             Self::ResponseProcessing => "response_processing",
         }

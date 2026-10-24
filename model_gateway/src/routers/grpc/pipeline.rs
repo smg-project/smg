@@ -487,10 +487,10 @@ impl RequestPipeline {
     }
 
     /// Ingress phase: run the request-owning stages through request building.
-    /// Every step is timed under its `smg_router_stage_seconds` stage from
-    /// the previous boundary (`mark`, which moves with each: the caller
-    /// carries it into the first attempt), a refusal or a failure included:
-    /// the time was spent.
+    /// The worker selection step is timed under its `smg_router_stage_seconds`
+    /// stage (`mark` is read at its start and its end, a refusal or a failure
+    /// included: the time was spent); the other steps are the request's
+    /// remainder, its duration minus the timed stages.
     async fn run_ingress(
         &self,
         ctx: &mut RequestContext,
@@ -534,15 +534,14 @@ impl RequestPipeline {
 
         let stages = &self.stages;
         step!(
-            RouterStage::Preparation,
             stages.preparation.name(),
             stages.preparation.execute(ctx).await
         )?;
         step!(
-            RouterStage::RateLimit,
             stages.rate_limit.name(),
             stages.rate_limit.execute(ctx).await
         )?;
+        *mark = Instant::now();
         step!(
             RouterStage::WorkerSelection,
             stages.worker_selection.name(),
@@ -562,7 +561,6 @@ impl RequestPipeline {
             enforce_output_budget(&ctx.input.request_type, workers, &ctx.input.model_id)
         )?;
         ctx.state.clients = Some(step!(
-            RouterStage::ClientAcquisition,
             "ClientAcquisition",
             acquire_clients(
                 workers,
@@ -572,14 +570,9 @@ impl RequestPipeline {
             .await
         )?);
         if let Some(encode) = &stages.encode {
-            step!(
-                RouterStage::Encode,
-                encode.name(),
-                encode.execute(ctx).await
-            )?;
+            step!(encode.name(), encode.execute(ctx).await)?;
         }
         step!(
-            RouterStage::RequestBuilding,
             stages.request_building.name(),
             stages.request_building.build(ctx).await
         )
@@ -603,7 +596,8 @@ impl RequestPipeline {
         dctx.attempt = attempt;
         let streaming = dctx.streaming;
         if attempt > 0 {
-            // A retry's stages start here: the backoff before it is no stage.
+            // A retry's reselection is a worker selection, timed from here:
+            // the backoff before it is no stage.
             *mark = Instant::now();
         }
         let consumed = || {
@@ -616,7 +610,7 @@ impl RequestPipeline {
             // call's shape, PD rooms) for the new workers. Buffered decode
             // state from the failed attempt is reset.
             let reselected = self.stages.worker_selection.reselect(dctx).await;
-            Metrics::record_stage_duration(RouterStage::Reselection, streaming, lap(mark));
+            Metrics::record_stage_duration(RouterStage::WorkerSelection, streaming, lap(mark));
             reselected?;
             let workers = stage_output(dctx.workers.as_ref(), "run_attempt")?;
             let clients = acquire_clients(
@@ -625,7 +619,6 @@ impl RequestPipeline {
                 self.worker_registry.overload_shed_enabled(),
             )
             .await;
-            Metrics::record_stage_duration(RouterStage::ClientAcquisition, streaming, lap(mark));
             dctx.clients = Some(clients?);
             let retained = plan.as_mut().ok_or_else(consumed)?;
             helpers::restamp_plan_for_attempt(retained, stamp, workers, &self.tool_parser_factory)?;
@@ -656,6 +649,9 @@ impl RequestPipeline {
             dctx.workers.as_ref(),
         ));
 
+        // The execute stage's clock; the client acquisition, the build and
+        // the plan's stamping before it are the request's remainder.
+        *mark = Instant::now();
         let executed = execute_plan(dctx, attempt_plan, last_attempt).await;
         Metrics::record_stage_duration(RouterStage::Execute, streaming, lap(mark));
         executed?;
@@ -3517,9 +3513,8 @@ mod request_release_tests {
     }
 
     /// `smg_router_stage_seconds`: a request that ran to its answer observed
-    /// every stage it crossed once under the stage's label, and no other (no
-    /// encode step without media, no reselection without a retry), so the
-    /// stage series of a scrape sum to the requests' time in the pipeline.
+    /// each of the three timed stages once under its label, and no other
+    /// series (the untimed steps are the request's remainder).
     #[test]
     fn a_request_observes_every_stage_it_crossed_once() {
         let recorder = PrometheusBuilder::new().build_recorder();
@@ -3546,11 +3541,7 @@ mod request_release_tests {
             .collect();
         counts.sort_unstable();
         let mut expected: Vec<String> = [
-            RouterStage::Preparation,
-            RouterStage::RateLimit,
             RouterStage::WorkerSelection,
-            RouterStage::ClientAcquisition,
-            RouterStage::RequestBuilding,
             RouterStage::Execute,
             RouterStage::ResponseProcessing,
         ]
