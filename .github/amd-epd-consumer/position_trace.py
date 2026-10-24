@@ -13,6 +13,9 @@ from pathlib import Path
 
 LOGGER = logging.getLogger("smg.epd.position")
 LOGGER.setLevel(logging.WARNING)
+LOGGER.propagate = False
+if not LOGGER.handlers:
+    LOGGER.addHandler(logging.StreamHandler())
 LOCK = threading.RLock()
 PID, REQUESTS, ORIGINS, USED, DROPPED = None, {}, {}, 0, False
 
@@ -77,6 +80,8 @@ def emit(stage, role, req, module, filename, *, embedding=None, scheduler=None, 
             if PID != pid:
                 PID, REQUESTS, ORIGINS, USED, DROPPED = pid, {}, {}, 0, False
             rid = str(req.rid)
+            if len(rid) > 4096:
+                raise ValueError("position diagnostic RID cap")
             room = getattr(req, "bootstrap_room", None)
             if stage != "receiver_before" and stage != "receiver_after" and not (type(room) is int and room > 0):
                 return  # Do not exhaust the bounded request sample on startup warmups.
@@ -104,7 +109,7 @@ def emit(stage, role, req, module, filename, *, embedding=None, scheduler=None, 
             row["processor_class"] = (type(processor).__module__ + "." + type(processor).__qualname__) if processor is not None else None
             row["lengths"] = {key: value for key, value in (lengths or {}).items() if type(value) is int}
             text = json.dumps(row, separators=(",", ":"), allow_nan=False)
-            size = len(text.encode())
+            size = len(text.encode()) + 1  # Include the JSONL newline; dedicated handler has no prefix.
             if size > 4096 or USED + size > 256 * 1024 - 512:
                 raise ValueError("position diagnostic byte cap")
             REQUESTS[rid] = events | {stage}
