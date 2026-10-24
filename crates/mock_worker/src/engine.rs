@@ -424,7 +424,8 @@ pub struct EngineParams {
     pub reserve_full_isl: bool,
     /// Output tokens to generate when a request does not specify `max_new_tokens`.
     pub max_new_default: u32,
-    /// Identity used for synthetic output. Does not change cancellation IDs or cache keys.
+    /// Identity used for synthetic output. Cancellation IDs and prompt-block cache keys
+    /// stay unchanged; decode-block keys follow the generated output.
     pub output_seed: OutputSeed,
     /// Fixed per-request overhead in ms (a calibration's intercept that the
     /// pass polynomials do not explain): every event of a request's stream is
