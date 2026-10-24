@@ -2155,8 +2155,14 @@ impl StreamingProcessor {
             tx,
         );
         stream.read_engine(&mut grpc_stream).await?;
+        // The stream's verdict, before the engine side is released: a client
+        // that left gets no finish of its open choices (the held tail would go
+        // to a closed sender), as on the chat and Messages paths.
+        let client_left = grpc_stream.client_left();
         stream.release_engine(grpc_stream, self.backend_type);
-        stream.finish_open_choices().await?;
+        if !client_left {
+            stream.finish_open_choices().await?;
+        }
 
         Ok(stream.outcome())
     }
@@ -2661,6 +2667,13 @@ impl<'a> ChatStream<'a> {
                 // engine stream is polled once per message.
                 StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
                 let item = grpc_stream.next().await;
+                if item.is_none() && grpc_stream.client_left() {
+                    // The client's departure ends the read here: text the
+                    // decoder or a parser still holds can reach nobody, and
+                    // the EOF flush would fail on the closed sender before
+                    // the caller settles what was read.
+                    return Ok(());
+                }
                 match item.transpose() {
                     Ok(response) => response,
                     Err(e) => {
@@ -4080,7 +4093,13 @@ impl<'a> MessagesStream<'a> {
             let response = if self.decoder_finished_at_eof || self.engine_outlived {
                 None
             } else {
-                grpc_stream.next().await.transpose().map_err(|e| {
+                let next = grpc_stream.next().await;
+                if next.is_none() && grpc_stream.client_left() {
+                    // As on the chat path: the departure ends the read before
+                    // held-back text is flushed to the closed sender.
+                    return Ok(());
+                }
+                next.transpose().map_err(|e| {
                     utils::StreamFailure::upstream(e, self.completion_tokens.delivered())
                 })?
             };
