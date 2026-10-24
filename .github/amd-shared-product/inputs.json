@@ -232,13 +232,15 @@
     "schemas_unchanged_from_parent": "19c68a5527f61358a0e9a56a6ed4906dcfb1d1b5",
     "generated_code_version_checks_preserved": true,
     "built": true,
-    "imported": true,
+    "imported": false,
     "wire_tested": true,
     "stock_vllm_runtime_accepted": false,
     "generated16_imported_in_CPU": true,
     "inert_fixture_wire_tested": true,
-    "actual_artifact_manifest": "runtime-evidence.json"
+    "actual_artifact_manifest": "runtime-evidence.json",
+    "imports_scope": "Actual16 generated protobuf/gRPC modules were imported. Servicer90 files were hashed/read, not production-imported or initialized; generic servicer imported flag remainsfalse."
   },
   "new_native_artifact_bound": true,
-  "bound_runtime_evidence_manifest": "runtime-evidence.json"
+  "bound_runtime_evidence_manifest": "runtime-evidence.json",
+  "bound_runtime_evidence_sha256": "df74c2a7669daeb7831eeee2b9205f6e374d8b3bce53f3f8ababbe8cb963166e"
 }
