@@ -310,6 +310,15 @@ fn build_harmony_proto(
             ZmqDialect::Sglang => {
                 build_sglang(body, request_id, text, token_ids, tool_constraints)?
             }
+            // A TensorRT-LLM engine is reached through its gRPC servicer; the
+            // gateway's direct ZMQ lane builds no request for it.
+            ZmqDialect::Trtllm => {
+                return Err(
+                    "a TensorRT-LLM engine is served through its gRPC servicer, not the \
+                            gateway's direct ZMQ lane"
+                        .to_string(),
+                )
+            }
         },
     })
 }
