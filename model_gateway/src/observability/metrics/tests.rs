@@ -1383,6 +1383,13 @@ fn the_stage_series_renders_as_a_bucketed_histogram_under_the_installed_map() {
             Duration::from_micros(40),
         );
         Metrics::record_stage_duration(RouterStage::Execute, true, Duration::from_millis(80));
+        // A collected generation of a minute and a half: the tail edges keep
+        // it out of `+Inf`, where a quantile would read the top finite edge.
+        Metrics::record_stage_duration(
+            RouterStage::ResponseProcessing,
+            false,
+            Duration::from_secs(90),
+        );
     });
     let rendered = handle.render();
     for expected in [
@@ -1391,6 +1398,9 @@ fn the_stage_series_renders_as_a_bucketed_histogram_under_the_installed_map() {
         "smg_router_stage_seconds_bucket{stage=\"execute\",streaming=\"true\",le=\"0.1\"} 1",
         "smg_router_stage_seconds_bucket{stage=\"execute\",streaming=\"true\",le=\"0.05\"} 0",
         "smg_router_stage_seconds_count{stage=\"execute\",streaming=\"true\"} 1",
+        "smg_router_stage_seconds_bucket{stage=\"response_processing\",streaming=\"false\",le=\"60\"} 0",
+        "smg_router_stage_seconds_bucket{stage=\"response_processing\",streaming=\"false\",le=\"120\"} 1",
+        "smg_router_stage_seconds_bucket{stage=\"response_processing\",streaming=\"false\",le=\"1800\"} 1",
     ] {
         assert!(
             rendered.lines().any(|line| line == expected),

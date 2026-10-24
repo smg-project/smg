@@ -373,13 +373,16 @@ pub(crate) const WORKER_RETRY_BACKOFF_BUCKETS: &[f64] = &[
 ];
 
 /// Histogram buckets for `smg_router_stage_seconds`: the ingress stages take
-/// tens of microseconds and the engine's execute seconds, so the edges run
-/// from ten microseconds to a minute. Without explicit buckets the recorder
+/// tens of microseconds, the engine's execute seconds, and the response
+/// processing of a request that does not stream is its whole generation,
+/// minutes for a long output or reasoning trace, so the edges run from ten
+/// microseconds to half an hour (the request-duration buckets reach two
+/// hours for the same requests). Without explicit buckets the recorder
 /// renders the family as a summary, whose quantiles cannot be aggregated
 /// across gateways or time windows and whose sketch costs every record.
 pub(crate) const ROUTER_STAGE_BUCKETS: &[f64] = &[
     0.000_01, 0.000_025, 0.000_05, 0.000_1, 0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025,
-    0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+    0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0,
 ];
 
 /// Jemalloc's run-time options for a long-running gateway, for every final
