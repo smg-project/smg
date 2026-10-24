@@ -44,6 +44,10 @@ impl BaseReasoningParser {
 }
 
 impl ReasoningParser for BaseReasoningParser {
+    fn token_counting_markers(&self) -> Option<(&str, &str)> {
+        Some((&self.config.think_start_token, &self.config.think_end_token))
+    }
+
     fn detect_and_parse_reasoning(&mut self, text: &str) -> Result<ParserResult, ParseError> {
         // Check input size against buffer limit
         if text.len() > self.config.max_buffer_size {

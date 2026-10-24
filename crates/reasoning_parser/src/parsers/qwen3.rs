@@ -39,6 +39,10 @@ impl Default for Qwen3Parser {
 }
 
 impl ReasoningParser for Qwen3Parser {
+    fn token_counting_markers(&self) -> Option<(&str, &str)> {
+        self.base.token_counting_markers()
+    }
+
     fn detect_and_parse_reasoning(&mut self, text: &str) -> Result<ParserResult, ParseError> {
         self.base.detect_and_parse_reasoning(text)
     }
@@ -106,6 +110,10 @@ impl Default for QwenThinkingParser {
 }
 
 impl ReasoningParser for QwenThinkingParser {
+    fn token_counting_markers(&self) -> Option<(&str, &str)> {
+        self.base.token_counting_markers()
+    }
+
     fn detect_and_parse_reasoning(&mut self, text: &str) -> Result<ParserResult, ParseError> {
         self.base.detect_and_parse_reasoning(text)
     }

@@ -22,6 +22,7 @@ use symphony::{adapt, Events};
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{error, warn};
 
+use super::reasoning_usage::{Counter, VllmReasoningUsage};
 use crate::routers::{
     error,
     grpc::{
@@ -452,6 +453,20 @@ impl ResponseProcessor {
 
         // Process all choices
         let mut choices = Vec::new();
+        let mut reasoning_usage = VllmReasoningUsage::default();
+        if chat_request.symphony.is_none() {
+            for complete in &all_responses {
+                reasoning_usage.record(complete, || {
+                    Counter::new(
+                        &self.reasoning_parser_factory,
+                        reasoning_parser_name.as_deref(),
+                        model,
+                        &tokenizer,
+                        &chat_request,
+                    )
+                });
+            }
+        }
         let mut parsed_reasoning_tokens = 0;
         for (index, complete) in all_responses.iter().enumerate() {
             match self
@@ -489,12 +504,13 @@ impl ResponseProcessor {
         // gateway's parser split off when it ran (zero included) and every
         // detail counter present as the OpenAI API sends it.
         let counts = response_formatting::TokenCounts::of(&all_responses);
-        let usage = response_formatting::chat_usage(
+        let mut usage = response_formatting::chat_usage(
             counts.usage(),
             (reasoning_parser_available || chat_request.symphony.is_some())
                 .then_some(parsed_reasoning_tokens),
             chat_request.unbilled_prompt_tokens,
         );
+        reasoning_usage.apply(&mut usage, chat_request.expected_choices);
 
         // Build final ChatCompletionResponse
         let response = ChatCompletionResponse::builder(&dispatch.request_id, &dispatch.model)

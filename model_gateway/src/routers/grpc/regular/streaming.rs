@@ -36,8 +36,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tool_parser::{ParserFactory as ToolParserFactory, StreamingParseResult, ToolParser};
 use tracing::{debug, error, warn};
 
-use super::symphony::{
-    engine_finish, finished, reasoning_text_tokens, telemetry::Who, Delta, Reader,
+use super::{
+    reasoning_usage::{Counter, VllmReasoningUsage},
+    symphony::{engine_finish, finished, reasoning_text_tokens, telemetry::Who, Delta, Reader},
 };
 use crate::{
     observability::metrics::{metrics_labels, LocalStopAbort, Metrics, StreamingMetricsParams},
@@ -2336,6 +2337,7 @@ struct ChatStream<'a> {
     /// of chunks that decoded to no text yet (counted with the chunk that
     /// releases their text).
     parsed_reasoning_tokens: HashMap<u32, u32>,
+    reasoning_usage: VllmReasoningUsage,
     held_tokens: HashMap<u32, u32>,
     spec_accepted: HashMap<u32, u32>,
     spec_drafted: HashMap<u32, u32>,
@@ -2501,6 +2503,7 @@ impl<'a> ChatStream<'a> {
             cached_tokens: HashMap::new(),
             reasoning_tokens: HashMap::new(),
             parsed_reasoning_tokens: HashMap::new(),
+            reasoning_usage: VllmReasoningUsage::default(),
             held_tokens: HashMap::new(),
             spec_accepted: HashMap::new(),
             spec_drafted: HashMap::new(),
@@ -2662,6 +2665,17 @@ impl<'a> ChatStream<'a> {
         }
 
         self.completion_tokens.record_chunk(&chunk);
+        if self.spec.symphony.is_none() {
+            self.reasoning_usage.record_chunk(&chunk, || {
+                Counter::new(
+                    &self.processor.reasoning_parser_factory,
+                    self.reasoning_parser_name.as_deref(),
+                    &self.dispatch.model,
+                    &self.tokenizer,
+                    self.spec,
+                )
+            });
+        }
         if let Some(usage) = &mut self.continuous_usage {
             usage.record_chunk(&chunk);
         }
@@ -2847,6 +2861,17 @@ impl<'a> ChatStream<'a> {
         self.prompt_tokens.insert(index, complete.prompt_tokens());
 
         self.completion_tokens.record_complete(&complete);
+        if self.spec.symphony.is_none() {
+            self.reasoning_usage.record(&complete, || {
+                Counter::new(
+                    &self.processor.reasoning_parser_factory,
+                    self.reasoning_parser_name.as_deref(),
+                    &self.dispatch.model,
+                    &self.tokenizer,
+                    self.spec,
+                )
+            });
+        }
         if let Some(usage) = &mut self.continuous_usage {
             usage.record_complete(&complete);
         }
@@ -3384,12 +3409,15 @@ impl<'a> ChatStream<'a> {
     /// usage chunk carries the usage object that answer carries.
     fn final_usage(&self) -> Option<Usage> {
         (self.deepseek_usage || self.include_usage).then(|| {
-            chat_usage(
+            let mut usage = chat_usage(
                 self.counts().usage(),
                 (self.reasoning_parser_available || self.spec.symphony.is_some())
                     .then(|| self.parsed_reasoning_tokens.values().sum()),
                 self.spec.unbilled_prompt_tokens,
-            )
+            );
+            self.reasoning_usage
+                .apply(&mut usage, self.spec.expected_choices);
+            usage
         })
     }
 
