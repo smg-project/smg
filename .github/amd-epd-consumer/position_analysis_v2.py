@@ -32,6 +32,10 @@ def expected_sources(manifest):
     helper = manifest["helper"]
     sources[helper["module"]] = {"module": helper["module"], "path": str(root / helper["path"]),
                                  "sha256": helper["sha256"]}
+    if "delta_helper" in manifest:
+        helper = manifest["delta_helper"]
+        sources[helper["module"]] = {"module": helper["module"], "path": str(root / helper["path"]),
+                                     "sha256": helper["sha256"]}
     return sources
 
 

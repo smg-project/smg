@@ -51,6 +51,8 @@ def restore(row, req):
         require(value == 0 and row[4].item() == 0, "missing versioned image delta")
         return
     require(tag == TAG, "unknown metadata version")
+    require(len(req.origin_input_ids) > 0 and len(req.origin_input_ids) + value > 0,
+            "delta precedes prompt coordinates")
     req.pd_mrope_delta = scalar(value)
     req.pd_mrope_prompt_len = len(req.origin_input_ids)
 

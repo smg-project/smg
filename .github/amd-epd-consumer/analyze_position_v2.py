@@ -30,6 +30,8 @@ def main():
     parser.add_argument("--capture", required=True, type=Path)
     parser.add_argument("--contract", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--manifest", choices=("position_manifest.json", "mrope_manifest.json"),
+                        default="position_manifest.json")
     args = parser.parse_args()
     require(not args.output.exists(), "analysis refuses overwrite")
     contract = json.loads(read(args.contract, 65536))
@@ -39,7 +41,7 @@ def main():
             and contract["gpu_job_name"] == "amd-sglang-epd / run", "future run identity not bound")
     original_ids = contract["original_case_ids"]
     require(len(original_ids) == len(set(original_ids)) == 8, "original eight case contract")
-    manifest_bytes = read(HERE / "position_manifest.json", 16384)
+    manifest_bytes = read(HERE / args.manifest, 16384)
     require(sha(manifest_bytes) == contract["position_manifest_sha256"], "source manifest binding")
     manifest = json.loads(manifest_bytes)
     root = args.capture.resolve()

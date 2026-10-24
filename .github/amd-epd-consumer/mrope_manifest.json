@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "model_id": "Qwen/Qwen3.5-9B",
+  "root": "/sgl-workspace/sglang/python/sglang",
+  "helper": {
+    "module": "sglang.srt.disaggregation._smg_epd_position_trace",
+    "path": "srt/disaggregation/_smg_epd_position_trace.py",
+    "source": "position_trace.py",
+    "sha256": "609749af6f37c402c73d1c7d6fdb1103220a052cc17fd07f644cb3e6ce39cac8"
+  },
+  "modules": [
+    {
+      "module": "sglang.srt.disaggregation.encoder.receiver",
+      "path": "srt/disaggregation/encoder/receiver.py",
+      "original_sha256": "7c2f095a69420bdbd77ba3f2b0d19cee96602f0d279b3caa78d60e00e518b77d",
+      "patched_sha256": "107a9b0ea601c185e86086821992a3fee147ddccd72d65fe46135686ff919831",
+      "patch": "position_patches/receiver.py.json",
+      "patch_sha256": "bcfc3d06beac4d95ad698927398fb477ead132cacb65a38cec7a66f1803d0d1c"
+    },
+    {
+      "module": "sglang.srt.disaggregation.prefill",
+      "path": "srt/disaggregation/prefill.py",
+      "original_sha256": "50bec634f895b09f835d0a3c67e9a73288db046cb9eb7b8e8540fc9d00a684bd",
+      "patched_sha256": "8414a4d38d7d6303fac8b0d7ab57290d8e9c0094a1fbcdf1dd41a0c3d97b1ab8",
+      "patch": "position_patches/prefill.py.json",
+      "patch_sha256": "b09808454751d81f77ab9c312f32293db66493e3697fd96dad66de260fc2d090"
+    },
+    {
+      "module": "sglang.srt.disaggregation.decode",
+      "path": "srt/disaggregation/decode.py",
+      "original_sha256": "136f7b95152d6f3e1631dde8e5e2770af229cd5bfdd3c217dec7a3461b006d33",
+      "patched_sha256": "37af0bef1ebd238df7058783705b58d0238b4921b1fa5c9b6ab1fa249dd9b275",
+      "patch": "position_patches/mrope_decode.py.json",
+      "patch_sha256": "a66e3212b57ad603315413c6b4c67740b9e01bca82c2932ec526844fd96cc1f1"
+    },
+    {
+      "module": "sglang.srt.disaggregation.utils",
+      "path": "srt/disaggregation/utils.py",
+      "original_sha256": "56e490e77b2729fe383ab5968e8859da971a6d1c9f48a796b0421baf193f745a",
+      "patched_sha256": "a6defdf5845c06262f07f3840a0ceea7942aba0109a5c61e9239b8bbd65d5c95",
+      "patch": "position_patches/mrope_utils.py.json",
+      "patch_sha256": "cf690f984d7c0ded1dac2d94178d1c52db303dbe4e506b2bda0831058a4927ea"
+    },
+    {
+      "module": "sglang.srt.managers.schedule_batch",
+      "path": "srt/managers/schedule_batch.py",
+      "original_sha256": "b2f78c781de88c36ce27cc5d44b343420338b4da299e885c575665d6fab843ca",
+      "patched_sha256": "c38a56de971b88e33dc3c9a09d9a684edd204dd166f8c677ab59f4c77d0344c2",
+      "patch": "position_patches/mrope_schedule_batch.py.json",
+      "patch_sha256": "78f336022a266dc7b4740bcef1b57619bddbd8158fb05b9a0890bf9cc3fb268e"
+    },
+    {
+      "module": "sglang.srt.model_executor.forward_batch_info",
+      "path": "srt/model_executor/forward_batch_info.py",
+      "original_sha256": "ef4426b3ece1b515eeb5223d394de6a8d154d912bcf62e7ed4bae20e17064797",
+      "patched_sha256": "c755cfe06723dea40a26afd92cf75866958f721ea877d739a7dd790e50b8b7c4",
+      "patch": "position_patches/mrope_forward_batch_info.py.json",
+      "patch_sha256": "57ff93957b0c7f24538d416a28e42c95a24160dc458de4d492f2e954d7dbbaf1"
+    }
+  ],
+  "delta_helper": {
+    "module": "sglang.srt.disaggregation._smg_epd_mrope_delta",
+    "path": "srt/disaggregation/_smg_epd_mrope_delta.py",
+    "source": "mrope_delta.py",
+    "sha256": "ffeeda537be95b5658f15782f390d21b29e6d012b89854fe31d11206c665a41f"
+  }
+}

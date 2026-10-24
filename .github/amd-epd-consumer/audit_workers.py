@@ -6,7 +6,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from artifact_io import require
-from position_overlay import HELPER, expected_engine
+from position_overlay import DELTA_HELPER, DELTA_PATHS, HELPER, expected_engine
 
 
 def verify(directory):
@@ -61,6 +61,8 @@ def verify(directory):
             required |= {HELPER, "sglang.srt.disaggregation." + role}
             if role == "prefill":
                 required.add("sglang.srt.disaggregation.encoder.receiver")
+            if DELTA_HELPER in position:
+                required |= {DELTA_HELPER, *DELTA_PATHS}
         require(
             required <= group["modules"],
             "worker actual imports missing: " + repr(required - group["modules"]),

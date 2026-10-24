@@ -19,6 +19,12 @@ PATHS = {
     "sglang.srt.disaggregation.decode": "srt/disaggregation/decode.py",
 }
 HELPER = "sglang.srt.disaggregation._smg_epd_position_trace"
+DELTA_HELPER = "sglang.srt.disaggregation._smg_epd_mrope_delta"
+DELTA_PATHS = {
+    "sglang.srt.disaggregation.utils": "srt/disaggregation/utils.py",
+    "sglang.srt.managers.schedule_batch": "srt/managers/schedule_batch.py",
+    "sglang.srt.model_executor.forward_batch_info": "srt/model_executor/forward_batch_info.py",
+}
 META = "srt/disaggregation/_smg_epd_position_manifest.json"
 
 
@@ -26,12 +32,24 @@ def sha(raw):
     return hashlib.sha256(raw).hexdigest()
 
 
+def manifest_path():
+    return HERE / ("mrope_manifest.json" if os.environ.get("SMG_EPD_MROPE_DELTA_HANDOFF") == "1"
+                   else "position_manifest.json")
+
+
 def configuration():
-    data = json.loads((HERE / "position_manifest.json").read_text())
+    data = json.loads(manifest_path().read_text())
     require(data["version"] == 1 and data["root"] == str(ROOT), "overlay root/version")
     require(data["model_id"] == "Qwen/Qwen3.5-9B", "overlay model")
-    require(len(data["modules"]) == 3, "overlay module count")
-    require({row["module"]: row["path"] for row in data["modules"]} == PATHS, "overlay modules")
+    delta = os.environ.get("SMG_EPD_MROPE_DELTA_HANDOFF") == "1"
+    paths = PATHS | DELTA_PATHS if delta else PATHS
+    require(len(data["modules"]) == len(paths), "overlay module count")
+    require({row["module"]: row["path"] for row in data["modules"]} == paths, "overlay modules")
+    if delta:
+        require(data["delta_helper"]["module"] == DELTA_HELPER
+                and data["delta_helper"]["source"] == "mrope_delta.py"
+                and data["delta_helper"]["path"] == "srt/disaggregation/_smg_epd_mrope_delta.py",
+                "delta helper identity")
     helper = data["helper"]
     require(helper["module"] == HELPER and helper["source"] == "position_trace.py"
             and helper["path"] == "srt/disaggregation/_smg_epd_position_trace.py", "overlay helper")
@@ -39,13 +57,19 @@ def configuration():
 
 
 def expected_engine():
+    require(os.environ.get("SMG_EPD_MROPE_DELTA_HANDOFF") != "1"
+            or os.environ.get("SMG_EPD_POSITION_DIAGNOSTIC") == "1", "delta needs source witness")
     if os.environ.get("SMG_EPD_POSITION_DIAGNOSTIC") != "1":
         return {}
     data = configuration()
-    return {row["module"]: {"path": str(ROOT / row["path"]), "sha256": row["patched_sha256"]}
+    result = {row["module"]: {"path": str(ROOT / row["path"]), "sha256": row["patched_sha256"]}
             for row in data["modules"]} | {
         HELPER: {"path": str(ROOT / data["helper"]["path"]), "sha256": data["helper"]["sha256"]}
     }
+    if "delta_helper" in data:
+        helper = data["delta_helper"]
+        result[DELTA_HELPER] = {"path": str(ROOT / helper["path"]), "sha256": helper["sha256"]}
+    return result
 
 
 def read(path):
@@ -73,6 +97,8 @@ def atomic(path, raw):
 
 
 def apply(directory):
+    require(os.environ.get("SMG_EPD_MROPE_DELTA_HANDOFF") != "1"
+            or os.environ.get("SMG_EPD_POSITION_DIAGNOSTIC") == "1", "delta needs source witness")
     if os.environ.get("SMG_EPD_POSITION_DIAGNOSTIC") != "1":
         return
     data = configuration()
@@ -109,7 +135,12 @@ def apply(directory):
         helper_bytes = read(HERE / helper["source"])
         require(sha(helper_bytes) == helper["sha256"], "overlay helper source")
         additions = [(ROOT / helper["path"], helper_bytes),
-                     (ROOT / META, (HERE / "position_manifest.json").read_bytes())]
+                     (ROOT / META, manifest_path().read_bytes())]
+        if "delta_helper" in data:
+            extra = data["delta_helper"]
+            raw = read(HERE / extra["source"])
+            require(sha(raw) == extra["sha256"], "delta helper source")
+            additions.append((ROOT / extra["path"], raw))
         for path, raw in additions:
             require(not path.is_symlink() and path.parent.resolve() == path.parent, "unsafe overlay addition")
             require(not path.exists() or read(path) == raw, "overlay addition already differs")
@@ -117,6 +148,6 @@ def apply(directory):
             atomic(path, raw)
             require(read(path) == raw, "overlay write differs")
     report = {"applied": True, "pid": os.getpid(), "modules": expected_engine(),
-              "manifest_sha256": sha((HERE / "position_manifest.json").read_bytes()),
+              "manifest_sha256": sha(manifest_path().read_bytes()),
               "runtime_events": "NOT_YET_VERIFIED"}
     (directory / f"position-overlay-{os.getpid()}.json").write_text(json.dumps(report, indent=2) + "\n")
