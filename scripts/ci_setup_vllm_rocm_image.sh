@@ -10,6 +10,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RETRY="bash ${SCRIPT_DIR}/ci_retry.sh"
 
+if [[ -n "${SMG_CI_RUNTIME_STATE_DIR:-}" ]]; then
+    SMG_CI_EFFECTIVE_CONSTRAINT="$(python3 "$SCRIPT_DIR/ci_runtime_constraints.py" prepare "$SMG_CI_RUNTIME_STATE_DIR")"
+    export PIP_CONSTRAINT="$SMG_CI_EFFECTIVE_CONSTRAINT"
+    if [[ -n "${GITHUB_ENV:-}" ]]; then
+        printf '%s\n' "PIP_CONSTRAINT=$PIP_CONSTRAINT" >> "$GITHUB_ENV"
+    fi
+fi
+
 SMG_CI_IMAGE_PACKAGE_VERSIONS="$(python3 -c '
 from importlib.metadata import version
 from packaging.version import Version
