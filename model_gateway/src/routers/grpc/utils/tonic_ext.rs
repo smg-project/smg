@@ -4,7 +4,8 @@ use axum::response::Response;
 use http::StatusCode;
 use llm_multimodal::MediaErrorCode;
 use smg_grpc_client::{
-    is_constraint_failure, is_request_timeout, is_transport_failure, WorkerMediaFault,
+    is_constraint_failure, is_request_timeout, is_transport_failure, request_timeout_kind,
+    TimeoutKind, WorkerMediaFault,
 };
 use tonic::Code;
 
@@ -169,6 +170,15 @@ impl TonicStatusExt for tonic::Status {
 
     fn error_reason(&self) -> &'static str {
         use metrics_labels::*;
+        // The gateway's own bounds on the call, by kind: the total reads as
+        // any deadline, the two silence bounds under their own names.
+        if let Some(kind) = request_timeout_kind(self) {
+            return match kind {
+                TimeoutKind::Total => REASON_DEADLINE,
+                TimeoutKind::FirstToken => REASON_FIRST_TOKEN_TIMEOUT,
+                TimeoutKind::InterToken => REASON_INTER_TOKEN_TIMEOUT,
+            };
+        }
         if is_constraint_failure(self) {
             return REASON_CONSTRAINT_FAILED;
         }
@@ -347,6 +357,22 @@ mod tests {
             (
                 tonic::Status::deadline_exceeded("too slow"),
                 REASON_DEADLINE,
+            ),
+            // The gateway's own bounds on the call, by kind.
+            (
+                smg_grpc_client::RequestDeadline::after(std::time::Duration::from_secs(15))
+                    .status(TimeoutKind::Total),
+                REASON_DEADLINE,
+            ),
+            (
+                smg_grpc_client::RequestDeadline::after(std::time::Duration::from_secs(15))
+                    .status(TimeoutKind::FirstToken),
+                REASON_FIRST_TOKEN_TIMEOUT,
+            ),
+            (
+                smg_grpc_client::RequestDeadline::after(std::time::Duration::from_secs(15))
+                    .status(TimeoutKind::InterToken),
+                REASON_INTER_TOKEN_TIMEOUT,
             ),
             (
                 tonic::Status::resource_exhausted("kv cache full"),

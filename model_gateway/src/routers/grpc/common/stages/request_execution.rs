@@ -9,7 +9,7 @@ use std::{
 
 use axum::response::Response;
 use futures::future::{join_all, try_join_all};
-use smg_grpc_client::{is_transport_failure, vllm_proto as vllm, RequestDeadline};
+use smg_grpc_client::{is_transport_failure, vllm_proto as vllm, RequestBounds, RequestDeadline};
 use tracing::{debug, error, info_span, warn, Instrument};
 
 use super::{
@@ -260,16 +260,17 @@ fn pd_side_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
 ///
 /// `last_attempt` says whether a plan is still retained for a replay, which
 /// is what decides when the media bytes stop counting against the in-flight
-/// budget. `request_timeout` is `--request-timeout-secs`: the attempt's
-/// deadline, counted from its dispatch (after the admission gate below,
-/// which has a bound of its own) over the calls that open the streams and
-/// over every message on them (see [`RequestDeadline`]); `None` leaves the
-/// attempt unbounded.
+/// budget. `bounds` are the attempt's: `--request-timeout-secs` (dispatch to
+/// last message) and the silence bounds (`--first-token-timeout-secs`,
+/// `--inter-token-timeout-secs`), counted from its dispatch (after the
+/// admission gate below, which has a bound of its own) over the calls that
+/// open the streams and over every message on them (see
+/// [`RequestDeadline`]); none set leaves the attempt unbounded.
 pub(crate) async fn execute_plan(
     ctx: &mut DispatchContext,
     mut execution_plan: ExecutionPlan,
     last_attempt: bool,
-    request_timeout: Option<Duration>,
+    bounds: RequestBounds,
 ) -> Result<(), Response> {
     // One bootstrap room per backend request the plan will post: a batched
     // completion fans out one PD dispatch per sub-request, so admission has
@@ -355,9 +356,9 @@ pub(crate) async fn execute_plan(
         otel.status_code = tracing::field::Empty,
     );
 
-    // The deadline runs from here: the admission wait above is the gateway's
+    // The bounds run from here: the admission wait above is the gateway's
     // own queueing, bounded by its own setting, not time the worker had.
-    let deadline = request_timeout.map(RequestDeadline::after);
+    let deadline = RequestDeadline::from_dispatch(bounds);
     let dispatch = async {
         match execution_plan {
             ExecutionPlan::Single(request) => match request {
@@ -401,11 +402,12 @@ pub(crate) async fn execute_plan(
         }
     }
     .instrument(span.clone());
-    // The deadline bounds the dispatch itself: a call the worker has not
-    // answered when it passes is dropped, which cancels it on the worker as a
-    // client's leaving does (see `dispatch_timed_out`).
+    // The earlier of the total and the first-token bound bounds the dispatch
+    // itself: a call the worker has not answered when it passes is dropped,
+    // which cancels it on the worker as a client's leaving does (see
+    // `dispatch_timed_out`).
     let result = match deadline {
-        Some(deadline) => match tokio::time::timeout_at(deadline.at(), dispatch).await {
+        Some(deadline) => match tokio::time::timeout_at(deadline.dispatch_at(), dispatch).await {
             Ok(result) => result,
             Err(_) => Err(dispatch_timed_out(deadline, workers, ledger, request_id)),
         },
@@ -439,11 +441,12 @@ pub(crate) async fn execute_plan(
     Ok(())
 }
 
-/// The client's answer for an attempt whose deadline passed before the
-/// worker answered the call that opens the stream (a worker that took the
-/// request and never spoke; on a disaggregated pair, a side the pair's own
-/// silence bounds did not cover): the HTTP path's 504 for its client
-/// timeout. The timeout is charged, as a failed dispatch of the status is
+/// The client's answer for an attempt whose bound (the total, or the
+/// first-token bound when it is the earlier) passed before the worker
+/// answered the call that opens the stream (a worker that took the request
+/// and never spoke; on a disaggregated pair, a side the pair's own silence
+/// bounds did not cover): the HTTP path's 504 for its client timeout. The
+/// timeout is charged, as a failed dispatch of the status is
 /// (the breaker sample and the worker-error count), to the one worker the
 /// attempt waited on: the single worker, or the decode side of a pair. The
 /// decode side is the one a pair's answer waits on in every shape: on the
@@ -459,12 +462,16 @@ fn dispatch_timed_out(
     ledger: &AttemptLedger,
     request_id: &str,
 ) -> Response {
-    let status = deadline.status();
+    let kind = deadline
+        .dispatch_bound()
+        .map_or(smg_grpc_client::TimeoutKind::Total, |(_, kind)| kind);
+    let status = deadline.status(kind);
     let urls: Vec<&str> = workers.workers().map(|worker| worker.url()).collect();
     warn!(
         request_id = %request_id,
         workers = ?urls,
-        timeout = ?deadline.timeout(),
+        bound = kind.label(),
+        timeout = ?deadline.timeout(kind),
         "Request timed out before the worker answered its call; the call is dropped, which cancels the request on the worker"
     );
     if let Some(worker) = workers.decode_worker().or_else(|| workers.single()) {

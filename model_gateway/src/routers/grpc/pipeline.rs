@@ -30,6 +30,7 @@ use openai_protocol::{
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg_external_router::header_utils::insert_routed_worker_id;
+use smg_grpc_client::RequestBounds;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, error};
 
@@ -127,10 +128,10 @@ pub(crate) struct PipelineDeps {
     /// `--queue-timeout-secs`: a request still ahead of worker selection this
     /// long after the gateway accepted it is refused instead of dispatched.
     queue_timeout: Duration,
-    /// `--request-timeout-secs`: the deadline of each attempt's calls to its
-    /// workers and of the streams they open, counted from the dispatch;
-    /// `None` leaves them unbounded.
-    request_timeout: Option<Duration>,
+    /// The bounds of each attempt's calls to its workers and of the streams
+    /// they open, counted from the dispatch: `--request-timeout-secs` and the
+    /// silence bounds; none set leaves them unbounded.
+    bounds: RequestBounds,
 }
 
 impl PipelineDeps {
@@ -161,7 +162,7 @@ impl PipelineDeps {
             configured_reasoning_parser,
             rate_limit_manager,
             queue_timeout,
-            request_timeout: None,
+            bounds: RequestBounds::NONE,
         }
     }
 
@@ -184,7 +185,7 @@ impl PipelineDeps {
             configured_reasoning_parser: None,
             rate_limit_manager,
             queue_timeout,
-            request_timeout: None,
+            bounds: RequestBounds::NONE,
         }
     }
 
@@ -193,7 +194,22 @@ impl PipelineDeps {
     /// them unbounded.
     #[must_use]
     pub(crate) fn with_request_timeout(mut self, timeout: Duration) -> Self {
-        self.request_timeout = (!timeout.is_zero()).then_some(timeout);
+        self.bounds.total = (!timeout.is_zero()).then_some(timeout);
+        self
+    }
+
+    /// Bound each attempt's silences: `first_token` from the dispatch to the
+    /// stream's first message (`--first-token-timeout-secs`), `inter_token`
+    /// between one message and the next (`--inter-token-timeout-secs`); zero
+    /// leaves a silence unbounded.
+    #[must_use]
+    pub(crate) fn with_silence_bounds(
+        mut self,
+        first_token: Duration,
+        inter_token: Duration,
+    ) -> Self {
+        self.bounds.first_token = (!first_token.is_zero()).then_some(first_token);
+        self.bounds.inter_token = (!inter_token.is_zero()).then_some(inter_token);
         self
     }
 
@@ -264,7 +280,7 @@ impl PipelineDeps {
             configured_reasoning_parser: None,
             rate_limit_manager: None,
             queue_timeout: Duration::from_secs(60),
-            request_timeout: None,
+            bounds: RequestBounds::NONE,
         }
     }
 }
@@ -296,8 +312,8 @@ pub(crate) struct RequestPipeline {
     worker_registry: Arc<WorkerRegistry>,
     /// Shapes a forced tool call's constraint for each attempt's worker.
     tool_parser_factory: ToolParserFactory,
-    /// The deadline of each attempt's dispatch and streams, when set.
-    request_timeout: Option<Duration>,
+    /// The bounds of each attempt's dispatch and streams, when set.
+    bounds: RequestBounds,
 }
 
 /// Outcome of one full pipeline run.
@@ -483,7 +499,7 @@ impl RequestPipeline {
             mode,
             worker_registry: deps.worker_registry.clone(),
             tool_parser_factory: deps.tool_parser_factory.clone(),
-            request_timeout: deps.request_timeout,
+            bounds: deps.bounds,
         })
     }
 
@@ -622,7 +638,7 @@ impl RequestPipeline {
             dctx.workers.as_ref(),
         ));
 
-        execute_plan(dctx, attempt_plan, last_attempt, self.request_timeout).await?;
+        execute_plan(dctx, attempt_plan, last_attempt, self.bounds).await?;
         self.stages
             .response_processing
             .process(dctx, attempt_spec)
@@ -2104,6 +2120,9 @@ mod request_release_tests {
         fail_engine_report: bool,
         answer_after: Option<Duration>,
         frame_gap: Option<Duration>,
+        /// A gap before every frame but the first: a stream that speaks once
+        /// and then goes silent.
+        gap_after_first: Option<Duration>,
         calls: Arc<AtomicUsize>,
         seen_input_ids: Arc<Mutex<Vec<Vec<u32>>>>,
         seen_original_texts: Arc<Mutex<Vec<String>>>,
@@ -2242,6 +2261,7 @@ mod request_release_tests {
             let probe = (!self.gate_rpc).then(|| self.probe.clone()).flatten();
             let released = Arc::clone(&self.released);
             let frame_gap = self.frame_gap;
+            let gap_after_first = self.gap_after_first;
             let fail_mid_stream = self.fail_mid_stream;
             tokio::spawn(async move {
                 if let Some(probe) = probe {
@@ -2249,6 +2269,9 @@ mod request_release_tests {
                 }
                 for (index, frame) in generate_frames(&request_id).into_iter().enumerate() {
                     if let Some(gap) = frame_gap {
+                        tokio::time::sleep(gap).await;
+                    }
+                    if let (Some(gap), true) = (gap_after_first, index > 0) {
                         tokio::time::sleep(gap).await;
                     }
                     let frame = if fail_mid_stream && index == 1 {
@@ -5234,11 +5257,13 @@ mod request_release_tests {
     const CASE_CAP: Duration = Duration::from_secs(10);
 
     /// Where the worker falls silent: after it answered the call with an
-    /// open stream (`Stream`), or before answering the call at all (`Call`).
+    /// open stream (`Stream`), before answering the call at all (`Call`), or
+    /// after its first message (`AfterFirst`).
     #[derive(Clone, Copy)]
     enum SilentShape {
         Stream,
         Call,
+        AfterFirst,
     }
 
     /// A completion pipeline with `request_timeout` over one stub worker that
@@ -5246,6 +5271,21 @@ mod request_release_tests {
     async fn silent_worker_pipeline(
         shape: SilentShape,
         request_timeout: Duration,
+    ) -> (
+        RequestPipeline,
+        Arc<dyn Worker>,
+        GatedScheduler,
+        Arc<SharedComponents>,
+    ) {
+        bounded_silent_worker_pipeline(shape, request_timeout, Duration::ZERO, Duration::ZERO).await
+    }
+
+    /// The same, with the silence bounds (zero = off) beside the total.
+    async fn bounded_silent_worker_pipeline(
+        shape: SilentShape,
+        request_timeout: Duration,
+        first_token: Duration,
+        inter_token: Duration,
     ) -> (
         RequestPipeline,
         Arc<dyn Worker>,
@@ -5262,6 +5302,10 @@ mod request_release_tests {
                 answer_after: Some(silence),
                 ..Default::default()
             },
+            SilentShape::AfterFirst => GatedScheduler {
+                gap_after_first: Some(silence),
+                ..Default::default()
+            },
         };
         let port = spawn_stub(scheduler.clone()).await;
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -5273,11 +5317,89 @@ mod request_release_tests {
             None,
             Duration::from_secs(60),
         )
-        .with_request_timeout(request_timeout);
+        .with_request_timeout(request_timeout)
+        .with_silence_bounds(first_token, inter_token);
         let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
             .expect("completion pipeline");
         let components = components(Arc::clone(&worker_registry)).await;
         (pipeline, worker, scheduler, components)
+    }
+
+    /// A streamed completion whose worker speaks once and then goes silent
+    /// ends at the inter-token bound, under a total out of reach: the
+    /// `stream_error` event names the silence, `[DONE]` follows, the stub
+    /// receives the abort and the worker's load goes with the body.
+    #[tokio::test]
+    async fn a_stream_that_goes_silent_after_its_first_message_ends_at_the_inter_token_bound() {
+        let (pipeline, worker, scheduler, components) = bounded_silent_worker_pipeline(
+            SilentShape::AfterFirst,
+            Duration::from_secs(60),
+            Duration::ZERO,
+            REQUEST_TIMEOUT,
+        )
+        .await;
+        let started = Instant::now();
+        let response = pipeline
+            .execute_completion(
+                completion(true),
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let body = tokio::time::timeout(
+            CASE_CAP,
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the inter-token bound ends the body: without it the gateway waits on the silent worker until the total")
+        .expect("drain body");
+        let elapsed = started.elapsed();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            elapsed >= REQUEST_TIMEOUT && elapsed < CASE_CAP,
+            "ended after {elapsed:?}: {body}"
+        );
+        assert!(body.contains("\"type\":\"stream_error\""), "{body}");
+        assert!(body.contains("no token for 300ms"), "{body}");
+        assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
+        assert_aborted_and_released(&scheduler, &worker).await;
+    }
+
+    /// A worker that takes the call and sends nothing is cut by the
+    /// first-token bound, under a total out of reach: the 504
+    /// `call_upstream_timeout` at the bound, the request aborted and released.
+    #[tokio::test]
+    async fn a_worker_that_sends_no_first_message_is_the_504_at_the_first_token_bound() {
+        let (pipeline, worker, scheduler, components) = bounded_silent_worker_pipeline(
+            SilentShape::Stream,
+            Duration::from_secs(60),
+            REQUEST_TIMEOUT,
+            Duration::ZERO,
+        )
+        .await;
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            CASE_CAP,
+            pipeline.execute_completion(
+                completion(false),
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the first-token bound answers: without it the gateway waits on the silent worker until the total");
+        let elapsed = started.elapsed();
+        assert_timeout_response_saying(response, elapsed, "no first token within 300ms").await;
+        assert_aborted_and_released(&scheduler, &worker).await;
     }
 
     fn completion(stream: bool) -> Arc<CompletionRequest> {
@@ -5294,6 +5416,11 @@ mod request_release_tests {
 
     /// The HTTP path's 504 for its client timeout, at the deadline.
     async fn assert_timeout_response(response: Response, elapsed: Duration) {
+        assert_timeout_response_saying(response, elapsed, "request timed out after 300ms").await;
+    }
+
+    /// The same, with the bound's own words in the message.
+    async fn assert_timeout_response_saying(response: Response, elapsed: Duration, saying: &str) {
         assert_eq!(response.status(), http::StatusCode::GATEWAY_TIMEOUT);
         assert!(
             elapsed >= REQUEST_TIMEOUT && elapsed < CASE_CAP,
@@ -5308,7 +5435,7 @@ mod request_release_tests {
         assert!(
             error["error"]["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("request timed out after 300ms")),
+                .is_some_and(|message| message.contains(saying)),
             "{error}"
         );
     }

@@ -592,6 +592,8 @@ struct Router {
     remove_unhealthy_workers: Option<bool>,
     request_id_headers: Option<Vec<String>>,
     request_timeout_secs: u64,
+    first_token_timeout_secs: u64,
+    inter_token_timeout_secs: u64,
     retry_backoff_multiplier: f32,
     retry_initial_backoff_ms: u64,
     retry_jitter_factor: f32,
@@ -1132,6 +1134,8 @@ impl Router {
             .zmq_startup_timeout_secs(self.zmq_startup_timeout_secs)
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
+            .first_token_timeout_secs(self.first_token_timeout_secs)
+            .inter_token_timeout_secs(self.inter_token_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_delay_secs(self.worker_startup_delay)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
@@ -1468,6 +1472,8 @@ impl Router {
         remove_unhealthy_workers = None,
         request_id_headers = None,
         request_timeout_secs = 1800,
+        first_token_timeout_secs = 0,
+        inter_token_timeout_secs = 0,
         retry_backoff_multiplier = 1.5,
         retry_initial_backoff_ms = 50,
         retry_jitter_factor = 0.2,
@@ -1689,6 +1695,8 @@ impl Router {
         remove_unhealthy_workers: Option<bool>,
         request_id_headers: Option<Vec<String>>,
         request_timeout_secs: u64,
+        first_token_timeout_secs: u64,
+        inter_token_timeout_secs: u64,
         retry_backoff_multiplier: f32,
         retry_initial_backoff_ms: u64,
         retry_jitter_factor: f32,
@@ -1946,6 +1954,8 @@ impl Router {
             remove_unhealthy_workers,
             request_id_headers,
             request_timeout_secs,
+            first_token_timeout_secs,
+            inter_token_timeout_secs,
             retry_backoff_multiplier,
             retry_initial_backoff_ms,
             retry_jitter_factor,

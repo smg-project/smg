@@ -262,6 +262,12 @@ pub mod metrics_labels {
     /// DEADLINE_EXCEEDED, a side was silent past its liveness bound, an
     /// upstream call timed out (a 504 or 408).
     pub const REASON_DEADLINE: &str = "deadline";
+    /// The worker answered nothing within the gateway's first-token bound
+    /// on the call (`--first-token-timeout-secs`).
+    pub const REASON_FIRST_TOKEN_TIMEOUT: &str = "first_token_timeout";
+    /// The worker's stream went silent past the gateway's inter-token bound
+    /// (`--inter-token-timeout-secs`).
+    pub const REASON_INTER_TOKEN_TIMEOUT: &str = "inter_token_timeout";
     /// The worker's connection failed under the call: an HTTP/2 or socket
     /// fault below the status, the worker's side cancelling the call, a
     /// connect failure, a relayed body cut short (a 502).
