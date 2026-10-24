@@ -217,6 +217,8 @@ fn batch(
         num_waiting,
         kv_active_pages,
         kv_total_pages,
+        finished_status_codes: Vec::new(),
+        finished_messages: Vec::new(),
     }
 }
 
@@ -698,6 +700,102 @@ async fn non_streaming_generate_delivers_only_the_complete() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// A request the scheduler refuses at admission on a scheduler that
+/// declares the finish-detail columns: its abort carries the 400 and the
+/// reason, and the Generate ends with INVALID_ARGUMENT and the scheduler's
+/// own words (streamed and not); the next request is served. The same frame
+/// from a scheduler that declares no such column ends the Generate with
+/// INTERNAL and the sentence naming an engine abort whose reason did not
+/// travel: an engine abort is never an empty success on either kind of
+/// scheduler.
+#[tokio::test]
+async fn a_refusal_the_scheduler_attributes_ends_the_generate_with_its_status_and_words() {
+    use engine_zmq_client::protocol::tokenspeed::output::{
+        BASE_COLUMN_NAMES, BATCH_TOKEN_ID_OUT_SLIM_TAG, FINISHED_MESSAGES, FINISHED_STATUS_CODES,
+    };
+    const REFUSAL: &str =
+        "Invalid request: the input (8191 tokens) exceeds the engine's maximum input length \
+         (8190 tokens)";
+    let refused = |rid: &str| BatchTokenIDOutSlim {
+        finished_status_codes: vec![Some(400)],
+        finished_messages: vec![Some(REFUSAL.to_string())],
+        ..batch(rid, Vec::new(), 0, Some("abort"), None)
+    };
+
+    let mut declaring = default_ready_response();
+    declaring.cache_trace_epochs = vec!["capture-epoch".to_string()];
+    declaring.positional_layouts.insert(
+        BATCH_TOKEN_ID_OUT_SLIM_TAG.to_string(),
+        BASE_COLUMN_NAMES
+            .iter()
+            .copied()
+            .chain([FINISHED_STATUS_CODES, FINISHED_MESSAGES])
+            .map(str::to_string)
+            .collect(),
+    );
+    let mut h = harness_with_ready(model_info(), None, declaring).await;
+    for stream in [false, true] {
+        let rid = if stream { "edge-s" } else { "edge" };
+        let mut responses = h
+            .client
+            .generate(generate_request(rid, stream, Vec::new()))
+            .await
+            .expect("generate")
+            .into_inner();
+        recv_add(&mut h.engine_in).await;
+        send(&mut h.engine_out, &refused(rid)).await;
+        let status = responses
+            .message()
+            .bounded()
+            .await
+            .expect_err("the scheduler's refusal");
+        assert_eq!(status.code(), Code::InvalidArgument, "stream {stream}");
+        assert_eq!(status.message(), REFUSAL, "stream {stream}");
+    }
+    // The next request is served as usual.
+    let mut responses = h
+        .client
+        .generate(generate_request("next", false, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("next", vec![10], 1, Some("stop"), None),
+    )
+    .await;
+    let done = complete(responses.message().bounded().await.unwrap().unwrap());
+    assert_eq!(
+        (done.finish_reason.as_str(), done.output_ids),
+        ("stop", vec![10])
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    // A scheduler that declares no such column: the columns are not read,
+    // and the abort is the internal status with the fixed sentence.
+    let mut h = harness(model_info(), None).await;
+    let mut responses = h
+        .client
+        .generate(generate_request("plain", false, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(&mut h.engine_out, &refused("plain")).await;
+    let status = responses
+        .message()
+        .bounded()
+        .await
+        .expect_err("an engine abort is never an empty success");
+    assert_eq!(status.code(), Code::Internal);
+    assert_eq!(
+        status.message(),
+        "the engine aborted the request (its reason stays in the engine's log on this wire)"
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// A multi-token stop string never reaches the scheduler; the servicer
 /// matches it on the decoded output, ends the choice with
 /// `matched_stop_str`, and aborts the scheduler-side request.
@@ -790,8 +888,9 @@ async fn string_stops_without_a_tokenizer_are_refused() {
 }
 
 /// `Abort` ends the stream with an `abort` Complete and reaches the
-/// scheduler. The caller's own abort stays a completion; only a shutdown
-/// under an open request is a status
+/// scheduler. The caller's own abort stays a completion (the scheduler's own
+/// terminal abort frame for it, which arrives after, reaches no stream and
+/// is never a status); only a shutdown under an open request is a status
 /// (`a_shutdown_ends_an_open_stream_with_unavailable_not_an_abort_completion`).
 #[tokio::test]
 async fn abort_rpc_cancels_an_in_flight_stream() {
@@ -826,6 +925,31 @@ async fn abort_rpc_cancels_an_in_flight_stream() {
     assert_eq!(aborted.output_ids, vec![10]);
     assert!(stream.message().bounded().await.unwrap().is_none());
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r4".to_string()]);
+    // The scheduler's own terminal abort frame for the aborted request
+    // arrives after the stream ended: nothing to answer, and the next request
+    // is served as usual.
+    send(
+        &mut h.engine_out,
+        &batch("r4", Vec::new(), 1, Some("abort"), None),
+    )
+    .await;
+    let mut next = h
+        .client
+        .generate(generate_request("r4-next", false, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("r4-next", vec![11], 1, Some("stop"), None),
+    )
+    .await;
+    let done = complete(next.message().bounded().await.unwrap().unwrap());
+    assert_eq!(
+        (done.finish_reason.as_str(), done.output_ids),
+        ("stop", vec![11])
+    );
     // An unknown id is a no-op, not an error (idempotent cleanup).
     h.client
         .abort(ts::AbortRequest {

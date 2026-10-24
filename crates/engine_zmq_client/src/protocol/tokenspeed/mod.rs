@@ -29,14 +29,16 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 
 use crate::{
-    codec::{decode_msgpack, encode_msgpack, tensor::encode_with_aux_frames, OpaqueValue},
+    codec::{encode_msgpack, tensor::encode_with_aux_frames, OpaqueValue},
     error::Result,
     protocol::{
         control::{CONTROL_REPLY_SLIM_TAG, CONTROL_REPLY_WIRE_FIELDS},
         handshake::EngineCoreReadyResponse,
         positional::check_prefix,
         tokenspeed::{
-            output::{TokenSpeedOutput, TokenSpeedWireOutput},
+            output::{
+                decode_wire_output, SlimOutputLayout, TokenSpeedOutput, TokenSpeedWireOutput,
+            },
             request::{TokenSpeedRequestType, TokenizedGenerateReqInput},
         },
         EngineBatch, EngineLoad, EngineProtocol, UtilityReply,
@@ -53,12 +55,13 @@ pub fn wire_carries_control_calls(layouts: &BTreeMap<String, Vec<String>>) -> bo
 }
 
 /// The TokenSpeed engine protocol: drives [`TokenizedGenerateReqInput`] over
-/// the shared ZMQ transport and decodes [`output::BatchTokenIDOutSlim`] back.
+/// the shared ZMQ transport and decodes [`BatchTokenIDOutSlim`](output::BatchTokenIDOutSlim) back.
 pub struct TokenSpeedProtocol;
 
 impl EngineProtocol for TokenSpeedProtocol {
     type Request = TokenizedGenerateReqInput;
     type Output = TokenSpeedOutput;
+    type Layout = SlimOutputLayout;
 
     fn add_frame() -> Bytes {
         TokenSpeedRequestType::Add.to_frame()
@@ -153,7 +156,17 @@ impl EngineProtocol for TokenSpeedProtocol {
         )))
     }
 
-    fn decode_batch(frames: &[Bytes]) -> Result<EngineBatch<Self::Output>> {
+    fn read_layout(ready: &EngineCoreReadyResponse) -> SlimOutputLayout {
+        // The finish-detail columns are read where the engine declares them
+        // (`positional_layouts["BatchTokenIDOutSlim"]`), never at a pinned
+        // position: an engine that declares neither is read as before.
+        SlimOutputLayout::declared(&ready.positional_layouts)
+    }
+
+    fn decode_batch(
+        frames: &[Bytes],
+        layout: &SlimOutputLayout,
+    ) -> Result<EngineBatch<Self::Output>> {
         // Output messages are `[payload, aux...]`. The slim batch carries no
         // tensor fields today, so aux frames are unexpected but not fatal.
         if frames.len() > 1 {
@@ -164,7 +177,7 @@ impl EngineProtocol for TokenSpeedProtocol {
             );
         }
         let payload = frames.first().map(AsRef::as_ref).unwrap_or_default();
-        let batch = match decode_msgpack::<TokenSpeedWireOutput>(payload)? {
+        let batch = match decode_wire_output(payload, layout)? {
             TokenSpeedWireOutput::Tokens(batch) => *batch,
             TokenSpeedWireOutput::ControlReply(reply) => {
                 return Ok(EngineBatch {
@@ -215,7 +228,7 @@ mod tests {
     use super::*;
     use crate::{
         codec::{
-            decode_value,
+            decode_msgpack, decode_value,
             tensor::{
                 resolve_array_bytes, TensorFields, WireArrayData, WireTensor, TENSOR_AUX_MIN_BYTES,
             },
@@ -397,6 +410,8 @@ mod tests {
             num_waiting: 5,
             kv_active_pages: 100,
             kv_total_pages: 400,
+            finished_status_codes: Vec::new(),
+            finished_messages: Vec::new(),
         }
     }
 
@@ -441,7 +456,7 @@ mod tests {
     #[test]
     fn decode_batch_maps_outputs_and_finished_ids() {
         let frames = vec![Bytes::from(encode_msgpack(&slim_batch()).unwrap())];
-        let decoded = TokenSpeedProtocol::decode_batch(&frames).unwrap();
+        let decoded = TokenSpeedProtocol::decode_batch(&frames, &Default::default()).unwrap();
         assert_eq!(decoded.outputs.len(), 2);
         assert_eq!(decoded.finished_request_ids, vec!["b".to_string()]);
         // The batch names its producing DP rank; the connector routes in-flight
@@ -467,7 +482,7 @@ mod tests {
             ..slim_batch()
         };
         let frames = vec![Bytes::from(encode_msgpack(&batch).unwrap())];
-        let decoded = TokenSpeedProtocol::decode_batch(&frames).unwrap();
+        let decoded = TokenSpeedProtocol::decode_batch(&frames, &Default::default()).unwrap();
         assert!(decoded.load.is_none());
     }
 
@@ -479,7 +494,7 @@ mod tests {
             Bytes::from(encode_msgpack(&slim_batch()).unwrap()),
             Bytes::from_static(b"opaque-aux-frame"),
         ];
-        let decoded = TokenSpeedProtocol::decode_batch(&frames).unwrap();
+        let decoded = TokenSpeedProtocol::decode_batch(&frames, &Default::default()).unwrap();
         assert_eq!(decoded.outputs.len(), 2);
     }
 
@@ -530,9 +545,10 @@ mod tests {
         // takes, and what its `ControlReplySlim` struct emits for an accepted
         // flush and for a refused profiler stop: the captured vectors.
         assert_eq!(payload, vector_bytes(FLUSH_CALL_VECTOR));
-        let accepted = TokenSpeedProtocol::decode_batch(&[Bytes::from(vector_bytes(
-            CONTROL_REPLY_ACCEPTED_VECTOR,
-        ))])
+        let accepted = TokenSpeedProtocol::decode_batch(
+            &[Bytes::from(vector_bytes(CONTROL_REPLY_ACCEPTED_VECTOR))],
+            &SlimOutputLayout::default(),
+        )
         .unwrap();
         assert_eq!(accepted.engine_index, 0);
         let utility = accepted.utility.expect("a utility reply");
@@ -573,7 +589,8 @@ mod tests {
             engine_index: 1,
         };
         let frames = vec![Bytes::from(encode_msgpack(&reply).unwrap())];
-        let batch = TokenSpeedProtocol::decode_batch(&frames).unwrap();
+        let batch =
+            TokenSpeedProtocol::decode_batch(&frames, &SlimOutputLayout::default()).unwrap();
         assert!(batch.outputs.is_empty() && batch.load.is_none());
         assert_eq!(batch.engine_index, 1);
         let utility = batch.utility.expect("a utility reply");
@@ -586,7 +603,7 @@ mod tests {
         // The token batch still decodes through the same dispatch.
         let frames = vec![Bytes::from(encode_msgpack(&slim_batch()).unwrap())];
         assert_eq!(
-            TokenSpeedProtocol::decode_batch(&frames)
+            TokenSpeedProtocol::decode_batch(&frames, &SlimOutputLayout::default())
                 .unwrap()
                 .outputs
                 .len(),
@@ -643,5 +660,61 @@ mod tests {
             error.contains("`ControlReplySlim` field 1 is `success` on this side and `message`"),
             "{error}"
         );
+    }
+
+    /// The connection's layout comes off the ready response by name, and the
+    /// batch decoder reads the finish details where it points; an engine that
+    /// declares nothing is read as before.
+    #[test]
+    fn the_layout_is_read_off_the_handshake_and_drives_the_batch_decode() {
+        use crate::protocol::tokenspeed::output::{
+            BASE_COLUMN_NAMES, FINISHED_MESSAGES, FINISHED_STATUS_CODES,
+        };
+        let mut ready = crate::mock_engine::default_ready_response();
+        assert_eq!(
+            TokenSpeedProtocol::read_layout(&ready),
+            SlimOutputLayout::default()
+        );
+        let mut names: Vec<String> = BASE_COLUMN_NAMES.iter().map(|n| n.to_string()).collect();
+        names.push(FINISHED_STATUS_CODES.to_string());
+        names.push(FINISHED_MESSAGES.to_string());
+        ready
+            .positional_layouts
+            .insert(output::BATCH_TOKEN_ID_OUT_SLIM_TAG.to_string(), names);
+        let layout = TokenSpeedProtocol::read_layout(&ready);
+        assert_eq!(
+            layout,
+            SlimOutputLayout {
+                finish_status: Some(13),
+                finish_message: Some(14),
+            }
+        );
+
+        let batch = BatchTokenIDOutSlim {
+            rids: vec!["edge".into()],
+            output_ids: vec![vec![]],
+            finished_reasons: vec!["abort".into()],
+            prompt_tokens: vec![8191],
+            completion_tokens: vec![0],
+            cached_tokens: vec![0],
+            output_token_logprobs_val: vec![vec![]],
+            output_token_logprobs_idx: vec![vec![]],
+            finished_status_codes: vec![Some(400)],
+            finished_messages: vec![Some("Invalid request: too long".into())],
+            ..Default::default()
+        };
+        let frames = vec![Bytes::from(encode_msgpack(&batch).unwrap())];
+        let read = TokenSpeedProtocol::decode_batch(&frames, &layout).unwrap();
+        assert_eq!(read.outputs[0].finish_status, Some(400));
+        assert_eq!(
+            read.outputs[0].finish_message.as_deref(),
+            Some("Invalid request: too long")
+        );
+        assert_eq!(read.finished_request_ids, vec!["edge".to_string()]);
+        let unread =
+            TokenSpeedProtocol::decode_batch(&frames, &SlimOutputLayout::default()).unwrap();
+        assert_eq!(unread.outputs[0].finish_reason.as_deref(), Some("abort"));
+        assert_eq!(unread.outputs[0].finish_status, None);
+        assert_eq!(unread.outputs[0].finish_message, None);
     }
 }

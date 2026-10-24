@@ -1067,7 +1067,7 @@ impl ZmqEngineClient {
                         .as_deref()
                         .unwrap_or("no reason reported")
                 );
-                return Err(crate::sglang::scheduler_abort_status(
+                return Err(crate::abort_status::engine_abort_status(
                     output.finish_status,
                     message,
                 ));

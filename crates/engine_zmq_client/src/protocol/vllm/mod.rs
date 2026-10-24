@@ -67,6 +67,7 @@ pub struct VllmProtocol;
 impl EngineProtocol for VllmProtocol {
     type Request = EngineCoreRequest;
     type Output = EngineCoreOutput;
+    type Layout = ();
 
     fn add_frame() -> Bytes {
         EngineCoreRequestType::Add.to_frame()
@@ -143,7 +144,7 @@ impl EngineProtocol for VllmProtocol {
         )))
     }
 
-    fn decode_batch(frames: &[Bytes]) -> Result<EngineBatch<Self::Output>> {
+    fn decode_batch(frames: &[Bytes], _layout: &()) -> Result<EngineBatch<Self::Output>> {
         // vLLM multiplexes request batches, utility replies, and DP control on
         // one wire struct; each lands in its own slot of the batch.
         match decode_engine_core_outputs(frames)? {
