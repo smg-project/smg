@@ -297,6 +297,17 @@
     "artifact_directory": "AMD_DEPENDENCY_DIRECTORY/sglang-startup",
     "runtime_origin": "HOLD until actual same-worker events match manifest hashes; installer file hashes alone do not close it.",
     "no_CU_prime_or_parameter_change": true,
-    "GPU_or_model_or_RDMA_or_original20_passed": false
+    "GPU_or_model_or_RDMA_or_original20_passed": false,
+    "installed_observer_package_data": {
+      "pyproject_path": ".github/amd-shared-product/pyproject.toml",
+      "pyproject_sha256": "9c91050b381717d575489e37cd6af5541e2f54f866d80bd9e80cee3a49631263",
+      "required_JSON_resources": [
+        "selection.json",
+        "registration-overlay.json",
+        "startup-overlay.json"
+      ],
+      "startup_manifest_sha256": "a622c1bd6f14701eb9fd71a924079e8ae3002b2736847f99edaff0abcf2bdb09",
+      "scope": "Package existing exact startup manifest in normal observer wheel; no diagnostic overlay/helper/oracle/compiled change. Requires fresh installed-wheel resource CPU verification; not GPU evidence."
+    }
   }
 }

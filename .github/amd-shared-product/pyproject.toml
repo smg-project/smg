@@ -14,4 +14,4 @@ smg-sglang-pd-observer = "sglang_pd_observer.plugin"
 include = ["sglang_pd_observer*"]
 
 [tool.setuptools.package-data]
-sglang_pd_observer = ["selection.json", "registration-overlay.json"]
+sglang_pd_observer = ["selection.json", "registration-overlay.json", "startup-overlay.json"]
