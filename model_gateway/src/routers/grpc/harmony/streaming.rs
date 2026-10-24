@@ -116,6 +116,9 @@ impl HarmonyStreamingProcessor {
         let guards = body_guards(load_guards, reservation.as_ref());
         // Create SSE channel
         let (tx, rx) = sse_channel();
+        // Read for this client: the moment the response body is dropped, the
+        // request is aborted on the engine (see `ProtoStream::until_client_gone`).
+        let execution_result = execution_result.until_client_gone(&tx, &dispatch.request_id);
 
         // Spawn background task based on execution mode
         match execution_result {
@@ -255,8 +258,10 @@ impl HarmonyStreamingProcessor {
         )
         .await?;
 
-        // Mark prefill stream completed AFTER decode succeeds
-        // This ensures that if client disconnects during decode, BOTH streams send abort
+        // The prefill stream is marked completed after the decode's read ended
+        // well: a decode that failed leaves both streams to abort on drop; a
+        // client that left ends the read with `Ok` too, its decode stream
+        // aborting the request on drop, the prefill's own request complete.
         prefill_stream.mark_completed();
         Ok(())
     }
@@ -320,6 +325,8 @@ impl HarmonyStreamingProcessor {
             }
         }
 
+        // The stream's verdict, before the engine side is released.
+        decode.client_left = decode_stream.client_left();
         decode.release_engine(decode_stream, &original_request.model);
 
         decode
@@ -1084,6 +1091,9 @@ struct ChatDecode {
     // Tokens the engine streamed for choices after their router-side stop, read before the
     // abort: the tail generated for nobody.
     tail_tokens: u64,
+    /// Whether the client left during the read: the stream's verdict, taken before
+    /// the finish so that no terminal router metric is recorded for a leaving client.
+    client_left: bool,
     // Reusable SSE encoder shared across every chunk emitted for this stream.
     encoder: SseEncoder,
 }
@@ -1108,6 +1118,7 @@ impl ChatDecode {
             tailed: HashSet::new(),
             engine_outlived: false,
             tail_tokens: 0,
+            client_left: false,
             encoder: SseEncoder::new(),
         }
     }
@@ -1487,6 +1498,14 @@ impl ChatDecode {
             }
         }
 
+        // The read ended with the client's leaving, not with the engine's end:
+        // no usage chunk on the sender it closed, and no terminal router metric
+        // for it, as the HTTP router has none for a disconnect (neither a
+        // completed request nor a failure).
+        if self.client_left {
+            return Ok(());
+        }
+
         // Emit final usage if requested
         if let Some(true) = original_request
             .stream_options
@@ -1503,7 +1522,6 @@ impl ChatDecode {
             )
             .await?;
         }
-
         // Record streaming metrics
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
