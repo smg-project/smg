@@ -79,7 +79,7 @@
   "producer_branch": "ci/frozen-python173-main19c-producer-admitted-20261024",
   "producer_policy": "frozen_main19c_python173_build_only_all_18_steps_success_v1",
   "source_base": "740bd0c7e88bdfb57776785eaee16ff8e71f1833",
-  "target_product_commit": "740bd0c7e88bdfb57776785eaee16ff8e71f1833",
+  "target_product_commit": "156845926c07699869c17d9cbc0910f04b5a7d9e",
   "source_trees": {
     ".cargo": "8a9d55bb8edfa19d9f90b313fbdc24326d3f667b",
     "Cargo.toml": "74bad7a60f31586e667b6ea84323f70ec477bddc",
@@ -91,7 +91,7 @@
     "crates": "84086855e0f09846092bcce34ecd7b7b43bdc29c",
     "model_gateway": "e511dbc60efa61b550e70a8ccd749e79db6ab843",
     "grpc_servicer": "01164131fca3a192bd6b56fc348ca004bccc78fe",
-    "e2e_test": "cfa4c5dc32edc060e4eb2cc6d3f554ccbc3c014c",
+    "e2e_test": "06620fd04ebb757d46ba0af950e6717c89fb7625",
     "scripts": "4dc8528e28fbbe38e9a2cdc966ab0dd70b89c158",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows/e2e-gpu-job.yml": "51f0b35d0f32d9d52797fe7f4b9ecd8bc8fa2e65",
@@ -223,7 +223,7 @@
     "wholepip_still_required": true
   },
   "new_native_required": false,
-  "source_identity_note": "Frozen3de3/main19c consumer19/compiled37 remain byte-exact. Actual18-step producer40132965389/c5596e fourarchives/actual14/native1d22 are source-data bound; native integrity/hosted smoke accepted separately from target ABI/runtime. FreshRPC240a5/2c68 and target PhaseB CPU proof are joined in runtime-evidence.json. No143a/f545 artifacts or results are borrowed. All4flags and runtime_cohort_accepted remain false; fullcurrentunits/original173/currentmain qualification remain pending.",
+  "source_identity_note": "Original3de3/main19c remains the accepted artifact/source reference. Product1568459 replays exactly the existingPR4234 MCP2 3file implementation; consumer19.e2e_test is updated while its other18 paths andcompiled37 are unchanged. Captured actualproducer14 remainsc559, not rewritten toconsumer19; no Rustrebuild is needed for these3 e2e-only files. Actual18-step producer40132965389/c5596e fourarchives/actual14/native1d22 are source-data bound; integrity/hosted smoke are separate from targetnative/runtime. FreshRPC240a5/2c68 and target PhaseB CPU proof refer to unchanged90servicer/8schemas only. No143a/f545 artifacts/results are borrowed. Fourflags/runtime_cohort_accepted remainfalse; new MCP replay targetnormalresolver/currentunits/original173/currentmain qualification remainpending.",
   "grpc178_source_candidate": {
     "generator": "grpcio-tools==1.78.0",
     "proto_version": "0.4.28+smg.main19c.g178",
@@ -242,5 +242,24 @@
   },
   "new_native_artifact_bound": true,
   "bound_runtime_evidence_manifest": "runtime-evidence.json",
-  "bound_runtime_evidence_sha256": "df74c2a7669daeb7831eeee2b9205f6e374d8b3bce53f3f8ababbe8cb963166e"
+  "bound_runtime_evidence_sha256": "d774366c6fc98d7284c114d44bdf42e0c80102f4fc8ad5f80f8efd187dff6f94",
+  "explicit_MCP2_dependency": {
+    "original_implementation": "7fb31a63bb1fa1761c946f496483c1bc94e77088",
+    "normal_PR": 4234,
+    "observed_published_head": "1b2e271dae9280ad4afecc7031c235426c95eb43",
+    "replayed_product": "156845926c07699869c17d9cbc0910f04b5a7d9e",
+    "files": [
+      "e2e_test/infra/mock_mcp_server.py",
+      "e2e_test/infra/test_mock_mcp_server.py",
+      "e2e_test/pyproject.toml"
+    ],
+    "scope": "Exact3file existing implementation replay only; no newworkflow/defaultactivation, original173 modules/oracles and90servicer8schemas unchanged; compiled37/native1d22 identity unchanged.",
+    "normal_PR_CPU_evidence": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/rocm-dependency-closure/mcp2-compatibility/evidence/normal-pr-4234/normal-pr-result.json",
+      "sha256": "a602de4145091c72073147e6d0a4d3448c209e2be570912a57183b05000ed644"
+    },
+    "old_actual_CPU_on_new_source_transferred": false,
+    "new_source_CPU_executed": false,
+    "target_normal_resolver_or_MCP5_or_fullunits_or_173_accepted": false
+  }
 }

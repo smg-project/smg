@@ -81,5 +81,25 @@
   "runtime_cohort_accepted": false,
   "GPU_admitted": false,
   "reserved_runner_seconds": 0,
-  "coverage_increment": 0
+  "coverage_increment": 0,
+  "consumer_product_after_MCP2_replay": "156845926c07699869c17d9cbc0910f04b5a7d9e",
+  "MCP2_implementation_replay": {
+    "original_implementation": "7fb31a63bb1fa1761c946f496483c1bc94e77088",
+    "normal_PR": 4234,
+    "observed_published_head": "1b2e271dae9280ad4afecc7031c235426c95eb43",
+    "replayed_product": "156845926c07699869c17d9cbc0910f04b5a7d9e",
+    "files": [
+      "e2e_test/infra/mock_mcp_server.py",
+      "e2e_test/infra/test_mock_mcp_server.py",
+      "e2e_test/pyproject.toml"
+    ],
+    "scope": "Exact3file existing implementation replay only; no newworkflow/defaultactivation, original173 modules/oracles and90servicer8schemas unchanged; compiled37/native1d22 identity unchanged.",
+    "normal_PR_CPU_evidence": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/rocm-dependency-closure/mcp2-compatibility/evidence/normal-pr-4234/normal-pr-result.json",
+      "sha256": "a602de4145091c72073147e6d0a4d3448c209e2be570912a57183b05000ed644"
+    },
+    "old_actual_CPU_on_new_source_transferred": false,
+    "new_source_CPU_executed": false,
+    "target_normal_resolver_or_MCP5_or_fullunits_or_173_accepted": false
+  }
 }
