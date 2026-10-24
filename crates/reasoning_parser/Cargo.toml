@@ -16,10 +16,6 @@ categories = ["parsing", "text-processing"]
 parking_lot = { workspace = true }
 regex = "1.12"
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync"] }
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["full", "test-util", "macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

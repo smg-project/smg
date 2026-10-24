@@ -30,7 +30,6 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "rt-multi-thread", "macros"] }
 tracing.workspace = true
 uuid = { workspace = true, features = ["v4", "serde"] }
-futures.workspace = true
 # Only used by tokenizer
 aho-corasick = "1.1"
 base64 = "0.23"

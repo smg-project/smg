@@ -26,7 +26,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 futures.workspace = true
-tracing.workspace = true
 
 # Only used by this crate
 bytes = "1"
@@ -34,7 +33,6 @@ tokio-stream = "0.1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-wiremock = "0.6"
 serde_json.workspace = true
 
 [lints]

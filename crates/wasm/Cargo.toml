@@ -27,7 +27,6 @@ chrono = { workspace = true, features = ["serde"] }
 lru = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }
-sha2 = "0.11"
 smg-data-connector = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "rt-multi-thread", "time"] }

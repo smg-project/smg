@@ -17,8 +17,6 @@ categories = ["api-bindings"]
 name = "smg_mcp"
 
 [dependencies]
-async-trait.workspace = true
-axum.workspace = true
 futures.workspace = true
 dashmap.workspace = true
 lru.workspace = true

@@ -48,7 +48,6 @@ tempfile = "3.27"
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"
-prost-build = "0.14.4"
 
 [dev-dependencies]
 # The in-memory IO of the channel tests' raw HTTP/2 peer.

@@ -221,16 +221,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "assert-json-diff"
-version = "2.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47e4f2b81832e72834d7518d8487a0396a28cc408186a2e8854c0f98011faf12"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4021,7 +4011,6 @@ dependencies = [
  "rustix",
  "rustls",
  "serde",
- "serde_bytes",
  "serde_json",
  "sha2 0.11.0",
  "symphonia",
@@ -4046,7 +4035,6 @@ dependencies = [
  "criterion",
  "dashmap",
  "foldhash 0.2.0",
- "futures",
  "hf-hub",
  "minijinja",
  "minijinja-contrib",
@@ -6532,7 +6520,6 @@ dependencies = [
  "parking_lot",
  "regex",
  "thiserror 2.0.21",
- "tokio",
 ]
 
 [[package]]
@@ -7843,8 +7830,6 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
- "tracing",
- "wiremock",
 ]
 
 [[package]]
@@ -7921,7 +7906,6 @@ dependencies = [
  "hyper-util",
  "openai-protocol",
  "prost",
- "prost-build",
  "prost-types",
  "serde",
  "serde_json",
@@ -7941,8 +7925,6 @@ dependencies = [
 name = "smg-mcp"
 version = "2.3.5"
 dependencies = [
- "async-trait",
- "axum",
  "chrono",
  "dashmap",
  "futures",
@@ -8148,7 +8130,6 @@ dependencies = [
  "lru",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -10706,29 +10687,6 @@ checksum = "3f3fd376f71958b862e7afb20cfe5a22830e1963462f3a17f49d82a6c1d1f42d"
 dependencies = [
  "bitflags 2.13.2",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "wiremock"
-version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08db1edfb05d9b3c1542e521aea074442088292f00b5f28e435c714a98f85031"
-dependencies = [
- "assert-json-diff",
- "base64 0.22.1",
- "deadpool 0.12.3",
- "futures",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "log",
- "once_cell",
- "regex",
- "serde",
- "serde_json",
- "tokio",
- "url",
 ]
 
 [[package]]
