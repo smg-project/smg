@@ -20,7 +20,7 @@ axum = ["dep:axum", "axum/multipart"]
 [dependencies]
 axum = { workspace = true, optional = true }
 bitflags.workspace = true
-bytes = "1.12.0"
+bytes.workspace = true
 chrono.workspace = true
 indexmap = { version = "2", features = ["serde"] }
 rand.workspace = true

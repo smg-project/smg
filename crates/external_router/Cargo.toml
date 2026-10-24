@@ -30,7 +30,7 @@ workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 axum = { workspace = true, features = ["macros", "multipart", "ws", "tracing"] }
-bytes = "1.12.0"
+bytes.workspace = true
 chrono.workspace = true
 dashmap.workspace = true
 futures-util = "0.3"
