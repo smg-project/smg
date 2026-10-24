@@ -1,7 +1,12 @@
 """Reuse the actual ROCm loader canary; this does not prove KV transfer."""
 
 
-def capture(out):
+def capture(out, backend="nixl"):
+    if backend == "mooncake":
+        from .mooncake import capture as capture_mooncake
+
+        return capture_mooncake(out)
+    assert backend == "nixl", "unexpected connector canary"
     import hashlib
     import importlib
     import inspect
