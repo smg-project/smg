@@ -18,8 +18,14 @@ does: its requests carry the engine's own stand-in bootstrap (what the
 engine's warm-up sets in disaggregation mode: the fake-transfer host and room
 0), a transfer to nobody on either side, so the leg warms up without its peer
 and no first request of a prompt-length class pays a kernel compile under the
-Router's prefill-liveness bound. The EPD roles take no plan: their requests
-need multimodal inputs a warm-up does not carry.
+Router's prefill-liveness bound.
+The language side of an encode-disaggregated deployment (``--language-only``)
+plans as a single engine: a warm-up request carries no media, so it reaches
+the scheduler untouched and the encoders see nothing of it, and the first
+forward of a fresh scheduler process is paid here rather than by the first
+request (the engine's own frontend warms that role on the text path for the
+same reason). The encoder-only role takes no plan: the engine's entrypoint
+runs it on its own encoder server, never on a servicer.
 """
 
 from __future__ import annotations
@@ -55,15 +61,16 @@ def warmup_inputs(server_args: Any, facts: Mapping[str, Any]) -> WarmupInputs | 
     else the prefill budget, else the engine's default), the context, and on
     a prefill or decode leg the engine's stand-in bootstrap host for the
     requests to carry. ``None`` for a model that generates nothing and for the
-    EPD roles (``--language-only`` / ``--encoder-only``), whose requests need
-    multimodal inputs a warm-up does not carry. The plan is one rank's: the
+    encoder-only role, which the engine runs on its own server; the language
+    side of an encode-disaggregated deployment plans as a single engine (its
+    warm-up requests carry no media). The plan is one rank's: the
     servicer routes this engine's requests to the least-loaded scheduler rank
     and reads no rank off a request, so under data parallelism each prefill
     shape reaches one rank (a WARNING line says so)."""
     if not facts.get("is_generation", True):
         return None
     args = EngineConfigView(server_args).server_args
-    if args.language_only or args.encoder_only:
+    if args.encoder_only:
         return None
     lone_leg_bootstrap = None
     if args.disaggregation_mode != "null":

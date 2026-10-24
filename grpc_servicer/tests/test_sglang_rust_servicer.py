@@ -1198,6 +1198,28 @@ def test_a_language_only_launch_gets_the_encode_dispatch_as_a_server_extra(monke
     assert launched == {"args": args, "port": 24321, "bridge": launcher.encode}
 
 
+def test_a_language_only_launch_plans_the_warm_up_as_a_plain_worker():
+    """The language side of an encode-disaggregated deployment is held at
+    NOT_SERVING for the planned warm-up like a single engine: its warm-up
+    requests carry no media (the encoders see nothing of them), so the first
+    forward of a fresh scheduler is paid before the health flips, not by the
+    first request. The encoder-only role is the engine's own server and
+    plans nothing."""
+    launcher = rust.SglangLauncher()
+    facts = {"is_generation": True, "max_context_length": 4096, "vocab_size": 1024}
+    language_side = launcher.warmup_inputs(
+        _server_args(
+            language_only=True,
+            encoder_transfer_backend="zmq_to_scheduler",
+            encoder_urls=["http://10.0.0.8:30011"],
+        ),
+        facts,
+    )
+    assert language_side is not None
+    assert language_side == launcher.warmup_inputs(_server_args(), facts)
+    assert launcher.warmup_inputs(_server_args(encoder_only=True), facts) is None
+
+
 def test_serve_rust_serves_a_prefill_decode_launch(monkeypatch, tmp_path):
     """A disaggregated role is no longer a configuration error on the Rust
     path: the server binds and the ranks start as for a single engine."""

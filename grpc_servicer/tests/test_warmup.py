@@ -1163,8 +1163,13 @@ def test_the_sglang_inputs_come_from_the_server_arguments_and_the_facts(monkeypa
         assert leg.lone_leg_bootstrap == "2.2.2.2"
         assert leg.max_num_batched_tokens == sglang_warmup.DEFAULT_STEP_TOKENS
     assert sglang_warmup.warmup_inputs(SimpleNamespace(), facts).lone_leg_bootstrap is None
-    # The EPD roles take none: their requests need multimodal inputs.
-    assert sglang_warmup.warmup_inputs(SimpleNamespace(language_only=True), facts) is None
+    # The language side of an encode-disaggregated deployment plans as a
+    # plain worker (its warm-up requests carry no media, so the encoders see
+    # nothing of them); the encoder-only role is the engine's own server.
+    assert sglang_warmup.warmup_inputs(
+        SimpleNamespace(language_only=True, max_running_requests=64, chunked_prefill_size=8192),
+        facts,
+    ) == sglang_warmup.warmup_inputs(args, facts)
     assert sglang_warmup.warmup_inputs(SimpleNamespace(encoder_only=True), facts) is None
 
 

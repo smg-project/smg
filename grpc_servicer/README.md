@@ -1144,8 +1144,11 @@ where unset; the Python servicer runs the same plan over its own port after
 its first warm-up request and skips it on a disaggregation role; the Rust
 path plans a prefill or decode leg as a single engine, its requests carrying
 the engine's stand-in bootstrap so the leg warms up without its peer, and the
-EPD roles take none; under data parallelism the servicer routes a request by
-load, not by rank, so each
+language side of an encode-disaggregated deployment (`--language-only`) plans
+as a single engine, so the first forward of its fresh scheduler is paid before
+SERVING rather than by its first request, as the engine's own frontend warms
+that role on the text path; under data parallelism the servicer routes a
+request by load, not by rank, so each
 prefill shape warms one rank and the log says so),
 `SMG_SGLANG_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and
 `SMG_SGLANG_SERVICER_STARTUP_CEILING_SECS` (default 14400; the two startup
