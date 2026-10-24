@@ -23,11 +23,17 @@ pub const TOKENIZED_GENERATE_REQ_INPUT_TAG: &str = "TokenizedGenerateReqInput";
 /// The msgspec tag for [`TokenizedEmbeddingReqInput`] (element 0 on the wire).
 pub const TOKENIZED_EMBEDDING_REQ_INPUT_TAG: &str = "TokenizedEmbeddingReqInput";
 
+/// The msgspec tag for [`EncoderDispatchErrorReq`] (element 0 on the wire).
+pub const ENCODER_DISPATCH_ERROR_REQ_TAG: &str = "EncoderDispatchErrorReq";
+
 /// The scheduler's field order of [`TokenizedGenerateReqInput`] this encoder
-/// relies on, through `require_reasoning` (the tag, element 0, is not a
-/// field): the slots the extended form fills, which the handshake check
-/// compares with the order the engine declares.
-pub const GENERATE_WIRE_FIELDS: [&str; 33] = [
+/// relies on, through `encoder_urls` (the tag, element 0, is not a field):
+/// the slots the extended forms fill, which the handshake check compares
+/// with the order the engine declares. The form through `require_reasoning`
+/// (34 elements) serves every request but one whose media the encoders
+/// serve; that one reaches `encoder_urls` (42 elements), the slots between
+/// at the scheduler's defaults.
+pub const GENERATE_WIRE_FIELDS: [&str; 41] = [
     "rid",
     "http_worker_ipc",
     "input_text",
@@ -61,7 +67,20 @@ pub const GENERATE_WIRE_FIELDS: [&str; 33] = [
     "disagg_prefill_dp_rank",
     "routing_key",
     "require_reasoning",
+    "priority",
+    "extra_key",
+    "no_logs",
+    "return_bytes",
+    "return_entropy",
+    "need_wait_for_mm_inputs",
+    "num_items_assigned",
+    "encoder_urls",
 ];
+
+/// The scheduler's field order of [`EncoderDispatchErrorReq`] (the tag not
+/// counted): its base `rid` / `http_worker_ipc`, then the error.
+pub const ENCODER_DISPATCH_ERROR_WIRE_FIELDS: [&str; 4] =
+    ["rid", "http_worker_ipc", "error_msg", "error_code"];
 
 /// The same for [`TokenizedEmbeddingReqInput`], through `dimensions`.
 pub const EMBEDDING_WIRE_FIELDS: [&str; 12] = [
@@ -174,6 +193,18 @@ pub struct TokenizedGenerateReqInput {
     /// Hybrid-reasoning request: the scheduler tracks the reasoning phase and
     /// accounts its tokens separately.
     pub require_reasoning: bool,
+    /// A request whose media the encoders of an encode/prefill-disaggregated
+    /// deployment serve, in the scheduler's own slots as the engine's
+    /// frontend sets them when it dispatches the media: the scheduler is to
+    /// wait for the embeddings (`need_wait_for_mm_inputs`), how many items
+    /// each encoder was given per modality (`num_items_assigned`: the
+    /// modality's enum value to the count per encoder, in the encoder list's
+    /// order) and the encoder list that assignment indexes (`encoder_urls`,
+    /// the frontend's snapshot at dispatch time). `None` on every other
+    /// request: the scheduler's defaults.
+    pub need_wait_for_mm_inputs: Option<bool>,
+    pub num_items_assigned: Option<BTreeMap<u32, Vec<u32>>>,
+    pub encoder_urls: Option<Vec<String>>,
     /// The caller's W3C trace context (`traceparent`, `tracestate`) for the
     /// engine's tracer. Not a slot of the scheduler's struct (its own
     /// `time_stats` slot is a pickled object no frontend outside Python can
@@ -216,6 +247,15 @@ impl TokenizedGenerateReqInput {
             || self.bootstrap_host.is_some()
             || self.bootstrap_port.is_some()
             || self.bootstrap_room.is_some()
+            || self.needs_encode_slots()
+    }
+
+    /// Whether the encode dispatch set its slots (38-40), so the encoder
+    /// must emit the defaulted slots 33-37 before them.
+    fn needs_encode_slots(&self) -> bool {
+        self.need_wait_for_mm_inputs.is_some()
+            || self.num_items_assigned.is_some()
+            || self.encoder_urls.is_some()
     }
 }
 
@@ -239,19 +279,29 @@ impl Default for TokenizedGenerateReqInput {
             bootstrap_port: None,
             bootstrap_room: None,
             require_reasoning: false,
+            need_wait_for_mm_inputs: None,
+            num_items_assigned: None,
+            encoder_urls: None,
             trace_headers: None,
         }
     }
 }
+
+/// The tag plus the fields through `require_reasoning`: the extended form
+/// every request but an encode-dispatched one stops at.
+const THROUGH_REQUIRE_REASONING: usize = 34;
 
 impl Serialize for TokenizedGenerateReqInput {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         const NIL: Option<()> = None;
         // The shortest valid prefix: through `stream` unless a later field
         // (`return_hidden_states`, `lora_id`, `custom_logit_processor`, the bootstrap triple,
-        // `require_reasoning`) has to reach its slot past the defaulted ones.
-        let len = if self.needs_extended_form() {
+        // `require_reasoning`) has to reach its slot past the defaulted ones;
+        // through `encoder_urls` when the encode dispatch set its slots.
+        let len = if self.needs_encode_slots() {
             GENERATE_WIRE_FIELDS.len() + 1
+        } else if self.needs_extended_form() {
+            THROUGH_REQUIRE_REASONING
         } else {
             14
         };
@@ -298,6 +348,18 @@ impl Serialize for TokenizedGenerateReqInput {
                 tuple.serialize_element(&NIL)?;
             }
             tuple.serialize_element(&self.require_reasoning)?;
+            if self.needs_encode_slots() {
+                // priority, extra_key, no_logs, return_bytes, return_entropy
+                // at the scheduler's defaults, then the dispatch's three.
+                tuple.serialize_element(&NIL)?;
+                tuple.serialize_element(&NIL)?;
+                for _ in 0..3 {
+                    tuple.serialize_element(&false)?;
+                }
+                tuple.serialize_element(&self.need_wait_for_mm_inputs)?;
+                tuple.serialize_element(&self.num_items_assigned)?;
+                tuple.serialize_element(&self.encoder_urls)?;
+            }
         }
         tuple.end()
     }
@@ -388,6 +450,12 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                 let bootstrap_room = tail.next::<i64>()?;
                 tail.skip(5)?;
                 let require_reasoning = tail.next::<bool>()?.unwrap_or(false);
+                // priority, extra_key, no_logs, return_bytes, return_entropy,
+                // then the encode dispatch's three slots.
+                tail.skip(5)?;
+                let need_wait_for_mm_inputs = tail.next::<bool>()?;
+                let num_items_assigned = tail.next::<BTreeMap<u32, Vec<u32>>>()?;
+                let encoder_urls = tail.next::<Vec<String>>()?;
                 drain_trailing(&mut seq)?;
                 Ok(TokenizedGenerateReqInput {
                     rid,
@@ -407,6 +475,9 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                     bootstrap_port,
                     bootstrap_room,
                     require_reasoning,
+                    need_wait_for_mm_inputs,
+                    num_items_assigned,
+                    encoder_urls,
                     trace_headers: None,
                 })
             }
@@ -555,9 +626,80 @@ fn read_embedding_after_tag<'de, A: SeqAccess<'de>>(
     })
 }
 
+/// The scheduler's own notice that a request's encode dispatch failed
+/// (`EncoderDispatchErrorReq`, a tagged positional struct like the requests:
+/// `[tag, rid, http_worker_ipc, error_msg, error_code]`). The engine's
+/// frontend sends it after the request it names, on the same input socket,
+/// when its dispatch to the encoders failed; the scheduler's receiver then
+/// aborts that request with the message and the HTTP code instead of
+/// waiting out the embeddings that will never come. It is a notice, not a
+/// request: nothing answers it, so it rides [`crate::Client::notify`], never
+/// a submit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncoderDispatchErrorReq {
+    /// The request whose dispatch failed.
+    pub rid: String,
+    /// The encoder's (or the dispatcher's) message.
+    pub error_msg: String,
+    /// The HTTP status the scheduler aborts the request with (the engine's
+    /// frontend sends 502 for a dispatch it could not deliver).
+    pub error_code: u16,
+}
+
+impl Serialize for EncoderDispatchErrorReq {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        const NIL: Option<()> = None;
+        let mut tuple = serializer.serialize_tuple(ENCODER_DISPATCH_ERROR_WIRE_FIELDS.len() + 1)?;
+        tuple.serialize_element(ENCODER_DISPATCH_ERROR_REQ_TAG)?;
+        tuple.serialize_element(&self.rid)?;
+        tuple.serialize_element(&NIL)?; // http_worker_ipc
+        tuple.serialize_element(&self.error_msg)?;
+        tuple.serialize_element(&self.error_code)?;
+        tuple.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for EncoderDispatchErrorReq {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ErrorVisitor;
+
+        impl<'de> Visitor<'de> for ErrorVisitor {
+            type Value = EncoderDispatchErrorReq;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    f,
+                    "a tagged SGLang EncoderDispatchErrorReq positional array"
+                )
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                expect_tag(&mut seq, ENCODER_DISPATCH_ERROR_REQ_TAG)?;
+                let rid = next_field(&mut seq, "rid")?;
+                let _http_worker_ipc: IgnoredAny = next_field(&mut seq, "http_worker_ipc")?;
+                let error_msg = next_field(&mut seq, "error_msg")?;
+                let error_code = next_field(&mut seq, "error_code")?;
+                drain_trailing(&mut seq)?;
+                Ok(EncoderDispatchErrorReq {
+                    rid,
+                    error_msg,
+                    error_code,
+                })
+            }
+        }
+
+        deserializer.deserialize_seq(ErrorVisitor)
+    }
+}
+
 /// What rides the `ADD` frame: a generation or an embedding request, told
 /// apart by the tag, both keyed by `rid`.
 #[derive(Debug, Clone, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "each variant mirrors one of the scheduler's request structs slot for slot; a \
+              request is built, encoded on submit and dropped, never queued"
+)]
 pub enum SglangRequest {
     Generate(TokenizedGenerateReqInput),
     Embed(TokenizedEmbeddingReqInput),
@@ -836,6 +978,10 @@ mod tests {
         assert_eq!(GENERATE_WIRE_FIELDS[21], "lora_id");
         assert_eq!(GENERATE_WIRE_FIELDS[22], "custom_logit_processor");
         assert_eq!(GENERATE_WIRE_FIELDS[32], "require_reasoning");
+        assert_eq!(GENERATE_WIRE_FIELDS[38], "need_wait_for_mm_inputs");
+        assert_eq!(GENERATE_WIRE_FIELDS[39], "num_items_assigned");
+        assert_eq!(GENERATE_WIRE_FIELDS[40], "encoder_urls");
+        assert_eq!(GENERATE_WIRE_FIELDS.len(), 41);
         assert_eq!(EMBEDDING_WIRE_FIELDS[6], "sampling_params");
         assert_eq!(EMBEDDING_WIRE_FIELDS[11], "dimensions");
         for release in [&GENERATE_FIELDS_0_5_21[..], &GENERATE_FIELDS_0_5_22[..]] {
@@ -1041,6 +1187,125 @@ mod tests {
         assert_eq!(
             &GENERATE_WIRE_FIELDS[24..27],
             ["bootstrap_host", "bootstrap_port", "bootstrap_room"]
+        );
+    }
+
+    /// A request whose media the encoders serve reaches `encoder_urls`: the
+    /// defaulted slots 33-37 at the scheduler's defaults, then the dispatch's
+    /// three in 38-40 as the engine's frontend sets them; a request without
+    /// a dispatch keeps the shorter forms.
+    #[test]
+    fn an_encode_dispatched_request_fills_the_three_slots() {
+        let request = TokenizedGenerateReqInput {
+            rid: "epd".into(),
+            input_text: Some("<image> what is this".into()),
+            input_ids: vec![1, 2, 3],
+            need_wait_for_mm_inputs: Some(true),
+            num_items_assigned: Some(BTreeMap::from([(1, vec![1, 0])])),
+            encoder_urls: Some(vec![
+                "grpc://10.0.0.8:30001".into(),
+                "grpc://10.0.0.9:30001".into(),
+            ]),
+            ..Default::default()
+        };
+        let encoded = encode_msgpack(&request).unwrap();
+        let array: Vec<Value> = decode_msgpack(&encoded).unwrap();
+        assert_eq!(array.len(), 42, "the extended form through encoder_urls");
+        assert_eq!(
+            array[3].as_str(),
+            Some("<image> what is this"),
+            "input_text at 3"
+        );
+        assert_eq!(array[33], Value::Boolean(false), "require_reasoning at 33");
+        assert!(
+            array[34].is_nil() && array[35].is_nil(),
+            "priority, extra_key nil"
+        );
+        for (i, slot) in array[36..39].iter().enumerate() {
+            assert_eq!(
+                slot,
+                &Value::Boolean(false),
+                "no_logs .. return_entropy at {}",
+                36 + i
+            );
+        }
+        assert_eq!(
+            array[39],
+            Value::Boolean(true),
+            "need_wait_for_mm_inputs at 39"
+        );
+        let assigned = array[40]
+            .as_map()
+            .expect("num_items_assigned is a map at 40");
+        assert_eq!(assigned.len(), 1);
+        assert_eq!(
+            assigned[0].0.as_u64(),
+            Some(1),
+            "the modality's enum value keys it"
+        );
+        assert_eq!(
+            assigned[0]
+                .1
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64())
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(0)]
+        );
+        let urls = array[41].as_array().expect("encoder_urls at 41");
+        assert_eq!(urls.len(), 2);
+        let back: TokenizedGenerateReqInput = decode_msgpack(&encoded).unwrap();
+        assert_eq!(back, request);
+        // The slots sit inside the prefix the handshake check compares.
+        assert_eq!(
+            &GENERATE_WIRE_FIELDS[38..41],
+            [
+                "need_wait_for_mm_inputs",
+                "num_items_assigned",
+                "encoder_urls"
+            ]
+        );
+
+        // No dispatch: the form stops where it did before.
+        let plain = TokenizedGenerateReqInput {
+            rid: "pd".into(),
+            bootstrap_room: Some(0),
+            ..Default::default()
+        };
+        let array: Vec<Value> = decode_msgpack(&encode_msgpack(&plain).unwrap()).unwrap();
+        assert_eq!(array.len(), 34);
+        let decoded: TokenizedGenerateReqInput =
+            decode_msgpack(&encode_msgpack(&plain).unwrap()).unwrap();
+        assert_eq!(
+            (
+                decoded.need_wait_for_mm_inputs,
+                decoded.num_items_assigned,
+                decoded.encoder_urls
+            ),
+            (None, None, None)
+        );
+    }
+
+    /// The failure notice is the scheduler's own `EncoderDispatchErrorReq`,
+    /// byte for byte what `msgspec` writes for it (the pinned bytes come from
+    /// the engine's struct definition: tag, rid, `http_worker_ipc` nil, the
+    /// message, the code).
+    #[test]
+    fn the_dispatch_error_notice_is_the_schedulers_own_struct() {
+        const PYTHON_PINNED: &str = "95b7456e636f64657244697370617463684572726f72526571a56570642d31c0d925456e636f6465206661696c656420666f722072657175657374206570642d313a20626f6f6dcd01f6";
+        let notice = EncoderDispatchErrorReq {
+            rid: "epd-1".into(),
+            error_msg: "Encode failed for request epd-1: boom".into(),
+            error_code: 502,
+        };
+        let encoded = encode_msgpack(&notice).unwrap();
+        assert_eq!(encoded, hex(PYTHON_PINNED));
+        let back: EncoderDispatchErrorReq = decode_msgpack(&encoded).unwrap();
+        assert_eq!(back, notice);
+        assert_eq!(
+            ENCODER_DISPATCH_ERROR_WIRE_FIELDS,
+            ["rid", "http_worker_ipc", "error_msg", "error_code"]
         );
     }
 

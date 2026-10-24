@@ -56,8 +56,11 @@ pub(super) async fn generate(
         .sampling_params
         .as_ref()
         .map_or((None, 1), |params| (params.max_new_tokens, params.n));
+    // A language-side worker hands a request's image references to the
+    // encoders before the submit (the dispatcher the lifecycle owner
+    // supplied); every other worker refuses such a request there.
     let subs = client
-        .generate_sglang_streams_with_trace(req, trace_headers)
+        .generate_sglang_streams_dispatching(req, trace_headers, state.encode.as_ref())
         .await?;
     let metrics = state.shared.metrics.request(
         arrival,

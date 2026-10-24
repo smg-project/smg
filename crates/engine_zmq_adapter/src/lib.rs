@@ -27,6 +27,7 @@ mod eos;
 mod fanout;
 pub mod multimodal;
 mod sglang;
+pub mod sglang_encode;
 mod sockets;
 pub mod stops;
 mod stream;
@@ -47,6 +48,10 @@ pub use engine_zmq_client::protocol::vllm::{
 };
 pub use eos::{fold_tokenizer_eos_backstop, EosTokenIds};
 pub use sglang::{to_sglang_response, SglangGenerateStream, SglangProfileStart};
+pub use sglang_encode::{
+    EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
+    EncoderDispatchErrorReq, SglangEncodeDispatcher,
+};
 pub use sockets::{zmq_handshake_address, Handshake};
 pub use stream::ZmqGenerateStream;
 pub use structured_outputs::{

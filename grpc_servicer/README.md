@@ -1101,12 +1101,26 @@ scheduler as its own processor output: the preprocessed tensors the Router's
 media pipeline sends ride the wire as SGLang's own tensor encoding, and the
 scheduler hashes, pads and positions them as it does behind the Python
 servicer; `supports_vision` is advertised as SGLang's model config decides it.
-What the wire does not carry is reported, not emulated: EPD disaggregation (`--language-only` / `--encoder-only`) stays with
-the Python implementation (the worker refuses to start on the Rust path in
-those modes: the encode dispatch is not on it yet), a prefill or decode leg
-with more than one scheduler rank refuses to start the same way (a request is
-not yet placed on its room's rank on the Rust path), and LoRA loading answers
-UNIMPLEMENTED, as it does on the Python servicer.
+The language side of encode/prefill disaggregation (`--language-only`) works as
+behind SGLang's own frontend: the servicer process runs SGLang's own encoder
+bootstrap server and receiver (`--encoder-bootstrap-port`, `--encoder-urls`,
+the receiver's transport by `SGLANG_ENCODER_MM_RECEIVER_MODE`), a request's
+image references (`mm_inputs.image_urls`, with the prompt tokenized but not
+expanded and no tensors) go to the encoders through them before the request
+reaches the scheduler, the scheduler's request carries what the dispatch set
+(its wait flag, the per-encoder assignment, the encoder list) and the prompt
+text the scheduler rebuilds from once the embeddings arrive, and a dispatch
+that fails afterwards reaches the scheduler as its own failure notice. A
+request of references on any other worker, or on a language-only worker with
+no encoder registered, is refused (`FAILED_PRECONDITION`) rather than answered
+as text. What the wire does not carry is reported, not emulated: an `--encoder-only` launch is refused (SGLang's entrypoint runs
+that role on its own encoder server, never on a servicer), a `--language-only`
+launch on the `zmq_to_tokenizer` transfer backend is refused (the frontend
+itself receives and processes the embeddings there, which neither servicer
+runs), a prefill or decode leg with more than one scheduler rank refuses to
+start the same way (a request is not yet placed on its room's rank on the Rust
+path), and LoRA loading answers UNIMPLEMENTED, as it does on the Python
+servicer.
 `SubscribeKvEvents` relays SGLang's ZMQ KV-event publisher, which the servicer
 turns on by itself, on this path as on the Python one, when the launcher is
 given no `--kv-events-config`, at a port found free on the host rather than

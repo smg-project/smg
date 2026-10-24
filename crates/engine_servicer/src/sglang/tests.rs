@@ -5,6 +5,10 @@
 
 use std::{
     collections::BTreeMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -37,7 +41,8 @@ use tonic_health::pb::{
 use super::*;
 use crate::{
     testing::{assert_bucket_edges, assert_golden, http_get, servicer_config, Bounded},
-    ServicerError,
+    EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
+    EncoderDispatchErrorReq, ServicerError, SglangEncodeDispatcher,
 };
 
 fn model_info() -> SglangModelInfo {
@@ -67,6 +72,7 @@ fn config(dir: &std::path::Path, handshake: &str, model: SglangModelInfo) -> Sgl
     SglangServicerConfig {
         servicer: servicer_config(dir, handshake),
         model,
+        encode_dispatcher: None,
     }
 }
 
@@ -108,34 +114,56 @@ async fn grpc_channel(address: impl std::fmt::Display) -> Channel {
         .expect("grpc client")
 }
 
-/// A bound servicer, a handshaken mock scheduler, and a gRPC client.
+/// A bound servicer, a handshaken mock scheduler (rank 0; the further ranks
+/// of a data-parallel group in `more_ranks`, from index 1), and a gRPC
+/// client.
 struct Harness {
     server: SglangServicerServer,
     engine_in: MockEngineInput,
     engine_out: MockEngineOutput,
+    more_ranks: Vec<(MockEngineInput, MockEngineOutput)>,
     client: SglangSchedulerClient<Channel>,
     _dir: tempfile::TempDir,
 }
 
 async fn harness(model: SglangModelInfo) -> Harness {
+    harness_with(model, |_| {}).await
+}
+
+/// [`harness`] with the servicer's config adjusted before it starts (a
+/// metrics listener, an encode dispatcher, the rank count): as many mock
+/// schedulers handshake as the config expects, in index order.
+async fn harness_with(
+    model: SglangModelInfo,
+    configure: impl FnOnce(&mut SglangServicerConfig),
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
-    let server = SglangServicerServer::start(config(dir.path(), &handshake, model))
-        .expect("servicer starts");
-    let engine = connect_to_frontend(
-        &handshake,
-        EngineId::from_engine_index(0),
-        default_ready_response(),
-    )
-    .await
-    .expect("mock scheduler handshake");
+    let mut config = config(dir.path(), &handshake, model);
+    configure(&mut config);
+    let ranks = u32::try_from(config.servicer.engine_count).expect("a small rank count");
+    let server = SglangServicerServer::start(config).expect("servicer starts");
+    let mut engines = Vec::new();
+    for index in 0..ranks {
+        engines.push(
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(index),
+                default_ready_response(),
+            )
+            .await
+            .expect("mock scheduler handshake"),
+        );
+    }
     wait_until(|| server.engine_ready()).await;
     let client = SglangSchedulerClient::new(grpc_channel(server.address()).await);
-    let (engine_in, engine_out) = engine.split();
+    let mut ranks = engines.into_iter().map(|engine| engine.split());
+    let (engine_in, engine_out) = ranks.next().expect("rank 0");
     Harness {
         server,
         engine_in,
         engine_out,
+        more_ranks: ranks.collect(),
         client,
         _dir: dir,
     }
@@ -1183,6 +1211,289 @@ async fn multimodal_inputs_reach_the_scheduler_as_its_processor_output() {
     rids.sort();
     assert_eq!(rids, vec!["mm-0".to_string(), "mm-1".to_string()]);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+const ENCODERS: [&str; 2] = ["grpc://10.0.0.8:30001", "grpc://10.0.0.9:30001"];
+const UNEXPANDED_PROMPT: &str = "<|vision_start|><|image_pad|><|vision_end|>What is this?";
+const IMAGE_REFERENCE: &str = "data:image/png;base64,iVBORw0KGgo=";
+
+/// How a scripted dispatcher answers every call.
+enum DispatchAnswer {
+    /// Two encoders registered, the one image assigned to the first: the
+    /// engine's frontend with encoders behind it.
+    Encoders,
+    /// No encoder registered: the frontend leaves the request alone.
+    NoEncoder,
+    /// The dispatch itself fails before anything went out.
+    Failure(&'static str),
+}
+
+/// The lifecycle owner's dispatcher, scripted: records every call and the
+/// sink it was handed, counts its releases.
+struct ScriptedDispatcher {
+    answer: DispatchAnswer,
+    calls: Mutex<Vec<(String, Vec<String>)>>,
+    sinks: Mutex<Vec<EncodeDispatchErrorSink>>,
+    released: Arc<AtomicUsize>,
+}
+
+impl ScriptedDispatcher {
+    fn new(answer: DispatchAnswer) -> Arc<Self> {
+        Arc::new(Self {
+            answer,
+            calls: Mutex::default(),
+            sinks: Mutex::default(),
+            released: Arc::default(),
+        })
+    }
+
+    fn calls(&self) -> Vec<(String, Vec<String>)> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn released(&self) -> usize {
+        self.released.load(Ordering::SeqCst)
+    }
+
+    /// The sink handed over with the call for `rid`.
+    fn sink_for(&self, rid: &str) -> EncodeDispatchErrorSink {
+        let calls = self.calls.lock().unwrap();
+        let index = calls
+            .iter()
+            .position(|(called, _)| called == rid)
+            .expect("a dispatched rid");
+        Arc::clone(&self.sinks.lock().unwrap()[index])
+    }
+
+    /// The servicer's config with this dispatcher and `ranks` scheduler ranks.
+    fn configure(self: &Arc<Self>, ranks: usize) -> impl FnOnce(&mut SglangServicerConfig) {
+        let dispatcher: Arc<dyn SglangEncodeDispatcher> = Arc::<Self>::clone(self);
+        move |config| {
+            config.encode_dispatcher = Some(dispatcher);
+            config.servicer.engine_count = ranks;
+        }
+    }
+}
+
+impl SglangEncodeDispatcher for ScriptedDispatcher {
+    fn dispatch(
+        &self,
+        request: EncodeDispatchRequest,
+    ) -> EncodeFuture<Result<EncodeDispatchOutcome, String>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((request.rid, request.image_urls));
+        self.sinks.lock().unwrap().push(request.on_error);
+        let released = Arc::clone(&self.released);
+        let sent: Box<dyn FnOnce() -> EncodeFuture<()> + Send> = Box::new(move || {
+            Box::pin(async move {
+                released.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+        let answer = match &self.answer {
+            DispatchAnswer::Failure(message) => Err((*message).to_string()),
+            DispatchAnswer::Encoders => Ok(EncodeDispatchOutcome {
+                need_wait_for_mm_inputs: true,
+                num_items_assigned: Some(BTreeMap::from([(1, vec![1, 0])])),
+                encoder_urls: Some(ENCODERS.iter().map(ToString::to_string).collect()),
+                sent: Some(sent),
+            }),
+            DispatchAnswer::NoEncoder => Ok(EncodeDispatchOutcome {
+                need_wait_for_mm_inputs: false,
+                num_items_assigned: None,
+                encoder_urls: None,
+                sent: Some(sent),
+            }),
+        };
+        Box::pin(std::future::ready(answer))
+    }
+}
+
+/// A vision model served by `ranks` scheduler ranks.
+fn vision_model(ranks: i32) -> SglangModelInfo {
+    let mut model = model_info();
+    model.supports_vision = true;
+    model.data_parallel_size = ranks;
+    model
+}
+
+/// A request naming one image by reference beside its unexpanded prompt,
+/// `n` choices: what reaches a language-side worker.
+fn media_reference_request(id: &str, n: u32) -> sg::GenerateRequest {
+    let mut request = generate_request(id, false, Vec::new());
+    request.tokenized = Some(sg::TokenizedInput {
+        original_text: UNEXPANDED_PROMPT.to_string(),
+        input_ids: vec![1, 7, 7, 7, 2],
+    });
+    request.sampling_params.as_mut().unwrap().n = n;
+    request.mm_inputs = Some(sg::MultimodalInputs {
+        modalities: vec!["image".to_string()],
+        image_urls: vec![IMAGE_REFERENCE.to_string()],
+        ..Default::default()
+    });
+    request
+}
+
+/// On a language-side worker a request's image references go to the
+/// encoders before the request goes to its scheduler rank, one dispatch per
+/// choice under the choice's own id; the scheduler's request carries the
+/// unexpanded prompt and the three slots the dispatch set, and no processor
+/// output. A failure the dispatcher reports once the request is out reaches
+/// the rank that holds the request, after it, as the scheduler's own notice;
+/// the other rank sees nothing.
+#[tokio::test]
+async fn a_language_side_request_is_dispatched_to_the_encoders_before_its_rank() {
+    let dispatcher = ScriptedDispatcher::new(DispatchAnswer::Encoders);
+    let mut h = harness_with(vision_model(2), dispatcher.configure(2)).await;
+    let mut stream = h
+        .client
+        .generate(media_reference_request("epd", 2))
+        .await
+        .expect("generate")
+        .into_inner();
+    let (mut rank1_in, mut rank1_out) = h.more_ranks.pop().expect("the second rank");
+    // The two choices spread over the two idle ranks (the connector reserves
+    // its choice): one scheduler request on each.
+    let mut rid_by_rank = BTreeMap::new();
+    for (rank, engine) in [(0u32, &mut h.engine_in), (1, &mut rank1_in)] {
+        let add = recv_add(engine).await;
+        assert_eq!(add.need_wait_for_mm_inputs, Some(true), "{}", add.rid);
+        assert_eq!(
+            add.num_items_assigned,
+            Some(BTreeMap::from([(1, vec![1, 0])]))
+        );
+        assert_eq!(
+            add.encoder_urls,
+            Some(ENCODERS.iter().map(ToString::to_string).collect())
+        );
+        assert_eq!(add.input_text.as_deref(), Some(UNEXPANDED_PROMPT));
+        assert_eq!(add.input_ids, vec![1, 7, 7, 7, 2]);
+        assert!(
+            add.mm_inputs.is_none(),
+            "no processor output on the language side"
+        );
+        rid_by_rank.insert(rank, add.rid);
+    }
+    let mut rids: Vec<String> = rid_by_rank.values().cloned().collect();
+    rids.sort();
+    assert_eq!(rids, ["epd-0", "epd-1"]);
+    let calls = dispatcher.calls();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    for (rid, urls) in &calls {
+        assert!(rids.contains(rid), "{rid}");
+        assert_eq!(urls, &[IMAGE_REFERENCE.to_string()]);
+    }
+    // Released once each request was on the wire.
+    wait_until(|| dispatcher.released() == 2).await;
+
+    // The encoder behind rank 1's request fails: the notice follows the
+    // request on rank 1 (the bytes the wire test pins); rank 0 sees nothing.
+    let failing = rid_by_rank[&1].clone();
+    let error = EncoderDispatchErrorReq {
+        rid: failing.clone(),
+        error_msg: format!("Encode failed for request {failing}: boom"),
+        error_code: 502,
+    };
+    dispatcher.sink_for(&failing)(error.clone());
+    let frames = rank1_in.recv_frames().await.unwrap();
+    assert_eq!(
+        SglangRequestType::from_frame(frames[0].as_ref()),
+        Some(SglangRequestType::Add)
+    );
+    let notice: EncoderDispatchErrorReq = decode_msgpack(frames[1].as_ref()).unwrap();
+    assert_eq!(notice, error);
+    assert_scheduler_idle(&mut h.engine_in).await;
+
+    // Both ranks finish their request; the caller gets its two completions.
+    for (rank, engine_out) in [(0u32, &mut h.engine_out), (1, &mut rank1_out)] {
+        send(
+            engine_out,
+            &batch(&rid_by_rank[&rank], vec![10], 1, Some("stop"), None),
+        )
+        .await;
+    }
+    for _ in 0..2 {
+        let done = complete(stream.message().bounded().await.unwrap().unwrap());
+        assert_eq!(done.finish_reason, "stop");
+    }
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    wait_until(|| h.server.active_requests() == 0).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Media references a worker cannot have encoded are refused before the
+/// scheduler, by name: on a worker with no encode dispatch (not a
+/// language-side worker), on a language-side worker whose dispatch finds no
+/// encoder registered (the dispatcher is released even so), and when the
+/// dispatch itself fails; a failure reported for a request that never went
+/// out reaches no rank. The refused id is free again: a text request under
+/// it reaches the scheduler.
+#[tokio::test]
+async fn media_references_a_worker_cannot_encode_are_refused_before_the_scheduler() {
+    let mut h = harness(vision_model(1)).await;
+    let status = h
+        .client
+        .generate(media_reference_request("refs", 1))
+        .await
+        .expect_err("no encode dispatch on this worker");
+    assert_eq!(
+        status.code(),
+        Code::FailedPrecondition,
+        "{}",
+        status.message()
+    );
+    assert!(
+        status.message().contains("runs no encode dispatch"),
+        "{}",
+        status.message()
+    );
+    assert_scheduler_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    for (answer, code, needle) in [
+        (
+            DispatchAnswer::NoEncoder,
+            Code::FailedPrecondition,
+            "no encoder is registered with this language-only worker",
+        ),
+        (
+            DispatchAnswer::Failure("the encoder list is empty"),
+            Code::Internal,
+            "encode dispatch failed: the encoder list is empty",
+        ),
+    ] {
+        let releases = usize::from(matches!(answer, DispatchAnswer::NoEncoder));
+        let dispatcher = ScriptedDispatcher::new(answer);
+        let mut h = harness_with(vision_model(1), dispatcher.configure(1)).await;
+        let status = h
+            .client
+            .generate(media_reference_request("refs", 1))
+            .await
+            .expect_err("refused before the scheduler");
+        assert_eq!(status.code(), code, "{}", status.message());
+        assert!(status.message().contains(needle), "{}", status.message());
+        assert_eq!(
+            dispatcher.calls(),
+            vec![("refs".to_string(), vec![IMAGE_REFERENCE.to_string()])]
+        );
+        assert_eq!(dispatcher.released(), releases);
+        // A failure reported now is for a request no rank holds: dropped.
+        dispatcher.sink_for("refs")(EncoderDispatchErrorReq {
+            rid: "refs".to_string(),
+            error_msg: "late".to_string(),
+            error_code: 500,
+        });
+        assert_scheduler_idle(&mut h.engine_in).await;
+        let _stream = h
+            .client
+            .generate(generate_request("refs", true, Vec::new()))
+            .await
+            .expect("the id is free again")
+            .into_inner();
+        assert_eq!(recv_add(&mut h.engine_in).await.rid, "refs");
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
 }
 
 /// Model and server info come from the launcher's facts plus the handshake's
@@ -2695,28 +3006,10 @@ async fn the_configured_silence_bound_and_prefill_allowance_reach_the_scheduler_
 /// A bound servicer with its metrics listener on an ephemeral port, a
 /// handshaken mock scheduler and a gRPC client.
 async fn metrics_harness(model: SglangModelInfo) -> Harness {
-    let dir = tempfile::tempdir().unwrap();
-    let handshake = handshake_address(dir.path());
-    let mut config = config(dir.path(), &handshake, model);
-    config.servicer.metrics_bind_address = Some("127.0.0.1:0".to_string());
-    let server = SglangServicerServer::start(config).expect("servicer starts");
-    let engine = connect_to_frontend(
-        &handshake,
-        EngineId::from_engine_index(0),
-        default_ready_response(),
-    )
+    harness_with(model, |config| {
+        config.servicer.metrics_bind_address = Some("127.0.0.1:0".to_string());
+    })
     .await
-    .expect("mock scheduler handshake");
-    wait_until(|| server.engine_ready()).await;
-    let client = SglangSchedulerClient::new(grpc_channel(server.address()).await);
-    let (engine_in, engine_out) = engine.split();
-    Harness {
-        server,
-        engine_in,
-        engine_out,
-        client,
-        _dir: dir,
-    }
 }
 
 /// One scrape of the servicer's metrics listener.

@@ -14,19 +14,20 @@
 //! run in this process.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use bytes::Bytes;
 use engine_servicer::{
-    BoxFuture, MediaError, MediaFeatures, MediaProcessor, MediaRequest, ProcessedMedia,
-    ServicerConfig, ServicerError, SglangModelInfo, SglangServicerConfig, SglangServicerServer,
-    TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer, VllmModelInfo,
-    VllmServicerConfig, VllmServicerServer, ALL_MODALITIES, DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC,
-    DEFAULT_ENGINE_SILENCE_TIMEOUT, DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT,
-    PIXEL_MODALITIES,
+    BoxFuture, EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
+    EncoderDispatchErrorReq, MediaError, MediaFeatures, MediaProcessor, MediaRequest,
+    ProcessedMedia, ServicerConfig, ServicerError, SglangEncodeDispatcher, SglangModelInfo,
+    SglangServicerConfig, SglangServicerServer, TokenSpeedModelInfo, TokenSpeedServicerConfig,
+    TokenSpeedServicerServer, VllmModelInfo, VllmServicerConfig, VllmServicerServer,
+    ALL_MODALITIES, DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC, DEFAULT_ENGINE_SILENCE_TIMEOUT,
+    DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT, PIXEL_MODALITIES,
 };
 use llm_multimodal::{jpeg_turbo::TurboJpegPolicy, Modality};
 use prost::Message;
@@ -1184,6 +1185,112 @@ impl PyTokenSpeedGrpcServer {
     }
 }
 
+/// What the encode bridge answers one dispatch with: whether the scheduler is
+/// to wait for embeddings, the per-encoder assignment by the modality's enum
+/// value, the encoder list it indexes, and the callable that releases the
+/// receiver's dispatch thread once the request is on the wire.
+type DispatchAnswer = (
+    bool,
+    Option<BTreeMap<u32, Vec<u32>>>,
+    Option<Vec<String>>,
+    Option<Py<PyAny>>,
+);
+
+/// The encode dispatch of an SGLang language-side worker behind a Python
+/// object (see `smg_grpc_servicer.sglang.rust_encode.EncodeDispatchBridge`):
+/// `dispatch(rid, image_urls, on_error)` runs SGLang's own receiver for the
+/// request (the assignment across the encoders, the encode requests to them
+/// on the receiver's thread) and returns a [`DispatchAnswer`]; `on_error` is
+/// this side's [`DispatchError`], which the bridge calls with the receiver's
+/// failure once the release ran, so the notice reaches the scheduler rank
+/// holding the request. Calls into Python only from a blocking thread, as
+/// the media bridge does.
+struct PythonEncodeDispatcher {
+    bridge: Arc<Py<PyAny>>,
+}
+
+impl SglangEncodeDispatcher for PythonEncodeDispatcher {
+    fn dispatch(
+        &self,
+        request: EncodeDispatchRequest,
+    ) -> EncodeFuture<Result<EncodeDispatchOutcome, String>> {
+        let bridge = Arc::clone(&self.bridge);
+        Box::pin(async move {
+            let EncodeDispatchRequest {
+                rid,
+                image_urls,
+                on_error,
+            } = request;
+            let answer = tokio::task::spawn_blocking(move || {
+                Python::attach(|py| -> PyResult<DispatchAnswer> {
+                    let on_error = Py::new(
+                        py,
+                        DispatchError {
+                            rid: rid.clone(),
+                            sink: on_error,
+                        },
+                    )?;
+                    bridge
+                        .call_method1(py, "dispatch", (rid, image_urls, on_error))?
+                        .extract(py)
+                })
+            })
+            .await;
+            let (need_wait_for_mm_inputs, num_items_assigned, encoder_urls, sent) = match answer {
+                Ok(Ok(answer)) => answer,
+                Ok(Err(error)) => return Err(error.to_string()),
+                Err(join) => return Err(format!("encode dispatch did not run: {join}")),
+            };
+            let sent = sent.map(|release| -> Box<dyn FnOnce() -> EncodeFuture<()> + Send> {
+                Box::new(move || {
+                    Box::pin(async move {
+                        let released = tokio::task::spawn_blocking(move || {
+                            Python::attach(|py| release.call0(py).map(|_| ()))
+                        })
+                        .await;
+                        match released {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                tracing::warn!(%error, "encode dispatch release failed")
+                            }
+                            Err(join) => {
+                                tracing::warn!(%join, "encode dispatch release did not run")
+                            }
+                        }
+                    })
+                })
+            });
+            Ok(EncodeDispatchOutcome {
+                need_wait_for_mm_inputs,
+                num_items_assigned,
+                encoder_urls,
+                sent,
+            })
+        })
+    }
+}
+
+/// Where the encode bridge reports a dispatch failure, called once from the
+/// receiver's thread after the release: `(error_msg, error_code)`, the
+/// receiver's own `EncoderDispatchErrorReq` fields. A code outside the HTTP
+/// range is reported as 500.
+#[pyclass(name = "_DispatchError")]
+struct DispatchError {
+    rid: String,
+    sink: EncodeDispatchErrorSink,
+}
+
+#[pymethods]
+impl DispatchError {
+    fn __call__(&self, error_msg: String, error_code: i64) {
+        (self.sink)(EncoderDispatchErrorReq {
+            rid: self.rid.clone(),
+            error_msg,
+            error_code: u16::try_from(error_code).unwrap_or(500),
+        });
+    }
+}
+
 /// Rust-owned `sglang.grpc.scheduler.SglangScheduler` server over a same-host
 /// headless SGLang scheduler on the msgpack ZMQ wire (the SMG plugin inside
 /// the scheduler dials in). The Python launcher keeps the lifecycle: it starts
@@ -1229,6 +1336,7 @@ impl PySglangGrpcServer {
         kv_events_endpoint = String::new(),
         kv_events_replay_endpoint = String::new(),
         kv_events_topic = String::new(),
+        encode_dispatcher = None,
         engine_startup_timeout_secs = None,
         engine_startup_ceiling_secs = None,
         engine_silence_timeout_secs = None,
@@ -1269,12 +1377,20 @@ impl PySglangGrpcServer {
         kv_events_endpoint: String,
         kv_events_replay_endpoint: String,
         kv_events_topic: String,
+        encode_dispatcher: Option<Bound<'_, PyAny>>,
         engine_startup_timeout_secs: Option<f64>,
         engine_startup_ceiling_secs: Option<f64>,
         engine_silence_timeout_secs: Option<f64>,
         engine_prefill_tokens_per_sec: Option<i64>,
         metrics_bind_address: Option<String>,
     ) -> PyResult<Self> {
+        // The language side's encode dispatch, behind the launcher's bridge
+        // object; absent on every other worker.
+        let encode_dispatcher = encode_dispatcher.map(|bridge| {
+            Arc::new(PythonEncodeDispatcher {
+                bridge: Arc::new(bridge.unbind()),
+            }) as Arc<dyn SglangEncodeDispatcher>
+        });
         let model = SglangModelInfo {
             served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
             tokenizer_path: tokenizer_path.unwrap_or_else(|| model_path.clone()),
@@ -1315,7 +1431,11 @@ impl PySglangGrpcServer {
             engine_prefill_tokens_per_sec: prefill_tokens_per_sec(engine_prefill_tokens_per_sec)?,
             metrics_bind_address,
         };
-        let config = SglangServicerConfig { servicer, model };
+        let config = SglangServicerConfig {
+            servicer,
+            model,
+            encode_dispatcher,
+        };
         let inner = py
             .detach(|| SglangServicerServer::start(config))
             .map_err(to_py_err)?;

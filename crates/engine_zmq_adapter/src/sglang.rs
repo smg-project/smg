@@ -498,10 +498,10 @@ pub(crate) fn translate_request_sglang(
     req: sglang_proto::GenerateRequest,
     max_model_len: u64,
 ) -> Result<TokenizedGenerateReqInput, String> {
-    let input_ids = req
+    let tokenized = req
         .tokenized
-        .map(|tokenized| tokenized.input_ids)
         .ok_or_else(|| "ZMQ mode requires pre-tokenized input; no input provided".to_string())?;
+    let input_ids = tokenized.input_ids;
     // The scheduler's own bound on the prompt applies only after admission
     // (an abort with its reason; a cut down to the bound for a scheduler
     // started with `--allow-auto-truncate`, whose servicer then passes no
@@ -509,10 +509,22 @@ pub(crate) fn translate_request_sglang(
     // `max_new_tokens` stays unset: the scheduler caps it at the remaining
     // context itself.
     admit_prompt(input_ids.len(), max_model_len)?;
-    let mm_inputs = req
-        .mm_inputs
-        .map(|mm| translate_sglang_multimodal(mm, input_ids.len()))
-        .transpose()?;
+    // Media by reference (the encoders' input on a language-side worker)
+    // leaves the processor-output slot empty and forwards the prompt text:
+    // the scheduler's receiver rebuilds the prompt from it once the
+    // embeddings arrive, as behind the engine's own frontend, which sends the
+    // text it rendered. Preprocessed tensors take the processor-output path.
+    let (mm_inputs, input_text) = match req.mm_inputs {
+        Some(mm) if encode_media_refs(&mm)?.is_some() => (
+            None,
+            (!tokenized.original_text.is_empty()).then_some(tokenized.original_text),
+        ),
+        Some(mm) => (
+            Some(translate_sglang_multimodal(mm, input_ids.len())?),
+            None,
+        ),
+        None => (None, None),
+    };
     // The prefill/decode rendezvous (the prefill side's bootstrap server and
     // the room both sides meet in), forwarded as the Python servicer forwards
     // it: an empty host and a zero port are unset, the room is kept as given
@@ -528,6 +540,7 @@ pub(crate) fn translate_request_sglang(
     };
     Ok(TokenizedGenerateReqInput {
         rid: req.request_id,
+        input_text,
         input_ids,
         mm_inputs,
         sampling_params: req
@@ -555,6 +568,30 @@ pub(crate) fn translate_request_sglang(
     })
 }
 
+/// The image references a payload names for the encoders of an
+/// encode/prefill-disaggregated deployment, in prompt order: `Some` for a
+/// payload of references without preprocessed tensors (the encoders' input
+/// on a language-side worker, see [`crate::sglang_encode`]), `None` for one
+/// carrying tensors (the processor-output path, whatever references ride
+/// beside them: the engine's frontend processes such a request locally) or
+/// nothing at all. Video and audio references are refused by name: the
+/// encoders' gRPC service takes images only.
+pub(crate) fn encode_media_refs(
+    mm: &sglang_proto::MultimodalInputs,
+) -> Result<Option<Vec<String>>, String> {
+    if mm.pixel_values.is_some() {
+        return Ok(None);
+    }
+    if !mm.video_urls.is_empty() || !mm.audio_urls.is_empty() {
+        return Err(
+            "multimodal payload carries video or audio references; the encoders of an \
+             encode/prefill-disaggregated deployment take image references only"
+                .to_string(),
+        );
+    }
+    Ok((!mm.image_urls.is_empty()).then(|| mm.image_urls.clone()))
+}
+
 /// The request's multimodal payload as the scheduler's processor output, by
 /// the Python servicer's rules (`_parse_mm_inputs`): one image item whose
 /// feature is `pixel_values`, the model-specific tensors beside it, the
@@ -565,7 +602,8 @@ pub(crate) fn translate_request_sglang(
 /// does behind the Python servicer. What that servicer would mis-tag or
 /// silently drop is refused instead: a payload naming another modality
 /// (every item is tagged an image), one of media references without tensors
-/// (the scheduler's encode path, which this wire does not drive), a tensor
+/// (the encoders' input, which [`encode_media_refs`] takes before this and
+/// the dispatch serves; refused here on a worker that runs none), a tensor
 /// of a dtype the wire does not carry or of the wrong length, and a
 /// placeholder outside the prompt or of zero length.
 pub(crate) fn translate_sglang_multimodal(
@@ -1034,10 +1072,17 @@ mod tests {
         let mut video = media_payload();
         video.modalities = vec!["video".to_string()];
         refused(video, "modality \"video\" is not carried");
+        // References without tensors are the encoders' input, taken before
+        // this translation by `encode_media_refs`; handed to the
+        // processor-output path anyway, they are refused by name.
         let mut references = media_payload();
         references.pixel_values = None;
         references.image_urls = vec!["http://example.test/a.png".to_string()];
-        refused(references, "media references but no preprocessed tensors");
+        let error = translate_sglang_multimodal(references, 5).unwrap_err();
+        assert!(
+            error.contains("media references but no preprocessed tensors"),
+            "{error}"
+        );
         let mut empty = media_payload();
         empty.pixel_values = None;
         refused(empty, "carries no pixel_values");
@@ -1082,6 +1127,69 @@ mod tests {
         };
         let error = translate_embed_request_sglang(embed).unwrap_err();
         assert!(error.contains("embedding request"), "{error}");
+    }
+
+    /// References without tensors are the encoders' input on a language-side
+    /// worker, not the scheduler's processor output: the translation leaves
+    /// the media slot empty, carries the unexpanded prompt for the
+    /// scheduler's rebuild once the embeddings land, and sets none of the
+    /// dispatch's slots (the dispatch does, once it ran). Tensors beside
+    /// references take the processor-output path; video and audio references
+    /// are refused: the encoders take images only.
+    #[test]
+    fn reference_only_media_is_the_encoders_input_not_the_schedulers() {
+        let mut references = media_payload();
+        references.pixel_values = None;
+        references.image_urls = vec!["http://example.test/a.png".to_string()];
+        assert_eq!(
+            encode_media_refs(&references).unwrap(),
+            Some(vec!["http://example.test/a.png".to_string()])
+        );
+        let mut request = media_request(references.clone());
+        request.tokenized.as_mut().unwrap().original_text =
+            "<|vision_start|><|image_pad|><|vision_end|>What is this?".to_string();
+        let translated = translate(request).unwrap();
+        assert_eq!(translated.mm_inputs, None);
+        assert_eq!(
+            translated.input_text.as_deref(),
+            Some("<|vision_start|><|image_pad|><|vision_end|>What is this?")
+        );
+        assert_eq!(translated.input_ids, vec![1, 7, 7, 7, 2]);
+        assert_eq!(
+            (
+                translated.need_wait_for_mm_inputs,
+                translated.num_items_assigned.clone(),
+                translated.encoder_urls.clone(),
+            ),
+            (None, None, None)
+        );
+        // Without the prompt text the slot stays empty: nothing to rebuild from.
+        assert_eq!(
+            translate(media_request(references)).unwrap().input_text,
+            None
+        );
+        // Tensors win: references beside them are the frontend's own record.
+        let mut both = media_payload();
+        both.image_urls = vec!["http://example.test/a.png".to_string()];
+        assert_eq!(encode_media_refs(&both).unwrap(), None);
+        let translated = translate(media_request(both)).unwrap();
+        assert!(translated.mm_inputs.is_some() && translated.input_text.is_none());
+        // Nothing at all is nothing to dispatch.
+        let mut empty = media_payload();
+        empty.pixel_values = None;
+        assert_eq!(encode_media_refs(&empty).unwrap(), None);
+        let mut video = media_payload();
+        video.pixel_values = None;
+        video.video_urls = vec!["http://example.test/a.mp4".to_string()];
+        let mut audio = media_payload();
+        audio.pixel_values = None;
+        audio.audio_urls = vec!["http://example.test/a.wav".to_string()];
+        for refs in [video, audio] {
+            let error = encode_media_refs(&refs).unwrap_err();
+            assert!(error.contains("image references only"), "{error}");
+            let error = translate(media_request(refs)).unwrap_err();
+            assert!(error.contains("image references only"), "{error}");
+        }
     }
 
     #[test]

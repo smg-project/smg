@@ -118,6 +118,83 @@ def test_request_decodes_the_bootstrap_triple_from_its_slots():
     assert req.require_reasoning is False and req.lora_id is None
 
 
+def test_request_decodes_the_encode_dispatch_slots_as_the_frontend_sets_them():
+    """A language-only worker's request whose media went to the encoders
+    carries the three slots the scheduler's receiver reads, past the
+    defaulted ones through ``return_entropy``: the wait flag, the assignment
+    keyed by the modality (its enum value on the wire) and the encoder
+    snapshot; the prompt text rides ``input_text`` for the rebuild."""
+    from sglang.srt.managers.schedule_batch import Modality
+
+    fields = list(TokenizedGenerateReqInput.__struct_fields__)
+    request = _positional_request(rid="epd") + [
+        False,  # return_sampling_mask
+        False,  # return_flat_raw_top_logprobs
+        False,  # return_hidden_states
+        False,  # return_routed_experts
+        0,  # routed_experts_start_len
+        False,  # return_indexer_topk
+        None,  # session_id
+        None,  # session_params
+        None,  # lora_id
+        None,  # custom_logit_processor
+        None,  # positional_embed_overrides
+        None,  # bootstrap_host
+        None,  # bootstrap_port
+        None,  # bootstrap_room
+        None,  # bootstrap_pair_key
+        None,  # decode_tp_size
+        None,  # routed_dp_rank
+        None,  # disagg_prefill_dp_rank
+        None,  # routing_key
+        False,  # require_reasoning
+        None,  # priority
+        None,  # extra_key
+        False,  # no_logs
+        False,  # return_bytes
+        False,  # return_entropy
+        True,  # need_wait_for_mm_inputs
+        {1: [1, 0]},  # num_items_assigned: Modality.IMAGE -> per-encoder counts
+        ["grpc://10.0.0.8:30001", "grpc://10.0.0.9:30001"],  # encoder_urls
+    ]
+    request[3] = "<|vision_start|><|image_pad|><|vision_end|>What is this?"
+    assert len(request) == fields.index("encoder_urls") + 2  # the tag at element 0
+    assert fields.index("need_wait_for_mm_inputs") == 38
+    assert fields.index("num_items_assigned") == 39
+    assert fields.index("encoder_urls") == 40
+    (req,) = wire.decode_request_frames([wire.REQ_TYPE_ADD, msgspec.msgpack.encode(request)])
+    assert req.need_wait_for_mm_inputs is True
+    assert req.num_items_assigned == {Modality.IMAGE: [1, 0]}
+    assert req.encoder_urls == ["grpc://10.0.0.8:30001", "grpc://10.0.0.9:30001"]
+    assert req.input_text == "<|vision_start|><|image_pad|><|vision_end|>What is this?"
+    assert req.mm_inputs is None and req.require_reasoning is False
+
+
+def test_the_encode_dispatch_failure_notice_decodes_as_the_schedulers_own_request():
+    """The notice the Rust servicer sends after a request whose dispatch
+    failed (the bytes its wire test pins) is the scheduler's own
+    ``EncoderDispatchErrorReq``, passed through the ADD decode untouched for
+    the scheduler's receiver to consume; its layout is declared for the
+    handshake check like the requests'."""
+    rust_pinned = bytes.fromhex(
+        "95b7456e636f64657244697370617463684572726f72526571a56570642d31c0d925456e636f6465206661"
+        "696c656420666f722072657175657374206570642d313a20626f6f6dcd01f6"
+    )
+    (notice,) = wire.decode_request_frames([wire.REQ_TYPE_ADD, rust_pinned])
+    assert isinstance(notice, sglang_io.EncoderDispatchErrorReq)
+    assert (notice.rid, notice.error_msg, notice.error_code) == (
+        "epd-1",
+        "Encode failed for request epd-1: boom",
+        502,
+    )
+    assert wire.request_layouts()["EncoderDispatchErrorReq"] == [
+        "rid",
+        "http_worker_ipc",
+        "error_msg",
+        "error_code",
+    ]
+
+
 def test_the_ready_response_declares_the_request_structs_field_order():
     """The field order SMG checks the prefixes it encodes against: the
     installed release's own declaration, which pins where the prefixes end."""

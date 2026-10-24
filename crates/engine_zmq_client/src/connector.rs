@@ -1416,6 +1416,19 @@ impl<P: EngineProtocol> Client<P> {
         self.inner.release_one(engine_id, &request_id);
         self.inner.abort(engine_id, &request_id).await
     }
+
+    /// Hand one engine a notice under the protocol's add frame: a message of
+    /// the engine's own request vocabulary that names a request already
+    /// submitted to that engine and that the engine consumes itself (nothing
+    /// answers it, no stream is opened, no registration or in-flight slot is
+    /// taken). The caller encodes it; the frame is queued in order behind
+    /// the frames before it, so a notice sent after a request's submit
+    /// reaches the engine after that request.
+    pub async fn notify(&self, engine_id: &EngineId, payload: Vec<u8>) -> Result<()> {
+        self.inner
+            .send_to_engine(engine_id, P::add_frame(), payload, Vec::new())
+            .await
+    }
 }
 
 impl<P: EngineProtocol> Drop for Client<P> {

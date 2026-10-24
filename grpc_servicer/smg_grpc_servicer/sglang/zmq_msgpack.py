@@ -14,10 +14,12 @@ module adds the one thing it lacks, discovery, and keeps everything else:
   and connects in;
 * requests arrive as ``[type_byte, payload, *aux]`` frames whose payload is
   the scheduler's own positional ``TokenizedGenerateReqInput`` or
-  ``TokenizedEmbeddingReqInput`` (``ADD``, told apart by the tag), a plain
-  list of request ids (``ABORT``), or a control call ``[call_id, method,
-  args]`` (``CONTROL``) that becomes the scheduler's own control request
-  (``FlushCacheReqInput``, ``ProfileReq``);
+  ``TokenizedEmbeddingReqInput`` (``ADD``, told apart by the tag; the same
+  frame carries the scheduler's own ``EncoderDispatchErrorReq`` when a
+  language-only worker's encode dispatch failed after its request went out),
+  a plain list of request ids (``ABORT``), or a control call ``[call_id,
+  method, args]`` (``CONTROL``) that becomes the scheduler's own control
+  request (``FlushCacheReqInput``, ``ProfileReq``);
 * outputs leave as positional tagged structs: :class:`BatchTokenIDSlimOutput`
   (the token columns a frontend that detokenizes itself needs, plus a
   scheduler-load tail, so the output batch is the one in-band load channel),
@@ -491,12 +493,16 @@ _DEC_ADD: msgspec.msgpack.Decoder | None = None
 
 def _request_decoder() -> msgspec.msgpack.Decoder:
     """The scheduler's request structs (generation or embedding, told apart
-    by the tag), decoded with its own extension hooks plus one widening: SMG
-    sends token ids as a plain integer array where the tokenizer manager
-    would send an ``array('q')`` extension."""
+    by the tag) and its encode-dispatch failure notice
+    (``EncoderDispatchErrorReq``, which a language-only worker's frontend
+    sends after the request it names, for the scheduler's own receiver),
+    decoded with its own extension hooks plus one widening: SMG sends token
+    ids as a plain integer array where the tokenizer manager would send an
+    ``array('q')`` extension."""
     global _DEC_ADD
     if _DEC_ADD is None:
         from sglang.srt.managers.io_struct import (
+            EncoderDispatchErrorReq,
             TokenizedEmbeddingReqInput,
             TokenizedGenerateReqInput,
         )
@@ -508,7 +514,7 @@ def _request_decoder() -> msgspec.msgpack.Decoder:
             return dec_hook(tp, obj)
 
         _DEC_ADD = msgspec.msgpack.Decoder(
-            TokenizedGenerateReqInput | TokenizedEmbeddingReqInput,
+            TokenizedGenerateReqInput | TokenizedEmbeddingReqInput | EncoderDispatchErrorReq,
             dec_hook=request_dec_hook,
             ext_hook=ext_hook,
         )
@@ -583,10 +589,13 @@ def request_meta(frame: bytes) -> dict:
 
 def decode_request_frames(frames: list[bytes], traces: RequestTraces | None = None) -> list:
     """Decode one ``[type_byte, payload, *aux]`` message into io_structs. An
-    ADD yields exactly one request (generation or embedding), and starts its
-    trace in ``traces`` when a metadata frame carries the caller's context;
-    an ABORT may carry several request ids and yields one ``AbortReq`` each;
-    a CONTROL yields the scheduler's control request for the call."""
+    ADD yields exactly one request (generation or embedding) and starts its
+    trace in ``traces`` when a metadata frame carries the caller's context,
+    or one ``EncoderDispatchErrorReq`` (a language-only worker's encode
+    dispatch failed after the request it names went out: the scheduler's own
+    receiver consumes it and aborts that request); an ABORT may carry several
+    request ids and yields one ``AbortReq`` each; a CONTROL yields the
+    scheduler's control request for the call."""
     from sglang.srt.managers.io_struct import AbortReq
 
     if len(frames) < 2:
@@ -1095,12 +1104,14 @@ def _parallel_rank(state: Any, name: str) -> int | None:
 
 
 def request_layouts() -> dict[str, list[str]]:
-    """The field order of the structs an ``ADD`` decodes into, of the sampling
-    params nested in them and of the multimodal payload's two structs (the
-    processor output in the ``mm_inputs`` slot and its items), from the
-    running release's own classes (``__struct_fields__``: declaration order,
-    base classes first, the tag not counted), by class name."""
+    """The field order of the structs an ``ADD`` decodes into (the two
+    requests and the encode-dispatch failure notice), of the sampling params
+    nested in them and of the multimodal payload's two structs (the processor
+    output in the ``mm_inputs`` slot and its items), from the running
+    release's own classes (``__struct_fields__``: declaration order, base
+    classes first, the tag not counted), by class name."""
     from sglang.srt.managers.io_struct import (
+        EncoderDispatchErrorReq,
         TokenizedEmbeddingReqInput,
         TokenizedGenerateReqInput,
     )
@@ -1115,6 +1126,7 @@ def request_layouts() -> dict[str, list[str]]:
         for cls in (
             TokenizedGenerateReqInput,
             TokenizedEmbeddingReqInput,
+            EncoderDispatchErrorReq,
             SamplingParams,
             MultimodalProcessorOutput,
             MultimodalDataItem,

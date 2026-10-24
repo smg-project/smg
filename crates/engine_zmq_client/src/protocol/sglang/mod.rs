@@ -48,6 +48,7 @@ use crate::{
             output::{SglangOutput, SglangWireOutput},
             request::{
                 RequestMeta, SglangRequest, SglangRequestType, EMBEDDING_WIRE_FIELDS,
+                ENCODER_DISPATCH_ERROR_REQ_TAG, ENCODER_DISPATCH_ERROR_WIRE_FIELDS,
                 GENERATE_WIRE_FIELDS, TOKENIZED_EMBEDDING_REQ_INPUT_TAG,
                 TOKENIZED_GENERATE_REQ_INPUT_TAG,
             },
@@ -146,6 +147,13 @@ impl EngineProtocol for SglangProtocol {
         check_prefix(
             MULTIMODAL_DATA_ITEM_NAME,
             &DATA_ITEM_WIRE_FIELDS,
+            &ready.positional_layouts,
+        )?;
+        // The encode dispatch's failure notice, every slot of which is
+        // written ([`crate::Client::notify`] carries it under the ADD frame).
+        check_prefix(
+            ENCODER_DISPATCH_ERROR_REQ_TAG,
+            &ENCODER_DISPATCH_ERROR_WIRE_FIELDS,
             &ready.positional_layouts,
         )
     }

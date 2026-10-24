@@ -391,13 +391,18 @@ def test_server_facts_carry_the_kv_events_publisher(monkeypatch):
     assert rust.kv_events_publisher(_server_args(kv_events_config="not json")) == ("", "", "")
 
 
-def test_epd_workers_are_refused_up_front_and_prefill_decode_ones_are_not():
-    """The encode dispatch is not on the Rust path: an EPD role is a
-    configuration error before the server binds. A prefill/decode role with
-    one scheduler rank is served (the wire carries the bootstrap fields), so
-    it passes; with more than one rank (the pinned release's ``dp_size``, or
-    the newer releases' ``attn_dp_size`` beside ``dp_size=1``) it is refused,
-    since a request is not placed on its room's rank on the Rust path yet."""
+def test_epd_roles_this_process_cannot_serve_are_refused_up_front():
+    """An encoder-only launch is refused before the server binds (SGLang's
+    entrypoint runs that role on its own encoder server, never on a
+    servicer), and so is a language-only launch on the transfer backend
+    whose frontend receives the embeddings itself (``zmq_to_tokenizer``). A
+    language-only launch on a backend the scheduler ranks receive on passes
+    (the encode dispatch runs in this process), as do the prefill/decode
+    roles with one scheduler rank (the wire carries the bootstrap fields)
+    and a plain worker; a prefill/decode leg with more than one rank (the
+    pinned release's ``dp_size``, or the newer releases' ``attn_dp_size``
+    beside ``dp_size=1``) is refused, since a request is not placed on its
+    room's rank on the Rust path yet."""
     rust.refuse_epd_disaggregation(_server_args())
     rust.refuse_epd_disaggregation(_server_args(disaggregation_mode="null"))
     rust.refuse_epd_disaggregation(_server_args(dp_size=2))
@@ -413,11 +418,18 @@ def test_epd_workers_are_refused_up_front_and_prefill_decode_ones_are_not():
             rust.refuse_epd_disaggregation(
                 _server_args(disaggregation_mode=mode, dp_size=1, attn_dp_size=2)
             )
-    for role in ({"language_only": True}, {"encoder_only": True}):
-        with pytest.raises(rust_lifecycle.ServicerConfigError, match="EPD disaggregation"):
-            rust.refuse_epd_disaggregation(_server_args(**role))
-    with pytest.raises(rust_lifecycle.ServicerConfigError, match="EPD disaggregation"):
-        asyncio.run(rust.serve_rust(_server_args(language_only=True)))
+    for backend in ("zmq_to_scheduler", "mooncake"):
+        rust.refuse_epd_disaggregation(
+            _server_args(language_only=True, encoder_transfer_backend=backend)
+        )
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="encoder-only worker"):
+        rust.refuse_epd_disaggregation(_server_args(encoder_only=True))
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="zmq_to_tokenizer"):
+        rust.refuse_epd_disaggregation(
+            _server_args(language_only=True, encoder_transfer_backend="zmq_to_tokenizer")
+        )
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="encoder-only worker"):
+        asyncio.run(rust.serve_rust(_server_args(encoder_only=True)))
 
 
 def test_the_prefill_side_starts_its_bootstrap_server_before_the_ranks(
@@ -453,6 +465,42 @@ def test_the_prefill_side_starts_its_bootstrap_server_before_the_ranks(
             _preparable_args(recorded, disaggregation_mode=mode), handshake_port=24321
         )
         assert "bootstrap" not in recorded["calls"] and engine._manager.holding == []
+
+
+def test_the_language_side_starts_its_encode_dispatch_before_the_ranks(
+    monkeypatch, restore_fault_signals
+):
+    """A language-only worker's encode dispatch (the encoder bootstrap server
+    and SGLang's own receiver behind the bridge) starts in this process after
+    the runtime context is published, where the engine's entrypoint starts
+    it, and before the ranks; the ranks' handle holds it for their lifetime
+    and shuts it down with them. Off the main thread it starts before the
+    spawned headless launcher takes over."""
+    recorded = _stub_rank_launch(monkeypatch)
+    bridge = SimpleNamespace(
+        name="encode",
+        start=lambda: recorded["calls"].append("encode"),
+        shutdown=lambda: recorded["calls"].append("encode-shutdown"),
+    )
+    args = _preparable_args(recorded, language_only=True)
+    engine = rust.launch_scheduler_ranks(args, handshake_port=24321, encode_bridge=bridge)
+    assert recorded["calls"][-4:] == ["publish:tokenizer", "encode", "port_args", "launch"]
+    assert engine._manager.holding == [bridge]
+    engine._manager.shutdown(timeout=0)
+    assert "encode-shutdown" in recorded["calls"]
+
+    recorded["calls"].clear()
+    monkeypatch.setattr(
+        rust,
+        "launch_headless_scheduler",
+        lambda server_args, *, handshake_port: recorded["calls"].append("headless"),
+    )
+    thread = threading.Thread(
+        target=lambda: rust.launch_scheduler_ranks(args, handshake_port=1, encode_bridge=bridge)
+    )
+    thread.start()
+    thread.join(5)
+    assert recorded["calls"] == ["encode", "headless"]
 
 
 def test_server_facts_refuse_non_finite_floats():
@@ -1113,9 +1161,41 @@ def test_serve_rust_refuses_a_socket_dir_that_is_a_file_before_the_server_binds(
     assert created == {}
 
 
-def test_an_epd_worker_is_refused_as_a_configuration_error():
-    with pytest.raises(rust_lifecycle.ServicerConfigError, match="EPD disaggregation"):
+def test_an_encoder_only_worker_is_refused_as_a_configuration_error():
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="encoder-only worker"):
         rust.refuse_epd_disaggregation(_server_args(encoder_only=True))
+
+
+def test_a_language_only_launch_gets_the_encode_dispatch_as_a_server_extra(monkeypatch, caplog):
+    """The launcher hands the Rust server the encode bridge (SGLang's own
+    receiver behind it) for a language-only worker whose scheduler ranks
+    receive the embeddings, and nothing for any other worker; the same
+    bridge is started with the ranks (``launch``)."""
+    launcher = rust.SglangLauncher()
+    assert launcher.server_extras(_server_args(), "/tok") == {}
+    assert launcher.encode is None
+    args = _server_args(
+        language_only=True,
+        encoder_transfer_backend="zmq_to_scheduler",
+        encoder_urls=["grpc://10.0.0.8:30001"],
+        encoder_bootstrap_port=8997,
+    )
+    with caplog.at_level("INFO"):
+        extras = launcher.server_extras(args, "/tok")
+    assert list(extras) == ["encode_dispatcher"]
+    assert extras["encode_dispatcher"] is launcher.encode
+    assert launcher.encode.encoder_urls == ["grpc://10.0.0.8:30001"]
+    assert "1 encoder URL(s) configured, bootstrap port 8997" in caplog.text
+    launched = {}
+    monkeypatch.setattr(
+        rust,
+        "launch_scheduler_ranks",
+        lambda a, *, handshake_port, encode_bridge=None: launched.update(
+            args=a, port=handshake_port, bridge=encode_bridge
+        ),
+    )
+    launcher.launch(args, 24321, {})
+    assert launched == {"args": args, "port": 24321, "bridge": launcher.encode}
 
 
 def test_serve_rust_serves_a_prefill_decode_launch(monkeypatch, tmp_path):

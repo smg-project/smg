@@ -10,6 +10,16 @@
 //! over the wire, the launcher starts the prefill side's bootstrap server
 //! before the ranks, and `GetServerInfo` carries the server args the Router
 //! pairs on.
+//!
+//! The language side of encode/prefill disaggregation (`--language-only`)
+//! works as behind the engine's own frontend: a request's image references
+//! go to the encoders through the dispatcher the launcher supplies (SGLang's
+//! own receiver, in the launcher process) before the request reaches the
+//! scheduler, the scheduler's request carries what that dispatch set (its
+//! wait flag, the per-encoder assignment, the encoder list) and the prompt
+//! text the scheduler rebuilds from, and a dispatch that fails afterwards
+//! reaches the scheduler as its own failure notice on the request's rank
+//! ([`engine_zmq_adapter::sglang_encode`]).
 
 mod admin;
 mod embed;
@@ -23,8 +33,8 @@ mod tests;
 use std::{sync::Arc, time::Duration};
 
 use engine_zmq_adapter::{
-    ConstraintKinds, StructuredOutputBackend, StructuredOutputsBackendConfig,
-    StructuredOutputsSupport,
+    ConstraintKinds, SglangEncodeDispatcher, StructuredOutputBackend,
+    StructuredOutputsBackendConfig, StructuredOutputsSupport,
 };
 use smg_grpc_client::sglang_proto::sglang_scheduler_server::SglangSchedulerServer;
 use tonic::service::Routes;
@@ -198,7 +208,7 @@ pub(super) fn hidden_states_cap(model: &SglangModelInfo) -> Option<HiddenStatesC
 }
 
 /// How to bind, where the engines dial in, and what to advertise.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SglangServicerConfig {
     /// The listener, the scheduler's endpoints, the tokenizer directory and
     /// the start-up bounds. `handshake_address` is what the headless
@@ -208,6 +218,22 @@ pub struct SglangServicerConfig {
     /// strings.
     pub servicer: ServicerConfig,
     pub model: SglangModelInfo,
+    /// The encode dispatch of a language-side worker under encode/prefill
+    /// disaggregation (`--language-only`): a request's image references go
+    /// to the encoders through it before the request reaches the scheduler,
+    /// as the engine's own frontend sends them ([`SglangEncodeDispatcher`]).
+    /// `None` on every other worker: a request of references is refused.
+    pub encode_dispatcher: Option<Arc<dyn SglangEncodeDispatcher>>,
+}
+
+impl std::fmt::Debug for SglangServicerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SglangServicerConfig")
+            .field("servicer", &self.servicer)
+            .field("model", &self.model)
+            .field("encode_dispatcher", &self.encode_dispatcher.is_some())
+            .finish()
+    }
 }
 
 /// The servicer's `GetLoads` figures, read for the load record the relay
@@ -232,6 +258,8 @@ pub(super) struct State {
     /// What every servicer's state shares: the engine link, the admitted
     /// requests, the KV-event relay, the metrics and the serving switch.
     pub(super) shared: Shared,
+    /// The language-side encode dispatch, when this worker runs one.
+    pub(super) encode: Option<Arc<dyn SglangEncodeDispatcher>>,
 }
 
 impl WireState for State {
@@ -289,6 +317,7 @@ impl SglangServicerServer {
         let state = Arc::new(State {
             model: config.model,
             shared: Shared::new(kv_relay, metrics, config.servicer.tokenizer_dir.clone()),
+            encode: config.encode_dispatcher,
         });
         let routes = Routes::new(
             SglangSchedulerServer::new(service::SglangService {

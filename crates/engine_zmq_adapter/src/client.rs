@@ -34,9 +34,10 @@ use crate::{
     eos::EosTokenIds,
     sglang::{
         aggregate_control, constraint_ref as sglang_constraint_ref, control_outcome,
-        fan_out_sglang_requests, translate_embed_request_sglang, translate_request_sglang,
-        SglangGenerateStream, SglangProfileStart,
+        encode_media_refs, fan_out_sglang_requests, translate_embed_request_sglang,
+        translate_request_sglang, SglangGenerateStream, SglangProfileStart,
     },
+    sglang_encode::{EncodeDispatchRequest, EncodeNotice, SglangEncodeDispatcher},
     sockets::{ensure_ipc_socket_dir, zmq_socket_addresses, Handshake},
     stream::{RequestDeadline, ZmqGenerateStream},
     structured_outputs::{
@@ -895,6 +896,27 @@ impl ZmqEngineClient {
         req: sglang_proto::GenerateRequest,
         trace_headers: Option<BTreeMap<String, String>>,
     ) -> Result<Vec<SglangGenerateStream>, tonic::Status> {
+        self.generate_sglang_streams_dispatching(req, trace_headers, None)
+            .await
+    }
+
+    /// [`generate_sglang_streams_with_trace`](Self::generate_sglang_streams_with_trace)
+    /// on a language-side worker of an encode/prefill-disaggregated
+    /// deployment: a choice naming image references (and carrying no
+    /// preprocessed tensors) is handed to `dispatcher` before its submit, as
+    /// the engine's own frontend hands the media to the encoders, and the
+    /// scheduler's request carries what the dispatch set
+    /// ([`crate::sglang_encode`]). Without a dispatcher such a request is
+    /// refused: this worker runs no encode dispatch. A dispatch that finds no
+    /// encoder registered leaves the request without embeddings, which this
+    /// worker cannot make itself: refused as well, rather than answered as
+    /// text.
+    pub async fn generate_sglang_streams_dispatching(
+        &self,
+        req: sglang_proto::GenerateRequest,
+        trace_headers: Option<BTreeMap<String, String>>,
+        dispatcher: Option<&Arc<dyn SglangEncodeDispatcher>>,
+    ) -> Result<Vec<SglangGenerateStream>, tonic::Status> {
         let ZmqBackend::Sglang(client) = &self.backend else {
             return Err(tonic::Status::internal(
                 "this ZMQ backend is not an SGLang scheduler",
@@ -912,13 +934,71 @@ impl ZmqEngineClient {
         let max_model_len = self.prompt_bound()?;
         let mut streams = Vec::new();
         for (index, sub) in fan_out_sglang_requests(req).into_iter().enumerate() {
+            let image_refs = sub
+                .mm_inputs
+                .as_ref()
+                .map(encode_media_refs)
+                .transpose()
+                .map_err(tonic::Status::invalid_argument)?
+                .flatten();
             let mut request = translate_request_sglang(sub, max_model_len)
                 .map_err(tonic::Status::invalid_argument)?;
             request.trace_headers.clone_from(&trace_headers);
-            let stream = client
-                .submit(SglangRequest::Generate(request))
-                .await
-                .map_err(zmq_status)?;
+            let dispatched = match (image_refs, dispatcher) {
+                (None, _) => None,
+                (Some(_), None) => {
+                    return Err(tonic::Status::failed_precondition(
+                        "multimodal payload carries media references but no preprocessed \
+                         tensors, and this worker runs no encode dispatch (not a language-only \
+                         worker of an encode/prefill-disaggregated deployment)",
+                    ));
+                }
+                (Some(image_urls), Some(dispatcher)) => {
+                    let notice = EncodeNotice::new(Arc::clone(client));
+                    let outcome = dispatcher
+                        .dispatch(EncodeDispatchRequest {
+                            rid: request.rid.clone(),
+                            image_urls,
+                            on_error: notice.sink(),
+                        })
+                        .await
+                        .map_err(|error| {
+                            tonic::Status::internal(format!("encode dispatch failed: {error}"))
+                        })?;
+                    if !outcome.need_wait_for_mm_inputs {
+                        // The engine's frontend would process the media
+                        // locally; a language-side worker has no encoder of
+                        // its own and this servicer never pretends to.
+                        if let Some(sent) = outcome.sent {
+                            sent().await;
+                        }
+                        return Err(tonic::Status::failed_precondition(
+                            "no encoder is registered with this language-only worker: the \
+                             request's media cannot be encoded",
+                        ));
+                    }
+                    request.need_wait_for_mm_inputs = Some(true);
+                    request.num_items_assigned = outcome.num_items_assigned;
+                    request.encoder_urls = outcome.encoder_urls;
+                    Some((notice, outcome.sent))
+                }
+            };
+            let submitted = client.submit(SglangRequest::Generate(request)).await;
+            if let Some((notice, sent)) = dispatched {
+                // The rank first, then the dispatcher's release: a failure it
+                // reports from here on finds the rank that holds the request.
+                // A submit that failed releases the dispatcher the same way;
+                // its failures are dropped (nothing holds the request).
+                if let Ok(stream) = submitted.as_ref() {
+                    if let Some(rank) = stream.engine_index() {
+                        notice.sent_to(rank);
+                    }
+                }
+                if let Some(sent) = sent {
+                    sent().await;
+                }
+            }
+            let stream = submitted.map_err(zmq_status)?;
             streams.push(SglangGenerateStream::new(stream, index as u32));
         }
         Ok(streams)
