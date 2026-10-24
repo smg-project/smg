@@ -149,6 +149,22 @@ def closure(members: dict[str, dict], names: list[str]) -> set[str]:
 
 
 class ShardTableTests(unittest.TestCase):
+    def test_rust_ci_covers_semver_inputs_and_excludes_unrelated_changes(self):
+        patterns = path_filters()["rust-ci"]
+        for path in (
+            "crates/tokenizer/src/lib.rs",
+            "Cargo.toml",
+            "Cargo.lock",
+            "rust-toolchain.toml",
+            ".github/actions/check-crate-semver/action.yml",
+            ".github/actions/publish-crate/action.yml",
+            ".github/workflows/release-crates.yml",
+            "scripts/install_opencv.sh",
+        ):
+            self.assertTrue(filter_matches(patterns, path), path)
+        for path in ("docs/README.md", "clients/python/smg_client/client.py"):
+            self.assertFalse(filter_matches(patterns, path), path)
+
     def test_every_package_is_tested_by_exactly_one_shard(self):
         members = workspace()
         owners: dict[str, set[str]] = {}

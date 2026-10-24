@@ -2,11 +2,12 @@
 """Pre-release version check for the workspace crates and the Python packages.
 
 For every component (a workspace crate or a Python package), since the given tag:
-whether its files changed, whether its version was bumped, and, for a crate, whether
-the workspace root's dependency entry agrees. Then the files that must mirror the
-gateway's version. Issues are listed with the bump conventional commits ask for
+whether its files changed, whether its version was bumped sufficiently, and, for
+a crate, whether the workspace root's dependency entry agrees. Then the files that
+must mirror the gateway's version. Issues are listed with the bump conventional commits ask for
 (``feat!:`` or ``BREAKING CHANGE``: major; ``feat:``: minor; otherwise patch) and,
-on request, applied.
+on request, applied. Minimum bumps for Rust crates before 1.0 follow Cargo's
+first-nonzero-component compatibility rule.
 
 Usage:
     check_release_versions.py [tag] [--check | --fix]
@@ -16,7 +17,7 @@ Usage:
     --fix     apply the proposed fixes without prompting
 
 Environment:
-    VERSION_OVERRIDE  X.Y.Z: the gateway's new version instead of the detected bump
+    VERSION_OVERRIDE  X.Y.Z: gateway target, at least the detected minimum version
 
 Exit code 0 = all versions consistent (or fixed), 1 = issues found and not fixed.
 """
@@ -212,14 +213,19 @@ def bump_level(commits: Iterable[tuple[str, str]]) -> str:
 
 
 def bumped(version: str, level: str) -> str:
-    if not SEMVER.match(version):
-        raise Fatal(f"bump only supports X.Y.Z versions, got: {version}")
-    major, minor, patch = (int(part) for part in version.split("."))
+    major, minor, patch = version_tuple(version)
     return {
         "major": f"{major + 1}.0.0",
         "minor": f"{major}.{minor + 1}.0",
         "patch": f"{major}.{minor}.{patch + 1}",
     }[level]
+
+
+def version_tuple(version: str) -> tuple[int, int, int]:
+    if not SEMVER.match(version):
+        raise Fatal(f"bump only supports X.Y.Z versions, got: {version}")
+    major, minor, patch = (int(part) for part in version.split("."))
+    return major, minor, patch
 
 
 # --- the repository -----------------------------------------------------------
@@ -311,12 +317,28 @@ class Verdict:
     files_changed: int  # 0 = nothing to check
     version: str = ""
     tag_version: str | None = None  # None = not at the tag: a new component
-    level: str | None = None  # the bump asked for when the version was not bumped
+    level: str | None = None  # minimum bump required by commits since the tag
     workspace_version: str | None = None  # the root's entry when it disagrees
 
     @property
     def unbumped(self) -> bool:
         return self.tag_version is not None and self.tag_version == self.version
+
+    @property
+    def minimum_version(self) -> str:
+        """The minimum bump, using Cargo's first-nonzero-component rule for 0.x crates."""
+        baseline = self.tag_version or self.version
+        major, minor, _ = version_tuple(baseline)
+        level = self.level or "patch"
+        if self.component.kind == "crate" and major == 0:
+            level = "minor" if level == "major" and minor > 0 else "patch"
+        return bumped(baseline, level)
+
+    @property
+    def needs_bump(self) -> bool:
+        return self.tag_version is not None and version_tuple(self.version) < version_tuple(
+            self.minimum_version
+        )
 
 
 def version_file_has_other_changes(repo: Repo, tag: str, file: str) -> bool:
@@ -359,11 +381,11 @@ def check(repo: Repo, tag: str, component: Component, root_toml: str) -> Verdict
         if text is not None:
             verdict.tag_version = read_version(kind, text, f"{path} at {tag}")
             break
-    if verdict.unbumped:
+    if verdict.tag_version is not None:
         verdict.level = bump_level(
             repo.commits_since(tag, [f"{p}/" for p in with_legacy(component.path)])
         )
-    elif component.dep_key:
+    if not verdict.needs_bump and component.dep_key:
         pinned = workspace_dep_version(root_toml, component.dep_key)
         if pinned != verdict.version:
             verdict.workspace_version = pinned or ""
@@ -411,7 +433,7 @@ class Plan:
     @property
     def issues(self) -> int:
         return (
-            sum(1 for v in self.verdicts if v.unbumped)
+            sum(1 for v in self.verdicts if v.needs_bump)
             + sum(1 for v in self.verdicts if v.workspace_version is not None)
             + len(self.mirrors)
         )
@@ -419,7 +441,10 @@ class Plan:
     def new_version(self, verdict: Verdict) -> str:
         if self.override and verdict.component.name == GATEWAY:
             return self.override
-        return bumped(verdict.version, verdict.level or "patch")
+        # A breaking change to a 0.x crate does not imply readiness for 1.0.
+        if verdict.component.kind == "crate" and verdict.level == "major":
+            return verdict.minimum_version
+        return bumped(verdict.tag_version or verdict.version, verdict.level or "patch")
 
 
 def report(verdict: Verdict, out: Out) -> None:
@@ -431,6 +456,12 @@ def report(verdict: Verdict, out: Out) -> None:
     elif verdict.unbumped:
         out.line(
             f"  {warn} {name} {where} — {n} but version not bumped (v{verdict.version}) [{out.level(verdict.level)}]"
+        )
+    elif verdict.needs_bump:
+        required = verdict.minimum_version
+        out.line(
+            f"  {bad} {name} {where} — v{verdict.tag_version} → v{verdict.version}"
+            f" is below required v{required} [{out.level(verdict.level)}]"
         )
     else:
         out.line(f"  {ok} {name} {where} — v{verdict.tag_version} → v{verdict.version} ({n})")
@@ -464,7 +495,10 @@ def examine(
         "cargo", repo.read(gateway_component.version_file), gateway_component.version_file
     )
     plan = Plan(verdicts, [], target, override)
-    if gateway is not None and gateway.unbumped:
+    if gateway is not None and gateway.needs_bump:
+        required = gateway.minimum_version
+        if override and version_tuple(override) < version_tuple(required):
+            raise Fatal(f"VERSION_OVERRIDE {override} is below required gateway version {required}")
         plan.gateway_target = plan.new_version(gateway)
     for mirror in mirrors:
         carried = read_version(mirror.kind, repo.read(mirror.file), mirror.file)
@@ -499,7 +533,7 @@ def propose(plan: Plan, out: Out) -> None:
     sync = out.paint("blue", "sync")
     for v in plan.verdicts:
         c = v.component
-        if v.unbumped and c.kind == "crate":
+        if v.needs_bump and c.kind == "crate":
             out.line(
                 f"  {out.level(v.level)} {c.name} v{v.version} → v{plan.new_version(v)} ({c.version_file})"
             )
@@ -512,7 +546,7 @@ def propose(plan: Plan, out: Out) -> None:
             )
     for v in plan.verdicts:
         c = v.component
-        if v.unbumped and c.kind == "package":
+        if v.needs_bump and c.kind == "package":
             out.line(
                 f"  {out.level(v.level)} {c.name} v{v.version} → v{plan.new_version(v)} ({c.version_file})"
             )
@@ -548,7 +582,7 @@ def apply(plan: Plan, repo: Repo, out: Out) -> int:
 
     for v in plan.verdicts:
         c = v.component
-        if v.unbumped:
+        if v.needs_bump:
             kind = "cargo" if c.kind == "crate" else version_kind(c.version_file)
             new = plan.new_version(v)
             failed += not rewrite(c.version_file, kind, v.version, new)
@@ -602,7 +636,7 @@ def run(
         out.line(
             out.paint("bold", "Version override: ")
             + out.paint("cyan", override)
-            + " (ignoring conventional commit detection)"
+            + " (must satisfy the required gateway bump)"
         )
     out.line()
     plan = examine(repo, tag, override, out, crates, packages, mirrors)

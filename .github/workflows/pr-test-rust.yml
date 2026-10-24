@@ -28,6 +28,33 @@ env:
   GENAI_BENCH_IMAGE: ghcr.io/moirai-internal/genai-bench:0.0.4
 
 jobs:
+  rust-semver:
+    needs: [detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.detect-changes.result == 'success'
+      && (
+        github.event_name != 'pull_request'
+        || needs.detect-changes.outputs.rust-ci == 'true'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # This job uses the semver action's cache, without the workspace sccache setup.
+      RUSTC_WRAPPER: ''
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [llm-tokenizer, tool-parser, reasoning-parser, llm-multimodal, openai-protocol]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/check-crate-semver
+        with:
+          crate: ${{ matrix.crate }}
+          # Compatible additions may merge before the next release version is chosen.
+          release-type: minor
+
   pre-commit:
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -725,6 +752,7 @@ jobs:
             rust-ci:
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'rust-toolchain.toml'
               - 'rustfmt.toml'
               - 'clippy.toml'
               - 'crates/**'
@@ -739,9 +767,13 @@ jobs:
               - 'clients/openapi-gen/**'
               - '.cargo/**'
               - '.github/actions/setup-rust/**'
+              - '.github/actions/check-crate-semver/**'
+              - '.github/actions/publish-crate/**'
               - 'scripts/ci_install_rust.sh'
               - 'scripts/ci_apt_mirror.sh'
+              - 'scripts/install_opencv.sh'
               - '.github/workflows/pr-test-rust.yml'
+              - '.github/workflows/release-crates.yml'
               - 'scripts/ci_rust_tests.sh'
               - 'examples/wasm/wasm-guest-storage-hook/**'
               - 'examples/wasm/wasm-guest-storage-hook-passthrough/**'
@@ -968,6 +1000,7 @@ jobs:
               (".github/actions/setup-gh/**",                    NONE),
               (".github/actions/export-pod-api-key/**",          NONE),
               (".github/actions/publish-crate/**",               NONE),
+              (".github/actions/check-crate-semver/**",          NONE),
               (".github/actions/**",                             FULL),
               (".github/versions/tokenspeed.ref",                TOKENSPEED),
               (".github/versions/tokenspeed-nightly.txt",        TOKENSPEED),
@@ -2104,7 +2137,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-symphony, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, rust-semver, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-symphony, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -2172,6 +2205,7 @@ jobs:
                 "${{ needs.python-unit-tests.result }}" =~ $bad || \
                 "${{ needs.rust-lint.result }}" =~ $bad || \
                 "${{ needs.rust-tests.result }}" =~ $bad || \
+                "${{ needs.rust-semver.result }}" =~ $bad || \
                 "${{ needs.cargo-audit.result }}" =~ $bad || \
                 "${{ needs.rust-aarch64.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat.result }}" =~ $bad || \

@@ -359,6 +359,97 @@ def test_the_override_applies_to_the_gateway_only(mod, repo):
     assert "  ! chart (chart/Chart.yaml) — v1.0.0, expected v3.5.0" in out
 
 
+@pytest.mark.parametrize(
+    ("subject", "version", "required", "needs_bump"),
+    [
+        ("feat(beta)!: remove an API", "1.0.1", "2.0.0", True),
+        ("feat(beta)!: remove an API", "1.9.7", "2.0.0", True),
+        ("feat(beta)!: remove an API", "2.0.0", "2.0.0", False),
+        ("feat(beta): add an API", "1.0.1", "1.1.0", True),
+        ("feat(beta): add an API", "1.10.0", "1.1.0", False),
+        ("fix(beta): correct output", "0.9.9", "1.0.1", True),
+        ("fix(beta): correct output", "1.0.1", "1.0.1", False),
+    ],
+)
+def test_an_existing_bump_must_satisfy_the_commits(
+    mod, repo, subject, version, required, needs_bump
+):
+    put(repo, "crates/beta/Cargo.toml", manifest("beta", version))
+    put(repo, "crates/beta/src/lib.rs", "// a changed public API\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", subject)
+    component = mod.crate("beta", "crates/beta", "beta")
+    verdict = mod.check(mod.Repo(repo), "v1.0.0", component, root_manifest({"beta": version}))
+    assert verdict.needs_bump is needs_bump
+    assert mod.bumped(verdict.tag_version, verdict.level) == required
+
+
+def test_fixing_an_insufficient_bump_uses_the_tag_as_its_base(mod, repo):
+    put(repo, "crates/alpha/Cargo.toml", manifest("alpha", "1.0.1"))
+    code, out = run(mod, repo)
+    assert code == 1
+    assert "v1.0.0 → v1.0.1 is below required v1.1.0 [minor]" in out
+    code, out = run(mod, repo, mode="fix")
+    assert code == 0, out
+    assert mod.read_version("cargo", (repo / "crates/alpha/Cargo.toml").read_text(), "") == "1.1.0"
+    assert mod.workspace_dep_version((repo / "Cargo.toml").read_text(), "alpha") == "1.1.0"
+    assert run(mod, repo)[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("baseline", "version", "level", "required", "needs_bump"),
+    [
+        ("0.2.0", "0.2.1", "major", "0.3.0", True),
+        ("0.2.0", "0.3.0", "major", "0.3.0", False),
+        ("0.2.0", "0.2.1", "minor", "0.2.1", False),
+        ("0.2.0", "0.1.9", "patch", "0.2.1", True),
+        ("0.0.2", "0.0.2", "major", "0.0.3", True),
+        ("0.0.2", "0.0.3", "major", "0.0.3", False),
+        ("0.0.2", "0.0.3", "minor", "0.0.3", False),
+    ],
+)
+def test_zero_major_crates_follow_cargo_compatibility(
+    mod, baseline, version, level, required, needs_bump
+):
+    verdict = mod.Verdict(mod.crate("beta", "crates/beta"), 1, version, baseline, level)
+    assert verdict.minimum_version == required
+    assert verdict.needs_bump is needs_bump
+
+
+def test_fixing_a_breaking_zero_major_crate_does_not_force_stabilization(mod, repo):
+    put(repo, "crates/beta/Cargo.toml", manifest("beta", "0.2.0"))
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "chore: pre-stable baseline")
+    git(repo, "tag", "v-zero-baseline")
+    put(repo, "crates/beta/Cargo.toml", manifest("beta", "0.2.1"))
+    put(repo, "crates/beta/src/lib.rs", "// removed public API\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "feat(beta)!: remove an API")
+    code, out = run(mod, repo, tag="v-zero-baseline")
+    assert code == 1
+    assert "v0.2.0 → v0.2.1 is below required v0.3.0" in out
+    code, out = run(mod, repo, tag="v-zero-baseline", mode="fix")
+    assert code == 0, out
+    assert mod.read_version("cargo", (repo / "crates/beta/Cargo.toml").read_text(), "") == "0.3.0"
+    assert mod.workspace_dep_version((repo / "Cargo.toml").read_text(), "beta") == "0.3.0"
+    assert run(mod, repo, tag="v-zero-baseline")[0] == 0
+
+
+@pytest.mark.parametrize(("level", "required"), [("major", "1.0.0"), ("minor", "0.3.0")])
+def test_zero_major_python_packages_keep_conventional_bumps(mod, level, required):
+    component = mod.package("pkg", "pkg", "pkg/pyproject.toml")
+    verdict = mod.Verdict(component, 1, "0.2.1", "0.2.0", level)
+    assert verdict.minimum_version == required
+    assert verdict.needs_bump
+
+
+def test_override_cannot_downgrade_the_required_gateway_bump(mod, repo):
+    before = (repo / "model_gateway/Cargo.toml").read_text()
+    with pytest.raises(mod.Fatal, match="below required gateway version 2.0.0"):
+        run(mod, repo, mode="fix", override="1.0.1")
+    assert (repo / "model_gateway/Cargo.toml").read_text() == before
+
+
 def test_a_bad_tag_or_override_is_refused(mod, repo):
     with pytest.raises(mod.Fatal, match="does not exist"):
         run(mod, repo, tag="v9.9.9")

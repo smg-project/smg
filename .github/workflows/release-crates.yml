@@ -10,6 +10,7 @@ on:
       - '**/Cargo.toml'
       - '.github/workflows/release-crates.yml'
       - '.github/actions/publish-crate/**'
+      - '.github/actions/check-crate-semver/**'
   workflow_dispatch:
 
 env:
