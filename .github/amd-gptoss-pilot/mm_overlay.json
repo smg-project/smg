@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "model_id": "Qwen/Qwen3-VL-8B-Instruct",
+  "base_overlay_sha256": "17f0bd17d954b0fca2c36934db405bb4bab5523723effd24d49693d11495191c",
+  "files": [
+    {
+      "path": "srt/managers/_smg_qwen_mm_trace.py",
+      "module": "sglang.srt.managers._smg_qwen_mm_trace",
+      "old_sha256": null,
+      "new_sha256": "ca54589afd311737b3ed7b14a31573b0275b9129e92299af6751014259bfc661",
+      "edits": [],
+      "new_content": null,
+      "source": "mm_trace.py"
+    },
+    {
+      "path": "srt/model_executor/forward_batch_info.py",
+      "module": "sglang.srt.model_executor.forward_batch_info",
+      "old_sha256": "ef4426b3ece1b515eeb5223d394de6a8d154d912bcf62e7ed4bae20e17064797",
+      "new_sha256": "6c62ecc82893f56c15d1272f5f2397cc53d078124622374700743c86eefbc19d",
+      "edits": [
+        {
+          "old": "import torch\n",
+          "new": "import torch\n\nfrom sglang.srt.managers._smg_qwen_mm_trace import positions as _smg_mm_positions\n"
+        },
+        {
+          "old": "        self.mrope_positions = torch.cat(\n            mrope_positions_list,\n            dim=1,\n        ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)\n",
+          "new": "        _smg_mm_positions(\n            batch.reqs, mm_inputs, mrope_positions_list, prefix_lens, extend_lens,\n            getattr(getattr(model_runner, \"model_config\", None), \"model_path\", None),\n            __name__, __file__,\n        )\n        self.mrope_positions = torch.cat(\n            mrope_positions_list,\n            dim=1,\n        ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)\n"
+        }
+      ],
+      "new_content": null,
+      "defer_origin_to_qwen_trace": true
+    },
+    {
+      "path": "srt/managers/mm_schedule.py",
+      "module": "sglang.srt.managers.mm_schedule",
+      "old_sha256": "c2f1e4fddb76086604398418af5862fc1c6648c8b162163614c2aff480631440",
+      "new_sha256": "d4823fe541b7d957ada05c8c7bfaaa8cc9b91fb3d24c1be1eb263342ad2d6464",
+      "edits": [
+        {
+          "old": "import torch\n",
+          "new": "import torch\n\nfrom sglang.srt.managers._smg_qwen_mm_trace import selection as _smg_mm_selection\n"
+        },
+        {
+          "old": "    if embedding_per_req is None:\n        _move_items_to_device(embedding_items_per_req, device, data_embedding_func)\n",
+          "new": "    _smg_mm_selection(\n        embedding_items_per_req, embedding_items_hash, embedding_per_req,\n        sum(end - start + 1 for start, end in items_offset),\n        \"full_post_length_guard\", __name__, __file__,\n    )\n    if embedding_per_req is None:\n        _move_items_to_device(embedding_items_per_req, device, data_embedding_func)\n"
+        },
+        {
+          "old": "        cached = embedding_cache.get_single(item.hash)\n        if cached is not None:\n",
+          "new": "        cached = embedding_cache.get_single(item.hash)\n        _smg_mm_selection([item], item.hash, cached, expected_token_count,\n                          \"HIP_per_item_lookup_before_length_guard\", __name__, __file__)\n        if cached is not None:\n"
+        }
+      ],
+      "new_content": null,
+      "defer_origin_to_qwen_trace": true
+    }
+  ],
+  "execution_status": "SOURCE_ONLY_NOT_ACTIVATED_OR_EXECUTED",
+  "actual_origins": "New helper is checked at apply/final; two exact engine origins deferred until same-RID actual observation. Original five GPT origin gates unchanged."
+}

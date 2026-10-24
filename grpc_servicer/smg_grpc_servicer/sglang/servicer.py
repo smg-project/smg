@@ -972,6 +972,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         mm_inputs = None
         if grpc_req.HasField("mm_inputs") and grpc_req.mm_inputs.HasField("pixel_values"):
             mm_inputs = self._parse_mm_inputs(grpc_req.mm_inputs)
+            if os.environ.get("SMG_QWEN_MM_TRACE") == "1":
+                from sglang.srt.managers._smg_qwen_mm_trace import wire
+
+                wire(grpc_req.request_id, mm_inputs, self.server_args.model_path, __name__, __file__)
 
         # Create request
         require_reasoning = bool(grpc_req.require_reasoning)

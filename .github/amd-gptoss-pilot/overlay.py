@@ -37,7 +37,11 @@ def apply(root, manifest):
         path = target(root, entry["path"])
         if entry["old_sha256"] is None:
             require(not path.exists(), f"new helper already exists: {entry['path']}")
-            data, mode = entry["new_content"].encode(), 0o644
+            if entry.get("source"):
+                require(entry["source"] == "mm_trace.py", "unexpected observation helper")
+                data, mode = (HERE / entry["source"]).read_bytes(), 0o644
+            else:
+                data, mode = entry["new_content"].encode(), 0o644
         else:
             require(path.is_file(), f"missing original: {entry['path']}")
             data, mode = path.read_bytes(), stat.S_IMODE(path.stat().st_mode)
@@ -101,11 +105,17 @@ def origins(root, manifest):
     records = []
     for entry in manifest["files"]:
         if entry.get("defer_origin_to_qwen_trace"):
+            extra = {
+                "srt/managers/mm_schedule.py": "sglang.srt.managers.mm_schedule",
+                "srt/model_executor/forward_batch_info.py": "sglang.srt.model_executor.forward_batch_info",
+            }
             require(
-                entry["path"] == "srt/managers/scheduler.py"
-                and entry["module"] == "sglang.srt.managers.scheduler"
+                ((entry["path"] == "srt/managers/scheduler.py"
+                  and entry["module"] == "sglang.srt.managers.scheduler")
+                 or (os.environ.get("SMG_QWEN_MM_TRACE") == "1"
+                     and extra.get(entry["path"]) == entry["module"]))
                 and entry["defer_origin_to_qwen_trace"] is True,
-                "only the exact diagnostic scheduler origin may be deferred",
+                "only exact opted-in diagnostic origins may be deferred",
             )
             records.append(
                 dict(
@@ -130,6 +140,15 @@ def main():
     parser.add_argument("directory", type=Path)
     args = parser.parse_args()
     manifest = json.loads((HERE / "overlay.json").read_text())
+    value = os.environ.get("SMG_QWEN_MM_TRACE", "0")
+    require(value in {"0", "1"}, "invalid MM observation opt-in")
+    if value == "1":
+        extra = json.loads((HERE / "mm_overlay.json").read_text())
+        require(os.environ.get("SMG_QWEN_MM_MODEL") == extra["model_id"]
+                == "Qwen/Qwen3-VL-8B-Instruct", "MM observation model opt-in")
+        require(digest((HERE / "overlay.json").read_bytes()) == extra["base_overlay_sha256"],
+                "canonical overlay changed")
+        manifest["files"] += extra["files"]
     require(os.environ.get("SGLANG_GPT_OSS_MXFP4_BF16") == "1", "explicit BF16 switch missing")
     require(os.environ.get("SMG_SGLANG_ROCM_IMAGE") == manifest["image"], "image binding")
     spec = importlib.util.find_spec("sglang")  # Top-level lookup, no engine import.
