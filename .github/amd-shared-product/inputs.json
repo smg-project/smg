@@ -159,19 +159,19 @@
   ],
   "budget": {
     "relay_hosted_cpu_minutes": 10,
-    "gpu_job_minutes": 36,
-    "pytest_minutes": 28,
+    "gpu_job_minutes": 20,
+    "pytest_minutes": 16,
     "cleanup_reserve_is_not_enforced_by_shared_workflow": true,
     "workflow_auto_retry": 0,
     "original_pytest_reruns": 2,
     "original_reruns_delay_seconds": 5
   },
   "contract": {
-    "selected": 231,
-    "models": 9,
-    "floor": 204,
-    "test_dirs": "e2e_test/chat_completions",
-    "test_filter": "",
+    "selected": 6,
+    "models": 1,
+    "floor": 6,
+    "test_dirs": "e2e_test/chat_completions/test_multimodal.py",
+    "test_filter": "TestMultimodalQwen3VL",
     "servicer_impl": "",
     "servicer_unit_tests": false,
     "engine_unit_junit": false,
@@ -188,10 +188,11 @@
     "warmup_budget_seconds": 300,
     "default_startup_total_seconds": 600,
     "shared_warmup_level": "fast",
-    "original_explicit_skip_markers": 8,
-    "original_conditional_skip_markers_evaluate_false": 4
+    "original_explicit_skip_markers": 0,
+    "original_conditional_skip_markers_evaluate_false": 0,
+    "scope": "DIAGNOSTIC_SUBSET_NO231_ACCEPTANCE_NO_COVERAGE"
   },
-  "diagnostic_difference": "caller container explicitly sets SPT_NOENV=1 for process cleanup ownership; normal product shared workflow does not. Engine AMD image/native repairs + wholepip/native post-install/final hard gates are AMD QA additions. NV test selection/models/assertions and original36/28 budget unchanged. Full caller explicitly enables reviewed GPTOSS BF16 expert expansion and PYTHONDONTWRITEBYTECODE; default/NVIDIA overlay paths are inactive. No pilot40 selection or prior pilot results transferred. Early GPTOSS auto\u2192BF16 is an explicit source repair within the same opt-in; original strict dtype/platform/checkpoint/draft guard and downstream TP1/loader restrictions are retained. Qwen3VL mixed-image body failure remains independent and unresolved.",
+  "diagnostic_difference": "DIAGNOSTIC_SUBSET_ONLY: original TestMultimodalQwen3VL six IDs, one unchanged Qwen3-VL-8B-Instruct model and all original images/requests/assertions; no new skip or xfail. Explicit class filter/floor6 replaces full231 only in this isolated manual caller. Proposed20-minute job/16-minute pytest is a new diagnostic budget, not the original36/28 SG row. Original reruns2/delay5 and normal shared workflow remain unchanged. Opt-in bounded Qwen trace uses WARNING under the normal worker WARNING level. Source/CPU logging evidence is not actual scheduler origin or a semantic repair; root actual audit must require emitted source/rid/phase records. No full231, model quality, latestmain/stableCI or coverage credit.",
   "producer_binary_relabelled": false,
   "producer_artifact_pins_status": "LOCALLY_BOUND_ACCEPTED_445_ACTUAL4_NATIVE143A: three admission flags remain false; fresh API availability/expiry and runner/budget admission remain root-owned",
   "explicit_product_dependency": {
@@ -247,8 +248,8 @@
     "helper_and_manifest_byte_equal_reviewed_pilot": false,
     "explicit_opt_in": "SGLANG_GPT_OSS_MXFP4_BF16=1",
     "functional_difference": "Original GPTOSS MXFP4 checkpoint identity retained; experts explicitly expanded to BF16 with reviewed gfx942/TP1/Triton gates. No native packed-MXFP4/precision/performance equivalence claim.",
-    "full_selection": "No pilot plugin/cases imported. Original full231/9models, empty filter, floor204 and36/28 shared caller remain.",
-    "overlay_result_scope_note": "Unchanged overlay helper labels its own evidence PARTIAL_DEVELOPER_PILOT_NO231_ACCEPTANCE; that helper cannot award full-row acceptance. Complete231 original JUnit/log/environment require independent actual audit.",
+    "full_selection": "This isolated caller selects only original Qwen3VL6 class IDs, not GPT40 or full231. Reviewed five GPT/BF16 source entries and their fresh helper origin hard gates are retained as an inherited environment dependency, with no GPT model executed by this selection.",
+    "overlay_result_scope_note": "Helper evidence labels and five original origins remain; scheduler origin6 is DEFERRED_NOT_YET_VERIFIED until real bounded request-time trace contains module/path/newhash. Subset API success alone cannot close the runtime trace gate or award full231 acceptance.",
     "native_or_model_execution_in_this_candidate": false,
     "overlay_helper_byte_equal_reviewed_pilot": true,
     "overlay_manifest_byte_equal_reviewed_pilot": false,
@@ -269,5 +270,14 @@
       "new_source_runtime_regression_executed": false,
       "full_ModelConfig_hardware_weights_or_model_accepted": false
     }
+  },
+  "full_contract_remains_separate": {
+    "selected": 231,
+    "models": 9,
+    "floor": 204,
+    "job_minutes": 36,
+    "pytest_minutes": 28,
+    "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat[0]/sglang/nvidia",
+    "not_accepted_by_this_subset": true
   }
 }

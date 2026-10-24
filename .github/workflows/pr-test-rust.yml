@@ -1,11 +1,11 @@
-name: AMD shared product SGLang chat validation
+name: AMD Qwen3VL six-case diagnostic only
 on:
   workflow_dispatch:
 permissions:
   contents: read
   actions: read
 concurrency:
-  group: amd-shared-product-sglang-chat
+  group: amd-sglang-qwen6-diagnostic
   cancel-in-progress: false
 jobs:
   artifact-relay:
@@ -65,17 +65,18 @@ jobs:
           path: ${{ steps.relay.outputs.directory }}/evidence/
           if-no-files-found: ignore
           retention-days: 7
-  amd-product-sglang-chat:
+  amd-sglang-qwen6-diagnostic:
     needs: artifact-relay
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: sglang
       gpu_tier: '1'
       runner: 1-gpu-mi300x
-      timeout: 36
-      test_timeout: 28
-      test_dirs: e2e_test/chat_completions
-      min_selected: 204
+      timeout: 20
+      test_timeout: 16
+      test_dirs: e2e_test/chat_completions/test_multimodal.py
+      test_filter: TestMultimodalQwen3VL
+      min_selected: 6
       servicer_unit_tests: false
       gpu_vendor: amd
       container_image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
@@ -83,12 +84,12 @@ jobs:
     secrets: inherit
   finish:
     if: always()
-    needs: [artifact-relay, amd-product-sglang-chat]
+    needs: [artifact-relay, amd-sglang-qwen6-diagnostic]
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     steps:
       - name: Require the actual shared workflow to finish successfully
         env:
           RELAY: ${{ needs.artifact-relay.result }}
-          CHAT: ${{ needs.amd-product-sglang-chat.result }}
+          CHAT: ${{ needs.amd-sglang-qwen6-diagnostic.result }}
         run: test "$RELAY" = success && test "$CHAT" = success
