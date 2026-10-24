@@ -36,7 +36,8 @@ class EnvironmentProof:
         try:
             self.check("after")
         except Exception:
-            session.exitstatus = pytest.ExitCode.TESTS_FAILED
+            if not session.exitstatus:
+                session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 def pytest_configure(config):

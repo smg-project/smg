@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from . import canary, mooncake, mooncake_transfer, owned
+from . import canary, mooncake, mooncake_topology, owned
 
 
 def canonical(nodeid):
@@ -91,7 +91,14 @@ class RuntimeProof:
         self.recipe = json.loads(Path(__file__).with_name("cases.json").read_text())[
             os.environ["E2E_GPU_TIER"]
         ]
-        owned.require(os.environ["E2E_VLLM_KV_BACKEND"] == "mooncake", "Mooncake-only caller")
+        owned.require(os.environ["E2E_GPU_TIER"] == "4", "original Mooncake4 tier required")
+        owned.require(
+            all(
+                os.environ[name] == "mooncake"
+                for name in ("E2E_VLLM_KV_BACKEND", "E2E_KV_BACKEND", "E2E_VLLM_EXTRA_KV_BACKENDS")
+            ),
+            "original Mooncake4 main/global/extra backend configuration differs",
+        )
         root = Path(os.environ["GITHUB_WORKSPACE"])
         self.native = json.loads((root / ".github/amd-shared-product/inputs.json").read_text())[
             "gateway_native"
@@ -232,6 +239,9 @@ class RuntimeProof:
         owned.require(self.native is not None, "actual producer native not bound")
         owned.require(os.environ.get("SPT_NOENV") == "1", "marker preservation missing")
         canary.capture(self.directory, os.environ["E2E_VLLM_KV_BACKEND"])
+        nixl = self.directory / "mixed-nixl-canary"
+        nixl.mkdir()
+        canary.capture(nixl, "nixl")
         for cls, kind, names in [
             (Worker, "worker", ("start", "wait_ready", "stop", "kill_engine")),
             (Gateway, "gateway", ("start", "shutdown", "add_worker", "remove_worker")),
@@ -242,7 +252,7 @@ class RuntimeProof:
     def pytest_collection_finish(self, session):
         owned.require(
             sorted(canonical(x.nodeid) for x in session.items) == sorted(self.recipe["cases"]),
-            "original Mooncake2 selection changed",
+            "original Mooncake4 topology selection changed",
         )
 
     @pytest.hookimpl(hookwrapper=True)
@@ -271,7 +281,7 @@ class RuntimeProof:
             owned.require(not self.errors, "runtime observations failed")
             verify_reports(self.recipe, self.reports)
             verify_mixed_native(self.recipe, self.events)
-            mooncake_transfer.verify(self.recipe, self.events, self.directory)
+            mooncake_topology.verify(self.recipe, self.events, self.directory)
             for nodeid in set(self.recipe["cases"]) - set(self.recipe["setup_skips"]):
                 events = [e for e in self.events if e["nodeid"] == nodeid and e.get("identity")]
                 owned.require(
@@ -280,7 +290,8 @@ class RuntimeProof:
                 )
         except Exception as error:
             self.errors.append({"stage": "finish", "error": str(error)})
-            session.exitstatus = pytest.ExitCode.TESTS_FAILED
+            if not session.exitstatus:
+                session.exitstatus = pytest.ExitCode.TESTS_FAILED
         (self.directory / "summary.json").write_text(
             json.dumps(
                 {
