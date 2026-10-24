@@ -10,7 +10,7 @@ use wfaas::{
 
 use super::{pool_group, refresh_worker_pool_sizes, PoolGroups};
 use crate::{
-    routers::common::pd_admission,
+    routers::{common::pd_admission, grpc::regular::symphony::telemetry},
     worker::{bootstrap_probe, registry::WorkerId, Worker, WorkerRegistry},
     workflow::data::{WorkerRegistrationData, WorkerRegistrationMode},
 };
@@ -160,6 +160,16 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
             // rather than inferred later from absent series.
             pd_admission::announce_decode_window(worker.as_ref());
             worker_ids.push(worker_id);
+        }
+
+        // Under Symphony the failure classes of the table that reads these
+        // workers' model exist at zero from here, once every worker of the
+        // batch is in the registry: a registration refused above leaves no
+        // series behind. The table was resolved where the model card and the
+        // names are (none for an HTTP worker, the legacy parsers or a model
+        // no table reads).
+        if let Some(table) = context.data.symphony_table() {
+            telemetry::init_table_series(table);
         }
 
         // The rendezvous port a disaggregated worker advertises is probed once
