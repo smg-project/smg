@@ -244,5 +244,14 @@
   },
   "reference_contract_sha256": "f618f45a175495293f9832e81b92b9c396928cb0f0c36effad1d80a05b92bf93",
   "selection_contract_verified": true,
-  "source_identity_note": "Consumer19 remains the exact ordinarySGef4 product source. Only the manual caller/recipe/observer namespace differs; compiled37c9d/actual44514 are unchanged and no EPDca46/a974 source is used."
+  "source_identity_note": "Consumer19 remains the exact ordinarySGef4 product source. Only the manual caller/recipe/observer namespace differs; compiled37c9d/actual44514 are unchanged and no EPDca46/a974 source is used.",
+  "explicit_RDMA_device_dependency": {
+    "added_container_option": "--device=/dev/infiniband",
+    "network": "unchanged_default_bridge",
+    "effective_MOONCAKE_PROTOCOL": "rdma",
+    "protocol_override_added": false,
+    "actual_visibility_receipt": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T0300Z/SG2-RDMA-visibility-actual-20261024T141434Z/result.json",
+    "actual_visibility_sha256": "2942a58520f09b5804871cfbbd5e0844fddf18616c543fae13c9f9eb89f9ffc7",
+    "actual_scope": "Both authorized nodes: original detect_ib_device returns None without HCA mapping and mlx5_0 with mapping; no engine constructor, QP, GPU or transfer proof."
+  }
 }
