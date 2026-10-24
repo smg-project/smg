@@ -36,7 +36,8 @@ use crate::{
     },
     encode_path::{self, EncodePath},
     encoders::{
-        deepseek_v32, deepseek_v4, deepseek_v41, glm53, marks, PromptSegment, RendererProfile,
+        deepseek_v32, deepseek_v4, deepseek_v41, ends_with_generation_header, glm53, marks,
+        PromptSegment, RendererProfile,
     },
     native::{AddedTokens, NativeEncoder},
     traits::{
@@ -1821,12 +1822,25 @@ impl HuggingFaceTokenizer {
         params: ChatTemplateParams,
         assistant_prefix: Option<&str>,
     ) -> Result<ChatTemplateOutput> {
-        // The native encoders continue the final message whenever they are
-        // asked to (V4.1) or are never asked, and otherwise write the
-        // generation header whatever the request asked, as the engines' own
-        // encoders do (their reference reads neither flag).
-        let continue_final_message = params.continue_final_message;
+        // The native encoders read neither flag, as the engines' own encoders
+        // do, and the flags report what the renderer wrote: a continuation by
+        // the V4.1 encoder alone, on a trailing assistant message, when the
+        // request asks (`wo_eos`; V4 closes it with EOS); the header read from
+        // the marked render for V4 and V4.1 (their encoders' final transition,
+        // after their own preprocessing), and from the final message's role
+        // for V3.2, which writes the header inside every user, developer and
+        // tool-result render, before any trailing system text.
+        let continued_final_message = matches!(self.renderer, Renderer::DeepseekV41(_))
+            && continues_final_assistant_message(messages, &params);
         let mut marked = self.render_marked(messages, params)?;
+        let generation_prompt = match self.renderer {
+            Renderer::DeepseekV32 => !final_message_is_assistant(messages),
+            Renderer::DeepseekV4(_) | Renderer::DeepseekV41(_) => {
+                ends_with_generation_header(&marked)
+            }
+            // No marked prompt: `render_marked` refused above.
+            Renderer::Jinja | Renderer::Glm53(_) => false,
+        };
         if let Some(prefix) = assistant_prefix {
             // Request text: a mark a client wrote into it is no mark.
             marked.push_str(&marks::strip(prefix));
@@ -1845,8 +1859,8 @@ impl HuggingFaceTokenizer {
             text,
             encoding,
             unbilled_prompt_tokens: 0,
-            continued_final_message: continue_final_message,
-            generation_prompt: !continue_final_message,
+            continued_final_message,
+            generation_prompt,
         })
     }
 }
@@ -1932,7 +1946,8 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         // The Jinja and GLM renderers say whether they continued the final
         // message or appended its text after the generation prompt; their
         // header is the flag they rendered under (the template's
-        // `add_generation_prompt` variable is that flag).
+        // `add_generation_prompt` variable is that flag: the render context
+        // keeps the field's value over a `template_kwargs` entry of that name).
         let generation_prompt_unless_continued = params.generation_prompt_unless_continued();
         let (mut text, continued_final_message) = match self.renderer {
             Renderer::Jinja => self.apply_jinja(messages, params)?,
@@ -2390,6 +2405,27 @@ fn restore_integer_reasoning_effort(value: &serde_json::Value) -> Option<serde_j
     digits.parse::<u64>().ok().map(serde_json::Value::from)
 }
 
+/// Whether the conversation ends on an assistant message: the one shape the
+/// native encoders write no generation header for (closed with EOS, or
+/// continued).
+fn final_message_is_assistant(messages: &[serde_json::Value]) -> bool {
+    messages
+        .last()
+        .and_then(|m| m.get("role"))
+        .and_then(|r| r.as_str())
+        == Some("assistant")
+}
+
+/// Whether a render continues its final message natively: asked to, and the
+/// final message is an assistant one (the only shape the V4.1 encoder
+/// continues, as `wo_eos` on that message).
+fn continues_final_assistant_message(
+    messages: &[serde_json::Value],
+    params: &ChatTemplateParams,
+) -> bool {
+    params.continue_final_message && final_message_is_assistant(messages)
+}
+
 /// DeepSeek V4.1 chat-template shim. Order: attach tools to the first system
 /// message (the engine's rule) -> resolve `reasoning_effort` -> resolve the
 /// thinking mode -> `drop_thinking` -> stamp `wo_eos` on a trailing assistant
@@ -2493,12 +2529,7 @@ fn apply_deepseek_v41(
     // the engine's own encoder reads neither flag: with any other shape the
     // generation header is written where the conversation takes one (V3.2/V4
     // read neither flag either).
-    let continues_final_assistant_message = params.continue_final_message
-        && msgs
-            .last()
-            .and_then(|m| m.get("role"))
-            .and_then(|r| r.as_str())
-            == Some("assistant");
+    let continues_final_assistant_message = continues_final_assistant_message(&msgs, params);
     if continues_final_assistant_message {
         if let Some(obj) = msgs.last_mut().and_then(serde_json::Value::as_object_mut) {
             obj.insert("wo_eos".into(), serde_json::Value::Bool(true));
@@ -3438,7 +3469,7 @@ mod segment_tests {
     /// V4.1 continues a trailing assistant message when `continue_final_message`
     /// asks (no EOS, no header: the prompt is not rendered for generation);
     /// `add_generation_prompt: false` alone is not read, and the message is
-    /// closed as the renderer's reference closes it.
+    /// closed as the renderer's reference closes it, with no header after it.
     #[test]
     fn v41_continues_the_final_message_only_when_asked() {
         let tok = v41_like(&ADDED);
@@ -3473,7 +3504,106 @@ mod segment_tests {
             closed.text
         );
         assert!(!closed.continued_final_message);
-        assert!(closed.generation_prompt);
+        assert!(!closed.generation_prompt);
+    }
+
+    /// The native path reports a continuation only where the renderer
+    /// continued, and the header only where it wrote one: V4 closes a
+    /// trailing assistant message with EOS whatever the request asked (no
+    /// continuation, no header), and V4.1 continues a trailing assistant
+    /// message only, so a trailing user message takes the header.
+    #[test]
+    fn the_native_renderers_report_a_continuation_only_where_they_continue() {
+        let params = || ChatTemplateParams {
+            add_generation_prompt: false,
+            continue_final_message: true,
+            thinking: Some(false),
+            ..Default::default()
+        };
+        let assistant_last = [
+            json!({"role": "user", "content": "q"}),
+            json!({"role": "assistant", "content": "Sure,"}),
+        ];
+        let rendered = v4_like(&ADDED)
+            .apply_chat_template_with_encoding(&assistant_last, params(), None)
+            .expect("the renderer renders the conversation");
+        assert!(
+            rendered.text.ends_with("Sure,<｜end▁of▁sentence｜>"),
+            "{}",
+            rendered.text
+        );
+        assert!(!rendered.continued_final_message);
+        assert!(!rendered.generation_prompt);
+        let user_last = [json!({"role": "user", "content": "q"})];
+        let rendered = v41_like(&ADDED)
+            .apply_chat_template_with_encoding(&user_last, params(), None)
+            .expect("the renderer renders the conversation");
+        assert!(
+            rendered.text.ends_with("<｜Assistant｜></think>"),
+            "{}",
+            rendered.text
+        );
+        assert!(!rendered.continued_final_message);
+        assert!(rendered.generation_prompt);
+    }
+
+    /// The report follows the text where the encoders differ on a trailing
+    /// system message: V4 writes no header after one, V4.1 writes it after a
+    /// system message that is not the conversation's first and none after a
+    /// lone one or one left alone by its thinking-drop.
+    #[test]
+    fn the_native_renderers_report_the_header_after_a_trailing_system_message_as_written() {
+        let params = || ChatTemplateParams {
+            add_generation_prompt: true,
+            thinking: Some(true),
+            ..Default::default()
+        };
+        let system_last = [
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "system", "content": "Answer in French."}),
+        ];
+        let rendered = v4_like(&ADDED)
+            .apply_chat_template_with_encoding(&system_last, params(), None)
+            .expect("the renderer renders the conversation");
+        assert!(
+            rendered.text.ends_with("Answer in French."),
+            "{}",
+            rendered.text
+        );
+        assert!(!rendered.generation_prompt);
+        let rendered = v41_like(&ADDED)
+            .apply_chat_template_with_encoding(&system_last, params(), None)
+            .expect("the renderer renders the conversation");
+        assert!(
+            rendered
+                .text
+                .ends_with("Answer in French.<｜Assistant｜><think>"),
+            "{}",
+            rendered.text
+        );
+        assert!(rendered.generation_prompt);
+        let system_alone = [json!({"role": "system", "content": "Be brief."})];
+        let rendered = v41_like(&ADDED)
+            .apply_chat_template_with_encoding(&system_alone, params(), None)
+            .expect("the renderer renders the conversation");
+        assert!(rendered.text.ends_with("Be brief."), "{}", rendered.text);
+        assert!(!rendered.generation_prompt);
+        // V4.1's thinking-drop removes a developer message before the final
+        // turn: the system message renders first, with no header; the report
+        // reads the render, not the request's message list.
+        let developer_then_system = [
+            json!({"role": "developer", "content": "Be terse."}),
+            json!({"role": "system", "content": "Answer in French."}),
+        ];
+        let rendered = v41_like(&ADDED)
+            .apply_chat_template_with_encoding(&developer_then_system, params(), None)
+            .expect("the renderer renders the conversation");
+        assert!(
+            rendered.text.ends_with("Answer in French."),
+            "{}",
+            rendered.text
+        );
+        assert!(!rendered.generation_prompt);
     }
 
     fn render(tok: &HuggingFaceTokenizer, messages: &[Value]) -> ChatTemplateOutput {

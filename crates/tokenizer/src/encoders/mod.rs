@@ -118,3 +118,20 @@ impl RendererProfile {
         ..Self::NO_CAPABILITIES
     };
 }
+
+/// Whether a marked render of the V4 family ends in the generation header its
+/// encoder writes at the final transition: the assistant token and the think
+/// token that opens or closes the reasoning, with the action task's token
+/// after them for an action task. Read from the render, so it follows the
+/// encoder's own preprocessing (merged tool turns, dropped messages), and
+/// request text cannot forge a mark.
+pub(crate) fn ends_with_generation_header(marked: &str) -> bool {
+    let tail = deepseek_common::task_sp_token("action")
+        .and_then(|action| marked.strip_suffix(action))
+        .unwrap_or(marked);
+    let header = |think: &str| {
+        tail.strip_suffix(think)
+            .is_some_and(|rest| rest.ends_with(deepseek_common::ASSISTANT))
+    };
+    header(deepseek_common::THINKING_START) || header(deepseek_common::THINKING_END)
+}

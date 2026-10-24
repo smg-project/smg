@@ -1414,7 +1414,10 @@ fn add_generation_prompt_false_renders_the_conversation_without_a_header() {
 
 /// Through a Jinja template: without the header the prompt ends at the last
 /// turn's end marker; with it (the field absent) the assistant header follows.
-/// The rendered prompt reports which, for the reasoning decisions.
+/// The rendered prompt reports which, for the reasoning decisions. A
+/// `chat_template_kwargs` entry of that name does not override the request's
+/// field (the render context keeps the field's value), so the header stays
+/// and is reported as such.
 #[test]
 fn jinja_template_renders_no_header_when_add_generation_prompt_is_false() {
     let mut tokenizer =
@@ -1423,12 +1426,16 @@ fn jinja_template_renders_no_header_when_add_generation_prompt_is_false() {
         .set_chat_template(HEADER_TEMPLATE.to_string())
         .unwrap();
     let render = |add_generation_prompt: Value| {
-        let request: ChatCompletionRequest = serde_json::from_value(json!({
+        let mut body = json!({
             "model": "m",
             "messages": [{"role": "user", "content": "Hello."}],
             "add_generation_prompt": add_generation_prompt
-        }))
-        .unwrap();
+        });
+        if let Some(kwargs) = add_generation_prompt.get("chat_template_kwargs") {
+            body["chat_template_kwargs"] = kwargs.clone();
+            body["add_generation_prompt"] = Value::Null;
+        }
+        let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
         process_chat_messages_with_placeholders(
             &request,
             &tokenizer,
@@ -1447,6 +1454,12 @@ fn jinja_template_renders_no_header_when_add_generation_prompt_is_false() {
         "<|turn|>user<|body|>Hello.<|end|><|turn|>assistant"
     );
     assert!(open.generation_prompt);
+    let by_kwargs = render(json!({"chat_template_kwargs": {"add_generation_prompt": false}}));
+    assert_eq!(
+        by_kwargs.text,
+        "<|turn|>user<|body|>Hello.<|end|><|turn|>assistant"
+    );
+    assert!(by_kwargs.generation_prompt);
 }
 
 /// The rendered prompt reports whether it carries the generation header, as
