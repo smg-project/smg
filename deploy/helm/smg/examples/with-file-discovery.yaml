@@ -1,0 +1,20 @@
+# Router with file discovery: the workers are listed in a JSON manifest held
+# in an existing ConfigMap, which the router pod mounts and the gateway
+# rereads whenever the kubelet projects an update of it. No Kubernetes API
+# access is needed, so the chart creates no Role.
+#
+# Create the manifest (the ConfigMap may also follow the release; the gateway
+# waits for it):
+#   kubectl create configmap smg-workers --from-file=workers.json
+# where workers.json is, for example:
+#   {"version": 1, "workers": [{"id": "w1", "url": "10.0.0.21:8000"}]}
+#
+# Usage: helm install smg deploy/helm/smg -f deploy/helm/smg/examples/with-file-discovery.yaml
+router:
+  policy: cache_aware
+  discovery:
+    provider: file
+    file:
+      configMap:
+        name: smg-workers
+        key: workers.json

@@ -64,7 +64,7 @@ See [`values.yaml`](values.yaml) for the full list of configurable parameters.
 | `auth` | API key authentication, rate limiting |
 | `history` | Storage backend (none/memory/postgres/redis/oracle) and the Secret its connection URL or credentials come from |
 | `serviceAccount` | Service account creation and annotations |
-| `rbac` | RBAC for Kubernetes service discovery |
+| `rbac` | RBAC for reading pods through the Kubernetes API (Kubernetes discovery, mesh peer discovery) |
 
 ### Routing Policies
 
@@ -87,7 +87,7 @@ workers:
       tag: "1.13.0-vllm-v0.31.0"     # engine image tag
 ```
 
-Workers are automatically wired to the router via `--worker-urls`. The URL scheme (`http://` or `grpc://`) is set based on `connectionMode`.
+Workers are automatically wired to the router via `--worker-urls`, unless the router discovers its workers ([Worker Discovery](#worker-discovery)). The URL scheme (`http://` or `grpc://`) is set based on `connectionMode`.
 
 #### Connection Modes
 
@@ -136,6 +136,29 @@ its gate), so a disaggregated or multimodal SGLang worker keeps `metrics` off.
 A `metrics.port` equal to the serving port is refused when the chart renders.
 An HTTP worker runs the engine's own server, which has its own `/metrics`; the
 setting is ignored there.
+
+#### Worker Discovery
+
+`router.discovery.provider` selects where the router finds its workers at runtime, passed as `--discovery-provider` with the settings of that provider's block under `router.discovery`: `kubernetes`, `file`, `slurm` or `consul` (empty, the default, discovers nothing). `router.discovery.checkIntervalSecs` sets the provider's periodic pass (`--discovery-check-interval-secs`, 30 s when unset). Selecting a provider turns IGW mode on in the gateway, and the chart's `workers` are then not passed as `--worker-urls`: the provider is the source of workers.
+
+| Provider | Workers | Needs |
+|---|---|---|
+| `kubernetes` | pods matching `kubernetes.selector` in `kubernetes.namespace` (the release's by default; every namespace with `clusterWide`) | a Role, or a ClusterRole with `clusterWide`, which the chart creates |
+| `file` | the workers listed in a JSON manifest, reread when it changes | the manifest: an existing ConfigMap (`file.configMap.name`, its key `file.configMap.key`), or a path in the image (`file.path`) |
+| `slurm` | a worker on every node of each running job named in `slurm.jobNames` (or `encodeJobNames`, `prefillJobNames`, `decodeJobNames`), at `slurm.port` | an image with Slurm clients (below) |
+| `consul` | the instances of `consul.service` with passing health checks | Consul's address, and the ACL token and TLS files from existing Secrets |
+
+`router.serviceDiscovery.enabled` is the legacy spelling of `provider: kubernetes` and renders the arguments it always has; `router.discovery.kubernetes` takes the same settings. The chart refuses the two together, as the gateway refuses `--service-discovery` beside `--discovery-provider`. It also refuses a provider without what it cannot start without (a file provider without a manifest, Slurm without a port or a job name, Consul without a service, a Consul client certificate without its key), so the mistake surfaces at `helm install` rather than as a crash-looping pod.
+
+The Role and RoleBinding (`get`, `list` and `watch` on pods) exist for what reads pods through the Kubernetes API: Kubernetes worker discovery, by either spelling, and mesh without `router.mesh.peerUrls`, which finds its peers among the release's router pods. The file, Slurm and Consul providers never call the API, so they get none unless `rbac.create` is set; nor does a mesh with `peerUrls`, which earlier chart versions gave one.
+
+Mesh without `router.mesh.peerUrls` finds its peers through Kubernetes discovery, the only place the gateway runs router discovery. With no provider, the chart turns on Kubernetes discovery of the release's own workers for it, as it always has. Under `provider: kubernetes` it adds the router selector to the provider, whose namespace router discovery then watches: the provider has to watch the release namespace (no `clusterWide`, no other `namespace`), or another namespace finds no peer and every namespace finds other releases' routers. The file, Slurm and Consul providers cannot carry router discovery, so a mesh with one of them needs `router.mesh.peerUrls`; the chart refuses it without.
+
+**File.** The ConfigMap is mounted whole at `/etc/smg/discovery`, not as a subPath, so the kubelet projects each update of it into the pod and the gateway's watch on that directory picks it up; the manifest path is `/etc/smg/discovery/<key>` unless `file.path` names another. The volume is optional: the gateway waits for a manifest that is not there yet, so the ConfigMap can be published after the release. The manifest format is in the gateway's file provider (`model_gateway/src/service_discovery/file.rs`); [`with-file-discovery.yaml`](examples/with-file-discovery.yaml) has an example.
+
+**Slurm.** The provider runs `squeue` and `scontrol` (Slurm 23.11 or later) in the router container, and the published gateway image has no Slurm client. It needs an image built from the gateway's with those commands and what the cluster's authentication needs, its `slurm.conf` and MUNGE, or `auth/jwt` with `SLURM_JWT` (which `router.extraEnv` can take from a Secret); the chart mounts nothing for it. The router runs as UID 65532, so set `slurm.user` to the user whose jobs are the workers. Every node of a selected job runs one server on `slurm.port`, so worker jobs should run `--exclusive`.
+
+**Consul.** The ACL token and the TLS files reach the gateway through Consul's own environment variables, never as arguments. `consul.token.existingSecret` sets `CONSUL_HTTP_TOKEN` from that Secret's `consul.token.secretKey` (default `token`). `consul.tls.existingSecret` mounts the Secret's `consul.tls.secretKeys` at `/etc/smg/consul-tls` and points `CONSUL_CACERT` (`caCert`, default `ca.crt`) and, when both are set, `CONSUL_CLIENT_CERT` and `CONSUL_CLIENT_KEY` (`clientCert`, `clientKey`) at them; give `consul.address` an `https://` scheme. The gateway reads them once, at start-up, so restart the router pods after rotating either Secret.
 
 #### HuggingFace Token
 
@@ -218,7 +241,7 @@ threshold and includes per-role counts; the load balancer must honor readiness
 to stop new traffic. The thresholds do not enforce an exact P:D ratio or shed
 requests themselves.
 
-A router that gets its workers at runtime through the admin API (`POST /workers`) rather than from `workers`, `router.workerUrls` or `router.serviceDiscovery` has no healthy worker when it starts, so `/readiness` answers 503 until one is registered, the Service has no endpoint for the pod, and a registration sent through the Service cannot reach it (a rolling update's new pod then never becomes Ready). Such deployments set `router.readinessProbe.path: /health`, or register their workers through a port-forward to the pod.
+A router that gets its workers at runtime through the admin API (`POST /workers`) rather than from `workers`, `router.workerUrls`, `router.serviceDiscovery` or `router.discovery` has no healthy worker when it starts, so `/readiness` answers 503 until one is registered, the Service has no endpoint for the pod, and a registration sent through the Service cannot reach it (a rolling update's new pod then never becomes Ready). Such deployments set `router.readinessProbe.path: /health`, or register their workers through a port-forward to the pod.
 
 The gateway drains in-flight requests for `router.shutdownGracePeriodSeconds` (default 180, passed as `--shutdown-grace-period-secs`); the pod's `terminationGracePeriodSeconds` is that plus `router.terminationGraceMarginSeconds` (default 30), so the kubelet does not kill the drain at its default 30 s.
 
@@ -245,7 +268,7 @@ Readiness itself is a kubelet signal: with kube-state-metrics in the cluster, `k
 
 #### Readiness Deadlines
 
-`/readiness` follows the engine, not the router process. A worker from `router.workerUrls` or `router.serviceDiscovery` is registered only once its engine reports healthy: the gateway polls it every `--worker-startup-check-interval` (30 s) for at most `--worker-startup-timeout-secs` (1800 s), and a worker whose engine is not healthy by then is not registered (a discovered worker is tried again on a later discovery pass, one named in `router.workerUrls` is not). The router therefore answers `/readiness` 503 for the whole of the engine's bring-up (weights, initialisation, warm-up: tens of minutes for a large checkpoint streamed from object storage, 37 minutes measured for a two-node tensor-parallel gang), while `/health` and `/liveness` answer 200 from the first second, and it becomes Ready within a poll of the engine.
+`/readiness` follows the engine, not the router process. A worker from `router.workerUrls`, `router.serviceDiscovery` or `router.discovery` is registered only once its engine reports healthy: the gateway polls it every `--worker-startup-check-interval` (30 s) for at most `--worker-startup-timeout-secs` (1800 s), and a worker whose engine is not healthy by then is not registered (a discovered worker is tried again on a later discovery pass, one named in `router.workerUrls` is not). The router therefore answers `/readiness` 503 for the whole of the engine's bring-up (weights, initialisation, warm-up: tens of minutes for a large checkpoint streamed from object storage, 37 minutes measured for a two-node tensor-parallel gang), while `/health` and `/liveness` answer 200 from the first second, and it becomes Ready within a poll of the engine.
 
 Every deadline on the router's readiness has to cover that bring-up:
 
@@ -286,6 +309,9 @@ Size the budget past the longest load you expect: a startup probe that fails for
 | [`with-multi-model.yaml`](examples/with-multi-model.yaml) | Multiple models on different engines |
 | [`with-postgres.yaml`](examples/with-postgres.yaml) | PostgreSQL history backend, its URL in a Secret |
 | [`with-service-discovery.yaml`](examples/with-service-discovery.yaml) | K8s auto-discovery |
+| [`with-file-discovery.yaml`](examples/with-file-discovery.yaml) | Workers from a manifest in a ConfigMap |
+| [`with-consul-discovery.yaml`](examples/with-consul-discovery.yaml) | Workers from Consul, token and CA from Secrets |
+| [`with-slurm-discovery.yaml`](examples/with-slurm-discovery.yaml) | Workers on Slurm job nodes (custom image) |
 | [`with-ingress.yaml`](examples/with-ingress.yaml) | Ingress with TLS |
 | [`with-monitoring.yaml`](examples/with-monitoring.yaml) | ServiceMonitor + Grafana dashboard + PrometheusRule |
 

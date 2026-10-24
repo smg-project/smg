@@ -1,6 +1,9 @@
-{{- if or .Values.rbac.create .Values.router.serviceDiscovery.enabled .Values.router.mesh.enabled }}
+{{- /* Created for what reads pods through the Kubernetes API
+     (smg.usesKubernetesApi): Kubernetes worker discovery and mesh router
+     discovery. The file, Slurm and Consul providers never call it. */}}
+{{- if or .Values.rbac.create (include "smg.usesKubernetesApi" .) }}
 apiVersion: rbac.authorization.k8s.io/v1
-{{- if .Values.router.serviceDiscovery.clusterWide }}
+{{- if include "smg.discoveryClusterWide" . }}
 kind: ClusterRole
 {{- else }}
 kind: Role

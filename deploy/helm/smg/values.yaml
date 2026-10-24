@@ -40,13 +40,19 @@ router:
     enabled: false
     port: 39527               # mesh gossip port
     # peerUrls: []            # auto-generated from StatefulSet pod DNS
+    # Without peerUrls the routers find each other among the release's router
+    # pods through the Kubernetes API, which the gateway runs only inside
+    # Kubernetes discovery; with the file, slurm or consul discovery
+    # provider, set peerUrls.
 
   # -- Explicit worker URLs
   workerUrls: []
   #   - http://worker-1:8000
   #   - grpc://worker-2:8001
 
-  # -- Kubernetes service discovery (auto-discover worker pods by label)
+  # -- Kubernetes service discovery (auto-discover worker pods by label).
+  #    The legacy spelling of discovery.provider=kubernetes, rendering the
+  #    arguments it always has; set this or discovery.provider, not both.
   serviceDiscovery:
     enabled: false
     clusterWide: false     # set true to watch all namespaces (requires ClusterRole/ClusterRoleBinding)
@@ -55,6 +61,73 @@ router:
     port: 80
     # -- Extract model ID from pod metadata
     modelIdFrom: ""        # "namespace", "label:key", or "annotation:key"
+
+  # -- Worker discovery: where the router finds its workers at runtime
+  #    (README, Worker Discovery). Selecting a provider turns IGW mode on in
+  #    the gateway, and the chart's `workers` are then no longer passed as
+  #    --worker-urls: the provider is the source of workers.
+  discovery:
+    # -- "" (off), kubernetes, file, slurm or consul
+    provider: ""
+    # -- Seconds between the provider's periodic passes (the gateway's
+    #    default, 30, when unset). Kubernetes, file and Consul discovery apply
+    #    a change as it happens and use the pass to retry; Slurm polls on it.
+    checkIntervalSecs: null
+
+    # -- Worker pods found by label through the Kubernetes API; the chart
+    #    creates the Role (ClusterRole when clusterWide) that allows it
+    kubernetes:
+      clusterWide: false   # watch all namespaces (ClusterRole/ClusterRoleBinding)
+      namespace: ""        # defaults to release namespace
+      selector: ""         # e.g. "app=sglang-worker"; empty matches no pod
+      port: 80             # for pods without a smg.ai/worker-ports annotation
+      modelIdFrom: ""      # "namespace", "label:key", or "annotation:key"
+
+    # -- Workers listed in a JSON manifest the gateway rereads when it
+    #    changes. The manifest usually comes from an existing ConfigMap,
+    #    mounted whole at /etc/smg/discovery: the kubelet projects each update
+    #    of it into the pod, which a subPath mount would not.
+    file:
+      configMap:
+        name: ""           # existing ConfigMap holding the manifest
+        key: workers.json  # its key holding the manifest
+      path: ""             # the manifest's path in the pod (default: the ConfigMap key under /etc/smg/discovery)
+
+    # -- Workers on the nodes of running Slurm jobs, found with `squeue` and
+    #    `scontrol`. The published image has no Slurm client: this needs an
+    #    image with Slurm >= 23.11 clients and the cluster's configuration and
+    #    authentication (README, Worker Discovery).
+    slurm:
+      jobNames: []         # jobs whose nodes are regular workers
+      encodeJobNames: []
+      prefillJobNames: []
+      decodeJobNames: []
+      port: null           # the inference server's port on every node (required)
+      bootstrapPort: null  # bootstrap port of encode and prefill workers
+      user: ""             # whose jobs (default: the router's user, UID 65532 in the published image)
+      account: ""
+      partition: ""
+
+    # -- Instances of a Consul service with passing health checks. The ACL
+    #    token and the TLS files reach the gateway through Consul's own
+    #    environment variables, never as arguments.
+    consul:
+      service: ""          # required
+      address: ""          # e.g. https://consul-server.consul:8501 (default: CONSUL_HTTP_ADDR, else 127.0.0.1:8500)
+      datacenter: ""       # default: the agent's own
+      # -- An existing Secret holding the ACL token, set as CONSUL_HTTP_TOKEN
+      token:
+        existingSecret: ""
+        secretKey: token
+      # -- An existing Secret holding the TLS files, mounted at
+      #    /etc/smg/consul-tls and named by CONSUL_CACERT, CONSUL_CLIENT_CERT
+      #    and CONSUL_CLIENT_KEY. Give the address an https:// scheme.
+      tls:
+        existingSecret: ""
+        secretKeys:
+          caCert: ca.crt   # added to the default trust roots (empty: those alone)
+          clientCert: ""   # client certificate and key: both or neither
+          clientKey: ""
 
   # -- Model / tokenizer
   model: ""                # HuggingFace model ID or local path
@@ -205,12 +278,13 @@ router:
   #    no healthy worker, while a tokenizer is not yet registered and while it
   #    drains after SIGTERM, so traffic is steered away from such a pod. A
   #    router whose workers are registered at runtime through the admin API
-  #    (no `workers`, `router.workerUrls` or `router.serviceDiscovery`
-  #    configured) stays unready until the first one is: set `path: /health`
-  #    there, or register through a port-forward to the pod. A worker's engine
-  #    counts as healthy only once it reports so, which for a large checkpoint
-  #    is tens of minutes after its pod starts: every deadline on the router's
-  #    readiness has to cover that bring-up (README, Readiness Deadlines).
+  #    (no `workers`, `router.workerUrls`, `router.serviceDiscovery` or
+  #    `router.discovery` configured) stays unready until the first one is:
+  #    set `path: /health` there, or register through a port-forward to the
+  #    pod. A worker's engine counts as healthy only once it reports so, which
+  #    for a large checkpoint is tens of minutes after its pod starts: every
+  #    deadline on the router's readiness has to cover that bring-up (README,
+  #    Readiness Deadlines).
   readinessProbe:
     path: /readiness
     initialDelaySeconds: 5
@@ -322,7 +396,11 @@ serviceAccount:
 
 rbac:
   # -- Create Role/RoleBinding for K8s service discovery (pods list/watch).
-  #    Automatically enabled when router.serviceDiscovery.enabled=true.
+  #    Created anyway when the router calls the Kubernetes API: Kubernetes
+  #    worker discovery (router.serviceDiscovery.enabled or
+  #    router.discovery.provider=kubernetes), or mesh without peerUrls, which
+  #    finds its peers among the router pods. The file, Slurm and Consul
+  #    providers need none.
   create: false
 
 # =============================================================================

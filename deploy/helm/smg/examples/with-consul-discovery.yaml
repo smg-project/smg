@@ -1,0 +1,23 @@
+# Router with Consul discovery: the workers are the instances of a Consul
+# service with passing health checks. The ACL token and the TLS files come
+# from existing Secrets through Consul's own environment variables, never as
+# arguments. No Kubernetes API access is needed, so the chart creates no Role.
+#
+#   kubectl create secret generic consul-acl --from-literal=token=<ACL token>
+#   kubectl create secret generic consul-tls --from-file=ca.crt
+#
+# Usage: helm install smg deploy/helm/smg -f deploy/helm/smg/examples/with-consul-discovery.yaml
+router:
+  policy: cache_aware
+  discovery:
+    provider: consul
+    consul:
+      service: llm-workers
+      address: https://consul-server.consul.svc:8501
+      token:
+        existingSecret: consul-acl
+        secretKey: token
+      tls:
+        existingSecret: consul-tls
+        secretKeys:
+          caCert: ca.crt

@@ -1,3 +1,4 @@
+{{- include "smg.validateDiscovery" . -}}
 apiVersion: apps/v1
 {{- if .Values.router.mesh.enabled }}
 kind: StatefulSet
@@ -140,6 +141,24 @@ spec:
                   key: {{ .key }}
             {{- end }}
             {{- end }}
+            {{- /* Consul discovery takes its ACL token and TLS files from Consul's
+                 own variables only, never from flags: the token from an
+                 existing Secret, the files from one mounted below. */}}
+            {{- if eq (.Values.router.discovery.provider | default "") "consul" }}
+            {{- with .Values.router.discovery.consul.token }}
+            {{- if .existingSecret }}
+            - name: CONSUL_HTTP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .existingSecret }}
+                  key: {{ .secretKey | default "token" }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- range (include "smg.consulTlsFiles" . | fromJsonArray) }}
+            - name: {{ .env }}
+              value: {{ printf "/etc/smg/consul-tls/%s" .path | quote }}
+            {{- end }}
             {{- with .Values.router.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -149,6 +168,16 @@ spec:
             {{- if include "smg.authSecretName" . }}
             - name: auth
               mountPath: /etc/smg/auth
+              readOnly: true
+            {{- end }}
+            {{- if and (eq (.Values.router.discovery.provider | default "") "file") .Values.router.discovery.file.configMap.name }}
+            - name: discovery-manifest
+              mountPath: /etc/smg/discovery
+              readOnly: true
+            {{- end }}
+            {{- if include "smg.consulTlsFiles" . | fromJsonArray }}
+            - name: consul-tls
+              mountPath: /etc/smg/consul-tls
               readOnly: true
             {{- end }}
       volumes:
@@ -161,6 +190,26 @@ spec:
             items:
               - key: {{ include "smg.authSecretKey" . }}
                 path: {{ include "smg.authSecretKey" . }}
+        {{- end }}
+        {{- /* The whole ConfigMap, not a subPath of it: the kubelet projects an
+             update by swapping a symlink in this directory, which the
+             gateway's watch on it reports. Optional, as the gateway waits for
+             a manifest not there yet, so the ConfigMap can follow the release. */}}
+        {{- if and (eq (.Values.router.discovery.provider | default "") "file") .Values.router.discovery.file.configMap.name }}
+        - name: discovery-manifest
+          configMap:
+            name: {{ .Values.router.discovery.file.configMap.name }}
+            optional: true
+        {{- end }}
+        {{- with include "smg.consulTlsFiles" . | fromJsonArray }}
+        - name: consul-tls
+          secret:
+            secretName: {{ $.Values.router.discovery.consul.tls.existingSecret }}
+            items:
+              {{- range . }}
+              - key: {{ .key }}
+                path: {{ .path }}
+              {{- end }}
         {{- end }}
       {{- with .Values.router.nodeSelector }}
       nodeSelector:
