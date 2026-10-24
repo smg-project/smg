@@ -24,7 +24,7 @@ smg-external-router = { version = "0.3.0", path = "crates/external_router" }
 kv-index = { version = "2.0.0", path = "crates/kv_index" }
 smg-radix-tree = { version = "0.1.0", path = "crates/radix_tree" }
 smg-data-connector = { version = "2.4.0", path = "crates/data_connector", package = "data-connector" }
-# Members build it with its default features (`hf-hub`): the gateway asks for `hf-hub` itself and the Python binding reaches it through the gateway.
+# Members build it with its default features (`hf-hub`): the gateway asks for `hf-hub` itself and the Python binding depends on the crate directly, taking the default.
 llm-multimodal = { version = "1.14.0", path = "crates/multimodal" }
 smg-wasm = { version = "1.1.4", path = "crates/wasm", package = "smg-wasm" }
 smg-mesh = { version = "1.4.4", path = "crates/mesh", package = "smg-mesh" }
