@@ -170,3 +170,7 @@ pub(crate) fn handoff(
         num_items_assigned: counts,
     })
 }
+
+#[cfg(test)]
+#[path = "sglang_encode/media_tests.rs"]
+mod media_tests;
