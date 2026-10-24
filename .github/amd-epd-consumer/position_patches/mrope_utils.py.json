@@ -1,0 +1,10 @@
+[
+  [
+    "import torch\n",
+    "import torch\n\nfrom sglang.srt.disaggregation._smg_epd_mrope_delta import write as _smg_write_mrope_delta\n"
+  ],
+  [
+    "        self.cached_tokens[req.metadata_buffer_index][6] = video_t\n",
+    "        self.cached_tokens[req.metadata_buffer_index][6] = video_t\n        _smg_write_mrope_delta(self.cached_tokens[req.metadata_buffer_index], req)\n"
+  ]
+]

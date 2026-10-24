@@ -1,0 +1,6 @@
+[
+  [
+    "        self.origin_input_ids = origin_input_ids\n",
+    "        self.origin_input_ids = origin_input_ids\n        self.pd_mrope_delta: Optional[int] = None\n        self.pd_mrope_prompt_len: Optional[int] = None\n"
+  ]
+]

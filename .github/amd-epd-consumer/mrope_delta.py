@@ -53,3 +53,29 @@ def restore(row, req):
     require(tag == TAG, "unknown metadata version")
     req.pd_mrope_delta = scalar(value)
     req.pd_mrope_prompt_len = len(req.origin_input_ids)
+
+
+def request_delta(req):
+    if not enabled() or getattr(req, "pd_mrope_delta", None) is None:
+        return None
+    require(type(req.pd_mrope_prompt_len) is int
+            and req.pd_mrope_prompt_len == len(req.origin_input_ids), "prompt length changed")
+    return scalar(req.pd_mrope_delta)
+
+
+def decode_deltas(reqs):
+    values = [request_delta(req) for req in reqs]
+    return None if all(value is None for value in values) else [value or 0 for value in values]
+
+
+def tail_delta(req, prefix, length):
+    value = request_delta(req)
+    if value is None:
+        return 0
+    require(type(prefix) is type(length) is int and length > 0
+            and prefix >= req.pd_mrope_prompt_len, "prompt re-prefill needs full positions")
+    return value
+
+
+def reject_spec(reqs):
+    require(decode_deltas(reqs) is None, "delta-only speculative decode is unsupported")
