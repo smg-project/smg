@@ -212,7 +212,7 @@ pub(super) fn forces_tool_call(spec: &ChatResponseSpec) -> bool {
 
 /// A streamed choice carrying whichever of `content`, `reasoning_content` and
 /// `tool_calls` the caller sets; the role is not repeated, the first chunk
-/// ([`role_choice`]) carried it.
+/// ([`opening_choice`]) carried it.
 pub(super) fn assistant_choice(
     index: u32,
     content: Option<String>,
