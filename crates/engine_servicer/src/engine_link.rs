@@ -85,7 +85,7 @@ pub(crate) async fn connect_engine(
     runtime: RuntimeType,
     words: PeerWords,
     inputs: ConnectInputs,
-    configure: impl FnOnce(&ZmqEngineClient),
+    configure: impl FnOnce(&ZmqEngineClient) -> Result<(), String>,
 ) {
     let ConnectInputs {
         ipc_base_url,
@@ -118,7 +118,16 @@ pub(crate) async fn connect_engine(
     .await
     {
         Ok(client) => {
-            configure(&client);
+            // What the handshake declared against what this servicer was
+            // launched for: a disagreement is a connect failure with its
+            // reason, never a servicer that reports SERVING for a role the
+            // wire cannot serve.
+            if let Err(message) = configure(&client) {
+                error!(%message);
+                link.fail(message.clone());
+                record_error(&last_error, message);
+                return;
+            }
             silence.apply(&client);
             info!(
                 handshake = %handshake_address,

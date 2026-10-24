@@ -29,6 +29,7 @@ pub(super) async fn connect_engine(state: Arc<State>, inputs: ConnectInputs) {
             if super::truncates_long_prompts(&state.model) {
                 client.note_engine_truncates_long_prompts();
             }
+            Ok(())
         },
     )
     .await;

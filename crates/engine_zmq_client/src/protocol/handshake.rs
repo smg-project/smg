@@ -116,6 +116,34 @@ pub struct EngineCoreReadyResponse {
     /// out or sends it as nil.
     #[serde(default, deserialize_with = "nil_as_empty_map")]
     pub positional_layouts: BTreeMap<String, Vec<String>>,
+    /// The request types this engine role takes, by name (`add`, `abort`,
+    /// `control`, `encode`), as the engine's own declaration lists them: a
+    /// scheduler lists the first three, a disaggregated encode worker lists
+    /// `encode` alone. Empty from an engine that predates the field, which
+    /// takes add and abort (and a control call when `positional_layouts`
+    /// names its reply).
+    #[serde(default)]
+    pub request_types: Vec<String>,
+}
+
+/// The request type an engine lists for the generate path (`add`).
+pub const REQUEST_KIND_ADD: &str = "add";
+/// The request type a disaggregated encode worker lists (`encode`).
+pub const REQUEST_KIND_ENCODE: &str = "encode";
+
+impl EngineCoreReadyResponse {
+    /// Whether the engine listed `kind` among the request types it takes.
+    /// An engine that declared none takes add and abort: `takes_generate`
+    /// reads that silence as yes, this reads it as no.
+    pub fn lists_request_kind(&self, kind: &str) -> bool {
+        self.request_types.iter().any(|listed| listed == kind)
+    }
+
+    /// Whether the engine takes generate requests: every engine that declared
+    /// nothing, else one that lists `add`.
+    pub fn takes_generate(&self) -> bool {
+        self.request_types.is_empty() || self.lists_request_kind(REQUEST_KIND_ADD)
+    }
 }
 
 /// A map an engine may send as nil (a Python `None` in a struct that omits
@@ -194,6 +222,37 @@ mod tests {
         // Optional trailing field defaults when omitted.
         assert!(resp.kv_events_config.is_none());
         assert!(resp.positional_layouts.is_empty());
+        assert!(resp.request_types.is_empty());
+        assert!(resp.takes_generate());
+        assert!(!resp.lists_request_kind(REQUEST_KIND_ENCODE));
+    }
+
+    /// An engine role lists what it takes: a scheduler add, abort and
+    /// control; an encode worker encode alone, which takes no generate.
+    #[test]
+    fn ready_response_reads_the_declared_request_types() {
+        let mut json = serde_json::json!({
+            "max_model_len": 4096u64,
+            "num_gpu_blocks": 0u64,
+            "block_size": 16u64,
+            "dp_stats_address": serde_json::Value::Null,
+            "dtype": "bfloat16",
+            "vllm_version": "engine-1.0",
+            "world_size": 1u64,
+            "data_parallel_size": 1u64,
+            "request_types": ["encode"],
+        });
+        let bytes = rmp_serde::to_vec_named(&json).unwrap();
+        let resp: EngineCoreReadyResponse = decode_msgpack(&bytes).unwrap();
+        assert_eq!(resp.request_types, vec!["encode".to_string()]);
+        assert!(resp.lists_request_kind(REQUEST_KIND_ENCODE));
+        assert!(!resp.takes_generate());
+
+        json["request_types"] = serde_json::json!(["add", "abort", "control"]);
+        let bytes = rmp_serde::to_vec_named(&json).unwrap();
+        let resp: EngineCoreReadyResponse = decode_msgpack(&bytes).unwrap();
+        assert!(resp.takes_generate());
+        assert!(!resp.lists_request_kind(REQUEST_KIND_ENCODE));
     }
 
     #[test]
