@@ -1100,7 +1100,9 @@ carries the server args the Router pairs on. What the wire does not carry is
 reported, not emulated: multimodal inputs are refused, EPD
 disaggregation (`--language-only` / `--encoder-only`) stays with the Python
 implementation (the worker refuses to start on the Rust path in those modes:
-the encode dispatch is not on it yet), and LoRA loading answers UNIMPLEMENTED,
+the encode dispatch is not on it yet), a prefill or decode leg with more than
+one scheduler rank refuses to start the same way (a request is not yet placed
+on its room's rank on the Rust path), and LoRA loading answers UNIMPLEMENTED,
 as it does on the Python servicer.
 `SubscribeKvEvents` relays SGLang's ZMQ KV-event publisher, which the servicer
 turns on by itself, on this path as on the Python one, when the launcher is

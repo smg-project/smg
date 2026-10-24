@@ -414,13 +414,24 @@ def refuse_epd_disaggregation(server_args: Any) -> None:
     process (the receiver's encode request), which this path does not run
     yet, so such a worker must not start rather than report SERVING and
     refuse every image. Prefill/decode disaggregation is served (the wire
-    carries the bootstrap fields; :func:`start_bootstrap_server`)."""
+    carries the bootstrap fields; :func:`start_bootstrap_server`) on a leg with
+    one scheduler rank; with more than one, the Python servicer places a
+    request on the rank of its room (``bootstrap_room % dp_size``) and the
+    decode side looks for the KV there, which this path does not do yet, so
+    such a leg must not start either."""
     args = EngineConfigView(server_args).server_args
     if args.language_only or args.encoder_only:
         raise ServicerConfigError(
             f"{SERVICER_IMPL_ENV}=rust does not serve EPD disaggregation yet "
             "(language_only / encoder_only: the encode dispatch is not on the Rust path); "
             "run this worker on the Python servicer"
+        )
+    if args.disaggregation_mode in ("prefill", "decode") and args.scheduler_count > 1:
+        raise ServicerConfigError(
+            f"{SERVICER_IMPL_ENV}=rust does not serve prefill/decode disaggregation with more "
+            f"than one scheduler rank yet ({args.scheduler_count} ranks: a request is not placed "
+            "on its room's rank on the Rust path); run this worker on the Python servicer or "
+            "with one rank per leg"
         )
 
 
