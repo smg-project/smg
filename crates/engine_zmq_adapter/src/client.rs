@@ -13,13 +13,13 @@ use engine_zmq_client::{
     check_engine_layouts,
     codec::OpaqueValue,
     connect_handshake,
-    connector::{EngineCoreClient, SglangClient, TokenSpeedClient},
+    connector::{Client, EngineCoreClient, SglangClient, TokenSpeedClient},
     protocol::{
         handshake::EngineCoreReadyResponse,
         sglang::{request::SglangRequest, SglangProtocol},
-        tokenspeed::TokenSpeedProtocol,
+        tokenspeed::{wire_carries_control_calls, TokenSpeedProtocol},
         vllm::{request::EngineCoreRequest, sampling::EngineCoreSamplingParams, VllmProtocol},
-        EngineLoad,
+        EngineLoad, EngineProtocol,
     },
     ConnectedEngine, StartupBudget,
 };
@@ -1052,38 +1052,65 @@ impl ZmqEngineClient {
         )))
     }
 
-    /// One control call on every connected scheduler rank (the plugin
-    /// dispatches it to the scheduler's own handler), each rank's
-    /// `(success, message)` in engine order. The wait is per rank
-    /// (DEADLINE_EXCEEDED); a dead engine is UNAVAILABLE.
-    async fn control_sglang(
+    /// Whether every connected TokenSpeed rank declared the control reply at
+    /// its handshake (the control-wire revision), so the scheduler's control
+    /// RPCs can be carried to it; false on a scheduler that declares none and
+    /// on the other backends.
+    pub fn tokenspeed_wire_carries_control_calls(&self) -> bool {
+        matches!(&self.backend, ZmqBackend::TokenSpeed(_))
+            && self
+                .engines()
+                .iter()
+                .all(|engine| wire_carries_control_calls(&engine.ready_response.positional_layouts))
+    }
+
+    /// One control call (`rpc`, as `method(*args)` on the wire) on every
+    /// connected scheduler rank, each rank's `(success, message)` in engine
+    /// order: the SGLang plugin, or a TokenSpeed scheduler of the control-wire
+    /// revision, dispatches it to the scheduler's own handler. The wait is per
+    /// rank (DEADLINE_EXCEEDED); a dead engine is UNAVAILABLE. A TokenSpeed
+    /// scheduler whose handshake declares no control reply answers
+    /// UNIMPLEMENTED naming the gap, as does a vLLM engine, whose own RPCs
+    /// serve its admin.
+    async fn control_calls(
         &self,
+        rpc: &str,
         method: &str,
         args: Vec<OpaqueValue>,
         wait: Duration,
     ) -> Result<Vec<(bool, String)>, tonic::Status> {
-        let client = self.sglang_client(method)?;
-        let calls = client
-            .engines()
-            .iter()
-            .map(|engine| client.call_utility(&engine.engine_id, method, args.clone(), wait));
-        let replies = futures::future::try_join_all(calls)
-            .await
-            .map_err(utility_status)?;
-        Ok(replies.iter().map(control_outcome).collect())
+        match &self.backend {
+            ZmqBackend::Sglang(client) => control_on_every_rank(client, method, args, wait).await,
+            ZmqBackend::TokenSpeed(client) => {
+                if !self.tokenspeed_wire_carries_control_calls() {
+                    return Err(tonic::Status::unimplemented(format!(
+                        "{rpc} is not available through the Rust TokenSpeed servicer: the \
+                         scheduler's msgpack wire carries generate and abort only (its \
+                         handshake declares no control reply)"
+                    )));
+                }
+                control_on_every_rank(client, method, args, wait).await
+            }
+            ZmqBackend::Vllm(_) => Err(tonic::Status::unimplemented(format!(
+                "{rpc} is only available on an SGLang or TokenSpeed ZMQ backend"
+            ))),
+        }
     }
 
-    /// SGLang's `FlushCacheReqInput(timeout_s)` on every rank: the scheduler
-    /// flushes at once when idle, or waits up to `timeout_s` for idle when
-    /// positive; `wait` bounds the reply. Aggregated as the Python servicer
-    /// aggregates its per-rank communicator results.
-    pub async fn flush_cache_sglang(
+    /// The scheduler's cache flush (`FlushCacheReqInput(timeout_s)` on
+    /// SGLang; the control-wire revision's `flush_cache` on TokenSpeed) on
+    /// every rank: the scheduler flushes at once when idle, or waits up to
+    /// `timeout_s` for idle when positive; `wait` bounds the reply.
+    /// Aggregated as the Python servicer aggregates its per-rank communicator
+    /// results.
+    pub async fn flush_cache_control(
         &self,
         timeout_s: f32,
         wait: Duration,
     ) -> Result<(bool, String), tonic::Status> {
         let results = self
-            .control_sglang(
+            .control_calls(
+                "FlushCache",
                 "flush_cache",
                 vec![OpaqueValue::F64(f64::from(timeout_s))],
                 wait,
@@ -1092,22 +1119,30 @@ impl ZmqEngineClient {
         Ok(aggregate_control(&results, "Cache flushed successfully"))
     }
 
-    /// SGLang's `ProfileReq` on every rank: start with the given options, or
-    /// stop (`None`) and export the traces.
-    pub async fn profile_sglang(
+    /// The scheduler's profiler on every rank (`ProfileReq` on SGLang; the
+    /// control-wire revision's `start_profile` / `stop_profile` on
+    /// TokenSpeed): start with the given options, or stop (`None`) and export
+    /// the traces.
+    pub async fn profile_control(
         &self,
         start: Option<SglangProfileStart>,
         wait: Duration,
     ) -> Result<(bool, String), tonic::Status> {
-        let (method, args, ok_message) = match start {
+        let (rpc, method, args, ok_message) = match start {
             Some(start) => (
+                "StartProfile",
                 "start_profile",
                 vec![start.into_opaque()],
                 "Start profiling succeeded",
             ),
-            None => ("stop_profile", Vec::new(), "Stop profiling succeeded"),
+            None => (
+                "StopProfile",
+                "stop_profile",
+                Vec::new(),
+                "Stop profiling succeeded",
+            ),
         };
-        let results = self.control_sglang(method, args, wait).await?;
+        let results = self.control_calls(rpc, method, args, wait).await?;
         Ok(aggregate_control(&results, ok_message))
     }
 
@@ -1168,7 +1203,7 @@ impl ZmqEngineClient {
     /// is bounded by `timeout` (DEADLINE_EXCEEDED); an engine failure (a
     /// profiler the engine was launched without) is INTERNAL with the
     /// engine's words, a dead engine UNAVAILABLE. TokenSpeed and SGLang have
-    /// control calls of their own ([`Self::profile_sglang`]).
+    /// control calls of their own ([`Self::profile_control`]).
     pub async fn profile_vllm(
         &self,
         is_start: bool,
@@ -1406,6 +1441,24 @@ fn zmq_status_of(error: &engine_zmq_client::Error) -> tonic::Status {
 
 /// A utility call's error as a status: the wait expiring is the caller's
 /// deadline, everything else is the engine failing.
+/// `method(*args)` on every rank of `client`, each rank's `(success,
+/// message)` in engine order; the wait is per rank.
+async fn control_on_every_rank<P: EngineProtocol>(
+    client: &Client<P>,
+    method: &str,
+    args: Vec<OpaqueValue>,
+    wait: Duration,
+) -> Result<Vec<(bool, String)>, tonic::Status> {
+    let calls = client
+        .engines()
+        .iter()
+        .map(|engine| client.call_utility(&engine.engine_id, method, args.clone(), wait));
+    let replies = futures::future::try_join_all(calls)
+        .await
+        .map_err(utility_status)?;
+    Ok(replies.iter().map(control_outcome).collect())
+}
+
 fn utility_status(error: engine_zmq_client::Error) -> tonic::Status {
     match error {
         engine_zmq_client::Error::UtilityTimeout { .. } => {

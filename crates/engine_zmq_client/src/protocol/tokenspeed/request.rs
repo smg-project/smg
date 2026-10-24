@@ -29,6 +29,11 @@ pub const TOKENIZED_GENERATE_REQ_INPUT_TAG: &str = "TokenizedGenerateReqInput";
 pub enum TokenSpeedRequestType {
     Add = 0,
     Abort = 1,
+    /// A control call for a scheduler of the control-wire revision:
+    /// `(call_id, method, args)`, answered by a `ControlReplySlim` under the
+    /// same call id on the output socket. Sent only to a scheduler whose
+    /// handshake declared that reply.
+    Control = 2,
 }
 
 impl TokenSpeedRequestType {
@@ -40,6 +45,7 @@ impl TokenSpeedRequestType {
         match value {
             0 => Some(Self::Add),
             1 => Some(Self::Abort),
+            2 => Some(Self::Control),
             _ => None,
         }
     }
@@ -49,6 +55,7 @@ impl TokenSpeedRequestType {
         Bytes::from_static(match self {
             Self::Add => b"\x00",
             Self::Abort => b"\x01",
+            Self::Control => b"\x02",
         })
     }
 }
