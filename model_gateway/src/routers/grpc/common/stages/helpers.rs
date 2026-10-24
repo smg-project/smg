@@ -2353,7 +2353,7 @@ mod epd_restamp_tests {
             // selected runtime actually uses its bootstrap wire protocol.
             let mut request = ProtoGenerateRequest::Sglang(Box::default());
             let before = request.as_sglang().clone();
-            super::maybe_inject_pd_metadata(&mut request, &workers);
+            maybe_inject_pd_metadata(&mut request, &workers);
             assert_eq!(*request.as_sglang(), before, "runtime {runtime:?}");
         }
     }

@@ -3093,7 +3093,7 @@ mod tests {
             context::AttemptStamp,
         };
 
-        let worker = |url, role| -> Arc<dyn Worker> {
+        let worker = |url: &str, role| -> Arc<dyn Worker> {
             Arc::new(
                 BasicWorkerBuilder::new(url)
                     .worker_type(role)
@@ -3143,12 +3143,10 @@ mod tests {
             };
             for attempt in 0..2 {
                 let previous = plan.clone();
+                let prefill_url = format!("grpc://retry-prefill-{attempt}:30000");
                 let workers = WorkerSelection::Disaggregated {
                     encode_assignments: None,
-                    prefill: worker(
-                        &format!("grpc://retry-prefill-{attempt}:30000"),
-                        WorkerType::Prefill,
-                    ),
+                    prefill: worker(&prefill_url, WorkerType::Prefill),
                     decode: workers.decode_worker().unwrap().clone(),
                     runtime_type: RuntimeType::Sglang,
                 };
