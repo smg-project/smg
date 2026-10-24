@@ -10,7 +10,7 @@
   "producer_sha": null,
   "producer_branch": "ci/frozen-c9d-cpu-producer-20261023",
   "producer_policy": "frozen_c9d_dispatch_build_only_all_18_steps_success_v1",
-  "target_product_commit": "69a0a160721b5f669c82d7ec711737221cd9602d",
+  "target_product_commit": "6332ac94e00a587e14e5e68faaaa3b83b442a714",
   "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat[0]/sglang/nvidia",
   "source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
@@ -24,7 +24,7 @@
     "model_gateway": "d1a181bfb1d16a661e16346d4eb8f257689701ce",
     "grpc_servicer": "a10bb7235d74ac91d8de4b3eafabd1ef7ed1344e",
     "e2e_test": "35d5321770a24d3706a3c0730c465d3a0e11d437",
-    "scripts": "0f65e05d51346101f6d7a0c586c25d00f7b4ca36",
+    "scripts": "6f2082a851689a51de9fd5211fd491a38c8ada8a",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows/e2e-gpu-job.yml": "d84eaa5bcf0a29415b1a512cef7c9f5be8e47d4f",
     "README.md": "83b7df25632da03f0184bd5b4628b9c9a3ace803",
@@ -168,6 +168,9 @@
     "only_scripts_and_shared_workflow_changed": true,
     "full_target_environment_verified": false,
     "benchmark_setup_unchanged": true,
-    "no_EPD_stage_or_schema": true
+    "no_EPD_stage_or_schema": true,
+    "tvm_bootstrap_commit": "7161e0d8f7fb34c93db374cd190a435dc1e72091",
+    "tvm_bootstrap_shared_target": "6332ac94e00a587e14e5e68faaaa3b83b442a714",
+    "actual_no_device_canary": "ROOT_REPORTED_CPU_ONLY_9.87S_NONAUTHOR_AUDIT_PENDING_NO_MODEL_RESULT_TRANSFERRED"
   }
 }
