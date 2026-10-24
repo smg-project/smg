@@ -1,0 +1,119 @@
+name: AMD original TokenSpeed chat167 functional equivalent
+on:
+  workflow_dispatch:
+    inputs:
+      execute:
+        type: boolean
+        default: false
+      lane:
+        type: choice
+        options: [rust, zmq]
+        required: true
+        default: rust
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: amd-ts-chat167-${{ inputs.lane }}
+  cancel-in-progress: false
+jobs:
+  artifact-relay:
+    if: inputs.execute
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Require exactly one separately admitted original167 lane
+        env:
+          LANE: ${{ inputs.lane }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          data = json.loads(Path(".github/amd-shared-product/inputs.json").read_text())
+          assert data["admitted_lane"] == os.environ["LANE"] in {"rust", "zmq"}
+          assert data["recipe"]["selected"] == 167 and data["recipe"]["test_filter"] == ""
+          assert all(data[key] is True for key in ("ready", "run_budget_admitted", "artifacts_pinned"))
+          PY
+      - name: Verify external producer and relay payloads
+        id: relay
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          DIRECTORY="$RUNNER_TEMP/shared-relay-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "directory=$DIRECTORY" >> "$GITHUB_OUTPUT"
+          python3 .github/amd-shared-product/relay.py --out "$DIRECTORY"
+      - name: Relay wheel without changing its bytes
+        uses: actions/upload-artifact@v7
+        with:
+          name: smg-wheel
+          path: ${{ steps.relay.outputs.directory }}/smg-wheel/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+      - name: Relay Go FFI without changing its bytes
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-ffi-library
+          path: ${{ steps.relay.outputs.directory }}/go-ffi-library/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+      - name: Relay WASM without changing its bytes
+        uses: actions/upload-artifact@v7
+        with:
+          name: wasm-test-fixtures
+          path: ${{ steps.relay.outputs.directory }}/wasm-test-fixtures/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+      - name: Relay Python types without changing their bytes
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-client-types
+          path: ${{ steps.relay.outputs.directory }}/python-client-types/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+      - name: Preserve external producer identity and verification
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: external-producer-relay-evidence
+          path: ${{ steps.relay.outputs.directory }}/evidence/
+          if-no-files-found: ignore
+          retention-days: 7
+  amd-ts-chat167:
+    needs: artifact-relay
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: '1'
+      runner: 1-gpu-mi300x
+      timeout: ${{ inputs.lane == 'rust' && 56 || 60 }}
+      test_timeout: ${{ inputs.lane == 'rust' && 26 || 48 }}
+      test_dirs: e2e_test/chat_completions
+      min_selected: ${{ inputs.lane == 'rust' && 114 || 109 }}
+      connection_mode: ${{ inputs.lane == 'rust' && 'grpc' || 'zmq' }}
+      servicer_impl: ${{ inputs.lane == 'rust' && 'rust' || '' }}
+      extra_deps: e2e_test/amd_ts_chat167
+      servicer_unit_tests: true
+      gpu_vendor: amd
+      container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
+      container_options: --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN --env SPT_NOENV=1 --env SMG_TS_CHAT167_LANE=${{ inputs.lane }} --env E2E_AMD_VLLM_ALWAYS_GRAMMAR_EQUIVALENT=1 --env SMG_CI_RUNTIME_STATE_DIR=/tmp/smg-ts-chat167 --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1
+    secrets: inherit
+  finish:
+    if: always() && inputs.execute
+    needs: [artifact-relay, amd-ts-chat167]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Require the actual shared workflow to finish successfully
+        env:
+          RELAY: ${{ needs.artifact-relay.result }}
+          CHAT: ${{ needs.amd-ts-chat167.result }}
+        run: test "$RELAY" = success && test "$CHAT" = success
