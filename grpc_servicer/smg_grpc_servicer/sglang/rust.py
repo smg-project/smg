@@ -22,8 +22,12 @@ before the ranks, where the Python servicer starts it; the planned warm-up
 runs on a prefill or decode leg as on a single engine, its requests carrying
 the engine's stand-in bootstrap, so the leg warms up without its peer and no
 first request of a prompt-length class pays a kernel compile under the
-Router's prefill-liveness bound. Multimodal inputs reach the scheduler as its
-own processor output over the wire. What the msgpack wire
+Router's prefill-liveness bound. A leg of more than one scheduler rank is
+served too: a prefill leg's request runs on the rank of its room's residue
+(``bootstrap_room % dp_size``, where SGLang's prefill side requires it and
+the decode side looks for the KV), the Router's pin yielding to it with a
+warning, and a decode leg's on its pinned rank. Multimodal inputs reach the
+scheduler as its own processor output over the wire. What the msgpack wire
 does not carry, the Rust path reports rather than emulates: LoRA loading
 answers UNIMPLEMENTED (as on the Python servicer), and EPD disaggregation
 (``language_only`` / ``encoder_only``) stays with the Python implementation
@@ -414,24 +418,16 @@ def refuse_epd_disaggregation(server_args: Any) -> None:
     process (the receiver's encode request), which this path does not run
     yet, so such a worker must not start rather than report SERVING and
     refuse every image. Prefill/decode disaggregation is served (the wire
-    carries the bootstrap fields; :func:`start_bootstrap_server`) on a leg with
-    one scheduler rank; with more than one, the Python servicer places a
-    request on the rank of its room (``bootstrap_room % dp_size``) and the
-    decode side looks for the KV there, which this path does not do yet, so
-    such a leg must not start either."""
+    carries the bootstrap fields; :func:`start_bootstrap_server`) on a leg of
+    any number of scheduler ranks: the Rust servicer places a prefill leg's
+    request on the rank of its room (``bootstrap_room % dp_size``, where the
+    decode side looks for the KV) and a decode leg's on its pinned rank."""
     args = EngineConfigView(server_args).server_args
     if args.language_only or args.encoder_only:
         raise ServicerConfigError(
             f"{SERVICER_IMPL_ENV}=rust does not serve EPD disaggregation yet "
             "(language_only / encoder_only: the encode dispatch is not on the Rust path); "
             "run this worker on the Python servicer"
-        )
-    if args.disaggregation_mode in ("prefill", "decode") and args.scheduler_count > 1:
-        raise ServicerConfigError(
-            f"{SERVICER_IMPL_ENV}=rust does not serve prefill/decode disaggregation with more "
-            f"than one scheduler rank yet ({args.scheduler_count} ranks: a request is not placed "
-            "on its room's rank on the Rust path); run this worker on the Python servicer or "
-            "with one rank per leg"
         )
 
 

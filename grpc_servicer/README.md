@@ -1104,12 +1104,18 @@ servicer; `supports_vision` is advertised as SGLang's model config decides it.
 A request the Router pins to a data-parallel rank (`--dp-size` above one
 behind a dp-aware Router) goes to that rank's scheduler, as the engine's
 data-parallel controller sends it behind SGLang's own frontend; a pin past the
-connected ranks is refused as the caller's error. What the wire does not carry is reported, not emulated: EPD disaggregation (`--language-only` / `--encoder-only`) stays with
-the Python implementation (the worker refuses to start on the Rust path in
-those modes: the encode dispatch is not on it yet), a prefill or decode leg
-with more than one scheduler rank refuses to start the same way (a request is
-not yet placed on its room's rank on the Rust path), and LoRA loading answers
-UNIMPLEMENTED, as it does on the Python servicer.
+connected ranks is refused as the caller's error. On the prefill side of a disaggregated pair a request runs on
+the rank of its room's residue instead (`bootstrap_room % dp_size`: SGLang's
+prefill side follows the room and its KV sender fails a request placed
+elsewhere, and the decode side looks for the KV on that rank), the Router's pin
+yielding to it with a warning; the decode side keeps the pin. The planned
+warm-up pins each of its requests to a rank (on a prefill or decode leg with a
+stand-in room of that rank's residue), so every rank is warm before the Router
+sends anything. What the wire does not carry is reported, not emulated: EPD disaggregation
+(`--language-only` / `--encoder-only`) stays with the Python implementation
+(the worker refuses to start on the Rust path in those modes: the encode
+dispatch is not on it yet), and LoRA loading answers UNIMPLEMENTED, as it does
+on the Python servicer.
 `SubscribeKvEvents` relays SGLang's ZMQ KV-event publisher, which the servicer
 turns on by itself, on this path as on the Python one, when the launcher is
 given no `--kv-events-config`, at a port found free on the host rather than

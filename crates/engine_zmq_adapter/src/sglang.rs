@@ -494,13 +494,16 @@ pub(crate) fn fan_out_sglang_requests(
 /// forwards them. `max_model_len` is the context window the scheduler
 /// reported at the handshake: an empty prompt, or one that fills the window,
 /// is refused before it reaches the scheduler ([`admit_prompt`]). `ranks` is
-/// how many scheduler ranks are connected: the request's data-parallel pin is
-/// placed among them as the engine's own frontend places it
-/// ([`routed_dp_rank`]).
+/// how many scheduler ranks are connected and `placement` how a request is
+/// placed among them ([`RankPlacement`]): by its data-parallel pin, as the
+/// engine's own frontend places it ([`routed_dp_rank`]), or, on the prefill
+/// side of a disaggregated pair, by its room's residue
+/// ([`room_residue_rank`]).
 pub(crate) fn translate_request_sglang(
     req: sglang_proto::GenerateRequest,
     max_model_len: u64,
     ranks: usize,
+    placement: RankPlacement,
 ) -> Result<TokenizedGenerateReqInput, String> {
     let input_ids = req
         .tokenized
@@ -530,7 +533,12 @@ pub(crate) fn translate_request_sglang(
         ),
         None => (None, None, None),
     };
-    let routed_dp_rank = routed_dp_rank(req.data_parallel_rank, ranks)?;
+    let routed_dp_rank = match (placement, bootstrap_room) {
+        (RankPlacement::RoomResidue, Some(room)) => {
+            room_residue_rank(room, req.data_parallel_rank, ranks, &req.request_id)
+        }
+        _ => routed_dp_rank(req.data_parallel_rank, ranks)?,
+    };
     Ok(TokenizedGenerateReqInput {
         rid: req.request_id,
         input_ids,
@@ -653,6 +661,51 @@ fn wire_tensor_sglang(
         tensor.data,
     )
     .map_err(|error| format!("multimodal tensor {name:?}: {error}"))
+}
+
+/// How a request is placed among the scheduler ranks: by its data-parallel
+/// pin, as the engine's own frontend places one (an aggregated engine, and
+/// the decode side of a disaggregated pair, whose own placement is free), or
+/// by the residue of its rendezvous room, as the prefill side of a
+/// disaggregated pair requires: SGLang's prefill side follows the room by
+/// default (`load_balance_method` `auto` resolves to `follow_bootstrap_room`
+/// there), its KV sender fails a request that runs on another rank than
+/// `bootstrap_room % dp_size`, and the decode side looks for the KV on that
+/// rank. The servicer that launched the engine says which
+/// (`ZmqEngineClient::note_engine_places_by_rendezvous_room`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RankPlacement {
+    Pin,
+    RoomResidue,
+}
+
+/// The scheduler rank a disaggregated request goes to on a prefill side that
+/// follows the room: `bootstrap_room % ranks`, Python's `%` as the engine
+/// computes it (a negative room folds the same way); a pin that names
+/// another rank is logged and ignored, never refused, since placing by the
+/// pin would fail the request at the engine's KV sender. A single rank takes
+/// everything.
+fn room_residue_rank(room: i64, pin: Option<i32>, ranks: usize, request_id: &str) -> Option<u32> {
+    let Ok(ranks) = u32::try_from(ranks) else {
+        return None;
+    };
+    if ranks <= 1 {
+        return None;
+    }
+    let rank = u32::try_from(room.rem_euclid(i64::from(ranks))).unwrap_or(0);
+    if let Some(pin) = pin {
+        if u32::try_from(pin).ok() != Some(rank) {
+            warn!(
+                request_id,
+                data_parallel_rank = pin,
+                bootstrap_room = room,
+                dp_size = ranks,
+                "data_parallel_rank conflicts with the bootstrap_room residue; the room \
+                 stays authoritative on a disaggregated request, the pin is ignored"
+            );
+        }
+    }
+    Some(rank)
 }
 
 /// The scheduler rank a request's data-parallel pin routes it to, by the
@@ -960,7 +1013,12 @@ mod tests {
 
     /// The translation under the mock scheduler's context window, one rank.
     fn translate(req: sglang_proto::GenerateRequest) -> Result<WireRequest, String> {
-        translate_request_sglang(req, default_ready_response().max_model_len, 1)
+        translate_request_sglang(
+            req,
+            default_ready_response().max_model_len,
+            1,
+            RankPlacement::Pin,
+        )
     }
 
     fn tensor(dtype: &str, shape: Vec<u32>, data: Vec<u8>) -> sglang_proto::TensorData {
@@ -1359,7 +1417,12 @@ mod tests {
             ..Default::default()
         };
         let translate_among = |pin: Option<i32>, ranks: usize| {
-            translate_request_sglang(pinned(pin), default_ready_response().max_model_len, ranks)
+            translate_request_sglang(
+                pinned(pin),
+                default_ready_response().max_model_len,
+                ranks,
+                RankPlacement::Pin,
+            )
         };
         assert_eq!(translate_among(None, 2).unwrap().routed_dp_rank, None);
         assert_eq!(translate_among(Some(1), 2).unwrap().routed_dp_rank, Some(1));
@@ -1387,6 +1450,102 @@ mod tests {
         let wire = translate_among(Some(1), 2).unwrap();
         let back: WireRequest = decode_msgpack(&encode_msgpack(&wire).unwrap()).unwrap();
         assert_eq!(back.routed_dp_rank, Some(1));
+    }
+
+    /// On the prefill side of a disaggregated pair the room places the
+    /// request: `bootstrap_room % ranks` over two and over four ranks, a
+    /// negative room folding as the engine's `%` does; a pin that disagrees
+    /// yields to the room (and is logged once, which the servicer's test
+    /// reads); a request without a room, the decode side and an aggregated
+    /// engine keep the pin rule; a single rank takes everything.
+    #[test]
+    fn sglang_translation_places_a_prefill_sides_request_by_its_rooms_residue() {
+        use RankPlacement::{Pin, RoomResidue};
+
+        let disaggregated = |room: Option<i32>, pin: Option<i32>| sglang_proto::GenerateRequest {
+            request_id: "pd".into(),
+            tokenized: Some(sglang_proto::TokenizedInput {
+                original_text: String::new(),
+                input_ids: vec![1, 2, 3],
+            }),
+            data_parallel_rank: pin,
+            disaggregated_params: room.map(|room| sglang_proto::DisaggregatedParams {
+                bootstrap_host: "10.0.0.1".into(),
+                bootstrap_port: 8998,
+                bootstrap_room: room,
+            }),
+            ..Default::default()
+        };
+        let place = |placement: RankPlacement, room: Option<i32>, pin: Option<i32>, ranks| {
+            translate_request_sglang(
+                disaggregated(room, pin),
+                default_ready_response().max_model_len,
+                ranks,
+                placement,
+            )
+            .map(|wire| wire.routed_dp_rank)
+        };
+        assert_eq!(place(RoomResidue, Some(7), None, 2), Ok(Some(1)));
+        assert_eq!(place(RoomResidue, Some(8), None, 2), Ok(Some(0)));
+        assert_eq!(place(RoomResidue, Some(7), None, 4), Ok(Some(3)));
+        assert_eq!(place(RoomResidue, Some(9), None, 4), Ok(Some(1)));
+        assert_eq!(
+            place(RoomResidue, Some(7), Some(0), 2),
+            Ok(Some(1)),
+            "the room stays authoritative over the pin"
+        );
+        assert_eq!(
+            place(RoomResidue, Some(7), Some(1), 2),
+            Ok(Some(1)),
+            "a pin that agrees changes nothing"
+        );
+        assert_eq!(
+            place(RoomResidue, Some(7), Some(5), 2),
+            Ok(Some(1)),
+            "a pin past the ranks yields too, never refused"
+        );
+        assert_eq!(
+            place(RoomResidue, Some(-3), None, 4),
+            Ok(Some(1)),
+            "a negative room folds as Python's % does"
+        );
+        assert_eq!(
+            place(RoomResidue, Some(0), Some(3), 4),
+            Ok(Some(0)),
+            "room 0 (a lone leg's stand-in) is a room"
+        );
+        assert_eq!(
+            place(RoomResidue, Some(7), Some(1), 1),
+            Ok(None),
+            "a single rank takes everything"
+        );
+        // No room: the pin rule, as on an aggregated engine.
+        assert_eq!(place(RoomResidue, None, Some(1), 2), Ok(Some(1)));
+        assert_eq!(place(RoomResidue, None, None, 2), Ok(None));
+        assert_eq!(
+            place(RoomResidue, None, Some(2), 2),
+            Err("routed_dp_rank=2 out of range [0, 2)".to_string())
+        );
+        // The decode side and an aggregated engine: the pin, the room's
+        // residue not consulted.
+        assert_eq!(place(Pin, Some(7), Some(0), 2), Ok(Some(0)));
+        assert_eq!(place(Pin, Some(7), None, 2), Ok(None));
+        assert_eq!(
+            place(Pin, Some(7), Some(2), 2),
+            Err("routed_dp_rank=2 out of range [0, 2)".to_string())
+        );
+        // The room rides the wire beside the rank it placed the request on.
+        let wire = translate_request_sglang(
+            disaggregated(Some(7), Some(0)),
+            default_ready_response().max_model_len,
+            2,
+            RoomResidue,
+        )
+        .unwrap();
+        assert_eq!(
+            (wire.bootstrap_room, wire.routed_dp_rank),
+            (Some(7), Some(1))
+        );
     }
 
     /// Prompt bounds apply before the scheduler, with or without an output
@@ -1428,6 +1587,7 @@ mod tests {
                     request(prompt_len, sampling.clone()),
                     max_model_len,
                     1,
+                    RankPlacement::Pin,
                 );
                 assert_eq!(
                     result.is_ok(),

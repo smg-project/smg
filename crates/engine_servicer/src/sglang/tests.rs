@@ -42,7 +42,9 @@ use tonic_health::pb::{
 
 use super::*;
 use crate::{
-    testing::{assert_bucket_edges, assert_golden, http_get, servicer_config, Bounded},
+    testing::{
+        assert_bucket_edges, assert_golden, captured_logs, http_get, servicer_config, Bounded,
+    },
     ServicerError,
 };
 
@@ -814,6 +816,140 @@ async fn a_pinned_request_reaches_its_data_parallel_rank() {
     assert_eq!(status.message(), "routed_dp_rank=2 out of range [0, 2)");
     assert_scheduler_idle(&mut h.engine_in).await;
     assert_scheduler_idle(&mut rank1_in).await;
+    wait_until(|| h.server.active_requests() == 0).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A disaggregated request for the test: the Router's pin and the room both
+/// sides meet in.
+fn disaggregated_request(id: &str, room: i32, pin: i32) -> sg::GenerateRequest {
+    let mut request = generate_request(id, false, Vec::new());
+    request.data_parallel_rank = Some(pin);
+    request.disaggregated_params = Some(sg::DisaggregatedParams {
+        bootstrap_host: "10.0.0.1".to_string(),
+        bootstrap_port: 8998,
+        bootstrap_room: room,
+    });
+    request
+}
+
+/// On the prefill side of a disaggregated pair (the launcher's
+/// `disaggregation_mode`) the room places the request: a request whose
+/// Router pin names rank 0 but whose room's residue over two ranks is 1
+/// reaches rank 1's scheduler, `routed_dp_rank` 1 and the room on the wire,
+/// with one warning line naming the request; a request whose pin agrees
+/// logs nothing.
+#[tokio::test]
+async fn a_prefill_sides_request_runs_on_the_rank_of_its_rooms_residue() {
+    let logs = captured_logs();
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    model.server_args_json = r#"{"model_path":"org/model","dp_size":2,"disaggregation_mode":"prefill","load_balance_method":"follow_bootstrap_room"}"#.to_string();
+    let (mut h, mut rank1_in, mut rank1_out) = two_rank_harness(model).await;
+
+    // Room 7 over two ranks is rank 1; the pin says 0 and yields.
+    let mut stream = h
+        .client
+        .generate(disaggregated_request("room7", 7, 0))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank1_in).await;
+    assert_eq!(
+        (add.rid.as_str(), add.routed_dp_rank, add.bootstrap_room),
+        ("room7", Some(1), Some(7))
+    );
+    rank1_out
+        .send_frames(vec![Bytes::from(
+            encode_msgpack(&BatchTokenIDSlimOutput {
+                engine_index: 1,
+                ..batch("room7", vec![10], 1, Some("stop"), None)
+            })
+            .unwrap(),
+        )])
+        .await
+        .unwrap();
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(
+        (done.finish_reason.as_str(), done.output_ids),
+        ("stop", vec![10])
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    let lines = logs.lines_containing("room7");
+    assert_eq!(lines.len(), 1, "one warning line: {lines:?}");
+    assert!(lines[0].contains("WARN"), "{}", lines[0]);
+    assert!(
+        lines[0].contains("data_parallel_rank conflicts with the bootstrap_room residue"),
+        "{}",
+        lines[0]
+    );
+
+    // Room 8 is rank 0; the pin agrees: nothing logged.
+    let mut stream = h
+        .client
+        .generate(disaggregated_request("room8", 8, 0))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut h.engine_in).await;
+    assert_eq!(
+        (add.rid.as_str(), add.routed_dp_rank, add.bootstrap_room),
+        ("room8", Some(0), Some(8))
+    );
+    send(
+        &mut h.engine_out,
+        &batch("room8", vec![11], 1, Some("stop"), None),
+    )
+    .await;
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "stop"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert!(logs.lines_containing("room8").is_empty());
+    assert_scheduler_idle(&mut rank1_in).await;
+    wait_until(|| h.server.active_requests() == 0).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The decode side of a disaggregated pair places a request by its pin, as
+/// an aggregated engine does: its own placement is free, the KV is looked
+/// for on the prefill rank the room names. A room whose residue is rank 0
+/// does not move a request pinned to rank 1.
+#[tokio::test]
+async fn a_decode_sides_request_runs_on_its_pinned_rank() {
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    model.server_args_json =
+        r#"{"model_path":"org/model","dp_size":2,"disaggregation_mode":"decode"}"#.to_string();
+    let (mut h, mut rank1_in, mut rank1_out) = two_rank_harness(model).await;
+    let mut stream = h
+        .client
+        .generate(disaggregated_request("decode8", 8, 1))
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank1_in).await;
+    assert_eq!(
+        (add.rid.as_str(), add.routed_dp_rank, add.bootstrap_room),
+        ("decode8", Some(1), Some(8))
+    );
+    rank1_out
+        .send_frames(vec![Bytes::from(
+            encode_msgpack(&BatchTokenIDSlimOutput {
+                engine_index: 1,
+                ..batch("decode8", vec![12], 1, Some("stop"), None)
+            })
+            .unwrap(),
+        )])
+        .await
+        .unwrap();
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "stop"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert_scheduler_idle(&mut h.engine_in).await;
     wait_until(|| h.server.active_requests() == 0).await;
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

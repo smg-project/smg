@@ -35,7 +35,7 @@ use crate::{
     sglang::{
         aggregate_control, constraint_ref as sglang_constraint_ref, control_outcome,
         fan_out_sglang_requests, translate_embed_request_sglang, translate_request_sglang,
-        SglangGenerateStream, SglangProfileStart,
+        RankPlacement, SglangGenerateStream, SglangProfileStart,
     },
     sockets::{ensure_ipc_socket_dir, zmq_socket_addresses, Handshake},
     stream::{RequestDeadline, ZmqGenerateStream},
@@ -134,6 +134,13 @@ pub(crate) struct ZmqConnectionMeta {
     /// no upper bound on this connection
     /// (see [`ZmqEngineClient::note_engine_truncates_long_prompts`]).
     engine_truncates_long_prompts: OnceLock<()>,
+    /// Set once by the caller that knows it (the servicer that launched the
+    /// engine) when the engine places a disaggregated request, one carrying
+    /// a rendezvous room, on the data-parallel rank of the room's residue:
+    /// such a request is placed there on this connection, a pin that
+    /// disagrees yielding to it
+    /// (see [`ZmqEngineClient::note_engine_places_by_rendezvous_room`]).
+    engine_places_by_rendezvous_room: OnceLock<()>,
     /// The bound on every generate request this connection opens, from its
     /// dispatch to its last message, set once by the caller that knows it
     /// (see [`ZmqEngineClient::set_request_timeout`]); unset leaves the
@@ -348,6 +355,7 @@ impl ZmqEngineClient {
                 structured_outputs: OnceLock::new(),
                 supported_tasks: tokio::sync::OnceCell::new(),
                 engine_truncates_long_prompts: OnceLock::new(),
+                engine_places_by_rendezvous_room: OnceLock::new(),
                 request_timeout: OnceLock::new(),
             }),
         };
@@ -430,6 +438,20 @@ impl ZmqEngineClient {
     /// Set once: a later call changes nothing.
     pub fn note_engine_truncates_long_prompts(&self) {
         let _ = self.meta.engine_truncates_long_prompts.set(());
+    }
+
+    /// The engine places a disaggregated request (one carrying a rendezvous
+    /// room) on the data-parallel rank of the room's residue, as the
+    /// launcher that started it knows: the prefill side of a disaggregated
+    /// pair whose engine follows the room, where the engine's KV sender
+    /// fails a request that runs elsewhere and the decode side looks for the
+    /// KV. A request with a room goes to that rank on this connection from
+    /// now, a pin that disagrees yielding to it with a warning; a request
+    /// without a room, and every request on a connection nobody notes this
+    /// on (an aggregated engine, a decode side), is placed by its pin. Set
+    /// once: a later call changes nothing.
+    pub fn note_engine_places_by_rendezvous_room(&self) {
+        let _ = self.meta.engine_places_by_rendezvous_room.set(());
     }
 
     /// The window the prompt admission applies on this connection: the
@@ -910,12 +932,19 @@ impl ZmqEngineClient {
             .map_err(tonic::Status::invalid_argument)?;
         }
         let max_model_len = self.prompt_bound()?;
-        // The connected scheduler ranks: a data-parallel pin is placed among
-        // them as the engine's own frontend would place it.
+        // The connected scheduler ranks: a request is placed among them as
+        // the engine's own dispatcher would place it, by its data-parallel
+        // pin, or on a prefill side that follows the room by its room's
+        // residue ([`Self::note_engine_places_by_rendezvous_room`]).
         let ranks = client.engines().len();
+        let placement = if self.meta.engine_places_by_rendezvous_room.get().is_some() {
+            RankPlacement::RoomResidue
+        } else {
+            RankPlacement::Pin
+        };
         let mut streams = Vec::new();
         for (index, sub) in fan_out_sglang_requests(req).into_iter().enumerate() {
-            let mut request = translate_request_sglang(sub, max_model_len, ranks)
+            let mut request = translate_request_sglang(sub, max_model_len, ranks, placement)
                 .map_err(tonic::Status::invalid_argument)?;
             request.trace_headers.clone_from(&trace_headers);
             let stream = client

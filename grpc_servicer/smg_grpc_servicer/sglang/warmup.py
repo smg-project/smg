@@ -24,14 +24,11 @@ need multimodal inputs a warm-up does not carry.
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Mapping
 from typing import Any
 
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.warmup import WarmupInputs, WarmupRequest
-
-logger = logging.getLogger(__name__)
 
 WARMUP_ENV = "SMG_SGLANG_SERVICER_WARMUP"
 #: The engine's own prefill budget when the arguments carry neither a chunk
@@ -50,10 +47,11 @@ def warmup_inputs(server_args: Any, facts: Mapping[str, Any]) -> WarmupInputs | 
     a prefill or decode leg the engine's stand-in bootstrap host for the
     requests to carry. ``None`` for a model that generates nothing and for the
     EPD roles (``--language-only`` / ``--encoder-only``), whose requests need
-    multimodal inputs a warm-up does not carry. The plan is one rank's: its
-    requests carry no data-parallel pin, so the servicer places each on the
-    least-loaded scheduler rank and under data parallelism each prefill shape
-    reaches one rank (a WARNING line says so)."""
+    multimodal inputs a warm-up does not carry. The plan covers every
+    scheduler rank: each request is pinned to its rank, where the servicer
+    places it (on a prefill leg by the stand-in room, whose residue is that
+    rank), so under data parallelism every prefill shape reaches every rank
+    before the Router sends anything."""
     if not facts.get("is_generation", True):
         return None
     args = EngineConfigView(server_args).server_args
@@ -66,14 +64,6 @@ def warmup_inputs(server_args: Any, facts: Mapping[str, Any]) -> WarmupInputs | 
         from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 
         lone_leg_bootstrap = FAKE_BOOTSTRAP_HOST
-    if args.scheduler_count > 1:
-        logger.warning(
-            "The engine runs %d scheduler ranks and a warm-up request carries no rank pin, so the "
-            "servicer places it on the least-loaded one: each prefill shape of the planned warm-up "
-            "reaches one rank; the other ranks pay its first-time cost at their first request of "
-            "that shape",
-            args.scheduler_count,
-        )
     step = args.chunked_prefill_size or args.max_prefill_tokens or DEFAULT_STEP_TOKENS
     return WarmupInputs(
         max_num_seqs=args.max_running_requests or 0,
@@ -81,6 +71,7 @@ def warmup_inputs(server_args: Any, facts: Mapping[str, Any]) -> WarmupInputs | 
         max_model_len=args.context_length or int(facts.get("max_context_length") or 0),
         vocab_size=int(facts.get("vocab_size") or 0),
         source="window and step from the server arguments (the engine's default step when unset)",
+        data_parallel_size=args.scheduler_count,
         lone_leg_bootstrap=lone_leg_bootstrap,
     )
 
@@ -125,12 +116,18 @@ class GrpcWire:
             ),
             stream=False,
         )
+        if request.data_parallel_rank is not None:
+            message.data_parallel_rank = request.data_parallel_rank
         if request.lone_leg_bootstrap is not None:
-            # As the engine's own warm-up sends it in disaggregation mode:
-            # the stand-in host and room 0.
+            # As the engine's own warm-up sends it in disaggregation mode: the
+            # stand-in host and a room, which is the request's rank (0 on one
+            # rank, as the engine sends it): a prefill leg places a
+            # disaggregated request on the rank of its room's residue, so the
+            # request runs on the rank the plan pinned it to.
             message.disaggregated_params.CopyFrom(
                 sglang_scheduler_pb2.DisaggregatedParams(
-                    bootstrap_host=request.lone_leg_bootstrap, bootstrap_room=0
+                    bootstrap_host=request.lone_leg_bootstrap,
+                    bootstrap_room=request.data_parallel_rank or 0,
                 )
             )
         last = None

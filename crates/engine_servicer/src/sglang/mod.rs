@@ -12,7 +12,11 @@
 //! pairs on. A request the Router pins to a data-parallel rank goes to that
 //! rank's scheduler (the connector sends it on that rank's socket, the
 //! dispatch the engine's data-parallel controller does behind its own
-//! frontend), with the rank in the request's `routed_dp_rank` slot.
+//! frontend), with the rank in the request's `routed_dp_rank` slot. On the
+//! prefill side of a disaggregated pair a request runs on the rank of its
+//! room's residue instead (`bootstrap_room % dp_size`: where SGLang's prefill
+//! side requires it and the decode side looks for the KV), the pin yielding
+//! to it with a warning; the decode side keeps the pin.
 
 mod admin;
 mod embed;
@@ -165,6 +169,22 @@ pub(super) fn truncates_long_prompts(model: &SglangModelInfo) -> bool {
     args.get("allow_auto_truncate")
         .and_then(serde_json::Value::as_bool)
         == Some(true)
+}
+
+/// Whether the scheduler is the prefill side of a disaggregated pair
+/// (`--disaggregation-mode prefill`), read off the launcher's `server_args`:
+/// SGLang's prefill side follows the room by default (`load_balance_method`
+/// `auto` resolves to `follow_bootstrap_room` there), its KV sender fails a
+/// request that runs on another rank than `bootstrap_room % dp_size`, and the
+/// decode side looks for the KV on that rank, so the connection places a
+/// disaggregated request by its room's residue, the Router's pin yielding to
+/// it. The decode side's own placement is free (its `auto` is
+/// `round_robin`): it keeps the pin, as an aggregated engine does.
+pub(super) fn places_by_rendezvous_room(model: &SglangModelInfo) -> bool {
+    let args: serde_json::Value = serde_json::from_str(&model.server_args_json).unwrap_or_default();
+    args.get("disaggregation_mode")
+        .and_then(serde_json::Value::as_str)
+        == Some("prefill")
 }
 
 /// SGLang's `CaptureHiddenMode`: how much of the hidden states the scheduler
