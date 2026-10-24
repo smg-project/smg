@@ -87,7 +87,7 @@
     "crates": "ae100a0dd89846418c93c09861dd7f24b3222296",
     "model_gateway": "d1a181bfb1d16a661e16346d4eb8f257689701ce",
     "grpc_servicer": "a10bb7235d74ac91d8de4b3eafabd1ef7ed1344e",
-    "e2e_test": "35d5321770a24d3706a3c0730c465d3a0e11d437",
+    "e2e_test": "e08dec5cb9a6300047076c8aa382fbff046fcdf6",
     "scripts": "6b21b75245705e319d0334500e6f41b16d602e97",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows/e2e-gpu-job.yml": "c8daa461a9d5913bffa56b890505b6074776fb78",
@@ -170,7 +170,7 @@
     },
     "GPU_jobs_per_dispatch": 1
   },
-  "diagnostic_difference": "Only original Mooncake2 may dispatch; original27/4models/router emptyfilter/floor15/50job34pytest retained. Inherited14unit/environment/private-constraint/owned-process gates stay; Mooncake canary and fixture log proof replace any NIXL requirement. No GPU/ABI/transfer result is transferred.",
+  "diagnostic_difference": "Only original Mooncake2 may dispatch; original27/4models/router emptyfilter/floor15/50job34pytest retained. Inherited14unit/environment/private-constraint/owned-process gates stay; Mooncake canary and fixture log proof replace any NIXL requirement. No GPU/ABI/transfer result is transferred. Privatepath parser fix3685162 plus exact3 productiontest port5366d8e; only e2e testsource differs through narrow manifest, no80e3 compiled imports. Actualcounter/periodicflush success remains unverified.",
   "producer_binary_relabelled": false,
   "producer_artifact_pins_status": "BOUND: root-accepted actual40038340532/445bb37 four archives and native143a; all admission flags remainfalse",
   "explicit_product_dependency": {
@@ -227,7 +227,7 @@
     "unit_junit": "servicer-engine.xml in the existing unique AMD dependency artifact",
     "diagnostic_workflow_difference": "NIXL tier-select dispatch caller only; normal product tooling CPU jobs are not part of this diagnostic workflow."
   },
-  "source_identity_note": "Original shared reusable03d blob, consumer19 product source and compiled37c9d unchanged. Diagnostic-only Mooncake2 caller/canary/transfer witness does not relabel native143a or alter originalcase bodies.",
+  "source_identity_note": "Original shared reusable03d blob, consumer19 product source and compiled37c9d unchanged. Diagnostic-only Mooncake2 caller/canary/transfer witness does not relabel native143a or alter originalcase bodies. Actualconsumer e2e tree includes exact3 owned-log test overlays; test-overlay.json binds each file/hash/base. Producer14 andcompiled37 remain actual445/c9d, notconsumer test source.",
   "admitted_tier": null,
   "contracts": {
     "2": {
@@ -280,5 +280,6 @@
     "no_prior_GPU_acceptance_transferred": true,
     "original_default_parser_connection_servicer_mm_overrides": "all empty; kv_backend empty; enginevllm with explicit vllm_kv_backend=mooncake and extra empty"
   },
-  "future_four_gpu_scope": "Original Mooncake4 is a separate later caller/contract; no tier4 recipe or admission is provided here."
+  "future_four_gpu_scope": "Original Mooncake4 is a separate later caller/contract; no tier4 recipe or admission is provided here.",
+  "test_overlay_sha256": "27a341c95f13fe6ea2c4770ea6d0aa4dcf35dee8c35194833fa7764c353e492a"
 }

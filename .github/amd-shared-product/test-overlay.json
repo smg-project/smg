@@ -1,0 +1,21 @@
+{
+  "policy": "mooncake_owned_logs_exact3_v1",
+  "base_product_commit": "3b79acc59b68b84465e58a025850af2c93c96fe8",
+  "base_e2e_tree": "35d5321770a24d3706a3c0730c465d3a0e11d437",
+  "port_from_source": "5366d8e04504a3e39834ff9186719cd6f74ad6a8",
+  "files": {
+    "e2e_test/infra/pd_logs.py": {
+      "base_ls_tree": "100644 blob 9de822df91e43abf22b30f495f772b9d735e71f7\te2e_test/infra/pd_logs.py",
+      "sha256": "8d94edf650b51847e989003a7bf7284eeef1b0b2364f4ebd64289e45166cfe55"
+    },
+    "e2e_test/infra/test_pd_logs.py": {
+      "base_ls_tree": "",
+      "sha256": "d9d8fa355b7e78d84c4b76d901f3985845b9fb5da949390d6c35e371ab33a760"
+    },
+    "e2e_test/router/test_pd_mooncake.py": {
+      "base_ls_tree": "100644 blob 85a89f7c7e053060446ece8a0a1fcd37e312be0e\te2e_test/router/test_pd_mooncake.py",
+      "sha256": "4da368fc5e599484221d240faec1f65b36eff44a388e1fcc46cdbc8651a1ac3e"
+    }
+  },
+  "scope": "Only these exact three test-source files differ; other e2e source unchanged. No80e3 compiled source or binary relabelling."
+}
