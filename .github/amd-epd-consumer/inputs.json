@@ -1,6 +1,6 @@
 {
-  "ready": false,
-  "run_budget_admitted": false,
+  "ready": true,
+  "run_budget_admitted": true,
   "artifacts_pinned": true,
   "artifacts": [
     {
