@@ -24,7 +24,10 @@ RECIPES = {
         "timeout": 50,
         "test_timeout": 42,
         "test_dirs": "e2e_test/router/test_pd_topologies.py",
-        "test_filter": '-k "(2p2d and not http) or AssembledAtRuntime or SmallWindow or MismatchedTransport or MismatchedProtocol"',
+        "test_filter": (
+            '-k "(2p2d and not http) or AssembledAtRuntime or SmallWindow'
+            ' or MismatchedTransport or MismatchedProtocol"'
+        ),
         "min_selected": 14,
         "vllm_kv_backend": "nixl",
         "vllm_extra_kv_backends": "mooncake",
