@@ -53,9 +53,10 @@ struct Kept {
     weight: usize,
 }
 
-/// What a set costs kept, estimated from its JSON values: the bytes of its
-/// strings and keys plus a fixed cost per value and per map entry, counted
-/// twice for the render's values made of the same content. The estimate
+/// What a set's values cost kept, estimated from its JSON values: the bytes
+/// of its strings and keys plus a fixed cost per value and per map entry,
+/// counted twice for the render's values made of the same content; the
+/// entry's key bytes are added by the caller. The estimate
 /// follows the content's shape (a long enum of small numbers weighs its
 /// elements, not its bytes), which the serialized length does not.
 fn kept_weight(tools: &[Value]) -> usize {
@@ -102,7 +103,8 @@ pub(crate) fn prepare_tools(tools: &[Tool]) -> Result<Arc<PreparedTools>, String
             return Ok(Arc::clone(kept));
         }
         let values = tool_values(tools)?;
-        let weight = kept_weight(&values);
+        // What the entry holds: its key, its JSON values and the render's values.
+        let weight = key.len() + kept_weight(&values);
         let prepared = Arc::new(PreparedTools::new(values));
         if weight > PREPARED_TOOLS_MAX_SET_WEIGHT {
             return Ok(prepared);
@@ -243,11 +245,12 @@ mod tests {
             .unwrap()
         };
         let one = [enum_tool("weight_probe")];
-        let weight = kept_weight(
-            &one.iter()
-                .map(|t| serde_json::to_value(t).unwrap())
-                .collect::<Vec<_>>(),
-        );
+        let weight = serde_json::to_vec(&one).unwrap().len()
+            + kept_weight(
+                &one.iter()
+                    .map(|t| serde_json::to_value(t).unwrap())
+                    .collect::<Vec<_>>(),
+            );
         assert!(weight < PREPARED_TOOLS_MAX_SET_WEIGHT, "{weight}");
         let sets = PREPARED_TOOLS_KEPT_WEIGHT / weight + 2;
         assert!(
@@ -268,8 +271,23 @@ mod tests {
             !Arc::ptr_eq(&first, &prepare_tools(&first_tools).unwrap()),
             "a set the weight's restart dropped is prepared again"
         );
+        // Heavy kept, light on the wire: 12,000 one-digit numbers serialize to
+        // about 24 KiB, under the key cap, and weigh past the per-set cap.
         let heavy = [serde_json::from_value::<Tool>(json!({"type": "function", "function": {"name": "heavy",
-            "parameters": {"type": "object", "properties": {"code": {"type": "integer", "enum": (0..30000).collect::<Vec<_>>()}}}}})).unwrap()];
+            "parameters": {"type": "object", "properties": {"code": {"type": "integer", "enum": (0..12000).map(|i| i % 10).collect::<Vec<_>>()}}}}})).unwrap()];
+        let heavy_key = serde_json::to_vec(&heavy).unwrap().len();
+        let heavy_weight = heavy_key
+            + kept_weight(
+                &heavy
+                    .iter()
+                    .map(|t| serde_json::to_value(t).unwrap())
+                    .collect::<Vec<_>>(),
+            );
+        assert!(
+            heavy_key <= PREPARED_TOOLS_MAX_KEY_BYTES
+                && heavy_weight > PREPARED_TOOLS_MAX_SET_WEIGHT,
+            "{heavy_key} bytes, {heavy_weight} weight"
+        );
         assert!(
             !Arc::ptr_eq(
                 &prepare_tools(&heavy).unwrap(),
