@@ -215,9 +215,14 @@ def test_slim_output_carries_the_schedulers_abort_err_type():
     assert slim.finished_status == [None, None]
     assert slim.finished_err_types == [None, "GrammarRejectedToken"]
     encoded = msgspec.msgpack.decode(msgspec.msgpack.encode(slim))
-    assert len(encoded) == 27 and encoded[26] == [None, "GrammarRejectedToken"]
-    # Pin for the Rust decoder (`protocol/sglang/output.rs`, PYTHON_SLIM27).
-    print("PIN_SLIM27", msgspec.msgpack.encode(slim).hex())
+    # 28 fields: the 27th (index 26) is finished_err_types, the 28th (index 27)
+    # output_hidden_states, None per request that asked for none.
+    assert len(encoded) == 28 and encoded[26] == [None, "GrammarRejectedToken"]
+    assert encoded[27] == [None, None]
+    # Pins for the Rust decoder (`protocol/sglang/output.rs`): PYTHON_SLIM27 is
+    # this batch as an earlier plugin encoded it (27 fields, decoded with no
+    # rows); PYTHON_SLIM28 the 28-field form. The hex below is today's.
+    print("PIN_SLIM28", msgspec.msgpack.encode(slim).hex())
     # A PD decode side's grammar failure carries the name next to its 500.
     full.finished_reasons[1] = {
         "type": "abort",
@@ -527,9 +532,13 @@ def test_slim_output_appends_prompt_logprobs_and_reasoning_tokens():
     full.input_top_logprobs_idx = [None, [None, [2], [3]]]
     slim = wire.BatchTokenIDSlimOutput.from_full(full)
     encoded = msgspec.msgpack.decode(msgspec.msgpack.encode(slim))
-    assert len(encoded) == 27
+    assert len(encoded) == 28
     assert encoded[24:26] == [[[], []], [[], []]]
     assert encoded[26] == [None, None]  # finished_err_types: no abort
+    assert encoded[27] == [
+        None,
+        None,
+    ]  # output_hidden_states: None per request without the relay's rows
     assert encoded[19] == [0, 4]
     assert encoded[20] == [[], [None, -0.7, -1.1]] and encoded[21] == [[], [1, 2, 3]]
     assert encoded[22] == [[], [[], [-0.7], [-1.1]]] and encoded[23] == [[], [[], [2], [3]]]
@@ -667,19 +676,24 @@ def test_slim_output_carries_hidden_states_as_rows_per_position():
     full = _full_output()
     prefill_block = [[0.5, 1.5], [2.5, 3.5]]  # two prompt positions
     full.output_hidden_states = [None, [prefill_block, [4.5, 5.5]]]
+    # The fixture's second request has finished; here it is still running, so
+    # its rows accumulate across outputs until the step that finishes it.
+    finished_at_the_end = list(full.finished_reasons)
+    full.finished_reasons = [None, None]
     rows = wire.HiddenStateRows()
     slim = wire.BatchTokenIDSlimOutput.from_full(
         full, engine_index=1, hidden_rows=rows.column(full)
     )
     assert slim.output_hidden_states == [None, [[0.5, 1.5], [2.5, 3.5], [4.5, 5.5]]]
-    # The next output of the same request carries only the row the step added;
-    # once it finishes, the relay forgets it; without the column, nothing rides.
+    # The next output of the same request carries only the row the step added.
     full.output_hidden_states = [None, [prefill_block, [4.5, 5.5], [6.5, 7.5]]]
     assert rows.column(full) == [None, [[6.5, 7.5]]]
-    finished_before = list(full.finished_reasons)
-    full.finished_reasons = [None, {"type": "length"}]
+    # The output that finishes it carries what that step added (nothing here)
+    # and the relay forgets the request: a later output under the same rid
+    # starts over from the whole list. Without the column, nothing rides.
+    full.finished_reasons = finished_at_the_end
     assert rows.column(full) == [None, []]
-    full.finished_reasons = finished_before
+    full.finished_reasons = [None, None]
     assert rows.column(full) == [None, [*prefill_block, [4.5, 5.5], [6.5, 7.5]]]
     assert wire.BatchTokenIDSlimOutput.from_full(full).output_hidden_states == [None, None]
     full.output_hidden_states = [None, [prefill_block, [4.5, 5.5]]]
