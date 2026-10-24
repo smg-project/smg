@@ -75,7 +75,7 @@
   "producer_sha": "445bb37bccb47e620b2b3aac12cd30b4ebd71a43",
   "producer_branch": "ci/frozen-c9d-cpu-producer-20261023",
   "producer_policy": "frozen_c9d_dispatch_build_only_all_18_steps_success_v1",
-  "target_product_commit": "6332ac94e00a587e14e5e68faaaa3b83b442a714",
+  "target_product_commit": "3535f7cf5f3ddcc9168c95b98d4d2b40be7e5888",
   "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-2gpu-pd[0]/sglang/nvidia",
   "source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
@@ -275,12 +275,12 @@
     "env": "SMG_SG2_STARTUP_DIAGNOSTIC",
     "actual_image_digest": "sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d",
     "manifest": "sglang_pd_observer/startup-overlay.json",
-    "manifest_sha256": "a622c1bd6f14701eb9fd71a924079e8ae3002b2736847f99edaff0abcf2bdb09",
+    "manifest_sha256": "f4b7bf8b08eda237823642c707e3d52d68716fa7d050c9e3f23c25b6721842fa",
     "source_paths_and_before_after": {
       "/sgl-workspace/aiter/aiter/jit/utils/chip_info.py": {
         "actual_capture_path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T0300Z/SG2-AB-4420-source-canonical-root-933b80bb0c1547128659f28c5b42265a/2.py",
         "before_sha256": "67b9b709ad95a7df5fdad1c49ad23b7374b5d2a1ec1c4a3d67b4d6c597c5f33d",
-        "after_sha256": "c6f094a6f6339fc92b2e0673c2ce9935440a30682662c22ea8a07e5fb4dc6348"
+        "after_sha256": "4e59719bbf622106270d4d83a182e2d8a10ffe93354e794681993dbbe5f0a3d5"
       },
       "/sgl-workspace/sglang/python/sglang/srt/arg_groups/memory_hook.py": {
         "actual_capture_path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T0300Z/SG2-AB-4420-source-canonical-root-933b80bb0c1547128659f28c5b42265a/1.py",
@@ -293,7 +293,7 @@
         "after_sha256": "d6216ddea10a0d3360619179de914ef49c8da3b2da77d810be8cf61f216127f4"
       }
     },
-    "helper_sha256": "abc2453262fae93964033391f7347a3eeddecca43116f0b0338de551d7c5525e",
+    "helper_sha256": "1e2bd0397da0230194ef462f501cbb16ad9fdf6ac145ae1a53a6318af389c934",
     "artifact_directory": "AMD_DEPENDENCY_DIRECTORY/sglang-startup",
     "runtime_origin": "HOLD until actual same-worker events match manifest hashes; installer file hashes alone do not close it.",
     "no_CU_prime_or_parameter_change": true,
@@ -306,8 +306,23 @@
         "registration-overlay.json",
         "startup-overlay.json"
       ],
-      "startup_manifest_sha256": "a622c1bd6f14701eb9fd71a924079e8ae3002b2736847f99edaff0abcf2bdb09",
-      "scope": "Package existing exact startup manifest in normal observer wheel; no diagnostic overlay/helper/oracle/compiled change. Requires fresh installed-wheel resource CPU verification; not GPU evidence."
+      "startup_manifest_sha256": "f4b7bf8b08eda237823642c707e3d52d68716fa7d050c9e3f23c25b6721842fa",
+      "scope": "All three JSON resources remain packaged; new startup-manifest and helper bytes need fresh normal-wheel installed-resource verification. Old7de packaging CPU evidence does not prove this candidate installed."
     }
+  },
+  "explicit_existing_runtime_CU_dependency": {
+    "default_enabled": false,
+    "manual_dispatch_input": "existing_runtime_cu",
+    "requires_manual_startup_diagnostic": true,
+    "env": "SMG_SG2_CU_EXISTING_RUNTIME",
+    "exact4420_chip_before_sha256": "67b9b709ad95a7df5fdad1c49ad23b7374b5d2a1ec1c4a3d67b4d6c597c5f33d",
+    "candidate_chip_after_sha256": "4e59719bbf622106270d4d83a182e2d8a10ffe93354e794681993dbbe5f0a3d5",
+    "domain": "All process-visible logical HIP devices, not rocminfo physical-agent inventory; positive homogeneous CU count and valid current logical index required.",
+    "initialized_path": "Already-initialized PyTorch HIP metadata only; no subprocess, set_device, allocation, synchronization, priming or fallback after a property failure.",
+    "uninitialized_path": "Legacy rocminfo lookup only before PyTorch HIP initialization, with strict nonzero-exit and empty/nonpositive rejection when this opt-in is set.",
+    "CU_NUM_override": "Existing nonzero explicit override is preserved, not used by this candidate caller.",
+    "actual_CPU_or_GPU_verified": false,
+    "prefill_async_OOM_resolved": false,
+    "original20_or_RDMA_accepted": false
   }
 }
