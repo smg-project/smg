@@ -1,7 +1,7 @@
 {
-  "ready": false,
-  "run_budget_admitted": false,
-  "artifacts_pinned": false,
+  "ready": true,
+  "run_budget_admitted": true,
+  "artifacts_pinned": true,
   "artifacts": [
     {
       "name": "smg-wheel",
@@ -191,7 +191,7 @@
     "original_explicit_skip_markers": 8,
     "original_conditional_skip_markers_evaluate_false": 4
   },
-  "diagnostic_difference": "caller container explicitly sets SPT_NOENV=1 for process cleanup ownership; normal product shared workflow does not. Engine AMD image/native repairs + wholepip/native post-install/final hard gates are AMD QA additions. NV test selection/models/assertions and original36/28 budget unchanged. Full caller explicitly enables reviewed GPTOSS BF16 expert expansion and PYTHONDONTWRITEBYTECODE; default/NVIDIA overlay paths are inactive. No pilot40 selection or prior pilot results transferred. Early GPTOSS auto\u2192BF16 is an explicit source repair within the same opt-in; original strict dtype/platform/checkpoint/draft guard and downstream TP1/loader restrictions are retained. Qwen3VL mixed-image body failure remains independent and unresolved.",
+  "diagnostic_difference": "caller container explicitly sets SPT_NOENV=1 for process cleanup ownership; normal product shared workflow does not. Engine AMD image/native repairs + wholepip/native post-install/final hard gates are AMD QA additions. NV test selection/models/assertions and original36/28 budget unchanged. Full caller explicitly enables reviewed GPTOSS BF16 expert expansion and PYTHONDONTWRITEBYTECODE; default/NVIDIA overlay paths are inactive. No pilot40 selection or prior pilot results transferred. Early GPTOSS auto→BF16 is an explicit source repair within the same opt-in; original strict dtype/platform/checkpoint/draft guard and downstream TP1/loader restrictions are retained. Qwen3VL mixed-image body failure remains independent and unresolved.",
   "producer_binary_relabelled": false,
   "producer_artifact_pins_status": "LOCALLY_BOUND_ACCEPTED_445_ACTUAL4_NATIVE143A: three admission flags remain false; fresh API availability/expiry and runner/budget admission remain root-owned",
   "explicit_product_dependency": {
