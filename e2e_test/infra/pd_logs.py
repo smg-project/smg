@@ -67,6 +67,21 @@ def wait_for_pattern(log_dir: Path, pattern: str, regex: re.Pattern[str]) -> str
     return logs
 
 
+def wait_for_pattern_in_files(paths: list[str | Path | None], regex: re.Pattern[str]) -> str:
+    """Poll only the supplied live-worker logs, without a directory fallback."""
+    files = [Path(path) for path in paths if path]
+    deadline = time.monotonic() + LOG_FLUSH_TIMEOUT_S
+    logs = ""
+    while time.monotonic() < deadline:
+        logs = "\n".join(
+            path.read_text(encoding="utf-8", errors="replace") for path in files if path.is_file()
+        )
+        if regex.search(logs):
+            return logs
+        time.sleep(0.5)
+    return logs
+
+
 def unique_prompt() -> str:
     # Unique filler defeats prefix caching so every request exercises a fresh
     # prefill -> transfer -> decode cycle

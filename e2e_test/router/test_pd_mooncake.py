@@ -31,8 +31,7 @@ from infra.pd_logs import (
     assert_worker_logs_captured,
     unique_prompt,
     wait_for_marker,
-    wait_for_pattern,
-    worker_log_dir,
+    wait_for_pattern_in_files,
 )
 
 logger = logging.getLogger(__name__)
@@ -75,7 +74,7 @@ class TestPDMooncakeKvTransfer:
         )
 
     def test_workers_transferred_kv(self, setup_backend):
-        backend, model, client, *_ = setup_backend
+        backend, model, client, gateway = setup_backend
 
         response = client.chat.completions.create(
             model=model,
@@ -85,11 +84,13 @@ class TestPDMooncakeKvTransfer:
         )
         assert response.choices[0].message.content
 
-        worker_dir = worker_log_dir(_LOG_DIR)
-        worker_logs = wait_for_pattern(worker_dir, "worker-*.log", TRANSFER_SUCCESS_RE)
+        worker_paths = [
+            worker.log_path for worker in gateway.prefill_workers + gateway.decode_workers
+        ]
+        worker_logs = wait_for_pattern_in_files(worker_paths, TRANSFER_SUCCESS_RE)
         assert_worker_logs_captured(worker_logs, "Mooncake transfer")
         assert TRANSFER_SUCCESS_RE.search(worker_logs), (
             "No successful Mooncake KV transfer in worker logs (zero-success "
             "metrics mean decode recomputed locally); checked "
-            f"{worker_dir}/worker-*.log for {TRANSFER_SUCCESS_RE.pattern}"
+            f"owned worker paths {worker_paths} for {TRANSFER_SUCCESS_RE.pattern}"
         )
