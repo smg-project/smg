@@ -1101,7 +1101,10 @@ scheduler as its own processor output: the preprocessed tensors the Router's
 media pipeline sends ride the wire as SGLang's own tensor encoding, and the
 scheduler hashes, pads and positions them as it does behind the Python
 servicer; `supports_vision` is advertised as SGLang's model config decides it.
-What the wire does not carry is reported, not emulated: EPD disaggregation (`--language-only` / `--encoder-only`) stays with
+A request the Router pins to a data-parallel rank (`--dp-size` above one
+behind a dp-aware Router) goes to that rank's scheduler, as the engine's
+data-parallel controller sends it behind SGLang's own frontend; a pin past the
+connected ranks is refused as the caller's error. What the wire does not carry is reported, not emulated: EPD disaggregation (`--language-only` / `--encoder-only`) stays with
 the Python implementation (the worker refuses to start on the Rust path in
 those modes: the encode dispatch is not on it yet), a prefill or decode leg
 with more than one scheduler rank refuses to start the same way (a request is
