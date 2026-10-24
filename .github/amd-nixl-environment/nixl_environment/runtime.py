@@ -16,6 +16,21 @@ def canonical(nodeid):
     return nodeid.removeprefix("e2e_test/")
 
 
+def report_row(report):
+    reason = None
+    if report.skipped and isinstance(report.longrepr, tuple) and len(report.longrepr) == 3:
+        text = report.longrepr[2]
+        if isinstance(text, str) and text.startswith("Skipped: "):
+            reason = text.removeprefix("Skipped: ")
+    return {
+        "phase": report.when,
+        "outcome": report.outcome,
+        "xfail": hasattr(report, "wasxfail"),
+        "reason": reason,
+        "longrepr": str(report.longrepr) if report.skipped else None,
+    }
+
+
 def verify_reports(recipe, reports):
     owned.require(set(reports) == set(recipe["cases"]), "missing terminal original case")
     for nodeid, rows in reports.items():
@@ -25,15 +40,20 @@ def verify_reports(recipe, reports):
         if reason:
             owned.require(set(last) == {"setup", "teardown"}, "original setup skip phase changed")
             owned.require(
-                last["setup"]["outcome"] == "skipped" and reason in last["setup"]["reason"],
+                last["setup"]["outcome"] == "skipped" and reason == last["setup"]["reason"],
                 "original setup skip differs",
             )
         else:
             owned.require(set(last) == {"setup", "call", "teardown"}, "incomplete original case")
-            owned.require(
-                all(row["outcome"] == "passed" for row in last.values()),
-                "original case did not pass",
-            )
+            owned.require(last["setup"]["outcome"] == "passed", "original setup failed")
+            call_reason = recipe.get("call_skips", {}).get(nodeid)
+            if call_reason:
+                owned.require(
+                    last["call"]["outcome"] == "skipped" and last["call"]["reason"] == call_reason,
+                    "original call skip differs",
+                )
+            else:
+                owned.require(last["call"]["outcome"] == "passed", "original case did not pass")
         owned.require(last["teardown"]["outcome"] == "passed", "original teardown failed")
 
 
@@ -236,14 +256,7 @@ class RuntimeProof:
         self.snapshot("call-after")
 
     def pytest_runtest_logreport(self, report):
-        self.reports.setdefault(canonical(report.nodeid), []).append(
-            {
-                "phase": report.when,
-                "outcome": report.outcome,
-                "xfail": hasattr(report, "wasxfail"),
-                "reason": str(report.longrepr) if report.skipped else None,
-            }
-        )
+        self.reports.setdefault(canonical(report.nodeid), []).append(report_row(report))
 
     @pytest.hookimpl(trylast=True)
     def pytest_sessionfinish(self, session, exitstatus):

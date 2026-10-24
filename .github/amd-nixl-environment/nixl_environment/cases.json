@@ -32,6 +32,9 @@
     "setup_skips": {
       "router/test_pd_mooncake.py::TestPDMooncakeKvTransfer::test_minted_params_injected[pd_grpc]": "mooncake PD leg only",
       "router/test_pd_mooncake.py::TestPDMooncakeKvTransfer::test_workers_transferred_kv[pd_grpc]": "mooncake PD leg only"
+    },
+    "call_skips": {
+      "router/test_pd_multimodal.py::TestPDMultimodalMrope::test_worker_media_is_processed_once_on_the_prefill_side[pd_grpc]": "router-side lane: the workers receive preprocessed tensors"
     }
   },
   "4": {
@@ -55,6 +58,9 @@
       "router/test_pd_topologies.py::TestPDTopology::test_workers_registered_by_role[2p2d]",
       "router/test_pd_topologies.py::TestPDMixedTransport::test_every_request_lands_on_a_matching_pair[2p2d-mixed-kv]"
     ],
-    "setup_skips": {}
+    "setup_skips": {},
+    "call_skips": {
+      "router/test_pd_topologies.py::TestPDTopology::test_sole_leg_outage_is_reported_promptly[2p2d]": "both pools have more than one worker"
+    }
   }
 }

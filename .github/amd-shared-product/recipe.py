@@ -16,7 +16,9 @@ RECIPES = {
         "vllm_kv_backend": "nixl",
         "vllm_extra_kv_backends": "",
         "selected": 27,
-        "original_skip_count": 2,
+        "original_skip_count": 3,
+        "original_setup_skip_count": 2,
+        "original_call_skip_count": 1,
     },
     "4": {
         "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-4gpu-pd[1]/vllm/nvidia",
@@ -32,7 +34,9 @@ RECIPES = {
         "vllm_kv_backend": "nixl",
         "vllm_extra_kv_backends": "mooncake",
         "selected": 18,
-        "original_skip_count": 0,
+        "original_skip_count": 1,
+        "original_setup_skip_count": 0,
+        "original_call_skip_count": 1,
     },
 }
 

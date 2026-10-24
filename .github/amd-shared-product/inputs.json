@@ -178,7 +178,9 @@
       "vllm_kv_backend": "nixl",
       "vllm_extra_kv_backends": "",
       "selected": 27,
-      "original_skip_count": 2
+      "original_skip_count": 3,
+      "original_setup_skip_count": 2,
+      "original_call_skip_count": 1
     },
     "4": {
       "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-4gpu-pd[1]/vllm/nvidia",
@@ -191,7 +193,9 @@
       "vllm_kv_backend": "nixl",
       "vllm_extra_kv_backends": "mooncake",
       "selected": 18,
-      "original_skip_count": 0
+      "original_skip_count": 1,
+      "original_setup_skip_count": 0,
+      "original_call_skip_count": 1
     }
   },
   "diagnostic_runtime_instrumentation": {
@@ -208,7 +212,8 @@
       "Mapped libraries/configuration alone do not prove KV bytes, ABORT/ACK, peer/HBM release or long-term stability; original assertions/logs and independent actual audit determine scope"
     ],
     "actual_GPU_or_coverage": false,
-    "runtime_witnesses_source_connected": true
+    "runtime_witnesses_source_connected": true,
+    "skip_contract": "Tier2:2 exact setup skips plus1 exact original call skip in router-side media mode. Tier4:1 exact original call skip for sole-leg outage in2p2d. Other skip/phase/reason and missing teardown rejected."
   },
   "environment_contract": {
     "required_14_units_hard_gate": true,
