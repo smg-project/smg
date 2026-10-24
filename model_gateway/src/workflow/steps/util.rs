@@ -241,6 +241,42 @@ pub(crate) async fn try_grpc_reachable(url: &str, timeout_secs: u64) -> Result<(
         .map_err(|_| "gRPC reachability timeout".to_string())?
 }
 
+/// A declared SGLang encoder exposes standard Health, not scheduler Health.
+/// This verifies readiness only; the configured role/runtime identify the peer.
+pub(crate) async fn try_sglang_encoder_reachable(
+    url: &str,
+    timeout_secs: u64,
+) -> Result<(), String> {
+    use tonic_health::pb::{
+        health_check_response::ServingStatus, health_client::HealthClient, HealthCheckRequest,
+    };
+
+    let grpc_url = grpc_reachable_url(url)?;
+    let timeout = Duration::from_secs(timeout_secs);
+    let probe = async {
+        let channel = connect_channel_with_timeout(&grpc_url, timeout)
+            .await
+            .map_err(|error| format!("encoder gRPC connection failed: {error}"))?;
+        let mut request = tonic::Request::new(HealthCheckRequest {
+            service: "sglang.grpc.encoder.SglangEncoder".to_string(),
+        });
+        request.set_timeout(timeout);
+        let status = HealthClient::new(channel)
+            .check(request)
+            .await
+            .map_err(|error| format!("encoder Health/Check failed: {error}"))?
+            .into_inner()
+            .status;
+        if status != ServingStatus::Serving as i32 {
+            return Err(format!("encoder Health/Check is not SERVING: {status}"));
+        }
+        Ok(())
+    };
+    tokio::time::timeout(timeout, probe)
+        .await
+        .map_err(|_| "encoder gRPC reachability timeout".to_string())?
+}
+
 /// A mock gRPC engine on an ephemeral loopback port for the probes' tests,
 /// answering its health check as its overrides say (healthy until told
 /// otherwise): its `grpc://` URL and those overrides.
