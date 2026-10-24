@@ -493,10 +493,14 @@ pub(crate) fn fan_out_sglang_requests(
 /// bootstrap fields ride the scheduler's own slots, as the Python servicer
 /// forwards them. `max_model_len` is the context window the scheduler
 /// reported at the handshake: an empty prompt, or one that fills the window,
-/// is refused before it reaches the scheduler ([`admit_prompt`]).
+/// is refused before it reaches the scheduler ([`admit_prompt`]). `ranks` is
+/// how many scheduler ranks are connected: the request's data-parallel pin is
+/// placed among them as the engine's own frontend places it
+/// ([`routed_dp_rank`]).
 pub(crate) fn translate_request_sglang(
     req: sglang_proto::GenerateRequest,
     max_model_len: u64,
+    ranks: usize,
 ) -> Result<TokenizedGenerateReqInput, String> {
     let input_ids = req
         .tokenized
@@ -526,6 +530,7 @@ pub(crate) fn translate_request_sglang(
         ),
         None => (None, None, None),
     };
+    let routed_dp_rank = routed_dp_rank(req.data_parallel_rank, ranks)?;
     Ok(TokenizedGenerateReqInput {
         rid: req.request_id,
         input_ids,
@@ -550,6 +555,7 @@ pub(crate) fn translate_request_sglang(
         bootstrap_host,
         bootstrap_port,
         bootstrap_room,
+        routed_dp_rank,
         require_reasoning: req.require_reasoning,
         ..TokenizedGenerateReqInput::default()
     })
@@ -647,6 +653,30 @@ fn wire_tensor_sglang(
         tensor.data,
     )
     .map_err(|error| format!("multimodal tensor {name:?}: {error}"))
+}
+
+/// The scheduler rank a request's data-parallel pin routes it to, by the
+/// rule of SGLang's own frontend (`TokenizerManager`, where the API's pin
+/// becomes the request's `routed_dp_rank`): no pin leaves the placement to
+/// the dispatcher (here the connector's least-loaded selection); a pin on an
+/// engine of one rank is ignored, as the frontend logs and ignores it; a pin
+/// among several ranks must name one of them, else it is refused with the
+/// frontend's 400 wording. Each scheduler rank dials the connector with its
+/// rank as its engine index, so the rank is the engine the request goes to.
+fn routed_dp_rank(pin: Option<i32>, ranks: usize) -> Result<Option<u32>, String> {
+    let Some(pin) = pin else {
+        return Ok(None);
+    };
+    let out_of_range = || format!("routed_dp_rank={pin} out of range [0, {ranks})");
+    let rank = u32::try_from(pin).map_err(|_| out_of_range())?;
+    if ranks <= 1 && rank == 0 {
+        return Ok(None);
+    }
+    if usize::try_from(rank).is_ok_and(|rank| rank < ranks) {
+        Ok(Some(rank))
+    } else {
+        Err(out_of_range())
+    }
 }
 
 /// Translate an SGLang proto `EmbedRequest` into the scheduler's
@@ -928,9 +958,9 @@ mod tests {
     use super::*;
     use crate::test_support::connected_pair;
 
-    /// The translation under the mock scheduler's context window.
+    /// The translation under the mock scheduler's context window, one rank.
     fn translate(req: sglang_proto::GenerateRequest) -> Result<WireRequest, String> {
-        translate_request_sglang(req, default_ready_response().max_model_len)
+        translate_request_sglang(req, default_ready_response().max_model_len, 1)
     }
 
     fn tensor(dtype: &str, shape: Vec<u32>, data: Vec<u8>) -> sglang_proto::TensorData {
@@ -1313,6 +1343,51 @@ mod tests {
         );
     }
 
+    /// The data-parallel pin is placed as the engine's own frontend places
+    /// it: no pin stays unrouted, a pin names a connected rank, a pin on an
+    /// engine of one rank is ignored, and a pin past the connected ranks (or
+    /// a negative one) is refused with the frontend's 400 wording.
+    #[test]
+    fn sglang_translation_routes_the_data_parallel_pin_as_the_engine_frontend_does() {
+        let pinned = |pin: Option<i32>| sglang_proto::GenerateRequest {
+            request_id: "dp".into(),
+            tokenized: Some(sglang_proto::TokenizedInput {
+                original_text: String::new(),
+                input_ids: vec![1, 2, 3],
+            }),
+            data_parallel_rank: pin,
+            ..Default::default()
+        };
+        let translate_among = |pin: Option<i32>, ranks: usize| {
+            translate_request_sglang(pinned(pin), default_ready_response().max_model_len, ranks)
+        };
+        assert_eq!(translate_among(None, 2).unwrap().routed_dp_rank, None);
+        assert_eq!(translate_among(Some(1), 2).unwrap().routed_dp_rank, Some(1));
+        assert_eq!(translate_among(Some(0), 2).unwrap().routed_dp_rank, Some(0));
+        assert_eq!(
+            translate_among(Some(0), 1).unwrap().routed_dp_rank,
+            None,
+            "a pin on the only rank is ignored, as the frontend ignores it"
+        );
+        assert_eq!(
+            translate_among(Some(2), 2).unwrap_err(),
+            "routed_dp_rank=2 out of range [0, 2)"
+        );
+        assert_eq!(
+            translate_among(Some(1), 1).unwrap_err(),
+            "routed_dp_rank=1 out of range [0, 1)"
+        );
+        assert_eq!(
+            translate_among(Some(-1), 2).unwrap_err(),
+            "routed_dp_rank=-1 out of range [0, 2)"
+        );
+        // The routed rank survives the wire (its slot is pinned by the wire's
+        // own tests) and is what the protocol's rank hook reads.
+        let wire = translate_among(Some(1), 2).unwrap();
+        let back: WireRequest = decode_msgpack(&encode_msgpack(&wire).unwrap()).unwrap();
+        assert_eq!(back.routed_dp_rank, Some(1));
+    }
+
     /// Prompt bounds apply before the scheduler, with or without an output
     /// limit, under the window the handshake reported; the request's own
     /// limit is kept as it is (an unset one stays the scheduler's to cap).
@@ -1348,8 +1423,11 @@ mod tests {
                 (1_049_692, 0, true),
                 (0, 0, false),
             ] {
-                let result =
-                    translate_request_sglang(request(prompt_len, sampling.clone()), max_model_len);
+                let result = translate_request_sglang(
+                    request(prompt_len, sampling.clone()),
+                    max_model_len,
+                    1,
+                );
                 assert_eq!(
                     result.is_ok(),
                     accepted,

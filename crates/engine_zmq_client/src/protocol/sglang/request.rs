@@ -121,13 +121,13 @@ impl SglangRequestType {
 /// `return_logprob`, `logprob_start_len`, `top_logprobs_num`,
 /// `token_ids_logprob`, `stream`, then the 19 defaulted fields up to
 /// `require_reasoning`, of which this side fills `return_hidden_states`, the
-/// LoRA id, the logit processor and the prefill/decode bootstrap triple (the
-/// session and routing slots stay at the scheduler's defaults), so that flag
-/// lands in its slot. The encoder emits the shortest valid prefix: 14 elements
-/// (tag + 13 fields) through `stream`, or 34 when a later field is set; every
-/// field after the prefix keeps its `msgspec` default. Token ids go as a
-/// plain integer array; the plugin widens the scheduler's `array('q')`
-/// decode hook to accept it.
+/// LoRA id, the logit processor, the prefill/decode bootstrap triple and the
+/// routed data-parallel rank (the session and routing-key slots stay at the
+/// scheduler's defaults), so that flag lands in its slot. The encoder emits
+/// the shortest valid prefix: 14 elements (tag + 13 fields) through
+/// `stream`, or 34 when a later field is set; every field after the prefix
+/// keeps its `msgspec` default. Token ids go as a plain integer array; the
+/// plugin widens the scheduler's `array('q')` decode hook to accept it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TokenizedGenerateReqInput {
     /// Request id (the routing/registry key).
@@ -171,6 +171,15 @@ pub struct TokenizedGenerateReqInput {
     pub bootstrap_host: Option<String>,
     pub bootstrap_port: Option<i32>,
     pub bootstrap_room: Option<i64>,
+    /// The data-parallel rank the request is routed to, in the scheduler's
+    /// own `routed_dp_rank` slot: what SGLang's frontend sets from the API's
+    /// pin and its data-parallel controller dispatches on. On this wire the
+    /// connector is that dispatcher: the request goes out on the socket of
+    /// the engine whose index is this rank (each scheduler rank dials in with
+    /// its rank as its identity), and the slot carries the same value so the
+    /// scheduler's record of the request matches its frontend's. `None`
+    /// leaves the placement to the least-loaded selection.
+    pub routed_dp_rank: Option<u32>,
     /// Hybrid-reasoning request: the scheduler tracks the reasoning phase and
     /// accounts its tokens separately.
     pub require_reasoning: bool,
@@ -216,6 +225,7 @@ impl TokenizedGenerateReqInput {
             || self.bootstrap_host.is_some()
             || self.bootstrap_port.is_some()
             || self.bootstrap_room.is_some()
+            || self.routed_dp_rank.is_some()
     }
 }
 
@@ -238,6 +248,7 @@ impl Default for TokenizedGenerateReqInput {
             bootstrap_host: None,
             bootstrap_port: None,
             bootstrap_room: None,
+            routed_dp_rank: None,
             require_reasoning: false,
             trace_headers: None,
         }
@@ -249,7 +260,8 @@ impl Serialize for TokenizedGenerateReqInput {
         const NIL: Option<()> = None;
         // The shortest valid prefix: through `stream` unless a later field
         // (`return_hidden_states`, `lora_id`, `custom_logit_processor`, the bootstrap triple,
-        // `require_reasoning`) has to reach its slot past the defaulted ones.
+        // `routed_dp_rank`, `require_reasoning`) has to reach its slot past
+        // the defaulted ones.
         let len = if self.needs_extended_form() {
             GENERATE_WIRE_FIELDS.len() + 1
         } else {
@@ -272,14 +284,15 @@ impl Serialize for TokenizedGenerateReqInput {
         tuple.serialize_element(&self.stream)?;
         if self.needs_extended_form() {
             // The fields between `stream` and `require_reasoning`, at the
-            // scheduler's own defaults except the six this wire carries:
+            // scheduler's own defaults except the seven this wire carries:
             // return_sampling_mask, return_flat_raw_top_logprobs,
             // return_hidden_states, return_routed_experts,
             // routed_experts_start_len, return_indexer_topk, session_id,
             // session_params, lora_id, custom_logit_processor,
             // positional_embed_overrides, then the bootstrap triple
             // (bootstrap_host, bootstrap_port, bootstrap_room), then
-            // bootstrap_pair_key .. routing_key (5 optionals).
+            // bootstrap_pair_key, decode_tp_size, routed_dp_rank,
+            // disagg_prefill_dp_rank, routing_key.
             tuple.serialize_element(&false)?; // return_sampling_mask
             tuple.serialize_element(&false)?; // return_flat_raw_top_logprobs
             tuple.serialize_element(&self.return_hidden_states)?;
@@ -294,9 +307,11 @@ impl Serialize for TokenizedGenerateReqInput {
             tuple.serialize_element(&self.bootstrap_host)?;
             tuple.serialize_element(&self.bootstrap_port)?;
             tuple.serialize_element(&self.bootstrap_room)?;
-            for _ in 0..5 {
-                tuple.serialize_element(&NIL)?;
-            }
+            tuple.serialize_element(&NIL)?; // bootstrap_pair_key
+            tuple.serialize_element(&NIL)?; // decode_tp_size
+            tuple.serialize_element(&self.routed_dp_rank)?;
+            tuple.serialize_element(&NIL)?; // disagg_prefill_dp_rank
+            tuple.serialize_element(&NIL)?; // routing_key
             tuple.serialize_element(&self.require_reasoning)?;
         }
         tuple.end()
@@ -368,9 +383,10 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                 // The slots after `stream`: two defaulted flags, then
                 // `return_hidden_states`, five more defaulted slots, then
                 // `lora_id` and `custom_logit_processor`,
-                // `positional_embed_overrides`, the bootstrap triple, 5 more
-                // defaulted ones, then `require_reasoning`. A shorter array (a
-                // frontend that stopped at `stream`) leaves them all unset.
+                // `positional_embed_overrides`, the bootstrap triple, 2
+                // defaulted ones, `routed_dp_rank`, 2 more defaulted ones, then
+                // `require_reasoning`. A shorter array (a frontend that stopped
+                // at `stream`) leaves them all unset.
                 let mut tail = Tail {
                     seq: &mut seq,
                     ended: false,
@@ -386,7 +402,9 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                 let bootstrap_host = tail.next::<String>()?;
                 let bootstrap_port = tail.next::<i32>()?;
                 let bootstrap_room = tail.next::<i64>()?;
-                tail.skip(5)?;
+                tail.skip(2)?;
+                let routed_dp_rank = tail.next::<u32>()?;
+                tail.skip(2)?;
                 let require_reasoning = tail.next::<bool>()?.unwrap_or(false);
                 drain_trailing(&mut seq)?;
                 Ok(TokenizedGenerateReqInput {
@@ -406,6 +424,7 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                     bootstrap_host,
                     bootstrap_port,
                     bootstrap_room,
+                    routed_dp_rank,
                     require_reasoning,
                     trace_headers: None,
                 })
@@ -1042,6 +1061,65 @@ mod tests {
             &GENERATE_WIRE_FIELDS[24..27],
             ["bootstrap_host", "bootstrap_port", "bootstrap_room"]
         );
+    }
+
+    /// A request routed to a data-parallel rank carries the rank in the
+    /// scheduler's own `routed_dp_rank` slot: the extended form, the struct's
+    /// index, a round trip, and the protocol's rank hook reads it (an
+    /// embedding request has no pin on this wire). Unrouted, the slot is nil
+    /// and the hook leaves the placement to the connector.
+    #[test]
+    fn a_routed_request_fills_the_routed_dp_rank_slot() {
+        use crate::protocol::{sglang::SglangProtocol, EngineProtocol};
+
+        let routed = TokenizedGenerateReqInput {
+            rid: "dp".into(),
+            input_ids: vec![1, 2],
+            routed_dp_rank: Some(1),
+            ..Default::default()
+        };
+        let encoded = encode_msgpack(&routed).unwrap();
+        let array: Vec<Value> = decode_msgpack(&encoded).unwrap();
+        assert_eq!(
+            array.len(),
+            34,
+            "the extended form through require_reasoning"
+        );
+        assert!(
+            array[25..30].iter().all(Value::is_nil),
+            "bootstrap_host .. decode_tp_size nil"
+        );
+        assert_eq!(array[30].as_u64(), Some(1), "routed_dp_rank at 30");
+        assert!(
+            array[31].is_nil() && array[32].is_nil(),
+            "disagg_prefill_dp_rank, routing_key nil"
+        );
+        assert_eq!(array[33], Value::Boolean(false), "require_reasoning at 33");
+        let back: TokenizedGenerateReqInput = decode_msgpack(&encoded).unwrap();
+        assert_eq!(back, routed);
+        assert_eq!(GENERATE_WIRE_FIELDS[29], "routed_dp_rank");
+        assert_eq!(
+            SglangProtocol::data_parallel_rank(&SglangRequest::Generate(routed)),
+            Some(1)
+        );
+
+        let unrouted = TokenizedGenerateReqInput {
+            rid: "plain".into(),
+            input_ids: vec![1, 2],
+            ..Default::default()
+        };
+        let array: Vec<Value> = decode_msgpack(&encode_msgpack(&unrouted).unwrap()).unwrap();
+        assert_eq!(array.len(), 14, "nothing past stream: the short form");
+        assert_eq!(
+            SglangProtocol::data_parallel_rank(&SglangRequest::Generate(unrouted)),
+            None
+        );
+        let embed = SglangRequest::Embed(TokenizedEmbeddingReqInput {
+            rid: "e".into(),
+            input_ids: vec![1],
+            ..Default::default()
+        });
+        assert_eq!(SglangProtocol::data_parallel_rank(&embed), None);
     }
 
     #[test]
