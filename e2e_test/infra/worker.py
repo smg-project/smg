@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import IO, Any
 
 import yaml
@@ -207,6 +208,16 @@ class Worker:
         """
         cmd = self._build_cmd()
         env = self._build_env()
+        if env.get("E2E_EPD_RPC_PROOF_DIRECTORY"):
+            if (
+                self.engine != "sglang"
+                or self.mode != ConnectionMode.GRPC
+                or self.worker_type
+                not in (WorkerType.ENCODE, WorkerType.PREFILL, WorkerType.DECODE)
+            ):
+                raise ValueError("EPD RPC import proof requires a native SGLang E/P/D worker")
+            proof = Path(__file__).resolve().parents[2] / ".github/amd-epd-consumer/worker_proof.py"
+            cmd = [cmd[0], str(proof), self.worker_type.value, self.model_id, *cmd[1:]]
 
         logger.info(
             "Starting %s %s worker for %s on GPUs %s port %d",

@@ -18,9 +18,11 @@ the prefill/decode workers via ``stop_workers``. The function-scoped
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
 import time
+from pathlib import Path
 
 import anthropic
 import httpx
@@ -133,6 +135,12 @@ def _start_gateway(gateway: Gateway, gateway_config: dict, **mode_kwargs) -> Non
         log_level=gateway_config.get("log_level"),
         log_dir=gateway_config.get("log_dir"),
     )
+    if os.environ.get("E2E_EPD_RPC_PROOF_DIRECTORY"):
+        path = Path(__file__).resolve().parents[2] / ".github/amd-epd-consumer/gateway_proof.py"
+        spec = importlib.util.spec_from_file_location("epd_gateway_proof", path)
+        proof = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(proof)
+        proof.from_fixture(gateway)
 
 
 def _gateway_readiness_timeout(
