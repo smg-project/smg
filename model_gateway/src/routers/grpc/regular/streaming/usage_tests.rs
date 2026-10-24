@@ -13,6 +13,7 @@
 use futures::stream;
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
+    common::StringOrArray,
     completion::{CompletionRequest, CompletionResponse},
     generate::GenerateResponse,
 };
@@ -1277,4 +1278,123 @@ async fn a_watched_stream_whose_client_leaves_sends_nothing_more_and_closes_its_
         );
         assert_eq!(backend.closes(), 1, "messages {messages}");
     }
+}
+
+/// The watched stream again, with text held back at the departure: the stop
+/// decoder keeps `hi` as the start of a possible `hiya`, so nothing of it was
+/// sent when the client drops. The departure ends the read before the
+/// decoder's end-of-stream flush (which would fail on the closed sender), so
+/// the path returns `Ok` and closes the reservation as reserved-only, on
+/// both paths.
+#[tokio::test]
+async fn a_watched_stream_whose_client_leaves_with_held_text_ends_its_read_at_the_departure() {
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "eof-test", "messages": [], "stream": true,
+        "stream_options": {"include_usage": true},
+    }))
+    .expect("chat request");
+    for messages in [false, true] {
+        let (release, gate) = oneshot::channel();
+        let mut frames = choice_frames(0, &["x", "hi"], SETTLED);
+        let complete = frames.pop().expect("the terminal frame");
+        let (stream, server) = gated_stream(frames, gate, vec![complete], "0").await;
+        let (tx, mut rx) = sse_channel();
+        let stream = stream.until_client_gone(&tx, "chatcmpl-eof");
+        let (handle, backend) = RecordingBackend::reservation();
+        let processor = processor(false);
+        let stop = Some(StringOrArray::Array(vec!["hiya".to_string()]));
+        let streamed = async {
+            if messages {
+                processor
+                    .process_messages_streaming_chunks(
+                        stream,
+                        dispatch(),
+                        tokenizer(),
+                        (stop, None, false, false, false),
+                        messages_spec(false),
+                        &tx,
+                        Some(handle),
+                    )
+                    .await
+            } else {
+                processor
+                    .process_streaming_chunks(
+                        stream,
+                        dispatch(),
+                        tokenizer(),
+                        (stop, None, false, false, false),
+                        ChatResponseSpec::from(&request),
+                        &tx,
+                        Some(handle),
+                    )
+                    .await
+            }
+        };
+        let client = async {
+            let mut text = String::new();
+            while !text.contains('x') {
+                let frame = rx.recv().await.expect("the first delta reaches the client");
+                text.push_str(std::str::from_utf8(&frame.expect("an SSE write")).expect("UTF-8"));
+            }
+            assert!(
+                !text.contains("hi"),
+                "messages {messages}: `hi` is held back: {text}"
+            );
+            drop(rx);
+            release.send(()).expect("the gate is waited on");
+        };
+        let (result, ()) = tokio::join!(streamed, client);
+        server.abort();
+        assert!(result.is_ok(), "messages {messages}: {result:?}");
+        assert!(
+            backend.settlements().is_empty(),
+            "messages {messages}: no terminal frame was read: {:?}",
+            backend.settlements()
+        );
+        assert_eq!(backend.closes(), 1, "messages {messages}");
+    }
+}
+
+/// The completions processor on the same departure: the read ends at the
+/// client's leaving and the open choices are not finished (the held `hi`
+/// would go to the closed sender), so the path returns `Ok` as the chat and
+/// Messages paths do.
+#[tokio::test]
+async fn a_watched_completion_stream_whose_client_leaves_with_held_text_ends_at_the_departure() {
+    let request: CompletionRequest = serde_json::from_value(json!({
+        "model": "eof-test", "prompt": "p", "stream": true,
+    }))
+    .expect("completion request");
+    let (release, gate) = oneshot::channel();
+    let mut frames = choice_frames(0, &["x", "hi"], SETTLED);
+    let complete = frames.pop().expect("the terminal frame");
+    let (stream, server) = gated_stream(frames, gate, vec![complete], "0").await;
+    let (tx, mut rx) = sse_channel();
+    let stream = stream.until_client_gone(&tx, "cmpl-eof");
+    let processor = processor(false);
+    let stop = Some(StringOrArray::Array(vec!["hiya".to_string()]));
+    let spec = CompletionResponseSpec::from(&request);
+    let streamed = processor.process_completion_streaming_chunks(
+        stream,
+        dispatch(),
+        tokenizer(),
+        (stop, None, false, false, false),
+        &spec,
+        "p",
+        0,
+        &tx,
+    );
+    let client = async {
+        let mut text = String::new();
+        while !text.contains('x') {
+            let frame = rx.recv().await.expect("the first delta reaches the client");
+            text.push_str(std::str::from_utf8(&frame.expect("an SSE write")).expect("UTF-8"));
+        }
+        assert!(!text.contains("hi"), "`hi` is held back: {text}");
+        drop(rx);
+        release.send(()).expect("the gate is waited on");
+    };
+    let (result, ()) = tokio::join!(streamed, client);
+    server.abort();
+    assert!(result.is_ok(), "{:?}", result.err());
 }
