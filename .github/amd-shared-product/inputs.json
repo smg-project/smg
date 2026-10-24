@@ -88,7 +88,7 @@
     "model_gateway": "d1a181bfb1d16a661e16346d4eb8f257689701ce",
     "grpc_servicer": "a10bb7235d74ac91d8de4b3eafabd1ef7ed1344e",
     "e2e_test": "3408fbe66433940953c4399e03f5ff148c248ac8",
-    "scripts": "6003dbf64901f523a7204ec675da40df907b2f0b",
+    "scripts": "0fc0bfa5705269f536fec174e84b844933cb26fd",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows/e2e-gpu-job.yml": "c8daa461a9d5913bffa56b890505b6074776fb78",
     "README.md": "83b7df25632da03f0184bd5b4628b9c9a3ace803",
@@ -198,7 +198,7 @@
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows": "7c956a4ee89bdf800d48c63815d10a4dd568d90e"
   },
-  "producer_source_map_note": "Actual14 source trees remain exact accepted445bb37; compiled37c9d/native143a are unchanged. Consumer19 changes only the e2e_test tree for the explicit fourth hash-bound overlay: logical NIXL discovery accepts nixl or nixl_rocm while Mooncake remains mandatory.",
+  "producer_source_map_note": "Actual14 source trees remain exact accepted445bb37; compiled37c9d/native143a are unchanged. Consumer19/scripts is the actual Git tree with exactly two hash-bound default-off hooks relative to the product base; e2e_test retains the existing exact four-file overlay. Auxiliary proto/Cairo/tools provenance is separate from the actual445 four archives.",
   "resource_precondition": {
     "requested_runner_label": "1-gpu-mi300x",
     "required_logical_devices_by_tier": {
@@ -227,7 +227,7 @@
     "unit_junit": "servicer-engine.xml in the existing unique AMD dependency artifact",
     "diagnostic_workflow_difference": "NIXL tier-select dispatch caller only; normal product tooling CPU jobs are not part of this diagnostic workflow."
   },
-  "source_identity_note": "Original f470 tests/caller selection and compiled37 c9d/gateway143a/actual445 producer14 remain fixed. Consumer19/scripts changes only two exact hash-bound default-off private-wheel setup/audit hooks; namespace observers verify the genuine local version/RECORD/private-prefix and each owned TP1 EngineCore. No GPU, cleanup-fix or prior MC4 acceptance is transferred.",
+  "source_identity_note": "Original MC4 current18 selection, models, requests, oracles, 50job/42pytest and floor14 remain fixed. Actual consumer19 includes the existing exact four-file e2e overlay and two exact default-off scripts hooks; compiled37 c9d/gateway143a and actual445 producer14 remain unchanged. The private MC4 branch normally installs the independently built exact8451 proto wheel (source39dea, eight current schemas), editable consumer servicer, pinned tools and separate Cairo inputs. It does not install the proto from the editable checkout or relabel the auxiliary wheel as a fifth445 archive. Both pooled-node auxiliary/private staging and all runtime validation are pending; no CPU result or prior GPU acceptance is transferred.",
   "admitted_tier": null,
   "contracts": {
     "4": {
@@ -296,7 +296,7 @@
     "runtime_proof": false,
     "reference_contract": ".github/amd-shared-product/mooncake4-reference.json"
   },
-  "private_runtime_overlay_sha256": "243509c9ee32d68806478bd614929a77d1220a630205b5fcf17d5b173f505cd2",
+  "private_runtime_overlay_sha256": "3212a1a27553e08ade986cc62e042c71d628b521b28684df5a039baf0dc20aa3",
   "private_mooncake_runtime": {
     "wheel": {
       "bytes": 4203741,
@@ -314,5 +314,25 @@
     "staging_receipt": null,
     "GPU_verified": false,
     "base_image_installation_preserved": true
+  },
+  "runtime_auxiliary_inputs": {
+    "policy": "fixed749f_mc4_auxiliary_normal_resolver_cairo_v1",
+    "manifest_sha256": "f3519bade67f15b8bf0fe30f60b84313128175b14ca12d5c431168e3c1e50e7f",
+    "proto_source": "39dea18284553fd3e46a524081088b0a2a503d95",
+    "proto_wheel_sha256": "8451ff940377931f2904d18207c669d4f5e4da7613c9a1fedab8b722c471e934",
+    "separate_from_actual445_four_artifacts": true,
+    "host_bundle": "/tmp/smg-mc4-runtime-inputs-8451-c2ac-v1",
+    "read_only_mounts": [
+      "/input/mc4-cohort",
+      "/work/cairo-runtime",
+      "/input/private-five"
+    ],
+    "eligible_nodes": [
+      "amd-mi300x-1",
+      "amd-mi300x-2"
+    ],
+    "staging_accepted": false,
+    "staging_receipt": null,
+    "GPU_verified": false
   }
 }
