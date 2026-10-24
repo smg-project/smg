@@ -66,6 +66,7 @@ pub struct SglangProtocol;
 impl EngineProtocol for SglangProtocol {
     type Request = SglangRequest;
     type Output = SglangOutput;
+    type Layout = ();
 
     fn add_frame() -> Bytes {
         SglangRequestType::Add.to_frame()
@@ -201,7 +202,7 @@ impl EngineProtocol for SglangProtocol {
         )))
     }
 
-    fn decode_batch(frames: &[Bytes]) -> Result<EngineBatch<Self::Output>> {
+    fn decode_batch(frames: &[Bytes], _layout: &()) -> Result<EngineBatch<Self::Output>> {
         if frames.len() > 1 {
             tracing::debug!(
                 aux_frames = frames.len() - 1,
@@ -350,7 +351,7 @@ mod tests {
     #[test]
     fn decode_batch_maps_outputs_finished_ids_and_load() {
         let frames = vec![Bytes::from(encode_msgpack(&slim_batch()).unwrap())];
-        let decoded = SglangProtocol::decode_batch(&frames).unwrap();
+        let decoded = SglangProtocol::decode_batch(&frames, &()).unwrap();
         assert_eq!(decoded.outputs.len(), 2);
         assert_eq!(decoded.finished_request_ids, vec!["b".to_string()]);
         assert_eq!(decoded.engine_index, 1);
@@ -374,7 +375,7 @@ mod tests {
             Bytes::from(encode_msgpack(&slim_batch()).unwrap()),
             Bytes::from_static(b"aux"),
         ];
-        let decoded = SglangProtocol::decode_batch(&frames).unwrap();
+        let decoded = SglangProtocol::decode_batch(&frames, &()).unwrap();
         assert_eq!(decoded.outputs.len(), 2);
     }
 
@@ -385,7 +386,7 @@ mod tests {
             ..slim_batch()
         };
         let frames = vec![Bytes::from(encode_msgpack(&batch).unwrap())];
-        assert!(SglangProtocol::decode_batch(&frames)
+        assert!(SglangProtocol::decode_batch(&frames, &())
             .unwrap()
             .load
             .is_none());
@@ -414,7 +415,7 @@ mod tests {
             engine_index: 1,
         };
         let frames = vec![Bytes::from(encode_msgpack(&reply).unwrap())];
-        let batch = SglangProtocol::decode_batch(&frames).unwrap();
+        let batch = SglangProtocol::decode_batch(&frames, &()).unwrap();
         assert!(batch.outputs.is_empty() && batch.load.is_none());
         let utility = batch.utility.expect("a utility reply");
         assert_eq!(utility.call_id, 9);
@@ -438,7 +439,7 @@ mod tests {
             kv_total_tokens: 100,
         };
         let frames = vec![Bytes::from(encode_msgpack(&embeddings).unwrap())];
-        let batch = SglangProtocol::decode_batch(&frames).unwrap();
+        let batch = SglangProtocol::decode_batch(&frames, &()).unwrap();
         assert_eq!(batch.finished_request_ids, vec!["e1".to_string()]);
         assert_eq!(batch.outputs[0].embedding, Some(vec![0.5]));
         assert!(batch.load.is_some());

@@ -24,6 +24,7 @@ use smg_grpc_client::{constraint_failed_status, sglang_proto, vllm_proto as vllm
 use tracing::warn;
 
 use crate::{
+    abort_status::engine_abort_status,
     context_window::admit_prompt,
     fanout::fan_out_n,
     stream::{poll_mapped, MappedGenerateStream, StreamState},
@@ -403,7 +404,7 @@ impl MappedGenerateStream for SglangGenerateStream {
         // status (400 when the request is at fault). The frontend never asked
         // for it (its own aborts drop the stream first), so it is an error to
         // the caller, not an empty success, with the status mapped by the one
-        // table the engine's front ends share (`scheduler_abort_status`). The
+        // table the engine's front ends share (`engine_abort_status`). The
         // one abort the scheduler itself attributes to the request's grammar
         // (the plugin's `err_type` stamp on the scheduler's own grammar
         // failure, see `GRAMMAR_REJECTED_ERR_TYPE`) is the constraint failing
@@ -423,7 +424,7 @@ impl MappedGenerateStream for SglangGenerateStream {
             if output.finish_err_type.as_deref() == Some(GRAMMAR_REJECTED_ERR_TYPE) {
                 return Err(constraint_failed_status(message));
             }
-            return Err(scheduler_abort_status(output.finish_status, message));
+            return Err(engine_abort_status(output.finish_status, message));
         }
         let finish = output.finish_reason.map(|reason| {
             (
@@ -917,23 +918,6 @@ pub(crate) fn constraint_ref(sp: &sglang_proto::SamplingParams) -> Option<Constr
 /// (`smg_grpc_servicer.sglang`) stamps it, this wire reads it.
 pub(crate) const GRAMMAR_REJECTED_ERR_TYPE: &str = "GrammarRejectedToken";
 
-/// The gRPC status for a request the scheduler aborted with an HTTP-style
-/// status: the table the engine's Python servicer uses for the same status,
-/// so the two front ends of one engine answer alike. 400 is the caller's
-/// fault, 404 a missing resource, 408 and 504 a deadline, 429 a full queue,
-/// 503 an unavailable engine; anything else, a missing status included, is
-/// internal.
-pub(crate) fn scheduler_abort_status(status: Option<u16>, message: String) -> tonic::Status {
-    match status {
-        Some(400) => tonic::Status::invalid_argument(message),
-        Some(404) => tonic::Status::not_found(message),
-        Some(408 | 504) => tonic::Status::deadline_exceeded(message),
-        Some(429) => tonic::Status::resource_exhausted(message),
-        Some(503) => tonic::Status::unavailable(message),
-        _ => tonic::Status::internal(message),
-    }
-}
-
 /// Normalize an SGLang finish reason into the canonical set the gateway's
 /// response layer exact-matches (`stop`, `length`, `abort`).
 pub(crate) fn normalize_finish_reason(reason: &str) -> &'static str {
@@ -1189,26 +1173,6 @@ mod tests {
             assert!(error.contains("image references only"), "{error}");
             let error = translate(media_request(refs)).unwrap_err();
             assert!(error.contains("image references only"), "{error}");
-        }
-    }
-
-    #[test]
-    fn a_scheduler_abort_carries_the_status_its_http_code_means() {
-        let rows = [
-            (Some(400), tonic::Code::InvalidArgument),
-            (Some(404), tonic::Code::NotFound),
-            (Some(408), tonic::Code::DeadlineExceeded),
-            (Some(429), tonic::Code::ResourceExhausted),
-            (Some(500), tonic::Code::Internal),
-            (Some(503), tonic::Code::Unavailable),
-            (Some(504), tonic::Code::DeadlineExceeded),
-            (Some(418), tonic::Code::Internal),
-            (None, tonic::Code::Internal),
-        ];
-        for (status, code) in rows {
-            let got = scheduler_abort_status(status, "why".to_string());
-            assert_eq!(got.code(), code, "{status:?}");
-            assert_eq!(got.message(), "why");
         }
     }
 

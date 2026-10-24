@@ -478,6 +478,7 @@ pub async fn send_message(
 pub async fn run_output_loop<P: EngineProtocol>(
     mut output_socket: PullSocket,
     tx: mpsc::Sender<Result<EngineBatch<P::Output>>>,
+    layout: P::Layout,
 ) {
     loop {
         let message = match output_socket.recv().await {
@@ -500,7 +501,7 @@ pub async fn run_output_loop<P: EngineProtocol>(
             return;
         }
 
-        let decoded = match P::decode_batch(&frames) {
+        let decoded = match P::decode_batch(&frames, &layout) {
             Ok(decoded) => Ok(decoded),
             Err(error) => {
                 // Keep the loop running so a single bad message doesn't drop the
@@ -616,7 +617,7 @@ mod tests {
             clippy::disallowed_methods,
             reason = "test output loop torn down when the test ends"
         )]
-        let _output_loop = tokio::spawn(run_output_loop::<VllmProtocol>(output_socket, out_tx));
+        let _output_loop = tokio::spawn(run_output_loop::<VllmProtocol>(output_socket, out_tx, ()));
 
         let outputs = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             engine_index: 0,
@@ -674,6 +675,7 @@ mod tests {
         let _output_loop = tokio::spawn(run_output_loop::<VllmProtocol>(
             transport.output_socket,
             out_tx,
+            (),
         ));
 
         engine
