@@ -822,7 +822,9 @@ decided). With `--servicer-impl rust` the same process serves the
 launcher computes the model and server facts from TokenSpeed's own config,
 runs the scheduler(s) headless in a spawned child over the msgpack ZMQ wire,
 and supervises both. What that wire does not carry is reported, not emulated:
-`FlushCache` and profiling answer UNIMPLEMENTED, ranked `top_logprobs` and
+`FlushCache` and profiling ride the wire's control call on a scheduler whose
+handshake declares its control reply (the control-wire revision) and answer
+UNIMPLEMENTED, naming the gap, on one that does not; ranked `top_logprobs` and
 prompt logprobs are refused, and the RL control-plane extras (the `rl.*`
 advertisement, the live `weight_version` on generate responses, `is_paused`)
 stay with the Python implementation; the Rust server redacts credentials from

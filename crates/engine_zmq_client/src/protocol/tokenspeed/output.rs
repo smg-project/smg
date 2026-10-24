@@ -12,6 +12,7 @@ use serde::{
 use crate::{
     error::{Error, Result},
     protocol::{
+        control::{read_control_reply_after_tag, ControlReplySlim, CONTROL_REPLY_SLIM_TAG},
         positional::{drain_trailing, expect_tag, next_field},
         EngineOutput,
     },
@@ -108,31 +109,81 @@ impl<'de> Deserialize<'de> for BatchTokenIDOutSlim {
                 mut seq: A,
             ) -> std::result::Result<Self::Value, A::Error> {
                 expect_tag(&mut seq, BATCH_TOKEN_ID_OUT_SLIM_TAG)?;
-                let batch = BatchTokenIDOutSlim {
-                    rids: next_field(&mut seq, "rids")?,
-                    output_ids: next_field(&mut seq, "output_ids")?,
-                    finished_reasons: next_field(&mut seq, "finished_reasons")?,
-                    prompt_tokens: next_field(&mut seq, "prompt_tokens")?,
-                    completion_tokens: next_field(&mut seq, "completion_tokens")?,
-                    cached_tokens: next_field(&mut seq, "cached_tokens")?,
-                    output_token_logprobs_val: next_field(&mut seq, "output_token_logprobs_val")?,
-                    output_token_logprobs_idx: next_field(&mut seq, "output_token_logprobs_idx")?,
-                    // Appended by the DP wire revision: a 9-element batch from
-                    // an older sender means rank 0 (the only rank it can be).
-                    engine_index: seq.next_element::<u32>()?.unwrap_or(0),
-                    // Appended by the load-piggyback revision; zeros from
-                    // older senders decode as "no snapshot".
-                    num_running: seq.next_element::<u64>()?.unwrap_or(0),
-                    num_waiting: seq.next_element::<u64>()?.unwrap_or(0),
-                    kv_active_pages: seq.next_element::<u64>()?.unwrap_or(0),
-                    kv_total_pages: seq.next_element::<u64>()?.unwrap_or(0),
-                };
-                drain_trailing(&mut seq)?;
-                Ok(batch)
+                read_token_batch_after_tag(&mut seq)
             }
         }
 
         deserializer.deserialize_seq(BatchVisitor)
+    }
+}
+
+/// The token batch's columns after the tag; shared by the struct's own
+/// decoder and the wire enum's.
+fn read_token_batch_after_tag<'de, A: SeqAccess<'de>>(
+    seq: &mut A,
+) -> std::result::Result<BatchTokenIDOutSlim, A::Error> {
+    let batch = BatchTokenIDOutSlim {
+        rids: next_field(seq, "rids")?,
+        output_ids: next_field(seq, "output_ids")?,
+        finished_reasons: next_field(seq, "finished_reasons")?,
+        prompt_tokens: next_field(seq, "prompt_tokens")?,
+        completion_tokens: next_field(seq, "completion_tokens")?,
+        cached_tokens: next_field(seq, "cached_tokens")?,
+        output_token_logprobs_val: next_field(seq, "output_token_logprobs_val")?,
+        output_token_logprobs_idx: next_field(seq, "output_token_logprobs_idx")?,
+        // Appended by the DP wire revision: a 9-element batch from
+        // an older sender means rank 0 (the only rank it can be).
+        engine_index: seq.next_element::<u32>()?.unwrap_or(0),
+        // Appended by the load-piggyback revision; zeros from
+        // older senders decode as "no snapshot".
+        num_running: seq.next_element::<u64>()?.unwrap_or(0),
+        num_waiting: seq.next_element::<u64>()?.unwrap_or(0),
+        kv_active_pages: seq.next_element::<u64>()?.unwrap_or(0),
+        kv_total_pages: seq.next_element::<u64>()?.unwrap_or(0),
+    };
+    drain_trailing(seq)?;
+    Ok(batch)
+}
+
+/// One output message on the wire, told apart by its tag: the token batch
+/// (boxed: by far the larger and the common case), or the control reply of a
+/// scheduler of the control-wire revision.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TokenSpeedWireOutput {
+    Tokens(Box<BatchTokenIDOutSlim>),
+    ControlReply(ControlReplySlim),
+}
+
+impl<'de> Deserialize<'de> for TokenSpeedWireOutput {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct WireVisitor;
+
+        impl<'de> Visitor<'de> for WireVisitor {
+            type Value = TokenSpeedWireOutput;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "a tagged TokenSpeed output positional array")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let tag: String = next_field(&mut seq, "tag")?;
+                match tag.as_str() {
+                    BATCH_TOKEN_ID_OUT_SLIM_TAG => read_token_batch_after_tag(&mut seq)
+                        .map(|batch| TokenSpeedWireOutput::Tokens(Box::new(batch))),
+                    CONTROL_REPLY_SLIM_TAG => read_control_reply_after_tag(&mut seq)
+                        .map(TokenSpeedWireOutput::ControlReply),
+                    other => Err(serde::de::Error::custom(format!(
+                        "wrong msgspec tag: expected `{BATCH_TOKEN_ID_OUT_SLIM_TAG}` or \
+                         `{CONTROL_REPLY_SLIM_TAG}`, got `{other}`"
+                    ))),
+                }
+            }
+        }
+
+        deserializer.deserialize_seq(WireVisitor)
     }
 }
 
@@ -255,7 +306,10 @@ mod tests {
     use rmpv::Value;
 
     use super::*;
-    use crate::codec::{decode_msgpack, decode_value, encode_msgpack};
+    use crate::{
+        codec::{decode_msgpack, decode_value, encode_msgpack},
+        protocol::positional::vector_bytes,
+    };
 
     /// A slim output batch captured from the Python msgspec encoder: rids
     /// ["vec-1"], output_ids [[10, 11]], finished_reasons ["length"], prompt 3
@@ -278,14 +332,6 @@ mod tests {
     const PYTHON_OUTPUT_VECTOR_PRE_DP: &str =
         "99b34261746368546f6b656e49444f7574536c696d91a57665632d3191920a0b91a66c656e\
          6774689103910291019192cbbfe0000000000000cbbfd000000000000091920a0b";
-
-    fn vector_bytes(hex_vector: &str) -> Vec<u8> {
-        let hex: String = hex_vector.chars().filter(|c| !c.is_whitespace()).collect();
-        (0..hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-            .collect()
-    }
 
     fn python_output_bytes() -> Vec<u8> {
         vector_bytes(PYTHON_OUTPUT_VECTOR)

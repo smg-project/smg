@@ -83,6 +83,17 @@ pub(crate) fn check_prefix(
     Ok(())
 }
 
+/// The bytes of a hex vector captured from the engine's own encoder (spaces
+/// and line breaks between the digits are ignored).
+#[cfg(test)]
+pub(crate) fn vector_bytes(hex_vector: &str) -> Vec<u8> {
+    let hex: String = hex_vector.chars().filter(|c| !c.is_whitespace()).collect();
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4,18 +4,20 @@
 //! does.
 
 use std::{
+    collections::BTreeMap,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
 use engine_zmq_client::{
-    codec::{decode_msgpack, decode_value, encode_msgpack},
+    codec::{decode_msgpack, decode_value, encode_msgpack, OpaqueValue},
     mock_engine::{
         connect_to_frontend, default_ready_response, hello, MockEngineInput, MockEngineOutput,
         MOCK_DEADLINE,
     },
     protocol::{
+        control::ControlReplySlim,
         handshake::EngineCoreReadyResponse,
         tokenspeed::{
             output::BatchTokenIDOutSlim,
@@ -138,6 +140,29 @@ struct Harness {
 }
 
 async fn harness(model: TokenSpeedModelInfo, tokenizer: Option<Arc<dyn Tokenizer>>) -> Harness {
+    harness_with_ready(model, tokenizer, default_ready_response()).await
+}
+
+/// The READY a scheduler of the control-wire revision sends: it declares
+/// the control reply it answers control calls with.
+fn control_wire_ready() -> EngineCoreReadyResponse {
+    EngineCoreReadyResponse {
+        positional_layouts: BTreeMap::from([(
+            "ControlReplySlim".to_string(),
+            ["call_id", "success", "message", "engine_index"]
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        )]),
+        ..default_ready_response()
+    }
+}
+
+async fn harness_with_ready(
+    model: TokenSpeedModelInfo,
+    tokenizer: Option<Arc<dyn Tokenizer>>,
+    ready: EngineCoreReadyResponse,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
     let config = config(dir.path(), &handshake, model);
@@ -151,7 +176,7 @@ async fn harness(model: TokenSpeedModelInfo, tokenizer: Option<Arc<dyn Tokenizer
         EngineId::from_engine_index(0),
         EngineCoreReadyResponse {
             cache_trace_epochs: vec!["capture-epoch".to_string()],
-            ..default_ready_response()
+            ..ready
         },
     )
     .await
@@ -1115,9 +1140,97 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
-/// The msgpack wire has no control messages, so the scheduler's control RPCs
-/// say so instead of pretending; a disabled KV publisher reads as the Python
-/// servicer's UNIMPLEMENTED.
+/// A control call as the mock scheduler sees it: `[CONTROL, (call_id,
+/// method, args)]`.
+async fn recv_control(engine: &mut MockEngineInput) -> (i64, String, Vec<OpaqueValue>) {
+    let frames = engine.recv_frames().await.unwrap();
+    assert_eq!(
+        TokenSpeedRequestType::from_frame(frames[0].as_ref()),
+        Some(TokenSpeedRequestType::Control)
+    );
+    decode_msgpack(frames[1].as_ref()).unwrap()
+}
+
+async fn reply_control(
+    engine_out: &mut MockEngineOutput,
+    call_id: i64,
+    success: bool,
+    message: Option<&str>,
+) {
+    let reply = ControlReplySlim {
+        call_id,
+        success,
+        message: message.map(str::to_string),
+        engine_index: 0,
+    };
+    engine_out
+        .send_frames(vec![Bytes::from(encode_msgpack(&reply).unwrap())])
+        .await
+        .unwrap();
+}
+
+/// A scheduler whose handshake declares the control reply (the control-wire
+/// revision) gets `FlushCache` and the profile RPCs as control calls on its
+/// input socket, answered under the call id with its own `success` and
+/// `message`, aggregated as the Python servicer aggregates them.
+#[tokio::test]
+async fn control_rpcs_ride_the_control_wire_when_the_scheduler_declares_it() {
+    let mut h = harness_with_ready(model_info(), None, control_wire_ready()).await;
+    let (engine_in, engine_out) = (&mut h.engine_in, &mut h.engine_out);
+    let (flushed, ()) = tokio::join!(
+        h.client
+            .flush_cache(common::FlushCacheRequest { timeout_s: 0.0 }),
+        async {
+            let (call_id, method, args) = recv_control(engine_in).await;
+            assert_eq!(method, "flush_cache");
+            assert_eq!(args, vec![OpaqueValue::F64(0.0)]);
+            reply_control(engine_out, call_id, true, None).await;
+        }
+    );
+    let flushed = flushed.unwrap().into_inner();
+    assert!(flushed.success);
+    assert_eq!(flushed.message, "Cache flushed successfully");
+
+    let (started, ()) = tokio::join!(
+        h.client.start_profile(common::StartProfileRequest {
+            output_dir: Some("/tmp/traces".to_string()),
+            num_steps: Some(3),
+            ..Default::default()
+        }),
+        async {
+            let (call_id, method, args) = recv_control(engine_in).await;
+            assert_eq!(method, "start_profile");
+            let options = args[0].as_map().unwrap();
+            assert!(options
+                .iter()
+                .any(|(k, v)| k.as_str() == Some("num_steps") && *v == OpaqueValue::from(3i64)));
+            reply_control(engine_out, call_id, true, None).await;
+        }
+    );
+    assert!(started.unwrap().into_inner().success);
+
+    let (stopped, ()) = tokio::join!(
+        h.client.stop_profile(common::StopProfileRequest::default()),
+        async {
+            let (call_id, method, _args) = recv_control(engine_in).await;
+            assert_eq!(method, "stop_profile");
+            reply_control(engine_out, call_id, false, Some("no profiler running")).await;
+        }
+    );
+    let stopped = stopped.unwrap().into_inner();
+    assert!(!stopped.success);
+    assert!(
+        stopped.message.contains("no profiler running"),
+        "{}",
+        stopped.message
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A scheduler whose handshake declares no control reply (today's) carries
+/// generate and abort only, so the scheduler's control RPCs say so instead of
+/// pretending, and nothing reaches it; a disabled KV publisher reads as the
+/// Python servicer's UNIMPLEMENTED.
 #[tokio::test]
 async fn control_rpcs_report_what_the_wire_cannot_carry() {
     let mut h = harness(model_info(), None).await;
@@ -1127,6 +1240,11 @@ async fn control_rpcs_report_what_the_wire_cannot_carry() {
         .await
         .expect_err("no control wire");
     assert_eq!(flush.code(), Code::Unimplemented);
+    assert!(
+        flush.message().contains("declares no control reply"),
+        "{}",
+        flush.message()
+    );
     let profile = h
         .client
         .start_profile(common::StartProfileRequest::default())

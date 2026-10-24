@@ -21,7 +21,6 @@
 //! reaches the scheduler as its own failure notice on the request's rank
 //! ([`engine_zmq_adapter::sglang_encode`]).
 
-mod admin;
 mod embed;
 mod engine;
 mod generate;

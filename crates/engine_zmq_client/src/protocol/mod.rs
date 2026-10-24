@@ -14,6 +14,7 @@ use bytes::Bytes;
 use self::handshake::EngineCoreReadyResponse;
 use crate::{codec::OpaqueValue, Result};
 
+pub mod control;
 pub mod handshake;
 pub(crate) mod positional;
 pub mod sglang;

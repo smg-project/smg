@@ -11,7 +11,7 @@ use smg_grpc_client::{
 };
 use tonic::{Request, Response, Status};
 
-use super::{admin, embed, generate, info, State};
+use super::{embed, generate, info, State};
 use crate::{kv_events, tokenizer_bundle, BoxStream};
 
 /// What neither servicer serves: the msgpack wire has no adapter-loading
@@ -113,7 +113,7 @@ impl SglangScheduler for SglangService {
         &self,
         request: Request<common::FlushCacheRequest>,
     ) -> Result<Response<common::FlushCacheResponse>, Status> {
-        admin::flush_cache(&self.state, request)
+        crate::admin::flush_cache(&self.state.shared, request)
             .await
             .map(Response::new)
     }
@@ -122,7 +122,7 @@ impl SglangScheduler for SglangService {
         &self,
         request: Request<common::StartProfileRequest>,
     ) -> Result<Response<common::ProfileResponse>, Status> {
-        admin::start_profile(&self.state, request.into_inner())
+        crate::admin::start_profile(&self.state.shared, request.into_inner())
             .await
             .map(Response::new)
     }
@@ -131,7 +131,9 @@ impl SglangScheduler for SglangService {
         &self,
         _request: Request<common::StopProfileRequest>,
     ) -> Result<Response<common::ProfileResponse>, Status> {
-        admin::stop_profile(&self.state).await.map(Response::new)
+        crate::admin::stop_profile(&self.state.shared)
+            .await
+            .map(Response::new)
     }
 
     async fn get_tokenizer(

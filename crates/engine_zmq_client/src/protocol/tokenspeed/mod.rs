@@ -14,26 +14,41 @@
 //! request-type frame (a single raw byte ahead of the payload, so the receiver
 //! dispatches without decoding) is `ADD = 0x00` / `ABORT = 0x01`, and the
 //! abort payload is a plain msgpack `list[str]` of request ids, not a tagged
-//! struct.
+//! struct. A scheduler of the control-wire revision also takes `CONTROL =
+//! 0x02` (`(call_id, method, args)`, answered by a `ControlReplySlim` on the
+//! output socket) and says so by declaring that reply in its handshake
+//! ([`wire_carries_control_calls`]); SMG sends control calls to no other.
 
 pub mod multimodal;
 pub mod output;
 pub mod request;
 pub mod sampling;
 
+use std::collections::BTreeMap;
+
 use bytes::Bytes;
 
 use crate::{
-    codec::{decode_msgpack, encode_msgpack, tensor::encode_with_aux_frames},
+    codec::{decode_msgpack, encode_msgpack, tensor::encode_with_aux_frames, OpaqueValue},
     error::Result,
     protocol::{
+        control::CONTROL_REPLY_SLIM_TAG,
         tokenspeed::{
-            output::{BatchTokenIDOutSlim, TokenSpeedOutput},
+            output::{TokenSpeedOutput, TokenSpeedWireOutput},
             request::{TokenSpeedRequestType, TokenizedGenerateReqInput},
         },
-        EngineBatch, EngineLoad, EngineProtocol,
+        EngineBatch, EngineLoad, EngineProtocol, UtilityReply,
     },
 };
+
+/// Whether the engine's handshake declared the control reply
+/// (`positional_layouts["ControlReplySlim"]`): the scheduler then takes
+/// control calls (`FlushCache`, profiling) on its input socket and answers
+/// them on its output socket. A scheduler that declares no layout at all
+/// (today's) carries generate and abort only, and the servicer says so.
+pub fn wire_carries_control_calls(layouts: &BTreeMap<String, Vec<String>>) -> bool {
+    layouts.contains_key(CONTROL_REPLY_SLIM_TAG)
+}
 
 /// The TokenSpeed engine protocol: drives [`TokenizedGenerateReqInput`] over
 /// the shared ZMQ transport and decodes [`BatchTokenIDOutSlim`] back.
@@ -107,6 +122,22 @@ impl EngineProtocol for TokenSpeedProtocol {
         Ok(None)
     }
 
+    fn encode_utility(
+        call_id: i64,
+        method: &str,
+        args: &[OpaqueValue],
+    ) -> Result<Option<(Bytes, Vec<u8>)>> {
+        // `[engine, CONTROL, (call_id, method, args)]`, the triple the SGLang
+        // plugin takes: a scheduler of the control-wire revision builds its
+        // own control request from it and answers under the call id. The
+        // caller sends it only to a scheduler whose handshake declared the
+        // reply ([`wire_carries_control_calls`]).
+        Ok(Some((
+            TokenSpeedRequestType::Control.to_frame(),
+            encode_msgpack(&(call_id, method, args))?,
+        )))
+    }
+
     fn decode_batch(frames: &[Bytes]) -> Result<EngineBatch<Self::Output>> {
         // Output messages are `[payload, aux...]`. The slim batch carries no
         // tensor fields today, so aux frames are unexpected but not fatal.
@@ -118,7 +149,19 @@ impl EngineProtocol for TokenSpeedProtocol {
             );
         }
         let payload = frames.first().map(AsRef::as_ref).unwrap_or_default();
-        let batch: BatchTokenIDOutSlim = decode_msgpack(payload)?;
+        let batch = match decode_msgpack::<TokenSpeedWireOutput>(payload)? {
+            TokenSpeedWireOutput::Tokens(batch) => *batch,
+            TokenSpeedWireOutput::ControlReply(reply) => {
+                return Ok(EngineBatch {
+                    engine_index: reply.engine_index,
+                    utility: Some(UtilityReply {
+                        call_id: reply.call_id,
+                        outcome: Ok(reply.into_outcome()),
+                    }),
+                    ..EngineBatch::default()
+                });
+            }
+        };
         let engine_index = batch.engine_index;
         // `kv_total_pages == 0` marks a pre-piggyback sender (or a snapshot
         // the engine could not take): report no load rather than fabricating
@@ -162,8 +205,11 @@ mod tests {
                 resolve_array_bytes, TensorFields, WireArrayData, WireTensor, TENSOR_AUX_MIN_BYTES,
             },
         },
-        protocol::tokenspeed::multimodal::{
-            mm_pad_value, TokenSpeedWireMmInputs, TokenSpeedWireMmItem, TokenSpeedWireModality,
+        protocol::tokenspeed::{
+            multimodal::{
+                mm_pad_value, TokenSpeedWireMmInputs, TokenSpeedWireMmItem, TokenSpeedWireModality,
+            },
+            output::BatchTokenIDOutSlim,
         },
     };
 
@@ -426,6 +472,121 @@ mod tests {
     fn request_type_frames_match_wire_contract() {
         assert_eq!(TokenSpeedProtocol::add_frame().as_ref(), b"\x00");
         assert_eq!(TokenSpeedProtocol::abort_frame().as_ref(), b"\x01");
+        assert_eq!(
+            TokenSpeedRequestType::from_frame(b"\x02"),
+            Some(TokenSpeedRequestType::Control)
+        );
+        assert_eq!(TokenSpeedRequestType::Control.to_frame().as_ref(), b"\x02");
+        assert_eq!(TokenSpeedRequestType::from_frame(b"\x03"), None);
+    }
+
+    /// A control call rides the `CONTROL` frame as the positional triple the
+    /// SGLang plugin takes; the reply comes back on the output socket as a
+    /// utility reply under the call id; and the handshake's layout
+    /// declaration is what tells a scheduler that takes control calls from
+    /// one that does not.
+    /// `[7, "flush_cache", [1.5]]` as the scheduler's msgspec decoder of the
+    /// control triple takes it.
+    const FLUSH_CALL_VECTOR: &str = "9307ab666c7573685f636163686591cb3ff8000000000000";
+    /// `["ControlReplySlim", 7, True, None, 0]` from the scheduler's own
+    /// struct: an accepted flush on rank 0.
+    const CONTROL_REPLY_ACCEPTED_VECTOR: &str = "95b0436f6e74726f6c5265706c79536c696d07c3c000";
+    /// `["ControlReplySlim", 9, False, "no profiler running", 1]`: a refused
+    /// profiler stop on rank 1.
+    const CONTROL_REPLY_REFUSED_VECTOR: &str =
+        "95b0436f6e74726f6c5265706c79536c696d09c2b36e6f2070726f66696c65722072756e6e696e6701";
+
+    #[test]
+    fn control_calls_ride_the_control_frame_and_replies_resolve_by_call_id() {
+        use crate::protocol::{control::ControlReplySlim, positional::vector_bytes};
+
+        let (frame, payload) =
+            TokenSpeedProtocol::encode_utility(7, "flush_cache", &[OpaqueValue::F64(1.5)])
+                .unwrap()
+                .expect("the control-wire revision has control calls");
+        assert_eq!(frame.as_ref(), b"\x02");
+        let decoded: (i64, String, Vec<OpaqueValue>) = decode_msgpack(&payload).unwrap();
+        assert_eq!(
+            decoded,
+            (7, "flush_cache".to_string(), vec![OpaqueValue::F64(1.5)])
+        );
+        // Byte for byte what the scheduler's msgspec decoder of the triple
+        // takes, and what its `ControlReplySlim` struct emits for an accepted
+        // flush and for a refused profiler stop: the captured vectors.
+        assert_eq!(payload, vector_bytes(FLUSH_CALL_VECTOR));
+        let accepted = TokenSpeedProtocol::decode_batch(&[Bytes::from(vector_bytes(
+            CONTROL_REPLY_ACCEPTED_VECTOR,
+        ))])
+        .unwrap();
+        assert_eq!(accepted.engine_index, 0);
+        let utility = accepted.utility.expect("a utility reply");
+        assert_eq!(utility.call_id, 7);
+        assert_eq!(
+            utility.outcome.unwrap().as_map().unwrap(),
+            &[
+                (OpaqueValue::from("success"), OpaqueValue::Boolean(true)),
+                (OpaqueValue::from("message"), OpaqueValue::Nil),
+            ]
+        );
+        let refused: ControlReplySlim =
+            decode_msgpack(&vector_bytes(CONTROL_REPLY_REFUSED_VECTOR)).unwrap();
+        assert_eq!(
+            refused,
+            ControlReplySlim {
+                call_id: 9,
+                success: false,
+                message: Some("no profiler running".into()),
+                engine_index: 1,
+            }
+        );
+        let accepted_reply = ControlReplySlim {
+            call_id: 7,
+            success: true,
+            message: None,
+            engine_index: 0,
+        };
+        assert_eq!(
+            encode_msgpack(&accepted_reply).unwrap(),
+            vector_bytes(CONTROL_REPLY_ACCEPTED_VECTOR)
+        );
+
+        let reply = ControlReplySlim {
+            call_id: 9,
+            success: false,
+            message: Some("busy".into()),
+            engine_index: 1,
+        };
+        let frames = vec![Bytes::from(encode_msgpack(&reply).unwrap())];
+        let batch = TokenSpeedProtocol::decode_batch(&frames).unwrap();
+        assert!(batch.outputs.is_empty() && batch.load.is_none());
+        assert_eq!(batch.engine_index, 1);
+        let utility = batch.utility.expect("a utility reply");
+        assert_eq!(utility.call_id, 9);
+        let map = utility.outcome.unwrap();
+        assert_eq!(
+            map.as_map().unwrap()[0],
+            (OpaqueValue::from("success"), OpaqueValue::Boolean(false))
+        );
+        // The token batch still decodes through the same dispatch.
+        let frames = vec![Bytes::from(encode_msgpack(&slim_batch()).unwrap())];
+        assert_eq!(
+            TokenSpeedProtocol::decode_batch(&frames)
+                .unwrap()
+                .outputs
+                .len(),
+            2
+        );
+
+        let mut layouts = BTreeMap::new();
+        assert!(!wire_carries_control_calls(&layouts));
+        layouts.insert(
+            "ControlReplySlim".to_string(),
+            ["call_id", "success", "message", "engine_index"]
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        );
+        assert!(wire_carries_control_calls(&layouts));
     }
 
     #[test]
