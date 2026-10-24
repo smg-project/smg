@@ -157,6 +157,36 @@ pub(super) fn truncates_long_prompts(model: &SglangModelInfo) -> bool {
         == Some(true)
 }
 
+/// SGLang's `CaptureHiddenMode`: how much of the hidden states the scheduler
+/// was launched to return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HiddenStatesCap {
+    Null,
+    Last,
+    Full,
+}
+
+/// The scheduler's launch-time cap on hidden states, as its own frontend
+/// keeps it: `--return-hidden-states-mode {last,full}` (the earlier
+/// `--enable-return-hidden-states` is `full`), read off the launcher's
+/// `server_args`. `None` when they name neither: an engine release without
+/// the cap, which then decides itself.
+pub(super) fn hidden_states_cap(model: &SglangModelInfo) -> Option<HiddenStatesCap> {
+    let args: serde_json::Value = serde_json::from_str(&model.server_args_json).unwrap_or_default();
+    let mode = args
+        .get("return_hidden_states_mode")
+        .and_then(serde_json::Value::as_str);
+    let legacy = args
+        .get("enable_return_hidden_states")
+        .and_then(serde_json::Value::as_bool);
+    match (mode, legacy) {
+        (Some("full"), _) | (_, Some(true)) => Some(HiddenStatesCap::Full),
+        (Some("last"), _) => Some(HiddenStatesCap::Last),
+        (None, None) => None,
+        _ => Some(HiddenStatesCap::Null),
+    }
+}
+
 /// How to bind, where the engines dial in, and what to advertise.
 #[derive(Debug, Clone)]
 pub struct SglangServicerConfig {

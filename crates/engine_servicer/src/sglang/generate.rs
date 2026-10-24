@@ -18,7 +18,7 @@ use futures::{stream::SelectAll, Stream};
 use smg_grpc_client::{sglang_proto as sg, vllm_proto as vllm};
 use tonic::Status;
 
-use super::State;
+use super::{hidden_states_cap, HiddenStatesCap, SglangModelInfo, State};
 use crate::{
     metrics::{complete_finish_reason, ChoiceMetrics},
     requests::HeldTerminal,
@@ -40,6 +40,9 @@ pub(super) async fn generate(
     let client = state.shared.engine()?;
     if req.request_id.is_empty() {
         return Err(Status::invalid_argument("request_id is required"));
+    }
+    if req.return_hidden_states {
+        refuse_hidden_states_above_cap(&state.model)?;
     }
     let request_id: Arc<str> = Arc::from(req.request_id.as_str());
     // Register before the submit: an `Abort` landing in the gap must find the
@@ -78,6 +81,24 @@ pub(super) async fn generate(
         registration,
         metrics,
     )))
+}
+
+/// `return_hidden_states` on a scheduler launched below `full`
+/// (`--return-hidden-states-mode`): refused ahead of the scheduler with the
+/// engine frontend's own words, as the Python servicer refuses it. A launcher
+/// whose server args name no cap leaves the decision to the scheduler.
+fn refuse_hidden_states_above_cap(model: &SglangModelInfo) -> Result<(), Status> {
+    const LAUNCH: &str =
+        "Please launch with `--return-hidden-states-mode full` to allow return_hidden_states=True.";
+    match hidden_states_cap(model) {
+        None | Some(HiddenStatesCap::Full) => Ok(()),
+        Some(HiddenStatesCap::Last) => Err(Status::invalid_argument(format!(
+            "The requested return_hidden_states mode exceeds the server maximum `last`. {LAUNCH}"
+        ))),
+        Some(HiddenStatesCap::Null) => Err(Status::invalid_argument(format!(
+            "The server is not configured to return hidden states. {LAUNCH}"
+        ))),
+    }
 }
 
 /// One choice of a generate request: the ZMQ-mapped stream under the

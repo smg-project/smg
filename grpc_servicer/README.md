@@ -1071,10 +1071,15 @@ generation with sampled and prompt logprobs, reasoning-token counts, LoRA ids
 and custom logit processors forwarded as the Python servicer forwards them,
 `Embed`, `FlushCache` and profiling (the scheduler's own control requests,
 carried by the wire's control call) all answer as the Python servicer does.
-What the wire does not carry is reported, not emulated: multimodal inputs and
-hidden states are refused, PD/EPD disaggregation stays with the Python
-implementation (the worker refuses to start on the Rust path in those modes),
-and LoRA loading answers UNIMPLEMENTED, as it does on the Python servicer.
+Hidden states (`return_hidden_states`) answer as on the Python servicer: the
+final hidden layer's vector per token position, a step's new rows on each
+chunk and the whole list on the completion, within the scheduler's
+`--return-hidden-states-mode` cap, which both servicers keep ahead of the
+scheduler with the engine's own words. What the wire does not carry is
+reported, not emulated: multimodal inputs are refused, PD/EPD disaggregation
+stays with the Python implementation (the worker refuses to start on the Rust
+path in those modes), and LoRA loading answers UNIMPLEMENTED, as it does on
+the Python servicer.
 `SubscribeKvEvents` relays SGLang's ZMQ KV-event publisher, which the servicer
 turns on by itself, on this path as on the Python one, when the launcher is
 given no `--kv-events-config`, at a port found free on the host rather than

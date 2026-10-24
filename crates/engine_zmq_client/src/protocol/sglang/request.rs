@@ -122,9 +122,11 @@ impl SglangRequestType {
 /// `require_reasoning` (session, LoRA, PD and routing slots SMG leaves at the
 /// scheduler's defaults) so that flag lands in its slot. The encoder emits
 /// the shortest valid prefix: 14 elements (tag + 13 fields) through `stream`,
-/// or 34 when `require_reasoning` is set; every later field keeps its
-/// `msgspec` default. Token ids go as a plain integer array; the plugin
-/// widens the scheduler's `array('q')` decode hook to accept it.
+/// or 34 when a later field this wire fills (`return_hidden_states`,
+/// `lora_id`, `custom_logit_processor`, `require_reasoning`) is set; every
+/// other later field keeps its `msgspec` default. Token ids go as a plain
+/// integer array; the plugin widens the scheduler's `array('q')` decode hook
+/// to accept it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TokenizedGenerateReqInput {
     /// Request id (the routing/registry key).
@@ -145,6 +147,11 @@ pub struct TokenizedGenerateReqInput {
     pub token_ids_logprob: Option<Vec<u32>>,
     /// Whether to stream outputs incrementally.
     pub stream: bool,
+    /// Whether the scheduler captures the final hidden layer's vector of every
+    /// token for this request (SGLang's `return_hidden_states=True`; the
+    /// engine's `"last"` mode has no slot on the gRPC contract). The slim
+    /// output carries the rows back.
+    pub return_hidden_states: bool,
     /// LoRA adapter id, forwarded as the Python servicer forwards it (the
     /// scheduler resolves it against the adapters it loaded).
     pub lora_id: Option<String>,
@@ -188,7 +195,10 @@ impl TokenizedGenerateReqInput {
     /// Whether any field past `stream` is set, so the encoder must emit the
     /// defaulted slots up to the last set one.
     fn needs_extended_form(&self) -> bool {
-        self.require_reasoning || self.lora_id.is_some() || self.custom_logit_processor.is_some()
+        self.require_reasoning
+            || self.return_hidden_states
+            || self.lora_id.is_some()
+            || self.custom_logit_processor.is_some()
     }
 }
 
@@ -204,6 +214,7 @@ impl Default for TokenizedGenerateReqInput {
             top_logprobs_num: 0,
             token_ids_logprob: None,
             stream: false,
+            return_hidden_states: false,
             lora_id: None,
             custom_logit_processor: None,
             require_reasoning: false,
@@ -216,8 +227,8 @@ impl Serialize for TokenizedGenerateReqInput {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         const NIL: Option<()> = None;
         // The shortest valid prefix: through `stream` unless a later field
-        // (`lora_id`, `custom_logit_processor`, `require_reasoning`) has to
-        // reach its slot past the defaulted ones.
+        // (`return_hidden_states`, `lora_id`, `custom_logit_processor`,
+        // `require_reasoning`) has to reach its slot past the defaulted ones.
         let len = if self.needs_extended_form() {
             GENERATE_WIRE_FIELDS.len() + 1
         } else {
@@ -240,15 +251,16 @@ impl Serialize for TokenizedGenerateReqInput {
         tuple.serialize_element(&self.stream)?;
         if self.needs_extended_form() {
             // The fields between `stream` and `require_reasoning`, at the
-            // scheduler's own defaults except the two this wire carries:
+            // scheduler's own defaults except the three this wire carries:
             // return_sampling_mask, return_flat_raw_top_logprobs,
             // return_hidden_states, return_routed_experts,
             // routed_experts_start_len, return_indexer_topk, session_id,
             // session_params, lora_id, custom_logit_processor, then
             // positional_embed_overrides .. routing_key (9 optionals).
-            for _ in 0..4 {
-                tuple.serialize_element(&false)?;
-            }
+            tuple.serialize_element(&false)?; // return_sampling_mask
+            tuple.serialize_element(&false)?; // return_flat_raw_top_logprobs
+            tuple.serialize_element(&self.return_hidden_states)?;
+            tuple.serialize_element(&false)?; // return_routed_experts
             tuple.serialize_element(&0u32)?;
             tuple.serialize_element(&false)?;
             tuple.serialize_element(&NIL)?;
@@ -293,15 +305,21 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                 let top_logprobs_num = next_field(&mut seq, "top_logprobs_num")?;
                 let token_ids_logprob = next_field(&mut seq, "token_ids_logprob")?;
                 let stream = next_field(&mut seq, "stream")?;
-                // The slots after `stream`: 8 defaulted ones, then `lora_id`
-                // and `custom_logit_processor`, 9 more defaulted ones, then
-                // `require_reasoning`. A shorter array (a frontend that stopped
-                // at `stream`) leaves them all unset.
-                let mut skipped = 0;
-                while skipped < 8 && seq.next_element::<IgnoredAny>()?.is_some() {
-                    skipped += 1;
-                }
-                let (lora_id, custom_logit_processor) = if skipped == 8 {
+                // The slots after `stream`: two defaulted flags, then
+                // `return_hidden_states`, five more defaulted slots, then
+                // `lora_id` and `custom_logit_processor`, 9 more defaulted
+                // ones, then `require_reasoning`. A shorter array (a frontend
+                // that stopped at `stream`) leaves them all unset.
+                let mut present = skip_slots(&mut seq, 2)? == 2;
+                let return_hidden_states = match seq.next_element::<HiddenStatesSlot>()? {
+                    Some(slot) if present => slot.asked(),
+                    _ => {
+                        present = false;
+                        false
+                    }
+                };
+                present = present && skip_slots(&mut seq, 5)? == 5;
+                let (lora_id, custom_logit_processor) = if present {
                     (
                         seq.next_element::<Option<String>>()?.flatten(),
                         seq.next_element::<Option<String>>()?.flatten(),
@@ -309,11 +327,7 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                 } else {
                     (None, None)
                 };
-                let mut skipped = 0;
-                while skipped < 9 && seq.next_element::<IgnoredAny>()?.is_some() {
-                    skipped += 1;
-                }
-                let require_reasoning = if skipped == 9 {
+                let require_reasoning = if present && skip_slots(&mut seq, 9)? == 9 {
                     seq.next_element::<Option<bool>>()?
                         .flatten()
                         .unwrap_or(false)
@@ -331,6 +345,7 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                     top_logprobs_num,
                     token_ids_logprob,
                     stream,
+                    return_hidden_states,
                     lora_id,
                     custom_logit_processor,
                     require_reasoning,
@@ -341,6 +356,34 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
 
         deserializer.deserialize_seq(ReqVisitor)
     }
+}
+
+/// The `return_hidden_states` slot as the scheduler declares it
+/// (`ReturnHiddenStatesMode = bool | "last"`): `true` is the capture of every
+/// token's vector, the one this wire asks for; the engine's own frontend's
+/// `"last"` (never sent by SMG) and a nil read as not asked.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum HiddenStatesSlot {
+    Flag(bool),
+    Other(IgnoredAny),
+}
+
+impl HiddenStatesSlot {
+    fn asked(self) -> bool {
+        matches!(self, Self::Flag(true))
+    }
+}
+
+/// Skip up to `count` defaulted slots; how many the array still had tells a
+/// shorter array (an older frontend's prefix) from one that reaches the
+/// slot after them.
+fn skip_slots<'de, A: SeqAccess<'de>>(seq: &mut A, count: usize) -> Result<usize, A::Error> {
+    let mut skipped = 0;
+    while skipped < count && seq.next_element::<IgnoredAny>()?.is_some() {
+        skipped += 1;
+    }
+    Ok(skipped)
 }
 
 /// The scheduler's `TokenizedEmbeddingReqInput`, as the SMG plugin decodes
@@ -438,11 +481,7 @@ fn read_embedding_after_tag<'de, A: SeqAccess<'de>>(
     let token_type_ids: Option<Vec<i32>> = next_field(seq, "token_type_ids")?;
     let sampling_params = next_field(seq, "sampling_params")?;
     // lora_id, positional_embed_overrides, routed_dp_rank, priority: defaults.
-    let mut skipped = 0;
-    while skipped < 4 && seq.next_element::<IgnoredAny>()?.is_some() {
-        skipped += 1;
-    }
-    let dimensions = if skipped == 4 {
+    let dimensions = if skip_slots(seq, 4)? == 4 {
         seq.next_element::<Option<u32>>()?.flatten()
     } else {
         None
@@ -735,6 +774,7 @@ mod tests {
     fn the_wire_field_lists_name_the_slots_the_encoders_fill() {
         assert_eq!(GENERATE_WIRE_FIELDS[7], "sampling_params");
         assert_eq!(GENERATE_WIRE_FIELDS[12], "stream");
+        assert_eq!(GENERATE_WIRE_FIELDS[15], "return_hidden_states");
         assert_eq!(GENERATE_WIRE_FIELDS[21], "lora_id");
         assert_eq!(GENERATE_WIRE_FIELDS[22], "custom_logit_processor");
         assert_eq!(GENERATE_WIRE_FIELDS[32], "require_reasoning");
@@ -837,6 +877,57 @@ mod tests {
         let back: TokenizedGenerateReqInput =
             decode_msgpack(&encode_msgpack(&request).unwrap()).unwrap();
         assert_eq!(back, request);
+    }
+
+    /// `return_hidden_states` rides its own slot of the extended form (the
+    /// array's element 16), is reason enough for that form on its own, and
+    /// round-trips. The pinned Python request carries `False` there; the
+    /// engine frontend's `"last"` in the slot decodes as not asked.
+    #[test]
+    fn hidden_states_take_the_extended_form_at_their_slot() {
+        let request = TokenizedGenerateReqInput {
+            rid: "h".into(),
+            input_ids: vec![1, 2],
+            return_hidden_states: true,
+            ..Default::default()
+        };
+        let encoded = encode_msgpack(&request).unwrap();
+        let array: Vec<Value> = decode_msgpack(&encoded).unwrap();
+        assert_eq!(array.len(), 34);
+        assert_eq!(
+            array[14],
+            Value::Boolean(false),
+            "return_sampling_mask at 14"
+        );
+        assert_eq!(
+            array[15],
+            Value::Boolean(false),
+            "return_flat_raw_top_logprobs at 15"
+        );
+        assert_eq!(
+            array[16],
+            Value::Boolean(true),
+            "return_hidden_states at 16"
+        );
+        assert_eq!(
+            array[17],
+            Value::Boolean(false),
+            "return_routed_experts at 17"
+        );
+        assert_eq!(
+            array[33],
+            Value::Boolean(false),
+            "require_reasoning stays off"
+        );
+        let back: TokenizedGenerateReqInput = decode_msgpack(&encoded).unwrap();
+        assert_eq!(back, request);
+        let pinned: TokenizedGenerateReqInput = decode_msgpack(&hex(PYTHON_REQUEST)).unwrap();
+        assert!(!pinned.return_hidden_states);
+        let mut last: Vec<Value> = rmp_serde::from_slice(&hex(PYTHON_REQUEST)).unwrap();
+        last[16] = Value::from("last");
+        let bytes = rmp_serde::to_vec(&Value::Array(last)).unwrap();
+        let decoded: TokenizedGenerateReqInput = decode_msgpack(&bytes).unwrap();
+        assert!(!decoded.return_hidden_states && decoded.require_reasoning);
     }
 
     #[test]

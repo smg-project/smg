@@ -191,6 +191,7 @@ def test_slim_output_pins_its_positional_layout():
         [[], []],  # output_token_ids_logprobs_val
         [[], []],  # output_token_ids_logprobs_idx
         [None, None],  # finished_err_types: no abort
+        [None, None],  # output_hidden_states: neither request asked
     ]
 
 
@@ -651,3 +652,26 @@ def test_relay_failures_abort_in_the_scheduler_too(caplog, monkeypatch):
     sender.send_output(_full_output())
     (batch,) = sink.sent
     assert batch[1] == ["a", "b"] and batch[11:15] == [0, 0, 0, 0] and not sender.pending_aborts
+
+
+def test_slim_output_carries_hidden_states_as_rows_per_position():
+    """A request that asked for hidden states gets the scheduler's cumulative
+    list as rows, one per token position: the engine appends the prefill's
+    block (one element, a row per prompt position) and then a row per decoded
+    token, and the slim wire flattens that into rows so the Rust decoder and
+    the Python request manager read the same thing. A request that asked for
+    none rides as None; an older sender without the column decodes as None."""
+    full = _full_output()
+    prefill_block = [[0.5, 1.5], [2.5, 3.5]]  # two prompt positions
+    full.output_hidden_states = [None, [prefill_block, [4.5, 5.5]]]
+    slim = wire.BatchTokenIDSlimOutput.from_full(full, engine_index=1)
+    assert slim.output_hidden_states == [None, [[0.5, 1.5], [2.5, 3.5], [4.5, 5.5]]]
+    encoded = msgspec.msgpack.encode(slim)
+    arr = msgspec.msgpack.decode(encoded)
+    assert arr[-1] == [None, [[0.5, 1.5], [2.5, 3.5], [4.5, 5.5]]]
+    decoded = msgspec.msgpack.decode(encoded, type=wire.BatchTokenIDSlimOutput)
+    assert decoded.output_hidden_states == slim.output_hidden_states
+    older = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(arr[:-1]), type=wire.BatchTokenIDSlimOutput
+    )
+    assert older.output_hidden_states is None

@@ -98,15 +98,26 @@ pub struct BatchTokenIDSlimOutput {
     /// adapter); `None` for other finishes. Appended; empty from a plugin
     /// that predates the column.
     pub finished_err_types: Vec<Option<String>>,
+    /// The final hidden layer's vector per token position of a request that
+    /// asked for them (`return_hidden_states`): the scheduler's cumulative
+    /// rows so far (the prompt's positions first, then each generated token;
+    /// the plugin flattens the engine's prefill block), `None` for a request
+    /// that did not ask. Appended; empty from a plugin that predates the
+    /// column. Kept as `f32`, the proto's `float`, as the embedding vectors
+    /// are.
+    pub output_hidden_states: Vec<Option<Vec<Vec<f32>>>>,
 }
 
 impl Serialize for BatchTokenIDSlimOutput {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        let has_err_types = !self.finished_err_types.is_empty();
+        let has_hidden_states = !self.output_hidden_states.is_empty();
+        let has_err_types = has_hidden_states || !self.finished_err_types.is_empty();
         let has_selected = has_err_types
             || !self.output_token_ids_logprobs_val.is_empty()
             || !self.output_token_ids_logprobs_idx.is_empty();
-        let len = if has_err_types {
+        let len = if has_hidden_states {
+            28
+        } else if has_err_types {
             27
         } else if has_selected {
             26
@@ -144,6 +155,9 @@ impl Serialize for BatchTokenIDSlimOutput {
         }
         if has_err_types {
             tuple.serialize_element(&self.finished_err_types)?;
+        }
+        if has_hidden_states {
+            tuple.serialize_element(&self.output_hidden_states)?;
         }
         tuple.end()
     }
@@ -226,6 +240,7 @@ fn read_token_batch_after_tag<'de, A: SeqAccess<'de>>(
         output_token_ids_logprobs_val: appended_column(seq)?,
         output_token_ids_logprobs_idx: appended_column(seq)?,
         finished_err_types: appended_column(seq)?,
+        output_hidden_states: appended_column(seq)?,
     };
     drain_trailing(seq)?;
     Ok(batch)
@@ -268,6 +283,10 @@ pub struct SglangOutput {
     /// the routed output prevents isolated malformed batches being dropped
     /// by the connector and leaving their requests waiting indefinitely.
     pub selected_logprobs_error: Option<String>,
+    /// The final hidden layer's vector per token position so far (the
+    /// prompt's positions first), when the request asked for them; empty
+    /// otherwise. Cumulative: the scheduler ships the whole list each step.
+    pub output_hidden_states: Vec<Vec<f32>>,
     /// The pooled vector of an embedding request (its one, finished, output).
     pub embedding: Option<Vec<f32>>,
 }
@@ -327,6 +346,7 @@ impl BatchTokenIDSlimOutput {
             ("input_top_logprobs_val", self.input_top_logprobs_val.len()),
             ("input_top_logprobs_idx", self.input_top_logprobs_idx.len()),
             ("finished_err_types", self.finished_err_types.len()),
+            ("output_hidden_states", self.output_hidden_states.len()),
         ];
         if let Some((name, len)) = columns
             .iter()
@@ -362,6 +382,7 @@ impl BatchTokenIDSlimOutput {
         let mut input_top_idx = self.input_top_logprobs_idx.into_iter();
         let mut selected_val = self.output_token_ids_logprobs_val.into_iter();
         let mut selected_idx = self.output_token_ids_logprobs_idx.into_iter();
+        let mut hidden_states = self.output_hidden_states.into_iter();
         Ok(self
             .rids
             .into_iter()
@@ -400,6 +421,7 @@ impl BatchTokenIDSlimOutput {
                     output_token_ids_logprobs_val: selected_values,
                     output_token_ids_logprobs_idx: selected_ids,
                     selected_logprobs_error,
+                    output_hidden_states: hidden_states.next().flatten().unwrap_or_default(),
                     embedding: None,
                 }
             })
@@ -687,6 +709,11 @@ mod tests {
     /// sampled token named in the last column (`GrammarRejectedToken`), no
     /// status on either, engine 1.
     const PYTHON_SLIM27: &str = "dc001bb64261746368546f6b656e4944536c696d4f757470757492a161a16292910a92141592a561626f7274a561626f727492a741626f72746564d924746865206772616d6d61722072656a656374656420612073616d706c656420746f6b656e92c0c0920304920102920001929092cbbfe0000000000000cbbfd00000000000009290921415010000000092c0c092909192cbbfe0000000000000cbbff000000000000092909192151692000092909092909092909092909092909092909092c0b44772616d6d617252656a6563746564546f6b656e";
+    /// The plugin's 28-element batch for rids a/b: `a` asked for nothing,
+    /// `b` (finished on token 42) asked for hidden states and carries the
+    /// prefill's three prompt rows and its one decoded token's row (hidden
+    /// size 2); engine 1, load 2/0/40/400, no abort status or name.
+    const PYTHON_SLIM28: &str = "dc001cb64261746368546f6b656e4944536c696d4f757470757492a161a16292910a911492a0a473746f7092c0c092c02a92030392010192000092909092909001020028cd019092c0c092909092909092000092909092909092909092909092909092909092c0c092c09492cb3fe0000000000000cbbfe000000000000092cb3fd0000000000000cb3fe800000000000092cb3ff0000000000000cb000000000000000092cbbff0000000000000cb4000000000000000";
     /// The plugin's terminal abort for rid `x`: its `n=2` rejection, status 400.
     const PYTHON_ABORT: &str = "dc0013b64261746368546f6b656e4944536c696d4f757470757491a178919091a561626f727491d9396e3d32206973206e6f7420736572766564206f6e207468697320776972653b20534d472066616e73206f7574206e203e203120697473656c6691c091009100910091909190000000000091cd019091909190";
 
@@ -822,6 +849,47 @@ mod tests {
             outputs[1].finish_err_type.as_deref(),
             Some("GrammarRejectedToken")
         );
+    }
+
+    /// Hidden states ride the last appended column as the scheduler's
+    /// cumulative rows per request: the plugin's 28-element batch reads back
+    /// the rows for the request that asked and none for the other, the value
+    /// round-trips (Python writes float64, this side keeps the proto's
+    /// float32), the 27-element batches of earlier plugins decode with no
+    /// rows, and a ragged column is a protocol bug.
+    #[test]
+    fn the_hidden_states_column_is_appended_and_optional() {
+        let batch: BatchTokenIDSlimOutput = decode_msgpack(&hex(PYTHON_SLIM28)).unwrap();
+        let rows = vec![
+            vec![0.5, -0.5],
+            vec![0.25, 0.75],
+            vec![1.0, 0.0],
+            vec![-1.0, 2.0],
+        ];
+        assert_eq!(batch.output_hidden_states, vec![None, Some(rows.clone())]);
+        assert_eq!(batch.finished_err_types, vec![None, None]);
+        assert_eq!(batch.finished_matched[1], Some(MatchedStop::TokenId(42)));
+        let encoded = encode_msgpack(&batch).unwrap();
+        assert_eq!(encoded[0..3], [0xdc, 0x00, 0x1c]);
+        assert_eq!(
+            decode_msgpack::<BatchTokenIDSlimOutput>(&encoded).unwrap(),
+            batch
+        );
+        let outputs = batch.clone().into_outputs().unwrap();
+        assert!(outputs[0].output_hidden_states.is_empty());
+        assert_eq!(outputs[1].output_hidden_states, rows);
+        assert_eq!(outputs[1].finish_reason.as_deref(), Some("stop"));
+        let older: BatchTokenIDSlimOutput = decode_msgpack(&hex(PYTHON_SLIM27)).unwrap();
+        assert!(older.output_hidden_states.is_empty());
+        assert!(older
+            .into_outputs()
+            .unwrap()
+            .iter()
+            .all(|output| output.output_hidden_states.is_empty()));
+        let mut ragged = batch;
+        ragged.output_hidden_states.pop();
+        let error = ragged.into_outputs().unwrap_err().to_string();
+        assert!(error.contains("output_hidden_states"), "{error}");
     }
 
     #[test]

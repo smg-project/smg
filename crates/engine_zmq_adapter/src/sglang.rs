@@ -51,6 +51,13 @@ pub struct SglangGenerateStream {
     /// rows on completion (including prefill-only scores with no output ids).
     selected_logprobs: Vec<sglang_proto::TopLogProbs>,
     selected_logprobs_delta: Vec<sglang_proto::TopLogProbs>,
+    /// The final hidden layer's vectors the scheduler reported for this
+    /// choice, when the request asked for them: the cumulative rows (one per
+    /// token position, the prompt's first) and the rows new in the last tick.
+    /// The vLLM-proto intermediate has no slot for them either: the chunk
+    /// carries the tick's rows, the completion the whole list.
+    hidden_states: Vec<Vec<f32>>,
+    hidden_states_delta: Vec<Vec<f32>>,
 }
 
 impl SglangGenerateStream {
@@ -64,6 +71,8 @@ impl SglangGenerateStream {
             input_logprobs_emitted: false,
             selected_logprobs: Vec::new(),
             selected_logprobs_delta: Vec::new(),
+            hidden_states: Vec::new(),
+            hidden_states_delta: Vec::new(),
         }
     }
 
@@ -83,7 +92,8 @@ impl SglangGenerateStream {
         self.inner.engine_index()
     }
 
-    /// Convert a stream item without discarding SGLang-only score rows.
+    /// Convert a stream item without discarding the SGLang-only rows: the
+    /// selected scores and the hidden states.
     pub fn to_sglang_response(
         &self,
         request_id: &str,
@@ -105,6 +115,15 @@ impl SglangGenerateStream {
                 .get_or_insert_with(Default::default)
                 .token_ids_logprobs
                 .clone_from(selected);
+        }
+        match response.response.as_mut() {
+            Some(Response::Chunk(chunk)) => {
+                chunk.hidden_states = flat_hidden_states(&self.hidden_states_delta);
+            }
+            Some(Response::Complete(complete)) => {
+                complete.all_hidden_states = all_hidden_states(&self.hidden_states);
+            }
+            None => {}
         }
         response
     }
@@ -147,9 +166,10 @@ impl SglangGenerateStream {
 /// A vLLM-proto response of an SGLang stream as the SGLang proto the
 /// `SglangScheduler` service answers with, under `request_id` (the vLLM proto
 /// carries none) and the stream's `reasoning_tokens` (which it has no slot
-/// for). The two share the chunk and completion fields this wire fills; what
-/// it does not carry (hidden states, speculative counters) stays at the proto
-/// defaults, as it does on the Python servicer.
+/// for). The two share the chunk and completion fields this wire fills; the
+/// hidden states, which the intermediate has no slot for either, are the
+/// stream's own (the method above); what the wire does not carry (speculative
+/// counters) stays at the proto defaults, as it does on the Python servicer.
 pub fn to_sglang_response(
     request_id: &str,
     response: vllm::GenerateResponse,
@@ -223,6 +243,30 @@ pub fn to_sglang_response(
     }
 }
 
+/// The layer `GenerateComplete.all_hidden_states` names: the model's final
+/// hidden layer, the only one SGLang returns.
+const FINAL_HIDDEN_LAYER: i32 = -1;
+
+/// `GenerateStreamChunk.hidden_states`: the rows a tick added, flattened (the
+/// client splits them by the hidden size), as the Python servicer sends them.
+fn flat_hidden_states(rows: &[Vec<f32>]) -> Vec<f32> {
+    rows.iter().flatten().copied().collect()
+}
+
+/// `GenerateComplete.all_hidden_states`: one entry per token position (the
+/// prompt's positions first, as the engine returns them, then the generated
+/// tokens), the final hidden layer, the position its index.
+fn all_hidden_states(rows: &[Vec<f32>]) -> Vec<sglang_proto::HiddenStates> {
+    rows.iter()
+        .enumerate()
+        .map(|(position, values)| sglang_proto::HiddenStates {
+            values: values.clone(),
+            layer: FINAL_HIDDEN_LAYER,
+            position: i32::try_from(position).unwrap_or(i32::MAX),
+        })
+        .collect()
+}
+
 impl MappedGenerateStream for SglangGenerateStream {
     type Output = SglangOutput;
     type Inner = SglangStream;
@@ -254,6 +298,16 @@ impl MappedGenerateStream for SglangGenerateStream {
         state.completion_tokens = output.completion_tokens;
         state.output_ids.extend(output.output_ids.iter().copied());
         self.reasoning_tokens = output.reasoning_tokens;
+        // The scheduler ships the whole list of rows each tick: the rows past
+        // what this choice has seen are the tick's.
+        let seen = self.hidden_states.len();
+        let rows = output.output_hidden_states;
+        if rows.len() > seen {
+            self.hidden_states_delta = rows[seen..].to_vec();
+            self.hidden_states = rows;
+        } else {
+            self.hidden_states_delta.clear();
+        }
         self.selected_logprobs_delta = output
             .output_token_ids_logprobs_val
             .iter()
@@ -413,11 +467,11 @@ pub(crate) fn fan_out_sglang_requests(
 /// Translate an SGLang proto `GenerateRequest` into the scheduler's
 /// `TokenizedGenerateReqInput`. ZMQ mode requires pre-tokenized input (SMG
 /// tokenizes upstream). The slim output carries sampled and prompt logprobs
-/// with their ranked and selected candidates; what it has no columns for
-/// (hidden states) and what
-/// the wire does not carry (multimodal payloads, PD bootstrap fields) is
-/// refused rather than silently dropped. `max_model_len` is the context
-/// window the scheduler reported at the handshake: an empty prompt, or one
+/// with their ranked and selected candidates, and the hidden states a request
+/// asks for; what the wire does not carry (multimodal payloads, PD bootstrap
+/// fields) is refused rather than silently dropped. `max_model_len` is the
+/// context window the scheduler reported at the handshake: an empty prompt,
+/// or one
 /// that fills the window, is refused before it reaches the scheduler
 /// ([`admit_prompt`]).
 pub(crate) fn translate_request_sglang(
@@ -440,9 +494,6 @@ pub(crate) fn translate_request_sglang(
             "multimodal inputs are not supported over the SGLang ZMQ backend yet".to_string(),
         );
     }
-    if req.return_hidden_states {
-        return Err("hidden states are not supported over the SGLang ZMQ backend".to_string());
-    }
     // The bootstrap slots stay at the scheduler's defaults on this wire;
     // refuse rather than run without the PD bootstrap the request asked for.
     if req.disaggregated_params.is_some() {
@@ -464,6 +515,9 @@ pub(crate) fn translate_request_sglang(
         top_logprobs_num: u32::try_from(req.top_logprobs_num).unwrap_or(0),
         token_ids_logprob: (!req.token_ids_logprob.is_empty()).then_some(req.token_ids_logprob),
         stream: req.stream,
+        // Full capture, the one mode the contract's bool can ask for; the
+        // servicer keeps the scheduler's launch-time cap ahead of this.
+        return_hidden_states: req.return_hidden_states,
         // Forwarded as the Python servicer forwards them: the scheduler
         // resolves the adapter id and runs the processor it was started with.
         lora_id: (!req.lora_id.is_empty()).then_some(req.lora_id),
@@ -806,6 +860,23 @@ mod tests {
         assert!(params.stop_regex.is_none() && params.custom_params.is_none());
     }
 
+    /// The scheduler's cumulative rows become the proto's shapes: a tick's
+    /// rows flattened on the chunk, one `HiddenStates` per token position on
+    /// the completion, the final layer.
+    #[test]
+    fn hidden_state_rows_map_to_the_chunk_and_completion_shapes() {
+        let rows = vec![vec![0.5, -0.5], vec![1.0, 2.0], vec![3.0, 4.0]];
+        assert_eq!(flat_hidden_states(&rows[1..]), vec![1.0, 2.0, 3.0, 4.0]);
+        assert!(flat_hidden_states(&[]).is_empty());
+        let all = all_hidden_states(&rows);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[2].values, vec![3.0, 4.0]);
+        assert!(all
+            .iter()
+            .enumerate()
+            .all(|(i, hs)| hs.layer == -1 && hs.position == i32::try_from(i).unwrap()));
+    }
+
     #[test]
     fn sglang_request_translation_refuses_what_the_slim_wire_cannot_carry() {
         let base = sglang_proto::GenerateRequest {
@@ -830,11 +901,15 @@ mod tests {
             .top_logprobs_num,
             3
         );
-        assert!(translate(sglang_proto::GenerateRequest {
-            return_hidden_states: true,
-            ..base.clone()
-        })
-        .is_err());
+        assert!(
+            translate(sglang_proto::GenerateRequest {
+                return_hidden_states: true,
+                ..base.clone()
+            })
+            .unwrap()
+            .return_hidden_states,
+            "hidden states ride the wire"
+        );
         assert!(translate(sglang_proto::GenerateRequest {
             disaggregated_params: Some(sglang_proto::DisaggregatedParams::default()),
             ..base.clone()

@@ -45,6 +45,7 @@ import msgspec
 import zmq
 
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
+from smg_grpc_servicer.sglang.hidden_states import hidden_state_rows
 from smg_grpc_servicer.sglang.request_traces import TRACE_HEADERS_KEY, RequestTraces
 
 if TYPE_CHECKING:
@@ -203,6 +204,13 @@ class BatchTokenIDSlimOutput(msgspec.Struct, tag=True, array_like=True):
     # grammar's rejection of a sampled token with `GRAMMAR_REJECTED_ERR_TYPE`,
     # see `zmq_plugin`); None for other finishes.
     finished_err_types: list[str | None] | None = None
+    # Hidden states when the request asked for them (`return_hidden_states`):
+    # per request, the scheduler's cumulative list so far as rows, one
+    # final-layer vector per token position (the prompt's positions first, then
+    # each generated token; `hidden_states.hidden_state_rows` flattens the
+    # engine's prefill block); the frontends emit the delta per step. None for
+    # a request that did not ask, or a scheduler that captured none.
+    output_hidden_states: list[list[list[float]] | None] | None = None
 
     @classmethod
     def from_full(
@@ -294,6 +302,10 @@ class BatchTokenIDSlimOutput(msgspec.Struct, tag=True, array_like=True):
                 for v in column(getattr(out, "output_token_ids_logprobs_idx", None), None)
             ],
             finished_err_types=[err_type(r) for r in reasons],
+            output_hidden_states=[
+                None if v is None else hidden_state_rows(v)
+                for v in column(getattr(out, "output_hidden_states", None), None)
+            ],
         )
 
 

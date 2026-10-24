@@ -42,6 +42,7 @@ from sglang.srt.utils import get_or_create_event_loop, kill_process_tree
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.utils import get_exception_traceback
 
+from smg_grpc_servicer.sglang.hidden_states import hidden_state_rows, new_rows
 from smg_grpc_servicer.trace_context import trace_headers
 
 logger = logging.getLogger(__name__)
@@ -183,6 +184,9 @@ class GrpcReqState:
     output_top_logprobs_idx: list[list[int]] = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_val: list[list[float]] = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_idx: list[list[int]] = dataclasses.field(default_factory=list)
+    # Hidden states: one final-layer vector per output token, as far as the
+    # scheduler has shipped them (it ships the cumulative list each step).
+    output_hidden_states: list[list[float]] = dataclasses.field(default_factory=list)
 
     # Session state
     session_id: str | None = None
@@ -881,6 +885,20 @@ class GrpcRequestManager:
                         "token_ids_logprobs_val": state.output_token_ids_logprobs_val,
                         "token_ids_logprobs_idx": state.output_token_ids_logprobs_idx,
                     }
+
+            # Hidden states: the step's new rows to a stream, the whole list
+            # on completion (the scheduler ships the cumulative list each step).
+            if getattr(state.obj, "return_hidden_states", False):
+                hidden_column = getattr(batch_out, "output_hidden_states", None)
+                cumulative = hidden_state_rows(
+                    hidden_column[i] if hidden_column and i < len(hidden_column) else None
+                )
+                fresh = new_rows(cumulative, len(state.output_hidden_states))
+                state.output_hidden_states.extend(fresh)
+                if state.obj.stream and fresh:
+                    output_data["hidden_states"] = fresh
+                if output_data["finished"] and state.output_hidden_states:
+                    output_data["all_hidden_states"] = list(state.output_hidden_states)
 
             # Update state for accumulation
             if output_data["token_ids"]:
