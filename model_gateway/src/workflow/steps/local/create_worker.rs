@@ -1173,9 +1173,11 @@ mod tests {
         );
     }
 
-    /// The table a worker's registration resolved is published by the registration step, once the
-    /// worker is in the registry: a registration the step refuses leaves no series behind, an
-    /// accepted one leaves the table's failure classes at zero.
+    /// The table a worker's registration resolves is published by the registration step, once the
+    /// worker is in the registry: under `--parser symphony` a gRPC worker of a model the registry
+    /// knows resolves the registry's table in the create step, a registration the registration
+    /// step refuses leaves no series behind, and an accepted one leaves the table's failure classes
+    /// at zero.
     #[tokio::test]
     async fn a_refused_registration_publishes_no_table_and_an_accepted_one_its_failure_classes() {
         use crate::workflow::steps::RegisterWorkersStep;
@@ -1183,18 +1185,26 @@ mod tests {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let _guard = metrics::set_default_local_recorder(&recorder);
+        let symphony = || {
+            app_context_with(
+                crate::config::RouterConfig::builder()
+                    .worker_startup_timeout_secs(1)
+                    .parser(ParserChoice::Symphony)
+                    .build_unchecked(),
+            )
+        };
 
         // The replacement of a worker the registry no longer holds is refused.
         let refused = WorkerRegistrationMode::ReplaceById {
             worker_id: "worker-gone".to_string(),
             expected_revision: 0,
         };
-        let mut ctx = worker_context(WorkerType::Regular, None, refused);
+        let mut ctx = grpc_worker_context("Qwen/Qwen3-8B", refused, symphony());
         assert_eq!(
             CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
             StepResult::Success
         );
-        ctx.data.symphony_table = Some("qwen3");
+        assert_eq!(ctx.data.symphony_table, Some("qwen3"));
         assert!(RegisterWorkersStep.execute(&mut ctx).await.is_err());
         assert!(
             !handle.render().contains("smg_symphony_"),
@@ -1202,12 +1212,13 @@ mod tests {
             handle.render()
         );
 
-        let mut ctx = worker_context(WorkerType::Regular, None, WorkerRegistrationMode::Upsert);
+        let mut ctx =
+            grpc_worker_context("Qwen/Qwen3-8B", WorkerRegistrationMode::Upsert, symphony());
         assert_eq!(
             CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
             StepResult::Success
         );
-        ctx.data.symphony_table = Some("qwen3");
+        assert_eq!(ctx.data.symphony_table, Some("qwen3"));
         assert_eq!(
             RegisterWorkersStep.execute(&mut ctx).await.unwrap(),
             StepResult::Success
@@ -1222,6 +1233,26 @@ mod tests {
             }),
             "{scrape}"
         );
+    }
+
+    /// A registration context for a gRPC worker of `model` at a loopback URL
+    /// under `app_context`'s configuration.
+    fn grpc_worker_context(
+        model: &str,
+        registration_mode: WorkerRegistrationMode,
+        app_context: Arc<crate::app_context::AppContext>,
+    ) -> WorkflowContext<WorkerWorkflowData> {
+        use openai_protocol::worker::WorkerModels;
+        use wfaas::WorkflowInstanceId;
+
+        use crate::workflow::steps::create_worker_workflow_data;
+
+        let mut spec = WorkerSpec::new("grpc://127.0.0.1:18001");
+        spec.models = WorkerModels::Single(Box::new(ModelCard::new(model)));
+        let mut data = create_worker_workflow_data(spec, registration_mode, app_context);
+        data.worker_kind = Some(WorkerKind::Local);
+        data.connection_mode = Some(ConnectionMode::Grpc);
+        WorkflowContext::new(WorkflowInstanceId::new(), data)
     }
 
     /// Under `--parser symphony`, the registration of a model's first worker whose labels select

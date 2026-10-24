@@ -679,8 +679,9 @@ pub(crate) fn record_fallback(why: Fallback, table: Option<&'static str>) {
 /// `failed`, `malformed` and the rest before the first such output instead of no series at all:
 /// the outcomes, the malformed reasons, the suppressed calls, the refusal, the fallback of a forced
 /// call the table has no tag for, and the empty distribution of the malformed bytes. Called where
-/// the table that reads a model becomes known, at the model's first registration
-/// (`workflow::steps::local::create_worker`); a table published again sets nothing.
+/// the table that reads a model becomes known: by the registration step once a worker of the
+/// model is in the registry (`workflow::steps::shared::register`; the create step resolves the
+/// table); a table published again sets nothing.
 pub(crate) fn init_table_series(table: &'static str) {
     let series = series(table);
     for key in series.outputs.iter().chain(series.malformed.iter()).chain([
