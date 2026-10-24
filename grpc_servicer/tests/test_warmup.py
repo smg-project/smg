@@ -6,6 +6,7 @@ readiness until the pass ran, and the Python servicer's health hold."""
 from __future__ import annotations
 
 import asyncio
+import base64
 import dataclasses
 import importlib.util
 import logging
@@ -1074,6 +1075,129 @@ def test_the_vllm_wire_pins_each_request_to_its_rank_over_the_servicers_port():
         ]
         assert sorted(seen_on_rank) == one_ranks_shapes
     assert set(seen.ranks[pinned:]) == {None}  # one rank: the field stays unset
+
+
+def test_a_media_leg_follows_the_second_pass_and_precedes_the_chunk_remainders():
+    """An engine module that asks for the media leg gets one step with one
+    media request per rank, after the measured second pass and before the
+    chunk remainders (a budget cut takes the remainders first); without the
+    flag no request carries media, and the start line counts the item."""
+    plain = plan_warmup(SMALL, "full")
+    assert not any(s.kind == "media" or any(r.media for r in s.requests) for s in plain.steps)
+    assert "media" not in plain.describe()
+    with_media = plan_warmup(
+        dataclasses.replace(SMALL, media_leg=True, every_prefill_length=True), "full"
+    )
+    kinds = [step.kind for step in with_media.steps]
+    assert kinds.count("media") == 1
+    media_at = kinds.index("media")
+    assert (kinds[media_at - 1], kinds[media_at + 1]) == ("again", "remainder")
+    step = with_media.steps[media_at]
+    assert [(r.media, r.max_tokens) for r in step.requests] == [(True, 1)]
+    assert "one media item" in with_media.describe()
+    # The fast level has no remainders: the media leg ends the plan, one per rank.
+    two_ranks = plan_warmup(
+        dataclasses.replace(SMALL, media_leg=True, data_parallel_size=2), "fast"
+    )
+    assert two_ranks.steps[-1].kind == "media"
+    assert [r.data_parallel_rank for r in two_ranks.steps[-1].requests] == [0, 1]
+
+
+def test_the_sglang_wire_sends_the_media_leg_as_a_client_names_an_image():
+    """The media leg's request carries the rendered prompt and its ids (not
+    the plan's drawn ids) and the image as a reference on the multimodal
+    slot; a plain request keeps the plan's ids and no media; a media request
+    on a wire given no media is an error, never a text request."""
+    seen = []
+
+    class _Engine(sgl_grpc.SglangSchedulerServicer):
+        def Generate(self, request, context):
+            seen.append(
+                (
+                    list(request.tokenized.input_ids),
+                    request.tokenized.original_text,
+                    list(request.mm_inputs.image_urls),
+                    list(request.mm_inputs.modalities),
+                )
+            )
+            yield sgl_pb.GenerateResponse(complete=sgl_pb.GenerateComplete())
+
+    server, target = _serve(sgl_grpc.add_SglangSchedulerServicer_to_server, _Engine())
+    try:
+        media = sglang_warmup.MediaWarmup(
+            prompt="<image>describe", input_ids=(5, 6, 7), image_url="data:image/png;base64,AAAA"
+        )
+        wire = sglang_warmup.warmup_wire(target, media=media)
+        try:
+            wire.generate(
+                warmup.WarmupRequest("smg-warmup-0", 3, 1, seed=0, vocab_size=100, media=True), 10
+            )
+            wire.generate(warmup.WarmupRequest("smg-warmup-1", 3, 1, seed=1, vocab_size=100), 10)
+        finally:
+            wire.close()
+        bare = sglang_warmup.warmup_wire(target)
+        try:
+            with pytest.raises(RuntimeError, match="nothing to send"):
+                bare.generate(
+                    warmup.WarmupRequest("smg-warmup-2", 3, 1, seed=2, vocab_size=100, media=True),
+                    10,
+                )
+        finally:
+            bare.close()
+    finally:
+        server.stop(0)
+    assert seen[0] == ([5, 6, 7], "<image>describe", ["data:image/png;base64,AAAA"], ["image"])
+    ids, text, urls, modalities = seen[1]
+    assert (len(ids), text, urls, modalities) == (3, "warm-up", [], [])
+    assert len(seen) == 2
+
+
+def test_the_media_leg_material_comes_from_the_models_own_template(caplog):
+    """The prompt is what the model's chat template renders around one image
+    item and the question, its ids are that prompt's tokens, the image is the
+    engine's own minimal PNG as a data URL; no tokenizer directory, a
+    tokenizer that does not load, or a template that renders no image
+    placeholder leaves the leg out, with the reason in the log."""
+
+    class _Tokenizer:
+        def __init__(self, placeholder):
+            self.placeholder = placeholder
+
+        def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+            assert tokenize is False and add_generation_prompt is True
+            content = messages[0]["content"]
+            images = sum(1 for part in content if part["type"] == "image")
+            text = "".join(part["text"] for part in content if part["type"] == "text")
+            return f"<user>{self.placeholder * images}{text}<assistant>"
+
+        def __call__(self, text, add_special_tokens):
+            assert add_special_tokens is False
+            return {"input_ids": [len(text), 7]}
+
+    loaded = []
+
+    def load(directory):
+        loaded.append(directory)
+        return _Tokenizer("<image>")
+
+    media = sglang_warmup.media_warmup("/tok", load_tokenizer=load)
+    assert loaded == ["/tok"]
+    assert media.prompt == "<user><image>Describe the image.<assistant>"
+    assert media.input_ids == (len(media.prompt), 7)
+    assert media.image_url == f"data:image/png;base64,{sglang_warmup.WARMUP_IMAGE_PNG_BASE64}"
+    png = base64.b64decode(sglang_warmup.WARMUP_IMAGE_PNG_BASE64)
+    assert png[:8] == b"\x89PNG\r\n\x1a\n" and png[16:24] == (32).to_bytes(4, "big") * 2
+
+    def broken(directory):
+        raise OSError("no tokenizer.json")
+
+    with caplog.at_level("INFO"):
+        assert sglang_warmup.media_warmup("/tok", load_tokenizer=lambda d: _Tokenizer("")) is None
+        assert sglang_warmup.media_warmup(None, load_tokenizer=load) is None
+        assert sglang_warmup.media_warmup("/tok", load_tokenizer=broken) is None
+    assert "renders no image placeholder" in caplog.text
+    assert "no tokenizer directory" in caplog.text
+    assert "could not be rendered: no tokenizer.json" in caplog.text
 
 
 def test_a_wire_over_a_borrowed_channel_leaves_it_open():

@@ -83,7 +83,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
 )
 from smg_grpc_servicer.sglang import METRICS_HOST_ENV, METRICS_PORT_ENV
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
-from smg_grpc_servicer.sglang.warmup import WARMUP_ENV, warmup_inputs, warmup_wire
+from smg_grpc_servicer.sglang.warmup import WARMUP_ENV, media_warmup, warmup_inputs, warmup_wire
 
 logger = logging.getLogger(__name__)
 
@@ -560,11 +560,37 @@ class SglangLauncher(RustLauncher):
             args, handshake_port=handshake_port, encode_bridge=self.encode
         )
 
+    # The media leg's request material, built with the inputs for a
+    # language-side worker whose frontend dispatches to the encoders; ``None``
+    # on every other worker and where no prompt could be rendered.
+    media: Any | None = None
+
     def warmup_inputs(self, args: Any, facts: Mapping[str, Any]) -> Any:
-        return warmup_inputs(args, facts)
+        """The plan's inputs; on a language-side worker whose frontend
+        dispatches to the encoders, with the media leg when the model's chat
+        template renders an image placeholder (the text ladder never reaches
+        the scheduler's media path, whose first use costs a fresh worker
+        seconds once)."""
+        from smg_grpc_servicer.sglang.rust_encode import dispatches_from_the_frontend
+
+        inputs = warmup_inputs(args, facts)
+        if inputs is None or not dispatches_from_the_frontend(args):
+            return inputs
+        self.media = media_warmup(
+            self.tokenizer_dir(args),
+            trust_remote_code=bool(getattr(args, "trust_remote_code", False)),
+        )
+        if self.media is None:
+            return inputs
+        logger.info(
+            "Planned warm-up ends its shapes with one image through the encoders (the prompt the "
+            "model's chat template renders around it, %d tokens)",
+            len(self.media.input_ids),
+        )
+        return dataclasses.replace(inputs, media_leg=True)
 
     def warmup_wire(self, target: str) -> Any:
-        return warmup_wire(target)
+        return warmup_wire(target, media=self.media)
 
 
 async def serve_rust(server_args: Any) -> int:

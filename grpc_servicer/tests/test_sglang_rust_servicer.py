@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import inspect
 import json
 import os
@@ -1198,13 +1199,14 @@ def test_a_language_only_launch_gets_the_encode_dispatch_as_a_server_extra(monke
     assert launched == {"args": args, "port": 24321, "bridge": launcher.encode}
 
 
-def test_a_language_only_launch_plans_the_warm_up_as_a_plain_worker():
+def test_a_language_only_launch_plans_the_warm_up_as_a_plain_worker(monkeypatch):
     """The language side of an encode-disaggregated deployment is held at
-    NOT_SERVING for the planned warm-up like a single engine: its warm-up
-    requests carry no media (the encoders see nothing of them), so the first
-    forward of a fresh scheduler is paid before the health flips, not by the
-    first request. The encoder-only role is the engine's own server and
-    plans nothing."""
+    NOT_SERVING for the planned warm-up like a single engine: its text
+    warm-up requests carry no media (the encoders see nothing of them), so
+    the first forward of a fresh scheduler is paid before the health flips,
+    not by the first request. The encoder-only role is the engine's own
+    server and plans nothing."""
+    monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: None)  # no image leg here
     launcher = rust.SglangLauncher()
     facts = {"is_generation": True, "max_context_length": 4096, "vocab_size": 1024}
     language_side = launcher.warmup_inputs(
@@ -1218,6 +1220,60 @@ def test_a_language_only_launch_plans_the_warm_up_as_a_plain_worker():
     assert language_side is not None
     assert language_side == launcher.warmup_inputs(_server_args(), facts)
     assert launcher.warmup_inputs(_server_args(encoder_only=True), facts) is None
+
+
+def test_a_language_only_launch_ends_its_warm_up_with_one_image_through_the_encoders(
+    monkeypatch, caplog
+):
+    """A language-side worker whose frontend dispatches to the encoders plans
+    the text shapes of a single engine and ends them with one image through
+    the encoders, built from the model's own template (the scheduler's media
+    path has a first-use cost no text request reaches); the wire gets that
+    material. A template without an image placeholder leaves the leg out; a
+    plain worker and the encoder-only role never render the prompt."""
+    facts = {"is_generation": True, "max_context_length": 4096, "vocab_size": 1024}
+    language = _server_args(
+        language_only=True,
+        encoder_transfer_backend="zmq_to_scheduler",
+        encoder_urls=["http://10.0.0.8:30011"],
+        trust_remote_code=True,
+    )
+    built = []
+    fake = SimpleNamespace(
+        prompt="<image>hi", input_ids=(1, 2, 3), image_url="data:image/png;base64,AAAA"
+    )
+
+    def media_warmup(tokenizer_dir, *, trust_remote_code=False):
+        built.append((tokenizer_dir, trust_remote_code))
+        return fake
+
+    monkeypatch.setattr(rust, "media_warmup", media_warmup)
+    monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: "/tok")
+    launcher = rust.SglangLauncher()
+    with caplog.at_level("INFO"):
+        inputs = launcher.warmup_inputs(language, facts)
+    assert built == [("/tok", True)]
+    assert inputs.media_leg is True
+    assert dataclasses.replace(inputs, media_leg=False) == launcher.warmup_inputs(
+        _server_args(), facts
+    )
+    assert "one image through the encoders" in caplog.text and "3 tokens" in caplog.text
+    wire = launcher.warmup_wire("127.0.0.1:1")
+    assert wire._media is fake
+    wire.close()
+    # No placeholder rendered: the text shapes alone, and the wire has no media.
+    monkeypatch.setattr(rust, "media_warmup", lambda *args, **kwargs: None)
+    bare = rust.SglangLauncher()
+    assert bare.warmup_inputs(language, facts).media_leg is False
+    wire = bare.warmup_wire("127.0.0.1:1")
+    assert wire._media is None
+    wire.close()
+    # A plain worker and the encoder-only role never render the prompt.
+    monkeypatch.setattr(
+        rust, "media_warmup", lambda *args, **kwargs: pytest.fail("no image leg on this worker")
+    )
+    assert rust.SglangLauncher().warmup_inputs(_server_args(), facts).media_leg is False
+    assert rust.SglangLauncher().warmup_inputs(_server_args(encoder_only=True), facts) is None
 
 
 def test_serve_rust_serves_a_prefill_decode_launch(monkeypatch, tmp_path):

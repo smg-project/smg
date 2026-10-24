@@ -1622,7 +1622,14 @@ class RustLauncher:
         self.announce_capabilities(facts, tokenizer_dir)
         plan = None
         if self.warmup_env:
-            plan = plan_for(warmup_setting, self.warmup_inputs(args, facts), knob=self.warmup_env)
+            # The inputs (a tokenizer load, the media material of a language-side
+            # worker) are built only when the knob is on: plan_for logs the off
+            # reason first and reads no inputs then.
+            plan = plan_for(
+                warmup_setting,
+                self.warmup_inputs(args, facts) if warmup_setting.enabled else None,
+                knob=self.warmup_env,
+            )
         handshake_port = knobs.handshake_port or free_port()
         # The metrics endpoint, resolved and checked before the port is
         # bound and the engine starts (a clash with the gRPC port is refused

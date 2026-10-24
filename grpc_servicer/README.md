@@ -1147,8 +1147,13 @@ the engine's stand-in bootstrap so the leg warms up without its peer, and the
 language side of an encode-disaggregated deployment (`--language-only`) plans
 as a single engine, so the first forward of its fresh scheduler is paid before
 SERVING rather than by its first request, as the engine's own frontend warms
-that role on the text path; under data parallelism the servicer routes a
-request by load, not by rank, so each
+that role on the text path, and where its
+frontend dispatches to the encoders the plan ends its shapes with one image
+through them (the prompt the model's chat template renders around the
+engine's own minimal warm-up image; a template without an image placeholder
+leaves the leg out, a leg the encoders cannot serve yet is a logged step), so
+the scheduler's first media forward is paid before SERVING too; under
+data parallelism the servicer routes a request by load, not by rank, so each
 prefill shape warms one rank and the log says so),
 `SMG_SGLANG_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and
 `SMG_SGLANG_SERVICER_STARTUP_CEILING_SECS` (default 14400; the two startup

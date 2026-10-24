@@ -20,18 +20,28 @@ engine's warm-up sets in disaggregation mode: the fake-transfer host and room
 and no first request of a prompt-length class pays a kernel compile under the
 Router's prefill-liveness bound.
 The language side of an encode-disaggregated deployment (``--language-only``)
-plans as a single engine: a warm-up request carries no media, so it reaches
-the scheduler untouched and the encoders see nothing of it, and the first
-forward of a fresh scheduler process is paid here rather than by the first
-request (the engine's own frontend warms that role on the text path for the
-same reason). The encoder-only role takes no plan: the engine's entrypoint
-runs it on its own encoder server, never on a servicer.
+plans as a single engine: a text warm-up request carries no media, so it
+reaches the scheduler untouched and the encoders see nothing of it, and the
+first forward of a fresh scheduler process is paid here rather than by the
+first request (the engine's own frontend warms that role on the text path for
+the same reason). The text ladder does not reach the scheduler's media path,
+whose own first use (the first forward with precomputed embeddings) costs a
+fresh worker seconds once; so where that worker's frontend dispatches to the
+encoders, the plan ends its shapes with one image through them
+(:func:`media_warmup`: the prompt the model's own chat template renders around
+one image item, its token ids, and the engine's own minimal warm-up image as a
+data URL), the production path once, before SERVING. A template that renders
+no image placeholder leaves the leg out, and a leg the encoders cannot serve
+yet is a logged step, never the end of the start. The encoder-only role takes
+no plan: the engine's entrypoint runs it on its own encoder server, never on a
+servicer.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
@@ -40,6 +50,16 @@ from smg_grpc_servicer.warmup import WarmupInputs, WarmupRequest
 logger = logging.getLogger(__name__)
 
 WARMUP_ENV = "SMG_SGLANG_SERVICER_WARMUP"
+#: The image of the media leg: the engine's own minimal warm-up image (a
+#: 32x32 black PNG, what its frontend sends its vision models at start),
+#: carried as a data URL so the encoders fetch nothing.
+WARMUP_IMAGE_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRY"
+    "he3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpke"
+    "I77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
+)
+#: The text beside the image in the media leg's prompt.
+WARMUP_IMAGE_QUESTION = "Describe the image."
 #: The engine's own prefill budget when the arguments carry neither a chunk
 #: size nor a prefill budget as a count.
 DEFAULT_STEP_TOKENS = 16384
@@ -98,15 +118,81 @@ def warmup_inputs(server_args: Any, facts: Mapping[str, Any]) -> WarmupInputs | 
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class MediaWarmup:
+    """What the media leg's request carries: the prompt the model's own chat
+    template renders around one image item, its token ids, and the image as a
+    data URL."""
+
+    prompt: str
+    input_ids: tuple[int, ...]
+    image_url: str
+
+
+def _render(tokenizer: Any, with_image: bool) -> str:
+    content = ([{"type": "image"}] if with_image else []) + [
+        {"type": "text", "text": WARMUP_IMAGE_QUESTION}
+    ]
+    return tokenizer.apply_chat_template(
+        [{"role": "user", "content": content}], tokenize=False, add_generation_prompt=True
+    )
+
+
+def media_warmup(
+    tokenizer_dir: str | None,
+    *,
+    trust_remote_code: bool = False,
+    load_tokenizer: Callable[[str], Any] | None = None,
+    log: logging.Logger = logger,
+) -> MediaWarmup | None:
+    """The media leg's request material, or ``None`` with the reason logged:
+    no tokenizer directory to render the prompt from, a tokenizer that does
+    not load, or a chat template that renders no image placeholder (the leg
+    would be a text request). The prompt is what the template renders around
+    one image item and :data:`WARMUP_IMAGE_QUESTION`, unexpanded, as a
+    client sends it to a language-side worker; the ids are its tokens."""
+    if not tokenizer_dir:
+        log.info("Planned warm-up: no image leg (no tokenizer directory to render the prompt from)")
+        return None
+    try:
+        if load_tokenizer is None:
+            from transformers import AutoTokenizer
+
+            def load_tokenizer(directory: str) -> Any:
+                return AutoTokenizer.from_pretrained(directory, trust_remote_code=trust_remote_code)
+
+        tokenizer = load_tokenizer(tokenizer_dir)
+        with_image = _render(tokenizer, with_image=True)
+        without_image = _render(tokenizer, with_image=False)
+        if with_image == without_image:
+            log.info(
+                "Planned warm-up: no image leg (the chat template renders no image placeholder)"
+            )
+            return None
+        input_ids = tuple(
+            int(t) for t in tokenizer(with_image, add_special_tokens=False)["input_ids"]
+        )
+    except Exception as error:  # noqa: BLE001 -- the leg is an optimisation; the reason is logged
+        log.info("Planned warm-up: no image leg (the prompt could not be rendered: %s)", error)
+        return None
+    return MediaWarmup(
+        prompt=with_image,
+        input_ids=input_ids,
+        image_url=f"data:image/png;base64,{WARMUP_IMAGE_PNG_BASE64}",
+    )
+
+
 class GrpcWire:
     """The warm-up's requests over the servicer's own port, as a client sends
     them: tokenized input, greedy sampling with the stop ignored, so a request
-    produces exactly the output it asked for."""
+    produces exactly the output it asked for; the media leg's request with
+    its image reference and the prompt rendered around it (``media``)."""
 
-    def __init__(self, target: str, channel: Any = None) -> None:
+    def __init__(self, target: str, channel: Any = None, media: MediaWarmup | None = None) -> None:
         import grpc
         from smg_grpc_proto import sglang_scheduler_pb2_grpc
 
+        self._media = media
         self._owns_channel = channel is None
         self._channel = channel or grpc.insecure_channel(
             target,
@@ -120,11 +206,19 @@ class GrpcWire:
     def generate(self, request: WarmupRequest, timeout: float) -> None:
         from smg_grpc_proto import sglang_scheduler_pb2
 
+        if request.media:
+            if self._media is None:
+                raise RuntimeError("the plan's media leg has nothing to send on this wire")
+            tokenized = sglang_scheduler_pb2.TokenizedInput(
+                input_ids=list(self._media.input_ids), original_text=self._media.prompt
+            )
+        else:
+            tokenized = sglang_scheduler_pb2.TokenizedInput(
+                input_ids=list(request.token_ids), original_text="warm-up"
+            )
         message = sglang_scheduler_pb2.GenerateRequest(
             request_id=request.request_id,
-            tokenized=sglang_scheduler_pb2.TokenizedInput(
-                input_ids=list(request.token_ids), original_text="warm-up"
-            ),
+            tokenized=tokenized,
             # The proto's scalar defaults are not valid sampling values for
             # the engine; the greedy settings are spelled out.
             sampling_params=sglang_scheduler_pb2.SamplingParams(
@@ -144,6 +238,14 @@ class GrpcWire:
             message.disaggregated_params.CopyFrom(
                 sglang_scheduler_pb2.DisaggregatedParams(
                     bootstrap_host=request.lone_leg_bootstrap, bootstrap_room=0
+                )
+            )
+        if request.media:
+            # As a client names an image to a language-side worker: the
+            # reference alone, the prompt unexpanded; the encoders do the rest.
+            message.mm_inputs.CopyFrom(
+                sglang_scheduler_pb2.MultimodalInputs(
+                    image_urls=[self._media.image_url], modalities=["image"]
                 )
             )
         last = None
@@ -168,7 +270,8 @@ class GrpcWire:
             self._channel.close()
 
 
-def warmup_wire(target: str, channel: Any = None) -> GrpcWire:
+def warmup_wire(target: str, channel: Any = None, media: MediaWarmup | None = None) -> GrpcWire:
     """The wire to the servicer at ``target`` (a loopback ``host:port``), or
-    over a ``channel`` the caller already holds and closes."""
-    return GrpcWire(target, channel)
+    over a ``channel`` the caller already holds and closes; ``media`` is what
+    the plan's media leg sends, when the plan has one."""
+    return GrpcWire(target, channel, media)

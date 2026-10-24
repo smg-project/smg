@@ -38,7 +38,15 @@ flips, so the first-time costs are paid while nothing is routed here:
   with a collective of the overlapped previous chunk still in flight, that
   load has deadlocked the forward. The ``fast`` level plans none of them and
   leaves that hazard open (the start log says so): it is for a test leg or a
-  quick restart, and the shipped default is ``full``.
+  quick restart, and the shipped default is ``full``;
+- the **media leg**, when the engine module asks for it
+  (:attr:`WarmupInputs.media_leg`): one request carrying one media item
+  through the engine's own media path, after the second pass and before the
+  chunk remainders, so the first-use cost of that path (a kernel compiled on
+  the first media forward, which no text request reaches) is paid before
+  SERVING as well. The wire builds that request (the prompt the model's own
+  template renders around the item, its ids, the item); the planner only
+  places it.
 
 Every request carries its own token ids (no two requests share a prefix
 block), so prefix caching never turns a planned prefill into a hit, and the
@@ -214,6 +222,12 @@ class WarmupInputs:
     #: disaggregated pair: every request carries it, so the leg warms up
     #: without its peer. ``None`` for a single engine.
     lone_leg_bootstrap: str | None = None
+    #: Whether the plan carries one request with one media item through the
+    #: engine's media path (after the second pass, before the chunk
+    #: remainders): an engine module sets it for a worker whose first media
+    #: request pays a first-use cost no text request reaches, and its wire
+    #: builds that request.
+    media_leg: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -235,6 +249,10 @@ class WarmupRequest:
     #: A lone leg's stand-in bootstrap host
     #: (:attr:`WarmupInputs.lone_leg_bootstrap`), for the wire to carry.
     lone_leg_bootstrap: str | None = None
+    #: The request carries one media item: the wire supplies the item and the
+    #: prompt around it (its own token ids), so :attr:`prompt_tokens` and
+    #: :attr:`token_ids` are not what reaches the engine for this one.
+    media: bool = False
 
     @property
     def token_ids(self) -> tuple[int, ...]:
@@ -247,8 +265,10 @@ class WarmupStep:
     """One scheduler shape: the requests sent together to reach it."""
 
     name: str
-    # "decode", "prefill", "again" (the measuring second pass) or "remainder"
-    # (a prompt length the ladder left out, for an engine that asks for all)
+    # "decode", "prefill", "again" (the measuring second pass), "media" (one
+    # media item through the engine's media path, for an engine that asks for
+    # it) or "remainder" (a prompt length the ladder left out, for an engine
+    # that asks for all)
     kind: str
     requests: tuple[WarmupRequest, ...]
 
@@ -278,13 +298,14 @@ class WarmupPlan:
     def describe(self) -> str:
         kinds = {
             kind: sum(1 for step in self.steps if step.kind == kind)
-            for kind in ("decode", "prefill", "again", "remainder")
+            for kind in ("decode", "prefill", "again", "media", "remainder")
         }
         ranks = self.inputs.data_parallel_size
         return (
             f"level {self.level}: {len(self.steps)} steps ({kinds['decode']} decode "
             f"staircase{'s' if kinds['decode'] != 1 else ''}, "
             f"{kinds['prefill']} prefill shapes, {kinds['again']} measured again"
+            + (", one media item" if kinds["media"] else "")
             + (f", {kinds['remainder']} chunk remainders" if kinds["remainder"] else "")
             + f"), {self.prompt_tokens} prompt tokens and {self.output_tokens} output tokens over "
             f"a window of {self.inputs.max_num_seqs} and a step of "
@@ -373,7 +394,13 @@ class _Requests:
         self._lone_leg_bootstrap = lone_leg_bootstrap
         self._next = 0
 
-    def one(self, prompt_tokens: int, max_tokens: int, rank: int | None = None) -> WarmupRequest:
+    def one(
+        self,
+        prompt_tokens: int,
+        max_tokens: int,
+        rank: int | None = None,
+        media: bool = False,
+    ) -> WarmupRequest:
         ordinal = self._next
         self._next += 1
         # The exact form the Rust servicers admit while readiness is held
@@ -387,13 +414,15 @@ class _Requests:
             vocab_size=self._vocab_size,
             data_parallel_rank=rank,
             lone_leg_bootstrap=self._lone_leg_bootstrap,
+            media=media,
         )
 
 
 def plan_warmup(inputs: WarmupInputs, level: str = DEFAULT_LEVEL) -> WarmupPlan:
     """The steps for ``inputs`` at ``level``, in the order they run: the
     decode staircase first (cheap, and every ramp's first shapes), then the
-    prefill shapes by length, the odd variants, the second pass, and, when
+    prefill shapes by length, the odd variants, the second pass, the media
+    leg when the inputs ask for one, and, when
     the inputs ask for every prefill length, the chunk remainders in
     :func:`spread_order` at the ``full`` level (the ``fast`` level keeps the
     merged ladder: a test leg or a quick start takes the classes alone, and
@@ -464,6 +493,18 @@ def plan_warmup(inputs: WarmupInputs, level: str = DEFAULT_LEVEL) -> WarmupPlan:
                 name=f"prefill {length} tokens again",
                 kind="again",
                 requests=tuple(requests.one(length, 1, rank) for rank in ranks),
+            )
+        )
+    if inputs.media_leg:
+        # One item through the engine's media path, on every rank: its
+        # first-use cost is the media path's own, which no text shape reaches.
+        steps.append(
+            WarmupStep(
+                name="one media item through the engine's media path",
+                kind="media",
+                requests=tuple(
+                    requests.one(STAIRCASE_PROMPT_TOKENS, 1, rank, media=True) for rank in ranks
+                ),
             )
         )
     if inputs.every_prefill_length and level == LEVEL_FULL:
