@@ -164,11 +164,11 @@ class GrpcWire:
             last = frame
         if last is None or not last.HasField("complete"):
             raise RuntimeError("the request ended without a complete frame")
-        if reason := unserved(last.complete.finish_reason, len(last.complete.output_ids)):
+        if error := unserved(last.complete.finish_reason, len(last.complete.output_ids)):
             # The engine ended the request without serving it (an abort at
             # admission arrives as a completion with no token): a failed
             # request, not a covered step.
-            raise RuntimeError(reason)
+            raise error
 
     def flush_cache(self) -> bool:
         from smg_grpc_proto.generated import common_pb2

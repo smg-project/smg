@@ -505,14 +505,25 @@ class WarmupWire(Protocol):
 UNSERVED_FINISHES = frozenset({"abort", "error"})
 
 
-def unserved(finish_reason: str | None, output_tokens: int) -> str | None:
-    """Why a request that completed was not served, or ``None`` when it
-    was: the finish the engine ended it with, when that finish is one of
-    :data:`UNSERVED_FINISHES`, and how many tokens came before it (none for
-    a refusal at admission). A wire raises these words from ``generate`` so
-    the pass records the request as failed, next to a raised status, and
-    the step as not covered. An empty or absent finish is not a refusal (a
-    completion a stand-in answers without one)."""
+class UnservedRequest(RuntimeError):
+    """A request the engine completed without serving it (one of
+    :data:`UNSERVED_FINISHES`). A failed request in the pass's accounting,
+    like a raised status; unlike one, no sign that the engine stopped taking
+    requests: the engine answered. So a step of these never counts toward
+    the consecutive-failures stop (:data:`CONSECUTIVE_FAILED_STEPS`), which
+    exists for an engine that answers nothing: an engine whose input bound
+    sits below the plan's longest prompts refuses those steps in a row and
+    the pass still runs everything after them."""
+
+
+def unserved(finish_reason: str | None, output_tokens: int) -> UnservedRequest | None:
+    """The :class:`UnservedRequest` a completion that was not served
+    raises, or ``None`` when it was served: the finish the engine ended it
+    with, when that finish is one of :data:`UNSERVED_FINISHES`, and how
+    many tokens came before it (none for a refusal at admission). A wire
+    raises it from ``generate`` so the pass records the request as failed
+    and the step as not covered. An empty or absent finish is not a refusal
+    (a completion a stand-in answers without one)."""
     if (finish_reason or "") not in UNSERVED_FINISHES:
         return None
     produced = (
@@ -520,7 +531,9 @@ def unserved(finish_reason: str | None, output_tokens: int) -> str | None:
         if output_tokens == 0
         else f"after {output_tokens} token{'s' if output_tokens != 1 else ''}"
     )
-    return f"the engine ended the request with finish_reason {finish_reason!r} {produced}"
+    return UnservedRequest(
+        f"the engine ended the request with finish_reason {finish_reason!r} {produced}"
+    )
 
 
 @dataclasses.dataclass
@@ -635,7 +648,12 @@ class _Pass:
         index = len(self.report.results)
         remainder = step.kind == "remainder"
         if errors:
-            if len(errors) == len(step.requests):
+            # A whole step of refusals (the engine answered every request
+            # with an abort) is a failed step, not a step toward the stop:
+            # the stop is for an engine that answers nothing.
+            whole = len(errors) == len(step.requests)
+            answered = all(isinstance(error, UnservedRequest) for error in errors)
+            if whole and not answered:
                 if self._failed_in_a_row == 0:
                     self._first_failed = index - 1
                 self._failed_in_a_row += 1

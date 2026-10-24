@@ -1083,7 +1083,40 @@ def test_the_sglang_wire_carries_a_lone_legs_stand_in_bootstrap():
 def test_a_request_the_engine_did_not_serve_is_worded_by_its_finish_and_its_tokens(
     finish, tokens, words
 ):
-    assert warmup.unserved(finish, tokens) == words
+    error = warmup.unserved(finish, tokens)
+    assert (None if error is None else str(error)) == words
+    assert error is None or isinstance(error, warmup.UnservedRequest)
+
+
+def test_a_run_of_refused_shapes_does_not_stop_the_pass(caplog):
+    """An engine whose input bound sits below the plan's longest prompts
+    refuses those steps in a row (the prefill shapes run in ascending
+    order). They are failed steps, not the stop meant for an engine that
+    answers nothing: the steps after them (the re-measures, the chunk
+    remainders) still run."""
+    caplog.set_level(logging.INFO, logger="smg_grpc_servicer.warmup")
+    plan = plan_warmup(SMALL, "fast")
+    longest = sorted({len(r.token_ids) for s in plan.steps for r in s.requests})[-3:]
+    assert len(longest) == 3
+
+    class Refusing(_Wire):
+        def generate(self, request, timeout):
+            super().generate(request, timeout)
+            if len(request.token_ids) in longest and request.max_tokens == 1:
+                raise warmup.unserved("abort", 0)
+
+    wire = Refusing()
+    report = run_warmup(plan, wire, budget_secs=30)
+    assert report.stopped is None and not report.budget_hit
+    assert len(report.results) == len(plan.steps)  # every step ran
+    refused = [r for r in report.results if r.errors]
+    assert len(refused) >= 3 and all(r.errors == len(r.step.requests) for r in refused)
+    assert report.covered == len(plan.steps) - len(refused)
+    assert len(wire.requests) == sum(len(s.requests) for s in plan.steps)
+    assert (
+        "stopped" not in report.summary()
+        and f"({len(refused)} failed requests)" in report.summary()
+    )
 
 
 @pytest.mark.parametrize(
