@@ -32,7 +32,7 @@
       "sha256": "8efa558454e7fd15799b1debd2243e88e781fb2231183198084f6296f2d65d04"
     },
     ".github/amd-nixl-environment/nixl_environment/runtime_inputs.py": {
-      "sha256": "b3598cd4c19e66ae0d832f36cf34c952661cf422f0aefd64b577c3649a090266"
+      "sha256": "9731167e429073ea57bfb9a825b3187cdc36779e8277f7074d95bf4511a2f9e4"
     }
   },
   "auxiliary_manifest_sha256": "f3519bade67f15b8bf0fe30f60b84313128175b14ca12d5c431168e3c1e50e7f",

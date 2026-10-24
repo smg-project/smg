@@ -110,11 +110,12 @@ def installed_record(dist):
     rows = list(csv.reader(io.StringIO(record)))
     require(len(rows) == len({row[0] for row in rows}), "duplicate installed RECORD entry")
     base = Path(dist.locate_file("")).resolve()
+    self_record = Path(dist._path).resolve(strict=True) / "RECORD"
     for relative, digest, size in rows:
         require(relative and not Path(relative).is_absolute(), "absolute installed RECORD path")
         path = Path(dist.locate_file(relative)).resolve(strict=True)
         require(path.is_relative_to(Path(sys.prefix).resolve()) or path.is_relative_to(base), "RECORD escaped active installation")
-        if relative.endswith(".dist-info/RECORD"):
+        if path == self_record:
             require(digest == size == "", "installed RECORD self entry")
         elif digest:
             found = identity(path)
@@ -141,10 +142,10 @@ def distribution_proof(name, item, root):
             require(not Path(member.filename).is_absolute() and ".." not in Path(member.filename).parts, "wheel member path")
             if member.is_dir():
                 continue  # Genuine setproctitle/PyYAML wheels include directory entries.
-            if member.filename.endswith(".dist-info/RECORD"):
-                continue  # pip adds installer/direct_url/console entries to this file.
-            raw = wheel.read(member)
             path = Path(dist.locate_file(member.filename))
+            if path.resolve(strict=True) == Path(dist._path).resolve(strict=True) / "RECORD":
+                continue  # Only this distribution's outer RECORD is rewritten by pip.
+            raw = wheel.read(member)
             require(not path.is_symlink() and identity(path) == {"bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}, "installed source wheel differs: " + name)
             if name == "smg-grpc-proto" and member.filename.startswith("smg_grpc_proto/proto/") and member.filename.endswith(".proto"):
                 require((ROOT / "crates/grpc_client/proto" / Path(member.filename).name).read_bytes() == raw, "current eight-schema source differs")
