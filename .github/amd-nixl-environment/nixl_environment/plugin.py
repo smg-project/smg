@@ -1,11 +1,27 @@
 """Observe environment continuity; never replace PD process/transfer proof."""
 
+import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 
 import pytest
+
+
+def error_context(error, stage):
+    environment = {}
+    for name in ("PYTHONPATH", "LD_LIBRARY_PATH"):
+        value = os.environ.get(name)
+        raw = (value or "").encode(errors="backslashreplace")
+        environment[name] = {
+            "present": value is not None,
+            "bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "value_prefix": raw[:8192].decode(errors="backslashreplace"),
+            "truncated": len(raw) > 8192,
+        }
+    return {"error": str(error), "stage": stage, "private_environment": environment}
 
 
 class EnvironmentProof:
@@ -27,7 +43,7 @@ class EnvironmentProof:
             verify(self.stage + "-" + suffix)
         except Exception as error:
             (directory / (self.stage + "-" + suffix + "-error.json")).write_text(
-                json.dumps({"error": str(error)}) + "\n"
+                json.dumps(error_context(error, self.stage + "-" + suffix)) + "\n"
             )
             raise
 

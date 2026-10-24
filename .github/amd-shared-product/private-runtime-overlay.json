@@ -26,7 +26,7 @@
       "sha256": "6231f2b4985b5d86b78abf6ecf2d17ad8d2c9e5526da3eed82f3289a32bdfac3"
     },
     ".github/amd-nixl-environment/nixl_environment/plugin.py": {
-      "sha256": "86fdc703dfcd7dcb376cb06f49c7cf03c626d49b3cc3413f876ee48a1ed8f92a"
+      "sha256": "8c54d2074368351c6ed101dfdb85691fec7a5b5c347643117f559a0db151c2a1"
     },
     ".github/amd-nixl-environment/pyproject.toml": {
       "sha256": "8efa558454e7fd15799b1debd2243e88e781fb2231183198084f6296f2d65d04"
