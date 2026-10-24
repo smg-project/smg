@@ -191,14 +191,33 @@ pub(crate) fn qwen35_positions(
         // A video's (T, H, W) row stands for T frames, one span each.
         let (rows, placeholder): (Vec<[i64; 3]>, u32) = match kind {
             GridKind::Image => (rows.clone(), layout.image_token_id),
-            GridKind::Video => (
-                rows.iter()
-                    .flat_map(|&[t, h, w]| {
-                        std::iter::repeat_n([1, h, w], usize::try_from(t).unwrap_or(0))
+            GridKind::Video => {
+                // The frame count first, so a malformed row cannot ask for a
+                // frame list the size of its `t`: the frames must equal the
+                // spans before any list exists.
+                let frames = rows
+                    .iter()
+                    .try_fold(0usize, |sum, &[t, ..]| {
+                        usize::try_from(t).ok().and_then(|t| sum.checked_add(t))
                     })
-                    .collect(),
-                layout.video_token_id,
-            ),
+                    .ok_or_else(|| {
+                        format!("multimodal item {index} video grid frame count overflows")
+                    })?;
+                if frames != item.offsets.len() {
+                    return Err(format!(
+                        "multimodal item {index} has {frames} grid row(s) for {} placeholder span(s)",
+                        item.offsets.len()
+                    ));
+                }
+                (
+                    rows.iter()
+                        .flat_map(|&[t, h, w]| {
+                            std::iter::repeat_n([1, h, w], usize::try_from(t).unwrap_or(0))
+                        })
+                        .collect(),
+                    layout.video_token_id,
+                )
+            }
         };
         if rows.len() != item.offsets.len() {
             return Err(format!(
@@ -227,7 +246,10 @@ pub(crate) fn qwen35_positions(
                     "multimodal item {index} grid ({t}, {h}, {w}) is empty under spatial merge {merge}"
                 ));
             }
-            let expected = t * lh * lw;
+            let expected = t
+                .checked_mul(lh)
+                .and_then(|n| n.checked_mul(lw))
+                .ok_or_else(|| format!("multimodal item {index} grid ({t}, {h}, {w}) overflows"))?;
             if (end - start + 1) as i64 != expected {
                 return Err(format!(
                     "multimodal item {index} placeholder span [{start}, {end}] has {} tokens; its \
@@ -489,6 +511,13 @@ pub(crate) mod tests {
         assert!(table(&[], &[]).unwrap_err().contains("non-empty prompt"));
         // A video frame count of zero leaves no rows for its span.
         assert!(err(&[video(&[[0, 4, 4]], &[(1, 4)])]).contains("0 grid row(s) for 1"));
+        // A video row asking for more frames than there are spans is refused
+        // before any frame list exists (a count, not an allocation).
+        assert!(err(&[video(&[[1 << 40, 4, 4]], &[(1, 4)])]).contains("grid row(s) for 1"));
+        // A grid whose token count overflows is refused, not wrapped.
+        assert!(
+            err(&[image(&[[1, 22, 2 * 0x2E8B_A2E8_BA2E_8BA3]], &[(1, 4)])]).contains("overflows")
+        );
     }
 
     #[test]
