@@ -25,6 +25,7 @@ from infra import (
     get_zmq_engine_count,
 )
 from infra.worker_pool import get_pool
+from infra.constants import get_vllm_servicer_impl
 
 from .markers import model_id_for_engine, resolve_class_marker
 
@@ -33,6 +34,12 @@ from .markers import model_id_for_engine, resolve_class_marker
 # fixture). Anything else — ``pd_*``/``epd_*``, EPD topology tuples, cloud
 # vendor names — is out of scope for ZMQ.
 _ZMQ_LOCAL_WIRES = frozenset({"grpc", "http"})
+
+_AMD_ALWAYS_GRAMMAR_ENV = "E2E_AMD_VLLM_ALWAYS_GRAMMAR_EQUIVALENT"
+_ALWAYS_GRAMMAR_CASE = (
+    "chat_completions/test_function_calling.py::TestConstrainedDecodingAlways::"
+    "test_an_always_worker_is_constrained_under_auto[openai-grpc]"
+)
 
 # Per-session selection accounting filled in by ``pytest_collection_modifyitems``
 # and printed as one greppable ``e2e selection:`` line after collection.
@@ -376,6 +383,50 @@ def _filter_sglang_rust_items(
     return kept, deselected
 
 
+def _amd_always_grammar_enabled(engine: str | None, gpu_tier: str | None) -> bool:
+    """Opt one original TokenSpeed case into a real, single-worker vLLM lane."""
+    value = os.environ.get(_AMD_ALWAYS_GRAMMAR_ENV, "")
+    if value in ("", "0"):
+        return False
+    if value != "1":
+        raise pytest.UsageError(f"{_AMD_ALWAYS_GRAMMAR_ENV} must be 0 or 1")
+    if (
+        engine != "vllm"
+        or get_runtime() != "vllm"
+        or gpu_tier != "1"
+        or get_connection_mode_override() not in (None, ConnectionMode.GRPC, ConnectionMode.ZMQ)
+        or get_zmq_engine_count() != 1
+    ):
+        raise pytest.UsageError(
+            f"{_AMD_ALWAYS_GRAMMAR_ENV}=1 requires engine/runtime vllm, tier 1, "
+            "and a single-worker gRPC or ZMQ lane"
+        )
+    return True
+
+
+def _amd_python_admin_equivalent(item: pytest.Item, engine: str | None, gpu_tier: str | None) -> bool:
+    if os.environ.get("SMG_TS_PYTHON173_LANE") != "python":
+        return False
+    names = {
+        "test_flush_cache_full_cycle[grpc]",
+        "test_profile_url_filter_without_match_returns_404[grpc]",
+        "test_start_and_stop_profile_produces_traces[grpc]",
+        "test_start_profile_rejects_malformed_json[grpc]",
+    }
+    prefix = "router/test_admin_ops.py::TestAdminOpsTokenSpeed::"
+    nodeid = item.nodeid.removeprefix("e2e_test/")
+    if not nodeid.startswith(prefix) or nodeid[len(prefix):] not in names:
+        return False
+    marker = _get_marker(item, "engine")
+    if (engine != "vllm" or get_runtime() != "vllm" or gpu_tier != "1"
+            or get_connection_mode_override() != ConnectionMode.GRPC
+            or get_vllm_servicer_impl() != "python" or marker is None
+            or marker.args != ("tokenspeed",) or _setup_backend_param(item) != "grpc"
+            or _get_marker(item, "model") is not None or _get_marker(item, "workers") is not None):
+        raise pytest.UsageError("Python173 admin equivalence requires the original regular gRPC fixture")
+    return True
+
+
 def _filter_env_items(
     items: list[pytest.Item],
     engine: str | None,
@@ -389,13 +440,26 @@ def _filter_env_items(
     """
     selected: list[pytest.Item] = []
     deselected_by: dict[str, list[pytest.Item]] = {"engine": [], "vendor": [], "tier": []}
+    amd_always = _amd_always_grammar_enabled(engine, gpu_tier)
     for item in items:
         # Filter by engine
         if engine:
             engine_marker = _get_marker(item, "engine")
             if not engine_marker or engine not in engine_marker.args:
-                deselected_by["engine"].append(item)
-                continue
+                model_marker = _get_marker(item, "model") if amd_always else None
+                equivalent = (
+                    amd_always
+                    and item.nodeid.removeprefix("e2e_test/") == _ALWAYS_GRAMMAR_CASE
+                    and engine_marker is not None
+                    and engine_marker.args == ("tokenspeed",)
+                    and model_marker is not None
+                    and model_marker.args == ("Qwen/Qwen3-4B-Instruct-2507",)
+                    and not model_marker.kwargs
+                    and _setup_backend_param(item) == "grpc"
+                )
+                if not (equivalent or _amd_python_admin_equivalent(item, engine, gpu_tier)):
+                    deselected_by["engine"].append(item)
+                    continue
         # Filter by vendor
         if vendor:
             vendor_marker = _get_marker(item, "vendor")
