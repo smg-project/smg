@@ -16,6 +16,8 @@
 //! schema is not consulted: any number of parameters with any name, each `string="true"` with
 //! any text or `string="false"` with any JSON value, the shape the gateway hand-wrote for
 //! DeepSeek V4.1; a schema-driven spelling is a change of its own.
+//!
+//! [`shape`]: crate::shape
 
 use openai_protocol::common::Tool;
 use serde_json::Value;

@@ -22,7 +22,7 @@ use crate::{
 pub(super) enum Mode {
     /// A declared string, pushed piece by piece once its opening fragment is out.
     Streaming { opened: bool },
-    /// Written at the close with [`json`](super::json).
+    /// Written at the close with [`json`](super::value::json).
     Whole,
     /// A string that may be null: held until its text rules the null words out.
     Undecided,

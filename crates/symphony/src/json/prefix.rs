@@ -37,6 +37,8 @@
 use std::{borrow::Cow, cmp::Ordering};
 
 /// The nesting the prefix parser allows, which is [`PartialJson::DEFAULT_MAX_DEPTH`].
+///
+/// [`PartialJson::DEFAULT_MAX_DEPTH`]: crate::json::PartialJson::DEFAULT_MAX_DEPTH
 const DEEPEST: usize = 32;
 
 /// The whitespace JSON allows between tokens and around a value: these four characters and no

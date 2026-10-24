@@ -13,6 +13,8 @@
 //! string as it is, everything else as JSON, which [`shape`] pins); a property without a type, or
 //! a schema without properties, takes any text up to the value's close. When the calls sit in a
 //! block, the block's ways in frame one or more calls, as Kimi K3's do.
+//!
+//! [`shape`]: crate::shape
 
 use openai_protocol::common::Tool;
 use serde_json::Value;

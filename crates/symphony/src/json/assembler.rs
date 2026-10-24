@@ -307,6 +307,8 @@ impl Assembler {
     /// Whether the arguments the call has said are one whole JSON value a strict reader takes:
     /// the value's bytes are one by the judge's account ([`Prefix::whole`]), or none came and `{}`
     /// stands for them ([`Self::no_arguments`]).
+    ///
+    /// [`Prefix::whole`]: crate::json::Prefix::whole
     fn arguments_whole(&self, arguments: Option<&Span>) -> bool {
         match arguments {
             Some(_) => self.fragments.whole(),

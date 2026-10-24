@@ -23,7 +23,7 @@
 //! What the assembler cannot read as the call is never content: the block's markers and tags are
 //! the format's own tokens, and the text between them where the syntax has no place for text is
 //! the model's failed call, which the families' own parsers drop whole. Such bytes are refused
-//! ([`refuse`](super::refuse)): a `Malformed` event of no bytes with the reason counts the failure
+//! ([`refuse`]): a `Malformed` event of no bytes with the reason counts the failure
 //! where it stands, the bytes leave as `Dropped { MalformedCall }`, and a call that started keeps
 //! the pairs it read.
 //!
