@@ -43,15 +43,31 @@ pub(crate) fn validate(req: &CreateMessageRequest) -> Result<(), ValidationError
     validate_thinking(req)
 }
 
-/// `temperature` and `top_p` take the public API's range, 0 to 1.
+/// `temperature` takes the public API's range, 0 to 1; `top_p` the same range
+/// without its zero, and `top_k` at least 1. Every engine refuses a nucleus
+/// of nothing, and a `top_k` of 0 is "disabled" on one engine and an error on
+/// the others; the wire the engines read cannot tell either zero from a field
+/// the client left out, so such a request is refused here, with the engine's
+/// answer, instead of being sampled over the whole distribution or failing
+/// at the engine.
 fn validate_sampling(req: &CreateMessageRequest) -> Result<(), ValidationError> {
-    for (name, value) in [("temperature", req.temperature), ("top_p", req.top_p)] {
-        if value.is_some_and(|v| !(0.0..=1.0).contains(&v)) {
-            return Err(invalid(
-                "value_out_of_range",
-                format!("{name}: range: 0..1"),
-            ));
-        }
+    if req.temperature.is_some_and(|v| !(0.0..=1.0).contains(&v)) {
+        return Err(invalid(
+            "value_out_of_range",
+            "temperature: range: 0..1".to_owned(),
+        ));
+    }
+    if req.top_p.is_some_and(|v| !(v > 0.0 && v <= 1.0)) {
+        return Err(invalid(
+            "value_out_of_range",
+            "top_p: range: (0, 1]".to_owned(),
+        ));
+    }
+    if req.top_k.is_some_and(|k| k < 1) {
+        return Err(invalid(
+            "value_out_of_range",
+            "top_k: at least 1".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -380,8 +396,19 @@ mod tests {
     fn sampling_parameters_take_the_public_range() {
         assert!(rejection(json!({"temperature": 2.0})).contains("temperature: range: 0..1"));
         assert!(rejection(json!({"temperature": -1.0})).contains("temperature: range: 0..1"));
-        assert!(rejection(json!({"top_p": 1.5})).contains("top_p: range: 0..1"));
-        accepted(json!({"temperature": 1.0, "top_p": 0.0}));
+        assert!(rejection(json!({"top_p": 1.5})).contains("top_p: range: (0, 1]"));
+        accepted(json!({"temperature": 1.0, "top_p": 1.0, "top_k": 1}));
+        accepted(json!({"temperature": 0.0, "top_p": 0.5, "top_k": 40}));
+    }
+
+    #[test]
+    fn a_nucleus_of_nothing_and_a_top_k_of_zero_are_refused() {
+        // Every engine rejects a top_p of 0.0; a top_k of 0 is "disabled" on
+        // one engine and an error on the others; and the wire cannot tell
+        // either zero from a field the client left out, so the request gets
+        // the engine's answer here instead of a whole-distribution sample.
+        assert!(rejection(json!({"top_p": 0.0})).contains("top_p: range: (0, 1]"));
+        assert!(rejection(json!({"top_k": 0})).contains("top_k: at least 1"));
     }
 
     #[test]
