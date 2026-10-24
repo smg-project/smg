@@ -166,7 +166,7 @@ pub(crate) fn process_messages_prompt(
     // Step 3: Process tool call arguments in assistant messages (reuse from
     // chat_utils), unless the renderer parses them itself as written.
     if !capabilities.raw_tool_call_arguments {
-        chat_utils::process_tool_call_arguments(&mut transformed_messages)?;
+        chat_utils::process_tool_call_arguments(&mut transformed_messages);
     }
 
     // Step 4: Serialize tools to JSON values for template processing

@@ -101,7 +101,7 @@ impl SincePollDispatch {
 ///   way to an engine that has not seen them. A report releases the credit of
 ///   the dispatches made before its sample; while those sit in transit the
 ///   report reads emptier than the worker is, and the router would keep
-///   piling on (see [`Self::unaccounted_requests`]). Each is priced at `p̄`,
+///   piling on (see `Self::unaccounted_requests`). Each is priced at `p̄`,
 ///   like a dispatch whose size is unknown.
 /// - `/ throughput` — normalizes work to *time*, comparing heterogeneous
 ///   workers by drain time rather than raw token count.
@@ -124,7 +124,7 @@ impl SincePollDispatch {
 ///   relevant;
 /// - zero/absent generation throughput (the backend reports no rate, or
 ///   reports one for a rank with nothing running, which is a stale gauge
-///   rather than a rate; see [`live_throughput`]): the fleet's nominal rate,
+///   rather than a rate; see `live_throughput`): the fleet's nominal rate,
 ///   the mean live rate among the candidates, or `default_throughput` when
 ///   none has one;
 /// - a worker with no fresh snapshot while peers report: its live in-flight is

@@ -88,9 +88,10 @@ pub enum MediaError {
     /// the report as trailers (see [`WorkerMediaFault`] and the code's,
     /// `smg_grpc_client::MEDIA_CODE_METADATA_KEY`) under the gRPC code the
     /// fault would have had without them (`INVALID_ARGUMENT`,
-    /// `UNAVAILABLE`), so a Router that reads the trailers answers a 400 for
-    /// the media under `code` and records no worker failure, and one that
-    /// does not reads the gRPC code as before.
+    /// `UNAVAILABLE`), so a Router that reads the trailers answers the media
+    /// under `code` (a 400 for the request's own fault, a 502 for its host's)
+    /// and records no worker failure, and one that does not reads the gRPC
+    /// code as before.
     Media {
         fault: WorkerMediaFault,
         /// The code the public API answers: `media_fetch_failed` or

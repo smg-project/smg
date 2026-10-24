@@ -353,6 +353,9 @@ class _Requests:
     def one(self, prompt_tokens: int, max_tokens: int, rank: int | None = None) -> WarmupRequest:
         ordinal = self._next
         self._next += 1
+        # The exact form the Rust servicers admit while readiness is held
+        # (`is_warmup_request_id` in the engine servicer crate's request
+        # registry): the prefix, the ordinal, nothing else.
         return WarmupRequest(
             request_id=f"smg-warmup-{ordinal}",
             prompt_tokens=prompt_tokens,

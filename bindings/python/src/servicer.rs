@@ -916,7 +916,8 @@ impl PyVllmGrpcServer {
 
     /// Hold (`False`) or release (`True`) readiness alone: health flips,
     /// admission stays open for the launcher's own requests before SERVING
-    /// (its planned warm-up); `set_serving(False)` is the drain switch.
+    /// (its planned warm-up's, `smg-warmup-<n>`) and closes to every other;
+    /// `set_serving(False)` is the drain switch.
     fn set_ready(&self, ready: bool) {
         self.inner.set_ready(ready);
     }
@@ -1144,7 +1145,8 @@ impl PyTokenSpeedGrpcServer {
 
     /// Hold (`False`) or release (`True`) readiness alone: health flips,
     /// admission stays open for the launcher's own requests before SERVING
-    /// (its planned warm-up); `set_serving(False)` is the drain switch.
+    /// (its planned warm-up's, `smg-warmup-<n>`) and closes to every other;
+    /// `set_serving(False)` is the drain switch.
     fn set_ready(&self, ready: bool) {
         self.inner.set_ready(ready);
     }
@@ -1366,7 +1368,8 @@ impl PySglangGrpcServer {
 
     /// Hold (`False`) or release (`True`) readiness alone: health flips,
     /// admission stays open for the launcher's own requests before SERVING
-    /// (its planned warm-up); `set_serving(False)` is the drain switch.
+    /// (its planned warm-up's, `smg-warmup-<n>`) and closes to every other;
+    /// `set_serving(False)` is the drain switch.
     fn set_ready(&self, ready: bool) {
         self.inner.set_ready(ready);
     }

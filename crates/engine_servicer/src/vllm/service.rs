@@ -61,6 +61,24 @@ impl VllmEngine for VllmEngineService {
             .map(Response::new)
     }
 
+    async fn start_profile(
+        &self,
+        request: Request<common::StartProfileRequest>,
+    ) -> Result<Response<common::ProfileResponse>, Status> {
+        admin::start_profile(&self.state, request)
+            .await
+            .map(Response::new)
+    }
+
+    async fn stop_profile(
+        &self,
+        request: Request<common::StopProfileRequest>,
+    ) -> Result<Response<common::ProfileResponse>, Status> {
+        admin::stop_profile(&self.state, request)
+            .await
+            .map(Response::new)
+    }
+
     async fn abort(
         &self,
         request: Request<vllm::AbortRequest>,

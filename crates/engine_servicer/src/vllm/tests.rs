@@ -422,8 +422,9 @@ async fn health_gates_on_the_engine_link_and_the_drain_flag() {
     assert_eq!(unknown.code(), Code::NotFound);
 
     // Readiness held alone (the lifecycle owner's planned warm-up): health
-    // answers NOT_SERVING with its own message while admission stays open,
-    // then the release restores SERVING; the drain below closes admission.
+    // answers NOT_SERVING with its own message while admission stays open to
+    // the warm-up's own requests only, then the release restores SERVING and
+    // admits every request; the drain below closes admission.
     server.set_ready(false);
     let held = client
         .health_check(vllm::HealthCheckRequest::default())
@@ -432,14 +433,30 @@ async fn health_gates_on_the_engine_link_and_the_drain_flag() {
         .into_inner();
     assert!(!held.healthy);
     assert_eq!(held.message, "Warming up");
+    let refused = server
+        .state
+        .shared
+        .registry
+        .register("held-probe")
+        .err()
+        .expect("a request that is not the warm-up's is refused while readiness is held");
+    assert_eq!(refused.code(), Code::Unavailable);
+    assert_eq!(refused.message(), "servicer is warming up");
+    let (admitted, _cancel) = server
+        .state
+        .shared
+        .registry
+        .register("smg-warmup-1")
+        .expect("the warm-up's own request is admitted while readiness is held");
+    drop(admitted);
+    server.set_ready(true);
     let (admitted, _cancel) = server
         .state
         .shared
         .registry
         .register("held-probe")
-        .expect("admission stays open while readiness is held");
+        .expect("the release admits every request");
     drop(admitted);
-    server.set_ready(true);
     assert!(
         client
             .health_check(vllm::HealthCheckRequest::default())
@@ -2288,6 +2305,88 @@ mod flush_cache {
         answered
     }
 
+    /// `StartProfile` is vLLM's `profile(True)` as a utility call on every rank and
+    /// `StopProfile` its `profile(False)`; the engine's answer is the Python servicer's
+    /// success response; an option the engine takes only at its launch is refused before
+    /// any call; the engine's own failure (a profiler it was launched without) is INTERNAL
+    /// with its words.
+    #[tokio::test]
+    async fn starts_and_stops_the_profiler_through_utility_calls() {
+        let mut h = harness(model_info(), None).await;
+        for (start, expected_args, op_name) in [
+            (true, vec![OpaqueValue::from(true)], "Start profiling"),
+            (false, vec![OpaqueValue::from(false)], "Stop profiling"),
+        ] {
+            let answer = async {
+                let call = recv_utility(&mut h.engine_in).await;
+                h.engine_out
+                    .send_utility_reply(0, call.call_id, Ok(OpaqueValue::Nil))
+                    .await
+                    .unwrap();
+                call
+            };
+            let (response, call) = if start {
+                let (response, call) = tokio::join!(
+                    h.client
+                        .start_profile(common::StartProfileRequest::default()),
+                    answer
+                );
+                (response, call)
+            } else {
+                let (response, call) =
+                    tokio::join!(h.client.stop_profile(common::StopProfileRequest {}), answer);
+                (response, call)
+            };
+            assert_eq!(call.method, "profile");
+            assert_eq!(call.args, expected_args);
+            assert_eq!(call.client_index, 0);
+            let response = response.expect(op_name).into_inner();
+            assert!(response.success, "{op_name}");
+            assert_eq!(response.message, format!("{op_name} succeeded"));
+        }
+        // Options the engine takes at its launch are refused before any call.
+        let status = h
+            .client
+            .start_profile(common::StartProfileRequest {
+                output_dir: Some("/traces".to_string()),
+                num_steps: Some(3),
+                ..Default::default()
+            })
+            .await
+            .expect_err("refused");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(
+            status.message().contains("output_dir, num_steps"),
+            "{}",
+            status.message()
+        );
+        assert_engine_idle(&mut h.engine_in).await;
+        // The engine's own failure, in its words.
+        let (response, ()) = tokio::join!(
+            h.client
+                .start_profile(common::StartProfileRequest::default()),
+            async {
+                let call = recv_utility(&mut h.engine_in).await;
+                h.engine_out
+                    .send_utility_reply(
+                        0,
+                        call.call_id,
+                        Err("Profiler is not enabled.".to_string()),
+                    )
+                    .await
+                    .unwrap();
+            }
+        );
+        let status = response.expect_err("failed");
+        assert_eq!(status.code(), Code::Internal);
+        assert!(
+            status.message().contains("Profiler is not enabled"),
+            "{}",
+            status.message()
+        );
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
+
     /// The RPC is vLLM's `reset_prefix_cache(False, False)` as a utility call;
     /// `true` from the engine is the Python servicer's success response.
     #[tokio::test]
@@ -3518,6 +3617,10 @@ async fn an_engine_that_never_dials_in_fails_the_link_at_the_startup_bound() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     assert!(error.contains("timed out"), "{error}");
+    assert!(
+        error.starts_with("vLLM engine connection failed: "),
+        "{error}"
+    );
     assert!(!server.engine_ready());
     assert!(
         server.running(),
@@ -4757,4 +4860,65 @@ async fn a_process_hosting_two_servicers_keeps_two_registries() {
         .server
         .stop(Duration::from_secs(5))
         .expect("clean stop");
+}
+
+/// Readiness held for the lifecycle owner's planned warm-up: a request that
+/// is not the warm-up's own is refused as not serving before anything of it
+/// reaches the engine (the engine's next admission is the warm-up's), the
+/// warm-up's own request is served, and the release admits the other again.
+#[tokio::test]
+async fn a_request_that_is_not_the_warm_ups_is_refused_while_readiness_is_held() {
+    let mut h = harness(model_info(), None).await;
+    h.server.set_ready(false);
+    let status = h
+        .client
+        .generate(generate_request("chatcmpl-1", true, Vec::new()))
+        .await
+        .expect_err("readiness held: not the warm-up's request");
+    assert_eq!(status.code(), Code::Unavailable);
+    assert_eq!(status.message(), "servicer is warming up");
+    assert_eq!(h.server.active_requests(), 0);
+
+    let mut own = h
+        .client
+        .generate(generate_request("smg-warmup-1", true, Vec::new()))
+        .await
+        .expect("the warm-up's own request is admitted")
+        .into_inner();
+    let request = recv_add(&mut h.engine_in).await;
+    assert_eq!(
+        request.request_id, "smg-warmup-1",
+        "the engine's first admission is the warm-up's"
+    );
+    h.engine_out
+        .send_outputs(&batch(
+            "smg-warmup-1",
+            vec![10],
+            Some(EngineCoreFinishReason::Length),
+            None,
+        ))
+        .await
+        .unwrap();
+    while own.message().bounded().await.unwrap().is_some() {}
+
+    h.server.set_ready(true);
+    let mut late = h
+        .client
+        .generate(generate_request("chatcmpl-1", true, Vec::new()))
+        .await
+        .expect("the release admits every request")
+        .into_inner();
+    let request = recv_add(&mut h.engine_in).await;
+    assert_eq!(request.request_id, "chatcmpl-1");
+    h.engine_out
+        .send_outputs(&batch(
+            "chatcmpl-1",
+            vec![10],
+            Some(EngineCoreFinishReason::Length),
+            None,
+        ))
+        .await
+        .unwrap();
+    while late.message().bounded().await.unwrap().is_some() {}
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

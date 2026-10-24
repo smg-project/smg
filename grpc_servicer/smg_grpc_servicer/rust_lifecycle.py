@@ -1225,12 +1225,14 @@ async def drain_server(server: Any, engine: Any, timeout: float, poll_secs: floa
 
 def hold_readiness(server: Any, ready: bool) -> None:
     """Hold (``False``) or release (``True``) the server's health answer
-    alone, admission left open, so the servicer's own requests still reach
-    the engine while readiness is held (the planned warm-up runs over the
-    server's own port): ``set_ready`` where the server has it. ``set_serving``
-    is the drain switch (it closes admission as well, and would refuse the
-    warm-up's requests); a server without ``set_ready`` is an older binding
-    whose ``set_serving`` flipped health alone, and that is what it gets."""
+    alone, admission left open to the servicer's own requests (the planned
+    warm-up's ``smg-warmup-<n>``, over the server's own port) and closed to
+    every other while readiness is held, so nothing shares the engine's
+    steps with the warm-up: ``set_ready`` where the server has it.
+    ``set_serving`` is the drain switch (it closes admission as well, and
+    would refuse the warm-up's requests); a server without ``set_ready`` is
+    an older binding whose ``set_serving`` flipped health alone, and that is
+    what it gets."""
     setter = getattr(server, "set_ready", None)
     if setter is None:
         setter = server.set_serving

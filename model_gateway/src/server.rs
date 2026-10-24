@@ -58,7 +58,7 @@ pub mod posture;
 
 use crate::{
     app_context::AppContext,
-    config::RouterConfig,
+    config::{ParserChoice, RouterConfig},
     endpoints::{conversations, models, parse, responses as response_handlers, tokenize},
     mesh::MeshAdapters,
     mesh_discovery::{start_mesh_discovery, MeshDiscoveryConfig},
@@ -71,8 +71,11 @@ use crate::{
         metrics_server, otel_trace, runtime_metrics,
     },
     routers::{
-        common::realtime::ws::RealtimeQueryParams, error as route_error, gateway::Gateway,
-        grpc::common::responses::spawn_unstored_sweeper, http::router::StreamBodyState,
+        common::realtime::ws::RealtimeQueryParams,
+        error as route_error,
+        gateway::Gateway,
+        grpc::{common::responses::spawn_unstored_sweeper, regular::symphony::telemetry},
+        http::router::StreamBodyState,
         RouterTrait,
     },
     server::{
@@ -1988,6 +1991,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let metrics_handle = config.prometheus_config.as_ref().map(|prometheus_config| {
         let handle = metrics::start_prometheus(prometheus_config.clone());
         metrics::init_startup_series();
+        // Under Symphony the series of a request no table reads exist at zero
+        // from the start; a table's own follow its model's first registration.
+        if config.router_config.parser == ParserChoice::Symphony {
+            telemetry::init_startup_series();
+        }
         handle
     });
 

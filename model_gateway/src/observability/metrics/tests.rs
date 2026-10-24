@@ -187,6 +187,64 @@ fn record_engine_load_sets_core_gauges_per_dp_rank() {
     );
 }
 
+/// The capacity behind the usage ratio is a series of its own when the
+/// engine reports it, and absent when the record carries the ratio alone.
+#[test]
+fn record_engine_load_sets_the_kv_capacity_when_the_engine_reports_it() {
+    let mut response = WorkerLoadResponse {
+        timestamp: "t".to_string(),
+        dp_rank_count: 1,
+        loads: vec![SchedulerLoadSnapshot {
+            dp_rank: 2,
+            token_usage: 0.5,
+            max_total_num_tokens: 262_144,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let rendered = render_with_recorder(|| {
+        Metrics::record_engine_load("http://w:1", "m", &response);
+    });
+    assert_metric(
+        &rendered,
+        "smg_engine_kv_capacity_tokens",
+        &CORE_LABELS,
+        "262144",
+    );
+    assert_metric(&rendered, "smg_engine_token_usage", &CORE_LABELS, "0.5");
+
+    response.loads[0].max_total_num_tokens = 0;
+    let rendered = render_with_recorder(|| {
+        Metrics::record_engine_load("http://w:1", "m", &response);
+    });
+    assert!(
+        !rendered.contains("smg_engine_kv_capacity_tokens"),
+        "a record without the capacity sets no series; rendered:\n{rendered}"
+    );
+    assert_metric(&rendered, "smg_engine_token_usage", &CORE_LABELS, "0.5");
+}
+
+/// A model's block size is one gauge, set from what the gateway knows, and
+/// 0 once it knows none.
+#[test]
+fn the_kv_block_size_of_a_model_is_a_gauge() {
+    let rendered = render_with_recorder(|| {
+        Metrics::set_kv_block_size("m", 16);
+        Metrics::set_kv_block_size("m", 64);
+    });
+    assert_metric(
+        &rendered,
+        "smg_kv_block_size_tokens",
+        &["model=\"m\""],
+        "64",
+    );
+    let rendered = render_with_recorder(|| {
+        Metrics::set_kv_block_size("m", 64);
+        Metrics::set_kv_block_size("m", 0);
+    });
+    assert_metric(&rendered, "smg_kv_block_size_tokens", &["model=\"m\""], "0");
+}
+
 #[test]
 fn record_engine_load_sets_pd_gauges_when_disagg_present() {
     let response = WorkerLoadResponse {
@@ -925,6 +983,7 @@ fn the_stream_timing_set_renders_the_same_through_kept_handles() {
                 ttft,
                 generation_duration: Duration::from_millis(50),
                 input_tokens,
+                cached_tokens: input_tokens.map(|input| input / 10),
                 output_tokens,
             });
         }
@@ -936,6 +995,7 @@ fn the_stream_timing_set_renders_the_same_through_kept_handles() {
             ttft: None,
             generation_duration: Duration::from_millis(20),
             input_tokens: None,
+            cached_tokens: None,
             output_tokens: 1,
         });
     };
@@ -953,6 +1013,7 @@ fn the_stream_timing_set_renders_the_same_through_kept_handles() {
     for expected in [
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\",token_type=\"output\"} 7",
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\",token_type=\"input\"} 107",
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\",token_type=\"cached\"} 10",
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\",endpoint=\"generate\",token_type=\"output\"} 1",
         "smg_router_ttft_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 2",
         "smg_router_tpot_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 1",
@@ -968,6 +1029,7 @@ fn the_stream_timing_set_renders_the_same_through_kept_handles() {
         "smg_router_ttft_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\"",
         "smg_router_tpot_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\"",
         "model=\"m2\",endpoint=\"generate\",token_type=\"input\"",
+        "model=\"m2\",endpoint=\"generate\",token_type=\"cached\"",
     ] {
         assert!(!kept.contains(absent), "unexpected {absent} in:\n{kept}");
     }
@@ -1166,6 +1228,7 @@ fn time_per_router_record() {
             ttft: Some(Duration::from_millis(50)),
             generation_duration: Duration::from_secs(1),
             input_tokens: Some(128),
+            cached_tokens: Some(64),
             output_tokens: 128,
         });
         duration();

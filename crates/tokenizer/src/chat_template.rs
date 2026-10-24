@@ -871,10 +871,11 @@ struct JsonSeparators {
 }
 
 impl JsonSeparators {
-    fn python_default(indent: Option<i64>) -> Self {
-        // Python's json.dumps defaults to `(', ', ': ')` for compact output
-        // and `(',', ': ')` when pretty indentation is enabled.
-        let item: &'static [u8] = if indent.is_some() { b"," } else { b", " };
+    /// Python's defaults: `(', ', ': ')` for compact output and `(',', ': ')`
+    /// when an indent was given (`pretty`), whatever the indent is: an empty
+    /// one still puts every item on its own line.
+    fn python_default(pretty: bool) -> Self {
+        let item: &'static [u8] = if pretty { b"," } else { b", " };
         Self {
             item: Cow::Borrowed(item),
             key: Cow::Borrowed(b": "),
@@ -893,11 +894,14 @@ struct PythonJsonFormatter {
 }
 
 impl PythonJsonFormatter {
-    fn new(indent: Option<usize>, separators: JsonSeparators, ensure_ascii: bool) -> Self {
+    /// `indent` is the bytes written per level of nesting, `None` for compact
+    /// output; an empty indent breaks the lines and indents nothing, as
+    /// Python's `json.dumps(indent=0)` does.
+    fn new(indent: Option<Vec<u8>>, separators: JsonSeparators, ensure_ascii: bool) -> Self {
         Self {
             current_indent: 0,
             has_value: false,
-            indent: indent.map(|spaces| vec![b' '; spaces]),
+            indent,
             separators,
             ensure_ascii,
         }
@@ -1075,15 +1079,47 @@ fn invalid_tojson_option(message: impl Into<String>) -> MinijinjaError {
     MinijinjaError::new(ErrorKind::InvalidOperation, message.into())
 }
 
+/// The indent `tojson(indent=...)` asked for, as Python's `json.dumps` reads
+/// it: nothing (compact output); an integer, that many spaces, and none at
+/// all when it is zero or negative (Python multiplies one space by it, so the
+/// lines still break); a bool as the integer it is in Python (`True` is one
+/// space); a string as the literal indent (`"\t"`, `""`); any other kind is
+/// refused, as Python refuses a float.
+fn parse_indent(indent: Option<Value>) -> std::result::Result<Option<Vec<u8>>, MinijinjaError> {
+    let Some(indent) = indent else {
+        return Ok(None);
+    };
+    match indent.kind() {
+        ValueKind::None | ValueKind::Undefined => Ok(None),
+        ValueKind::Bool => Ok(Some(if indent.is_true() {
+            vec![b' ']
+        } else {
+            Vec::new()
+        })),
+        ValueKind::Number if indent.is_integer() => {
+            let spaces = indent.as_i64().ok_or_else(|| {
+                invalid_tojson_option("indent is too large to be a number of spaces")
+            })?;
+            Ok(Some(vec![b' '; usize::try_from(spaces).unwrap_or(0)]))
+        }
+        ValueKind::String => Ok(Some(
+            indent.as_str().unwrap_or_default().as_bytes().to_vec(),
+        )),
+        other => Err(invalid_tojson_option(format!(
+            "indent must be an integer or a string, not {other}"
+        ))),
+    }
+}
+
 fn parse_separators(
     separators: Option<Value>,
-    indent: Option<i64>,
+    pretty: bool,
 ) -> std::result::Result<JsonSeparators, MinijinjaError> {
     let Some(separators) = separators else {
-        return Ok(JsonSeparators::python_default(indent));
+        return Ok(JsonSeparators::python_default(pretty));
     };
     if separators.is_none() || separators.is_undefined() {
-        return Ok(JsonSeparators::python_default(indent));
+        return Ok(JsonSeparators::python_default(pretty));
     }
 
     let parsed: serde_json::Value = serde_json::to_value(&separators).map_err(|e| {
@@ -1115,21 +1151,11 @@ fn parse_separators(
 
 fn serialize_with_python_json<T: Serialize>(
     value: &T,
-    indent: Option<i64>,
+    indent: Option<&[u8]>,
     separators: JsonSeparators,
     ensure_ascii: bool,
 ) -> std::result::Result<String, MinijinjaError> {
-    let indent = indent
-        .map(|spaces| {
-            if spaces < 0 {
-                Err(invalid_tojson_option("indent cannot be negative"))
-            } else {
-                Ok(spaces as usize)
-            }
-        })
-        .transpose()?;
-
-    let formatter = PythonJsonFormatter::new(indent, separators, ensure_ascii);
+    let formatter = PythonJsonFormatter::new(indent.map(<[u8]>::to_vec), separators, ensure_ascii);
     // Sized for a tool schema up front: a buffer grown from empty is
     // reallocated at every doubling on the way to the same size.
     let mut buf = Vec::with_capacity(TOJSON_BUFFER_BYTES);
@@ -1150,7 +1176,7 @@ fn serialize_with_python_json<T: Serialize>(
 
 /// Compact JSON spelling shared by the Jinja filter and native renderers.
 pub(crate) fn compact_python_json(value: &JsonValue) -> Result<String> {
-    serialize_with_python_json(value, None, JsonSeparators::python_default(None), false)
+    serialize_with_python_json(value, None, JsonSeparators::python_default(false), false)
         .map_err(Into::into)
 }
 
@@ -1159,7 +1185,8 @@ pub(crate) fn compact_python_json(value: &JsonValue) -> Result<String> {
 /// HuggingFace transformers registers a custom `tojson` filter that accepts additional
 /// keyword arguments beyond what standard Jinja2 provides:
 /// - `ensure_ascii` (bool): Whether to escape non-ASCII characters
-/// - `indent` (int): Number of spaces for indentation (pretty-printing)
+/// - `indent` (int or str): the indent per level of nesting, as Python reads it: a number of
+///   spaces (zero or negative breaks the lines and indents nothing) or the literal string
 /// - `separators`: Custom item/key separators for JSON output
 /// - `sort_keys` (bool): Whether to sort dictionary keys
 ///
@@ -1167,14 +1194,15 @@ pub(crate) fn compact_python_json(value: &JsonValue) -> Result<String> {
 /// See: https://github.com/huggingface/transformers/blob/main/src/transformers/utils/chat_template_utils.py
 fn tojson_filter(value: Value, kwargs: Kwargs) -> std::result::Result<Value, MinijinjaError> {
     let ensure_ascii: Option<bool> = kwargs.get("ensure_ascii")?;
-    let indent: Option<i64> = kwargs.get("indent")?;
+    let indent: Option<Value> = kwargs.get("indent")?;
     let separators: Option<Value> = kwargs.get("separators")?;
     let sort_keys: Option<bool> = kwargs.get("sort_keys")?;
 
     // Ensure all kwargs are consumed to avoid "unknown keyword argument" errors
     kwargs.assert_all_used()?;
 
-    let separators = parse_separators(separators, indent)?;
+    let indent = parse_indent(indent)?;
+    let separators = parse_separators(separators, indent.is_some())?;
     let ensure_ascii = ensure_ascii.unwrap_or(false);
     // The template value is written straight into its JSON text: its serde
     // form is what a `serde_json::Value` built from it would serialize as
@@ -1190,12 +1218,12 @@ fn tojson_filter(value: Value, kwargs: Kwargs) -> std::result::Result<Value, Min
         })?;
         serialize_with_python_json(
             &sort_json_keys(&json_value),
-            indent,
+            indent.as_deref(),
             separators,
             ensure_ascii,
         )
     } else {
-        serialize_with_python_json(&value, indent, separators, ensure_ascii)
+        serialize_with_python_json(&value, indent.as_deref(), separators, ensure_ascii)
     };
 
     json_str.map(Value::from_safe_string)
@@ -3365,13 +3393,13 @@ mod tests {
         for (indent, ensure_ascii) in [
             (None, false),
             (None, true),
-            (Some(2), false),
-            (Some(0), true),
+            (Some(&b"  "[..]), false),
+            (Some(&b""[..]), true),
         ] {
             let direct = serialize_with_python_json(
                 &given,
                 indent,
-                JsonSeparators::python_default(indent),
+                JsonSeparators::python_default(indent.is_some()),
                 ensure_ascii,
             )
             .unwrap();
@@ -3379,7 +3407,7 @@ mod tests {
             let through_tree = serialize_with_python_json(
                 &tree,
                 indent,
-                JsonSeparators::python_default(indent),
+                JsonSeparators::python_default(indent.is_some()),
                 ensure_ascii,
             )
             .unwrap();
@@ -3388,6 +3416,84 @@ mod tests {
                 "indent {indent:?} ensure_ascii {ensure_ascii}"
             );
         }
+    }
+
+    /// `tojson(indent=...)` renders as Python's `json.dumps(indent=...)` for
+    /// every kind of indent a template may write: an integer is that many
+    /// spaces, zero and a negative integer break the lines and indent nothing,
+    /// a bool is the integer it is in Python, a string is the literal indent
+    /// (a tab, two spaces, any text, the empty string), and the item separator
+    /// is the pretty one (`,`) whenever an indent was given, empty or not; a
+    /// float is refused, as Python refuses it. The expectations are Python
+    /// 3.12's `json.dumps(value, indent=indent, ensure_ascii=False)`.
+    #[test]
+    fn tojson_indent_renders_as_python_for_every_kind_of_indent() {
+        let value = serde_json::json!({"a": [1, {"b": 2}], "c": {}, "d": [], "e": "x"});
+        let newlines_only =
+            "{\n\"a\": [\n1,\n{\n\"b\": 2\n}\n],\n\"c\": {},\n\"d\": [],\n\"e\": \"x\"\n}";
+        let one_space = "{\n \"a\": [\n  1,\n  {\n   \"b\": 2\n  }\n ],\n \"c\": {},\n \"d\": [],\n \"e\": \"x\"\n}";
+        let two_spaces = "{\n  \"a\": [\n    1,\n    {\n      \"b\": 2\n    }\n  ],\n  \"c\": {},\n  \"d\": [],\n  \"e\": \"x\"\n}";
+        let oracle: [(serde_json::Value, &str); 13] = [
+            (serde_json::Value::Null, r#"{"a": [1, {"b": 2}], "c": {}, "d": [], "e": "x"}"#),
+            (serde_json::json!(0), newlines_only),
+            (serde_json::json!(-1), newlines_only),
+            (serde_json::json!(-5), newlines_only),
+            (serde_json::json!(1), one_space),
+            (serde_json::json!(2), two_spaces),
+            (serde_json::json!(true), one_space),
+            (serde_json::json!(false), newlines_only),
+            (serde_json::json!(""), newlines_only),
+            (serde_json::json!(" "), one_space),
+            (serde_json::json!("  "), two_spaces),
+            (
+                serde_json::json!("\t"),
+                "{\n\t\"a\": [\n\t\t1,\n\t\t{\n\t\t\t\"b\": 2\n\t\t}\n\t],\n\t\"c\": {},\n\t\"d\": [],\n\t\"e\": \"x\"\n}",
+            ),
+            (
+                serde_json::json!("ab"),
+                "{\nab\"a\": [\nabab1,\nabab{\nababab\"b\": 2\nabab}\nab],\nab\"c\": {},\nab\"d\": [],\nab\"e\": \"x\"\n}",
+            ),
+        ];
+        let processor = ChatTemplateProcessor::new(
+            "{{ messages[0].v | tojson(indent=messages[0].i) }}".to_string(),
+        )
+        .unwrap();
+        for (indent, want) in &oracle {
+            let messages = [serde_json::json!({"role": "user", "v": value, "i": indent})];
+            let rendered = processor
+                .apply_chat_template(&messages, ChatTemplateParams::default())
+                .unwrap();
+            assert_eq!(&rendered, want, "indent {indent}");
+        }
+        // Keys sorted under a string indent, and empty containers on one line.
+        let processor = ChatTemplateProcessor::new(
+            "{{ messages[0].v | tojson(indent=messages[0].i, sort_keys=True) }}".to_string(),
+        )
+        .unwrap();
+        let messages = [serde_json::json!({
+            "role": "user", "v": {"b": 1, "a": {"d": [], "c": 2}}, "i": "\t"
+        })];
+        let rendered = processor
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "{\n\t\"a\": {\n\t\t\"c\": 2,\n\t\t\"d\": []\n\t},\n\t\"b\": 1\n}"
+        );
+        // A float is no indent, in Python either.
+        let processor = ChatTemplateProcessor::new(
+            "{{ messages[0].v | tojson(indent=messages[0].i) }}".to_string(),
+        )
+        .unwrap();
+        let messages = [serde_json::json!({"role": "user", "v": value, "i": 2.0})];
+        let error = processor
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("indent must be an integer or a string"),
+            "{error}"
+        );
     }
 
     /// transformers renders with `tools=None` and `documents=None` when the

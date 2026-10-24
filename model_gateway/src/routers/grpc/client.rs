@@ -261,7 +261,8 @@ impl GrpcClient {
         match self {
             Self::Sglang(client) => client.start_profile(req).await,
             Self::TokenSpeed(client) => client.start_profile(req).await,
-            Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => Err(tonic::Status::unimplemented(
+            Self::Vllm(client) => client.start_profile(req).await,
+            Self::Trtllm(_) | Self::Mlx(_) => Err(tonic::Status::unimplemented(
                 "StartProfile RPC not supported for this backend",
             )),
         }
@@ -273,7 +274,8 @@ impl GrpcClient {
         match self {
             Self::Sglang(client) => client.stop_profile().await,
             Self::TokenSpeed(client) => client.stop_profile().await,
-            Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => Err(tonic::Status::unimplemented(
+            Self::Vllm(client) => client.stop_profile().await,
+            Self::Trtllm(_) | Self::Mlx(_) => Err(tonic::Status::unimplemented(
                 "StopProfile RPC not supported for this backend",
             )),
         }

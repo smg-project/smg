@@ -9,7 +9,7 @@ use symphony::{
     Format,
 };
 
-use super::{template::Templates, SymphonyError};
+use super::{telemetry, template::Templates, SymphonyError};
 use crate::{
     config::{ParserChoice, TEMPLATE_PARSER},
     routers::grpc::utils::{answering_to, ModelNames, Names},
@@ -238,6 +238,20 @@ pub(crate) fn reads(
     templates: &Templates,
 ) -> Result<Option<Arc<Format>>, SymphonyError> {
     table_reading(parser, names, model, templates).map(|read| read.map(|(format, _)| format))
+}
+
+/// The `table` label under which Symphony counts `model`'s outputs ([`telemetry`]), when a table
+/// reads them: the table [`decision`] gives for the names set for the model, or the response
+/// template's name for a model read through its template. `None` when the legacy parsers read the
+/// model: its requests count under `none`, whose series exist from start-up. Asked at the model's
+/// first registration, so the table's series exist at zero before its first output
+/// (`workflow::steps::local::create_worker`).
+pub(crate) fn table_label_read(names: &ModelNames<'_>, model: &str) -> Option<&'static str> {
+    match decision(names, model) {
+        Decision::Template => Some(telemetry::TEMPLATE),
+        Decision::Table(format) => Some(telemetry::table_label(format.name())),
+        Decision::Legacy(_) => None,
+    }
 }
 
 /// What the gateway's flags select for `model`, a model the registry knows, that the precedence of
@@ -1380,5 +1394,46 @@ mod tests {
             ),
             Err(SymphonyError::Name(text)) if text == "unknown tool-call parser 'nonsense'"
         ));
+    }
+
+    /// The label a model's outputs count under is known from its names at registration: the
+    /// registry's table for a model it knows, the labels' table over it, the flags' table for a
+    /// model the registry does not know, the template's name, and none for a model the legacy
+    /// parsers read.
+    #[test]
+    fn the_table_label_a_model_counts_under_is_known_from_its_names() {
+        let no_flags = Names::default();
+        let flags = pair(Some("mistral_v13"), None);
+        let read = |labels: Names, flags: &Names, model: &str| {
+            table_label_read(&ModelNames { labels, flags }, model)
+        };
+        assert_eq!(
+            read(Names::default(), &no_flags, "Qwen/Qwen3-8B"),
+            Some("qwen3")
+        );
+        assert_eq!(
+            read(pair(Some("kimi_k2"), None), &no_flags, "Qwen/Qwen3-8B"),
+            Some("kimi_k2")
+        );
+        assert_eq!(
+            read(Names::default(), &flags, "acme/unknown-model"),
+            Some("mistral_v13")
+        );
+        assert_eq!(
+            read(
+                pair(Some(TEMPLATE_PARSER), None),
+                &no_flags,
+                "Qwen/Qwen3-8B"
+            ),
+            Some("response_template")
+        );
+        assert_eq!(
+            read(Names::default(), &no_flags, "acme/unknown-model"),
+            None
+        );
+        assert_eq!(
+            read(pair(Some("passthrough"), None), &no_flags, "Qwen/Qwen3-8B"),
+            None
+        );
     }
 }

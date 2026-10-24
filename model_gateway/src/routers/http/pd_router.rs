@@ -373,7 +373,7 @@ impl PDRouter {
                         error!("Failed to read response body: {}", e);
                         error::internal_error(
                             "read_response_body_failed",
-                            format!("Failed to read response body: {e}"),
+                            format!("Failed to read response body: {}", cause(&e)),
                         )
                     }
                 }
@@ -413,7 +413,7 @@ impl PDRouter {
                 error!("Failed to proxy request server: {}", e);
                 error::internal_error(
                     "proxy_request_failed",
-                    format!("Failed to proxy request: {e}"),
+                    format!("Failed to proxy request: {}", cause(&e)),
                 )
             }
         }
@@ -1109,7 +1109,10 @@ impl PDRouter {
         let retry_after = response.headers().get(RETRY_AFTER).cloned();
         let detail = match response.bytes().await {
             Ok(body) => upstream_error_message(&body),
-            Err(e) => format!("{status}, and its error body could not be read: {e}"),
+            Err(e) => format!(
+                "{status}, and its error body could not be read: {}",
+                cause(&e)
+            ),
         };
         let mut answer = side.answer(SidePhase::Start, status, detail);
         if let Some(value) = retry_after {
@@ -1170,7 +1173,7 @@ impl PDRouter {
     ) -> Response {
         error!("PD {what} timed out: {e}");
         Self::record_sequential_side(worker, role, StatusCode::GATEWAY_TIMEOUT);
-        request_timeout_response(format!("{what} timed out: {e}"))
+        request_timeout_response(format!("{what} timed out: {}", cause(e)))
     }
 
     /// A side that failed below HTTP in `phase`: the call never reached its
@@ -1378,7 +1381,7 @@ impl PDRouter {
                 // records the 504 on both workers as it records every status.
                 if is_request_timeout(&e) {
                     error!("PD request timed out, both sides aborted: {e}");
-                    return request_timeout_response(format!("Transport error: {e}"));
+                    return request_timeout_response(format!("Transport error: {}", cause(&e)));
                 }
                 error!(
                     worker_type = side.name(),
@@ -2020,7 +2023,7 @@ impl PDRouter {
                     }
                     Err(e) if is_request_timeout(&e) => {
                         error!("Decode response timed out: {e}");
-                        request_timeout_response(format!("Failed to read response: {e}"))
+                        request_timeout_response(format!("Failed to read response: {}", cause(&e)))
                     }
                     Err(e) => {
                         error!("Failed to read decode response: {}", e);
@@ -2241,7 +2244,7 @@ impl PDRouter {
             Ok(decode_body) => decode_body,
             Err(e) if is_request_timeout(&e) => {
                 error!("Decode response timed out: {e}");
-                return request_timeout_response(format!("Failed to read response: {e}"));
+                return request_timeout_response(format!("Failed to read response: {}", cause(&e)));
             }
             Err(e) => {
                 error!("Failed to read decode response: {}", e);
@@ -2708,7 +2711,7 @@ impl RouterTrait for PDRouter {
                 worker.record_outcome(StatusCode::BAD_GATEWAY.as_u16());
                 return error::bad_gateway(
                     "prefill_count_tokens_failed",
-                    format!("Prefill server error: {e}"),
+                    format!("Prefill server error: {}", cause(&e)),
                 );
             }
         };
@@ -2728,7 +2731,7 @@ impl RouterTrait for PDRouter {
                 worker.record_outcome(StatusCode::BAD_GATEWAY.as_u16());
                 error::bad_gateway(
                     "prefill_count_tokens_failed",
-                    format!("Failed to read prefill response: {e}"),
+                    format!("Failed to read prefill response: {}", cause(&e)),
                 )
             }
         }
@@ -2802,6 +2805,98 @@ mod tests {
         tenant::TenantKey,
         worker::{circuit_breaker::CircuitState, BasicWorkerBuilder, WorkerType},
     };
+
+    /// A call that never reached its worker, with the worker's URL on the
+    /// error as reqwest attaches it.
+    async fn call_refused_by(addr: std::net::SocketAddr) -> reqwest::Error {
+        crate::clients::http_client_builder()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/generate"))
+            .send()
+            .await
+            .unwrap_err()
+    }
+
+    /// The message of the error envelope `response` carries.
+    async fn error_message(response: Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        body["error"]["message"].as_str().unwrap().to_string()
+    }
+
+    /// A side that failed below HTTP is answered with the side's words and the
+    /// transport's reason, and never with the worker's address: the client is
+    /// told what happened, not where the gateway's workers are.
+    #[tokio::test]
+    async fn a_side_that_failed_below_http_is_answered_without_the_workers_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let worker = BasicWorkerBuilder::new(format!("http://{addr}")).build();
+        let error = call_refused_by(addr).await;
+        assert!(
+            error.url().is_some(),
+            "reqwest attaches the URL to the error"
+        );
+
+        let response = PDRouter::side_failed_below_http(
+            PdSide::Prefill,
+            SidePhase::Start,
+            "prefill request",
+            &worker,
+            &error,
+        );
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let message = error_message(response).await;
+        assert!(
+            message.starts_with(PdSide::Prefill.description(SidePhase::Start)),
+            "{message}"
+        );
+        assert!(message.contains("error sending request"), "{message}");
+        assert!(!message.contains(&addr.to_string()), "{message}");
+        assert!(!message.contains("for url"), "{message}");
+    }
+
+    /// The request's own timeout on a side is the gateway's 504 with the
+    /// reason, and the worker's address stays out of it the same way.
+    #[tokio::test]
+    async fn a_side_that_timed_out_is_answered_without_the_workers_address() {
+        // Never accepted: the connect completes into the backlog and the
+        // request waits for an answer that never comes until the client's
+        // timeout fires.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = BasicWorkerBuilder::new(format!("http://{addr}")).build();
+        let error = crate::clients::http_client_builder()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/generate"))
+            .send()
+            .await
+            .unwrap_err();
+        drop(listener);
+        assert!(is_request_timeout(&error));
+
+        let response = PDRouter::side_failed_below_http(
+            PdSide::Decode,
+            SidePhase::Start,
+            "decode request",
+            &worker,
+            &error,
+        );
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let message = error_message(response).await;
+        assert!(
+            message.starts_with("decode request timed out: "),
+            "{message}"
+        );
+        assert!(!message.contains(&addr.to_string()), "{message}");
+        assert!(!message.contains("for url"), "{message}");
+    }
 
     #[test]
     fn pd_route_facts_per_request_type() {

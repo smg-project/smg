@@ -1077,6 +1077,35 @@ impl ZmqEngineClient {
         Ok(results.iter().all(|result| result.as_bool() == Some(true)))
     }
 
+    /// vLLM's `profile(is_start)` on every connected rank, as the Python
+    /// servicer's `AsyncLLM.start_profile` / `stop_profile` issue it: the
+    /// engine's own torch profiler, configured at its launch, starts, or
+    /// stops and exports its traces. `Ok` once every rank answered; the wait
+    /// is bounded by `timeout` (DEADLINE_EXCEEDED); an engine failure (a
+    /// profiler the engine was launched without) is INTERNAL with the
+    /// engine's words, a dead engine UNAVAILABLE. TokenSpeed and SGLang have
+    /// control calls of their own ([`Self::profile_sglang`]).
+    pub async fn profile_vllm(
+        &self,
+        is_start: bool,
+        timeout: Duration,
+    ) -> Result<(), tonic::Status> {
+        let ZmqBackend::Vllm(client) = &self.backend else {
+            return Err(tonic::Status::unimplemented(
+                "StartProfile and StopProfile are only available on a vLLM ZMQ backend",
+            ));
+        };
+        let args = vec![OpaqueValue::from(is_start)];
+        let calls = client
+            .engines()
+            .iter()
+            .map(|engine| client.call_utility(&engine.engine_id, "profile", args.clone(), timeout));
+        futures::future::try_join_all(calls)
+            .await
+            .map_err(utility_status)?;
+        Ok(())
+    }
+
     /// Latest per-rank load for one engine index, if the backend has reported
     /// it: every dialect piggybacks it on its output batches.
     fn engine_load(&self, engine_index: u32) -> Option<EngineLoad> {
@@ -1936,6 +1965,96 @@ mod tests {
         let (client, _engine, _dir) = connected_pair(RuntimeType::TokenSpeed).await;
         let status = client
             .reset_prefix_cache(Duration::from_secs(1))
+            .await
+            .expect_err("tokenspeed");
+        assert_eq!(status.code(), Code::Unimplemented);
+    }
+
+    /// Answer each rank's next utility call with its entry in `answers` (the
+    /// engine's `profile` returns nothing), returning the calls received.
+    async fn answer_profile(
+        engines: &mut [MockEngine],
+        answers: &[Result<(), &str>],
+    ) -> Vec<UtilityCall> {
+        let mut calls = Vec::new();
+        for (index, (engine, answer)) in engines.iter_mut().zip(answers).enumerate() {
+            let EngineInbound::Utility(call) = engine.recv().await.expect("inbound") else {
+                panic!("expected a utility call");
+            };
+            let outcome = answer.map(|()| OpaqueValue::Nil).map_err(str::to_string);
+            engine
+                .send_utility_reply(index as u32, call.call_id, outcome)
+                .await
+                .expect("reply");
+            calls.push(call);
+        }
+        calls
+    }
+
+    /// StartProfile's and StopProfile's engine half: `profile(is_start)` goes
+    /// to every rank, with the start's and the stop's flag; one rank's failure
+    /// fails the whole call, in the engine's words.
+    #[tokio::test]
+    async fn profile_vllm_reaches_every_rank() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) = connected_ranks(dir.path(), 2).await;
+        for is_start in [true, false] {
+            let (result, calls) = tokio::join!(
+                client.profile_vllm(is_start, Duration::from_secs(5)),
+                answer_profile(&mut engines, &[Ok(()), Ok(())])
+            );
+            result.unwrap();
+            assert_eq!(calls.len(), 2);
+            for call in &calls {
+                assert_eq!(call.method, "profile");
+                assert_eq!(call.args, vec![OpaqueValue::from(is_start)]);
+            }
+        }
+        let (status, calls) = tokio::join!(
+            client.profile_vllm(true, Duration::from_secs(5)),
+            answer_profile(&mut engines, &[Ok(()), Err("Profiler is not enabled.")])
+        );
+        let status = status.expect_err("one rank failed");
+        assert_eq!(status.code(), Code::Internal);
+        assert!(
+            status.message().contains("Profiler is not enabled."),
+            "{status:?}"
+        );
+        assert_eq!(calls.len(), 2);
+    }
+
+    /// The wait expiring is the caller's deadline; an engine failure is the
+    /// engine's, with its message.
+    #[tokio::test]
+    async fn profile_vllm_maps_timeouts_and_failures_to_statuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) = connected_ranks(dir.path(), 1).await;
+        let status = client
+            .profile_vllm(true, Duration::from_millis(200))
+            .await
+            .expect_err("no answer");
+        assert_eq!(status.code(), Code::DeadlineExceeded);
+        // The unanswered call did reach the engine; drain it.
+        assert!(matches!(
+            engines[0].recv().await.unwrap(),
+            EngineInbound::Utility(_)
+        ));
+
+        let (status, _) = tokio::join!(
+            client.profile_vllm(false, Duration::from_secs(5)),
+            answer_profile(&mut engines, &[Err("Call to profile method failed: boom")])
+        );
+        let status = status.expect_err("engine failure");
+        assert_eq!(status.code(), Code::Internal);
+        assert!(status.message().contains("boom"), "{status:?}");
+    }
+
+    /// TokenSpeed has no profiler call on the ZMQ wire.
+    #[tokio::test]
+    async fn profile_vllm_is_unimplemented_for_tokenspeed() {
+        let (client, _engine, _dir) = connected_pair(RuntimeType::TokenSpeed).await;
+        let status = client
+            .profile_vllm(true, Duration::from_secs(1))
             .await
             .expect_err("tokenspeed");
         assert_eq!(status.code(), Code::Unimplemented);

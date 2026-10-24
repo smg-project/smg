@@ -43,7 +43,6 @@ pub use media::{
 use service::VllmEngineService;
 use smg_grpc_client::vllm_proto::vllm_engine_server::VllmEngineServer;
 use tonic::service::Routes;
-use tracing::info;
 
 use crate::{
     engine_link::{EngineLink, TokenizerSlot},
@@ -320,49 +319,21 @@ impl VllmServicerServer {
         );
         let connect_state = Arc::clone(&state);
         let stats_state = Arc::clone(&state);
-        let silence = config.servicer.silence_bounds();
-        let ServicerConfig {
-            bind_address,
-            metrics_bind_address,
-            ipc_base_url,
-            handshake_address,
-            engine_count,
-            tokenizer_dir,
-            engine_startup_timeout,
-            engine_startup_ceiling,
-            ..
-        } = config.servicer;
         let server = servicer::Server::start(
             "smg-vllm-servicer",
-            &bind_address,
-            metrics_bind_address.as_deref(),
+            config.servicer,
             SERVICE_NAME,
+            "vLLM",
             &state,
             routes,
-            move |address, last_error| {
-                // Fire-and-forget on the server runtime: dropping the runtime
-                // with the server thread cancels a still-running connect.
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "engine connect is fire-and-forget; the runtime drop cancels it"
-                )]
-                let _connect = tokio::spawn(connect_engine(
-                    connect_state,
-                    ipc_base_url,
-                    handshake_address,
-                    engine_count,
-                    engine_startup_timeout,
-                    engine_startup_ceiling,
-                    silence,
-                    tokenizer_dir,
-                    last_error,
-                ));
+            move |inputs| {
+                // The stats line runs beside the connect, from the start.
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "the stats log is fire-and-forget; the runtime drop ends it"
                 )]
                 let _stats = tokio::spawn(info::log_engine_stats(stats_state));
-                info!(%address, "vLLM gRPC servicer listening");
+                connect_engine(connect_state, inputs)
             },
         )?;
         Ok(Self { server, state })
@@ -408,9 +379,11 @@ impl VllmServicerServer {
     }
 
     /// Hold (`false`) or release (`true`) readiness alone: health flips as
-    /// with `set_serving`, admission stays open, so the lifecycle owner's own
-    /// requests (its planned warm-up before SERVING) still reach the engine.
-    /// `set_serving(false)` is the drain switch and closes admission as well.
+    /// with `set_serving`, admission stays open to the lifecycle owner's own
+    /// requests (its planned warm-up before SERVING, `smg-warmup-<n>`) and to
+    /// nothing else, so the warm-up's steps share the engine with no client
+    /// request. `set_serving(false)` is the drain switch and closes admission
+    /// as well.
     pub fn set_ready(&self, ready: bool) {
         self.state.shared.set_ready(ready);
     }

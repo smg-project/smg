@@ -160,6 +160,9 @@ pub mod metrics_labels {
     // Token types
     pub const TOKEN_INPUT: &str = "input";
     pub const TOKEN_OUTPUT: &str = "output";
+    /// The prompt tokens the engine served from its cache: a share of
+    /// `input`, counted again under its own type.
+    pub const TOKEN_CACHED: &str = "cached";
 
     // PD KV connector modes (smg_pd_kv_connector_mode_total)
     pub const KV_CONNECTOR_MOONCAKE: &str = "mooncake";

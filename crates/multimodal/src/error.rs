@@ -162,9 +162,9 @@ pub enum MediaFault {
     Client,
     /// The media host's, for now: a fetch that ran out of its budget, a 5xx
     /// answer, a transfer that broke while the body arrived. Answered as the
-    /// request's own is ([`Self::Client`], a 400): an origin that does not
-    /// deliver is the request's input, which the reference APIs answer a
-    /// 4xx for; the fault stays told apart for the logs.
+    /// host's trouble (a 502 under the media's code, where the request's own
+    /// is a 400), so a client can tell what to retry from what to fix; it
+    /// says as little about the process that fetched as [`Self::Client`].
     Transient,
     /// This process's: a decode task that panicked or was cancelled, a
     /// scratch file or a decoder process that failed on this side (a

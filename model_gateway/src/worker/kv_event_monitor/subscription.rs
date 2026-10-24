@@ -299,6 +299,7 @@ impl KvEventMonitor {
                 tokens,
                 from_events: true,
             };
+            Metrics::set_kv_block_size(model_id, tokens);
             info!(
                 model_id = %model_id,
                 block_size = tokens,

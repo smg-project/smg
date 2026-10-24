@@ -807,8 +807,39 @@ impl schemars::JsonSchema for FunctionCall {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct FunctionCallResponse {
     pub name: String,
-    #[serde(default)]
+    /// The call's arguments as JSON text, the shape the API documents and a
+    /// response carries. A request's history may carry a call's arguments as
+    /// the JSON object itself (a client that replays the parsed call rather
+    /// than the text it received); the engines accept both shapes and hand
+    /// their template an object either way, so both are read here, an
+    /// object kept as its JSON text.
+    #[serde(default, deserialize_with = "deserialize_arguments_text")]
     pub arguments: Option<String>, // JSON string
+}
+
+/// Tool-call `arguments` as text: a JSON string as written, a JSON object as
+/// its compact JSON text (keys in their order), null or absent as none. Any
+/// other shape is refused.
+fn deserialize_arguments_text<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text)),
+        Some(object @ Value::Object(_)) => Ok(Some(object.to_string())),
+        Some(Value::Array(_)) => Err(de::Error::invalid_type(
+            de::Unexpected::Seq,
+            &"a JSON string or an object",
+        )),
+        Some(Value::Bool(flag)) => Err(de::Error::invalid_type(
+            de::Unexpected::Bool(flag),
+            &"a JSON string or an object",
+        )),
+        Some(Value::Number(_)) => Err(de::Error::invalid_type(
+            de::Unexpected::Other("a number"),
+            &"a JSON string or an object",
+        )),
+    }
 }
 
 // ============================================================================
@@ -1244,6 +1275,56 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// A history tool call's `arguments`: the JSON text the API documents,
+    /// or the JSON object itself, kept as its text so every reader and a
+    /// forwarded request see the documented shape; null and absent are
+    /// none; any other shape is refused.
+    #[test]
+    fn tool_call_arguments_are_read_as_text_or_as_an_object() {
+        let call = |arguments: Value| -> Result<ToolCall, serde_json::Error> {
+            serde_json::from_value(json!({
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": arguments}
+            }))
+        };
+        let text = call(json!("{\"city\": \"Paris\"}")).expect("text");
+        assert_eq!(
+            text.function.arguments.as_deref(),
+            Some("{\"city\": \"Paris\"}")
+        );
+
+        let object = call(json!({"unit": "celsius", "city": "Paris"})).expect("object");
+        assert_eq!(
+            object.function.arguments.as_deref(),
+            Some("{\"unit\":\"celsius\",\"city\":\"Paris\"}")
+        );
+        let forwarded = serde_json::to_value(&object).expect("serialize");
+        assert_eq!(
+            forwarded["function"]["arguments"],
+            json!("{\"unit\":\"celsius\",\"city\":\"Paris\"}")
+        );
+
+        assert!(call(Value::Null)
+            .expect("null")
+            .function
+            .arguments
+            .is_none());
+        let absent: ToolCall = serde_json::from_value(json!({
+            "id": "call_1", "type": "function", "function": {"name": "get_weather"}
+        }))
+        .expect("absent");
+        assert!(absent.function.arguments.is_none());
+
+        for other in [json!(42), json!(["x"]), json!(true)] {
+            let error = call(other.clone()).expect_err("refused").to_string();
+            assert!(
+                error.contains("expected a JSON string or an object"),
+                "{other}: {error}"
+            );
+        }
+    }
 
     #[test]
     fn the_logprobs_object_carries_content_and_refusal() {

@@ -137,6 +137,15 @@ performed by vLLM's own `inprocess` or `redis` processors; configure those
 through the engine's media loader settings. SGLang and TokenSpeed currently
 use the Router's media pipeline, so set the budgets on the Router for them.
 
+A fetch that fails is answered under `media_fetch_failed` by whose fault it
+is, on the Router's pipeline and the vLLM Rust worker's alike: a reference the
+request got wrong (a URL that cannot be parsed or resolved, a host that refuses
+the connection or answers 4xx, a payload that is not the media it claims to
+be) is a 400; a host that does not deliver within the budget, answers 5xx or
+breaks the transfer is a 502, so a client knows whether to retry. Neither
+counts against the worker's circuit breaker, and the Router does not replay
+either on another worker, which would meet the same host.
+
 On the router side, `--mm-processing` selects `auto` (default: forward when
 every registered worker of the model advertises `mm_processor` and the model's
 spec opts in, or every one of those workers runs the router's own pipeline,
@@ -274,8 +283,9 @@ tokens, and the time-to-first-token, inter-token, per-request-mean and
 end-to-end latency histograms (vLLM's own bucket edges), plus the servicer's
 lifecycle state and start time. The listener binds beside the gRPC one, before
 the engine connects (a scrape during the engine's start answers
-`smg_servicer_state{state="starting"} 1`; a readiness hold with admission open
-reads `warming_up`, a drain `draining`), runs on its own thread, and closes
+`smg_servicer_state{state="starting"} 1`; a readiness hold (admission open to
+the warm-up's own requests only) reads `warming_up`, a drain `draining`), runs
+on its own thread, and closes
 with the servicer; a port equal to `--port` is refused before the engine
 starts, and the flag needs `--servicer-impl rust` (the Python servicer exposes
 no endpoint). A planned warm-up's own requests go through the request path
@@ -350,7 +360,11 @@ contract the Python servicer serves: text generation, PD disaggregation
 (`--kv-transfer-config`: connector params pass through both ways and
 `GetServerInfo` carries the pairing identity), Router-preprocessed media
 (inline and `/dev/shm` tensors), worker-side media processing (`media_refs`,
-below), `Embed`, `FlushCache`, `GetTokenizer` (which answers
+below), `Embed`, `FlushCache`, `StartProfile` and `StopProfile` (the engine's own
+torch profiler as its launch configured it, started and stopped on every rank;
+a start that sets per-request options is refused, since the engine takes its
+profiler's directory and options at launch; the same on the Python servicer),
+`GetTokenizer` (which answers
 FAILED_PRECONDITION when the launcher could not resolve a local tokenizer
 directory) and `SubscribeKvEvents` (vLLM's ZMQ publisher, which the servicer
 turns on by itself, on this path as on the Python one, when the launcher is

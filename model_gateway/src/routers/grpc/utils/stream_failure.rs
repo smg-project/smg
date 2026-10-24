@@ -103,6 +103,13 @@ impl UpstreamClass {
             metrics_labels::ERROR_CONSTRAINT
         } else if is_the_engines_own_report(status) {
             metrics_labels::ERROR_ENGINE
+        } else if status.media_fault().is_some() {
+            // The request's media failed, on whichever side of the fetch: the
+            // router counts it as the request's error (the reference is the
+            // request's input) and never as the worker's, whatever status
+            // tells the client to do about it (a 400 to fix the reference, a
+            // 502 to try the host again later).
+            metrics_labels::ERROR_VALIDATION
         } else {
             error_type_from_status(http)
         };
@@ -730,16 +737,28 @@ mod tests {
     #[test]
     fn a_failure_of_the_requests_media_takes_no_breaker_sample() {
         // A worker that predates the media-fault trailer reports the media
-        // host's failure on UNAVAILABLE, in the connector's words. It is
-        // answered as the request's own input (a 400), so the router counts
-        // it as the request's error, and the worker's breaker never sees it.
+        // host's failure on UNAVAILABLE, in the connector's words. The client
+        // is answered for the host (a 502, so it knows to retry), but the
+        // router counts it as the request's error (the reference is the
+        // request's input), not the worker's: no breaker sample, no
+        // worker-failure class, and the router-error family keeps the
+        // request's label.
         let status = tonic::Status::unavailable(
             "media fetch of https://media.example/a.png timed out after 10s",
         );
-        assert_eq!(UpstreamClass::of(&status).breaker_sample, None);
+        let class = UpstreamClass::of(&status);
+        assert_eq!(
+            (class.http, class.error_type, class.breaker_sample),
+            (StatusCode::BAD_GATEWAY, "validation_error", None)
+        );
+        assert!(!class.is_worker_failure());
+        let failure = StreamFailure::upstream(status.clone(), 7);
+        assert_eq!(failure.error_type(), "server_error");
         let (worker, handle) = account_on_a_fresh_worker(status);
         assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
-        assert_eq!(router_error_type(&handle.render()), "validation_error");
+        let rendered = handle.render();
+        assert_eq!(worker_error_type(&rendered), None, "{rendered}");
+        assert_eq!(router_error_type(&rendered), "validation_error");
     }
 
     #[test]

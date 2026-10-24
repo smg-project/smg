@@ -146,12 +146,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          the recorded template run keeps or drops the role: one case of every such model",
     ),
     (
-        "*/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12): one \
-         case of every model",
-    ),
-    (
         "*/render/tools-history-content-and-call",
         "the gateway parses a history call's arguments into an object before rendering, \
          which the templates that write the string as recorded render otherwise: one \
@@ -366,18 +360,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "hermes-4-14b/render/tools-history-single-call",
         "the gateway parses tool-call arguments into objects before rendering, which this \
          template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "lightonocr-0.9b-16k-1025/render/*",
-        "the template's text has a backslash and an n where a newline would be \
-         (`system<|im_end|>\\n`), which the reference run keeps as the two characters \
-         and the gateway's render turns into the newline: every case of the model",
-    ),
-    (
-        "lightonocr-0.9b-32k-1025/render/*",
-        "the template's text has a backslash and an n where a newline would be \
-         (`system<|im_end|>\\n`), which the reference run keeps as the two characters \
-         and the gateway's render turns into the newline: every case of the model",
     ),
     (
         "llama-3.1-nemotron-nano-8b-v1/render/glaive-v2-32.jsonl",

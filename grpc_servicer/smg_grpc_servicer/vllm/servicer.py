@@ -36,7 +36,7 @@ from smg_grpc_servicer.kv_relay import Engine, relay
 from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
 from smg_grpc_servicer.trace_context import trace_headers
 from smg_grpc_servicer.vllm import attach_vllm_logging, settle_logging
-from smg_grpc_servicer.vllm.admin import flush_cache
+from smg_grpc_servicer.vllm.admin import flush_cache, start_profile, stop_profile
 from smg_grpc_servicer.vllm.config_view import EngineConfigView, uses_mrope
 from smg_grpc_servicer.vllm.errors import grpc_code_for
 from smg_grpc_servicer.vllm.kv_events import (
@@ -770,6 +770,20 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         context: grpc.aio.ServicerContext,
     ) -> common_pb2.FlushCacheResponse:
         return await flush_cache(self.engine, request, context)
+
+    async def StartProfile(
+        self,
+        request: common_pb2.StartProfileRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> common_pb2.ProfileResponse:
+        return await start_profile(self.engine, request, context)
+
+    async def StopProfile(
+        self,
+        request: common_pb2.StopProfileRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> common_pb2.ProfileResponse:
+        return await stop_profile(self.engine, context)
 
     async def Abort(
         self,

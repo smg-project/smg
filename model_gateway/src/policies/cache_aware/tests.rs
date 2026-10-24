@@ -2732,6 +2732,59 @@ fn test_overlap_affinity_group_prefers_deeper_partial_match() {
 
 // -- select_worker_event_driven integration tests --
 
+/// Every event-driven decision observes its predicted overlap on the match
+/// ratio histogram: a request cached whole on one worker reads 1, a novel
+/// request 0, so the histogram is the production signal of the prediction.
+#[test]
+fn an_event_driven_decision_observes_its_match_ratio() {
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    policy.init_workers(&workers);
+    update_expected_wait_loads(&policy, &workers, &[0, 0]);
+    let monitor = Arc::new(KvEventMonitor::new());
+    let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4], &[5, 6, 7, 8]]);
+    monitor.indexers.insert("unknown".to_string(), indexer);
+    policy.set_kv_event_monitor(Some(monitor));
+
+    let recorder = PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Full(String::from("smg_cache_aware_match_ratio")),
+            CACHE_AWARE_MATCH_RATIO_BUCKETS,
+        )
+        .unwrap()
+        .build_recorder();
+    let handle = recorder.handle();
+    let cached = [1, 2, 3, 4, 5, 6, 7, 8];
+    let novel = [101, 102, 103, 104, 105, 106, 107, 108];
+    metrics::with_local_recorder(&recorder, || {
+        for request in [&cached, &novel] {
+            policy
+                .select_worker(
+                    &workers,
+                    &SelectWorkerInfo {
+                        tokens: Some(request),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+    });
+    let rendered = handle.render();
+    for series in [
+        "smg_cache_aware_policy_branch_total{branch=\"event_hit\"} 1",
+        "smg_cache_aware_policy_branch_total{branch=\"event_miss\"} 1",
+        "smg_cache_aware_match_ratio_bucket{le=\"0\"} 1",
+        "smg_cache_aware_match_ratio_bucket{le=\"0.9\"} 1",
+        "smg_cache_aware_match_ratio_bucket{le=\"1\"} 2",
+        "smg_cache_aware_match_ratio_count 2",
+    ] {
+        assert!(
+            rendered.lines().any(|line| line == series),
+            "missing {series} in:\n{rendered}"
+        );
+    }
+}
+
 #[test]
 fn event_unique_hit_keeps_affinity_and_credits_expected_wait() {
     let policy = CacheAwarePolicy::with_config(test_config());
@@ -2785,24 +2838,54 @@ fn a_worker_with_an_emptied_index_gets_the_warm_up_slice_whatever_its_age() {
     // w1's first block (the shared head) followed by eleven novel blocks.
     let mut request: Vec<u32> = (1..=4).collect();
     request.extend(90_000..90_044);
-    let picks: Vec<usize> = (0..8)
-        .map(|_| {
-            policy
-                .select_worker(
-                    &workers,
-                    &SelectWorkerInfo {
-                        tokens: Some(&request),
-                        ..Default::default()
-                    },
-                )
-                .unwrap()
-        })
-        .collect();
+    let recorder = PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Full(String::from("smg_cache_aware_match_ratio")),
+            CACHE_AWARE_MATCH_RATIO_BUCKETS,
+        )
+        .unwrap()
+        .build_recorder();
+    let handle = recorder.handle();
+    let picks: Vec<usize> = metrics::with_local_recorder(&recorder, || {
+        (0..8)
+            .map(|_| {
+                policy
+                    .select_worker(
+                        &workers,
+                        &SelectWorkerInfo {
+                            tokens: Some(&request),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+            })
+            .collect()
+    });
     assert!(
         picks.contains(&1),
         "the emptied worker got its slice of the thin-overlap requests: {picks:?}"
     );
     assert!(picks.contains(&0), "the holder kept the rest: {picks:?}");
+    // Every decision observed the chosen worker's overlap, the slice's
+    // included (w2 holds nothing: a zero; w1 one block of twelve), so the
+    // histogram's count is the count of decisions.
+    let sliced = picks.iter().filter(|&&pick| pick == 1).count();
+    let rendered = handle.render();
+    assert!(
+        rendered.lines().any(|line| line
+            .starts_with("smg_cache_aware_policy_branch_total{branch=\"warmup_slice\"} ")),
+        "no warm-up slice decision in:\n{rendered}"
+    );
+    for series in [
+        format!("smg_cache_aware_match_ratio_bucket{{le=\"0\"}} {sliced}"),
+        String::from("smg_cache_aware_match_ratio_bucket{le=\"0.1\"} 8"),
+        String::from("smg_cache_aware_match_ratio_count 8"),
+    ] {
+        assert!(
+            rendered.lines().any(|line| line == series),
+            "missing {series} in:\n{rendered}"
+        );
+    }
 }
 
 #[test]

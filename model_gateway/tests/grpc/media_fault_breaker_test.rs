@@ -251,12 +251,12 @@ async fn answers_of(
 }
 
 /// Twenty requests whose media the worker could not fetch, in each of the
-/// forms the worker reports it, are each answered for the media (a 400
-/// `invalid_request_error`: the request's own reference and an origin that
-/// does not deliver alike, under the code the worker names, and
-/// `media_fetch_failed` from a worker that names none) and leave the
-/// worker's breaker closed and the worker in rotation; the request after
-/// them is served.
+/// forms the worker reports it, are each answered for the media (the
+/// request's own reference a 400 `invalid_request_error`, an origin that
+/// does not deliver right now a 502 `server_error`, under the code the
+/// worker names, and `media_fetch_failed` from a worker that names none) and
+/// leave the worker's breaker closed and the worker in rotation; the request
+/// after them is served.
 #[tokio::test]
 async fn media_faults_are_answered_for_the_media_and_leave_the_worker_in_rotation() {
     let cases = [
@@ -267,6 +267,7 @@ async fn media_faults_are_answered_for_the_media_and_leave_the_worker_in_rotatio
                  status client error (404 Not Found) for url (https://media.example/missing.png)",
             )),
             "media_fetch_failed",
+            StatusCode::BAD_REQUEST,
         ),
         (
             "the media host's fault, reported in the trailer",
@@ -275,6 +276,7 @@ async fn media_faults_are_answered_for_the_media_and_leave_the_worker_in_rotatio
                  https://media.example/picture.png timed out after 10s",
             )),
             "media_fetch_failed",
+            StatusCode::BAD_GATEWAY,
         ),
         (
             "a size refusal, with its code in the trailer",
@@ -286,6 +288,7 @@ async fn media_faults_are_answered_for_the_media_and_leave_the_worker_in_rotatio
                 "media_too_large",
             ),
             "media_too_large",
+            StatusCode::BAD_REQUEST,
         ),
         (
             "a worker that predates the trailer",
@@ -294,14 +297,19 @@ async fn media_faults_are_answered_for_the_media_and_leave_the_worker_in_rotatio
                  sending request for url (https://media.example/picture.png)",
             ),
             "media_fetch_failed",
+            StatusCode::BAD_GATEWAY,
         ),
     ];
-    for (name, refusal, code) in cases {
+    for (name, refusal, code, status) in cases {
+        let kind = if status.is_server_error() {
+            "server_error"
+        } else {
+            "invalid_request_error"
+        };
         let (answers, worker) = answers_of(refusal, 20, 21).await;
         for (index, answer) in answers[..20].iter().enumerate() {
             assert_eq!(
-                answer.status,
-                StatusCode::BAD_REQUEST,
+                answer.status, status,
                 "{name}: request {index}: {}",
                 answer.body
             );
@@ -311,7 +319,7 @@ async fn media_faults_are_answered_for_the_media_and_leave_the_worker_in_rotatio
                 answer.body
             );
             assert_eq!(
-                answer.body["error"]["type"], "invalid_request_error",
+                answer.body["error"]["type"], kind,
                 "{name}: {}",
                 answer.body
             );

@@ -24,7 +24,9 @@ use llm_multimodal::{
 };
 use llm_tokenizer::{Encoding, TokenizerTrait};
 
-use crate::routers::{error, grpc::proto_wrapper::VLLM_MROPE_GRID_KEYS};
+use crate::routers::{
+    common::retry::mark_non_retryable, error, grpc::proto_wrapper::VLLM_MROPE_GRID_KEYS,
+};
 
 /// Bridges the gateway's tokenizer to the model registry's local tokenizer
 /// seam: `llm-multimodal` deliberately depends on no tokenizer crate, so the
@@ -138,13 +140,17 @@ pub(crate) fn media_verdict(error: &anyhow::Error) -> Option<&MediaConnectorErro
 
 /// The client's answer for a failure of the router-side media pipeline, by
 /// the connector's verdict on it, the same the worker-side pipeline reports
-/// for the same failure: a failure of the request's media (a reference it got
-/// wrong, an origin that does not deliver within the fetch budget, a clip
-/// over a size cap) is a 400 under the media's code (`media_fetch_failed`,
-/// `media_too_large`); this process's own fault (a scratch file, a decoder it
-/// cannot run, a decode task that died) a 500; a failure with no verdict in
-/// its chain (a part the pipeline does not take, a model it has no spec for)
-/// stays a 400 `multimodal_processing_failed`.
+/// for the same failure: a failure of the request's own media (a reference it
+/// got wrong, an origin that refuses or answers 4xx, a clip over a size cap)
+/// is a 400 under the media's code (`media_fetch_failed`, `media_too_large`);
+/// a failure of the media's host for now (an origin that does not deliver
+/// within the fetch budget, answers 5xx or breaks the transfer) a 502 under
+/// the same code, so a client can tell what to fix from what to retry, and
+/// terminal for the retry layer (another attempt would meet the same host);
+/// this process's own fault (a scratch file, a decoder it cannot run, a
+/// decode task that died) a 500; a failure with no verdict in its chain (a
+/// part the pipeline does not take, a model it has no spec for) stays a 400
+/// `multimodal_processing_failed`.
 /// An item the engine could never place ([`encoder_budget::ItemOverEncoderBudget`])
 /// is a 400 under a code of its own, so a client can tell the item's size from a
 /// fetch or a decode that failed.
@@ -156,8 +162,11 @@ pub(crate) fn processing_failed_response(error: &anyhow::Error) -> Response {
     }
     if let Some(media) = media_verdict(error) {
         return match media.fault() {
-            MediaFault::Client | MediaFault::Transient => {
-                error::bad_request(media.code().as_str(), message)
+            MediaFault::Client => error::bad_request(media.code().as_str(), message),
+            MediaFault::Transient => {
+                let mut response = error::bad_gateway(media.code().as_str(), message);
+                mark_non_retryable(&mut response);
+                response
             }
             MediaFault::Internal => error::internal_error(PIPELINE_CODE, message),
         };
@@ -480,18 +489,33 @@ mod tests {
         (status, header, body)
     }
 
-    /// A fetch that ran out of its budget and a host that cannot be resolved
-    /// are the request's own input, a 400 `invalid_request_error` under
-    /// `media_fetch_failed`; a clip over the decoded-size cap and an item
-    /// over the input cap are 400s under `media_too_large`; a scratch file
-    /// that failed on this side and a preprocessing task that died are 500
-    /// `server_error`s; a failure with no connector verdict keeps the
-    /// pipeline's own 400 code. The message is the whole chain in every case.
+    /// A fetch that ran out of its budget and an origin that answered 5xx are
+    /// the media host's trouble for now, a 502 `server_error` under
+    /// `media_fetch_failed`; a host that cannot be resolved is the request's
+    /// own input, a 400 `invalid_request_error` under the same code; a clip
+    /// over the decoded-size cap and an item over the input cap are 400s
+    /// under `media_too_large`; a scratch file that failed on this side and
+    /// a preprocessing task that died are 500 `server_error`s; a failure with
+    /// no connector verdict keeps the pipeline's own 400 code. The message is
+    /// the whole chain in every case.
     #[tokio::test]
     async fn a_pipeline_failure_is_answered_by_the_connectors_verdict() {
         let finalize = |media: MediaConnectorError| {
             anyhow::Error::new(MultiModalError::Media(media))
                 .context("Failed to finalize multimodal tracker")
+        };
+        let origin_answered = |status: u16| {
+            let response = reqwest::Response::from(
+                http::Response::builder()
+                    .status(status)
+                    .body("")
+                    .expect("a response"),
+            );
+            finalize(MediaConnectorError::Http(
+                response
+                    .error_for_status()
+                    .expect_err("a 5xx is the fetch's error"),
+            ))
         };
         let died = tokio::task::spawn_blocking(|| panic!("the preprocessor died"))
             .await
@@ -503,6 +527,18 @@ mod tests {
                     url: "https://media.example/video_251mb.mp4".to_string(),
                     budget: Duration::from_secs(30),
                 }),
+                StatusCode::BAD_GATEWAY,
+                "media_fetch_failed",
+                "server_error",
+            ),
+            (
+                origin_answered(503),
+                StatusCode::BAD_GATEWAY,
+                "media_fetch_failed",
+                "server_error",
+            ),
+            (
+                origin_answered(404),
                 StatusCode::BAD_REQUEST,
                 "media_fetch_failed",
                 "invalid_request_error",
@@ -573,6 +609,35 @@ mod tests {
             assert_eq!(body["error"]["type"], kind, "{message}: {body}");
             assert_eq!(body["error"]["message"], message, "{body}");
         }
+    }
+
+    /// The media host's trouble is answered as the host's (a 502) and is
+    /// terminal for the retry layer: another attempt, on this worker or
+    /// another, would fetch from the same host; the request's own fault stays
+    /// a 400, terminal by its status.
+    #[test]
+    fn a_media_hosts_failure_is_terminal_for_the_retry_layer() {
+        use crate::routers::common::retry::is_retryable_response;
+
+        let timed_out = anyhow::Error::new(MultiModalError::Media(MediaConnectorError::Timeout {
+            url: "https://media.example/clip.mp4".to_string(),
+            budget: Duration::from_secs(30),
+        }))
+        .context("Failed to finalize multimodal tracker");
+        let response = processing_failed_response(&timed_out);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            !is_retryable_response(&response),
+            "a media host's failure is not replayed"
+        );
+
+        let wrong = anyhow::Error::new(MultiModalError::Media(
+            MediaConnectorError::UnsupportedScheme("ftp".to_string()),
+        ))
+        .context("Failed to finalize multimodal tracker");
+        let response = processing_failed_response(&wrong);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!is_retryable_response(&response));
     }
 
     /// The decoder availability gauges land in the recorder in force when the

@@ -11,6 +11,11 @@ logger = logging.getLogger(__name__)
 
 _RESET_RPC_TIMEOUT_S = 30.0
 _RETRY_INTERVAL_S = 0.1
+# The most a profiler start or stop may take (the other servicers' PROFILE_TIMEOUT);
+# the client's gRPC deadline caps it when shorter.
+PROFILE_TIMEOUT_S = 600.0
+# The StartProfile options the engine takes at its launch, not per request.
+_LAUNCH_TIME_OPTIONS = ("output_dir", "start_step", "num_steps", "with_stack", "record_shapes")
 
 
 async def _reset_prefix_cache(engine) -> bool:
@@ -39,6 +44,59 @@ async def _reset_prefix_cache(engine) -> bool:
         if isinstance(result, BaseException):
             raise result
     return all(result is True for result in results)
+
+
+def _launch_time_options_set(request) -> list[str]:
+    named = [name for name in _LAUNCH_TIME_OPTIONS if request.HasField(name)]
+    if request.activities:
+        named.append("activities")
+    if request.profile_by_stage:
+        named.append("profile_by_stage")
+    return named
+
+
+async def start_profile(engine, request, context) -> common_pb2.ProfileResponse:
+    """Start the engine's own torch profiler on every rank (``AsyncLLM.start_profile``).
+
+    The engine takes its profiler's directory and options at its launch, not per
+    request: a start that sets any of them is refused (``INVALID_ARGUMENT``), so an
+    operator is never told a trace went where, or how, it did not.
+    """
+    named = _launch_time_options_set(request)
+    if named:
+        await context.abort(
+            grpc.StatusCode.INVALID_ARGUMENT,
+            f"StartProfile options {', '.join(named)} cannot be set per request on this "
+            "engine: its profiler's directory and options are its launch configuration; "
+            "send a start with no options",
+        )
+        return common_pb2.ProfileResponse(success=False, message="Start profiling refused")
+    return await _profile(engine.start_profile, "Start profiling", context)
+
+
+async def stop_profile(engine, context) -> common_pb2.ProfileResponse:
+    """Stop the profiler and export its traces (``AsyncLLM.stop_profile``)."""
+    return await _profile(engine.stop_profile, "Stop profiling", context)
+
+
+async def _profile(call, op_name, context) -> common_pb2.ProfileResponse:
+    budget = PROFILE_TIMEOUT_S
+    rpc_remaining = context.time_remaining()
+    if rpc_remaining is not None:
+        budget = min(budget, rpc_remaining)
+    try:
+        await asyncio.wait_for(call(), timeout=budget)
+    # asyncio.TimeoutError is a separate exception on Python 3.10.
+    except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041
+        await context.abort(
+            grpc.StatusCode.DEADLINE_EXCEEDED, f"{op_name} timed out after {budget:g}s"
+        )
+        return common_pb2.ProfileResponse(success=False, message=f"{op_name} timed out")
+    except Exception as e:  # noqa: BLE001 - the engine's own failure, in its words
+        logger.exception("%s failed", op_name)
+        await context.abort(grpc.StatusCode.INTERNAL, f"{op_name} failed: {e}")
+        return common_pb2.ProfileResponse(success=False, message=f"{op_name} failed")
+    return common_pb2.ProfileResponse(success=True, message=f"{op_name} succeeded")
 
 
 async def flush_cache(engine, request, context) -> common_pb2.FlushCacheResponse:

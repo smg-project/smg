@@ -2,6 +2,7 @@
 
 use axum::response::Response;
 use http::StatusCode;
+use llm_multimodal::MediaErrorCode;
 
 use super::tonic_ext::CONSTRAINT_FAILED_CODE;
 use crate::{
@@ -69,11 +70,16 @@ const GATEWAY_REFUSAL_CODES: &[&str] = &[
 /// minted the code, no worker took the request, so it is not a backend's
 /// error whatever its status. The one relay that copies a worker's own code
 /// into the response, the Decisions path, counts a worker that answers with
-/// one of these codes the same way; every other response counts by its
-/// status through [`error_type_from_status`],
-/// the map a worker's status takes at dispatch and after the first chunk
-/// alike. The client's `error.type` is untouched: a 503 reads `server_error`
-/// as before.
+/// one of these codes the same way. A failure of the request's media
+/// (a response under one of the [`MediaErrorCode`]s, from the router's own
+/// media pipeline or a worker's report) counts as the request's error,
+/// `validation_error`, whichever status tells the client what to do about
+/// it: a 400 to fix the reference, a 502 to try the host again later; the
+/// reference is the request's input, and a host a client names must not
+/// count as a backend's failure. Every other response counts by its status
+/// through [`error_type_from_status`], the map a worker's status takes at
+/// dispatch and after the first chunk alike. The client's `error.type` is
+/// untouched: a 503 reads `server_error` as before.
 pub(crate) fn error_type_for_response(response: &Response) -> &'static str {
     let code = extract_error_code_from_response(response);
     if GATEWAY_REFUSAL_CODES.contains(&code) {
@@ -84,6 +90,12 @@ pub(crate) fn error_type_for_response(response: &Response) -> &'static str {
     // `TonicStatusExt::constraint_failure_response`).
     if code == CONSTRAINT_FAILED_CODE {
         return metrics_labels::ERROR_CONSTRAINT;
+    }
+    // The request's media failed (see `TonicStatusExt::media_fault`,
+    // `multimodal::processing_failed_response`): the request's error whichever
+    // status tells the client what to do about it.
+    if MediaErrorCode::parse(code).is_some() {
+        return metrics_labels::ERROR_VALIDATION;
     }
     error_type_from_status(response.status())
 }
@@ -132,6 +144,55 @@ mod tests {
         assert_eq!(error_type_for_response(&response), "constraint_error");
         let other = error::create_error(StatusCode::UNPROCESSABLE_ENTITY, "other", "other");
         assert_eq!(error_type_for_response(&other), "internal_error");
+    }
+
+    /// A failure of the request's media counts as the request's error on both
+    /// paths that answer it before any stream exists, the router's media
+    /// pipeline and a worker's report, whichever status the client reads: the
+    /// host's trouble (a 502) as much as the reference the request got wrong
+    /// (a 400); a 502 of another making keeps the status's class.
+    #[test]
+    fn a_failure_of_the_requests_media_counts_as_the_requests_error_whatever_its_status() {
+        use std::time::Duration;
+
+        use llm_multimodal::{MediaConnectorError, MultiModalError};
+
+        use crate::routers::{
+            error,
+            grpc::{multimodal::processing_failed_response, utils::tonic_ext::TonicStatusExt},
+        };
+
+        // The router's own pipeline: the host's trouble and the request's fault.
+        for (media, status) in [
+            (
+                MediaConnectorError::Timeout {
+                    url: "https://media.example/clip.mp4".to_string(),
+                    budget: Duration::from_secs(30),
+                },
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                MediaConnectorError::UnsupportedScheme("ftp".to_string()),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let failed = anyhow::Error::new(MultiModalError::Media(media))
+                .context("Failed to finalize multimodal tracker");
+            let response = processing_failed_response(&failed);
+            assert_eq!(response.status(), status);
+            assert_eq!(error_type_for_response(&response), "validation_error");
+        }
+        // A worker's report, in the pre-trailer form: answered a 502, counted
+        // as the request's.
+        let report = tonic::Status::unavailable(
+            "media fetch of https://media.example/a.png timed out after 10s",
+        );
+        let response = report.to_http_error(report.media_code().as_str(), report.message().into());
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(error_type_for_response(&response), "validation_error");
+        // A 502 of another making keeps the status's class.
+        let other = error::bad_gateway("upstream_failed", "the worker's connection reset");
+        assert_eq!(error_type_for_response(&other), "backend_error");
     }
 
     /// A refusal the gateway answers on its own counts as `unavailable`,

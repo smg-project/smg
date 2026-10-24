@@ -330,6 +330,10 @@ async fn a_scheduler_that_falls_silent_after_hello_fails_the_link_at_the_bound()
         "{error}"
     );
     assert!(error.contains("without a sign of life"), "{error}");
+    assert!(
+        error.starts_with("TokenSpeed scheduler connection failed: "),
+        "{error}"
+    );
     assert!(!server.engine_ready());
     server.stop(Duration::from_secs(5)).unwrap();
 }
@@ -482,8 +486,9 @@ async fn health_gates_on_the_engine_link_and_the_drain_flag() {
     }
 
     // Readiness held alone (the lifecycle owner's planned warm-up): health
-    // answers NOT_SERVING with its own message while admission stays open,
-    // then the release restores SERVING; the drain below closes admission.
+    // answers NOT_SERVING with its own message while admission stays open to
+    // the warm-up's own requests only, then the release restores SERVING and
+    // admits every request; the drain below closes admission.
     server.set_ready(false);
     let held = client
         .health_check(ts::HealthCheckRequest::default())
@@ -492,14 +497,30 @@ async fn health_gates_on_the_engine_link_and_the_drain_flag() {
         .into_inner();
     assert!(!held.healthy);
     assert_eq!(held.message, "Warming up");
+    let refused = server
+        .state
+        .shared
+        .registry
+        .register("held-probe")
+        .err()
+        .expect("a request that is not the warm-up's is refused while readiness is held");
+    assert_eq!(refused.code(), Code::Unavailable);
+    assert_eq!(refused.message(), "servicer is warming up");
+    let (admitted, _cancel) = server
+        .state
+        .shared
+        .registry
+        .register("smg-warmup-1")
+        .expect("the warm-up's own request is admitted while readiness is held");
+    drop(admitted);
+    server.set_ready(true);
     let (admitted, _cancel) = server
         .state
         .shared
         .registry
         .register("held-probe")
-        .expect("admission stays open while readiness is held");
+        .expect("the release admits every request");
     drop(admitted);
-    server.set_ready(true);
     assert!(
         client
             .health_check(ts::HealthCheckRequest::default())
@@ -522,6 +543,59 @@ async fn health_gates_on_the_engine_link_and_the_drain_flag() {
         "the drain closes admission"
     );
     server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Readiness held for the lifecycle owner's planned warm-up: a request that
+/// is not the warm-up's own is refused as not serving before anything of it
+/// reaches the engine (the engine's next admission is the warm-up's), the
+/// warm-up's own request is served, and the release admits the other again.
+#[tokio::test]
+async fn a_request_that_is_not_the_warm_ups_is_refused_while_readiness_is_held() {
+    let mut h = harness(model_info(), None).await;
+    h.server.set_ready(false);
+    let status = h
+        .client
+        .generate(generate_request("chatcmpl-1", true, Vec::new()))
+        .await
+        .expect_err("readiness held: not the warm-up's request");
+    assert_eq!(status.code(), Code::Unavailable);
+    assert_eq!(status.message(), "servicer is warming up");
+    assert_eq!(h.server.active_requests(), 0);
+
+    let mut own = h
+        .client
+        .generate(generate_request("smg-warmup-1", true, Vec::new()))
+        .await
+        .expect("the warm-up's own request is admitted")
+        .into_inner();
+    let request = recv_add(&mut h.engine_in).await;
+    assert_eq!(
+        request.rid, "smg-warmup-1",
+        "the engine's first admission is the warm-up's"
+    );
+    send(
+        &mut h.engine_out,
+        &batch("smg-warmup-1", vec![10], 1, Some("length"), None),
+    )
+    .await;
+    while own.message().bounded().await.unwrap().is_some() {}
+
+    h.server.set_ready(true);
+    let mut late = h
+        .client
+        .generate(generate_request("chatcmpl-1", true, Vec::new()))
+        .await
+        .expect("the release admits every request")
+        .into_inner();
+    let request = recv_add(&mut h.engine_in).await;
+    assert_eq!(request.rid, "chatcmpl-1");
+    send(
+        &mut h.engine_out,
+        &batch("chatcmpl-1", vec![10], 1, Some("length"), None),
+    )
+    .await;
+    while late.message().bounded().await.unwrap().is_some() {}
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
 /// Streaming: one chunk per scheduler step, then the scheduler's own

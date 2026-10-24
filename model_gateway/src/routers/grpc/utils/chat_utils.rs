@@ -357,48 +357,64 @@ pub(crate) async fn encode_prompt_blocking(
     }
 }
 
-/// Process tool call arguments in messages
-/// Per Transformers docs, tool call arguments in assistant messages should be dicts. An empty
-/// `arguments` string is a call with no arguments, `{}`; any other text that is not JSON is
-/// refused.
-pub(crate) fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), String> {
+/// Hand the template the tool-call arguments of the assistant turns in the
+/// shape the engines hand theirs: an object (what the Transformers docs ask
+/// of a tool-use template). The arguments' JSON text is parsed; an object is
+/// kept; absent arguments are an empty object.
+pub(crate) fn process_tool_call_arguments(messages: &mut [Value]) {
     for msg in messages {
-        let role = msg.get("role").and_then(|v| v.as_str());
-        if role != Some("assistant") {
+        if msg.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
-
-        let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|tc| tc.as_array_mut()) else {
+        let Some(tool_calls) = msg.get_mut("tool_calls").and_then(Value::as_array_mut) else {
             continue;
         };
-
         for call in tool_calls {
-            let Some(function) = call.get_mut("function") else {
+            let Some(function) = call.get_mut("function").and_then(Value::as_object_mut) else {
                 continue;
             };
-            let Some(args) = function.get_mut("arguments") else {
-                continue;
-            };
-            let Some(args_str) = args.as_str() else {
-                continue;
-            };
-            if args_str.trim().is_empty() {
-                *args = json!({});
-                continue;
-            }
-
-            // Parse JSON string to object (like Python json.loads)
-            match serde_json::from_str::<Value>(args_str) {
-                Ok(parsed) => *args = parsed,
-                Err(e) => {
-                    return Err(format!(
-                        "Failed to parse tool call arguments as JSON: '{args_str}'. Error: {e}"
-                    ))
+            let arguments = match function.get("arguments") {
+                Some(Value::Object(_)) => continue,
+                Some(Value::String(text)) => {
+                    arguments_object(function.get("name").and_then(Value::as_str), text)
                 }
-            }
+                _ => json!({}),
+            };
+            function.insert("arguments".to_string(), arguments);
         }
     }
-    Ok(())
+}
+
+/// The object an `arguments` text holds, read as the engines read it: empty
+/// text is a call without arguments; text that is not JSON, or JSON that is
+/// not an object, is an empty object too, with a warning. A malformed
+/// `arguments` text lives in the conversation's history, so refusing it
+/// would fail every later turn of that conversation.
+fn arguments_object(tool: Option<&str>, text: &str) -> Value {
+    if text.trim().is_empty() {
+        return json!({});
+    }
+    match serde_json::from_str::<Value>(text) {
+        Ok(object @ Value::Object(_)) => object,
+        Ok(_) => {
+            tracing::warn!(
+                tool,
+                bytes = text.len(),
+                "tool call arguments in history are JSON but not an object; rendered as an \
+                 empty object"
+            );
+            json!({})
+        }
+        Err(error) => {
+            tracing::warn!(
+                tool,
+                bytes = text.len(),
+                %error,
+                "tool call arguments in history are not valid JSON; rendered as an empty object"
+            );
+            json!({})
+        }
+    }
 }
 
 /// Process messages based on content format for ANY message type
@@ -818,7 +834,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
         // them as written; every other template gets the parsed object the
         // Transformers docs expect.
         if !tokenizer.renderer_capabilities().raw_tool_call_arguments {
-            process_tool_call_arguments(&mut transformed_messages)?;
+            process_tool_call_arguments(&mut transformed_messages);
         }
 
         // Convert tools to JSON values for template processing

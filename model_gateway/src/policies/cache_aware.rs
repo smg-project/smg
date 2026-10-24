@@ -2659,11 +2659,25 @@ impl CacheAwarePolicy {
             .map(|candidate| candidate.raw_score)
             .fold(0.0_f64, f64::max);
         let request_blocks = request.request_blocks as f64;
+        // The chosen worker's undecayed overlap in blocks is the predicted
+        // overlap of a decision, observed at every exit (the warm-up
+        // placements included, where it is thin or nothing) so the
+        // histogram's count is the count of event-driven decisions.
+        let overlap_of = |idx: usize| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.idx == idx)
+                .map_or(0.0, |candidate| candidate.raw_score)
+        };
+        let observe = |overlap: f64| {
+            Metrics::record_cache_aware_match_ratio(overlap / request_blocks);
+        };
         let thin_overlap = best_overlap / request_blocks <= f64::from(self.config.cache_threshold)
             || (best_overlap <= WARMUP_MISS_BLOCKS && best_overlap * 2.0 < request_blocks);
         if thin_overlap {
             if let Some(idx) = self.warmup_slice(workers, &table, indexer, info, avg_load) {
                 Metrics::record_worker_cache_aware_policy_branch("warmup_slice");
+                observe(overlap_of(idx));
                 debug!(
                     worker = workers[idx].url(),
                     branch = "warmup_slice",
@@ -2681,6 +2695,7 @@ impl CacheAwarePolicy {
             best_overlap / request_blocks,
         ) {
             Metrics::record_worker_cache_aware_policy_branch("warmup_divert");
+            observe(overlap_of(idx));
             debug!(
                 worker = workers[idx].url(),
                 branch = "warmup_divert",
@@ -2703,10 +2718,8 @@ impl CacheAwarePolicy {
         // `overlap_blocks` is the chosen worker's undecayed overlap, so a
         // per-decision join against the engine's `cached_tokens` compares
         // blocks and not only the branch.
-        let overlap_blocks = candidates
-            .iter()
-            .find(|candidate| candidate.idx == idx)
-            .map_or(0, |candidate| candidate.raw_score as u64);
+        let overlap = overlap_of(idx);
+        let overlap_blocks = overlap as u64;
         let branch = if !had_overlap {
             "event_miss"
         } else if overlap_blocks > 0 {
@@ -2715,6 +2728,7 @@ impl CacheAwarePolicy {
             "event_spill"
         };
         Metrics::record_worker_cache_aware_policy_branch(branch);
+        observe(overlap);
         debug!(
             worker = workers[idx].url(),
             branch,
