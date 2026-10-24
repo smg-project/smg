@@ -1,10 +1,10 @@
 //! Multi-tenant rate limit config: on-disk YAML shape + validation.
 //!
-//! Intended to be loaded once at startup via a `--tenant-rate-limit-config
-//! <path>` CLI flag — added in a follow-up PR alongside the reserve/settle
-//! engine, not wired up yet here. Mirrors the priority scheduler's
-//! `PrioritySchedulerYaml` (`middleware::scheduler::config`) — kept
-//! separate from `RouterConfig` so the actual policy content isn't
+//! Loaded once at startup from the file `--tenant-rate-limit-config <path>`
+//! names (required with `--tenant-rate-limit-enabled`); the manager compiles
+//! the parsed policies for the reserve/settle engine. Mirrors the priority
+//! scheduler's `PrioritySchedulerYaml` (`middleware::scheduler::config`) —
+//! kept separate from `RouterConfig` so the actual policy content isn't
 //! crammed into the main config struct.
 
 use std::collections::{HashMap, HashSet};
@@ -49,8 +49,8 @@ pub enum ModelMatcherSpec {
     Prefix { value: String },
 }
 
-/// Optional YAML config, intended to be loaded via a
-/// `--tenant-rate-limit-config <path>` CLI flag added in a follow-up PR.
+/// The YAML file `--tenant-rate-limit-config <path>` names, as read from
+/// disk at startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimitYaml {

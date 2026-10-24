@@ -1,8 +1,10 @@
 //! Per-tenant LLM token/request rate limiting.
 //!
 //! Config schema, policy compilation, the reserve/settle engine, and an
-//! in-memory backend. Nothing in the request path calls `reserve()` yet
-//! — that's wired in per protocol in a later phase.
+//! in-memory backend. The gRPC router's typed routes reserve once per
+//! logical request in the ingress stage (`RateLimitReserveStage`) and settle
+//! through the handle it returns; the gRPC Responses iterations reserve
+//! nothing today, and the HTTP routers are not wired to the manager.
 
 mod backend;
 mod bucket;
