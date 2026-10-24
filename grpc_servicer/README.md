@@ -1120,7 +1120,10 @@ text the scheduler rebuilds from once the embeddings arrive, and a dispatch
 that fails afterwards reaches the scheduler as its own failure notice. A
 request of references on any other worker, or on a language-only worker with
 no encoder registered, is refused (`FAILED_PRECONDITION`) rather than answered
-as text. What the wire does not carry is reported, not emulated: an `--encoder-only` launch is refused (SGLang's entrypoint runs
+as text. A request the Router pins to a data-parallel rank (`--dp-size` above one
+behind a dp-aware Router) goes to that rank's scheduler, as the engine's
+data-parallel controller sends it behind SGLang's own frontend; a pin past the
+connected ranks is refused as the caller's error. What the wire does not carry is reported, not emulated: an `--encoder-only` launch is refused (SGLang's entrypoint runs
 that role on its own encoder server, never on a servicer), a `--language-only`
 launch on the `zmq_to_tokenizer` transfer backend is refused (the frontend
 itself receives and processes the embeddings there, which neither servicer
