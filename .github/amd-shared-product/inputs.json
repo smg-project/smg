@@ -1,7 +1,7 @@
 {
-  "ready": false,
-  "run_budget_admitted": false,
-  "artifacts_pinned": false,
+  "ready": true,
+  "run_budget_admitted": true,
+  "artifacts_pinned": true,
   "artifacts": [
     {
       "name": "smg-wheel",
@@ -169,7 +169,7 @@
     ".github/workflows": "7c956a4ee89bdf800d48c63815d10a4dd568d90e"
   },
   "consumer_gpu_ready": false,
-  "admitted_lane": null,
+  "admitted_lane": "rust",
   "target_product_commit": "d61f5964595f6e596bf90880a915639e773bf5a8",
   "reference_target_ids": {
     "rust": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat-rust-servicer[2]/tokenspeed/nvidia",
@@ -204,8 +204,8 @@
     }
   },
   "budget": {
-    "admitted": false,
-    "reserved_runner_seconds": 0,
+    "admitted": true,
+    "reserved_runner_seconds": 3360,
     "global_owned_max": 2,
     "one_lane_per_run": true,
     "new_rust_max_seconds": 3360,
