@@ -275,11 +275,12 @@ pub mod metrics_labels {
     pub const REASON_OVERLOADED: &str = "overloaded";
     /// The gateway's own tenant rate limit refused the request.
     pub const REASON_RATE_LIMITED: &str = "rate_limited";
-    /// The gateway shed the request under its overload protection or its
-    /// prefill admission queue was full.
+    /// The gateway shed the request on a capacity bound of its own: its
+    /// overload protection, a full prefill admission queue, or another
+    /// budget or cap it holds (a 429 under a code of the gateway's).
     pub const REASON_OVERLOAD_SHED: &str = "overload_shed";
-    /// The request waited longer than the queue timeout inside the gateway
-    /// before worker selection.
+    /// The request waited longer than an admission bound inside the gateway:
+    /// the selection queue's timeout, or the prefill admission queue's.
     pub const REASON_SELECTION_QUEUE_TIMEOUT: &str = "selection_queue_timeout";
     /// Every worker of the model was unavailable (unhealthy, behind an open
     /// circuit breaker, or declined by the policy).
