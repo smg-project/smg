@@ -2510,63 +2510,9 @@ mod request_release_tests {
             labels.iter().all(|(key, _)| key != SUPPORTS_VISION_LABEL),
             "{labels:?}"
         );
-        let seen_ids = Arc::new(Mutex::new(Vec::new()));
-        let port = spawn_stub(GatedScheduler {
-            seen_input_ids: Arc::clone(&seen_ids),
-            ..Default::default()
-        })
-        .await;
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        register_worker_with_labels(
-            &worker_registry,
-            port,
-            WorkerType::Regular,
-            &label_pairs(&labels),
-        );
-        let deps = PipelineDeps::pair(
-            worker_registry.clone(),
-            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
-            None,
-            None,
-            Duration::from_secs(60),
-        );
-        let pipeline =
-            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
-        let components = components_with_multimodal(worker_registry, true).await;
-        let request: Arc<ChatCompletionRequest> = Arc::new(
-            serde_json::from_value(serde_json::json!({
-                "model": MODEL,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "What colour is this pixel?"},
-                        {"type": "image_url", "image_url": {"url": ONE_PIXEL_PNG_DATA_URL}}
-                    ]
-                }],
-                "max_completion_tokens": 32,
-            }))
-            .expect("chat request"),
-        );
-        let response = tokio::time::timeout(
-            Duration::from_secs(10),
-            pipeline.execute_chat(
-                request,
-                None,
-                MODEL.to_string(),
-                components,
-                None,
-                None,
-                None,
-                None,
-            ),
-        )
-        .await
-        .expect("the mock path answers");
-        let status = response.status();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("drain body");
-        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+        let (pipeline, components, _) =
+            chat_pipeline_over(RuntimeType::TokenSpeed, &label_pairs(&labels)).await;
+        let (status, body) = chat_error_body(&pipeline, components, one_pixel_image_chat()).await;
         assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
         assert_ne!(body["error"]["code"], "multimodal_not_supported", "{body}");
         assert_eq!(
@@ -2612,63 +2558,9 @@ mod request_release_tests {
                 .any(|(key, value)| key == SUPPORTS_VISION_LABEL && value == "false"),
             "{labels:?}"
         );
-        let seen_ids = Arc::new(Mutex::new(Vec::new()));
-        let port = spawn_stub(GatedScheduler {
-            seen_input_ids: Arc::clone(&seen_ids),
-            ..Default::default()
-        })
-        .await;
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        register_worker_with_labels(
-            &worker_registry,
-            port,
-            WorkerType::Regular,
-            &label_pairs(&labels),
-        );
-        let deps = PipelineDeps::pair(
-            worker_registry.clone(),
-            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
-            None,
-            None,
-            Duration::from_secs(60),
-        );
-        let pipeline =
-            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
-        let components = components_with_multimodal(worker_registry, true).await;
-        let request: Arc<ChatCompletionRequest> = Arc::new(
-            serde_json::from_value(serde_json::json!({
-                "model": MODEL,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "What colour is this pixel?"},
-                        {"type": "image_url", "image_url": {"url": ONE_PIXEL_PNG_DATA_URL}}
-                    ]
-                }],
-                "max_completion_tokens": 32,
-            }))
-            .expect("chat request"),
-        );
-        let response = tokio::time::timeout(
-            Duration::from_secs(10),
-            pipeline.execute_chat(
-                request,
-                None,
-                MODEL.to_string(),
-                components,
-                None,
-                None,
-                None,
-                None,
-            ),
-        )
-        .await
-        .expect("the refusal must not wait on anything");
-        let status = response.status();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("drain body");
-        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+        let (pipeline, components, seen_ids) =
+            chat_pipeline_over(RuntimeType::TokenSpeed, &label_pairs(&labels)).await;
+        let (status, body) = chat_error_body(&pipeline, components, one_pixel_image_chat()).await;
         assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(body["error"]["code"], "multimodal_not_supported", "{body}");
         assert!(
@@ -2684,71 +2576,15 @@ mod request_release_tests {
     /// schedules it, which the client saw as a hang).
     #[tokio::test]
     async fn image_to_a_language_model_only_pool_is_refused_before_dispatch() {
-        let seen_ids = Arc::new(Mutex::new(Vec::new()));
-        let port = spawn_stub(GatedScheduler {
-            seen_input_ids: Arc::clone(&seen_ids),
-            ..Default::default()
-        })
-        .await;
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        register_worker_with_labels(
-            &worker_registry,
-            port,
-            WorkerType::Regular,
-            LANGUAGE_MODEL_ONLY,
-        );
-        let deps = PipelineDeps::pair(
-            worker_registry.clone(),
-            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
-            None,
-            None,
-            Duration::from_secs(60),
-        );
-        let pipeline =
-            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
-        let components = components_with_multimodal(worker_registry, true).await;
-        let request: Arc<ChatCompletionRequest> = Arc::new(
-            serde_json::from_value(serde_json::json!({
-                "model": MODEL,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "What colour is this pixel?"},
-                        {"type": "image_url", "image_url": {"url": ONE_PIXEL_PNG_DATA_URL}}
-                    ]
-                }],
-                "max_completion_tokens": 32,
-            }))
-            .expect("chat request"),
-        );
-
+        let (pipeline, components, seen_ids) =
+            chat_pipeline_over(RuntimeType::TokenSpeed, LANGUAGE_MODEL_ONLY).await;
         let started = Instant::now();
-        let response = tokio::time::timeout(
-            Duration::from_secs(10),
-            pipeline.execute_chat(
-                request,
-                None,
-                MODEL.to_string(),
-                components,
-                None,
-                None,
-                None,
-                None,
-            ),
-        )
-        .await
-        .expect("the refusal must not wait on anything");
+        let (status, body) = chat_error_body(&pipeline, components, one_pixel_image_chat()).await;
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "{:?}",
             started.elapsed()
         );
-
-        let status = response.status();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("drain body");
-        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
         assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(body["error"]["code"], "multimodal_not_supported", "{body}");
         let message = body["error"]["message"].as_str().expect("message");
@@ -2766,10 +2602,27 @@ mod request_release_tests {
         );
     }
 
-    /// The chat pipeline over one stub worker typed as `runtime`, and the
-    /// ids the stub saw.
-    async fn chat_pipeline_of_runtime(
+    /// The chat request of one text part and the one-pixel image, as the
+    /// vision tests send it.
+    fn one_pixel_image_chat() -> serde_json::Value {
+        serde_json::json!({
+            "model": MODEL,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What colour is this pixel?"},
+                    {"type": "image_url", "image_url": {"url": ONE_PIXEL_PNG_DATA_URL}}
+                ]
+            }],
+            "max_completion_tokens": 32,
+        })
+    }
+
+    /// The chat pipeline over one stub worker typed as `runtime` that carries
+    /// `labels`, and the ids the stub saw.
+    async fn chat_pipeline_over(
         runtime: RuntimeType,
+        labels: &[(&str, &str)],
     ) -> (
         RequestPipeline,
         Arc<SharedComponents>,
@@ -2782,7 +2635,7 @@ mod request_release_tests {
         })
         .await;
         let worker_registry = Arc::new(WorkerRegistry::new());
-        register_worker_of_runtime(&worker_registry, port, WorkerType::Regular, runtime, &[]);
+        register_worker_of_runtime(&worker_registry, port, WorkerType::Regular, runtime, labels);
         let deps = PipelineDeps::pair(
             worker_registry.clone(),
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
@@ -2819,7 +2672,7 @@ mod request_release_tests {
             ),
         )
         .await
-        .expect("the refusal must not wait on anything");
+        .expect("the pipeline answers within its budget");
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -2845,7 +2698,7 @@ mod request_release_tests {
             serde_json::json!({"url": "data:video/mp4;base64,invalid"}),
         ] {
             let (pipeline, components, seen_ids) =
-                chat_pipeline_of_runtime(RuntimeType::Sglang).await;
+                chat_pipeline_over(RuntimeType::Sglang, &[]).await;
             let started = Instant::now();
             let (status, body) = chat_error_body(
                 &pipeline,
@@ -2889,23 +2742,8 @@ mod request_release_tests {
     /// tokenizer cannot satisfy, as for the worker without a vision verdict).
     #[tokio::test]
     async fn image_to_a_pool_whose_engine_takes_images_goes_on_into_media_processing() {
-        let (pipeline, components, _) = chat_pipeline_of_runtime(RuntimeType::Sglang).await;
-        let (status, body) = chat_error_body(
-            &pipeline,
-            components,
-            serde_json::json!({
-                "model": MODEL,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "What colour is this pixel?"},
-                        {"type": "image_url", "image_url": {"url": ONE_PIXEL_PNG_DATA_URL}}
-                    ]
-                }],
-                "max_completion_tokens": 32,
-            }),
-        )
-        .await;
+        let (pipeline, components, _) = chat_pipeline_over(RuntimeType::Sglang, &[]).await;
+        let (status, body) = chat_error_body(&pipeline, components, one_pixel_image_chat()).await;
         assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
         assert_ne!(body["error"]["code"], "multimodal_not_supported", "{body}");
         assert_eq!(
