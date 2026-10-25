@@ -235,7 +235,23 @@ jobs:
         run: |
           python3 -c "import ${{ inputs.engine }}, msgspec, zmq"  # the gates these tests importorskip on
           pip install pytest-asyncio  # runs the @pytest.mark.asyncio cases; pytest>=8.4 fails them without a plugin
-          pytest -q grpc_servicer/tests -p no:cacheprovider -rs
+          if [ "${{ inputs.gpu_vendor }}" = amd ] && [ "${{ inputs.engine }}" = sglang ]; then
+            mkdir -p unit-junit
+            timeout --signal=INT --kill-after=30s 600s \
+              pytest -vv grpc_servicer/tests -p no:cacheprovider -rs \
+                -o faulthandler_timeout=120 --junitxml=unit-junit/sglang.xml
+            test -s unit-junit/sglang.xml
+          else
+            pytest -q grpc_servicer/tests -p no:cacheprovider -rs
+          fi
+
+      - name: Upload AMD SGLang unit results
+        if: always() && inputs.servicer_unit_tests && inputs.gpu_vendor == 'amd' && inputs.engine == 'sglang'
+        uses: actions/upload-artifact@v7
+        with:
+          name: sglang-unit-results-gpu${{ inputs.gpu_tier }}-${{ inputs.connection_mode }}
+          path: unit-junit/
+          if-no-files-found: ignore
 
       - name: Setup Oracle
         if: inputs.setup_agentic_deps
