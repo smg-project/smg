@@ -205,27 +205,7 @@ fn count_request(model: &str) -> CountMessageTokensRequest {
 /// model_not_found for a model nobody serves. No worker takes part.
 #[tokio::test]
 async fn count_tokens_is_answered_from_the_tokenizer() {
-    let ctx = grpc_ctx(regular_routing_mode()).await;
-    let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
-        llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![11, 12, 13]),
-    );
-    ctx.tokenizer_registry
-        .load("m", "m", "mock", || async move { Ok(tokenizer) })
-        .await
-        .expect("register the tokenizer");
-    let worker = BasicWorkerBuilder::new("grpc://worker:30000")
-        .worker_type(WorkerType::Regular)
-        .connection_mode(ConnectionMode::Grpc)
-        .model(ModelCard::new("m"))
-        .health_config(HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        })
-        .build();
-    ctx.worker_registry
-        .register(Arc::new(worker))
-        .expect("register worker");
-    let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+    let (_ctx, router) = regular_router_over_m(None).await;
     let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
     let response = router
@@ -266,28 +246,7 @@ async fn count_tokens_refuses_media_no_worker_of_the_model_takes() {
         ),
         (RuntimeType::Sglang, "invalid_multimodal_request", None),
     ] {
-        let ctx = grpc_ctx(regular_routing_mode()).await;
-        let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
-            llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![11, 12, 13]),
-        );
-        ctx.tokenizer_registry
-            .load("m", "m", "mock", || async move { Ok(tokenizer) })
-            .await
-            .expect("register the tokenizer");
-        let worker = BasicWorkerBuilder::new("grpc://worker:30000")
-            .worker_type(WorkerType::Regular)
-            .connection_mode(ConnectionMode::Grpc)
-            .runtime_type(runtime)
-            .model(ModelCard::new("m"))
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
-            .build();
-        ctx.worker_registry
-            .register(Arc::new(worker))
-            .expect("register worker");
-        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let (_ctx, router) = regular_router_over_m(Some(runtime)).await;
         let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
         let request: CountMessageTokensRequest = serde_json::from_value(json!({
             "model": "m",
@@ -352,17 +311,8 @@ async fn count_tokens_refuses_a_model_no_worker_serves_whatever_the_tokenizer_re
 #[tokio::test]
 async fn count_tokens_answers_not_ready_while_a_served_models_tokenizer_loads() {
     let ctx = grpc_ctx(regular_routing_mode()).await;
-    let worker = BasicWorkerBuilder::new("grpc://worker:30000")
-        .worker_type(WorkerType::Regular)
-        .connection_mode(ConnectionMode::Grpc)
-        .model(ModelCard::new("m"))
-        .health_config(HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        })
-        .build();
     ctx.worker_registry
-        .register(Arc::new(worker))
+        .register(grpc_worker_for_m())
         .expect("register worker");
     let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
     let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
@@ -386,17 +336,43 @@ async fn count_tokens_answers_not_ready_while_a_served_models_tokenizer_loads() 
 
 /// A local gRPC worker of model `m`, as the pipeline tests register it.
 fn grpc_worker_for_m() -> Arc<BasicWorker> {
-    Arc::new(
-        BasicWorkerBuilder::new("grpc://worker:30000")
-            .worker_type(WorkerType::Regular)
-            .connection_mode(ConnectionMode::Grpc)
-            .model(ModelCard::new("m"))
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
-            .build(),
-    )
+    grpc_worker_for_m_on(None)
+}
+
+/// The same worker, naming its engine when a test's claim depends on it.
+fn grpc_worker_for_m_on(runtime: Option<RuntimeType>) -> Arc<BasicWorker> {
+    let mut builder = BasicWorkerBuilder::new("grpc://worker:30000")
+        .worker_type(WorkerType::Regular)
+        .connection_mode(ConnectionMode::Grpc)
+        .model(ModelCard::new("m"))
+        .health_config(HealthCheckConfig {
+            disable_health_check: true,
+            ..Default::default()
+        });
+    if let Some(runtime) = runtime {
+        builder = builder.runtime_type(runtime);
+    }
+    Arc::new(builder.build())
+}
+
+/// A regular gRPC router over one local worker of model `m`, whose
+/// tokenizer is the mock that answers three ids: the context the count and
+/// Messages tests share. `runtime` names the worker's engine when a test's
+/// claim depends on it.
+async fn regular_router_over_m(runtime: Option<RuntimeType>) -> (Arc<AppContext>, GrpcRouter) {
+    let ctx = grpc_ctx(regular_routing_mode()).await;
+    let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
+        llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![11, 12, 13]),
+    );
+    ctx.tokenizer_registry
+        .load("m", "m", "mock", || async move { Ok(tokenizer) })
+        .await
+        .expect("register the tokenizer");
+    ctx.worker_registry
+        .register(grpc_worker_for_m_on(runtime))
+        .expect("register worker");
+    let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+    (ctx, router)
 }
 
 /// The tokenizer-registration step's input for a local gRPC worker with
@@ -654,27 +630,7 @@ fn sse_event(frame: &str, name: &str) -> serde_json::Value {
 /// context window the model's workers advertise is the pipeline's 400.
 #[tokio::test]
 async fn max_tokens_zero_is_answered_with_an_empty_message() {
-    let ctx = grpc_ctx(regular_routing_mode()).await;
-    let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
-        llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![11, 12, 13]),
-    );
-    ctx.tokenizer_registry
-        .load("m", "m", "mock", || async move { Ok(tokenizer) })
-        .await
-        .expect("register the tokenizer");
-    let worker = BasicWorkerBuilder::new("grpc://worker:30000")
-        .worker_type(WorkerType::Regular)
-        .connection_mode(ConnectionMode::Grpc)
-        .model(ModelCard::new("m"))
-        .health_config(HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        })
-        .build();
-    ctx.worker_registry
-        .register(Arc::new(worker))
-        .expect("register worker");
-    let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+    let (ctx, router) = regular_router_over_m(None).await;
     let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
     let body = json!({
         "model": "m", "max_tokens": 0,
@@ -836,17 +792,8 @@ async fn counts_render_the_output_config_effort() {
         .load("m", "m", "mock", || async move { Ok(registered) })
         .await
         .expect("register the tokenizer");
-    let worker = BasicWorkerBuilder::new("grpc://worker:30000")
-        .worker_type(WorkerType::Regular)
-        .connection_mode(ConnectionMode::Grpc)
-        .model(ModelCard::new("m"))
-        .health_config(HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        })
-        .build();
     ctx.worker_registry
-        .register(Arc::new(worker))
+        .register(grpc_worker_for_m())
         .expect("register worker");
     let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
     let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
@@ -1612,27 +1559,7 @@ fn max_tokens_zero_records_the_requests_media_and_count_tokens_does_not() {
     ]}]);
     ::metrics::with_local_recorder(&recorder, || {
         runtime.block_on(async {
-            let ctx = grpc_ctx(regular_routing_mode()).await;
-            let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
-                llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![11, 12, 13]),
-            );
-            ctx.tokenizer_registry
-                .load("m", "m", "mock", || async move { Ok(tokenizer) })
-                .await
-                .expect("register the tokenizer");
-            let worker = BasicWorkerBuilder::new("grpc://worker:30000")
-                .worker_type(WorkerType::Regular)
-                .connection_mode(ConnectionMode::Grpc)
-                .model(ModelCard::new("m"))
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
-                .build();
-            ctx.worker_registry
-                .register(Arc::new(worker))
-                .expect("register worker");
-            let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+            let (_ctx, router) = regular_router_over_m(None).await;
             let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
             let count: CountMessageTokensRequest =
