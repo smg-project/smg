@@ -1117,7 +1117,8 @@ class TestServicerWiring:
         assert servicer._mm_settings.source == "flag"
         assert servicer._mm_limit == 3, "an env-supplied cap still applies when the flag is silent"
         assert any(
-            "VllmEngineServicer initialized (mm_processor=off, source=flag)" in r.getMessage()
+            "VllmEngineServicer initialized "
+            f"(mm_processor=off, source=flag, pid={os.getpid()})" in r.getMessage()
             for r in caplog.records
         )
 

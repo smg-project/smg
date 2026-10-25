@@ -17,6 +17,12 @@ admin = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(admin)
 
 
+@pytest.fixture(autouse=True)
+def legacy_launch_profile_mode(monkeypatch):
+    """These standalone-module tests exercise the launch-configured profiler."""
+    monkeypatch.delenv("SMG_VLLM_REQUEST_PROFILE", raising=False)
+
+
 def context(remaining=None):
     return Mock(time_remaining=Mock(return_value=remaining), abort=AsyncMock())
 
