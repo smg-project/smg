@@ -752,7 +752,9 @@ where
 /// Logging helpers for tests elsewhere in the crate.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use tracing::{subscriber::DefaultGuard, Dispatch};
+    use std::sync::{Arc, Mutex};
+
+    use tracing::{subscriber::DefaultGuard, Dispatch, Level};
     use tracing_subscriber::{layer::SubscriberExt, Layer, Registry};
 
     /// A test's subscriber: this thread's default until the value drops,
@@ -784,6 +786,47 @@ pub(crate) mod test_support {
         TestSubscriber {
             _guard: guard,
             _second: second,
+        }
+    }
+
+    /// Every event of the `smg::response` target, as (level, message): the
+    /// lines the response-side middleware writes, as a test reads them.
+    #[derive(Clone, Default)]
+    pub(crate) struct ResponseLines(Arc<Mutex<Vec<(Level, String)>>>);
+
+    impl ResponseLines {
+        pub(crate) fn lines(&self) -> Vec<(Level, String)> {
+            self.0.lock().expect("lines").clone()
+        }
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for ResponseLines {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != "smg::response" {
+                return;
+            }
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0
+                .lock()
+                .expect("lines")
+                .push((*event.metadata().level(), message.0));
         }
     }
 }
