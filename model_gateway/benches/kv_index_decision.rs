@@ -22,6 +22,7 @@
 #![expect(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::panic,
     clippy::print_stderr,
     reason = "benchmark code: panicking on setup failure is expected, eprintln is the report"
 )]
