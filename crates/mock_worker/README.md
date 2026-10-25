@@ -37,9 +37,13 @@ With `--grpc-vllm true`, the same port also exposes the experimental
 plane**: health, model/server metadata, loads, abort, and KV events share the
 TokenSpeed worker's engine and shutdown. Its load records use the vLLM reporting
 profile regardless of `--loads-like`; `--step-reports` still controls heartbeat
-semantics. Only DP rank 0 and the `core` load section are supported. The standard
+semantics. Only DP rank 0 is supported; load responses contain `core` data and
+omit unavailable optional sections, as the real servicer does. The standard
 health service recognizes both registered service names. The flag defaults to
-false so existing backend detection continues to see only TokenSpeed.
+false so existing backend detection continues to see only TokenSpeed. With the
+flag enabled, gateway auto-detection selects vLLM before TokenSpeed. Register an
+explicit `tokenspeed` runtime to generate through TokenSpeed until the vLLM
+generation adapter is available.
 
 vLLM `Generate` and `Embed` currently return `unimplemented`; tokenizer transfer,
 cache flush and profiling remain unsupported. Metadata describes the existing

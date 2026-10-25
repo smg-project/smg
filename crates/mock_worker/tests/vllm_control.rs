@@ -2,7 +2,9 @@
 use std::{sync::Arc, time::Duration};
 
 use mock_worker::{config::Config, grpc::serve_with_listener_until, overrides};
-use smg_grpc_client::{common_proto as common, tokenspeed_proto as ts, vllm_proto as v};
+use smg_grpc_client::{
+    common_proto as common, tokenspeed_proto as ts, vllm_proto as v, VllmEngineClient,
+};
 use tokio::{net::TcpListener, sync::oneshot, time::timeout};
 use tonic::{transport::Channel, Code};
 use tonic_health::pb::{health_client::HealthClient, HealthCheckRequest};
@@ -76,6 +78,30 @@ async fn vllm_control_shares_health_load_cache_and_abort_with_tokenspeed() {
             .into_inner();
         assert_eq!(info.served_model_name, "shared-mock");
         assert_eq!(info.vocab_size, 32000);
+        for supported in [true, false] {
+            serving.patch_info(
+                serde_json::json!({"supports_vision": supported})
+                    .as_object()
+                    .unwrap(),
+            );
+            assert_eq!(
+                vllm.get_model_info(v::GetModelInfoRequest {})
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .supports_vision,
+                supported
+            );
+            assert_eq!(
+                scheduler
+                    .get_model_info(ts::GetModelInfoRequest {})
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .supports_vision,
+                supported
+            );
+        }
         let info = vllm
             .get_server_info(v::GetServerInfoRequest {})
             .await
@@ -100,21 +126,16 @@ async fn vllm_control_shares_health_load_cache_and_abort_with_tokenspeed() {
                 .code(),
             Code::Unimplemented
         );
-        for (rank, sections, code) in [
-            (Some(1), vec![], Code::InvalidArgument),
-            (None, vec!["memory".into()], Code::Unimplemented),
-        ] {
-            assert_eq!(
-                vllm.get_loads(v::GetLoadsRequest {
-                    dp_rank: rank,
-                    include: sections
-                })
-                .await
-                .unwrap_err()
-                .code(),
-                code
-            );
-        }
+        assert_eq!(
+            vllm.get_loads(v::GetLoadsRequest {
+                dp_rank: Some(1),
+                include: vec![]
+            })
+            .await
+            .unwrap_err()
+            .code(),
+            Code::InvalidArgument
+        );
         let mut events = vllm
             .subscribe_kv_events(common::SubscribeKvEventsRequest {
                 load_records_before_first_batch: true,
@@ -141,14 +162,18 @@ async fn vllm_control_shares_health_load_cache_and_abort_with_tokenspeed() {
             .unwrap()
             .into_inner();
         assert!(output.message().await.unwrap().is_some());
-        let load = vllm
-            .get_loads(v::GetLoadsRequest {
-                dp_rank: Some(0),
-                include: vec!["core".into()],
-            })
+        // Exercise the actual client with the same sections the gateway asks for.
+        let client = VllmEngineClient::connect(&format!("http://{address}"))
+            .await
+            .unwrap();
+        let load = client
+            .get_loads(
+                ["core", "disagg", "queues", "memory"]
+                    .map(String::from)
+                    .to_vec(),
+            )
             .await
             .unwrap()
-            .into_inner()
             .loads
             .remove(0);
         assert_eq!(load.num_running_reqs, 1);

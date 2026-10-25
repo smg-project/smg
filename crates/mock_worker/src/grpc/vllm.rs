@@ -87,7 +87,7 @@ impl VllmEngine for MockVllm {
             is_generation: true,
             max_context_length: info.max_context_length as u32,
             vocab_size: info.vocab_size as u32,
-            supports_vision: false,
+            supports_vision: info.supports_vision,
             served_model_name: info.served_model_name,
             tokenizer_path: info.tokenizer_path,
             model_type: info.model_type,
@@ -136,11 +136,8 @@ impl VllmEngine for MockVllm {
         if request.dp_rank.is_some_and(|rank| rank != 0) {
             return Err(Status::invalid_argument("mock-worker has only DP rank 0"));
         }
-        if request.include.iter().any(|section| section != "core") {
-            return Err(Status::unimplemented(
-                "mock-worker supports only core loads",
-            ));
-        }
+        // Like the real servicer, return available core data and omit optional
+        // sections. The gateway always requests core/disagg/queues/memory.
         let report = self
             .0
             .get_loads(Request::new(ts::GetLoadsRequest::default()))
