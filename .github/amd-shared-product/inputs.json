@@ -1,9 +1,9 @@
 {
-  "ready": false,
-  "run_budget_admitted": false,
-  "artifacts_pinned": false,
+  "ready": true,
+  "run_budget_admitted": true,
+  "artifacts_pinned": true,
   "consumer_gpu_ready": false,
-  "runtime_cohort_accepted": false,
+  "runtime_cohort_accepted": true,
   "admitted_lane": "sglang-zmq-full223",
   "target_product_commit": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
   "artifacts": [
@@ -196,8 +196,8 @@
     "original_skips": "No added or removed skip/xfail; preserve full source-selected row. NV reference214pass9skip is reference data, not AMD acceptance."
   },
   "budget": {
-    "admitted": false,
-    "reserved_runner_seconds": 0,
+    "admitted": true,
+    "reserved_runner_seconds": 3600,
     "proposed_new_max_seconds": 3600,
     "global_owned_max": 2,
     "one_lane_per_run": true,
@@ -217,13 +217,13 @@
     "run_binding": null,
     "watch_PID_or_session": null
   },
-  "pending_note": "Bound actual1473 product and all19/37/14 Git objects; exact d5 fourZIP/sixpayload/b7d5 native proof and root-accepted1473 normal-install proof are available. Root admission metadata has not been granted/bound: freshTTL, a separate NEW3600, eligible physical runner and actual sole-watch/run identity remain pending. Full engine-gated units and complete original223 chat/8models await actual GPU. All five authority flags remain false; no old GPU proof or retired budget transfers.",
+  "pending_note": "SOURCE-ONLY CONDITIONAL PREVIEW, NOT APPLIED OR ADMITTED. The proposed execution flags and NEW3600 reservation below may be applied only by root after a new explicit grant, current complete physical/API/source/TTL checks and exact sole-watch registration. Normal1473/b7 root97a/Ddeba is accepted normal-install-only evidence. Complete original SG units and unfiltered223 chat/eight models remain unaccepted; consumer_gpu_ready stays false. Actual new nonce/head/run/job/owner/watch and root grant are unbound. No old GPU proof, retired budget, newer a0c5/7070 native or source cohort transfers.",
   "binding_preparation_evidence": {
     "producer_build_archive_integrity_sha256": "fa8e1be5899a9f5d74ade0f6de9cfa10eb5065a404f597c2ee95d55cfa03cb6f",
     "producer_policy_source_review_sha256": "707a143df969433664b923c54e9cc44ad511dba00bdde978c4b40b02d94901fb",
     "producer_policy_metadata_validation_sha256": "f352422414b7e3a2cab1a55701c3360bacfae7d20eb3be26df2b4b7077e62d2e",
     "normal_install_proof_available": true,
-    "normal_install_admission_metadata_bound": false,
+    "normal_install_admission_metadata_bound": true,
     "normal_install_root_acceptance_sha256": "97a2658237750a3c55b3f98a722077055428503cb8ad3b83ae8a01f4d377a571",
     "normal_install_independent_actual_peer_sha256": "deba14fd0db4270b317c25c23ecf1e0bde7b01b9ead92b1bf413014f06138cef"
   }
