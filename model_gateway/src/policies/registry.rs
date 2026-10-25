@@ -484,7 +484,7 @@ impl PolicyRegistry {
     }
 
     /// Policies that already honor the routing key keep their own handling
-    /// (they consult `rid_key` before the header, like the override does); all
+    /// (they consult the header before `rid_key`, like the override does); all
     /// others (cache_aware, least_load, prefix_hash, ...) get the sticky override.
     fn routing_key_override_applies(name: &str) -> bool {
         !matches!(name, "manual" | "consistent_hashing")
