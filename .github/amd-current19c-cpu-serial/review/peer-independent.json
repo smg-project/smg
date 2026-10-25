@@ -1,0 +1,223 @@
+{
+  "carrier_head": "2a9ddf6734deab0f63c2eb7d05a5f876b692adab",
+  "reviewed_head": "be343dc128bfddbcad8296166da1da92d59df963",
+  "spec_sha256": "6d66771bbb5a7cf8d2151a20aeacb2320aff0ba5b8a00ddfa69bfc20f496c257",
+  "publisher_sha256": "4046cab83f06c9f56a353f79570edf912075d5423621bc0490c27e25396eb76f",
+  "observer_sha256": "fb927b69a45e62e187062b76c28b14b7be6dbec33acf6db9f1de169a3f8d10c0",
+  "common_sha256": "848ad435d97423ed3ae443bc40597800de2f8821284c013383e1439c611f8a11",
+  "driver_sha256": "26601e8b5b07f1e02eb24304dc93f0cf78c1a15aa8c1aecff26fd7111b0eb6ae",
+  "worker_identity_sha256": "909b87b28d5a98efbd546df590c144d078e79ad7744e65cc8f76622fa89245c2",
+  "payload_sha256": "edf0ac992f2160282325ea2a8b104f2eaf835b751732f51c7ce0d5fd85081a62",
+  "inputs_sha256": "164e5b56505237eb8bcf0d2c2b9cd020eb956d1a4e6bf91790845b509f7b66df",
+  "frozen_manifest_sha256": "236c963d68b93aedafb6975d8c16e794e3f627696b5445404fcbdd14e9472615",
+  "source_manifest_sha256": "d85b6e8d1d2ff4433504f33f473ad11fc456c00c40a3ef0f01672f96166a8c6d",
+  "job_runner_sha256": "50ee3f19b86655fb5c803db9441f0efa5a8e7b8a64b44171e8e398a905682b5c",
+  "workflow_template_sha256": "2f5b3661c226cea0f96187b59142c627a556f6bdba800191a29cbe9de80b20e4",
+  "test_controls_sha256": "52aa544302724e90377298d27b01fc7724fe8c37d18b4b4eb3eacfc0894ce83c",
+  "serial_control_sha256": "5935732e792a6317535f94dbcdf45f7c85a537dbbeefbd7d353749f258371b98",
+  "installed_record_sha256": "befa493865fc221565477630613d7e3431fbcc8cffe5857deb1fbbdaa71350f5",
+  "editable_proof_sha256": "1bb58b042843769a1060fe5c79cca02eb9d0fc50d9184dad7b0bb8435bea1680",
+  "collection_recorder_sha256": "fab508de579c08610ab51a6e4991284ead6c9414ac71dd27478da53cfea185d8",
+  "complete_proof_sha256": "3d7b630ad4239631c6d9988273de38fdeb19cc552e966f773e7bf3cb31b793a7",
+  "skip_contract_sha256": "33fa1956e16a64c507d7d411feb06df75cf497ac09bde0d5c77a60f9a4823366",
+  "result": "PASS_SOURCE_ONLY_ROOT_PY310_SHA_STREAMING_DELTA",
+  "findings": [],
+  "delivery_sha256": "fd67b072b0981835e98d70f1b12e439eb2d7352415773fb59cbdcabeff951960",
+  "manifest_sha256": "f98d0e55ea71ebd0402909d08ba361ec661e22b26826b9b0bd63e5368f08f228",
+  "reviewed_at_utc": "2026-10-25T01:48:52.660009+00:00",
+  "reviewer": "A; nonauthor of this scheduled carrier/publisher/observer and worker helper; local source/data/AST/hash/Git reads only",
+  "scope": "Root nonauthor delta: one bounded1MiB hash function, two inverse-exact preimport pins. All47 members verified; all29 CPU packet files and original4-method controls byteexact. Full parent sourcepeer d001 retained; no candidate or fixture executed.",
+  "verified": {
+    "manifest_44_all_regular_nonlink_SHA": true,
+    "Git_exact_clean_DCO_6_namespace_only": true,
+    "all20_nondata_Python_AST_parsed": true,
+    "all11_other_CPU_Python_and_inputs_tar_native_generated_exact_V12": true,
+    "CPU_common_848ad_and_outer_serial_control_bf41_typed_separately": true,
+    "namespace_and_packet_driver_and_worker_helper_byteexact": true,
+    "scheduled_worker_identity": "Actual workflow_dispatch repository/actor/ref/run/head/attempt/path via bounded no-redirect GET; exact sole job/labels/runnerID/agent .runner and local sole Worker/Listener with before/after proc start/PPID/argv SHA, real driver ancestry. Driver os.execv preserves parent chain and rechecks complete local identity before Docker create.",
+    "CI_ownership": "Single self-hosted GHA job uses existing registered path only in future private admitted child. Normal main workflows remain byteexact. Source neither stops Listener nor treats a Worker0 snapshot as reservation. The admitted job driver is a later workflow step, so no bare idle-root launch is introduced.",
+    "no_GPU": "runc, no devices/device requests or privileged mode, explicit empty CUDA/HIP/ROCR/GPU masks; no host GPU/models/Docker-socket bind. Existing unchanged CPU guard remains hard.",
+    "clock_and_cleanup": "Actual API job.started_at is approval issued_epoch, <30s at preflight; same absolute600 includes setup/tests/cleanup/upload, work565/payload540. SIGINT/TERM marks FAIL and routes cooperative cancellation through bounded original finally; hard kill remains uncatchable and durable host recovery is retained. CID filter exact labels/image plus machine-readable absence/PG absence; capture independent of ids list and first failure preserved.",
+    "publisher": "Known3CPU slots must allNone, ownedGPU count+1<=2 plus exact preserved wholewatch/run/job joins; normal registered workflow checked; exact6 namespace carrier, root-staged both-node packet; one nonforce push journal, one dispatch POST journal/CAS to CPU_active only; no repeat push/POST on ambiguity, GET-only reconciliation.",
+    "observer": "Exclusive sole lock plus real PID/start/wholeargv/session registration before API, exact run/head/ref/path/attempt and incomplete pagination refused. jobs[] remains unknown even if workflow completed, earliest observed allocated start/job retained through gap, queue900/allocated600/overall1800 triggers observed normal one-cancel journal before POST; later GET only; no accounting release or artifact/CPU-result acceptance.",
+    "complete_contract": "Original173 exact module/case/model/admin4/load2/sixskip collection only; nofixtures/runtests incollection. Full current unit collection/runtime join incl5 collection skips/MCP5/canonical14/normal fullpip/source90/schema8/generated16/descriptors/installed native1d22/RECORD/direct_url remains byteexact V12; current total is derived, no old1602 borrowed. RPC archive bytes not claimed consumed where normaleditable source evidence is used."
+  },
+  "actual_host_python_prerequisite": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/serial-host-python-readonly-root-411e7c245a1041bb84576df52219e339/receipt.json",
+    "bytes": 632,
+    "sha256": "496397cfd0cfcf224d60e4c087c203970b0c696577fad0b2ab830cf778104e31"
+  },
+  "source_and_metadata_references": [
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/delivery.json",
+      "bytes": 4793,
+      "sha256": "1a1a3746c9ffb77c13496e166cb99b0a29ac6fa147682d7fe42dba886eaeec52"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/manifest.json",
+      "bytes": 4491,
+      "sha256": "cf834d652e62fa8dc5fa4abeb43e454b680e0d9896352eceae575685431f9cb1"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/driver-v12-serial-delta.patch",
+      "bytes": 3297,
+      "sha256": "3b178687ad718a25e22bd88fa72ec7e626b82a4d3988fb2f4c694cd3a5947183"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/source-files.json",
+      "bytes": 1356,
+      "sha256": "1ca6b9377dd7c7618178859d5de1068b25a3a359e6df56c02085e9dce5972365"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/source-map-static.json",
+      "bytes": 6281,
+      "sha256": "9dbbdf816c27a699a45cc38331c8c627764ad74403e96d08d4db4e0932fcbf21"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/cpu-packet/pin-cross-reference-audit.json",
+      "bytes": 7171,
+      "sha256": "9be8432be563fbb222878ff8baa32346b57d28fed8f02507e7dd9fbd6d89e1df"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/CPU30-controls-proposal.json",
+      "bytes": 2685,
+      "sha256": "1c69dbe77f9546a5591402343c75bcf177fef6066f8168a0eb900ba13f482089"
+    }
+  ],
+  "source_ast_files": [
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/serial_control.py",
+      "bytes": 9233,
+      "sha256": "bf41a61f3d7d4958c17361e44565e3be1b57a3d26aee9780cc56654575debd17"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/test_serial_controls.py",
+      "bytes": 5226,
+      "sha256": "52aa544302724e90377298d27b01fc7724fe8c37d18b4b4eb3eacfc0894ce83c"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/admit_serial_cpu.py",
+      "bytes": 13088,
+      "sha256": "003e5db1e6de777c45f402397eac8313dc9703ae758c211950a7e4f56599978e"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/watch_serial_cpu.py",
+      "bytes": 8676,
+      "sha256": "0f46ef3790b13fb74568f4375905d530d3b8bde275cdd44a3d52dc8f7588712d"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/cpu-packet/complete_proof.py",
+      "bytes": 4672,
+      "sha256": "3d7b630ad4239631c6d9988273de38fdeb19cc552e966f773e7bf3cb31b793a7"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/cpu-packet/installed_record.py",
+      "bytes": 3852,
+      "sha256": "befa493865fc221565477630613d7e3431fbcc8cffe5857deb1fbbdaa71350f5"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/cpu-packet/native_prestate.py",
+      "bytes": 930,
+      "sha256": "aac804b3d6783d4041fa1405458feb4fdde49b8fefabd604da8ddfd983c9ab1a"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/cpu-packet/payload.py",
+      "bytes": 12255,
+      "sha256": "edf0ac992f2160282325ea2a8b104f2eaf835b751732f51c7ce0d5fd85081a62"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/cpu-packet/run_owned_current_units.py",
+      "bytes": 18900,
+      "sha256": "26601e8b5b07f1e02eb24304dc93f0cf78c1a15aa8c1aecff26fd7111b0eb6ae"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/cpu-packet/common.py",
+      "bytes": 1078,
+      "sha256": "848ad435d97423ed3ae443bc40597800de2f8821284c013383e1439c611f8a11"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/cpu-packet/test_installed_record.py",
+      "bytes": 4310,
+      "sha256": "0587d5ede8a3f5fcc14412be900bab96a8f7997cdd5c9c4da3584e183cbb2a06"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/cpu-packet/worker_identity.py",
+      "bytes": 4762,
+      "sha256": "909b87b28d5a98efbd546df590c144d078e79ad7744e65cc8f76622fa89245c2"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/cpu-packet/prepare_packet.py",
+      "bytes": 1573,
+      "sha256": "aac46dd6f7d471a75a3ce43e3d552d78b5fa6071565183f268e271b1067abbba"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/cpu-packet/distribution_snapshot.py",
+      "bytes": 916,
+      "sha256": "afd68ceadede09441f19056622011e26b521e59f242325cc12a00c3ddc7c8a9d"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/cpu-packet/editable_proof.py",
+      "bytes": 8393,
+      "sha256": "1bb58b042843769a1060fe5c79cca02eb9d0fc50d9184dad7b0bb8435bea1680"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/cpu-packet/collect_only.py",
+      "bytes": 6635,
+      "sha256": "fab508de579c08610ab51a6e4991284ead6c9414ac71dd27478da53cfea185d8"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/cpu-packet/unit_reporter.py",
+      "bytes": 1689,
+      "sha256": "1d220678cca0fa26f285fc94f853dad6057f9512a29b6f4cea97d4e4ac9ec737"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/current19c-cpu-serial-source-20261025/.github/amd-current19c-cpu-serial/job_runner.py",
+      "bytes": 7377,
+      "sha256": "50ee3f19b86655fb5c803db9441f0efa5a8e7b8a64b44171e8e398a905682b5c"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/current19c-cpu-serial-source-20261025/.github/amd-current19c-cpu-serial/run_owned_current_units.py",
+      "bytes": 18900,
+      "sha256": "26601e8b5b07f1e02eb24304dc93f0cf78c1a15aa8c1aecff26fd7111b0eb6ae"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/current19c-cpu-serial-source-20261025/.github/amd-current19c-cpu-serial/worker_identity.py",
+      "bytes": 4762,
+      "sha256": "909b87b28d5a98efbd546df590c144d078e79ad7744e65cc8f76622fa89245c2"
+    }
+  ],
+  "remaining_runtime_gates": [
+    "All source admission flags remain false; this peer authorizes no resource claim, push, POST or actual validation.",
+    "The four/13 planned inert identity controls have not run; they do not claim runtime validation of publisher/observer/signal cancellation behavior. Separate root review/controls/approval remain required.",
+    "Actual DATA-only export30 and exact same nonce-owned readable root-owned nonlink packet at both potential runner nodes, followed by fresh rootapproval/CONTROL CAS and unique dispatch, remain pending.",
+    "Only a true scheduled assigned Worker permits execution; no SSH bare-GPU/CPU replay or Worker0-reservation inference. Actual in-job API identity, noforeigncontainer preflight, setup, full suite, final provenance/cleanup and upload all must pass.",
+    "OS/runner hard kill can prevent finally/upload. Preserve partial durable evidence and raw failures; never infer a unit result or cleanup from missing data.",
+    "No prior CPU/unit/native acceptance is transferred to this new actual scheduled attempt; no original173 GPU/admin/load result, latestmain qualification, ABI completeness or coverage increment."
+  ],
+  "candidate_or_test_execution": false,
+  "API_SSH_Docker_push_POST_CONTROL_M_formal_actions": false,
+  "root_admitted": false,
+  "GPU": 0,
+  "coverage_increment": 0,
+  "sha310_test_sha256": "37bbd8e64555dbaebb8d8e3dbd03013d8c855532b124425321027320c622e9fd",
+  "sha310_CPU10_proposal_sha256": "daee07eb847c9f3e00c919d1b606cd104b761d9b1dc6d82ce0f322165e8949fd",
+  "parent_source_peer_sha256": "d001c19e734b0881af33c8c87d30f78a903cd98a4a08da543c2d8998f4b8cae8",
+  "parent_full_source_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/current19c-cpu-serial-gha-20261025/peer-independent.json",
+    "sha256": "d001c19e734b0881af33c8c87d30f78a903cd98a4a08da543c2d8998f4b8cae8"
+  },
+  "verified_delta": {
+    "one_function_only": true,
+    "hash_reads_bounded_1MiB": true,
+    "read_errors_propagate_and_context_closes": true,
+    "publisher_observer_inverse_pin_byteexact": true,
+    "all47_manifest_members_verified": true,
+    "all29_CPU_packet_members_parent_byteexact": true,
+    "carrier6_namespace_unchanged": true,
+    "outer_fourPython_AST_310": true,
+    "all_source_flags_false": true,
+    "original_four_method_controls_byteexact": true,
+    "new_hash_four_controls_unexecuted": true,
+    "new_GPU_credit": 0
+  }
+}
