@@ -111,7 +111,7 @@ impl CapturePool {
     /// Requires Tokio for file creation; each writer has a dedicated thread so an idle capture
     /// cannot pin the runtime's shared blocking pool. Cancellation
     /// does not refund an admitted attempt: active capacity returns only after both the owner
-    /// and writer exit. Failed creation still consumes its conservative disk/attempt reservation.
+    /// and writer exit. Failed initialization still consumes its disk/attempt reservation.
     pub async fn start(&self) -> io::Result<CaptureSession> {
         self.start_with(CaptureWriter::run).await
     }
@@ -131,13 +131,13 @@ impl CapturePool {
                 let (queue, writer) =
                     CaptureQueue::new(file, limits.queue_capacity, limits.record_bytes)?;
                 let writer_lease = lease.clone();
-                let worker =
-                    thread::Builder::new()
-                        .name("smg-capture".into())
-                        .spawn(move || {
-                            let _lease = writer_lease;
-                            run(writer);
-                        })?;
+                let worker = thread::Builder::new()
+                    .name("smg-capture".into())
+                    .spawn(move || {
+                        let _lease = writer_lease;
+                        run(writer);
+                    })
+                    .map_err(io::Error::other)?;
                 Ok(CaptureSession {
                     directory,
                     queue,
@@ -191,7 +191,9 @@ impl CaptureSession {
     /// Seal and join the writer before releasing admission; requires a Tokio runtime.
     ///
     /// Polling authorizes sealing even if this waiter is later cancelled. The active lease then
-    /// remains with the writer until it exits. Storage success still does not prove coverage.
+    /// remains with the writer until it exits. Cancelled owners detach writer threads; runtime
+    /// shutdown does not join them. Await finish before process exit for durable completion.
+    /// Storage success still does not prove coverage.
     pub async fn finish(self) -> io::Result<PathBuf> {
         let handle = Handle::try_current().map_err(io::Error::other)?;
         let Self {
