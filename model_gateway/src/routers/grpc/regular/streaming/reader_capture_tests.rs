@@ -70,7 +70,9 @@ async fn render(
     }
     let mut deltas: Vec<_> = pieces.iter().map(|_| Delta::default()).collect();
     for (piece, delta) in pieces.into_iter().zip(&mut deltas) {
-        reader.tail(piece, delta, &mut events).expect("read synthetic output");
+        reader
+            .tail(piece, delta, &mut events)
+            .expect("read synthetic output");
         batches.push(serde_json::to_value(events.as_slice()).expect("serialize adapter batch"));
         if let Err(why) = StreamingProcessor::push_events(
             &tx,
@@ -93,7 +95,8 @@ async fn render(
         reader
             .end(::symphony::EngineFinish::Stop, who(), &mut events)
             .expect("finish reader");
-        batches.push(serde_json::to_value(events.as_slice()).expect("serialize final adapter batch"));
+        batches
+            .push(serde_json::to_value(events.as_slice()).expect("serialize final adapter batch"));
         StreamingProcessor::push_events(
             &tx,
             &mut buffer,
@@ -175,7 +178,9 @@ async fn reader_capture_chat_adapter_preserves_wire_on_capture_failure() {
                     .map(|line| serde_json::from_str::<Value>(line).unwrap()["payload"].clone())
                     .collect();
                 assert_eq!(prefix[0]["kind"], "open");
-                assert!(prefix.iter().any(|record| record["input"]["kind"] == "prompt"));
+                assert!(prefix
+                    .iter()
+                    .any(|record| record["input"]["kind"] == "prompt"));
             }
             if complete {
                 let snapshot = CaptureSnapshot::read(
