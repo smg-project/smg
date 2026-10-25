@@ -788,13 +788,13 @@ async fn kv_transfer_params_pass_through_both_ways() {
 
     let mut outputs = batch("pd1", vec![7], Some(EngineCoreFinishReason::Length), None);
     if let EngineCoreOutputs::RequestBatch(batch) = &mut outputs {
-        batch.outputs[0].kv_transfer_params = Some(serde_json::json!({
+        batch.outputs[0].kv_transfer_params = Some(Box::new(serde_json::json!({
             "do_remote_prefill": true,
             "remote_block_ids": [1, 2],
             "remote_engine_id": "eng-a",
             "remote_host": "10.0.0.1",
             "remote_port": 5600,
-        }));
+        })));
     }
     h.engine_out.send_outputs(&outputs).await.unwrap();
     let finished = complete(stream.message().bounded().await.unwrap().unwrap());
@@ -1140,12 +1140,12 @@ async fn spec_decode_counts_reach_the_complete() {
         None,
     );
     if let EngineCoreOutputs::RequestBatch(batch) = &mut outputs {
-        batch.outputs[0].spec_decode_metrics = Some(SpecDecodeMetrics {
+        batch.outputs[0].spec_decode_metrics = Some(Box::new(SpecDecodeMetrics {
             num_spec_tokens: 3,
             histogram: vec![1, 2, 0, 1],
             num_draft_tokens: 9,
             ..Default::default()
-        });
+        }));
     }
     h.engine_out.send_outputs(&outputs).await.unwrap();
     let done = complete(stream.message().bounded().await.unwrap().unwrap());
@@ -2546,9 +2546,9 @@ fn pooled_batch(request_id: &str, values: Vec<f32>) -> EngineCoreOutputs {
     EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         outputs: vec![EngineCoreOutput {
             request_id: request_id.to_string(),
-            pooling_output: Some(PoolingOutput::new(
+            pooling_output: Some(Box::new(PoolingOutput::new(
                 WireTensor::from_f32(vec![values.len()], values).unwrap(),
-            )),
+            ))),
             finish_reason: Some(EngineCoreFinishReason::Stop),
             ..Default::default()
         }],

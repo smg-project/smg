@@ -314,8 +314,16 @@ impl MappedGenerateStream for VllmGenerateStream {
             &mut self.input_logprobs_emitted,
             &mut response,
         );
-        attach_kv_transfer_params(&mut response, &mut self.pending, output.kv_transfer_params);
-        attach_spec_decode_counts(&mut response, &mut self.pending, output.spec_decode_metrics);
+        attach_kv_transfer_params(
+            &mut response,
+            &mut self.pending,
+            output.kv_transfer_params.map(|params| *params),
+        );
+        attach_spec_decode_counts(
+            &mut response,
+            &mut self.pending,
+            output.spec_decode_metrics.map(|metrics| *metrics),
+        );
         Ok(response)
     }
 }
