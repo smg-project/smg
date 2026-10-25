@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from . import canary, mooncake, mooncake_topology, owned
+from . import canary, mooncake, mooncake_topology, owned, passive_flush
 
 
 def canonical(nodeid):
@@ -100,9 +100,14 @@ class RuntimeProof:
             "original Mooncake4 main/global/extra backend configuration differs",
         )
         root = Path(os.environ["GITHUB_WORKSPACE"])
-        self.native = json.loads((root / ".github/amd-shared-product/inputs.json").read_text())[
-            "gateway_native"
-        ]
+        inputs = json.loads((root / ".github/amd-shared-product/inputs.json").read_text())
+        self.native = inputs["gateway_native"]
+        self.passive_flush = os.environ.get("SMG_CI_MC4_PERIODIC_FLUSH") == "1"
+        if self.passive_flush:
+            owned.require(os.environ.get("SMG_CI_PRIVATE_MOONCAKE") == "1" and all(
+                inputs.get(key) is True for key in
+                ("ready", "run_budget_admitted", "artifacts_pinned", "consumer_gpu_ready")),
+                "passive flush requires admitted private AMD diagnostic")
         self.objects, self.logs, self.offsets = {}, {}, {}
         self.events, self.errors, self.reports, self.patches = [], [], {}, []
         self.nodeid = None
@@ -266,8 +271,13 @@ class RuntimeProof:
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_call(self, item):
         self.snapshot("call-before")
-        yield
+        outcome = yield
         self.snapshot("call-after")
+        if self.passive_flush and canonical(item.nodeid) == mooncake_topology.CASE and outcome.excinfo is None:
+            try:
+                passive_flush.observe(self)
+            except Exception as error:
+                self.errors.append({"nodeid": self.nodeid, "stage": "passive-flush", "error": str(error)})
 
     def pytest_runtest_logreport(self, report):
         self.reports.setdefault(canonical(report.nodeid), []).append(report_row(report))

@@ -92,7 +92,7 @@ def verify(recipe, events, directory):
                 "positive_transfer_counts_by_owned_log": counters,
                 "accepted": None,
                 "scope": (
-                    "Case-associated nominal fixture logs and cumulative counters; "
+                    "Case-associated nominal fixture logs and periodic interval counters; "
                     "not request-specific KV bytes, ACK, peer release or HBM proof"
                 ),
             },
