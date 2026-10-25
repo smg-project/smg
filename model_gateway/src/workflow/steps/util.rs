@@ -6,7 +6,10 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use smg_grpc_client::connect_channel_with_timeout;
 
-use crate::routers::grpc::client::{GrpcClient, HealthCheckResponse};
+use crate::{
+    routers::grpc::client::{GrpcClient, HealthCheckResponse},
+    worker::endpoint::Endpoint,
+};
 
 fn strip_scheme<'a>(url: &'a str, scheme: &str) -> Option<&'a str> {
     url.get(..scheme.len())
@@ -50,11 +53,17 @@ pub(crate) fn grpc_base_url(url: &str) -> String {
 fn http_health_url(url: &str) -> Result<String, String> {
     match url_scheme(url).as_deref() {
         Some("http") | Some("https") => Ok(format!("{}/health", url.trim_end_matches('/'))),
+        // The refusals name the address masked: on the detection step's
+        // auto-detect arm (a URL whose scheme names no mode) a scheme neither
+        // probe accepts ends in the step's failure message, which a log line
+        // carries.
         Some("grpc") | Some("grpcs") => Err(format!(
-            "HTTP health check does not accept gRPC URL scheme: {url}"
+            "HTTP health check does not accept gRPC URL scheme: {}",
+            Endpoint::redacted_str(url)
         )),
         Some(scheme) => Err(format!(
-            "HTTP health check does not accept URL scheme '{scheme}': {url}"
+            "HTTP health check does not accept URL scheme '{scheme}': {}",
+            Endpoint::redacted_str(url)
         )),
         None => Ok(format!("http://{}/health", url.trim_end_matches('/'))),
     }
@@ -64,10 +73,12 @@ fn grpc_reachable_url(url: &str) -> Result<String, String> {
     match url_scheme(url).as_deref() {
         Some("grpc") | Some("grpcs") => Ok(url.trim_end_matches('/').to_string()),
         Some("http") | Some("https") => Err(format!(
-            "gRPC health check does not accept HTTP URL scheme: {url}"
+            "gRPC health check does not accept HTTP URL scheme: {}",
+            Endpoint::redacted_str(url)
         )),
         Some(scheme) => Err(format!(
-            "gRPC health check does not accept URL scheme '{scheme}': {url}"
+            "gRPC health check does not accept URL scheme '{scheme}': {}",
+            Endpoint::redacted_str(url)
         )),
         None => Ok(format!("grpc://{}", url.trim_end_matches('/'))),
     }
@@ -331,6 +342,26 @@ mod tests {
             grpc_reachable_url("localhost:30001").unwrap(),
             "grpc://localhost:30001"
         );
+    }
+
+    /// A scheme refusal names the address masked: a secret in the URL's
+    /// userinfo reaches no failure message through it (the detection step's
+    /// auto-detect arm runs both probes and appends their refusals to its
+    /// failure message).
+    #[test]
+    fn a_scheme_refusal_names_the_address_masked() {
+        for refusal in [
+            grpc_reachable_url("http://user:secret@worker:3000").unwrap_err(),
+            grpc_reachable_url("https://user:secret@worker:3000/").unwrap_err(),
+            http_health_url("grpc://user:secret@worker:3000").unwrap_err(),
+            http_health_url("grpcs://user:secret@worker:3000/").unwrap_err(),
+        ] {
+            assert!(!refusal.contains("secret"), "{refusal}");
+            assert!(refusal.contains("user:***@worker:3000"), "{refusal}");
+        }
+        let unknown = grpc_reachable_url("ftp://user:secret@worker:3000").unwrap_err();
+        assert!(!unknown.contains("secret"), "{unknown}");
+        assert!(unknown.contains("'ftp'"), "{unknown}");
     }
 
     #[test]
