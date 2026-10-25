@@ -188,6 +188,11 @@ impl CaptureSession {
         self.queue.record(payload)
     }
 
+    /// Invalidate observation coverage while retaining the writer acknowledgement and lease.
+    pub(super) fn invalidate(&mut self) {
+        self.queue.invalidate();
+    }
+
     /// Seal and join the writer before releasing admission; requires a Tokio runtime.
     ///
     /// Polling authorizes sealing even if this waiter is later cancelled. The active lease then

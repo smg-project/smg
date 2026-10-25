@@ -108,6 +108,11 @@ impl CaptureQueue {
         Ok(())
     }
 
+    /// Close admission without sealing; `finish` still collects the writer's original result.
+    pub(super) fn invalidate(&mut self) {
+        self.sender = None;
+    }
+
     /// Explicitly seal admission, drain accepted records and await durable storage completion.
     ///
     /// Once polled, this authorizes sealing even if the awaiting future is subsequently dropped.

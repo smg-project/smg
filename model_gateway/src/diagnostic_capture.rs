@@ -2,6 +2,7 @@
 //!
 //! Run `CaptureFile` on a blocking writer, not an inference task. `CaptureQueue` supplies a
 //! bounded single-producer mailbox. `CapturePool` schedules writers under shared run limits.
+//! `SharedCapture` gives observation boundaries nonwaiting handles and one completion owner.
 //! Sampling, source metadata, capture hooks and retention across runs remain the caller's job.
 //! A completion marker attests only that the accepted records were stored: it cannot prove
 //! that every required engine/parser/adapter boundary was captured or that inference passed.
@@ -21,8 +22,10 @@ use serde::Serialize;
 
 mod admission;
 mod queue;
+mod shared;
 pub use admission::{CaptureLimits, CapturePool, CaptureSession};
 pub use queue::{CaptureQueue, CaptureWriter};
+pub use shared::{CaptureObserver, SharedCapture};
 
 // The temporary and published marker names can both appear in an artifact inventory.
 const MARKER_BYTES: u64 = 256;
