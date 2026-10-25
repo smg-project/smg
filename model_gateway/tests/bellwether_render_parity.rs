@@ -1822,7 +1822,10 @@ fn download(
             bytes.len()
         ));
     }
-    let part = dir.join(format!("{file}.part"));
+    // Named for this process: two test binaries may fetch the same file into one
+    // shared directory at the same moment, and each renames its own whole file
+    // into place.
+    let part = dir.join(format!("{file}.{}.part", std::process::id()));
     fs::write(&part, &bytes).map_err(|e| format!("cannot write {}: {e}", part.display()))?;
     fs::rename(&part, &path)
         .map_err(|e| format!("cannot rename {} into place: {e}", part.display()))?;
@@ -2916,7 +2919,9 @@ fn a_download_whose_body_breaks_is_sent_again_and_lands_on_the_second_try() {
         "the wait before the second try was {elapsed:?}"
     );
     assert!(
-        !dir.path().join("tokenizer.json.part").exists(),
+        !dir.path()
+            .join(format!("tokenizer.json.{}.part", std::process::id()))
+            .exists(),
         "no part is left behind"
     );
     println!("a body broken once: 2 requests, the file landed after {elapsed:?}");
@@ -3019,7 +3024,10 @@ fn a_download_that_breaks_at_every_try_fails_after_the_bounded_retries() {
         "the waits of {waits:?} in all were honoured: {elapsed:?}"
     );
     assert!(!dir.path().join("tokenizer.json").exists());
-    assert!(!dir.path().join("tokenizer.json.part").exists());
+    assert!(!dir
+        .path()
+        .join(format!("tokenizer.json.{}.part", std::process::id()))
+        .exists());
     println!(
         "broken at every try: {} requests, failed after {elapsed:?}: {error}",
         served.load(Ordering::SeqCst)

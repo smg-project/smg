@@ -172,21 +172,78 @@ jobs:
           cache-key: bellwether-fixtures-tokenizers-v1
 
       # The tests fetch each model's tokenizer files from Hugging Face once, at
-      # the revision its manifest pins, into these directories. Which files
-      # are there depends on the manifests the tests read (the unpacked copy)
-      # and on the list each test asks for, so the key is the hash of both:
-      # moving the pin to a commit with the same models stores nothing new,
-      # and a test that asks for one more file gets a new entry that starts
-      # from the old one.
-      - name: Cache tokenizer files
-        uses: actions/cache@v6
+      # the revision its manifest pins, into the cache directory under their
+      # crate (the working directory cargo gives an integration test). Which
+      # files are there depends on the manifests the tests read (the unpacked
+      # copy) and on the list each test asks for, so the key is the hash of
+      # both: moving the pin to a commit with the same models stores nothing
+      # new, and a test that asks for one more file gets a new entry that
+      # starts from the old one. The key's `shared` names the entries that
+      # hold one copy of the files (the link step below); the prefix in
+      # restore-keys takes the entries made before as well, so the first run
+      # after the change starts from one of them and saves the one-copy entry
+      # under the new key. The restore and the save are separate steps: the
+      # cache service answers a share of the restores with 429 (the
+      # repository's matrices and sccache share its quota), the action gives
+      # up after one retry seconds later, and the job then fetches every file
+      # from the hub and packs an entry nothing restores. So one more attempt
+      # after the limit's window, only when no key matched at all: a job
+      # cannot read its own step's log, and the action reports a refused
+      # restore as a miss, but with the prefix key an entry always exists once
+      # the job has run on the repository, so that outcome is the service's
+      # 429 and not a miss.
+      - name: Restore the tokenizer files
+        id: tokenizers
+        uses: actions/cache/restore@v6
         with:
           path: |
             crates/tokenizer/.tokenizer_cache/bellwether
             model_gateway/.tokenizer_cache/bellwether
-          key: bellwether-tokenizers-${{ hashFiles('.bellwether/fixtures-plain/*/manifest.toml', 'model_gateway/tests/bellwether_*.rs', 'crates/tokenizer/tests/bellwether_*.rs') }}
+          key: bellwether-tokenizers-shared-${{ hashFiles('.bellwether/fixtures-plain/*/manifest.toml', 'model_gateway/tests/bellwether_*.rs', 'crates/tokenizer/tests/bellwether_*.rs') }}
           restore-keys: |
             bellwether-tokenizers-
+
+      - name: Wait out the cache service's limit (the first restore matched no key, the service's 429 since an entry under the prefix always exists)
+        if: steps.tokenizers.outputs.cache-hit != 'true' && steps.tokenizers.outputs.cache-matched-key == ''
+        run: sleep 45
+
+      - name: Restore the tokenizer files, second attempt (after the service's 429)
+        id: tokenizers-again
+        if: steps.tokenizers.outputs.cache-hit != 'true' && steps.tokenizers.outputs.cache-matched-key == ''
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            crates/tokenizer/.tokenizer_cache/bellwether
+            model_gateway/.tokenizer_cache/bellwether
+          key: bellwether-tokenizers-shared-${{ hashFiles('.bellwether/fixtures-plain/*/manifest.toml', 'model_gateway/tests/bellwether_*.rs', 'crates/tokenizer/tests/bellwether_*.rs') }}
+          restore-keys: |
+            bellwether-tokenizers-
+
+      # The two harnesses keep the same files at the same revisions, each
+      # under its own crate: one directory serves both, so a file one of them
+      # fetched is there for the other, and the entry holds one copy, half
+      # the bytes to pack and to send. The tokenizer crate's directory becomes
+      # a link to the gateway's; the link sits at the path the cache lists, so
+      # the entry stores the link, not a second tree, and the list of paths
+      # (part of an entry's identity) stays as it was, so the entries made
+      # before this step restore as before: a directory there, which goes
+      # and the link takes its place; what it held (the tokenizer harness's
+      # tiktoken files among them) is asked for again, into the one
+      # directory. Each loader writes a file under a name of its own process
+      # beside the final name and renames it into place, so the two fetching
+      # the same file into the one directory at the same moment each put a
+      # whole file there.
+      - name: One tokenizer cache directory for both harnesses
+        run: |
+          set -euo pipefail
+          shared=model_gateway/.tokenizer_cache/bellwether
+          mirror=crates/tokenizer/.tokenizer_cache/bellwether
+          mkdir -p "$shared" "$(dirname "$mirror")"
+          if [ -d "$mirror" ] && ! [ -L "$mirror" ]; then
+            rm -r "$mirror"
+          fi
+          [ -L "$mirror" ] || ln -s "../../../$shared" "$mirror"
+          ls -ld "$mirror"
 
       # One build for the test targets, so they build with the same features
       # (the tokenizer files are downloaded over the TLS backend the gateway
@@ -277,6 +334,25 @@ jobs:
             echo "::error::tests that read bellwether failed: ${failed[*]}"
             exit 1
           fi
+
+      # What the restores did not bring, under the primary key: the entry the
+      # single cache action saved in its post step, on the same condition (no
+      # exact key hit) and, as that step, after a run that passed; a run that
+      # ended early fetched a part of the files, and an entry of a part under
+      # the key would keep the whole one out. Only a run on `main` saves (a
+      # push, or a dispatch on `main` to seed the entry again): a pull
+      # request's run reads `main`'s entries but saves in a scope of its own
+      # that `main` never reads, and the repository's cache budget (10 GB, the
+      # oldest entries evicted) held none of the job's entries while every
+      # run that missed packed one.
+      - name: Save the tokenizer files
+        if: github.ref == 'refs/heads/main' && steps.tokenizers.outputs.cache-hit != 'true' && steps.tokenizers-again.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            crates/tokenizer/.tokenizer_cache/bellwether
+            model_gateway/.tokenizer_cache/bellwether
+          key: ${{ steps.tokenizers.outputs.cache-primary-key }}
 
       # The per-case reports, one file per harness: what the log summarizes
       # per model, case by case. Kept whether the tests passed or not; when
