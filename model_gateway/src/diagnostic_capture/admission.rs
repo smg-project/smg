@@ -188,6 +188,16 @@ impl CaptureSession {
         self.queue.record(payload)
     }
 
+    /// The immutable payload cap inherited from the admitted queue.
+    pub(super) fn record_bytes_limit(&self) -> usize {
+        self.queue.record_bytes_limit()
+    }
+
+    /// Invalidate observation coverage while retaining the writer acknowledgement and lease.
+    pub(super) fn invalidate(&mut self) {
+        self.queue.invalidate();
+    }
+
     /// Seal and join the writer before releasing admission; requires a Tokio runtime.
     ///
     /// Polling authorizes sealing even if this waiter is later cancelled. The active lease then

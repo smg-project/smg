@@ -2,6 +2,7 @@
 //!
 //! Run `CaptureFile` on a blocking writer, not an inference task. `CaptureQueue` supplies a
 //! bounded single-producer mailbox. `CapturePool` schedules writers under shared run limits.
+//! `SharedCapture` gives observation boundaries nonwaiting handles and one completion owner.
 //! Sampling, source metadata, capture hooks and retention across runs remain the caller's job.
 //! A completion marker attests only that the accepted records were stored: it cannot prove
 //! that every required engine/parser/adapter boundary was captured or that inference passed.
@@ -27,8 +28,10 @@ pub use reader::{CaptureReadLimits, CaptureSnapshot};
 
 mod admission;
 mod queue;
+mod shared;
 pub use admission::{CaptureLimits, CapturePool, CaptureSession};
 pub use queue::{CaptureQueue, CaptureWriter};
+pub use shared::{CaptureObserver, SharedCapture};
 
 pub use crate::routers::grpc::regular::symphony::FormatRecipe;
 
