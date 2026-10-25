@@ -1715,10 +1715,10 @@ impl StreamingProcessor {
                 });
             }
             context::ExecutionResult::PrefillDecode {
-                // TODO(#1781 follow-up): thread pd_timing for honest PD TTFT
                 prefill,
                 decode,
                 prefill_guards,
+                pd_timing,
                 ..
             } => {
                 let processor = self.clone();
@@ -1739,6 +1739,7 @@ impl StreamingProcessor {
                             stop_params,
                             messages_request,
                             &tx,
+                            pd_timing,
                             prefill_guards,
                             reservation,
                         ))
@@ -1797,12 +1798,40 @@ impl StreamingProcessor {
     #[expect(clippy::too_many_arguments)]
     pub async fn process_messages_streaming_chunks(
         &self,
+        grpc_stream: ProtoStream,
+        dispatch: context::DispatchMetadata,
+        tokenizer: Arc<dyn Tokenizer>,
+        stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
+        original_request: MessagesResponseSpec,
+        tx: &SseSender,
+        reservation: Option<Arc<SharedReservationHandle>>,
+    ) -> Result<(), utils::StreamFailure> {
+        self.process_messages_streaming_chunks_inner(
+            grpc_stream,
+            dispatch,
+            tokenizer,
+            stop_params,
+            original_request,
+            tx,
+            None,
+            reservation,
+        )
+        .await
+    }
+
+    /// Inner implementation shared by single-mode and PD prefill/decode
+    /// Messages streaming. `pd_timing` is `Some` only in PD mode and yields
+    /// honest PD TTFT (prefill start to first decode token).
+    #[expect(clippy::too_many_arguments)]
+    async fn process_messages_streaming_chunks_inner(
+        &self,
         mut grpc_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: MessagesResponseSpec,
         tx: &SseSender,
+        pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
         let mut stream = MessagesStream::open(
@@ -1812,6 +1841,7 @@ impl StreamingProcessor {
             stop_params,
             &original_request,
             tx,
+            pd_timing,
         )?;
         stream.send_message_start().await?;
         stream.read_engine(&mut grpc_stream).await?;
@@ -1841,7 +1871,9 @@ impl StreamingProcessor {
     /// Process prefill/decode streaming chunks for Messages API (PD mode).
     ///
     /// Consumes prefill stream then delegates to
-    /// [`Self::process_messages_streaming_chunks`] with the decode stream.
+    /// [`Self::process_messages_streaming_chunks_inner`] with the decode
+    /// stream and `pd_timing`, so the first decode token yields honest PD
+    /// TTFT.
     #[expect(clippy::too_many_arguments)]
     pub async fn process_prefill_decode_messages_streaming_chunks(
         &self,
@@ -1852,6 +1884,7 @@ impl StreamingProcessor {
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: MessagesResponseSpec,
         tx: &SseSender,
+        pd_timing: context::PdTiming,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
@@ -1864,13 +1897,14 @@ impl StreamingProcessor {
         let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
         let result = self
-            .process_messages_streaming_chunks(
+            .process_messages_streaming_chunks_inner(
                 decode_stream,
                 dispatch,
                 tokenizer,
                 stop_params,
                 original_request,
                 tx,
+                Some(pd_timing),
                 reservation,
             )
             .await;
@@ -1927,6 +1961,17 @@ impl StreamingProcessor {
         )]
         tokio::spawn(async move {
             let start_time = Instant::now();
+            // In PD mode this task only starts once the decode streams exist --
+            // for sequential PD that is after prefill completes, with the first
+            // decode chunk already buffered -- so `start_time` would report a
+            // near-zero TTFT. Anchor at the earliest prefill dispatch instead,
+            // as the chat stream does; generation duration must share the base
+            // or TPOT underflows.
+            let stream_base = units
+                .iter()
+                .filter_map(CompletionStreamUnit::prefill_start)
+                .min()
+                .unwrap_or(start_time);
             let choices_per_prompt = completion_request.choices_per_prompt;
             let echo = completion_request.echo;
             let include_usage = completion_request.include_usage;
@@ -1983,6 +2028,7 @@ impl StreamingProcessor {
                                 prefill,
                                 decode,
                                 prefill_guards,
+                                pd_timing,
                             } => {
                                 processor
                                     .process_prefill_decode_completion_streaming_chunks(
@@ -1995,6 +2041,7 @@ impl StreamingProcessor {
                                         prompt_text,
                                         index_offset,
                                         tx,
+                                        pd_timing,
                                         prefill_guards,
                                     )
                                     .await
@@ -2089,8 +2136,8 @@ impl StreamingProcessor {
                         backend_type: processor.backend_type,
                         model_id: &dispatch.model,
                         endpoint: metrics_labels::ENDPOINT_COMPLETIONS,
-                        ttft: first_token_time.map(|t| t.duration_since(start_time)),
-                        generation_duration: start_time.elapsed(),
+                        ttft: first_token_time.map(|t| t.duration_since(stream_base)),
+                        generation_duration: stream_base.elapsed(),
                         input_tokens: Some(total_prompt as u64),
                         cached_tokens: Some(u64::from(total_cached)),
                         output_tokens: total_completion as u64,
@@ -2113,15 +2160,16 @@ impl StreamingProcessor {
                 Ok(vec![CompletionStreamUnit::Single(stream)])
             }
             context::ExecutionResult::PrefillDecode {
-                // TODO(#1781 follow-up): thread pd_timing for honest PD TTFT
                 prefill,
                 decode,
                 prefill_guards,
+                pd_timing,
                 ..
             } => Ok(vec![CompletionStreamUnit::PrefillDecode {
                 prefill,
                 decode,
                 prefill_guards,
+                pd_timing,
             }]),
             context::ExecutionResult::Batch { results } => results
                 .into_iter()
@@ -2133,11 +2181,13 @@ impl StreamingProcessor {
                         prefill,
                         decode,
                         prefill_guards,
+                        pd_timing,
                         ..
                     } => Ok(CompletionStreamUnit::PrefillDecode {
                         prefill,
                         decode,
                         prefill_guards,
+                        pd_timing,
                     }),
                     _ => Err("Nested batch or embedding result in completion streaming"),
                 })
@@ -2159,6 +2209,35 @@ impl StreamingProcessor {
     #[expect(clippy::too_many_arguments)]
     async fn process_completion_streaming_chunks(
         &self,
+        grpc_stream: ProtoStream,
+        dispatch: context::DispatchMetadata,
+        tokenizer: Arc<dyn Tokenizer>,
+        stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
+        completion_request: &CompletionResponseSpec,
+        prompt_text: &str,
+        index_offset: u32,
+        tx: &SseSender,
+    ) -> Result<CompletionStreamOutcome, utils::StreamFailure> {
+        self.process_completion_streaming_chunks_inner(
+            grpc_stream,
+            dispatch,
+            tokenizer,
+            stop_params,
+            completion_request,
+            prompt_text,
+            index_offset,
+            tx,
+            None,
+        )
+        .await
+    }
+
+    /// Inner implementation shared by single-mode and PD prefill/decode
+    /// completion units. `pd_timing` is `Some` only in PD mode and yields
+    /// honest PD TTFT (prefill start to first decode token).
+    #[expect(clippy::too_many_arguments)]
+    async fn process_completion_streaming_chunks_inner(
+        &self,
         mut grpc_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
@@ -2167,6 +2246,7 @@ impl StreamingProcessor {
         prompt_text: &str,
         index_offset: u32,
         tx: &SseSender,
+        pd_timing: Option<context::PdTiming>,
     ) -> Result<CompletionStreamOutcome, utils::StreamFailure> {
         let mut stream = CompletionStream::open(
             &dispatch,
@@ -2176,13 +2256,15 @@ impl StreamingProcessor {
             prompt_text,
             index_offset,
             tx,
+            pd_timing,
+            self.backend_type,
         );
         stream.read_engine(&mut grpc_stream).await?;
         // The stream's verdict, before the engine side is released: a client
         // that left gets no finish of its open choices (the held tail would go
         // to a closed sender), as on the chat and Messages paths.
         let client_left = grpc_stream.client_left();
-        stream.release_engine(grpc_stream, self.backend_type);
+        stream.release_engine(grpc_stream);
         if !client_left {
             stream.finish_open_choices().await?;
         }
@@ -2191,7 +2273,8 @@ impl StreamingProcessor {
     }
 
     /// PD prefill/decode variant: consume prefill stream, then delegate decode
-    /// stream to [`Self::process_completion_streaming_chunks`].
+    /// stream to [`Self::process_completion_streaming_chunks_inner`] with
+    /// `pd_timing`, so the first decode token yields honest PD TTFT.
     #[expect(clippy::too_many_arguments)]
     async fn process_prefill_decode_completion_streaming_chunks(
         &self,
@@ -2204,6 +2287,7 @@ impl StreamingProcessor {
         prompt_text: &str,
         index_offset: u32,
         tx: &SseSender,
+        pd_timing: context::PdTiming,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
     ) -> Result<CompletionStreamOutcome, utils::StreamFailure> {
         // The client's prompt-side usage is the prefill side's.
@@ -2214,7 +2298,7 @@ impl StreamingProcessor {
         let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
         let result = self
-            .process_completion_streaming_chunks(
+            .process_completion_streaming_chunks_inner(
                 decode_stream,
                 dispatch,
                 tokenizer,
@@ -2223,6 +2307,7 @@ impl StreamingProcessor {
                 prompt_text,
                 index_offset,
                 tx,
+                Some(pd_timing),
             )
             .await;
 
@@ -3788,6 +3873,7 @@ struct MessagesStream<'a> {
     /// Dispatch metadata, for consistent response fields.
     dispatch: &'a context::DispatchMetadata,
     tx: &'a SseSender,
+    pd_timing: Option<context::PdTiming>,
 
     // Metrics timing
     start_time: Instant,
@@ -3885,6 +3971,7 @@ impl<'a> MessagesStream<'a> {
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         spec: &'a MessagesResponseSpec,
         tx: &'a SseSender,
+        pd_timing: Option<context::PdTiming>,
     ) -> Result<Self, utils::StreamFailure> {
         let start_time = Instant::now();
         let model = &dispatch.model;
@@ -3987,6 +4074,7 @@ impl<'a> MessagesStream<'a> {
             spec,
             dispatch,
             tx,
+            pd_timing,
             start_time,
             first_token_time: None,
             sse_buffer: Vec::with_capacity(512),
@@ -4157,6 +4245,9 @@ impl<'a> MessagesStream<'a> {
     ) -> Result<Option<MessagesPendingText>, utils::StreamFailure> {
         if self.first_token_time.is_none() {
             self.first_token_time = Some(Instant::now());
+            if let Some(timing) = &self.pd_timing {
+                timing.record_first_decode_token(self.processor.backend_type, &self.dispatch.model);
+            }
         }
 
         // Once the local stop decoder has fired, a further engine chunk is
@@ -4721,16 +4812,24 @@ impl<'a> MessagesStream<'a> {
         if client_left {
             return;
         }
-        // Record metrics
+        // In PD mode this task only starts once the decode stream exists --
+        // for sequential PD that is after prefill completes, with the first
+        // decode chunk already buffered -- so `start_time` would report a
+        // near-zero TTFT. Anchor at the prefill dispatch instant instead, as
+        // the chat stream does; generation duration must share the base or
+        // TPOT underflows.
+        let stream_base = self
+            .pd_timing
+            .as_ref()
+            .map(|timing| timing.prefill_start)
+            .unwrap_or(self.start_time);
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.processor.backend_type,
             model_id: &self.dispatch.model,
             endpoint: metrics_labels::ENDPOINT_MESSAGES,
-            ttft: self
-                .first_token_time
-                .map(|t| t.duration_since(self.start_time)),
-            generation_duration: self.start_time.elapsed(),
+            ttft: self.first_token_time.map(|t| t.duration_since(stream_base)),
+            generation_duration: stream_base.elapsed(),
             input_tokens: Some(u64::from(self.prompt_tokens)),
             cached_tokens: Some(u64::from(self.cached_tokens)),
             output_tokens: u64::from(self.completion_tokens.total()),
@@ -4746,6 +4845,8 @@ mod failure_tests;
 mod isolation_tests;
 #[cfg(test)]
 mod local_stop_tests;
+#[cfg(test)]
+mod pd_anchor_tests;
 #[cfg(test)]
 mod pd_usage_tests;
 #[cfg(test)]

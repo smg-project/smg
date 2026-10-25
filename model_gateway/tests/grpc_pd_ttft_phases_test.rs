@@ -8,6 +8,11 @@
 //! response headers at once or holds them until its first token. Parallel
 //! dispatch (both sides sent together): the decode phase is the whole TTFT.
 //!
+//! Every streaming route (chat, Messages, completions) anchors its own time to
+//! first token and generation duration at the prefill dispatch as well: on the
+//! sequential pair they carry both workers' delays, not the decode worker's
+//! alone.
+//!
 //! Each case runs on a current-thread runtime under a thread-local Prometheus
 //! recorder, so the request path's emissions land in the rendered text.
 
@@ -243,28 +248,82 @@ fn tenant() -> TenantRequestMeta {
     TenantRequestMeta::new(TenantKey::new("pd-ttft-phases-test-tenant"))
 }
 
-/// One streaming chat through `router`, read to its `[DONE]`.
+/// A streaming route of the router, with the endpoint label its stream
+/// metrics carry.
+#[derive(Clone, Copy)]
+enum Route {
+    Chat,
+    Messages,
+    Completions,
+}
+
+impl Route {
+    fn endpoint(self) -> &'static str {
+        match self {
+            Route::Chat => "chat",
+            Route::Messages => "messages",
+            Route::Completions => "completions",
+        }
+    }
+}
+
+/// One streaming request on `route` through `router`, read to its end.
 #[expect(
     clippy::unwrap_used,
     clippy::expect_used,
     reason = "test helper - panicking on failure is intentional"
 )]
-async fn one_streaming_chat(router: &dyn RouterTrait) {
-    let request = serde_json::from_value(serde_json::json!({
-        "model": MODEL,
-        "messages": [{"role": "user", "content": "Hello world"}],
-        "max_tokens": 8,
-        "stream": true,
-    }))
-    .unwrap();
-    let response = router.route_chat(None, &tenant(), request, MODEL).await;
+async fn one_streaming_request(router: &dyn RouterTrait, route: Route) {
+    let response = match route {
+        Route::Chat => {
+            let request = serde_json::from_value(serde_json::json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Hello world"}],
+                "max_tokens": 8,
+                "stream": true,
+            }))
+            .unwrap();
+            router.route_chat(None, &tenant(), request, MODEL).await
+        }
+        Route::Messages => {
+            let request = serde_json::from_value(serde_json::json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Hello world"}],
+                "max_tokens": 8,
+                "stream": true,
+            }))
+            .unwrap();
+            router.route_messages(None, &tenant(), request, MODEL).await
+        }
+        Route::Completions => {
+            let request = serde_json::from_value(serde_json::json!({
+                "model": MODEL,
+                "prompt": "Hello world",
+                "max_tokens": 8,
+                "stream": true,
+            }))
+            .unwrap();
+            router
+                .route_completion(None, &tenant(), request, MODEL)
+                .await
+        }
+    };
     let status = response.status();
     let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
         .await
         .expect("response body");
     let body = String::from_utf8(bytes.to_vec()).expect("utf-8 body");
     assert_eq!(status, http::StatusCode::OK, "{body}");
-    assert!(body.contains("data: [DONE]"), "{body}");
+    let ended = match route {
+        Route::Chat | Route::Completions => body.contains("data: [DONE]"),
+        Route::Messages => body.contains("event: message_stop"),
+    };
+    assert!(ended, "{body}");
+}
+
+/// One streaming chat through `router`, read to its `[DONE]`.
+async fn one_streaming_chat(router: &dyn RouterTrait) {
+    one_streaming_request(router, Route::Chat).await;
 }
 
 /// Run `case` on a current-thread runtime under a thread-local recorder and
@@ -290,15 +349,20 @@ where
     handle.render()
 }
 
-/// The `_sum` or `_count` sample of `family` for `runtime`, if it was emitted.
-fn sample(rendered: &str, family: &str, field: &str, runtime: &str) -> Option<f64> {
+/// The `_sum` or `_count` sample of `family` whose labels contain `label`, if
+/// it was emitted.
+fn labelled(rendered: &str, family: &str, field: &str, label: &str) -> Option<f64> {
     let prefix = format!("{family}_{field}{{");
-    let label = format!("runtime=\"{runtime}\"");
     rendered
         .lines()
-        .find(|line| line.starts_with(&prefix) && line.contains(&label))
+        .find(|line| line.starts_with(&prefix) && line.contains(label))
         .and_then(|line| line.rsplit(' ').next())
         .and_then(|value| value.parse().ok())
+}
+
+/// The `_sum` or `_count` sample of `family` for `runtime`, if it was emitted.
+fn sample(rendered: &str, family: &str, field: &str, runtime: &str) -> Option<f64> {
+    labelled(rendered, family, field, &format!("runtime=\"{runtime}\""))
 }
 
 /// The four PD TTFT families of one request, in seconds.
@@ -464,4 +528,84 @@ fn parallel_dispatch_reports_the_decode_phase_as_the_whole_ttft() {
         phases.prefill.is_none() && phases.relay.is_none(),
         "parallel dispatch has no prefill or relay phase:\n{rendered}"
     );
+}
+
+/// A streaming route anchors its own time to first token and generation
+/// duration at the prefill dispatch: on the sequential pair the route's TTFT
+/// carries the prefill worker's delay and the decode worker's, and the PD
+/// first-token pair is recorded once. A stream clocked from its own start
+/// would read the time to the decode side's first buffered chunk alone.
+#[expect(
+    clippy::panic,
+    reason = "test helper - panicking on failure is intentional"
+)]
+fn route_anchors_at_the_prefill_dispatch(route: Route) {
+    let rendered = render_after(|| async {
+        let prefill = start_mock_engine(DelayedEngine {
+            delay: PREFILL_DELAY,
+            hold_headers: false,
+        })
+        .await;
+        let decode = start_mock_engine(DelayedEngine {
+            delay: DECODE_DELAY,
+            hold_headers: false,
+        })
+        .await;
+        let router = build_pd_router(prefill, decode, RuntimeType::Vllm).await;
+        one_streaming_request(router.as_ref(), route).await;
+    });
+    let endpoint = route.endpoint();
+    let label = format!("endpoint=\"{endpoint}\"");
+    let (Some(count), Some(ttft), Some(generation)) = (
+        labelled(&rendered, "smg_router_ttft_seconds", "count", &label),
+        labelled(&rendered, "smg_router_ttft_seconds", "sum", &label),
+        labelled(
+            &rendered,
+            "smg_router_generation_duration_seconds",
+            "sum",
+            &label,
+        ),
+    ) else {
+        panic!("{endpoint}: the stream metrics are missing:\n{rendered}");
+    };
+    let pd_pair = sample(
+        &rendered,
+        "smg_pd_ttft_seconds",
+        "count",
+        RuntimeType::Vllm.as_str(),
+    );
+    report(
+        &format!("{endpoint} route: ttft={ttft} generation={generation}"),
+        &Phases::of(&rendered, RuntimeType::Vllm.as_str()),
+    );
+    assert_eq!(count, 1.0, "{endpoint}: one TTFT record:\n{rendered}");
+    let floor = (PREFILL_DELAY + DECODE_DELAY).as_secs_f64();
+    assert!(
+        ttft >= floor,
+        "{endpoint}: TTFT {ttft} s carries both workers' delays ({floor} s)"
+    );
+    assert!(
+        generation >= ttft,
+        "{endpoint}: generation duration {generation} s shares the TTFT's base ({ttft} s)"
+    );
+    assert_eq!(
+        pd_pair,
+        Some(1.0),
+        "{endpoint}: the PD pair recorded once:\n{rendered}"
+    );
+}
+
+#[test]
+fn the_chat_route_anchors_its_ttft_at_the_prefill_dispatch() {
+    route_anchors_at_the_prefill_dispatch(Route::Chat);
+}
+
+#[test]
+fn the_messages_route_anchors_its_ttft_at_the_prefill_dispatch() {
+    route_anchors_at_the_prefill_dispatch(Route::Messages);
+}
+
+#[test]
+fn the_completions_route_anchors_its_ttft_at_the_prefill_dispatch() {
+    route_anchors_at_the_prefill_dispatch(Route::Completions);
 }

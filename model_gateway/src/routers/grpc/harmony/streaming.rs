@@ -142,10 +142,10 @@ impl HarmonyStreamingProcessor {
                 });
             }
             context::ExecutionResult::PrefillDecode {
-                // TODO(#1781 follow-up): thread pd_timing for honest PD TTFT
                 prefill,
                 decode,
                 prefill_guards,
+                pd_timing,
                 ..
             } => {
                 tokio::spawn(async move {
@@ -156,6 +156,7 @@ impl HarmonyStreamingProcessor {
                         chat_request,
                         &tx,
                         router_stop_strings,
+                        pd_timing,
                         prefill_guards,
                         reservation,
                     )
@@ -214,6 +215,7 @@ impl HarmonyStreamingProcessor {
             &mut prompt_tokens,
             &mut cached_tokens,
             &router_stop_strings,
+            None,
             reservation,
         )
         .await
@@ -231,6 +233,7 @@ impl HarmonyStreamingProcessor {
         original_request: Arc<ChatCompletionRequest>,
         tx: &SseSender,
         router_stop_strings: Vec<String>,
+        pd_timing: context::PdTiming,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
@@ -245,7 +248,8 @@ impl HarmonyStreamingProcessor {
         .await
         .map_err(utils::StreamFailure::prefill)?;
 
-        // Phase 2: Decode (shared helper)
+        // Phase 2: Decode (shared helper). Pass pd_timing so the first decode
+        // token yields honest PD TTFT.
         Self::process_chat_decode_stream(
             decode_stream,
             &dispatch,
@@ -254,6 +258,7 @@ impl HarmonyStreamingProcessor {
             &mut prompt_tokens,
             &mut cached_tokens,
             &router_stop_strings,
+            Some(pd_timing),
             reservation,
         )
         .await?;
@@ -271,7 +276,8 @@ impl HarmonyStreamingProcessor {
     /// Shared between single-stream and prefill/decode stream modes. The `prompt_tokens`
     /// and `cached_tokens` maps may be pre-populated from a prefill phase
     /// (prefill/decode stream) or empty (single stream). Values from `Complete` messages
-    /// are inserted only if not already present.
+    /// are inserted only if not already present. `pd_timing` is `Some` only in PD mode and
+    /// yields honest PD TTFT (prefill start to first decode token).
     #[expect(clippy::too_many_arguments)]
     async fn process_chat_decode_stream(
         mut decode_stream: ProtoStream,
@@ -281,9 +287,10 @@ impl HarmonyStreamingProcessor {
         prompt_tokens: &mut HashMap<u32, u32>,
         cached_tokens: &mut HashMap<u32, u32>,
         router_stop_strings: &[String],
+        pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
-        let mut decode = ChatDecode::new();
+        let mut decode = ChatDecode::new(pd_timing);
         while let Some(result) = decode_stream.next().await {
             let response = result.map_err(|e| {
                 utils::StreamFailure::upstream(e, decode.completion_tokens.delivered())
@@ -503,13 +510,14 @@ impl HarmonyStreamingProcessor {
         match execution_result {
             context::ExecutionResult::Single { stream } => {
                 debug!("Processing Responses API single stream mode");
-                Self::process_decode_stream(stream, emitter, tx, session, format_registry).await
+                Self::process_decode_stream(stream, emitter, tx, session, format_registry, None)
+                    .await
             }
             context::ExecutionResult::PrefillDecode {
-                // TODO(#1781 follow-up): thread pd_timing for honest PD TTFT
                 prefill,
                 decode,
                 prefill_guards,
+                pd_timing,
                 ..
             } => {
                 debug!("Processing Responses API prefill/decode stream mode");
@@ -520,6 +528,7 @@ impl HarmonyStreamingProcessor {
                     tx,
                     session,
                     format_registry,
+                    pd_timing,
                     prefill_guards,
                 )
                 .await
@@ -534,6 +543,7 @@ impl HarmonyStreamingProcessor {
         }
     }
 
+    #[expect(clippy::too_many_arguments)]
     async fn process_responses_prefill_decode_stream(
         mut prefill_stream: ProtoStream,
         decode_stream: ProtoStream,
@@ -541,6 +551,7 @@ impl HarmonyStreamingProcessor {
         tx: &SseSender,
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
+        pd_timing: context::PdTiming,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
     ) -> Result<ResponsesIterationResult, String> {
         // Phase 1: Drain prefill stream. The client's prompt-side usage is the
@@ -553,23 +564,34 @@ impl HarmonyStreamingProcessor {
                 .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
         let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
-        // Phase 2: Process decode stream
-        let result =
-            Self::process_decode_stream(decode_stream, emitter, tx, session, format_registry).await;
+        // Phase 2: Process decode stream. Pass pd_timing so the first decode
+        // frame records honest PD TTFT.
+        let result = Self::process_decode_stream(
+            decode_stream,
+            emitter,
+            tx,
+            session,
+            format_registry,
+            Some(pd_timing),
+        )
+        .await;
 
         prefill_stream.mark_completed();
         result
     }
 
-    /// Process decode stream for tool call events.
+    /// Process decode stream for tool call events. `pd_timing` is `Some` only
+    /// in PD mode and yields honest PD TTFT (prefill start to first decode
+    /// frame).
     async fn process_decode_stream(
         mut decode_stream: ProtoStream,
         emitter: &mut ResponseStreamEventEmitter,
         tx: &SseSender,
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
+        pd_timing: Option<context::PdTiming>,
     ) -> Result<ResponsesIterationResult, String> {
-        let mut decode = ResponsesDecode::new()?;
+        let mut decode = ResponsesDecode::new(pd_timing)?;
         while let Some(result) = decode_stream.next().await {
             decode.frames += 1;
             let response = result.map_err(|e| format!("Decode stream error: {}", e.message()))?;
@@ -628,10 +650,13 @@ struct ResponsesDecode {
     engine_reasoning_tokens: u32,
     spec_accepted: u32,
     spec_drafted: u32,
+    /// The PD dispatch instants, in PD mode, until the first decode frame records the PD
+    /// first-token pair against them (the iteration records no streaming TTFT of its own).
+    pd_timing: Option<context::PdTiming>,
 }
 
 impl ResponsesDecode {
-    fn new() -> Result<Self, String> {
+    fn new(pd_timing: Option<context::PdTiming>) -> Result<Self, String> {
         Ok(Self {
             parser: HarmonyParserAdapter::new()
                 .map_err(|e| format!("Failed to create parser: {e}"))?,
@@ -650,7 +675,16 @@ impl ResponsesDecode {
             engine_reasoning_tokens: 0,
             spec_accepted: 0,
             spec_drafted: 0,
+            pd_timing,
         })
+    }
+
+    /// The first decode frame: in PD mode the PD first-token pair, measured from the dispatch
+    /// instants, recorded once.
+    fn note_first_output(&mut self, model: &str) {
+        if let Some(timing) = self.pd_timing.take() {
+            timing.record_first_decode_token(metrics_labels::BACKEND_HARMONY, model);
+        }
     }
 
     /// One chunk: its tokens counted on a delta stream, parsed, and each channel's delta emitted
@@ -664,6 +698,7 @@ impl ResponsesDecode {
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
     ) -> Result<(), String> {
+        self.note_first_output(emitter.model());
         // Track token counts on delta streams; cumulative streams report them in Complete
         // instead.
         if chunk.chunk_semantics().is_delta() {
@@ -852,6 +887,7 @@ impl ResponsesDecode {
         tx: &SseSender,
         session: Option<&McpToolSession<'_>>,
     ) {
+        self.note_first_output(emitter.model());
         let finish_reason = complete.finish_reason().to_string();
         self.prompt_tokens = complete.prompt_tokens();
         // The prefill side's hit through a prefill/decode pair, the engine's own through a
@@ -1059,6 +1095,9 @@ struct ChatDecode {
     // Timing for metrics
     start_time: Instant,
     first_token_time: Option<Instant>,
+    /// The PD dispatch instants, in PD mode: the first token records the PD pair against
+    /// them and the metrics anchor at the prefill dispatch.
+    pd_timing: Option<context::PdTiming>,
     // Per-index state management (for n>1 support)
     parsers: HashMap<u32, HarmonyParserAdapter>,
     is_firsts: HashMap<u32, bool>,
@@ -1099,10 +1138,11 @@ struct ChatDecode {
 }
 
 impl ChatDecode {
-    fn new() -> Self {
+    fn new(pd_timing: Option<context::PdTiming>) -> Self {
         Self {
             start_time: Instant::now(),
             first_token_time: None,
+            pd_timing,
             parsers: HashMap::new(),
             is_firsts: HashMap::new(),
             matched_stops: HashMap::new(),
@@ -1174,6 +1214,17 @@ impl ChatDecode {
         drop(decode_stream);
     }
 
+    /// The stream's first engine output, for the TTFT; in PD mode the PD first-token pair is
+    /// recorded against the dispatch instants.
+    fn note_first_token(&mut self, model: &str) {
+        if self.first_token_time.is_none() {
+            self.first_token_time = Some(Instant::now());
+            if let Some(timing) = &self.pd_timing {
+                timing.record_first_decode_token(metrics_labels::BACKEND_HARMONY, model);
+            }
+        }
+    }
+
     /// One chunk of one choice: its parser made on the first, its tokens counted and parsed,
     /// the router's stop strings scanned, and the delta emitted (the choice's role chunk first);
     /// a router-side stop emits the choice's final chunk, closes the choice with the chunk's
@@ -1192,10 +1243,7 @@ impl ChatDecode {
     ) -> Result<(), utils::StreamFailure> {
         let index = chunk.index();
 
-        // Track first token time for TTFT metric
-        if self.first_token_time.is_none() {
-            self.first_token_time = Some(Instant::now());
-        }
+        self.note_first_token(&original_request.model);
 
         // A choice's engine chunk after its router-side stop is the tail the engine generated
         // for nobody (an engine that ends the choice on that step sends its Complete instead):
@@ -1382,9 +1430,7 @@ impl ChatDecode {
         // chunk, as a choice with content opened on its first delta, and is the stream's first
         // output when nothing preceded it.
         if self.is_firsts.get(&index).copied().unwrap_or(true) {
-            if self.first_token_time.is_none() {
-                self.first_token_time = Some(Instant::now());
-            }
+            self.note_first_token(&original_request.model);
             HarmonyStreamingProcessor::emit_role_chunk(
                 index,
                 dispatch,
@@ -1522,16 +1568,24 @@ impl ChatDecode {
             )
             .await?;
         }
-        // Record streaming metrics
+
+        // In PD mode this task only starts once the decode stream exists -- for sequential PD
+        // that is after prefill completes, with the first decode chunk already buffered -- so
+        // `start_time` would report a near-zero TTFT. Anchor at the prefill dispatch instant
+        // instead, as the chat stream does; generation duration must share the base or TPOT
+        // underflows.
+        let stream_base = self
+            .pd_timing
+            .as_ref()
+            .map(|timing| timing.prefill_start)
+            .unwrap_or(self.start_time);
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: metrics_labels::BACKEND_HARMONY,
             model_id: &original_request.model,
             endpoint: metrics_labels::ENDPOINT_CHAT,
-            ttft: self
-                .first_token_time
-                .map(|t| t.duration_since(self.start_time)),
-            generation_duration: self.start_time.elapsed(),
+            ttft: self.first_token_time.map(|t| t.duration_since(stream_base)),
+            generation_duration: stream_base.elapsed(),
             input_tokens: Some(counts.prompt as u64),
             cached_tokens: Some(u64::from(counts.cached)),
             output_tokens: counts.completion as u64,

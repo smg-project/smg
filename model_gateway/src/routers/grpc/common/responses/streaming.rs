@@ -175,6 +175,11 @@ struct ReasoningStreamItem {
 }
 
 impl ResponseStreamEventEmitter {
+    /// The model label the response's events carry.
+    pub(crate) fn model(&self) -> &str {
+        &self.model
+    }
+
     pub fn new(response_id: String, model: String, created_at: u64) -> Self {
         let message_id = format!("msg_{}", Uuid::now_v7());
 
