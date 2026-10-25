@@ -1,10 +1,10 @@
 {
-  "ready": false,
-  "run_budget_admitted": false,
-  "artifacts_pinned": false,
-  "consumer_gpu_ready": false,
-  "admitted_lane": null,
-  "runtime_cohort_accepted": false,
+  "ready": true,
+  "run_budget_admitted": true,
+  "artifacts_pinned": true,
+  "consumer_gpu_ready": true,
+  "admitted_lane": "python",
+  "runtime_cohort_accepted": true,
   "artifacts": [
     {
       "name": "go-ffi-library",
@@ -197,8 +197,8 @@
     "profile_original_per_request_directory": true
   },
   "budget": {
-    "admitted": false,
-    "reserved_runner_seconds": 0,
+    "admitted": true,
+    "reserved_runner_seconds": 3360,
     "global_owned_max": 2,
     "one_lane_per_run": true,
     "proposed_new_max_seconds": 3360,
