@@ -1744,17 +1744,21 @@ impl WorkerRegistry {
     // 7. Remove
     // ───────────────────────────────────────────────────────────────────
 
-    /// Whether a registered worker other than `worker` renders to its label
+    /// Whether a registration at another URL renders to `worker`'s label
     /// (`Worker::redacted_url`): two registrations at one address that
     /// differ only by their secret share one, and a leaving registration's
     /// teardown then leaves the label's series to the one that stays (the
     /// retirement in `remove_inner`, the load monitor's eviction sentinel).
-    /// By registration, not by URL: a worker evicted for a status change is
-    /// not the other registration of its own label.
+    /// By URL: the worker's own object (a status-change eviction) and a
+    /// same-URL successor (a `replace`, whose old object is evicted while
+    /// the successor sits in the map) are not another registration, so a
+    /// replacement that drops a model still sentinels that model's series.
+    /// In `remove_inner` the leaving URL still maps to the leaving id under
+    /// the per-id lock, so no other registration at that URL is in the map.
     pub(crate) fn label_shared_with(&self, worker: &Arc<dyn Worker>) -> bool {
         let label = worker.redacted_url();
         self.workers.iter().any(|other| {
-            !Arc::ptr_eq(other.value(), worker) && other.value().redacted_url() == label
+            other.value().url() != worker.url() && other.value().redacted_url() == label
         })
     }
 

@@ -997,9 +997,11 @@ impl WorkerMonitor {
     /// republished keeps its entry, and its series continues uninterrupted.
     pub(crate) fn flush_pending_evictions(&self) {
         for worker in self.load_state.apply_pending_evictions() {
-            // The label's series belong to another registration that
-            // renders to it (the same address under a rotated credential):
-            // its next poll writes them, and a sentinel would read as its own.
+            // The label's series belong to a registration at another URL
+            // that renders to it (the same address under a rotated
+            // credential): a sentinel here would read as its own. A same-URL
+            // successor (a replacement) is not one: the old object's
+            // eviction sentinels the series of a model the successor dropped.
             if self.worker_registry.label_shared_with(&worker) {
                 continue;
             }

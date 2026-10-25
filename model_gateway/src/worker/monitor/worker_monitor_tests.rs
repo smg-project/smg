@@ -424,6 +424,49 @@ async fn status_changed_away_from_ready_evicts_worker() {
     assert!(!cached.contains_key(&url));
 }
 
+/// A replacement at one URL with a smaller model set: the old object's
+/// eviction sentinels the dropped model's series (nothing polls that model
+/// for the worker any more), because a same-URL successor is not another
+/// registration of the label; only a registration at another URL that
+/// renders to the same label (a rotated credential) keeps a sentinel off.
+#[tokio::test]
+async fn a_replacements_eviction_sentinels_the_dropped_models_series() {
+    let (registry, monitor) = build_monitor();
+    let two_models = |models: Vec<&str>| -> Arc<dyn Worker> {
+        let worker = BasicWorkerBuilder::new("http://w:8080")
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Http)
+            .models(models.into_iter().map(ModelCard::new).collect::<Vec<_>>())
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        worker.set_status(WorkerStatus::Ready);
+        Arc::new(worker)
+    };
+    let old = two_models(vec!["m1", "m2"]);
+    let id = registry.register(Arc::clone(&old)).unwrap();
+    monitor.load_state.publish_group(
+        &[],
+        vec![(Arc::clone(&old), Arc::new(WorkerLoadResponse::default()))],
+    );
+
+    assert!(registry.replace(&id, two_models(vec!["m1"])));
+    // What the event loop's `Replaced` handler does with the old object,
+    // then the flush under a recorder of this test's (no event loop here:
+    // its debounced flusher would race the read).
+    monitor.evict_worker_loads(&old);
+    let body = render_with_recorder(|| monitor.flush_pending_evictions());
+    let sentinel = body.lines().any(|line| {
+        line.starts_with("smg_engine_running_requests{")
+            && line.contains("worker=\"http://w:8080\"")
+            && line.contains("model=\"m2\"")
+            && line.ends_with(" -1")
+    });
+    assert!(sentinel, "the dropped model's series read -1:\n{body}");
+}
+
 #[tokio::test]
 async fn spawned_tasks_use_weak_references() {
     // Regression test for the Arc cycle bug: the spawned event
