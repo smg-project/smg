@@ -8,6 +8,7 @@ BASELINE = (
     "scripts/tests/test_ci_prepared_backend_env.py",
     "scripts/tests/test_ci_gpu_runner_image.py",
     "scripts/tests/test_ci_tooling_tests.py",
+    "scripts/tests/test_ci_amd_path_filters.py",
 )
 COMPONENTS = (
     ("scripts/ci_check_e2e_dependencies.py", "scripts/tests/test_ci_e2e_dependencies.py"),
