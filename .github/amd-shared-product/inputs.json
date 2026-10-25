@@ -1,0 +1,236 @@
+{
+  "ready": false,
+  "run_budget_admitted": false,
+  "artifacts_pinned": false,
+  "consumer_gpu_ready": false,
+  "runtime_cohort_accepted": false,
+  "admitted_lane": "go-bindings-full23",
+  "target_product_commit": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
+  "artifacts": [
+    {
+      "name": "smg-wheel",
+      "id": 12609313653,
+      "bytes": 52600567,
+      "sha256": "ecce3937864f36c77ac5f08734bc73ef5795e5e8e23cd794fce8ea1cd30e2cb8",
+      "expires_at": "2026-10-26T18:20:49Z",
+      "files": {
+        "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl": {
+          "bytes": 52739343,
+          "sha256": "e2bd9a2325d4a9ef96d3d89ec91c41b2945019bbe3d511d2fbf7589caeebd750"
+        }
+      }
+    },
+    {
+      "name": "wasm-test-fixtures",
+      "id": 12609142504,
+      "bytes": 56596,
+      "sha256": "2169eab7ef97014996abb71a15eacfbd9217c77759c6fff16bafabfa5feb8ba3",
+      "expires_at": "2026-10-26T18:20:59Z",
+      "files": {
+        "storage_hook_guest.wasm": {
+          "bytes": 80680,
+          "sha256": "7e3a093e09bfe30244d128c1aaaf8558a1b13c05558cc81cff04021947445e11"
+        },
+        "storage_hook_passthrough.wasm": {
+          "bytes": 79153,
+          "sha256": "3a10ce115ea179026a00f3e85ce6b6a388bcc1f274bc7abfc074be876d7c3e55"
+        }
+      }
+    },
+    {
+      "name": "python-client-types",
+      "id": 12608937526,
+      "bytes": 34700,
+      "sha256": "19cb852722d76789e6e69a2f7f53b11e4a618dbacb9646f34158c6498928f78e",
+      "expires_at": "2026-10-26T18:20:57Z",
+      "files": {
+        "_generated.py": {
+          "bytes": 188140,
+          "sha256": "95c2ed8d194fc673d4695afa62542bc5fa801ac14e8af5d310920e329c3ea537"
+        }
+      }
+    },
+    {
+      "name": "go-ffi-library",
+      "id": 12608627976,
+      "bytes": 13845631,
+      "sha256": "30848e64a676f301ba428169ce96ede0106800d9114c5bca6db230fb31c6b876",
+      "expires_at": "2026-10-26T18:20:53Z",
+      "files": {
+        "libsmg_go.d": {
+          "bytes": 66105,
+          "sha256": "caa91d5d341e096bad353e1ac16fbd3000ae3c7f4560970b13a27fcb70efeb34"
+        },
+        "libsmg_go.so": {
+          "bytes": 35041680,
+          "sha256": "ef55ec047165f9f4c6226249538598b125c6fcd0ee459eaf3b18035697c77a12"
+        }
+      }
+    }
+  ],
+  "gateway_native": {
+    "name": "smg/smg_rs.abi3.so",
+    "bytes": 143064752,
+    "sha256": "b7d5ccb1d5e4c06cf93fc9f77ad405951b9d3def7038113f5435a0d57a170fd6"
+  },
+  "producer_sha": "d5f8f9e765dcdec1f56dd623b46e49e1e47862d4",
+  "run_id": 40218847194,
+  "run_attempt": 1,
+  "build_job_id": 121246077837,
+  "producer_branch": "main",
+  "producer_policy": "exact_d5f8_main_push_build_leg_all_17_steps_success_v1",
+  "source_base": "d5f8f9e765dcdec1f56dd623b46e49e1e47862d4",
+  "source_trees": {
+    ".cargo": "8a9d55bb8edfa19d9f90b313fbdc24326d3f667b",
+    "Cargo.toml": "cb29df18a6eede1eed9f2d244367e804d20a2f14",
+    "Cargo.lock": "7022fa76a1f1e4ef7aa812ee7f2d3ac159fd6aa4",
+    "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+    "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+    "bindings": "a7570c34e19461de3579acc385541f7afc9de774",
+    "clients": "599d7ce2727e5d6287825271f464a3b7b5e64ee9",
+    "crates": "aa183216a4a450185252105434e4fe8f981ebd94",
+    "model_gateway": "c9b0a8e790c4f71a760c41fd4e311f546db6bf48",
+    "grpc_servicer": "7e23f8999c36292d7b0c8bfd11b29843352da2b0",
+    "e2e_test": "492e701db279e840457d832af81f5e0377112109",
+    "scripts": "2aaa0d62644a24b1580a7ef46ee6fd00499ff57b",
+    ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
+    ".github/workflows/e2e-gpu-job.yml": "453b36ebfd26262dc79c3f376dcb2469af6435a1",
+    "README.md": "83b7df25632da03f0184bd5b4628b9c9a3ace803",
+    "LICENSE": "9088c2872db9763b9e6533c6960e9adb0c9cb65f",
+    "rustfmt.toml": "19e1ab31f8958c31292f0f568976a036af7e683b",
+    "clippy.toml": "cfb9e85a5074e6b02e603df8da9653ee18dbcca3",
+    "examples/wasm": "fc10fea21779371f9de247209af2028cf8173236"
+  },
+  "compiled_source_trees": {
+    ".cargo": "8a9d55bb8edfa19d9f90b313fbdc24326d3f667b",
+    "Cargo.toml": "cb29df18a6eede1eed9f2d244367e804d20a2f14",
+    "Cargo.lock": "7022fa76a1f1e4ef7aa812ee7f2d3ac159fd6aa4",
+    "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+    "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+    "bindings": "a7570c34e19461de3579acc385541f7afc9de774",
+    "clients": "599d7ce2727e5d6287825271f464a3b7b5e64ee9",
+    "model_gateway": "c9b0a8e790c4f71a760c41fd4e311f546db6bf48",
+    "examples/wasm": "fc10fea21779371f9de247209af2028cf8173236",
+    "crates/auth": "642cfcb069e7a56f0637909b6bf67365f4c48d07",
+    "crates/data_connector": "2ca7833aab63d6f08f7bc0da901aab61afa21230",
+    "crates/engine_servicer": "ec24b9e50c3bfebfeafc9cd77b0543c5a4a9075e",
+    "crates/engine_zmq_adapter": "8249fedf64b9682d3a3f300578d9e1fceacd8cdd",
+    "crates/engine_zmq_client": "54191b437189593eb07d395f67de733031cfc4e0",
+    "crates/external_router": "203ff0abe44f03e23c0777da075befe3a170bf5b",
+    "crates/kv_index": "e06fc1ee0a365ad1bf8206c2b8b93097fa4521dd",
+    "crates/mcp": "4c7ba4ce0a2b299525230da4b8f709c1720f5bd7",
+    "crates/mesh": "5ea000e15527dbd3728257eb5515f30dc1e31b38",
+    "crates/mm_rdma": "5e42c1198e2f08f74061c398258971e7ecaa33aa",
+    "crates/mock_worker": "d746fa9732055d088918d5f3215fa9ec61d38935",
+    "crates/multimodal": "813c63d70c24910dd91559ccc887cee812eb15cb",
+    "crates/protocols": "2d2231cf4c98e5d3de8887fbbb95dcaf53f5828e",
+    "crates/radix_tree": "063bfb16dbbf4423b632fbc00aa79b01a3b06996",
+    "crates/reasoning_parser": "fad4e67c1082415ccf5975209cf6dbb4b4753651",
+    "crates/response_template": "51ea20dd99da5a89644f0960c64d8a383c144b02",
+    "crates/rl": "01aa1de7bdca3e37f94e1ba19c16aead3a9a540a",
+    "crates/symphony": "6ffa46daebe55f544d28ad241f132add630568e7",
+    "crates/tokenizer": "02d9079a02cbe7bfcd5213c71004fcb53642a84e",
+    "crates/tool_parser": "4f2b4246f15b1497fdf74f4c5683e0a57ff37db0",
+    "crates/wasm": "fb912247f8c792a58e7add6a04d69a3c492d3670",
+    "crates/workflow": "8ccb53659ecf1013f7f533db14f5cb9270c8ccfc",
+    "crates/grpc_client/Cargo.toml": "16ed107c1d32f668216ca23bc92f6862457ac14f",
+    "crates/grpc_client/build.rs": "946832e4554939503959adf7d0ee725beb6b65c8",
+    "crates/grpc_client/go": "89b5a2463e45e0f64d577e9ab74ec318653b9352",
+    "crates/grpc_client/proto": "a74e47fffa37e1f9a2448dd658544a97c0430686",
+    "crates/grpc_client/src": "29f6a377b334297582af8f01019192839a963b6a",
+    "crates/grpc_client/tests": "61ce3e030a193e2f118cedd213edcd82622bdf56"
+  },
+  "producer_source_trees": {
+    ".cargo": "8a9d55bb8edfa19d9f90b313fbdc24326d3f667b",
+    "Cargo.toml": "cb29df18a6eede1eed9f2d244367e804d20a2f14",
+    "Cargo.lock": "7022fa76a1f1e4ef7aa812ee7f2d3ac159fd6aa4",
+    "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+    "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+    "bindings": "a7570c34e19461de3579acc385541f7afc9de774",
+    "clients": "599d7ce2727e5d6287825271f464a3b7b5e64ee9",
+    "crates": "aa183216a4a450185252105434e4fe8f981ebd94",
+    "model_gateway": "c9b0a8e790c4f71a760c41fd4e311f546db6bf48",
+    "grpc_servicer": "7e23f8999c36292d7b0c8bfd11b29843352da2b0",
+    "e2e_test": "c255aac03c859b861907554808ebba71fcb9b30c",
+    "scripts": "a5f12792df38a4cb1f82ef724f8234360fddf99a",
+    ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
+    ".github/workflows": "dac1133ab809a4b6cdc7deddaed7cacbc029d696"
+  },
+  "prior_GPU_results_transferred": false,
+  "new_native_required": false,
+  "recipe": {
+    "test_dirs": "e2e_test/bindings_go",
+    "test_filter": "",
+    "reference_selected": 23,
+    "reference_case_ids": [
+      "e2e_test/bindings_go/test_go_oai_server.py::TestGoOAIServerBasic::test_non_streaming_completion",
+      "e2e_test/bindings_go/test_go_oai_server.py::TestGoOAIServerBasic::test_streaming_completion",
+      "e2e_test/bindings_go/test_go_oai_server.py::TestGoOAIServerBasic::test_streaming_multiple_messages",
+      "e2e_test/bindings_go/test_go_oai_server.py::TestGoOAIServerConcurrency::test_concurrent_non_streaming",
+      "e2e_test/bindings_go/test_go_oai_server.py::TestGoOAIServerConcurrency::test_concurrent_streaming",
+      "e2e_test/bindings_go/test_go_oai_server.py::TestGoOAIServerEdgeCases::test_empty_message_content",
+      "e2e_test/bindings_go/test_go_oai_server.py::TestGoOAIServerEdgeCases::test_long_context",
+      "e2e_test/bindings_go/test_go_oai_server.py::TestGoOAIServerEdgeCases::test_stop_sequences",
+      "e2e_test/bindings_go/test_go_oai_server.py::TestGoOAIServerEdgeCases::test_system_message_only",
+      "e2e_test/bindings_go/test_go_oai_server.py::TestGoOAIServerFunctionCalling::test_function_calling_non_streaming",
+      "e2e_test/bindings_go/test_go_oai_server.py::TestGoOAIServerFunctionCalling::test_function_calling_streaming",
+      "e2e_test/bindings_go/test_go_oai_server.py::TestGoOAIServerFunctionCalling::test_function_calling_tool_choice_none",
+      "e2e_test/bindings_go/test_go_oai_server.py::TestGoOAIServerMultipleChoices::test_n_parameter_non_streaming",
+      "e2e_test/bindings_go/test_go_oai_server.py::TestGoOAIServerMultipleChoices::test_n_parameter_streaming",
+      "e2e_test/bindings_go/test_go_oai_server.py::TestGoOAIServerParameters::test_max_tokens_limit",
+      "e2e_test/bindings_go/test_go_oai_server.py::TestGoOAIServerParameters::test_temperature_variation",
+      "e2e_test/bindings_go/test_go_oai_server.py::TestGoOAIServerParameters::test_top_p_parameter",
+      "e2e_test/bindings_go/test_go_oai_server.py::TestGoOAIServerResponseValidation::test_finish_reason_length",
+      "e2e_test/bindings_go/test_go_oai_server.py::TestGoOAIServerResponseValidation::test_finish_reason_stop",
+      "e2e_test/bindings_go/test_go_oai_server.py::TestGoOAIServerResponseValidation::test_response_fields_non_streaming",
+      "e2e_test/bindings_go/test_go_oai_server.py::TestGoOAIServerResponseValidation::test_response_fields_streaming",
+      "e2e_test/bindings_go/test_go_oai_server.py::TestGoOAIServerResponseValidation::test_usage_tokens_non_streaming",
+      "e2e_test/bindings_go/test_go_oai_server.py::TestGoOAIServerResponseValidation::test_usage_tokens_streaming"
+    ],
+    "models": [
+      "meta-llama/Llama-3.2-1B-Instruct"
+    ],
+    "engine": "sglang",
+    "connection_mode": "grpc",
+    "TP": 1,
+    "DP": 1,
+    "fixture_classes": 7,
+    "frontend": "real Go OpenAI-compatible HTTP server",
+    "same_original_tests_and_oracles": true,
+    "reruns": 2,
+    "reruns_delay": 5,
+    "job_minutes": 30,
+    "standard_JUnit": "e2e-go-results/junit.xml",
+    "reference_counts_not_outcome_quota": true,
+    "xfail_policy": "Unchanged original two strict n>1 xfails and two conditional tool-call xfails; no new skip/filter/oracle changes."
+  },
+  "budget": {
+    "admitted": false,
+    "reserved_runner_seconds": 0,
+    "proposed_new_max_seconds": 1800,
+    "global_owned_max": 2,
+    "one_lane_per_run": true,
+    "old_retired_seconds_reused": 0
+  },
+  "dispatch_contract": {
+    "registered_workflow": ".github/workflows/pr-test-rust.yml",
+    "manual_only": true,
+    "execute_default": false,
+    "root_admission_required": true,
+    "one_GPU_job": "go-bindings-e2e-amd",
+    "other_GPU_matrix_jobs": 0,
+    "private_ref": "ci/amd-go-full23-main-d5f8-validation-20261025",
+    "actual_dispatch_head": null,
+    "actual_run_id": null,
+    "controller_source": null,
+    "run_binding": null,
+    "watch_PID_or_session": null
+  },
+  "pending_note": "Bound actual1473 product and all19/37/14 Git objects; exact d5 fourZIP/sixpayload/native bytes verified. Normal-install cohort, freshTTL, one separate NEW1800, eligible physical runner and actual sole-watch/run binding are pending. All authority flags remain false; no old GPU proof or retired budget transfers.",
+  "binding_preparation_evidence": {
+    "normal_install_verified": false,
+    "producer_build_archive_integrity_sha256": "fa8e1be5899a9f5d74ade0f6de9cfa10eb5065a404f597c2ee95d55cfa03cb6f",
+    "producer_policy_source_review_sha256": "707a143df969433664b923c54e9cc44ad511dba00bdde978c4b40b02d94901fb",
+    "producer_policy_metadata_validation_sha256": "f352422414b7e3a2cab1a55701c3360bacfae7d20eb3be26df2b4b7077e62d2e"
+  }
+}
