@@ -191,7 +191,8 @@ def main():
         spec.loader.exec_module(module)
         env = dict(base, GITHUB_WORKSPACE=str(checkout))
         old = module.checkout_git_environment(env)
-        require(run("old-env-effective-before-SCM", ["/usr/bin/git", "rev-parse", "HEAD"], cwd=checkout, env=old)[0] == 0, "old Git environment itself is ineffective")
+        old_direct = run("old-env-effective-before-SCM", ["/usr/bin/git", "rev-parse", "HEAD"], cwd=checkout, env=old)
+        require(old_direct[0] == 0 and old_direct[1].decode().strip() == HEAD, "old environment must resolve exact product HEAD without extra argv trust")
         # Actual old code's env is correct, then actual stock SCM deletes GIT_*.
         rc, _, err = run("old-git-dubious", ["/usr/bin/git", "rev-parse", "HEAD"], cwd=checkout, env=base)
         require(rc != 0 and b"dubious ownership" in err, "fixture must reproduce Git dubious ownership")
