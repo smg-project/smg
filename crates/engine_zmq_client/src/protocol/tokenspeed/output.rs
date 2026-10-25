@@ -465,7 +465,6 @@ mod tests {
          cd0190919293cbbfe0000000000000cbbff0000000000000cbc00000000000000091cbbfd000\
          00000000009192930a0c0d910b";
 
-
     fn python_output_bytes() -> Vec<u8> {
         vector_bytes(PYTHON_OUTPUT_VECTOR)
     }

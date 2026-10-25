@@ -36,10 +36,7 @@ use crate::{
         handshake::EngineCoreReadyResponse,
         positional::check_prefix,
         tokenspeed::{
-            output::{
-                check_slim_output_layout, BatchTokenIDOutSlim, TokenSpeedOutput,
-                TokenSpeedWireOutput,
-            },
+            output::{check_slim_output_layout, TokenSpeedOutput, TokenSpeedWireOutput},
             request::{TokenSpeedRequestType, TokenizedGenerateReqInput},
         },
         EngineBatch, EngineLoad, EngineProtocol, UtilityReply,

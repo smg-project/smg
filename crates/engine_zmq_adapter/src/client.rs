@@ -17,7 +17,9 @@ use engine_zmq_client::{
     protocol::{
         handshake::EngineCoreReadyResponse,
         sglang::{request::SglangRequest, SglangProtocol},
-        tokenspeed::{output::wire_carries_top_logprobs, wire_carries_control_calls, TokenSpeedProtocol},
+        tokenspeed::{
+            output::wire_carries_top_logprobs, wire_carries_control_calls, TokenSpeedProtocol,
+        },
         vllm::{request::EngineCoreRequest, sampling::EngineCoreSamplingParams, VllmProtocol},
         EngineLoad, EngineProtocol,
     },
