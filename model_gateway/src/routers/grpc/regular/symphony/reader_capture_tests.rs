@@ -8,7 +8,7 @@ use std::{
 
 use llm_tokenizer::{stop::StopSequenceDecoder, StopSequenceConfig};
 use serde_json::{json, Value};
-use symphony::{formats, CallSyntax, Format, RecordedInput};
+use symphony::{adapt::chat, formats, CallSyntax, Format, RecordedInput};
 
 use super::{
     super::{Delta, Reader},
@@ -121,7 +121,7 @@ async fn reader_capture_binds_nonce_prompt_tools_and_actual_policy_order() {
             .tail(output.to_owned(), &mut delta, &mut events)
             .unwrap();
         reader.end(EngineFinish::Stop, who(), &mut events).unwrap();
-        let choice = symphony::adapt::chat::message(0, events.as_slice());
+        let choice = chat::message(0, events.as_slice());
         assert_eq!(choice.message.tool_calls.unwrap()[0].id, nonce().id(0));
         reader.observe_chat_batch(0, &events);
         let expected = serde_json::to_value(events.as_slice()).unwrap();
@@ -310,16 +310,16 @@ async fn reader_capture_retains_decoder_and_feed_errors_without_replacing_them()
         let records = records(owner).await;
         let failed = records.iter().position(|r| r["kind"] == "failed").unwrap();
         assert_eq!(records[failed]["message"], results[0].0);
-        if !decoder_error {
-            assert_eq!(records[failed - 1]["kind"], "input");
-            assert_eq!(records[failed - 1]["input"]["text"], "after end");
-        } else {
+        if decoder_error {
             assert_eq!(
                 records.iter().filter(|r| r["kind"] == "input").count(),
                 1,
                 "no decoded input was fed"
             );
             assert_eq!(records.last().unwrap()["finished"], false);
+        } else {
+            assert_eq!(records[failed - 1]["kind"], "input");
+            assert_eq!(records[failed - 1]["input"]["text"], "after end");
         }
         assert_eq!(records.last().unwrap()["failed"], true);
     }
@@ -385,7 +385,7 @@ async fn reader_capture_rejects_wrong_choice_and_abandoned_owner() {
         reader.end(EngineFinish::Stop, who(), &mut events).unwrap();
         reader.observe_chat_batch(if abandoned { 0 } else { 1 }, &events);
         assert_eq!(
-            symphony::adapt::chat::message(0, events.as_slice())
+            chat::message(0, events.as_slice())
                 .message
                 .content
                 .as_deref(),

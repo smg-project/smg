@@ -13,7 +13,7 @@ fn tools() -> Vec<Tool> {
             "name": "lookup", "parameters": {"type": "object", "properties": {}}
         }
     }]))
-    .unwrap()
+    .expect("valid declared tool fixture")
 }
 
 fn who() -> Who<'static> {
@@ -34,7 +34,7 @@ async fn render(
         prompt: PROMPT.to_owned(),
         recipe: None,
     };
-    let ids = ::symphony::CallIds::from_nonce("0123456789abcdef00000000").unwrap();
+    let ids = ::symphony::CallIds::from_nonce("0123456789abcdef00000000").expect("recorded nonce");
     let mut events = Events::new();
     let mut reader = match observer {
         Some(observer) => Reader::observed(
@@ -48,7 +48,7 @@ async fn render(
         ),
         None => Reader::with_call_ids(&assignment, tools().into(), ids, &mut events),
     }
-    .unwrap()
+    .expect("construct reader")
     .first_call_only(first_call_only);
     let (tx, rx) = sse_channel();
     let mut rx = if disconnected {
@@ -70,8 +70,8 @@ async fn render(
     }
     let mut deltas: Vec<_> = pieces.iter().map(|_| Delta::default()).collect();
     for (piece, delta) in pieces.into_iter().zip(&mut deltas) {
-        reader.tail(piece, delta, &mut events).unwrap();
-        batches.push(serde_json::to_value(events.as_slice()).unwrap());
+        reader.tail(piece, delta, &mut events).expect("read synthetic output");
+        batches.push(serde_json::to_value(events.as_slice()).expect("serialize adapter batch"));
         if let Err(why) = StreamingProcessor::push_events(
             &tx,
             &mut buffer,
@@ -92,8 +92,8 @@ async fn render(
     if error.is_none() {
         reader
             .end(::symphony::EngineFinish::Stop, who(), &mut events)
-            .unwrap();
-        batches.push(serde_json::to_value(events.as_slice()).unwrap());
+            .expect("finish reader");
+        batches.push(serde_json::to_value(events.as_slice()).expect("serialize final adapter batch"));
         StreamingProcessor::push_events(
             &tx,
             &mut buffer,
@@ -106,16 +106,16 @@ async fn render(
             false,
         )
         .await
-        .unwrap();
+        .expect("adapt final batch");
         StreamingProcessor::flush_chunks(&tx, &mut buffer)
             .await
-            .unwrap();
+            .expect("flush synthetic frames");
     }
     drop(tx);
     let mut wire = Vec::new();
     if let Some(rx) = &mut rx {
         while let Some(frame) = rx.recv().await {
-            wire.extend_from_slice(&frame.unwrap());
+            wire.extend_from_slice(&frame.expect("successful synthetic frame"));
         }
     }
     (wire, error, batches)
@@ -125,7 +125,7 @@ async fn owner(
     record_bytes: usize,
     file_bytes: u64,
 ) -> (tempfile::TempDir, CapturePool, SharedCapture) {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().expect("capture root");
     let pool = CapturePool::new(
         root.path().to_owned(),
         CaptureLimits {
@@ -137,8 +137,8 @@ async fn owner(
             queue_capacity: 256,
         },
     )
-    .unwrap();
-    let owner = SharedCapture::new(pool.start().await.unwrap());
+    .expect("bounded capture pool");
+    let owner = SharedCapture::new(pool.start().await.expect("admit capture session"));
     (root, pool, owner)
 }
 
@@ -152,6 +152,8 @@ async fn reader_capture_chat_adapter_preserves_wire_on_capture_failure() {
             (100_000, 1_000_000, true),
             (64, 1_000_000, false),
             (100_000, 600, false),
+            (512, 1_000_000, false),
+            (100_000, 1600, false),
         ] {
             let (_root, _pool, owner) = owner(record_bytes, file_bytes).await;
             let directory = owner.directory().to_owned();
@@ -163,6 +165,18 @@ async fn reader_capture_chat_adapter_preserves_wire_on_capture_failure() {
             let receipt = owner.finish().await;
             assert_eq!(receipt.is_ok(), complete);
             assert_eq!(directory.join("complete.json").exists(), complete);
+            if record_bytes == 512 || file_bytes == 1600 {
+                // These budgets accept Open/Prompt before a later record or file write fails.
+                // Check the retained prefix as well as parity, so early admission failure
+                // cannot accidentally satisfy this partial-capture regression.
+                let prefix: Vec<Value> = std::fs::read_to_string(directory.join("records.jsonl"))
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap()["payload"].clone())
+                    .collect();
+                assert_eq!(prefix[0]["kind"], "open");
+                assert!(prefix.iter().any(|record| record["input"]["kind"] == "prompt"));
+            }
             if complete {
                 let snapshot = CaptureSnapshot::read(
                     &directory,
