@@ -33,9 +33,13 @@
 //! `AllBlocksCleared` batch, as the scheduler does; replay replies are
 //! `[routing…, seq, payload]` and `[routing…, END, b""]`.
 
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    pin::Pin,
+    sync::{Arc, Weak},
+};
 
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use rmpv::Value;
 use smg_grpc_client::common_proto as common;
 use zeromq::{
@@ -43,7 +47,7 @@ use zeromq::{
     PubSocket, RouterSocket, ZmqError, ZmqMessage,
 };
 
-use crate::engine::{unix_seconds, Engine};
+use crate::engine::{unix_seconds, Engine, Published};
 
 /// The engines' end-of-replay marker: `(-1).to_bytes(8, "big", signed=True)`.
 const END_SEQ: [u8; 8] = [0xff; 8];
@@ -71,7 +75,7 @@ impl std::str::FromStr for Wire {
 #[derive(Clone, Debug)]
 pub(crate) struct KvZmqConfig {
     pub(crate) host: String,
-    /// PUB port; the replay ROUTER, when enabled, binds `port + 1`.
+    /// PUB port; replay binds `port + 1`, or independently to 0 for an ephemeral PUB.
     pub(crate) port: u16,
     pub(crate) replay: bool,
     pub(crate) topic: String,
@@ -93,43 +97,124 @@ fn tcp_endpoint(host: &str, port: u16) -> String {
     }
 }
 
-/// Bind the sockets and publish the engine's events until its event channel
-/// closes.
-pub(crate) async fn serve(engine: Engine, cfg: KvZmqConfig) {
-    let mut publisher = PubSocket::new();
-    let endpoint = tcp_endpoint(&cfg.host, cfg.port);
-    if let Err(e) = publisher.bind(&endpoint).await {
-        tracing::error!("kv-events publisher failed to bind {endpoint}: {e}");
-        return;
-    }
-    let mut replay = None;
-    if cfg.replay {
-        let mut router = RouterSocket::new();
-        let replay_endpoint = tcp_endpoint(&cfg.host, cfg.port.saturating_add(1));
-        if let Err(e) = router.bind(&replay_endpoint).await {
-            tracing::error!("kv-events replay failed to bind {replay_endpoint}: {e}");
-            return;
-        }
-        replay = Some(router);
-    }
-    tracing::info!(
-        "kv-events publisher {} on {endpoint} ({:?} wire, replay {}, topic {:?})",
-        engine.name(),
-        cfg.wire,
-        if cfg.replay { "on" } else { "off" },
-        cfg.topic
-    );
-    run(engine, cfg, publisher, replay).await;
+/// Actual bound endpoints; the weak lease never keeps the publisher alive.
+#[derive(Clone)]
+pub(crate) struct Source {
+    pub(crate) endpoint: String,
+    pub(crate) replay_endpoint: String,
+    pub(crate) cfg: KvZmqConfig,
+    live: Weak<()>,
 }
 
-/// Publish on already-bound sockets (tests bind port 0 and read it back).
-async fn run(
+impl Source {
+    pub(crate) fn is_live(&self) -> bool {
+        self.live.strong_count() > 0
+    }
+}
+
+/// Both sockets and the event subscription exist before discovery is exposed.
+pub(crate) struct BoundPublisher {
+    engine: Engine,
+    cfg: KvZmqConfig,
+    publisher: PubSocket,
+    replay: Option<RouterSocket>,
+    events: Pin<Box<dyn Stream<Item = Published> + Send>>,
+    source: Source,
+    live: Arc<()>,
+}
+
+impl BoundPublisher {
+    pub(crate) async fn bind(engine: Engine, cfg: KvZmqConfig) -> Result<Self, String> {
+        let replay_port = if cfg.port == 0 {
+            0 // Each ephemeral socket gets its own actual endpoint.
+        } else if cfg.replay {
+            cfg.port
+                .checked_add(1)
+                .ok_or("KV replay port overflows u16")?
+        } else {
+            0
+        };
+        let mut publisher = PubSocket::new();
+        let endpoint = tcp_endpoint(&cfg.host, cfg.port);
+        let endpoint = publisher
+            .bind(&endpoint)
+            .await
+            .map_err(|e| format!("KV publisher bind {endpoint}: {e}"))?
+            .to_string();
+        let mut replay = None;
+        let mut replay_endpoint = String::new();
+        if cfg.replay {
+            let mut router = RouterSocket::new();
+            let requested = tcp_endpoint(&cfg.host, replay_port);
+            replay_endpoint = router
+                .bind(&requested)
+                .await
+                .map_err(|e| format!("KV replay bind {requested}: {e}"))?
+                .to_string();
+            replay = Some(router);
+        }
+        let events = engine.subscribe_published();
+        let live = Arc::new(());
+        let source = Source {
+            endpoint,
+            replay_endpoint,
+            cfg: cfg.clone(),
+            live: Arc::downgrade(&live),
+        };
+        tracing::info!(endpoint = %source.endpoint, replay = %source.replay_endpoint,
+            wire = ?cfg.wire, topic = ?cfg.topic, "KV publisher bound");
+        Ok(Self {
+            engine,
+            cfg,
+            publisher,
+            replay,
+            events,
+            source,
+            live,
+        })
+    }
+
+    pub(crate) fn source(&self) -> Source {
+        self.source.clone()
+    }
+
+    pub(crate) async fn run(self) {
+        let Self {
+            engine,
+            cfg,
+            publisher,
+            replay,
+            events,
+            live,
+            ..
+        } = self;
+        run_events(engine, cfg, publisher, replay, events).await;
+        drop(live);
+    }
+}
+
+/// Existing non-discovery callers still bind and run with one entry point.
+pub(crate) async fn serve(engine: Engine, cfg: KvZmqConfig) {
+    match BoundPublisher::bind(engine, cfg).await {
+        Ok(publisher) => publisher.run().await,
+        Err(error) => tracing::error!("{error}"),
+    }
+}
+
+/// Publish on already-bound sockets in the wire conformance tests.
+#[cfg(test)]
+async fn run(engine: Engine, cfg: KvZmqConfig, publisher: PubSocket, replay: Option<RouterSocket>) {
+    let events = engine.subscribe_published();
+    run_events(engine, cfg, publisher, replay, events).await;
+}
+
+async fn run_events(
     engine: Engine,
     cfg: KvZmqConfig,
     mut publisher: PubSocket,
     mut replay: Option<RouterSocket>,
+    mut events: Pin<Box<dyn Stream<Item = Published> + Send>>,
 ) {
-    let mut events = engine.subscribe_published();
     let mut state = Publisher::new(
         cfg.topic.into_bytes(),
         cfg.buffer_steps,
@@ -476,6 +561,21 @@ mod tests {
 
     use super::*;
     use crate::engine::{EngineParams, GenEvent, NewRequest};
+
+    #[tokio::test]
+    async fn replay_port_overflow_is_rejected_before_binding() {
+        let cfg = KvZmqConfig {
+            host: "127.0.0.1".into(),
+            port: u16::MAX,
+            replay: true,
+            topic: String::new(),
+            buffer_steps: 1,
+            dp_rank: 0,
+            wire: Wire::Vllm,
+        };
+        let result = BoundPublisher::bind(Engine::spawn(EngineParams::default()), cfg).await;
+        assert!(matches!(result, Err(error) if error == "KV replay port overflows u16"));
+    }
 
     fn stored(
         hashes: &[i64],

@@ -44,9 +44,10 @@ Malformed IDs return `INVALID_ARGUMENT` in either engine mode.
 Canned-mode `Abort` returns `FAILED_PRECONDITION`: canned streams have no
 engine cancellation handle, so success would not confirm cancellation.
 It does not manage an engine process: `Shutdown` also returns
-`FAILED_PRECONDITION`. Native KV discovery, LoRA and RL methods return
-`UNIMPLEMENTED`. Native inference is not registered or marked healthy, and
-model input/capability flags remain false. This control surface alone cannot
+`FAILED_PRECONDITION`. LoRA and RL methods return `UNIMPLEMENTED`.
+Native `GetKvEventSources` discovers the listener's bound vLLM-wire ZMQ
+publisher (details below). Native inference is not registered or marked healthy,
+and model input/capability flags remain false. This control surface alone cannot
 serve a Dynamo workload or establish protocol parity.
 
 With `--grpc-vllm true`, the same port also exposes the experimental
@@ -191,6 +192,21 @@ vLLM runs (`ZmqEventPublisher` in `vllm/distributed/kv_events.py`), so the
 servicers' relays (`crates/engine_servicer`, the Python servicer) can be
 exercised end to end without a GPU: worker `i` (gRPC workers by port offset,
 then ZMQ ranks) publishes on `base + 2i` and answers replay on `base + 2i + 1`.
+Replay on a fixed PUB port 65535 is rejected. An individual publisher binding
+port 0 uses independently assigned PUB/replay ports and reports their actual
+addresses; this is useful for an isolated ephemeral worker, not a fleet preset.
+
+With native control enabled, `GetKvEventSources` returns the actual bound
+endpoints, topic, rank 0, MessagePack schema 1 and effective replay retention.
+Both sockets and the event subscription exist before gRPC discovery begins.
+Disabled publishing, canned mode and disabled prefix caching return no sources;
+the SGLang wire returns `FAILED_PRECONDITION`; a configured publisher that failed
+to bind or whose task stopped returns `UNAVAILABLE`.
+The pinned zeromq dependency configures 100,000 entries in both its PUB fanout
+and per-peer queues, reported as `max_queue_size` and `hwm`. Slow subscribers
+can lose events. These settings are not total-memory bounds, and discovery
+does not confirm delivery to a subscriber. Native Dynamo consumption, hashing
+parity and two-worker cache routing still require separate qualification.
 
 - PUB frames: `[topic, sequence as u64 big-endian, msgpack]`, the sequence
   counting from 0 per publisher (`--kv-events-topic`, empty by default as

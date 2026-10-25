@@ -107,13 +107,22 @@ pub async fn serve_with_listener_until(
         .realistic
         .then(|| Engine::spawn_named(cfg.engine.clone(), name.clone(), true));
     // The worker's vLLM-wire KV-event publisher, numbered by its port offset.
-    let publisher = engine.as_ref().and_then(|engine| {
-        let port = addr.map(|a| a.port())?;
-        let index = port.checked_sub(cfg.grpc_base_port)?;
-        // A gRPC worker is a single-rank engine: it publishes as rank 0.
-        cfg.kv_zmq_for(index, 0)
-            .map(|kv| crate::kv_zmq::serve(engine.clone(), kv))
-    });
+    let publisher_cfg = addr
+        .and_then(|a| a.port().checked_sub(cfg.grpc_base_port))
+        .and_then(|index| cfg.kv_zmq_for(index, 0));
+    let publisher = match (engine.as_ref(), publisher_cfg) {
+        (Some(engine), Some(kv)) => {
+            match crate::kv_zmq::BoundPublisher::bind(engine.clone(), kv).await {
+                Ok(publisher) => Some(publisher),
+                Err(error) => {
+                    tracing::error!("{error}");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let kv_source = publisher.as_ref().map(|publisher| publisher.source());
     let max_message_bytes = cfg.grpc_max_message_bytes;
     // The stop reaches the service's streams that have no end of their own
     // (a KV-event subscription) before the server's graceful shutdown
@@ -138,6 +147,7 @@ pub async fn serve_with_listener_until(
         stopped,
         prefill_pending: Arc::new(AtomicU64::new(0)),
         admissions: admission::Admissions::default(),
+        kv_source,
         overrides,
     };
     let vllm_service = service.cfg.grpc_vllm.then(|| {
@@ -188,7 +198,7 @@ pub async fn serve_with_listener_until(
             // goes with it; a publisher that stops on its own leaves the
             // server serving, as before.
             let mut server = pin!(server);
-            let mut publisher = pin!(publisher);
+            let mut publisher = pin!(publisher.run());
             tokio::select! {
                 () = &mut server => {}
                 () = &mut publisher => server.await,
@@ -233,6 +243,8 @@ struct MockScheduler {
     prefill_pending: Arc<AtomicU64>,
     /// Requests waiting before engine submission, shared by all gRPC adapters.
     admissions: admission::Admissions,
+    /// Bound publisher metadata with a lease that expires when its task stops.
+    kv_source: Option<crate::kv_zmq::Source>,
     /// What the admin API made this worker report about itself (serving,
     /// server args, model capabilities).
     overrides: Arc<crate::overrides::WorkerOverrides>,

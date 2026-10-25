@@ -158,14 +158,13 @@ async fn native_control_uses_shared_state_and_rejects_unimplemented_capabilities
                     .code(),
                 Code::FailedPrecondition
             );
-            assert_eq!(
-                native
-                    .get_kv_event_sources(v::GetKvEventSourcesRequest {})
-                    .await
-                    .unwrap_err()
-                    .code(),
-                Code::Unimplemented
-            );
+            assert!(native
+                .get_kv_event_sources(v::GetKvEventSourcesRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .sources
+                .is_empty());
             assert_eq!(
                 native
                     .list_loras(v::ListLorasRequest {})

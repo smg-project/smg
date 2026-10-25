@@ -1,5 +1,5 @@
 //! Native vLLM control discovery and cancellation for the same mock engine.
-//! Inference and native KV discovery are deliberately unavailable at this stage.
+//! Native inference remains deliberately unavailable at this stage.
 
 use vllm_proto::{
     self as v,
@@ -113,9 +113,48 @@ impl Control for MockNative {
         &self,
         _request: Request<v::GetKvEventSourcesRequest>,
     ) -> Result<Response<v::GetKvEventSourcesResponse>, Status> {
-        Err(Status::unimplemented(
-            "native GetKvEventSources is not implemented",
-        ))
+        if *self.0.stopped.borrow() {
+            return Err(Status::unavailable("worker is stopping"));
+        }
+        let cfg = &self.0.cfg;
+        if !cfg.realistic || !cfg.engine.prefix_cache || cfg.kv_events_zmq_base_port.is_none() {
+            return Ok(Response::new(v::GetKvEventSourcesResponse {
+                sources: vec![],
+            }));
+        }
+        if cfg.kv_events_wire != crate::kv_zmq::Wire::Vllm {
+            return Err(Status::failed_precondition(
+                "native KV discovery requires the vllm event wire",
+            ));
+        }
+        let source = self
+            .0
+            .kv_source
+            .as_ref()
+            .filter(|source| source.is_live())
+            .ok_or_else(|| Status::unavailable("configured KV publisher is not live"))?;
+        // The pinned zeromq revision 67dcba9 PUB fanout and per-peer queues each configure
+        // 100000 entries. These are queue settings, not total-memory bounds.
+        const PUB_QUEUE_CAPACITY: u32 = 100_000;
+        Ok(Response::new(v::GetKvEventSourcesResponse {
+            sources: vec![v::KvEventSource {
+                transport: "zmq".into(),
+                endpoint: source.endpoint.clone(),
+                topic: source.cfg.topic.clone(),
+                replay_endpoint: source.replay_endpoint.clone(),
+                data_parallel_rank: Some(
+                    u32::try_from(source.cfg.dp_rank).map_err(|_| {
+                        Status::failed_precondition("KV rank cannot be represented")
+                    })?,
+                ),
+                encoding: "msgpack".into(),
+                schema_version: 1,
+                buffer_steps: u32::try_from(source.cfg.buffer_steps.max(1))
+                    .map_err(|_| Status::failed_precondition("KV buffer cannot be represented"))?,
+                hwm: PUB_QUEUE_CAPACITY,
+                max_queue_size: PUB_QUEUE_CAPACITY,
+            }],
+        }))
     }
 
     async fn pause_generation(
@@ -238,6 +277,60 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn discovery_expires_when_an_unpolled_or_running_publisher_is_dropped() {
+        for poll in [false, true] {
+            let cfg = Config {
+                host: "127.0.0.1".into(),
+                realistic: true,
+                kv_events_zmq_base_port: Some(0),
+                kv_events_replay: false,
+                kv_events_buffer_steps: 0,
+                ..Default::default()
+            };
+            let engine = Engine::spawn(cfg.engine.clone());
+            let publisher =
+                crate::kv_zmq::BoundPublisher::bind(engine.clone(), cfg.kv_zmq_for(0, 0).unwrap())
+                    .await
+                    .unwrap();
+            let (_stop, stopped) = watch::channel(false);
+            let native = MockNative(MockScheduler {
+                cfg: Arc::new(cfg),
+                name: "native-kv-lease".into(),
+                engine: Some(engine),
+                capture: None,
+                kv_source: Some(publisher.source()),
+                stopped,
+                prefill_pending: Arc::new(AtomicU64::new(0)),
+                admissions: admission::Admissions::default(),
+                overrides: crate::overrides::for_port(0),
+            });
+            let source = native
+                .get_kv_event_sources(Request::new(v::GetKvEventSourcesRequest {}))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                source.sources[0].buffer_steps, 1,
+                "effective replay retention"
+            );
+            assert!(source.sources[0].replay_endpoint.is_empty());
+            let mut running = Box::pin(publisher.run());
+            if poll {
+                assert!(futures::poll!(&mut running).is_pending());
+            }
+            drop(running);
+            assert_eq!(
+                native
+                    .get_kv_event_sources(Request::new(v::GetKvEventSourcesRequest {}))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Unavailable
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn all_grpc_abort_paths_cancel_delayed_admission_without_submitting() {
         tokio::time::timeout(Duration::from_secs(5), async {
             for protocol in ["native", "tokenspeed", "smg-vllm"] {
@@ -252,6 +345,7 @@ mod tests {
                     name: format!("admission-test-{protocol}"),
                     engine: Some(engine.clone()),
                     capture: None,
+                    kv_source: None,
                     stopped,
                     prefill_pending: Arc::new(AtomicU64::new(0)),
                     admissions: admission::Admissions::default(),
