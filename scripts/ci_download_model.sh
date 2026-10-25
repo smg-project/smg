@@ -81,11 +81,7 @@ download_model() {
             fi
             echo "Download attempt ${attempt}/${MAX_RETRIES} failed for ${model_id}."
             if [ $attempt -lt $MAX_RETRIES ]; then
-                # Clean up stale HF hub lock files older than 30 min (both legacy and new locations)
-                # Only delete old locks to avoid removing locks held by active processes
-                find "${model_dir}" -name "*.lock" -type f -mmin +30 -delete 2>/dev/null || true
-                local hf_lock_dir="${HF_HOME}/hub/.locks/models--${model_id//\//--}"
-                find "${hf_lock_dir}" -name "*.lock" -type f -mmin +30 -delete 2>/dev/null || true
+                # Lock age does not prove that another downloader released it.
                 echo "Retrying in ${RETRY_DELAY}s..."
                 sleep "$RETRY_DELAY"
             fi
