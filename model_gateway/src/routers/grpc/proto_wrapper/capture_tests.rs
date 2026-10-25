@@ -331,7 +331,7 @@ async fn cancelled_poll_does_not_invent_a_message_or_eof() -> TestResult {
     assert!(timeout(Duration::from_millis(20), observed.next())
         .await
         .is_err());
-    tx.send(()).map_err(|_| "gated stream dropped")?;
+    tx.send(()).map_err(|()| "gated stream dropped")?;
     assert!(matches!(observed.next().await, Some(Ok(_))));
     assert!(observed.next().await.is_none());
     observed.mark_completed();
@@ -362,7 +362,7 @@ async fn capture_size_and_writer_failures_do_not_change_native_output() -> TestR
             )),
         };
         let mut observed = ProtoStream::capture_vllm(
-            scripted(&endpoint, &[large.clone()], "0"),
+            scripted(&endpoint, std::slice::from_ref(&large), "0"),
             owner.observer(),
             7,
         );
@@ -403,7 +403,7 @@ async fn drop_preserves_immediate_deferred_and_suppressed_native_abort() -> Test
                 .await
                 .is_err());
             tx.send(())
-                .map_err(|_| "deferred stream did not retain its body")?;
+                .map_err(|()| "deferred stream did not retain its body")?;
         }
         assert_eq!(
             timeout(Duration::from_secs(5), endpoint.aborts.recv())
