@@ -1,13 +1,29 @@
 //! Actual streaming Chat adapter consumption, with synthetic Reader output.
 
 use super::*;
-use crate::{
-    diagnostic_capture::{
-        CaptureLimits, CaptureObserver, CapturePool, CaptureReadLimits, CaptureSnapshot,
-        SharedCapture,
-    },
-    routers::grpc::regular::symphony::testing::{tools, who, PROMPT},
+use crate::diagnostic_capture::{
+    CaptureLimits, CaptureObserver, CapturePool, CaptureReadLimits, CaptureSnapshot,
+    SharedCapture,
 };
+
+const PROMPT: &str = "<|im_start|>assistant\n<think>\n";
+
+fn tools() -> Vec<Tool> {
+    serde_json::from_value(serde_json::json!([{
+        "type": "function", "function": {
+            "name": "lookup", "parameters": {"type": "object", "properties": {}}
+        }
+    }]))
+    .unwrap()
+}
+
+fn who() -> Who<'static> {
+    Who {
+        request_id: "test-request",
+        model: "test-model",
+        choice: 0,
+    }
+}
 
 async fn render(
     observer: Option<CaptureObserver>,
