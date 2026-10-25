@@ -1,16 +1,22 @@
 """Passive observations for the private original SG-ZMQ unit and chat commands."""
+import base64
+import csv
 import hashlib
+import importlib.metadata as metadata
+import io
 import json
 import os
 from pathlib import Path
+import sys
 import _pytest.junitxml as junitxml
 
 selected, reports, collection = [], {}, []
 prefix = phase = directory = root = None
+asyncio = None
 
 
 def pytest_configure(config):
-    global prefix, phase, directory, root
+    global prefix, phase, directory, root, asyncio
     assert __debug__ and os.environ.get("SMG_SGLANG_ZMQ_ORIGINAL") == "1"
     assert os.environ["E2E_ENGINE"] == "sglang" and os.environ["E2E_CONNECTION_MODE"] == "zmq"
     phase = os.environ["SG_ZMQ_PROOF_PHASE"]
@@ -20,6 +26,28 @@ def pytest_configure(config):
     assert directory.is_absolute() and directory.resolve(strict=True) == directory
     assert directory.is_relative_to(Path(os.environ["RUNNER_TEMP"]).resolve(strict=True))
     prefix = config.getoption("junitprefix")
+    asyncio = asyncio_proof()
+
+
+def asyncio_proof():
+    """Record the original workflow's installed and active async test plugin."""
+    dist = metadata.distribution("pytest-asyncio")
+    raw = dist.read_text("RECORD")
+    assert raw and Path(dist._path).resolve().is_relative_to(Path(sys.prefix).resolve())
+    with (directory / (phase + "-pytest-asyncio-RECORD.csv")).open("x") as stream:
+        stream.write(raw)
+    rows = list(csv.reader(io.StringIO(raw)))
+    found = [row for row in rows if row[0] == "pytest_asyncio/plugin.py"]
+    assert len(found) == 1
+    name, encoded, size = found[0]
+    path = Path(dist.locate_file(name)).resolve(strict=True)
+    active = Path(sys.modules["pytest_asyncio.plugin"].__file__).resolve(strict=True)
+    content = path.read_bytes()
+    digest = hashlib.sha256(content).digest()
+    assert active == path and size.isdecimal() and len(content) == int(size)
+    assert encoded == "sha256=" + base64.urlsafe_b64encode(digest).decode().rstrip("=")
+    return {"version": dist.version, "metadata_origin": str(dist._path), "active_origin": str(active),
+        "plugin_sha256": digest.hex(), "RECORD_text_sha256": hashlib.sha256(raw.encode()).hexdigest()}
 
 
 def junit_address(nodeid):
@@ -86,5 +114,6 @@ def pytest_sessionfinish(session, exitstatus):
             "exit_code": int(exitstatus), "phase": phase,
             "junit_writer": {"path": str(Path(junitxml.__file__).resolve()),
                 "sha256": hashlib.sha256(Path(junitxml.__file__).read_bytes()).hexdigest(), "prefix": prefix},
-            "source": str(root), "scope": "Passive original command observations; no selection or outcome changes."}, stream, indent=2)
+            "pytest_asyncio": asyncio, "source": str(root),
+            "scope": "Passive original command observations; no selection or outcome changes."}, stream, indent=2)
         stream.write("\n")

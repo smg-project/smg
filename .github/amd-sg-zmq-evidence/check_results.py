@@ -63,6 +63,8 @@ def main():
         observed = json.loads((directory / (args.phase + "-reports.json")).read_text())
         assert observed["exit_code"] == 0 and observed["phase"] == args.phase
         assert observed["source"] == str(root)
+        record = directory / (args.phase + "-pytest-asyncio-RECORD.csv")
+        assert hashlib.sha256(record.read_bytes()).hexdigest() == observed["pytest_asyncio"]["RECORD_text_sha256"]
         assert len(observed["selected"]) == len({x["nodeid"] for x in observed["selected"]})
         assert set(observed["reports"]) == {x["pytest_nodeid"] for x in observed["selected"]}
         required = set()
@@ -75,6 +77,8 @@ def main():
             value, reruns = observed, None
             xml = Path(os.environ["RUNNER_TEMP"]) / "sglang-zmq-units.xml"
         else:
+            units = json.loads((directory / "units-reports.json").read_text())
+            assert observed["pytest_asyncio"] == units["pytest_asyncio"], "async plugin changed between original commands"
             expected = {x["id"]: x for x in contract["chat_cases"]}
             assert [x["nodeid"] for x in observed["selected"]] == list(expected)
             for item in observed["selected"]:

@@ -241,10 +241,25 @@ jobs:
           if [[ "${SMG_SGLANG_ZMQ_ORIGINAL-0}" == 1 ]]; then
             test "${{ inputs.engine }}" = sglang
             test "${{ inputs.connection_mode }}" = zmq
+            DIRECTORY="$RUNNER_TEMP/sg-zmq-evidence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            mkdir -m 700 "$DIRECTORY"
+            export SG_ZMQ_PROOF_DIRECTORY="$DIRECTORY"
+            echo "SG_ZMQ_PROOF_DIRECTORY=$DIRECTORY" >> "$GITHUB_ENV"
+            export SG_ZMQ_PROOF_PHASE=units
+            export PYTHONPATH="$GITHUB_WORKSPACE/.github/amd-sg-zmq-evidence${PYTHONPATH:+:$PYTHONPATH}"
+            export PYTEST_PLUGINS="${PYTEST_PLUGINS:+$PYTEST_PLUGINS,}sg_zmq_reports"
             pytest -q grpc_servicer/tests -p no:cacheprovider -rs --junitxml="$RUNNER_TEMP/sglang-zmq-units.xml"
           else
             pytest -q grpc_servicer/tests -p no:cacheprovider -rs
           fi
+
+      - name: Check original SG ZMQ unit evidence
+        if: always() && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd' && inputs.servicer_unit_tests
+        shell: bash
+        run: |
+          case "${SMG_SGLANG_ZMQ_ORIGINAL-0}" in 0) exit 0 ;; 1) ;; *) exit 1 ;; esac
+          test -n "$SG_ZMQ_PROOF_DIRECTORY"
+          python3 .github/amd-sg-zmq-evidence/check_results.py units
 
       - name: Check installed AMD dependencies
         id: amd-dependencies
@@ -342,12 +357,39 @@ jobs:
             test -n "$AMD_DEPENDENCY_DIRECTORY"
             set -- "--junitxml=$AMD_DEPENDENCY_DIRECTORY/e2e.xml"
           fi
+          if [ "${SMG_SGLANG_ZMQ_ORIGINAL-0}" = 1 ]; then
+            test -n "$SG_ZMQ_PROOF_DIRECTORY"
+            export SG_ZMQ_PROOF_PHASE=chat
+            export PYTHONPATH="$GITHUB_WORKSPACE/.github/amd-sg-zmq-evidence${PYTHONPATH:+:$PYTHONPATH}"
+            export PYTEST_PLUGINS="${PYTEST_PLUGINS:+$PYTEST_PLUGINS,}sg_zmq_reports"
+          fi
           pytest ${{ inputs.test_dirs }} \
             --ignore=e2e_test/benchmarks \
             --ignore=e2e_test/bindings_go \
             ${{ inputs.test_filter }} \
             --reruns 2 --reruns-delay 5 \
             -s -vv "$@"
+
+      - name: Check original SG ZMQ chat evidence
+        if: always() && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'
+        shell: bash
+        env:
+          AMD_DEPENDENCY_DIRECTORY: ${{ steps.amd-dependencies.outputs.directory }}
+        run: |
+          case "${SMG_SGLANG_ZMQ_ORIGINAL-0}" in 0) exit 0 ;; 1) ;; *) exit 1 ;; esac
+          test -n "$SG_ZMQ_PROOF_DIRECTORY"
+          python3 .github/amd-sg-zmq-evidence/check_results.py chat
+
+      - name: Preserve original SG ZMQ phase evidence
+        if: always() && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd' && env.SG_ZMQ_PROOF_DIRECTORY != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: sg-zmq-phase-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.SG_ZMQ_PROOF_DIRECTORY }}/
+            ${{ runner.temp }}/sglang-zmq-units.xml
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Worker failure diagnostics
         if: failure() || cancelled()
