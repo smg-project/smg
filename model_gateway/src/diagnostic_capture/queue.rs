@@ -96,12 +96,8 @@ impl CaptureQueue {
                     io::Error::new(io::ErrorKind::BrokenPipe, "capture writer closed")
                 }
             })?;
-            let mut bytes = Vec::new();
-            bytes
-                .try_reserve_exact(self.max_record_bytes)
-                .map_err(io::Error::other)?;
             let mut buffer = Payload {
-                bytes,
+                bytes: Vec::new(),
                 limit: self.max_record_bytes,
             };
             serde_json::to_writer(&mut buffer, payload).map_err(io::Error::from)?;
@@ -117,9 +113,11 @@ impl CaptureQueue {
     /// An unpolled future instead drops the owner without sealing. A caller must observe `Ok`
     /// before reporting success; a storage marker still does not establish boundary coverage.
     pub async fn finish(mut self) -> io::Result<PathBuf> {
-        let sender = self.sender.take().ok_or_else(incomplete)?;
-        self.sealed.store(true, Ordering::Release);
-        drop(sender);
+        // Even closed admission must collect the writer's original storage failure.
+        if let Some(sender) = self.sender.take() {
+            self.sealed.store(true, Ordering::Release);
+            drop(sender);
+        }
         self.completion
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "capture writer lost"))?
@@ -163,6 +161,18 @@ impl Write for Payload {
                 io::ErrorKind::FileTooLarge,
                 "capture payload too large",
             ));
+        }
+        let required = self.bytes.len() + bytes.len();
+        if required > self.bytes.capacity() {
+            let target = self
+                .bytes
+                .capacity()
+                .saturating_mul(2)
+                .max(required)
+                .min(self.limit);
+            self.bytes
+                .try_reserve_exact(target - self.bytes.len())
+                .map_err(io::Error::other)?;
         }
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
@@ -313,11 +323,16 @@ mod tests {
         let (mut queue, writer) = CaptureQueue::new(file, 1, 64).unwrap();
         queue.record(&1).unwrap();
         let worker = tokio::task::spawn_blocking(|| writer.run());
+        worker.await.unwrap();
+        // This later enqueue must not mask the earlier disk/file-budget error.
+        assert_eq!(
+            queue.record(&2).unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
         assert_eq!(
             queue.finish().await.unwrap_err().kind(),
             io::ErrorKind::FileTooLarge
         );
-        worker.await.unwrap();
         assert!(!path.join("complete.json").exists());
         let (queue, writer, _) = pair(root.path(), 1, 64);
         drop(writer);
@@ -342,5 +357,28 @@ mod tests {
                 matches!(CaptureQueue::new(file, slots, bytes), Err(e) if e.kind() == io::ErrorKind::InvalidInput)
             );
         }
+    }
+
+    #[test]
+    fn small_records_do_not_reserve_the_whole_cap_and_growth_stays_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut queue, mut writer, _) = pair(root.path(), 1, 1024);
+        queue.record(&true).unwrap();
+        let payload = writer.receiver.try_recv().unwrap();
+        assert_eq!(payload, b"true");
+        assert!(payload.capacity() < 1024);
+        let mut buffer = Payload {
+            bytes: Vec::new(),
+            limit: 31,
+        };
+        for _ in 0..31 {
+            buffer.write_all(b"x").unwrap();
+            assert!(buffer.bytes.capacity() <= 31);
+        }
+        assert_eq!(
+            buffer.write_all(b"x").unwrap_err().kind(),
+            io::ErrorKind::FileTooLarge
+        );
+        assert_eq!(buffer.bytes, vec![b'x'; 31]);
     }
 }
