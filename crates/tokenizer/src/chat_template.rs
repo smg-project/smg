@@ -3,7 +3,13 @@
 //! This module provides functionality to apply chat templates to messages,
 //! similar to HuggingFace transformers' apply_chat_template method.
 
-use std::{borrow::Cow, collections::HashMap, fs, io, iter, sync::OnceLock};
+use std::{
+    borrow::Cow,
+    cmp::Ordering,
+    collections::HashMap,
+    fs, io, iter,
+    sync::{Arc, OnceLock},
+};
 
 use anyhow::{anyhow, Result};
 use chrono::{
@@ -17,7 +23,7 @@ use minijinja::{
         parse, WhitespaceConfig,
     },
     syntax::SyntaxConfig,
-    value::{Kwargs, ValueKind},
+    value::{DynObject, Enumerator, Kwargs, Object, ObjectRepr, ValueKind},
     Environment, Error as MinijinjaError, ErrorKind, Output, State, Value,
 };
 use serde::Serialize;
@@ -873,13 +879,20 @@ pub struct ChatTemplateParams<'a> {
 /// prepared value is the render without it, byte for byte.
 pub struct PreparedTools {
     tools: Vec<JsonValue>,
+    /// The render's value of `tools`: the serializer's sequence, each tool
+    /// that is a map held as a [`KeptTool`].
     value: Value,
 }
 
 impl PreparedTools {
     /// Converts `tools` as a render converts [`ChatTemplateParams::tools`].
     pub fn new(tools: Vec<JsonValue>) -> Self {
-        let value = Value::from_serialize(tools.as_slice());
+        // The serializer's sequence of the slice, item by item: a tool that
+        // is a map renders through a `KeptTool`, which answers every template
+        // operation as the map itself and keeps the text `tojson` writes of
+        // it; any other item is the serializer's value of it.
+        let items: Vec<Value> = tools.iter().map(KeptTool::value_of_tool).collect();
+        let value = Value::from_object(items);
         Self { tools, value }
     }
 
@@ -894,6 +907,148 @@ impl PreparedTools {
     fn value_of(&self, tools: &[JsonValue]) -> Option<Value> {
         (std::ptr::eq(self.tools.as_ptr(), tools.as_ptr()) && self.tools.len() == tools.len())
             .then(|| self.value.clone())
+    }
+}
+
+/// A prepared tool as the render reads it: the map the serializer made of
+/// the tool, which answers every template operation (the tests of `is
+/// mapping`, `in` and truth, the lookups, the iteration and its order, the
+/// methods, the comparisons, the text forms), and beside it the text
+/// `tojson` wrote of the map, kept for the next request that renders the
+/// same kept value: a tool set is an application's, and its `tojson` text
+/// under the same arguments is the same bytes for every request. The two
+/// forms the shipped templates use are kept, `tojson` with no argument and
+/// `tojson(indent=...)` with one indent; any other call (`ensure_ascii`,
+/// `separators`, `sort_keys`, a second indent) is written as for any value.
+struct KeptTool {
+    /// The tool's map as the serializer made it: the object every
+    /// operation forwards to.
+    object: DynObject,
+    /// The text of `tojson` with no argument, once written.
+    plain: OnceLock<Value>,
+    /// The indent of the first `tojson(indent=...)` asked and its text,
+    /// once written.
+    indented: OnceLock<(Vec<u8>, Value)>,
+}
+
+impl KeptTool {
+    /// The render's value of one prepared tool: the kept form when the tool
+    /// is a map (a function tool is), else the serializer's value of it.
+    fn value_of_tool(tool: &JsonValue) -> Value {
+        let value = Value::from_serialize(tool);
+        match value.as_object() {
+            Some(object) if object.repr() == ObjectRepr::Map => Value::from_object(KeptTool {
+                object: object.clone(),
+                plain: OnceLock::new(),
+                indented: OnceLock::new(),
+            }),
+            _ => value,
+        }
+    }
+
+    /// The `tojson` text of this tool for `indent` (`None` for the call
+    /// without an argument) as a safe string: the kept text when the form
+    /// was written before, else `write`'s text, kept when the form is a
+    /// kept one. The text is always the writer's own for this value and
+    /// these arguments.
+    fn tojson(
+        &self,
+        indent: Option<&[u8]>,
+        write: impl FnOnce() -> std::result::Result<String, MinijinjaError>,
+    ) -> std::result::Result<Value, MinijinjaError> {
+        let Some(indent) = indent else {
+            if let Some(text) = self.plain.get() {
+                return Ok(text.clone());
+            }
+            let text = Value::from_safe_string(write()?);
+            // Two requests may write the first text at once: the same bytes
+            // either way, the slot keeps one.
+            return Ok(self.plain.get_or_init(|| text).clone());
+        };
+        if let Some((kept_indent, text)) = self.indented.get() {
+            return if kept_indent.as_slice() == indent {
+                Ok(text.clone())
+            } else {
+                write().map(Value::from_safe_string)
+            };
+        }
+        let text = Value::from_safe_string(write()?);
+        // Two requests may race to keep two indents: the slot takes the
+        // first; the other answers with the text it wrote.
+        let (kept_indent, kept) = self
+            .indented
+            .get_or_init(|| (indent.to_vec(), text.clone()));
+        Ok(if kept_indent.as_slice() == indent {
+            kept.clone()
+        } else {
+            text
+        })
+    }
+}
+
+/// Every operation is the inner map's: the kept tool is that map to the
+/// template, in every test, lookup, iteration, method, comparison and text
+/// (`Value`'s `Debug` and `Display` of an object both go through `render`).
+impl Object for KeptTool {
+    fn repr(self: &Arc<Self>) -> ObjectRepr {
+        self.object.repr()
+    }
+
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        self.object.get_value(key)
+    }
+
+    fn get_value_by_str(self: &Arc<Self>, key: &str) -> Option<Value> {
+        self.object.get_value_by_str(key)
+    }
+
+    fn enumerate(self: &Arc<Self>) -> Enumerator {
+        self.object.enumerate()
+    }
+
+    fn enumerator_len(self: &Arc<Self>) -> Option<usize> {
+        self.object.enumerator_len()
+    }
+
+    fn is_true(self: &Arc<Self>) -> bool {
+        self.object.is_true()
+    }
+
+    fn call(
+        self: &Arc<Self>,
+        state: &State<'_, '_>,
+        args: &[Value],
+    ) -> std::result::Result<Value, MinijinjaError> {
+        self.object.call(state, args)
+    }
+
+    fn call_method(
+        self: &Arc<Self>,
+        state: &State<'_, '_>,
+        method: &str,
+        args: &[Value],
+    ) -> std::result::Result<Value, MinijinjaError> {
+        self.object.call_method(state, method, args)
+    }
+
+    fn custom_cmp(self: &Arc<Self>, other: &DynObject) -> Option<Ordering> {
+        self.object.custom_cmp(other)
+    }
+
+    // `render` stays the trait's own: for a map it is the debug map of the
+    // pairs, which the inner map renders by the same default, and it keeps
+    // the formatter's flags (`pprint` asks for the alternate form); a
+    // forward through `Display` would write a fresh formatter and lose them.
+}
+
+/// As the map's own `Debug`: the pairs in their order.
+impl std::fmt::Debug for KeptTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut map = f.debug_map();
+        for (key, value) in self.object.try_iter_pairs().into_iter().flatten() {
+            map.entry(&key, &value);
+        }
+        map.finish()
     }
 }
 
@@ -1241,15 +1396,31 @@ fn tojson_filter(value: Value, kwargs: Kwargs) -> std::result::Result<Value, Min
     // Ensure all kwargs are consumed to avoid "unknown keyword argument" errors
     kwargs.assert_all_used()?;
 
+    let separators_given = separators.is_some();
     let indent = parse_indent(indent)?;
     let separators = parse_separators(separators, indent.is_some())?;
     let ensure_ascii = ensure_ascii.unwrap_or(false);
+    let sort_keys = sort_keys.unwrap_or(false);
+    // A prepared tool's text under the forms the shipped templates use is
+    // written once per kept tool and shared by every request that renders
+    // the same kept value; every other form is written as for any value.
+    if !sort_keys && !ensure_ascii && !separators_given {
+        if let Some(kept) = value
+            .as_object()
+            .and_then(|object| object.downcast_ref::<KeptTool>())
+        {
+            let separators = separators.clone();
+            return kept.tojson(indent.as_deref(), || {
+                serialize_with_python_json(&value, indent.as_deref(), separators, ensure_ascii)
+            });
+        }
+    }
     // The template value is written straight into its JSON text: its serde
     // form is what a `serde_json::Value` built from it would serialize as
     // (the same `Serialize` impl drives both, in the same key order), so
     // the tree is built only when the keys are to be sorted, which needs
     // the value as a whole.
-    let json_str = if sort_keys.unwrap_or(false) {
+    let json_str = if sort_keys {
         let json_value: serde_json::Value = serde_json::to_value(&value).map_err(|e| {
             MinijinjaError::new(
                 ErrorKind::InvalidOperation,
@@ -3381,6 +3552,101 @@ mod tests {
             );
             assert_ne!(mismatched, plain);
         }
+    }
+
+    /// A prepared tool answers every template operation as the map it holds,
+    /// and its `tojson` text is the writer's under every argument shape: the
+    /// kept forms (no argument, the first indent) come from the kept text on
+    /// the second render, the others are written as for any value.
+    #[test]
+    fn a_prepared_tool_renders_as_its_map_and_keeps_its_tojson_text() {
+        let template = "{% for tool in tools %}\
+            {{ tool | tojson }}|{{ tool | tojson(indent=2) }}|{{ tool | tojson(indent=4) }}|\
+            {{ tool | tojson(ensure_ascii=True) }}|{{ tool | tojson(sort_keys=True) }}|\
+            {{ tool | tojson(separators=(',', ':')) }}|{{ tool.function | tojson }}|\
+            {{ tool is mapping }}|{{ tool is iterable }}|{{ tool | length }}|{{ 'function' in tool }}|\
+            {{ 'nope' in tool }}|{{ tool.function.name }}|{{ tool['type'] }}|{{ tool.get('type') }}|\
+            {{ tool.get('nope', 'd') }}|{{ tool.items() | list | length }}|{{ tool.keys() | list }}|\
+            {{ tool.values() | list | length }}|{{ tool == tool }}|{{ tool != tools[0] }}|{{ tool }}|\
+            {{ tool | string }}|{{ tool | pprint }}|{% for k in tool %}{{ k }},{% endfor %}|\
+            {% for k, v in tool.items() %}{{ k }}={{ v }};{% endfor %}|{{ tool | list }}|\
+            {{ tool if tool else 'empty' }}|{{ tool | dictsort | length }}\n\
+            {% endfor %}{{ tools | tojson }}|{{ tools | length }}|{{ tools[1].function.name }}|\
+            {{ tools | map(attribute='type') | list }}|{{ tools | selectattr('function.name', 'eq', 'g') | list | length }}";
+        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
+        let tools = vec![
+            serde_json::json!({"type": "function", "function": {"name": "zoë", "description": "first ✓",
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}}}),
+            serde_json::json!({"type": "function", "function": {"name": "g", "parameters": {}}}),
+        ];
+        let messages = [serde_json::json!({"role": "user", "content": "Hi"})];
+        let plain = processor
+            .apply_chat_template(
+                &messages,
+                ChatTemplateParams {
+                    tools: Some(&tools),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(plain.contains("\"name\": \"zoë\""), "{plain}");
+        assert!(plain.contains("\"name\": \"zo\\u00eb\""), "{plain}");
+        let prepared = PreparedTools::new(tools.clone());
+        let params = || ChatTemplateParams {
+            tools: Some(prepared.tools()),
+            prepared_tools: Some(&prepared),
+            ..Default::default()
+        };
+        let first = processor.apply_chat_template(&messages, params()).unwrap();
+        assert_eq!(first, plain, "the first render writes the kept texts");
+        let second = processor.apply_chat_template(&messages, params()).unwrap();
+        assert_eq!(second, plain, "the second render reads them");
+    }
+
+    /// The kept text is written once per kept tool and form: the second
+    /// `tojson` of a kept tool answers with the string the first wrote; a
+    /// second indent is not kept and is written every time.
+    #[test]
+    fn a_prepared_tools_tojson_text_is_written_once_per_kept_form() {
+        let tools = vec![serde_json::json!({"type": "function", "function": {"name": "f"}})];
+        let prepared = PreparedTools::new(tools);
+        let tool = prepared.value.get_item(&Value::from(0)).unwrap();
+        let kept = tool
+            .as_object()
+            .and_then(|object| object.downcast_ref::<KeptTool>())
+            .expect("a prepared tool is kept");
+        let mut writes = 0;
+        let mut write = || {
+            writes += 1;
+            Ok(format!("text {writes}"))
+        };
+        let first = kept.tojson(None, &mut write).unwrap();
+        let again = kept.tojson(None, &mut write).unwrap();
+        assert_eq!(first.as_str(), Some("text 1"));
+        assert_eq!(
+            first.as_str().unwrap().as_ptr(),
+            again.as_str().unwrap().as_ptr(),
+            "one string, shared"
+        );
+        let two = kept.tojson(Some(b"  "), &mut write).unwrap();
+        assert_eq!(two.as_str(), Some("text 2"));
+        assert_eq!(
+            kept.tojson(Some(b"  "), &mut write).unwrap().as_str(),
+            Some("text 2")
+        );
+        assert_eq!(
+            kept.tojson(Some(b"    "), &mut write).unwrap().as_str(),
+            Some("text 3")
+        );
+        assert_eq!(
+            kept.tojson(Some(b"    "), &mut write).unwrap().as_str(),
+            Some("text 4")
+        );
+        assert_eq!(
+            kept.tojson(None, &mut write).unwrap().as_str(),
+            Some("text 1")
+        );
+        assert_eq!(writes, 4);
     }
 
     /// A checkpoint's processor template renders the requests that declare no

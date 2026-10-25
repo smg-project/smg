@@ -103,8 +103,10 @@ pub(crate) fn prepare_tools(tools: &[Tool]) -> Result<Arc<PreparedTools>, String
             return Ok(Arc::clone(kept));
         }
         let values = tool_values(tools)?;
-        // What the entry holds: its key, its JSON values and the render's values.
-        let weight = key.len() + kept_weight(&values);
+        // What the entry holds: its key, its JSON values, the render's values
+        // and the `tojson` texts the render keeps per tool (about the key's
+        // bytes once more).
+        let weight = 2 * key.len() + kept_weight(&values);
         let prepared = Arc::new(PreparedTools::new(values));
         if weight > PREPARED_TOOLS_MAX_SET_WEIGHT {
             return Ok(prepared);
