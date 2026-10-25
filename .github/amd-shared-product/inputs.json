@@ -75,7 +75,7 @@
   "producer_sha": "f93b547de753c96373988b60b1590638629b3568",
   "producer_branch": "ci/frozen-legacy-c9d-refresh-producer-admitted-20261024",
   "producer_policy": "frozen_c9d_dispatch_build_only_all_18_steps_success_v1",
-  "target_product_commit": "7fcdbea474e0ac2641e296065e29278288f9b4b7",
+  "target_product_commit": "4757ca80fcff975ca8dd512f2aa9513268a3cf96",
   "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat-zmq[2]/sglang/nvidia",
   "source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
@@ -91,7 +91,7 @@
     "e2e_test": "35d5321770a24d3706a3c0730c465d3a0e11d437",
     "scripts": "6f2082a851689a51de9fd5211fd491a38c8ada8a",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
-    ".github/workflows/e2e-gpu-job.yml": "341d274095148119f18e30049bd55c895b1a6cd9",
+    ".github/workflows/e2e-gpu-job.yml": "1d6bfedf62fa3572a1373fca45e25f4913e9b42f",
     "README.md": "83b7df25632da03f0184bd5b4628b9c9a3ace803",
     "LICENSE": "9088c2872db9763b9e6533c6960e9adb0c9cb65f",
     "rustfmt.toml": "19e1ab31f8958c31292f0f568976a036af7e683b",
