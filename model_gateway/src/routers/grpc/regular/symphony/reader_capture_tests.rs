@@ -394,6 +394,16 @@ async fn reader_capture_rejects_wrong_choice_and_abandoned_owner() {
         drop(reader);
         if let Some(owner) = owner {
             assert!(owner.finish().await.is_err());
+            let prefix: Vec<Value> = fs::read_to_string(directory.join("records.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let rejected = &prefix.last().unwrap()["payload"];
+            assert_eq!(rejected["kind"], "rejected");
+            assert_eq!(rejected["reason"], "chat batch choice differs from reader choice");
+            assert_eq!(rejected["attempted_choice"], 1);
+            assert_eq!(rejected["choice"], 0);
         }
         assert!(!fs::exists(directory.join("complete.json")).unwrap());
     }

@@ -84,7 +84,7 @@ impl Observation {
         if self.pending.is_some() {
             // Continuing a reader whose prior operation unwound cannot silently erase the
             // missing return. Keep inference unchanged, but reject completion of its evidence.
-            self.capture.invalidate();
+            self.reject("previous reader operation did not return", None);
         }
         self.pending = Some(operation.kind());
         self.record(Record::Operation { step: operation });
@@ -92,7 +92,7 @@ impl Observation {
 
     pub(super) fn returned(&mut self, stopped: Option<bool>) {
         let Some(operation) = self.pending.take() else {
-            self.capture.invalidate();
+            self.reject("reader returned without a pending operation", None);
             return;
         };
         if operation == OperationKind::End {
@@ -107,7 +107,7 @@ impl Observation {
 
     pub(super) fn input(&mut self, input: &Input<'_>) {
         if increment(&mut self.inputs).is_none() {
-            self.capture.invalidate();
+            self.reject("reader input counter overflow", None);
         }
         self.record(Record::Input { input });
     }
@@ -118,13 +118,28 @@ impl Observation {
     }
 
     pub(super) fn batch(&mut self, choice: u32, events: &Events<'_>) {
-        if choice != self.choice || increment(&mut self.batches).is_none() {
-            self.capture.invalidate();
+        if choice != self.choice {
+            self.reject("chat batch choice differs from reader choice", Some(choice));
+            return;
+        }
+        if increment(&mut self.batches).is_none() {
+            self.reject("reader batch counter overflow", None);
             return;
         }
         self.record(Record::ChatBatch {
             events: events.as_slice(),
         });
+    }
+
+    fn reject(&mut self, reason: &'static str, attempted_choice: Option<u32>) {
+        // Preserve the cause when the sink still accepts records. Latching first would make
+        // the otherwise valid prefix indistinguishable from an unexplained observer failure.
+        self.record(Record::Rejected {
+            reason,
+            attempted_choice,
+            pending: self.pending,
+        });
+        self.capture.invalidate();
     }
 
     fn record(&mut self, record: Record<'_>) {
@@ -200,6 +215,11 @@ enum Record<'a> {
     },
     Failed {
         message: &'a str,
+    },
+    Rejected {
+        reason: &'static str,
+        attempted_choice: Option<u32>,
+        pending: Option<OperationKind>,
     },
     ChatBatch {
         events: &'a [Event<'a>],
