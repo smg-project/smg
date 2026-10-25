@@ -1744,6 +1744,20 @@ impl WorkerRegistry {
     // 7. Remove
     // ───────────────────────────────────────────────────────────────────
 
+    /// Whether a registered worker other than `worker` renders to its label
+    /// (`Worker::redacted_url`): two registrations at one address that
+    /// differ only by their secret share one, and a leaving registration's
+    /// teardown then leaves the label's series to the one that stays (the
+    /// retirement in `remove_inner`, the load monitor's eviction sentinel).
+    /// By registration, not by URL: a worker evicted for a status change is
+    /// not the other registration of its own label.
+    pub(crate) fn label_shared_with(&self, worker: &Arc<dyn Worker>) -> bool {
+        let label = worker.redacted_url();
+        self.workers.iter().any(|other| {
+            !Arc::ptr_eq(other.value(), worker) && other.value().redacted_url() == label
+        })
+    }
+
     /// Remove a worker by ID and clean up every index entry.
     ///
     /// Returns `Some(worker)` if the ID existed, `None` otherwise. Tears
@@ -1820,24 +1834,36 @@ impl WorkerRegistry {
             // before this one is removed) keeps the label's series: they are
             // retired with the last registration that renders to it.
             let label = worker.redacted_url();
-            let label_shared = self
-                .workers
-                .iter()
-                .any(|other| other.value().redacted_url() == label);
-            if label_shared {
-                // The leaving registration's demotion wrote the gauges the
-                // label shares; the registrations that stay write theirs again.
-                for other in self.workers.iter() {
-                    let other = other.value();
-                    if other.redacted_url() == label {
-                        Metrics::set_worker_health(label, other.is_healthy());
-                        Metrics::set_worker_cb_state(label, other.circuit_breaker_state().as_int());
-                        Metrics::set_worker_requests_active(label, other.load());
-                        other.republish_state();
+            {
+                // The scan and the retirement under the membership-order
+                // write guard: a registration of another URL that renders to
+                // this label inserts under the read side, so it lands before
+                // the scan (the label reads shared) or after the retirement
+                // (its `worker_registered` brings the label back), never
+                // between them with its fresh series retired under it.
+                let _order = self.global_membership_order.write();
+                if self.label_shared_with(&worker) {
+                    // The leaving registration's demotion wrote the gauges
+                    // the label shares and left its state pair at 1: every
+                    // pair of the label is lowered once, then the
+                    // registrations that stay write their gauges and publish
+                    // their pair again, so the family ends one-hot on theirs.
+                    super::worker::lower_routing_state_series(label);
+                    for other in self.workers.iter() {
+                        let other = other.value();
+                        if other.redacted_url() == label {
+                            Metrics::set_worker_health(label, other.is_healthy());
+                            Metrics::set_worker_cb_state(
+                                label,
+                                other.circuit_breaker_state().as_int(),
+                            );
+                            Metrics::set_worker_requests_active(label, other.load());
+                            other.republish_state();
+                        }
                     }
+                } else {
+                    Metrics::remove_worker_metrics(label);
                 }
-            } else {
-                Metrics::remove_worker_metrics(label);
             }
             self.url_to_id.remove(worker.url());
             // We hold _guard; drop the DashMap entry but the Mutex stays alive via Arc.

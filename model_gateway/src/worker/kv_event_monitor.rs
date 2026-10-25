@@ -145,6 +145,17 @@ struct WorkerSubscription {
 /// Ids for [`WorkerSubscription`]s, unique within the process.
 static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Whether an `Active` slot carries `rendered_url`: two subscriptions at one
+/// address that differ only by their secret render to one label
+/// (`Worker::redacted_url`). Where a gauge of the label is lowered, the
+/// leaving subscription's slot is a reservation, so an active one is another
+/// subscription's, and the gauge is its to lower.
+fn label_shared_by_an_active_slot(handles: &HashMap<String, Slot>, rendered_url: &str) -> bool {
+    handles
+        .values()
+        .any(|slot| matches!(slot, Slot::Active(other) if other.rendered_url == rendered_url))
+}
+
 impl KvEventMonitor {
     /// A monitor whose models get chain indexes.
     pub fn new() -> Self {
@@ -251,9 +262,12 @@ impl KvEventMonitor {
                 // guard): nothing is left to wait for. Whatever it raised on
                 // the gauge is lowered before its successor starts, whose
                 // answer owns the gauge from here (the removal's own reset
-                // skips a slot that is no longer its reservation).
+                // skips a slot that is no longer its reservation), unless
+                // the label is another live subscription's to keep.
                 handles.remove(&url);
-                Metrics::set_kv_events_unavailable(&rendered, false);
+                if !label_shared_by_an_active_slot(&handles, &rendered) {
+                    Metrics::set_kv_events_unavailable(&rendered, false);
+                }
                 break handles;
             }
             drop(handles);
@@ -404,8 +418,12 @@ impl KvEventMonitor {
         // subscription and under the slot lock, so a re-add of the URL that
         // follows the removal cannot see its fresh gauge reset by a stale
         // caller, and a caller that dropped `on_worker_removed` early does
-        // not leave it raised.
-        Metrics::set_kv_events_unavailable(rendered_url, false);
+        // not leave it raised. A label another live subscription renders to
+        // (the same address under a rotated credential) is that
+        // subscription's: its gauge is left as it is.
+        if !label_shared_by_an_active_slot(&handles, rendered_url) {
+            Metrics::set_kv_events_unavailable(rendered_url, false);
+        }
         handles.remove(worker_url);
         // Under the slot lock, which `on_worker_added` holds from its lookup
         // of the model's index to its insert: an add of the model racing
@@ -485,7 +503,9 @@ impl KvEventMonitor {
         // the reservation is still this subscription's. A successor under the
         // URL owns the gauge from its add on.
         let handles = self.worker_handles.lock().await;
-        if matches!(handles.get(worker_url), Some(Slot::Removing(held)) if held.id == id) {
+        if matches!(handles.get(worker_url), Some(Slot::Removing(held)) if held.id == id)
+            && !label_shared_by_an_active_slot(&handles, &rendered_url)
+        {
             Metrics::set_kv_events_unavailable(&rendered_url, false);
         }
     }
@@ -833,6 +853,53 @@ mod tests {
         })
         .await;
         monitor.stop().await;
+    }
+
+    /// Two subscriptions at one address that differ only by their secret
+    /// render to one label: the label is shared while another `Active` slot
+    /// carries it, so a leaving subscription leaves the label's gauge to it.
+    #[tokio::test]
+    async fn a_rendered_label_is_shared_while_another_active_slot_carries_it() {
+        fn active(rendered: &str) -> Slot {
+            let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+            let (_done_tx, done) = watch::channel(());
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a task that has ended stands in for a subscription's; nothing waits for it"
+            )]
+            let handle = tokio::spawn(async {});
+            Slot::Active(WorkerSubscription {
+                id: 0,
+                handle,
+                model_id: "m".to_string(),
+                rendered_url: rendered.to_string(),
+                shutdown_tx,
+                done,
+            })
+        }
+        let label = "grpc://user:***@127.0.0.1:1";
+        let mut handles = HashMap::new();
+        handles.insert("grpc://user:old@127.0.0.1:1".to_string(), active(label));
+        handles.insert("grpc://user:new@127.0.0.1:1".to_string(), active(label));
+        handles.insert(
+            "grpc://127.0.0.1:2".to_string(),
+            active("grpc://127.0.0.1:2"),
+        );
+        assert!(label_shared_by_an_active_slot(&handles, label));
+        assert!(!label_shared_by_an_active_slot(
+            &handles,
+            "grpc://127.0.0.1:3"
+        ));
+
+        // The leaving subscription's slot is a reservation, not an active one.
+        let (_done_tx, done) = watch::channel(());
+        handles.insert(
+            "grpc://user:old@127.0.0.1:1".to_string(),
+            Slot::Removing(Reservation { id: 0, done }),
+        );
+        assert!(label_shared_by_an_active_slot(&handles, label));
+        handles.remove("grpc://user:new@127.0.0.1:1");
+        assert!(!label_shared_by_an_active_slot(&handles, label));
     }
 
     #[test]

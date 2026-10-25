@@ -229,7 +229,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// routed-worker response header, the request-sent event, the `worker`
     /// label of the worker's metric series): the registered URL byte for
     /// byte, unless it carries userinfo, whose secret is masked. Computed
-    /// once at registration (`WorkerMetadata::redacted_url`); an implementor
+    /// once at registration (`WorkerMetadata::redacted_url`); an implementer
     /// reads it from its metadata unless it keeps the field closer.
     fn redacted_url(&self) -> &str {
         &self.metadata().redacted_url
@@ -1226,6 +1226,16 @@ const _: () = assert!(matches!(
         .as_bytes(),
     b"circuit_open"
 ));
+
+/// Lower every `smg_worker_state` series of `label`: the step before the
+/// registrations that stay under a shared label publish theirs again
+/// (`WorkerRegistry::remove_inner`), so a pair the leaving registration
+/// published is not left at 1 beside the live one's.
+pub(crate) fn lower_routing_state_series(label: &str) {
+    for (state, reason) in ROUTING_STATE_SERIES {
+        Metrics::set_worker_state(label, state, reason, false);
+    }
+}
 
 /// The index in [`ROUTING_STATE_SERIES`] of a worker with these facts: the
 /// first that excludes it, else available.

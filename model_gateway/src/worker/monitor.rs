@@ -997,6 +997,12 @@ impl WorkerMonitor {
     /// republished keeps its entry, and its series continues uninterrupted.
     pub(crate) fn flush_pending_evictions(&self) {
         for worker in self.load_state.apply_pending_evictions() {
+            // The label's series belong to another registration that
+            // renders to it (the same address under a rotated credential):
+            // its next poll writes them, and a sentinel would read as its own.
+            if self.worker_registry.label_shared_with(&worker) {
+                continue;
+            }
             // A worker can serve multiple models (one load group per model),
             // so sentinel every model's series — not just the primary.
             let dp_size = worker.dp_size().unwrap_or(1);

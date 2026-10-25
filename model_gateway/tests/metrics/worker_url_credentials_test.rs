@@ -6,7 +6,8 @@
 //! without credentials keeps its URL byte for byte on all three.
 //!
 //! The recorder is this binary's, installed once for all its tests (see
-//! `recorder()` in the group's `mod.rs`).
+//! `recorder()` in the group's `mod.rs`), and so is the capture of the
+//! request events (`event_lines`).
 
 #![expect(
     clippy::unwrap_used,
@@ -18,7 +19,7 @@
 use std::{
     io,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -42,8 +43,12 @@ use smg::{
 };
 use tokio::net::TcpListener;
 use tower::ServiceExt;
-use tracing::instrument::WithSubscriber;
-use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::{
+    filter::{LevelFilter, Targets},
+    fmt::MakeWriter,
+    layer::SubscriberExt,
+    Layer,
+};
 
 use crate::common::{
     grpc_harness::{
@@ -108,12 +113,36 @@ fn requests_total(body: &str, worker_label: &str) -> Option<u64> {
         .map(|line| line.rsplit(' ').next().unwrap().parse().unwrap())
 }
 
-/// The value of the worker's health gauge in a scrape, if the series exists.
-fn health(body: &str, worker_label: &str) -> Option<f64> {
+/// The value of a worker's gauge of `family` in a scrape, if the series exists.
+fn gauge(body: &str, family: &str, worker_label: &str) -> Option<f64> {
+    let prefix = format!("{family}{{");
     let worker = format!("worker=\"{worker_label}\"");
     body.lines()
-        .find(|line| line.starts_with("smg_worker_health{") && line.contains(&worker))
+        .find(|line| line.starts_with(&prefix) && line.contains(&worker))
         .map(|line| line.rsplit(' ').next().unwrap().parse().unwrap())
+}
+
+/// The value of the worker's health gauge in a scrape, if the series exists.
+fn health(body: &str, worker_label: &str) -> Option<f64> {
+    gauge(body, "smg_worker_health", worker_label)
+}
+
+/// The worker's `smg_worker_state` series in a scrape: `(state, reason)` and
+/// the value, one entry per series.
+fn state_series(body: &str, worker_label: &str) -> Vec<((String, String), f64)> {
+    fn label(line: &str, name: &str) -> String {
+        let key = format!("{name}=\"");
+        let start = line.find(&key).unwrap() + key.len();
+        line[start..].split('"').next().unwrap().to_owned()
+    }
+    let worker = format!("worker=\"{worker_label}\"");
+    body.lines()
+        .filter(|line| line.starts_with("smg_worker_state{") && line.contains(&worker))
+        .map(|line| {
+            let value = line.rsplit(' ').next().unwrap().parse().unwrap();
+            ((label(line, "state"), label(line, "reason")), value)
+        })
+        .collect()
 }
 
 /// An HTTP upstream that answers every `/generate` with a completion; the
@@ -207,22 +236,39 @@ fn masked(url: &str) -> String {
     url.replacen("user:secret@", "user:***@", 1)
 }
 
-/// One request through the HTTP app, the DEBUG lines it wrote captured
-/// (the request-sent event is a DEBUG line with no tracing exporter).
-async fn http_request(app: &Router) -> (axum::response::Response, String) {
-    let capture = Capture::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .with_ansi(false)
-        .with_writer(capture.clone())
-        .finish();
-    let response = app
-        .clone()
-        .oneshot(generate_request())
-        .with_subscriber(subscriber)
-        .await
-        .unwrap();
-    (response, capture.text())
+/// The request events of this process, captured once for every test of the
+/// binary: a subscriber on the events module at DEBUG (the request-sent
+/// event is a DEBUG line with no tracing exporter), installed as the global
+/// default on the first call. A subscriber scoped to one request shares the
+/// process-wide callsite-interest cache with the other tests of the binary
+/// and missed the line in a parallel run.
+fn event_lines() -> &'static Capture {
+    static CAPTURE: OnceLock<Capture> = OnceLock::new();
+    CAPTURE.get_or_init(|| {
+        let capture = Capture::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(capture.clone())
+            .with_filter(
+                Targets::new().with_target("smg::observability::events", LevelFilter::DEBUG),
+            );
+        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
+            .expect("this binary installs its one tracing subscriber here");
+        capture
+    })
+}
+
+/// One request through the HTTP app, and the request-sent event line that
+/// names `worker` (the URL as the gateway renders it), if one was written.
+async fn http_request(app: &Router, worker: &str) -> (axum::response::Response, Option<String>) {
+    let lines = event_lines();
+    let response = app.clone().oneshot(generate_request()).await.unwrap();
+    let sent = lines
+        .text()
+        .lines()
+        .find(|line| line.contains("Sending request") && line.contains(worker))
+        .map(str::to_owned);
+    (response, sent)
 }
 
 fn routed_worker_id(response: &axum::response::Response) -> String {
@@ -242,17 +288,17 @@ async fn a_worker_urls_secret_is_masked_on_the_header_the_event_and_the_label() 
     // HTTP: the header, the request-sent event line and the counter's label.
     let upstream = with_credentials(&start_http_upstream().await);
     let app = http_app(&upstream).await;
-    let (response, log) = http_request(&app).await;
+    let (response, sent) = http_request(&app, &masked(&upstream)).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(routed_worker_id(&response), masked(&upstream));
-    let sent = log
-        .lines()
-        .find(|line| line.contains("Sending request"))
-        .unwrap_or_else(|| panic!("no request-sent event line in:\n{log}"));
-    assert!(
-        sent.contains(&masked(&upstream)) && !sent.contains("secret"),
-        "the event line: {sent}"
-    );
+    let sent = sent.unwrap_or_else(|| {
+        panic!(
+            "no request-sent event line names {}:\n{}",
+            masked(&upstream),
+            event_lines().text()
+        )
+    });
+    assert!(!sent.contains("secret"), "the event line: {sent}");
     let body = scrape(metrics_addr).await;
     assert_eq!(
         requests_total(&body, &masked(&upstream)),
@@ -291,13 +337,15 @@ async fn a_worker_url_without_credentials_is_rendered_byte_for_byte() {
         .expect("metrics server binds an ephemeral port");
     let upstream = start_http_upstream().await;
     let app = http_app(&upstream).await;
-    let (response, log) = http_request(&app).await;
+    let (response, sent) = http_request(&app, &upstream).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(routed_worker_id(&response), upstream);
-    let sent = log
-        .lines()
-        .find(|line| line.contains("Sending request"))
-        .unwrap_or_else(|| panic!("no request-sent event line in:\n{log}"));
+    let sent = sent.unwrap_or_else(|| {
+        panic!(
+            "no request-sent event line names {upstream}:\n{}",
+            event_lines().text()
+        )
+    });
     assert!(
         sent.contains(&format!("url={upstream}")),
         "the event line: {sent}"
@@ -308,8 +356,9 @@ async fn a_worker_url_without_credentials_is_rendered_byte_for_byte() {
 
 /// Two registrations at one address that differ only by their secret render
 /// to one label. A credential rotation registers the new URL and then removes
-/// the old one: the label's series stay for the live registration and are
-/// retired with the last one.
+/// the old one: the label's series stay for the live registration, read its
+/// state (one `smg_worker_state` pair at 1, the leaving registration's
+/// demotion lowered again) and are retired with the last one.
 #[tokio::test]
 async fn a_credential_rotation_at_one_address_keeps_the_labels_series() {
     let handle = crate::metrics::recorder();
@@ -340,6 +389,32 @@ async fn a_credential_rotation_at_one_address_keeps_the_labels_series() {
         Some(1.0),
         "the live registration's series survive the other's removal:\n{body}"
     );
+    let states = state_series(&body, label);
+    let at_one: Vec<&(String, String)> = states
+        .iter()
+        .filter(|(_, value)| *value == 1.0)
+        .map(|(pair, _)| pair)
+        .collect();
+    assert_eq!(
+        at_one,
+        vec![&("available".to_string(), "none".to_string())],
+        "one state pair at 1 after the rotation, the live registration's:\n{body}"
+    );
+    assert_eq!(
+        states.iter().map(|(_, value)| value).sum::<f64>(),
+        1.0,
+        "the state family is one-hot:\n{body}"
+    );
+    assert_eq!(
+        gauge(&body, "smg_worker_cb_state", label),
+        Some(0.0),
+        "{body}"
+    );
+    assert_eq!(
+        gauge(&body, "smg_worker_requests_active", label),
+        Some(0.0),
+        "{body}"
+    );
 
     ctx.worker_registry.remove_by_url(new).unwrap();
     let body = scrape(metrics_addr).await;
@@ -347,5 +422,9 @@ async fn a_credential_rotation_at_one_address_keeps_the_labels_series() {
         health(&body, label),
         None,
         "the last registration's removal retires the label:\n{body}"
+    );
+    assert!(
+        state_series(&body, label).is_empty(),
+        "the last registration's removal retires the state family:\n{body}"
     );
 }

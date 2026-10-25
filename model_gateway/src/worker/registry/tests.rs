@@ -3005,3 +3005,36 @@ fn clear_all_overload_flags_resets_every_model() {
     assert_eq!(registry.overloaded_worker_count("m1"), 0);
     assert_eq!(registry.overloaded_worker_count("m2"), 0);
 }
+
+/// Two registrations at one address that differ only by their secret render
+/// to one label: a worker's label is shared while another registered worker
+/// renders to it, by registration, not by URL.
+#[test]
+fn a_label_is_shared_while_another_registration_renders_to_it() {
+    let registry = WorkerRegistry::new();
+    let worker = |url: &str| -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .build(),
+        )
+    };
+    let old = worker("http://user:old@127.0.0.1:9711");
+    let new = worker("http://user:new@127.0.0.1:9711");
+    let plain = worker("http://127.0.0.1:9712");
+    let old_id = registry.register(Arc::clone(&old)).unwrap();
+    registry.register(Arc::clone(&new)).unwrap();
+    registry.register(Arc::clone(&plain)).unwrap();
+    assert_eq!(old.redacted_url(), new.redacted_url());
+    assert!(registry.label_shared_with(&old));
+    assert!(registry.label_shared_with(&new));
+    assert!(!registry.label_shared_with(&plain));
+
+    registry.remove(&old_id);
+    assert!(!registry.label_shared_with(&new));
+    // The removed registration's label is still the live one's: the question
+    // a removal asks ("does another registration render to my label?") reads
+    // yes, and the label's series stay.
+    assert!(registry.label_shared_with(&old));
+}
