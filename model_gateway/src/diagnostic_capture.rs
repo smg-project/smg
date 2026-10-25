@@ -18,6 +18,8 @@ use std::{
 
 use serde::Serialize;
 
+pub use crate::routers::grpc::regular::symphony::FormatRecipe;
+
 // The temporary and published marker names can both appear in an artifact inventory.
 const MARKER_BYTES: u64 = 256;
 const RESERVED_BYTES: u64 = 2 * MARKER_BYTES;

@@ -9,7 +9,7 @@ use symphony::{
     Format,
 };
 
-use super::{telemetry, template::Templates, SymphonyError};
+use super::{provenance::Source, telemetry, template::Templates, SymphonyError};
 use crate::{
     config::{ParserChoice, TEMPLATE_PARSER},
     routers::grpc::utils::{answering_to, ModelNames, Names},
@@ -113,7 +113,7 @@ pub(super) enum Decision {
     Template,
     /// A table, shared with every request and engine that reads with it: the registry's, or
     /// the one the names select.
-    Table(Arc<Format>),
+    Table(Arc<Format>, Source),
     /// The legacy parsers, for the reason the precedence names: never
     /// [`Fallback::ForcedCallWithoutTag`], which the assignment decides.
     Legacy(Fallback),
@@ -157,17 +157,19 @@ pub(super) fn decision(names: &ModelNames<'_>, model: &str) -> Decision {
     match selection(&names.labels) {
         Selection::Template => Decision::Template,
         Selection::Legacy => Decision::Legacy(legacy_reason(&names.labels)),
-        Selection::Table(table) => Decision::Table(match for_model_shared(model) {
-            Some(format) if table_for(model) == Some(table) => format,
-            _ => table.shared(),
-        }),
+        Selection::Table(table) => match for_model_shared(model) {
+            Some(format) if table_for(model) == Some(table) => {
+                Decision::Table(format, Source::Registry {})
+            }
+            _ => Decision::Table(table.shared(), Source::Named { table }),
+        },
         Selection::Nothing => match for_model_shared(model) {
-            Some(format) => Decision::Table(format),
+            Some(format) => Decision::Table(format, Source::Registry {}),
             // The registry does not know the model: the flags read it, a table they name from
             // its own opener.
             None => match selection(names.flags) {
                 Selection::Template => Decision::Template,
-                Selection::Table(table) => Decision::Table(table.shared()),
+                Selection::Table(table) => Decision::Table(table.shared(), Source::Named { table }),
                 Selection::Legacy => Decision::Legacy(legacy_reason(names.flags)),
                 Selection::Nothing => Decision::Legacy(nothing_reason(names)),
             },
@@ -177,9 +179,9 @@ pub(super) fn decision(names: &ModelNames<'_>, model: &str) -> Decision {
 
 /// What reads a model's responses under a parser ([`reading`]).
 pub(super) enum Reading {
-    /// A table, and whether it is the response template's, compiled for the model: a constraint
-    /// is compiled against it, and a worker may take its whole turn's grammar.
-    Table(Arc<Format>, bool),
+    /// A table and its construction source. A template table is compiled for the model: a
+    /// constraint is compiled against it, and a worker may take its whole turn's grammar.
+    Table(Arc<Format>, Source),
     /// The legacy parsers, by the gateway's choice: `--parser legacy`, or the request's header.
     Legacy,
     /// The legacy parsers under Symphony: no table reads the request, for the reason the
@@ -203,9 +205,9 @@ pub(super) fn reading(
     Ok(match decision(names, model) {
         Decision::Template => Reading::Table(
             templates.format(model).map_err(SymphonyError::Template)?,
-            true,
+            Source::Template {},
         ),
-        Decision::Table(format) => Reading::Table(format, false),
+        Decision::Table(format, source) => Reading::Table(format, source),
         Decision::Legacy(why) => Reading::Fallback(why),
     })
 }
@@ -220,7 +222,7 @@ pub(super) fn table_reading(
     templates: &Templates,
 ) -> Result<Option<(Arc<Format>, bool)>, SymphonyError> {
     Ok(match reading(parser, names, model, templates)? {
-        Reading::Table(format, compiled) => Some((format, compiled)),
+        Reading::Table(format, source) => Some((format, source == Source::Template {})),
         Reading::Legacy | Reading::Fallback(_) => None,
     })
 }
@@ -249,7 +251,7 @@ pub(crate) fn reads(
 pub(crate) fn table_label_read(names: &ModelNames<'_>, model: &str) -> Option<&'static str> {
     match decision(names, model) {
         Decision::Template => Some(telemetry::TEMPLATE),
-        Decision::Table(format) => Some(telemetry::table_label(format.name())),
+        Decision::Table(format, _) => Some(telemetry::table_label(format.name())),
         Decision::Legacy(_) => None,
     }
 }
@@ -1219,7 +1221,7 @@ mod tests {
         let unknown = "acme/ministral-3-14b-instruct-w4a16";
         let why = |names: &ModelNames<'_>, model: &str| match decision(names, model) {
             Decision::Legacy(why) => Some(why),
-            Decision::Template | Decision::Table(_) => None,
+            Decision::Template | Decision::Table(..) => None,
         };
         fn labeled<'a>(labels: Names, flags: &'a Names) -> ModelNames<'a> {
             ModelNames { labels, flags }

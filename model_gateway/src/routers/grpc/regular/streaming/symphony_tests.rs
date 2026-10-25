@@ -45,6 +45,8 @@ pub(super) fn assigned(
     prompt: &str,
 ) -> ChatResponseSpec {
     spec.symphony = Some(Assignment {
+        #[cfg(feature = "diagnostic-capture")]
+        recipe: None,
         format: Arc::new(format),
         prompt: prompt.to_string(),
     });
@@ -660,6 +662,8 @@ pub(super) fn assigned_message(
         chat_tools: lookup_tools().into(),
         stop_sequences: None,
         symphony: Some(Assignment {
+            #[cfg(feature = "diagnostic-capture")]
+            recipe: None,
             format: Arc::new(format),
             prompt: prompt.to_string(),
         }),
