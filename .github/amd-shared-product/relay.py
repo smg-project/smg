@@ -17,7 +17,8 @@ NAMES = {"smg-wheel", "python-client-types", "wasm-test-fixtures", "go-ffi-libra
 def admitted(inputs):
     io.require(
         all(
-            inputs.get(key) is True for key in ("ready", "run_budget_admitted", "artifacts_pinned")
+            inputs.get(key) is True
+            for key in ("ready", "run_budget_admitted", "artifacts_pinned", "root_GPU_admission")
         ),
         "source, runner budget, and actual artifact pins must all be admitted",
     )

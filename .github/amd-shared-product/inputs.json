@@ -5,23 +5,23 @@
   "artifacts": [
     {
       "name": "smg-wheel",
-      "id": 12539960818,
-      "bytes": 52386264,
-      "sha256": "51f4d219a9e691e94890ec267310e9d963a85ecc5c60ccba55c5d38a91ef049f",
-      "expires_at": "2026-10-24T23:54:34Z",
+      "id": 12579435360,
+      "bytes": 52388362,
+      "sha256": "2957a4f6debcc0bf7ad6e79904adcc9cb5aeb6d45304131d9f6f2b11fd32b95b",
+      "expires_at": "2026-10-31T23:19:10Z",
       "files": {
         "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl": {
-          "bytes": 52529349,
-          "sha256": "283ba6730ab1328332b1b61b2c692a2a28e0141b1987ae9422d07bd6c653512d"
+          "bytes": 52529140,
+          "sha256": "2583bda41747126822ef9d1697fd88e68fc95e1cea394521e9703c24e0a7393a"
         }
       }
     },
     {
       "name": "go-ffi-library",
-      "id": 12539866422,
+      "id": 12578519812,
       "bytes": 13837182,
-      "sha256": "beb1eb23135ba3ec036c296fea5c7abb96314fbd36dab8ad14b89efa6db2a329",
-      "expires_at": "2026-10-24T23:54:37Z",
+      "sha256": "65ffa0a52908f2cfe34e3d50aaaaae670d3af8bde246a2b6ab9199658a67a442",
+      "expires_at": "2026-10-31T23:19:13Z",
       "files": {
         "libsmg_go.d": {
           "bytes": 64539,
@@ -35,23 +35,23 @@
     },
     {
       "name": "python-client-types",
-      "id": 12539751694,
-      "bytes": 34373,
-      "sha256": "58f2a41f1455c7660a5594cfcfbeb6c4e696eb8ac76735501418899acd3d90e5",
-      "expires_at": "2026-10-24T23:54:39Z",
+      "id": 12579535141,
+      "bytes": 34374,
+      "sha256": "f17ad9810f28e882037dc7270493dbbd7d00ace289361e00fdf9173f2e1c68c7",
+      "expires_at": "2026-10-31T23:19:15Z",
       "files": {
         "_generated.py": {
           "bytes": 187180,
-          "sha256": "f2f808705287928f7a4095867bacaa3b1ffbc8eea6f038857dc3456529adeaf6"
+          "sha256": "2bf54fb6b78b00ff833eddcd67943e11837b38202fa7fa84557b4c697f169f1b"
         }
       }
     },
     {
       "name": "wasm-test-fixtures",
-      "id": 12539567404,
+      "id": 12578659886,
       "bytes": 56596,
-      "sha256": "a4df6f4b2f6bd3740aba28ddb1a081ce087475588ad03c72c6cdd47afdd5c4e5",
-      "expires_at": "2026-10-24T23:54:40Z",
+      "sha256": "5a8f2bd048f899eb86f1ae8556a14cb0f584d45884c66b161f1052396e592fb8",
+      "expires_at": "2026-10-31T23:19:16Z",
       "files": {
         "storage_hook_guest.wasm": {
           "bytes": 80680,
@@ -67,16 +67,16 @@
   "gateway_native": {
     "name": "smg/smg_rs.abi3.so",
     "bytes": 142443344,
-    "sha256": "143a28b8834bb16b01d87f4ba71b6f68254c71c52e5c7424ccf401b8ce9c29a9"
+    "sha256": "e6d8073ed3484cf95403046875d6ba655d61d4bcb2860e62bd6df2aa9859be1c"
   },
-  "run_id": 40038340532,
+  "run_id": 40139189680,
   "run_attempt": 1,
-  "build_job_id": 120703217001,
-  "producer_sha": "445bb37bccb47e620b2b3aac12cd30b4ebd71a43",
-  "producer_branch": "ci/frozen-c9d-cpu-producer-20261023",
+  "build_job_id": 121007094597,
+  "producer_sha": "f93b547de753c96373988b60b1590638629b3568",
+  "producer_branch": "ci/frozen-legacy-c9d-refresh-producer-admitted-20261024",
   "producer_policy": "frozen_c9d_dispatch_build_only_all_18_steps_success_v1",
-  "target_product_commit": "b5cc3afd4c440a6bbb031b1cba74a9df74518b8a",
-  "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat[0]/sglang/nvidia",
+  "target_product_commit": "7fcdbea474e0ac2641e296065e29278288f9b4b7",
+  "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat-zmq[2]/sglang/nvidia",
   "source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
     "Cargo.toml": "1524dd4960a96dd3ae5069917324836dee979150",
@@ -91,7 +91,7 @@
     "e2e_test": "35d5321770a24d3706a3c0730c465d3a0e11d437",
     "scripts": "6f2082a851689a51de9fd5211fd491a38c8ada8a",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
-    ".github/workflows/e2e-gpu-job.yml": "64369ffc07499baa6ac8750e08315baa5c6f5e6c",
+    ".github/workflows/e2e-gpu-job.yml": "341d274095148119f18e30049bd55c895b1a6cd9",
     "README.md": "83b7df25632da03f0184bd5b4628b9c9a3ace803",
     "LICENSE": "9088c2872db9763b9e6533c6960e9adb0c9cb65f",
     "rustfmt.toml": "19e1ab31f8958c31292f0f568976a036af7e683b",
@@ -151,7 +151,7 @@
     "e2e_test": "ac24cbe1b88c3219bbe07b76dc4dd8370bf2ff1b",
     "scripts": "a5f12792df38a4cb1f82ef724f8234360fddf99a",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
-    ".github/workflows": "01f44d96ef6820514539989da56df9c60c184790"
+    ".github/workflows": "2eeb29be8966ea74d0906a6ee860d2cd5ded6e5e"
   },
   "explicit_consumer_only_paths": [
     ".github/amd-shared-product/",
@@ -159,22 +159,22 @@
   ],
   "budget": {
     "relay_hosted_cpu_minutes": 10,
-    "gpu_job_minutes": 36,
-    "pytest_minutes": 28,
+    "gpu_job_minutes": 60,
+    "pytest_minutes": 48,
     "cleanup_reserve_is_not_enforced_by_shared_workflow": true,
     "workflow_auto_retry": 0,
     "original_pytest_reruns": 2,
     "original_reruns_delay_seconds": 5
   },
   "contract": {
-    "selected": 231,
-    "models": 9,
+    "selected": null,
+    "models": 8,
     "floor": 204,
     "test_dirs": "e2e_test/chat_completions",
     "test_filter": "",
     "servicer_impl": "",
-    "servicer_unit_tests": false,
-    "engine_unit_junit": false,
+    "servicer_unit_tests": true,
+    "engine_unit_junit": true,
     "whole_pip_check_stages": [
       "installed",
       "final"
@@ -188,12 +188,17 @@
     "warmup_budget_seconds": 300,
     "default_startup_total_seconds": 600,
     "shared_warmup_level": "fast",
-    "original_explicit_skip_markers": 8,
-    "original_conditional_skip_markers_evaluate_false": 4
+    "original_explicit_skip_markers": null,
+    "original_conditional_skip_markers_evaluate_false": null,
+    "connection_mode": "zmq",
+    "original_selected_hint": 223,
+    "original_selected_hint_is_workflow_comment_not_current_collection": true,
+    "original_cases_remain_exact": true,
+    "current_selected_ids_and_skip_projection": "UNBOUND_PENDING_REAL_ORIGINAL_AND_CURRENT_COLLECTION"
   },
-  "diagnostic_difference": "caller container explicitly sets SPT_NOENV=1 for process cleanup ownership; normal product shared workflow does not. Engine AMD image/native repairs + wholepip/native post-install/final hard gates are AMD QA additions. NV test selection/models/assertions and original36/28 budget unchanged. Full caller explicitly enables reviewed GPTOSS BF16 expert expansion and PYTHONDONTWRITEBYTECODE; default/NVIDIA overlay paths are inactive. No pilot40 selection or prior pilot results transferred. Early GPTOSS auto\u2192BF16 is an explicit source repair within the same opt-in; original strict dtype/platform/checkpoint/draft guard and downstream TP1/loader restrictions are retained. Qwen3VL mixed-image body failure remains independent and unresolved.",
+  "diagnostic_difference": "Private manual-only AMD original SGLang ZMQ caller. Original empty test filter, floor204, 60job/48pytest, reruns2/delay5 and whole grpc_servicer/tests retained. Original hooks exclude PD/EPD/multi-worker/MM/error_shapes; no new exclusion. Eight static model families retained, tier1 downloader still prefetches complete14 model registry. Same reviewed explicit GPTOSS BF16 overlay remains; no Qwen/MM diagnostic or SG2 allocator/CU/stream source is added. JUnit is added only under private SMG_SGLANG_ZMQ_ORIGINAL=1; default reusable unit command is unchanged. No prior GPU or CPU whole-unit acceptance transferred.",
   "producer_binary_relabelled": false,
-  "producer_artifact_pins_status": "LOCALLY_BOUND_ACCEPTED_445_ACTUAL4_NATIVE143A: three admission flags remain false; fresh API availability/expiry and runner/budget admission remain root-owned",
+  "producer_artifact_pins_status": "LOCALLY_BOUND_ROOT_ACCEPTED_401391_F93B_ACTUAL4_E6D: four admission flags false; target4420 normal setup/full units/actual collection/runtime/freshAPI/runner/budget remain unaccepted",
   "explicit_product_dependency": {
     "PR": 4266,
     "original_public_head": "3cef9af6a73610f501b920221c7232bf640219d0",
@@ -219,12 +224,12 @@
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows": "7c956a4ee89bdf800d48c63815d10a4dd568d90e"
   },
-  "producer_source_map_note": "14 actual445 Git objects re-read; diagnostic producer workflow differs from originalc9d workflow; no native relabelling",
+  "producer_source_map_note": "14 actual f93b/401391 Git objects independently re-read; refreshed workflow retention is private seven days. Old445/143a artifacts are historical only.",
   "explicit_lock_safety_dependency": {
     "product_commit": "a37083a4eb667c0d261de85cf464025a9a29e506",
     "base_product_alias_leaf": "ee1b8f0f83186a0e33d805b4b2551d17322a80fb",
     "consumer_change": "scripts/ci_download_model.sh removes age-only cache lock deletion; three retries/30s/flock1800/models unchanged",
-    "diagnostic_workflow_difference": "Normal product retains its existing CPU/GPU jobs; this internal branch replaces only the registered pr-test-rust.yml with relay + one real reusable SG chat caller + finish."
+    "diagnostic_workflow_difference": "Only this private validation branch uses the registered pr-test-rust.yml as a manual relay + original full SGLang ZMQ caller. Upstream/default/NVIDIA workflows are not published or changed."
   },
   "explicit_native_dependency": {
     "original_helper": "5020aa4a1892b225b4ec83ce4a9a25b8b6329a8b",
@@ -247,7 +252,7 @@
     "helper_and_manifest_byte_equal_reviewed_pilot": false,
     "explicit_opt_in": "SGLANG_GPT_OSS_MXFP4_BF16=1",
     "functional_difference": "Original GPTOSS MXFP4 checkpoint identity retained; experts explicitly expanded to BF16 with reviewed gfx942/TP1/Triton gates. No native packed-MXFP4/precision/performance equivalence claim.",
-    "full_selection": "No pilot plugin/cases imported. Original full231/9models, empty filter, floor204 and36/28 shared caller remain.",
+    "full_selection": "Original SGLang ZMQ row, empty filter/floor204, all original test modules/markers/oracles unchanged; current real collection pending. No pilot subset.",
     "overlay_result_scope_note": "Unchanged overlay helper labels its own evidence PARTIAL_DEVELOPER_PILOT_NO231_ACCEPTANCE; that helper cannot award full-row acceptance. Complete231 original JUnit/log/environment require independent actual audit.",
     "native_or_model_execution_in_this_candidate": false,
     "overlay_helper_byte_equal_reviewed_pilot": true,
@@ -269,5 +274,11 @@
       "new_source_runtime_regression_executed": false,
       "full_ModelConfig_hardware_weights_or_model_accepted": false
     }
+  },
+  "root_GPU_admission": false,
+  "fresh_producer_acceptance": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/frozen-legacy-c9d-refresh-cpu-producer-20261024/run-40139189680/root-producer-integrity-acceptance.json",
+    "sha256": "e1d5b35d2508e81f51ecb114abdb45dfe54fbdc0b2d785e74e69fdc303f290db",
+    "scope": "Artifact integrity/hosted smoke only; not target4420 ABI/full units/ZMQ original row."
   }
 }
