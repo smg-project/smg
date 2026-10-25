@@ -131,10 +131,12 @@ impl EventReceiver {
                 _ = tokio::time::sleep_until(at.into()) => {}
             }
         }
+        // Release the slot before the final observation of overflow.
+        let event = self.pending.take().map(|buffered| buffered.event);
         if self.shared.overflow.load(Ordering::Acquire) {
             return Some(self.overflow());
         }
-        self.pending.take().map(|buffered| buffered.event)
+        event
     }
 
     /// The pure scheduler tests only enqueue events with immediate delivery.
