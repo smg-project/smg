@@ -1,0 +1,42 @@
+name: Manual MC4 real Git metadata validation
+run-name: MC4 real metadata CPU180 ${{ inputs.admission_nonce }}
+on:
+  workflow_dispatch:
+    inputs:
+      admission_nonce:
+        required: true
+        type: string
+concurrency:
+  group: amd-mc4-real-metadata-cpu
+  cancel-in-progress: false
+permissions:
+  contents: read
+  actions: read
+jobs:
+  real-metadata-cpu:
+    runs-on: 1-gpu-mi300x
+    timeout-minutes: 3
+    container:
+      image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
+      options: --runtime=runc --cpus=2 --memory=4g --pids-limit=256
+    env:
+      ADMISSION_NONCE: ${{ inputs.admission_nonce }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: .smg-mc4-real-metadata-${{ inputs.admission_nonce }}
+          fetch-depth: 4
+          persist-credentials: false
+      - name: Real stock SCM old failure and exact-checkout repair
+        working-directory: ${{ github.workspace }}/.smg-mc4-real-metadata-${{ inputs.admission_nonce }}
+        run: python3 -I -B .github/amd-mc4-real-metadata-cpu/job_runner.py
+      - name: Preserve real metadata evidence
+        if: always() && env.MC4_METADATA_OUTPUT != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: mc4-real-metadata-${{ github.run_id }}
+          path: ${{ env.MC4_METADATA_OUTPUT }}
+          include-hidden-files: true
+          retention-days: 7
+          if-no-files-found: error
