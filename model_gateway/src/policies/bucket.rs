@@ -680,38 +680,16 @@ mod tests {
             bucket_adjust_interval_secs: 10,
         };
         let policy = BucketPolicy::with_config(config);
-        let prefill_workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w3:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-        ];
+        let workers = prefill_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
-        // Initialize the policy with prefill_workers
-        policy.init_prefill_worker_urls(&prefill_workers);
+        // Initialize the policy with the prefill workers
+        policy.init_prefill_worker_urls(&workers);
 
         // === Phase S1: Construct bucket boundaries ===
         // Requests len =33 -> Bucket 1(expected range: 0-33)
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(33)),
                     ..Default::default()
@@ -721,7 +699,7 @@ mod tests {
         // Two requests len =34 ->load balancing
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(34)),
                     ..Default::default()
@@ -730,7 +708,7 @@ mod tests {
             .unwrap();
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(34)),
                     ..Default::default()
@@ -740,7 +718,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(11)).await;
         {
-            let boundaries = boundaries(&policy, &prefill_workers);
+            let boundaries = boundaries(&policy, &workers);
             // Expected Boundary: [0, 33] [34, 34] [35, MAX]
             assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (33, 34));
         }
@@ -748,7 +726,7 @@ mod tests {
         // Three consecutive len=33 requests (Should route to different buckets)
         let idx_1 = policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(33)),
                     ..Default::default()
@@ -757,7 +735,7 @@ mod tests {
             .unwrap();
         let idx_2 = policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(33)),
                     ..Default::default()
@@ -766,7 +744,7 @@ mod tests {
             .unwrap();
         let idx_3 = policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(33)),
                     ..Default::default()
@@ -785,12 +763,12 @@ mod tests {
             ..Default::default()
         };
         let policy = BucketPolicy::with_config(config);
-        policy.init_prefill_worker_urls(&prefill_workers);
+        policy.init_prefill_worker_urls(&workers);
 
         // Create load difference below absolute threshold(20 + 8 = 28 < 30)
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(20)),
                     ..Default::default()
@@ -799,7 +777,7 @@ mod tests {
             .unwrap(); // worker1: 20
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(8)),
                     ..Default::default()
@@ -810,7 +788,7 @@ mod tests {
         // Next request should not use bucket scheduling (no load balancing)
         let idx = policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some("request"),
                     ..Default::default()
@@ -829,13 +807,13 @@ mod tests {
             ..Default::default()
         };
         let policy = BucketPolicy::with_config(config);
-        policy.init_prefill_worker_urls(&prefill_workers);
+        policy.init_prefill_worker_urls(&workers);
 
         // Create load difference (but relative threshold not met)
         // Max/Min ratio = 15/5 = 3.0
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(15)),
                     ..Default::default()
@@ -844,7 +822,7 @@ mod tests {
             .unwrap(); // worker1: 15
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some("short"),
                     ..Default::default()
@@ -853,7 +831,7 @@ mod tests {
             .unwrap(); // worker2: 5
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(10)),
                     ..Default::default()
@@ -864,7 +842,7 @@ mod tests {
         // Next request should use bucket scheduling (load balancing)
         let idx = policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some("request"),
                     ..Default::default()
@@ -886,36 +864,14 @@ mod tests {
             bucket_adjust_interval_secs: 3,
         };
         let policy = BucketPolicy::with_config(config);
-        let prefill_workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w3:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-        ];
+        let workers = prefill_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
-        // Initialize the policy with prefill_workers
-        policy.init_prefill_worker_urls(&prefill_workers);
+        // Initialize the policy with the prefill workers
+        policy.init_prefill_worker_urls(&workers);
 
         // Initial boundary
         {
-            let boundaries = boundaries(&policy, &prefill_workers);
+            let boundaries = boundaries(&policy, &workers);
             assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (1364, 2729));
         }
 
@@ -923,7 +879,7 @@ mod tests {
         // Send requests with lengths: [5, 10, 15, 20, 24, 26] (total = 100)
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(5)),
                     ..Default::default()
@@ -932,7 +888,7 @@ mod tests {
             .unwrap();
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(10)),
                     ..Default::default()
@@ -941,7 +897,7 @@ mod tests {
             .unwrap();
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(15)),
                     ..Default::default()
@@ -950,7 +906,7 @@ mod tests {
             .unwrap();
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(20)),
                     ..Default::default()
@@ -959,7 +915,7 @@ mod tests {
             .unwrap();
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(24)),
                     ..Default::default()
@@ -968,7 +924,7 @@ mod tests {
             .unwrap();
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(26)),
                     ..Default::default()
@@ -982,7 +938,7 @@ mod tests {
         // is the third worker's (an open end no seen size reaches is never
         // written while a class remains).
         {
-            let boundaries = boundaries(&policy, &prefill_workers);
+            let boundaries = boundaries(&policy, &workers);
             assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 24));
         }
 
@@ -990,7 +946,7 @@ mod tests {
         // Send requests with lengths: [10, 20, 30, 40, 45, 57] (total = 202)
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(10)),
                     ..Default::default()
@@ -999,7 +955,7 @@ mod tests {
             .unwrap();
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(20)),
                     ..Default::default()
@@ -1008,7 +964,7 @@ mod tests {
             .unwrap();
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(30)),
                     ..Default::default()
@@ -1017,7 +973,7 @@ mod tests {
             .unwrap();
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(40)),
                     ..Default::default()
@@ -1026,7 +982,7 @@ mod tests {
             .unwrap();
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(45)),
                     ..Default::default()
@@ -1035,7 +991,7 @@ mod tests {
             .unwrap();
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(57)),
                     ..Default::default()
@@ -1047,7 +1003,7 @@ mod tests {
         // Verify boundaries adjusted to: [0, 40], [41, 45], [46, MAX]: a share
         // of 67; the second worker stops at 45, 57 being the third worker's.
         {
-            let boundaries = boundaries(&policy, &prefill_workers);
+            let boundaries = boundaries(&policy, &workers);
             assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (40, 45));
         }
     }
@@ -1060,43 +1016,21 @@ mod tests {
             bucket_adjust_interval_secs: 3,
         };
         let policy = BucketPolicy::with_config(config);
-        let prefill_workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w3:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-        ];
+        let workers = prefill_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
-        // Initialize the policy with prefill_workers
-        policy.init_prefill_worker_urls(&prefill_workers);
+        // Initialize the policy with the prefill workers
+        policy.init_prefill_worker_urls(&workers);
 
         // Initial boundary
         {
-            let boundaries = boundaries(&policy, &prefill_workers);
+            let boundaries = boundaries(&policy, &workers);
             assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (1364, 2729));
         }
 
         // Send requests with char_count 20
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(20)),
                     ..Default::default()
@@ -1106,7 +1040,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(4)).await;
         {
-            let boundaries = boundaries(&policy, &prefill_workers);
+            let boundaries = boundaries(&policy, &workers);
             // Expected Boundary: [0, 20] [21, MAX]: one size seen, the
             // second worker owns no range, the third takes the open end.
             assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, usize::MAX));
@@ -1115,7 +1049,7 @@ mod tests {
 
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(7)),
                     ..Default::default()
@@ -1125,7 +1059,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(4)).await;
         {
-            let boundaries = boundaries(&policy, &prefill_workers);
+            let boundaries = boundaries(&policy, &workers);
             // Expected Boundary: [0, 7] [8, MAX]
             assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (7, usize::MAX));
             assert_eq!(boundaries.len(), 2);
@@ -1140,42 +1074,20 @@ mod tests {
             bucket_adjust_interval_secs: 3,
         };
         let policy = BucketPolicy::with_config(config);
-        let prefill_workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w3:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-        ];
+        let workers = prefill_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
-        // Initialize the policy with prefill_workers
-        policy.init_prefill_worker_urls(&prefill_workers);
+        // Initialize the policy with the prefill workers
+        policy.init_prefill_worker_urls(&workers);
 
         // Initial boundary
         {
-            let boundaries = boundaries(&policy, &prefill_workers);
+            let boundaries = boundaries(&policy, &workers);
             assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (1364, 2729));
         }
 
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(5)),
                     ..Default::default()
@@ -1184,7 +1096,7 @@ mod tests {
             .unwrap();
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(10)),
                     ..Default::default()
@@ -1193,7 +1105,7 @@ mod tests {
             .unwrap();
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(15)),
                     ..Default::default()
@@ -1202,7 +1114,7 @@ mod tests {
             .unwrap();
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(20)),
                     ..Default::default()
@@ -1211,7 +1123,7 @@ mod tests {
             .unwrap();
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(24)),
                     ..Default::default()
@@ -1220,7 +1132,7 @@ mod tests {
             .unwrap();
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(26)),
                     ..Default::default()
@@ -1231,13 +1143,13 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(4)).await;
         // [0, 20] [21, 24] [25, MAX], as in test_adjust_boundary_1's first phase.
         {
-            let boundaries = boundaries(&policy, &prefill_workers);
+            let boundaries = boundaries(&policy, &workers);
             assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 24));
         }
 
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(10)),
                     ..Default::default()
@@ -1246,7 +1158,7 @@ mod tests {
             .unwrap();
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(20)),
                     ..Default::default()
@@ -1255,7 +1167,7 @@ mod tests {
             .unwrap();
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(30)),
                     ..Default::default()
@@ -1264,7 +1176,7 @@ mod tests {
             .unwrap();
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(32)),
                     ..Default::default()
@@ -1273,7 +1185,7 @@ mod tests {
             .unwrap();
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(45)),
                     ..Default::default()
@@ -1282,7 +1194,7 @@ mod tests {
             .unwrap();
         policy
             .select_worker(
-                &prefill_workers,
+                &workers,
                 &SelectWorkerInfo {
                     request_text: Some(&*"a".repeat(55)),
                     ..Default::default()
@@ -1294,7 +1206,7 @@ mod tests {
         // The second set moves the per-worker share from 33 to 64, within the
         // factor of two: the partition stays.
         {
-            let boundaries = boundaries(&policy, &prefill_workers);
+            let boundaries = boundaries(&policy, &workers);
             assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 24));
         }
     }
