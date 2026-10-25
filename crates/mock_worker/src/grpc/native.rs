@@ -60,16 +60,16 @@ impl Control for MockNative {
         &self,
         request: Request<v::AbortRequest>,
     ) -> Result<Response<v::AbortResponse>, Status> {
-        let engine =
-            self.0.engine.as_ref().ok_or_else(|| {
-                Status::failed_precondition("native abort requires --realistic true")
-            })?;
         let ids = request.into_inner().request_ids;
         if ids.len() > 1024 || ids.iter().any(|id| id.is_empty() || id.len() > 256) {
             return Err(Status::invalid_argument(
                 "abort accepts at most 1024 request IDs, each 1..=256 bytes",
             ));
         }
+        let engine =
+            self.0.engine.as_ref().ok_or_else(|| {
+                Status::failed_precondition("native abort requires --realistic true")
+            })?;
         // Validate the entire batch before changing the shared engine. Unknown
         // and repeated IDs are harmless, matching the native cancellation API.
         for id in ids {

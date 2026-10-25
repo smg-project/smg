@@ -182,21 +182,21 @@ async fn native_control_uses_shared_state_and_rejects_unimplemented_capabilities
                     .code(),
                 Code::Unimplemented
             );
+            for ids in [
+                vec!["".into()],
+                vec!["x".repeat(257)],
+                vec!["x".into(); 1025],
+            ] {
+                assert_eq!(
+                    native
+                        .abort(v::AbortRequest { request_ids: ids })
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    Code::InvalidArgument
+                );
+            }
             if realistic {
-                for ids in [
-                    vec!["".into()],
-                    vec!["x".repeat(257)],
-                    vec!["x".into(); 1025],
-                ] {
-                    assert_eq!(
-                        native
-                            .abort(v::AbortRequest { request_ids: ids })
-                            .await
-                            .unwrap_err()
-                            .code(),
-                        Code::InvalidArgument
-                    );
-                }
                 let mut output = scheduler
                     .generate(ts::GenerateRequest {
                         request_id: "native-abort".into(),
