@@ -1865,7 +1865,7 @@ async fn a_served_model_whose_tokenizer_load_failed_is_a_503_without_retry_after
         "Workflow failed at step load_tokenizer: File not found: /models/secret".to_string(),
     );
     for (failure, autoload, reason) in [
-        (&TokenizerLoadFailure::NoSource, true, "no tokenizer path"),
+        (&TokenizerLoadFailure::NoSource, true, "no tokenizer source"),
         (
             &TokenizerLoadFailure::Removed,
             true,

@@ -69,9 +69,9 @@ pub struct TokenizerRemovalRequest {
 /// instead of the retry hint of a load still in flight.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenizerLoadFailure {
-    /// Nothing to load from: neither `tokenizer_path` nor `model_path` among
-    /// the worker's labels, and no `--tokenizer-path` or `--model-path` in
-    /// the router configuration.
+    /// Nothing to load from: no `tokenizer_path`, `model_path` or `model_id`
+    /// among the worker's labels, and no `--tokenizer-path` or
+    /// `--model-path` in the router configuration.
     NoSource,
     /// The registration workflow failed; its error, for the log.
     Failed(String),
@@ -86,7 +86,7 @@ impl TokenizerLoadFailure {
     pub fn reason(&self) -> &'static str {
         match self {
             Self::NoSource => {
-                "no tokenizer path in the worker's labels or the router configuration"
+                "no tokenizer source in the worker's labels (tokenizer_path, model_path, model_id) or the router configuration"
             }
             Self::Failed(_) => "the load failed; see the gateway log",
             Self::Removed => "the tokenizer was removed; register one again",
