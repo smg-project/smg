@@ -114,6 +114,9 @@ mod tests {
         no_calls: bool,
         no_reasoning: bool,
     ) -> Result<Value, Box<dyn std::error::Error>> {
+        let context = || {
+            format!("model={model} names={names:?} no_calls={no_calls} no_reasoning={no_reasoning}")
+        };
         let request = request(json!({"model": model, "tools": tools(),
             "tool_choice": if no_calls { "none" } else { "auto" }, "separate_reasoning": !no_reasoning}));
         let assigned = reader::assign(
@@ -123,16 +126,22 @@ mod tests {
             None,
             PROMPT,
             &templates(),
-        )?
-        .ok_or("missing Symphony assignment")?;
-        let value = serde_json::to_value(&assigned)?;
+        )
+        .map_err(|error| format!("{}: assign: {error}", context()))?
+        .ok_or_else(|| format!("{}: missing Symphony assignment", context()))?;
+        let value = serde_json::to_value(&assigned)
+            .map_err(|error| format!("{}: serialize: {error}", context()))?;
         assert_eq!(value["prompt"], assigned.prompt);
-        let recipe: FormatRecipe = serde_json::from_value(value["recipe"].clone())?;
+        let recipe: FormatRecipe = serde_json::from_value(value["recipe"].clone())
+            .map_err(|error| format!("{}: deserialize: {error}", context()))?;
         assert_eq!(
             (recipe.no_calls, recipe.no_reasoning),
             (no_calls, no_reasoning)
         );
-        assert_eq!(*recipe.resolve(model)?, *assigned.format, "{model}");
+        let restored = recipe
+            .resolve(model)
+            .map_err(|error| format!("{}: resolve {recipe:?}: {error}", context()))?;
+        assert_eq!(*restored, *assigned.format, "{}", context());
         Ok(value["recipe"]["source"].clone())
     }
 
