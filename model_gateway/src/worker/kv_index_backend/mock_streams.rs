@@ -457,6 +457,10 @@ impl Generator {
                         match event {
                             GenEvent::Token { token_id, .. } => output.push(token_id),
                             GenEvent::Done { .. } => break,
+                            #[expect(
+                                clippy::panic,
+                                reason = "test/benchmark fixture must reject truncated engine output"
+                            )]
                             GenEvent::OutputOverflow => {
                                 panic!("mock index fixture exceeded its output budget")
                             }
