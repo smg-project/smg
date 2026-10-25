@@ -1848,6 +1848,176 @@ pub fn run(
     served
 }
 
+/// The listeners `bind_listeners` bound, for `serve_listeners`.
+struct BoundListeners {
+    /// The HTTP listener's address, as configured.
+    addr: std::net::SocketAddr,
+    /// The HTTP (data) listener.
+    data: std::net::TcpListener,
+    /// The admin listener (`--admin-port`); `None` without one.
+    admin: Option<std::net::TcpListener>,
+}
+
+/// The admin and HTTP listeners, bound in that order after the mesh
+/// listener, eagerly: a port another process holds fails the start here,
+/// before anything serves (the comments inside say why each binds where it
+/// does and how).
+async fn bind_listeners(
+    addr: std::net::SocketAddr,
+    admin_addr: Option<std::net::SocketAddr>,
+) -> Result<BoundListeners, Box<dyn std::error::Error>> {
+    // The admin listener binds now, before the HTTP listener, as the mesh
+    // listener did in `startup` before this call: a port another process
+    // holds fails the start here, before anything serves.
+    let admin_listener = match admin_addr {
+        Some(admin_addr) => Some(
+            tokio::net::TcpListener::bind(admin_addr)
+                .await
+                .and_then(tokio::net::TcpListener::into_std)
+                .map_err(|e| {
+                    format!("Failed to bind the admin listener on {admin_addr} (--admin-port): {e}")
+                })?,
+        ),
+        None => None,
+    };
+    // The HTTP listener binds now, eagerly, the last of the listeners: a port
+    // another process holds fails the start here, before `startup` lets the
+    // mesh server join the cluster. Bound through tokio, as axum-server
+    // binds (the same socket options and accept backlog; std's bind would
+    // queue 128 connections instead of 1024), and served from the socket in
+    // `serve_listeners`.
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .and_then(tokio::net::TcpListener::into_std)
+        .map_err(|e| format!("Failed to bind the HTTP listener on {addr}: {e}"))?;
+    info!("Starting server on {addr}");
+    Ok(BoundListeners {
+        addr,
+        data: listener,
+        admin: admin_listener,
+    })
+}
+
+/// What each listener serves, as the two futures `serve_together` runs: the
+/// admin listener the control plane, with the data listener's TLS material
+/// and connection timeouts but outside its connection limit; the data
+/// listener the data plane behind the limit. The connection bounds are read
+/// from the router configuration and logged here; both servings drain
+/// through their handles.
+fn serve_listeners(
+    listeners: BoundListeners,
+    apps: GatewayApps,
+    tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
+    router_config: &RouterConfig,
+    handle: axum_server::Handle<std::net::SocketAddr>,
+    admin_handle: axum_server::Handle<std::net::SocketAddr>,
+) -> Result<(Serving, Serving), Box<dyn std::error::Error>> {
+    let BoundListeners {
+        addr,
+        data: listener,
+        admin: admin_listener,
+    } = listeners;
+    let GatewayApps {
+        data: app,
+        admin: admin_app,
+    } = apps;
+    // Bounds on connections that carry no request (a head that never
+    // arrives or stalls, an idle keep-alive connection); a request in flight,
+    // an open streaming response included, is never cut here.
+    let connection_timeouts = ConnectionTimeouts::from_secs(
+        router_config.header_read_timeout_secs,
+        router_config.idle_connection_timeout_secs,
+    );
+    info!(
+        header_read_timeout_secs = router_config.header_read_timeout_secs,
+        idle_connection_timeout_secs = router_config.idle_connection_timeout_secs,
+        "HTTP connection timeouts (0 = disabled)"
+    );
+    // The bound on the connections open at once (see [`connection_limit`]):
+    // a connection beyond it is closed at accept, unanswered. 0 is no bound.
+    let max_connections = router_config.max_connections;
+    info!(
+        max_connections,
+        "HTTP connection limit on the data listener (0 = unlimited; the admin and probe listeners \
+         are outside it)"
+    );
+    // The admission limit the bound is compared with is the effective one
+    // (the one resolution of `max_concurrent_requests`, shared with the
+    // admission bucket).
+    let admission_limit = crate::app_context::effective_max_concurrent_requests(
+        router_config.max_concurrent_requests,
+    );
+    if let Some(admission_limit) =
+        admission_limit.filter(|limit| max_connections > 0 && max_connections < *limit)
+    {
+        warn!(
+            max_connections,
+            admission_limit,
+            "The connection limit is below the admission limit: clients on HTTP/1, one request \
+             per connection, are refused at the listener (a closed connection, no response) \
+             before admission can queue or answer them"
+        );
+    }
+
+    // The admin listener serves the control plane with the data listener's
+    // TLS material and connection timeouts, but outside its connection limit
+    // (`--max-connections`), so the control plane and the probes it serves
+    // stay reachable while the data plane is saturated; it drains with it
+    // (`startup`'s shutdown handler closes both handles together).
+    let admin_serving: Serving = match (admin_listener, admin_app) {
+        (Some(admin_listener), Some(admin_app)) => {
+            let admin_addr = admin_listener.local_addr()?;
+            info!(
+                "Admin listener serving the control plane on {admin_addr} (--admin-port): the \
+                 admin, worker-registry and RL routes answer there, and 404 on {addr}"
+            );
+            let admin_app = admin_app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+            match tls_config.clone() {
+                Some(tls_config) => Box::pin(
+                    axum_server::from_tcp_rustls(admin_listener, tls_config)?
+                        .map(|acceptor| tls_acceptor(acceptor, connection_timeouts))
+                        .handle(admin_handle)
+                        .serve(admin_app),
+                ),
+                None => Box::pin(
+                    axum_server::from_tcp(admin_listener)?
+                        .acceptor(http_acceptor(connection_timeouts))
+                        .handle(admin_handle)
+                        .serve(admin_app),
+                ),
+            }
+        }
+        _ => Box::pin(std::future::ready(Ok(()))),
+    };
+    let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let data_serving: Serving = if let Some(tls_config) = tls_config {
+        info!("TLS enabled");
+
+        Box::pin(
+            axum_server::from_tcp_rustls(listener, tls_config)?
+                .map(|acceptor| {
+                    ConnectionLimitAcceptor::new(
+                        tls_acceptor(acceptor, connection_timeouts),
+                        max_connections,
+                    )
+                })
+                .handle(handle)
+                .serve(app),
+        )
+    } else {
+        Box::pin(
+            axum_server::from_tcp(listener)?
+                .acceptor(ConnectionLimitAcceptor::new(
+                    http_acceptor(connection_timeouts),
+                    max_connections,
+                ))
+                .handle(handle)
+                .serve(app),
+        )
+    };
+    Ok((data_serving, admin_serving))
+}
+
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     crate::tls::install_crypto_provider();
 
@@ -2233,10 +2403,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // And where a keyed start's secrets came from, sources alone.
     posture::log_secret_sources(&config.secret_sources);
 
-    let GatewayApps {
-        data: app,
-        admin: admin_app,
-    } = build_apps(
+    let apps = build_apps(
         app_state,
         serving_auth_config,
         admin_auth_config,
@@ -2253,31 +2420,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // The mesh listener binds and the mesh server prepares now, eagerly,
     // before the admin and HTTP listeners bind (see `prepare_mesh_server`).
     let mesh_server = prepare_mesh_server(mesh_server, config.mesh_server_config.as_ref()).await?;
-    // The admin listener binds now, before the HTTP listener, for the reason
-    // the mesh listener did: a port another process holds fails the start
-    // here, before anything serves.
-    let admin_listener = match admin_addr {
-        Some(admin_addr) => Some(
-            tokio::net::TcpListener::bind(admin_addr)
-                .await
-                .and_then(tokio::net::TcpListener::into_std)
-                .map_err(|e| {
-                    format!("Failed to bind the admin listener on {admin_addr} (--admin-port): {e}")
-                })?,
-        ),
-        None => None,
-    };
-    // The HTTP listener binds now, eagerly, the last of the listeners: a port
-    // another process holds fails the start here, before the mesh server
-    // below has joined the cluster. Bound through tokio, as axum-server
-    // binds (the same socket options and accept backlog; std's bind would
-    // queue 128 connections instead of 1024), and served from the socket at
-    // `serve` below.
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .and_then(tokio::net::TcpListener::into_std)
-        .map_err(|e| format!("Failed to bind the HTTP listener on {addr}: {e}"))?;
-    info!("Starting server on {addr}");
+    let listeners = bind_listeners(addr, admin_addr).await?;
 
     // The mesh server serves once every listener is bound: a member that
     // joined the cluster and vanished with a failed bind is the partial start
@@ -2350,100 +2493,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .await;
     });
 
-    // Bounds on connections that carry no request (a head that never
-    // arrives or stalls, an idle keep-alive connection); a request in flight,
-    // an open streaming response included, is never cut here.
-    let connection_timeouts = ConnectionTimeouts::from_secs(
-        config.router_config.header_read_timeout_secs,
-        config.router_config.idle_connection_timeout_secs,
-    );
-    info!(
-        header_read_timeout_secs = config.router_config.header_read_timeout_secs,
-        idle_connection_timeout_secs = config.router_config.idle_connection_timeout_secs,
-        "HTTP connection timeouts (0 = disabled)"
-    );
-    // The bound on the connections open at once (see [`connection_limit`]):
-    // a connection beyond it is closed at accept, unanswered. 0 is no bound.
-    let max_connections = config.router_config.max_connections;
-    info!(
-        max_connections,
-        "HTTP connection limit on the data listener (0 = unlimited; the admin and probe listeners \
-         are outside it)"
-    );
-    // The admission limit the bound is compared with is the effective one
-    // (the one resolution of `max_concurrent_requests`, shared with the
-    // admission bucket).
-    let admission_limit = crate::app_context::effective_max_concurrent_requests(
-        config.router_config.max_concurrent_requests,
-    );
-    if let Some(admission_limit) =
-        admission_limit.filter(|limit| max_connections > 0 && max_connections < *limit)
-    {
-        warn!(
-            max_connections,
-            admission_limit,
-            "The connection limit is below the admission limit: clients on HTTP/1, one request \
-             per connection, are refused at the listener (a closed connection, no response) \
-             before admission can queue or answer them"
-        );
-    }
-
-    // The admin listener serves the control plane with the data listener's
-    // TLS material and connection timeouts, but outside its connection limit
-    // (`--max-connections`), so the control plane and the probes it serves
-    // stay reachable while the data plane is saturated; it drains with it
-    // (the shutdown above closes both handles together).
-    let admin_serving: Serving = match (admin_listener, admin_app) {
-        (Some(admin_listener), Some(admin_app)) => {
-            let admin_addr = admin_listener.local_addr()?;
-            info!(
-                "Admin listener serving the control plane on {admin_addr} (--admin-port): the \
-                 admin, worker-registry and RL routes answer there, and 404 on {addr}"
-            );
-            let admin_app = admin_app.into_make_service_with_connect_info::<std::net::SocketAddr>();
-            match tls_config.clone() {
-                Some(tls_config) => Box::pin(
-                    axum_server::from_tcp_rustls(admin_listener, tls_config)?
-                        .map(|acceptor| tls_acceptor(acceptor, connection_timeouts))
-                        .handle(admin_handle)
-                        .serve(admin_app),
-                ),
-                None => Box::pin(
-                    axum_server::from_tcp(admin_listener)?
-                        .acceptor(http_acceptor(connection_timeouts))
-                        .handle(admin_handle)
-                        .serve(admin_app),
-                ),
-            }
-        }
-        _ => Box::pin(std::future::ready(Ok(()))),
-    };
-    let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
-    let data_serving: Serving = if let Some(tls_config) = tls_config {
-        info!("TLS enabled");
-
-        Box::pin(
-            axum_server::from_tcp_rustls(listener, tls_config)?
-                .map(|acceptor| {
-                    ConnectionLimitAcceptor::new(
-                        tls_acceptor(acceptor, connection_timeouts),
-                        max_connections,
-                    )
-                })
-                .handle(handle)
-                .serve(app),
-        )
-    } else {
-        Box::pin(
-            axum_server::from_tcp(listener)?
-                .acceptor(ConnectionLimitAcceptor::new(
-                    http_acceptor(connection_timeouts),
-                    max_connections,
-                ))
-                .handle(handle)
-                .serve(app),
-        )
-    };
+    let (data_serving, admin_serving) = serve_listeners(
+        listeners,
+        apps,
+        tls_config,
+        &config.router_config,
+        handle,
+        admin_handle,
+    )?;
     // Until both listeners have stopped; one that fails stops the other
     // (see `serve_together`), so the gateway is never half-served.
     let (server_result, admin_result) = serve_together(
