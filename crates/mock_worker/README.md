@@ -32,6 +32,19 @@ scheduler service the server hosts the standard `grpc.health.v1` service
 exactly when `HealthCheck` answers healthy (`POST /admin/serving/{port}` flips
 both), any other name is unknown.
 
+The same port also exposes the **SMG `vllm.grpc.engine.VllmEngine` control
+plane**: health, model/server metadata, loads, abort, and KV events share the
+TokenSpeed worker's engine and shutdown. Its load records use the vLLM reporting
+profile regardless of `--loads-like`; `--step-reports` still controls heartbeat
+semantics. Only DP rank 0 and the `core` load section are supported. The standard
+health service recognizes both registered service names.
+
+vLLM `Generate` and `Embed` currently return `unimplemented`; tokenizer transfer,
+cache flush and profiling remain unsupported. Metadata describes the existing
+synthetic mock model (32,000-token vocabulary), not an arbitrary configured real
+tokenizer. This control-plane support does not qualify vLLM generation, native
+vLLM protocol compatibility, or cross-router performance comparisons.
+
 **ZMQ** (`--zmq-handshake <ipc://…> --zmq-count N [--zmq-start-index I]`):
 mock vLLM `EngineCore` ranks on the `engine-zmq-client` wire. Unlike the HTTP
 and gRPC workers, which bind and are dialed, each rank dials the frontend's

@@ -1,7 +1,9 @@
-//! Mock gRPC worker implementing the TokenSpeed scheduler service. The gateway
+//! Mock gRPC worker implementing TokenSpeed and vLLM control services. The gateway
 //! tokenizes and sends token ids; this service streams back canned token ids.
 //! Beside it the server hosts the standard `grpc.health.v1` service, which
 //! answers as the scheduler's own `HealthCheck` does.
+
+mod vllm;
 
 use std::{
     future::{pending, Future},
@@ -41,7 +43,7 @@ use crate::{
     script::{self, Answer, MatchedStop},
 };
 
-/// Serve the mock TokenSpeed gRPC service on `port` until the process exits.
+/// Serve the mock gRPC services on `port` until the process exits.
 pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
     serve_until(cfg, host, port, pending()).await;
 }
@@ -152,7 +154,12 @@ pub async fn serve_with_listener_until(
         // default, as the engine servicers run.
         if let Err(e) = Server::builder()
             .add_service(
-                TokenSpeedSchedulerServer::new(service)
+                TokenSpeedSchedulerServer::new(service.clone())
+                    .max_decoding_message_size(max_message_bytes)
+                    .max_encoding_message_size(max_message_bytes),
+            )
+            .add_service(
+                vllm::VllmServer::new(vllm::MockVllm::new(service))
                     .max_decoding_message_size(max_message_bytes)
                     .max_encoding_message_size(max_message_bytes),
             )
@@ -558,7 +565,7 @@ const HEALTH_WATCH_INTERVAL: Duration = Duration::from_millis(250);
 type HealthWatchStream = Pin<Box<dyn Stream<Item = Result<HealthCheckResponse, Status>> + Send>>;
 
 /// The standard `grpc.health.v1` service of a gRPC worker: the whole server
-/// (the empty name) and the scheduler service are SERVING exactly when the
+/// (the empty name) and both engine services are SERVING exactly when the
 /// scheduler's own `HealthCheck` answers healthy, i.e. unless the admin API
 /// set the worker not serving (`/admin/serving/{port}`); any other name is
 /// unknown. It is the service a harness or a probe asks before it asks the
@@ -576,6 +583,7 @@ impl MockHealth {
     fn status(&self, service: &str) -> ServingStatus {
         if !service.is_empty()
             && service != <TokenSpeedSchedulerServer<MockScheduler> as NamedService>::NAME
+            && service != <vllm::VllmServer as NamedService>::NAME
         {
             ServingStatus::ServiceUnknown
         } else if self.overrides.serving() {
