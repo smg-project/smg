@@ -36,9 +36,7 @@ pub(super) fn normalize(
     let Some(v::generate_request::Input::Tokenized(input)) = input else {
         return Err(Status::invalid_argument("tokenized input is required"));
     };
-    if input.input_ids.is_empty()
-        || input.input_ids.iter().any(|id| *id >= SYNTHETIC_VOCAB_SIZE)
-    {
+    if input.input_ids.is_empty() || input.input_ids.iter().any(|id| *id >= SYNTHETIC_VOCAB_SIZE) {
         return Err(Status::invalid_argument(format!(
             "prompt must contain tokens in the synthetic {SYNTHETIC_VOCAB_SIZE}-token vocabulary"
         )));
