@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, PoisonError, TryLockError,
+        Arc, Mutex, PoisonError, TryLockError, Weak,
     },
 };
 
@@ -16,17 +16,30 @@ use super::CaptureSession;
 /// The only completion authority for a session shared by multiple observation boundaries.
 ///
 /// Drop all observers before finishing. Observers keep admission charged after an owner is
-/// abandoned; dropping the final observer then abandons the session, never seals it. This
+/// abandoned, but reject further records; dropping the final observer abandons the session. This
 /// coordinates storage only: callers still must record and validate configuration, boundary
 /// coverage and terminal outcomes. No serving path creates these handles automatically.
 pub struct SharedCapture {
     inner: Arc<Shared>,
     directory: PathBuf,
+    _on_drop: InvalidateOnDrop,
 }
 
 struct Shared {
     session: Mutex<CaptureSession>,
     failed: AtomicBool,
+}
+
+// A weak guard does not add a strong observer reference. After a successful try_unwrap its
+// upgrade fails, so dropping it cannot invalidate the session transferred to finish.
+struct InvalidateOnDrop(Weak<Shared>);
+
+impl Drop for InvalidateOnDrop {
+    fn drop(&mut self) {
+        if let Some(shared) = self.0.upgrade() {
+            shared.failed.store(true, Ordering::Release);
+        }
+    }
 }
 
 /// A cloneable observation handle with no permission to seal the capture.
@@ -42,11 +55,13 @@ impl SharedCapture {
     /// Share an already admitted session without adding a writer or changing its budgets.
     pub fn new(session: CaptureSession) -> Self {
         let directory = session.directory().to_owned();
+        let inner = Arc::new(Shared {
+            session: Mutex::new(session),
+            failed: AtomicBool::new(false),
+        });
         Self {
-            inner: Arc::new(Shared {
-                session: Mutex::new(session),
-                failed: AtomicBool::new(false),
-            }),
+            _on_drop: InvalidateOnDrop(Arc::downgrade(&inner)),
+            inner,
             directory,
         }
     }
@@ -69,13 +84,17 @@ impl SharedCapture {
     /// polled, cancellation has the same semantics as [`CaptureSession::finish`]. Success is
     /// storage completion, not an inference pass or proof that all boundaries were observed.
     pub async fn finish(self) -> io::Result<PathBuf> {
-        let Shared { session, failed } = Arc::try_unwrap(self.inner).map_err(|shared| {
+        let Self {
+            inner, _on_drop, ..
+        } = self;
+        let Shared { session, failed } = Arc::try_unwrap(inner).map_err(|shared| {
             shared.failed.store(true, Ordering::Release);
             io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "capture observers are still alive",
             )
         })?;
+        drop(_on_drop);
         let poisoned = session.is_poisoned();
         // A panicking serializer already closes the queue. Recover only to await its writer;
         // neither mutex recovery nor a later finish may turn that partial record into a pass.
@@ -334,6 +353,10 @@ mod tests {
             } else {
                 drop(owner);
             }
+            assert!(
+                observer.record(&Panics).is_err(),
+                "abandonment rejects before serialization"
+            );
             assert_eq!(
                 pool.start().await.err().unwrap().kind(),
                 io::ErrorKind::WouldBlock
