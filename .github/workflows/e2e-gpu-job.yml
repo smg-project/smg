@@ -285,7 +285,7 @@ jobs:
 
       - name: Apply scoped GPTOSS BF16 development overlay
         id: gptoss-overlay
-        if: inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd' && inputs.amd_agentic_services
+        if: inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'
         shell: bash
         env:
           SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}

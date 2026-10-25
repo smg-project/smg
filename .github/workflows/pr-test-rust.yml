@@ -1,4 +1,4 @@
-name: AMD SGLang Responses
+name: AMD SGLang Rust-servicer
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: amd-sglang-responses-${{ github.ref }}
+  group: amd-sglang-rust-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -16,14 +16,6 @@ jobs:
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     timeout-minutes: 10
     steps:
-      - name: Require private Responses service credentials before downloads
-        env:
-          BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
-        run: |
-          if ! test -n "${BRAVE_API_KEY:-}"; then
-            echo "::error::Private AMD Responses services require the BRAVE_API_KEY secret"
-            exit 1
-          fi
       # PR Test 40180473165 / a8580fcf: reuse its unchanged compiled sources.
       - uses: actions/download-artifact@v8
         with:
@@ -68,20 +60,20 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  amd-sglang-responses:
+  amd-sglang-rust:
     needs: artifacts
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: sglang
       gpu_tier: "1"
       runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
-      timeout: 32
-      test_timeout: 24
-      test_dirs: e2e_test/responses
-      min_selected: 92
-      setup_agentic_deps: true
-      amd_agentic_services: true
+      timeout: 40
+      test_timeout: 32
+      test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py e2e_test/router/test_decisions.py
+      min_selected: 204
+      setup_agentic_deps: false
       servicer_unit_tests: false
+      servicer_impl: rust
       gpu_vendor: amd
       container_image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
       container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --ulimit memlock=-1:-1 --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }} --env SPT_NOENV=1 --env SGLANG_GPT_OSS_MXFP4_BF16=1 --env PYTHONDONTWRITEBYTECODE=1
