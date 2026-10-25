@@ -34,7 +34,7 @@ use tokio::{
 use crate::{
     config::Config,
     drain::InFlight,
-    engine::{Engine, GenEvent, LoadSnapshot, NewRequest},
+    engine::{Engine, EventReceiver, GenEvent, LoadSnapshot, NewRequest},
     script::{self, Answer, MatchedStop},
 };
 
@@ -220,23 +220,28 @@ pub async fn serve_until(
                     inflight.insert(request_id, forwarder);
                     continue;
                 }
-                let (gen_tx, gen_rx) = mpsc::unbounded_channel::<GenEvent>();
-                match &engine {
-                    Some(engine) => engine.submit(NewRequest {
-                        request_id: request_id.clone(),
-                        prompt_token_ids: prompt,
-                        max_new,
-                        events: gen_tx,
-                    }),
+                let gen_rx = match &engine {
+                    Some(engine) => {
+                        let (gen_tx, gen_rx) = engine.output_channel();
+                        engine.submit(NewRequest {
+                            request_id: request_id.clone(),
+                            prompt_token_ids: prompt,
+                            max_new,
+                            events: gen_tx,
+                        });
+                        GenerationEvents::Realistic(gen_rx)
+                    }
                     None => {
+                        let (gen_tx, gen_rx) = mpsc::unbounded_channel::<GenEvent>();
                         let delay = cfg.gen_delay;
                         #[expect(
                             clippy::disallowed_methods,
                             reason = "canned producer self-terminates after Done"
                         )]
                         let _canned = tokio::spawn(canned_generate(gen_tx, max_new, delay));
+                        GenerationEvents::Canned(gen_rx)
                     }
-                }
+                };
 
                 let forwarder = forwarders.spawn(forward_request(
                     request_id.clone(),
@@ -305,12 +310,28 @@ pub async fn serve_until(
     forwarders.detach_all();
 }
 
+// Keep canned-mode buffering unchanged; only the shared realistic engine
+// uses the bounded event contract.
+enum GenerationEvents {
+    Realistic(EventReceiver),
+    Canned(mpsc::UnboundedReceiver<GenEvent>),
+}
+
+impl GenerationEvents {
+    async fn recv(&mut self) -> Option<GenEvent> {
+        match self {
+            Self::Realistic(rx) => rx.recv().await,
+            Self::Canned(rx) => rx.recv().await,
+        }
+    }
+}
+
 /// Forward one request's generation events to the output funnel as
 /// `EngineCoreOutputs`, attaching the engine's load snapshot as `scheduler_stats`.
 async fn forward_request(
     request_id: String,
     engine_index: u32,
-    mut gen_rx: mpsc::UnboundedReceiver<GenEvent>,
+    mut gen_rx: GenerationEvents,
     out_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
     engine: Option<Engine>,
     // Held until the forwarder is done or aborted: the request's share of
@@ -322,6 +343,14 @@ async fn forward_request(
             .as_ref()
             .map(|engine| to_scheduler_stats(&engine.load()));
         match event {
+            GenEvent::OutputOverflow => {
+                let _ = out_tx.send(terminal_batch(
+                    engine_index,
+                    request_id,
+                    EngineCoreFinishReason::Error,
+                ));
+                return;
+            }
             GenEvent::Token { token_id, .. } => {
                 let batch =
                     token_batch(engine_index, request_id.clone(), vec![token_id], None, load);
@@ -532,6 +561,43 @@ mod tests {
 
     use super::*;
     use crate::engine::EngineParams;
+
+    #[tokio::test]
+    async fn output_overflow_becomes_a_terminal_engine_error() {
+        let (tx, rx) = crate::engine::output_channel(2);
+        let token = GenEvent::Token {
+            token_id: 7,
+            prompt_tokens: 4,
+            cached_tokens: 0,
+        };
+        tx.send(token.clone()).unwrap();
+        tx.send(token.clone()).unwrap();
+        assert!(tx.send(token).is_err());
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        forward_request(
+            "slow".into(),
+            0,
+            GenerationEvents::Realistic(rx),
+            out_tx,
+            None,
+            InFlight::enter(),
+        )
+        .await;
+        let EngineCoreOutputs::RequestBatch(batch) = out_rx.recv().await.unwrap() else {
+            panic!("expected request batch")
+        };
+        assert_eq!(batch.outputs.len(), 1);
+        assert_eq!(
+            batch.outputs[0].finish_reason,
+            Some(EngineCoreFinishReason::Error)
+        );
+        assert!(batch.outputs[0].new_token_ids.is_empty());
+        assert_eq!(
+            batch.finished_requests,
+            Some(BTreeSet::from(["slow".into()]))
+        );
+        assert!(out_rx.recv().await.is_none());
+    }
 
     fn test_config() -> Config {
         Config {

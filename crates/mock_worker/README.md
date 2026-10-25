@@ -131,8 +131,9 @@ Realistic-mode output is bounded per request, including events awaiting
 `--request-overhead-ms`. A full queue stops that request without blocking other
 requests. gRPC reports `RESOURCE_EXHAUSTED`; HTTP unary reports 503 and HTTP
 streaming ends with a body error instead of a successful finish or `[DONE]`.
+ZMQ's engine-event forwarder reports an engine-error terminal.
 Treat this as invalid capacity evidence in an ordinary benchmark. Canned and
-scripted output, admission queues, KV-event queues, and total process memory are
+scripted output, ZMQ's shared output funnel, admission queues, KV-event queues, and total process memory are
 outside this per-request limit; it does not qualify high-concurrency headroom.
 
 ```bash

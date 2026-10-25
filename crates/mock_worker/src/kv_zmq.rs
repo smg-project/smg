@@ -475,7 +475,7 @@ mod tests {
     use zeromq::{DealerSocket, SubSocket};
 
     use super::*;
-    use crate::engine::{EngineParams, GenEvent, NewRequest};
+    use crate::engine::{EngineParams, NewRequest};
 
     fn stored(
         hashes: &[i64],
@@ -921,7 +921,7 @@ mod tests {
         let mut receivers = Vec::new();
         let mut first = None;
         for i in 0..200 {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GenEvent>();
+            let (tx, rx) = engine.output_channel();
             receivers.push(rx);
             engine.submit(NewRequest {
                 request_id: format!("r{i}"),
@@ -985,7 +985,7 @@ mod tests {
         engine.restart_publisher().await;
         let mut restarted = None;
         for i in 200..400 {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<GenEvent>();
+            let (tx, rx) = engine.output_channel();
             receivers.push(rx);
             engine.submit(NewRequest {
                 request_id: format!("r{i}"),
