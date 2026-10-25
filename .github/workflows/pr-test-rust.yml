@@ -1,4 +1,4 @@
-name: AMD SGLang complete original ZMQ validation
+name: AMD SGLang complete original default chat validation
 on:
   workflow_dispatch:
     inputs:
@@ -9,7 +9,7 @@ permissions:
   contents: read
   actions: read
 concurrency:
-  group: amd-sglang-zmq-original223
+  group: amd-sglang-chat-original-full
   cancel-in-progress: false
 jobs:
   artifact-relay:
@@ -22,23 +22,23 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Require one separately admitted complete SGLang ZMQ row
+      - name: Require one separately admitted complete SGLang default chat row
         shell: bash
         run: |
           python3 - <<'PYTHON'
           import json
           from pathlib import Path
           data = json.loads(Path(".github/amd-shared-product/inputs.json").read_text())
-          assert data["admitted_lane"] == "sglang-zmq-full223"
+          assert data["admitted_lane"] == "sglang-default-chat-full"
           assert data["runtime_cohort_accepted"] is True
           assert all(data[key] is True for key in ("ready", "run_budget_admitted", "artifacts_pinned"))
           recipe = data["recipe"]
           assert recipe["test_dirs"] == "e2e_test/chat_completions" and recipe["test_filter"] == ""
           assert recipe["engine"] == "sglang" and recipe["gpu_tier"] == "1"
-          assert recipe["connection_mode"] == "zmq" and recipe["min_selected"] == 204
-          assert recipe["servicer_unit_tests"] is True and recipe["unit_test_dirs"] == "grpc_servicer/tests"
-          assert recipe["reference_selected"] == 223 and len(recipe["models"]) == 8
-          assert recipe["job_minutes"] == 60 and recipe["pytest_minutes"] == 48
+          assert recipe["connection_mode"] == "" and recipe["min_selected"] == 204
+          assert recipe["parser"] == ""
+          assert recipe["servicer_unit_tests"] is False and recipe["unit_test_dirs"] == ""
+          assert recipe["job_minutes"] == 36 and recipe["pytest_minutes"] == 28
           assert recipe["reruns"] == 2 and recipe["reruns_delay"] == 5
           assert recipe["setup_agentic_deps"] is False and recipe["same_original_tests_and_oracles"] is True
           PYTHON
@@ -90,7 +90,7 @@ jobs:
           path: ${{ steps.relay.outputs.directory }}/evidence/
           if-no-files-found: ignore
           retention-days: 7
-  amd-sglang-zmq:
+  amd-sglang-chat:
     needs: artifact-relay
     if: inputs.execute && needs.artifact-relay.result == 'success'
     uses: ./.github/workflows/e2e-gpu-job.yml
@@ -98,12 +98,11 @@ jobs:
       engine: sglang
       gpu_tier: "1"
       runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
-      timeout: 60
-      test_timeout: 48
+      timeout: 36
+      test_timeout: 28
       test_dirs: e2e_test/chat_completions
-      connection_mode: zmq
       min_selected: 204
-      servicer_unit_tests: true
+      servicer_unit_tests: false
       gpu_vendor: amd
       container_image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
       container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --ulimit memlock=-1:-1 --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }} --env SPT_NOENV=1 --env SGLANG_GPT_OSS_MXFP4_BF16=1 --env PYTHONDONTWRITEBYTECODE=1
@@ -111,12 +110,12 @@ jobs:
 
   finish:
     if: always() && inputs.execute
-    needs: [artifact-relay, amd-sglang-zmq]
+    needs: [artifact-relay, amd-sglang-chat]
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     timeout-minutes: 3
     steps:
-      - name: Require the relay and complete SGLang ZMQ row to succeed
+      - name: Require the relay and complete SGLang default chat row to succeed
         env:
           RELAY: ${{ needs.artifact-relay.result }}
-          SG: ${{ needs.amd-sglang-zmq.result }}
+          SG: ${{ needs.amd-sglang-chat.result }}
         run: test "$RELAY" = success && test "$SG" = success
