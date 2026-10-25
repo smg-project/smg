@@ -108,12 +108,13 @@ const HAND_WRITTEN_SET: &str = "common";
 const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 
 /// The reason of the render sets of a Llama-class checkpoint whose
-/// `tokenizer.json` keeps the legacy pipeline: the reference's ids were
-/// recorded from that file read as it is, the engines' tokenizer class
-/// rebuilds the pipeline, and the loader follows the class (see
-/// `huggingface::HuggingFaceTokenizer::llama_class_pipeline`). The tokenizer
-/// crate's fixture harness lists the same sets under the same reason.
-const LEGACY_FILE_PIPELINE: &str = "the render ids of this Llama-class checkpoint were recorded from its raw tokenizer.json read by `tokenizers` (the file's legacy pipeline, the ids transformers 4.x gave by taking the file as is: a word marker after every special token, a marker token missed after a newline or a letter); transformers 5.17.0, the version the engines run, rebuilds the class's pipeline (no normalizer, a Metaspace pre-tokenizer) and the loader matches it since smg-project/smg#4248, so the reference's ids differ from the engine's at the special tokens and the markers while the text is equal; every render case of the model, until the sets are re-recorded with the class (smg-project/bellwether#210), when this entry heals and the run asks for its removal";
+/// tokenizer config sets `legacy: true`: the reference's ids are recorded
+/// through the tokenizer class, the loader's Llama-class rule maps the flag
+/// to the `always` prepend scheme (see
+/// `huggingface::HuggingFaceTokenizer::llama_class_pipeline`), and the v1
+/// encode path the job builds reads that scheme differently from the class.
+/// The tokenizer crate's fixture harness lists the same sets under the same reason.
+const LEGACY_FLAG_PIPELINE: &str = "this Llama-class checkpoint's tokenizer config sets `legacy: true`, which the loader's Llama-class rule maps to a Metaspace pre-tokenizer with the `always` prepend scheme (see `huggingface::HuggingFaceTokenizer::llama_class_pipeline`); the reference's ids are recorded through the tokenizer class (transformers 5.17.0, the version the engines run), which prepends the word marker at the start of every split, special tokens included, while the v1 encode path the job builds (`--features tokenizers-v1`) reads that scheme as one marker at the start of the input and none after a special token, so the ids differ at the splits that follow a special token (a marker token before a newline, `▁[` against `[`) while the text is equal; the render cases of the model whose text has such a split, until the v1 path declines or maps that scheme, when this entry heals and the run asks for its removal";
 
 /// Cases known to differ from the reference, each with the reason and where
 /// it is tracked: a fixture id, `<slug>/render/<name>`; a prefix ending in
@@ -380,8 +381,8 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          which the template, writing the string as recorded, renders otherwise: a \
          benchmark set in the tree's sample, every case with a call in its history",
     ),
-    ("nanbeige4-3b-thinking-2510/render/*", LEGACY_FILE_PIPELINE),
-    ("nanbeige4-3b-thinking-2511/render/*", LEGACY_FILE_PIPELINE),
+    ("nanbeige4-3b-thinking-2510/render/*", LEGACY_FLAG_PIPELINE),
+    ("nanbeige4-3b-thinking-2511/render/*", LEGACY_FLAG_PIPELINE),
     (
         "nft-7b/render/swehero-5.jsonl",
         "the gateway parses a history call's arguments into an object before rendering, \
@@ -459,7 +460,7 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     ),
     (
         "spec-decoding-subfolder-fixture/render/*",
-        LEGACY_FILE_PIPELINE,
+        LEGACY_FLAG_PIPELINE,
     ),
 ];
 /// Models whose tokenizer is known not to load, with the reason and where it

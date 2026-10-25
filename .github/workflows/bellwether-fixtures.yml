@@ -227,10 +227,8 @@ jobs:
           # strftime_now takes its instant from SOURCE_DATE_EPOCH when it is
           # set, so the harness renders that day too; noon UTC of it, so the
           # day is the same in whichever zone the runner formats it. The value
-          # belongs with the pin: 2026-10-14, the day most of them were
-          # recorded at this pin; the seven recorded on the two days before
-          # are listed by prefix in the render harness's KNOWN_DIFFERENCES
-          # until the recorder pins the day itself.
+          # belongs with the pin: 2026-10-14, the day the dated groups'
+          # references are recorded at this pin.
           SOURCE_DATE_EPOCH: "1791979200"
         run: |
           source "$HOME/.cargo/env"
