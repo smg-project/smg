@@ -234,7 +234,15 @@ impl BackendClient {
     ) -> Result<ProtoStream, tonic::Status> {
         match self {
             Self::Grpc(client) => client.generate(req).await,
-            Self::Zmq(client) => Ok(ProtoStream::Zmq(zmq_client::generate(client, req).await?)),
+            // The ZMQ submit future is boxed so that its state (the per-dialect
+            // encode dispatch, the trace headers, the sub-stream set-up) does not
+            // size this future, and with it every request's: an async block's
+            // state holds the largest of its awaited branches inline, and the gRPC
+            // backends, which never take this arm, were paying one jemalloc size
+            // class (10,240 -> 12,288 B per request) for the ZMQ arm's growth.
+            Self::Zmq(client) => Ok(ProtoStream::Zmq(
+                Box::pin(zmq_client::generate(client, req)).await?,
+            )),
         }
     }
 
