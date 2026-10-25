@@ -1770,15 +1770,11 @@ impl Metrics {
 
     /// Set active HTTP connections count
     pub fn set_http_connections_active(count: usize) {
-        if !handles::keep_handles() {
-            gauge!("smg_http_connections_active").set(count as f64);
-            return;
-        }
-        handles::HTTP_CONNECTIONS_ACTIVE.with_borrow_mut(|gauge| {
-            gauge
-                .get_or_insert_with(|| gauge!("smg_http_connections_active"))
-                .set(count as f64);
-        });
+        handles::with_single(
+            &handles::HTTP_CONNECTIONS_ACTIVE,
+            || gauge!("smg_http_connections_active"),
+            |active| active.set(count as f64),
+        );
     }
 
     /// Record HTTP response.
@@ -1828,14 +1824,12 @@ impl Metrics {
 
     /// Record rate limit decision.
     pub fn record_http_rate_limit(result: &'static str) {
-        let build = || counter!("smg_http_rate_limit_total", "result" => result);
-        if !handles::keep_handles() {
-            build().increment(1);
-            return;
-        }
-        handles::HTTP_RATE_LIMITS.with_borrow_mut(|by_result| {
-            by_result.entry(result).or_insert_with(build).increment(1);
-        });
+        handles::with_static(
+            &handles::HTTP_RATE_LIMITS,
+            result,
+            || counter!("smg_http_rate_limit_total", "result" => result),
+            |count| count.increment(1),
+        );
     }
 
     /// Track a request entering the admission queue.
