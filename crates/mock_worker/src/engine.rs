@@ -422,6 +422,10 @@ pub struct EngineParams {
     pub kv_broadcast_capacity: usize,
     /// How many recent KV-event batches to retain for subscriber replay.
     pub kv_replay_capacity: usize,
+    /// The data-parallel rank this engine stamps on its KV-event batches
+    /// (`KvEventBatch.dp_rank`): 0 for a single-rank engine, the rank's index
+    /// for one of a gRPC worker's `--grpc-dp-size` ranks.
+    pub dp_rank: i32,
 }
 
 impl Default for EngineParams {
@@ -440,6 +444,7 @@ impl Default for EngineParams {
             request_overhead_ms: 0.0,
             kv_broadcast_capacity: 1024,
             kv_replay_capacity: 4096,
+            dp_rank: 0,
         }
     }
 }
@@ -2051,7 +2056,7 @@ impl SchedulerState {
                 // delay hook holds back keeps it, so the delay shows up as lag.
                 timestamp: unix_seconds(),
                 events: kv,
-                dp_rank: Some(0),
+                dp_rank: Some(p.dp_rank),
                 snapshot: None,
                 load: None,
             })

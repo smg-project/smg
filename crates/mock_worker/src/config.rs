@@ -17,6 +17,12 @@ pub struct Config {
     pub grpc_base_port: u16,
     /// Number of gRPC workers to start.
     pub grpc_count: u16,
+    /// Data-parallel ranks per gRPC worker (realistic engines only): the
+    /// worker advertises `dp_size`, runs one engine per rank, places a request
+    /// on its `data_parallel_rank` when pinned and on the rank with the fewest
+    /// requests of its own otherwise, and reports one `GetLoads` entry and one
+    /// KV-event stream per rank. 1 (the default) is a single-rank engine.
+    pub grpc_dp_size: u16,
     /// Frontend handshake `ipc://` address ZMQ mock engines connect to (they
     /// dial the SMG/test frontend, which binds the sockets).
     pub zmq_handshake: Option<String>,
@@ -166,6 +172,7 @@ impl Default for Config {
             http_count: 0,
             grpc_base_port: 0,
             grpc_count: 0,
+            grpc_dp_size: 1,
             zmq_handshake: None,
             zmq_count: 0,
             zmq_start_index: 0,
@@ -215,6 +222,7 @@ impl Config {
                 "--http-count" => cfg.http_count = parse(value(&mut args, &flag)?, &flag)?,
                 "--grpc-base-port" => cfg.grpc_base_port = parse(value(&mut args, &flag)?, &flag)?,
                 "--grpc-count" => cfg.grpc_count = parse(value(&mut args, &flag)?, &flag)?,
+                "--grpc-dp-size" => cfg.grpc_dp_size = parse(value(&mut args, &flag)?, &flag)?,
                 "--zmq-handshake" => cfg.zmq_handshake = Some(value(&mut args, &flag)?),
                 "--zmq-count" => cfg.zmq_count = parse(value(&mut args, &flag)?, &flag)?,
                 "--zmq-start-index" => {
@@ -348,6 +356,12 @@ impl Config {
         if cfg.grpc_count > 0 && cfg.grpc_base_port == 0 {
             return Err("--grpc-base-port is required when --grpc-count > 0".to_string());
         }
+        if cfg.grpc_dp_size == 0 {
+            return Err("--grpc-dp-size must be at least 1".to_string());
+        }
+        if cfg.grpc_dp_size > 1 && !cfg.realistic {
+            return Err("--grpc-dp-size above 1 needs --engine realistic".to_string());
+        }
         if cfg.zmq_count > 0 && cfg.zmq_handshake.is_none() {
             return Err("--zmq-handshake <ipc://…> is required when --zmq-count > 0".to_string());
         }
@@ -401,6 +415,10 @@ pub fn usage() -> String {
        --http-count <n>         number of HTTP workers (default 0)\n\
        --grpc-base-port <port>  first gRPC port (required if --grpc-count > 0)\n\
        --grpc-count <n>         number of gRPC workers (default 0)\n\
+       --grpc-dp-size <n>       data-parallel ranks per gRPC worker (default 1; realistic engine only):\n\
+                                dp_size advertised, one engine per rank, a pinned request runs on its\n\
+                                rank, an unpinned one on the rank with the fewest of its own requests,\n\
+                                GetLoads and the KV-event stream report per rank\n\
        --grpc-max-message-bytes <n>  largest gRPC message a worker decodes or encodes, in bytes\n\
                                 (default none, as the engine servicers; tonic's own default is 4 MiB)\n\
        --zmq-handshake <addr>   frontend ipc:// handshake addr (required if --zmq-count > 0)\n\
