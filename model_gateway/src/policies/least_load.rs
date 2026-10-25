@@ -759,20 +759,14 @@ impl Default for LeastLoadPolicy {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::{HealthCheckConfig, SchedulerLoadSnapshot};
+    use openai_protocol::worker::SchedulerLoadSnapshot;
 
     use super::*;
     use crate::worker::{
         load_state::{one_rank_load, one_rank_load_reqs_only, TestFeed},
+        test_support::no_health_check,
         BasicWorkerBuilder, WorkerType,
     };
-
-    fn no_health_check() -> HealthCheckConfig {
-        HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        }
-    }
 
     fn mk(url: &str) -> Arc<dyn Worker> {
         Arc::new(

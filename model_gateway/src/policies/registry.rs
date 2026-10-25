@@ -1158,7 +1158,7 @@ impl std::fmt::Debug for PolicyRegistry {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::{HealthCheckConfig, SchedulerLoadSnapshot, WorkerLoadResponse};
+    use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
     use tokio::sync::watch;
     use tracing_test::traced_test;
 
@@ -1166,17 +1166,10 @@ mod tests {
     use crate::{
         policies::{BucketConfig, CacheAwareConfig, LeastLoadPolicy, SelectWorkerInfo},
         worker::{
-            load_state::LoadSnapshot, BasicWorkerBuilder, HashRing, Worker, WorkerLoadGuard,
-            WorkerType,
+            load_state::LoadSnapshot, test_support::no_health_check, BasicWorkerBuilder, HashRing,
+            Worker, WorkerLoadGuard, WorkerType,
         },
     };
-
-    fn no_health_check() -> HealthCheckConfig {
-        HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        }
-    }
 
     fn worker(url: &str, worker_type: WorkerType) -> Arc<dyn Worker> {
         Arc::new(

@@ -1,8 +1,6 @@
 use kv_index::{compute_content_hash, SequenceHash, StoredBlock};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
-use openai_protocol::worker::{
-    HealthCheckConfig, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerStatus,
-};
+use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse, WorkerStatus};
 use tokio::sync::watch;
 use tracing_test::traced_test;
 
@@ -48,15 +46,11 @@ fn overlap_affinity_group(
 }
 use crate::{
     observability::metrics::CACHE_AWARE_MATCH_RATIO_BUCKETS,
-    worker::{runtime::StallReason, BasicWorkerBuilder, WorkerBlocks, WorkerType},
+    worker::{
+        runtime::StallReason, test_support::no_health_check, BasicWorkerBuilder, WorkerBlocks,
+        WorkerType,
+    },
 };
-
-fn no_health_check() -> HealthCheckConfig {
-    HealthCheckConfig {
-        disable_health_check: true,
-        ..Default::default()
-    }
-}
 
 #[test]
 fn test_cache_aware_with_balanced_load() {

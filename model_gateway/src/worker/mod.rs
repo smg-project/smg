@@ -31,6 +31,8 @@ pub mod runtime;
 pub mod sampling_defaults;
 pub mod service;
 pub mod stream;
+#[cfg(test)]
+pub(crate) mod test_support;
 // FIXME: worker.rs is a 1800-line monolith containing the Worker trait,
 // BasicWorker impl, HealthChecker, WorkerType, ConnectionMode, and more.
 // Break it apart into focused modules (e.g. health_checker.rs, types.rs).

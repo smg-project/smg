@@ -300,7 +300,6 @@ impl TreeHandle for PolicyRegistryTreeHandle {
 mod tests {
     use std::{collections::BTreeMap, time::Duration};
 
-    use openai_protocol::worker::HealthCheckConfig;
     use parking_lot::RwLock;
     use smg_mesh::{gossip::NodeState, WorkerState};
     use tokio::time::sleep;
@@ -309,15 +308,8 @@ mod tests {
     use crate::{
         config::types::PolicyConfig,
         policies::SelectWorkerInfo,
-        worker::{BasicWorkerBuilder, Worker, WorkerType},
+        worker::{test_support::no_health_check, BasicWorkerBuilder, Worker, WorkerType},
     };
-
-    fn no_health_check() -> HealthCheckConfig {
-        HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        }
-    }
 
     fn empty_cluster_state() -> ClusterState {
         Arc::new(RwLock::new(BTreeMap::new()))

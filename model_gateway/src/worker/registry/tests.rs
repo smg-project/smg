@@ -5,15 +5,9 @@ use openai_protocol::model_card::ModelCard;
 use super::*;
 use crate::worker::{
     circuit_breaker::{CircuitBreakerConfig, CircuitState},
+    test_support::no_health_check,
     BasicWorkerBuilder, WorkerLoadGuard,
 };
-
-fn no_health_check() -> openai_protocol::worker::HealthCheckConfig {
-    openai_protocol::worker::HealthCheckConfig {
-        disable_health_check: true,
-        ..Default::default()
-    }
-}
 
 /// A worker whose breaker opens on one failed request and would stay
 /// open for an hour on its own.
