@@ -91,8 +91,10 @@ def _install(monkeypatch, name, **attrs):
 def server_mod(monkeypatch, tokenspeed_servicer_mod):
     """The TokenSpeed server module over the real scheduler servicer
     (``tokenspeed_servicer_mod``, the engine's imports stubbed), with stand-ins
-    for the two imports that load the engine at module level: the server args
-    type and the scheduler launcher."""
+    for the two imports that load the engine at module level, the server args
+    type and the scheduler launcher, and for the reflection package the server
+    registers at start-up (a separate grpcio distribution a unit-test
+    environment need not carry; nothing here starts the server)."""
     _install(
         monkeypatch, "tokenspeed.runtime.utils.server_args", ServerArgs=type("ServerArgs", (), {})
     )
@@ -100,6 +102,13 @@ def server_mod(monkeypatch, tokenspeed_servicer_mod):
         monkeypatch,
         "smg_grpc_servicer.tokenspeed.scheduler_launcher",
         launch_engine=lambda _args: (object(), {}),
+    )
+    _install(
+        monkeypatch,
+        "grpc_reflection.v1alpha",
+        reflection=SimpleNamespace(
+            SERVICE_NAME="reflection", enable_server_reflection=lambda *_args: None
+        ),
     )
     spec = importlib.util.spec_from_file_location("test_tokenspeed_encode_server", _SERVER)
     module = importlib.util.module_from_spec(spec)
