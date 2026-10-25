@@ -146,14 +146,10 @@ const LEGACY_FILE_PIPELINE: &str = "the render ids of this Llama-class checkpoin
 const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     ("nanbeige4-3b-thinking-2510/render/*", LEGACY_FILE_PIPELINE),
     ("nanbeige4-3b-thinking-2511/render/*", LEGACY_FILE_PIPELINE),
-    ("nanbeige4.1-3b/render/*", LEGACY_FILE_PIPELINE),
-    ("nanollama/render/*", LEGACY_FILE_PIPELINE),
     (
         "spec-decoding-subfolder-fixture/render/*",
         LEGACY_FILE_PIPELINE,
     ),
-    ("tinyllama-1.1b-chat-v1.0/render/*", LEGACY_FILE_PIPELINE),
-    ("toolmind-web-3b/render/*", LEGACY_FILE_PIPELINE),
 ];
 
 /// Models whose tokenizer is known not to load, with the reason and where it

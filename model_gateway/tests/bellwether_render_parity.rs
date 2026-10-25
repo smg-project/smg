@@ -166,27 +166,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          case of every such model",
     ),
     (
-        "apertus-70b-instruct-2509/render/*",
-        "the template writes the day of the render into the prompt with strftime_now and \
-         the group was recorded on 2026-10-13, where the job renders SOURCE_DATE_EPOCH's \
-         day, 2026-10-14, the day most of the dated groups were recorded; every case of \
-         the model, until the recorder pins the day",
-    ),
-    (
-        "apertus-8b-instruct-2509/render/*",
-        "the template writes the day of the render into the prompt with strftime_now and \
-         the group was recorded on 2026-10-12, where the job renders SOURCE_DATE_EPOCH's \
-         day, 2026-10-14, the day most of the dated groups were recorded; every case of \
-         the model, until the recorder pins the day",
-    ),
-    (
-        "arcee-blitz/render/*",
-        "the template writes the day of the render into the prompt with strftime_now and \
-         the group was recorded on 2026-10-13, where the job renders SOURCE_DATE_EPOCH's \
-         day, 2026-10-14, the day most of the dated groups were recorded; every case of \
-         the model, until the recorder pins the day",
-    ),
-    (
         "deepseek-v3.1/render/bfcl-*",
         "the checkpoint's template never reads the request's tools and the reference is \
          its own render; the gateway writes the family's tools block into the system prompt \
@@ -326,48 +305,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          parameter",
     ),
     (
-        "dots.mocr/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
-        "dots.ocr.base/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
-        "eagle2-2b/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
-        "game-rl-llava-ov-7b/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
-        "granite-3.2-8b-instruct-preview/render/*",
-        "the template writes the day of the render into the prompt with strftime_now and \
-         the group was recorded on 2026-10-13, where the job renders SOURCE_DATE_EPOCH's \
-         day, 2026-10-14, the day most of the dated groups were recorded; every case of \
-         the model, until the recorder pins the day",
-    ),
-    (
-        "granite-3.3-8b-math-prm-v2/render/*",
-        "the template writes the day of the render into the prompt with strftime_now and \
-         the group was recorded on 2026-10-13, where the job renders SOURCE_DATE_EPOCH's \
-         day, 2026-10-14, the day most of the dated groups were recorded; every case of \
-         the model, until the recorder pins the day",
-    ),
-    (
         "hermes-4-14b/render/hermes-func-calling-*",
         "the gateway parses tool-call arguments into objects before rendering and this \
          template writes them as the API's string, so a call in the history renders \
@@ -398,13 +335,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "hermes-4-14b/render/tools-history-single-call",
         "the gateway parses tool-call arguments into objects before rendering, which this \
          template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "idefics3-8b-llama3/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
     ),
     (
         "llama-3.1-nemotron-nano-8b-v1/render/glaive-v2-32.jsonl",
@@ -445,50 +375,13 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          template does not render as the reference does (smg-project/smg#2783)",
     ),
     (
-        "llava-onevision-qwen2-0.5b-ov-hf/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
-        "llava-v1.6-mistral-7b-hf/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
-        "locateanything-3b/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
         "mimo-vl-7b-rl-2508/render/glaive-v2-61.jsonl",
         "the gateway parses a history call's arguments into an object before rendering, \
          which the template, writing the string as recorded, renders otherwise: a \
          benchmark set in the tree's sample, every case with a call in its history",
     ),
-    (
-        "mistral-small-24b-instruct-2501/render/*",
-        "the template writes the day of the render into the prompt with strftime_now and \
-         the group was recorded on 2026-10-12, where the job renders SOURCE_DATE_EPOCH's \
-         day, 2026-10-14, the day most of the dated groups were recorded; every case of \
-         the model, until the recorder pins the day",
-    ),
-    (
-        "muse-glimmer-30b/render/*",
-        "the template writes the day of the render into the prompt with strftime_now and \
-         the group was recorded on 2026-10-12, where the job renders SOURCE_DATE_EPOCH's \
-         day, 2026-10-14, the day most of the dated groups were recorded; every case of \
-         the model, until the recorder pins the day",
-    ),
     ("nanbeige4-3b-thinking-2510/render/*", LEGACY_FILE_PIPELINE),
     ("nanbeige4-3b-thinking-2511/render/*", LEGACY_FILE_PIPELINE),
-    ("nanbeige4.1-3b/render/*", LEGACY_FILE_PIPELINE),
-    ("nanollama/render/*", LEGACY_FILE_PIPELINE),
     (
         "nft-7b/render/swehero-5.jsonl",
         "the gateway parses a history call's arguments into an object before rendering, \
@@ -565,52 +458,8 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          benchmark set in the tree's sample, every case with a call in its history",
     ),
     (
-        "smolvlm-256m-base/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
-        "smolvlm-500m-base/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
-        "smolvlm2-2.2b-base/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
         "spec-decoding-subfolder-fixture/render/*",
         LEGACY_FILE_PIPELINE,
-    ),
-    ("tinyllama-1.1b-chat-v1.0/render/*", LEGACY_FILE_PIPELINE),
-    ("toolmind-web-3b/render/*", LEGACY_FILE_PIPELINE),
-    (
-        "step3/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
-        "ui-tars-72b-dpo/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
-        "ui-tars-7b-dpo/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
     ),
 ];
 /// Models whose tokenizer is known not to load, with the reason and where it
