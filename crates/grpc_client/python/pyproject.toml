@@ -1,16 +1,18 @@
-# grpcio-tools is capped at 1.81.x so the bundled protoc emits protobuf-6
+# grpcio-tools is pinned to 1.81.1 so the bundled protoc emits protobuf-6
 # gencode: 1.82.x emits protobuf-7 gencode, which the protobuf 6.x runtime
 # (pinned via grpcio-health-checking/reflection in ci_install_e2e_deps.sh)
-# refuses to load. The runtime floors under [project] follow from that cap:
+# refuses to load, and a 1.81.x patch release would move the generated
+# modules' version stamps without a change in this repository. The runtime
+# floors under [project] follow from that pin:
 # every generated *_pb2.py checks at import that the protobuf runtime is at
 # least the protobuf it was generated with (6.33.5, from grpcio-tools 1.81.x;
 # an older runtime raises VersionError at import, a newer one loads it),
 # and every *_pb2_grpc.py refuses a grpcio older than the grpcio-tools that
 # wrote it (1.81.1). tests/test_declared_floors.py fails when the floors and
-# the generated modules drift apart. Drop the cap once the whole stack moves
+# the generated modules drift apart. Move the pin once the whole stack moves
 # to protobuf 7, and move the floors with it.
 [build-system]
-requires = ["setuptools>=77.0", "grpcio-tools>=1.81.1,<1.82"]
+requires = ["setuptools>=77.0", "grpcio-tools==1.81.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
