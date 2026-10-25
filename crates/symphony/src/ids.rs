@@ -44,6 +44,13 @@ impl CallIds {
             .map(|base| Self { base })
     }
 
+    /// The starting nonce as 24 lowercase hex characters, for recording alongside a replay's
+    /// inputs. Passing it to [`Self::from_nonce`] restores the same ids at every call index.
+    /// Keep one nonce per output; reusing it for a new output would reuse that output's ids.
+    pub fn nonce(&self) -> String {
+        format!("{:0width$x}", self.base, width = HEX)
+    }
+
     /// The id of the output's call `index`.
     pub fn id(&self, index: u32) -> String {
         format!(
@@ -100,6 +107,30 @@ mod tests {
         assert!(CallIds::from_nonce("call_0123456789abcdef000").is_none());
         let upper = CallIds::from_nonce("0123456789ABCDEF00000000").expect("hex in upper case");
         assert_eq!(upper.id(0), "call_0123456789abcdef00000000");
+    }
+
+    #[test]
+    fn a_recorded_nonce_restores_ids_including_wraparound() {
+        for original in [
+            CallIds::fresh(),
+            CallIds::from_nonce("000000000000000000000000").expect("zero nonce"),
+            CallIds::from_nonce("FFFFFFFFFFFFFFFFFFFFFFFF").expect("maximum nonce"),
+        ] {
+            let nonce = original.nonce();
+            assert_eq!(nonce.len(), HEX);
+            assert!(nonce
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+            let restored = CallIds::from_nonce(&nonce).expect("recorded nonce");
+            assert_eq!(restored, original);
+            for index in [0, 1, 255, u32::MAX] {
+                assert_eq!(
+                    restored.id(index),
+                    original.id(index),
+                    "{nonce}, index {index}"
+                );
+            }
+        }
     }
 
     #[test]

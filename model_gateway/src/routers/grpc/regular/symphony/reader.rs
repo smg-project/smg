@@ -10,7 +10,7 @@ use llm_tokenizer::stop::StopSequenceDecoder;
 use openai_protocol::common::Tool;
 use parking_lot::RwLock;
 use symphony::{
-    adapt::chat, Declared, DropReason, Engine, EngineFinish, Event, Events, Format, Input,
+    adapt::chat, CallIds, Declared, DropReason, Engine, EngineFinish, Event, Events, Format, Input,
     Parser as _, Text, TokenSpan,
 };
 use tracing::debug;
@@ -301,9 +301,25 @@ impl Reader {
         tools: Arc<[Tool]>,
         out: &mut Events<'_>,
     ) -> Result<Self, SymphonyError> {
+        Self::with_call_ids(assignment, tools, CallIds::fresh(), out)
+    }
+
+    /// [`Self::new`] using the same call-id nonce as a recorded output. The caller can retain
+    /// `ids.nonce()` before this call: the engine receives `ids` before either construction or
+    /// prompt replay can open a call. Only a replay should reuse an output's nonce.
+    pub(crate) fn with_call_ids(
+        assignment: &Assignment,
+        tools: Arc<[Tool]>,
+        ids: CallIds,
+        out: &mut Events<'_>,
+    ) -> Result<Self, SymphonyError> {
         let mut reader = Self {
             table: assignment.table(),
-            engine: Engine::shared(Arc::clone(&assignment.format), Declared::shared(tools)),
+            engine: Engine::with_call_ids(
+                Arc::clone(&assignment.format),
+                Declared::shared(tools),
+                ids,
+            ),
             tally: Tally::default(),
             last_token: None,
             ends: Vec::new(),
@@ -772,6 +788,132 @@ mod tests {
         reader.end(finish, who(), &mut events).expect("ended");
         all.extend(events.into_owned().drain());
         all
+    }
+
+    /// Retain the complete batch after initialization, every decoded piece, and the finish,
+    /// just as an adapter consumes it. No tokenizer or live transport is exercised here.
+    fn nonce_batches(
+        assignment: &Assignment,
+        ids: Option<CallIds>,
+        pieces: &[&str],
+        first_call_only: bool,
+    ) -> Result<Vec<Vec<Event<'static>>>, SymphonyError> {
+        let mut events = Events::new();
+        let reader = match ids {
+            Some(ids) => Reader::with_call_ids(assignment, tools().into(), ids, &mut events)?,
+            None => Reader::new(assignment, tools().into(), &mut events)?,
+        };
+        let mut reader = reader.first_call_only(first_call_only);
+        let mut batches = vec![events.into_owned().drain()];
+        for piece in pieces {
+            let mut delta = Delta::default();
+            let mut events = Events::new();
+            reader.tail((*piece).to_string(), &mut delta, &mut events)?;
+            batches.push(events.into_owned().drain());
+        }
+        let mut events = Events::new();
+        reader.end(EngineFinish::Stop, who(), &mut events)?;
+        batches.push(events.into_owned().drain());
+        Ok(batches)
+    }
+
+    #[test]
+    fn a_recorded_nonce_replays_reader_batches_and_chat_choices() {
+        let assignment = Assignment {
+            format: Arc::new(qwen3(CallSyntax::Json)),
+            prompt: PROMPT.to_string(),
+        };
+        let pieces = [
+            "plan</think>\n\nHello <tool_",
+            "call>{\"name\":\"lookup\",\"arguments\":{\"q\":1}}</tool_call>",
+            "<tool_call>{\"name\":\"lookup\",\"arguments\":{\"q\":2}}</tool_call>",
+        ];
+        let ids = CallIds::fresh();
+        let recorded_nonce = ids.nonce();
+        for first_call_only in [false, true] {
+            let original = nonce_batches(&assignment, Some(ids), &pieces, first_call_only)
+                .expect("original reader");
+            let restored = CallIds::from_nonce(&recorded_nonce).expect("recorded nonce");
+            let replay = nonce_batches(&assignment, Some(restored), &pieces, first_call_only)
+                .expect("replayed reader");
+            assert_eq!(
+                replay, original,
+                "complete batches, policy {first_call_only}"
+            );
+            assert!(original[0].contains(&Event::ReasoningStart), "prompt batch");
+            let events: Vec<_> = original.iter().flatten().collect();
+            let replayed: Vec<_> = replay.iter().flatten().collect();
+            let message = chat::message(0, events.iter().copied());
+            let calls = message.message.tool_calls.as_ref().expect("tool calls");
+            assert_eq!(calls.len(), if first_call_only { 1 } else { 2 });
+            assert_eq!(calls[0].id, ids.id(0));
+            if !first_call_only {
+                assert_eq!(calls[1].id, ids.id(1));
+            }
+            assert_eq!(message.message.reasoning_content.as_deref(), Some("plan"));
+            assert_eq!(message.finish_reason.as_deref(), Some("tool_calls"));
+            assert_eq!(
+                serde_json::to_value(chat::message(0, replayed.iter().copied()))
+                    .expect("replay message"),
+                serde_json::to_value(message).expect("original message")
+            );
+            assert_eq!(
+                serde_json::to_value(chat::deltas(0, replayed.iter().copied()))
+                    .expect("replay deltas"),
+                serde_json::to_value(chat::deltas(0, events.iter().copied()))
+                    .expect("original deltas")
+            );
+        }
+    }
+
+    #[test]
+    fn a_recorded_nonce_is_used_for_calls_opened_before_the_first_delta() {
+        let ids = CallIds::from_nonce("ffffffffffffffffffffffff").expect("maximum nonce");
+        for (format, prompt, output) in [
+            (
+                symphony::formats::json(),
+                "",
+                "{\"name\":\"lookup\",\"arguments\":{}};{\"name\":\"lookup\",\"arguments\":{}}",
+            ),
+            (
+                qwen3(CallSyntax::Json),
+                "<|im_start|>assistant\n<tool_call>\n",
+                "{\"name\":\"lookup\",\"arguments\":{}}</tool_call><tool_call>{\"name\":\"lookup\",\"arguments\":{}}</tool_call>",
+            ),
+        ] {
+            let assignment = Assignment { format: Arc::new(format), prompt: prompt.to_string() };
+            let batches = nonce_batches(&assignment, Some(ids), &[output], false).expect("reader");
+            let message = chat::message(0, batches.iter().flatten());
+            let calls = message.message.tool_calls.expect("two calls");
+            assert_eq!(calls.len(), 2, "{}", assignment.format.name());
+            assert_eq!(calls[0].id, "call_ffffffffffffffffffffffff");
+            assert_eq!(calls[1].id, "call_000000000000000000000000");
+        }
+    }
+
+    #[test]
+    fn ordinary_readers_keep_distinct_ids_without_changing_other_events() {
+        let assignment = Assignment {
+            format: Arc::new(qwen3(CallSyntax::Json)),
+            prompt: "<|im_start|>assistant\n".to_string(),
+        };
+        let mut first =
+            nonce_batches(&assignment, None, &[QWEN3_OUTPUT], false).expect("first reader");
+        let mut second =
+            nonce_batches(&assignment, None, &[QWEN3_OUTPUT], false).expect("second reader");
+        let first_message = chat::message(0, first.iter().flatten());
+        let second_message = chat::message(0, second.iter().flatten());
+        let first_calls = first_message.message.tool_calls.expect("first calls");
+        let second_calls = second_message.message.tool_calls.expect("second calls");
+        assert_eq!(first_calls.len(), 1);
+        assert_eq!(second_calls.len(), 1);
+        assert_ne!(first_calls[0].id, second_calls[0].id);
+        for event in first.iter_mut().chain(&mut second).flatten() {
+            if let Event::ToolCallStart { id, .. } = event {
+                id.clear();
+            }
+        }
+        assert_eq!(first, second, "only call ids differ between fresh readers");
     }
 
     fn newlines(count: usize) -> Vec<&'static str> {
