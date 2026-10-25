@@ -37,7 +37,8 @@ async fn render(
         prompt: PROMPT.to_owned(),
         recipe: None,
     };
-    let ids = ::symphony::CallIds::from_nonce("0123456789abcdef00000000").ok_or("invalid fixture nonce")?;
+    let ids = ::symphony::CallIds::from_nonce("0123456789abcdef00000000")
+        .ok_or("invalid fixture nonce")?;
     let mut events = Events::new();
     let mut reader = match observer {
         Some(observer) => Reader::observed(
@@ -153,7 +154,9 @@ async fn reader_capture_chat_adapter_preserves_wire_on_capture_failure() {
         ] {
             let (_root, _pool, owner) = owner(record_bytes, file_bytes).await.unwrap();
             let directory = owner.directory().to_owned();
-            let observed = render(Some(owner.observer()), first_call_only, false).await.unwrap();
+            let observed = render(Some(owner.observer()), first_call_only, false)
+                .await
+                .unwrap();
             assert_eq!(
                 observed, original,
                 "capture limits {record_bytes}/{file_bytes}"
