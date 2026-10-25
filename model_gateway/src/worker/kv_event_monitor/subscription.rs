@@ -645,7 +645,10 @@ impl KvEventMonitor {
     /// worker's data-parallel rank under `--dp-aware` (one rank of an engine
     /// whose stream names every rank's batches), `None` for a worker that
     /// stands for its whole engine.
-    #[expect(clippy::too_many_arguments, reason = "one stream's plumbing, not state")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one stream's plumbing, not state"
+    )]
     async fn process_stream(
         mut stream: tonic::Streaming<KvEventBatch>,
         worker_url: &str,
