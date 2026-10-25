@@ -95,19 +95,14 @@ impl CaptureSnapshot {
                 return Err(invalid("capture contains extra records"));
             }
             let end = offset.saturating_add(limits.record_bytes).min(jsonl.len());
-            let mut records = serde_json::Deserializer::from_slice(&jsonl.as_bytes()[offset..end])
-                .into_iter::<StoredRecord<'_>>();
+            let window = &jsonl.as_bytes()[offset..end];
+            let mut records =
+                serde_json::Deserializer::from_slice(window).into_iter::<StoredRecord<'_>>();
             // RawValue can contain pretty JSON: parse a bounded object, not a physical line.
             let record = records
                 .next()
                 .ok_or_else(|| invalid("missing capture record"))?
-                .map_err(|error| {
-                    if error.is_eof() && end < jsonl.len() {
-                        too_large()
-                    } else {
-                        io::Error::from(error)
-                    }
-                })?;
+                .map_err(|error| boundary_error(error, window, end < jsonl.len()))?;
             let length = records.byte_offset();
             if length == limits.record_bytes {
                 return Err(too_large());
@@ -141,7 +136,7 @@ impl CaptureSnapshot {
 }
 
 fn read_regular(directory: &OwnedFd, name: &str, limit: usize) -> io::Result<Vec<u8>> {
-    // NONBLOCK lets us reject a substituted FIFO/device without blocking while opening it.
+    // NONBLOCK keeps a FIFO open from waiting for a writer; metadata rejects nonregular files.
     let mut file = File::from(openat(
         directory,
         name,
@@ -170,6 +165,24 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+fn boundary_error(error: serde_json::Error, window: &[u8], truncated: bool) -> io::Error {
+    // RawValue reports a numeric prefix cut after e.g. '-' or '1e+' as Syntax, not EOF.
+    let number_cut = error.is_syntax()
+        && matches!(window.last(), Some(b'-' | b'+' | b'.' | b'e' | b'E'))
+        && error.line() == window.iter().filter(|&&byte| byte == b'\n').count() + 1
+        && error.column()
+            == window
+                .rsplit(|&byte| byte == b'\n')
+                .next()
+                .unwrap_or_default()
+                .len();
+    if truncated && (error.is_eof() || number_cut) {
+        too_large()
+    } else {
+        io::Error::from(error)
+    }
+}
+
 fn too_large() -> io::Error {
     io::Error::new(io::ErrorKind::FileTooLarge, "capture exceeds read limits")
 }
@@ -193,8 +206,10 @@ mod tests {
 
     fn sealed(root: &Path) -> PathBuf {
         let mut file = CaptureFile::create(root, 4096).unwrap();
-        file.record(&json!({"text": "héllo\n", "tokens": [3, 4]}))
-            .unwrap();
+        file.record(
+            &json!({"text": "héllo\n", "tokens": [3, 4], "numbers": [-0.25, 1.25e30, 1.25e-30]}),
+        )
+        .unwrap();
         file.record(&json!({"finish": true})).unwrap();
         file.finish().unwrap()
     }
@@ -294,6 +309,19 @@ mod tests {
         }
         replace(&directory, b"\xff\n", 1);
         assert!(CaptureSnapshot::read(&directory, limits()).is_err());
+        let malformed = b"{\"sequence\":0,\"payload\":x-}\n";
+        replace(&directory, malformed, 1);
+        let bounded = CaptureReadLimits {
+            record_bytes: malformed.len() - 2,
+            ..limits()
+        };
+        assert_eq!(
+            CaptureSnapshot::read(&directory, bounded)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
@@ -336,6 +364,22 @@ mod tests {
             records: 2,
         };
         assert!(CaptureSnapshot::read(&directory, exact).is_ok());
+        for record_bytes in 1..exact.record_bytes {
+            let error = CaptureSnapshot::read(
+                &directory,
+                CaptureReadLimits {
+                    record_bytes,
+                    ..exact
+                },
+            )
+            .err()
+            .unwrap();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::FileTooLarge,
+                "record_bytes={record_bytes}: {error:?}"
+            );
+        }
         use io::ErrorKind::{FileTooLarge, InvalidInput};
         let (bytes, record) = (exact.file_bytes, exact.record_bytes);
         for (file_bytes, record_bytes, records, expected) in [
