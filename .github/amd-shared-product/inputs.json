@@ -79,7 +79,7 @@
   "producer_branch": "ci/frozen-python173-main19c-producer-admitted-20261024",
   "producer_policy": "frozen_main19c_python173_build_only_all_18_steps_success_v1",
   "source_base": "740bd0c7e88bdfb57776785eaee16ff8e71f1833",
-  "target_product_commit": "e10e333406432b60aa7f78456b1be31c9c3833c0",
+  "target_product_commit": "3c25e7e2f4a1e9a0875dc74f1fa31cc3879fc59d",
   "source_trees": {
     ".cargo": "8a9d55bb8edfa19d9f90b313fbdc24326d3f667b",
     "Cargo.toml": "74bad7a60f31586e667b6ea84323f70ec477bddc",
@@ -91,7 +91,7 @@
     "crates": "84086855e0f09846092bcce34ecd7b7b43bdc29c",
     "model_gateway": "e511dbc60efa61b550e70a8ccd749e79db6ab843",
     "grpc_servicer": "fbf9f0ef424b29e7b0444ec3a9856136795af705",
-    "e2e_test": "06620fd04ebb757d46ba0af950e6717c89fb7625",
+    "e2e_test": "0c5e8d019adce7041d93ffa71e38ef9090c1df48",
     "scripts": "9e79fff6c73f5c84a10bb4afb7270a10258e3cbd",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows/e2e-gpu-job.yml": "51f0b35d0f32d9d52797fe7f4b9ecd8bc8fa2e65",
