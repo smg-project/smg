@@ -397,13 +397,8 @@ impl VisionPreProcessor for Phi3VisionProcessor {
 
 #[cfg(test)]
 mod tests {
-    use image::RgbImage;
-
     use super::*;
-
-    fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
-        DynamicImage::from(RgbImage::from_pixel(width, height, color))
-    }
+    use crate::test_support::create_test_image;
 
     #[test]
     fn test_phi3_vision_processor_default() {

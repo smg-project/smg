@@ -840,13 +840,10 @@ fn divide_to_samples(image: &DynamicImage, crop_size: (u32, u32)) -> Vec<Dynamic
 
 #[cfg(test)]
 mod tests {
-    use image::{Rgb, RgbImage};
+    use image::Rgb;
 
     use super::*;
-
-    fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
-        DynamicImage::from(RgbImage::from_pixel(width, height, color))
-    }
+    use crate::test_support::create_test_image;
 
     #[test]
     fn test_llava_processor_default() {
