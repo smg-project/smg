@@ -113,6 +113,7 @@ impl CaptureFile {
             )
             .map_err(io::Error::from)?;
             writer.write_all(b"\n")?;
+            writer.flush()?;
             self.records = next;
             Ok(())
         })();
@@ -206,20 +207,20 @@ mod tests {
             .unwrap();
         capture.record(&json!({"finish": "stop"})).unwrap();
         assert!(!capture.directory().join("complete.json").exists());
+        let data_path = capture.directory().join("records.jsonl");
+        assert!(!fs::read(&data_path).unwrap().is_empty());
         let directory = capture.finish().unwrap();
-        let data = fs::read(directory.join("records.jsonl")).unwrap();
+        let data = fs::read(data_path).unwrap();
         let records: Vec<Value> = data
-            .split(|b| *b == b'\n')
-            .filter(|s| !s.is_empty())
+            .split_inclusive(|b| *b == b'\n')
             .map(|s| serde_json::from_slice(s).unwrap())
             .collect();
         assert_eq!(
-            records[0],
-            json!({"sequence": 0, "payload": {"text": "héllo\n", "tokens": [1, 2]}})
-        );
-        assert_eq!(
-            records[1],
-            json!({"sequence": 1, "payload": {"finish": "stop"}})
+            records,
+            vec![
+                json!({"sequence": 0, "payload": {"text": "héllo\n", "tokens": [1, 2]}}),
+                json!({"sequence": 1, "payload": {"finish": "stop"}})
+            ]
         );
         let marker: Value =
             serde_json::from_slice(&fs::read(directory.join("complete.json")).unwrap()).unwrap();
@@ -338,14 +339,18 @@ mod tests {
     #[test]
     fn write_and_sync_failures_never_publish_completion() {
         let root = tempfile::tempdir().unwrap();
-        for device in ["/dev/full", "/dev/null"] {
+        for (device, size) in [
+            ("/dev/full", 1),
+            ("/dev/full", BUFFER_BYTES * 2),
+            ("/dev/null", 1),
+        ] {
             let mut capture = CaptureFile::create(root.path(), 32768).unwrap();
             let directory = capture.directory().to_owned();
             capture.file = BufWriter::with_capacity(
                 BUFFER_BYTES,
                 OpenOptions::new().write(true).open(device).unwrap(),
             );
-            let result = capture.record(&"x".repeat(BUFFER_BYTES * 2));
+            let result = capture.record(&"x".repeat(size));
             assert_eq!(result.is_err(), device == "/dev/full");
             if device == "/dev/full" {
                 assert_eq!(result.unwrap_err().kind(), io::ErrorKind::StorageFull);
@@ -358,7 +363,6 @@ mod tests {
 
     #[test]
     fn short_writes_count_only_bytes_actually_written() {
-        #[derive(Default)]
         struct Short(Vec<u8>);
         impl Write for Short {
             fn write(&mut self, data: &[u8]) -> io::Result<usize> {
@@ -370,7 +374,7 @@ mod tests {
                 Ok(())
             }
         }
-        let mut target = Short::default();
+        let mut target = Short(Vec::new());
         let mut bytes = 0;
         let mut digest = blake3::Hasher::new();
         let mut limited = Limited {
