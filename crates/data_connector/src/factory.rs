@@ -496,24 +496,13 @@ mod tests {
         assert!(!err.contains("s3cr3t"), "the password is masked: {err}");
     }
 
-    #[tokio::test]
-    async fn test_create_storage_memory() {
-        let config = StorageFactoryConfig {
-            backend: &HistoryBackend::Memory,
-            oracle: None,
-            postgres: None,
-            redis: None,
-            memory: None,
-            hook: None,
-        };
-        let bundle = create_storage(config).await.unwrap();
+    /// The three stores of `bundle` take a write each and read it back.
+    async fn stores_and_reads_back(bundle: StorageBundle) {
         let (resp, conv, items) = (
             bundle.response_storage,
             bundle.conversation_storage,
             bundle.conversation_item_storage,
         );
-
-        // Verify they work end-to-end
         let mut response = StoredResponse::new(None);
         response.input = json!("hello");
         let id = resp.store_response(response).await.unwrap();
@@ -546,6 +535,19 @@ mod tests {
             .await
             .unwrap();
         assert!(items.get_item(&item.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_create_storage_memory() {
+        let config = StorageFactoryConfig {
+            backend: &HistoryBackend::Memory,
+            oracle: None,
+            postgres: None,
+            redis: None,
+            memory: None,
+            hook: None,
+        };
+        stores_and_reads_back(create_storage(config).await.unwrap()).await;
     }
 
     #[tokio::test]
@@ -711,45 +713,6 @@ mod tests {
             memory: None,
             hook: Some(Arc::new(NoOpHook)),
         };
-        let bundle = create_storage(config).await.unwrap();
-        let (resp, conv, items) = (
-            bundle.response_storage,
-            bundle.conversation_storage,
-            bundle.conversation_item_storage,
-        );
-
-        // Verify hooked storage works end-to-end
-        let mut response = StoredResponse::new(None);
-        response.input = json!("hello");
-        let id = resp.store_response(response).await.unwrap();
-        assert!(resp.get_response(&id).await.unwrap().is_some());
-
-        let conversation = conv
-            .create_conversation(NewConversation {
-                id: None,
-                metadata: None,
-                tenant: None,
-            })
-            .await
-            .unwrap();
-        assert!(conv
-            .get_conversation(&conversation.id)
-            .await
-            .unwrap()
-            .is_some());
-
-        let item = items
-            .create_item(NewConversationItem {
-                id: None,
-                response_id: None,
-                item_type: "message".to_string(),
-                role: Some("user".to_string()),
-                content: json!([]),
-                status: Some("completed".to_string()),
-                tenant: None,
-            })
-            .await
-            .unwrap();
-        assert!(items.get_item(&item.id).await.unwrap().is_some());
+        stores_and_reads_back(create_storage(config).await.unwrap()).await;
     }
 }
