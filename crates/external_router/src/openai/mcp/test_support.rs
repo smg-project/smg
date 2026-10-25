@@ -44,7 +44,7 @@ pub(crate) async fn internal_orchestrator(
 
 /// The binding a request names [`INTERNAL_SERVER`] by: label `internal-label`,
 /// no tool allow-list.
-pub(crate) fn internal_binding() -> McpServerBinding {
+fn internal_binding() -> McpServerBinding {
     McpServerBinding {
         label: "internal-label".to_string(),
         server_key: INTERNAL_SERVER.to_string(),
