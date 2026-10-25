@@ -20,6 +20,8 @@ default = ["grpc-client", "jemalloc-stats", "providers"]
 tokenizers-v1 = ["llm-tokenizer/tokenizers-v1"]
 grpc-client = []
 grpc-server = []
+# Unix capture-file storage only; gateway recording hooks are separate.
+diagnostic-capture = []
 jemalloc-stats = ["tikv-jemallocator/stats", "dep:tikv-jemalloc-ctl"]
 jemalloc-profiling = [
     "tikv-jemallocator/profiling",

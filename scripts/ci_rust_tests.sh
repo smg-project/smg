@@ -149,8 +149,9 @@ commands_of() {
             # and run its harness anyway, so the binary is named.
             # One invocation for both packages: on its own, the harness's `-p` would unify the gateway
             # down to the harness's feature set and build the gateway lib a second time.
-            echo "-p smg -p smg-test-harness --lib --bin smg"
-            echo "-p smg --doc" ;;
+            # Exercise opt-in file storage; integration shards retain the default feature set.
+            echo "-p smg -p smg-test-harness --features smg/diagnostic-capture --lib --bin smg"
+            echo "-p smg --doc --features smg/diagnostic-capture" ;;
         gateway-[0-9]*)
             local index=${shard#gateway-} selectors
             [ "$index" -ge 1 ] && [ "$index" -le "$GATEWAY_SHARDS" ] || { echo "no gateway shard $index" >&2; exit 2; }

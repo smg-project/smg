@@ -27,6 +27,8 @@
 pub mod app_context;
 pub mod clients;
 pub mod config;
+#[cfg(all(feature = "diagnostic-capture", unix))]
+pub mod diagnostic_capture;
 pub mod endpoints;
 pub mod health;
 pub mod mesh;
