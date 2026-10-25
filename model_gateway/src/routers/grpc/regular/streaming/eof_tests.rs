@@ -263,17 +263,32 @@ async fn mock_client() -> (VllmEngineClient, JoinHandle<()>) {
     (client, server)
 }
 
-pub(super) fn processor(with_tools: bool) -> StreamingProcessor {
+/// A streaming processor over fresh parser factories and `resolver`.
+fn streaming_processor(resolver: utils::ParserResolver) -> StreamingProcessor {
     StreamingProcessor::new(
         ToolParserFactory::new(),
         ReasoningParserFactory::new(),
-        utils::ParserResolver::with_flags(
-            Arc::new(WorkerRegistry::new()),
-            with_tools.then(|| "json".to_string()),
-            Some("qwen3".to_string()),
-        ),
+        resolver,
         "vllm",
     )
+}
+
+/// The unary (non-streaming) processor over fresh parser factories and
+/// `resolver`.
+fn unary_processor(resolver: utils::ParserResolver) -> ResponseProcessor {
+    ResponseProcessor::new(
+        ToolParserFactory::new(),
+        ReasoningParserFactory::new(),
+        resolver,
+    )
+}
+
+pub(super) fn processor(with_tools: bool) -> StreamingProcessor {
+    streaming_processor(utils::ParserResolver::with_flags(
+        Arc::new(WorkerRegistry::new()),
+        with_tools.then(|| "json".to_string()),
+        Some("qwen3".to_string()),
+    ))
 }
 
 pub(super) fn dispatch() -> context::DispatchMetadata {
@@ -406,11 +421,7 @@ async fn byte_fallback_generate_mid_run_stop_reports_gateway_stop() {
         llm_tokenizer::StopSequenceConfig::default().with_stop_sequence("tt"),
         true,
     );
-    let processor = ResponseProcessor::new(
-        ToolParserFactory::new(),
-        ReasoningParserFactory::new(),
-        utils::ParserResolver::disabled(),
-    );
+    let processor = unary_processor(utils::ParserResolver::disabled());
     let responses = processor
         .process_non_streaming_generate_response(
             context::ExecutionResult::Single { stream },
@@ -447,11 +458,7 @@ async fn byte_fallback_generate_stop_token_keeps_the_engine_matched_stop() {
         llm_tokenizer::StopSequenceConfig::default().with_stop_token(3),
         true,
     );
-    let processor = ResponseProcessor::new(
-        ToolParserFactory::new(),
-        ReasoningParserFactory::new(),
-        utils::ParserResolver::disabled(),
-    );
+    let processor = unary_processor(utils::ParserResolver::disabled());
     let responses = processor
         .process_non_streaming_generate_response(
             context::ExecutionResult::Single { stream },
@@ -484,11 +491,7 @@ async fn byte_fallback_generate_eof_reports_gateway_stop() {
         llm_tokenizer::StopSequenceConfig::default().with_stop_sequence("�"),
         true,
     );
-    let processor = ResponseProcessor::new(
-        ToolParserFactory::new(),
-        ReasoningParserFactory::new(),
-        utils::ParserResolver::disabled(),
-    );
+    let processor = unary_processor(utils::ParserResolver::disabled());
     let responses = processor
         .process_non_streaming_generate_response(
             context::ExecutionResult::Single { stream },
@@ -1082,15 +1085,11 @@ async fn byte_fallback_unary_valid_reasoning_counts_original_tokens() {
         byte_fallback_reasoning_tokenizer(),
         llm_tokenizer::CacheConfig::default(),
     ));
-    let processor = ResponseProcessor::new(
-        ToolParserFactory::new(),
-        ReasoningParserFactory::new(),
-        utils::ParserResolver::with_flags(
-            Arc::new(WorkerRegistry::new()),
-            None,
-            Some("qwen3".into()),
-        ),
-    );
+    let processor = unary_processor(utils::ParserResolver::with_flags(
+        Arc::new(WorkerRegistry::new()),
+        None,
+        Some("qwen3".into()),
+    ));
     for ids in [
         b"<think>ab</think>de"
             .iter()
@@ -1171,11 +1170,7 @@ async fn non_byte_fallback_held_stop_keeps_original_reasoning_accounting() {
         finish_reason: "length".into(),
         ..Default::default()
     }));
-    let processor = ResponseProcessor::new(
-        ToolParserFactory::new(),
-        ReasoningParserFactory::new(),
-        utils::ParserResolver::disabled(),
-    );
+    let processor = unary_processor(utils::ParserResolver::disabled());
     let (choice, reasoning_tokens) = processor
         .process_single_choice(
             "test-request",
@@ -1214,11 +1209,7 @@ async fn byte_fallback_unary_malformed_tail_retains_canonical_reasoning() {
     ];
     let canonical = tokenizer.decode(&ids, true).unwrap();
     assert_eq!(canonical, "<think>ab</think>���");
-    let processor = ResponseProcessor::new(
-        ToolParserFactory::new(),
-        ReasoningParserFactory::new(),
-        utils::ParserResolver::disabled(),
-    );
+    let processor = unary_processor(utils::ParserResolver::disabled());
     let complete = ProtoGenerateComplete::Vllm(Box::new(proto::GenerateComplete {
         output_ids: ids.to_vec(),
         finish_reason: "length".into(),
@@ -1598,12 +1589,7 @@ async fn kimi_k3_cut_inside_the_closing_structure_keeps_the_markers_out_of_conte
         frames.push(complete(0, finish));
         let (stream, server) = scripted_stream(frames, "0").await;
         let (tx, rx) = sse_channel();
-        let processor = StreamingProcessor::new(
-            ToolParserFactory::new(),
-            ReasoningParserFactory::new(),
-            resolver(),
-            "vllm",
-        );
+        let processor = streaming_processor(resolver());
         let result = processor
             .process_streaming_chunks(
                 stream,
@@ -1639,21 +1625,17 @@ async fn kimi_k3_cut_inside_the_closing_structure_keeps_the_markers_out_of_conte
         let (stream, server) = scripted_stream(vec![chunk(0, &text), last], "0").await;
         let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
         let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
-        let (response, _) = ResponseProcessor::new(
-            ToolParserFactory::new(),
-            ReasoningParserFactory::new(),
-            resolver(),
-        )
-        .process_non_streaming_chat_response(
-            context::ExecutionResult::Single { stream },
-            chat_spec(false),
-            dispatch(),
-            tokenizer,
-            &mut decoder,
-            false,
-        )
-        .await
-        .unwrap_or_else(|response| panic!("{}", response.status()));
+        let (response, _) = unary_processor(resolver())
+            .process_non_streaming_chat_response(
+                context::ExecutionResult::Single { stream },
+                chat_spec(false),
+                dispatch(),
+                tokenizer,
+                &mut decoder,
+                false,
+            )
+            .await
+            .unwrap_or_else(|response| panic!("{}", response.status()));
         server.abort();
         let response = serde_json::to_value(response).unwrap();
         assert_eq!(
@@ -1738,15 +1720,11 @@ async fn chat_unary_logprobs_cover_the_content_only() {
     let stop = Some(StringOrArray::String("STOP".to_string()));
     let mut decoder =
         utils::create_stop_decoder(&tokenizer, stop.as_ref(), None, false, false, false);
-    let (response, _) = ResponseProcessor::new(
-        ToolParserFactory::new(),
-        ReasoningParserFactory::new(),
-        utils::ParserResolver::with_flags(
-            Arc::new(WorkerRegistry::new()),
-            None,
-            Some("qwen3".to_string()),
-        ),
-    )
+    let (response, _) = unary_processor(utils::ParserResolver::with_flags(
+        Arc::new(WorkerRegistry::new()),
+        None,
+        Some("qwen3".to_string()),
+    ))
     .process_non_streaming_chat_response(
         context::ExecutionResult::Single { stream },
         chat_spec(false),
@@ -2069,12 +2047,7 @@ async fn qwen_xml_messages(text: &str, finish: &str, stream: bool) -> (Vec<Strin
     let (grpc_stream, server) = scripted_stream(vec![chunk(0, text), last], "0").await;
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
     let read = if stream {
-        let processor = StreamingProcessor::new(
-            ToolParserFactory::new(),
-            ReasoningParserFactory::new(),
-            resolver(),
-            "vllm",
-        );
+        let processor = streaming_processor(resolver());
         let (tx, rx) = sse_channel();
         let result = processor
             .process_messages_streaming_chunks(
@@ -2099,11 +2072,7 @@ async fn qwen_xml_messages(text: &str, finish: &str, stream: bool) -> (Vec<Strin
         let stop_reason = &delta.unwrap()["delta"]["stop_reason"];
         (blocks, stop_reason.as_str().unwrap().to_string())
     } else {
-        let processor = ResponseProcessor::new(
-            ToolParserFactory::new(),
-            ReasoningParserFactory::new(),
-            resolver(),
-        );
+        let processor = unary_processor(resolver());
         let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
         let (message, _) = processor
             .process_non_streaming_messages_response(
@@ -2502,16 +2471,11 @@ async fn messages_blocks_do_not_overlap_when_reasoning_calls_and_text_alternate(
 
 /// A processor with the registered parsers `tool` and `reasoning`.
 fn named_processor(tool: &str, reasoning: &str) -> StreamingProcessor {
-    StreamingProcessor::new(
-        ToolParserFactory::new(),
-        ReasoningParserFactory::new(),
-        utils::ParserResolver::with_flags(
-            Arc::new(WorkerRegistry::new()),
-            Some(tool.to_string()),
-            Some(reasoning.to_string()),
-        ),
-        "vllm",
-    )
+    streaming_processor(utils::ParserResolver::with_flags(
+        Arc::new(WorkerRegistry::new()),
+        Some(tool.to_string()),
+        Some(reasoning.to_string()),
+    ))
 }
 
 /// The tool-call deltas of choice 0 across `events`, in stream order.
@@ -2706,22 +2670,17 @@ async fn gemma4_rendered_prompt_state_controls_chat_responses() {
                         reason = "fixture collector is joined before assertions"
                     )]
                     let collector = tokio::spawn(collect_events(rx));
-                    let result = StreamingProcessor::new(
-                        ToolParserFactory::new(),
-                        ReasoningParserFactory::new(),
-                        resolver,
-                        "vllm",
-                    )
-                    .process_streaming_chunks(
-                        stream,
-                        metadata,
-                        tokenizer,
-                        (None, None, false, false, false),
-                        spec,
-                        &tx,
-                        None,
-                    )
-                    .await;
+                    let result = streaming_processor(resolver)
+                        .process_streaming_chunks(
+                            stream,
+                            metadata,
+                            tokenizer,
+                            (None, None, false, false, false),
+                            spec,
+                            &tx,
+                            None,
+                        )
+                        .await;
                     drop(tx);
                     let events = collector.await.unwrap();
                     server.abort();
@@ -2743,21 +2702,17 @@ async fn gemma4_rendered_prompt_state_controls_chat_responses() {
                 } else {
                     let mut decoder =
                         utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
-                    let (response, _) = ResponseProcessor::new(
-                        ToolParserFactory::new(),
-                        ReasoningParserFactory::new(),
-                        resolver,
-                    )
-                    .process_non_streaming_chat_response(
-                        context::ExecutionResult::Single { stream },
-                        spec,
-                        metadata,
-                        tokenizer,
-                        &mut decoder,
-                        false,
-                    )
-                    .await
-                    .unwrap_or_else(|error| panic!("{}", error.status()));
+                    let (response, _) = unary_processor(resolver)
+                        .process_non_streaming_chat_response(
+                            context::ExecutionResult::Single { stream },
+                            spec,
+                            metadata,
+                            tokenizer,
+                            &mut decoder,
+                            false,
+                        )
+                        .await
+                        .unwrap_or_else(|error| panic!("{}", error.status()));
                     server.abort();
                     let message = &response.choices[0].message;
                     assert_eq!(
@@ -2809,22 +2764,17 @@ async fn gemma4_rendered_prompt_state_controls_messages_responses() {
                         reason = "fixture collector is joined before assertions"
                     )]
                     let collector = tokio::spawn(collect_events(rx));
-                    let result = StreamingProcessor::new(
-                        ToolParserFactory::new(),
-                        ReasoningParserFactory::new(),
-                        resolver,
-                        "vllm",
-                    )
-                    .process_messages_streaming_chunks(
-                        stream,
-                        metadata,
-                        tokenizer,
-                        (None, None, false, false, false),
-                        spec,
-                        &tx,
-                        None,
-                    )
-                    .await;
+                    let result = streaming_processor(resolver)
+                        .process_messages_streaming_chunks(
+                            stream,
+                            metadata,
+                            tokenizer,
+                            (None, None, false, false, false),
+                            spec,
+                            &tx,
+                            None,
+                        )
+                        .await;
                     drop(tx);
                     let events = collector.await.unwrap();
                     server.abort();
@@ -2861,20 +2811,16 @@ async fn gemma4_rendered_prompt_state_controls_messages_responses() {
                 } else {
                     let mut decoder =
                         utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
-                    let (response, _) = ResponseProcessor::new(
-                        ToolParserFactory::new(),
-                        ReasoningParserFactory::new(),
-                        resolver,
-                    )
-                    .process_non_streaming_messages_response(
-                        context::ExecutionResult::Single { stream },
-                        spec,
-                        metadata,
-                        tokenizer,
-                        &mut decoder,
-                    )
-                    .await
-                    .unwrap_or_else(|error| panic!("{}", error.status()));
+                    let (response, _) = unary_processor(resolver)
+                        .process_non_streaming_messages_response(
+                            context::ExecutionResult::Single { stream },
+                            spec,
+                            metadata,
+                            tokenizer,
+                            &mut decoder,
+                        )
+                        .await
+                        .unwrap_or_else(|error| panic!("{}", error.status()));
                     server.abort();
                     let response = serde_json::to_value(response).unwrap();
                     let blocks = response["content"].as_array().unwrap();
@@ -3002,15 +2948,11 @@ plan<|tool_call>call:lookup{q:<|"|>Paris<|"|>}<tool_call|>"#;
             complete.output_ids = output.chars().map(u32::from).collect();
         }
         let (stream, server) = scripted_stream(vec![final_frame], "0").await;
-        let processor = ResponseProcessor::new(
-            ToolParserFactory::new(),
-            ReasoningParserFactory::new(),
-            utils::ParserResolver::with_flags(
-                Arc::new(WorkerRegistry::new()),
-                Some("gemma4".to_string()),
-                Some("gemma4".to_string()),
-            ),
-        );
+        let processor = unary_processor(utils::ParserResolver::with_flags(
+            Arc::new(WorkerRegistry::new()),
+            Some("gemma4".to_string()),
+            Some("gemma4".to_string()),
+        ));
         let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
         let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
         let result = processor
@@ -3565,12 +3507,7 @@ async fn chat_stream_with_parallel_tool_calls_false_has_the_first_call() {
         ];
         let (stream, server) = scripted_stream(frames, "0").await;
         let (tx, rx) = sse_channel();
-        let processor = StreamingProcessor::new(
-            ToolParserFactory::new(),
-            ReasoningParserFactory::new(),
-            qwen_resolver(),
-            "vllm",
-        );
+        let processor = streaming_processor(qwen_resolver());
         let result = processor
             .process_streaming_chunks(
                 stream,
@@ -3622,12 +3559,7 @@ async fn messages_tool_inputs(tool_choice: &Value, texts: &[&str], stream: bool)
     let (grpc_stream, server) = scripted_stream(frames, "0").await;
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
     let inputs = if stream {
-        let processor = StreamingProcessor::new(
-            ToolParserFactory::new(),
-            ReasoningParserFactory::new(),
-            qwen_resolver(),
-            "vllm",
-        );
+        let processor = streaming_processor(qwen_resolver());
         let (tx, rx) = sse_channel();
         let result = processor
             .process_messages_streaming_chunks(
@@ -3656,11 +3588,7 @@ async fn messages_tool_inputs(tool_choice: &Value, texts: &[&str], stream: bool)
             .map(|json| serde_json::from_str(json).unwrap())
             .collect()
     } else {
-        let processor = ResponseProcessor::new(
-            ToolParserFactory::new(),
-            ReasoningParserFactory::new(),
-            qwen_resolver(),
-        );
+        let processor = unary_processor(qwen_resolver());
         let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
         let (message, _) = processor
             .process_non_streaming_messages_response(
