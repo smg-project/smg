@@ -124,16 +124,21 @@ mod tests {
             PROMPT,
             &templates(),
         )
-        .unwrap()
-        .unwrap();
-        let value = serde_json::to_value(&assigned).unwrap();
+        .expect("supported selector")
+        .expect("Symphony assignment");
+        let value = serde_json::to_value(&assigned).expect("serialize assignment");
         assert_eq!(value["prompt"], assigned.prompt);
-        let recipe: FormatRecipe = serde_json::from_value(value["recipe"].clone()).unwrap();
+        let recipe: FormatRecipe =
+            serde_json::from_value(value["recipe"].clone()).expect("decode assigned recipe");
         assert_eq!(
             (recipe.no_calls, recipe.no_reasoning),
             (no_calls, no_reasoning)
         );
-        assert_eq!(*recipe.resolve(model).unwrap(), *assigned.format, "{model}");
+        assert_eq!(
+            *recipe.resolve(model).expect("resolve assigned recipe"),
+            *assigned.format,
+            "{model}"
+        );
         value["recipe"]["source"].clone()
     }
 
