@@ -4,8 +4,11 @@ on:
   pull_request:
     paths:
       - scripts/tau2/budget.py
+      - scripts/tau2/budget_hook.py
       - scripts/tau2/costmap_shim/sitecustomize.py
       - scripts/tests/test_tau2_budget.py
+      - scripts/tests/test_tau2_budget_hook.py
+      - scripts/tests/fixtures/tau2_generate*
       - scripts/tests/test_tau2_budget_startup.py
       - scripts/tests/test_tau2_costmap_shim.py
       - .github/workflows/tau2-budget-tests.yml
@@ -20,6 +23,14 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: sierra-research/tau2-bench
+          ref: 5bfa7e37b36656b37dc6d022156be6563c1007f3
+          path: .tau2-upstream
+          persist-credentials: false
+          sparse-checkout: src/tau2/utils/llm_utils.py
+          sparse-checkout-cone-mode: false
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
