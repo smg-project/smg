@@ -218,6 +218,8 @@ async fn reader_capture_distinguishes_tokens_tail_stop_and_exact_inputs() {
                 .unwrap(),
             stop
         );
+        // End the event buffer's borrow before inspecting the decoded input itself.
+        let mut events: Events<'_> = events.into_owned();
         let expected_input = RecordedInput::from(&delta.input());
         assert_eq!(delta.text, "hé");
         let mut tail = Delta::default();
