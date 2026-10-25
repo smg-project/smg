@@ -2870,6 +2870,52 @@ async fn an_encode_worker_takes_encode_requests_under_the_wires_encode_type() {
     h.server.stop(Duration::from_secs(5)).unwrap();
 }
 
+/// An encode worker whose handshake also declares the control reply (an
+/// engine that builds every role's READY from one helper): `FlushCache` and
+/// the profile RPCs are refused in the discovery servicer's words, nothing
+/// sent, since the worker lists the encode request alone and no rank would
+/// dispatch a control frame.
+#[tokio::test]
+async fn an_encode_worker_refuses_the_control_rpcs_before_the_wire() {
+    let mut h = harness_with_ready(
+        encode_model_info(),
+        None,
+        EngineCoreReadyResponse {
+            positional_layouts: control_wire_ready().positional_layouts,
+            ..encode_ready()
+        },
+    )
+    .await;
+    let flush = h
+        .client
+        .flush_cache(common::FlushCacheRequest::default())
+        .await
+        .expect_err("refused");
+    let started = h
+        .client
+        .start_profile(common::StartProfileRequest::default())
+        .await
+        .expect_err("refused");
+    let stopped = h
+        .client
+        .stop_profile(common::StopProfileRequest::default())
+        .await
+        .expect_err("refused");
+    for (rpc, error) in [
+        ("FlushCache", flush),
+        ("StartProfile", started),
+        ("StopProfile", stopped),
+    ] {
+        assert_eq!(error.code(), Code::Unimplemented, "{rpc}");
+        assert_eq!(
+            error.message(),
+            format!("{rpc} is unavailable on TokenSpeed encode workers")
+        );
+    }
+    assert_scheduler_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).unwrap();
+}
+
 /// An `Encode` outside the gRPC servicer's rules is refused in its words,
 /// nothing sent: no `mm_inputs`, two items, no feature.
 #[tokio::test]

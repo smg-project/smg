@@ -841,7 +841,7 @@ item's `encode_bootstrap_info` entry rides on the item); the EPD encode role
 the encode request: the servicer mounts the encoder service next to the
 scheduler's discovery surface, hands each `Encode` to the worker over the wire
 (the worker's own rendezvous address rides in every request, as the Python
-encoder servicer fills it) and refuses `Generate` there; an engine whose wire
+encoder servicer fills it) and refuses `Generate` and the scheduler's control RPCs there (the Python discovery servicer's answers); an engine whose wire
 predates the encode request is refused before anything starts (its encode rank
 never dials the handshake, so the launch would otherwise wait in silence), one
 that lists no encode request fails the start by name, and the Python servicer
