@@ -1,117 +1,42 @@
-name: AMD shared product vLLM Mooncake4 topology validation
+name: Manual MC4 real Git metadata validation
+run-name: MC4 real metadata CPU180 ${{ inputs.admission_nonce }}
 on:
   workflow_dispatch:
     inputs:
-      tier:
-        description: Original Mooncake4 GPU tier (must match root admission)
-        type: choice
+      admission_nonce:
         required: true
-        default: '4'
-        options: ['4']
+        type: string
+concurrency:
+  group: amd-mc4-real-metadata-cpu
+  cancel-in-progress: false
 permissions:
   contents: read
   actions: read
-concurrency:
-  group: amd-shared-product-vllm-mooncake4-pd
-  cancel-in-progress: false
 jobs:
-  artifact-relay:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    outputs:
-      gpu_tier: ${{ steps.recipe.outputs.gpu_tier }}
-      test_timeout: ${{ steps.recipe.outputs.test_timeout }}
-      test_dirs: ${{ steps.recipe.outputs.test_dirs }}
-      test_filter: ${{ steps.recipe.outputs.test_filter }}
-      min_selected: ${{ steps.recipe.outputs.min_selected }}
-      kv_backend: ${{ steps.recipe.outputs.kv_backend }}
-      vllm_extra_kv_backends: ${{ steps.recipe.outputs.vllm_extra_kv_backends }}
+  real-metadata-cpu:
+    runs-on: 1-gpu-mi300x
+    timeout-minutes: 3
+    container:
+      image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
+      options: --runtime=runc --cpus=2 --memory=4g --pids-limit=256
     env:
-      PYTHONDONTWRITEBYTECODE: '1'
+      ADMISSION_NONCE: ${{ inputs.admission_nonce }}
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0
-      - name: Require exactly the admitted original row
-        id: recipe
-        run: python3 .github/amd-shared-product/recipe.py --tier '${{ inputs.tier }}' --outputs "$GITHUB_OUTPUT"
-      - name: Verify external producer and relay payloads
-        id: relay
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          DIRECTORY="$RUNNER_TEMP/shared-relay-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          echo "directory=$DIRECTORY" >> "$GITHUB_OUTPUT"
-          python3 .github/amd-shared-product/relay.py --out "$DIRECTORY"
-      - name: Relay wheel without changing its bytes
+          ref: ${{ github.sha }}
+          path: .smg-mc4-real-metadata-${{ inputs.admission_nonce }}
+          fetch-depth: 4
+          persist-credentials: false
+      - name: Real stock SCM old failure and exact-checkout repair
+        working-directory: ${{ github.workspace }}/.smg-mc4-real-metadata-${{ inputs.admission_nonce }}
+        run: python3 -I -B .github/amd-mc4-real-metadata-cpu/job_runner.py
+      - name: Preserve real metadata evidence
+        if: always() && env.MC4_METADATA_OUTPUT != ''
         uses: actions/upload-artifact@v7
         with:
-          name: smg-wheel
-          path: ${{ steps.relay.outputs.directory }}/smg-wheel/
-          compression-level: 0
-          if-no-files-found: error
-          retention-days: 1
-      - name: Relay Go FFI without changing its bytes
-        uses: actions/upload-artifact@v7
-        with:
-          name: go-ffi-library
-          path: ${{ steps.relay.outputs.directory }}/go-ffi-library/
-          compression-level: 0
-          if-no-files-found: error
-          retention-days: 1
-      - name: Relay WASM without changing its bytes
-        uses: actions/upload-artifact@v7
-        with:
-          name: wasm-test-fixtures
-          path: ${{ steps.relay.outputs.directory }}/wasm-test-fixtures/
-          compression-level: 0
-          if-no-files-found: error
-          retention-days: 1
-      - name: Relay Python types without changing their bytes
-        uses: actions/upload-artifact@v7
-        with:
-          name: python-client-types
-          path: ${{ steps.relay.outputs.directory }}/python-client-types/
-          compression-level: 0
-          if-no-files-found: error
-          retention-days: 1
-      - name: Preserve external producer identity and verification
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: external-producer-relay-evidence
-          path: ${{ steps.relay.outputs.directory }}/evidence/
-          if-no-files-found: ignore
+          name: mc4-real-metadata-${{ github.run_id }}
+          path: ${{ env.MC4_METADATA_OUTPUT }}
+          include-hidden-files: true
           retention-days: 7
-  amd-product-mooncake-pd:
-    needs: artifact-relay
-    uses: ./.github/workflows/e2e-gpu-job.yml
-    with:
-      engine: vllm
-      gpu_tier: ${{ needs.artifact-relay.outputs.gpu_tier }}
-      runner: 1-gpu-mi300x
-      timeout: 50
-      test_timeout: ${{ fromJSON(needs.artifact-relay.outputs.test_timeout) }}
-      test_dirs: ${{ needs.artifact-relay.outputs.test_dirs }}
-      test_filter: ${{ needs.artifact-relay.outputs.test_filter }}
-      min_selected: ${{ fromJSON(needs.artifact-relay.outputs.min_selected) }}
-      kv_backend: ${{ needs.artifact-relay.outputs.kv_backend }}
-      vllm_kv_backend: mooncake
-      vllm_extra_kv_backends: ${{ needs.artifact-relay.outputs.vllm_extra_kv_backends }}
-      servicer_unit_tests: true
-      extra_deps: ./.github/amd-nixl-environment
-      gpu_vendor: amd
-      container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
-      container_options: --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN --env SPT_NOENV=1 --env SMG_CI_RUNTIME_STATE_DIR=/tmp/smg-mooncake4-runtime-${{ github.run_id }}-${{ github.run_attempt }} --env SMG_CI_PRIVATE_MOONCAKE=1 --volume /tmp/smg-mooncake-hip723-1f2ded97f9a0/prefix:/work/prefix:ro --volume /tmp/smg-mooncake-hip723-1f2ded97f9a0/mooncake_transfer_engine_rocm-0.3.13.post1+amd.hip723.g26b0229.curl30.teonly-cp312-cp312-linux_x86_64.whl:/work/mooncake_transfer_engine_rocm-0.3.13.post1+amd.hip723.g26b0229.curl30.teonly-cp312-cp312-linux_x86_64.whl:ro --env SMG_CI_MC4_RUNTIME_INPUTS=1 --volume /tmp/smg-mc4-runtime-inputs-8451-c2ac-v1:/input/mc4-cohort:ro --volume /tmp/smg-mc4-runtime-inputs-8451-c2ac-v1/cairo-runtime:/work/cairo-runtime:ro --volume /tmp/smg-mc4-runtime-inputs-8451-c2ac-v1/private-five:/input/private-five:ro --volume /tmp/smg-mc4-resolver-3d5c5ae805a0:/resolver-wheels:ro --env PIP_NO_INDEX=1 --env PIP_FIND_LINKS="/input/mc4-cohort/wheels /resolver-wheels"
-    secrets: inherit
-  finish:
-    if: always()
-    needs: [artifact-relay, amd-product-mooncake-pd]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 3
-    steps:
-      - name: Require the actual shared workflow to finish successfully
-        env:
-          RELAY: ${{ needs.artifact-relay.result }}
-          PD: ${{ needs.amd-product-mooncake-pd.result }}
-        run: test "$RELAY" = success && test "$PD" = success
+          if-no-files-found: error

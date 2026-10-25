@@ -1,0 +1,62 @@
+{
+  "result": "PASS_SOURCE_ONLY_SCHEDULED_REAL_METADATA_CARRIER_RUNTIME_PENDING",
+  "findings": [],
+  "carrier_head": "cac4cf8c4d23d718933baf38f704898e324eb53b",
+  "program_sha256": "0cd419bc8914c5af85b6b282b941f430c8022caa4bc2ce99db766b3604c3933e",
+  "job_runner_sha256": "2c0b7ab73c9c632504c143b1f72815c4f6fdcc7cb72d99237afafa901fe1991e",
+  "product_head": "a03e3dba902a0be3caedd2b65f50af7a2804d3e6",
+  "product_parent": "83e9290328f8774b7ab04a4290ab10a033743ea5",
+  "workflow_sha256": "1b508a819985ac0263b6850ea0dd2735df28bf8d7783f7d68ade89ab265a1d29",
+  "admission_template_sha256": "e1b3f5c75dba4896db78b1f3752557fcbe946198d8370e5ea6e10dcfd0852c13",
+  "carrier_control": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/MC4-real-metadata-CPU180-scheduled-root-fb29b208799f41379609573f0c503f2e/carrier-source-head-control.json",
+    "sha256": "2645118096546a0edc8c654e843996c42501eec01d2455bcc79c90aa4c3110f4"
+  },
+  "original_delivery": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/mooncake4-scm-git-argv-fix-20261025/delivery.json",
+    "sha256": "b44b3825c2a9f457f76fc4732249124128ed2f65980273a2bc873ef367484230"
+  },
+  "original_product_and_CPU_program_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/mooncake4-scm-git-argv-fix-20261025/peer-independent-C.json",
+    "sha256": "2f7abe9d8ce1107990c4a2db7577b90354aaaf81f0f055af8c61e8889a147e14"
+  },
+  "reviewed_files": {
+    "real_metadata_check.py": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/mooncake4-real-metadata-cpu-source-20261025/.github/amd-mc4-real-metadata-cpu/real_metadata_check.py",
+      "sha256": "0cd419bc8914c5af85b6b282b941f430c8022caa4bc2ce99db766b3604c3933e"
+    },
+    "job_runner.py": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/mooncake4-real-metadata-cpu-source-20261025/.github/amd-mc4-real-metadata-cpu/job_runner.py",
+      "sha256": "2c0b7ab73c9c632504c143b1f72815c4f6fdcc7cb72d99237afafa901fe1991e"
+    },
+    "workflow-template.yml": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/mooncake4-real-metadata-cpu-source-20261025/.github/amd-mc4-real-metadata-cpu/workflow-template.yml",
+      "sha256": "1b508a819985ac0263b6850ea0dd2735df28bf8d7783f7d68ade89ab265a1d29"
+    },
+    "admission.json": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/mooncake4-real-metadata-cpu-source-20261025/.github/amd-mc4-real-metadata-cpu/admission.json",
+      "sha256": "e1b3f5c75dba4896db78b1f3752557fcbe946198d8370e5ea6e10dcfd0852c13"
+    }
+  },
+  "checks": [
+    "Clean immutable carrier exact cac4; four CPU namespace additions only relative to a03; default registered pr-test-rust workflow bytes unchanged.",
+    "Original nine packet files and five product paths match manifest; independently recomputed consumer19/compiled37 at a03 and f93/actual producer14. Carrier preserves all original mapped product scopes.",
+    "Corrected program byte inverse differs from D 41f38 only in old-env direct Git control: unadorned fixed binary and returncode0 plus exact a03 HEAD.",
+    "Program uses actual stock SCM source RECORD and fixed callchain SHA, real pip editable dry-run old dubious FAIL/new PASS/neighbor dubious FAIL; no finder bypass, pretend version, shared Git config/HOME changes or engine imports in intended path.",
+    "Only new owned cross-UID fixture trees are chowned/deleted; exact helper ROOT derives from fixture GITHUB_WORKSPACE before helper import. Local clone prep failures are recorded and fail closed; no assumption that clone succeeded constitutes proof.",
+    "Runner pins approval, nonce, exact dispatch parent, program/peer/self SHA, three-file admission-only delta and template equality before mutation; all template authority fields remain false/null.",
+    "Single scheduled job uses exact stock749f/runc/2CPU/4GiB/pids256, noGPU devices check, timeout180 and retryfalse; probe125 is stricter than original155 work proposal.",
+    "Unreaped WNOWAIT leader anchors last TERM/KILL; final PG member list must be empty for success; evidence restore is lazy nofollow,512 entries/64MiB/3 seconds and UID995:GID985.",
+    "Full program254 lines, runner159 lines, workflow and admission reviewed; AST parse only, no candidate code imported or executed."
+  ],
+  "accepted_scope": "Source review only of the fixed a03 private Git wrapper and cac4 scheduled real-stock editable-metadata probe. Does not authorize dispatch or claim actual metadata/normal resolver/install/fullCPU1602/canonical14/original18/native ABI/GPU/latestmain acceptance.",
+  "remaining": [
+    "Root must create the exact three-file internal admission child, bind this receipt SHA and fresh nonce, and own any single dispatch/watcher/budget/cleanup.",
+    "Actual raw results must establish source-clone preparation, real old/new/neighbor outcomes and physical cleanup. No in-progress or fixture/source evidence may be promoted to full CI/GPU credit."
+  ],
+  "resource_authorized": false,
+  "executed_by_reviewer": false,
+  "GPU": 0,
+  "coverage_increment": 0,
+  "at_utc": "2026-10-25T04:44:03.228811+00:00"
+}

@@ -1,12 +1,12 @@
 {
-  "ready": false,
-  "root_admitted": false,
+  "ready": true,
+  "root_admitted": true,
   "CPU_new_seconds": 180,
   "GPU": 0,
   "automatic_retry": false,
-  "window_nonce": null,
+  "window_nonce": "90322d3380af49a8ba16930a99135e47",
   "product_head": "a03e3dba902a0be3caedd2b65f50af7a2804d3e6",
-  "carrier_head": null,
-  "peer_sha256": null,
+  "carrier_head": "cac4cf8c4d23d718933baf38f704898e324eb53b",
+  "peer_sha256": "0c556b023a8273233eb3865162bf905725e16cb9045a91bcbe6094b9a204ceb8",
   "program_sha256": "0cd419bc8914c5af85b6b282b941f430c8022caa4bc2ce99db766b3604c3933e"
 }
