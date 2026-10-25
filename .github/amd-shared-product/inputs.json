@@ -155,7 +155,8 @@
   },
   "explicit_consumer_only_paths": [
     ".github/amd-shared-product/",
-    ".github/workflows/pr-test-rust.yml"
+    ".github/workflows/pr-test-rust.yml",
+    ".github/amd-sg-zmq-evidence/"
   ],
   "budget": {
     "relay_hosted_cpu_minutes": 10,
