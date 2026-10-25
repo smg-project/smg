@@ -252,11 +252,11 @@ async fn declared_model_tokens_are_shared_with_discovery_and_prompt_validation()
         assert_eq!((info.vocab_size, info.max_context_length), (151936, 40960));
         assert_eq!(info.vocab_size as i32, ts_info.vocab_size);
         assert_eq!(info.eos_token_ids, vec![151645, 151643]);
-        assert_eq!(info.eos_token_ids, ts_info.eos_token_ids);
+        assert_eq!(ts_info.eos_token_ids, vec![151645, 151643]);
         assert_eq!((info.bos_token_id, info.pad_token_id), (151643, 151643));
         assert_eq!(
-            (info.bos_token_id, info.pad_token_id),
-            (ts_info.bos_token_id, ts_info.pad_token_id)
+            (ts_info.bos_token_id, ts_info.pad_token_id),
+            (151643, 151643)
         );
         let mut high = request("expanded-vocabulary", false, 4);
         if let Some(v::generate_request::Input::Tokenized(input)) = &mut high.input {

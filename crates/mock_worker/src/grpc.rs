@@ -417,9 +417,16 @@ impl TokenSpeedScheduler for MockScheduler {
             max_context_length: self.cfg.context_length.min(i32::MAX as u32) as i32,
             max_req_input_len: self.cfg.context_length.min(i32::MAX as u32) as i32,
             vocab_size: self.cfg.model_tokens.vocab_size() as i32,
-            eos_token_ids: self.cfg.model_tokens.eos_token_ids().to_vec(),
-            pad_token_id: self.cfg.model_tokens.pad_token_id(),
-            bos_token_id: self.cfg.model_tokens.bos_token_id(),
+            // ModelTokens validates that every ID fits this protocol's signed fields.
+            eos_token_ids: self
+                .cfg
+                .model_tokens
+                .eos_token_ids()
+                .iter()
+                .map(|id| *id as i32)
+                .collect(),
+            pad_token_id: self.cfg.model_tokens.pad_token_id() as i32,
+            bos_token_id: self.cfg.model_tokens.bos_token_id() as i32,
             weight_version: "mock".to_string(),
             default_sampling_params_json: String::new(),
             supports_vision: self.overrides.info_bool("supports_vision").unwrap_or(false),
