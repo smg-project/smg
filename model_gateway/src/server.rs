@@ -55,6 +55,7 @@ use wfaas::LoggingSubscriber;
 pub mod connection_limit;
 pub mod connection_timeouts;
 pub mod posture;
+pub(crate) mod tls;
 
 use crate::{
     app_context::AppContext,
@@ -1849,7 +1850,7 @@ pub fn run(
 }
 
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    crate::tls::install_crypto_provider();
+    crate::clients::install_crypto_provider();
 
     // Defense in depth: the CLI and Python bindings both validate via
     // `RouterConfigBuilder::build()` before reaching here, but `RouterConfig`
@@ -1952,17 +1953,17 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // subscriber exists, so the line reaches the log (the configuration is
     // validated before logging starts).
     if let Some(path) = &config.router_config.server_key_path {
-        crate::tls::warn_if_private_key_is_shared(std::path::Path::new(path), "--tls-key-path");
+        tls::warn_if_private_key_is_shared(std::path::Path::new(path), "--tls-key-path");
     }
     if let Some(path) = &config.router_config.client_key_path {
-        crate::tls::warn_if_private_key_is_shared(std::path::Path::new(path), "--client-key-path");
+        tls::warn_if_private_key_is_shared(std::path::Path::new(path), "--client-key-path");
     }
     if let Some(mtls) = config
         .mesh_server_config
         .as_ref()
         .and_then(|mesh| mesh.mtls_config.as_ref())
     {
-        crate::tls::warn_if_private_key_is_shared(&mtls.server_key_path, "--mesh-tls-key");
+        tls::warn_if_private_key_is_shared(&mtls.server_key_path, "--mesh-tls-key");
     }
 
     // Seed the process-wide multimodal tensor transport defaults from the

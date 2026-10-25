@@ -1058,7 +1058,7 @@ jobs:
               ("model_gateway/src/mesh_discovery/**",            CORE),
               ("model_gateway/src/service_discovery/**",         CORE),
               ("model_gateway/src/wasm/**",                      CORE),
-              ("model_gateway/src/tls.rs",                       CORE_GO),
+              ("model_gateway/src/server/tls.rs",                CORE),
               ("model_gateway/src/version.rs",                   CORE),
               ("model_gateway/src/posture.rs",                   CORE),
               ("model_gateway/src/tenant.rs",                    CORE),
