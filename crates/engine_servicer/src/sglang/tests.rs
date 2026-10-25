@@ -3531,3 +3531,31 @@ async fn the_listener_binds_before_the_engine_connects_and_answers_starting() {
     drop(engine);
     server.stop(Duration::from_secs(5)).expect("clean stop");
 }
+
+/// Two connected schedulers whose handshakes each say a data-parallel size
+/// of one: the zero-filled `GetLoads` before the first snapshot names the
+/// ranks the servicer serves (one per connected scheduler), as the pinned
+/// request path counts them.
+#[tokio::test]
+async fn the_zero_filled_loads_count_the_connected_ranks() {
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    let mut h = harness_with(model, |config| config.servicer.engine_count = 2).await;
+    assert_eq!(default_ready_response().data_parallel_size, 1);
+
+    let loads = h
+        .client
+        .get_loads(sg::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.dp_rank_count, 2);
+    assert_eq!(
+        loads
+            .loads
+            .iter()
+            .map(|load| load.dp_rank)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+}

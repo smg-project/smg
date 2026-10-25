@@ -581,6 +581,15 @@ impl ZmqEngineClient {
         self.engines().first().map(|engine| &engine.ready_response)
     }
 
+    /// The data-parallel ranks this connection serves: one connected engine
+    /// per rank (a pinned request is placed on the engine of its index and
+    /// refused past this count, `get_loads` names an entry per engine). The
+    /// handshake's `data_parallel_size` is not this figure: ranks launched
+    /// independently each report a size of one.
+    pub fn engine_count(&self) -> usize {
+        self.engines().len()
+    }
+
     /// The engine's context window as the ready handshake reported it (`0`
     /// from an engine that reported none), the bound every wire's prompt
     /// admission applies ([`crate::context_window`]); a connected engine is

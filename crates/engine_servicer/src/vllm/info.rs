@@ -127,10 +127,11 @@ pub(super) async fn server_info(state: &State) -> vllm::GetServerInfoResponse {
 
 fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
     let ready = state.shared.ready();
-    let data_parallel_size = ready
-        .map(|ready| i32::try_from(ready.data_parallel_size).unwrap_or(i32::MAX))
-        .filter(|&size| size > 0)
-        .unwrap_or_else(|| state.model.data_parallel_size.max(1));
+    // The ranks this servicer serves (the gateway expands the worker into
+    // that many under `--dp-aware`): the connected engines, as `GetLoads`
+    // counts them, not the handshake's figure.
+    let data_parallel_size =
+        i32::try_from(state.shared.rank_count(state.model.data_parallel_size)).unwrap_or(i32::MAX);
     let model = &state.model;
     // Block size: the handshake's resolved figure once the engine is up, the
     // launcher's config value before that. Model dtype: the launcher's label

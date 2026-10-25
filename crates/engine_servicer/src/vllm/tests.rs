@@ -5017,3 +5017,40 @@ async fn a_request_that_is_not_the_warm_ups_is_refused_while_readiness_is_held()
     while late.message().bounded().await.unwrap().is_some() {}
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
+
+/// A data-parallel engine whose ranks were launched independently: each
+/// rank's handshake says a data-parallel size of one while the servicer
+/// serves two. `GetServerInfo` advertises the two (the gateway expands the
+/// worker into that many rank workers under `--dp-aware`) and the
+/// zero-filled `GetLoads` before the first snapshot names both ranks.
+#[tokio::test]
+async fn server_info_and_the_zero_filled_loads_count_the_connected_ranks() {
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    let (mut h, _rank1_in, _rank1_out) = two_rank_harness(model).await;
+    assert_eq!(default_ready_response().data_parallel_size, 1);
+
+    let server = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(server.data_parallel_size, 2);
+
+    let loads = h
+        .client
+        .get_loads(vllm::GetLoadsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(loads.dp_rank_count, 2);
+    assert_eq!(
+        loads
+            .loads
+            .iter()
+            .map(|load| load.dp_rank)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+}
