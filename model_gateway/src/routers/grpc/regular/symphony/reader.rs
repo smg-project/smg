@@ -22,6 +22,12 @@ use super::{
     template::Templates,
     SymphonyError,
 };
+#[cfg(all(feature = "diagnostic-capture", unix))]
+#[path = "reader_capture.rs"]
+mod capture;
+#[cfg(all(feature = "diagnostic-capture", unix))]
+use capture::{Observation, Operation};
+
 use crate::{
     config::ParserChoice,
     routers::grpc::utils::{isolation, ModelNames},
@@ -309,6 +315,8 @@ pub(crate) struct Reader {
     /// request's isolation is driven end to end. `None` in every other process: one branch per
     /// step.
     trap: Option<&'static str>,
+    #[cfg(all(feature = "diagnostic-capture", unix))]
+    capture: Option<Observation>,
 }
 
 impl Reader {
@@ -335,7 +343,46 @@ impl Reader {
         ids: CallIds,
         out: &mut Events<'_>,
     ) -> Result<Self, SymphonyError> {
+        Self::build(
+            assignment,
+            tools,
+            ids,
+            out,
+            #[cfg(all(feature = "diagnostic-capture", unix))]
+            None,
+        )
+    }
+
+    /// Observe this reader from before construction, including its immediate Prompt feed.
+    /// The caller binds a unique source/choice and the same nonce used by this engine, keeps
+    /// the completion owner outside inference panic isolation, and later checks its receipt.
+    /// This records reader operations and Chat adapter input batches, not tokenizer/configuration
+    /// identity, wire delivery or replay eligibility. No serving request installs it yet.
+    #[cfg(all(feature = "diagnostic-capture", unix))]
+    #[cfg_attr(not(test), expect(dead_code, reason = "explicit hook for the pending request capture coordinator"))]
+    pub(crate) fn observed(
+        assignment: &Assignment,
+        tools: Arc<[Tool]>,
+        ids: CallIds,
+        out: &mut Events<'_>,
+        observer: crate::diagnostic_capture::CaptureObserver,
+        source: u64,
+        choice: u32,
+    ) -> Result<Self, SymphonyError> {
+        let observation = Observation::new(observer, source, choice, assignment, &tools, ids);
+        Self::build(assignment, tools, ids, out, Some(observation))
+    }
+
+    fn build(
+        assignment: &Assignment,
+        tools: Arc<[Tool]>,
+        ids: CallIds,
+        out: &mut Events<'_>,
+        #[cfg(all(feature = "diagnostic-capture", unix))] capture: Option<Observation>,
+    ) -> Result<Self, SymphonyError> {
         let mut reader = Self {
+            #[cfg(all(feature = "diagnostic-capture", unix))]
+            capture,
             table: assignment.table(),
             engine: Engine::with_call_ids(
                 Arc::clone(&assignment.format),
@@ -371,6 +418,10 @@ impl Reader {
         for event in replayed.into_owned() {
             out.push(event);
         }
+        #[cfg(all(feature = "diagnostic-capture", unix))]
+        if let Some(capture) = &mut reader.capture {
+            capture.returned(None);
+        }
         Ok(reader)
     }
 
@@ -378,6 +429,10 @@ impl Reader {
     /// events of every call after the first are dropped: the table's grammar
     /// limits a forced call, the reader limits a free one.
     pub(crate) fn first_call_only(mut self, on: bool) -> Self {
+        #[cfg(all(feature = "diagnostic-capture", unix))]
+        if let Some(capture) = &mut self.capture {
+            capture.policy(on);
+        }
         self.first_call_only = on;
         self
     }
@@ -393,6 +448,10 @@ impl Reader {
         delta: &'d mut Delta,
         out: &mut Events<'d>,
     ) -> Result<bool, SymphonyError> {
+        #[cfg(all(feature = "diagnostic-capture", unix))]
+        if let Some(capture) = &mut self.capture {
+            capture.begin(Operation::Read { token_ids });
+        }
         delta.clear();
         let mut stopped = false;
         for &token_id in token_ids {
@@ -425,6 +484,10 @@ impl Reader {
             }
         }
         self.feed(delta.input(), out)?;
+        #[cfg(all(feature = "diagnostic-capture", unix))]
+        if let Some(capture) = &mut self.capture {
+            capture.returned(Some(stopped));
+        }
         Ok(stopped)
     }
 
@@ -445,6 +508,10 @@ impl Reader {
         if text.is_empty() {
             return Ok(());
         }
+        #[cfg(all(feature = "diagnostic-capture", unix))]
+        if let Some(capture) = &mut self.capture {
+            capture.begin(Operation::Tail { text: &text });
+        }
         delta.clear();
         delta
             .spans
@@ -459,7 +526,12 @@ impl Reader {
         if let Some(last) = self.ends.last_mut() {
             *last = self.read;
         }
-        self.feed(delta.input(), out)
+        self.feed(delta.input(), out)?;
+        #[cfg(all(feature = "diagnostic-capture", unix))]
+        if let Some(capture) = &mut self.capture {
+            capture.returned(None);
+        }
+        Ok(())
     }
 
     /// Ends the output with the engine's finish, once: the events, the last of them the
@@ -493,6 +565,10 @@ impl Reader {
         if self.ended {
             return Ok(());
         }
+        #[cfg(all(feature = "diagnostic-capture", unix))]
+        if let Some(capture) = &mut self.capture {
+            capture.begin(Operation::End { finish: &finish });
+        }
         self.ended = true;
         self.feed(Input::End { finish }, out)?;
         if self.tally.is_empty() && !self.unshown.is_empty() {
@@ -507,6 +583,10 @@ impl Reader {
             release_before_the_finish(released, out);
         }
         self.tally.report(self.table, who);
+        #[cfg(all(feature = "diagnostic-capture", unix))]
+        if let Some(capture) = &mut self.capture {
+            capture.returned(None);
+        }
         Ok(())
     }
 
@@ -542,9 +622,23 @@ impl Reader {
     /// ([`Self::feed`]). The output is recorded as failed for the table and is over: its end
     /// counts nothing more.
     pub(crate) fn failed(&mut self, why: String) -> SymphonyError {
+        #[cfg(all(feature = "diagnostic-capture", unix))]
+        if let Some(capture) = &mut self.capture {
+            capture.failed(&why);
+        }
         self.ended = true;
         telemetry::record_failed(self.table);
         SymphonyError::Read(why)
+    }
+
+    /// Observe the entire batch immediately before the streaming Chat adapter consumes it.
+    /// This includes coalesced events and text released after End; it does not attest that
+    /// every event was adapted or that any resulting bytes reached the client.
+    #[cfg(all(feature = "diagnostic-capture", unix))]
+    pub(crate) fn observe_chat_batch(&mut self, choice: u32, events: &Events<'_>) {
+        if let Some(capture) = &mut self.capture {
+            capture.batch(choice, events);
+        }
     }
 
     /// Feeds `input` to the engine, its events into `out` after the ones already there: the
@@ -552,6 +646,10 @@ impl Reader {
     /// call where the request asks. An output the engine refuses is recorded as failed for the
     /// table, which the error names.
     fn feed<'d>(&mut self, input: Input<'d>, out: &mut Events<'d>) -> Result<(), SymphonyError> {
+        #[cfg(all(feature = "diagnostic-capture", unix))]
+        if let Some(capture) = &mut self.capture {
+            capture.input(&input);
+        }
         let before = out.len();
         let last = out.as_slice().last().map_or(0, telemetry::bytes_of);
         self.engine.feed(input, out).map_err(|e| {

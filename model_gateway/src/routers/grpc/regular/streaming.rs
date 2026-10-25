@@ -1376,10 +1376,15 @@ impl StreamingProcessor {
         frame: &ChatChunkFrame,
         index: u32,
         events: &mut Events<'_>,
+        #[cfg(all(feature = "diagnostic-capture", unix))] reader: Option<&mut Reader>,
         mut logprobs: Option<ChatLogProbs>,
         usage: Option<&Usage>,
         emit_usage_null: bool,
     ) -> Result<(), String> {
+        #[cfg(all(feature = "diagnostic-capture", unix))]
+        if let Some(reader) = reader {
+            reader.observe_chat_batch(index, events);
+        }
         for event in events.consume() {
             let Some(mut choice) = adapt::chat::into_delta_ref(index, event) else {
                 continue;
@@ -2862,6 +2867,8 @@ impl<'a> ChatStream<'a> {
                 &self.chunk_frame,
                 index,
                 &mut events,
+                #[cfg(all(feature = "diagnostic-capture", unix))]
+                self.readers.get_mut(&index),
                 choice_logprobs,
                 usage.as_ref(),
                 self.emit_usage_null,
@@ -3067,6 +3074,8 @@ impl<'a> ChatStream<'a> {
             &self.chunk_frame,
             index,
             &mut events,
+            #[cfg(all(feature = "diagnostic-capture", unix))]
+            self.readers.get_mut(&index),
             None,
             usage.as_ref(),
             self.emit_usage_null,
@@ -3183,6 +3192,8 @@ impl<'a> ChatStream<'a> {
                 &self.chunk_frame,
                 index,
                 &mut events,
+                #[cfg(all(feature = "diagnostic-capture", unix))]
+                self.readers.get_mut(&index),
                 None,
                 usage.as_ref(),
                 self.emit_usage_null,
@@ -4761,6 +4772,10 @@ mod delta_slicing_tests;
 mod sse_bytes_tests;
 #[cfg(test)]
 mod usage_tests;
+
+#[cfg(all(test, feature = "diagnostic-capture", unix))]
+#[path = "streaming/reader_capture_tests.rs"]
+mod reader_capture_tests;
 
 #[cfg(test)]
 mod tests {
