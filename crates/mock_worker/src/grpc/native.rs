@@ -298,6 +298,7 @@ mod tests {
                         service
                             .abort(Request::new(ts::AbortRequest {
                                 request_id: "delayed".into(),
+                                ..Default::default()
                             }))
                             .await
                             .unwrap();
