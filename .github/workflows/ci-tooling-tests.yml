@@ -1,0 +1,42 @@
+name: CI Tooling CPU Tests
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/ci-tooling-tests.yml
+      - .github/workflows/pr-test-rust.yml
+      - .github/workflows/e2e-gpu-job.yml
+      - scripts/**
+      - e2e_test/**
+      - grpc_servicer/**
+      - crates/grpc_client/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-tooling-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tooling:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      CUDA_VISIBLE_DEVICES: ""
+      HIP_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+      PYTHONPATH: e2e_test
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install CPU test dependencies
+        run: python -m pip install pytest pyyaml ./e2e_test
+      # Unlike the main GPU workflow, this accepts PRs against stacked branches.
+      # Only the explicitly selected CPU fixtures run; no engine is installed.
+      - name: Run available CI tooling contracts
+        run: python scripts/ci_run_tooling_tests.py
