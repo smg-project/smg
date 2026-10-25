@@ -835,13 +835,8 @@ the engine's KV bootstrap server in the launcher process before the ranks (as
 the engine's own frontend does), and under attention data parallelism the
 servicer places a disaggregated request on the rank of its room's residue,
 the engine's own dispatch rule, and an aggregated one on its
-`data_parallel_rank` pin. A prefill leg of several plain data-parallel
-replicas (`--dp-size N` without attention DP) is refused at launch with the
-engine's reason: every replica reports attention-DP rank 0 to the engine's KV
-sender, which fails each request whose room's residue is not 0; attention DP
-(`--tp-size N --attn-dp-size N`) is the multi-rank prefill shape. The EPD
-prefill side is served the same way (each item's `encode_bootstrap_info` entry
-rides on the item); the EPD encode role
+`data_parallel_rank` pin. The EPD prefill side is served the same way (each
+item's `encode_bootstrap_info` entry rides on the item); the EPD encode role
 (`--disaggregation-mode encode`) is refused at launch under `--servicer-impl
 rust` and stays with the Python implementation, whose encode servicer feeds
 the encode worker over the engine's in-process channel. `SubscribeKvEvents` relays
@@ -1134,7 +1129,12 @@ connected ranks is refused as the caller's error. On the prefill side of a disag
 the rank of its room's residue instead (`bootstrap_room % dp_size`: SGLang's
 prefill side follows the room and its KV sender fails a request placed
 elsewhere, and the decode side looks for the KV on that rank), the Router's pin
-yielding to it with a warning; the decode side keeps the pin. The planned
+yielding to it with a warning; the decode side keeps the pin. A prefill leg of
+several plain data-parallel replicas (`--dp-size N` without attention DP) is
+refused at launch with the engine's reason: every replica reports attention-DP
+rank 0 to the engine's KV sender, which fails each request whose room's residue
+is not 0; attention DP (`--tp-size N --attn-dp-size N`) is the multi-rank
+prefill shape. The planned
 warm-up pins each of its requests to a rank (on a prefill or decode leg with a
 stand-in room of that rank's residue), so every rank is warm before the Router
 sends anything. What the wire does not carry is reported, not emulated: an `--encoder-only` launch is refused (SGLang's entrypoint runs
