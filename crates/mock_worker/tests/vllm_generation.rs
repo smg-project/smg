@@ -270,10 +270,8 @@ async fn declared_model_tokens_are_shared_with_discovery_and_prompt_validation()
         }
         let done = completion(&client, high).await;
         assert_eq!(done.output_ids.len(), 4);
-        assert!(done
-            .output_ids
-            .iter()
-            .all(|id| (100..30100).contains(id) && !info.eos_token_ids.contains(id)));
+        assert!(done.output_ids.iter().all(|id| (100..30100).contains(id)
+            && !info.eos_token_ids.contains(&i32::try_from(*id).unwrap())));
         match client.generate(invalid).await {
             Err(error) => assert_eq!(error.code(), Code::InvalidArgument),
             Ok(_) => panic!("the exclusive vocabulary bound must reject the prompt"),
