@@ -124,17 +124,17 @@ impl EventReceiver {
         }
         // Keep the event and its permit in self if this receive is cancelled.
         let at = self.pending.as_ref()?.at;
-        tokio::select! {
-            biased;
-            _ = self.shared.failed.notified() => Some(self.overflow()),
-            _ = tokio::time::sleep_until(at.into()) => {
-                if self.shared.overflow.load(Ordering::Acquire) {
-                    Some(self.overflow())
-                } else {
-                    self.pending.take().map(|buffered| buffered.event)
-                }
+        if at > Instant::now() {
+            tokio::select! {
+                biased;
+                _ = self.shared.failed.notified() => return Some(self.overflow()),
+                _ = tokio::time::sleep_until(at.into()) => {}
             }
         }
+        if self.shared.overflow.load(Ordering::Acquire) {
+            return Some(self.overflow());
+        }
+        self.pending.take().map(|buffered| buffered.event)
     }
 
     /// The pure scheduler tests only enqueue events with immediate delivery.
@@ -164,6 +164,32 @@ mod tests {
             prompt_tokens: 4,
             cached_tokens: 0,
         }
+    }
+
+    #[test]
+    fn ready_events_do_not_register_a_timer() {
+        // No time driver: an immediate event must not depend on a timer tick.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (tx, mut rx) = output_channel(2);
+            let mut receiving = Box::pin(rx.recv());
+            assert!(futures::poll!(&mut receiving).is_pending());
+            tx.send(token(1)).unwrap();
+            assert!(matches!(
+                futures::poll!(&mut receiving),
+                Poll::Ready(Some(GenEvent::Token { token_id: 1, .. }))
+            ));
+            drop(receiving);
+
+            tx.send_at(token(2), Instant::now() - Duration::from_millis(1))
+                .unwrap();
+            assert!(matches!(
+                futures::poll!(rx.recv()),
+                Poll::Ready(Some(GenEvent::Token { token_id: 2, .. }))
+            ));
+        });
     }
 
     #[tokio::test]
