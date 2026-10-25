@@ -179,7 +179,8 @@ impl Serialize for Protobuf<'_> {
         // The capped JSON writer still enforces envelope overhead and final serialized bytes.
         let len = self.message.encoded_len();
         check_binary_len::<S::Error>(len, self.limit)?;
-        let mut encoded = Vec::with_capacity(len);
+        let mut encoded = Vec::new();
+        encoded.try_reserve_exact(len).map_err(S::Error::custom)?;
         self.message
             .encode(&mut encoded)
             .map_err(S::Error::custom)?;
