@@ -40,3 +40,11 @@ jobs:
       # Only the explicitly selected CPU fixtures run; no engine is installed.
       - name: Run available CI tooling contracts
         run: python scripts/ci_run_tooling_tests.py
+      - name: Upload CPU test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-tooling-results
+          path: ci-tooling-results.xml
+          if-no-files-found: error
+          retention-days: 7

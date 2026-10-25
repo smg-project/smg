@@ -9,6 +9,8 @@ BASELINE = (
     "scripts/tests/test_ci_gpu_runner_image.py",
     "scripts/tests/test_ci_tooling_tests.py",
     "scripts/tests/test_ci_amd_path_filters.py",
+    "scripts/tests/test_ci_tokenspeed_scheduler_pin.py",
+    "e2e_test/infra/test_epd_cmd_builders.py",
 )
 COMPONENTS = (
     ("scripts/ci_check_e2e_dependencies.py", "scripts/tests/test_ci_e2e_dependencies.py"),
@@ -20,6 +22,7 @@ REGRESSIONS = (
     ("scripts/ci_download_model.sh", "scripts/tests/test_ci_download_model.py"),
     ("scripts/ci_install_e2e_deps.sh", "scripts/test_grpc_ci_dependencies.py"),
     ("e2e_test/infra/worker.py", "e2e_test/infra/test_vllm_model_name.py"),
+    ("e2e_test/responses/conftest.py", "e2e_test/fixtures/test_responses_startup.py"),
 )
 
 
@@ -47,5 +50,16 @@ if __name__ == "__main__":
     tests = test_paths(root)
     print("CPU suites selected:\n" + "\n".join(tests), flush=True)
     raise SystemExit(
-        subprocess.call([sys.executable, "-m", "pytest", "-q", "--noconftest", *tests], cwd=root)
+        subprocess.call(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                "--noconftest",
+                "--junitxml=ci-tooling-results.xml",
+                *tests,
+            ],
+            cwd=root,
+        )
     )
