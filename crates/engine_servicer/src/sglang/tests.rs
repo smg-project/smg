@@ -19,16 +19,10 @@ use engine_zmq_client::{
         connect_to_frontend, default_ready_response, hello, MockEngineInput, MockEngineOutput,
         MOCK_DEADLINE,
     },
-    protocol::{
-        handshake::EngineCoreReadyResponse,
-        sglang::{
-            output::{
-                BatchEmbeddingSlimOutput, BatchTokenIDSlimOutput, ControlReplySlim, MatchedStop,
-            },
-            request::{
-                RequestMeta, SglangRequestType, TokenizedEmbeddingReqInput,
-                TokenizedGenerateReqInput,
-            },
+    protocol::sglang::{
+        output::{BatchEmbeddingSlimOutput, BatchTokenIDSlimOutput, ControlReplySlim, MatchedStop},
+        request::{
+            RequestMeta, SglangRequestType, TokenizedEmbeddingReqInput, TokenizedGenerateReqInput,
         },
     },
     EngineId,
@@ -175,48 +169,6 @@ async fn harness_with(
         client,
         _dir: dir,
     }
-}
-
-/// A bound servicer over two data-parallel scheduler ranks (two handshaken
-/// mock schedulers, each dialing with its rank as its engine index, as the
-/// plugin does) and a gRPC client: the harness holds rank 0, the pair
-/// returned with it is rank 1.
-async fn two_rank_harness(model: SglangModelInfo) -> (Harness, MockEngineInput, MockEngineOutput) {
-    let dir = tempfile::tempdir().unwrap();
-    let handshake = handshake_address(dir.path());
-    let mut config = config(dir.path(), &handshake, model);
-    config.servicer.engine_count = 2;
-    let server = SglangServicerServer::start(config).expect("servicer starts");
-    let rank = |index: u32| {
-        connect_to_frontend(
-            &handshake,
-            EngineId::from_engine_index(index),
-            EngineCoreReadyResponse {
-                data_parallel_size: 2,
-                data_parallel_rank: index,
-                ..default_ready_response()
-            },
-        )
-    };
-    let (rank0, rank1) = tokio::join!(rank(0), rank(1));
-    let rank0 = rank0.expect("rank 0 handshake");
-    let rank1 = rank1.expect("rank 1 handshake");
-    wait_until(|| server.engine_ready()).await;
-    let client = SglangSchedulerClient::new(grpc_channel(server.address()).await);
-    let (engine_in, engine_out) = rank0.split();
-    let (rank1_in, rank1_out) = rank1.split();
-    (
-        Harness {
-            server,
-            engine_in,
-            engine_out,
-            client,
-            more_ranks: Vec::new(),
-            _dir: dir,
-        },
-        rank1_in,
-        rank1_out,
-    )
 }
 
 /// One scheduler step for `rid`: `tokens` generated, finished with `finish`
@@ -785,7 +737,8 @@ async fn a_disaggregated_request_carries_its_bootstrap_to_the_scheduler() {
 async fn a_pinned_request_reaches_its_data_parallel_rank() {
     let mut model = model_info();
     model.data_parallel_size = 2;
-    let (mut h, mut rank1_in, mut rank1_out) = two_rank_harness(model).await;
+    let mut h = harness_with(model, |config| config.servicer.engine_count = 2).await;
+    let (mut rank1_in, mut rank1_out) = h.more_ranks.pop().expect("the second rank");
 
     let mut request = generate_request("dp1", false, Vec::new());
     request.data_parallel_rank = Some(1);
@@ -874,7 +827,8 @@ async fn a_prefill_sides_request_runs_on_the_rank_of_its_rooms_residue() {
     let mut model = model_info();
     model.data_parallel_size = 2;
     model.server_args_json = r#"{"model_path":"org/model","dp_size":2,"disaggregation_mode":"prefill","load_balance_method":"follow_bootstrap_room"}"#.to_string();
-    let (mut h, mut rank1_in, mut rank1_out) = two_rank_harness(model).await;
+    let mut h = harness_with(model, |config| config.servicer.engine_count = 2).await;
+    let (mut rank1_in, mut rank1_out) = h.more_ranks.pop().expect("the second rank");
 
     // Room 7 over two ranks is rank 1; the pin says 0 and yields.
     let mut stream = h
@@ -951,7 +905,8 @@ async fn a_decode_sides_request_runs_on_its_pinned_rank() {
     model.data_parallel_size = 2;
     model.server_args_json =
         r#"{"model_path":"org/model","dp_size":2,"disaggregation_mode":"decode"}"#.to_string();
-    let (mut h, mut rank1_in, mut rank1_out) = two_rank_harness(model).await;
+    let mut h = harness_with(model, |config| config.servicer.engine_count = 2).await;
+    let (mut rank1_in, mut rank1_out) = h.more_ranks.pop().expect("the second rank");
     let mut stream = h
         .client
         .generate(disaggregated_request("decode8", 8, 1))
