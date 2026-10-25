@@ -36,7 +36,7 @@ use serde_json::{json, Value};
 use smg_grpc_client::common_proto::{
     kv_cache_event, KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheEvent, KvEventBatch,
 };
-use tokio::{runtime::Builder, sync::mpsc, time::timeout};
+use tokio::{runtime::Builder, time::timeout};
 
 /// The engines' page size in tokens.
 pub const BLOCK: usize = 16;
@@ -441,7 +441,7 @@ impl Generator {
                 session,
             } = self.draw();
             let max_new = self.rng.range(8, 64) as u32;
-            let (events, mut receiver) = mpsc::unbounded_channel();
+            let (events, mut receiver) = self.engines[rank].output_channel();
             self.engines[rank].submit(NewRequest {
                 request_id: format!("r{index}"),
                 prompt_token_ids: prompt.clone(),
@@ -457,6 +457,9 @@ impl Generator {
                         match event {
                             GenEvent::Token { token_id, .. } => output.push(token_id),
                             GenEvent::Done { .. } => break,
+                            GenEvent::OutputOverflow => {
+                                panic!("mock index fixture exceeded its output budget")
+                            }
                         }
                     }
                     (index, output)
