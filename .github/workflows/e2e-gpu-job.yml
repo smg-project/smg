@@ -232,11 +232,14 @@ jobs:
       # engine here; the CPU unit-test job skips them. One lane per engine opts in.
       - name: Run engine-gated servicer unit tests
         if: inputs.servicer_unit_tests
+        env:
+          SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
         run: |
           python3 -c "import ${{ inputs.engine }}, msgspec, zmq"  # the gates these tests importorskip on
           pip install pytest-asyncio  # runs the @pytest.mark.asyncio cases; pytest>=8.4 fails them without a plugin
           if [ "${{ inputs.gpu_vendor }}" = amd ] && [ "${{ inputs.engine }}" = sglang ]; then
             mkdir -p unit-junit
+            python3 scripts/ci_repair_sglang_rocm_native.py --verify-only unit-junit/native-environment.json
             timeout --signal=INT --kill-after=30s 600s \
               pytest -vv grpc_servicer/tests -p no:cacheprovider -rs \
                 -o faulthandler_timeout=120 --junitxml=unit-junit/sglang.xml
@@ -282,6 +285,7 @@ jobs:
           E2E_LOG_DIR: e2e-logs
           E2E_MIN_SELECTED: ${{ inputs.min_selected }}
           E2E_AMD_REQUIRE_PASSING_CALL: ${{ inputs.gpu_vendor == 'amd' && '1' || '' }}
+          SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
           BRAVE_MCP_HOST: ${{ inputs.setup_agentic_deps && 'brave-search-mcp' || '' }}
           # Every gRPC servicer runs a planned warm-up before it reports
           # SERVING (grpc_servicer/smg_grpc_servicer/warmup.py). At its default
@@ -302,6 +306,10 @@ jobs:
         run: |
           if [ "${{ inputs.gpu_vendor }}" = amd ]; then
             bash scripts/ci_killall_sglang.sh rocm  # the default mode reads nvidia-smi
+            if [ "${{ inputs.engine }}" = sglang ]; then
+              mkdir -p e2e-logs
+              python3 scripts/ci_repair_sglang_rocm_native.py --verify-only e2e-logs/sglang-native-environment.json
+            fi
           else
             bash scripts/ci_killall_sglang.sh "nuke_gpus"
           fi

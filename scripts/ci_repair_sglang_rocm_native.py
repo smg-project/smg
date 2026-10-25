@@ -192,7 +192,7 @@ def main():
     plan = json.loads(Path(__file__).with_name("sglang_rocm_native_patches.json").read_text())
     for spec in plan[1:]:
         patched(read(spec["path"]), spec)
-    subprocess.run([sys.executable, "-m", "pip", "install", "--retries", "0", *WHEELS], check=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", *WHEELS], check=True)
     require(CONSTRAINT.read_bytes() == original, "Torch constraints changed")
     require(
         torch_before == {n: (md.version(n), md.requires(n)) for n in torch_before},
