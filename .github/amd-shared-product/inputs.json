@@ -4,14 +4,14 @@
   "artifacts_pinned": true,
   "consumer_gpu_ready": false,
   "admitted_lane": "python",
-  "runtime_cohort_accepted": true,
+  "runtime_cohort_accepted": false,
   "artifacts": [
     {
       "name": "go-ffi-library",
-      "id": 12577085048,
+      "id": 12613676687,
       "bytes": 13836995,
-      "sha256": "c7dc51d3e5c958ea6c683f4e295f51f4f4e8237e74d775082fb1f48754c54d11",
-      "expires_at": "2026-10-25T21:53:25Z",
+      "sha256": "fcd2b3ca33b1792f4837f0a6a1c5baa989fc5d01a07f4b7a3a4f52544a97e86e",
+      "expires_at": "2026-10-26T20:37:14Z",
       "files": {
         "libsmg_go.d": {
           "bytes": 64858,
@@ -25,36 +25,36 @@
     },
     {
       "name": "python-client-types",
-      "id": 12576019776,
+      "id": 12612932687,
       "bytes": 34557,
-      "sha256": "2b56b8c42dc0fe0be7526a2997fe4f30360900a98294a401f8b8d5a08aa4483a",
-      "expires_at": "2026-10-25T21:53:28Z",
+      "sha256": "7057df197d5e195889e9d84d25cba8166b4a92ad8be85c62051e7de7817e35af",
+      "expires_at": "2026-10-26T20:37:16Z",
       "files": {
         "_generated.py": {
           "bytes": 187632,
-          "sha256": "6086eba214dc97311bbcda1a0c43d34eb2b1e7864eeee7eb9e974149417465b6"
+          "sha256": "ae28a22663cbdab6378db3127025fd0e0e484dfaa72a1221f3cb48acd45a4e7a"
         }
       }
     },
     {
       "name": "smg-wheel",
-      "id": 12576990213,
-      "bytes": 52481714,
-      "sha256": "5699e646438895c6c7437b7b1f7d30bee551778537fb98126e9f7e083df225a5",
-      "expires_at": "2026-10-25T21:53:22Z",
+      "id": 12613891085,
+      "bytes": 52482271,
+      "sha256": "87b13b3289612c6e911e2ddd54eb3c53c4bfa7bca1b2e60c2bb7382a3984c9d9",
+      "expires_at": "2026-10-26T20:37:11Z",
       "files": {
         "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl": {
-          "bytes": 52623874,
-          "sha256": "e3f9bb03ff5062bdd5a8df979654ae0455b97fc4fe8235eabfcf283e59c40211"
+          "bytes": 52623969,
+          "sha256": "99f89ebd201cf1b87b0e02d0d79e5b324fd02d8b241f4e01e9b00c9b8078da74"
         }
       }
     },
     {
       "name": "wasm-test-fixtures",
-      "id": 12576249305,
+      "id": 12613636776,
       "bytes": 56596,
-      "sha256": "6783892e26ef47488aab2616f3d1d36706d83f48a5bd350dfb810efd70ad598b",
-      "expires_at": "2026-10-25T21:53:29Z",
+      "sha256": "71251fe81a5a2f00ddc4fe05aa67572455bb73faf7c5504f2192fe612b6cbac7",
+      "expires_at": "2026-10-26T20:37:18Z",
       "files": {
         "storage_hook_guest.wasm": {
           "bytes": 80680,
@@ -70,12 +70,12 @@
   "gateway_native": {
     "name": "smg/smg_rs.abi3.so",
     "bytes": 142663760,
-    "sha256": "1d22cb0ad04ff252b09fe14fc44260808906b398953689f6ed038967f7ccf4c8"
+    "sha256": "d8f759e32658b13c2c4d2a2c2417654613d4be23bcacf392f78da44eff4dc647"
   },
   "producer_sha": "c5596e27ac6e3d857477d9127c78d713c6df0371",
-  "run_id": 40132965389,
+  "run_id": 40228379463,
   "run_attempt": 1,
-  "build_job_id": 120988439488,
+  "build_job_id": 121274629218,
   "producer_branch": "ci/frozen-python173-main19c-producer-admitted-20261024",
   "producer_policy": "frozen_main19c_python173_build_only_all_18_steps_success_v1",
   "source_base": "740bd0c7e88bdfb57776785eaee16ff8e71f1833",
@@ -198,7 +198,7 @@
   },
   "budget": {
     "admitted": false,
-    "reserved_runner_seconds": 3360,
+    "reserved_runner_seconds": 0,
     "global_owned_max": 2,
     "one_lane_per_run": true,
     "proposed_new_max_seconds": 3360,
@@ -218,12 +218,12 @@
     "image_grpcio_exact": "1.78.0",
     "image_grpcio_reflection_exact": "1.78.0",
     "current_source_requires": ">=1.78.0; same-source private proto required",
-    "normal_resolution_intersection": "ACTUAL_PAIRED_NORMAL_INSTALL_THREE_WHOLEPIP_AND_INERT_GENERATED_RPC_CPU_ACCEPTED_ONLY_FOR_FROZEN3DE3; fullsharedCIdependencies/currentunits/productionengine/profile/original173 pending",
-    "permitted_resolution": "Use new actual g178 main19c wheels from the accepted build in a separate reviewed stage; normal shared CI same-source editable install remains unchanged and needs fresh provenance/full-dependency proof. No oldwheel substitution, metadata edit, stale stubs, version-check bypass or no-deps escape. Runtime-cohort admission remains false.",
+    "normal_resolution_intersection": "ROOT_ACCEPTED_AFE_C559_D8_NORMAL_INSTALL_NATIVE_LOAD_AND_PAIRED_GENERATED_RPC_CPU_ONLY; installed/final wholepip both0. Full installed-vLLM units, engine/model/profile and original173 remain pending.",
+    "permitted_resolution": "Keep the original normal editable same-source g178 setup and runtime constraints. The accepted CPU window installed current source, not old RPC wheel archives. No metadata edit, stale generated stub, generated-version bypass or native no-deps/force-reinstall escape. Top-level runtime-cohort and GPU admission remain false.",
     "wholepip_still_required": true
   },
   "new_native_required": false,
-  "source_identity_note": "Original3de3/main19c remains the accepted artifact/source reference. Product1568459 replays exactly the existingPR4234 MCP2 3file implementation; consumer19.e2e_test is updated while its other18 paths andcompiled37 are unchanged. Captured actualproducer14 remainsc559, not rewritten toconsumer19; no Rustrebuild is needed for these3 e2e-only files. Actual18-step producer40132965389/c5596e fourarchives/actual14/native1d22 are source-data bound; integrity/hosted smoke are separate from targetnative/runtime. FreshRPC240a5/2c68 and target PhaseB CPU proof refer to unchanged90servicer/8schemas only. No143a/f545 artifacts/results are borrowed. Fourflags/runtime_cohort_accepted remainfalse; new MCP replay targetnormalresolver/currentunits/original173/currentmain qualification remainpending. Test-only child c4b5fb7cc59a91e950a0f995d274e570cda39fb6 updates two existing current-unit files: exact same-process PID log assertion and module-local legacy-profile env isolation. Consumer19.grpc_servicer is rebound to the new test tree; compiled37, actualproducer14/native1d22, runtimeRPC90/8schemas/generated16/Profile feature implementations and real original173/GPU opt-in1 stay unchanged. No new unit/GPU result or previous fullsuite pass is inferred.",
+  "source_identity_note": "Consumer afe4163/376 and target_product_commit3c25e7 retain the exact original173 Python functional-equivalent vLLM implementation, worker/model/oracles and source19/compiled37/actualc559 producer14. New actual18-step producer40228379463 supplies fresh4archives/6payloads, native d8f759 and clienttypesae28a2. Root accepted the separate44.194807s normalTS749f CPU install/load and paired generated-RPC proof only; old native1d22 results are not transferred. No fullunits, engine/model/profile/admin/load/original173 or latest-main GPU acceptance is inferred. ProposedNEW3360 remains ungranted.",
   "grpc178_source_candidate": {
     "generator": "grpcio-tools==1.78.0",
     "proto_version": "0.4.28+smg.main19c.g178",
@@ -231,18 +231,10 @@
     "schema_count": 8,
     "schemas_unchanged_from_parent": "19c68a5527f61358a0e9a56a6ed4906dcfb1d1b5",
     "generated_code_version_checks_preserved": true,
-    "built": true,
-    "imported": false,
-    "wire_tested": true,
-    "stock_vllm_runtime_accepted": false,
-    "generated16_imported_in_CPU": true,
-    "inert_fixture_wire_tested": true,
-    "actual_artifact_manifest": "runtime-evidence.json",
-    "imports_scope": "Actual16 generated protobuf/gRPC modules were imported. Servicer90 files were hashed/read, not production-imported or initialized; generic servicer imported flag remainsfalse."
+    "normal_source_install_evidence": "normal_install_cpu_evidence",
+    "production_handler_or_engine_accepted": false
   },
   "new_native_artifact_bound": true,
-  "bound_runtime_evidence_manifest": "runtime-evidence.json",
-  "bound_runtime_evidence_sha256": "d774366c6fc98d7284c114d44bdf42e0c80102f4fc8ad5f80f8efd187dff6f94",
   "explicit_MCP2_dependency": {
     "original_implementation": "7fb31a63bb1fa1761c946f496483c1bc94e77088",
     "normal_PR": 4234,
@@ -253,7 +245,7 @@
       "e2e_test/infra/test_mock_mcp_server.py",
       "e2e_test/pyproject.toml"
     ],
-    "scope": "Exact3file existing implementation replay only; no newworkflow/defaultactivation, original173 modules/oracles and90servicer8schemas unchanged; compiled37/native1d22 identity unchanged.",
+    "scope": "Exact original3file MCP2 implementation replay and historical PR4234 identity remain unchanged. Current normalCPU evidence covers dependency resolution only; it did not rerun MCP5 SDK tests or original173. No historical native1d22 or GPU result is transferred to d8.",
     "normal_PR_CPU_evidence": {
       "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/rocm-dependency-closure/mcp2-compatibility/evidence/normal-pr-4234/normal-pr-result.json",
       "sha256": "a602de4145091c72073147e6d0a4d3448c209e2be570912a57183b05000ed644"
@@ -261,5 +253,73 @@
     "old_actual_CPU_on_new_source_transferred": false,
     "new_source_CPU_executed": false,
     "target_normal_resolver_or_MCP5_or_fullunits_or_173_accepted": false
-  }
+  },
+  "normal_install_cpu_evidence": {
+    "scope_normal_accepted": true,
+    "scope": "NORMAL_TS749F_D8_INSTALL_NATIVE_LOAD_AND_PAIRED_GENERATED_RPC_CPU_ONLY",
+    "source_commit": "afe4163130be6ec261a399ac65d21fa6e9589c86",
+    "producer_head": "c5596e27ac6e3d857477d9127c78d713c6df0371",
+    "producer_run": 40228379463,
+    "producer_build_job": 121274629218,
+    "image": "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f",
+    "native_sha256": "d8f759e32658b13c2c4d2a2c2417654613d4be23bcacf392f78da44eff4dc647",
+    "client_types_sha256": "ae28a22663cbdab6378db3127025fd0e0e484dfaa72a1221f3cb48acd45a4e7a",
+    "root_acceptance": {
+      "bytes": 2662,
+      "sha256": "1c04b77e90de42c9a5ddc7f32967a90e8733df06e326614666c00edef7b65d5a"
+    },
+    "independent_actual_peer_C": {
+      "bytes": 12970,
+      "sha256": "49181f5f951d988ce48f9c1b7f8462bff5474cb405871a895ee49e01fa4ebb7d"
+    },
+    "root_result": {
+      "bytes": 934,
+      "sha256": "75835d2ca65afe28ccb812394b7a63836ad7f3a37adbac11f1d8b3beeee76d31"
+    },
+    "terminal_consumption": {
+      "bytes": 1451,
+      "sha256": "8889836afed93d45dd77b1718b5d851be16e29013f4e270b3ded3745d234f8ab"
+    },
+    "normal_commands": 14,
+    "all_command_exit_codes_zero": true,
+    "wholepip": {
+      "installed": 0,
+      "final": 0
+    },
+    "normal_editable_g178_pair": true,
+    "RPC_source_files_including_support": 93,
+    "proto_schemas": 8,
+    "fresh_generated_imports": 16,
+    "descriptors": 8,
+    "native_maps": 4,
+    "native_symbols": [
+      "Router",
+      "BackendType",
+      "PolicyType"
+    ],
+    "original_inert_generated_RPC": {
+      "field19_absent_vs_zero": true,
+      "StartStopProfile": true,
+      "health_reflection": true,
+      "deadline_and_cancel": true,
+      "production_servicer": false,
+      "engine": false,
+      "GPU": false
+    },
+    "CPU_new_seconds": 600,
+    "CPU_used_seconds": 44.19480713503435,
+    "CPU_retired_seconds": 555.8051928649656,
+    "coverage_increment": 0,
+    "not_acceptance": [
+      "full current units",
+      "served-name runtime",
+      "models",
+      "production engine/servicer",
+      "profile/admin/load execution",
+      "original173",
+      "GPU ABI/transport",
+      "latestmain"
+    ]
+  },
+  "pending_note": "New d8 normal-install/native-load/pairedRPC CPU proof is genuinely accepted and content-bound above. Disabled consumer rebind only: top-level runtime_cohort_accepted/ready/run_budget_admitted/consumer_gpu_ready and budget.admitted stayfalse; actualGPU reservation0. Root still needs currentTTL/ownership/source/API checks and separately admittedNEW3360 before a fresh complete173 run."
 }
