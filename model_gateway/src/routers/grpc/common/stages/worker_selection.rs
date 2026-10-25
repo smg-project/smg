@@ -3653,25 +3653,9 @@ mod tests {
         }
         let stage = WorkerSelectionStage::new(
             worker_registry,
-            Arc::new(PolicyRegistry::new(PolicyConfig::CacheAware {
-                cache_threshold: 0.5,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 0,
-                max_tree_size: 4096,
-                block_size: 16,
-                balance_token_usage_threshold: 1.0,
-                overload_token_usage_threshold: 1.0,
-                overlap_decay: 0.0,
-                selection_temperature: 0.0,
-                cache_index: Default::default(),
-                cache_ttl_secs: 180,
-                cache_boundaries: Vec::new(),
-                selection_policy: None,
-                selection_accounting_ttl_ms: 0,
-                balance_prefix_margin_tokens: 0,
-                balance_uncached_credit: false,
-            })),
+            Arc::new(PolicyRegistry::new(PolicyConfig::cache_aware(
+                0.5, 32, 1.1, 0, 4096,
+            ))),
             WorkerSelectionMode::Regular,
             None,
         );
@@ -5421,25 +5405,9 @@ mod tests {
             .unwrap();
         let stage = WorkerSelectionStage::new(
             Arc::clone(&registry),
-            Arc::new(PolicyRegistry::new(PolicyConfig::CacheAware {
-                cache_threshold: 0.5,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 0,
-                max_tree_size: 4096,
-                block_size: 16,
-                balance_token_usage_threshold: 1.0,
-                overload_token_usage_threshold: 1.0,
-                overlap_decay: 0.0,
-                selection_temperature: 0.0,
-                cache_index: Default::default(),
-                cache_ttl_secs: 180,
-                cache_boundaries: Vec::new(),
-                selection_policy: None,
-                selection_accounting_ttl_ms: 0,
-                balance_prefix_margin_tokens: 0,
-                balance_uncached_credit: false,
-            })),
+            Arc::new(PolicyRegistry::new(PolicyConfig::cache_aware(
+                0.5, 32, 1.1, 0, 4096,
+            ))),
             WorkerSelectionMode::Regular,
             None,
         );

@@ -1285,25 +1285,9 @@ mod tests {
         // Other non-cache-aware policies are likewise skipped.
         assert!(!kv_monitor_created_for(PolicyConfig::RoundRobin));
         // Control: cache-aware still creates the monitor.
-        assert!(kv_monitor_created_for(PolicyConfig::CacheAware {
-            cache_threshold: 0.5,
-            balance_abs_threshold: 32,
-            balance_rel_threshold: 1.1,
-            eviction_interval_secs: 30,
-            max_tree_size: 1000,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-            balance_prefix_margin_tokens: 0,
-            balance_uncached_credit: false,
-        }));
+        assert!(kv_monitor_created_for(PolicyConfig::cache_aware(
+            0.5, 32, 1.1, 30, 1000
+        )));
     }
 
     /// A cache-aware PD/EPD role policy needs the monitor even when the
@@ -1312,25 +1296,7 @@ mod tests {
     fn test_cache_aware_role_policy_creates_kv_event_monitor() {
         use crate::config::types::RoutingMode;
 
-        let cache_aware = PolicyConfig::CacheAware {
-            cache_threshold: 0.5,
-            balance_abs_threshold: 32,
-            balance_rel_threshold: 1.1,
-            eviction_interval_secs: 30,
-            max_tree_size: 1000,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-            balance_prefix_margin_tokens: 0,
-            balance_uncached_credit: false,
-        };
+        let cache_aware = PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000);
 
         let mut config = config_with_policy(PolicyConfig::Random);
         config.mode = RoutingMode::PrefillDecode {
