@@ -1,5 +1,6 @@
 """Opt-in image metadata and private pip-constraint continuity for one CI job."""
 
+from contextlib import contextmanager
 import hashlib
 import importlib.metadata as metadata
 import json
@@ -66,6 +67,34 @@ def snapshot():
         "active": active,
         "records": sorted(records, key=lambda r: (r["name"], r["version"], r["origin"])),
     }
+
+
+@contextmanager
+def evidence_owner(value=None):
+    """Opt-in numeric owner for private CI evidence creation; default is unchanged."""
+    if value is None:
+        value = os.environ.get("SMG_CI_RUNTIME_EVIDENCE_OWNER")
+    if value is None:
+        yield
+        return
+    require(re.fullmatch(r"[1-9][0-9]*:[1-9][0-9]*", value) is not None, "invalid evidence owner")
+    uid, gid = map(int, value.split(":"))
+    require(uid < 2**31 and gid < 2**31 and os.geteuid() == 0, "root evidence writer required")
+    previous = os.geteuid(), os.getegid(), os.getgroups()
+    try:
+        os.setgroups([])
+        os.setegid(gid)
+        os.seteuid(uid)
+        yield
+    finally:
+        # Attempt every restoration even when entry or the original operation failed.
+        try:
+            os.seteuid(previous[0])
+        finally:
+            try:
+                os.setegid(previous[1])
+            finally:
+                os.setgroups(previous[2])
 
 
 def prepare(directory):
@@ -159,4 +188,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    with evidence_owner():
+        main()
