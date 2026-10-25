@@ -1,5 +1,7 @@
 //! Actual streaming Chat adapter consumption, with synthetic Reader output.
 
+use std::error::Error;
+
 use super::*;
 use crate::diagnostic_capture::{
     CaptureLimits, CaptureObserver, CapturePool, CaptureReadLimits, CaptureSnapshot, SharedCapture,
@@ -7,13 +9,14 @@ use crate::diagnostic_capture::{
 
 const PROMPT: &str = "<|im_start|>assistant\n<think>\n";
 
-fn tools() -> Vec<Tool> {
-    serde_json::from_value(serde_json::json!([{
+type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+fn tools() -> TestResult<Vec<Tool>> {
+    Ok(serde_json::from_value(serde_json::json!([{
         "type": "function", "function": {
             "name": "lookup", "parameters": {"type": "object", "properties": {}}
         }
-    }]))
-    .expect("valid declared tool fixture")
+    }]))?)
 }
 
 fn who() -> Who<'static> {
@@ -28,27 +31,26 @@ async fn render(
     observer: Option<CaptureObserver>,
     first_call_only: bool,
     disconnected: bool,
-) -> (Vec<u8>, Option<String>, Vec<Value>) {
+) -> TestResult<(Vec<u8>, Option<String>, Vec<Value>)> {
     let assignment = Assignment {
         format: Arc::new(::symphony::formats::qwen3(::symphony::CallSyntax::Json)),
         prompt: PROMPT.to_owned(),
         recipe: None,
     };
-    let ids = ::symphony::CallIds::from_nonce("0123456789abcdef00000000").expect("recorded nonce");
+    let ids = ::symphony::CallIds::from_nonce("0123456789abcdef00000000").ok_or("invalid fixture nonce")?;
     let mut events = Events::new();
     let mut reader = match observer {
         Some(observer) => Reader::observed(
             &assignment,
-            tools().into(),
+            tools()?.into(),
             ids,
             &mut events,
             observer,
             7,
             0,
         ),
-        None => Reader::with_call_ids(&assignment, tools().into(), ids, &mut events),
-    }
-    .expect("construct reader")
+        None => Reader::with_call_ids(&assignment, tools()?.into(), ids, &mut events),
+    }?
     .first_call_only(first_call_only);
     let (tx, rx) = sse_channel();
     let mut rx = if disconnected {
@@ -70,10 +72,8 @@ async fn render(
     }
     let mut deltas: Vec<_> = pieces.iter().map(|_| Delta::default()).collect();
     for (piece, delta) in pieces.into_iter().zip(&mut deltas) {
-        reader
-            .tail(piece, delta, &mut events)
-            .expect("read synthetic output");
-        batches.push(serde_json::to_value(events.as_slice()).expect("serialize adapter batch"));
+        reader.tail(piece, delta, &mut events)?;
+        batches.push(serde_json::to_value(events.as_slice())?);
         if let Err(why) = StreamingProcessor::push_events(
             &tx,
             &mut buffer,
@@ -92,11 +92,8 @@ async fn render(
         }
     }
     if error.is_none() {
-        reader
-            .end(::symphony::EngineFinish::Stop, who(), &mut events)
-            .expect("finish reader");
-        batches
-            .push(serde_json::to_value(events.as_slice()).expect("serialize final adapter batch"));
+        reader.end(::symphony::EngineFinish::Stop, who(), &mut events)?;
+        batches.push(serde_json::to_value(events.as_slice())?);
         StreamingProcessor::push_events(
             &tx,
             &mut buffer,
@@ -108,27 +105,24 @@ async fn render(
             None,
             false,
         )
-        .await
-        .expect("adapt final batch");
-        StreamingProcessor::flush_chunks(&tx, &mut buffer)
-            .await
-            .expect("flush synthetic frames");
+        .await?;
+        StreamingProcessor::flush_chunks(&tx, &mut buffer).await?;
     }
     drop(tx);
     let mut wire = Vec::new();
     if let Some(rx) = &mut rx {
         while let Some(frame) = rx.recv().await {
-            wire.extend_from_slice(&frame.expect("successful synthetic frame"));
+            wire.extend_from_slice(&frame?);
         }
     }
-    (wire, error, batches)
+    Ok((wire, error, batches))
 }
 
 async fn owner(
     record_bytes: usize,
     file_bytes: u64,
-) -> (tempfile::TempDir, CapturePool, SharedCapture) {
-    let root = tempfile::tempdir().expect("capture root");
+) -> TestResult<(tempfile::TempDir, CapturePool, SharedCapture)> {
+    let root = tempfile::tempdir()?;
     let pool = CapturePool::new(
         root.path().to_owned(),
         CaptureLimits {
@@ -139,16 +133,15 @@ async fn owner(
             record_bytes,
             queue_capacity: 256,
         },
-    )
-    .expect("bounded capture pool");
-    let owner = SharedCapture::new(pool.start().await.expect("admit capture session"));
-    (root, pool, owner)
+    )?;
+    let owner = SharedCapture::new(pool.start().await?);
+    Ok((root, pool, owner))
 }
 
 #[tokio::test]
 async fn reader_capture_chat_adapter_preserves_wire_on_capture_failure() {
     for first_call_only in [false, true] {
-        let original = render(None, first_call_only, false).await;
+        let original = render(None, first_call_only, false).await.unwrap();
         assert!(!original.0.is_empty());
         assert!(original.1.is_none());
         for (record_bytes, file_bytes, complete) in [
@@ -158,9 +151,9 @@ async fn reader_capture_chat_adapter_preserves_wire_on_capture_failure() {
             (512, 1_000_000, false),
             (100_000, 1600, false),
         ] {
-            let (_root, _pool, owner) = owner(record_bytes, file_bytes).await;
+            let (_root, _pool, owner) = owner(record_bytes, file_bytes).await.unwrap();
             let directory = owner.directory().to_owned();
-            let observed = render(Some(owner.observer()), first_call_only, false).await;
+            let observed = render(Some(owner.observer()), first_call_only, false).await.unwrap();
             assert_eq!(
                 observed, original,
                 "capture limits {record_bytes}/{file_bytes}"
@@ -206,11 +199,11 @@ async fn reader_capture_chat_adapter_preserves_wire_on_capture_failure() {
 
 #[tokio::test]
 async fn reader_capture_chat_batch_does_not_claim_delivery_after_disconnect() {
-    let original = render(None, false, true).await;
+    let original = render(None, false, true).await.unwrap();
     assert_eq!(original.1.as_deref(), Some("Failed to send chunk"));
     assert!(original.0.is_empty());
-    let (_root, _pool, owner) = owner(100_000, 1_000_000).await;
-    let observed = render(Some(owner.observer()), false, true).await;
+    let (_root, _pool, owner) = owner(100_000, 1_000_000).await.unwrap();
+    let observed = render(Some(owner.observer()), false, true).await.unwrap();
     assert_eq!(observed, original);
     let directory = owner.finish().await.unwrap();
     let snapshot = CaptureSnapshot::read(
