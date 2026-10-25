@@ -1289,6 +1289,30 @@ def test_the_rendezvous_host_is_the_engines_reading_or_empty(monkeypatch):
     assert rust.encode_bootstrap_host(FakeServerArgs(host="10.1.2.3")) == ""
 
 
+def test_an_encode_launch_on_an_engine_without_the_encode_wire_is_refused_first(monkeypatch):
+    """An engine before the encode request never dials the servicer's
+    handshake in the encode role, so the handshake-time refusal is
+    unreachable: the capability is read off the installed engine's wire
+    module before anything starts and the launch fails by name (a
+    configuration error, exit code 2 through ``main``). An engine whose wire
+    carries the request passes, the other roles pass on either, and an engine
+    that cannot be imported is left to the handshake-time check."""
+    wire = types.ModuleType("tokenspeed.runtime.engine.zmq_wire")
+    monkeypatch.setitem(sys.modules, "tokenspeed.runtime.engine.zmq_wire", wire)
+    encode = FakeServerArgs(disaggregation_mode="encode")
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="carries no encode request"):
+        rust.refuse_encode_role_without_wire(encode)
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="carries no encode request"):
+        asyncio.run(rust.serve_rust(encode))
+    for mode in ("null", "prefill", "decode"):
+        rust.refuse_encode_role_without_wire(FakeServerArgs(disaggregation_mode=mode))
+    wire.REQ_TYPE_ENCODE = b"\x03"
+    rust.refuse_encode_role_without_wire(encode)
+    monkeypatch.delitem(sys.modules, "tokenspeed.runtime.engine.zmq_wire")
+    monkeypatch.setitem(sys.modules, "tokenspeed.runtime.engine", None)
+    rust.refuse_encode_role_without_wire(encode)
+
+
 def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_path):
     """With a warm-up planned (the default knob, a generation model whose
     facts carry a vocabulary and a context), the server's readiness is held

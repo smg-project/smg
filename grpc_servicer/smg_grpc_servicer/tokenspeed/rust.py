@@ -25,8 +25,11 @@ engine's KV bootstrap server here as the engine's own frontend does
 and the EPD encode role on an engine whose handshake lists the encode
 request: the Rust servicer mounts the encoder service and hands each
 ``Encode`` to the worker over the wire, the launcher adds the worker's own
-rendezvous address to the facts (:func:`encode_bootstrap_host`), and an
-engine that lists no encode request fails the start by name. Multimodal items
+rendezvous address to the facts (:func:`encode_bootstrap_host`), an engine
+whose wire predates the encode request is refused before anything starts
+(:func:`refuse_encode_role_without_wire`: its encode rank never dials the
+handshake, so nothing later could name the gap), and one that dials in but
+lists no encode request fails the start by name. Multimodal items
 of the Qwen3.5 lineage (an MRoPE family) are served: the Rust servicer
 computes the engine's MRoPE position table itself from the checkpoint facts
 :func:`mrope_layout` ships (the wire bypasses the engine's input processor,
@@ -40,6 +43,7 @@ import argparse
 import contextlib
 import copy
 import dataclasses
+import importlib
 import json
 import logging
 import multiprocessing
@@ -620,6 +624,36 @@ def close_kv_bootstrap_server(server: Any) -> None:
         logger.exception("The KV bootstrap server did not stop cleanly")
 
 
+def refuse_encode_role_without_wire(server_args: Any) -> None:
+    """Refuse an EPD encode launch on an engine whose direct msgpack wire
+    predates the encode request, before anything starts.
+
+    On such an engine the encode rank reads the in-process channel only and
+    never dials the servicer's handshake, so the handshake-time refusal of an
+    engine that lists no encode request is never reached: the worker would
+    wait in silence past its scheduler-startup bound (the engine rank's own
+    start counts as its sign of life), SERVING nothing. The capability is read
+    off the installed engine (``zmq_wire.REQ_TYPE_ENCODE``,
+    the request-type byte the wire gained with the encode request). The other
+    roles pass; an engine that cannot be imported (the launcher's unit tests)
+    is left to the handshake-time check."""
+    if EngineConfigView(server_args).server_args.disaggregation_mode != "encode":
+        return
+    try:
+        zmq_wire = importlib.import_module("tokenspeed.runtime.engine.zmq_wire")
+    except ImportError:
+        return
+    if getattr(zmq_wire, "REQ_TYPE_ENCODE", None) is None:
+        raise ServicerConfigError(
+            f"{SERVICER_IMPL_ENV}=rust does not serve the EPD encode role on this engine build "
+            "(disaggregation_mode='encode'): its direct msgpack wire carries no encode request, "
+            "so the encode rank would never dial the servicer's handshake and the worker would "
+            "wait in silence, serving nothing; run an engine whose wire carries the encode "
+            f"request, or this worker on the Python servicer (unset {SERVICER_IMPL_ENV} or pass "
+            "--servicer-impl python)"
+        )
+
+
 def encode_bootstrap_host(server_args: Any) -> str:
     """The encode worker's own address, which every encode request names as
     the host the prefill side pulls the embedding from: the engine's own
@@ -719,5 +753,8 @@ async def serve_rust(server_args: Any) -> int:
     until a signal or a failure (:class:`TokenSpeedLauncher`). Returns the
     process exit code. The EPD encode role runs here too: the Rust servicer
     mounts the encoder service on an engine whose handshake lists the encode
-    request, and fails the start by name on one that does not."""
+    request, and fails the start by name on one that does not; an engine whose
+    wire predates the encode request is refused first
+    (:func:`refuse_encode_role_without_wire`)."""
+    refuse_encode_role_without_wire(server_args)
     return await TokenSpeedLauncher().serve(server_args)
