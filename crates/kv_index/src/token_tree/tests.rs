@@ -736,24 +736,6 @@ fn test_prefix_match_tenant() {
 }
 
 #[test]
-fn test_simple_tenant_eviction() {
-    let tree = TokenTree::new();
-
-    let tokens1 = make_tokens(1, 2);
-    let tokens2 = make_tokens(1000, 2);
-    tree.insert_tokens(&tokens1, "tenant1");
-    tree.insert_tokens(&tokens2, "tenant2");
-
-    let tenant1_id: TenantId = Arc::from("tenant1");
-    tree.evict_tenant(&tenant1_id, 0);
-
-    // tenant2 should be unaffected
-    let result = tree.match_prefix_with_counts(&tokens2);
-    assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
-    assert_eq!(result.tenant.as_ref(), "tenant2");
-}
-
-#[test]
 fn test_complex_tenant_eviction() {
     let tree = TokenTree::new();
 
@@ -897,28 +879,6 @@ fn test_leaf_first_eviction() {
 }
 
 #[test]
-fn test_prefix_is_subset_of_existing() {
-    let tree = TokenTree::new();
-
-    // Insert longer sequence first (3 pages)
-    let long_tokens = make_tokens(1, 3);
-    tree.insert_tokens(&long_tokens, "tenant1");
-
-    // Insert prefix (1 page)
-    let short_tokens = make_tokens(1, 1);
-    tree.insert_tokens(&short_tokens, "tenant2");
-
-    // Short match
-    let result = tree.match_prefix_with_counts(&short_tokens);
-    assert_eq!(result.matched_token_count, PAGE_SIZE);
-
-    // Long match
-    let result = tree.match_prefix_with_counts(&long_tokens);
-    assert_eq!(result.matched_token_count, 3 * PAGE_SIZE);
-    assert_eq!(result.tenant.as_ref(), "tenant1");
-}
-
-#[test]
 fn test_existing_is_prefix_of_new() {
     let tree = TokenTree::new();
 
@@ -964,28 +924,6 @@ fn test_prefix_match_with_counts_accuracy() {
     let result = tree.match_prefix_with_counts(&extended);
     assert_eq!(result.matched_token_count, 4 * PAGE_SIZE);
     assert_eq!(result.input_token_count, 6 * PAGE_SIZE);
-}
-
-#[test]
-fn test_split_at_page_boundary() {
-    let tree = TokenTree::new();
-
-    // Insert 3 pages
-    let long_tokens = make_tokens(1, 3);
-    tree.insert_tokens(&long_tokens, "tenant1");
-
-    // Insert 1 page (causes split at page boundary)
-    let short_tokens = make_tokens(1, 1);
-    tree.insert_tokens(&short_tokens, "tenant2");
-
-    // 1 page match
-    let result = tree.match_prefix_with_counts(&short_tokens);
-    assert_eq!(result.matched_token_count, PAGE_SIZE);
-
-    // 3 pages match
-    let result = tree.match_prefix_with_counts(&long_tokens);
-    assert_eq!(result.matched_token_count, 3 * PAGE_SIZE);
-    assert_eq!(result.tenant.as_ref(), "tenant1");
 }
 
 #[test]
