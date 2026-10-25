@@ -331,9 +331,9 @@ impl GridTensors {
     /// the `layout` facts the rule needs (without them a lineage checkpoint's
     /// multimodal items are refused outright). The lineage comes first: a
     /// lineage checkpoint takes its rule whatever `mrope_positions` says (a
-    /// `Some(false)` there would otherwise ship empty position slots the
-    /// engine fills), and the reading decides only the families without a
-    /// rule.
+    /// `Some(false)` there would otherwise ship empty position slots, which
+    /// the engine fills with 1-D positions), and the reading decides only the
+    /// families without a rule.
     pub fn for_model(
         architectures: &[String],
         model_type: &str,
@@ -1869,6 +1869,16 @@ mod tests {
         // with or without a grid, never empty position slots for this lineage.
         assert_eq!(
             GridTensors::for_model(&lineage, "qwen3_5", Some(true), None),
+            GridTensors::Qwen35PositionsUnavailable
+        );
+        // The lineage comes first: a launcher reading `Some(false)` does not
+        // send a lineage checkpoint down the patch-layout path.
+        assert_eq!(
+            GridTensors::for_model(&lineage, "qwen3_5", Some(false), Some(QWEN35)),
+            GridTensors::Qwen35Positions(QWEN35)
+        );
+        assert_eq!(
+            GridTensors::for_model(&lineage, "qwen3_5", Some(false), None),
             GridTensors::Qwen35PositionsUnavailable
         );
         for item in [
