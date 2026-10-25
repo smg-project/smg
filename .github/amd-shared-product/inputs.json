@@ -75,7 +75,7 @@
   "producer_sha": "f93b547de753c96373988b60b1590638629b3568",
   "producer_branch": "ci/frozen-legacy-c9d-refresh-producer-admitted-20261024",
   "producer_policy": "frozen_c9d_dispatch_build_only_all_18_steps_success_v1",
-  "target_product_commit": "d8f14920747b5b8fc6f27af8cbdeeac3da6220be",
+  "target_product_commit": "91d880733443b01c150cd0ed5529396c0c0cd9d1",
   "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat-zmq[2]/sglang/nvidia",
   "source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
@@ -201,9 +201,10 @@
     "source_bound_original_cases": 222,
     "source_bound_original_declared_skips": 8,
     "source_bound_current_warmup_skip": 1,
-    "actual_GPU_quality_result": null
+    "actual_GPU_quality_result": null,
+    "rerun_XML_policy": "Exact actual attempt count/address/order/outcome/skip then derived final view; raw XML retained."
   },
-  "diagnostic_difference": "Private manual-only AMD original SGLang ZMQ caller. Original empty test filter, floor204, 60job/48pytest, reruns2/delay5 and whole grpc_servicer/tests retained. Original hooks exclude PD/EPD/multi-worker/MM/error_shapes; no new exclusion. Eight static model families retained, tier1 downloader still prefetches complete14 model registry. Same reviewed explicit GPTOSS BF16 overlay remains; no Qwen/MM diagnostic or SG2 allocator/CU/stream source is added. JUnit is added only under private SMG_SGLANG_ZMQ_ORIGINAL=1; default reusable unit command is unchanged. No prior GPU or CPU whole-unit acceptance transferred. New passive private SG namespace observes all original unit and chat phases and joins real parameterized/JUnit identities. Original pip install pytest-asyncio stays before full engine-gated units on real GPU. Source-bound222/223 collection records do not qualify the failed CPU600 or any GPU row. No test body, model, filter, skip condition, original3job bounds or default unit/E2E command is changed.",
+  "diagnostic_difference": "Private manual-only AMD original SGLang ZMQ caller. Original empty test filter, floor204, 60job/48pytest, reruns2/delay5 and whole grpc_servicer/tests retained. Original hooks exclude PD/EPD/multi-worker/MM/error_shapes; no new exclusion. Eight static model families retained, tier1 downloader still prefetches complete14 model registry. Same reviewed explicit GPTOSS BF16 overlay remains; no Qwen/MM diagnostic or SG2 allocator/CU/stream source is added. JUnit is added only under private SMG_SGLANG_ZMQ_ORIGINAL=1; default reusable unit command is unchanged. No prior GPU or CPU whole-unit acceptance transferred. New passive private SG namespace observes all original unit and chat phases and joins real parameterized/JUnit identities. Original pip install pytest-asyncio stays before full engine-gated units on real GPU. Source-bound222/223 collection records do not qualify the failed CPU600 or any GPU row. No test body, model, filter, skip condition, original3job bounds or default unit/E2E command is changed. Rerun XML child preserves original raw reports/XML and derives a final-attempt view only after exact per-attempt count/address/order/outcome/skip/suite-stat closure; unit unique-XML join remains unchanged. No unconditional duplicate removal.",
   "producer_binary_relabelled": false,
   "producer_artifact_pins_status": "LOCALLY_BOUND_ROOT_ACCEPTED_401391_F93B_ACTUAL4_E6D: four admission flags false; target4420 normal setup/full units/actual collection/runtime/freshAPI/runner/budget remain unaccepted",
   "explicit_product_dependency": {
@@ -288,7 +289,7 @@
     "sha256": "e1d5b35d2508e81f51ecb114abdb45dfe54fbdc0b2d785e74e69fdc303f290db",
     "scope": "Artifact integrity/hosted smoke only; not target4420 ABI/full units/ZMQ original row."
   },
-  "evidence_namespace_oid": "87de77171ec1afdc84fcb4246353c24e2106b6e8",
+  "evidence_namespace_oid": "bf247d7561e697e79eacbd9d338fce9e0a3e8d2a",
   "qualification_mode": {
     "name": "ORIGINAL_ENGINE_GATED_UNITS_THEN_WHOLE_ZMQ_ON_REAL_GPU",
     "same_source_full_SG_CPU_units_accepted": false,
