@@ -32,12 +32,14 @@ scheduler service the server hosts the standard `grpc.health.v1` service
 exactly when `HealthCheck` answers healthy (`POST /admin/serving/{port}` flips
 both), any other name is unknown.
 
-The same port also exposes the **SMG `vllm.grpc.engine.VllmEngine` control
+With `--grpc-vllm true`, the same port also exposes the experimental
+**SMG `vllm.grpc.engine.VllmEngine` control
 plane**: health, model/server metadata, loads, abort, and KV events share the
 TokenSpeed worker's engine and shutdown. Its load records use the vLLM reporting
 profile regardless of `--loads-like`; `--step-reports` still controls heartbeat
 semantics. Only DP rank 0 and the `core` load section are supported. The standard
-health service recognizes both registered service names.
+health service recognizes both registered service names. The flag defaults to
+false so existing backend detection continues to see only TokenSpeed.
 
 vLLM `Generate` and `Embed` currently return `unimplemented`; tokenizer transfer,
 cache flush and profiling remain unsupported. Metadata describes the existing

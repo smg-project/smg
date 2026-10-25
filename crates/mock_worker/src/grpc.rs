@@ -123,6 +123,7 @@ pub async fn serve_with_listener_until(
     };
     let overrides = crate::overrides::for_port(addr.map(|a| a.port()).unwrap_or(0));
     let health = MockHealth {
+        vllm: cfg.grpc_vllm,
         overrides: Arc::clone(&overrides),
         stopped: stopped.clone(),
     };
@@ -135,6 +136,11 @@ pub async fn serve_with_listener_until(
         prefill_pending: Arc::new(AtomicU64::new(0)),
         overrides,
     };
+    let vllm_service = service.cfg.grpc_vllm.then(|| {
+        vllm::VllmServer::new(vllm::MockVllm::new(service.clone()))
+            .max_decoding_message_size(max_message_bytes)
+            .max_encoding_message_size(max_message_bytes)
+    });
     let server = async {
         // tonic drains on incoming EOF when graceful shutdown is enabled,
         // but retains the stream while waiting for existing connections.
@@ -154,15 +160,11 @@ pub async fn serve_with_listener_until(
         // default, as the engine servicers run.
         if let Err(e) = Server::builder()
             .add_service(
-                TokenSpeedSchedulerServer::new(service.clone())
+                TokenSpeedSchedulerServer::new(service)
                     .max_decoding_message_size(max_message_bytes)
                     .max_encoding_message_size(max_message_bytes),
             )
-            .add_service(
-                vllm::VllmServer::new(vllm::MockVllm::new(service))
-                    .max_decoding_message_size(max_message_bytes)
-                    .max_encoding_message_size(max_message_bytes),
-            )
+            .add_optional_service(vllm_service)
             .add_service(HealthServer::new(health))
             .serve_with_incoming_shutdown(incoming, pending())
             .await
@@ -565,13 +567,15 @@ const HEALTH_WATCH_INTERVAL: Duration = Duration::from_millis(250);
 type HealthWatchStream = Pin<Box<dyn Stream<Item = Result<HealthCheckResponse, Status>> + Send>>;
 
 /// The standard `grpc.health.v1` service of a gRPC worker: the whole server
-/// (the empty name) and both engine services are SERVING exactly when the
+/// (the empty name) and enabled engine services are SERVING exactly when the
 /// scheduler's own `HealthCheck` answers healthy, i.e. unless the admin API
 /// set the worker not serving (`/admin/serving/{port}`); any other name is
 /// unknown. It is the service a harness or a probe asks before it asks the
 /// engine's own protocol, as every engine servicer hosts it.
 #[derive(Clone)]
 struct MockHealth {
+    /// The optional vLLM service is known only when explicitly enabled.
+    vllm: bool,
     overrides: Arc<crate::overrides::WorkerOverrides>,
     /// Flips when the worker stops: ends the watch streams, which have no
     /// end of their own, so the server's drain can finish.
@@ -583,7 +587,7 @@ impl MockHealth {
     fn status(&self, service: &str) -> ServingStatus {
         if !service.is_empty()
             && service != <TokenSpeedSchedulerServer<MockScheduler> as NamedService>::NAME
-            && service != <vllm::VllmServer as NamedService>::NAME
+            && !(self.vllm && service == <vllm::VllmServer as NamedService>::NAME)
         {
             ServingStatus::ServiceUnknown
         } else if self.overrides.serving() {
@@ -1309,6 +1313,13 @@ mod tests {
         assert_eq!(
             check(scheduler_service).await.expect("check"),
             ServingStatus::Serving
+        );
+        assert_eq!(
+            check(<vllm::VllmServer as NamedService>::NAME)
+                .await
+                .expect_err("disabled")
+                .code(),
+            Code::NotFound
         );
         assert_eq!(
             check("not.a.Service").await.expect_err("unknown").code(),

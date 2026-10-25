@@ -12,6 +12,7 @@ async fn vllm_control_shares_health_load_cache_and_abort_with_tokenspeed() {
     timeout(Duration::from_secs(15), async {
         let cfg = Config {
             realistic: true,
+            grpc_vllm: true,
             model_id: "shared-mock".into(),
             ..Config::default()
         };
