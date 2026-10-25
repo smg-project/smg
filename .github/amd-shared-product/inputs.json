@@ -1,10 +1,10 @@
 {
-  "ready": false,
-  "run_budget_admitted": false,
+  "ready": true,
+  "run_budget_admitted": true,
   "artifacts_pinned": true,
   "consumer_gpu_ready": false,
   "admitted_lane": "python",
-  "runtime_cohort_accepted": false,
+  "runtime_cohort_accepted": true,
   "artifacts": [
     {
       "name": "go-ffi-library",
@@ -197,8 +197,8 @@
     "profile_original_per_request_directory": true
   },
   "budget": {
-    "admitted": false,
-    "reserved_runner_seconds": 0,
+    "admitted": true,
+    "reserved_runner_seconds": 3360,
     "global_owned_max": 2,
     "one_lane_per_run": true,
     "proposed_new_max_seconds": 3360,
@@ -219,7 +219,7 @@
     "image_grpcio_reflection_exact": "1.78.0",
     "current_source_requires": ">=1.78.0; same-source private proto required",
     "normal_resolution_intersection": "ROOT_ACCEPTED_AFE_C559_D8_NORMAL_INSTALL_NATIVE_LOAD_AND_PAIRED_GENERATED_RPC_CPU_ONLY; installed/final wholepip both0. Full installed-vLLM units, engine/model/profile and original173 remain pending.",
-    "permitted_resolution": "Keep the original normal editable same-source g178 setup and runtime constraints. The accepted CPU window installed current source, not old RPC wheel archives. No metadata edit, stale generated stub, generated-version bypass or native no-deps/force-reinstall escape. Top-level runtime-cohort and GPU admission remain false.",
+    "permitted_resolution": "Keep the original normal editable same-source g178 setup and runtime constraints. Accepted CPU evidence installed current source, not old RPC wheel archives. No metadata edit, stale generated stub, generated-version bypass or native no-deps/force-reinstall escape. In this unapplied conditional preview only, runtime_cohort_accepted denotes that accepted normal-install/wholepip scope after a genuine root admission; consumer_gpu_ready remains false and no engine/model/original173 GPU acceptance is supplied.",
     "wholepip_still_required": true
   },
   "new_native_required": false,
@@ -321,5 +321,5 @@
       "latestmain"
     ]
   },
-  "pending_note": "New d8 normal-install/native-load/pairedRPC CPU proof is genuinely accepted and content-bound above. Disabled consumer rebind only: top-level runtime_cohort_accepted/ready/run_budget_admitted/consumer_gpu_ready and budget.admitted stayfalse; actualGPU reservation0. Root still needs currentTTL/ownership/source/API checks and separately admittedNEW3360 before a fresh complete173 run."
+  "pending_note": "SOURCE-ONLY CONDITIONAL PREVIEW, NOT APPLIED OR ADMITTED. The proposed ready/run_budget_admitted/runtime_cohort_accepted and NEW3360 reservation may be applied only by root after a new explicit grant and current complete source/producer/API/TTL/physical-owner checks. artifacts_pinned was already true in795; consumer_gpu_ready remains false. Genuine root1c04/C4918 supports only d8 normal TS749f install/native load/paired generated RPC. Full installed-vLLM units and original173/four models/admin4/load2/profile32x1536/reruns2/original six setup skips remain unaccepted. Actual new nonce/head/run/job/owner/watch/deployment and grant are unbound. No old GPU proof, retired budget or newer SG/d5/7070/a0c5 native/source result transfers."
 }
