@@ -1538,6 +1538,36 @@ impl Serialize for PolicyConfig {
 }
 
 impl PolicyConfig {
+    /// A cache-aware policy with these thresholds and every other knob at
+    /// the value a configuration file gets when it leaves the knob out.
+    pub fn cache_aware(
+        cache_threshold: f32,
+        balance_abs_threshold: usize,
+        balance_rel_threshold: f32,
+        eviction_interval_secs: u64,
+        max_tree_size: usize,
+    ) -> Self {
+        PolicyConfig::CacheAware {
+            cache_threshold,
+            balance_abs_threshold,
+            balance_rel_threshold,
+            eviction_interval_secs,
+            max_tree_size,
+            block_size: default_block_size(),
+            balance_token_usage_threshold: default_balance_token_usage_threshold(),
+            overload_token_usage_threshold: default_balance_token_usage_threshold(),
+            overlap_decay: default_overlap_decay(),
+            selection_temperature: default_selection_temperature(),
+            cache_index: CacheIndexKind::default(),
+            cache_ttl_secs: default_cache_ttl_secs(),
+            cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             PolicyConfig::Random => "random",
@@ -2844,25 +2874,7 @@ mod tests {
         assert_eq!(PolicyConfig::RoundRobin.name(), "round_robin");
         assert_eq!(PolicyConfig::Passthrough.name(), "passthrough");
 
-        let cache_aware = PolicyConfig::CacheAware {
-            cache_threshold: 0.8,
-            balance_abs_threshold: 10,
-            balance_rel_threshold: 1.5,
-            eviction_interval_secs: 300,
-            max_tree_size: 1000,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-            balance_prefix_margin_tokens: 0,
-            balance_uncached_credit: false,
-        };
+        let cache_aware = PolicyConfig::cache_aware(0.8, 10, 1.5, 300, 1000);
         assert_eq!(cache_aware.name(), "cache_aware");
 
         let power_of_two = PolicyConfig::PowerOfTwo {
@@ -2877,25 +2889,7 @@ mod tests {
         let json = serde_json::to_string(&random).unwrap();
         assert_eq!(json, r#"{"type":"random"}"#);
 
-        let cache_aware = PolicyConfig::CacheAware {
-            cache_threshold: 0.8,
-            balance_abs_threshold: 10,
-            balance_rel_threshold: 1.5,
-            eviction_interval_secs: 300,
-            max_tree_size: 1000,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-            balance_prefix_margin_tokens: 0,
-            balance_uncached_credit: false,
-        };
+        let cache_aware = PolicyConfig::cache_aware(0.8, 10, 1.5, 300, 1000);
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
         assert!(json.contains("\"cache_threshold\":0.8"));
@@ -2911,25 +2905,7 @@ mod tests {
 
     #[test]
     fn test_cache_aware_parameters() {
-        let cache_aware = PolicyConfig::CacheAware {
-            cache_threshold: 0.75,
-            balance_abs_threshold: 20,
-            balance_rel_threshold: 2.0,
-            eviction_interval_secs: 600,
-            max_tree_size: 5000,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-            balance_prefix_margin_tokens: 0,
-            balance_uncached_credit: false,
-        };
+        let cache_aware = PolicyConfig::cache_aware(0.75, 20, 2.0, 600, 5000);
 
         match cache_aware {
             PolicyConfig::CacheAware {
@@ -2948,6 +2924,25 @@ mod tests {
             }
             _ => panic!("Expected CacheAware"),
         }
+    }
+
+    /// The constructor's policy is the one a configuration file yields when
+    /// it names the five thresholds and nothing else.
+    #[test]
+    fn cache_aware_constructor_matches_the_file_defaults() {
+        let json = r#"{
+            "type": "cache_aware",
+            "cache_threshold": 0.5,
+            "balance_abs_threshold": 32,
+            "balance_rel_threshold": 1.1,
+            "eviction_interval_secs": 60,
+            "max_tree_size": 1000
+        }"#;
+        let from_file: PolicyConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            serde_json::to_value(PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1000)).unwrap(),
+            serde_json::to_value(from_file).unwrap()
+        );
     }
 
     #[test]
@@ -3732,25 +3727,7 @@ discovery:
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
-            prefill_policy: Some(PolicyConfig::CacheAware {
-                cache_threshold: 0.5,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 60,
-                max_tree_size: 1000,
-                block_size: 16,
-                balance_token_usage_threshold: 1.0,
-                overload_token_usage_threshold: 1.0,
-                overlap_decay: 0.0,
-                selection_temperature: 0.0,
-                cache_index: Default::default(),
-                cache_ttl_secs: 180,
-                cache_boundaries: Vec::new(),
-                selection_policy: None,
-                selection_accounting_ttl_ms: 0,
-                balance_prefix_margin_tokens: 0,
-                balance_uncached_credit: false,
-            }),
+            prefill_policy: Some(PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1000)),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_metric: Default::default(),
             }),
@@ -3774,25 +3751,7 @@ discovery:
         let pd = RoutingMode::PrefillDecode {
             prefill_urls: vec![("http://prefill1".to_string(), None)],
             decode_urls: vec!["http://decode1".to_string()],
-            prefill_policy: Some(PolicyConfig::CacheAware {
-                cache_threshold: 0.5,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 60,
-                max_tree_size: 1000,
-                block_size: 16,
-                balance_token_usage_threshold: 1.0,
-                overload_token_usage_threshold: 1.0,
-                overlap_decay: 0.0,
-                selection_temperature: 0.0,
-                cache_index: Default::default(),
-                cache_ttl_secs: 180,
-                cache_boundaries: Vec::new(),
-                selection_policy: None,
-                selection_accounting_ttl_ms: 0,
-                balance_prefix_margin_tokens: 0,
-                balance_uncached_credit: false,
-            }),
+            prefill_policy: Some(PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1000)),
             decode_policy: None,
         };
 
@@ -3842,25 +3801,7 @@ discovery:
             decode_policy: None,
         };
 
-        let main_policy = PolicyConfig::CacheAware {
-            cache_threshold: 0.7,
-            balance_abs_threshold: 20,
-            balance_rel_threshold: 1.5,
-            eviction_interval_secs: 300,
-            max_tree_size: 2000,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-            balance_prefix_margin_tokens: 0,
-            balance_uncached_credit: false,
-        };
+        let main_policy = PolicyConfig::cache_aware(0.7, 20, 1.5, 300, 2000);
 
         match pd.get_prefill_policy(&main_policy) {
             PolicyConfig::CacheAware {

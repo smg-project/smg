@@ -5,10 +5,10 @@ use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use smg_mcp::McpConfig;
 
 use super::{
-    AccessLogField, CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult,
-    DiscoveryConfig, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig,
-    MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig,
-    PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
+    AccessLogField, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
+    HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig, MetricsConfig,
+    OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig, PostgresConfig,
+    RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
     TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::{ConnectionMode, RuntimeType};
@@ -110,25 +110,13 @@ impl RouterConfigBuilder {
         eviction_interval_secs: u64,
         max_tree_size: usize,
     ) -> Self {
-        self.config.policy = PolicyConfig::CacheAware {
+        self.config.policy = PolicyConfig::cache_aware(
             cache_threshold,
             balance_abs_threshold,
             balance_rel_threshold,
             eviction_interval_secs,
             max_tree_size,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: CacheIndexKind::Tree,
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-            balance_prefix_margin_tokens: 0,
-            balance_uncached_credit: false,
-        };
+        );
         self
     }
 
