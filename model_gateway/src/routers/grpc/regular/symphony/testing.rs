@@ -266,6 +266,8 @@ pub(super) const QWEN3_OUTPUT: &str = "<think>plan</think>\n\nHello <tool_call>\
 
 pub(super) fn read_with(format: Format) -> Vec<Event<'static>> {
     let assignment = Assignment {
+        #[cfg(feature = "diagnostic-capture")]
+        recipe: None,
         format: Arc::new(format),
         prompt: "<|im_start|>assistant\n".to_string(),
     };

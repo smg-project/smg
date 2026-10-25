@@ -53,6 +53,9 @@
 
 mod constraint;
 mod names;
+mod provenance;
+#[cfg(feature = "diagnostic-capture")]
+pub use provenance::FormatRecipe;
 mod reader;
 pub(crate) mod telemetry;
 pub(crate) mod template;

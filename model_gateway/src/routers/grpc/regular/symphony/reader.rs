@@ -30,10 +30,15 @@ use crate::{
 /// Symphony's assignment to a response: the table that reads it, as the request's asks make it
 /// ([`assign`]), and the part of the rendered prompt the engine replays.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "diagnostic-capture", derive(serde::Serialize))]
 pub(crate) struct Assignment {
     /// The table, shared with every reader of the response and every request it reads for.
+    #[cfg_attr(feature = "diagnostic-capture", serde(skip))]
     pub format: Arc<Format>,
     pub prompt: String,
+    /// The construction recipe; absent for manually supplied formats of unknown provenance.
+    #[cfg(feature = "diagnostic-capture")]
+    pub recipe: Option<super::FormatRecipe>,
 }
 
 impl Assignment {
@@ -47,7 +52,12 @@ impl Assignment {
 pub(super) fn assignment(format: Arc<Format>, model: &str, prompt: &str) -> Assignment {
     debug!(model, table = format.name(), "Symphony reads the response");
     let prompt = format.replay(prompt).to_string();
-    Assignment { format, prompt }
+    Assignment {
+        format,
+        prompt,
+        #[cfg(feature = "diagnostic-capture")]
+        recipe: None,
+    }
 }
 
 /// The table as the request's asks make it: without its calls when the legacy path would run no
@@ -154,8 +164,8 @@ pub(crate) fn assign(
     prompt: &str,
     templates: &Templates,
 ) -> Result<Option<Assignment>, SymphonyError> {
-    let format = match reading(parser, names, asks.model(), templates)? {
-        Reading::Table(format, _) => format,
+    let (format, _source) = match reading(parser, names, asks.model(), templates)? {
+        Reading::Table(format, source) => (format, source),
         Reading::Legacy => return Ok(None),
         Reading::Fallback(why) => {
             telemetry::record_fallback(why, None);
@@ -170,7 +180,17 @@ pub(crate) fn assign(
         return Ok(None);
     }
     let format = asked(format, asks.no_calls(), asks.no_reasoning());
-    Ok(Some(assignment(format, asks.model(), prompt)))
+    let assigned = assignment(format, asks.model(), prompt);
+    #[cfg(feature = "diagnostic-capture")]
+    let assigned = Assignment {
+        recipe: Some(super::FormatRecipe {
+            source: _source,
+            no_calls: asks.no_calls(),
+            no_reasoning: asks.no_reasoning(),
+        }),
+        ..assigned
+    };
+    Ok(Some(assigned))
 }
 
 /// The engine's finish reason as Symphony takes it.
@@ -769,6 +789,8 @@ mod tests {
         finish: EngineFinish,
     ) -> Vec<Event<'static>> {
         let assignment = Assignment {
+            #[cfg(feature = "diagnostic-capture")]
+            recipe: None,
             format: Arc::new(format),
             prompt: prompt.to_string(),
         };
@@ -1193,6 +1215,8 @@ mod tests {
     fn the_released_bytes_are_placed_where_the_output_wrote_them() {
         use symphony::formats::glm;
         let assignment = Assignment {
+            #[cfg(feature = "diagnostic-capture")]
+            recipe: None,
             format: Arc::new(glm()),
             prompt: GLM_PROMPT.to_string(),
         };
@@ -1305,6 +1329,8 @@ mod tests {
             assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
         }
         let assignment = Assignment {
+            #[cfg(feature = "diagnostic-capture")]
+            recipe: None,
             format: Arc::new(glm()),
             prompt: GLM_PROMPT.to_string(),
         };
@@ -1374,6 +1400,8 @@ mod tests {
             assert!(finish_last, "{events:?}");
         }
         let assignment = Assignment {
+            #[cfg(feature = "diagnostic-capture")]
+            recipe: None,
             format: Arc::new(glm()),
             prompt: GLM_PROMPT.to_string(),
         };
@@ -1454,6 +1482,8 @@ mod tests {
             );
         }
         let assignment = Assignment {
+            #[cfg(feature = "diagnostic-capture")]
+            recipe: None,
             format: Arc::new(glm4()),
             prompt: GLM4_PROMPT.to_string(),
         };
@@ -2084,6 +2114,8 @@ mod tests {
         // client sees the bare JSON as content, the thoughts as reasoning, and the reader reads
         // no malformed run.
         let assignment = Assignment {
+            #[cfg(feature = "diagnostic-capture")]
+            recipe: None,
             format: Arc::new(symphony::formats::inkling().without_calls()),
             prompt: "<|message_model|>".to_string(),
         };
@@ -2154,6 +2186,8 @@ mod tests {
         }]))
         .expect("tools");
         let assignment = Assignment {
+            #[cfg(feature = "diagnostic-capture")]
+            recipe: None,
             format: Arc::new(glm4()),
             prompt: GLM4_PROMPT.to_string(),
         };
@@ -2209,6 +2243,8 @@ mod tests {
     #[test]
     fn a_reader_ends_once() {
         let assignment = Assignment {
+            #[cfg(feature = "diagnostic-capture")]
+            recipe: None,
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: String::new(),
         };
@@ -2230,6 +2266,8 @@ mod tests {
     #[test]
     fn a_token_the_decoder_refuses_fails_the_output_and_counts_it_once() {
         let assignment = Assignment {
+            #[cfg(feature = "diagnostic-capture")]
+            recipe: None,
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: String::new(),
         };
@@ -2343,6 +2381,16 @@ mod tests {
         .expect("read")
         .expect("assigned");
         assert_eq!(assigned.format.name(), "response_template");
+        #[cfg(feature = "diagnostic-capture")]
+        assert_eq!(
+            assigned
+                .recipe
+                .unwrap()
+                .resolve(&kept.model)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::Unsupported
+        );
         assert_eq!(assigned.prompt, "<|im_start|>assistant\n<think>\n");
     }
 
@@ -2353,6 +2401,8 @@ mod tests {
         const TWO_CALLS: &str = "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": 1}}\n</tool_call>\
                                  <tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": 2}}\n</tool_call>";
         let assignment = Assignment {
+            #[cfg(feature = "diagnostic-capture")]
+            recipe: None,
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: "<|im_start|>assistant\n".to_string(),
         };
@@ -2382,6 +2432,8 @@ mod tests {
     #[test]
     fn the_tally_counts_the_bytes_a_later_step_merged_into_an_earlier_event() {
         let assignment = Assignment {
+            #[cfg(feature = "diagnostic-capture")]
+            recipe: None,
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: String::new(),
         };
@@ -2428,6 +2480,8 @@ mod tests {
     #[test]
     fn a_bare_answer_the_json_table_reads_as_a_call_comes_back_as_its_text() {
         let assignment = Assignment {
+            #[cfg(feature = "diagnostic-capture")]
+            recipe: None,
             format: Arc::new(symphony::formats::json().without_calls()),
             prompt: String::new(),
         };
@@ -2632,6 +2686,8 @@ mod tests {
         let mut events = Vec::new();
         let scrape = rendered(|| {
             let assignment = Assignment {
+                #[cfg(feature = "diagnostic-capture")]
+                recipe: None,
                 format: Arc::new(format),
                 prompt: prompt.to_string(),
             };
