@@ -38,6 +38,8 @@ shared model and simulator capacities, participates in standard health checks,
 and cancels realistic TokenSpeed requests by ID (up to 1024 IDs of 1–256 bytes
 per call), including requests still waiting for admission. An abort during
 an admission/fault delay returns `CANCELLED` from generation before submission.
+A cancelled request still consumes any `admit_per_sec` rate-limit slot it
+already reserved; cancellation does not move later requests forward.
 Malformed IDs return `INVALID_ARGUMENT` in either engine mode.
 Canned-mode `Abort` returns `FAILED_PRECONDITION`: canned streams have no
 engine cancellation handle, so success would not confirm cancellation.
