@@ -75,6 +75,12 @@ an `Input`. `record.as_input()` borrows its text, tokens and spans for replay. T
 empty prompt token lists, zero-width spans, continued spans and arbitrary finish reasons; it
 also preserves malformed alignment for investigation. Nothing records inputs automatically.
 
+For bounded capture, `serde_json::to_writer(writer, &input)` serializes the borrowed input
+in the same schema without first copying it into `RecordedInput`. Supply a writer that caps
+bytes and propagate serialization failures; the trait itself is not a size limit. Constructing
+an owned snapshot or serializing to an unbounded `Vec`/`Value` before that writer would bypass
+its allocation boundary. Deserialize retained JSON into `RecordedInput` for replay.
+
 Input records alone do not reproduce a gateway response. A diagnostic bundle must also retain
 the exact source revision, format configuration, declared tools, call-id nonce, input order and
 adapter-consumed event batches. The recording caller supplies bounds, sequence checks and a

@@ -5,7 +5,10 @@
     reason = "test helpers report invalid fixtures and parser failures"
 )]
 
-use std::sync::Arc;
+use std::{
+    io::{self, Write},
+    sync::Arc,
+};
 
 use serde_json::json;
 use symphony::{
@@ -15,8 +18,13 @@ use symphony::{
 
 fn round_trip(input: &Input<'_>) -> RecordedInput {
     let recorded = RecordedInput::from(input);
-    let json = serde_json::to_string(&recorded).expect("serialize input");
-    let restored: RecordedInput = serde_json::from_str(&json).expect("deserialize input");
+    let mut json = Vec::new();
+    serde_json::to_writer(&mut json, input).expect("serialize borrowed input");
+    assert_eq!(
+        json,
+        serde_json::to_vec(&recorded).expect("serialize owned input")
+    );
+    let restored: RecordedInput = serde_json::from_slice(&json).expect("deserialize input");
     assert_eq!(restored, recorded);
     assert_eq!(RecordedInput::from(&restored.as_input()), recorded);
     restored
@@ -216,4 +224,95 @@ fn serialized_inputs_reproduce_each_consumed_event_batch() {
         actual.last().and_then(|batch| batch.last()),
         Some(Event::Finish { .. })
     ));
+}
+
+/// Exercise partial writes and a storage error without an intermediate whole-record buffer.
+struct CappedWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl Write for CappedWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let n = bytes.len().min(3).min(self.limit - self.bytes.len());
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "capture budget exhausted",
+            ));
+        }
+        self.bytes.extend_from_slice(&bytes[..n]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn borrowed_input_survives_short_writes_and_unicode_escaping() {
+    let input = Input::Delta {
+        token_ids: &[7],
+        text: "é\n\0\"",
+        spans: &[TokenSpan {
+            token_id: 7,
+            start: 0,
+            end: 5,
+            continued: false,
+        }],
+    };
+    let mut writer = CappedWriter {
+        bytes: Vec::new(),
+        limit: 512,
+    };
+    serde_json::to_writer(&mut writer, &input).expect("write input in short pieces");
+    let restored: RecordedInput = serde_json::from_slice(&writer.bytes).expect("decode input");
+    assert_eq!(restored, RecordedInput::from(&input));
+}
+
+#[test]
+fn bounded_writers_refuse_large_borrowed_fields_without_a_complete_record() {
+    let text = "é\n".repeat(128 * 1024);
+    let tokens = vec![u32::MAX; 16 * 1024];
+    let spans = vec![
+        TokenSpan {
+            token_id: 1,
+            start: 0,
+            end: 0,
+            continued: true
+        };
+        8 * 1024
+    ];
+    for input in [
+        Input::Prompt {
+            token_ids: &[],
+            text: &text,
+        },
+        Input::Prompt {
+            token_ids: &tokens,
+            text: "",
+        },
+        Input::Delta {
+            token_ids: &[],
+            text: "",
+            spans: &spans,
+        },
+        Input::End {
+            finish: EngineFinish::Other("stop\0".repeat(128 * 1024)),
+        },
+    ] {
+        let mut writer = CappedWriter {
+            bytes: Vec::new(),
+            limit: 64,
+        };
+        let error =
+            serde_json::to_writer(&mut writer, &input).expect_err("bounded write must fail");
+        assert_eq!(error.io_error_kind(), Some(io::ErrorKind::StorageFull));
+        assert_eq!(writer.bytes.len(), writer.limit);
+        assert!(serde_json::from_slice::<RecordedInput>(&writer.bytes).is_err());
+    }
 }

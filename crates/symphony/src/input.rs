@@ -65,7 +65,13 @@ pub enum EngineFinish {
 }
 
 /// One step of a parser's lifecycle. Fed in order: one `Prompt`, any number of `Delta`s, one `End`.
-#[derive(Clone, Debug)]
+///
+/// Serializes to the same schema as [`RecordedInput`], borrowing its text, tokens, spans and
+/// finish reason instead of constructing an owned snapshot. A capture caller can serialize
+/// directly into a bounded writer; the serializer and destination still own their allocations
+/// and limits. Normal parsing does not serialize inputs automatically.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Input<'a> {
     /// The prompt the engine was given, before any output. Sets the initial state (is reasoning
     /// already open, which channel is active) and lets the format decide grammar coverage.
