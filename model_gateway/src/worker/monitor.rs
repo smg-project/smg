@@ -255,9 +255,11 @@ impl NativeLoadsPath {
         }
     }
 
-    /// Where to probe this route on `worker`.
+    /// Where to probe this route on `worker`: its engine's address (under
+    /// `--dp-aware` the worker's URL carries an `@rank` suffix that is the
+    /// router's, not an address).
     fn probe_url(self, worker: &Arc<dyn Worker>) -> String {
-        let base = worker.url();
+        let base = worker.base_url();
         match self {
             // Sections beyond `core` degrade gracefully: an engine that does
             // not report them omits the fields, which deserialize to `None`.
@@ -1298,6 +1300,37 @@ async fn eviction_flush_loop(load_state: Arc<LoadState>, monitor: Weak<WorkerMon
     }
 }
 
+/// A poll answer as a rank worker's report: of the engine's ranks, the
+/// worker's own. What is stored under a worker's key is read as that
+/// worker's load, and under `--dp-aware` the key is one rank of an engine
+/// whose `GetLoads` names every rank; keeping them all there priced each rank
+/// worker by the whole engine (the same figure for its siblings, so the
+/// expected wait tied across the ranks and the router's own in-flight floor
+/// never engaged), judged its overload by the engine's totals and listed the
+/// engine once per rank in `/loads`. An answer of one rank (a `/metrics`
+/// synthesis, an older servicer) or one that does not name this rank is kept
+/// whole, as before; a pushed record arrives per rank already
+/// (`WorkerMonitor::apply_pushed_load`). The engine's aggregate section
+/// describes every rank, so it does not ride a rank's report.
+fn rank_report(mut load: WorkerLoadResponse, worker: &dyn Worker) -> WorkerLoadResponse {
+    let Some(rank) = worker.dp_rank() else {
+        return load;
+    };
+    let Ok(rank) = i32::try_from(rank) else {
+        return load;
+    };
+    if load.loads.len() < 2
+        || !load.ranks_are_dp_ranks()
+        || !load.loads.iter().any(|entry| entry.dp_rank == rank)
+    {
+        return load;
+    }
+    load.loads.retain(|entry| entry.dp_rank == rank);
+    load.dp_rank_count = i32::try_from(load.loads.len()).unwrap_or(i32::MAX);
+    load.aggregate = None;
+    load
+}
+
 /// Compute the set of `WorkerGroupKey`s a worker participates in.
 ///
 /// A worker can serve multiple models (multimodel deployments), so it
@@ -1551,6 +1584,8 @@ async fn poll_group_once(
     let mut dp_evict: Vec<String> = Vec::new();
     for (worker, response) in results {
         let url = worker.url().to_string();
+        // A rank worker's report is its rank's part of the engine's answer.
+        let response = response.map(|load| rank_report(load, worker.as_ref()));
         // The overload predicate runs exactly here, once per report, never
         // on a request path, against the worker's effective thresholds
         // (resolved at registration). A failed fetch means no fresh
@@ -2417,6 +2452,98 @@ mod native_loads_tests {
             memo.get(worker.url()).and_then(|hit| hit.answered()),
             Some(NativeLoadsPath::Engine)
         );
+    }
+
+    /// Under `--dp-aware` a rank worker's poll answer names the engine's
+    /// ranks; its report keeps its own rank, so the policies price the rank
+    /// and not the engine. An unexpanded worker, and an answer that does not
+    /// name the rank, keep the whole answer.
+    #[test]
+    fn a_rank_workers_report_is_its_ranks_entry() {
+        let two_ranks = || WorkerLoadResponse {
+            dp_rank_count: 2,
+            loads: vec![
+                SchedulerLoadSnapshot {
+                    dp_rank: 0,
+                    num_running_reqs: 3,
+                    num_waiting_reqs: 1,
+                    max_total_num_tokens: 1000,
+                    ..Default::default()
+                },
+                SchedulerLoadSnapshot {
+                    dp_rank: 1,
+                    num_running_reqs: 9,
+                    num_waiting_reqs: 4,
+                    max_total_num_tokens: 1000,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let rank_one: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://w:8000")
+                .dp_config(1, 2)
+                .build(),
+        );
+        let report = rank_report(two_ranks(), rank_one.as_ref());
+        assert_eq!(
+            (
+                report.dp_rank_count,
+                report.loads.len(),
+                report.loads[0].dp_rank,
+                report.total_running_reqs(),
+                report.total_waiting_reqs()
+            ),
+            (1, 1, 1, 9, 4)
+        );
+        assert!(report.has_absolute_token_data());
+
+        let plain: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w:8000").build());
+        assert_eq!(
+            rank_report(two_ranks(), plain.as_ref()).total_running_reqs(),
+            12
+        );
+
+        let one_rank = WorkerLoadResponse {
+            dp_rank_count: 1,
+            loads: vec![SchedulerLoadSnapshot {
+                dp_rank: 0,
+                num_running_reqs: 5,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            rank_report(one_rank, rank_one.as_ref()).total_running_reqs(),
+            5
+        );
+    }
+
+    /// The load probe of a dp-aware HTTP worker goes to its engine's address:
+    /// the `@rank` suffix of the worker's URL is the router's, not a host.
+    #[tokio::test]
+    async fn a_dp_aware_http_workers_probe_reaches_its_engine() {
+        let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(stub.url.as_str())
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .runtime_type(RuntimeType::Vllm)
+                .model(ModelCard::new("a"))
+                .dp_config(1, 2)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        assert_eq!(worker.url(), format!("{}@1", stub.url));
+        let memo = DashMap::new();
+        let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+            .await
+            .expect("the engine answers at its address");
+        assert_eq!(resp.loads[0].num_running_reqs, 3);
+        assert_eq!(stub.probes.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

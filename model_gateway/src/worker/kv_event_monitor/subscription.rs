@@ -627,18 +627,30 @@ impl KvEventMonitor {
         };
         let result = tokio::select! {
             result = Self::process_stream(
-                stream, sub.worker_url, sub.worker_id, sub.indexer, state, on_batch, on_load,
+                stream,
+                sub.worker_url,
+                sub.worker_id,
+                sub.worker.dp_rank(),
+                sub.indexer,
+                state,
+                on_batch,
+                on_load,
             ) => result,
             _ = &mut *shutdown_rx => return Drained::Shutdown,
         };
         Drained::Ended { result, applied }
     }
 
-    /// Process batches from a single stream connection.
+    /// Process batches from a single stream connection. `rank` is the
+    /// worker's data-parallel rank under `--dp-aware` (one rank of an engine
+    /// whose stream names every rank's batches), `None` for a worker that
+    /// stands for its whole engine.
+    #[allow(clippy::too_many_arguments)]
     async fn process_stream(
         mut stream: tonic::Streaming<KvEventBatch>,
         worker_url: &str,
         worker_id: u32,
+        rank: Option<usize>,
         indexer: &KvIndex,
         state: &mut WorkerStreamState,
         mut on_batch: impl FnMut(&KvEventBatch),
@@ -655,6 +667,19 @@ impl KvEventMonitor {
                 on_load(&batch, load);
                 if Self::is_load_only(&batch) {
                     Metrics::record_kv_event_batch(worker_url, "load_only");
+                    continue;
+                }
+            }
+            // Another rank's blocks are not this worker's cache: a rank
+            // worker indexes the batches of its rank, so the overlap it
+            // offers is what its rank holds and a request pinned to it finds
+            // its prefix there. The batch is still the stream working (the
+            // backoff resets, the block size is learnt); it is counted, not
+            // indexed. A batch that names no rank is every rank's, as before.
+            if let (Some(mine), Some(theirs)) = (rank, batch.dp_rank) {
+                if i32::try_from(mine) != Ok(theirs) {
+                    on_batch(&batch);
+                    Metrics::record_kv_event_batch(worker_url, "other_rank");
                     continue;
                 }
             }
@@ -1118,8 +1143,10 @@ mod tests {
         }
     }
 
-    /// Load-only batches contact only their eligible rank, while admitted KV
-    /// events still contact the subscriber even when their load is foreign.
+    /// Load-only batches contact only their eligible rank, while KV events
+    /// still contact the subscriber even when their rank is foreign (another
+    /// rank's batch is the stream working; it is not indexed, see
+    /// `a_rank_worker_indexes_its_ranks_batches_only`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pushed_load_contact_respects_virtual_rank_without_filtering_events() {
         for (pinned, rank, load_only, contact) in [
@@ -1187,6 +1214,73 @@ mod tests {
                 worker.stall_reason().is_none(),
                 contact,
                 "pinned={pinned:?}, rank={rank:?}, load_only={load_only}"
+            );
+            server.abort();
+        }
+    }
+
+    /// Under `--dp-aware` an engine's stream names every rank's batches; a
+    /// rank worker indexes its rank's and the unranked ones, never another
+    /// rank's, so its overlap is its own cache. An unexpanded worker indexes
+    /// them all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rank_worker_indexes_its_ranks_batches_only() {
+        let batches = || {
+            let mut rank_zero = stored_batch(&[(42, 16)]);
+            rank_zero.dp_rank = Some(0);
+            let mut rank_one = stored_batch(&[(43, 16)]);
+            rank_one.sequence_number = 2;
+            rank_one.dp_rank = Some(1);
+            let mut unranked = stored_batch(&[(44, 16)]);
+            unranked.sequence_number = 3;
+            vec![Ok(rank_zero), Ok(rank_one), Ok(unranked)]
+        };
+        for (pinned, indexed) in [(Some(1), 2), (Some(0), 2), (None, 3)] {
+            let (addr, server) = serve(Subscribe::Stream(batches())).await;
+            let (_transport_worker, client) = connected(addr).await;
+            let mut builder = BasicWorkerBuilder::new(format!("grpc://{addr}"));
+            if let Some(pinned) = pinned {
+                builder = builder.dp_config(pinned, 2);
+            }
+            let worker: Arc<dyn Worker> = Arc::new(builder.build());
+            let indexer = KvIndex::chain();
+            let worker_id = indexer.intern_worker(worker.url()).unwrap();
+            let block_sizes = DashMap::new();
+            let sub = WorkerSubscription {
+                worker: &worker,
+                worker_url: worker.url(),
+                worker_id,
+                indexer: &indexer,
+                block_sizes: &block_sizes,
+                model_id: "m",
+                load_sink: None,
+                wake: None,
+            };
+            let (_keep, mut shutdown_rx) = oneshot::channel();
+            let Subscribed::Stream(stream) =
+                subscribe_with_deadline(&client, 0, None, &mut shutdown_rx, Duration::from_secs(5))
+                    .await
+            else {
+                panic!("the server answers with a stream");
+            };
+            let mut state = WorkerStreamState::default();
+            let drained = tokio::time::timeout(
+                Duration::from_secs(5),
+                KvEventMonitor::drain_stream(&sub, stream, &mut state, &mut shutdown_rx),
+            )
+            .await
+            .expect("the finite stream ends");
+            assert!(matches!(
+                drained,
+                Drained::Ended {
+                    result: StreamResult::Ended,
+                    applied: true
+                }
+            ));
+            assert_eq!(
+                indexer.worker_block_count(worker_id),
+                indexed,
+                "pinned={pinned:?}"
             );
             server.abort();
         }
