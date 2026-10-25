@@ -122,7 +122,7 @@ def pytest_configure(config: pytest.Config) -> None:
     )
 
     # ``hooks.py`` is not itself a conftest — only the functions conftest.py
-    # re-imports act as hooks — so the collection-summary reporter is
+    # re-imports act as hooks — so the selection and passing-call reporter is
     # registered here as a plugin object instead.
     if not config.pluginmanager.has_plugin("e2e_selection_reporter"):
         config.pluginmanager.register(_SelectionReporter(), "e2e_selection_reporter")
@@ -476,7 +476,7 @@ def _format_selection_line(stats: dict) -> str:
 
 
 class _SelectionReporter:
-    """Terminal plugin printing the selection summary after collection.
+    """Report selection and enforce ``E2E_AMD_REQUIRE_PASSING_CALL`` at exit.
 
     Lives on the plugin manager (registered in ``pytest_configure``) because
     ``hooks.py`` is not a conftest, so a module-level
