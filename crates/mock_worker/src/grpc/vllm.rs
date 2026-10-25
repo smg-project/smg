@@ -1,5 +1,7 @@
 //! SMG vLLM control plane backed by the listener's existing simulated worker.
-//! Generation remains explicitly unsupported until its semantic adapter lands.
+//! Generation accepts the bounded, tokenized synthetic profile in `generation`.
+
+mod generation;
 
 use smg_grpc_client::vllm_proto as v;
 use v::vllm_engine_server::{VllmEngine, VllmEngineServer};
@@ -30,11 +32,22 @@ impl VllmEngine for MockVllm {
 
     async fn generate(
         &self,
-        _request: Request<v::GenerateRequest>,
+        request: Request<v::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
-        Err(Status::unimplemented(
-            "mock-worker vLLM generation is not implemented",
-        ))
+        if self.0.engine.is_none() {
+            return Err(Status::failed_precondition(
+                "vLLM generation requires --realistic true",
+            ));
+        }
+        let request = generation::normalize(
+            request.into_inner(),
+            self.0.cfg.context_length.min(i32::MAX as u32),
+        )?;
+        let response = self.0.generate(Request::new(request)).await?;
+        let output = response
+            .into_inner()
+            .map(|item| item.and_then(generation::response));
+        Ok(Response::new(Box::pin(output)))
     }
 
     async fn embed(

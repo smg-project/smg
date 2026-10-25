@@ -33,8 +33,8 @@ exactly when `HealthCheck` answers healthy (`POST /admin/serving/{port}` flips
 both), any other name is unknown.
 
 With `--grpc-vllm true`, the same port also exposes the experimental
-**SMG `vllm.grpc.engine.VllmEngine` control
-plane**: health, model/server metadata, loads, abort, and KV events share the
+**SMG `vllm.grpc.engine.VllmEngine` service**: generation, health, model/server
+metadata, loads, abort, and KV events share the
 TokenSpeed worker's engine and shutdown. Its load records use the vLLM reporting
 profile regardless of `--loads-like`; `--step-reports` still controls heartbeat
 semantics. Only DP rank 0 is supported; load responses contain `core` data and
@@ -45,11 +45,20 @@ flag enabled, gateway auto-detection selects vLLM before TokenSpeed. Register an
 explicit `tokenspeed` runtime to generate through TokenSpeed until the vLLM
 generation adapter is available.
 
-vLLM `Generate` and `Embed` currently return `unimplemented`; tokenizer transfer,
-cache flush and profiling remain unsupported. Metadata describes the existing
-synthetic mock model (32,000-token vocabulary), not an arbitrary configured real
-tokenizer. This control-plane support does not qualify vLLM generation, native
-vLLM protocol compatibility, or cross-router performance comparisons.
+vLLM `Generate` requires realistic mode, a nonempty request ID and tokenized
+prompt, explicit positive `max_tokens`, `temperature=0`, `top_p=1`,
+`repetition_penalty=1`, neutral remaining sampling controls and `n=1`. Prompt
+plus output must fit the advertised context. Other sampling/stop/logprob/seed/
+constraint controls, text input, multimodal data and KV transfer are rejected.
+Streaming sends incremental IDs with cumulative counts and a terminal containing
+all output IDs; non-streaming sends only the terminal. Both preserve shared
+engine cache counts, cancellation and injected failures. Text formatting flags
+are forwarded; this token-only service does not detokenize outputs.
+
+Metadata and input validation describe the existing synthetic 32,000-token
+vocabulary, not an arbitrary configured real tokenizer. `Embed`, tokenizer
+transfer, cache flush and profiling remain unsupported. Native vLLM protocol
+compatibility and cross-router performance comparisons remain unqualified.
 
 **ZMQ** (`--zmq-handshake <ipc://…> --zmq-count N [--zmq-start-index I]`):
 mock vLLM `EngineCore` ranks on the `engine-zmq-client` wire. Unlike the HTTP

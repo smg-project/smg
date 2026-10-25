@@ -111,13 +111,13 @@ async fn vllm_control_shares_health_load_cache_and_abort_with_tokenspeed() {
             (info.data_parallel_size, info.block_size, info.max_num_seqs),
             (1, 16, 256)
         );
-        // Unsupported capabilities must fail, never return fake successful outputs.
+        // Invalid requests and unsupported capabilities must fail explicitly.
         assert_eq!(
             vllm.generate(v::GenerateRequest::default())
                 .await
                 .unwrap_err()
                 .code(),
-            Code::Unimplemented
+            Code::InvalidArgument
         );
         assert_eq!(
             vllm.embed(v::EmbedRequest::default())
