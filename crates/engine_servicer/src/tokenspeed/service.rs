@@ -5,8 +5,8 @@
 //! revision), and answer UNIMPLEMENTED naming the gap on a scheduler whose
 //! wire carries generate and abort only. In the encode role this service is
 //! the discovery surface (health, model and server facts): `Generate` and
-//! the control RPCs are refused there, as the Python discovery servicer
-//! answers them, and the encoder service (`encode.rs`) takes the requests.
+//! the control RPCs are refused there by name, before the engine is asked,
+//! and the encoder service (`encode.rs`) takes the requests.
 
 use std::sync::Arc;
 
@@ -26,10 +26,9 @@ pub(super) struct TokenSpeedService {
 
 impl TokenSpeedService {
     /// The encode role's answer to a scheduler control RPC, before the
-    /// engine is asked: UNIMPLEMENTED naming the RPC, the Python discovery
-    /// servicer's answer. The role's worker lists the encode request alone,
-    /// so a control frame would have no rank to dispatch it, whatever reply
-    /// layout the handshake declared.
+    /// engine is asked: UNIMPLEMENTED naming the RPC. The role's worker
+    /// lists the encode request alone, so a control frame would have no
+    /// rank to dispatch it, whatever reply layout the handshake declared.
     fn refuse_control_in_encode_role(&self, rpc: &str) -> Result<(), Status> {
         if self.state.encode_role.is_some() {
             return Err(Status::unimplemented(format!(
