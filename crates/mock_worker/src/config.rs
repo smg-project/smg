@@ -455,8 +455,9 @@ pub fn usage() -> String {
        --reserve-full-isl <bool>  admit a prompt only with KV room for all of it beyond its cached\n\
                                 blocks, head-of-line (vLLM's scheduler_reserve_full_isl; default true)\n\
        --context-length <n>     advertised context length (default 32768)\n\
-       --kv-events-zmq-base-port <port>  vLLM-wire ZMQ KV-event publishers: worker i publishes\n\
-                                on base+2i (PUB) and replays on base+2i+1 (ROUTER) (default off)\n\
+       --kv-events-zmq-base-port <port>  vLLM-wire ZMQ KV-event publishers (default off)\n\
+                                nonzero base: worker i uses base+2i (PUB), base+2i+1 (ROUTER)\n\
+                                0: independent ephemeral PUB/replay ports; use actual bound endpoints\n\
        --kv-events-replay <bool>  serve replay requests on the ROUTER port (default true)\n\
        --kv-events-topic <s>    topic frame (default empty, as vLLM)\n\
        --kv-events-buffer-steps <n>  batches kept for replay (default 10000)\n\
