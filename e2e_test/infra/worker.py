@@ -628,6 +628,11 @@ class Worker:
             cmd.extend(["--kv-transfer-config", json.dumps(config)])
 
         extra = spec.get("vllm_args", [])
+        all_args = [*extra, *(self.extra_engine_args or [])]
+        if not any(
+            arg.split("=", 1)[0].replace("_", "-") == "--served-model-name" for arg in all_args
+        ):
+            cmd.extend(["--served-model-name", model_path])
         if extra:
             cmd.extend(extra)
         return cmd
