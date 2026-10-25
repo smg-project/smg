@@ -223,6 +223,34 @@ def cairo_proof(value):
     return {"extension": str(extension), "extension_sha256": identity(extension)["sha256"], "loaded_library": str(loaded), "loaded_library_sha256": identity(loaded)["sha256"], "PNG_sha256": hashlib.sha256(raw).hexdigest(), "PNG_size": [2, 2], "PyGObject_origin": str(pygobject._path)}
 
 
+def checkout_git_environment(environment):
+    """Trust only this checkout in descendants; never write shared Git config."""
+    env = dict(environment)
+    workspace = Path(env["GITHUB_WORKSPACE"])
+    require(workspace.is_absolute() and workspace.resolve(strict=True) == ROOT
+            and workspace == ROOT and ROOT.is_dir() and "*" not in str(ROOT),
+            "exact canonical checkout for Git trust")
+    # Legacy command-scope config could override the exact list below.
+    require(not env.get("GIT_CONFIG_PARAMETERS"), "ambiguous inherited Git parameters")
+    raw_count = env.get("GIT_CONFIG_COUNT", "0")
+    require(isinstance(raw_count, str) and raw_count.isascii() and raw_count.isdecimal()
+            and len(raw_count) <= 2 and int(raw_count) <= 62,
+            "bounded inherited Git config count")
+    count = int(raw_count)
+    for index in range(count):
+        key, value = env.get(f"GIT_CONFIG_KEY_{index}"), env.get(f"GIT_CONFIG_VALUE_{index}")
+        require(isinstance(key, str) and key and isinstance(value, str),
+                "incomplete inherited Git config entry")
+    # Empty safe.directory resets earlier system/global/process entries, including
+    # wildcard entries. The following absolute literal is the sole trusted path.
+    env.update({"GIT_CONFIG_COUNT": str(count + 2),
+                f"GIT_CONFIG_KEY_{count}": "safe.directory",
+                f"GIT_CONFIG_VALUE_{count}": "",
+                f"GIT_CONFIG_KEY_{count + 1}": "safe.directory",
+                f"GIT_CONFIG_VALUE_{count + 1}": str(ROOT)})
+    return env
+
+
 def bootstrap():
     value, root = verify_bundle()
     original = json.loads(state().with_name(state().name + "-original-image-environment.json").read_text())
@@ -236,7 +264,7 @@ def bootstrap():
     for name, version in value["image_versions"].items():
         require(metadata.version(name) == version, "fixed image metadata differs: " + name)
     require(metadata.version("setuptools") == "79.0.1", "stock build frontend changed")
-    env = dict(os.environ, PIP_CONFIG_FILE="/dev/null", PIP_NO_INDEX="1", PIP_DISABLE_PIP_VERSION_CHECK="1", PYTHONDONTWRITEBYTECODE="1")
+    env = checkout_git_environment(dict(os.environ, PIP_CONFIG_FILE="/dev/null", PIP_NO_INDEX="1", PIP_DISABLE_PIP_VERSION_CHECK="1", PYTHONDONTWRITEBYTECODE="1"))
     pip = [sys.executable, "-m", "pip", "install", "--no-compile", "--no-index", "--no-cache-dir", "--find-links=" + str(root / "wheels")]
     commands = [("tools", [*pip, "--ignore-installed", *value["tool_requirements"]]),
                 ("cairo", [*pip, str(root / value["packages"]["pycairo"]["wheel"])]),
