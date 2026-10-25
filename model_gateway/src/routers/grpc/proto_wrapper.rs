@@ -32,6 +32,8 @@ use crate::{
     worker::{liveness, Worker},
 };
 
+#[cfg(all(feature = "diagnostic-capture", unix))]
+mod capture;
 mod embed;
 mod logprobs;
 mod multimodal;
@@ -936,6 +938,9 @@ impl ProtoGenerateComplete {
 pub enum ProtoStream {
     Sglang(SglangStream),
     Vllm(VllmStream),
+    /// Explicitly observed decoded vLLM gRPC ingress, before router-side transformations.
+    #[cfg(all(feature = "diagnostic-capture", unix))]
+    CapturedVllm(Box<capture::CapturedVllmStream>),
     Trtllm(TrtllmStream),
     Mlx(MlxStream),
     TokenSpeed(TokenSpeedStream),
@@ -1608,6 +1613,21 @@ fn reject_engine_error(
 }
 
 impl ProtoStream {
+    /// Observe a fresh native vLLM-protocol stream before any polling, mapping or wrapping.
+    ///
+    /// The caller must bind a unique source ID to the request, verified runtime and exact
+    /// configuration. This accepts only the native transport type, not a vLLM-shaped ZMQ or
+    /// already mapped stream. It does not establish endpoint/choice support or complete capture.
+    /// Capture errors remain on the completion owner and never replace inference results.
+    #[cfg(all(feature = "diagnostic-capture", unix))]
+    pub fn capture_vllm(
+        stream: VllmStream,
+        observer: crate::diagnostic_capture::CaptureObserver,
+        source: u64,
+    ) -> Self {
+        Self::CapturedVllm(Box::new(capture::CapturedVllmStream::new(stream, observer, source)))
+    }
+
     /// Count this stream's responses as progress for `worker` (a response is
     /// progress whether it is a token of a streaming generation or the one
     /// answer of a non-streaming one), its `prompt_tokens` as pending prefill
@@ -1840,6 +1860,11 @@ impl ProtoStream {
                 .next()
                 .await
                 .map(|result| result.map(|r| ProtoGenerateResponse::Vllm(Box::new(r)))),
+            #[cfg(all(feature = "diagnostic-capture", unix))]
+            Self::CapturedVllm(stream) => stream
+                .next()
+                .await
+                .map(|result| result.map(|r| ProtoGenerateResponse::Vllm(Box::new(r)))),
             Self::Trtllm(stream) => stream
                 .next()
                 .await
@@ -1885,6 +1910,8 @@ impl ProtoStream {
         match self {
             Self::Sglang(stream) => stream.mark_completed(),
             Self::Vllm(stream) => stream.mark_completed(),
+            #[cfg(all(feature = "diagnostic-capture", unix))]
+            Self::CapturedVllm(stream) => stream.mark_completed(),
             Self::Trtllm(stream) => stream.mark_completed(),
             Self::Mlx(stream) => stream.mark_completed(),
             Self::TokenSpeed(stream) => stream.mark_completed(),
@@ -1909,6 +1936,8 @@ impl ProtoStream {
         match self {
             Self::Sglang(stream) => Self::Sglang(stream.defer_abort_until_first_item()),
             Self::Vllm(stream) => Self::Vllm(stream.defer_abort_until_first_item()),
+            #[cfg(all(feature = "diagnostic-capture", unix))]
+            Self::CapturedVllm(stream) => Self::CapturedVllm(Box::new(stream.defer_abort_until_first_item())),
             Self::Trtllm(stream) => Self::Trtllm(stream.defer_abort_until_first_item()),
             Self::Mlx(stream) => Self::Mlx(stream.defer_abort_until_first_item()),
             Self::TokenSpeed(stream) => Self::TokenSpeed(stream.defer_abort_until_first_item()),

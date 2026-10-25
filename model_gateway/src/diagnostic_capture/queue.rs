@@ -108,6 +108,11 @@ impl CaptureQueue {
         Ok(())
     }
 
+    /// The immutable payload cap, for preflighting a source before temporary encoding.
+    pub(super) fn record_bytes_limit(&self) -> usize {
+        self.max_record_bytes
+    }
+
     /// Close admission without sealing; `finish` still collects the writer's original result.
     pub(super) fn invalidate(&mut self) {
         self.sender = None;

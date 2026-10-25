@@ -28,6 +28,7 @@ pub struct SharedCapture {
 struct Shared {
     session: Mutex<CaptureSession>,
     failed: AtomicBool,
+    record_bytes_limit: usize,
 }
 
 // A weak guard does not add a strong observer reference. After a successful try_unwrap its
@@ -56,6 +57,7 @@ impl SharedCapture {
     pub fn new(session: CaptureSession) -> Self {
         let directory = session.directory().to_owned();
         let inner = Arc::new(Shared {
+            record_bytes_limit: session.record_bytes_limit(),
             session: Mutex::new(session),
             failed: AtomicBool::new(false),
         });
@@ -87,7 +89,7 @@ impl SharedCapture {
         let Self {
             inner, _on_drop, ..
         } = self;
-        let Shared { session, failed } = Arc::try_unwrap(inner).map_err(|shared| {
+        let Shared { session, failed, .. } = Arc::try_unwrap(inner).map_err(|shared| {
             shared.failed.store(true, Ordering::Release);
             io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -107,6 +109,16 @@ impl SharedCapture {
 }
 
 impl CaptureObserver {
+    /// Bound temporary source encodings before the capped writer checks final JSON overhead.
+    pub(crate) fn record_bytes_limit(&self) -> usize {
+        self.0.record_bytes_limit
+    }
+
+    /// A boundary failed before recording; the owner must not seal this observation prefix.
+    pub(crate) fn invalidate(&self) {
+        self.0.failed.store(true, Ordering::Release);
+    }
+
     /// Try one observation without waiting; any rejected record makes completion impossible.
     ///
     /// Success means queued, not persisted. A concurrent record can already be in flight when

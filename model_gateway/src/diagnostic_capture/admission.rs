@@ -188,6 +188,11 @@ impl CaptureSession {
         self.queue.record(payload)
     }
 
+    /// The immutable payload cap inherited from the admitted queue.
+    pub(super) fn record_bytes_limit(&self) -> usize {
+        self.queue.record_bytes_limit()
+    }
+
     /// Invalidate observation coverage while retaining the writer acknowledgement and lease.
     pub(super) fn invalidate(&mut self) {
         self.queue.invalidate();
