@@ -374,7 +374,7 @@ impl KvEventMonitor {
                 return;
             }
         };
-        let mut state = WorkerStreamState::default();
+        let mut state = WorkerStreamState::of_rank(worker.dp_rank());
         // A contact with the worker (a poll answered, a probe passed) ends the
         // reconnect backoff early: a worker that is back gets its stream back
         // at once instead of after the remaining delay.
@@ -1118,8 +1118,10 @@ mod tests {
         }
     }
 
-    /// Load-only batches contact only their eligible rank, while admitted KV
-    /// events still contact the subscriber even when their load is foreign.
+    /// Load-only batches contact only their eligible rank, while KV events
+    /// still contact the subscriber even when their rank is foreign (another
+    /// rank's batch is the stream working; it is not indexed, see
+    /// `a_rank_worker_indexes_its_ranks_batches_only`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pushed_load_contact_respects_virtual_rank_without_filtering_events() {
         for (pinned, rank, load_only, contact) in [
@@ -1187,6 +1189,88 @@ mod tests {
                 worker.stall_reason().is_none(),
                 contact,
                 "pinned={pinned:?}, rank={rank:?}, load_only={load_only}"
+            );
+            server.abort();
+        }
+    }
+
+    /// Under `--dp-aware` an engine's stream names every rank's batches; a
+    /// rank worker indexes its rank's and the unranked ones, never another
+    /// rank's, so its overlap is its own cache, while every rank's batch
+    /// moves its cursor, so the resubscribe cursor is the unpinned worker's.
+    /// An unexpanded worker indexes them all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rank_worker_indexes_its_ranks_batches_only() {
+        // Three blocks of distinct content (the chain index is keyed by the
+        // tokens, not the engine's hash), numbered per admission cursor: a
+        // batch that names no rank runs on rank 0's cursor.
+        let ranked = |hash: i64, first_token: u32, sequence_number: u64, dp_rank: Option<i32>| {
+            let mut batch = stored_batch(&[(hash, 16)]);
+            if let Some(kv_cache_event::Data::Stored(stored)) = batch.events[0].data.as_mut() {
+                stored.blocks[0].token_ids = (first_token..first_token + 16).collect();
+            }
+            batch.sequence_number = sequence_number;
+            batch.dp_rank = dp_rank;
+            batch
+        };
+        let batches = || {
+            vec![
+                Ok(ranked(42, 1_000, 1, Some(0))),
+                Ok(ranked(43, 2_000, 1, Some(1))),
+                Ok(ranked(44, 3_000, 2, None)),
+            ]
+        };
+        for (pinned, indexed) in [(Some(1), 2), (Some(0), 2), (None, 3)] {
+            let (addr, server) = serve(Subscribe::Stream(batches())).await;
+            let (_transport_worker, client) = connected(addr).await;
+            let mut builder = BasicWorkerBuilder::new(format!("grpc://{addr}"));
+            if let Some(pinned) = pinned {
+                builder = builder.dp_config(pinned, 2);
+            }
+            let worker: Arc<dyn Worker> = Arc::new(builder.build());
+            let indexer = KvIndex::chain();
+            let worker_id = indexer.intern_worker(worker.url()).unwrap();
+            let block_sizes = DashMap::new();
+            let sub = WorkerSubscription {
+                worker: &worker,
+                worker_url: worker.url(),
+                worker_id,
+                indexer: &indexer,
+                block_sizes: &block_sizes,
+                model_id: "m",
+                load_sink: None,
+                wake: None,
+            };
+            let (_keep, mut shutdown_rx) = oneshot::channel();
+            let Subscribed::Stream(stream) =
+                subscribe_with_deadline(&client, 0, None, &mut shutdown_rx, Duration::from_secs(5))
+                    .await
+            else {
+                panic!("the server answers with a stream");
+            };
+            let mut state = WorkerStreamState::of_rank(worker.dp_rank());
+            let drained = tokio::time::timeout(
+                Duration::from_secs(5),
+                KvEventMonitor::drain_stream(&sub, stream, &mut state, &mut shutdown_rx),
+            )
+            .await
+            .expect("the finite stream ends");
+            assert!(matches!(
+                drained,
+                Drained::Ended {
+                    result: StreamResult::Ended,
+                    applied: true
+                }
+            ));
+            assert_eq!(
+                indexer.worker_block_count(worker_id),
+                indexed,
+                "pinned={pinned:?}"
+            );
+            assert_eq!(
+                state.resume_sequence(),
+                2,
+                "rank 0's cursor moved by rank 0's and the unranked batch, pinned={pinned:?}"
             );
             server.abort();
         }
