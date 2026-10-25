@@ -184,23 +184,39 @@ pub(crate) async fn gated_stream(
     rest: Vec<proto::GenerateResponse>,
     grpc_status: &'static str,
 ) -> (ProtoStream, JoinHandle<()>) {
-    let head: Vec<Result<Frame<Bytes>, tonic::Status>> = first
-        .iter()
-        .map(|response| Ok(data_frame(response)))
-        .collect();
-    let tail: Vec<Result<Frame<Bytes>, tonic::Status>> = rest
-        .iter()
-        .map(|response| Ok(data_frame(response)))
-        .chain(std::iter::once(Ok(trailers_frame(grpc_status))))
+    staged_stream(vec![(None, first), (Some(gate), rest)], grpc_status).await
+}
+
+/// The gRPC frames of one stage of a [`staged_stream`].
+type StageFrames = Vec<Result<Frame<Bytes>, tonic::Status>>;
+
+/// A stream whose frames come in stages, each stage's frames once its gate
+/// has opened (`None`: at once), the end with `grpc_status` after the last.
+pub(crate) async fn staged_stream(
+    stages: Vec<(Option<oneshot::Receiver<()>>, Vec<proto::GenerateResponse>)>,
+    grpc_status: &'static str,
+) -> (ProtoStream, JoinHandle<()>) {
+    let stages: Vec<(Option<oneshot::Receiver<()>>, StageFrames)> = stages
+        .into_iter()
+        .map(|(gate, responses)| {
+            let frames = responses
+                .iter()
+                .map(|response| Ok(data_frame(response)))
+                .collect();
+            (gate, frames)
+        })
         .collect();
     let (client, server) = mock_client().await;
-    let gated = stream::once(async move {
-        let _ = gate.await;
-        stream::iter(tail)
-    })
-    .flatten();
-    let stream = response_stream(stream::iter(head).chain(gated), client);
-    (stream, server)
+    let body = stream::iter(stages)
+        .then(|(gate, frames)| async move {
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
+            stream::iter(frames)
+        })
+        .flatten()
+        .chain(stream::iter([Ok(trailers_frame(grpc_status))]));
+    (response_stream(body, client), server)
 }
 
 /// One length-prefixed gRPC data frame carrying `response`.

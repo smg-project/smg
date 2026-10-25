@@ -4,7 +4,7 @@
 //! supported backend, allowing the router to work with any backend
 //! transparently.
 
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Instant};
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, task::Poll, time::Instant};
 
 use futures::future::select_all;
 use futures_util::StreamExt;
@@ -989,6 +989,11 @@ pub struct WatchedStream {
     /// `None` once the client left: the inner stream was dropped there.
     inner: Option<ProtoStream>,
     client: SseSender,
+    /// The wait for the client's leaving, one for the stream's whole life:
+    /// built with the watch and polled only while the reader is parked on
+    /// the engine (see [`ProtoStream::next`]), so it registers with the
+    /// channel once, at the first park, instead of once per response.
+    client_gone: Pin<Box<dyn Future<Output = ()> + Send + Sync>>,
     request_id: String,
 }
 
@@ -1811,9 +1816,26 @@ impl ProtoStream {
     /// line.
     #[must_use]
     pub fn until_client_gone(self, client: &SseSender, request_id: &str) -> Self {
+        let sender = client.clone();
+        self.watched(
+            client,
+            request_id,
+            Box::pin(async move { sender.closed().await }),
+        )
+    }
+
+    /// [`Self::until_client_gone`] with `client_gone` as the wait for the
+    /// client's leaving: the sender's own `closed()`, or a test's view of it.
+    fn watched(
+        self,
+        client: &SseSender,
+        request_id: &str,
+        client_gone: Pin<Box<dyn Future<Output = ()> + Send + Sync>>,
+    ) -> Self {
         Self::Watched(Box::new(WatchedStream {
             inner: Some(self),
             client: client.clone(),
+            client_gone,
             request_id: request_id.to_string(),
         }))
     }
@@ -1852,17 +1874,35 @@ impl ProtoStream {
         let Self::Watched(watched) = self else {
             return self.next_unwatched().await;
         };
-        let WatchedStream { inner, client, .. } = &mut **watched;
+        let WatchedStream {
+            inner,
+            client,
+            client_gone,
+            ..
+        } = &mut **watched;
         // Nothing after the client left: the inner stream went with it.
         let stream = inner.as_mut()?;
-        // The client's leaving is looked at first, so a stream the engine
-        // keeps busy cannot outrun it; the inner stream is polled in place,
-        // without a boxed future per message. `None` here is the client's
-        // leaving, `Some(item)` the stream's own item or end.
-        let item = tokio::select! {
-            biased;
-            () = client.closed() => None,
-            item = stream.next_unwatched() => Some(item),
+        // The client's leaving is looked at first (the channel's flag), so a
+        // stream the engine keeps busy cannot outrun it; the inner stream is
+        // polled in place, without a boxed future per message; and the one
+        // wait for the client's leaving is polled only while the inner
+        // stream has nothing: a ready response costs no registration with
+        // the channel, and a parked reader finds the wait registered since
+        // its first park, so the moment the body is dropped it is woken.
+        // `None` here is the client's leaving, `Some(item)` the stream's own
+        // item or end.
+        let item = {
+            let mut next = std::pin::pin!(stream.next_unwatched());
+            std::future::poll_fn(|cx| {
+                if client.is_closed() {
+                    return Poll::Ready(None);
+                }
+                if let Poll::Ready(item) = next.as_mut().poll(cx) {
+                    return Poll::Ready(Some(item));
+                }
+                client_gone.as_mut().poll(cx).map(|()| None)
+            })
+            .await
         };
         match item {
             Some(item) => item,
@@ -2066,11 +2106,13 @@ impl ProtoStream {
                 let WatchedStream {
                     inner,
                     client,
+                    client_gone,
                     request_id,
                 } = *watched;
                 Self::Watched(Box::new(WatchedStream {
                     inner: inner.map(|inner| inner.with_deadline(deadline)),
                     client,
+                    client_gone,
                     request_id,
                 }))
             }
@@ -2133,11 +2175,13 @@ impl ProtoStream {
                 let WatchedStream {
                     inner,
                     client,
+                    client_gone,
                     request_id,
                 } = *watched;
                 Self::Watched(Box::new(WatchedStream {
                     inner: inner.map(ProtoStream::defer_abort_until_first_item),
                     client,
+                    client_gone,
                     request_id,
                 }))
             }
@@ -3056,7 +3100,14 @@ mod tests {
 
 #[cfg(test)]
 mod watched_tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        future::Future,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     use smg_grpc_client::vllm_proto as vllm;
     use tokio::sync::oneshot;
@@ -3065,7 +3116,7 @@ mod watched_tests {
     use crate::{
         routers::{
             common::sse::{sse_channel, SseReceiver},
-            grpc::regular::streaming::eof_tests::{chunk, complete, gated_stream},
+            grpc::regular::streaming::eof_tests::{chunk, complete, gated_stream, staged_stream},
         },
         worker::{BasicWorkerBuilder, Worker},
     };
@@ -3163,6 +3214,77 @@ mod watched_tests {
         assert!(
             stream.client_left(),
             "the end was the client's leaving, seen through the wrapper"
+        );
+    }
+
+    /// The wait for the client's leaving is one for the stream's whole life,
+    /// polled only while the reader is parked on the engine: a response that
+    /// is ready costs no poll of it, before a park as after one, and a client
+    /// that leaves during a later park still ends the wait at once.
+    #[tokio::test]
+    async fn the_wait_for_the_client_is_polled_while_parked_only_and_kept_across_parks() {
+        let (first_gate, first_gate_rx) = oneshot::channel();
+        let (_second_gate, second_gate_rx) = oneshot::channel();
+        let (stream, _server) = staged_stream(
+            vec![
+                (None, vec![chunk(0, "a"), chunk(0, "b"), chunk(0, "c")]),
+                (Some(first_gate_rx), vec![chunk(0, "d"), chunk(0, "e")]),
+                (Some(second_gate_rx), vec![complete(0, "stop")]),
+            ],
+            "0",
+        )
+        .await;
+        let (client, rx) = sse_channel();
+        // The sender's `closed()`, as `until_client_gone` keeps it, with its
+        // polls counted.
+        let polls = Arc::new(AtomicUsize::new(0));
+        let client_gone = {
+            let polls = Arc::clone(&polls);
+            let sender = client.clone();
+            let mut closed = Box::pin(async move { sender.closed().await });
+            Box::pin(std::future::poll_fn(move |cx| {
+                polls.fetch_add(1, Ordering::SeqCst);
+                closed.as_mut().poll(cx)
+            }))
+        };
+        let mut stream = stream.watched(&client, "req-watched", client_gone);
+        for _ in 0..3 {
+            assert!(matches!(stream.next().await, Some(Ok(_))));
+        }
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            0,
+            "a ready response costs no poll of the wait"
+        );
+        let (item, ()) = tokio::join!(stream.next(), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = first_gate.send(());
+        });
+        assert!(matches!(item, Some(Ok(_))), "the gap is waited out");
+        let parked = polls.load(Ordering::SeqCst);
+        assert!(parked >= 1, "the parked reader polled the wait");
+        assert!(
+            matches!(stream.next().await, Some(Ok(_))),
+            "the response behind the gate is ready"
+        );
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            parked,
+            "a ready response costs no poll of the wait after a park either"
+        );
+        let (item, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(stream.next(), async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                drop(rx);
+            })
+        })
+        .await
+        .expect("the second gate never opens; the client's leaving ends the wait");
+        assert!(item.is_none(), "the client's leaving is the end");
+        assert!(stream.client_left(), "the end was the client's leaving");
+        assert!(
+            stream.next().await.is_none(),
+            "nothing after the client left"
         );
     }
 
