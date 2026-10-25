@@ -11,7 +11,7 @@
 
 use std::{
     fs::{self, DirBuilder, File, OpenOptions},
-    io::{self, Write},
+    io::{self, BufWriter, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
 };
@@ -21,12 +21,13 @@ use serde::Serialize;
 // The temporary and published marker names can both appear in an artifact inventory.
 const MARKER_BYTES: u64 = 256;
 const RESERVED_BYTES: u64 = 2 * MARKER_BYTES;
+const BUFFER_BYTES: usize = 8192;
 
 /// An explicitly created diagnostic stream with a permanent failure state and a byte budget.
 pub struct CaptureFile {
     root: PathBuf,
     directory: PathBuf,
-    file: File,
+    file: BufWriter<File>,
     stream_limit: u64,
     bytes: u64,
     records: u64,
@@ -68,7 +69,7 @@ impl CaptureFile {
         Ok(Self {
             root,
             directory,
-            file,
+            file: BufWriter::with_capacity(BUFFER_BYTES, file),
             stream_limit,
             bytes: 0,
             records: 0,
@@ -110,7 +111,7 @@ impl CaptureFile {
                     payload,
                 },
             )
-            .map_err(io::Error::other)?;
+            .map_err(io::Error::from)?;
             writer.write_all(b"\n")?;
             self.records = next;
             Ok(())
@@ -129,7 +130,7 @@ impl CaptureFile {
             return Err(io::Error::other("capture is incomplete"));
         }
         self.file.flush()?;
-        self.file.sync_all()?;
+        self.file.get_ref().sync_all()?;
         let completion = Completion {
             version: 1,
             records: self.records,
@@ -172,7 +173,10 @@ struct Limited<'a, W> {
 impl<W: Write> Write for Limited<'_, W> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         if buffer.len() as u64 > self.limit.saturating_sub(*self.bytes) {
-            return Err(io::Error::other("capture byte budget exhausted"));
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "capture byte budget exhausted",
+            ));
         }
         let written = self.inner.write(buffer)?;
         self.digest.update(&buffer[..written]);
@@ -249,7 +253,10 @@ mod tests {
         let mut short =
             CaptureFile::create(root.path(), RESERVED_BYTES + line.len() as u64 - 1).unwrap();
         let directory = short.directory().to_owned();
-        assert!(short.record("x").is_err());
+        assert_eq!(
+            short.record("x").unwrap_err().kind(),
+            io::ErrorKind::FileTooLarge
+        );
         assert!(short.record(&0).is_err());
         assert!(short.finish().is_err());
         assert!(!directory.join("complete.json").exists());
@@ -274,7 +281,10 @@ mod tests {
         assert!(!directory.join("complete.json").exists());
         let mut rejected = CaptureFile::create(root.path(), 4096).unwrap();
         let directory = rejected.directory().to_owned();
-        assert!(rejected.record(&Reject).is_err());
+        assert_eq!(
+            rejected.record(&Reject).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
         assert!(rejected.record(&1).is_err());
         assert!(rejected.finish().is_err());
         assert!(!directory.join("complete.json").exists());
@@ -329,11 +339,18 @@ mod tests {
     fn write_and_sync_failures_never_publish_completion() {
         let root = tempfile::tempdir().unwrap();
         for device in ["/dev/full", "/dev/null"] {
-            let mut capture = CaptureFile::create(root.path(), 4096).unwrap();
+            let mut capture = CaptureFile::create(root.path(), 32768).unwrap();
             let directory = capture.directory().to_owned();
-            capture.file = OpenOptions::new().write(true).open(device).unwrap();
-            let result = capture.record(&1);
+            capture.file = BufWriter::with_capacity(
+                BUFFER_BYTES,
+                OpenOptions::new().write(true).open(device).unwrap(),
+            );
+            let result = capture.record(&"x".repeat(BUFFER_BYTES * 2));
             assert_eq!(result.is_err(), device == "/dev/full");
+            if device == "/dev/full" {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::StorageFull);
+                assert!(capture.record(&1).is_err());
+            }
             assert!(capture.finish().is_err());
             assert!(!directory.join("complete.json").exists());
         }
