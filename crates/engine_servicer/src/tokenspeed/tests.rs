@@ -2872,9 +2872,9 @@ async fn an_encode_worker_takes_encode_requests_under_the_wires_encode_type() {
 
 /// An encode worker whose handshake also declares the control reply (an
 /// engine that builds every role's READY from one helper): `FlushCache` and
-/// the profile RPCs are refused in the discovery servicer's words, nothing
-/// sent, since the worker lists the encode request alone and no rank would
-/// dispatch a control frame.
+/// the profile RPCs are refused by name, nothing sent, since the worker
+/// lists the encode request alone and no rank would dispatch a control
+/// frame.
 #[tokio::test]
 async fn an_encode_worker_refuses_the_control_rpcs_before_the_wire() {
     let mut h = harness_with_ready(
