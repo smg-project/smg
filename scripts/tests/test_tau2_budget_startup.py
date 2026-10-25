@@ -34,7 +34,18 @@ def install(litellm, *, original):
     Path("refusal_installed").touch()
     raise RuntimeError("installer failure")
 """
-    (tmp_path / "budget_hook.py").write_text(hook)
+    elif hook_failure is None:
+        hook = """
+from pathlib import Path
+def install(litellm, *, original):
+    Path("hook_origin").write_text(__file__)
+    def guarded(**payload):
+        raise RuntimeError("sibling budget guard refused the request")
+    litellm.completion = guarded
+"""
+    (shim.parent / "budget_hook.py").write_text(hook)
+    # A wrong parents[] index must not pass by finding a hook on PYTHONPATH.
+    (tmp_path / "budget_hook.py").write_text('raise AssertionError("decoy hook")\n')
     env = os.environ.copy()
     env.pop("SMG_TAU2_BUDGET_GUARD", None)
     if mode is not None:
@@ -79,3 +90,10 @@ def test_invalid_opt_in_stops_before_dependency_import(tmp_path):
     result = startup(tmp_path, "invalid")
     assert result.returncode != 0 and "main ran" not in result.stdout
     assert not (tmp_path / "attempts").exists() and not (tmp_path / "sent").exists()
+
+
+def test_startup_loads_the_sibling_hook_instead_of_pythonpath_decoy(tmp_path):
+    result = startup(tmp_path, "1", None, None)
+    assert result.returncode != 0 and "sibling budget guard refused" in result.stderr
+    assert Path((tmp_path / "hook_origin").read_text()) == tmp_path / "tau2/budget_hook.py"
+    assert not (tmp_path / "sent").exists()

@@ -28,6 +28,8 @@ if guard_enabled and guard_mode != "1":
 try:
     import litellm
 except Exception as exc:
+    # Non-tau2 interpreters share this PYTHONPATH; enable the guard only in
+    # the tau2 child's environment, not the whole benchmark workflow step.
     if guard_enabled:
         raise SystemExit("Cannot initialize the tau2 budget guard without LiteLLM") from exc
     if not isinstance(exc, ImportError):
