@@ -51,7 +51,12 @@ async fn render(
     .unwrap()
     .first_call_only(first_call_only);
     let (tx, rx) = sse_channel();
-    let mut rx = if disconnected { None } else { Some(rx) };
+    let mut rx = if disconnected {
+        drop(rx);
+        None
+    } else {
+        Some(rx)
+    };
     let frame = ChatChunkFrame::new("test-id", "test-model", 1, None);
     let mut buffer = BytesMut::new();
     let mut batches = Vec::new();
