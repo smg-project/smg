@@ -12,15 +12,9 @@
 
 use llm_tokenizer::{traits::Encoder, HuggingFaceTokenizer};
 use serde_json::{json, Map, Value};
-use tokenizers::{
-    decoders::byte_level::ByteLevel as ByteLevelDecoder,
-    models::bpe::{Merges, Vocab, BPE},
-    pre_tokenizers::byte_level::ByteLevel as ByteLevelPreTokenizer,
-    processors::byte_level::ByteLevel as ByteLevelProcessor,
-    AddedToken, Tokenizer,
-};
+use tokenizers::Tokenizer;
 
-use crate::common::byte_level_alphabet;
+use crate::common::FEW_MERGES;
 
 const BOS: &str = "<|startoftext|>";
 const EOS: &str = "<|endoftext|>";
@@ -41,38 +35,7 @@ const TEXTS: &[&str] = &[
 /// token: the shape of the checkpoints whose configuration alone asks for
 /// the BOS.
 fn byte_level_bpe() -> Tokenizer {
-    let mut vocab = Vocab::default();
-    for (id, letter) in byte_level_alphabet().into_iter().enumerate() {
-        vocab.insert(letter.to_string(), id as u32);
-    }
-    let mut merges = Merges::new();
-    for (a, b) in [
-        ("t", "h"),
-        ("th", "e"),
-        ("Ġ", "t"),
-        ("Ġt", "h"),
-        ("Ġth", "e"),
-        ("l", "l"),
-        ("ll", "o"),
-    ] {
-        let next = vocab.len() as u32;
-        vocab.insert(format!("{a}{b}"), next);
-        merges.push((a.to_string(), b.to_string()));
-    }
-    let model = BPE::builder()
-        .vocab_and_merges(vocab, merges)
-        .build()
-        .expect("a byte-level BPE");
-    let mut tokenizer = Tokenizer::new(model);
-    tokenizer.with_pre_tokenizer(Some(
-        ByteLevelPreTokenizer::default().add_prefix_space(false),
-    ));
-    tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
-    tokenizer.with_post_processor(Some(ByteLevelProcessor::default()));
-    tokenizer
-        .add_special_tokens([AddedToken::from(BOS, true), AddedToken::from(EOS, true)])
-        .expect("the special tokens");
-    tokenizer
+    crate::common::byte_level_bpe(&FEW_MERGES, &[BOS, EOS])
 }
 
 /// A checkpoint directory: the tokenizer above as `tokenizer.json` and, when

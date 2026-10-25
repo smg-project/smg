@@ -4,57 +4,18 @@
 //! serves that request too, with the ids `tokenizers` gives for it, instead
 //! of sending every such encode through `tokenizers`.
 
-#![expect(clippy::expect_used, reason = "a test that stops on a broken setup")]
-
 use llm_tokenizer::{
     traits::{Encoder, Encoding},
     HuggingFaceTokenizer,
 };
-use tokenizers::{
-    decoders::byte_level::ByteLevel as ByteLevelDecoder,
-    models::bpe::{Merges, Vocab, BPE},
-    pre_tokenizers::byte_level::ByteLevel as ByteLevelPreTokenizer,
-    processors::{byte_level::ByteLevel as ByteLevelProcessor, template::TemplateProcessing},
-    AddedToken, Tokenizer,
-};
+use tokenizers::{processors::template::TemplateProcessing, Tokenizer};
 
-use crate::common::byte_level_alphabet;
+use crate::common::FEW_MERGES;
 
 /// A byte-level BPE of the common shape with a few merges and one special
 /// token, with the byte-level post-processor, which adds no tokens.
 fn byte_level_bpe() -> Tokenizer {
-    let mut vocab = Vocab::default();
-    for (id, letter) in byte_level_alphabet().into_iter().enumerate() {
-        vocab.insert(letter.to_string(), id as u32);
-    }
-    let mut merges = Merges::new();
-    for (a, b) in [
-        ("t", "h"),
-        ("th", "e"),
-        ("Ġ", "t"),
-        ("Ġt", "h"),
-        ("Ġth", "e"),
-        ("l", "l"),
-        ("ll", "o"),
-    ] {
-        let next = vocab.len() as u32;
-        vocab.insert(format!("{a}{b}"), next);
-        merges.push((a.to_string(), b.to_string()));
-    }
-    let model = BPE::builder()
-        .vocab_and_merges(vocab, merges)
-        .build()
-        .expect("a byte-level BPE");
-    let mut tokenizer = Tokenizer::new(model);
-    tokenizer.with_pre_tokenizer(Some(
-        ByteLevelPreTokenizer::default().add_prefix_space(false),
-    ));
-    tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
-    tokenizer.with_post_processor(Some(ByteLevelProcessor::default()));
-    tokenizer
-        .add_special_tokens([AddedToken::from("<|endoftext|>", true)])
-        .expect("a special token");
-    tokenizer
+    crate::common::byte_level_bpe(&FEW_MERGES, &["<|endoftext|>"])
 }
 
 const TEXTS: &[&str] = &[

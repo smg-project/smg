@@ -7,10 +7,6 @@
 //! wrapper's own piece cache, owned by the encoder and freed with it, answers
 //! in front of the model, and the model's cache stays empty.
 
-#![expect(
-    unsafe_code,
-    reason = "a counting global allocator is the only way to see what a thread kept"
-)]
 #![expect(clippy::expect_used, reason = "a test that stops on a broken setup")]
 #![expect(
     clippy::print_stdout,
@@ -20,52 +16,13 @@
 mod common;
 
 use std::{
-    alloc::{GlobalAlloc, Layout, System},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        mpsc, Arc, Mutex, PoisonError,
-    },
+    sync::{atomic::Ordering, mpsc, Arc, Mutex, PoisonError},
     thread,
 };
 
-use common::byte_level_alphabet;
+use common::counting_alloc::{Counting, LIVE};
 use llm_tokenizer::{traits::Encoder, HuggingFaceTokenizer};
-use tokenizers::{
-    decoders::byte_level::ByteLevel as ByteLevelDecoder,
-    models::bpe::{Vocab, BPE},
-    pre_tokenizers::byte_level::ByteLevel as ByteLevelPreTokenizer,
-    processors::byte_level::ByteLevel as ByteLevelProcessor,
-    AddedToken, Tokenizer,
-};
-
-/// Bytes currently allocated through the global allocator.
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-
-struct Counting;
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        LIVE.fetch_add(layout.size(), Ordering::Relaxed);
-        // SAFETY: the same layout contract as the caller's, forwarded to the system allocator.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-        // SAFETY: `ptr` came from `alloc` with this layout.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if new_size >= layout.size() {
-            LIVE.fetch_add(new_size - layout.size(), Ordering::Relaxed);
-        } else {
-            LIVE.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
-        }
-        // SAFETY: `ptr` came from `alloc` with this layout; the caller upholds `new_size`.
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
+use tokenizers::Tokenizer;
 
 #[global_allocator]
 static GLOBAL: Counting = Counting;
@@ -90,24 +47,7 @@ const LEFT_BEHIND_MAX: usize = THREADS * 8 * 1024;
 /// piece and one symbol per byte, and each distinct word a thread encodes
 /// is one entry of the model's per-thread word cache.
 fn byte_level_bpe() -> Tokenizer {
-    let mut vocab = Vocab::default();
-    for (id, letter) in byte_level_alphabet().into_iter().enumerate() {
-        vocab.insert(letter.to_string(), id as u32);
-    }
-    let model = BPE::builder()
-        .vocab_and_merges(vocab, Vec::new())
-        .build()
-        .expect("a byte-level BPE with no merges");
-    let mut tokenizer = Tokenizer::new(model);
-    tokenizer.with_pre_tokenizer(Some(
-        ByteLevelPreTokenizer::default().add_prefix_space(false),
-    ));
-    tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
-    tokenizer.with_post_processor(Some(ByteLevelProcessor::default()));
-    tokenizer
-        .add_special_tokens([AddedToken::from("<|endoftext|>", true)])
-        .expect("a special token");
-    tokenizer
+    common::byte_level_bpe(&[], &["<|endoftext|>"])
 }
 
 /// The `i`-th of the words, all distinct: twelve letters, or eight times

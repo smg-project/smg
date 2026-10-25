@@ -1,6 +1,7 @@
 //! Common test utilities for tokenizer tests
 #![allow(dead_code)] // each integration test binary uses a subset of these helpers
 
+pub mod counting_alloc;
 pub mod hub_fetch;
 
 use std::{
@@ -9,6 +10,13 @@ use std::{
 };
 
 use rustls::crypto::ring;
+use tokenizers::{
+    decoders::byte_level::ByteLevel as ByteLevelDecoder,
+    models::bpe::{Merges, Vocab, BPE},
+    pre_tokenizers::byte_level::ByteLevel as ByteLevelPreTokenizer,
+    processors::byte_level::ByteLevel as ByteLevelProcessor,
+    AddedToken, Tokenizer,
+};
 
 // Tokenizer download configuration
 const TINYLLAMA_TOKENIZER_URL: &str =
@@ -377,4 +385,56 @@ pub fn byte_level_alphabet() -> Vec<char> {
             char::from_u32(code).expect("a character of the byte-level alphabet")
         })
         .collect()
+}
+
+/// Seven merges of a small byte-level BPE: `the` and ` the` (the space as
+/// the byte-level `Ġ`), and `llo`.
+pub const FEW_MERGES: [(&str, &str); 7] = [
+    ("t", "h"),
+    ("th", "e"),
+    ("Ġ", "t"),
+    ("Ġt", "h"),
+    ("Ġth", "e"),
+    ("l", "l"),
+    ("ll", "o"),
+];
+
+/// A byte-level BPE of the common shape: the byte-level alphabet as the
+/// vocabulary, `merges` applied in order (each merged pair added to the
+/// vocabulary), the byte-level pre-tokenizer without a prefix space, the
+/// byte-level decoder and post-processor (which adds no token), and
+/// `special_tokens` in the added vocabulary.
+#[expect(
+    clippy::expect_used,
+    reason = "a helper of tests that stop on a broken setup"
+)]
+pub fn byte_level_bpe(merges: &[(&str, &str)], special_tokens: &[&str]) -> Tokenizer {
+    let mut vocab = Vocab::default();
+    for (id, letter) in byte_level_alphabet().into_iter().enumerate() {
+        vocab.insert(letter.to_string(), id as u32);
+    }
+    let mut merged = Merges::new();
+    for (a, b) in merges {
+        let next = vocab.len() as u32;
+        vocab.insert(format!("{a}{b}"), next);
+        merged.push((a.to_string(), b.to_string()));
+    }
+    let model = BPE::builder()
+        .vocab_and_merges(vocab, merged)
+        .build()
+        .expect("a byte-level BPE");
+    let mut tokenizer = Tokenizer::new(model);
+    tokenizer.with_pre_tokenizer(Some(
+        ByteLevelPreTokenizer::default().add_prefix_space(false),
+    ));
+    tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+    tokenizer.with_post_processor(Some(ByteLevelProcessor::default()));
+    tokenizer
+        .add_special_tokens(
+            special_tokens
+                .iter()
+                .map(|token| AddedToken::from(*token, true)),
+        )
+        .expect("the special tokens");
+    tokenizer
 }
