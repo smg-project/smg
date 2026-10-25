@@ -1,8 +1,8 @@
 {
-  "ready": true,
-  "run_budget_admitted": true,
+  "ready": false,
+  "run_budget_admitted": false,
   "artifacts_pinned": true,
-  "consumer_gpu_ready": true,
+  "consumer_gpu_ready": false,
   "admitted_lane": "python",
   "runtime_cohort_accepted": true,
   "artifacts": [
@@ -197,7 +197,7 @@
     "profile_original_per_request_directory": true
   },
   "budget": {
-    "admitted": true,
+    "admitted": false,
     "reserved_runner_seconds": 3360,
     "global_owned_max": 2,
     "one_lane_per_run": true,
