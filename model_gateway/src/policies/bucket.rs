@@ -747,24 +747,7 @@ mod tests {
     async fn test_adjust_boundary_1() {
         let (policy, workers) = adjusting_policy_over_three_prefill_workers();
 
-        // ===Phase S1: Initial requests to trigger boundary adjustment ===
-        // Send requests with lengths: [5, 10, 15, 20, 24, 26] (total = 100)
-        select(&policy, &workers, 5).unwrap();
-        select(&policy, &workers, 10).unwrap();
-        select(&policy, &workers, 15).unwrap();
-        select(&policy, &workers, 20).unwrap();
-        select(&policy, &workers, 24).unwrap();
-        select(&policy, &workers, 26).unwrap();
-
-        tokio::time::sleep(Duration::from_secs(4)).await;
-        // Verify boundaries adjusted to: [0, 20], [21, 24], [25, MAX]: a share
-        // of 33; the second worker stops at 24 because the one class left, 26,
-        // is the third worker's (an open end no seen size reaches is never
-        // written while a class remains).
-        {
-            let boundaries = boundaries(&policy, &workers);
-            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 24));
-        }
+        first_phase(&policy, &workers).await;
 
         // ===Phase S2: Second set of  requests to trigger boundary adjustment ===
         // Send requests with lengths: [10, 20, 30, 40, 45, 57] (total = 202)
@@ -815,19 +798,7 @@ mod tests {
     async fn test_not_adjust_boundary() {
         let (policy, workers) = adjusting_policy_over_three_prefill_workers();
 
-        select(&policy, &workers, 5).unwrap();
-        select(&policy, &workers, 10).unwrap();
-        select(&policy, &workers, 15).unwrap();
-        select(&policy, &workers, 20).unwrap();
-        select(&policy, &workers, 24).unwrap();
-        select(&policy, &workers, 26).unwrap();
-
-        tokio::time::sleep(Duration::from_secs(4)).await;
-        // [0, 20] [21, 24] [25, MAX], as in test_adjust_boundary_1's first phase.
-        {
-            let boundaries = boundaries(&policy, &workers);
-            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 24));
-        }
+        first_phase(&policy, &workers).await;
 
         select(&policy, &workers, 10).unwrap();
         select(&policy, &workers, 20).unwrap();
@@ -856,6 +827,25 @@ mod tests {
                 ) as Arc<dyn Worker>
             })
             .collect()
+    }
+
+    /// The first phase both boundary tests start from: six requests of sizes
+    /// 5, 10, 15, 20, 24 and 26 (a total of 100), the adjustment interval
+    /// waited out, and the boundaries at [0, 20], [21, 24], [25, MAX]: a share
+    /// of 33; the second worker stops at 24 because the one class left, 26,
+    /// is the third worker's (an open end no seen size reaches is never
+    /// written while a class remains).
+    async fn first_phase(policy: &BucketPolicy, workers: &[Arc<dyn Worker>]) {
+        select(policy, workers, 5).unwrap();
+        select(policy, workers, 10).unwrap();
+        select(policy, workers, 15).unwrap();
+        select(policy, workers, 20).unwrap();
+        select(policy, workers, 24).unwrap();
+        select(policy, workers, 26).unwrap();
+
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let boundaries = boundaries(policy, workers);
+        assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 24));
     }
 
     /// A policy whose boundaries adjust every three seconds while the load
