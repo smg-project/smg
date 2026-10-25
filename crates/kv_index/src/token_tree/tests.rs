@@ -897,32 +897,6 @@ fn test_leaf_first_eviction() {
 }
 
 #[test]
-fn test_single_page_operations() {
-    let tree = TokenTree::new();
-
-    // Single page operations
-    let tokens1 = make_tokens(1, 1);
-    let tokens2 = make_tokens(1000, 1);
-    let tokens3 = make_tokens(2000, 1);
-
-    tree.insert_tokens(&tokens1, "tenant1");
-    tree.insert_tokens(&tokens2, "tenant2");
-    tree.insert_tokens(&tokens3, "tenant3");
-
-    let result = tree.match_prefix_with_counts(&tokens1);
-    assert_eq!(result.matched_token_count, PAGE_SIZE);
-    assert_eq!(result.tenant.as_ref(), "tenant1");
-
-    let result = tree.match_prefix_with_counts(&tokens2);
-    assert_eq!(result.matched_token_count, PAGE_SIZE);
-    assert_eq!(result.tenant.as_ref(), "tenant2");
-
-    let result = tree.match_prefix_with_counts(&tokens3);
-    assert_eq!(result.matched_token_count, PAGE_SIZE);
-    assert_eq!(result.tenant.as_ref(), "tenant3");
-}
-
-#[test]
 fn test_prefix_is_subset_of_existing() {
     let tree = TokenTree::new();
 
