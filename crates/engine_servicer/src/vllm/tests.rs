@@ -51,7 +51,8 @@ use super::*;
 use crate::{
     kv_events,
     testing::{
-        assert_bucket_edges, assert_golden, captured_logs, http_get, servicer_config, Bounded,
+        assert_bucket_edges, assert_golden, bound_port, captured_logs, http_get, servicer_config,
+        Bounded,
     },
     tokenizer_bundle, ServicerError,
 };
@@ -100,15 +101,6 @@ async fn assert_handshake_released(handshake: &str) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     UnixListener::bind(path).expect("handshake endpoint released");
-}
-
-/// The port a socket bound to `tcp://127.0.0.1:0` was given.
-fn bound_port(endpoint: &str) -> u16 {
-    endpoint
-        .rsplit(':')
-        .next()
-        .and_then(|port| port.parse().ok())
-        .expect("a bound tcp endpoint ends with its port")
 }
 
 async fn wait_until(mut condition: impl FnMut() -> bool) {
@@ -1888,28 +1880,13 @@ async fn relayed_batches_carry_the_servicers_load_record() {
 /// publisher's first batch, and the first gateway gets all four from it.
 #[tokio::test]
 async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_its_start() {
-    use kv_events::golden;
-    use zeromq::{prelude::*, PubSocket, RouterSocket, ZmqMessage};
+    use crate::testing::{publisher_and_replay_socket, replayed_from_the_publishers_start};
 
-    let mut publisher = PubSocket::new();
-    let pub_port = bound_port(
-        &publisher
-            .bind("tcp://127.0.0.1:0")
-            .await
-            .expect("publisher binds")
-            .to_string(),
-    );
-    let mut router = RouterSocket::new();
-    let replay_port = bound_port(
-        &router
-            .bind("tcp://127.0.0.1:0")
-            .await
-            .expect("replay socket binds")
-            .to_string(),
-    );
+    let (mut publisher, mut router, events_endpoint, replay_endpoint) =
+        publisher_and_replay_socket().await;
     let mut model = model_info();
-    model.kv_events_endpoint = format!("tcp://*:{pub_port}");
-    model.kv_events_replay_endpoint = format!("tcp://*:{replay_port}");
+    model.kv_events_endpoint = events_endpoint;
+    model.kv_events_replay_endpoint = replay_endpoint;
     model.kv_events_topic = "kv".to_string();
     let mut h = harness(model, None).await;
     let relay = h
@@ -1919,61 +1896,7 @@ async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_
         .kv_relay
         .clone()
         .expect("a relay for the publisher");
-    // Sequences 0..=2 went out before the subscription landed: publish 3
-    // until the relay asks the replay socket, which it must do from 0.
-    let batch1 = golden::bytes(golden::BATCH1);
-    let batch2 = golden::bytes(golden::BATCH2);
-    let mut request = None;
-    for _ in 0..250 {
-        publisher
-            .send(golden::frame(b"kv", 3, &batch2))
-            .await
-            .expect("publish");
-        if let Ok(message) = tokio::time::timeout(Duration::from_millis(20), router.recv()).await {
-            request = Some(message.expect("a replay request"));
-            break;
-        }
-    }
-    let request = request.expect("the relay asked the replay socket");
-    let frames: Vec<Vec<u8>> = request.iter().map(|frame| frame.to_vec()).collect();
-    assert_eq!(frames.len(), 3, "[identity, empty, start]");
-    assert_eq!(
-        frames[2],
-        0u64.to_be_bytes(),
-        "asked from the publisher's start"
-    );
-    for (sequence, payload) in [(0u64, &batch1), (1, &batch2), (2, &batch2), (3, &batch2)] {
-        let mut reply = ZmqMessage::from(frames[0].clone());
-        reply.push_back(Vec::new().into());
-        reply.push_back(b"kv".to_vec().into());
-        reply.push_back(sequence.to_be_bytes().to_vec().into());
-        reply.push_back(payload.clone().into());
-        router.send(reply).await.expect("reply");
-    }
-    let mut end = ZmqMessage::from(frames[0].clone());
-    end.push_back(Vec::new().into());
-    end.push_back(Vec::new().into());
-    end.push_back([0xff; 8].to_vec().into());
-    end.push_back(Vec::new().into());
-    router.send(end).await.expect("end marker");
-    for _ in 0..250 {
-        if relay.counts().relayed >= 4 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    // Whichever asked first, the start replay or the late join: all four came
-    // from the replay socket and nothing is unknown.
-    let counts = relay.counts();
-    assert_eq!(
-        (
-            counts.relayed,
-            counts.gap_batches_recovered + counts.primed_batches,
-            counts.unknown_before_start
-        ),
-        (4, 4, 0),
-        "{counts:?}"
-    );
+    replayed_from_the_publishers_start(&mut publisher, &mut router, &relay).await;
 
     // The window is the publisher's whole life: the first gateway gets it.
     let mut stream = h

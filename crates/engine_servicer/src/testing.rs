@@ -15,7 +15,7 @@ use engine_zmq_client::mock_engine::MOCK_DEADLINE;
 use tokio::time::timeout;
 use tracing_subscriber::EnvFilter;
 
-use crate::ServicerConfig;
+use crate::{kv_events::KvEventRelay, ServicerConfig};
 
 /// The servicer configuration every servicer test starts from: an ephemeral
 /// port, the engine's data-plane sockets under the test's own directory,
@@ -249,4 +249,113 @@ impl Write for CapturedLogs {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+/// The port a socket bound to `tcp://127.0.0.1:0` was given.
+pub(crate) fn bound_port(endpoint: &str) -> u16 {
+    endpoint
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.parse().ok())
+        .expect("a bound tcp endpoint ends with its port")
+}
+
+/// A publisher and a replay socket bound on free local ports for a KV-events
+/// relay test, with the two `tcp://*:<port>` endpoints a model info names
+/// for them.
+pub(crate) async fn publisher_and_replay_socket(
+) -> (zeromq::PubSocket, zeromq::RouterSocket, String, String) {
+    use zeromq::prelude::*;
+
+    let mut publisher = zeromq::PubSocket::new();
+    let pub_port = bound_port(
+        &publisher
+            .bind("tcp://127.0.0.1:0")
+            .await
+            .expect("publisher binds")
+            .to_string(),
+    );
+    let mut router = zeromq::RouterSocket::new();
+    let replay_port = bound_port(
+        &router
+            .bind("tcp://127.0.0.1:0")
+            .await
+            .expect("replay socket binds")
+            .to_string(),
+    );
+    (
+        publisher,
+        router,
+        format!("tcp://*:{pub_port}"),
+        format!("tcp://*:{replay_port}"),
+    )
+}
+
+/// The replay round of a publisher that was already counting when the
+/// servicer started. Sequences 0..=2 went out before the subscription landed:
+/// publishes sequence 3 until the relay asks the replay socket, which it must
+/// do from 0; answers 0..=3 (the first golden batch, then the second three
+/// times) and the end marker; then reads the relay's counts: whichever asked
+/// first, the start replay or the late join, all four came from the replay
+/// socket and nothing is unknown.
+pub(crate) async fn replayed_from_the_publishers_start(
+    publisher: &mut zeromq::PubSocket,
+    router: &mut zeromq::RouterSocket,
+    relay: &KvEventRelay,
+) {
+    use zeromq::{prelude::*, ZmqMessage};
+
+    use crate::kv_events::golden;
+
+    let batch1 = golden::bytes(golden::BATCH1);
+    let batch2 = golden::bytes(golden::BATCH2);
+    let mut request = None;
+    for _ in 0..250 {
+        publisher
+            .send(golden::frame(b"kv", 3, &batch2))
+            .await
+            .expect("publish");
+        if let Ok(message) = timeout(Duration::from_millis(20), router.recv()).await {
+            request = Some(message.expect("a replay request"));
+            break;
+        }
+    }
+    let request = request.expect("the relay asked the replay socket");
+    let frames: Vec<Vec<u8>> = request.iter().map(|frame| frame.to_vec()).collect();
+    assert_eq!(frames.len(), 3, "[identity, empty, start]");
+    assert_eq!(
+        frames[2],
+        0u64.to_be_bytes(),
+        "asked from the publisher's start"
+    );
+    for (sequence, payload) in [(0u64, &batch1), (1, &batch2), (2, &batch2), (3, &batch2)] {
+        let mut reply = ZmqMessage::from(frames[0].clone());
+        reply.push_back(Vec::new().into());
+        reply.push_back(b"kv".to_vec().into());
+        reply.push_back(sequence.to_be_bytes().to_vec().into());
+        reply.push_back(payload.clone().into());
+        router.send(reply).await.expect("reply");
+    }
+    let mut end = ZmqMessage::from(frames[0].clone());
+    end.push_back(Vec::new().into());
+    end.push_back(Vec::new().into());
+    end.push_back([0xff; 8].to_vec().into());
+    end.push_back(Vec::new().into());
+    router.send(end).await.expect("end marker");
+    for _ in 0..250 {
+        if relay.counts().relayed >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let counts = relay.counts();
+    assert_eq!(
+        (
+            counts.relayed,
+            counts.gap_batches_recovered + counts.primed_batches,
+            counts.unknown_before_start
+        ),
+        (4, 4, 0),
+        "{counts:?}"
+    );
 }
