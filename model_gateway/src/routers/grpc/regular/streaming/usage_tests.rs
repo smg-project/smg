@@ -23,6 +23,7 @@ use smg_grpc_client::{
     },
     vllm_engine::{proto, proto::generate_response::Response as GenerationEvent},
 };
+use symphony::{formats::qwen3, CallSyntax};
 use tokio::task::JoinHandle;
 
 use super::{
@@ -30,6 +31,7 @@ use super::{
         chunk, collect_events, data_frame, decoded_stream, mock_worker_endpoint, processor,
         scripted_stream, trailers_frame, CharacterTokenizer,
     },
+    symphony_tests::assigned_message,
     *,
 };
 use crate::{
@@ -1040,6 +1042,64 @@ fn a_collected_answer_records_its_token_and_generation_families() {
         "smg_router_request_time_per_output_token_seconds",
         "endpoint=\"generate\",token_type=\"input\"",
         "endpoint=\"generate\",token_type=\"cached\"",
+    ] {
+        assert!(
+            !rendered.contains(absent),
+            "unexpected {absent} in:\n{rendered}"
+        );
+    }
+}
+
+/// A collected Messages answer a Symphony table reads records the token and
+/// generation families as one the legacy parsers read does: the engine's
+/// counts under the messages endpoint and one generation observation, no
+/// TTFT or TPOT (the whole-answer Symphony reading once returned before the
+/// record was made).
+#[test]
+fn a_collected_symphony_message_records_its_token_and_generation_families() {
+    use crate::observability::metrics::test_support::render_with_recorder;
+
+    let counters = Counters {
+        prompt: 12,
+        cached: 4,
+        spec_accepted: 0,
+        spec_drafted: 0,
+    };
+    // The recorder is thread-local: a current-thread runtime keeps every
+    // record on this thread.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let rendered = render_with_recorder(|| {
+        runtime.block_on(async {
+            let (_, counts) = non_streamed_messages(
+                engine_stream(frames(&["hi"], 1, counters)).await,
+                assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false),
+            )
+            .await;
+            assert_eq!(
+                (counts.prompt, counts.cached, counts.completion),
+                (12, 4, 2)
+            );
+        });
+    });
+    for expected in [
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"messages\",token_type=\"input\"} 12",
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"messages\",token_type=\"cached\"} 4",
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"messages\",token_type=\"output\"} 2",
+        "smg_router_generation_duration_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"eof-test\",endpoint=\"messages\"} 1",
+    ] {
+        assert!(
+            rendered.lines().any(|line| line == expected),
+            "missing {expected} in:\n{rendered}"
+        );
+    }
+    for absent in [
+        "smg_router_ttft_seconds",
+        "smg_router_tpot_seconds",
+        "smg_router_time_to_first_token_seconds",
+        "smg_router_request_time_per_output_token_seconds",
     ] {
         assert!(
             !rendered.contains(absent),
