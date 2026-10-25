@@ -34,16 +34,15 @@ both), any other name is unknown.
 
 With `--grpc-vllm true`, the same port also exposes the experimental
 **SMG `vllm.grpc.engine.VllmEngine` service**: generation, health, model/server
-metadata, loads, abort, and KV events share the
-TokenSpeed worker's engine and shutdown. Its load records use the vLLM reporting
+metadata, loads, abort, and KV events share the TokenSpeed worker's engine and
+shutdown. Its load records use the vLLM reporting
 profile regardless of `--loads-like`; `--step-reports` still controls heartbeat
 semantics. Only DP rank 0 is supported; load responses contain `core` data and
 omit unavailable optional sections, as the real servicer does. The standard
 health service recognizes both registered service names. The flag defaults to
 false so existing backend detection continues to see only TokenSpeed. With the
 flag enabled, gateway auto-detection selects vLLM before TokenSpeed. Register an
-explicit `tokenspeed` runtime to generate through TokenSpeed until the vLLM
-generation adapter is available.
+explicit `tokenspeed` runtime when the TokenSpeed path is desired.
 
 vLLM `Generate` requires realistic mode, a nonempty request ID and tokenized
 prompt, explicit positive `max_tokens`, `temperature=0`, `top_p=1`,

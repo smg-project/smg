@@ -406,7 +406,7 @@ pub fn usage() -> String {
        --http-count <n>         number of HTTP workers (default 0)\n\
        --grpc-base-port <port>  first gRPC port (required if --grpc-count > 0)\n\
        --grpc-count <n>         number of gRPC workers (default 0)\n\
-       --grpc-vllm <bool>       also expose experimental vLLM control RPCs (default false)\n\
+       --grpc-vllm <bool>       also expose experimental vLLM RPCs (default false)\n\
        --grpc-max-message-bytes <n>  largest gRPC message a worker decodes or encodes, in bytes\n\
                                 (default none, as the engine servicers; tonic's own default is 4 MiB)\n\
        --zmq-handshake <addr>   frontend ipc:// handshake addr (required if --zmq-count > 0)\n\
