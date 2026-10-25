@@ -49,31 +49,12 @@ mod tests {
     use openai_protocol::worker::WorkerStatus;
 
     use super::*;
-    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder, WorkerType};
+    use crate::policies::test_support::make_workers;
 
     #[test]
     fn test_random_selection() {
         let policy = RandomPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w3:8000")
-                    .worker_type(WorkerType::Regular)
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-        ];
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let mut counts = HashMap::new();
         for _ in 0..100 {
@@ -90,20 +71,7 @@ mod tests {
     #[test]
     fn test_random_with_unhealthy_workers() {
         let policy = RandomPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-        ];
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
 
         // Mark first worker as unhealthy
         workers[0].set_status(WorkerStatus::NotReady);
@@ -120,12 +88,7 @@ mod tests {
     #[test]
     fn test_random_no_healthy_workers() {
         let policy = RandomPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
-            BasicWorkerBuilder::new("http://w1:8000")
-                .worker_type(WorkerType::Regular)
-                .health_config(no_health_check())
-                .build(),
-        )];
+        let workers = make_workers(&["http://w1:8000"]);
 
         workers[0].set_status(WorkerStatus::NotReady);
         assert_eq!(

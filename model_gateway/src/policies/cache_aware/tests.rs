@@ -5,7 +5,7 @@ use tokio::sync::watch;
 use tracing_test::traced_test;
 
 use super::*;
-use crate::worker::load_state::TestFeed;
+use crate::{policies::test_support::make_workers, worker::load_state::TestFeed};
 
 #[test]
 fn text_is_wanted_only_without_token_ids() {
@@ -332,20 +332,6 @@ fn expected_wait_load(
         }],
         ..Default::default()
     }
-}
-
-/// Healthy workers (health checks disabled) for the given URLs.
-fn make_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
-    urls.iter()
-        .map(|u| {
-            Arc::new(
-                BasicWorkerBuilder::new(*u)
-                    .worker_type(WorkerType::Regular)
-                    .health_config(no_health_check())
-                    .build(),
-            ) as Arc<dyn Worker>
-        })
-        .collect()
 }
 
 fn update_expected_wait_loads(

@@ -25,6 +25,8 @@ mod prefix_hash;
 mod random;
 mod registry;
 mod round_robin;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;
