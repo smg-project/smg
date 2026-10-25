@@ -446,7 +446,7 @@ impl Default for EngineParams {
 
 impl EngineParams {
     /// KV capacity in blocks.
-    fn capacity_blocks(&self) -> u64 {
+    pub(crate) fn capacity_blocks(&self) -> u64 {
         (self.kv_capacity_tokens / u64::from(self.block_size.max(1))).max(1)
     }
 }

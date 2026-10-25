@@ -37,6 +37,8 @@ tokio = { workspace = true, features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic.workspace = true
 tonic-health.workspace = true
+# Native vLLM/Dynamo wire, independent of SMG's vLLM protocol.
+vllm-proto = "=0.6.0"
 prost-types.workspace = true
 axum.workspace = true
 serde_json.workspace = true

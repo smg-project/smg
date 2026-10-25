@@ -20,6 +20,8 @@ pub struct Config {
     /// Also expose the experimental SMG vLLM service on each gRPC listener.
     /// Off by default to preserve existing backend detection.
     pub grpc_vllm: bool,
+    /// Also expose the experimental native `vllm.Control` service.
+    pub grpc_native_vllm: bool,
     /// Frontend handshake `ipc://` address ZMQ mock engines connect to (they
     /// dial the SMG/test frontend, which binds the sockets).
     pub zmq_handshake: Option<String>,
@@ -170,6 +172,7 @@ impl Default for Config {
             grpc_base_port: 0,
             grpc_count: 0,
             grpc_vllm: false,
+            grpc_native_vllm: false,
             zmq_handshake: None,
             zmq_count: 0,
             zmq_start_index: 0,
@@ -220,6 +223,9 @@ impl Config {
                 "--grpc-base-port" => cfg.grpc_base_port = parse(value(&mut args, &flag)?, &flag)?,
                 "--grpc-count" => cfg.grpc_count = parse(value(&mut args, &flag)?, &flag)?,
                 "--grpc-vllm" => cfg.grpc_vllm = parse(value(&mut args, &flag)?, &flag)?,
+                "--grpc-native-vllm" => {
+                    cfg.grpc_native_vllm = parse(value(&mut args, &flag)?, &flag)?;
+                }
                 "--zmq-handshake" => cfg.zmq_handshake = Some(value(&mut args, &flag)?),
                 "--zmq-count" => cfg.zmq_count = parse(value(&mut args, &flag)?, &flag)?,
                 "--zmq-start-index" => {
@@ -406,6 +412,7 @@ pub fn usage() -> String {
        --http-count <n>         number of HTTP workers (default 0)\n\
        --grpc-base-port <port>  first gRPC port (required if --grpc-count > 0)\n\
        --grpc-count <n>         number of gRPC workers (default 0)\n\
+       --grpc-native-vllm <bool> expose native vLLM control RPCs (default false)\n\
        --grpc-vllm <bool>       also expose experimental vLLM control RPCs (default false)\n\
        --grpc-max-message-bytes <n>  largest gRPC message a worker decodes or encodes, in bytes\n\
                                 (default none, as the engine servicers; tonic's own default is 4 MiB)\n\
@@ -489,6 +496,31 @@ mod tests {
             Config::default().kv_zmq_for(0, 0).is_none(),
             "no publisher for a canned worker"
         );
+    }
+
+    #[test]
+    fn native_control_is_explicitly_enabled() {
+        assert!(!Config::default().grpc_native_vllm);
+        let cfg = parse(&[
+            "--grpc-base-port",
+            "19000",
+            "--grpc-count",
+            "1",
+            "--grpc-native-vllm",
+            "true",
+        ])
+        .unwrap();
+        assert!(cfg.grpc_native_vllm);
+        assert!(!cfg.grpc_vllm);
+        assert!(parse(&[
+            "--grpc-base-port",
+            "19000",
+            "--grpc-count",
+            "1",
+            "--grpc-native-vllm",
+            "yes"
+        ])
+        .is_err());
     }
 
     #[test]

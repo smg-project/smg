@@ -3,6 +3,7 @@
 //! Beside it the server hosts the standard `grpc.health.v1` service, which
 //! answers as the scheduler's own `HealthCheck` does.
 
+mod native;
 mod vllm;
 
 use std::{
@@ -124,6 +125,7 @@ pub async fn serve_with_listener_until(
     let overrides = crate::overrides::for_port(addr.map(|a| a.port()).unwrap_or(0));
     let health = MockHealth {
         vllm: cfg.grpc_vllm,
+        native_vllm: cfg.grpc_native_vllm,
         overrides: Arc::clone(&overrides),
         stopped: stopped.clone(),
     };
@@ -138,6 +140,11 @@ pub async fn serve_with_listener_until(
     };
     let vllm_service = service.cfg.grpc_vllm.then(|| {
         vllm::VllmServer::new(vllm::MockVllm::new(service.clone()))
+            .max_decoding_message_size(max_message_bytes)
+            .max_encoding_message_size(max_message_bytes)
+    });
+    let native_service = service.cfg.grpc_native_vllm.then(|| {
+        native::NativeServer::new(native::MockNative(service.clone()))
             .max_decoding_message_size(max_message_bytes)
             .max_encoding_message_size(max_message_bytes)
     });
@@ -165,6 +172,7 @@ pub async fn serve_with_listener_until(
                     .max_encoding_message_size(max_message_bytes),
             )
             .add_optional_service(vllm_service)
+            .add_optional_service(native_service)
             .add_service(HealthServer::new(health))
             .serve_with_incoming_shutdown(incoming, pending())
             .await
@@ -576,6 +584,7 @@ type HealthWatchStream = Pin<Box<dyn Stream<Item = Result<HealthCheckResponse, S
 struct MockHealth {
     /// The optional vLLM service is known only when explicitly enabled.
     vllm: bool,
+    native_vllm: bool,
     overrides: Arc<crate::overrides::WorkerOverrides>,
     /// Flips when the worker stops: ends the watch streams, which have no
     /// end of their own, so the server's drain can finish.
@@ -588,6 +597,7 @@ impl MockHealth {
         if !service.is_empty()
             && service != <TokenSpeedSchedulerServer<MockScheduler> as NamedService>::NAME
             && !(self.vllm && service == <vllm::VllmServer as NamedService>::NAME)
+            && !(self.native_vllm && service == <native::NativeServer as NamedService>::NAME)
         {
             ServingStatus::ServiceUnknown
         } else if self.overrides.serving() {
@@ -1318,6 +1328,13 @@ mod tests {
             check(<vllm::VllmServer as NamedService>::NAME)
                 .await
                 .expect_err("disabled")
+                .code(),
+            Code::NotFound
+        );
+        assert_eq!(
+            check(<native::NativeServer as NamedService>::NAME)
+                .await
+                .expect_err("native control disabled")
                 .code(),
             Code::NotFound
         );

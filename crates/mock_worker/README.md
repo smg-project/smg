@@ -32,6 +32,16 @@ scheduler service the server hosts the standard `grpc.health.v1` service
 exactly when `HealthCheck` answers healthy (`POST /admin/serving/{port}` flips
 both), any other name is unknown.
 
+With `--grpc-native-vllm true`, the same port also exposes native
+`vllm.Control` using the official **vllm-proto 0.6.0** schema. It reports the
+shared model and simulator capacities, participates in standard health checks,
+and cancels realistic TokenSpeed requests by ID (up to 1024 IDs of 1–256 bytes
+per call). It does not manage an engine process: `Shutdown` returns
+`FAILED_PRECONDITION`. Native KV discovery, LoRA and RL methods return
+`UNIMPLEMENTED`. Native inference is not registered or marked healthy, and
+model input/capability flags remain false. This control surface alone cannot
+serve a Dynamo workload or establish protocol parity.
+
 With `--grpc-vllm true`, the same port also exposes the experimental
 **SMG `vllm.grpc.engine.VllmEngine` control
 plane**: health, model/server metadata, loads, abort, and KV events share the
