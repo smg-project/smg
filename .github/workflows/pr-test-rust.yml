@@ -1,11 +1,11 @@
-name: AMD shared product SGLang chat validation
+name: AMD original SGLang ZMQ validation
 on:
   workflow_dispatch:
 permissions:
   contents: read
   actions: read
 concurrency:
-  group: amd-shared-product-sglang-chat
+  group: amd-shared-product-sglang-zmq-original
   cancel-in-progress: false
 jobs:
   artifact-relay:
@@ -65,30 +65,31 @@ jobs:
           path: ${{ steps.relay.outputs.directory }}/evidence/
           if-no-files-found: ignore
           retention-days: 7
-  amd-product-sglang-chat:
+  amd-product-sglang-zmq:
     needs: artifact-relay
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: sglang
       gpu_tier: '1'
       runner: 1-gpu-mi300x
-      timeout: 36
-      test_timeout: 28
+      timeout: 60
+      test_timeout: 48
       test_dirs: e2e_test/chat_completions
       min_selected: 204
-      servicer_unit_tests: false
+      connection_mode: zmq
+      servicer_unit_tests: true
       gpu_vendor: amd
       container_image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
-      container_options: --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN --env SPT_NOENV=1 --env SGLANG_GPT_OSS_MXFP4_BF16=1 --env PYTHONDONTWRITEBYTECODE=1
+      container_options: --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN --env SPT_NOENV=1 --env SGLANG_GPT_OSS_MXFP4_BF16=1 --env PYTHONDONTWRITEBYTECODE=1 --env SMG_SGLANG_ZMQ_ORIGINAL=1
     secrets: inherit
   finish:
     if: always()
-    needs: [artifact-relay, amd-product-sglang-chat]
+    needs: [artifact-relay, amd-product-sglang-zmq]
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     steps:
       - name: Require the actual shared workflow to finish successfully
         env:
           RELAY: ${{ needs.artifact-relay.result }}
-          CHAT: ${{ needs.amd-product-sglang-chat.result }}
+          CHAT: ${{ needs.amd-product-sglang-zmq.result }}
         run: test "$RELAY" = success && test "$CHAT" = success

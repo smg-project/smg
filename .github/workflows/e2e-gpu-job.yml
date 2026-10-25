@@ -238,7 +238,13 @@ jobs:
         run: |
           python3 -c "import ${{ inputs.engine }}, msgspec, zmq"  # the gates these tests importorskip on
           pip install pytest-asyncio  # runs the @pytest.mark.asyncio cases; pytest>=8.4 fails them without a plugin
-          pytest -q grpc_servicer/tests -p no:cacheprovider -rs
+          if [[ "${SMG_SGLANG_ZMQ_ORIGINAL-0}" == 1 ]]; then
+            test "${{ inputs.engine }}" = sglang
+            test "${{ inputs.connection_mode }}" = zmq
+            pytest -q grpc_servicer/tests -p no:cacheprovider -rs --junitxml="$RUNNER_TEMP/sglang-zmq-units.xml"
+          else
+            pytest -q grpc_servicer/tests -p no:cacheprovider -rs
+          fi
 
       - name: Check installed AMD dependencies
         id: amd-dependencies
@@ -251,6 +257,9 @@ jobs:
           echo "directory=$DIRECTORY" >> "$GITHUB_OUTPUT"
           echo "python=$(command -v python3)" >> "$GITHUB_OUTPUT"
           echo "artifact=amd-dependencies-${{ inputs.engine }}-gpu${{ inputs.gpu_tier }}-${DIRECTORY##*.}" >> "$GITHUB_OUTPUT"
+          if [[ "${SMG_SGLANG_ZMQ_ORIGINAL-0}" == 1 ]]; then
+            cp "$RUNNER_TEMP/sglang-zmq-units.xml" "$DIRECTORY/sglang-zmq-units.xml"
+          fi
           status=0
           python3 scripts/ci_check_e2e_dependencies.py "$DIRECTORY" installed || status=$?
           if [[ "$E2E_ENGINE" == sglang ]]; then
