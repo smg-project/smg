@@ -168,10 +168,13 @@ async fn reader_capture_chat_adapter_preserves_wire_on_capture_failure() {
                 // These budgets accept Open/Prompt before a later record or file write fails.
                 // Check the retained prefix as well as parity, so early admission failure
                 // cannot accidentally satisfy this partial-capture regression.
-                let prefix: Vec<Value> = std::fs::read_to_string(directory.join("records.jsonl"))
-                    .unwrap()
-                    .lines()
-                    .map(|line| serde_json::from_str::<Value>(line).unwrap()["payload"].clone())
+                // File-budget exhaustion can retain an unterminated final record. Only
+                // inspect complete lines; the failed receipt still rejects this capture.
+                let data = std::fs::read(directory.join("records.jsonl")).unwrap();
+                let prefix: Vec<Value> = data
+                    .split_inclusive(|byte| *byte == b'\n')
+                    .filter(|line| line.ends_with(b"\n"))
+                    .map(|line| serde_json::from_slice::<Value>(line).unwrap()["payload"].clone())
                     .collect();
                 assert_eq!(prefix[0]["kind"], "open");
                 assert!(prefix
