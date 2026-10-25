@@ -1,9 +1,10 @@
 //! Narrow synthetic request profile; both gRPC adapters use one engine stream.
-use super::{super::SYNTHETIC_VOCAB_SIZE, ts, v, Status};
+use super::{ts, v, Status};
 
 pub(super) fn normalize(
     req: v::GenerateRequest,
     context: u32,
+    vocab_size: u32,
 ) -> Result<ts::GenerateRequest, Status> {
     let v::GenerateRequest {
         request_id,
@@ -36,9 +37,9 @@ pub(super) fn normalize(
     let Some(v::generate_request::Input::Tokenized(input)) = input else {
         return Err(Status::invalid_argument("tokenized input is required"));
     };
-    if input.input_ids.is_empty() || input.input_ids.iter().any(|id| *id >= SYNTHETIC_VOCAB_SIZE) {
+    if input.input_ids.is_empty() || input.input_ids.iter().any(|id| *id >= vocab_size) {
         return Err(Status::invalid_argument(format!(
-            "prompt must contain tokens in the synthetic {SYNTHETIC_VOCAB_SIZE}-token vocabulary"
+            "prompt must contain tokens in the declared {vocab_size}-token vocabulary"
         )));
     }
     let p =

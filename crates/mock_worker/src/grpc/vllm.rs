@@ -42,6 +42,7 @@ impl VllmEngine for MockVllm {
         let request = generation::normalize(
             request.into_inner(),
             self.0.cfg.context_length.min(i32::MAX as u32),
+            self.0.cfg.model_tokens.vocab_size(),
         )?;
         let response = self.0.generate(Request::new(request)).await?;
         let output = response

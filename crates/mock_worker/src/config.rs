@@ -2,7 +2,9 @@
 
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
-use crate::engine::{Calibration, EngineParams, LoadsLike, TimingModel};
+use crate::engine::{
+    Calibration, EngineParams, LoadsLike, TimingModel, OUTPUT_TOKEN_END, OUTPUT_TOKEN_START,
+};
 
 /// Configuration shared by every mocked HTTP and gRPC worker in the process.
 #[derive(Debug, Clone)]
@@ -31,6 +33,8 @@ pub struct Config {
     pub model_id: String,
     /// Tokenizer path advertised by gRPC workers (for gateway autoload).
     pub tokenizer_path: String,
+    /// Vocabulary and special-token IDs advertised by both gRPC services.
+    pub model_tokens: ModelTokens,
     /// Simulated per-request generation latency (canned mode only).
     pub gen_delay: Duration,
     /// Number of canned output tokens per generation; also the default output
@@ -83,6 +87,81 @@ pub struct Config {
     pub step_reports: bool,
     /// Settings for replay testing (gRPC workers only).
     pub replay: ReplayConfig,
+}
+
+/// Token metadata for a declared model; construction preserves the realistic
+/// generator's existing output interval and excludes EOS/BOS/PAD from it.
+/// Callers must separately verify these values against their pinned tokenizer.
+#[derive(Debug, Clone)]
+pub struct ModelTokens {
+    vocab_size: u32,
+    eos_token_ids: Vec<u32>,
+    bos_token_id: u32,
+    pad_token_id: u32,
+}
+
+impl Default for ModelTokens {
+    fn default() -> Self {
+        Self {
+            vocab_size: 32_000,
+            eos_token_ids: vec![2],
+            bos_token_id: 1,
+            pad_token_id: 0,
+        }
+    }
+}
+
+impl ModelTokens {
+    /// Validate representable metadata whose vocabulary contains every possible
+    /// realistic output token, without generating a declared special token.
+    pub fn new(
+        vocab_size: u32,
+        eos_token_ids: Vec<u32>,
+        bos_token_id: u32,
+        pad_token_id: u32,
+    ) -> Result<Self, String> {
+        if !(OUTPUT_TOKEN_END..=i32::MAX as u32).contains(&vocab_size) {
+            return Err(format!("vocab size must be in {OUTPUT_TOKEN_END}..={} to contain the synthetic output interval", i32::MAX));
+        }
+        if eos_token_ids.is_empty() || eos_token_ids.len() > 32 {
+            return Err("provide between 1 and 32 EOS token IDs".into());
+        }
+        let mut unique = std::collections::BTreeSet::new();
+        if eos_token_ids.iter().any(|id| !unique.insert(*id)) {
+            return Err("EOS token IDs must be distinct".into());
+        }
+        for id in eos_token_ids.iter().chain([&bos_token_id, &pad_token_id]) {
+            if *id >= vocab_size || (OUTPUT_TOKEN_START..OUTPUT_TOKEN_END).contains(id) {
+                return Err(format!("special token {id} must be inside the vocabulary and outside the synthetic output interval"));
+            }
+        }
+        Ok(Self {
+            vocab_size,
+            eos_token_ids,
+            bos_token_id,
+            pad_token_id,
+        })
+    }
+
+    /// Exclusive upper bound for accepted vLLM prompt IDs.
+    pub fn vocab_size(&self) -> u32 {
+        self.vocab_size
+    }
+
+    /// End-of-sequence IDs, preserving the declared order.
+    pub fn eos_token_ids(&self) -> &[u32] {
+        &self.eos_token_ids
+    }
+
+    /// Beginning-of-sequence ID advertised to the gateway.
+    pub fn bos_token_id(&self) -> u32 {
+        self.bos_token_id
+    }
+
+    /// Padding ID advertised to the gateway.
+    pub fn pad_token_id(&self) -> u32 {
+        self.pad_token_id
+    }
 }
 
 /// Settings for replaying recorded requests through the gateway against
@@ -175,6 +254,7 @@ impl Default for Config {
             zmq_start_index: 0,
             model_id: "mock-model".to_string(),
             tokenizer_path: String::new(),
+            model_tokens: ModelTokens::default(),
             gen_delay: Duration::from_millis(0),
             output_tokens: 8,
             realistic: false,
@@ -208,6 +288,10 @@ impl Config {
     fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let mut cfg = Self::default();
         let mut timing = TimingFlags::default();
+        let mut vocab_size = cfg.model_tokens.vocab_size;
+        let mut eos = cfg.model_tokens.eos_token_ids.clone();
+        let mut bos = cfg.model_tokens.bos_token_id;
+        let mut pad = cfg.model_tokens.pad_token_id;
         let mut kv_blocks: Option<u64> = None;
         let (mut kv_tokens_given, mut block_size_given, mut overhead_given) = (false, false, false);
 
@@ -227,6 +311,15 @@ impl Config {
                 }
                 "--model" => cfg.model_id = value(&mut args, &flag)?,
                 "--tokenizer" => cfg.tokenizer_path = value(&mut args, &flag)?,
+                "--vocab-size" => vocab_size = parse(value(&mut args, &flag)?, &flag)?,
+                "--eos-token-ids" => {
+                    eos = value(&mut args, &flag)?
+                        .split(',')
+                        .map(|id| parse(id.to_owned(), &flag))
+                        .collect::<Result<_, _>>()?;
+                }
+                "--bos-token-id" => bos = parse(value(&mut args, &flag)?, &flag)?,
+                "--pad-token-id" => pad = parse(value(&mut args, &flag)?, &flag)?,
                 "--gen-ms" => {
                     cfg.gen_delay = Duration::from_millis(parse(value(&mut args, &flag)?, &flag)?);
                 }
@@ -314,6 +407,7 @@ impl Config {
             }
         }
 
+        cfg.model_tokens = ModelTokens::new(vocab_size, eos, bos, pad)?;
         if cfg.tokenizer_path.is_empty() {
             cfg.tokenizer_path = cfg.model_id.clone();
         }
@@ -414,6 +508,10 @@ pub fn usage() -> String {
        --zmq-start-index <n>    engine index of the first ZMQ rank (default 0)\n\
        --model <id>             advertised model id (default mock-model)\n\
        --tokenizer <path>       tokenizer path for gRPC autoload (default = model)\n\
+       --vocab-size <n>         gRPC vocabulary / vLLM prompt bound (default 32000)\n\
+       --eos-token-ids <ids>    comma-separated EOS IDs (default 2; at most 32)\n\
+       --bos-token-id <id>      BOS ID (default 1)\n\
+       --pad-token-id <id>      PAD ID (default 0); special IDs must be outside 100..30100\n\
        --gen-ms <ms>            canned per-request latency (default 0)\n\
        --output-tokens <n>      output tokens per request when unspecified (default 8)\n\
        --capture <path>         append each gRPC Generate request to <path> as a JSON line\n\
@@ -468,6 +566,66 @@ mod tests {
 
     fn parse(flags: &[&str]) -> Result<Config, String> {
         Config::parse(flags.iter().map(|flag| (*flag).to_string()))
+    }
+
+    #[test]
+    fn model_token_flags_preserve_defaults_and_accept_a_larger_vocabulary() {
+        let base = ["--grpc-base-port", "19000", "--grpc-count", "1"];
+        let default = parse(&base).unwrap().model_tokens;
+        assert_eq!(
+            (
+                default.vocab_size(),
+                default.bos_token_id(),
+                default.pad_token_id()
+            ),
+            (32000, 1, 0)
+        );
+        assert_eq!(default.eos_token_ids(), &[2]);
+        let mut flags = base.to_vec();
+        flags.extend([
+            "--vocab-size",
+            "151936",
+            "--eos-token-ids",
+            "151645,151643",
+            "--bos-token-id",
+            "151643",
+            "--pad-token-id",
+            "151643",
+        ]);
+        let configured = parse(&flags).unwrap().model_tokens;
+        assert_eq!(configured.vocab_size(), 151936);
+        assert_eq!(configured.eos_token_ids(), &[151645, 151643]);
+        assert_eq!(
+            (configured.bos_token_id(), configured.pad_token_id()),
+            (151643, 151643)
+        );
+        for (flag, value) in [
+            ("--vocab-size", "0"),
+            ("--vocab-size", "2147483648"),
+            ("--eos-token-ids", "2,2"),
+            ("--eos-token-ids", ""),
+            ("--bos-token-id", "-1"),
+            ("--pad-token-id", "100"),
+        ] {
+            let mut invalid = base.to_vec();
+            invalid.extend([flag, value]);
+            assert!(parse(&invalid).is_err(), "{flag} {value} must be rejected");
+        }
+    }
+
+    #[test]
+    fn model_tokens_cannot_overlap_generated_ids_or_escape_the_vocabulary() {
+        assert!(ModelTokens::new(30100, vec![2], 1, 0).is_ok());
+        assert!(ModelTokens::new(30099, vec![2], 1, 0).is_err());
+        for id in [100, 30099, 32000, u32::MAX] {
+            assert!(ModelTokens::new(32000, vec![id], 1, 0).is_err());
+            assert!(ModelTokens::new(32000, vec![2], id, 0).is_err());
+            assert!(ModelTokens::new(32000, vec![2], 1, id).is_err());
+        }
+        assert!(ModelTokens::new(32000, vec![], 1, 0).is_err());
+        assert!(ModelTokens::new(32000, (0..33).collect(), 1, 0).is_err());
+        // The upper output endpoint is exclusive; these special IDs are safe.
+        assert!(ModelTokens::new(30101, vec![30100], 99, 0).is_ok());
     }
 
     #[test]

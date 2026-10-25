@@ -2,7 +2,10 @@
 use std::{sync::Arc, time::Duration};
 
 use futures::StreamExt;
-use mock_worker::{config::Config, grpc::serve_with_listener_until};
+use mock_worker::{
+    config::{Config, ModelTokens},
+    grpc::serve_with_listener_until,
+};
 use smg_grpc_client::{tokenspeed_proto as ts, vllm_proto as v, VllmEngineClient};
 use tokio::{
     net::TcpListener,
@@ -213,4 +216,71 @@ async fn vllm_generation_preserves_tokens_cache_and_multiplexed_cancellation() {
     })
     .await
     .expect("generation, rejection and shutdown remain bounded");
+}
+
+#[tokio::test]
+async fn declared_model_tokens_are_shared_with_discovery_and_prompt_validation() {
+    timeout(Duration::from_secs(15), async {
+        let cfg = Config {
+            realistic: true,
+            grpc_vllm: true,
+            context_length: 40960,
+            model_tokens: ModelTokens::new(151936, vec![151645, 151643], 151643, 151643).unwrap(),
+            ..Config::default()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (stop, stopped) = oneshot::channel();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test joins its server after shutdown"
+        )]
+        let server = tokio::spawn(serve_with_listener_until(Arc::new(cfg), listener, async {
+            let _ = stopped.await;
+        }));
+        let client = VllmEngineClient::connect(&endpoint).await.unwrap();
+        let info = client.get_model_info().await.unwrap();
+        let mut scheduler =
+            ts::token_speed_scheduler_client::TokenSpeedSchedulerClient::connect(endpoint)
+                .await
+                .unwrap();
+        let ts_info = scheduler
+            .get_model_info(ts::GetModelInfoRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!((info.vocab_size, info.max_context_length), (151936, 40960));
+        assert_eq!(info.vocab_size as i32, ts_info.vocab_size);
+        assert_eq!(info.eos_token_ids, vec![151645, 151643]);
+        assert_eq!(info.eos_token_ids, ts_info.eos_token_ids);
+        assert_eq!((info.bos_token_id, info.pad_token_id), (151643, 151643));
+        assert_eq!(
+            (info.bos_token_id, info.pad_token_id),
+            (ts_info.bos_token_id, ts_info.pad_token_id)
+        );
+        let mut high = request("expanded-vocabulary", false, 4);
+        if let Some(v::generate_request::Input::Tokenized(input)) = &mut high.input {
+            input.input_ids = vec![151644; 64];
+        } else {
+            panic!("the actual client builder must emit tokenized input");
+        }
+        let mut invalid = high.clone();
+        if let Some(v::generate_request::Input::Tokenized(input)) = &mut invalid.input {
+            input.input_ids[0] = info.vocab_size;
+        }
+        let done = completion(&client, high).await;
+        assert_eq!(done.output_ids.len(), 4);
+        assert!(done
+            .output_ids
+            .iter()
+            .all(|id| (100..30100).contains(id) && !info.eos_token_ids.contains(id)));
+        match client.generate(invalid).await {
+            Err(error) => assert_eq!(error.code(), Code::InvalidArgument),
+            Ok(_) => panic!("the exclusive vocabulary bound must reject the prompt"),
+        }
+        stop.send(()).unwrap();
+        server.await.unwrap();
+    })
+    .await
+    .expect("metadata, generation, rejection and shutdown remain bounded");
 }

@@ -2399,6 +2399,10 @@ fn prompt_blocks(ids: &[u32], block_size: usize) -> (Vec<u64>, u64, Vec<u32>) {
     (keys, h, pending)
 }
 
+// Keep the output plan stable when a larger model vocabulary is advertised.
+pub(crate) const OUTPUT_TOKEN_START: u32 = 100;
+pub(crate) const OUTPUT_TOKEN_END: u32 = 30_100;
+
 /// A synthetic, request-specific output token id. Decode blocks must never
 /// collide across requests (only shared *prompt* prefixes should match), so the
 /// id is derived from the request seed and position.
@@ -2407,7 +2411,7 @@ fn next_token(r: &RunningReq) -> u32 {
         .token_seed
         .wrapping_add(r.generated)
         .wrapping_mul(2_654_435_761);
-    100 + (mixed % 30_000)
+    OUTPUT_TOKEN_START + (mixed % (OUTPUT_TOKEN_END - OUTPUT_TOKEN_START))
 }
 
 fn ewma(prev: f64, sample: f64, alpha: f64) -> f64 {

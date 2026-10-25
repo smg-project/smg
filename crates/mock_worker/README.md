@@ -54,8 +54,21 @@ all output IDs; non-streaming sends only the terminal. Both preserve shared
 engine cache counts, cancellation and injected failures. Text formatting flags
 are forwarded; this token-only service does not detokenize outputs.
 
-Metadata and input validation describe the existing synthetic 32,000-token
-vocabulary, not an arbitrary configured real tokenizer. `Embed`, tokenizer
+Both gRPC services advertise the same declared token metadata. Defaults remain
+vocabulary size 32,000, EOS `[2]`, BOS `1`, and PAD `0`. Configure a pinned model's
+values with `--vocab-size`, comma-separated `--eos-token-ids`, `--bos-token-id`,
+and `--pad-token-id`. vLLM prompt validation uses the declared vocabulary bound.
+For example, Qwen3-0.6B's token metadata can be represented with
+`--vocab-size 151936 --eos-token-ids 151645,151643 --bos-token-id 151643 --pad-token-id 151643`
+and its context with `--context-length 40960`.
+
+The realistic generator still emits the same synthetic IDs in `[100, 30100)`;
+changing metadata does not change its output plan. Vocabulary size must contain
+that interval and fit a signed 32-bit value. The 1–32 distinct EOS IDs, BOS and
+PAD must be inside the vocabulary and outside that output interval. These flags
+declare metadata; they do not load or validate a tokenizer. A benchmark must
+verify the declarations, prompt IDs, and all output IDs against its pinned
+model/tokenizer, including any other special tokens. `Embed`, tokenizer
 transfer, cache flush and profiling remain unsupported. Native vLLM protocol
 compatibility and cross-router performance comparisons remain unqualified.
 
