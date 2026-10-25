@@ -1,7 +1,7 @@
 {
-  "ready": false,
-  "run_budget_admitted": false,
-  "artifacts_pinned": false,
+  "ready": true,
+  "run_budget_admitted": true,
+  "artifacts_pinned": true,
   "artifacts": [
     {
       "name": "smg-wheel",
@@ -228,7 +228,7 @@
     "diagnostic_workflow_difference": "NIXL tier-select dispatch caller only; normal product tooling CPU jobs are not part of this diagnostic workflow."
   },
   "source_identity_note": "Original currentMC4 18/floor14/50job42pytest/reruns2/models/TP/connectors/oracles and ee1d normalsharedsetup/twohooks/observer stay unchanged. Actualnew401391/e6d/4ZIP/14 binding is integrity-only. Auxiliary8451/Cairo/tools, private710c/HIP55leaf23dir and30normalresolver wheels remain separate read-only datasets. Both nodes still need freshstaging and matchinge6d fullnormalCPU acceptance; old143a CPU success is historical only.",
-  "admitted_tier": null,
+  "admitted_tier": "4",
   "contracts": {
     "4": {
       "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-4gpu-pd[3]/vllm/nvidia",
@@ -310,8 +310,11 @@
     "host_bundle": "/tmp/smg-mooncake-hip723-1f2ded97f9a0",
     "read_only_prefix_mount": "/work/prefix",
     "read_only_wheel_mount": "/work/mooncake_transfer_engine_rocm-0.3.13.post1+amd.hip723.g26b0229.curl30.teonly-cp312-cp312-linux_x86_64.whl",
-    "staging_accepted": false,
-    "staging_receipt": null,
+    "staging_accepted": true,
+    "staging_receipt": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/MC4-83e-X2-receipts-approval-root-9fb0156b18784c6db8e410c4d3db5dab/root-private-bundle-83e-eligibility.json",
+      "sha256": "64539cab4bd80d4381e6d58a7cbebe19290c6dfaa0e3aa41e00ca22ea91d51c5"
+    },
     "GPU_verified": false,
     "base_image_installation_preserved": true
   },
@@ -331,8 +334,24 @@
       "amd-mi300x-1",
       "amd-mi300x-2"
     ],
-    "staging_accepted": false,
-    "staging_receipt": null,
+    "staging_accepted": true,
+    "staging_receipt": {
+      "manifest_sha256": "f3519bade67f15b8bf0fe30f60b84313128175b14ca12d5c431168e3c1e50e7f",
+      "nodes": {
+        "amd-mi300x-1": {
+          "accepted": true,
+          "host_bundle": "/tmp/smg-mc4-runtime-inputs-8451-c2ac-v1",
+          "manifest_sha256": "f3519bade67f15b8bf0fe30f60b84313128175b14ca12d5c431168e3c1e50e7f",
+          "evidence_sha256": "cbc0e130e69afb96d4dc95bbde418a571834e42984e58982c211aba626bd6148"
+        },
+        "amd-mi300x-2": {
+          "accepted": true,
+          "host_bundle": "/tmp/smg-mc4-runtime-inputs-8451-c2ac-v1",
+          "manifest_sha256": "f3519bade67f15b8bf0fe30f60b84313128175b14ca12d5c431168e3c1e50e7f",
+          "evidence_sha256": "7382ae9fd12a1c6b64413e5f8c81016e282979bd2d359444e50d294d6fb0070f"
+        }
+      }
+    },
     "GPU_verified": false,
     "servicer_source_manifest_sha256": "e79fde207845a729312197903c55b07d7912b5157db87d6d88ea02149a6eda86",
     "separate_from_refreshed_four_archives": true
@@ -447,8 +466,28 @@
     "normal_dependency_resolver_enabled": true,
     "no_index": true,
     "find_links": "/input/mc4-cohort/wheels /resolver-wheels",
-    "staging_accepted": false,
-    "staging_receipt": null,
+    "staging_accepted": true,
+    "staging_receipt": {
+      "manifest_sha256": "f2aeb81b1a0b8768ced64fe9539b088feee40c0e121f42d15a7baf62ad42164d",
+      "nodes": {
+        "amd-mi300x-1": {
+          "accepted": true,
+          "host_bundle": "/tmp/smg-mc4-resolver-3d5c5ae805a0",
+          "manifest_sha256": "f2aeb81b1a0b8768ced64fe9539b088feee40c0e121f42d15a7baf62ad42164d",
+          "evidence_sha256": "cbc0e130e69afb96d4dc95bbde418a571834e42984e58982c211aba626bd6148",
+          "regular_files": 31,
+          "wheel_count": 30
+        },
+        "amd-mi300x-2": {
+          "accepted": true,
+          "host_bundle": "/tmp/smg-mc4-resolver-3d5c5ae805a0",
+          "manifest_sha256": "f2aeb81b1a0b8768ced64fe9539b088feee40c0e121f42d15a7baf62ad42164d",
+          "evidence_sha256": "7382ae9fd12a1c6b64413e5f8c81016e282979bd2d359444e50d294d6fb0070f",
+          "regular_files": 31,
+          "wheel_count": 30
+        }
+      }
+    },
     "not_a_fifth_producer_archive": true
   },
   "same_source_CPU_prerequisite": {
@@ -464,9 +503,156 @@
   },
   "scheduled_validation": {
     "policy": "historical_c345_CPU_plus_reviewed_checkout_env_delta_scheduled_full_validation",
-    "admitted": false,
+    "admitted": true,
     "candidate_CPU_accepted": false,
     "basis_sha256": "15b22b08e0fce07e4c369011abf2490d32e556605414a4e3b117677c83ed92b4",
-    "historical_node_receipts": null
+    "historical_node_receipts": {
+      "amd-mi300x-1": {
+        "root_acceptance_path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/MC4-e6d-node1-offline600-root-fa200b6cfd2047bdb94d59e427af36b3/root-acceptance-fresh-e6d-normal-CPU-only.json",
+        "root_acceptance_sha256": "0ad1120f6ec2a40d4b3574224ac31b2772e4b383016d634bc262a499eb3e9d63",
+        "gateway_native_sha256": "e6d8073ed3484cf95403046875d6ba655d61d4bcb2860e62bd6df2aa9859be1c",
+        "consumer19": {
+          ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
+          "Cargo.toml": "1524dd4960a96dd3ae5069917324836dee979150",
+          "Cargo.lock": "658f9376c020bef5e29a3e5728b4931cee891427",
+          "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+          "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+          "bindings": "e97f000df477e928953b6bcb5a7927adf5ff88c1",
+          "clients": "03b0cbb722670d98b37b726af18c1796beef82d5",
+          "crates": "ae100a0dd89846418c93c09861dd7f24b3222296",
+          "model_gateway": "d1a181bfb1d16a661e16346d4eb8f257689701ce",
+          "grpc_servicer": "a10bb7235d74ac91d8de4b3eafabd1ef7ed1344e",
+          "e2e_test": "3408fbe66433940953c4399e03f5ff148c248ac8",
+          "scripts": "0fc0bfa5705269f536fec174e84b844933cb26fd",
+          ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
+          ".github/workflows/e2e-gpu-job.yml": "c8daa461a9d5913bffa56b890505b6074776fb78",
+          "README.md": "83b7df25632da03f0184bd5b4628b9c9a3ace803",
+          "LICENSE": "9088c2872db9763b9e6533c6960e9adb0c9cb65f",
+          "rustfmt.toml": "19e1ab31f8958c31292f0f568976a036af7e683b",
+          "clippy.toml": "cfb9e85a5074e6b02e603df8da9653ee18dbcca3",
+          "examples/wasm": "fc10fea21779371f9de247209af2028cf8173236"
+        },
+        "compiled37": {
+          ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
+          "Cargo.toml": "1524dd4960a96dd3ae5069917324836dee979150",
+          "Cargo.lock": "658f9376c020bef5e29a3e5728b4931cee891427",
+          "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+          "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+          "bindings": "e97f000df477e928953b6bcb5a7927adf5ff88c1",
+          "clients": "03b0cbb722670d98b37b726af18c1796beef82d5",
+          "model_gateway": "d1a181bfb1d16a661e16346d4eb8f257689701ce",
+          "examples/wasm": "fc10fea21779371f9de247209af2028cf8173236",
+          "crates/auth": "642cfcb069e7a56f0637909b6bf67365f4c48d07",
+          "crates/data_connector": "0f2944404b40f9dc1abf7b681179db30ba01ccab",
+          "crates/engine_servicer": "68628b86d024d0d197ebea9f9b2d20739955d4ca",
+          "crates/engine_zmq_adapter": "8ab4e37c36d2a6b9317ecb745afe46970eb0020e",
+          "crates/engine_zmq_client": "17704bdc0b1ae560d05c8957adc84fe31fbf5592",
+          "crates/external_router": "6db695a38d5adc95f0a29133adc9c65e1d0244ae",
+          "crates/kv_index": "ff216cb75864ddf81543e778e9e4258abe576f8e",
+          "crates/mcp": "b1d2f09e63afe834a627b2af242f3accba09fbb0",
+          "crates/mesh": "50ff87d19f76a7c1b635b6eaaa3b23011a8a020c",
+          "crates/mm_rdma": "5e42c1198e2f08f74061c398258971e7ecaa33aa",
+          "crates/mock_worker": "8867fc086be30c7202125e3a8202d74037360568",
+          "crates/multimodal": "1f48ef64dab0f68d86f711dc0d8fb8ba15aadae6",
+          "crates/protocols": "ef1e32f72583c04584cdb218f4df1147013d34ff",
+          "crates/radix_tree": "72d99cda5a32de3d705cb8996bf60371e345cc70",
+          "crates/reasoning_parser": "9ba96949f8d28042ee8bd839202676298b400ae8",
+          "crates/response_template": "85edf62e4f7deb2626b361e2acbd044a007d230a",
+          "crates/rl": "01aa1de7bdca3e37f94e1ba19c16aead3a9a540a",
+          "crates/symphony": "f76f27bee4579d436cb925c2f80b3ffda0c87c15",
+          "crates/tokenizer": "f7e0c563a8001e29c1e1ec2c2d67f1b4cf30821a",
+          "crates/tool_parser": "4f2b4246f15b1497fdf74f4c5683e0a57ff37db0",
+          "crates/wasm": "112035c9bf4083f1477c0da8800e833be0d92a42",
+          "crates/workflow": "8ccb53659ecf1013f7f533db14f5cb9270c8ccfc",
+          "crates/grpc_client/Cargo.toml": "29ba1897ef8f8142107ee0a3df25165834e7128d",
+          "crates/grpc_client/build.rs": "946832e4554939503959adf7d0ee725beb6b65c8",
+          "crates/grpc_client/go": "89b5a2463e45e0f64d577e9ab74ec318653b9352",
+          "crates/grpc_client/proto": "7a402081bf9c06c847338ac986005787f3d78f3c",
+          "crates/grpc_client/src": "0068eacf800c1ca3dc8fd23d9658c0d4866ca266",
+          "crates/grpc_client/tests": "1bfcdb65a82db071422c03fc4f70b19d143dde5c"
+        },
+        "accepted": true,
+        "original_unit_cases": 1602,
+        "passed": 1594,
+        "exact_original_skips": 8,
+        "canonical14_once": 14,
+        "wholepip_passes": 3,
+        "normal_shared_install": true,
+        "full_SOURCE_RECORD_direct_url_postflight": true
+      },
+      "amd-mi300x-2": {
+        "root_acceptance_path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/MC4-e6d-node2-offline600-root-2070b2f12455469eba4944c3acfabc78/root-acceptance-fresh-e6d-normal-CPU-only.json",
+        "root_acceptance_sha256": "74ca1fd35308dabbb02fc9e2b67d4c6c34c85a55967a50b5a4d4fca1644a37b2",
+        "gateway_native_sha256": "e6d8073ed3484cf95403046875d6ba655d61d4bcb2860e62bd6df2aa9859be1c",
+        "consumer19": {
+          ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
+          "Cargo.toml": "1524dd4960a96dd3ae5069917324836dee979150",
+          "Cargo.lock": "658f9376c020bef5e29a3e5728b4931cee891427",
+          "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+          "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+          "bindings": "e97f000df477e928953b6bcb5a7927adf5ff88c1",
+          "clients": "03b0cbb722670d98b37b726af18c1796beef82d5",
+          "crates": "ae100a0dd89846418c93c09861dd7f24b3222296",
+          "model_gateway": "d1a181bfb1d16a661e16346d4eb8f257689701ce",
+          "grpc_servicer": "a10bb7235d74ac91d8de4b3eafabd1ef7ed1344e",
+          "e2e_test": "3408fbe66433940953c4399e03f5ff148c248ac8",
+          "scripts": "0fc0bfa5705269f536fec174e84b844933cb26fd",
+          ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
+          ".github/workflows/e2e-gpu-job.yml": "c8daa461a9d5913bffa56b890505b6074776fb78",
+          "README.md": "83b7df25632da03f0184bd5b4628b9c9a3ace803",
+          "LICENSE": "9088c2872db9763b9e6533c6960e9adb0c9cb65f",
+          "rustfmt.toml": "19e1ab31f8958c31292f0f568976a036af7e683b",
+          "clippy.toml": "cfb9e85a5074e6b02e603df8da9653ee18dbcca3",
+          "examples/wasm": "fc10fea21779371f9de247209af2028cf8173236"
+        },
+        "compiled37": {
+          ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
+          "Cargo.toml": "1524dd4960a96dd3ae5069917324836dee979150",
+          "Cargo.lock": "658f9376c020bef5e29a3e5728b4931cee891427",
+          "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+          "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+          "bindings": "e97f000df477e928953b6bcb5a7927adf5ff88c1",
+          "clients": "03b0cbb722670d98b37b726af18c1796beef82d5",
+          "model_gateway": "d1a181bfb1d16a661e16346d4eb8f257689701ce",
+          "examples/wasm": "fc10fea21779371f9de247209af2028cf8173236",
+          "crates/auth": "642cfcb069e7a56f0637909b6bf67365f4c48d07",
+          "crates/data_connector": "0f2944404b40f9dc1abf7b681179db30ba01ccab",
+          "crates/engine_servicer": "68628b86d024d0d197ebea9f9b2d20739955d4ca",
+          "crates/engine_zmq_adapter": "8ab4e37c36d2a6b9317ecb745afe46970eb0020e",
+          "crates/engine_zmq_client": "17704bdc0b1ae560d05c8957adc84fe31fbf5592",
+          "crates/external_router": "6db695a38d5adc95f0a29133adc9c65e1d0244ae",
+          "crates/kv_index": "ff216cb75864ddf81543e778e9e4258abe576f8e",
+          "crates/mcp": "b1d2f09e63afe834a627b2af242f3accba09fbb0",
+          "crates/mesh": "50ff87d19f76a7c1b635b6eaaa3b23011a8a020c",
+          "crates/mm_rdma": "5e42c1198e2f08f74061c398258971e7ecaa33aa",
+          "crates/mock_worker": "8867fc086be30c7202125e3a8202d74037360568",
+          "crates/multimodal": "1f48ef64dab0f68d86f711dc0d8fb8ba15aadae6",
+          "crates/protocols": "ef1e32f72583c04584cdb218f4df1147013d34ff",
+          "crates/radix_tree": "72d99cda5a32de3d705cb8996bf60371e345cc70",
+          "crates/reasoning_parser": "9ba96949f8d28042ee8bd839202676298b400ae8",
+          "crates/response_template": "85edf62e4f7deb2626b361e2acbd044a007d230a",
+          "crates/rl": "01aa1de7bdca3e37f94e1ba19c16aead3a9a540a",
+          "crates/symphony": "f76f27bee4579d436cb925c2f80b3ffda0c87c15",
+          "crates/tokenizer": "f7e0c563a8001e29c1e1ec2c2d67f1b4cf30821a",
+          "crates/tool_parser": "4f2b4246f15b1497fdf74f4c5683e0a57ff37db0",
+          "crates/wasm": "112035c9bf4083f1477c0da8800e833be0d92a42",
+          "crates/workflow": "8ccb53659ecf1013f7f533db14f5cb9270c8ccfc",
+          "crates/grpc_client/Cargo.toml": "29ba1897ef8f8142107ee0a3df25165834e7128d",
+          "crates/grpc_client/build.rs": "946832e4554939503959adf7d0ee725beb6b65c8",
+          "crates/grpc_client/go": "89b5a2463e45e0f64d577e9ab74ec318653b9352",
+          "crates/grpc_client/proto": "7a402081bf9c06c847338ac986005787f3d78f3c",
+          "crates/grpc_client/src": "0068eacf800c1ca3dc8fd23d9658c0d4866ca266",
+          "crates/grpc_client/tests": "1bfcdb65a82db071422c03fc4f70b19d143dde5c"
+        },
+        "accepted": true,
+        "original_unit_cases": 1602,
+        "passed": 1594,
+        "exact_original_skips": 8,
+        "canonical14_once": 14,
+        "wholepip_passes": 3,
+        "normal_shared_install": true,
+        "full_SOURCE_RECORD_direct_url_postflight": true
+      }
+    }
   }
 }
