@@ -3,6 +3,7 @@
 //! Beside it the server hosts the standard `grpc.health.v1` service, which
 //! answers as the scheduler's own `HealthCheck` does.
 
+mod admission;
 mod native;
 mod vllm;
 
@@ -136,6 +137,7 @@ pub async fn serve_with_listener_until(
         capture,
         stopped,
         prefill_pending: Arc::new(AtomicU64::new(0)),
+        admissions: admission::Admissions::default(),
         overrides,
     };
     let vllm_service = service.cfg.grpc_vllm.then(|| {
@@ -229,9 +231,20 @@ struct MockScheduler {
     /// Prompt tokens of the requests handed to the engine with no token yet:
     /// the prefill work in hand, as a servicer reports it on its load record.
     prefill_pending: Arc<AtomicU64>,
+    /// Requests waiting before engine submission, shared by all gRPC adapters.
+    admissions: admission::Admissions,
     /// What the admin API made this worker report about itself (serving,
     /// server args, model capabilities).
     overrides: Arc<crate::overrides::WorkerOverrides>,
+}
+
+impl MockScheduler {
+    /// Abort before or after submission with the same ordering for every adapter.
+    fn abort_request(&self, id: String) {
+        if let Some(engine) = &self.engine {
+            self.admissions.abort(&id, || engine.abort(id.clone()));
+        }
+    }
 }
 
 type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
@@ -285,12 +298,13 @@ impl TokenSpeedScheduler for MockScheduler {
 
         // Realistic mode: submit to the engine simulator and stream its output.
         if let Some(engine) = &self.engine {
+            let mut admission = self.admissions.register(req.request_id.clone());
             // The fault hook's answer for this request, when one is armed: a
             // stall, a status before admission, or a cut after some output.
             let injected = engine.inject();
             if let Some(fault) = injected {
                 if !fault.stall.is_zero() {
-                    tokio::time::sleep(fault.stall).await;
+                    admission.wait(tokio::time::sleep(fault.stall)).await?;
                 }
                 if fault.status != 0 && fault.after_tokens.is_none() {
                     engine.record_failure();
@@ -320,20 +334,22 @@ impl TokenSpeedScheduler for MockScheduler {
             // The admission hooks: the request is held here, between the
             // gateway and the engine, as a backlog in transit would hold it;
             // the load record does not see it until it lands.
-            engine.admit().await;
+            admission.wait(engine.admit()).await?;
             let weight_version = self.cfg.weight_version.clone();
             let (tx, rx) = mpsc::unbounded_channel();
             let pending = (
                 Arc::clone(&self.prefill_pending),
                 prompt_token_ids.len() as u64,
             );
-            pending.0.fetch_add(pending.1, Ordering::Relaxed);
-            engine.submit(NewRequest {
-                request_id: request_id.clone(),
-                prompt_token_ids,
-                max_new,
-                events: tx,
-            });
+            admission.submit(|| {
+                pending.0.fetch_add(pending.1, Ordering::Relaxed);
+                engine.submit(NewRequest {
+                    request_id: request_id.clone(),
+                    prompt_token_ids,
+                    max_new,
+                    events: tx,
+                });
+            })?;
             let stream = generate_stream(
                 rx,
                 stream_chunks,
@@ -403,9 +419,7 @@ impl TokenSpeedScheduler for MockScheduler {
         &self,
         request: Request<ts::AbortRequest>,
     ) -> Result<Response<ts::AbortResponse>, Status> {
-        if let Some(engine) = &self.engine {
-            engine.abort(request.into_inner().request_id);
-        }
+        self.abort_request(request.into_inner().request_id);
         Ok(Response::new(ts::AbortResponse {
             success: true,
             message: String::new(),

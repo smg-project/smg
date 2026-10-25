@@ -36,7 +36,9 @@ With `--grpc-native-vllm true`, the same port also exposes native
 `vllm.Control` using the official **vllm-proto 0.6.0** schema. It reports the
 shared model and simulator capacities, participates in standard health checks,
 and cancels realistic TokenSpeed requests by ID (up to 1024 IDs of 1–256 bytes
-per call). Malformed IDs return `INVALID_ARGUMENT` in either engine mode.
+per call), including requests still waiting for admission. An abort during
+an admission/fault delay returns `CANCELLED` from generation before submission.
+Malformed IDs return `INVALID_ARGUMENT` in either engine mode.
 Canned-mode `Abort` returns `FAILED_PRECONDITION`: canned streams have no
 engine cancellation handle, so success would not confirm cancellation.
 It does not manage an engine process: `Shutdown` also returns

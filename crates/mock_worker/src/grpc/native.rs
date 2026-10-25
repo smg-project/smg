@@ -66,14 +66,13 @@ impl Control for MockNative {
                 "abort accepts at most 1024 request IDs, each 1..=256 bytes",
             ));
         }
-        let engine =
-            self.0.engine.as_ref().ok_or_else(|| {
-                Status::failed_precondition("native abort requires --realistic true")
-            })?;
+        self.0.engine.as_ref().ok_or_else(|| {
+            Status::failed_precondition("native abort requires --engine realistic")
+        })?;
         // Validate the entire batch before changing the shared engine. Unknown
         // and repeated IDs are harmless, matching the native cancellation API.
         for id in ids {
-            engine.abort(id);
+            self.0.abort_request(id);
         }
         Ok(Response::new(v::AbortResponse {}))
     }
@@ -228,5 +227,118 @@ impl Control for MockNative {
         Err(Status::unimplemented(
             "native GetWeightVersion is not implemented",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use smg_grpc_client::vllm_proto::{self as smg_vllm, vllm_engine_server::VllmEngine};
+    use vllm_proto::control_server::Control;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn all_grpc_abort_paths_cancel_delayed_admission_without_submitting() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for protocol in ["native", "tokenspeed", "smg-vllm"] {
+                let engine = Engine::spawn(engine::EngineParams::default());
+                engine.fault_admit_delay_ms(60_000);
+                let (_stop, stopped) = watch::channel(false);
+                let service = MockScheduler {
+                    cfg: Arc::new(Config {
+                        realistic: true,
+                        ..Default::default()
+                    }),
+                    name: format!("admission-test-{protocol}"),
+                    engine: Some(engine.clone()),
+                    capture: None,
+                    stopped,
+                    prefill_pending: Arc::new(AtomicU64::new(0)),
+                    admissions: admission::Admissions::default(),
+                    overrides: crate::overrides::for_port(0),
+                };
+                let request = ts::GenerateRequest {
+                    request_id: "delayed".into(),
+                    stream: true,
+                    tokenized: Some(ts::TokenizedInput {
+                        input_ids: vec![100; 16],
+                        ..Default::default()
+                    }),
+                    sampling_params: Some(ts::SamplingParams {
+                        max_new_tokens: Some(1),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                let mut generation = Box::pin(service.generate(Request::new(request.clone())));
+                // Poll into the real admission wait before aborting; no scheduling sleep.
+                assert!(futures::poll!(&mut generation).is_pending());
+                let native = MockNative(service.clone());
+                let invalid = native
+                    .abort(Request::new(v::AbortRequest {
+                        request_ids: vec!["delayed".into(), "".into()],
+                    }))
+                    .await
+                    .unwrap_err();
+                assert_eq!(invalid.code(), tonic::Code::InvalidArgument);
+                assert!(
+                    futures::poll!(&mut generation).is_pending(),
+                    "invalid batches must not partially cancel"
+                );
+                match protocol {
+                    "native" => {
+                        native
+                            .abort(Request::new(v::AbortRequest {
+                                request_ids: vec!["delayed".into()],
+                            }))
+                            .await
+                            .unwrap();
+                    }
+                    "tokenspeed" => {
+                        service
+                            .abort(Request::new(ts::AbortRequest {
+                                request_id: "delayed".into(),
+                            }))
+                            .await
+                            .unwrap();
+                    }
+                    _ => {
+                        vllm::MockVllm::new(service.clone())
+                            .abort(Request::new(smg_vllm::AbortRequest {
+                                request_ids: vec!["delayed".into()],
+                            }))
+                            .await
+                            .unwrap();
+                    }
+                }
+                match generation.await {
+                    Err(error) => assert_eq!(error.code(), tonic::Code::Cancelled),
+                    Ok(_) => panic!("aborted admission returned a generation stream"),
+                }
+                assert_eq!(service.prefill_pending.load(Ordering::Relaxed), 0);
+                assert_eq!(engine.load().num_running_reqs, 0);
+                assert_eq!(engine.load().num_waiting_reqs, 0);
+
+                // Completed cancellation leaves no tombstone: the same ID can be reused.
+                engine.fault_admit_delay_ms(0);
+                let mut output = service
+                    .generate(Request::new(request))
+                    .await
+                    .unwrap()
+                    .into_inner();
+                let mut completed = false;
+                while let Some(frame) = output.next().await {
+                    if let Some(GenResp::Complete(done)) = frame.unwrap().response {
+                        assert_ne!(done.finish_reason, "abort");
+                        assert_eq!(done.output_ids.len(), 1);
+                        completed = true;
+                    }
+                }
+                assert!(completed);
+                assert_eq!(service.prefill_pending.load(Ordering::Relaxed), 0);
+            }
+        })
+        .await
+        .expect("cancelled admission must not wait for the 60-second delay");
     }
 }

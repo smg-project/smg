@@ -65,10 +65,8 @@ impl VllmEngine for MockVllm {
         &self,
         request: Request<v::AbortRequest>,
     ) -> Result<Response<v::AbortResponse>, Status> {
-        if let Some(engine) = &self.0.engine {
-            for id in request.into_inner().request_ids {
-                engine.abort(id);
-            }
+        for id in request.into_inner().request_ids {
+            self.0.abort_request(id);
         }
         Ok(Response::new(v::AbortResponse {}))
     }
