@@ -329,7 +329,11 @@ impl GridTensors {
     /// rope config (`Some(false)` is a patch layout; `Some(true)`, and `None`
     /// for a launcher that does not say, keep the conservative reading), and
     /// the `layout` facts the rule needs (without them a lineage checkpoint's
-    /// multimodal items are refused outright).
+    /// multimodal items are refused outright). The lineage comes first: a
+    /// lineage checkpoint takes its rule whatever `mrope_positions` says (a
+    /// `Some(false)` there would otherwise ship empty position slots the
+    /// engine fills), and the reading decides only the families without a
+    /// rule.
     pub fn for_model(
         architectures: &[String],
         model_type: &str,
