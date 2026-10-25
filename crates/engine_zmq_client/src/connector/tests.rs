@@ -2602,8 +2602,11 @@ async fn an_abandoned_typed_tensor_submit_aborts_its_request_on_the_tagged_wire(
     let (client, mut engine, _ns) = connect_tagged().await;
     client.set_send_timeout(SEND_WINDOW);
     for _ in 0..3 {
-        let (payload, aux) =
-            TokenSpeedProtocol::encode_add(&large_tagged_request("queue-saturation")).unwrap();
+        let (payload, aux) = TokenSpeedProtocol::encode_add(
+            &large_tagged_request("queue-saturation"),
+            &Default::default(),
+        )
+        .unwrap();
         client
             .inner
             .queue_frame(

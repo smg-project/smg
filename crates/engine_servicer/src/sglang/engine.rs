@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use engine_zmq_adapter::WireRevision;
 use openai_protocol::worker::RuntimeType;
 
 use super::State;
@@ -20,6 +21,8 @@ pub(super) async fn connect_engine(state: Arc<State>, inputs: ConnectInputs) {
         state.model.model_path.clone(),
         &state.model.eos_token_ids,
         RuntimeType::Sglang,
+        // This wire has one framing.
+        WireRevision::default(),
         PeerWords {
             peer: "SGLang scheduler",
             party: "scheduler",

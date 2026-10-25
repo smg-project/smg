@@ -559,6 +559,10 @@ struct ClientInner<P: EngineProtocol> {
     /// frame, for one log line when it does.
     refused: AtomicUsize,
     engines: Vec<ConnectedEngine>,
+    /// The connection's [`EngineProtocol::Layout`]: what the engines declared
+    /// at their handshake and what the caller knew of them at start, read
+    /// once and handed to every encode and decode.
+    layout: P::Layout,
     registry: Mutex<RequestRegistry<P::Output>>,
     routing: Mutex<RoutingState>,
     /// Rotates the selection scan start so all-zero ties (cold start, fresh
@@ -1062,12 +1066,12 @@ impl<P: EngineProtocol> ClientInner<P> {
     }
 }
 
-/// The output layout of a connection: what its engines declared for the
+/// The layout of a connection: what its engines declared for the
 /// optional output columns `P` knows. The ranks of one connection run one
 /// engine build and declare one layout; a group that disagrees reads none of
 /// the optional columns (the default layout) rather than a column at the
 /// wrong position on some rank, and says so once.
-fn connection_layout<P: EngineProtocol>(engines: &[ConnectedEngine]) -> P::Layout {
+pub fn connection_layout<P: EngineProtocol>(engines: &[ConnectedEngine]) -> P::Layout {
     let mut layouts = engines
         .iter()
         .map(|engine| P::read_layout(&engine.ready_response));
@@ -1099,6 +1103,16 @@ impl<P: EngineProtocol> Client<P> {
     /// Transport-owned payloads have a separate allowance with the same limits.
     /// Codec and kernel buffers are not included in either allowance.
     pub fn new(transport: ConnectedTransport) -> Self {
+        let layout = connection_layout::<P>(&transport.engines);
+        Self::with_layout(transport, layout)
+    }
+
+    /// [`Self::new`] with the connection's layout given by the caller: what
+    /// the engines declared at their handshake ([`connection_layout`]) with
+    /// what the caller read of them before it (a wire revision the launcher
+    /// read off the installed engine), for a protocol whose layout carries
+    /// such a fact. The layout is fixed from the first frame on.
+    pub fn with_layout(transport: ConnectedTransport, layout: P::Layout) -> Self {
         let ConnectedTransport {
             engines,
             input_send,
@@ -1132,6 +1146,7 @@ impl<P: EngineProtocol> Client<P> {
             writing_since: Mutex::new(None),
             refused: AtomicUsize::new(0),
             engines,
+            layout,
             registry: Mutex::new(RequestRegistry::default()),
             routing: Mutex::new(RoutingState::default()),
             scan_start: AtomicUsize::new(0),
@@ -1193,7 +1208,7 @@ impl<P: EngineProtocol> Client<P> {
         let output_task = tokio::spawn(run_output_loop::<P>(
             output_socket,
             out_tx,
-            connection_layout::<P>(&inner.engines),
+            inner.layout.clone(),
         ));
         #[expect(
             clippy::disallowed_methods,
@@ -1205,6 +1220,12 @@ impl<P: EngineProtocol> Client<P> {
             inner,
             tasks: vec![input_task, output_task, dispatch_task],
         }
+    }
+
+    /// The layout this connection was opened with: what its engines declared
+    /// at the handshake, and the facts the caller read before it.
+    pub fn layout(&self) -> &P::Layout {
+        &self.inner.layout
     }
 
     /// The engines connected on this transport.
@@ -1390,7 +1411,7 @@ impl<P: EngineProtocol> Client<P> {
             request_id,
             armed: true,
         };
-        let (payload, mut aux_frames) = match P::encode_add(&request) {
+        let (payload, mut aux_frames) = match P::encode_add(&request, &self.inner.layout) {
             Ok(encoded) => encoded,
             Err(error) => {
                 guard.take_back(false);

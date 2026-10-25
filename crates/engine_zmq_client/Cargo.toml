@@ -31,6 +31,10 @@ byteorder.workspace = true
 bytes.workspace = true
 half.workspace = true
 
+# The TokenSpeed engine's published wire schema and codec (lib `ts_wire`): the framing of a scheduler of
+# the engine's Rust control plane; the other revision of that wire is framed here.
+tokenspeed-wire.workspace = true
+
 # Keyword scan of a structured-output constraint's text before its parse.
 memchr.workspace = true
 

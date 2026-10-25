@@ -6,7 +6,7 @@ use std::{path::Path, time::Duration};
 
 use engine_zmq_client::{
     mock_engine::{connect_to_frontend, default_ready_response, MockEngine},
-    protocol::handshake::EngineCoreReadyResponse,
+    protocol::{handshake::EngineCoreReadyResponse, tokenspeed::WireRevision},
     EngineId,
 };
 use openai_protocol::worker::RuntimeType;
@@ -53,6 +53,53 @@ pub(crate) async fn connected_pair_declaring_in(
         client.expect("adapter connect"),
         engine.expect("mock engine"),
     )
+}
+
+/// [`connected_pair_declaring_in`] with the connection opened on `wire` (the
+/// TokenSpeed dialect's revision the launcher would have read).
+pub(crate) async fn connected_pair_declaring_on_wire_in(
+    dir: &Path,
+    runtime: RuntimeType,
+    ready: EngineCoreReadyResponse,
+    wire: WireRevision,
+) -> (ZmqEngineClient, MockEngine) {
+    let (client, engine) = connect_declaring_on_wire_in(dir, runtime, ready, wire).await;
+    (
+        client.expect("adapter connect"),
+        engine.expect("mock engine"),
+    )
+}
+
+/// [`connected_pair_declaring_on_wire_in`] with the client's verdict left to
+/// the caller, so a connect the client refuses after the handshake is read
+/// as the error it names; the mock engine's own registration may fail once
+/// the refused client closes the transport, so its side comes as an option.
+pub(crate) async fn connect_declaring_on_wire_in(
+    dir: &Path,
+    runtime: RuntimeType,
+    ready: EngineCoreReadyResponse,
+    wire: WireRevision,
+) -> (
+    Result<ZmqEngineClient, Box<dyn std::error::Error + Send + Sync>>,
+    Option<MockEngine>,
+) {
+    let ep = |name: &str| format!("ipc://{}", dir.join(name).display());
+    let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+    let (client, engine) = tokio::join!(
+        ZmqEngineClient::connect_with_wire(
+            &handshake,
+            &input,
+            &output,
+            1,
+            "m".to_string(),
+            EosTokenIds::default(),
+            runtime,
+            Duration::from_secs(10),
+            wire,
+        ),
+        connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready),
+    );
+    (client, engine.ok())
 }
 
 /// [`connected_pair_in`] over a fresh temporary directory, returned so it
@@ -121,4 +168,16 @@ pub(crate) async fn two_logprob_chunks_then_the_complete(
     }
     assert!(stream.next().await.is_none());
     first
+}
+
+/// [`connected_pair_declaring`] with the connection opened on `wire`.
+pub(crate) async fn connected_pair_declaring_on_wire(
+    runtime: RuntimeType,
+    ready: EngineCoreReadyResponse,
+    wire: WireRevision,
+) -> (ZmqEngineClient, MockEngine, TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let (client, engine) =
+        connected_pair_declaring_on_wire_in(dir.path(), runtime, ready, wire).await;
+    (client, engine, dir)
 }

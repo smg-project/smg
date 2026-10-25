@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use engine_zmq_adapter::{connect_with_eos, EosTokenIds, Handshake, ZmqEngineClient};
+use engine_zmq_adapter::{connect_with_eos, EosTokenIds, Handshake, WireRevision, ZmqEngineClient};
 use engine_zmq_client::{EngineLiveness, StartupBudget};
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::worker::RuntimeType;
@@ -72,17 +72,25 @@ pub(crate) struct ConnectInputs {
 /// The handshake's silence bound (`startup_timeout`) counts from the latest
 /// sign of life: a handshake message, or the lifecycle owner's report that
 /// the engine process is alive (`link.liveness`); the ceiling bounds the
-/// whole start regardless. `configure` runs on the connected client first,
-/// with the wire's own setup (its structured-outputs support, the
-/// tokenizer's EOS, what it knows of the engine at start); then the engine's
-/// silence is bounded by `silence` (with the prefill allowance for the
-/// prompt it holds), applied before the first request reaches it, and the
-/// client is published.
+/// whole start regardless. `wire` is the wire revision the launcher read of
+/// the engine before it started, for a wire with more than one framing (the
+/// others pass the default and ignore it); the connection speaks it from
+/// its first frame. `configure` runs on the connected client first, with
+/// the wire's own setup (its structured-outputs support, the tokenizer's
+/// EOS, what it knows of the engine at start); then the engine's silence is
+/// bounded by `silence` (with the prefill allowance for the prompt it
+/// holds), applied before the first request reaches it, and the client is
+/// published.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one connect: the link, the model, the EOS ids, the wire and its revision, the words, the inputs and the setup"
+)]
 pub(crate) async fn connect_engine(
     link: &EngineLink,
     model_path: String,
     eos_token_ids: &[u32],
     runtime: RuntimeType,
+    wire: WireRevision,
     words: PeerWords,
     inputs: ConnectInputs,
     configure: impl FnOnce(&ZmqEngineClient),
@@ -114,6 +122,7 @@ pub(crate) async fn connect_engine(
             ceiling: startup_ceiling,
             liveness: Some(link.liveness.clone()),
         },
+        wire,
     )
     .await
     {

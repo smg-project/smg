@@ -11,10 +11,10 @@ use super::State;
 use crate::engine_link::{self, load_tokenizer_once, ConnectInputs, PeerWords};
 
 /// This wire's connect: the tokenizer is loaded first (string stops need
-/// it), then [`engine_link::connect_engine`] with this wire's words; the
-/// connected scheduler takes the tokenizer's EOS and the structured-outputs
-/// support the launcher's arguments say. The start-up and silence bounds are
-/// the link's.
+/// it), then [`engine_link::connect_engine`] with this wire's words and the
+/// wire revision the launcher read; the connected scheduler takes the
+/// tokenizer's EOS and the structured-outputs support the launcher's
+/// arguments say. The start-up and silence bounds are the link's.
 pub(super) async fn connect_engine(state: Arc<State>, inputs: ConnectInputs) {
     load_tokenizer_once(&state.tokenizer, state.shared.tokenizer_dir.as_deref()).await;
 
@@ -23,6 +23,7 @@ pub(super) async fn connect_engine(state: Arc<State>, inputs: ConnectInputs) {
         state.model.model_path.clone(),
         &state.model.eos_token_ids,
         RuntimeType::TokenSpeed,
+        state.model.wire_revision,
         PeerWords {
             peer: "TokenSpeed scheduler",
             party: "scheduler",

@@ -2164,6 +2164,7 @@ dependencies = [
  "smg-grpc-client",
  "tempfile",
  "thiserror 2.0.21",
+ "tokenspeed-wire",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -2215,6 +2216,7 @@ dependencies = [
  "serde_with",
  "tempfile",
  "thiserror 2.0.21",
+ "tokenspeed-wire",
  "tokio",
  "tracing",
  "zeromq",
@@ -8786,6 +8788,16 @@ dependencies = [
  "tk-convert",
  "tk-encode",
  "tk-serialize",
+]
+
+[[package]]
+name = "tokenspeed-wire"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d26837852cda7db2830ffe974f7ae7356dcda34b7d73785e0649b112135d3482"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

@@ -165,7 +165,7 @@ impl EngineProtocol for SglangProtocol {
         )
     }
 
-    fn encode_add(request: &Self::Request) -> Result<(Vec<u8>, Vec<Bytes>)> {
+    fn encode_add(request: &Self::Request, (): &()) -> Result<(Vec<u8>, Vec<Bytes>)> {
         let payload = encode_msgpack(request)?;
         // The request's metadata (the caller's trace context) rides as one
         // more frame: the positional array is the scheduler's own struct. Its

@@ -18,11 +18,22 @@
 //! 0x02` (`(call_id, method, args)`, answered by a `ControlReplySlim` on the
 //! output socket) and says so by declaring that reply in its handshake
 //! ([`wire_carries_control_calls`]); SMG sends control calls to no other.
+//!
+//! That is the wire of the engine's Python control loop. The engine's Rust
+//! control plane speaks the same messages in the engine's own published
+//! schema (`tokenspeed-wire`, the `ts_wire` crate): the full request array,
+//! tensors framed out from 256 bytes, a 22-column output batch, tagged
+//! control structs. Which of the two a connection speaks is a fact the
+//! launcher reads off the installed engine before the first frame
+//! ([`WireRevision`], part of the connection's [`TokenSpeedLayout`]); the
+//! [`wire`] module frames the latter with the crate's codec, this module
+//! frames the former as it always has, byte for byte.
 
 pub mod multimodal;
 pub mod output;
 pub mod request;
 pub mod sampling;
+pub mod wire;
 
 use std::collections::BTreeMap;
 
@@ -54,6 +65,62 @@ pub fn wire_carries_control_calls(layouts: &BTreeMap<String, Vec<String>>) -> bo
     layouts.contains_key(CONTROL_REPLY_SLIM_TAG)
 }
 
+/// Which revision of the scheduler's msgpack wire a connection speaks: the
+/// one capability read of this wire, made by the launcher off the installed
+/// engine before any scheduler starts and handed down with the connection;
+/// nothing is sniffed off the frames, and an engine is never asked. The
+/// default is the wire this module has always spoken, so a caller that
+/// says nothing changes nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WireRevision {
+    /// A scheduler of the engine's Python control loop: the request prefix,
+    /// the 13 output columns plus the ones the engine declares, control
+    /// calls as the `(call_id, method, args)` triple, all framed here.
+    #[default]
+    PythonLoop,
+    /// A scheduler of the engine's Rust control plane: the engine's
+    /// published schema, framed by its own crate ([`wire`]).
+    RustControlPlane,
+}
+
+impl WireRevision {
+    /// The revision by the launcher's word (`python_loop`,
+    /// `rust_control_plane`); `None` for any other word.
+    pub fn parse(word: &str) -> Option<Self> {
+        match word {
+            "python_loop" => Some(Self::PythonLoop),
+            "rust_control_plane" => Some(Self::RustControlPlane),
+            _ => None,
+        }
+    }
+
+    /// The launcher's word for the revision.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PythonLoop => "python_loop",
+            Self::RustControlPlane => "rust_control_plane",
+        }
+    }
+}
+
+/// A connection's layout on this wire: the revision the launcher read, and
+/// where the engines declared the optional output columns this module knows
+/// (a scheduler of the Python loop alone declares any; the Rust control
+/// plane's batch carries its details at fixed columns).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenSpeedLayout {
+    pub wire: WireRevision,
+    pub columns: SlimOutputLayout,
+}
+
+impl TokenSpeedLayout {
+    /// This layout on the given wire revision: what the caller read of the
+    /// engine before the handshake, over what the handshake declared.
+    pub fn with_wire(self, wire: WireRevision) -> Self {
+        Self { wire, ..self }
+    }
+}
+
 /// The TokenSpeed engine protocol: drives [`TokenizedGenerateReqInput`] over
 /// the shared ZMQ transport and decodes [`BatchTokenIDOutSlim`](output::BatchTokenIDOutSlim) back.
 pub struct TokenSpeedProtocol;
@@ -61,7 +128,7 @@ pub struct TokenSpeedProtocol;
 impl EngineProtocol for TokenSpeedProtocol {
     type Request = TokenizedGenerateReqInput;
     type Output = TokenSpeedOutput;
-    type Layout = SlimOutputLayout;
+    type Layout = TokenSpeedLayout;
 
     fn add_frame() -> Bytes {
         TokenSpeedRequestType::Add.to_frame()
@@ -123,8 +190,13 @@ impl EngineProtocol for TokenSpeedProtocol {
     /// resolves a tensor's frame index against the message's frames, the
     /// payload being frame 0, as it resolves its own encoder's. A text
     /// request, or one whose tensors are all small, keeps its one frame.
-    fn encode_add(request: &Self::Request) -> Result<(Vec<u8>, Vec<Bytes>)> {
-        encode_with_aux_frames(request)
+    /// On the Rust control plane's wire the engine's own crate frames the
+    /// request instead ([`wire::encode_add`]).
+    fn encode_add(request: &Self::Request, layout: &Self::Layout) -> Result<(Vec<u8>, Vec<Bytes>)> {
+        match layout.wire {
+            WireRevision::PythonLoop => encode_with_aux_frames(request),
+            WireRevision::RustControlPlane => wire::encode_add(request),
+        }
     }
 
     fn encode_abort(request_id: &str) -> Result<Vec<u8>> {
@@ -156,17 +228,26 @@ impl EngineProtocol for TokenSpeedProtocol {
         )))
     }
 
-    fn read_layout(ready: &EngineCoreReadyResponse) -> SlimOutputLayout {
+    fn read_layout(ready: &EngineCoreReadyResponse) -> TokenSpeedLayout {
         // The finish-detail columns are read where the engine declares them
         // (`positional_layouts["BatchTokenIDOutSlim"]`), never at a pinned
-        // position: an engine that declares neither is read as before.
-        SlimOutputLayout::declared(&ready.positional_layouts)
+        // position: an engine that declares neither is read as before. The
+        // wire revision is not the handshake's to tell: the caller sets it
+        // ([`TokenSpeedLayout::with_wire`]) from what the launcher read.
+        TokenSpeedLayout {
+            wire: WireRevision::default(),
+            columns: SlimOutputLayout::declared(&ready.positional_layouts),
+        }
     }
 
     fn decode_batch(
         frames: &[Bytes],
-        layout: &SlimOutputLayout,
+        layout: &TokenSpeedLayout,
     ) -> Result<EngineBatch<Self::Output>> {
+        if layout.wire == WireRevision::RustControlPlane {
+            return wire::decode_batch(frames);
+        }
+        let layout = &layout.columns;
         // Output messages are `[payload, aux...]`. The slim batch carries no
         // tensor fields today, so aux frames are unexpected but not fatal.
         if frames.len() > 1 {
@@ -311,7 +392,8 @@ mod tests {
     fn large_media_tensors_ride_as_frames_the_payload_addresses() {
         let request = media_request();
         let inline = encode_msgpack(&request).unwrap();
-        let (payload, aux) = TokenSpeedProtocol::encode_add(&request).unwrap();
+        let (payload, aux) =
+            TokenSpeedProtocol::encode_add(&request, &TokenSpeedLayout::default()).unwrap();
         assert_eq!(
             aux.iter().map(Bytes::len).collect::<Vec<_>>(),
             vec![4 * TENSOR_AUX_MIN_BYTES, TENSOR_AUX_MIN_BYTES]
@@ -366,7 +448,8 @@ mod tests {
             let mut request = media_request();
             request.multimodal_inputs.as_mut().unwrap().mm_items =
                 vec![media_item(1, size, size), media_item(2, size, 0)];
-            let (payload, aux) = TokenSpeedProtocol::encode_add(&request).unwrap();
+            let (payload, aux) =
+                TokenSpeedProtocol::encode_add(&request, &TokenSpeedLayout::default()).unwrap();
             assert!(aux.is_empty(), "size={size}");
             assert_eq!(payload, encode_msgpack(&request).unwrap(), "size={size}");
         }
@@ -375,7 +458,8 @@ mod tests {
             input_ids: vec![1, 2, 3],
             ..TokenizedGenerateReqInput::default()
         };
-        let (payload, aux) = TokenSpeedProtocol::encode_add(&text).unwrap();
+        let (payload, aux) =
+            TokenSpeedProtocol::encode_add(&text, &TokenSpeedLayout::default()).unwrap();
         assert!(aux.is_empty());
         assert_eq!(payload, encode_msgpack(&text).unwrap());
     }
@@ -390,7 +474,8 @@ mod tests {
             .as_mut()
             .unwrap()
             .data = WireArrayData::AuxIndex(1);
-        let (payload, aux) = TokenSpeedProtocol::encode_add(&request).unwrap();
+        let (payload, aux) =
+            TokenSpeedProtocol::encode_add(&request, &TokenSpeedLayout::default()).unwrap();
         assert!(aux.is_empty());
         assert_eq!(payload, encode_msgpack(&request).unwrap());
     }
@@ -547,7 +632,7 @@ mod tests {
         assert_eq!(payload, vector_bytes(FLUSH_CALL_VECTOR));
         let accepted = TokenSpeedProtocol::decode_batch(
             &[Bytes::from(vector_bytes(CONTROL_REPLY_ACCEPTED_VECTOR))],
-            &SlimOutputLayout::default(),
+            &TokenSpeedLayout::default(),
         )
         .unwrap();
         assert_eq!(accepted.engine_index, 0);
@@ -590,7 +675,7 @@ mod tests {
         };
         let frames = vec![Bytes::from(encode_msgpack(&reply).unwrap())];
         let batch =
-            TokenSpeedProtocol::decode_batch(&frames, &SlimOutputLayout::default()).unwrap();
+            TokenSpeedProtocol::decode_batch(&frames, &TokenSpeedLayout::default()).unwrap();
         assert!(batch.outputs.is_empty() && batch.load.is_none());
         assert_eq!(batch.engine_index, 1);
         let utility = batch.utility.expect("a utility reply");
@@ -603,7 +688,7 @@ mod tests {
         // The token batch still decodes through the same dispatch.
         let frames = vec![Bytes::from(encode_msgpack(&slim_batch()).unwrap())];
         assert_eq!(
-            TokenSpeedProtocol::decode_batch(&frames, &SlimOutputLayout::default())
+            TokenSpeedProtocol::decode_batch(&frames, &TokenSpeedLayout::default())
                 .unwrap()
                 .outputs
                 .len(),
@@ -673,7 +758,7 @@ mod tests {
         let mut ready = crate::mock_engine::default_ready_response();
         assert_eq!(
             TokenSpeedProtocol::read_layout(&ready),
-            SlimOutputLayout::default()
+            TokenSpeedLayout::default()
         );
         let mut names: Vec<String> = BASE_COLUMN_NAMES.iter().map(|n| n.to_string()).collect();
         names.push(FINISHED_STATUS_CODES.to_string());
@@ -684,9 +769,12 @@ mod tests {
         let layout = TokenSpeedProtocol::read_layout(&ready);
         assert_eq!(
             layout,
-            SlimOutputLayout {
-                finish_status: Some(13),
-                finish_message: Some(14),
+            TokenSpeedLayout {
+                wire: WireRevision::PythonLoop,
+                columns: SlimOutputLayout {
+                    finish_status: Some(13),
+                    finish_message: Some(14),
+                },
             }
         );
 
@@ -712,7 +800,7 @@ mod tests {
         );
         assert_eq!(read.finished_request_ids, vec!["edge".to_string()]);
         let unread =
-            TokenSpeedProtocol::decode_batch(&frames, &SlimOutputLayout::default()).unwrap();
+            TokenSpeedProtocol::decode_batch(&frames, &TokenSpeedLayout::default()).unwrap();
         assert_eq!(unread.outputs[0].finish_reason.as_deref(), Some("abort"));
         assert_eq!(unread.outputs[0].finish_status, None);
         assert_eq!(unread.outputs[0].finish_message, None);

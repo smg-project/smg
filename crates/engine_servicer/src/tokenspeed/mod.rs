@@ -17,7 +17,7 @@ use std::{sync::Arc, time::Duration};
 
 use engine_zmq_adapter::{
     GridTensors, MropeLayout, StructuredOutputBackend, StructuredOutputsBackendConfig,
-    StructuredOutputsSupport,
+    StructuredOutputsSupport, WireRevision,
 };
 use llm_tokenizer::traits::Tokenizer;
 use smg_grpc_client::tokenspeed_proto::token_speed_scheduler_server::TokenSpeedSchedulerServer;
@@ -105,6 +105,14 @@ pub struct TokenSpeedModelInfo {
     /// and for the batches published before its subscription joined.
     pub kv_events_replay_endpoint: String,
     pub kv_events_topic: String,
+    /// Which revision of the msgpack wire the installed engine speaks, as
+    /// the launcher read it off the engine before any scheduler started
+    /// (the one capability read of this wire): a scheduler of the engine's
+    /// Rust control plane is spoken to in the engine's published schema, a
+    /// scheduler of its Python loop in the framing this servicer has always
+    /// spoken. The default is the latter: a launcher that says nothing
+    /// changes nothing.
+    pub wire_revision: WireRevision,
 }
 
 impl TokenSpeedModelInfo {

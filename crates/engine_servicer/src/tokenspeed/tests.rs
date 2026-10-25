@@ -667,6 +667,100 @@ async fn streaming_generate_maps_steps_to_chunks_and_a_complete() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// A scheduler of the engine's Rust control plane: the launcher's reading of
+/// the wire puts the connection on the engine's published schema from the
+/// first frame. The mock scheduler reads the request with the engine's own
+/// crate (the full request array, no prefix) and answers with the crate's
+/// 22-column batch; the gRPC side gets the same chunks and completion as on
+/// the other revision.
+#[tokio::test]
+async fn a_scheduler_of_the_rust_control_plane_is_spoken_to_in_its_published_schema() {
+    let model = TokenSpeedModelInfo {
+        wire_revision: WireRevision::RustControlPlane,
+        ..model_info()
+    };
+    let mut h = harness(model, None).await;
+    let mut stream = h
+        .client
+        .generate(generate_request("r1", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+
+    let frames = h.engine_in.recv_frames().bounded().await.unwrap();
+    let request = match ts_wire::EngineRequest::from_frames(&frames).expect("the engine's decoder")
+    {
+        ts_wire::EngineRequest::Add(request) => *request,
+        other => panic!("expected an add message, got {other:?}"),
+    };
+    assert_eq!(
+        request.rid,
+        Some(ts_wire::codec::StrOrList::One("r1".to_string()))
+    );
+    assert_eq!(request.input_ids, Some(vec![1, 2, 3]));
+    assert_eq!(request.sampling_params.max_new_tokens, Some(8));
+    assert!(request.sampling_params.is_normalized);
+    assert!(request.stream);
+    assert_eq!(request.data_parallel_rank, None);
+    // The payload is the crate's full array, not the other revision's prefix.
+    let OpaqueValue::Array(array) = decode_value(&frames[1]).unwrap() else {
+        panic!("a positional array");
+    };
+    assert_eq!(array.len(), 25);
+
+    let step = |tokens: Vec<i32>, completion_tokens: i64, finish: &str| {
+        ts_wire::EngineOutput::Batch(Box::new(ts_wire::BatchTokenIDOutSlim {
+            rids: Some(vec!["r1".to_string()]),
+            output_ids: vec![tokens],
+            finished_reasons: vec![finish.to_string()],
+            prompt_tokens: vec![3],
+            completion_tokens: vec![completion_tokens],
+            cached_tokens: vec![0],
+            output_token_logprobs_val: vec![Vec::new()],
+            output_token_logprobs_idx: vec![Vec::new()],
+            engine_index: 0,
+            num_running: 1,
+            num_waiting: 0,
+            kv_active_pages: 10,
+            kv_total_pages: 100,
+            finish_reason_details: Vec::new(),
+            spec_verify_ct: Vec::new(),
+            accept_draft_tokens: Vec::new(),
+            input_token_logprobs_val: Vec::new(),
+            input_token_logprobs_idx: Vec::new(),
+            input_top_logprobs_val: Vec::new(),
+            input_top_logprobs_idx: Vec::new(),
+            output_top_logprobs_val: Vec::new(),
+            output_top_logprobs_idx: Vec::new(),
+        }))
+        .to_frames()
+    };
+    h.engine_out
+        .send_frames(step(vec![10], 1, ""))
+        .bounded()
+        .await
+        .unwrap();
+    h.engine_out
+        .send_frames(step(vec![11], 2, "length"))
+        .bounded()
+        .await
+        .unwrap();
+
+    let first = stream.message().bounded().await.unwrap().unwrap();
+    assert_eq!(first.request_id, "r1");
+    assert_eq!(chunk_tokens(first), vec![10]);
+    let second = stream.message().bounded().await.unwrap().unwrap();
+    assert_eq!(chunk_tokens(second), vec![11]);
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "length");
+    assert_eq!(done.output_ids, vec![10, 11]);
+    assert_eq!(done.prompt_tokens, 3);
+    assert_eq!(done.completion_tokens, 2);
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert_eq!(h.server.active_requests(), 0);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// Non-streaming delivers exactly the terminal `Complete`.
 #[tokio::test]
 async fn non_streaming_generate_delivers_only_the_complete() {

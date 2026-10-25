@@ -1405,8 +1405,9 @@ mod tests {
             ..plain.clone()
         };
         let (plain_payload, plain_aux) =
-            SglangProtocol::encode_add(&SglangRequest::Generate(plain)).unwrap();
-        let (payload, aux) = SglangProtocol::encode_add(&SglangRequest::Generate(traced)).unwrap();
+            SglangProtocol::encode_add(&SglangRequest::Generate(plain), &()).unwrap();
+        let (payload, aux) =
+            SglangProtocol::encode_add(&SglangRequest::Generate(traced), &()).unwrap();
         // The scheduler's own array is byte-identical: the context never enters it.
         assert_eq!(payload, plain_payload);
         assert!(plain_aux.is_empty());

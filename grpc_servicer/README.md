@@ -821,7 +821,14 @@ decided). With `--servicer-impl rust` the same process serves the
 (`smg.servicer.TokenSpeedGrpcServer`, which needs the `smg` wheel): the
 launcher computes the model and server facts from TokenSpeed's own config,
 runs the scheduler(s) headless in a spawned child over the msgpack ZMQ wire,
-and supervises both. What that wire does not carry is reported, not emulated:
+and supervises both. Before any scheduler starts, the launcher reads which
+revision of that wire the installed engine speaks (whether its `zmq_wire`
+module carries the tagged control API of the engine's Rust control plane) and
+hands it to the Rust server as `wire_revision`: a scheduler of the Rust
+control plane is spoken to in the engine's published schema (the
+`tokenspeed-wire` crate), any other engine in the wire this package has always
+spoken, byte for byte; nothing is decided off the frames. What the wire does
+not carry is reported, not emulated:
 `FlushCache` and profiling ride the wire's control call on a scheduler whose
 handshake declares its control reply (the control-wire revision) and answer
 UNIMPLEMENTED, naming the gap, on one that does not; ranked `top_logprobs` and

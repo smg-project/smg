@@ -26,7 +26,7 @@ use engine_servicer::{
     MediaRequest, ProcessedMedia, ServicerConfig, ServicerError, SglangEncodeDispatcher,
     SglangModelInfo, SglangServicerConfig, SglangServicerServer, TokenSpeedModelInfo,
     TokenSpeedServicerConfig, TokenSpeedServicerServer, VllmModelInfo, VllmServicerConfig,
-    VllmServicerServer, ALL_MODALITIES, DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC,
+    VllmServicerServer, WireRevision, ALL_MODALITIES, DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC,
     DEFAULT_ENGINE_SILENCE_TIMEOUT, DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT,
     PIXEL_MODALITIES,
 };
@@ -998,6 +998,7 @@ impl PyTokenSpeedGrpcServer {
         kv_events_endpoint = String::new(),
         kv_events_replay_endpoint = String::new(),
         kv_events_topic = String::new(),
+        wire_revision = None,
         engine_startup_timeout_secs = None,
         engine_startup_ceiling_secs = None,
         engine_silence_timeout_secs = None,
@@ -1043,12 +1044,23 @@ impl PyTokenSpeedGrpcServer {
         kv_events_endpoint: String,
         kv_events_replay_endpoint: String,
         kv_events_topic: String,
+        wire_revision: Option<String>,
         engine_startup_timeout_secs: Option<f64>,
         engine_startup_ceiling_secs: Option<f64>,
         engine_silence_timeout_secs: Option<f64>,
         engine_prefill_tokens_per_sec: Option<i64>,
         metrics_bind_address: Option<String>,
     ) -> PyResult<Self> {
+        // The launcher's reading of the installed engine's wire, made before
+        // any scheduler starts; unsaid, the wire every engine took until now.
+        let wire_revision = match wire_revision.as_deref().map(str::trim) {
+            None | Some("") => WireRevision::default(),
+            Some(word) => WireRevision::parse(word).ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "wire_revision must be `python_loop` or `rust_control_plane`, got `{word}`"
+                ))
+            })?,
+        };
         let model = TokenSpeedModelInfo {
             served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
             tokenizer_path: tokenizer_path.unwrap_or_else(|| model_path.clone()),
@@ -1081,6 +1093,7 @@ impl PyTokenSpeedGrpcServer {
             kv_events_endpoint,
             kv_events_replay_endpoint,
             kv_events_topic,
+            wire_revision,
         };
         let servicer = ServicerConfig {
             bind_address,

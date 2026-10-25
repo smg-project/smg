@@ -56,6 +56,11 @@ serde_default = "0.2.0"
 serde_repr = "0.1.20"
 serde_tuple = "1.1.3"
 zeromq = { git = "https://github.com/zeromq/zmq.rs", rev = "67dcba97559ebe8e8206dab753710d8b9cb07591", default-features = false, features = ["tokio-runtime", "all-transport"] }
+# The TokenSpeed engine's own IPC schema and msgpack codec, published from its repository: the direct ZMQ
+# lane to a scheduler of the engine's Rust control plane frames its messages with it (a scheduler of
+# the engine's Python loop still takes the framing crates/engine_zmq_client speaks itself). Pinned to
+# the exact release: the engine appends wire fields with a release, and every move is a deliberate bump.
+tokenspeed-wire = "=0.1.0"
 chrono = { version = "0.4" }
 dashmap = "6.2.1"
 tikv-jemallocator = { version = "0.6", default-features = false, features = ["background_threads_runtime_support"] }

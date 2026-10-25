@@ -39,8 +39,8 @@ pub mod mock_engine;
 // Crate-root shortcuts for what consumers actually build against; everything
 // else stays reachable through its own module path.
 pub use connector::{
-    Client, EngineCoreClient, EngineCoreStream, RequestStream, SglangClient, SglangStream,
-    TokenSpeedClient, TokenSpeedStream, ENGINE_PREFILL_TOKENS_PER_SEC,
+    connection_layout, Client, EngineCoreClient, EngineCoreStream, RequestStream, SglangClient,
+    SglangStream, TokenSpeedClient, TokenSpeedStream, ENGINE_PREFILL_TOKENS_PER_SEC,
     ENGINE_SILENCE_DEATH_TIMEOUT,
 };
 pub use error::{Error, Result};

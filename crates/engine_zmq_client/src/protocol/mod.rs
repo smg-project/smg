@@ -117,11 +117,15 @@ pub trait EngineProtocol: Send + Sync + 'static {
     type Request: Send + 'static;
     /// The typed per-request output streamed back.
     type Output: EngineOutput + Send + 'static;
-    /// What this protocol reads off an engine's handshake and needs when it
-    /// decodes that engine's outputs: where the engine declared the optional
-    /// output columns this client knows (`()` for a protocol whose outputs
-    /// carry none). Read once per connection ([`EngineProtocol::read_layout`])
-    /// and handed to every [`EngineProtocol::decode_batch`].
+    /// What this protocol knows of a connection's engines beyond the request
+    /// in hand: what it reads off their handshake (where they declared the
+    /// optional output columns this client knows) and what its caller read
+    /// of them before the handshake (a wire revision, for a protocol with
+    /// more than one framing); `()` for a protocol with nothing of either.
+    /// Read once per connection ([`EngineProtocol::read_layout`], then the
+    /// caller's facts: [`Client::with_layout`](crate::connector::Client::with_layout))
+    /// and handed to every [`EngineProtocol::encode_add`] and
+    /// [`EngineProtocol::decode_batch`].
     type Layout: Clone + Default + PartialEq + std::fmt::Debug + Send + Sync + 'static;
 
     /// The single-byte request-type frame prepended to an add-request.
@@ -146,8 +150,10 @@ pub trait EngineProtocol: Send + Sync + 'static {
     fn data_parallel_rank(request: &Self::Request) -> Option<u32>;
     /// Reject fields this client cannot represent on the wire.
     fn validate(request: &Self::Request) -> Result<()>;
-    /// Encode the add payload plus any aux tensor frames (empty on the text path).
-    fn encode_add(request: &Self::Request) -> Result<(Vec<u8>, Vec<Bytes>)>;
+    /// Encode the add payload plus any aux tensor frames (empty on the text
+    /// path), in the framing the connection's [`EngineProtocol::Layout`]
+    /// names (a protocol with one framing reads nothing from it).
+    fn encode_add(request: &Self::Request, layout: &Self::Layout) -> Result<(Vec<u8>, Vec<Bytes>)>;
     /// Encode the abort payload for one request id.
     fn encode_abort(request_id: &str) -> Result<Vec<u8>>;
     /// Encode "start `wave` on every rank" as `(request-type frame, payload)`.

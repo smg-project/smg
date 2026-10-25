@@ -13,11 +13,14 @@ use engine_zmq_client::{
     check_engine_layouts,
     codec::OpaqueValue,
     connect_handshake,
-    connector::{Client, EngineCoreClient, SglangClient, TokenSpeedClient},
+    connector::{connection_layout, Client, EngineCoreClient, SglangClient, TokenSpeedClient},
     protocol::{
         handshake::EngineCoreReadyResponse,
         sglang::{request::SglangRequest, SglangProtocol},
-        tokenspeed::{wire_carries_control_calls, TokenSpeedProtocol},
+        tokenspeed::{
+            output::BATCH_TOKEN_ID_OUT_SLIM_TAG, wire_carries_control_calls, TokenSpeedProtocol,
+            WireRevision,
+        },
         vllm::{request::EngineCoreRequest, sampling::EngineCoreSamplingParams, VllmProtocol},
         EngineLoad, EngineProtocol,
     },
@@ -198,6 +201,9 @@ pub async fn connect_for_worker(
         engine_count,
         eos,
         startup,
+        // A registered worker's engine: the wire every engine took until now
+        // (a worker that speaks the other revision is its own change).
+        WireRevision::default(),
     )
     .await?;
     if let Some(timeout) = request_timeout {
@@ -217,7 +223,14 @@ pub async fn connect_for_worker(
 /// engine process. `handshake` is
 /// the endpoint the engine dials: a registered worker's is tcp-only
 /// ([`Handshake::registered`]); a servicer's own link may bind an `ipc://`
-/// socket ([`Handshake::TcpOrIpc`]).
+/// socket ([`Handshake::TcpOrIpc`]). `wire` is what the launcher read of
+/// the engine's wire before it started ([`WireRevision`]): the framing of
+/// the TokenSpeed dialect, which has two; the other dialects have one and
+/// ignore it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "connect inputs: endpoints, engine count, EOS, runtime, start-up bounds and the wire revision are all irreducible"
+)]
 pub async fn connect_with_eos(
     base_url: &str,
     model_id: String,
@@ -226,6 +239,7 @@ pub async fn connect_with_eos(
     engine_count: usize,
     eos: EosTokenIds,
     startup: impl Into<StartupBudget>,
+    wire: WireRevision,
 ) -> Result<ZmqEngineClient, String> {
     let (handshake, input, output) = zmq_socket_addresses(base_url, handshake)?;
     ensure_ipc_socket_dir(base_url).await?;
@@ -242,7 +256,7 @@ pub async fn connect_with_eos(
     tracing::info!(
         "Binding ZMQ client for worker {base_url} (handshake={handshake}, engines={engine_count})"
     );
-    ZmqEngineClient::connect(
+    ZmqEngineClient::connect_with_wire(
         &handshake,
         &input,
         &output,
@@ -251,6 +265,7 @@ pub async fn connect_with_eos(
         eos,
         runtime,
         startup,
+        wire,
     )
     .await
     .map_err(|e| format!("Failed to connect ZMQ engine: {e}"))
@@ -304,6 +319,40 @@ impl ZmqEngineClient {
         runtime: RuntimeType,
         startup: impl Into<StartupBudget>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::connect_with_wire(
+            handshake_address,
+            input_address,
+            output_address,
+            engine_count,
+            model_id,
+            eos,
+            runtime,
+            startup,
+            WireRevision::default(),
+        )
+        .await
+    }
+
+    /// [`Self::connect`] on the wire revision the caller read of the engine
+    /// before it started ([`WireRevision`]: the TokenSpeed dialect's framing,
+    /// fixed for the connection from its first frame; the other dialects
+    /// have one framing and ignore it). [`Self::connect`] takes the default,
+    /// the framing every engine took until now.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "transport constructor: endpoints, engine count, runtime and the wire revision are all irreducible connection inputs"
+    )]
+    pub async fn connect_with_wire(
+        handshake_address: &str,
+        input_address: &str,
+        output_address: &str,
+        engine_count: usize,
+        model_id: String,
+        eos: EosTokenIds,
+        runtime: RuntimeType,
+        startup: impl Into<StartupBudget>,
+        wire: WireRevision,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Resolve the dialect before the handshake: no silent fallback for a
         // runtime with no ZMQ engine adapter, and no such engine ever dials in,
         // so the handshake would just block for the full timeout.
@@ -343,7 +392,43 @@ impl ZmqEngineClient {
         let backend = match dialect {
             ZmqDialect::Vllm => ZmqBackend::Vllm(Arc::new(EngineCoreClient::new(transport))),
             ZmqDialect::TokenSpeed => {
-                ZmqBackend::TokenSpeed(Arc::new(TokenSpeedClient::new(transport)))
+                // The launcher's read against the handshake: a scheduler of
+                // the published schema declares no positional layout for its
+                // batch (its ready response has no such field), so a rank
+                // that declares one under the rust-control-plane read runs
+                // the engine's Python control loop, and every batch after
+                // the connect would fail to decode. Named here by its identity,
+                // as the layout check above names a rank, from the handshake
+                // alone; nothing is read off the frames.
+                if wire == WireRevision::RustControlPlane {
+                    if let Some(engine) = transport.engines.iter().find(|engine| {
+                        engine
+                            .ready_response
+                            .positional_layouts
+                            .contains_key(BATCH_TOKEN_ID_OUT_SLIM_TAG)
+                    }) {
+                        let engine_id = &engine.engine_id;
+                        return Err(format!(
+                            "the TokenSpeed wire was read as the rust control plane's published \
+                             schema, but engine {engine_id:?} declared a positional layout for \
+                             {BATCH_TOKEN_ID_OUT_SLIM_TAG} at its handshake, which only a \
+                             scheduler of the Python control loop does: the launcher's wire \
+                             read and the running scheduler disagree"
+                        )
+                        .into());
+                    }
+                }
+                // The connection's layout: what the schedulers declared at
+                // their handshake, on the wire revision the launcher read
+                // before they started; the framing is fixed from here on.
+                let layout =
+                    connection_layout::<TokenSpeedProtocol>(&transport.engines).with_wire(wire);
+                tracing::info!(
+                    wire_revision = wire.as_str(),
+                    engines = transport.engines.len(),
+                    "TokenSpeed ZMQ backend connected"
+                );
+                ZmqBackend::TokenSpeed(Arc::new(TokenSpeedClient::with_layout(transport, layout)))
             }
             ZmqDialect::Sglang => ZmqBackend::Sglang(Arc::new(SglangClient::new(transport))),
         };
@@ -1084,12 +1169,18 @@ impl ZmqEngineClient {
         )))
     }
 
-    /// Whether every connected TokenSpeed rank declared the control reply at
-    /// its handshake (the control-wire revision), so the scheduler's control
-    /// RPCs can be carried to it; false on a scheduler that declares none and
-    /// on the other backends.
+    /// Whether the scheduler's control RPCs can be carried to every connected
+    /// TokenSpeed rank: the connection speaks the Python loop's wire (the
+    /// Rust control plane's tagged control operations are not sent yet, so a
+    /// connection on that revision answers UNIMPLEMENTED whatever its
+    /// handshake declares) and every rank declared the control reply at its
+    /// handshake; false on a scheduler that declares none and on the other
+    /// backends.
     pub fn tokenspeed_wire_carries_control_calls(&self) -> bool {
-        matches!(&self.backend, ZmqBackend::TokenSpeed(_))
+        let ZmqBackend::TokenSpeed(client) = &self.backend else {
+            return false;
+        };
+        client.layout().wire == WireRevision::PythonLoop
             && self
                 .engines()
                 .iter()
@@ -1467,6 +1558,12 @@ fn zmq_status_of(error: &engine_zmq_client::Error) -> tonic::Status {
         | engine_zmq_client::Error::ClientClosed { .. } => {
             tonic::Status::unavailable(error.to_string())
         }
+        // A value of the request the wire cannot carry (a seed past the
+        // engine's integers) is the caller's argument, not the worker's
+        // failure.
+        engine_zmq_client::Error::RequestValueOutOfRange { .. } => {
+            tonic::Status::invalid_argument(error.to_string())
+        }
         other => tonic::Status::internal(other.to_string()),
     }
 }
@@ -1511,7 +1608,7 @@ mod tests {
         mock_engine::{
             connect_to_frontend, default_ready_response, hello, EngineInbound, MockEngine,
         },
-        protocol::vllm::request::UtilityCall,
+        protocol::{tokenspeed::output::BASE_COLUMN_NAMES, vllm::request::UtilityCall},
         EngineId,
     };
     use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer};
@@ -1519,7 +1616,12 @@ mod tests {
     use tonic::Code;
 
     use super::*;
-    use crate::{eos::EosTokenIds, test_support::connected_pair};
+    use crate::{
+        eos::EosTokenIds,
+        test_support::{
+            connect_declaring_on_wire_in, connected_pair, connected_pair_declaring_on_wire,
+        },
+    };
 
     /// A request that reaches the connector once it is shutting down (its
     /// engine died and the servicer is on its way out) is answered the way a
@@ -1646,6 +1748,7 @@ mod tests {
                 1,
                 EosTokenIds::default(),
                 Duration::from_secs(1),
+                WireRevision::default(),
             ),
             hello(&handshake, EngineId::from_engine_index(0)),
         );
@@ -1667,6 +1770,7 @@ mod tests {
                 1,
                 EosTokenIds::default(),
                 Duration::from_secs(10),
+                WireRevision::default(),
             ),
             async {
                 engine
@@ -1712,6 +1816,7 @@ mod tests {
                 1,
                 EosTokenIds::default(),
                 Duration::from_secs(10),
+                WireRevision::default(),
             ),
             connect_to_frontend(
                 &handshake,
@@ -2126,6 +2231,81 @@ mod tests {
         let status = status.expect_err("engine failure");
         assert_eq!(status.code(), Code::Internal);
         assert!(status.message().contains("boom"), "{status:?}");
+    }
+
+    /// A Rust-control-plane connection carries no control call yet, whatever
+    /// its handshake declares: a control RPC answers UNIMPLEMENTED at once
+    /// instead of sending the Python loop's triple and waiting out the
+    /// deadline.
+    #[tokio::test]
+    async fn a_rust_control_plane_connection_carries_no_control_calls() {
+        let mut ready = default_ready_response();
+        ready.positional_layouts.insert(
+            "ControlReplySlim".to_string(),
+            ["call_id", "success", "message", "engine_index"]
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        );
+        let (client, _engine, _dir) = connected_pair_declaring_on_wire(
+            RuntimeType::TokenSpeed,
+            ready,
+            WireRevision::RustControlPlane,
+        )
+        .await;
+        assert!(!client.tokenspeed_wire_carries_control_calls());
+        // A control RPC that reaches the guard: without it the mock engine
+        // never answers and the call ends in DEADLINE_EXCEEDED.
+        let status = client
+            .flush_cache_control(0.0, Duration::from_secs(1))
+            .await
+            .expect_err("no control call on this wire revision");
+        assert_eq!(status.code(), Code::Unimplemented);
+    }
+
+    /// The launcher's read against the handshake: a rank that declares the
+    /// batch struct's positional layout runs the engine's Python control
+    /// loop, so a rust-control-plane connection to it is refused at the
+    /// handshake, by name, instead of failing every batch after it; the
+    /// control reply's declaration alone is not that sign (the test above).
+    #[tokio::test]
+    async fn a_rust_control_plane_read_refuses_a_rank_that_declares_the_batch_layout() {
+        let mut ready = default_ready_response();
+        ready.positional_layouts.insert(
+            BATCH_TOKEN_ID_OUT_SLIM_TAG.to_string(),
+            BASE_COLUMN_NAMES
+                .iter()
+                .chain(["finished_status_codes", "finished_messages"].iter())
+                .map(ToString::to_string)
+                .collect(),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let (client, _engine) = connect_declaring_on_wire_in(
+            dir.path(),
+            RuntimeType::TokenSpeed,
+            ready,
+            WireRevision::RustControlPlane,
+        )
+        .await;
+        let error = client
+            .err()
+            .expect("the connect is refused at the handshake")
+            .to_string();
+        let rank = format!("engine {:?}", EngineId::from_engine_index(0));
+        assert!(
+            error.contains(BATCH_TOKEN_ID_OUT_SLIM_TAG) && error.contains(&rank),
+            "{error}"
+        );
+    }
+
+    /// A request value the wire cannot carry is the caller's argument.
+    #[test]
+    fn a_request_value_the_wire_cannot_carry_is_the_callers_error() {
+        let status = zmq_status(engine_zmq_client::Error::RequestValueOutOfRange {
+            field: "seed",
+            message: "does not fit".to_string(),
+        });
+        assert_eq!(status.code(), Code::InvalidArgument);
     }
 
     /// TokenSpeed has no prefix-cache reset on the ZMQ wire.

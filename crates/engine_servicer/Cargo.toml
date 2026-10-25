@@ -46,6 +46,8 @@ zeromq.workspace = true
 
 [dev-dependencies]
 engine-zmq-client = { workspace = true, features = ["mock-engine"] }
+# The engine's published wire schema: the mock scheduler of the Rust control plane reads and writes its frames.
+tokenspeed-wire.workspace = true
 criterion = { version = "0.8", features = ["html_reports"] }
 # The normalized KV-event streams' round trip into the gateway's reference index.
 kv-index.workspace = true

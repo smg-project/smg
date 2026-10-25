@@ -55,6 +55,11 @@ pub enum Error {
         context: &'static str,
         field: &'static str,
     },
+    #[error("field `{field}` of the request cannot be carried on this wire: {message}")]
+    RequestValueOutOfRange {
+        field: &'static str,
+        message: String,
+    },
     #[error("invalid structured outputs params: {message}")]
     InvalidStructuredOutputsParams { message: String },
     #[error("request `{request_id}` is already in flight")]

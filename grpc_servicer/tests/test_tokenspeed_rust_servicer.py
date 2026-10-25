@@ -359,6 +359,37 @@ def test_server_facts_carry_labels_window_and_kv_events(monkeypatch):
     assert plain["kv_events_replay_endpoint"] == ""
 
 
+def test_the_wire_revision_is_read_off_the_installed_engine_before_the_ranks_start(monkeypatch):
+    """The one capability read of the msgpack wire: an engine whose ``zmq_wire``
+    carries the tagged control API of its Rust control plane takes the
+    engine's published schema; any other engine, or none, takes the wire this
+    package has always spoken. The facts carry the word the Rust server takes."""
+    _stub_servicer_module(monkeypatch)
+    _install(
+        monkeypatch,
+        "tokenspeed.runtime.engine.zmq_wire",
+        encode_control=lambda request: [],
+        decode_control_output=lambda frames: None,
+    )
+    assert rust.wire_revision() == rust.WIRE_REVISION_RUST_CONTROL_PLANE
+    assert rust.server_facts(FakeServerArgs())["wire_revision"] == "rust_control_plane"
+
+    # An engine of the Python control loop: a `zmq_wire` without the tagged
+    # control API (the control triple of its own revision, or none at all).
+    _install(monkeypatch, "tokenspeed.runtime.engine.zmq_wire", REQ_TYPE_CONTROL=2)
+    assert rust.wire_revision() == rust.WIRE_REVISION_PYTHON_LOOP
+    _install(monkeypatch, "tokenspeed.runtime.engine.zmq_wire", encode_control=lambda request: [])
+    assert rust.wire_revision() == rust.WIRE_REVISION_PYTHON_LOOP
+    assert rust.server_facts(FakeServerArgs())["wire_revision"] == "python_loop"
+
+    # No importable engine: the Python loop's wire, as before this read existed.
+    # The package itself is masked: a None entry for it raises on the import
+    # whether or not an engine is installed, where a masked submodule under a
+    # fake parent (no __path__) would only bind None and never raise.
+    monkeypatch.setitem(sys.modules, "tokenspeed.runtime.engine", None)
+    assert rust.wire_revision() == rust.WIRE_REVISION_PYTHON_LOOP
+
+
 @dataclasses.dataclass
 class _ReasoningServerArgs(FakeServerArgs):
     reasoning_parser: str | None = None

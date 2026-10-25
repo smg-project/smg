@@ -14,6 +14,12 @@ runs, starts them), dialing the servicer's same-host msgpack ZMQ handshake.
 Python keeps the lifecycle only. The Router cannot tell the two
 implementations apart.
 
+Which revision of the msgpack wire the installed engine speaks is read off the
+engine before any scheduler starts (:func:`wire_revision`) and handed to the
+Rust server, which frames every message by it from the first frame: a
+scheduler of the engine's Rust control plane is spoken to in the engine's
+published schema, any other in the wire this package has always spoken.
+
 What the msgpack wire does not carry, the Rust path reports rather than
 emulates: ``FlushCache`` and profiling ride the wire's control call on a
 scheduler whose handshake declares its control reply, and answer UNIMPLEMENTED
@@ -105,6 +111,10 @@ PREFILL_TOKENS_PER_SEC_ENV = "SMG_TOKENSPEED_SERVICER_PREFILL_TOKENS_PER_SEC"
 # Set to 0/false/no/off to keep TokenSpeed's KV event publisher off when the
 # launcher was given no --kv-events-config (see `default_kv_events_config`).
 KV_EVENTS_ENV = "SMG_TOKENSPEED_SERVICER_KV_EVENTS"
+# The two revisions of the msgpack wire an installed engine may speak, as the
+# Rust server names them (its ``wire_revision`` argument; see `wire_revision`).
+WIRE_REVISION_PYTHON_LOOP = "python_loop"
+WIRE_REVISION_RUST_CONTROL_PLANE = "rust_control_plane"
 
 
 def default_kv_events_json(endpoint: str) -> str:
@@ -330,6 +340,8 @@ def server_facts(server_args: Any) -> dict[str, Any]:
         "kv_events_endpoint": kv_events.endpoint if kv_events else "",
         "kv_events_replay_endpoint": kv_events.replay_endpoint if kv_events else "",
         "kv_events_topic": kv_events.topic if kv_events else "",
+        # The wire the installed engine speaks, read before the ranks start.
+        "wire_revision": wire_revision(),
     }
 
 
@@ -419,6 +431,28 @@ def default_kv_events_config(
 # ---------------------------------------------------------------------------
 # Scheduler ranks: TokenSpeed's own launch from this process, dialing this servicer
 # ---------------------------------------------------------------------------
+
+
+def wire_revision() -> str:
+    """Which revision of the msgpack wire the installed engine speaks, read
+    off the engine's own ``zmq_wire`` module before any scheduler starts and
+    handed to the Rust server, which frames every request and reads every
+    output by it from the first frame (nothing is sniffed off the frames,
+    and the engine is never asked). An engine whose ``zmq_wire`` carries the
+    tagged control API of its Rust control plane (``encode_control`` and
+    ``decode_control_output``) takes the engine's published schema; any
+    other engine runs the Python control loop and takes the wire this
+    package has always spoken. An engine that cannot be imported reads as
+    the Python loop: the launcher fails on its own import of it next."""
+    try:
+        from tokenspeed.runtime.engine import zmq_wire
+    except ImportError:
+        return WIRE_REVISION_PYTHON_LOOP
+    if callable(getattr(zmq_wire, "encode_control", None)) and callable(
+        getattr(zmq_wire, "decode_control_output", None)
+    ):
+        return WIRE_REVISION_RUST_CONTROL_PLANE
+    return WIRE_REVISION_PYTHON_LOOP
 
 
 def headless_server_args(server_args: Any, *, handshake_port: int) -> Any:
