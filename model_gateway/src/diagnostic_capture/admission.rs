@@ -4,10 +4,11 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
+    thread::{self, JoinHandle},
 };
 
 use serde::Serialize;
-use tokio::{runtime::Handle, sync::Semaphore, task::JoinHandle};
+use tokio::{runtime::Handle, sync::Semaphore};
 
 use super::{CaptureFile, CaptureQueue, CaptureWriter, BUFFER_BYTES, RESERVED_BYTES};
 
@@ -62,7 +63,7 @@ impl Drop for Lease {
     }
 }
 
-/// A charged capture owner; its active slot is shared with the actual blocking writer.
+/// A charged capture owner; its active slot is shared with the dedicated writer thread.
 pub struct CaptureSession {
     directory: PathBuf,
     queue: CaptureQueue,
@@ -75,7 +76,7 @@ impl CapturePool {
     ///
     /// Active payload storage is bounded by `max_active * (queue_capacity + 2) * record_bytes`,
     /// including one transient reallocation per producer, plus fixed file buffers, allocator,
-    /// channel/task overhead and allocations in caller-provided serializers.
+    /// channel/task overhead, dedicated thread stacks and caller-provided serializer allocations.
     pub fn new(root: PathBuf, limits: CaptureLimits) -> io::Result<Self> {
         let memory = limits
             .queue_capacity
@@ -107,7 +108,8 @@ impl CapturePool {
 
     /// Admit immediately or return `WouldBlock` (active slots) / `QuotaExceeded` (run budget).
     ///
-    /// Requires a Tokio runtime. File creation and writes run on blocking tasks. Cancellation
+    /// Requires Tokio for file creation; each writer has a dedicated thread so an idle capture
+    /// cannot pin the runtime's shared blocking pool. Cancellation
     /// does not refund an admitted attempt: active capacity returns only after both the owner
     /// and writer exit. Failed creation still consumes its conservative disk/attempt reservation.
     pub async fn start(&self) -> io::Result<CaptureSession> {
@@ -121,7 +123,6 @@ impl CapturePool {
         let handle = Handle::try_current().map_err(io::Error::other)?;
         let lease = self.reserve()?;
         let shared = self.0.clone();
-        let writer_handle = handle.clone();
         handle
             .spawn_blocking(move || {
                 let limits = shared.limits;
@@ -130,10 +131,13 @@ impl CapturePool {
                 let (queue, writer) =
                     CaptureQueue::new(file, limits.queue_capacity, limits.record_bytes)?;
                 let writer_lease = lease.clone();
-                let worker = writer_handle.spawn_blocking(move || {
-                    let _lease = writer_lease;
-                    run(writer);
-                });
+                let worker =
+                    thread::Builder::new()
+                        .name("smg-capture".into())
+                        .spawn(move || {
+                            let _lease = writer_lease;
+                            run(writer);
+                        })?;
                 Ok(CaptureSession {
                     directory,
                     queue,
@@ -184,11 +188,12 @@ impl CaptureSession {
         self.queue.record(payload)
     }
 
-    /// Seal explicitly and await storage plus worker exit before releasing active admission.
+    /// Seal and join the writer before releasing admission; requires a Tokio runtime.
     ///
     /// Polling authorizes sealing even if this waiter is later cancelled. The active lease then
     /// remains with the writer until it exits. Storage success still does not prove coverage.
     pub async fn finish(self) -> io::Result<PathBuf> {
+        let handle = Handle::try_current().map_err(io::Error::other)?;
         let Self {
             queue,
             worker,
@@ -196,9 +201,16 @@ impl CaptureSession {
             ..
         } = self;
         let result = queue.finish().await;
-        let joined = worker.await;
-        drop(lease);
-        joined.map_err(io::Error::other)?;
+        // Join only after the writer has sent its result (or unwound), never while idle.
+        handle
+            .spawn_blocking(move || {
+                let _lease = lease;
+                worker
+                    .join()
+                    .map_err(|_| io::Error::other("capture writer panicked"))
+            })
+            .await
+            .map_err(io::Error::other)??;
         result
     }
 }
@@ -214,7 +226,7 @@ mod tests {
     };
 
     use tokio::{
-        sync::Barrier,
+        sync::{oneshot, Barrier},
         task::JoinSet,
         time::{sleep, timeout},
     };
@@ -377,5 +389,32 @@ mod tests {
             assert_eq!(directory.join("complete.json").exists(), seal);
             pool.start().await.unwrap().finish().await.unwrap();
         }
+    }
+    #[test]
+    fn active_writer_does_not_pin_the_shared_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let pool = make_pool(root.path(), |l| l.max_active = 1);
+            let (ready, started) = oneshot::channel();
+            let session = pool
+                .start_with(move |writer| {
+                    ready.send(()).unwrap();
+                    writer.run();
+                })
+                .await
+                .unwrap();
+            started.await.unwrap();
+            let probe = tokio::task::spawn_blocking(|| ());
+            let progressed = timeout(Duration::from_secs(1), probe).await.is_ok();
+            // Release the writer even on regression, before failing or dropping the runtime.
+            session.finish().await.unwrap();
+            assert!(progressed, "capture writer starved unrelated blocking work");
+        });
     }
 }
