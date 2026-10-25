@@ -71,7 +71,10 @@ impl SharedCapture {
     pub async fn finish(self) -> io::Result<PathBuf> {
         let Shared { session, failed } = Arc::try_unwrap(self.inner).map_err(|shared| {
             shared.failed.store(true, Ordering::Release);
-            io::Error::new(io::ErrorKind::WouldBlock, "capture observers are still alive")
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "capture observers are still alive",
+            )
         })?;
         let poisoned = session.is_poisoned();
         // A panicking serializer already closes the queue. Recover only to await its writer;
@@ -129,10 +132,17 @@ mod tests {
     use crate::diagnostic_capture::{CaptureLimits, CapturePool};
 
     fn pool(root: &Path, file_bytes: u64) -> io::Result<CapturePool> {
-        CapturePool::new(root.to_owned(), CaptureLimits {
-            max_active: 1, max_attempts: 4, max_retained_bytes: file_bytes * 4,
-            file_bytes, queue_capacity: 64, record_bytes: 256,
-        })
+        CapturePool::new(
+            root.to_owned(),
+            CaptureLimits {
+                max_active: 1,
+                max_attempts: 4,
+                max_retained_bytes: file_bytes * 4,
+                file_bytes,
+                queue_capacity: 64,
+                record_bytes: 256,
+            },
+        )
     }
 
     async fn after_release(pool: &CapturePool) -> io::Result<CaptureSession> {
@@ -145,7 +155,9 @@ mod tests {
                     result => return result,
                 }
             }
-        }).await.map_err(io::Error::other)?
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 
     struct Panics;
@@ -162,7 +174,9 @@ mod tests {
     impl Serialize for Held {
         fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
             self.entered.send(()).map_err(S::Error::custom)?;
-            self.resume.recv_timeout(Duration::from_secs(5)).map_err(S::Error::custom)?;
+            self.resume
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(S::Error::custom)?;
             serializer.serialize_str("first observation")
         }
     }
@@ -177,13 +191,19 @@ mod tests {
         let second = first.clone();
         let third = owner.observer();
         for n in 0..12 {
-            [&first, &second, &third][n % 3].record(&json!({"n": n})).unwrap();
+            [&first, &second, &third][n % 3]
+                .record(&json!({"n": n}))
+                .unwrap();
         }
         assert!(!directory.join("complete.json").exists());
         drop((first, second, third));
         assert_eq!(owner.finish().await.unwrap(), directory);
         let data = fs::read_to_string(directory.join("records.jsonl")).unwrap();
-        let records: Vec<Value> = data.lines().map(serde_json::from_str).collect::<Result<_,_>>().unwrap();
+        let records: Vec<Value> = data
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()
+            .unwrap();
         assert_eq!(records.len(), 12);
         for (n, record) in records.iter().enumerate() {
             assert_eq!(record, &json!({"sequence": n, "payload": {"n": n}}));
@@ -199,9 +219,18 @@ mod tests {
         let owner = SharedCapture::new(pool.start().await.unwrap());
         let directory = owner.directory().to_owned();
         let observer = owner.observer();
-        assert_eq!(owner.finish().await.unwrap_err().kind(), io::ErrorKind::WouldBlock);
-        assert!(observer.record(&Panics).is_err(), "failed owner rejects before serialization");
-        assert_eq!(pool.start().await.err().unwrap().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            owner.finish().await.unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(
+            observer.record(&Panics).is_err(),
+            "failed owner rejects before serialization"
+        );
+        assert_eq!(
+            pool.start().await.err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
         drop(observer);
         drop(after_release(&pool).await.unwrap());
         assert!(!directory.join("complete.json").exists());
@@ -217,9 +246,17 @@ mod tests {
         let second = owner.observer();
         let (entered, ready) = mpsc::channel();
         let (resume, receiver) = mpsc::channel();
-        let worker = thread::spawn(move || first.record(&Held { entered, resume: receiver }));
+        let worker = thread::spawn(move || {
+            first.record(&Held {
+                entered,
+                resume: receiver,
+            })
+        });
         ready.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(second.record(&Panics).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            second.record(&Panics).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         resume.send(()).unwrap();
         worker.join().unwrap().unwrap();
         assert!(second.record(&Panics).is_err());
@@ -252,10 +289,15 @@ mod tests {
         let observer = owner.observer();
         observer.record(&"x".repeat(100)).unwrap(); // Fits record cap, exceeds file allowance.
         for _ in 0..65 {
-            if observer.record(&"later").is_err() { break; }
+            if observer.record(&"later").is_err() {
+                break;
+            }
         }
         drop(observer);
-        assert_eq!(owner.finish().await.unwrap_err().kind(), io::ErrorKind::FileTooLarge);
+        assert_eq!(
+            owner.finish().await.unwrap_err().kind(),
+            io::ErrorKind::FileTooLarge
+        );
         assert!(!directory.join("complete.json").exists());
         drop(pool.start().await.unwrap());
     }
@@ -268,7 +310,10 @@ mod tests {
         let directory = owner.directory().to_owned();
         let observer = owner.observer();
         let another = observer.clone();
-        assert_eq!(observer.record(&"x".repeat(1024)).unwrap_err().kind(), io::ErrorKind::FileTooLarge);
+        assert_eq!(
+            observer.record(&"x".repeat(1024)).unwrap_err().kind(),
+            io::ErrorKind::FileTooLarge
+        );
         assert!(another.record(&Panics).is_err());
         drop((observer, another));
         assert!(owner.finish().await.is_err());
@@ -284,8 +329,15 @@ mod tests {
             let directory = owner.directory().to_owned();
             let observer = owner.observer();
             observer.record(&"prefix").unwrap();
-            if unpolled { drop(owner.finish()); } else { drop(owner); }
-            assert_eq!(pool.start().await.err().unwrap().kind(), io::ErrorKind::WouldBlock);
+            if unpolled {
+                drop(owner.finish());
+            } else {
+                drop(owner);
+            }
+            assert_eq!(
+                pool.start().await.err().unwrap().kind(),
+                io::ErrorKind::WouldBlock
+            );
             drop(observer);
             drop(after_release(&pool).await.unwrap());
             assert!(!directory.join("complete.json").exists());
