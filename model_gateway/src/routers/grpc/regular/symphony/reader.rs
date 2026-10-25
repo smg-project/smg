@@ -844,6 +844,8 @@ mod tests {
     #[test]
     fn a_recorded_nonce_replays_reader_batches_and_chat_choices() {
         let assignment = Assignment {
+            #[cfg(feature = "diagnostic-capture")]
+            recipe: None,
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: PROMPT.to_string(),
         };
@@ -907,7 +909,12 @@ mod tests {
                 1,
             ),
         ] {
-            let assignment = Assignment { format: Arc::new(format), prompt: prompt.to_string() };
+            let assignment = Assignment {
+                #[cfg(feature = "diagnostic-capture")]
+                recipe: None,
+                format: Arc::new(format),
+                prompt: prompt.to_string(),
+            };
             let batches = nonce_batches(&assignment, Some(ids), &[output], false).expect("reader");
             let message = chat::message(0, batches.iter().flatten());
             let calls = message.message.tool_calls.expect("generated calls");
@@ -929,6 +936,8 @@ mod tests {
     #[test]
     fn ordinary_readers_keep_distinct_ids_without_changing_other_events() {
         let assignment = Assignment {
+            #[cfg(feature = "diagnostic-capture")]
+            recipe: None,
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: "<|im_start|>assistant\n".to_string(),
         };
