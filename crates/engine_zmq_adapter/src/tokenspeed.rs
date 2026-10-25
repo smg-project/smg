@@ -971,7 +971,7 @@ mod tests {
     use openai_protocol::worker::RuntimeType;
 
     use super::*;
-    use crate::test_support::connected_pair;
+    use crate::test_support::{connected_pair, two_logprob_chunks_then_the_complete};
 
     /// The translation under the mock scheduler's context window, one rank.
     fn translate_for(
@@ -1074,49 +1074,8 @@ mod tests {
         };
         let mut stream = client.generate_tokenspeed(req).await.expect("generate");
 
-        let first = stream.next().await.expect("chunk item").expect("chunk ok");
-        match first.response {
-            Some(vllm::generate_response::Response::Chunk(chunk)) => {
-                assert_eq!(chunk.token_ids, vec![10]);
-                assert_eq!(chunk.prompt_tokens, 3);
-                let logprobs = chunk.output_logprobs.expect("chunk logprobs");
-                assert_eq!(logprobs.token_logprobs, vec![-0.5]);
-                assert_eq!(logprobs.token_ids, vec![10]);
-            }
-            other => panic!("expected chunk, got {other:?}"),
-        }
-        // The finish tick carried a new token, so its delta is emitted as a
-        // chunk before the (cumulative) terminal complete.
-        let second = stream.next().await.expect("chunk item").expect("chunk ok");
-        match second.response {
-            Some(vllm::generate_response::Response::Chunk(chunk)) => {
-                assert_eq!(chunk.token_ids, vec![11]);
-                let logprobs = chunk.output_logprobs.expect("chunk logprobs");
-                assert_eq!(logprobs.token_logprobs, vec![-1.25]);
-                assert_eq!(logprobs.token_ids, vec![11]);
-            }
-            other => panic!("expected chunk, got {other:?}"),
-        }
-        let third = stream
-            .next()
-            .await
-            .expect("complete item")
-            .expect("complete ok");
-        match third.response {
-            Some(vllm::generate_response::Response::Complete(complete)) => {
-                assert_eq!(complete.output_ids, vec![10, 11]);
-                assert_eq!(complete.finish_reason, "length");
-                assert_eq!(complete.completion_tokens, 2);
-                // Chunks carry the tick's incremental logprobs; the terminal
-                // `Complete` carries the cumulative set, parallel to `output_ids`
-                // (the non-streaming renderer reads only the `Complete`).
-                let logprobs = complete.output_logprobs.expect("complete logprobs");
-                assert_eq!(logprobs.token_logprobs, vec![-0.5, -1.25]);
-                assert_eq!(logprobs.token_ids, vec![10, 11]);
-            }
-            other => panic!("expected complete, got {other:?}"),
-        }
-        assert!(stream.next().await.is_none());
+        let first = two_logprob_chunks_then_the_complete(&mut stream).await;
+        assert_eq!(first.prompt_tokens, 3);
 
         engine_task.await.unwrap();
     }
