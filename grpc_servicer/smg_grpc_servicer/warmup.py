@@ -598,9 +598,10 @@ def refused(error: BaseException) -> UnservedRequest | None:
     becomes (its code one of :data:`REFUSAL_STATUS_CODES`; the words carry
     the code and the status' details), or ``None`` for any other error. A
     wire raises it in place of the status, so the pass records the request
-    as failed and the step as not covered, without a step toward the stop.
-    The status is read as a gRPC call exposes it (``code()``, ``details()``),
-    without a gRPC import here."""
+    as failed and the step as not covered, and counts the step toward the
+    stop by :class:`UnservedRequest`'s rule (only while no step has been
+    covered). The status is read as a gRPC call exposes it (``code()``,
+    ``details()``), without a gRPC import here."""
     code = getattr(error, "code", None)
     name = getattr(code() if callable(code) else code, "name", None)
     if name not in REFUSAL_STATUS_CODES:

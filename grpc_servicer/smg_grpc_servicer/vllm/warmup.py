@@ -125,8 +125,8 @@ class GrpcWire:
         except grpc.RpcError as error:
             if refusal := refused(error):
                 # The servicer answered the refusal as the status its code
-                # means: a failed request, not a covered step, and no step
-                # toward the stop.
+                # means: a failed request, not a covered step; whether it is
+                # a step toward the stop is UnservedRequest's rule.
                 raise refusal from error
             raise
         if last is None or not last.HasField("complete"):
