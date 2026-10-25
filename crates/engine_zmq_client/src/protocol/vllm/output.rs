@@ -302,7 +302,7 @@ struct WireEngineCoreOutputs {
     #[serde(default, deserialize_with = "deserialize_tolerant_seq")]
     outputs: Vec<WireEngineCoreOutput>,
     #[serde(default)]
-    scheduler_stats: Option<Box<SchedulerStats>>,
+    scheduler_stats: Option<SchedulerStats>,
     #[serde(default)]
     timestamp: f64,
     /// A utility RPC reply, tolerant of fields a newer engine appends.
@@ -331,7 +331,7 @@ pub enum DpControlMessage {
 pub struct RequestBatchOutputs {
     pub engine_index: u32,
     pub outputs: Vec<EngineCoreOutput>,
-    pub scheduler_stats: Option<Box<SchedulerStats>>,
+    pub scheduler_stats: Option<SchedulerStats>,
     pub timestamp: f64,
     pub finished_requests: Option<BTreeSet<String>>,
 }
@@ -543,7 +543,7 @@ impl<'a> From<&'a EngineCoreOutputs> for WireEngineCoreOutputsRef<'a> {
             EngineCoreOutputs::RequestBatch(batch) => Self {
                 engine_index: batch.engine_index,
                 outputs: &batch.outputs,
-                scheduler_stats: batch.scheduler_stats.as_deref(),
+                scheduler_stats: batch.scheduler_stats.as_ref(),
                 timestamp: batch.timestamp,
                 finished_requests: batch.finished_requests.as_ref(),
                 ..empty
@@ -1055,6 +1055,109 @@ mod tests {
         assert_eq!(
             decoded.outputs[0].mm_cache_miss_hashes,
             Some(vec!["hash-1".to_string()])
+        );
+    }
+
+    /// The engine's scheduler stats map carries more than the load (cache hit
+    /// counts, eviction samples, speculative-decoding, connector, graph and
+    /// performance stats, and whatever a newer engine adds): the decoder reads
+    /// the load fields and skips the rest.
+    #[test]
+    fn scheduler_stats_decode_the_load_and_skip_the_rest() {
+        use rmpv::Value;
+
+        let map = |pairs: Vec<(&str, Value)>| {
+            Value::Map(
+                pairs
+                    .into_iter()
+                    .map(|(key, value)| (Value::from(key), value))
+                    .collect(),
+            )
+        };
+        let cache_stats = |hits: u64| {
+            map(vec![
+                ("reset", Value::from(false)),
+                ("requests", Value::from(10u64)),
+                ("queries", Value::from(20u64)),
+                ("hits", Value::from(hits)),
+                ("preempted_requests", Value::from(0u64)),
+                ("preempted_queries", Value::from(0u64)),
+                ("preempted_hits", Value::from(0u64)),
+            ])
+        };
+        let stats = map(vec![
+            ("num_running_reqs", Value::from(3u64)),
+            ("num_waiting_reqs", Value::from(5u64)),
+            ("num_skipped_waiting_reqs", Value::from(1u64)),
+            ("step_counter", Value::from(77u64)),
+            ("current_wave", Value::from(2u64)),
+            ("kv_cache_usage", Value::from(0.25f64)),
+            ("prefix_cache_stats", cache_stats(7)),
+            ("connector_prefix_cache_stats", cache_stats(1)),
+            (
+                "kv_cache_eviction_events",
+                Value::Array(vec![map(vec![
+                    ("lifetime_seconds", Value::from(1.5f64)),
+                    ("idle_seconds", Value::from(0.5f64)),
+                    (
+                        "reuse_gaps_seconds",
+                        Value::Array(vec![Value::from(0.1f64)]),
+                    ),
+                ])]),
+            ),
+            (
+                "spec_decoding_stats",
+                map(vec![
+                    ("num_spec_tokens", Value::from(2u64)),
+                    ("num_drafts", Value::from(4u64)),
+                    ("num_draft_tokens", Value::from(8u64)),
+                    ("num_accepted_tokens", Value::from(6u64)),
+                    (
+                        "num_accepted_tokens_per_pos",
+                        Value::Array(vec![Value::from(4u64), Value::from(2u64)]),
+                    ),
+                ]),
+            ),
+            (
+                "kv_connector_stats",
+                map(vec![("transfers", Value::from(3u64))]),
+            ),
+            (
+                "cudagraph_stats",
+                map(vec![
+                    ("num_unpadded_tokens", Value::from(1u64)),
+                    ("num_padded_tokens", Value::from(2u64)),
+                    ("num_paddings", Value::from(1u64)),
+                    ("runtime_mode", Value::from("FULL")),
+                ]),
+            ),
+            (
+                "perf_stats",
+                map(vec![
+                    ("num_flops_per_gpu", Value::from(1u64)),
+                    ("num_read_bytes_per_gpu", Value::from(2u64)),
+                    ("num_write_bytes_per_gpu", Value::from(3u64)),
+                    ("debug_stats", Value::Nil),
+                ]),
+            ),
+            ("a_field_of_a_newer_engine", Value::from(true)),
+        ]);
+        let mut envelope = wire_array(&batch(Vec::new()));
+        envelope[2] = stats;
+
+        let frame = Bytes::from(encode_value(&Value::Array(envelope)));
+        let decoded = decode_engine_core_outputs(&[frame])
+            .unwrap()
+            .into_request_batch()
+            .expect("request batch");
+        assert_eq!(
+            decoded.scheduler_stats,
+            Some(SchedulerStats {
+                num_running_reqs: 3,
+                num_waiting_reqs: 5,
+                num_skipped_waiting_reqs: 1,
+                kv_cache_usage: 0.25,
+            })
         );
     }
 

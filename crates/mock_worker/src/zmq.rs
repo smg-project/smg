@@ -427,7 +427,7 @@ async fn scripted_request(
                 prefill_stats: (n == 0).then(|| prefill.clone()),
                 ..Default::default()
             }],
-            scheduler_stats: load.map(Box::new),
+            scheduler_stats: load,
             finished_requests: frame.last.then(|| BTreeSet::from([request_id.clone()])),
             ..Default::default()
         });
@@ -482,7 +482,7 @@ fn token_batch(
             finish_reason,
             ..Default::default()
         }],
-        scheduler_stats: scheduler_stats.map(Box::new),
+        scheduler_stats,
         finished_requests,
         ..Default::default()
     })
