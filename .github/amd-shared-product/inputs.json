@@ -1,7 +1,7 @@
 {
-  "ready": false,
-  "run_budget_admitted": false,
-  "artifacts_pinned": false,
+  "ready": true,
+  "run_budget_admitted": true,
+  "artifacts_pinned": true,
   "artifacts": [
     {
       "name": "smg-wheel",
@@ -283,7 +283,7 @@
       "full_ModelConfig_hardware_weights_or_model_accepted": false
     }
   },
-  "root_GPU_admission": false,
+  "root_GPU_admission": true,
   "fresh_producer_acceptance": {
     "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/frozen-legacy-c9d-refresh-cpu-producer-20261024/run-40139189680/root-producer-integrity-acceptance.json",
     "sha256": "e1d5b35d2508e81f51ecb114abdb45dfe54fbdc0b2d785e74e69fdc303f290db",
