@@ -135,6 +135,12 @@ where
             // One timer, reset per chunk, instead of a fresh sleep per token.
             let idle = tokio::time::sleep(IDLE_FLUSH);
             tokio::pin!(idle);
+            // One wait for the client's leaving, kept across the chunks: a
+            // `closed()` built per `select!` round registers a waiter on the
+            // channel and drops it on every chunk; kept, it registers once
+            // and a poll while the client is there is a state check.
+            let client_gone = tx.closed();
+            tokio::pin!(client_gone);
             loop {
                 tokio::select! {
                     chunk = stream.next() => {
@@ -230,7 +236,7 @@ where
                     // stalled upstream): break so the upstream stream drops,
                     // closing the upstream connection and letting the
                     // engine abort generation.
-                    () = tx.closed() => break,
+                    () = &mut client_gone => break,
                 }
             }
         }

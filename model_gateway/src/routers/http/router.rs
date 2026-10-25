@@ -1701,6 +1701,11 @@ fn relay_transcription_stream(
         let mut stream = stream;
         let mut stream_failed = false;
         let mut client_disconnected = false;
+        // One wait for the client's leaving, kept across the chunks (a
+        // `closed()` per `select!` round registers and drops a waiter on
+        // every chunk; kept, it registers once).
+        let client_gone = tx.closed();
+        tokio::pin!(client_gone);
         loop {
             tokio::select! {
                 chunk = stream.next() => match chunk {
@@ -1730,7 +1735,7 @@ fn relay_transcription_stream(
                 // stalled upstream): break so the reqwest stream drops,
                 // closing the upstream connection and letting the
                 // engine abort generation.
-                () = tx.closed() => {
+                () = &mut client_gone => {
                     client_disconnected = true;
                     break;
                 }
