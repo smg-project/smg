@@ -149,6 +149,7 @@ pub async fn serve_with_listener_until(
     let health = MockHealth {
         vllm: cfg.grpc_vllm,
         native_vllm: cfg.grpc_native_vllm,
+        native_inference: cfg.grpc_native_vllm && cfg.realistic && cfg.replay.script.is_none(),
         overrides: Arc::clone(&overrides),
         stopped: stopped.clone(),
     };
@@ -170,6 +171,14 @@ pub async fn serve_with_listener_until(
     });
     let native_service = service.cfg.grpc_native_vllm.then(|| {
         native::NativeServer::new(native::MockNative(service.clone()))
+            .max_decoding_message_size(max_message_bytes)
+            .max_encoding_message_size(max_message_bytes)
+    });
+    let native_inference = (service.cfg.grpc_native_vllm
+        && service.cfg.realistic
+        && service.cfg.replay.script.is_none())
+    .then(|| {
+        native::NativeInferenceServer::new(native::MockNative(service.clone()))
             .max_decoding_message_size(max_message_bytes)
             .max_encoding_message_size(max_message_bytes)
     });
@@ -198,6 +207,7 @@ pub async fn serve_with_listener_until(
             )
             .add_optional_service(vllm_service)
             .add_optional_service(native_service)
+            .add_optional_service(native_inference)
             .add_service(HealthServer::new(health))
             .serve_with_incoming_shutdown(incoming, pending())
             .await
@@ -624,6 +634,7 @@ struct MockHealth {
     /// The optional vLLM service is known only when explicitly enabled.
     vllm: bool,
     native_vllm: bool,
+    native_inference: bool,
     overrides: Arc<crate::overrides::WorkerOverrides>,
     /// Flips when the worker stops: ends the watch streams, which have no
     /// end of their own, so the server's drain can finish.
@@ -637,6 +648,8 @@ impl MockHealth {
             && service != <TokenSpeedSchedulerServer<MockScheduler> as NamedService>::NAME
             && !(self.vllm && service == <vllm::VllmServer as NamedService>::NAME)
             && !(self.native_vllm && service == <native::NativeServer as NamedService>::NAME)
+            && !(self.native_inference
+                && service == <native::NativeInferenceServer as NamedService>::NAME)
         {
             ServingStatus::ServiceUnknown
         } else if self.overrides.serving() {

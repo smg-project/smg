@@ -1,6 +1,8 @@
 //! Native vLLM control discovery and cancellation for the same mock engine.
-//! Native inference remains deliberately unavailable at this stage.
+//! Inference supports a restricted token-ID-only profile on the same scheduler.
 
+mod inference;
+pub(super) use inference::NativeInferenceServer;
 use vllm_proto::{
     self as v,
     control_server::{Control, ControlServer},
@@ -51,7 +53,8 @@ impl Control for MockNative {
         Ok(Response::new(v::ModelInfo {
             model_id: self.0.cfg.model_id.clone(),
             served_model_name: self.0.cfg.model_id.clone(),
-            // No native Inference service yet: all input/capability flags stay false.
+            // Canned/scripted workers do not expose native inference.
+            supports_token_ids_input: self.0.cfg.realistic && self.0.cfg.replay.script.is_none(),
             ..Default::default()
         }))
     }

@@ -1,4 +1,4 @@
-//! The pinned native client controls the existing engine without advertising inference.
+//! Native control shares engine state and advertises only supported input capabilities.
 use std::{sync::Arc, time::Duration};
 
 use mock_worker::{
@@ -95,11 +95,9 @@ async fn native_control_uses_shared_state_and_rejects_unimplemented_capabilities
                     .served_model_name
             );
             assert!(
-                !model.supports_text_input
-                    && !model.supports_token_ids_input
-                    && !model.supports_multimodal
-                    && !model.supports_lora
+                !model.supports_text_input && !model.supports_multimodal && !model.supports_lora
             );
+            assert_eq!(model.supports_token_ids_input, realistic);
             let check = HealthCheckRequest {
                 service: "vllm.Control".into(),
             };
@@ -131,16 +129,16 @@ async fn native_control_uses_shared_state_and_rejects_unimplemented_capabilities
                 2
             );
             serving.set_serving(true);
-            assert_eq!(
-                health
-                    .check(HealthCheckRequest {
-                        service: "vllm.Inference".into()
-                    })
-                    .await
-                    .unwrap_err()
-                    .code(),
-                Code::NotFound
-            );
+            let inference_health = health
+                .check(HealthCheckRequest {
+                    service: "vllm.Inference".into(),
+                })
+                .await;
+            if realistic {
+                assert_eq!(inference_health.unwrap().into_inner().status, 1);
+            } else {
+                assert_eq!(inference_health.unwrap_err().code(), Code::NotFound);
+            }
             let mut inference = v::inference_client::InferenceClient::new(channel);
             assert_eq!(
                 inference
@@ -148,7 +146,11 @@ async fn native_control_uses_shared_state_and_rejects_unimplemented_capabilities
                     .await
                     .unwrap_err()
                     .code(),
-                Code::Unimplemented
+                if realistic {
+                    Code::InvalidArgument
+                } else {
+                    Code::Unimplemented
+                }
             );
             assert_eq!(
                 native

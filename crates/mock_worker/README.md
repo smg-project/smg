@@ -46,9 +46,27 @@ engine cancellation handle, so success would not confirm cancellation.
 It does not manage an engine process: `Shutdown` also returns
 `FAILED_PRECONDITION`. LoRA and RL methods return `UNIMPLEMENTED`.
 Native `GetKvEventSources` discovers the listener's bound vLLM-wire ZMQ
-publisher (details below). Native inference is not registered or marked healthy,
-and model input/capability flags remain false. This control surface alone cannot
-serve a Dynamo workload or establish protocol parity.
+publisher (details below).
+
+In realistic mode without `--script`, native `vllm.Inference` provides unary
+`Generate` and streaming `GenerateStream` using the shared scheduler. It advertises
+token-ID input and participates in standard health checks. This first profile
+requires a nonempty token-ID prompt, one greedy sequence, an explicit positive
+`max_new_tokens`, `output_text=false`, and `output_token_ids=true`. Prompt plus
+output must fit the advertised context; IDs must fit the same vocabulary reported
+to TokenSpeed. Requests name the configured model or leave the model empty.
+Streaming token counts and IDs are deltas; the final frame reports total output
+and cached-token counts without repeating previously streamed IDs. Prompt metadata
+appears only in the first response; prompt IDs are included only when requested.
+Native Abort and dropped streams release work through the shared scheduler.
+
+Text output (including its native default), text prompts, non-neutral sampling,
+multiple sequences, stop controls, constraints, logprobs/candidates, nonzero DP
+rank, sessions, custom cache controls, watermarking, LoRA, and media are rejected.
+The omitted temperature resolves to zero; omitted sampling controls are neutral.
+Canned/scripted workers do not register native inference or advertise token-ID
+input. Tokenizer decoding, Dynamo's text-output path, two-worker routing, and
+semantic parity with actual routers remain unqualified.
 
 With `--grpc-vllm true`, the same port also exposes the experimental
 **SMG `vllm.grpc.engine.VllmEngine` control
