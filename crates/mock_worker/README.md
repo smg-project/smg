@@ -197,6 +197,9 @@ independently assigned PUB/replay ports and reports their actual addresses;
 worker indexes never turn ephemeral port 0 into fixed ports 2, 4, and so on.
 For an already-bound gRPC library listener, the default `grpc_base_port = 0`
 selects worker index 0 instead of using its OS-assigned port as a fleet offset.
+Invalid listener offsets, worker indexes or fixed publisher-port ranges log an
+error with the relevant worker and port settings. The worker continues serving;
+native discovery reports an unavailable publisher, as it does for a failed bind.
 
 With native control enabled, `GetKvEventSources` returns the actual bound
 endpoints, topic, rank 0, MessagePack schema 1 and effective replay retention.

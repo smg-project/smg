@@ -102,6 +102,14 @@ pub async fn serve_until(
         cfg.kv_zmq_for(index, dp_rank)
             .map(|kv| (engine.clone(), kv))
     });
+    if engine.is_some() && cfg.kv_events_zmq_base_port.is_some() && publisher.is_none() {
+        tracing::error!(
+            engine_index,
+            grpc_count = cfg.grpc_count,
+            kv_base_port = ?cfg.kv_events_zmq_base_port,
+            "cannot configure KV-event publisher: worker index or publisher port is out of range"
+        );
+    }
     #[expect(
         clippy::disallowed_methods,
         reason = "publisher self-terminates when the engine's event channel closes"

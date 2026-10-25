@@ -114,6 +114,15 @@ pub async fn serve_with_listener_until(
         addr.and_then(|a| a.port().checked_sub(cfg.grpc_base_port))
     };
     let publisher_cfg = publisher_index.and_then(|index| cfg.kv_zmq_for(index, 0));
+    if engine.is_some() && cfg.kv_events_zmq_base_port.is_some() && publisher_cfg.is_none() {
+        tracing::error!(
+            worker = %name,
+            listener = ?addr,
+            grpc_base_port = cfg.grpc_base_port,
+            kv_base_port = ?cfg.kv_events_zmq_base_port,
+            "cannot configure KV-event publisher: listener offset or publisher port is out of range"
+        );
+    }
     let publisher = match (engine.as_ref(), publisher_cfg) {
         (Some(engine), Some(kv)) => {
             match crate::kv_zmq::BoundPublisher::bind(engine.clone(), kv).await {
