@@ -6,6 +6,9 @@
 //! A completion marker attests only that the accepted records were stored: it cannot prove
 //! that every required engine/parser/adapter boundary was captured or that inference passed.
 //!
+//! `CaptureSnapshot` validates bounded storage bytes before exposing immutable payloads for
+//! replay. A matching checksum is not authentication or evidence of semantic completeness.
+//!
 //! Dropped or failed writers leave an incomplete directory for inspection. Stream and marker
 //! contents are synced before the marker is atomically published. A crash may lose the final
 //! directory entry; consumers must treat a missing marker as incomplete.
@@ -17,7 +20,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+mod reader;
+pub use reader::{CaptureReadLimits, CaptureSnapshot};
 
 mod admission;
 mod queue;
@@ -47,7 +53,8 @@ struct Record<'a, T: ?Sized> {
     payload: &'a T,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Completion {
     version: u32,
     records: u64,
