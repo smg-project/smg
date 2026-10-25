@@ -184,8 +184,14 @@ jobs:
 
       # Engine-specific setup
       - name: Setup SGLang backend
-        if: inputs.engine == 'sglang'
+        if: inputs.engine == 'sglang' && inputs.gpu_vendor != 'amd'
         uses: ./.github/actions/setup-sglang
+
+      - name: Setup SGLang backend (in SGLang's ROCm image)
+        if: inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'
+        env:
+          SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
+        run: bash scripts/ci_setup_sglang_rocm_e2e.sh
 
       - name: Setup vLLM backend
         if: inputs.engine == 'vllm' && inputs.gpu_vendor != 'amd'
@@ -226,10 +232,46 @@ jobs:
       # engine here; the CPU unit-test job skips them. One lane per engine opts in.
       - name: Run engine-gated servicer unit tests
         if: inputs.servicer_unit_tests
+        env:
+          SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
         run: |
           python3 -c "import ${{ inputs.engine }}, msgspec, zmq"  # the gates these tests importorskip on
           pip install pytest-asyncio  # runs the @pytest.mark.asyncio cases; pytest>=8.4 fails them without a plugin
-          pytest -q grpc_servicer/tests -p no:cacheprovider -rs
+          if [ "${{ inputs.gpu_vendor }}" = amd ] && [ "${{ inputs.engine }}" = sglang ]; then
+            mkdir -p unit-junit
+            python3 scripts/ci_repair_sglang_rocm_native.py --verify-only unit-junit/native-environment.json
+            timeout --signal=INT --kill-after=30s 600s \
+              pytest -vv grpc_servicer/tests -p no:cacheprovider -rs \
+                -o faulthandler_timeout=120 --junitxml=unit-junit/sglang.xml
+            test -s unit-junit/sglang.xml
+          else
+            pytest -q grpc_servicer/tests -p no:cacheprovider -rs
+          fi
+
+      - name: Upload AMD SGLang unit results
+        if: always() && inputs.servicer_unit_tests && inputs.gpu_vendor == 'amd' && inputs.engine == 'sglang'
+        uses: actions/upload-artifact@v7
+        with:
+          name: sglang-unit-results-gpu${{ inputs.gpu_tier }}-${{ inputs.connection_mode }}
+          path: unit-junit/
+          if-no-files-found: ignore
+
+      - name: Apply SGLang GPTOSS BF16 compatibility overlay
+        id: gptoss-overlay
+        if: inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'
+        shell: bash
+        env:
+          SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          case "${SGLANG_GPT_OSS_MXFP4_BF16-0}" in
+            0) exit 0 ;;
+            1) ;;
+            *) echo "invalid explicit GPTOSS BF16 opt-in" >&2; exit 1 ;;
+          esac
+          DIRECTORY="$RUNNER_TEMP/sglang-gptoss-overlay-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "directory=$DIRECTORY" >> "$GITHUB_OUTPUT"
+          python3 .github/amd-gptoss-pilot/overlay.py apply "$DIRECTORY"
 
       - name: Setup Oracle
         if: inputs.setup_agentic_deps
@@ -259,6 +301,8 @@ jobs:
           SHOW_ROUTER_LOGS: "1"
           E2E_LOG_DIR: e2e-logs
           E2E_MIN_SELECTED: ${{ inputs.min_selected }}
+          E2E_AMD_REQUIRE_PASSING_CALL: ${{ inputs.gpu_vendor == 'amd' && '1' || '' }}
+          SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
           BRAVE_MCP_HOST: ${{ inputs.setup_agentic_deps && 'brave-search-mcp' || '' }}
           # Every gRPC servicer runs a planned warm-up before it reports
           # SERVING (grpc_servicer/smg_grpc_servicer/warmup.py). At its default
@@ -279,6 +323,10 @@ jobs:
         run: |
           if [ "${{ inputs.gpu_vendor }}" = amd ]; then
             bash scripts/ci_killall_sglang.sh rocm  # the default mode reads nvidia-smi
+            if [ "${{ inputs.engine }}" = sglang ]; then
+              mkdir -p e2e-logs
+              python3 scripts/ci_repair_sglang_rocm_native.py --verify-only e2e-logs/sglang-native-environment.json
+            fi
           else
             bash scripts/ci_killall_sglang.sh "nuke_gpus"
           fi
@@ -360,3 +408,21 @@ jobs:
         run: |
           bash scripts/ci_agentic_svc_deps.sh cleanup-oracle-flyway-user oracle-db
           bash scripts/ci_agentic_svc_deps.sh cleanup-oracle-user oracle-db
+
+      - name: Verify final SGLang GPTOSS BF16 compatibility overlay
+        if: always() && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd' && steps.gptoss-overlay.outputs.directory != ''
+        shell: bash
+        env:
+          OVERLAY_DIRECTORY: ${{ steps.gptoss-overlay.outputs.directory }}
+          SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 .github/amd-gptoss-pilot/overlay.py final "$OVERLAY_DIRECTORY"
+
+      - name: Preserve SGLang GPTOSS overlay evidence
+        if: always() && steps.gptoss-overlay.outputs.directory != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: sglang-gptoss-overlay
+          path: ${{ steps.gptoss-overlay.outputs.directory }}/
+          if-no-files-found: error
+          retention-days: 7
