@@ -29,6 +29,11 @@ def verify(inputs):
         read_oid(target, ".github/amd-gptoss-pilot") == inputs["pilot_namespace_oid"],
         "pilot target identity",
     )
+    evidence = ".github/amd-sg-zmq-evidence"
+    require(
+        read_oid("HEAD", evidence) == read_oid(target, evidence) == inputs["evidence_namespace_oid"],
+        "passive original SG evidence identity",
+    )
     check_map(read_oid, "HEAD", inputs["source_trees"])
     check_map(read_oid, target, inputs["source_trees"])
     check_map(read_oid, "HEAD", inputs["compiled_source_trees"])

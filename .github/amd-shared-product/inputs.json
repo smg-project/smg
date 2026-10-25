@@ -75,7 +75,7 @@
   "producer_sha": "f93b547de753c96373988b60b1590638629b3568",
   "producer_branch": "ci/frozen-legacy-c9d-refresh-producer-admitted-20261024",
   "producer_policy": "frozen_c9d_dispatch_build_only_all_18_steps_success_v1",
-  "target_product_commit": "4757ca80fcff975ca8dd512f2aa9513268a3cf96",
+  "target_product_commit": "d8f14920747b5b8fc6f27af8cbdeeac3da6220be",
   "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat-zmq[2]/sglang/nvidia",
   "source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
@@ -91,7 +91,7 @@
     "e2e_test": "35d5321770a24d3706a3c0730c465d3a0e11d437",
     "scripts": "6f2082a851689a51de9fd5211fd491a38c8ada8a",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
-    ".github/workflows/e2e-gpu-job.yml": "1d6bfedf62fa3572a1373fca45e25f4913e9b42f",
+    ".github/workflows/e2e-gpu-job.yml": "6c5b84db342977d4b226e4bdddb882f79c078152",
     "README.md": "83b7df25632da03f0184bd5b4628b9c9a3ace803",
     "LICENSE": "9088c2872db9763b9e6533c6960e9adb0c9cb65f",
     "rustfmt.toml": "19e1ab31f8958c31292f0f568976a036af7e683b",
@@ -194,9 +194,15 @@
     "original_selected_hint": 223,
     "original_selected_hint_is_workflow_comment_not_current_collection": true,
     "original_cases_remain_exact": true,
-    "current_selected_ids_and_skip_projection": "UNBOUND_PENDING_REAL_ORIGINAL_AND_CURRENT_COLLECTION"
+    "current_selected_ids_and_skip_projection": "UNBOUND_PENDING_REAL_ORIGINAL_AND_CURRENT_COLLECTION",
+    "passive_evidence_namespace": ".github/amd-sg-zmq-evidence",
+    "source_bound_current_cases": 223,
+    "source_bound_original_cases": 222,
+    "source_bound_original_declared_skips": 8,
+    "source_bound_current_warmup_skip": 1,
+    "actual_GPU_quality_result": null
   },
-  "diagnostic_difference": "Private manual-only AMD original SGLang ZMQ caller. Original empty test filter, floor204, 60job/48pytest, reruns2/delay5 and whole grpc_servicer/tests retained. Original hooks exclude PD/EPD/multi-worker/MM/error_shapes; no new exclusion. Eight static model families retained, tier1 downloader still prefetches complete14 model registry. Same reviewed explicit GPTOSS BF16 overlay remains; no Qwen/MM diagnostic or SG2 allocator/CU/stream source is added. JUnit is added only under private SMG_SGLANG_ZMQ_ORIGINAL=1; default reusable unit command is unchanged. No prior GPU or CPU whole-unit acceptance transferred.",
+  "diagnostic_difference": "Private manual-only AMD original SGLang ZMQ caller. Original empty test filter, floor204, 60job/48pytest, reruns2/delay5 and whole grpc_servicer/tests retained. Original hooks exclude PD/EPD/multi-worker/MM/error_shapes; no new exclusion. Eight static model families retained, tier1 downloader still prefetches complete14 model registry. Same reviewed explicit GPTOSS BF16 overlay remains; no Qwen/MM diagnostic or SG2 allocator/CU/stream source is added. JUnit is added only under private SMG_SGLANG_ZMQ_ORIGINAL=1; default reusable unit command is unchanged. No prior GPU or CPU whole-unit acceptance transferred. New passive private SG namespace observes all original unit and chat phases and joins real parameterized/JUnit identities. Original pip install pytest-asyncio stays before full engine-gated units on real GPU. Source-bound222/223 collection records do not qualify the failed CPU600 or any GPU row. No test body, model, filter, skip condition, original3job bounds or default unit/E2E command is changed.",
   "producer_binary_relabelled": false,
   "producer_artifact_pins_status": "LOCALLY_BOUND_ROOT_ACCEPTED_401391_F93B_ACTUAL4_E6D: four admission flags false; target4420 normal setup/full units/actual collection/runtime/freshAPI/runner/budget remain unaccepted",
   "explicit_product_dependency": {
@@ -280,5 +286,16 @@
     "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/frozen-legacy-c9d-refresh-cpu-producer-20261024/run-40139189680/root-producer-integrity-acceptance.json",
     "sha256": "e1d5b35d2508e81f51ecb114abdb45dfe54fbdc0b2d785e74e69fdc303f290db",
     "scope": "Artifact integrity/hosted smoke only; not target4420 ABI/full units/ZMQ original row."
+  },
+  "evidence_namespace_oid": "87de77171ec1afdc84fcb4246353c24e2106b6e8",
+  "qualification_mode": {
+    "name": "ORIGINAL_ENGINE_GATED_UNITS_THEN_WHOLE_ZMQ_ON_REAL_GPU",
+    "same_source_full_SG_CPU_units_accepted": false,
+    "same_source_full_SG_GPU_units_accepted": false,
+    "original_GPU_row_accepted": false,
+    "previous_CPU600_result": "FAIL_COLLECTION_2_ERRORS_RUNTIME_0",
+    "CPU_phase_facts_are_not_full_suite_acceptance": true,
+    "normal_original_pytest_asyncio_install_retained": true,
+    "complete_GPU_unit_suite_is_mandatory_before_E2E": true
   }
 }
