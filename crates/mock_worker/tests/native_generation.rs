@@ -159,7 +159,9 @@ async fn native_unary_and_streaming_preserve_tokens_counts_and_cache_metadata() 
                     "Complete must not repeat streamed IDs"
                 );
                 assert_eq!(finish.num_output_tokens, total);
-                assert_eq!(finish.num_cached_tokens, Some(16));
+                // A fully cached prompt recomputes its final block: one of two
+                // eight-token blocks is reused, exactly as TokenSpeed reports.
+                assert_eq!(finish.num_cached_tokens, Some(8));
                 done = true;
             }
         }
@@ -167,6 +169,38 @@ async fn native_unary_and_streaming_preserve_tokens_counts_and_cache_metadata() 
         assert!(frames > 1);
         assert_eq!(total, 17);
         assert_eq!(ids, unary.token_ids);
+        let mut core = worker
+            .scheduler
+            .generate(ts::GenerateRequest {
+                request_id: "parity".into(),
+                tokenized: Some(ts::TokenizedInput {
+                    input_ids: vec![100; 16],
+                    ..Default::default()
+                }),
+                sampling_params: Some(ts::SamplingParams {
+                    max_new_tokens: Some(17),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let Some(ts::generate_response::Response::Complete(core_done)) =
+            core.message().await.unwrap().unwrap().response
+        else {
+            panic!("non-streaming core request must return its completion");
+        };
+        assert_eq!(core_done.output_ids, unary.token_ids);
+        assert_eq!(
+            (
+                core_done.prompt_tokens,
+                core_done.completion_tokens,
+                core_done.cached_tokens
+            ),
+            (16, 17, 8)
+        );
+        assert!(core.message().await.unwrap().is_none());
         let mut no_prompt = request("no-prompt-ids", 1);
         no_prompt.response.as_mut().unwrap().prompt_token_ids = false;
         let prompt = worker
