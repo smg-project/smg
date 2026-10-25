@@ -225,6 +225,12 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Get the worker's URL
     fn url(&self) -> &str;
+    /// The URL as every rendering on a request's success path shows it (the
+    /// routed-worker response header, the request-sent event, the `worker`
+    /// label of the worker's metric series): the registered URL byte for
+    /// byte, unless it carries userinfo, whose secret is masked. Computed
+    /// once at registration (`WorkerMetadata::redacted_url`).
+    fn redacted_url(&self) -> &str;
     /// Get the worker's API key
     fn api_key(&self) -> Option<&String>;
     /// Get the worker's type (Regular, Prefill, or Decode)
@@ -1337,7 +1343,7 @@ impl BasicWorker {
 
     fn update_running_requests_metrics(&self) {
         let load = self.load();
-        Metrics::set_worker_requests_active(self.url(), load);
+        Metrics::set_worker_requests_active(self.redacted_url(), load);
     }
 
     fn shared_runtime(&self) -> Arc<WorkerRuntime> {
@@ -1451,10 +1457,10 @@ impl BasicWorker {
             return;
         }
         let (state, reason) = ROUTING_STATE_SERIES[index];
-        Metrics::set_worker_state(self.url(), state, reason, true);
+        Metrics::set_worker_state(self.redacted_url(), state, reason, true);
         if let Some(left) = (previous as usize).checked_sub(1) {
             let (state, reason) = ROUTING_STATE_SERIES[left];
-            Metrics::set_worker_state(self.url(), state, reason, false);
+            Metrics::set_worker_state(self.redacted_url(), state, reason, false);
         }
     }
 
@@ -1463,7 +1469,7 @@ impl BasicWorker {
         shared_runtime.bump_revision();
         let shared_status = shared_runtime.status();
         self.runtime.store(shared_runtime);
-        Metrics::set_worker_health(self.url(), shared_status == WorkerStatus::Ready);
+        Metrics::set_worker_health(self.redacted_url(), shared_status == WorkerStatus::Ready);
 
         let existing_cb = self.circuit_breaker.load();
         let other_cb = other.circuit_breaker.load_full();
@@ -1555,6 +1561,10 @@ impl Worker for BasicWorker {
         &self.metadata.spec.url
     }
 
+    fn redacted_url(&self) -> &str {
+        &self.metadata.redacted_url
+    }
+
     fn api_key(&self) -> Option<&String> {
         self.metadata.spec.api_key.as_ref()
     }
@@ -1589,7 +1599,7 @@ impl Worker for BasicWorker {
 
     fn set_status(&self, status: WorkerStatus) {
         self.runtime.load().set_status(status);
-        Metrics::set_worker_health(self.url(), status == WorkerStatus::Ready);
+        Metrics::set_worker_health(self.redacted_url(), status == WorkerStatus::Ready);
         self.publish_state();
     }
 
@@ -3347,6 +3357,7 @@ mod tests {
             pd_pairing: PdPairing::derive(&WorkerSpec::new("http://test:8080")),
             spec: Arc::new(WorkerSpec::new("http://test:8080")),
             health_config: HealthCheckConfig::default(),
+            redacted_url: "http://test:8080".to_string(),
             health_endpoint: "/health".to_string(),
             zmq_startup_timeout: Duration::from_secs(600),
             zmq_request_timeout: None,
@@ -3376,6 +3387,7 @@ mod tests {
             pd_pairing: PdPairing::derive(&spec),
             spec: Arc::new(spec),
             health_config: HealthCheckConfig::default(),
+            redacted_url: "http://test:8080".to_string(),
             health_endpoint: "/health".to_string(),
             zmq_startup_timeout: Duration::from_secs(600),
             zmq_request_timeout: None,

@@ -130,8 +130,8 @@ pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
 }
 
 /// Stamp the response with the id of the worker that served the request — the
-/// worker URL as the gateway knows it, including the `@<rank>` suffix for
-/// dp-aware workers.
+/// worker URL as the gateway renders it (`redacted_url`: credentials in it
+/// masked), including the `@<rank>` suffix for dp-aware workers.
 ///
 /// Lets a client see which replica answered: which pod to pull logs from, and
 /// whether retries landed somewhere new. Call after

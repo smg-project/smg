@@ -437,7 +437,7 @@ impl PrefillAdmission {
                 ) else {
                     return LockedAttempt::AtCapacity;
                 };
-                Metrics::set_pd_prefill_admission_inflight(worker.url(), worker.load());
+                Metrics::set_pd_prefill_admission_inflight(worker.redacted_url(), worker.load());
 
                 LockedAttempt::Selected(AdmittedPrefill {
                     selected: value,
@@ -477,7 +477,7 @@ impl PrefillAdmissionInner {
     ) -> Option<Arc<PrefillWaiter>> {
         let state = self.state.lock();
         drop(load_guard);
-        Metrics::set_pd_prefill_admission_inflight(worker.url(), worker.load());
+        Metrics::set_pd_prefill_admission_inflight(worker.redacted_url(), worker.load());
 
         state.waiters.front().cloned()
     }

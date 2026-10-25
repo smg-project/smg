@@ -680,7 +680,10 @@ impl Router {
         });
 
         // Note: Using borrowed reference avoids heap allocation
-        events::RequestSentEvent { url: worker.url() }.emit();
+        events::RequestSentEvent {
+            url: worker.redacted_url(),
+        }
+        .emit();
         let raw_body_len = header_utils::content_length(headers);
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -1062,7 +1065,10 @@ impl Router {
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
-        events::RequestSentEvent { url: worker.url() }.emit();
+        events::RequestSentEvent {
+            url: worker.redacted_url(),
+        }
+        .emit();
 
         let form = match build_transcription_form(body, audio, canonical_model.as_deref()) {
             Ok(f) => f,
@@ -1084,7 +1090,7 @@ impl Router {
             worker.api_key(),
         );
 
-        Metrics::record_worker_request(worker.url(), worker.model_id());
+        Metrics::record_worker_request(worker.redacted_url(), worker.model_id());
         let res = match send_with_stale_conn_retry(request_builder).await {
             Ok(res) => res,
             Err(e) => {
@@ -1189,7 +1195,7 @@ impl Router {
             api_key.as_ref(),
         );
 
-        Metrics::record_worker_request(worker.url(), worker.model_id());
+        Metrics::record_worker_request(worker.redacted_url(), worker.model_id());
         let res = match send_with_stale_conn_retry(request_builder).await {
             Ok(res) => res,
             Err(e) => {
@@ -1229,7 +1235,10 @@ impl Router {
         if is_stream {
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            header_utils::insert_routed_worker_id(&mut response_headers, source.worker().url());
+            header_utils::insert_routed_worker_id(
+                &mut response_headers,
+                source.worker().redacted_url(),
+            );
             if status.is_success() && !response_headers.contains_key(CONTENT_TYPE) {
                 response_headers
                     .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
@@ -1287,7 +1296,10 @@ impl Router {
                 }
                 Err(error_response) => error_response,
             };
-            header_utils::insert_routed_worker_id(response.headers_mut(), source.worker().url());
+            header_utils::insert_routed_worker_id(
+                response.headers_mut(),
+                source.worker().redacted_url(),
+            );
 
             // load_guard dropped here automatically after response body is read
             response
@@ -1333,7 +1345,7 @@ impl Router {
             api_key.as_ref(),
         );
 
-        Metrics::record_worker_request(worker.url(), worker.model_id());
+        Metrics::record_worker_request(worker.redacted_url(), worker.model_id());
         let send = send_with_stale_conn_retry(request_builder);
         tokio::pin!(send);
         let sent = tokio::select! {
@@ -1673,7 +1685,7 @@ fn relay_transcription_stream(
     // responses as SSE; leave that judgment to whatever the worker
     // set.
     let mut response_headers = header_utils::preserve_response_headers(res.headers());
-    header_utils::insert_routed_worker_id(&mut response_headers, worker.url());
+    header_utils::insert_routed_worker_id(&mut response_headers, worker.redacted_url());
     let stream = res.bytes_stream();
     // Bounded channel applies backpressure: if the downstream client
     // is slow, the upstream relay awaits on `send` rather than piling
@@ -1794,7 +1806,7 @@ async fn buffer_transcription_response(
         };
     // The routed worker's id on the error answers too, as the typed
     // routes' buffered arm sets it.
-    header_utils::insert_routed_worker_id(response.headers_mut(), worker.url());
+    header_utils::insert_routed_worker_id(response.headers_mut(), worker.redacted_url());
 
     // Non-streaming: classify metrics off the final response the client
     // will actually see. A body-read failure can rewrite a 2xx upstream
@@ -2015,7 +2027,10 @@ impl Router {
             worker.clone(),
             self.policy_registry.sticky_header_key(Some(req.headers())),
         );
-        events::RequestSentEvent { url: worker.url() }.emit();
+        events::RequestSentEvent {
+            url: worker.redacted_url(),
+        }
+        .emit();
 
         let (parts, body) = req.into_parts();
         let mut headers_with_trace = parts.headers;

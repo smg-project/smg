@@ -15,6 +15,9 @@ pub type LoadHold = Box<dyn Any + Send + Sync>;
 /// One worker as an external router may use it.
 pub trait ExternalWorker: Send + Sync + Debug {
     fn url(&self) -> &str;
+    /// The URL as a response header or an event line shows it: credentials
+    /// in it are masked.
+    fn redacted_url(&self) -> &str;
     fn api_key(&self) -> Option<&String>;
     fn model_id(&self) -> &str;
     fn is_healthy(&self) -> bool;

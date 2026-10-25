@@ -608,7 +608,7 @@ impl WorkerMonitor {
             record.engine_reports_steps.unwrap_or(false),
             record.prefill_pending_tokens.map(u64::from),
         );
-        Metrics::record_engine_load(&url, worker.model_id(), &response);
+        Metrics::record_engine_load(worker.redacted_url(), worker.model_id(), &response);
         // The DP-rank token cache takes a report with absolute token counts,
         // as it takes a poll; a core-only record leaves its last-known-good
         // entry alone.
@@ -1001,7 +1001,7 @@ impl WorkerMonitor {
             // so sentinel every model's series — not just the primary.
             let dp_size = worker.dp_size().unwrap_or(1);
             for model_id in WorkerRegistry::worker_model_ids(&worker) {
-                Metrics::remove_engine_load_metrics(worker.url(), &model_id, dp_size);
+                Metrics::remove_engine_load_metrics(worker.redacted_url(), &model_id, dp_size);
             }
         }
     }
@@ -1514,7 +1514,7 @@ async fn poll_group_once(
     let mut polled: Vec<Arc<dyn Worker>> = Vec::with_capacity(workers.len());
     for worker in &workers {
         let mode = monitor.poll_mode(worker.url(), now, interval);
-        Metrics::record_engine_load_poll(worker.url(), mode.as_str());
+        Metrics::record_engine_load_poll(worker.redacted_url(), mode.as_str());
         if mode != PollMode::Suppressed {
             polled.push(Arc::clone(worker));
         }
@@ -1632,8 +1632,10 @@ async fn poll_group_once(
     // engine-metrics option only forces polling when routing does not.
     // Reusing the response avoids a second Engine RPC. (A pushed record
     // feeds the same gauges from `apply_pushed_load`.)
-    for (url, load) in &group_loads {
-        Metrics::record_engine_load(url, &group_key.model_id, load);
+    for worker in &polled {
+        if let Some(load) = group_loads.get(worker.url()) {
+            Metrics::record_engine_load(worker.redacted_url(), &group_key.model_id, load);
+        }
     }
 
     // Merge into the shared snapshot in one rebuild: clear stale entries

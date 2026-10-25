@@ -354,6 +354,8 @@ impl KvEventMonitor {
     /// reconnect backoff and the one place that ends the task.
     pub(super) async fn subscription_loop(
         worker: Arc<dyn Worker>,
+        // The worker's URL as its series and log lines show it
+        // (`Worker::redacted_url`); the index is keyed by `worker.url()`.
         worker_url: String,
         indexer: Arc<KvIndex>,
         block_sizes: Arc<DashMap<String, KvBlockSize>>,
@@ -361,7 +363,7 @@ impl KvEventMonitor {
         mut shutdown_rx: oneshot::Receiver<()>,
         load_sink: Option<Weak<WorkerMonitor>>,
     ) {
-        let worker_id = match indexer.intern_worker(&worker_url) {
+        let worker_id = match indexer.intern_worker(worker.url()) {
             Ok(id) => id,
             Err(e) => {
                 error!(

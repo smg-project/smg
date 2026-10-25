@@ -1289,8 +1289,8 @@ impl PDRouter {
         // Send both requests concurrently and wait for both
         // Note: Using borrowed references avoids heap allocation
         events::RequestPDSentEvent {
-            prefill_url: prefill.url(),
-            decode_url: decode.url(),
+            prefill_url: prefill.redacted_url(),
+            decode_url: decode.redacted_url(),
         }
         .emit();
 
@@ -1630,8 +1630,8 @@ impl PDRouter {
         let dispatch_start = Instant::now();
         let harvested = if relay {
             events::RequestPDSentEvent {
-                prefill_url: prefill.url(),
-                decode_url: decode.url(),
+                prefill_url: prefill.redacted_url(),
+                decode_url: decode.redacted_url(),
             }
             .emit();
 
@@ -1823,8 +1823,8 @@ impl PDRouter {
         let headers = Some(&headers_with_trace);
         Metrics::record_pd_kv_connector_mode(KvConnectorMode::MoriIo.metrics_label());
         events::RequestPDSentEvent {
-            prefill_url: prefill.url(),
-            decode_url: decode.url(),
+            prefill_url: prefill.redacted_url(),
+            decode_url: decode.redacted_url(),
         }
         .emit();
 
@@ -1997,7 +1997,7 @@ impl PDRouter {
 
             let mut response_headers =
                 header_utils::preserve_response_headers(decode_response.headers());
-            header_utils::insert_routed_worker_id(&mut response_headers, decode.url());
+            header_utils::insert_routed_worker_id(&mut response_headers, decode.redacted_url());
 
             self.create_streaming_response(
                 decode_response.bytes_stream(),
@@ -2043,7 +2043,7 @@ impl PDRouter {
 
             // The decode worker is the one that produced the body the client
             // sees, on both the merged-logprob and passthrough paths.
-            header_utils::insert_routed_worker_id(response.headers_mut(), decode.url());
+            header_utils::insert_routed_worker_id(response.headers_mut(), decode.redacted_url());
             response
         }
     }
@@ -2357,7 +2357,7 @@ impl PDRouter {
     ) -> reqwest::RequestBuilder {
         let endpoint_url = worker.endpoint_url(route);
         // Every side built here is sent; counted per side, on its worker.
-        Metrics::record_worker_request(worker.url(), worker.model_id());
+        Metrics::record_worker_request(worker.redacted_url(), worker.model_id());
         let mut request = attach_sized_body(
             worker
                 .http_client()
@@ -2713,7 +2713,7 @@ impl RouterTrait for PDRouter {
             headers,
             worker.api_key(),
         );
-        Metrics::record_worker_request(worker.url(), worker.model_id());
+        Metrics::record_worker_request(worker.redacted_url(), worker.model_id());
         let res = match send_with_stale_conn_retry(request).await {
             Ok(res) => res,
             Err(e) if is_request_timeout(&e) => {
@@ -2747,7 +2747,7 @@ impl RouterTrait for PDRouter {
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let mut response_headers = header_utils::preserve_response_headers(res.headers());
-        header_utils::insert_routed_worker_id(&mut response_headers, worker.url());
+        header_utils::insert_routed_worker_id(&mut response_headers, worker.redacted_url());
         match res.bytes().await {
             Ok(bytes) => {
                 worker.record_outcome(status.as_u16());

@@ -1007,14 +1007,14 @@ fn set(worker: &Arc<dyn Worker>, reason: Option<StallReason>, cause: &'static st
             // A veto that changes reason (wedged, then unreachable once its
             // connection failed) leaves one gauge up, not two.
             if let Some(previous) = previous.filter(|previous| *previous != reason) {
-                Metrics::set_worker_stalled(worker.url(), previous.as_str(), false);
+                Metrics::set_worker_stalled(worker.redacted_url(), previous.as_str(), false);
             }
             // The channel the engine's silence came on is gone with the
             // transport; the next record speaks for the engine again.
             if reason == StallReason::Unreachable {
                 worker.note_engine_stall(false);
             }
-            Metrics::set_worker_stalled(worker.url(), reason.as_str(), true);
+            Metrics::set_worker_stalled(worker.redacted_url(), reason.as_str(), true);
         }
         None => {
             info!(worker_url = %worker.url(), cause, "Worker re-admitted by liveness");
@@ -1028,7 +1028,7 @@ fn set(worker: &Arc<dyn Worker>, reason: Option<StallReason>, cause: &'static st
                 if previous == StallReason::Unreachable {
                     worker.reset_circuit_breaker();
                 }
-                Metrics::set_worker_stalled(worker.url(), previous.as_str(), false);
+                Metrics::set_worker_stalled(worker.redacted_url(), previous.as_str(), false);
             }
         }
     }

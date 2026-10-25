@@ -16,7 +16,8 @@ pub trait Event {
     fn emit(&self);
 }
 
-/// Event emitted when a prefill-decode request pair is sent.
+/// Event emitted when a prefill-decode request pair is sent. The URLs are
+/// the workers' rendered ones (`Worker::redacted_url`): credentials masked.
 #[derive(Debug, Clone, Copy)]
 pub struct RequestPDSentEvent<'a> {
     pub prefill_url: &'a str,
@@ -43,7 +44,8 @@ impl Event for RequestPDSentEvent<'_> {
     }
 }
 
-/// Event emitted when a request is sent to a worker.
+/// Event emitted when a request is sent to a worker. The URL is the
+/// worker's rendered one (`Worker::redacted_url`): credentials masked.
 #[derive(Debug, Clone, Copy)]
 pub struct RequestSentEvent<'a> {
     pub url: &'a str,

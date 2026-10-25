@@ -131,6 +131,9 @@ struct WorkerSubscription {
     id: u64,
     handle: JoinHandle<()>,
     model_id: String,
+    /// The worker's URL as its series and log lines show it
+    /// (`Worker::redacted_url`); the slot is keyed by the URL itself.
+    rendered_url: String,
     /// Signals the subscription task to shut down gracefully. The task owns
     /// the worker's index state and takes its blocks out of the index on exit.
     shutdown_tx: oneshot::Sender<()>,
@@ -216,6 +219,9 @@ impl KvEventMonitor {
     /// Duplicate calls for the same worker URL are no-ops.
     pub async fn on_worker_added(&self, worker: &Arc<dyn Worker>) {
         let url = worker.url().to_string();
+        // The URL as the subscription's series and log lines show it; the
+        // slot map and the index are keyed by `url`.
+        let rendered = worker.redacted_url().to_string();
         // Normalize model_id to match routing's normalize_model_key — empty → "unknown".
         let model_id = Self::normalize_model_id(worker.model_id());
 
@@ -247,7 +253,7 @@ impl KvEventMonitor {
                 // answer owns the gauge from here (the removal's own reset
                 // skips a slot that is no longer its reservation).
                 handles.remove(&url);
-                Metrics::set_kv_events_unavailable(&url, false);
+                Metrics::set_kv_events_unavailable(&rendered, false);
                 break handles;
             }
             drop(handles);
@@ -267,7 +273,7 @@ impl KvEventMonitor {
             Self::publish_index(&model_id, &indexer);
         }
         // The worker's integrity series exist before its stream does.
-        Metrics::init_kv_event_series(&url);
+        Metrics::init_kv_event_series(&rendered);
         // Seed block_size provisionally from WorkerSpec. The event stream will
         // overwrite this with the backend's actual page size once received.
         if let Some(bs) = worker.metadata().spec.kv_block_size {
@@ -289,7 +295,7 @@ impl KvEventMonitor {
         }
 
         let worker = Arc::clone(worker);
-        let worker_url = url.clone();
+        let worker_url = rendered.clone();
         let block_sizes = Arc::clone(&self.block_sizes);
 
         info!(
@@ -303,7 +309,8 @@ impl KvEventMonitor {
         let id = NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed);
         let load_sink = self.load_sink.get().cloned();
         let loop_model_id = model_id.clone();
-        let task_url = url.clone();
+        let task_key = url.clone();
+        let task_url = rendered.clone();
         let task_model_id = model_id.clone();
         let slots = Arc::clone(&self.worker_handles);
         let indexers = Arc::clone(&self.indexers);
@@ -348,6 +355,7 @@ impl KvEventMonitor {
                 &slots,
                 &indexers,
                 &model_block_sizes,
+                &task_key,
                 &task_url,
                 id,
                 &task_model_id,
@@ -363,6 +371,7 @@ impl KvEventMonitor {
                 id,
                 handle,
                 model_id,
+                rendered_url: rendered,
                 shutdown_tx,
                 done,
             }),
@@ -382,6 +391,7 @@ impl KvEventMonitor {
         indexers: &DashMap<String, Arc<KvIndex>>,
         block_sizes: &DashMap<String, KvBlockSize>,
         worker_url: &str,
+        rendered_url: &str,
         id: u64,
         model_id: &str,
     ) {
@@ -395,7 +405,7 @@ impl KvEventMonitor {
         // follows the removal cannot see its fresh gauge reset by a stale
         // caller, and a caller that dropped `on_worker_removed` early does
         // not leave it raised.
-        Metrics::set_kv_events_unavailable(worker_url, false);
+        Metrics::set_kv_events_unavailable(rendered_url, false);
         handles.remove(worker_url);
         // Under the slot lock, which `on_worker_added` holds from its lookup
         // of the model's index to its insert: an add of the model racing
@@ -443,23 +453,29 @@ impl KvEventMonitor {
         let Some(sub) = subscription else {
             return;
         };
-        info!(worker_url = %worker_url, "Stopping KV event subscription");
+        let WorkerSubscription {
+            id,
+            handle,
+            rendered_url,
+            shutdown_tx,
+            ..
+        } = sub;
+        info!(worker_url = %rendered_url, "Stopping KV event subscription");
         // Signal graceful shutdown — task cleans up its worker_blocks in the indexer.
-        let _ = sub.shutdown_tx.send(());
+        let _ = shutdown_tx.send(());
         // The task lifts the reservation and drops the model's last index on
         // its own (`complete_removal`); this wait is for the caller, who has
         // the worker out of the index on return. A caller that drops the
         // future here loses nothing but the join error below.
         // Panics are caught inside the task; a JoinError here (abort or a
         // panic that escaped the guard) must still be surfaced, not discarded.
-        let id = sub.id;
-        if let Err(e) = sub.handle.await {
+        if let Err(e) = handle.await {
             error!(
-                worker_url = %worker_url,
+                worker_url = %rendered_url,
                 error = %e,
                 "KV event subscription task failed"
             );
-            Metrics::record_kv_event_subscription_failure(worker_url, "join_error");
+            Metrics::record_kv_event_subscription_failure(&rendered_url, "join_error");
         }
         // A task that ends on the shutdown signal lowers the gauge in its own
         // cleanup (`complete_removal`). One that had ended before this removal
@@ -470,7 +486,7 @@ impl KvEventMonitor {
         // URL owns the gauge from its add on.
         let handles = self.worker_handles.lock().await;
         if matches!(handles.get(worker_url), Some(Slot::Removing(held)) if held.id == id) {
-            Metrics::set_kv_events_unavailable(worker_url, false);
+            Metrics::set_kv_events_unavailable(&rendered_url, false);
         }
     }
 
@@ -497,16 +513,22 @@ impl KvEventMonitor {
                 count = subscriptions.len(),
                 "Stopping all KV event subscriptions"
             );
-            for (url, sub) in subscriptions {
-                debug!(worker_url = %url, "Stopping KV event subscription");
-                let _ = sub.shutdown_tx.send(());
-                if let Err(e) = sub.handle.await {
+            for (_, sub) in subscriptions {
+                let WorkerSubscription {
+                    handle,
+                    rendered_url,
+                    shutdown_tx,
+                    ..
+                } = sub;
+                debug!(worker_url = %rendered_url, "Stopping KV event subscription");
+                let _ = shutdown_tx.send(());
+                if let Err(e) = handle.await {
                     error!(
-                        worker_url = %url,
+                        worker_url = %rendered_url,
                         error = %e,
                         "KV event subscription task failed"
                     );
-                    Metrics::record_kv_event_subscription_failure(&url, "join_error");
+                    Metrics::record_kv_event_subscription_failure(&rendered_url, "join_error");
                 }
             }
         }

@@ -705,6 +705,9 @@ mod tests {
         fn url(&self) -> &str {
             self.0.url()
         }
+        fn redacted_url(&self) -> &str {
+            self.0.redacted_url()
+        }
         fn api_key(&self) -> Option<&String> {
             self.0.api_key()
         }

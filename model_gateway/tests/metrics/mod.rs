@@ -32,3 +32,4 @@ mod pushed_loads_test;
 mod worker_request_counter_test;
 mod worker_retry_backoff_histogram_test;
 mod worker_series_retention_test;
+mod worker_url_credentials_test;

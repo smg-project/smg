@@ -843,7 +843,7 @@ impl RequestPipeline {
                 WorkerSelection::Single { worker } => worker,
                 WorkerSelection::Disaggregated { decode, .. } => decode,
             };
-            insert_routed_worker_id(response.headers_mut(), worker.url());
+            insert_routed_worker_id(response.headers_mut(), worker.redacted_url());
         }
         response
     }

@@ -28,6 +28,13 @@ pub struct WorkerMetadata {
     /// `GET /workers`) without a per-worker deep clone. Set once at construction
     /// and not mutated afterwards.
     pub spec: Arc<WorkerSpec>,
+    /// The URL as every rendering on a request's success path shows it:
+    /// the routed-worker response header, the request-sent event and the
+    /// `worker` label of the metric series. The registered URL byte for
+    /// byte, unless it carries userinfo, whose secret is masked
+    /// (`endpoint::Endpoint::redacted_url`). Computed once here; nothing on a
+    /// request path parses the URL.
+    pub redacted_url: String,
     /// Resolved health check config (router defaults + per-worker overrides).
     /// This is the concrete config used at runtime; `spec.health` only stores
     /// the partial overrides from the API layer.

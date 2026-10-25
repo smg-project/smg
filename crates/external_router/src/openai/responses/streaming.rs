@@ -656,7 +656,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
     }
 
     let mut preserved_headers = preserve_response_headers(response.headers());
-    insert_routed_worker_id(&mut preserved_headers, worker.url());
+    insert_routed_worker_id(&mut preserved_headers, worker.redacted_url());
     let mut upstream_stream = response.bytes_stream();
 
     let (tx, rx) = sse_channel();

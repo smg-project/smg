@@ -314,7 +314,7 @@ pub(crate) fn announce_decode_window(worker: &dyn Worker) {
         return;
     }
     let window = worker.max_running_requests();
-    Metrics::set_pd_admission_window(worker.url(), window);
+    Metrics::set_pd_admission_window(worker.redacted_url(), window);
     match window {
         Some(window) => debug!(
             worker = worker.url(),

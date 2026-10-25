@@ -1816,7 +1816,7 @@ impl WorkerRegistry {
             // Retire the URL's series while the URL still maps to this id: a
             // registration of the same URL cannot slip in between and have its
             // fresh series retired under it.
-            Metrics::remove_worker_metrics(worker.url());
+            Metrics::remove_worker_metrics(worker.redacted_url());
             self.url_to_id.remove(worker.url());
             // We hold _guard; drop the DashMap entry but the Mutex stays alive via Arc.
             self.worker_mutation_locks.remove(worker_id);
@@ -2055,15 +2055,18 @@ impl WorkerRegistry {
         // writes for health, HTTP/2 and breaker state preceded this
         // registration and were dropped if the address was retired by an
         // earlier removal, so they are repeated here.
-        Metrics::worker_registered(worker.url());
-        Metrics::set_worker_health(worker.url(), worker.is_healthy());
-        Metrics::set_worker_http2(worker.url(), worker.http2());
-        Metrics::set_worker_cb_state(worker.url(), worker.circuit_breaker_state().as_int());
+        Metrics::worker_registered(worker.redacted_url());
+        Metrics::set_worker_health(worker.redacted_url(), worker.is_healthy());
+        Metrics::set_worker_http2(worker.redacted_url(), worker.http2());
+        Metrics::set_worker_cb_state(
+            worker.redacted_url(),
+            worker.circuit_breaker_state().as_int(),
+        );
         worker.republish_state();
 
         // The worker's request counter starts at zero with its registration,
         // so a worker that gets no traffic shows as such.
-        Metrics::init_worker_requests(worker.url(), worker.model_id());
+        Metrics::init_worker_requests(worker.redacted_url(), worker.model_id());
 
         // Update model index for O(1) lookups using copy-on-write.
         for model_id in Self::worker_model_ids(&worker) {
@@ -2505,7 +2508,7 @@ impl WorkerRegistry {
         // one trial per promotion, and the next promotion costs it a full
         // demotion first. The breaker logs the transition itself.
         if worker.readmit_circuit_breaker() {
-            Metrics::record_worker_cb_health_readmission(worker.url());
+            Metrics::record_worker_cb_health_readmission(worker.redacted_url());
         }
     }
 
