@@ -305,8 +305,10 @@ impl Reader {
     }
 
     /// [`Self::new`] using the same call-id nonce as a recorded output. The caller can retain
-    /// `ids.nonce()` before this call: the engine receives `ids` before either construction or
-    /// prompt replay can open a call. Only a replay should reuse an output's nonce.
+    /// `ids.nonce()` before this call: the engine receives `ids` before construction can open
+    /// a call in a format whose initial state reads arguments. Prompt replay keeps its normal
+    /// behavior, including not resuming an unfinished prompt call. Only a replay should reuse
+    /// an output's nonce.
     pub(crate) fn with_call_ids(
         assignment: &Assignment,
         tools: Arc<[Tool]>,
@@ -867,27 +869,38 @@ mod tests {
     }
 
     #[test]
-    fn a_recorded_nonce_is_used_for_calls_opened_before_the_first_delta() {
+    fn a_supplied_nonce_follows_the_formats_call_opening_rules() {
         let ids = CallIds::from_nonce("ffffffffffffffffffffffff").expect("maximum nonce");
-        for (format, prompt, output) in [
+        for (format, prompt, output, expected_calls) in [
             (
                 symphony::formats::json(),
                 "",
                 "{\"name\":\"lookup\",\"arguments\":{}};{\"name\":\"lookup\",\"arguments\":{}}",
+                2,
             ),
             (
                 qwen3(CallSyntax::Json),
                 "<|im_start|>assistant\n<tool_call>\n",
                 "{\"name\":\"lookup\",\"arguments\":{}}</tool_call><tool_call>{\"name\":\"lookup\",\"arguments\":{}}</tool_call>",
+                1,
             ),
         ] {
             let assignment = Assignment { format: Arc::new(format), prompt: prompt.to_string() };
             let batches = nonce_batches(&assignment, Some(ids), &[output], false).expect("reader");
             let message = chat::message(0, batches.iter().flatten());
-            let calls = message.message.tool_calls.expect("two calls");
-            assert_eq!(calls.len(), 2, "{}", assignment.format.name());
+            let calls = message.message.tool_calls.expect("generated calls");
+            assert_eq!(calls.len(), expected_calls, "{}", assignment.format.name());
             assert_eq!(calls[0].id, "call_ffffffffffffffffffffffff");
-            assert_eq!(calls[1].id, "call_000000000000000000000000");
+            if expected_calls == 2 {
+                // Bare JSON opens its first call during engine construction.
+                assert_eq!(calls[1].id, "call_000000000000000000000000");
+            } else {
+                // An unfinished tagged prompt call is not resumed or assigned an ID. The
+                // leading object remains content; the generated opener starts call zero.
+                assert_eq!(message.message.content.as_deref(), Some(
+                    "{\"name\":\"lookup\",\"arguments\":{}}</tool_call>"
+                ));
+            }
         }
     }
 
