@@ -1859,6 +1859,10 @@ impl SchedulerState {
             let Some(front) = self.waiting.front() else {
                 break;
             };
+            if front.req.events.is_closed() {
+                self.waiting.pop_front();
+                continue;
+            }
             let prompt_len = front.req.prompt_token_ids.len() as u32;
             let mut cached_blocks = if p.prefix_cache {
                 self.pool.match_prefix(&front.keys)
@@ -2484,6 +2488,62 @@ mod tests {
         })
         .await
         .expect("overflow and cleanup must complete");
+    }
+
+    #[test]
+    fn preempted_overflow_does_not_block_a_waiting_request_that_fits() {
+        let p = EngineParams {
+            block_size: 4,
+            kv_capacity_tokens: 16,
+            prefix_cache: false,
+            ..Default::default()
+        };
+        let mut st = SchedulerState::new();
+        let (first, mut first_rx) = req("first", vec![1; 4], 32);
+        let (slow_tx, _slow_rx) = output_channel(3);
+        st.enqueue(first, &p);
+        st.enqueue(
+            NewRequest {
+                request_id: "slow".into(),
+                prompt_token_ids: vec![2; 4],
+                max_new: 32,
+                events: slow_tx.clone(),
+            },
+            &p,
+        );
+        for _ in 0..4 {
+            for (tx, event) in st.step(&p).sends {
+                let _ = tx.send(event);
+            }
+            while first_rx.try_recv().is_ok() {}
+        }
+        assert!(slow_tx.is_closed(), "the fourth token overflows the sink");
+        assert_eq!(st.running.len(), 2);
+        assert_eq!(st.preemptions, 0);
+
+        let (survivor, mut survivor_rx) = req("survivor", vec![3], 1);
+        st.enqueue(survivor, &p);
+        // The first request needs a third block and preempts the closed sink.
+        // Its resumed prompt cannot fit; the survivor needs only the free block.
+        for (tx, event) in st.step(&p).sends {
+            let _ = tx.send(event);
+        }
+        assert_eq!(st.preemptions, 1);
+        assert!(
+            st.waiting.is_empty(),
+            "closed work must not block admission"
+        );
+        assert!(matches!(survivor_rx.try_recv(), Ok(GenEvent::Token { .. })));
+        assert!(matches!(
+            survivor_rx.try_recv(),
+            Ok(GenEvent::Done {
+                completion_tokens: 1,
+                ..
+            })
+        ));
+        assert_eq!(st.running.len(), 1);
+        assert_eq!(st.running[0].request_id, "first");
+        assert_eq!(st.pool.allocated, 3, "only the live request retains KV");
     }
 
     /// Make a request plus a receiver to observe its events.
