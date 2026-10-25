@@ -359,7 +359,13 @@ impl Reader {
     /// This records reader operations and Chat adapter input batches, not tokenizer/configuration
     /// identity, wire delivery or replay eligibility. No serving request installs it yet.
     #[cfg(all(feature = "diagnostic-capture", unix))]
-    #[cfg_attr(not(test), expect(dead_code, reason = "explicit hook for the pending request capture coordinator"))]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "explicit hook for the pending request capture coordinator"
+        )
+    )]
     pub(crate) fn observed(
         assignment: &Assignment,
         tools: Arc<[Tool]>,

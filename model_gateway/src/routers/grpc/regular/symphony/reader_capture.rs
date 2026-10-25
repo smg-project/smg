@@ -184,12 +184,26 @@ enum Record<'a> {
         nonce: &'a str,
         first_call_only: bool,
     },
-    Policy { first_call_only: bool },
-    Operation { #[serde(flatten)] step: Operation<'a> },
-    Returned { operation: OperationKind, stopped: Option<bool> },
-    Input { input: &'a Input<'a> },
-    Failed { message: &'a str },
-    ChatBatch { events: &'a [Event<'a>] },
+    Policy {
+        first_call_only: bool,
+    },
+    Operation {
+        #[serde(flatten)]
+        step: Operation<'a>,
+    },
+    Returned {
+        operation: OperationKind,
+        stopped: Option<bool>,
+    },
+    Input {
+        input: &'a Input<'a>,
+    },
+    Failed {
+        message: &'a str,
+    },
+    ChatBatch {
+        events: &'a [Event<'a>],
+    },
     Closed {
         inputs: u64,
         batches: u64,

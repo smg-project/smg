@@ -1,20 +1,40 @@
 //! Actual streaming Chat adapter consumption, with synthetic Reader output.
 
 use super::*;
-use crate::diagnostic_capture::{CaptureLimits, CaptureObserver, CapturePool, CaptureReadLimits, CaptureSnapshot, SharedCapture};
-use crate::routers::grpc::regular::symphony::testing::{tools, who, PROMPT};
+use crate::{
+    diagnostic_capture::{
+        CaptureLimits, CaptureObserver, CapturePool, CaptureReadLimits, CaptureSnapshot,
+        SharedCapture,
+    },
+    routers::grpc::regular::symphony::testing::{tools, who, PROMPT},
+};
 
-async fn render(observer: Option<CaptureObserver>, first_call_only: bool, disconnected: bool) -> (Vec<u8>, Option<String>, Vec<Value>) {
+async fn render(
+    observer: Option<CaptureObserver>,
+    first_call_only: bool,
+    disconnected: bool,
+) -> (Vec<u8>, Option<String>, Vec<Value>) {
     let assignment = Assignment {
         format: Arc::new(::symphony::formats::qwen3(::symphony::CallSyntax::Json)),
-        prompt: PROMPT.to_owned(), recipe: None,
+        prompt: PROMPT.to_owned(),
+        recipe: None,
     };
     let ids = ::symphony::CallIds::from_nonce("0123456789abcdef00000000").unwrap();
     let mut events = Events::new();
     let mut reader = match observer {
-        Some(observer) => Reader::observed(&assignment, tools().into(), ids, &mut events, observer, 7, 0),
+        Some(observer) => Reader::observed(
+            &assignment,
+            tools().into(),
+            ids,
+            &mut events,
+            observer,
+            7,
+            0,
+        ),
         None => Reader::with_call_ids(&assignment, tools().into(), ids, &mut events),
-    }.unwrap().first_call_only(first_call_only);
+    }
+    .unwrap()
+    .first_call_only(first_call_only);
     let (tx, rx) = sse_channel();
     let mut rx = if disconnected { None } else { Some(rx) };
     let frame = ChatChunkFrame::new("test-id", "test-model", 1, None);
@@ -25,35 +45,79 @@ async fn render(observer: Option<CaptureObserver>, first_call_only: bool, discon
         "plan</think>Hello".to_owned(),
         "<tool_call>{\"name\":\"lookup\",\"arguments\":{\"q\":1}}</tool_call><tool_call>{\"name\":\"lookup\",\"arguments\":{\"q\":2}}</tool_call>".to_owned(),
     ];
-    if disconnected { pieces[0].push_str(&"x".repeat(CHUNK_FLUSH_BYTES * 2)); }
+    if disconnected {
+        pieces[0].push_str(&"x".repeat(CHUNK_FLUSH_BYTES * 2));
+    }
     let mut deltas: Vec<_> = pieces.iter().map(|_| Delta::default()).collect();
     for (piece, delta) in pieces.into_iter().zip(&mut deltas) {
         reader.tail(piece, delta, &mut events).unwrap();
         batches.push(serde_json::to_value(events.as_slice()).unwrap());
-        if let Err(why) = StreamingProcessor::push_events(&tx, &mut buffer, &frame, 0, &mut events, Some(&mut reader), None, None, false).await {
-            error = Some(why); break;
+        if let Err(why) = StreamingProcessor::push_events(
+            &tx,
+            &mut buffer,
+            &frame,
+            0,
+            &mut events,
+            Some(&mut reader),
+            None,
+            None,
+            false,
+        )
+        .await
+        {
+            error = Some(why);
+            break;
         }
     }
     if error.is_none() {
-        reader.end(::symphony::EngineFinish::Stop, who(), &mut events).unwrap();
+        reader
+            .end(::symphony::EngineFinish::Stop, who(), &mut events)
+            .unwrap();
         batches.push(serde_json::to_value(events.as_slice()).unwrap());
-        StreamingProcessor::push_events(&tx, &mut buffer, &frame, 0, &mut events, Some(&mut reader), None, None, false).await.unwrap();
-        StreamingProcessor::flush_chunks(&tx, &mut buffer).await.unwrap();
+        StreamingProcessor::push_events(
+            &tx,
+            &mut buffer,
+            &frame,
+            0,
+            &mut events,
+            Some(&mut reader),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        StreamingProcessor::flush_chunks(&tx, &mut buffer)
+            .await
+            .unwrap();
     }
     drop(tx);
     let mut wire = Vec::new();
     if let Some(rx) = &mut rx {
-        while let Some(frame) = rx.recv().await { wire.extend_from_slice(&frame.unwrap()); }
+        while let Some(frame) = rx.recv().await {
+            wire.extend_from_slice(&frame.unwrap());
+        }
     }
     (wire, error, batches)
 }
 
-async fn owner(record_bytes: usize, file_bytes: u64) -> (tempfile::TempDir, CapturePool, SharedCapture) {
+async fn owner(
+    record_bytes: usize,
+    file_bytes: u64,
+) -> (tempfile::TempDir, CapturePool, SharedCapture) {
     let root = tempfile::tempdir().unwrap();
-    let pool = CapturePool::new(root.path().to_owned(), CaptureLimits {
-        max_active: 1, max_attempts: 1, max_retained_bytes: file_bytes,
-        file_bytes, record_bytes, queue_capacity: 256,
-    }).unwrap();
+    let pool = CapturePool::new(
+        root.path().to_owned(),
+        CaptureLimits {
+            max_active: 1,
+            max_attempts: 1,
+            max_retained_bytes: file_bytes,
+            file_bytes,
+            record_bytes,
+            queue_capacity: 256,
+        },
+    )
+    .unwrap();
     let owner = SharedCapture::new(pool.start().await.unwrap());
     (root, pool, owner)
 }
@@ -64,17 +128,37 @@ async fn reader_capture_chat_adapter_preserves_wire_on_capture_failure() {
         let original = render(None, first_call_only, false).await;
         assert!(!original.0.is_empty());
         assert!(original.1.is_none());
-        for (record_bytes, file_bytes, complete) in [(100_000, 1_000_000, true), (64, 1_000_000, false), (100_000, 600, false)] {
+        for (record_bytes, file_bytes, complete) in [
+            (100_000, 1_000_000, true),
+            (64, 1_000_000, false),
+            (100_000, 600, false),
+        ] {
             let (_root, _pool, owner) = owner(record_bytes, file_bytes).await;
             let directory = owner.directory().to_owned();
             let observed = render(Some(owner.observer()), first_call_only, false).await;
-            assert_eq!(observed, original, "capture limits {record_bytes}/{file_bytes}");
+            assert_eq!(
+                observed, original,
+                "capture limits {record_bytes}/{file_bytes}"
+            );
             let receipt = owner.finish().await;
             assert_eq!(receipt.is_ok(), complete);
             assert_eq!(directory.join("complete.json").exists(), complete);
             if complete {
-                let snapshot = CaptureSnapshot::read(&directory, CaptureReadLimits { file_bytes: 1_000_000, record_bytes: 100_000, records: 256 }).unwrap();
-                let batches: Vec<_> = snapshot.payloads().map(|p| serde_json::from_str::<Value>(p).unwrap()).filter(|r| r["kind"] == "chat_batch").map(|r| r["events"].clone()).collect();
+                let snapshot = CaptureSnapshot::read(
+                    &directory,
+                    CaptureReadLimits {
+                        file_bytes: 1_000_000,
+                        record_bytes: 100_000,
+                        records: 256,
+                    },
+                )
+                .unwrap();
+                let batches: Vec<_> = snapshot
+                    .payloads()
+                    .map(|p| serde_json::from_str::<Value>(p).unwrap())
+                    .filter(|r| r["kind"] == "chat_batch")
+                    .map(|r| r["events"].clone())
+                    .collect();
                 assert_eq!(batches, original.2, "all actual adapter input boundaries");
             }
         }
@@ -90,9 +174,23 @@ async fn reader_capture_chat_batch_does_not_claim_delivery_after_disconnect() {
     let observed = render(Some(owner.observer()), false, true).await;
     assert_eq!(observed, original);
     let directory = owner.finish().await.unwrap();
-    let snapshot = CaptureSnapshot::read(&directory, CaptureReadLimits { file_bytes: 1_000_000, record_bytes: 100_000, records: 256 }).unwrap();
-    let records: Vec<Value> = snapshot.payloads().map(|p| serde_json::from_str(p).unwrap()).collect();
-    assert_eq!(records.iter().filter(|r| r["kind"] == "chat_batch").count(), 1);
+    let snapshot = CaptureSnapshot::read(
+        &directory,
+        CaptureReadLimits {
+            file_bytes: 1_000_000,
+            record_bytes: 100_000,
+            records: 256,
+        },
+    )
+    .unwrap();
+    let records: Vec<Value> = snapshot
+        .payloads()
+        .map(|p| serde_json::from_str(p).unwrap())
+        .collect();
+    assert_eq!(
+        records.iter().filter(|r| r["kind"] == "chat_batch").count(),
+        1
+    );
     assert_eq!(records.last().unwrap()["finished"], false);
     // Storage completion preserves an observed prefix; request/send outcomes remain the
     // future coordinator's job and cannot be inferred from this adapter entrance record.
