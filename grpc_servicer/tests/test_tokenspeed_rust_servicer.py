@@ -1295,8 +1295,9 @@ def test_an_encode_launch_on_an_engine_without_the_encode_wire_is_refused_first(
     unreachable: the capability is read off the installed engine's wire
     module before anything starts and the launch fails by name (a
     configuration error, exit code 2 through ``main``). An engine whose wire
-    carries the request passes, the other roles pass on either, and an engine
-    that cannot be imported is left to the handshake-time check."""
+    carries the request passes, the other roles pass on either, an installed
+    engine whose wire module does not import is refused by name too, and only
+    a missing engine is left to the handshake-time check."""
     wire = types.ModuleType("tokenspeed.runtime.engine.zmq_wire")
     monkeypatch.setitem(sys.modules, "tokenspeed.runtime.engine.zmq_wire", wire)
     encode = FakeServerArgs(disaggregation_mode="encode")
@@ -1310,6 +1311,14 @@ def test_an_encode_launch_on_an_engine_without_the_encode_wire_is_refused_first(
     rust.refuse_encode_role_without_wire(encode)
     monkeypatch.delitem(sys.modules, "tokenspeed.runtime.engine.zmq_wire")
     monkeypatch.setitem(sys.modules, "tokenspeed.runtime.engine", None)
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="cannot read the EPD encode"):
+        rust.refuse_encode_role_without_wire(encode)
+    monkeypatch.delitem(sys.modules, "tokenspeed.runtime.engine")
+
+    def no_engine(name):
+        raise ModuleNotFoundError("No module named 'tokenspeed'", name="tokenspeed")
+
+    monkeypatch.setattr(importlib, "import_module", no_engine)
     rust.refuse_encode_role_without_wire(encode)
 
 

@@ -635,14 +635,22 @@ def refuse_encode_role_without_wire(server_args: Any) -> None:
     start counts as its sign of life), SERVING nothing. The capability is read
     off the installed engine (``zmq_wire.REQ_TYPE_ENCODE``,
     the request-type byte the wire gained with the encode request). The other
-    roles pass; an engine that cannot be imported (the launcher's unit tests)
-    is left to the handshake-time check."""
+    roles pass; an engine that is not installed (the launcher's unit tests) is
+    left to the handshake-time check, while an installed engine whose wire
+    module does not import is refused by name (a broken engine would otherwise
+    wait in silence too)."""
     if EngineConfigView(server_args).server_args.disaggregation_mode != "encode":
         return
     try:
         zmq_wire = importlib.import_module("tokenspeed.runtime.engine.zmq_wire")
-    except ImportError:
-        return
+    except ImportError as error:
+        if getattr(error, "name", None) == "tokenspeed":
+            return  # no engine installed (the launcher's unit tests)
+        raise ServicerConfigError(
+            f"{SERVICER_IMPL_ENV}=rust cannot read the EPD encode capability off this engine "
+            f"build ({error}): its wire module does not import; run this worker on the Python "
+            f"servicer (unset {SERVICER_IMPL_ENV} or pass --servicer-impl python)"
+        ) from None
     if getattr(zmq_wire, "REQ_TYPE_ENCODE", None) is None:
         raise ServicerConfigError(
             f"{SERVICER_IMPL_ENV}=rust does not serve the EPD encode role on this engine build "
