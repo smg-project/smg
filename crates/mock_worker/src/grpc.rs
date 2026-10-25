@@ -43,6 +43,9 @@ use crate::{
     script::{self, Answer, MatchedStop},
 };
 
+/// Vocabulary advertised and accepted by the synthetic gRPC services.
+const SYNTHETIC_VOCAB_SIZE: u32 = 32_000;
+
 /// Serve the mock gRPC services on `port` until the process exits.
 pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
     serve_until(cfg, host, port, pending()).await;
@@ -416,7 +419,7 @@ impl TokenSpeedScheduler for MockScheduler {
             architectures: vec!["MockForCausalLM".to_string()],
             max_context_length: self.cfg.context_length.min(i32::MAX as u32) as i32,
             max_req_input_len: self.cfg.context_length.min(i32::MAX as u32) as i32,
-            vocab_size: 32000,
+            vocab_size: SYNTHETIC_VOCAB_SIZE as i32,
             eos_token_ids: vec![2],
             pad_token_id: 0,
             bos_token_id: 1,
