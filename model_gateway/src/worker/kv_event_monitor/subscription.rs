@@ -1225,15 +1225,24 @@ mod tests {
     /// them all.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_rank_worker_indexes_its_ranks_batches_only() {
+        // Three blocks of distinct content (the chain index is keyed by the
+        // tokens, not the engine's hash), numbered per admission cursor: a
+        // batch that names no rank runs on rank 0's cursor.
+        let ranked = |hash: i64, first_token: u32, sequence_number: u64, dp_rank: Option<i32>| {
+            let mut batch = stored_batch(&[(hash, 16)]);
+            if let Some(kv_cache_event::Data::Stored(stored)) = batch.events[0].data.as_mut() {
+                stored.blocks[0].token_ids = (first_token..first_token + 16).collect();
+            }
+            batch.sequence_number = sequence_number;
+            batch.dp_rank = dp_rank;
+            batch
+        };
         let batches = || {
-            let mut rank_zero = stored_batch(&[(42, 16)]);
-            rank_zero.dp_rank = Some(0);
-            let mut rank_one = stored_batch(&[(43, 16)]);
-            rank_one.sequence_number = 2;
-            rank_one.dp_rank = Some(1);
-            let mut unranked = stored_batch(&[(44, 16)]);
-            unranked.sequence_number = 3;
-            vec![Ok(rank_zero), Ok(rank_one), Ok(unranked)]
+            vec![
+                Ok(ranked(42, 1_000, 1, Some(0))),
+                Ok(ranked(43, 2_000, 1, Some(1))),
+                Ok(ranked(44, 3_000, 2, None)),
+            ]
         };
         for (pinned, indexed) in [(Some(1), 2), (Some(0), 2), (None, 3)] {
             let (addr, server) = serve(Subscribe::Stream(batches())).await;
