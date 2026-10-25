@@ -185,8 +185,9 @@ mod tests {
 
             tx.send_at(token(2), Instant::now() - Duration::from_millis(1))
                 .unwrap();
+            let mut expired = Box::pin(rx.recv());
             assert!(matches!(
-                futures::poll!(rx.recv()),
+                futures::poll!(&mut expired),
                 Poll::Ready(Some(GenEvent::Token { token_id: 2, .. }))
             ));
         });
