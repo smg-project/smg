@@ -1,8 +1,8 @@
 //! Bounded Unix file storage for diagnostic records. No serving path invokes it automatically.
 //!
 //! Run `CaptureFile` on a blocking writer, not an inference task. `CaptureQueue` supplies a
-//! bounded single-producer mailbox; its caller schedules the writer. Sampling, process-wide
-//! quotas, source metadata and capture hooks remain the caller's responsibility.
+//! bounded single-producer mailbox. `CapturePool` schedules writers under shared run limits.
+//! Sampling, source metadata, capture hooks and retention across runs remain the caller's job.
 //! A completion marker attests only that the accepted records were stored: it cannot prove
 //! that every required engine/parser/adapter boundary was captured or that inference passed.
 //!
@@ -19,7 +19,9 @@ use std::{
 
 use serde::Serialize;
 
+mod admission;
 mod queue;
+pub use admission::{CaptureLimits, CapturePool, CaptureSession};
 pub use queue::{CaptureQueue, CaptureWriter};
 
 // The temporary and published marker names can both appear in an artifact inventory.
