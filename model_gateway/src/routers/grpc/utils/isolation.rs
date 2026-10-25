@@ -116,11 +116,18 @@ impl fmt::Display for Panicked {
 /// request's failure: `Ok` with the work's output, `Err` with the panic.
 /// A poll that panics ends the work; its state is dropped as the unwind
 /// passes it, which is what a request's state is for.
-pub(crate) async fn isolated<F: Future>(work: F) -> Result<F::Output, Panicked> {
+///
+/// A plain function returning the combinator, not an `async fn`: an `async
+/// fn` keeps its argument in the prefix of its future after the argument
+/// has moved into the combinator that lives across the `await`, so its
+/// future holds the reading's state twice. The streaming paths spawn the
+/// guarded reading as a task, whose allocation is its future's size: the
+/// guard adds a few words to it, not a second copy
+/// (`the_guard_holds_the_readings_future_once`).
+pub(crate) fn isolated<F: Future>(work: F) -> impl Future<Output = Result<F::Output, Panicked>> {
     AssertUnwindSafe(work)
         .catch_unwind()
-        .await
-        .map_err(|payload| Panicked::from_payload(payload.as_ref()))
+        .map(|caught| caught.map_err(|payload| Panicked::from_payload(payload.as_ref())))
 }
 
 /// [`isolated`] for a reading that does not await: `work` run with its
@@ -265,6 +272,24 @@ mod tests {
         assert_eq!(
             sprung.message(),
             "the test trap sprang: the response carried `...`"
+        );
+    }
+
+    /// The guard's future is the reading's future plus a few words, never a
+    /// second copy of it: the streaming paths spawn the guarded reading as
+    /// a task, and the task's allocation is the future's size.
+    #[test]
+    fn the_guard_holds_the_readings_future_once() {
+        use std::mem::size_of_val;
+        async fn reading(state: [u8; 4096]) -> usize {
+            tokio::task::yield_now().await;
+            state.len()
+        }
+        let bare = size_of_val(&reading([0; 4096]));
+        let guarded = size_of_val(&isolated(reading([0; 4096])));
+        assert!(
+            guarded <= bare + 64,
+            "the guard's future is {guarded} bytes around a reading of {bare}"
         );
     }
 
