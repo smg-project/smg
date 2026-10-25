@@ -2514,12 +2514,28 @@ fn named_processor(tool: &str, reasoning: &str) -> StreamingProcessor {
     )
 }
 
-#[tokio::test]
-async fn vllm_native_auto_tool_stream_keeps_prefilled_reasoning() {
-    let output = "plan</think>\n<tool_call>\n<function=lookup>\n<parameter=q>\nParis\n</parameter>\n</function>\n</tool_call>";
+/// The tool-call deltas of choice 0 across `events`, in stream order.
+fn delta_tool_calls(events: &[Value]) -> Vec<&Value> {
+    events
+        .iter()
+        .flat_map(|event| {
+            event["choices"][0]["delta"]["tool_calls"]
+                .as_array()
+                .into_iter()
+                .flatten()
+        })
+        .collect()
+}
+
+/// Streams `output` through the qwen tool and reasoning parsers with the
+/// reasoning already in the prefill, for a chat request that offers the
+/// `lookup` tool under `tool_choice`: the SSE events of the stream, which
+/// must end without an error.
+async fn prefilled_reasoning_tool_events(tool_choice: Value, output: &str) -> Vec<Value> {
     let request = serde_json::from_value(serde_json::json!({
         "model":"test-model", "messages":[], "separate_reasoning":true,
-        "tool_choice":"auto", "tools":[{"type":"function","function":{"name":"lookup",
+        "tool_choice":tool_choice,
+        "tools":[{"type":"function","function":{"name":"lookup",
             "parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}]
     }))
     .unwrap();
@@ -2549,17 +2565,16 @@ async fn vllm_native_auto_tool_stream_keeps_prefilled_reasoning() {
     let events = collector.await.unwrap();
     server.abort();
     assert!(result.is_ok(), "{result:?}");
+    events
+}
+
+#[tokio::test]
+async fn vllm_native_auto_tool_stream_keeps_prefilled_reasoning() {
+    let output = "plan</think>\n<tool_call>\n<function=lookup>\n<parameter=q>\nParis\n</parameter>\n</function>\n</tool_call>";
+    let events = prefilled_reasoning_tool_events(serde_json::json!("auto"), output).await;
     assert_eq!(chat_text(&events, 0, "reasoning_content"), "plan");
     assert_eq!(chat_text(&events, 0, "content").trim(), "");
-    let calls: Vec<_> = events
-        .iter()
-        .flat_map(|event| {
-            event["choices"][0]["delta"]["tool_calls"]
-                .as_array()
-                .into_iter()
-                .flatten()
-        })
-        .collect();
+    let calls = delta_tool_calls(&events);
     assert!(calls
         .iter()
         .any(|call| call["function"]["name"] == "lookup"));
@@ -2585,50 +2600,10 @@ async fn vllm_json_tool_stream_keeps_prefilled_reasoning() {
             r#"plan</think>{"q":"Paris"}"#,
         ),
     ] {
-        let request = serde_json::from_value(serde_json::json!({
-            "model":"test-model", "messages":[], "separate_reasoning":true,
-            "tool_choice":tool_choice,
-            "tools":[{"type":"function","function":{"name":"lookup",
-                "parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}]
-        }))
-        .unwrap();
-        let mut spec = ChatResponseSpec::from(&request);
-        spec.reasoning_in_prefill = true;
-        let mut frames: Vec<_> = output.chars().map(|ch| chunk(0, &ch.to_string())).collect();
-        frames.push(complete(0, "stop"));
-        let (stream, server) = scripted_stream(frames, "0").await;
-        let (tx, rx) = sse_channel();
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "fixture collector is joined before assertions"
-        )]
-        let collector = tokio::spawn(collect_events(rx));
-        let result = named_processor("qwen_coder", "qwen3")
-            .process_streaming_chunks(
-                stream,
-                dispatch(),
-                Arc::new(CharacterTokenizer::default()),
-                (None, None, false, false, false),
-                spec,
-                &tx,
-                None,
-            )
-            .await;
-        drop(tx);
-        let events = collector.await.unwrap();
-        server.abort();
-        assert!(result.is_ok(), "{result:?}");
+        let events = prefilled_reasoning_tool_events(tool_choice, output).await;
         assert_eq!(chat_text(&events, 0, "reasoning_content"), "plan");
         assert_eq!(chat_text(&events, 0, "content"), "");
-        let calls: Vec<_> = events
-            .iter()
-            .flat_map(|event| {
-                event["choices"][0]["delta"]["tool_calls"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-            })
-            .collect();
+        let calls = delta_tool_calls(&events);
         assert!(calls
             .iter()
             .any(|call| call["function"]["name"] == "lookup"));
@@ -2664,6 +2639,45 @@ fn gemma4_prompt_outputs() -> [(&'static str, &'static str, &'static str, &'stat
     ]
 }
 
+/// The gemma4 twins' parser resolver (the gemma4 tool parser, `configured`
+/// as the reasoning parser) and the reasoning-in-prefill state the rendered
+/// `prompt` implies for `model`.
+fn gemma4_resolver_and_prefill(
+    model: &str,
+    configured: Option<&str>,
+    prompt: &str,
+) -> (utils::ParserResolver, bool) {
+    let resolver = utils::ParserResolver::with_flags(
+        Arc::new(WorkerRegistry::new()),
+        Some("gemma4".to_string()),
+        configured.map(str::to_string),
+    );
+    let reasoning_in_prefill = utils::rendered_prompt_reasoning_in_prefill(
+        &ReasoningParserFactory::new(),
+        resolver.reasoning_parser(model).as_deref(),
+        model,
+        prompt,
+    )
+    .unwrap_or(false);
+    (resolver, reasoning_in_prefill)
+}
+
+/// The engine frames of `output`: one chunk per character when `streaming`,
+/// then, either way, the complete frame carrying the output as its ids.
+fn gemma4_frames(output: &str, streaming: bool) -> Vec<proto::GenerateResponse> {
+    let mut final_frame = complete(0, "stop");
+    if let Some(GenerationEvent::Complete(complete)) = &mut final_frame.response {
+        complete.output_ids = output.chars().map(u32::from).collect();
+    }
+    let mut frames: Vec<_> = if streaming {
+        output.chars().map(|ch| chunk(0, &ch.to_string())).collect()
+    } else {
+        Vec::new()
+    };
+    frames.push(final_frame);
+    frames
+}
+
 #[tokio::test]
 async fn gemma4_rendered_prompt_state_controls_chat_responses() {
     let model = "google/gemma-4-serve";
@@ -2677,30 +2691,11 @@ async fn gemma4_rendered_prompt_state_controls_chat_responses() {
                         "parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}]
                 }))
                 .unwrap();
-                let resolver = utils::ParserResolver::with_flags(
-                    Arc::new(WorkerRegistry::new()),
-                    Some("gemma4".to_string()),
-                    configured.map(str::to_string),
-                );
+                let (resolver, reasoning_in_prefill) =
+                    gemma4_resolver_and_prefill(model, configured, prompt);
                 let mut spec = ChatResponseSpec::from(&request);
-                spec.reasoning_in_prefill = utils::rendered_prompt_reasoning_in_prefill(
-                    &ReasoningParserFactory::new(),
-                    resolver.reasoning_parser(model).as_deref(),
-                    model,
-                    prompt,
-                )
-                .unwrap_or(false);
-                let mut final_frame = complete(0, "stop");
-                if let Some(GenerationEvent::Complete(complete)) = &mut final_frame.response {
-                    complete.output_ids = output.chars().map(u32::from).collect();
-                }
-                let mut frames: Vec<_> = if streaming {
-                    output.chars().map(|ch| chunk(0, &ch.to_string())).collect()
-                } else {
-                    Vec::new()
-                };
-                frames.push(final_frame);
-                let (stream, server) = scripted_stream(frames, "0").await;
+                spec.reasoning_in_prefill = reasoning_in_prefill;
+                let (stream, server) = scripted_stream(gemma4_frames(output, streaming), "0").await;
                 let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
                 let mut metadata = dispatch();
                 metadata.model = model.to_string();
@@ -2733,15 +2728,7 @@ async fn gemma4_rendered_prompt_state_controls_chat_responses() {
                     assert!(result.is_ok(), "{result:?}");
                     assert_eq!(chat_text(&events, 0, "reasoning_content"), reasoning);
                     assert_eq!(chat_text(&events, 0, "content"), content);
-                    let calls: Vec<_> = events
-                        .iter()
-                        .flat_map(|event| {
-                            event["choices"][0]["delta"]["tool_calls"]
-                                .as_array()
-                                .into_iter()
-                                .flatten()
-                        })
-                        .collect();
+                    let calls = delta_tool_calls(&events);
                     assert_eq!(calls.len(), usize::from(content.is_empty()), "{events:?}");
                     if let Some(call) = calls.first() {
                         assert_eq!(call["function"]["name"], "lookup");
@@ -2807,30 +2794,11 @@ async fn gemma4_rendered_prompt_state_controls_messages_responses() {
                     "thinking":{"type":"enabled", "budget_tokens":1024},
                     "tools":[{"name":"lookup", "input_schema":{"type":"object","properties":{"q":{"type":"string"}}}}]
                 })).unwrap();
-                let resolver = utils::ParserResolver::with_flags(
-                    Arc::new(WorkerRegistry::new()),
-                    Some("gemma4".to_string()),
-                    configured.map(str::to_string),
-                );
+                let (resolver, reasoning_in_prefill) =
+                    gemma4_resolver_and_prefill(model, configured, prompt);
                 let mut spec = MessagesResponseSpec::from(&request);
-                spec.reasoning_in_prefill = utils::rendered_prompt_reasoning_in_prefill(
-                    &ReasoningParserFactory::new(),
-                    resolver.reasoning_parser(model).as_deref(),
-                    model,
-                    prompt,
-                )
-                .unwrap_or(false);
-                let mut final_frame = complete(0, "stop");
-                if let Some(GenerationEvent::Complete(complete)) = &mut final_frame.response {
-                    complete.output_ids = output.chars().map(u32::from).collect();
-                }
-                let mut frames: Vec<_> = if streaming {
-                    output.chars().map(|ch| chunk(0, &ch.to_string())).collect()
-                } else {
-                    Vec::new()
-                };
-                frames.push(final_frame);
-                let (stream, server) = scripted_stream(frames, "0").await;
+                spec.reasoning_in_prefill = reasoning_in_prefill;
+                let (stream, server) = scripted_stream(gemma4_frames(output, streaming), "0").await;
                 let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
                 let mut metadata = dispatch();
                 metadata.model = model.to_string();
@@ -2967,15 +2935,7 @@ plan<|tool_call>call:lookup{q:<|"|>Paris<|"|>}<tool_call|>"#;
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(chat_text(&events, 0, "reasoning_content"), "plan");
         assert_eq!(chat_text(&events, 0, "content"), "");
-        let calls: Vec<_> = events
-            .iter()
-            .flat_map(|event| {
-                event["choices"][0]["delta"]["tool_calls"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-            })
-            .collect();
+        let calls = delta_tool_calls(&events);
         assert_eq!(calls.len(), 1, "{events:?}");
         assert_eq!(calls[0]["function"]["name"], "lookup");
         assert!(calls[0]["id"].as_str().is_some_and(|id| !id.is_empty()));
@@ -3627,11 +3587,7 @@ async fn chat_stream_with_parallel_tool_calls_false_has_the_first_call() {
         server.abort();
         assert!(result.is_ok(), "{result:?}");
         let mut arguments: Vec<String> = Vec::new();
-        for call in events
-            .iter()
-            .filter_map(|event| event["choices"][0]["delta"]["tool_calls"].as_array())
-            .flatten()
-        {
+        for call in delta_tool_calls(&events) {
             let index = call["index"].as_u64().unwrap() as usize;
             if index == arguments.len() {
                 arguments.push(String::new());
