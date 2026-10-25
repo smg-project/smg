@@ -762,56 +762,16 @@ mod tests {
     use openai_protocol::worker::{HealthCheckConfig, SchedulerLoadSnapshot};
 
     use super::*;
-    use crate::worker::{load_state::TestFeed, BasicWorkerBuilder, WorkerType};
+    use crate::worker::{
+        load_state::{one_rank_load, one_rank_load_reqs_only, TestFeed},
+        BasicWorkerBuilder, WorkerType,
+    };
 
     fn no_health_check() -> HealthCheckConfig {
         HealthCheckConfig {
             disable_health_check: true,
             ..Default::default()
         }
-    }
-
-    /// One DP rank with the given queued tokens, KV utilization, and live
-    /// throughput (a request is running, so the rate gauge counts; the
-    /// scorer prices it at the mean prefill like any running request).
-    fn make_load(
-        num_waiting_uncached_tokens: i32,
-        token_usage: f64,
-        gen_throughput: f64,
-    ) -> WorkerLoadResponse {
-        WorkerLoadResponse {
-            timestamp: String::new(),
-            dp_rank_count: 1,
-            loads: vec![SchedulerLoadSnapshot {
-                dp_rank: 0,
-                num_running_reqs: 1,
-                num_waiting_reqs: 0,
-                num_waiting_uncached_tokens,
-                num_total_reqs: 0,
-                num_used_tokens: 0,
-                max_total_num_tokens: 0,
-                token_usage,
-                gen_throughput,
-                cache_hit_rate: 0.0,
-                utilization: 0.0,
-                max_running_requests: 0,
-                ..Default::default()
-            }],
-            ..Default::default()
-        }
-    }
-
-    /// One DP rank reporting a queue depth with no token count for it — the
-    /// shape produced by any backend scored from Prometheus gauges, which have
-    /// no waiting-token equivalent.
-    fn make_load_reqs_only(
-        num_waiting_reqs: i32,
-        token_usage: f64,
-        gen_throughput: f64,
-    ) -> WorkerLoadResponse {
-        let mut load = make_load(0, token_usage, gen_throughput);
-        load.loads[0].num_waiting_reqs = num_waiting_reqs;
-        load
     }
 
     fn mk(url: &str) -> Arc<dyn Worker> {
@@ -844,7 +804,7 @@ mod tests {
         for generated in [0.0, 0.5, 10_000.0] {
             feed.publish(&HashMap::from([(
                 workers[0].url().to_string(),
-                make_load(10_000, 0.0, generated),
+                one_rank_load(10_000, 0.0, generated),
             )]));
             let snapshot = policy.snapshot().unwrap();
             let inputs = policy.score_inputs(&workers, &[0, 1], Some(&snapshot), &inflight);
@@ -872,7 +832,7 @@ mod tests {
                     .build(),
             )];
             for generated in [0.0, 0.5, 10_000.0] {
-                let load = make_load(10_000, 0.0, generated);
+                let load = one_rank_load(10_000, 0.0, generated);
                 let expected = if generated > 0.0 {
                     generated
                 } else {
@@ -900,9 +860,9 @@ mod tests {
         let policy = LeastLoadPolicy::new();
         let feed = TestFeed::attached_to(&policy);
         let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
-        let mut busy = make_load(0, 0.0, 0.0);
+        let mut busy = one_rank_load(0, 0.0, 0.0);
         busy.loads[0].num_running_reqs = 1;
-        let mut idle = make_load(0, 0.1, 0.0);
+        let mut idle = one_rank_load(0, 0.1, 0.0);
         idle.loads[0].num_running_reqs = 0;
         let loads = HashMap::from([
             (workers[0].url().to_string(), busy),
@@ -922,9 +882,9 @@ mod tests {
         let policy = LeastLoadPolicy::new();
         let feed = TestFeed::attached_to(&policy);
         let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
-        let mut idle = make_load(0, 1.0, 0.0);
+        let mut idle = one_rank_load(0, 1.0, 0.0);
         idle.loads[0].active_token_usage = Some(0.0);
-        let mut busy = make_load(0, 0.5, 0.0);
+        let mut busy = one_rank_load(0, 0.5, 0.0);
         busy.loads[0].active_token_usage = Some(0.5);
         busy.loads[0].num_running_reqs = 1;
         feed.publish(&HashMap::from([
@@ -989,7 +949,7 @@ mod tests {
         for (i, worker) in workers.iter().enumerate() {
             loads.insert(
                 worker.url().to_string(),
-                make_load(0, i as f64 * 1e-9, 100.0),
+                one_rank_load(0, i as f64 * 1e-9, 100.0),
             );
         }
         feed.publish(&loads);
@@ -1017,7 +977,7 @@ mod tests {
             let workers: Vec<Arc<dyn Worker>> = urls.iter().map(|u| mk(u)).collect();
             let mut loads = HashMap::new();
             for url in urls {
-                loads.insert(url.to_string(), make_load(1000, 0.2, 100.0));
+                loads.insert(url.to_string(), one_rank_load(1000, 0.2, 100.0));
             }
             feed.publish(&loads);
             let idx = policy
@@ -1050,8 +1010,14 @@ mod tests {
             let feed = TestFeed::attached_to(&policy);
             let workers: Vec<Arc<dyn Worker>> = urls.iter().map(|u| mk(u)).collect();
             let mut loads = HashMap::new();
-            loads.insert(urls[0].to_string(), make_load_reqs_only(1, 0.125, 100.0));
-            loads.insert(urls[1].to_string(), make_load_reqs_only(3, 0.125, 100.0));
+            loads.insert(
+                urls[0].to_string(),
+                one_rank_load_reqs_only(1, 0.125, 100.0),
+            );
+            loads.insert(
+                urls[1].to_string(),
+                one_rank_load_reqs_only(3, 0.125, 100.0),
+            );
             feed.publish(&loads);
             let idx = policy
                 .select_worker(&workers, &SelectWorkerInfo::default())
@@ -1096,11 +1062,11 @@ mod tests {
         let mut loads = HashMap::new();
         loads.insert(
             "http://a:8000".to_string(),
-            make_load_reqs_only(64, 0.0, 100.0),
+            one_rank_load_reqs_only(64, 0.0, 100.0),
         );
         loads.insert(
             "http://b:8000".to_string(),
-            make_load(1_000_000, 0.0, 100.0),
+            one_rank_load(1_000_000, 0.0, 100.0),
         );
         feed.publish(&loads);
         assert_eq!(
@@ -1119,11 +1085,11 @@ mod tests {
         let mut loads = HashMap::new();
         loads.insert(
             "http://a:8000".to_string(),
-            make_load_reqs_only(48, 0.0, 100.0),
+            one_rank_load_reqs_only(48, 0.0, 100.0),
         );
         loads.insert(
             "http://b:8000".to_string(),
-            make_load_reqs_only(48, 0.0, 100.0),
+            one_rank_load_reqs_only(48, 0.0, 100.0),
         );
         feed.publish(&loads);
         assert_eq!(
@@ -1143,9 +1109,12 @@ mod tests {
         let mut loads = HashMap::new();
         loads.insert(
             "http://a:8000".to_string(),
-            make_load_reqs_only(1, 0.0, 100.0),
+            one_rank_load_reqs_only(1, 0.0, 100.0),
         );
-        loads.insert("http://b:8000".to_string(), make_load(400_000, 0.0, 100.0));
+        loads.insert(
+            "http://b:8000".to_string(),
+            one_rank_load(400_000, 0.0, 100.0),
+        );
         feed.publish(&loads);
         assert_eq!(
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
@@ -1163,7 +1132,7 @@ mod tests {
         for _ in 0..12 {
             w.increment_load();
         }
-        let mut load = make_load(0, 0.0, 100.0);
+        let mut load = one_rank_load(0, 0.0, 100.0);
         load.loads[0].num_running_reqs = 5;
         load.loads[0].num_waiting_reqs = 2;
         assert_eq!(
@@ -1193,7 +1162,7 @@ mod tests {
             a.increment_load();
         }
         let workers = vec![a, b];
-        let mut idle = make_load(0, 0.0, 2000.0);
+        let mut idle = one_rank_load(0, 0.0, 2000.0);
         idle.loads[0].num_running_reqs = 0;
         idle.sampled_at = Some(Instant::now());
         let mut loads = HashMap::new();
@@ -1227,14 +1196,14 @@ mod tests {
             b.increment_load();
         }
         let workers = vec![a, b, c];
-        let mut running = make_load(0, 0.0, 2000.0);
+        let mut running = one_rank_load(0, 0.0, 2000.0);
         running.loads[0].num_running_reqs = 10;
-        let mut waiting = make_load_reqs_only(10, 0.0, 2000.0);
+        let mut waiting = one_rank_load_reqs_only(10, 0.0, 2000.0);
         waiting.loads[0].num_running_reqs = 0;
         let mut loads = HashMap::new();
         loads.insert("http://a:8000".to_string(), running);
         loads.insert("http://b:8000".to_string(), waiting);
-        loads.insert("http://c:8000".to_string(), make_load(0, 0.0, 2000.0));
+        loads.insert("http://c:8000".to_string(), one_rank_load(0, 0.0, 2000.0));
         feed.publish(&loads);
         assert_eq!(
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
@@ -1273,9 +1242,12 @@ mod tests {
         let mut loads = HashMap::new();
         loads.insert(
             "http://a:8000".to_string(),
-            make_load_reqs_only(1, 0.0, 100.0),
+            one_rank_load_reqs_only(1, 0.0, 100.0),
         );
-        loads.insert("http://b:8000".to_string(), make_load(400_000, 0.0, 100.0));
+        loads.insert(
+            "http://b:8000".to_string(),
+            one_rank_load(400_000, 0.0, 100.0),
+        );
         feed.publish(&loads);
         assert_eq!(
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
@@ -1302,7 +1274,7 @@ mod tests {
             for _ in 0..if hidden { 16 } else { 2 } {
                 worker.increment_load();
             }
-            let mut load = make_load(0, 0.0, 2000.0);
+            let mut load = one_rank_load(0, 0.0, 2000.0);
             load.loads[0].num_running_reqs = if hidden { 0 } else { 2 };
             loads.insert(worker.url().to_string(), load);
         }
@@ -1328,7 +1300,7 @@ mod tests {
         let workers = vec![mk("http://a:8000")];
         let info = SelectWorkerInfo::default();
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(0, 0.1, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(0, 0.1, 100.0));
         feed.publish(&loads);
 
         // Two dispatches, then the engine is sampled, then one more.
@@ -1340,7 +1312,7 @@ mod tests {
         policy.select_min_expected_wait(&workers, &[0], &info, "test");
         assert_eq!(policy.load_state_for_test("http://a:8000"), (true, 3072, 3));
 
-        let mut sampled = make_load(0, 0.1, 100.0);
+        let mut sampled = one_rank_load(0, 0.1, 100.0);
         sampled.sampled_at = Some(sampled_at);
         loads.insert("http://a:8000".to_string(), sampled.clone());
         feed.publish(&loads);
@@ -1357,7 +1329,7 @@ mod tests {
 
         // A report without a sample instant is taken as sampled when it is
         // published: it releases everything dispatched before then.
-        loads.insert("http://a:8000".to_string(), make_load(0, 0.1, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(0, 0.1, 100.0));
         feed.publish(&loads);
         assert_eq!(policy.load_state_for_test("http://a:8000"), (true, 0, 0));
     }
@@ -1402,7 +1374,7 @@ mod tests {
         let mut loads = HashMap::new();
         loads.insert(
             "http://a:8000".to_string(),
-            make_load_reqs_only(64, 0.0, 100.0),
+            one_rank_load_reqs_only(64, 0.0, 100.0),
         );
         feed.publish(&loads);
         assert_eq!(
@@ -1421,11 +1393,11 @@ mod tests {
         let mut loads = HashMap::new();
         loads.insert(
             "http://a:8000".to_string(),
-            make_load_reqs_only(1000, 0.0, 100.0),
+            one_rank_load_reqs_only(1000, 0.0, 100.0),
         );
         loads.insert(
             "http://b:8000".to_string(),
-            make_load_reqs_only(1000, 0.0, 100.0),
+            one_rank_load_reqs_only(1000, 0.0, 100.0),
         );
         feed.publish(&loads);
         assert!(policy
@@ -1447,8 +1419,11 @@ mod tests {
         }
         let workers = vec![a, mk("http://b:8000"), mk("http://c:8000")];
         let mut loads = HashMap::new();
-        loads.insert("http://b:8000".to_string(), make_load(1000, 0.2, 100.0));
-        loads.insert("http://c:8000".to_string(), make_load(0, 0.2, 100_000.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(1000, 0.2, 100.0));
+        loads.insert(
+            "http://c:8000".to_string(),
+            one_rank_load(0, 0.2, 100_000.0),
+        );
         feed.publish(&loads);
         assert_eq!(
             policy.select_min_expected_wait(
@@ -1470,8 +1445,8 @@ mod tests {
         let feed = TestFeed::attached_to(&policy);
         let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(0, 0.2, 100.0));
-        loads.insert("http://b:8000".to_string(), make_load(2048, 0.2, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(0, 0.2, 100.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(2048, 0.2, 100.0));
         feed.publish(&loads);
 
         let tokens = vec![7u32; 2100];
@@ -1493,8 +1468,8 @@ mod tests {
         let feed = TestFeed::attached_to(&policy);
         let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(8000, 0.2, 100.0));
-        loads.insert("http://b:8000".to_string(), make_load(1000, 0.2, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(8000, 0.2, 100.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(1000, 0.2, 100.0));
         feed.publish(&loads);
         // a: 8000/100 = 80s ; b: 1000/100 = 10s -> pick b.
         assert_eq!(
@@ -1514,11 +1489,11 @@ mod tests {
         let mut loads = HashMap::new();
         loads.insert(
             "http://a:8000".to_string(),
-            make_load_reqs_only(64, 0.2, 100.0),
+            one_rank_load_reqs_only(64, 0.2, 100.0),
         );
         loads.insert(
             "http://b:8000".to_string(),
-            make_load_reqs_only(6, 0.2, 100.0),
+            one_rank_load_reqs_only(6, 0.2, 100.0),
         );
         feed.publish(&loads);
         // a: 64*1024/100 ≈ 655s ; b: 6*1024/100 ≈ 61s -> b, on every draw
@@ -1538,11 +1513,11 @@ mod tests {
         let policy = LeastLoadPolicy::new();
         let feed = TestFeed::attached_to(&policy);
         let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
-        let mut a = make_load(500, 0.2, 100.0);
+        let mut a = one_rank_load(500, 0.2, 100.0);
         a.loads[0].num_waiting_reqs = 200;
         let mut loads = HashMap::new();
         loads.insert("http://a:8000".to_string(), a);
-        loads.insert("http://b:8000".to_string(), make_load(8000, 0.2, 100.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(8000, 0.2, 100.0));
         feed.publish(&loads);
         // a: its reported 500/100 = 5s, not 200*1024 ; b: 8000/100 = 80s -> a.
         assert_eq!(
@@ -1561,11 +1536,11 @@ mod tests {
         let mut loads = HashMap::new();
         loads.insert(
             "http://a:8000".to_string(),
-            make_load_reqs_only(0, 0.9, 100.0),
+            one_rank_load_reqs_only(0, 0.9, 100.0),
         );
         loads.insert(
             "http://b:8000".to_string(),
-            make_load_reqs_only(0, 0.1, 100.0),
+            one_rank_load_reqs_only(0, 0.1, 100.0),
         );
         feed.publish(&loads);
         assert_eq!(
@@ -1581,8 +1556,8 @@ mod tests {
         let feed = TestFeed::attached_to(&policy);
         let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(5000, 0.2, 50.0));
-        loads.insert("http://b:8000".to_string(), make_load(5000, 0.2, 500.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(5000, 0.2, 50.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(5000, 0.2, 500.0));
         feed.publish(&loads);
         // a: 5000/50 = 100s ; b: 5000/500 = 10s -> pick b.
         assert_eq!(
@@ -1595,7 +1570,7 @@ mod tests {
     fn idle_rank_rate_is_not_a_live_throughput() {
         // Only a rank with requests running has a live rate; an idle rank's
         // gauge is whatever its last decode interval left behind.
-        let mut load = make_load(0, 0.1, 0.36);
+        let mut load = one_rank_load(0, 0.1, 0.36);
         load.loads[0].num_running_reqs = 0;
         assert_eq!(live_throughput(&load), 0.0);
 
@@ -1619,9 +1594,9 @@ mod tests {
         let policy = LeastLoadPolicy::new();
         let feed = TestFeed::attached_to(&policy);
         let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
-        let mut a = make_load(0, 0.1, 0.36);
+        let mut a = one_rank_load(0, 0.1, 0.36);
         a.loads[0].num_running_reqs = 0;
-        let mut b = make_load(0, 0.1, 0.0);
+        let mut b = one_rank_load(0, 0.1, 0.0);
         b.loads[0].num_running_reqs = 0;
         feed.publish(&HashMap::from([
             ("http://a:8000".to_string(), a),
@@ -1648,10 +1623,10 @@ mod tests {
         let policy = LeastLoadPolicy::new();
         let feed = TestFeed::attached_to(&policy);
         let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
-        let mut b = make_load(0, 0.1, 0.36);
+        let mut b = one_rank_load(0, 0.1, 0.36);
         b.loads[0].num_running_reqs = 0;
         feed.publish(&HashMap::from([
-            ("http://a:8000".to_string(), make_load(0, 0.1, 8000.0)),
+            ("http://a:8000".to_string(), one_rank_load(0, 0.1, 8000.0)),
             ("http://b:8000".to_string(), b),
         ]));
 
@@ -1673,8 +1648,8 @@ mod tests {
         let feed = TestFeed::attached_to(&policy);
         let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(10000, 0.2, 0.0));
-        loads.insert("http://b:8000".to_string(), make_load(1000, 0.2, 0.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(10000, 0.2, 0.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(1000, 0.2, 0.0));
         feed.publish(&loads);
         // gen_throughput=0 -> default 2000: a 10000/2000=5s ; b 1000/2000=0.5s -> pick b.
         assert_eq!(
@@ -1697,7 +1672,7 @@ mod tests {
         }
         let workers = vec![a, b];
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(4000, 0.0, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(4000, 0.0, 100.0));
         feed.publish(&loads);
         // a: 4000/100 = 40s ; b: 5 * 1024 / 100 ≈ 51.2s -> pick a.
         assert_eq!(
@@ -1713,8 +1688,8 @@ mod tests {
         let feed = TestFeed::attached_to(&policy);
         let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(0, 0.98, 100.0));
-        loads.insert("http://b:8000".to_string(), make_load(0, 0.0, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(0, 0.98, 100.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(0, 0.0, 100.0));
         feed.publish(&loads);
         // a: 0 + 2*0.98/0.02 = 98 ; b: 0 -> pick b.
         assert_eq!(
@@ -1732,8 +1707,8 @@ mod tests {
         let feed = TestFeed::attached_to(&policy);
         let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(0, 0.1, 100.0));
-        loads.insert("http://b:8000".to_string(), make_load(0, 0.1, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(0, 0.1, 100.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(0, 0.1, 100.0));
         feed.publish(&loads);
 
         let info = SelectWorkerInfo::default(); // tokens unknown -> mean prefill
@@ -1748,8 +1723,8 @@ mod tests {
         let feed = TestFeed::attached_to(&policy);
         let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(0, 0.1, 100.0));
-        loads.insert("http://b:8000".to_string(), make_load(0, 0.1, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(0, 0.1, 100.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(0, 0.1, 100.0));
         feed.publish(&loads);
 
         let info = SelectWorkerInfo::default();
@@ -1777,8 +1752,11 @@ mod tests {
         let feed = TestFeed::attached_to(&policy);
         let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(0, 0.1, 100.0));
-        loads.insert("http://b:8000".to_string(), make_load(10_000, 0.1, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(0, 0.1, 100.0));
+        loads.insert(
+            "http://b:8000".to_string(),
+            one_rank_load(10_000, 0.1, 100.0),
+        );
         feed.publish(&loads);
         let tokens: Vec<u32> = (0..64).collect();
         let info = SelectWorkerInfo {
@@ -1812,8 +1790,8 @@ mod tests {
         let feed = TestFeed::attached_to(&policy);
         let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(1000, 0.2, 100.0));
-        loads.insert("http://b:8000".to_string(), make_load(2000, 0.2, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(1000, 0.2, 100.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(2000, 0.2, 100.0));
         feed.publish(&loads);
 
         let info = SelectWorkerInfo::default();
@@ -1840,8 +1818,8 @@ mod tests {
         let feed = TestFeed::attached_to(&policy);
         let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(0, 0.1, 100.0));
-        loads.insert("http://b:8000".to_string(), make_load(0, 0.1, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(0, 0.1, 100.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(0, 0.1, 100.0));
         feed.publish(&loads);
         let info = SelectWorkerInfo::default();
         let first = policy.select_worker(&workers, &info).unwrap();

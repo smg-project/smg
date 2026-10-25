@@ -150,6 +150,43 @@ impl TestFeed {
     }
 }
 
+/// One DP rank with the given queued uncached tokens, KV utilization and
+/// live throughput; one request is running, so a rate gauge counts.
+#[cfg(test)]
+pub(crate) fn one_rank_load(
+    num_waiting_uncached_tokens: i32,
+    token_usage: f64,
+    gen_throughput: f64,
+) -> WorkerLoadResponse {
+    WorkerLoadResponse {
+        timestamp: String::new(),
+        dp_rank_count: 1,
+        loads: vec![openai_protocol::worker::SchedulerLoadSnapshot {
+            dp_rank: 0,
+            num_running_reqs: 1,
+            num_waiting_uncached_tokens,
+            token_usage,
+            gen_throughput,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// One DP rank reporting a queue depth with no token count for it: the shape
+/// of a backend scored from Prometheus gauges, which have no waiting-token
+/// equivalent.
+#[cfg(test)]
+pub(crate) fn one_rank_load_reqs_only(
+    num_waiting_reqs: i32,
+    token_usage: f64,
+    gen_throughput: f64,
+) -> WorkerLoadResponse {
+    let mut load = one_rank_load(0, token_usage, gen_throughput);
+    load.loads[0].num_waiting_reqs = num_waiting_reqs;
+    load
+}
+
 /// Publication side of the shared load view. Owned by `WorkerMonitor`.
 pub(crate) struct LoadState {
     registry: Arc<WorkerRegistry>,
