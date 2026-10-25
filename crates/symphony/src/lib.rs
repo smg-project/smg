@@ -55,6 +55,6 @@ pub use grammar::{
     OutputSpelling, Tag, Turn,
 };
 pub use ids::CallIds;
-pub use input::{EngineFinish, Input, TokenSpan};
+pub use input::{EngineFinish, Input, RecordedInput, TokenSpan};
 pub use parser::{ParseError, Parser};
 pub use shape::{Inferred, ValueRead};
