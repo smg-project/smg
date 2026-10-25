@@ -125,6 +125,11 @@ jobs:
           print("OK")
           PY
 
+      - name: Proto package unit tests
+        run: |
+          pip install pytest
+          pytest -q crates/grpc_client/python/tests
+
   build-wheel:
     # CPU-only Rust/wheel/Go-FFI/WASM compile — no GPU needed. Runs on the CPU
     # runner pool (which also tolerates the nvidia.com/gpu taint, so it can use
