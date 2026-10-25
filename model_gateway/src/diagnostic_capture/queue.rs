@@ -39,9 +39,10 @@ impl CaptureQueue {
     /// Pair an already created file with a bounded mailbox; this does not start a thread.
     ///
     /// Both limits must be positive. Admission reserves a slot before allocating or serializing.
-    /// Queued, serializing and actively written payload buffers together hold at most
-    /// `(capacity + 1) * max_record_bytes` bytes, excluding allocator/channel overhead, the
-    /// file's fixed buffer and allocations performed by the caller's `Serialize` implementation.
+    /// Queued, serializing and actively written buffers retain at most
+    /// `(capacity + 1) * max_record_bytes` payload bytes. During growth, reallocation may briefly
+    /// retain one additional old buffer, bounded by `max_record_bytes`. These bounds exclude
+    /// allocator/channel overhead, the file's fixed buffer and caller `Serialize` allocations.
     /// The record limit excludes the storage envelope, which has its own total file budget.
     pub fn new(
         file: CaptureFile,
