@@ -1,0 +1,86 @@
+{
+  "reviewed_engine_head": "858559b60ba8a0683b7761cb0dcd79dfa02721bc",
+  "image": "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d",
+  "package_root": "/sgl-workspace/sglang/python/sglang",
+  "files": [
+    {
+      "path": "srt/configs/model_config.py",
+      "old_sha256": "be3a0168bdd3b4a6b1f7778420b83f95c315535812b44e9422e1b48dd856a11e",
+      "new_sha256": "1d0f4201df130dd3d1b77e03b7174e6fa83327a85d1bf2918dda6106a0ef16e1",
+      "edits": [
+        {
+          "old": "                        f\"({self.quantization}).\"\n                    )\n\n        if self.quantization is not None:\n            if self.quantization not in supported_quantization:\n                raise ValueError(\n",
+          "new": "                        f\"({self.quantization}).\"\n                    )\n\n        from sglang.srt.utils.gpt_oss_bf16 import gpt_oss_bf16_enabled\n\n        if gpt_oss_bf16_enabled(\n            self.hf_config, self.quantization, self.dtype,\n            is_draft=self.is_draft_model,\n        ):\n            logger.warning(\"GPT-OSS: retaining MXFP4 checkpoint identity and expanding experts to BF16 on gfx942\")\n            return\n\n        if self.quantization is not None:\n            if self.quantization not in supported_quantization:\n                raise ValueError(\n"
+        },
+        {
+          "old": "        self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)\n",
+          "new": "        if dtype == \"auto\" and os.environ.get(\"SGLANG_GPT_OSS_MXFP4_BF16\", \"0\") == \"1\":\n            from sglang.srt.utils.gpt_oss_bf16 import gpt_oss_bf16_enabled\n\n            if gpt_oss_bf16_enabled(\n                self.hf_config, self.quantization, dtype,\n                is_draft=self.is_draft_model,\n            ):\n                dtype = \"bfloat16\"\n        self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)\n"
+        }
+      ],
+      "new_content": null,
+      "module": "sglang.srt.configs.model_config"
+    },
+    {
+      "path": "srt/models/gpt_oss.py",
+      "old_sha256": "4386dd1b4a711e58644a342c7ab6e2bc509c9d9bcf8ff6ccc4aac0d2e591c0e1",
+      "new_sha256": "a874f19d6df1af9ce7707d96d123b94ffd23e68bcbc495c803b3893d75d4e232",
+      "edits": [
+        {
+          "old": "\nimport logging\nimport math\nimport re\nfrom collections.abc import Iterable\nfrom functools import partial\n",
+          "new": "\nimport logging\nimport math\nimport os\nimport re\nfrom collections.abc import Iterable\nfrom functools import partial\n"
+        },
+        {
+          "old": "        quant_config_name = (\n            self.quant_config.get_name() if self.quant_config is not None else None\n        )\n        if quant_config_name == \"mxfp4\":\n            self._load_weights_mxfp4(\n                weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping\n",
+          "new": "        quant_config_name = (\n            self.quant_config.get_name() if self.quant_config is not None else None\n        )\n        fallback = os.environ.get(\"SGLANG_GPT_OSS_MXFP4_BF16\", \"0\")\n        if fallback not in {\"0\", \"1\"}:\n            raise ValueError(\"SGLANG_GPT_OSS_MXFP4_BF16 must be 0 or 1\")\n        if fallback == \"1\":\n            parallel = get_parallel()\n            if (\n                quant_config_name is not None\n                or is_nextn\n                or weight_name_mapping is not None\n                or parallel.tp_size != 1\n                or parallel.moe_tp_size != 1\n                or parallel.moe_ep_size != 1\n                or self.pp_group.world_size != 1\n            ):\n                raise ValueError(\n                    \"HF MXFP4 BF16 loading requires normal TP/EP/PP1 buffers\"\n                )\n            weights = _canonicalize_hf_mxfp4_bf16(\n                self.config, weights, dict(self.named_parameters())\n            )\n            return self._load_normal_weights(weights, False, None)\n        if quant_config_name == \"mxfp4\":\n            self._load_weights_mxfp4(\n                weights, is_nextn=is_nextn, weight_name_mapping=weight_name_mapping\n"
+        },
+        {
+          "old": "    return list(weights_out_dict.items())\n\n\ndef _dequant_mlp_weight(debug_name, w_blocks, w_scales):\n    if get_parallel().tp_rank == 0:\n        logger.info(f\"Dequantize {debug_name} start\")\n",
+          "new": "    return list(weights_out_dict.items())\n\n\ndef _canonicalize_hf_mxfp4_bf16(config, weights, params):\n    \"\"\"Validate the complete HF expert set before lazy BF16 materialization.\"\"\"\n    quant = getattr(config, \"quantization_config\", None)\n    if not isinstance(quant, dict) or quant.get(\"quant_method\") != \"mxfp4\":\n        raise ValueError(\"HF MXFP4 checkpoint metadata is required\")\n    dims = (\n        config.num_hidden_layers,\n        config.num_local_experts,\n        config.hidden_size,\n        config.intermediate_size,\n    )\n    if any(type(size) is not int or size <= 0 for size in dims):\n        raise ValueError(\"Invalid GPT-OSS expert dimensions\")\n    layers, experts, hidden, intermediate = dims\n    if hidden % 32 or intermediate % 32:\n        raise ValueError(\"HF MXFP4 weights require groups of 32\")\n    output = {}\n    for name, tensor in weights:\n        if name in output:\n            raise ValueError(f\"Duplicate checkpoint tensor: {name}\")\n        if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):\n            raise ValueError(\"HF MXFP4 BF16 loading rejects reused streamer buffers\")\n        output[name] = tensor\n    allowed = set()\n    for layer in range(layers):\n        prefix = f\"model.layers.{layer}.mlp.experts.\"\n        for projection, target, rows, columns in (\n            (\"gate_up_proj\", \"w13_weight\", 2 * intermediate, hidden),\n            (\"down_proj\", \"w2_weight\", hidden, intermediate),\n        ):\n            name = prefix + projection\n            blocks = output.pop(name + \"_blocks\", None)\n            scales = output.pop(name + \"_scales\", None)\n            if blocks is None or scales is None or name in output:\n                raise ValueError(f\"Missing or conflicting HF MXFP4 pair: {name}\")\n            if (\n                blocks.dtype != torch.uint8\n                or scales.dtype != torch.uint8\n                or tuple(blocks.shape) != (experts, rows, columns // 32, 16)\n                or tuple(scales.shape) != (experts, rows, columns // 32)\n                or blocks.device != scales.device\n            ):\n                raise ValueError(f\"Invalid HF MXFP4 pair: {name}\")\n            if (scales == 255).any():\n                raise ValueError(f\"Reserved E8M0 scale255: {name}\")\n            bias = output.get(name + \"_bias\")\n            if (\n                bias is None\n                or bias.dtype != torch.bfloat16\n                or tuple(bias.shape) != (experts, rows)\n                or not torch.isfinite(bias).all()\n            ):\n                raise ValueError(f\"Invalid HF expert bias: {name}\")\n            for suffix, shape, dtype in (\n                (\"\", (experts, rows, columns), torch.bfloat16),\n                (\"_bias\", (experts, rows), torch.float32),\n            ):\n                param = params.get(prefix + target + suffix)\n                loader = getattr(param, \"weight_loader\", None)\n                if (\n                    param is None\n                    or param.dtype != dtype\n                    or tuple(param.shape) != shape\n                    or getattr(loader, \"__func__\", None)\n                    is not FusedMoE.weight_loader_fused\n                ):\n                    raise ValueError(\n                        f\"Missing normal fused BF16 target: {name + suffix}\"\n                    )\n            output[name] = _WeightCreator(\n                partial(_dequant_hf_mxfp4_bf16, name, blocks, scales)\n            )\n            allowed.update((name, name + \"_bias\"))\n    if any(\".experts.\" in name and name not in allowed for name in output):\n        raise ValueError(\n            \"Unexpected HF expert tensor outside the complete configured set\"\n        )\n    return list(output.items())\n\n\ndef _dequant_hf_mxfp4_bf16(name, blocks, scales):\n    weight = _dequant_mlp_weight(name, blocks, scales)\n    if not torch.isfinite(weight).all():\n        raise ValueError(f\"Nonfinite BF16 expert weight: {name}\")\n    return weight\n\n\ndef _dequant_mlp_weight(debug_name, w_blocks, w_scales):\n    if get_parallel().tp_rank == 0:\n        logger.info(f\"Dequantize {debug_name} start\")\n"
+        }
+      ],
+      "new_content": null,
+      "module": "sglang.srt.models.gpt_oss"
+    },
+    {
+      "path": "srt/arg_groups/model_overrides/gpt_oss.py",
+      "old_sha256": "2c761dc9962aa7a8ab77b884d0ba2abfb0b3177f7a95df2b64e16db55c6a1ca1",
+      "new_sha256": "2a65ffdc505e41efbe9e26059434e9db8ba0488994aa269a53ea65a675ed0f18",
+      "edits": [
+        {
+          "old": "                f\"GptOssForCausalLM on Intel XPU only supports bfloat16 dtype, \"\n                f\"but got '{cfg.dtype}'. Please use --dtype bfloat16 or remove --dtype to use auto.\"\n            )\n    quantization_config = getattr(hf_config, \"quantization_config\", None)\n    is_mxfp4_quant_format = (\n        quantization_config is not None\n",
+          "new": "                f\"GptOssForCausalLM on Intel XPU only supports bfloat16 dtype, \"\n                f\"but got '{cfg.dtype}'. Please use --dtype bfloat16 or remove --dtype to use auto.\"\n            )\n    from sglang.srt.utils.gpt_oss_bf16 import gpt_oss_bf16_enabled\n\n    if gpt_oss_bf16_enabled(hf_config, cfg.quantization, cfg.dtype):\n        if (\n            any(getattr(cfg, key, 1) != 1 for key in (\"tp_size\", \"ep_size\", \"pp_size\", \"dp_size\"))\n            or cfg.moe_runner_backend not in {\"auto\", \"triton\"}\n            or getattr(cfg, \"enable_torch_compile\", False)\n        ):\n            raise ValueError(\"GPT-OSS BF16 expansion requires TP/EP/PP/DP1, Triton BF16 MoE, and no torch.compile\")\n        overrides.update(dtype=\"bfloat16\", moe_runner_backend=\"triton\")\n        return overrides\n\n    quantization_config = getattr(hf_config, \"quantization_config\", None)\n    is_mxfp4_quant_format = (\n        quantization_config is not None\n"
+        }
+      ],
+      "new_content": null,
+      "module": "sglang.srt.arg_groups.model_overrides.gpt_oss"
+    },
+    {
+      "path": "srt/utils/gpt_oss_bf16.py",
+      "old_sha256": null,
+      "new_sha256": "61c041f78fa6c68c3fb458389ae35b19b80dd1148c516f53ad65938ceb575a4c",
+      "edits": [],
+      "new_content": "\"\"\"Explicit BF16 expansion of the original GPT-OSS MXFP4 checkpoint.\"\"\"\nimport os\n\n\ndef gpt_oss_bf16_enabled(hf_config, quantization, dtype, *, is_draft=False):\n    value = os.environ.get(\"SGLANG_GPT_OSS_MXFP4_BF16\", \"0\")\n    if value not in {\"0\", \"1\"}:\n        raise ValueError(\"SGLANG_GPT_OSS_MXFP4_BF16 must be 0 or 1\")\n    if value == \"0\":\n        return False\n    if getattr(hf_config, \"model_type\", None) != \"gpt_oss\":\n        return False\n    from sglang.srt.utils.common import is_gfx942_supported, is_hip\n\n    config = getattr(hf_config, \"quantization_config\", None)\n    if (\n        getattr(hf_config, \"architectures\", None) != [\"GptOssForCausalLM\"]\n        or not isinstance(config, dict)\n        or config.get(\"quant_method\") != \"mxfp4\"\n        or quantization not in {None, \"mxfp4\"}\n        or str(dtype) not in {\"auto\", \"bfloat16\", \"torch.bfloat16\"}\n        or is_draft\n        or not is_hip()\n        or not is_gfx942_supported()\n    ):\n        raise ValueError(\"GPT-OSS BF16 expansion requires a gfx942 MXFP4 checkpoint, BF16, and no draft or requantization\")\n    return True\n",
+      "module": "sglang.srt.utils.gpt_oss_bf16"
+    },
+    {
+      "path": "srt/model_loader/loader.py",
+      "old_sha256": "ef2c09ef3abcbf65390347cda178443f59e6345b45ea55348a851ae06f59edac",
+      "new_sha256": "b33b561cf85fec5e528e2b27d260abdd91180348c0a1c29216cc4b0130925bc3",
+      "edits": [
+        {
+          "old": "    load_config: LoadConfig,\n) -> Optional[QuantizationConfig]:\n    \"\"\"Get the quantization config.\"\"\"\n    model_class, _ = get_model_architecture(model_config)\n    packed_modules_mapping = getattr(model_class, \"packed_modules_mapping\", {})\n    remap_prefix = getattr(model_class, \"remap_prefix\", None)\n",
+          "new": "    load_config: LoadConfig,\n) -> Optional[QuantizationConfig]:\n    \"\"\"Get the quantization config.\"\"\"\n    from sglang.srt.utils.gpt_oss_bf16 import gpt_oss_bf16_enabled\n\n    if gpt_oss_bf16_enabled(\n        model_config.hf_config, model_config.quantization, model_config.dtype,\n        is_draft=model_config.is_draft_model,\n    ):\n        load_format = getattr(load_config.load_format, \"value\", load_config.load_format)\n        if load_format not in {\"auto\", \"safetensors\"}:\n            raise ValueError(\"GPT-OSS BF16 expansion requires the default safetensors loader\")\n        return None\n    model_class, _ = get_model_architecture(model_config)\n    packed_modules_mapping = getattr(model_class, \"packed_modules_mapping\", {})\n    remap_prefix = getattr(model_class, \"remap_prefix\", None)\n"
+        }
+      ],
+      "new_content": null,
+      "module": "sglang.srt.model_loader.loader"
+    }
+  ],
+  "early_dtype_resolution": {
+    "change": "Explicit opt-in GPTOSS auto is resolved to BF16 before the first ModelConfig dtype conversion; existing strict guard and later TP1/loader gates are unchanged.",
+    "scope": "Source candidate only; no CPU/ModelConfig/GPU execution yet.",
+    "historical_overlay_engine_base": "858559b60ba8a0683b7761cb0dcd79dfa02721bc",
+    "original_model_config_overlay_sha256": "e994b55e5543ee9a674ce427118fa7f509189a7c0bf0bafc200bb9e367d116a8",
+    "strict_guard_file_sha256_unchanged": "61c041f78fa6c68c3fb458389ae35b19b80dd1148c516f53ad65938ceb575a4c"
+  }
+}

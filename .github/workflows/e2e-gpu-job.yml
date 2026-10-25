@@ -256,6 +256,23 @@ jobs:
           path: unit-junit/
           if-no-files-found: ignore
 
+      - name: Apply SGLang GPTOSS BF16 compatibility overlay
+        id: gptoss-overlay
+        if: inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'
+        shell: bash
+        env:
+          SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          case "${SGLANG_GPT_OSS_MXFP4_BF16-0}" in
+            0) exit 0 ;;
+            1) ;;
+            *) echo "invalid explicit GPTOSS BF16 opt-in" >&2; exit 1 ;;
+          esac
+          DIRECTORY="$RUNNER_TEMP/sglang-gptoss-overlay-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "directory=$DIRECTORY" >> "$GITHUB_OUTPUT"
+          python3 .github/amd-gptoss-pilot/overlay.py apply "$DIRECTORY"
+
       - name: Setup Oracle
         if: inputs.setup_agentic_deps
         run: |
@@ -391,3 +408,21 @@ jobs:
         run: |
           bash scripts/ci_agentic_svc_deps.sh cleanup-oracle-flyway-user oracle-db
           bash scripts/ci_agentic_svc_deps.sh cleanup-oracle-user oracle-db
+
+      - name: Verify final SGLang GPTOSS BF16 compatibility overlay
+        if: always() && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd' && steps.gptoss-overlay.outputs.directory != ''
+        shell: bash
+        env:
+          OVERLAY_DIRECTORY: ${{ steps.gptoss-overlay.outputs.directory }}
+          SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 .github/amd-gptoss-pilot/overlay.py final "$OVERLAY_DIRECTORY"
+
+      - name: Preserve SGLang GPTOSS overlay evidence
+        if: always() && steps.gptoss-overlay.outputs.directory != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: sglang-gptoss-overlay
+          path: ${{ steps.gptoss-overlay.outputs.directory }}/
+          if-no-files-found: error
+          retention-days: 7
