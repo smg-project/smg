@@ -53,3 +53,9 @@ print(json.dumps({"python": sys.executable, "prefix": sys.prefix,
                   "generated_modules": modules, "GPU_or_model_accepted": False}))
 PYTHON
 python3 -m pip check
+
+# Check the image's public NIXL bindings only on explicit NIXL lanes.
+if [ "${E2E_KV_BACKEND:-}" = "nixl" ] || [ "${E2E_SGLANG_TRANSFER_BACKEND:-}" = "nixl" ]; then
+    python3 -c "import torch; from nixl._api import nixl_agent; from nixl._bindings import nixlRemoteDisconnectError"
+    echo "nixl import canary OK"
+fi
