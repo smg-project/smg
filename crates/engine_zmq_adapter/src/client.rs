@@ -23,7 +23,7 @@ use engine_zmq_client::{
     },
     ConnectedEngine, StartupBudget,
 };
-use futures::{stream::SelectAll, StreamExt};
+use futures::StreamExt;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::worker::{RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse};
 use smg_grpc_client::{sglang_proto, tokenspeed_proto, vllm_proto as vllm};
@@ -810,11 +810,8 @@ impl ZmqEngineClient {
         }
         // The deadline counts from the dispatch: before the submits.
         let deadline = self.request_deadline();
-        let mut streams = SelectAll::new();
-        for stream in self.generate_vllm_streams(req).await? {
-            streams.push(stream);
-        }
-        Ok(ZmqGenerateStream::vllm(streams).with_deadline(deadline))
+        let subs = self.generate_vllm_streams(req).await?;
+        Ok(ZmqGenerateStream::vllm(subs).with_deadline(deadline))
     }
 
     /// [`Self::generate_vllm`] for a TokenSpeed backend and request.
@@ -823,11 +820,8 @@ impl ZmqEngineClient {
         req: tokenspeed_proto::GenerateRequest,
     ) -> Result<ZmqGenerateStream, tonic::Status> {
         let deadline = self.request_deadline();
-        let mut streams = SelectAll::new();
-        for stream in self.generate_tokenspeed_streams(req).await? {
-            streams.push(stream);
-        }
-        Ok(ZmqGenerateStream::tokenspeed(streams).with_deadline(deadline))
+        let subs = self.generate_tokenspeed_streams(req).await?;
+        Ok(ZmqGenerateStream::tokenspeed(subs).with_deadline(deadline))
     }
 
     /// [`Self::generate_vllm_streams`] for a TokenSpeed backend: the `n > 1`
@@ -900,11 +894,8 @@ impl ZmqEngineClient {
             ));
         }
         let deadline = self.request_deadline();
-        let mut streams = SelectAll::new();
-        for stream in self.generate_sglang_streams(req).await? {
-            streams.push(stream);
-        }
-        Ok(ZmqGenerateStream::sglang(streams).with_deadline(deadline))
+        let subs = self.generate_sglang_streams(req).await?;
+        Ok(ZmqGenerateStream::sglang(subs).with_deadline(deadline))
     }
 
     /// [`Self::generate_tokenspeed_streams`] for an SGLang backend: the
