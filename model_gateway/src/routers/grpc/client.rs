@@ -996,7 +996,7 @@ const SGLANG_GRPC_KEYS: &[&str] = &[
 /// TokenSpeed spells its parallelism `attn_tp_size` / `pipeline_parallel_size`
 /// / `data_parallel_size`; `normalize_grpc_keys` folds those into the
 /// canonical `tp_size` / `pp_size` / `dp_size`.
-const TOKENSPEED_GRPC_KEYS: &[&str] = &[
+pub(crate) const TOKENSPEED_GRPC_KEYS: &[&str] = &[
     "model",
     "served_model_name",
     "tokenizer",
