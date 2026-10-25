@@ -461,5 +461,12 @@
     "old_node2_native_not_fresh_accepted": true,
     "node1_pending": true,
     "old_source_CPU_acceptance_is_not_GPU_acceptance": true
+  },
+  "scheduled_validation": {
+    "policy": "historical_c345_CPU_plus_reviewed_checkout_env_delta_scheduled_full_validation",
+    "admitted": false,
+    "candidate_CPU_accepted": false,
+    "basis_sha256": "15b22b08e0fce07e4c369011abf2490d32e556605414a4e3b117677c83ed92b4",
+    "historical_node_receipts": null
   }
 }

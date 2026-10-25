@@ -1,6 +1,7 @@
 """Select only the original Mooncake4 topology row before any relay API call."""
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -48,6 +49,39 @@ def auxiliary_staging(inputs):
             raise ValueError("auxiliary node staging evidence differs")
 
 
+POLICY = 'historical_c345_CPU_plus_reviewed_checkout_env_delta_scheduled_full_validation'
+BASIS_SHA = '15b22b08e0fce07e4c369011abf2490d32e556605414a4e3b117677c83ed92b4'
+
+
+def historical_cpu_for_scheduled_validation(inputs):
+    """An execution prerequisite only; never new-source CPU acceptance."""
+    value = inputs["scheduled_validation"]
+    expected = {"policy", "admitted", "candidate_CPU_accepted", "basis_sha256", "historical_node_receipts"}
+    if (set(value) != expected or value["policy"] != POLICY
+            or value["admitted"] is not True or value["candidate_CPU_accepted"] is not False
+            or value["basis_sha256"] != BASIS_SHA):
+        raise ValueError("exact reviewed scheduled-validation basis is not admitted")
+    path = Path(__file__).with_name("scheduled-validation-basis.json")
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != BASIS_SHA:
+        raise ValueError("scheduled-validation basis bytes changed")
+    basis = json.loads(raw)
+    digest = lambda v: hashlib.sha256(json.dumps(v, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if (basis["policy"] != POLICY or basis["candidate_CPU_accepted"] is not False
+            or inputs["same_source_CPU_prerequisite"]["accepted"] is not False
+            or any(digest(inputs[key]) != expected for key, expected in basis["cohort_sha256"].items())
+            or digest(value["historical_node_receipts"]) != basis["historical_CPU"]["node_receipts_sha256"]):
+        raise ValueError("historical CPU/delta/cohort identity changed")
+    root = Path(__file__).resolve().parents[2]
+    expected = basis["checkout_environment_delta"]["three_files"]
+    for name, key in [(".github/amd-nixl-environment/nixl_environment/runtime_inputs.py", "runtime_helper"),
+                      (".github/amd-shared-product/private-runtime-overlay.json", "private_runtime_overlay")]:
+        path = root / name
+        if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != expected[key]["new"]:
+            raise ValueError("reviewed environment helper/overlay differs")
+    return {"accepted": True, "node_receipts": value["historical_node_receipts"]}
+
+
 def select(inputs, tier):
     if any(inputs.get(key) is not True for key in ("ready", "run_budget_admitted")):
         raise ValueError("source and runner budget are not admitted")
@@ -67,7 +101,7 @@ def select(inputs, tier):
                 or not isinstance(row.get("evidence_sha256"), str)
                 or len(row["evidence_sha256"]) != 64):
             raise ValueError("normal-resolver node data proof differs")
-    cpu = inputs["same_source_CPU_prerequisite"]
+    cpu = historical_cpu_for_scheduled_validation(inputs)
     rows = cpu["node_receipts"]
     if (cpu["accepted"] is not True or not isinstance(rows, dict)
             or set(rows) != {"amd-mi300x-1", "amd-mi300x-2"}):

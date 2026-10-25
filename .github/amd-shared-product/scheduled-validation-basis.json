@@ -1,0 +1,71 @@
+{
+  "policy": "historical_c345_CPU_plus_reviewed_checkout_env_delta_scheduled_full_validation",
+  "historical_CPU": {
+    "source_head": "c345b44172141b3896d376ef78f39e18ee3b795d",
+    "receipt": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/MC4-e6d-both-node-matching-CPU-runtime-schema-root.json",
+      "bytes": 9946,
+      "sha256": "54fac39193fc6a940c7747d3cc7a2351dcd80e9f74a9dcc1dc6e35eed4a4e493"
+    },
+    "node_receipts_sha256": "0079a36f39c538afd2b3bfe14c00c1b54d7e01b623832dfb126a4243315356e1",
+    "original_receipt": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/MC4-e6d-both-node-matching-CPU-acceptance-root.json",
+      "bytes": 9416,
+      "sha256": "3697892353b3073d51d7b49620ffe6b9fcde302a2295498f88407956f762d543"
+    }
+  },
+  "checkout_environment_delta": {
+    "source_parent": "c345b44172141b3896d376ef78f39e18ee3b795d",
+    "reviewed_head": "9dd8acfae9bfbfaa6f4f9dcb1e7d1aa8e3965775",
+    "source_peer": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/mooncake4-checkout-git-trust-fix-20261025/peer-independent-C.json",
+      "bytes": 7345,
+      "sha256": "574c5455004d1e5171bfc4e99cc3da2efbce8e0a4392e4a74f8df0eaa21c91ba"
+    },
+    "actual6_peer": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/MC4-checkouttrust-controls10-root-66cbc348a9e94bc192296f6ff73e55f0/actual-audit-C.json",
+      "bytes": 5551,
+      "sha256": "cca5d0ed205114a2f9153028336ed67010cd787a789192a1eb1a95d101b43346"
+    },
+    "patch": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/mooncake4-checkout-git-trust-fix-20261025/source.patch",
+      "bytes": 4683,
+      "sha256": "b1cdba278b2790ef18834fc7741221a7d7342485c2be8696ecd1117c272374c9"
+    },
+    "three_files": {
+      "runtime_helper": {
+        "old": "329e193d5635f16bb415def376b3d40722fc22b5638bbebd9a6c4e0d61b82be5",
+        "new": "a32473928b7673d2f3093a9acc71915c27c9766d77a954db7e0f501d7cfa502f"
+      },
+      "private_runtime_overlay": {
+        "old": "1a42cc2e2998d0d12158f1b780e734afc43babaa702944f1ee6dcd6095b81900",
+        "new": "67b121743e00110510295552acd3f135d529fcffafdc906c5e6d5356bd0782b3"
+      },
+      "inputs": {
+        "old": "484da15ae81878932e10d618eb99078ebda5b3f0e21761e0cff66d9fe75b802d",
+        "new": "e80e12472e4cf46cc67a7d90fd4de074fcccdca3db5d25fd62eeb53fbf8b982d"
+      }
+    }
+  },
+  "cohort_sha256": {
+    "source_trees": "4b20700d165e9ff85d1a58093ebf3052865643515fd478f59984218febd998c3",
+    "compiled_source_trees": "5b5c6db6c869febc39242a903fcf7f88ed6cb48d2e608da9161dbf400908e83a",
+    "producer_source_trees": "d41a1ca2f144e3ad72f06389ee5acc8115a140bea087f9d89a2a22f43a3ddbc7",
+    "artifacts": "25177e0b9d7513997e424c18ed8dfd45d6d1d02d7a209853c0814b6a975da3db",
+    "gateway_native": "64b6b0ef704eb767d4e599957a2b18578061f642816e7706e5f2c5f4fbae9459",
+    "contracts": "35cb506d7a75356bcdd5798bb712000828a7cd9218e76839b48f21540ba2fc30",
+    "same_source_CPU_prerequisite": "947864a910006a0d9e4660c4c4657edea1ea7e5082c7e3eb5378c6cdb348d39b"
+  },
+  "original_requirements": {
+    "unit_cases": 1602,
+    "original_skips": 8,
+    "canonical14": 14,
+    "original_E2E_selected": 18,
+    "floor": 14,
+    "job_minutes": 50,
+    "pytest_minutes": 42,
+    "reruns": 2
+  },
+  "candidate_CPU_accepted": false,
+  "coverage_increment": 0
+}
