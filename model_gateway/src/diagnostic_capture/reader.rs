@@ -364,6 +364,7 @@ mod tests {
             records: 2,
         };
         assert!(CaptureSnapshot::read(&directory, exact).is_ok());
+        use io::ErrorKind::{FileTooLarge, InvalidInput};
         for record_bytes in 1..exact.record_bytes {
             let error = CaptureSnapshot::read(
                 &directory,
@@ -376,11 +377,10 @@ mod tests {
             .unwrap();
             assert_eq!(
                 error.kind(),
-                io::ErrorKind::FileTooLarge,
+                FileTooLarge,
                 "record_bytes={record_bytes}: {error:?}"
             );
         }
-        use io::ErrorKind::{FileTooLarge, InvalidInput};
         let (bytes, record) = (exact.file_bytes, exact.record_bytes);
         for (file_bytes, record_bytes, records, expected) in [
             (bytes - 1, record, 2, FileTooLarge),
