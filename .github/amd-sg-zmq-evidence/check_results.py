@@ -1,5 +1,6 @@
 """Check passive original SG-ZMQ evidence; never execute or replace a test."""
 import argparse
+import copy
 from collections import Counter
 import hashlib
 import json
@@ -46,6 +47,70 @@ def final_chat_attempts(observed, expected):
     return normalized, reruns
 
 
+
+def final_chat_xml(observed, suites, expected):
+    """Derive a final-attempt view only after exact raw-history/XML closure."""
+    normalized, reruns = final_chat_attempts(observed, expected)
+    assert suites.tag == "testsuites" and len(suites) == 1 and suites[0].tag == "testsuite"
+    suite = suites[0]
+    assert not list(suites.iter("failure")) and not list(suites.iter("error"))
+    cases = list(suite.findall("testcase"))
+    assert len(cases) == sum(count + 1 for count in reruns.values()), "raw attempt/XML count"
+    assert len(list(suites.iter("testcase"))) == len(cases), "nested/unknown testcase"
+    for attribute in ("tests", "errors", "failures", "skipped"):
+        assert suite.attrib[attribute].isdecimal(), "invalid suite count"
+    all_reports = [report for history in observed["reports"].values() for report in history]
+    # Pytest counts passed calls, including a call before a teardown rerun.
+    passed_calls = sum(x["when"] == "call" and x["outcome"] == "passed" for x in all_reports)
+    skipped_reports = sum(x["outcome"] == "skipped" for x in all_reports)
+    assert int(suite.attrib["tests"]) == passed_calls + skipped_reports, "raw suite tests/history"
+    assert int(suite.attrib["skipped"]) == skipped_reports, "raw suite skips/history"
+    assert int(suite.attrib["errors"]) == int(suite.attrib["failures"]) == 0
+    cursor, final_indices, audit = 0, [], []
+    for item in observed["selected"]:
+        attempts = []
+        for report in observed["reports"][item["pytest_nodeid"]]:
+            if report["when"] == "setup":
+                attempts.append([])
+            attempts[-1].append(report)
+        assert len(attempts) == reruns[item["nodeid"]] + 1
+        for index, attempt in enumerate(attempts):
+            assert all(x["outcome"] in {"passed", "skipped", "rerun"} and not x["xfail"] for x in attempt)
+            if index < len(attempts) - 1:
+                assert sum(x["outcome"] == "rerun" for x in attempt) == 1, "ambiguous intermediate attempt"
+                assert all(x["longrepr"] for x in attempt if x["outcome"] == "rerun")
+            else:
+                assert not any(x["outcome"] == "rerun" for x in attempt)
+                final_indices.append(cursor)
+            case = cases[cursor]
+            assert {k: case.attrib[k] for k in ("classname", "name")} == item["junit_address"], "raw XML address/order"
+            assert all(child.tag in {"properties", "system-out", "system-err", "skipped"} for child in case), "unknown XML outcome"
+            skipped = [x for x in attempt if x["outcome"] == "skipped"]
+            actual_skip = case.findall("skipped")
+            assert len(skipped) == len(actual_skip) <= 1, "raw attempt/XML skip"
+            if skipped:
+                proof = skipped[0]["junit_skip"]
+                assert proof and not proof["truncated"]
+                assert expected[item["nodeid"]]["skip_reason"] == proof["attributes"]["message"]
+                assert actual_skip[0].attrib == proof["attributes"] and (actual_skip[0].text or "") == proof["text"]
+            audit.append({"nodeid": item["nodeid"], "attempt": index,
+                "outcomes": [x["outcome"] for x in attempt], "XML_index": cursor,
+                "XML_element_sha256": hashlib.sha256(ET.tostring(case)).hexdigest(),
+                "final": index == len(attempts) - 1})
+            cursor += 1
+    assert cursor == len(cases)
+    derived = copy.deepcopy(suites)
+    final_set = set(final_indices)
+    for index, case in enumerate(list(derived[0].findall("testcase"))):
+        if index not in final_set:
+            derived[0].remove(case)
+    derived[0].set("tests", str(len(final_indices)))
+    derived[0].set("skipped", str(sum(bool(x.findall("skipped")) for x in derived[0].findall("testcase"))))
+    return normalized, reruns, derived, {"raw_testcase_elements": len(cases),
+        "raw_suite_tests": int(suite.attrib["tests"]), "final_testcase_elements": len(final_indices),
+        "raw_attempt_XML_bijection": True, "derived_final_view_only": True, "attempts": audit}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("phase", choices=("units", "chat"))
@@ -86,10 +151,14 @@ def main():
                 assert digest(view) == expected[item["nodeid"]]["sha256"], "original case/model/params/skip changed"
             assert dict(Counter(x["model"] for x in observed["selected"])) == contract["model_counts"]
             assert observed["collection_reports"] == []
-            value, reruns = final_chat_attempts(observed, expected)
+            value, reruns = observed, None
             required = {x for x in expected if expected[x]["skip_reason"] is None}
             xml = Path(os.environ["AMD_DEPENDENCY_DIRECTORY"]) / "e2e.xml"
-        joined = join_unit_junit(value, ET.parse(xml).getroot(), required)
+        xml_root = ET.parse(xml).getroot()
+        if args.phase == "chat":
+            value, reruns, xml_root, rerun_XML = final_chat_xml(observed, xml_root, expected)
+            result.update(rerun_XML=rerun_XML, raw_XML_sha256=hashlib.sha256(xml.read_bytes()).hexdigest())
+        joined = join_unit_junit(value, xml_root, required)
         result.update(result="PASS_ORIGINAL_SG_ZMQ_" + args.phase.upper() + "_EVIDENCE_ONLY",
             selected=len(observed["selected"]), required_instances=len(required),
             required_source_definitions=len(contract["unit_definitions"]) if args.phase == "units" else None,
