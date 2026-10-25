@@ -120,6 +120,13 @@ class TestOpenAIServerFunctionCalling:
     On the mock engine each test states the model's answer first, in the
     llama parser's syntax (``mock_answers`` does nothing on a real engine);
     the ``n=2`` cases skip there, the mock answering one choice per request.
+
+    On a real engine the cases that leave the choice to the model
+    (``tool_choice: auto``) decode greedily (``temperature=0``): they assert
+    the shape of the tool call the gateway reads, and a sampled answer in
+    plain words would fail that by chance. The constrained cases (a
+    ``required`` or a named choice) are decided by the grammar the gateway
+    installs, not by the draw.
     """
 
     def test_function_calling_format(self, model, api_client, mock_answers):
@@ -161,8 +168,7 @@ class TestOpenAIServerFunctionCalling:
             model=model,
             max_tokens=2048,
             messages=messages,
-            temperature=0.8,
-            top_p=0.8,
+            temperature=0,
             stream=False,
             tools=tools,
         )
@@ -223,8 +229,7 @@ class TestOpenAIServerFunctionCalling:
             model=model,
             max_tokens=2048,
             messages=messages,
-            temperature=0.8,
-            top_p=0.8,
+            temperature=0,
             stream=True,
             tools=tools,
         )
@@ -290,8 +295,7 @@ class TestOpenAIServerFunctionCalling:
             model=model,
             max_tokens=2048,
             messages=messages,
-            temperature=0.9,
-            top_p=0.9,
+            temperature=0,
             stream=True,
             tools=tools,
         )
