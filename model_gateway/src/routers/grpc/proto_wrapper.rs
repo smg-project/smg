@@ -1625,7 +1625,9 @@ impl ProtoStream {
         observer: crate::diagnostic_capture::CaptureObserver,
         source: u64,
     ) -> Self {
-        Self::CapturedVllm(Box::new(capture::CapturedVllmStream::new(stream, observer, source)))
+        Self::CapturedVllm(Box::new(capture::CapturedVllmStream::new(
+            stream, observer, source,
+        )))
     }
 
     /// Count this stream's responses as progress for `worker` (a response is
@@ -1937,7 +1939,9 @@ impl ProtoStream {
             Self::Sglang(stream) => Self::Sglang(stream.defer_abort_until_first_item()),
             Self::Vllm(stream) => Self::Vllm(stream.defer_abort_until_first_item()),
             #[cfg(all(feature = "diagnostic-capture", unix))]
-            Self::CapturedVllm(stream) => Self::CapturedVllm(Box::new(stream.defer_abort_until_first_item())),
+            Self::CapturedVllm(stream) => {
+                Self::CapturedVllm(Box::new(stream.defer_abort_until_first_item()))
+            }
             Self::Trtllm(stream) => Self::Trtllm(stream.defer_abort_until_first_item()),
             Self::Mlx(stream) => Self::Mlx(stream.defer_abort_until_first_item()),
             Self::TokenSpeed(stream) => Self::TokenSpeed(stream.defer_abort_until_first_item()),

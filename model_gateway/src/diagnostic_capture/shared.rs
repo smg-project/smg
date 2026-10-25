@@ -89,7 +89,9 @@ impl SharedCapture {
         let Self {
             inner, _on_drop, ..
         } = self;
-        let Shared { session, failed, .. } = Arc::try_unwrap(inner).map_err(|shared| {
+        let Shared {
+            session, failed, ..
+        } = Arc::try_unwrap(inner).map_err(|shared| {
             shared.failed.store(true, Ordering::Release);
             io::Error::new(
                 io::ErrorKind::WouldBlock,

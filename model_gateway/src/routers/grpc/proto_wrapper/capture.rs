@@ -35,7 +35,10 @@ impl CapturedVllmStream {
             completion_marked: false,
         };
         observation.record(Event::Open {});
-        Self { stream, observation }
+        Self {
+            stream,
+            observation,
+        }
     }
 
     /// Observe each yielded native result before the router maps engine errors or restamps it.
@@ -51,8 +54,14 @@ impl CapturedVllmStream {
                     }),
                     Err(status) => self.observation.record(Event::Status {
                         code: status.code() as i32,
-                        message: LimitedText { text: status.message(), limit },
-                        details_base64: Binary { bytes: status.details(), limit },
+                        message: LimitedText {
+                            text: status.message(),
+                            limit,
+                        },
+                        details_base64: Binary {
+                            bytes: status.details(),
+                            limit,
+                        },
                     }),
                 }
             }
@@ -73,7 +82,10 @@ impl CapturedVllmStream {
     }
 
     pub(super) fn defer_abort_until_first_item(self) -> Self {
-        let Self { stream, observation } = self;
+        let Self {
+            stream,
+            observation,
+        } = self;
         Self {
             stream: stream.defer_abort_until_first_item(),
             observation,
@@ -139,10 +151,20 @@ struct Envelope<'a> {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Event<'a> {
     Open {},
-    Message { protobuf_base64: Protobuf<'a> },
-    Status { code: i32, message: LimitedText<'a>, details_base64: Binary<'a> },
+    Message {
+        protobuf_base64: Protobuf<'a>,
+    },
+    Status {
+        code: i32,
+        message: LimitedText<'a>,
+        details_base64: Binary<'a>,
+    },
     Eof {},
-    Closed { items: u64, eof: bool, completion_marked: bool },
+    Closed {
+        items: u64,
+        eof: bool,
+        completion_marked: bool,
+    },
 }
 
 struct Protobuf<'a> {
@@ -158,7 +180,9 @@ impl Serialize for Protobuf<'_> {
         let len = self.message.encoded_len();
         check_binary_len::<S::Error>(len, self.limit)?;
         let mut encoded = Vec::with_capacity(len);
-        self.message.encode(&mut encoded).map_err(S::Error::custom)?;
+        self.message
+            .encode(&mut encoded)
+            .map_err(S::Error::custom)?;
         serializer.collect_str(&Base64Display::new(&encoded, &STANDARD))
     }
 }
@@ -190,7 +214,9 @@ struct LimitedText<'a> {
 impl Serialize for LimitedText<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         if self.text.len() > self.limit {
-            return Err(S::Error::custom("native capture text exceeds its byte limit"));
+            return Err(S::Error::custom(
+                "native capture text exceeds its byte limit",
+            ));
         }
         serializer.serialize_str(self.text)
     }
