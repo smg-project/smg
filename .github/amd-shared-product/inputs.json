@@ -79,7 +79,7 @@
   "producer_branch": "ci/frozen-python173-main19c-producer-admitted-20261024",
   "producer_policy": "frozen_main19c_python173_build_only_all_18_steps_success_v1",
   "source_base": "740bd0c7e88bdfb57776785eaee16ff8e71f1833",
-  "target_product_commit": "156845926c07699869c17d9cbc0910f04b5a7d9e",
+  "target_product_commit": "c4b5fb7cc59a91e950a0f995d274e570cda39fb6",
   "source_trees": {
     ".cargo": "8a9d55bb8edfa19d9f90b313fbdc24326d3f667b",
     "Cargo.toml": "74bad7a60f31586e667b6ea84323f70ec477bddc",
@@ -90,7 +90,7 @@
     "clients": "599d7ce2727e5d6287825271f464a3b7b5e64ee9",
     "crates": "84086855e0f09846092bcce34ecd7b7b43bdc29c",
     "model_gateway": "e511dbc60efa61b550e70a8ccd749e79db6ab843",
-    "grpc_servicer": "01164131fca3a192bd6b56fc348ca004bccc78fe",
+    "grpc_servicer": "fbf9f0ef424b29e7b0444ec3a9856136795af705",
     "e2e_test": "06620fd04ebb757d46ba0af950e6717c89fb7625",
     "scripts": "4dc8528e28fbbe38e9a2cdc966ab0dd70b89c158",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
@@ -223,7 +223,7 @@
     "wholepip_still_required": true
   },
   "new_native_required": false,
-  "source_identity_note": "Original3de3/main19c remains the accepted artifact/source reference. Product1568459 replays exactly the existingPR4234 MCP2 3file implementation; consumer19.e2e_test is updated while its other18 paths andcompiled37 are unchanged. Captured actualproducer14 remainsc559, not rewritten toconsumer19; no Rustrebuild is needed for these3 e2e-only files. Actual18-step producer40132965389/c5596e fourarchives/actual14/native1d22 are source-data bound; integrity/hosted smoke are separate from targetnative/runtime. FreshRPC240a5/2c68 and target PhaseB CPU proof refer to unchanged90servicer/8schemas only. No143a/f545 artifacts/results are borrowed. Fourflags/runtime_cohort_accepted remainfalse; new MCP replay targetnormalresolver/currentunits/original173/currentmain qualification remainpending.",
+  "source_identity_note": "Original3de3/main19c remains the accepted artifact/source reference. Product1568459 replays exactly the existingPR4234 MCP2 3file implementation; consumer19.e2e_test is updated while its other18 paths andcompiled37 are unchanged. Captured actualproducer14 remainsc559, not rewritten toconsumer19; no Rustrebuild is needed for these3 e2e-only files. Actual18-step producer40132965389/c5596e fourarchives/actual14/native1d22 are source-data bound; integrity/hosted smoke are separate from targetnative/runtime. FreshRPC240a5/2c68 and target PhaseB CPU proof refer to unchanged90servicer/8schemas only. No143a/f545 artifacts/results are borrowed. Fourflags/runtime_cohort_accepted remainfalse; new MCP replay targetnormalresolver/currentunits/original173/currentmain qualification remainpending. Test-only child c4b5fb7cc59a91e950a0f995d274e570cda39fb6 updates two existing current-unit files: exact same-process PID log assertion and module-local legacy-profile env isolation. Consumer19.grpc_servicer is rebound to the new test tree; compiled37, actualproducer14/native1d22, runtimeRPC90/8schemas/generated16/Profile feature implementations and real original173/GPU opt-in1 stay unchanged. No new unit/GPU result or previous fullsuite pass is inferred.",
   "grpc178_source_candidate": {
     "generator": "grpcio-tools==1.78.0",
     "proto_version": "0.4.28+smg.main19c.g178",
