@@ -1,0 +1,48 @@
+name: Manual current19c normal CPU replay
+run-name: current19c CPU600 ${{ inputs.admission_nonce }}
+on:
+  workflow_dispatch:
+    inputs:
+      admission_nonce:
+        required: true
+        type: string
+concurrency:
+  group: amd-current19c-cpu-serial
+  cancel-in-progress: false
+permissions:
+  contents: read
+  actions: read
+jobs:
+  normal-current-units-cpu:
+    name: normal-current-units-cpu
+    runs-on: 1-gpu-mi300x
+    timeout-minutes: 10
+    env:
+      ADMISSION_NONCE: ${{ inputs.admission_nonce }}
+    steps:
+      - name: Checkout exact dispatch head
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Normal noGPU CPU600 in owned scheduled runner
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -I -B .github/amd-current19c-cpu-serial/job_runner.py run
+      - name: Upload raw durable CPU evidence
+        if: always() && env.CPU_SERIAL_OUTPUT != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: current19c-cpu-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.CPU_SERIAL_OUTPUT }}
+            ${{ env.CPU_SERIAL_OUTPUT }}.approval.json
+            ${{ env.CPU_SERIAL_OUTPUT }}.actual-GHA-job.json
+            ${{ env.CPU_SERIAL_OUTPUT }}.exact-argv.json
+          include-hidden-files: true
+          retention-days: 7
+          if-no-files-found: error
+      - name: Require full original CPU result and cleanup
+        if: always() && env.CPU_SERIAL_OUTPUT != ''
+        run: python3 -I -B .github/amd-current19c-cpu-serial/job_runner.py require-result
