@@ -406,6 +406,41 @@ mod tests {
     }
 
     #[test]
+    fn multiline_numeric_records_classify_every_truncated_window() {
+        let root = tempfile::tempdir().unwrap();
+        let mut file = CaptureFile::create(root.path(), 4096).unwrap();
+        let payload = RawValue::from_string(
+            serde_json::to_string_pretty(
+                &json!({"n": [-0.25, 1.25e30, 1.25e-30], "text": "héllo"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        file.record(&payload).unwrap();
+        let directory = file.finish().unwrap();
+        let length = fs::read(directory.join("records.jsonl")).unwrap().len();
+        for record_bytes in 1..=length {
+            let result = CaptureSnapshot::read(
+                &directory,
+                CaptureReadLimits {
+                    record_bytes,
+                    ..limits()
+                },
+            );
+            if record_bytes == length {
+                assert!(result.is_ok());
+            } else {
+                let error = result.err().unwrap();
+                assert_eq!(
+                    error.kind(),
+                    io::ErrorKind::FileTooLarge,
+                    "record_bytes={record_bytes}: {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn symlinks_directories_and_fifos_are_not_capture_files() {
         let root = tempfile::tempdir().unwrap();
         let directory = sealed(root.path());
