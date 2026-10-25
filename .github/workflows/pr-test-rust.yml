@@ -1,4 +1,4 @@
-name: AMD SGLang ZMQ
+name: AMD SGLang Responses
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: amd-sglang-zmq-${{ github.ref }}
+  group: amd-sglang-responses-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -16,6 +16,14 @@ jobs:
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     timeout-minutes: 10
     steps:
+      - name: Require private Responses service credentials before downloads
+        env:
+          BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
+        run: |
+          if ! test -n "${BRAVE_API_KEY:-}"; then
+            echo "::error::Private AMD Responses services require the BRAVE_API_KEY secret"
+            exit 1
+          fi
       # PR Test 40180473165 / a8580fcf: reuse its unchanged compiled sources.
       - uses: actions/download-artifact@v8
         with:
@@ -60,20 +68,21 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  amd-sglang-zmq:
+  amd-sglang-responses:
     needs: artifacts
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: sglang
       gpu_tier: "1"
       runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
-      timeout: 60
-      test_timeout: 48
-      test_dirs: e2e_test/chat_completions
-      connection_mode: zmq
-      min_selected: 204
-      servicer_unit_tests: true
+      timeout: 32
+      test_timeout: 24
+      test_dirs: e2e_test/responses
+      min_selected: 92
+      setup_agentic_deps: true
+      amd_agentic_services: true
+      servicer_unit_tests: false
       gpu_vendor: amd
       container_image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
-      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --ulimit memlock=-1:-1 --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --ulimit memlock=-1:-1 --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }} --env SPT_NOENV=1 --env SGLANG_GPT_OSS_MXFP4_BF16=1 --env PYTHONDONTWRITEBYTECODE=1
     secrets: inherit

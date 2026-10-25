@@ -54,6 +54,11 @@ on:
         type: boolean
         default: false
         description: "Set up Oracle DB and Brave MCP for agentic tests"
+      amd_agentic_services:
+        required: false
+        type: boolean
+        default: false
+        description: "Private AMD Responses: job-owned Oracle and Brave MCP services"
       vllm_kv_backend:
         required: false
         type: string
@@ -135,6 +140,28 @@ jobs:
     runs-on: ${{ inputs.runner }}
     container: ${{ inputs.container_image != '' && fromJSON(format('{{"image":{0},"options":{1}}}', toJSON(inputs.container_image), toJSON(inputs.container_options))) || vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     timeout-minutes: ${{ inputs.timeout }}
+    services:
+      oracle-db:
+        image: ${{ inputs.amd_agentic_services && inputs.gpu_vendor == 'amd' && inputs.setup_agentic_deps && 'gvenzl/oracle-free:23-slim-faststart@sha256:d86d09794ae138a8951e97d7ee010778dcd43088e8d0f83a51002abab8c6d7fd' || '' }}
+        env:
+          ORACLE_PASSWORD: oracle
+        options: >-
+          --cpus 2 --memory 4g --memory-swap 4g --pids-limit 512
+          --health-cmd healthcheck.sh --health-interval 10s
+          --health-timeout 5s --health-retries 30
+      brave-search-mcp:
+        image: ${{ inputs.amd_agentic_services && inputs.gpu_vendor == 'amd' && inputs.setup_agentic_deps && 'mcp/brave-search:latest@sha256:c7fcb7c3f794d8860362c6bcbc2ad959339d07e57503d1a8fc1a5aadf159ac6b' || '' }}
+        env:
+          BRAVE_MCP_TRANSPORT: http
+          BRAVE_MCP_PORT: '8080'
+          BRAVE_MCP_HOST: '0.0.0.0'
+          BRAVE_MCP_ENABLED_TOOLS: brave_web_search brave_local_search
+          BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
+        options: >-
+          --cpus 0.5 --memory 256m --memory-swap 256m --pids-limit 128
+          --health-cmd "node -e \"fetch('http://127.0.0.1:8080/ping',{signal:AbortSignal.timeout(4000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""
+          --health-start-period 5s --health-interval 10s
+          --health-timeout 5s --health-retries 3
     permissions:
       contents: read
     env:
@@ -255,6 +282,23 @@ jobs:
           name: sglang-unit-results-gpu${{ inputs.gpu_tier }}-${{ inputs.connection_mode }}
           path: unit-junit/
           if-no-files-found: ignore
+
+      - name: Apply scoped GPTOSS BF16 development overlay
+        id: gptoss-overlay
+        if: inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd' && inputs.amd_agentic_services
+        shell: bash
+        env:
+          SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          case "${SGLANG_GPT_OSS_MXFP4_BF16-0}" in
+            0) exit 0 ;;
+            1) ;;
+            *) echo "invalid explicit GPTOSS BF16 opt-in" >&2; exit 1 ;;
+          esac
+          DIRECTORY="$RUNNER_TEMP/sglang-responses-gptoss-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "directory=$DIRECTORY" >> "$GITHUB_OUTPUT"
+          python3 .github/amd-gptoss-pilot/overlay.py apply "$DIRECTORY"
 
       - name: Setup Oracle
         if: inputs.setup_agentic_deps
@@ -391,3 +435,21 @@ jobs:
         run: |
           bash scripts/ci_agentic_svc_deps.sh cleanup-oracle-flyway-user oracle-db
           bash scripts/ci_agentic_svc_deps.sh cleanup-oracle-user oracle-db
+
+      - name: Verify final GPTOSS BF16 development overlay
+        if: always() && inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd' && steps.gptoss-overlay.outputs.directory != ''
+        shell: bash
+        env:
+          OVERLAY_DIRECTORY: ${{ steps.gptoss-overlay.outputs.directory }}
+          SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 .github/amd-gptoss-pilot/overlay.py final "$OVERLAY_DIRECTORY"
+
+      - name: Preserve Responses GPTOSS overlay evidence
+        if: always() && steps.gptoss-overlay.outputs.directory != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: sglang-responses-gptoss-overlay
+          path: ${{ steps.gptoss-overlay.outputs.directory }}/
+          if-no-files-found: error
+          retention-days: 7
