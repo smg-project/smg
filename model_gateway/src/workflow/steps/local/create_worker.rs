@@ -1492,14 +1492,10 @@ mod tests {
         );
     }
 
-    /// On a dp-aware registration the engine's report is mapped to the rank's
-    /// space before the config's keys leave it: a DP label the config also
-    /// names still sizes the window share the record carries, so a later
-    /// refresh reads that share, not the whole engine window, as the engine's.
-    #[tokio::test]
-    async fn a_dp_label_the_config_also_sets_still_sizes_the_recorded_window_share() {
+    /// A dp-aware registration of one model under the DP label, as a local
+    /// HTTP worker with a client, before the engine's report is set on it.
+    fn dp_aware_local_http_data() -> WorkerWorkflowData {
         use openai_protocol::worker::WorkerModels;
-        use wfaas::WorkflowInstanceId;
 
         use crate::workflow::steps::create_worker_workflow_data;
 
@@ -1519,6 +1515,18 @@ mod tests {
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
         data.http_client_handle = Some(Arc::new(crate::clients::http_client()));
+        data
+    }
+
+    /// On a dp-aware registration the engine's report is mapped to the rank's
+    /// space before the config's keys leave it: a DP label the config also
+    /// names still sizes the window share the record carries, so a later
+    /// refresh reads that share, not the whole engine window, as the engine's.
+    #[tokio::test]
+    async fn a_dp_label_the_config_also_sets_still_sizes_the_recorded_window_share() {
+        use wfaas::WorkflowInstanceId;
+
+        let mut data = dp_aware_local_http_data();
         data.discovered_labels = HashMap::from([
             ("enable_dp_attention".to_string(), "true".to_string()),
             ("max_running_requests".to_string(), "256".to_string()),
@@ -1552,27 +1560,9 @@ mod tests {
     /// the record, so a refresh reads the share as the engine's.
     #[tokio::test]
     async fn a_dp_flag_only_the_config_sets_sizes_the_recorded_window_share_too() {
-        use openai_protocol::worker::WorkerModels;
         use wfaas::WorkflowInstanceId;
 
-        use crate::workflow::steps::create_worker_workflow_data;
-
-        let mut spec = WorkerSpec::new("http://worker:8000");
-        spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
-        spec.labels = HashMap::from([("enable_dp_attention".to_string(), "true".to_string())]);
-        let router_config = crate::config::RouterConfig::builder()
-            .worker_startup_timeout_secs(1)
-            .dp_aware(true)
-            .build_unchecked();
-
-        let mut data = create_worker_workflow_data(
-            spec,
-            WorkerRegistrationMode::Upsert,
-            app_context_with(router_config),
-        );
-        data.worker_kind = Some(WorkerKind::Local);
-        data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::clients::http_client()));
+        let mut data = dp_aware_local_http_data();
         data.discovered_labels =
             HashMap::from([("max_running_requests".to_string(), "256".to_string())]);
         data.dp_info = Some(DpInfo {
