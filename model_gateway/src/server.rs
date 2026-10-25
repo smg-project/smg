@@ -3259,6 +3259,65 @@ mod tests {
         }
     }
 
+    /// A chat request body over the edge layers' 1024-byte limit of these
+    /// tests.
+    fn over_limit_chat_body() -> String {
+        format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
+            "x".repeat(2048)
+        )
+    }
+
+    /// Posts the over-limit body to `app` as 256-byte chunked frames with no
+    /// Content-Length, so only the body read can discover the overrun (four
+    /// frames fit, the fifth crosses), and checks the refusal: 413 with the
+    /// `request_body_too_large` envelope, and the reading stopped at the
+    /// limit (at most five frames pulled, fewer than the body has).
+    async fn chunked_over_limit_post_is_refused_at_the_limit(app: Router) {
+        use std::sync::atomic::AtomicUsize;
+
+        use axum::{
+            body::{to_bytes, Body},
+            http::header::CONTENT_TYPE,
+        };
+        use bytes::Bytes;
+        use futures::StreamExt;
+        use tower::ServiceExt;
+
+        let oversized = over_limit_chat_body();
+        let frames: Vec<Result<Bytes, Infallible>> = oversized
+            .as_bytes()
+            .chunks(256)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+            .collect();
+        let total_frames = frames.len();
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&pulled);
+        let body = Body::from_stream(futures::stream::iter(frames).inspect(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "request_body_too_large");
+        let pulled = pulled.load(Ordering::SeqCst);
+        assert!(
+            pulled <= 5 && pulled < total_frames,
+            "reading must stop at the limit: {pulled} of {total_frames} frames pulled"
+        );
+    }
+
     /// An over-limit body answers 413 whatever its framing: a declared
     /// Content-Length over the limit is refused by the limit layer before the
     /// body, and a chunked upload is refused the moment it crosses the limit,
@@ -3266,14 +3325,10 @@ mod tests {
     /// json_parse_error) and no further frame pulled from the client.
     #[tokio::test]
     async fn over_limit_bodies_answer_413_whatever_the_framing() {
-        use std::sync::atomic::AtomicUsize;
-
         use axum::{
             body::{to_bytes, Body},
             http::header::{CONTENT_LENGTH, CONTENT_TYPE},
         };
-        use bytes::Bytes;
-        use futures::StreamExt;
         use tower::ServiceExt;
 
         let app = attach_edge_layers(
@@ -3300,45 +3355,9 @@ mod tests {
             vec![],
             middleware::AccessLogFields::NONE,
         );
-        let oversized = format!(
-            r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
-            "x".repeat(2048)
-        );
-
-        // Chunked: 256-byte frames and no Content-Length, so only the body
-        // read can discover the overrun; four frames fit, the fifth crosses.
-        let frames: Vec<Result<Bytes, Infallible>> = oversized
-            .as_bytes()
-            .chunks(256)
-            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
-            .collect();
-        let total_frames = frames.len();
-        let pulled = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&pulled);
-        let body = Body::from_stream(futures::stream::iter(frames).inspect(move |_| {
-            counter.fetch_add(1, Ordering::SeqCst);
-        }));
-        let response = app
-            .clone()
-            .oneshot(
-                http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/chat/completions")
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(body)
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let json: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["code"], "request_body_too_large");
-        let pulled = pulled.load(Ordering::SeqCst);
-        assert!(
-            pulled <= 5 && pulled < total_frames,
-            "reading must stop at the limit: {pulled} of {total_frames} frames pulled"
-        );
+        // Chunked: only the body read can discover the overrun.
+        chunked_over_limit_post_is_refused_at_the_limit(app.clone()).await;
+        let oversized = over_limit_chat_body();
 
         // Declared length on a Messages route: refused by the limit layer
         // before the body, and still the Messages envelope.
@@ -3398,16 +3417,6 @@ mod tests {
     /// (not 400 json_parse_error) and no frame past the limit is pulled.
     #[tokio::test]
     async fn chunked_over_limit_body_is_413_behind_the_body_watchdog() {
-        use std::sync::atomic::AtomicUsize;
-
-        use axum::{
-            body::{to_bytes, Body},
-            http::header::CONTENT_TYPE,
-        };
-        use bytes::Bytes;
-        use futures::StreamExt;
-        use tower::ServiceExt;
-
         let app = attach_edge_layers(
             Router::new()
                 .route(
@@ -3427,41 +3436,7 @@ mod tests {
             vec![],
             middleware::AccessLogFields::NONE,
         );
-        let oversized = format!(
-            r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
-            "x".repeat(2048)
-        );
-        let frames: Vec<Result<Bytes, Infallible>> = oversized
-            .as_bytes()
-            .chunks(256)
-            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
-            .collect();
-        let total_frames = frames.len();
-        let pulled = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&pulled);
-        let body = Body::from_stream(futures::stream::iter(frames).inspect(move |_| {
-            counter.fetch_add(1, Ordering::SeqCst);
-        }));
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/chat/completions")
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(body)
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let json: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["code"], "request_body_too_large");
-        let pulled = pulled.load(Ordering::SeqCst);
-        assert!(
-            pulled <= 5 && pulled < total_frames,
-            "reading must stop at the limit: {pulled} of {total_frames} frames pulled"
-        );
+        chunked_over_limit_post_is_refused_at_the_limit(app).await;
     }
 
     /// The CORS policy per `--cors-allowed-origins`, through the edge stack
