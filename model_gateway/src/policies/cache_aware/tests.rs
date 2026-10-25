@@ -226,22 +226,14 @@ fn test_cache_aware_with_imbalanced_load() {
         ..Default::default()
     });
 
-    let worker1 = BasicWorkerBuilder::new("http://w1:8000")
-        .worker_type(WorkerType::Regular)
-        .health_config(no_health_check())
-        .build();
-    let worker2 = BasicWorkerBuilder::new("http://w2:8000")
-        .worker_type(WorkerType::Regular)
-        .health_config(no_health_check())
-        .build();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
 
     // Create significant load imbalance
     for _ in 0..20 {
-        worker1.increment_load();
+        workers[0].increment_load();
     }
     // worker2 has load 0
 
-    let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker1), Arc::new(worker2)];
     policy.init_workers(&workers);
 
     // Should select worker2 (lower load) despite cache affinity
@@ -2349,23 +2341,7 @@ fn test_overlap_affinity_group_selects_best_match() {
 fn test_equal_overlap_forms_one_affinity_group() {
     // Equal overlap remains one affinity group so LeastLoad, rather than
     // raw load or slice order, owns the final tie-break.
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-
-    let chunks: [&[u32]; 2] = [&[1, 2, 3, 4], &[5, 6, 7, 8]];
-    let indexer = setup_indexer_with_blocks("http://w1:8000", &chunks);
-    // Same content cached on w2 under distinct backend seq hashes.
-    let w2 = indexer.intern_worker("http://w2:8000").unwrap();
-    let mut wb2 = WorkerBlocks::default();
-    let blocks: Vec<StoredBlock> = chunks
-        .iter()
-        .enumerate()
-        .map(|(i, tokens)| StoredBlock {
-            seq_hash: SequenceHash(100 + i as u64),
-            content_hash: compute_content_hash(tokens),
-        })
-        .collect();
-    indexer.apply_stored(w2, &blocks, None, &mut wb2).unwrap();
-
+    let (workers, indexer) = equal_overlap_fixture();
     assert_eq!(
         overlap_affinity_group(
             &workers,
@@ -2562,21 +2538,13 @@ fn test_overlap_affinity_group_no_match_is_empty() {
 fn test_raw_load_does_not_break_equal_affinity() {
     let policy = CacheAwarePolicy::with_config(test_config());
 
-    let w1 = BasicWorkerBuilder::new("http://w1:8000")
-        .worker_type(WorkerType::Regular)
-        .health_config(no_health_check())
-        .build();
-    let w2 = BasicWorkerBuilder::new("http://w2:8000")
-        .worker_type(WorkerType::Regular)
-        .health_config(no_health_check())
-        .build();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
 
     // Give w1 higher load
     for _ in 0..10 {
-        w1.increment_load();
+        workers[0].increment_load();
     }
 
-    let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(w1), Arc::new(w2)];
     policy.init_workers(&workers);
 
     // Store same blocks for both workers (equal overlap)
@@ -3488,20 +3456,12 @@ fn test_event_driven_overlap_selects_cached_worker() {
 fn test_event_driven_no_overlap_uses_dark_fleet_expected_wait() {
     let policy = CacheAwarePolicy::with_config(test_config());
 
-    let w1 = BasicWorkerBuilder::new("http://w1:8000")
-        .worker_type(WorkerType::Regular)
-        .health_config(no_health_check())
-        .build();
-    let w2 = BasicWorkerBuilder::new("http://w2:8000")
-        .worker_type(WorkerType::Regular)
-        .health_config(no_health_check())
-        .build();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
     // Give w1 higher live load so dark-fleet expected wait picks w2.
     for _ in 0..3 {
-        w1.increment_load();
+        workers[0].increment_load();
     }
 
-    let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(w1), Arc::new(w2)];
     policy.init_workers(&workers);
 
     // Monitor has indexer with data, but tokens don't match
@@ -3527,20 +3487,12 @@ fn test_event_driven_no_overlap_uses_dark_fleet_expected_wait() {
 fn test_event_driven_gated_hot_winner_spills_to_expected_wait() {
     let policy = CacheAwarePolicy::with_config(test_config());
 
-    let w1 = BasicWorkerBuilder::new("http://w1:8000")
-        .worker_type(WorkerType::Regular)
-        .health_config(no_health_check())
-        .build();
-    let w2 = BasicWorkerBuilder::new("http://w2:8000")
-        .worker_type(WorkerType::Regular)
-        .health_config(no_health_check())
-        .build();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
     // avg = 50; w1 clears both gate margins (100 > 50 * 1.1, 100 > 50 + 32).
     for _ in 0..100 {
-        w1.increment_load();
+        workers[0].increment_load();
     }
 
-    let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(w1), Arc::new(w2)];
     policy.init_workers(&workers);
 
     let monitor = Arc::new(KvEventMonitor::new());
@@ -3565,19 +3517,11 @@ fn test_event_driven_gated_hot_winner_spills_to_expected_wait() {
 fn test_event_driven_short_request_uses_dark_fleet_expected_wait() {
     let policy = CacheAwarePolicy::with_config(test_config()); // block_size=4
 
-    let w1 = BasicWorkerBuilder::new("http://w1:8000")
-        .worker_type(WorkerType::Regular)
-        .health_config(no_health_check())
-        .build();
-    let w2 = BasicWorkerBuilder::new("http://w2:8000")
-        .worker_type(WorkerType::Regular)
-        .health_config(no_health_check())
-        .build();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
     for _ in 0..3 {
-        w1.increment_load();
+        workers[0].increment_load();
     }
 
-    let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(w1), Arc::new(w2)];
     policy.init_workers(&workers);
 
     let monitor = Arc::new(KvEventMonitor::new());
@@ -3699,21 +3643,13 @@ fn test_imbalanced_skips_event_driven() {
         ..Default::default()
     });
 
-    let w1 = BasicWorkerBuilder::new("http://w1:8000")
-        .worker_type(WorkerType::Regular)
-        .health_config(no_health_check())
-        .build();
-    let w2 = BasicWorkerBuilder::new("http://w2:8000")
-        .worker_type(WorkerType::Regular)
-        .health_config(no_health_check())
-        .build();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
 
     // Create heavy imbalance: w1 has 20 load, w2 has 0
     for _ in 0..20 {
-        w1.increment_load();
+        workers[0].increment_load();
     }
 
-    let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(w1), Arc::new(w2)];
     policy.init_workers(&workers);
 
     // Even though we set up event monitor, imbalance check fires first
@@ -5003,19 +4939,11 @@ fn event_driven_salted_request_matches_only_its_namespace() {
     use openai_protocol::common::CachePartition;
 
     let policy = CacheAwarePolicy::with_config(test_config());
-    let w1 = BasicWorkerBuilder::new("http://w1:8000")
-        .worker_type(WorkerType::Regular)
-        .health_config(no_health_check())
-        .build();
-    let w2 = BasicWorkerBuilder::new("http://w2:8000")
-        .worker_type(WorkerType::Regular)
-        .health_config(no_health_check())
-        .build();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
     // w1 carries more live load, so every miss resolves to w2.
     for _ in 0..3 {
-        w1.increment_load();
+        workers[0].increment_load();
     }
-    let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(w1), Arc::new(w2)];
     policy.init_workers(&workers);
 
     // Blocks stored on w1 under (lora "adapter", salt "tenant-a"), as the
