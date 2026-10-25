@@ -137,8 +137,7 @@ where
             tokio::pin!(idle);
             // One wait for the client's leaving, kept across the chunks: a
             // `closed()` built per `select!` round registers a waiter on the
-            // channel and drops it on every chunk; kept, it registers once
-            // and a poll while the client is there is a state check.
+            // channel and drops it on every chunk; kept, it registers once.
             let client_gone = tx.closed();
             tokio::pin!(client_gone);
             loop {
