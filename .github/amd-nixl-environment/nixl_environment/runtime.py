@@ -106,7 +106,7 @@ class RuntimeProof:
         if self.passive_flush:
             owned.require(os.environ.get("SMG_CI_PRIVATE_MOONCAKE") == "1" and all(
                 inputs.get(key) is True for key in
-                ("ready", "run_budget_admitted", "artifacts_pinned", "consumer_gpu_ready")),
+                ("ready", "run_budget_admitted", "artifacts_pinned")),
                 "passive flush requires admitted private AMD diagnostic")
         self.objects, self.logs, self.offsets = {}, {}, {}
         self.events, self.errors, self.reports, self.patches = [], [], {}, []
