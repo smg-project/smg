@@ -1,9 +1,9 @@
 {
-  "ready": false,
-  "run_budget_admitted": false,
-  "artifacts_pinned": false,
+  "ready": true,
+  "run_budget_admitted": true,
+  "artifacts_pinned": true,
   "consumer_gpu_ready": false,
-  "runtime_cohort_accepted": false,
+  "runtime_cohort_accepted": true,
   "admitted_lane": "sglang-rust-full251",
   "target_product_commit": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
   "artifacts": [
@@ -199,8 +199,8 @@
     "original_parameterized_HTTP_cases_retained": true
   },
   "budget": {
-    "admitted": false,
-    "reserved_runner_seconds": 0,
+    "admitted": true,
+    "reserved_runner_seconds": 2400,
     "proposed_new_max_seconds": 2400,
     "global_owned_max": 2,
     "one_lane_per_run": true,
@@ -220,13 +220,13 @@
     "run_binding": null,
     "watch_PID_or_session": null
   },
-  "pending_note": "Fixed1473/d5 source19/compiled37/actualproducer14 and exact d5 fourZIP/sixpayload/b7 native retained. Prior normal14 and harness295 prove their CPU scope only. All5authorityflagsfalse,budgetfalse/reserved0;futurehead/run/solewatch/bindingnull. WholeRust251 reference/9models/admin+decisions/HTTP/40-32/floor204/reruns2 await separateactualGPU. Units=false/agentic=false; no ZMQunit/Brave prerequisite. No7070native or oldGPU/retiredbudget transfer.",
+  "pending_note": "SOURCE-ONLY CONDITIONAL PREVIEW, NOT APPLIED OR ADMITTED. Root alone may apply the proposed execution flags and separate NEW2400 after current complete physical/API/source/producer/artifact-TTL checks and an explicit grant. Genuine root97a/Ddeba already accepts only the fixed1473/d5/b7 normal-install CPU scope; no normal-install re-test or new native is requested. Complete original Rust251/nine models/all original HTTP/admin/decisions remain unaccepted; consumer_gpu_ready stays false. Actual new nonce/child head/run/job/owner/watch/controller deployment and grant remain unbound. No prior GPU result, retired budget, SG223 outcome or newer native/source result transfers.",
   "binding_preparation_evidence": {
     "producer_build_archive_integrity_sha256": "fa8e1be5899a9f5d74ade0f6de9cfa10eb5065a404f597c2ee95d55cfa03cb6f",
     "producer_policy_source_review_sha256": "707a143df969433664b923c54e9cc44ad511dba00bdde978c4b40b02d94901fb",
     "producer_policy_metadata_validation_sha256": "f352422414b7e3a2cab1a55701c3360bacfae7d20eb3be26df2b4b7077e62d2e",
     "normal_install_proof_available": true,
-    "normal_install_admission_metadata_bound": false,
+    "normal_install_admission_metadata_bound": true,
     "normal_install_root_acceptance_sha256": "97a2658237750a3c55b3f98a722077055428503cb8ad3b83ae8a01f4d377a571",
     "normal_install_independent_actual_peer_sha256": "deba14fd0db4270b317c25c23ecf1e0bde7b01b9ead92b1bf413014f06138cef"
   }
