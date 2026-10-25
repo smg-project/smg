@@ -17,11 +17,14 @@
     reason = "the bytes each encode allocated are the test's finding"
 )]
 
+mod common;
+
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use common::byte_level_alphabet;
 use llm_tokenizer::{traits::Encoder, HuggingFaceTokenizer};
 use tokenizers::{
     decoders::byte_level::ByteLevel as ByteLevelDecoder,
@@ -62,26 +65,6 @@ static GLOBAL: Counting = Counting;
 /// above the 64 the encoder caches by count.
 const CLAUSES: usize = 6;
 const CHARACTERS: usize = 30;
-
-/// The 256 characters a byte-level BPE spells its bytes with: the printable
-/// bytes as themselves, the others from U+0100 on.
-fn byte_level_alphabet() -> Vec<char> {
-    let mut next = 0x100;
-    (0u32..256)
-        .map(|byte| {
-            let printable = (0x21..=0x7E).contains(&byte)
-                || (0xA1..=0xAC).contains(&byte)
-                || (0xAE..=0xFF).contains(&byte);
-            let code = if printable {
-                byte
-            } else {
-                next += 1;
-                next - 1
-            };
-            char::from_u32(code).expect("a character of the byte-level alphabet")
-        })
-        .collect()
-}
 
 /// A byte-level BPE of the common shape with no merges: one id per byte, so
 /// the ids of a prompt are as many as its bytes.

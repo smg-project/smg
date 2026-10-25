@@ -354,3 +354,27 @@ pub fn ensure_minimax_m3_cached() -> Option<PathBuf> {
 
     Some(cache_dir)
 }
+
+/// The 256 characters a byte-level BPE spells its bytes with: the printable
+/// bytes as themselves, the others from U+0100 on.
+#[expect(
+    clippy::expect_used,
+    reason = "every byte maps to a scalar value; a helper of tests that stop on a broken setup"
+)]
+pub fn byte_level_alphabet() -> Vec<char> {
+    let mut next = 0x100;
+    (0u32..256)
+        .map(|byte| {
+            let printable = (0x21..=0x7E).contains(&byte)
+                || (0xA1..=0xAC).contains(&byte)
+                || (0xAE..=0xFF).contains(&byte);
+            let code = if printable {
+                byte
+            } else {
+                next += 1;
+                next - 1
+            };
+            char::from_u32(code).expect("a character of the byte-level alphabet")
+        })
+        .collect()
+}

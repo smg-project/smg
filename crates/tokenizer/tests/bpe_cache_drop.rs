@@ -17,6 +17,8 @@
     reason = "the bytes each dropped tokenizer left behind are the test's finding"
 )]
 
+mod common;
+
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     sync::{
@@ -26,6 +28,7 @@ use std::{
     thread,
 };
 
+use common::byte_level_alphabet;
 use llm_tokenizer::{traits::Encoder, HuggingFaceTokenizer};
 use tokenizers::{
     decoders::byte_level::ByteLevel as ByteLevelDecoder,
@@ -82,26 +85,6 @@ const WORDS: usize = 2_000;
 const CYCLES: usize = 5;
 /// What the threads together may keep of one dropped tokenizer.
 const LEFT_BEHIND_MAX: usize = THREADS * 8 * 1024;
-
-/// The 256 characters a byte-level BPE spells its bytes with: the printable
-/// bytes as themselves, the others from U+0100 on.
-fn byte_level_alphabet() -> Vec<char> {
-    let mut next = 0x100;
-    (0u32..256)
-        .map(|byte| {
-            let printable = (0x21..=0x7E).contains(&byte)
-                || (0xA1..=0xAC).contains(&byte)
-                || (0xAE..=0xFF).contains(&byte);
-            let code = if printable {
-                byte
-            } else {
-                next += 1;
-                next - 1
-            };
-            char::from_u32(code).expect("a character of the byte-level alphabet")
-        })
-        .collect()
-}
 
 /// A byte-level BPE of the common shape with no merges: every word is one
 /// piece and one symbol per byte, and each distinct word a thread encodes
