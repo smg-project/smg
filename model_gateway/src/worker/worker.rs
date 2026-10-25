@@ -229,8 +229,11 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// routed-worker response header, the request-sent event, the `worker`
     /// label of the worker's metric series): the registered URL byte for
     /// byte, unless it carries userinfo, whose secret is masked. Computed
-    /// once at registration (`WorkerMetadata::redacted_url`).
-    fn redacted_url(&self) -> &str;
+    /// once at registration (`WorkerMetadata::redacted_url`); an implementor
+    /// reads it from its metadata unless it keeps the field closer.
+    fn redacted_url(&self) -> &str {
+        &self.metadata().redacted_url
+    }
     /// Get the worker's API key
     fn api_key(&self) -> Option<&String>;
     /// Get the worker's type (Regular, Prefill, or Decode)

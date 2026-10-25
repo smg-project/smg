@@ -522,7 +522,7 @@ impl WorkerMonitor {
         let waiting = load.map_or(0, WorkerLoadResponse::total_waiting_reqs);
         let kv_pressure = load.map_or(0.0, WorkerLoadResponse::effective_kv_pressure);
         info!(
-            worker_url = %worker.url(),
+            worker_url = %worker.redacted_url(),
             overloaded = verdict,
             waiting_requests = waiting,
             kv_pressure,

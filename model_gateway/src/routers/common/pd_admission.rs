@@ -317,11 +317,11 @@ pub(crate) fn announce_decode_window(worker: &dyn Worker) {
     Metrics::set_pd_admission_window(worker.redacted_url(), window);
     match window {
         Some(window) => debug!(
-            worker = worker.url(),
+            worker = worker.redacted_url(),
             window, "PD admission bounds dispatch to this decode worker by its running window"
         ),
         None => warn!(
-            worker = worker.url(),
+            worker = worker.redacted_url(),
             "PD admission is off for this decode worker: it reports no running window (no \
              `max_num_seqs` or `max_running_requests` label), so a burst wider than its \
              scheduler runs at once queues at the engine instead of waiting at the gateway"

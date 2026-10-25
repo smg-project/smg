@@ -108,6 +108,14 @@ fn requests_total(body: &str, worker_label: &str) -> Option<u64> {
         .map(|line| line.rsplit(' ').next().unwrap().parse().unwrap())
 }
 
+/// The value of the worker's health gauge in a scrape, if the series exists.
+fn health(body: &str, worker_label: &str) -> Option<f64> {
+    let worker = format!("worker=\"{worker_label}\"");
+    body.lines()
+        .find(|line| line.starts_with("smg_worker_health{") && line.contains(&worker))
+        .map(|line| line.rsplit(' ').next().unwrap().parse().unwrap())
+}
+
 /// An HTTP upstream that answers every `/generate` with a completion; the
 /// credentials the gateway's client sends for a URL with userinfo are
 /// accepted as any header is.
@@ -296,4 +304,48 @@ async fn a_worker_url_without_credentials_is_rendered_byte_for_byte() {
     );
     let body = scrape(metrics_addr).await;
     assert_eq!(requests_total(&body, &upstream), Some(1), "{body}");
+}
+
+/// Two registrations at one address that differ only by their secret render
+/// to one label. A credential rotation registers the new URL and then removes
+/// the old one: the label's series stay for the live registration and are
+/// retired with the last one.
+#[tokio::test]
+async fn a_credential_rotation_at_one_address_keeps_the_labels_series() {
+    let handle = crate::metrics::recorder();
+    let (metrics_addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
+        .await
+        .expect("metrics server binds an ephemeral port");
+    let ctx = create_test_app_context().await;
+    let worker = |url: &str| -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(MODEL))
+                .health_config(health_checks_off())
+                .build(),
+        )
+    };
+    let old = "http://user:old@127.0.0.1:1";
+    let new = "http://user:new@127.0.0.1:1";
+    let label = "http://user:***@127.0.0.1:1";
+    ctx.worker_registry.register(worker(old)).unwrap();
+    ctx.worker_registry.register(worker(new)).unwrap();
+    let body = scrape(metrics_addr).await;
+    assert_eq!(health(&body, label), Some(1.0), "{body}");
+
+    ctx.worker_registry.remove_by_url(old).unwrap();
+    let body = scrape(metrics_addr).await;
+    assert_eq!(
+        health(&body, label),
+        Some(1.0),
+        "the live registration's series survive the other's removal:\n{body}"
+    );
+
+    ctx.worker_registry.remove_by_url(new).unwrap();
+    let body = scrape(metrics_addr).await;
+    assert_eq!(
+        health(&body, label),
+        None,
+        "the last registration's removal retires the label:\n{body}"
+    );
 }

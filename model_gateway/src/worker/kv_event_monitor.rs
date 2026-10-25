@@ -229,7 +229,7 @@ impl KvEventMonitor {
         // EngineCore returns `unimplemented` for SubscribeKvEvents — subscribing
         // there would just be a wasted handshake + round-trip per registration.
         if *worker.connection_mode() != ConnectionMode::Grpc {
-            debug!(worker_url = %url, mode = %worker.connection_mode(), "non-gRPC worker, skipping KV event subscription");
+            debug!(worker_url = %rendered, mode = %worker.connection_mode(), "non-gRPC worker, skipping KV event subscription");
             return;
         }
 
@@ -237,7 +237,7 @@ impl KvEventMonitor {
             let mut handles = self.worker_handles.lock().await;
             let mut done = match handles.get(&url) {
                 Some(Slot::Active(_)) => {
-                    debug!(worker_url = %url, "KV event subscription already active, skipping");
+                    debug!(worker_url = %rendered, "KV event subscription already active, skipping");
                     return;
                 }
                 Some(Slot::Removing(reservation)) => reservation.done.clone(),
@@ -290,7 +290,7 @@ impl KvEventMonitor {
                 // gauge by the seed.
                 Metrics::set_kv_block_size(&model_id, known.tokens);
             } else {
-                warn!(worker_url = %url, "Worker reports kv_block_size=0, ignoring");
+                warn!(worker_url = %rendered, "Worker reports kv_block_size=0, ignoring");
             }
         }
 
@@ -299,7 +299,7 @@ impl KvEventMonitor {
         let block_sizes = Arc::clone(&self.block_sizes);
 
         info!(
-            worker_url = %url,
+            worker_url = %rendered,
             model_id = %model_id,
             "Starting KV event subscription"
         );

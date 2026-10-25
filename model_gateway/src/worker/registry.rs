@@ -1426,7 +1426,7 @@ impl WorkerRegistry {
             if current != expected {
                 tracing::warn!(
                     worker_id = %worker_id.as_str(),
-                    worker_url = old_worker.url(),
+                    worker_url = old_worker.redacted_url(),
                     expected,
                     current,
                     "Aborting replacement: worker was replaced before the lock was acquired"
@@ -1441,8 +1441,8 @@ impl WorkerRegistry {
         // URL changes are not supported via replace — use remove + register instead
         if old_worker.url() != new_worker.url() {
             tracing::error!(
-                old_url = old_worker.url(),
-                new_url = new_worker.url(),
+                old_url = old_worker.redacted_url(),
+                new_url = new_worker.redacted_url(),
                 "replace() does not support URL changes"
             );
             return false;
@@ -1457,7 +1457,7 @@ impl WorkerRegistry {
         if !new_worker.inherit_shared_state_from(&*old_worker) {
             tracing::warn!(
                 worker_id = %worker_id.as_str(),
-                worker_url = old_worker.url(),
+                worker_url = old_worker.redacted_url(),
                 "replace() did not preserve shared mutable worker state"
             );
         }
@@ -1813,10 +1813,32 @@ impl WorkerRegistry {
             removed
         };
         if let Some((_, worker)) = removed {
-            // Retire the URL's series while the URL still maps to this id: a
+            // Retire the label's series while the URL still maps to this id: a
             // registration of the same URL cannot slip in between and have its
-            // fresh series retired under it.
-            Metrics::remove_worker_metrics(worker.redacted_url());
+            // fresh series retired under it. A registration that renders to the
+            // same label (the same address under a rotated credential, registered
+            // before this one is removed) keeps the label's series: they are
+            // retired with the last registration that renders to it.
+            let label = worker.redacted_url();
+            let label_shared = self
+                .workers
+                .iter()
+                .any(|other| other.value().redacted_url() == label);
+            if label_shared {
+                // The leaving registration's demotion wrote the gauges the
+                // label shares; the registrations that stay write theirs again.
+                for other in self.workers.iter() {
+                    let other = other.value();
+                    if other.redacted_url() == label {
+                        Metrics::set_worker_health(label, other.is_healthy());
+                        Metrics::set_worker_cb_state(label, other.circuit_breaker_state().as_int());
+                        Metrics::set_worker_requests_active(label, other.load());
+                        other.republish_state();
+                    }
+                }
+            } else {
+                Metrics::remove_worker_metrics(label);
+            }
             self.url_to_id.remove(worker.url());
             // We hold _guard; drop the DashMap entry but the Mutex stays alive via Arc.
             self.worker_mutation_locks.remove(worker_id);
@@ -1986,7 +2008,7 @@ impl WorkerRegistry {
                     model_id = %model_id,
                     worker_type = %worker_type,
                     connection_mode = %ConnectionMode::Grpc,
-                    worker_url = %worker.url(),
+                    worker_url = %worker.redacted_url(),
                     observed_values = ?values,
                     "Divergent default sampling params reported by workers in the same routing group"
                 );
