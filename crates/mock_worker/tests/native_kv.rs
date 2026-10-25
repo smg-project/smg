@@ -20,7 +20,6 @@ impl Worker {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         cfg.host = "127.0.0.1".into();
-        cfg.grpc_base_port = address.port();
         cfg.grpc_native_vllm = true;
         let (stop, stopped) = oneshot::channel();
         #[expect(
@@ -180,6 +179,46 @@ async fn discovered_endpoints_deliver_live_events_and_optional_replay() {
     })
     .await
     .expect("native discovery/live/replay/shutdown finish within the bound");
+}
+
+#[tokio::test]
+async fn concurrent_ephemeral_workers_have_independent_live_replay_endpoints() {
+    timeout(Duration::from_secs(10), async {
+        // Keep the default gRPC base 0 for already-bound library listeners.
+        let mut first = Worker::start(enabled()).await;
+        let mut second = Worker::start(enabled()).await;
+        let mut endpoints = std::collections::HashSet::new();
+        for worker in [&mut first, &mut second] {
+            let sources = worker
+                .native
+                .get_kv_event_sources(v::GetKvEventSourcesRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .sources;
+            assert_eq!(sources.len(), 1);
+            let source = &sources[0];
+            for endpoint in [&source.endpoint, &source.replay_endpoint] {
+                assert!(!endpoint.ends_with(":0"));
+                assert!(endpoints.insert(endpoint.clone()));
+            }
+            let mut replay = DealerSocket::new();
+            replay.connect(&source.replay_endpoint).await.unwrap();
+            let mut request = ZmqMessage::from(Vec::new());
+            request.push_back(0u64.to_be_bytes().to_vec().into());
+            replay.send(request).await.unwrap();
+            let end = replay.recv().await.unwrap();
+            assert_eq!(end.len(), 4);
+            assert!(end.get(1).unwrap().is_empty());
+            assert_eq!(end.get(2).unwrap().as_ref(), [0xff; 8]);
+            assert!(end.get(3).unwrap().is_empty());
+        }
+        assert_eq!(endpoints.len(), 4);
+        first.finish().await;
+        second.finish().await;
+    })
+    .await
+    .expect("both ephemeral workers and replay sockets drain within the bound");
 }
 
 #[tokio::test]

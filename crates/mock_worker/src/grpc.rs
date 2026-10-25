@@ -106,10 +106,14 @@ pub async fn serve_with_listener_until(
     let engine = cfg
         .realistic
         .then(|| Engine::spawn_named(cfg.engine.clone(), name.clone(), true));
-    // The worker's vLLM-wire KV-event publisher, numbered by its port offset.
-    let publisher_cfg = addr
-        .and_then(|a| a.port().checked_sub(cfg.grpc_base_port))
-        .and_then(|index| cfg.kv_zmq_for(index, 0));
+    // A default base of 0 denotes one already-bound library listener, not
+    // a fleet offset derived from the OS-assigned ephemeral port.
+    let publisher_index = if cfg.grpc_base_port == 0 {
+        Some(0)
+    } else {
+        addr.and_then(|a| a.port().checked_sub(cfg.grpc_base_port))
+    };
+    let publisher_cfg = publisher_index.and_then(|index| cfg.kv_zmq_for(index, 0));
     let publisher = match (engine.as_ref(), publisher_cfg) {
         (Some(engine), Some(kv)) => {
             match crate::kv_zmq::BoundPublisher::bind(engine.clone(), kv).await {

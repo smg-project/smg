@@ -66,7 +66,8 @@ pub struct Config {
     pub grpc_max_message_bytes: usize,
     /// vLLM-wire ZMQ KV-event publishers (realistic engines only): the first
     /// PUB port; worker `i` publishes on `base + 2i` and answers replay on
-    /// `base + 2i + 1`. Off when `None`.
+    /// `base + 2i + 1`. Base 0 gives every PUB/replay socket its own ephemeral
+    /// port. Off when `None`.
     pub kv_events_zmq_base_port: Option<u16>,
     /// Whether the publishers serve replay requests (ROUTER at `port + 1`).
     pub kv_events_replay: bool,
@@ -380,7 +381,11 @@ impl Config {
             return None;
         }
         let base = self.kv_events_zmq_base_port?;
-        let port = base.checked_add(index.checked_mul(2)?)?;
+        let port = if base == 0 {
+            0 // Every worker binds its own ephemeral PUB/replay sockets.
+        } else {
+            base.checked_add(index.checked_mul(2)?)?
+        };
         Some(crate::kv_zmq::KvZmqConfig {
             host: self.host.clone(),
             port,
@@ -496,6 +501,36 @@ mod tests {
             Config::default().kv_zmq_for(0, 0).is_none(),
             "no publisher for a canned worker"
         );
+    }
+
+    #[test]
+    fn ephemeral_publishers_do_not_offset_ports_by_worker_index() {
+        let cfg = parse(&[
+            "--engine",
+            "realistic",
+            "--grpc-base-port",
+            "19000",
+            "--grpc-count",
+            "2",
+            "--zmq-count",
+            "2",
+            "--zmq-handshake",
+            "ipc:///tmp/mock-ephemeral-test",
+            "--kv-events-zmq-base-port",
+            "0",
+        ])
+        .unwrap();
+        for (index, rank) in [(0, 0), (1, 0), (2, 0), (3, 1), (u16::MAX, 2)] {
+            let publisher = cfg.kv_zmq_for(index, rank).unwrap();
+            assert_eq!((publisher.port, publisher.dp_rank), (0, rank));
+            assert!(publisher.replay);
+        }
+        let fixed = Config {
+            kv_events_zmq_base_port: Some(19_000),
+            ..cfg
+        };
+        assert_eq!(fixed.kv_zmq_for(3, 1).unwrap().port, 19_006);
+        assert!(fixed.kv_zmq_for(u16::MAX, 0).is_none());
     }
 
     #[test]

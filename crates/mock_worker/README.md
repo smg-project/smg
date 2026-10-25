@@ -192,12 +192,18 @@ vLLM runs (`ZmqEventPublisher` in `vllm/distributed/kv_events.py`), so the
 servicers' relays (`crates/engine_servicer`, the Python servicer) can be
 exercised end to end without a GPU: worker `i` (gRPC workers by port offset,
 then ZMQ ranks) publishes on `base + 2i` and answers replay on `base + 2i + 1`.
-Replay on a fixed PUB port 65535 is rejected. An individual publisher binding
-port 0 uses independently assigned PUB/replay ports and reports their actual
-addresses; this is useful for an isolated ephemeral worker, not a fleet preset.
+Replay on a fixed PUB port 65535 is rejected. Base port 0 gives every worker
+independently assigned PUB/replay ports and reports their actual addresses;
+worker indexes never turn ephemeral port 0 into fixed ports 2, 4, and so on.
+For an already-bound gRPC library listener, the default `grpc_base_port = 0`
+selects worker index 0 instead of using its OS-assigned port as a fleet offset.
 
 With native control enabled, `GetKvEventSources` returns the actual bound
 endpoints, topic, rank 0, MessagePack schema 1 and effective replay retention.
+Wildcard bind hosts (`0.0.0.0`, `::` or `*`) remain wildcard hosts in this
+metadata. Consumers must replace the host in both PUB and replay endpoints
+with a reachable worker address, normally the host used for the gRPC connection;
+the mock cannot infer an externally reachable address from its bind interface.
 Both sockets and the event subscription exist before gRPC discovery begins.
 Disabled publishing, canned mode and disabled prefix caching return no sources;
 the SGLang wire returns `FAILED_PRECONDITION`; a configured publisher that failed
