@@ -1,0 +1,9 @@
+{
+  "root_admitted": true,
+  "CPU_seconds_new": 600,
+  "GPU": 0,
+  "window_nonce": "e56d0e95637848468f0c67f44ac1bc6d",
+  "max_owned_runners_after": 1,
+  "sole_observer_source_reviewed": true,
+  "no_retired_allowance_reused": true
+}

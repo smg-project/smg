@@ -1,95 +1,79 @@
-name: AMD original SGLang ZMQ validation
+name: Manual original SG ZMQ normal noGPU CPU replay
+run-name: SG-ZMQ scheduled CPU600 ${{ inputs.admission_nonce }}
 on:
   workflow_dispatch:
+    inputs:
+      admission_nonce:
+        required: true
+        type: string
+concurrency:
+  group: amd-sg-zmq-cpu-serial
+  cancel-in-progress: false
 permissions:
   contents: read
   actions: read
-concurrency:
-  group: amd-shared-product-sglang-zmq-original
-  cancel-in-progress: false
 jobs:
-  artifact-relay:
-    runs-on: ubuntu-24.04
+  normal-sg-zmq-cpu:
+    name: normal-sg-zmq-cpu
+    runs-on: 1-gpu-mi300x
     timeout-minutes: 10
     env:
-      PYTHONDONTWRITEBYTECODE: '1'
+      ADMISSION_NONCE: ${{ inputs.admission_nonce }}
     steps:
-      - uses: actions/checkout@v7
+      - name: Guard unique runner-owned checkout path
+        working-directory: ${{ runner.temp }}
+        shell: bash
+        run: |
+          python3 -I -B - <<'PY_GUARD'
+          import os
+          from pathlib import Path
+          import re
+
+          def guard():
+              assert __debug__
+              nonce = os.environ['ADMISSION_NONCE']
+              assert re.fullmatch('[0-9a-f]{32}', nonce), 'exact admission nonce'
+              assert re.fullmatch('[0-9a-f]{40}', os.environ['GITHUB_SHA']), 'exact dispatch SHA'
+              assert os.environ['GITHUB_REPOSITORY'] == 'smg-project/smg'
+              assert os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
+              assert os.environ['GITHUB_RUN_ATTEMPT'] == '1'
+              root = Path(os.environ['GITHUB_WORKSPACE'])
+              assert root.is_absolute() and root.resolve(strict=True) == root and root.is_dir()
+              assert not root.is_symlink() and '\n' not in str(root) and '\r' not in str(root)
+              assert root.stat().st_uid == os.geteuid() and os.access(root, os.W_OK | os.X_OK)
+              source = root / ('.smg-sg-zmq-cpu-' + nonce)
+              assert not source.exists() and not source.is_symlink(), 'never reuse a checkout'
+              with Path(os.environ['GITHUB_ENV']).open('a') as stream:
+                  stream.write('CPU_SERIAL_SOURCE=' + str(source) + '\n')
+
+          guard()
+          PY_GUARD
+      - name: Checkout exact dispatch head in unique subdirectory
+        uses: actions/checkout@v7
         with:
-          fetch-depth: 0
-      - name: Verify external producer and relay payloads
-        id: relay
+          ref: ${{ github.sha }}
+          path: .smg-sg-zmq-cpu-${{ inputs.admission_nonce }}
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Normal SG ZMQ noGPU CPU600 in owned scheduled runner
+        working-directory: ${{ github.workspace }}/.smg-sg-zmq-cpu-${{ inputs.admission_nonce }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          DIRECTORY="$RUNNER_TEMP/shared-relay-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          echo "directory=$DIRECTORY" >> "$GITHUB_OUTPUT"
-          python3 .github/amd-shared-product/relay.py --out "$DIRECTORY"
-      - name: Relay wheel without changing its bytes
+        run: python3 -I -B "$CPU_SERIAL_SOURCE/.github/amd-sg-zmq-cpu-serial/job_runner.py" run
+      - name: Upload raw durable CPU evidence
+        if: always() && env.CPU_SERIAL_OUTPUT != ''
         uses: actions/upload-artifact@v7
         with:
-          name: smg-wheel
-          path: ${{ steps.relay.outputs.directory }}/smg-wheel/
-          compression-level: 0
-          if-no-files-found: error
-          retention-days: 1
-      - name: Relay Go FFI without changing its bytes
-        uses: actions/upload-artifact@v7
-        with:
-          name: go-ffi-library
-          path: ${{ steps.relay.outputs.directory }}/go-ffi-library/
-          compression-level: 0
-          if-no-files-found: error
-          retention-days: 1
-      - name: Relay WASM without changing its bytes
-        uses: actions/upload-artifact@v7
-        with:
-          name: wasm-test-fixtures
-          path: ${{ steps.relay.outputs.directory }}/wasm-test-fixtures/
-          compression-level: 0
-          if-no-files-found: error
-          retention-days: 1
-      - name: Relay Python types without changing their bytes
-        uses: actions/upload-artifact@v7
-        with:
-          name: python-client-types
-          path: ${{ steps.relay.outputs.directory }}/python-client-types/
-          compression-level: 0
-          if-no-files-found: error
-          retention-days: 1
-      - name: Preserve external producer identity and verification
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: external-producer-relay-evidence
-          path: ${{ steps.relay.outputs.directory }}/evidence/
-          if-no-files-found: ignore
+          name: sg-zmq-cpu-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.CPU_SERIAL_OUTPUT }}
+            ${{ env.CPU_SERIAL_OUTPUT }}.approval.json
+            ${{ env.CPU_SERIAL_OUTPUT }}.actual-GHA-job.json
+            ${{ env.CPU_SERIAL_OUTPUT }}.exact-argv.json
+          include-hidden-files: true
           retention-days: 7
-  amd-product-sglang-zmq:
-    needs: artifact-relay
-    uses: ./.github/workflows/e2e-gpu-job.yml
-    with:
-      engine: sglang
-      gpu_tier: '1'
-      runner: 1-gpu-mi300x
-      timeout: 60
-      test_timeout: 48
-      test_dirs: e2e_test/chat_completions
-      min_selected: 204
-      connection_mode: zmq
-      servicer_unit_tests: true
-      gpu_vendor: amd
-      container_image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
-      container_options: --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN --env SPT_NOENV=1 --env SGLANG_GPT_OSS_MXFP4_BF16=1 --env PYTHONDONTWRITEBYTECODE=1 --env SMG_SGLANG_ZMQ_ORIGINAL=1
-    secrets: inherit
-  finish:
-    if: always()
-    needs: [artifact-relay, amd-product-sglang-zmq]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 3
-    steps:
-      - name: Require the actual shared workflow to finish successfully
-        env:
-          RELAY: ${{ needs.artifact-relay.result }}
-          CHAT: ${{ needs.amd-product-sglang-zmq.result }}
-        run: test "$RELAY" = success && test "$CHAT" = success
+          if-no-files-found: error
+      - name: Require full original CPU result and cleanup
+        if: always() && env.CPU_SERIAL_OUTPUT != ''
+        working-directory: ${{ github.workspace }}/.smg-sg-zmq-cpu-${{ inputs.admission_nonce }}
+        run: python3 -I -B "$CPU_SERIAL_SOURCE/.github/amd-sg-zmq-cpu-serial/job_runner.py" require-result

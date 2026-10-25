@@ -1,0 +1,65 @@
+{
+  "carrier_head": "1417decf4f01d075beb5cca6e576e5b0958aaad5",
+  "product_source_head": "4b65a6ce293be8959bcea48df3c1a552c6137191",
+  "manifest_sha256": "d43dc14caaf6aa7ebb97b41d8736b83fb7eb5292c0d5812e7b0711e405df8ebb",
+  "spec_sha256": "fde22051a8a478eed61734ecace29ce496a572eee367b80d292beecd60849fd8",
+  "publisher_sha256": "8529ae06e9131281d72de2e71548ced665c6b9995151092b16f90d1a2701a9d5",
+  "observer_sha256": "02fb5df9ef3dd86b7054e59e1bb4df71958356e7388651f72e801ecf99a85db9",
+  "serial_control_sha256": "13bfbc39353c3c20d4de797c839076cee6a654add261ca6c3cf81dad42fdd9bc",
+  "common_sha256": "39939e40eca2bbd5fd23110829949ade46a8efcacf23c59ba17880f6a092332c",
+  "driver_sha256": "f9ff9471ea46393e27d5eddbb0465b8e1beb8e454749e8ca1ad6997b373ab955",
+  "worker_identity_sha256": "c8fe23af2319a05999ec884f869a3b9764591f98424ee21b867ecbc376c380c0",
+  "payload_sha256": "6719d0afb97fd20380c578fa95623868989bf1d7d084bd8c07b68fdc622b9232",
+  "CPU_payload_sha256": "6719d0afb97fd20380c578fa95623868989bf1d7d084bd8c07b68fdc622b9232",
+  "inputs_sha256": "0b995ce2cd2bbba43b3b70551ce2236bc4429fbe4e2cf0a4b5cb81c5b70baa71",
+  "frozen_manifest_sha256": "f92427fc2f751822f8678074c6fe7ceabc8bacf34e24e449cd4eb6223ba82ae4",
+  "packet_manifest_sha256": "30f735ab57cb8bb99f13c6653f8d0f11d930fee730cd51df816e41fc24639dd5",
+  "result": "PASS_SOURCE_DATA_ONLY_SG_SCHEDULED_DURABLE_PROVENANCE_PATH_CHILD",
+  "reviewed_head": "4b65a6ce293be8959bcea48df3c1a552c6137191",
+  "reviewed_at_utc": "2026-10-25T04:50:17.882465+00:00",
+  "reviewer": "D / mc4_actual_independent, nonauthor of A child; parent complete independent review0be7 joined, no self-runtime acceptance",
+  "delivery_sha256": "549e188e279fefb603b3e138e57d43bdfc597ec1abac2d5ef7e81b24c149fe4e",
+  "findings": [],
+  "parent_delivery_sha256": "80514afe3373d024e199127f934334d52c3cd06fbdfee262bcf4eaa387b7f24b",
+  "parent_manifest_sha256": "942d3a94e435c4c711d2cf7068a16271311dff1d76f8b405d13c7304e158cdc5",
+  "parent_full_peer_sha256": "0be7a29d062b604517068787e93f38aa62e2094a6b43191315912ad85604c11c",
+  "closed_findings": [
+    "D-SG-SCHEDULED-PROVENANCE-PATH-1"
+  ],
+  "final_provenance_helper_sha256": "4db81cc55ecfbd3e476201d9e7d851082547ccf1445d1ac95271776b843f4f45",
+  "delta_verified": {
+    "only_Python_change": "prove_installed.py:96 reads /out/persistent/evidence/installed-provenance.json, the exact installed-phase output; all four package/module/metadata/constraint comparisons retained",
+    "inverse_one_literal_exact_parent_bytes": true,
+    "all_other19_Python_files_exact_parent": true,
+    "all46_author_files_actual_size_SHA_regular_nonlink": true,
+    "all20_Python_AST_valid_no_import_or_execution": true,
+    "packet25_regular_files_exact_map24_plusmap": true,
+    "frozen23_actual_hashes_exact": true,
+    "frozen_only_member_change": "prove_installed.py",
+    "packet_only_member_changes": [
+      "prove_installed.py",
+      "frozen-files.json"
+    ],
+    "spec_only_changes": [
+      "frozen_manifest_sha256",
+      "packet_manifest_sha256"
+    ],
+    "all10_proposal_pins_exact": true,
+    "false_approval_spec_packet_and_new_peer_path_joined": true,
+    "commandplan_only_new_child_directory_substitution": true,
+    "all_parent_delivery_manifest_HOLD_descriptors_verified": true,
+    "clean_Git_carrier1417_unchanged": true,
+    "source_product4b65_native_e6d_archives_inputs_contracts_models_oracles_budget_unchanged": true
+  },
+  "accepted_scope": "Narrow source/data delta qualification only, inheriting complete parent0be7 positive scan and C-v2 d161 chain. Corrected final baseline read closes sole parent HOLD. No actual controls/normalCPU/GPU acceptance or resource authority.",
+  "remaining": [
+    "Fresh root DATA60 and exact two-node packet25/data5 ownership/hash receipts, independent actual DATA review as root requires",
+    "Actual eight DATA controls under new bounded CPU10 authority, then root current identity/control/budget checks and one scheduled CPU600/queue900/overall1800 admission",
+    "Independent target4420 actual raw fullnormal/fullSGunits/real204collection/JUnit/RECORD/source/native+cleanup audit; original whole SG GPU row remains a separate admission"
+  ],
+  "limits": [
+    "Source/data/AST/hash/local Git only; no candidate/helper imports, tests/build/install, API/SSH/Docker, dispatch/resources, C/M/formal/ledger mutation. Only this new receipt written.",
+    "NEW600=580work+20cleanup, 2CPU8GiB/noGPU/995:985, true assigned Worker API/ancestry, sole observer/journal/CAS and max2 runner/ordinary CI preservation unchanged. All actual counts remain null; admission/executed flags remain false.",
+    "No historic1885/ec0e or vLLM1602/canonical14/native1d22 count or runtime transfer. Producer actualf93-14 is source inventory only. No ABI/FFI/model/transport/latestmain/strict38credit proof."
+  ]
+}
