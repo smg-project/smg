@@ -140,8 +140,10 @@ impl TokenSpeedModelInfo {
 /// (TokenSpeed's `--grammar-backend`, `xgrammar` or `none`: `none` unless
 /// set, `xgrammar` for the checkpoints the engine defaults so). `none`
 /// enforces nothing: the scheduler refuses such a request at admission with
-/// a 400 that the slim wire reports as a bare `abort`, which reaches the
-/// caller as an empty answer. `xgrammar` compiles all four kinds, a JSON
+/// a 400 that reaches the caller as INTERNAL with `BARE_ENGINE_ABORT` from
+/// an engine that declares no status columns, or as INVALID_ARGUMENT with
+/// the engine's reason from one that does; refusing before the scheduler
+/// gives the caller's error on either. `xgrammar` compiles all four kinds, a JSON
 /// schema with the features it lacks dropped. A launcher that wrote no
 /// backend could not tell (a checkpoint default not resolved yet, or an
 /// older launcher), and a name this servicer does not know is not one the

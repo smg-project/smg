@@ -2255,8 +2255,9 @@ fn structured_outputs_support_follows_the_launcher_args() {
 /// A constraint the scheduler's grammar backend cannot enforce is refused
 /// before the scheduler, as the caller's error, on this wire as on the
 /// others: every kind under `--grammar-backend none` (the scheduler would
-/// admit the request and abort it, which this wire reports as a bare
-/// `abort`, an empty answer), and a schema with a feature xgrammar drops;
+/// admit the request and abort it, which reaches the caller as INTERNAL with
+/// `BARE_ENGINE_ABORT`, or as INVALID_ARGUMENT with the engine's reason when
+/// the engine declares its status columns), and a schema with a feature xgrammar drops;
 /// what the backend compiles reaches the scheduler with its constraint, an
 /// unconstrained request is served as before, and nothing is judged when
 /// the launcher wrote no backend.
