@@ -1,0 +1,79 @@
+name: Manual original SG ZMQ normal noGPU CPU replay
+run-name: SG-ZMQ scheduled CPU600 ${{ inputs.admission_nonce }}
+on:
+  workflow_dispatch:
+    inputs:
+      admission_nonce:
+        required: true
+        type: string
+concurrency:
+  group: amd-sg-zmq-cpu-serial
+  cancel-in-progress: false
+permissions:
+  contents: read
+  actions: read
+jobs:
+  normal-sg-zmq-cpu:
+    name: normal-sg-zmq-cpu
+    runs-on: 1-gpu-mi300x
+    timeout-minutes: 10
+    env:
+      ADMISSION_NONCE: ${{ inputs.admission_nonce }}
+    steps:
+      - name: Guard unique runner-owned checkout path
+        working-directory: ${{ runner.temp }}
+        shell: bash
+        run: |
+          python3 -I -B - <<'PY_GUARD'
+          import os
+          from pathlib import Path
+          import re
+
+          def guard():
+              assert __debug__
+              nonce = os.environ['ADMISSION_NONCE']
+              assert re.fullmatch('[0-9a-f]{32}', nonce), 'exact admission nonce'
+              assert re.fullmatch('[0-9a-f]{40}', os.environ['GITHUB_SHA']), 'exact dispatch SHA'
+              assert os.environ['GITHUB_REPOSITORY'] == 'smg-project/smg'
+              assert os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
+              assert os.environ['GITHUB_RUN_ATTEMPT'] == '1'
+              root = Path(os.environ['GITHUB_WORKSPACE'])
+              assert root.is_absolute() and root.resolve(strict=True) == root and root.is_dir()
+              assert not root.is_symlink() and '\n' not in str(root) and '\r' not in str(root)
+              assert root.stat().st_uid == os.geteuid() and os.access(root, os.W_OK | os.X_OK)
+              source = root / ('.smg-sg-zmq-cpu-' + nonce)
+              assert not source.exists() and not source.is_symlink(), 'never reuse a checkout'
+              with Path(os.environ['GITHUB_ENV']).open('a') as stream:
+                  stream.write('CPU_SERIAL_SOURCE=' + str(source) + '\n')
+
+          guard()
+          PY_GUARD
+      - name: Checkout exact dispatch head in unique subdirectory
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: .smg-sg-zmq-cpu-${{ inputs.admission_nonce }}
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Normal SG ZMQ noGPU CPU600 in owned scheduled runner
+        working-directory: ${{ github.workspace }}/.smg-sg-zmq-cpu-${{ inputs.admission_nonce }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -I -B "$CPU_SERIAL_SOURCE/.github/amd-sg-zmq-cpu-serial/job_runner.py" run
+      - name: Upload raw durable CPU evidence
+        if: always() && env.CPU_SERIAL_OUTPUT != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: sg-zmq-cpu-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.CPU_SERIAL_OUTPUT }}
+            ${{ env.CPU_SERIAL_OUTPUT }}.approval.json
+            ${{ env.CPU_SERIAL_OUTPUT }}.actual-GHA-job.json
+            ${{ env.CPU_SERIAL_OUTPUT }}.exact-argv.json
+          include-hidden-files: true
+          retention-days: 7
+          if-no-files-found: error
+      - name: Require full original CPU result and cleanup
+        if: always() && env.CPU_SERIAL_OUTPUT != ''
+        working-directory: ${{ github.workspace }}/.smg-sg-zmq-cpu-${{ inputs.admission_nonce }}
+        run: python3 -I -B "$CPU_SERIAL_SOURCE/.github/amd-sg-zmq-cpu-serial/job_runner.py" require-result
