@@ -27,6 +27,10 @@ mod table_name {
     use serde::{Deserialize, Deserializer, Serializer};
     use symphony::formats::Table;
 
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "Serde with-module callbacks receive a reference to the serialized field"
+    )]
     pub(super) fn serialize<S: Serializer>(
         table: &Table,
         serializer: S,
@@ -66,7 +70,7 @@ impl FormatRecipe {
     /// selection deliberately ignores the model's registry entry. Compiled templates need a
     /// fuller recipe and return `Unsupported`; an unknown registry model returns `InvalidData`.
     pub fn resolve(
-        &self,
+        self,
         recorded_model: &str,
     ) -> std::io::Result<std::sync::Arc<symphony::Format>> {
         let format = match self.source {
