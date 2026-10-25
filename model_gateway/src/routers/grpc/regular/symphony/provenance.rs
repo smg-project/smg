@@ -113,7 +113,7 @@ mod tests {
         names: &ModelNames<'_>,
         no_calls: bool,
         no_reasoning: bool,
-    ) -> Value {
+    ) -> Result<Value, Box<dyn std::error::Error>> {
         let request = request(json!({"model": model, "tools": tools(),
             "tool_choice": if no_calls { "none" } else { "auto" }, "separate_reasoning": !no_reasoning}));
         let assigned = reader::assign(
@@ -123,27 +123,22 @@ mod tests {
             None,
             PROMPT,
             &templates(),
-        )
-        .expect("supported selector")
-        .expect("Symphony assignment");
-        let value = serde_json::to_value(&assigned).expect("serialize assignment");
+        )?
+        .ok_or("missing Symphony assignment")?;
+        let value = serde_json::to_value(&assigned)?;
         assert_eq!(value["prompt"], assigned.prompt);
-        let recipe: FormatRecipe =
-            serde_json::from_value(value["recipe"].clone()).expect("decode assigned recipe");
+        let recipe: FormatRecipe = serde_json::from_value(value["recipe"].clone())?;
         assert_eq!(
             (recipe.no_calls, recipe.no_reasoning),
             (no_calls, no_reasoning)
         );
-        assert_eq!(
-            *recipe.resolve(model).expect("resolve assigned recipe"),
-            *assigned.format,
-            "{model}"
-        );
-        value["recipe"]["source"].clone()
+        assert_eq!(*recipe.resolve(model)?, *assigned.format, "{model}");
+        Ok(value["recipe"]["source"].clone())
     }
 
     #[test]
-    fn registry_and_named_selection_round_trip_without_changing_the_assigned_format() {
+    fn registry_and_named_selection_round_trip_without_changing_the_assigned_format(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         for (model, _, table) in groups() {
             // Matching labels keep the model's table, even when flags select something else.
             for labels in [Names::default(), pair(Some(table.name()), None)] {
@@ -153,7 +148,7 @@ mod tests {
                     flags: &flags,
                 };
                 assert_eq!(
-                    round_trip(model, &names, false, false),
+                    round_trip(model, &names, false, false)?,
                     json!({"kind": "registry"})
                 );
             }
@@ -162,7 +157,7 @@ mod tests {
             let flags = pair(Some(table.name()), None);
             let expected = json!({"kind": "named", "table": table.name()});
             assert_eq!(
-                round_trip("unknown-model", &ModelNames::flagged(&flags), false, false),
+                round_trip("unknown-model", &ModelNames::flagged(&flags), false, false)?,
                 expected
             );
             // An explicit different label overrides a known model's registry entry.
@@ -172,14 +167,16 @@ mod tests {
                 "Qwen/Qwen3-8B"
             };
             assert_eq!(
-                round_trip(model, &names(Some(table.name()), None), false, false),
+                round_trip(model, &names(Some(table.name()), None), false, false)?,
                 expected
             );
         }
+        Ok(())
     }
 
     #[test]
-    fn a_table_name_alone_loses_the_model_opener_and_request_variants() {
+    fn a_table_name_alone_loses_the_model_opener_and_request_variants(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let model = "skt/A.X-3.1-Light";
         let named = Table::Qwen2_5.shared();
         let registered = for_model_shared(model).unwrap();
@@ -189,15 +186,16 @@ mod tests {
         assert_ne!(registered.replay(prompt), named.replay(prompt));
         for no_calls in [false, true] {
             for no_reasoning in [false, true] {
-                round_trip(model, &names(Some("qwen2.5"), None), no_calls, no_reasoning);
+                round_trip(model, &names(Some("qwen2.5"), None), no_calls, no_reasoning)?;
                 round_trip(
                     "unknown-model",
                     &names(Some("qwen3"), None),
                     no_calls,
                     no_reasoning,
-                );
+                )?;
             }
         }
+        Ok(())
     }
 
     #[test]
