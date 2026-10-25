@@ -107,6 +107,7 @@ experiments against it transfer to engines:
 |------|---------|---------|
 | `--timing` | polynomial | `polynomial`, `linear`, or `fit:<path>` (a hardware calibration JSON, below) |
 | `--output-seed` | request-id | `prompt` selects output from normalized input tokens for cross-router/retry comparisons |
+| `--output-buffer-events` | 1024 | per-request pending output events, including delivery delay; range 2–65536 |
 | `--prefill-poly a,b,c` | AISimulate | prefill ms = a + b·T + c·T² |
 | `--decode-poly a,b,c` | AISimulate | decode ms = max(1, a + b·u + c·u²) |
 | `--request-overhead-ms` | 0 | fixed per-request latency added to every event of a stream (TTFT and e2e grow by it, ITL does not) |
@@ -125,6 +126,14 @@ experiments against it transfer to engines:
 | `--admin-port` | off | process-wide admin API (below) |
 | `--drain-timeout-secs` | 5 | on SIGTERM or SIGINT: stop accepting, let the requests in flight finish for this long, then exit 0 either way |
 | `--kv-events-zmq-base-port` | off | ZMQ KV-event publishers on vLLM's or SGLang's wire (below) |
+
+Realistic-mode output is bounded per request, including events awaiting
+`--request-overhead-ms`. A full queue stops that request without blocking other
+requests. gRPC reports `RESOURCE_EXHAUSTED`; HTTP unary reports 503 and HTTP
+streaming ends with a body error instead of a successful finish or `[DONE]`.
+Treat this as invalid capacity evidence in an ordinary benchmark. Canned and
+scripted output, admission queues, KV-event queues, and total process memory are
+outside this per-request limit; it does not qualify high-concurrency headroom.
 
 ```bash
 cargo run --release -p mock-worker -- \

@@ -19,7 +19,7 @@ use smg_grpc_client::{
 };
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{mpsc, watch},
+    sync::watch,
 };
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{server::NamedService, transport::Server, Request, Response, Status};
@@ -305,7 +305,7 @@ impl TokenSpeedScheduler for MockScheduler {
             // the load record does not see it until it lands.
             engine.admit().await;
             let weight_version = self.cfg.weight_version.clone();
-            let (tx, rx) = mpsc::unbounded_channel();
+            let (tx, rx) = engine.output_channel();
             let pending = (
                 Arc::clone(&self.prefill_pending),
                 prompt_token_ids.len() as u64,
@@ -696,7 +696,7 @@ enum CutEnd {
 
 /// The generate stream's state between items.
 struct Generating {
-    rx: mpsc::UnboundedReceiver<engine::GenEvent>,
+    rx: engine::EventReceiver,
     output_ids: Vec<u32>,
     stream_chunks: bool,
     request_id: String,
@@ -739,7 +739,7 @@ impl Drop for Generating {
 /// longer than that completes as usual. Every chunk and completion carries
 /// `weight_version`, as an engine stamps them.
 fn generate_stream(
-    rx: mpsc::UnboundedReceiver<engine::GenEvent>,
+    rx: engine::EventReceiver,
     stream_chunks: bool,
     request_id: String,
     pending: Option<(Arc<AtomicU64>, u64)>,
@@ -838,6 +838,16 @@ fn generate_stream(
                         })),
                     };
                     return Some((Ok(resp), st));
+                }
+                Some(engine::GenEvent::OutputOverflow) => {
+                    st.settle_prefill();
+                    st.ended = true;
+                    return Some((
+                        Err(Status::resource_exhausted(
+                            "mock engine output buffer exceeded",
+                        )),
+                        st,
+                    ));
                 }
                 None => return None,
             }
@@ -1379,6 +1389,29 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn output_overflow_is_resource_exhausted_and_settles_pending_prefill() {
+        for stream_chunks in [false, true] {
+            let (tx, rx) = engine::output_channel(2);
+            tx.send(token(1)).unwrap();
+            tx.send(token(2)).unwrap();
+            assert!(tx.send(token(3)).is_err());
+            let pending = Arc::new(AtomicU64::new(4));
+            let mut stream = generate_stream(
+                rx,
+                stream_chunks,
+                "slow".into(),
+                Some((pending.clone(), 4)),
+                None,
+                None,
+            );
+            let error = stream.next().await.unwrap().unwrap_err();
+            assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+            assert_eq!(pending.load(Ordering::Relaxed), 0);
+            assert!(stream.next().await.is_none());
+        }
+    }
+
     fn done(tokens: u32) -> engine::GenEvent {
         engine::GenEvent::Done {
             finish_reason: "stop",
@@ -1462,7 +1495,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_cut_stream_ends_with_the_status_after_the_given_tokens() {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = engine::output_channel(1024);
         for id in 1..=4 {
             tx.send(token(id)).unwrap();
         }
@@ -1485,7 +1518,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_engine_failure_cut_ends_with_an_error_complete_after_the_given_tokens() {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = engine::output_channel(1024);
         for id in 1..=4 {
             tx.send(token(id)).unwrap();
         }
@@ -1519,7 +1552,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_output_no_longer_than_the_cut_completes_as_usual() {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = engine::output_channel(1024);
         tx.send(token(1)).unwrap();
         tx.send(done(1)).unwrap();
         drop(tx);

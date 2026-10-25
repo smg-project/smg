@@ -266,6 +266,12 @@ impl Config {
                     cfg.engine.request_overhead_ms = parse(value(&mut args, &flag)?, &flag)?;
                     overhead_given = true;
                 }
+                "--output-buffer-events" => {
+                    cfg.engine.output_buffer_events = parse(value(&mut args, &flag)?, &flag)?;
+                    if !(2..=65536).contains(&cfg.engine.output_buffer_events) {
+                        return Err("--output-buffer-events must be in 2..=65536".into());
+                    }
+                }
                 "--output-seed" => {
                     cfg.engine.output_seed = match value(&mut args, &flag)?.as_str() {
                         "request-id" => OutputSeed::RequestId,
@@ -427,6 +433,7 @@ pub fn usage() -> String {
      \n\
      Realistic engine simulator (vLLM pass loop over a block-level KV pool; opt-in):\n\
        --engine <canned|realistic>  engine mode (default canned)\n\
+       --output-buffer-events <N>  pending events per request, including delay (2..65536; default 1024);\n\
        --output-seed <request-id|prompt>  synthetic output identity (default request-id);\n\
                                 prompt ignores transport IDs for repeatable cross-router output\n\
        --timing <polynomial|linear|fit:<path>>  pass duration model (default polynomial);\n\
@@ -475,6 +482,19 @@ mod tests {
 
     fn parse(flags: &[&str]) -> Result<Config, String> {
         Config::parse(flags.iter().map(|flag| (*flag).to_string()))
+    }
+
+    #[test]
+    fn output_buffer_budget_rejects_invalid_limits() {
+        let grpc = ["--grpc-base-port", "19000", "--grpc-count", "1"];
+        assert_eq!(parse(&grpc).unwrap().engine.output_buffer_events, 1024);
+        for flag in ["2", "64", "65536"] {
+            let cfg = parse(&[&grpc[..], &["--output-buffer-events", flag]].concat()).unwrap();
+            assert_eq!(cfg.engine.output_buffer_events.to_string(), flag);
+        }
+        for flag in ["0", "1", "65537", "-1", "nan"] {
+            assert!(parse(&[&grpc[..], &["--output-buffer-events", flag]].concat()).is_err());
+        }
     }
 
     #[test]

@@ -22,6 +22,8 @@
 //! a pure synchronous function returning the work done plus the time it took,
 //! which makes it deterministically unit-testable with no real timers.
 
+mod output;
+
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     pin::Pin,
@@ -33,6 +35,7 @@ use std::{
 };
 
 use futures::{stream, Stream, StreamExt};
+pub use output::{output_channel, EventReceiver, EventSender};
 use smg_grpc_client::common_proto as common;
 use tokio::sync::{broadcast, mpsc, Notify};
 use tonic::Status;
@@ -431,6 +434,8 @@ pub struct EngineParams {
     /// pass polynomials do not explain): every event of a request's stream is
     /// delivered that much later, so TTFT and e2e grow by it and ITL does not.
     pub request_overhead_ms: f64,
+    /// Pending output events per request, including simulated delivery delay.
+    pub output_buffer_events: usize,
     /// Capacity of the live KV-event broadcast channel.
     pub kv_broadcast_capacity: usize,
     /// How many recent KV-event batches to retain for subscriber replay.
@@ -452,6 +457,7 @@ impl Default for EngineParams {
             max_new_default: 128,
             output_seed: OutputSeed::default(),
             request_overhead_ms: 0.0,
+            output_buffer_events: 1024,
             kv_broadcast_capacity: 1024,
             kv_replay_capacity: 4096,
         }
@@ -479,7 +485,7 @@ pub struct NewRequest {
     /// Requested output length; 0 means "use the engine default".
     pub max_new: u32,
     /// Sink for this request's generation events.
-    pub events: mpsc::UnboundedSender<GenEvent>,
+    pub events: EventSender,
 }
 
 /// One unit of generation output for a request.
@@ -492,6 +498,8 @@ pub enum GenEvent {
         prompt_tokens: u32,
         cached_tokens: u32,
     },
+    /// Output capacity was exceeded; the transport must report a failure.
+    OutputOverflow,
     /// Terminal event; the stream ends after this.
     Done {
         finish_reason: &'static str,
@@ -532,9 +540,8 @@ struct EngineShared {
     kv_tx: broadcast::Sender<Published>,
     /// Hands batches from the actor to the publisher task with their release time.
     publish_tx: mpsc::UnboundedSender<(Published, Instant)>,
-    /// Hands a request's events to the delivery task with their release time
-    /// (the per-request overhead); unused when the overhead is zero.
-    deliver_tx: mpsc::UnboundedSender<(Instant, mpsc::UnboundedSender<GenEvent>, GenEvent)>,
+    /// A finite budget for each request's output, including delayed events.
+    output_buffer_events: usize,
     kv_replay: Mutex<VecDeque<common::KvEventBatch>>,
     prefix_cache: bool,
     block_size: u32,
@@ -797,12 +804,11 @@ impl Engine {
         let (tx, rx) = mpsc::unbounded_channel();
         let (kv_tx, _) = broadcast::channel(params.kv_broadcast_capacity.max(1));
         let (publish_tx, publish_rx) = mpsc::unbounded_channel();
-        let (deliver_tx, deliver_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(EngineShared {
             snapshot: RwLock::new(LoadSnapshot::idle(&params)),
             kv_tx: kv_tx.clone(),
             publish_tx,
-            deliver_tx,
+            output_buffer_events: params.output_buffer_events,
             kv_replay: Mutex::new(VecDeque::new()),
             prefix_cache: params.prefix_cache,
             block_size: params.block_size,
@@ -817,7 +823,6 @@ impl Engine {
         // The publisher task releases batches in order at their release time
         // (the delay hook) and ends with the actor, which owns its sender.
         tokio::spawn(publish(publish_rx, kv_tx));
-        tokio::spawn(deliver(deliver_rx));
         tokio::spawn(run(params, rx, shared.clone()));
         let engine = Engine { tx, shared };
         if register {
@@ -827,6 +832,11 @@ impl Engine {
                 .push(engine.clone());
         }
         engine
+    }
+
+    /// Create a bounded event queue using this worker's output budget.
+    pub fn output_channel(&self) -> (EventSender, EventReceiver) {
+        output_channel(self.shared.output_buffer_events)
     }
 
     /// Submit a request. Dropped silently if the engine has shut down.
@@ -1209,7 +1219,7 @@ async fn run(
         if params.request_overhead_ms > 0.0 {
             let at = Instant::now() + Duration::from_secs_f64(params.request_overhead_ms / 1000.0);
             for (tx, ev) in step.sends {
-                let _ = shared.deliver_tx.send((at, tx, ev));
+                let _ = tx.send_at(ev, at);
             }
         } else {
             for (tx, ev) in step.sends {
@@ -1286,16 +1296,6 @@ async fn publish(
     }
 }
 
-/// Deliver request events in order, each at its release time.
-async fn deliver(
-    mut rx: mpsc::UnboundedReceiver<(Instant, mpsc::UnboundedSender<GenEvent>, GenEvent)>,
-) {
-    while let Some((at, tx, ev)) = rx.recv().await {
-        tokio::time::sleep_until(at.into()).await;
-        let _ = tx.send(ev);
-    }
-}
-
 /// Apply one actor message: enqueue a request (scoring the fleet oracle at
 /// arrival, before this engine's own cache changes), abort a request, reset
 /// the cache, or restart the publisher.
@@ -1339,12 +1339,8 @@ fn handle_msg(
                 shared.in_flight.store(state.in_flight(), Ordering::Relaxed);
                 *shared.snapshot.write().unwrap_or_else(|p| p.into_inner()) =
                     state.snapshot(params);
-                if params.request_overhead_ms > 0.0 {
-                    // Keep the terminal event behind tokens awaiting delivery.
-                    let _ = shared.deliver_tx.send((Instant::now(), tx, event));
-                } else {
-                    let _ = tx.send(event);
-                }
+                // The receiver preserves FIFO order behind delayed tokens.
+                let _ = tx.send(event);
             }
         }
         EngineMsg::Reset => state.reset(),
@@ -1369,7 +1365,7 @@ fn handle_msg(
 /// A request in the running batch (being prefilled or decoded).
 struct RunningReq {
     request_id: String,
-    events: mpsc::UnboundedSender<GenEvent>,
+    events: EventSender,
     /// Tokens to (re)compute: the prompt, extended by the output generated
     /// before a preemption.
     seq_prompt: Vec<u32>,
@@ -1599,7 +1595,7 @@ struct SchedulerState {
 /// The result of one pass.
 struct Step {
     duration: Duration,
-    sends: Vec<(mpsc::UnboundedSender<GenEvent>, GenEvent)>,
+    sends: Vec<(EventSender, GenEvent)>,
     batch: Option<common::KvEventBatch>,
     snapshot: LoadSnapshot,
     /// Cache deltas this pass, for the actor's mirror.
@@ -1678,11 +1674,7 @@ impl SchedulerState {
         self.running.len() + self.waiting.len()
     }
 
-    fn abort(
-        &mut self,
-        request_id: &str,
-        p: &EngineParams,
-    ) -> Option<(mpsc::UnboundedSender<GenEvent>, GenEvent)> {
+    fn abort(&mut self, request_id: &str, p: &EngineParams) -> Option<(EventSender, GenEvent)> {
         let (events, prompt_tokens, completion_tokens, cached_tokens) = if let Some(index) =
             self.running.iter().position(|r| r.request_id == request_id)
         {
@@ -1780,7 +1772,7 @@ impl SchedulerState {
         let mut kv: Vec<common::KvCacheEvent> = Vec::new();
         let mut inserted: Vec<u64> = Vec::new();
         let mut evicted: Vec<u64> = Vec::new();
-        let mut sends: Vec<(mpsc::UnboundedSender<GenEvent>, GenEvent)> = Vec::new();
+        let mut sends: Vec<(EventSender, GenEvent)> = Vec::new();
         let mut admitted: Vec<Admitted> = Vec::new();
         let bs = p.block_size.max(1);
 
@@ -2210,7 +2202,7 @@ impl SchedulerState {
     fn emit_token(
         &mut self,
         idx: usize,
-        sends: &mut Vec<(mpsc::UnboundedSender<GenEvent>, GenEvent)>,
+        sends: &mut Vec<(EventSender, GenEvent)>,
         p: &EngineParams,
     ) -> Vec<Completed> {
         let bs = p.block_size.max(1) as usize;
@@ -2441,13 +2433,62 @@ fn ewma(prev: f64, sample: f64, alpha: f64) -> f64 {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn slow_output_fails_without_stalling_other_requests_or_retaining_work() {
+        let engine = Engine::spawn(EngineParams {
+            output_buffer_events: 2,
+            timing: TimingModel::Linear {
+                prefill_tps: 1_000_000.0,
+                decode_base_ms: 1.0,
+                decode_per_req_ms: 0.0,
+            },
+            ..Default::default()
+        });
+        let (slow_tx, mut slow_rx) = engine.output_channel();
+        engine.submit(NewRequest {
+            request_id: "slow".into(),
+            prompt_token_ids: vec![10; 16],
+            max_new: 64,
+            events: slow_tx.clone(),
+        });
+        let (fast_tx, mut fast_rx) = engine.output_channel();
+        engine.submit(NewRequest {
+            request_id: "fast".into(),
+            prompt_token_ids: vec![20; 16],
+            max_new: 1,
+            events: fast_tx,
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            assert!(matches!(fast_rx.recv().await, Some(GenEvent::Token { .. })));
+            assert!(matches!(
+                fast_rx.recv().await,
+                Some(GenEvent::Done {
+                    completion_tokens: 1,
+                    ..
+                })
+            ));
+            // Leave the slow reader untouched until the engine detects overflow
+            // and releases both running and waiting work.
+            loop {
+                let load = engine.load();
+                if slow_tx.is_closed() && load.num_running_reqs == 0 && load.num_waiting_reqs == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert!(matches!(
+                slow_rx.recv().await,
+                Some(GenEvent::OutputOverflow)
+            ));
+            assert!(slow_rx.recv().await.is_none());
+        })
+        .await
+        .expect("overflow and cleanup must complete");
+    }
+
     /// Make a request plus a receiver to observe its events.
-    fn req(
-        id: &str,
-        prompt: Vec<u32>,
-        max_new: u32,
-    ) -> (NewRequest, mpsc::UnboundedReceiver<GenEvent>) {
-        let (tx, rx) = mpsc::unbounded_channel();
+    fn req(id: &str, prompt: Vec<u32>, max_new: u32) -> (NewRequest, EventReceiver) {
+        let (tx, rx) = output_channel(1024);
         (
             NewRequest {
                 request_id: id.to_string(),
@@ -2476,6 +2517,7 @@ mod tests {
             }
             while let Ok(event) = rx.try_recv() {
                 match event {
+                    GenEvent::OutputOverflow => panic!("unexpected output overflow"),
                     GenEvent::Token { token_id, .. } => tokens.push(token_id),
                     GenEvent::Done {
                         finish_reason,
@@ -2616,7 +2658,7 @@ mod tests {
     fn run_to_first_token(
         st: &mut SchedulerState,
         p: &EngineParams,
-        rx: &mut mpsc::UnboundedReceiver<GenEvent>,
+        rx: &mut EventReceiver,
     ) -> (Duration, u32) {
         let mut total = Duration::ZERO;
         for n in 1..100_000 {
@@ -3441,6 +3483,7 @@ mod tests {
             let mut done = None;
             while let Ok(ev) = rx.try_recv() {
                 match ev {
+                    GenEvent::OutputOverflow => panic!("unexpected output overflow"),
                     GenEvent::Token { .. } => tokens += 1,
                     GenEvent::Done {
                         completion_tokens, ..
@@ -3462,7 +3505,7 @@ mod tests {
         Engine::spawn(EngineParams::default())
     }
 
-    fn submit(engine: &Engine, id: &str, prompt: Vec<u32>) -> mpsc::UnboundedReceiver<GenEvent> {
+    fn submit(engine: &Engine, id: &str, prompt: Vec<u32>) -> EventReceiver {
         let (r, rx) = req(id, prompt, 1);
         engine.submit(r);
         rx
@@ -3650,7 +3693,7 @@ mod tests {
     /// since, runs at once.
     #[tokio::test]
     async fn a_cold_shape_hold_delays_the_first_pass_of_a_longer_prompt_once() {
-        async fn first_token_after(rx: &mut mpsc::UnboundedReceiver<GenEvent>) -> Duration {
+        async fn first_token_after(rx: &mut EventReceiver) -> Duration {
             let started = Instant::now();
             loop {
                 let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -3662,7 +3705,7 @@ mod tests {
                 }
             }
         }
-        async fn drain(rx: &mut mpsc::UnboundedReceiver<GenEvent>) {
+        async fn drain(rx: &mut EventReceiver) {
             while let Some(event) = rx.recv().await {
                 if matches!(event, GenEvent::Done { .. }) {
                     break;

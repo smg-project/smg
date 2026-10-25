@@ -32,7 +32,7 @@ use axum::{
 };
 use futures::{stream, Stream};
 use serde_json::{json, Value};
-use tokio::{net::TcpListener, sync::mpsc};
+use tokio::net::TcpListener;
 
 use crate::{
     config::Config,
@@ -264,7 +264,7 @@ async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Respon
         let prompt_tokens = prompt_ids.len() as u32;
         let max_new = extract_max_tokens(&parsed).unwrap_or(state.cfg.output_tokens);
         let request_id = next_request_id();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = engine.output_channel();
         engine.submit(NewRequest {
             request_id,
             prompt_token_ids: prompt_ids,
@@ -596,7 +596,7 @@ fn injected_error(status: u16) -> Response {
 /// With `cut`, the answer is that status instead once the engine has produced
 /// more than the given number of tokens (the fault hook's `after_tokens`).
 async fn realistic_completion(
-    mut rx: mpsc::UnboundedReceiver<engine::GenEvent>,
+    mut rx: engine::EventReceiver,
     model: String,
     prompt_tokens: u32,
     endpoint: Endpoint,
@@ -606,6 +606,11 @@ async fn realistic_completion(
     let mut cached_tokens = 0u32;
     while let Some(ev) = rx.recv().await {
         match ev {
+            engine::GenEvent::OutputOverflow => {
+                return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({
+                    "error": {"message": "mock engine output buffer exceeded", "type": "overload"}
+                }))).into_response();
+            }
             engine::GenEvent::Token { .. } => {
                 completion_tokens += 1;
                 if let Some((after, status, cut_total)) = &cut {
@@ -667,7 +672,7 @@ async fn realistic_completion(
 /// the connection is cut) once the engine has produced more than the given
 /// number of tokens (the fault hook's `after_tokens`).
 fn realistic_sse(
-    rx: mpsc::UnboundedReceiver<engine::GenEvent>,
+    rx: engine::EventReceiver,
     model: String,
     endpoint: Endpoint,
     cut: Option<(u32, u16, Arc<AtomicU64>)>,
@@ -678,14 +683,14 @@ fn realistic_sse(
 
 /// The frames of [`realistic_sse`].
 fn realistic_frames(
-    rx: mpsc::UnboundedReceiver<engine::GenEvent>,
+    rx: engine::EventReceiver,
     model: String,
     endpoint: Endpoint,
     cut: Option<(u32, u16, Arc<AtomicU64>)>,
 ) -> impl Stream<Item = Result<Event, io::Error>> {
     enum St {
         Active {
-            rx: mpsc::UnboundedReceiver<engine::GenEvent>,
+            rx: engine::EventReceiver,
             model: String,
             endpoint: Endpoint,
             served: u32,
@@ -736,6 +741,10 @@ fn realistic_frames(
                         let frame = final_chunk(endpoint, &model);
                         Some((Ok(Event::default().data(frame.to_string())), St::Closing))
                     }
+                    Some(engine::GenEvent::OutputOverflow) => Some((
+                        Err(io::Error::other("mock engine output buffer exceeded")),
+                        St::Ended,
+                    )),
                     None => None,
                 },
                 St::Closing => Some((Ok(Event::default().data("[DONE]")), St::Ended)),
@@ -846,6 +855,27 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn output_overflow_never_becomes_a_successful_http_completion() {
+        for streaming in [false, true] {
+            let (tx, rx) = engine::output_channel(2);
+            tx.send(token()).unwrap();
+            tx.send(token()).unwrap();
+            assert!(tx.send(token()).is_err());
+            if streaming {
+                let frames: Vec<_> = realistic_frames(rx, "m".into(), Endpoint::Completions, None)
+                    .collect()
+                    .await;
+                assert_eq!(frames.len(), 1, "no finish frame or DONE on overflow");
+                assert!(frames[0].is_err());
+            } else {
+                let response =
+                    realistic_completion(rx, "m".into(), 3, Endpoint::Completions, None).await;
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            }
+        }
+    }
+
     fn done(tokens: u32) -> engine::GenEvent {
         engine::GenEvent::Done {
             finish_reason: "stop",
@@ -857,7 +887,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_cut_stream_ends_in_an_error_after_the_given_frames() {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = engine::output_channel(1024);
         for _ in 0..3 {
             tx.send(token()).unwrap();
         }
@@ -884,7 +914,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_uncut_stream_still_finishes_with_done() {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = engine::output_channel(1024);
         tx.send(token()).unwrap();
         tx.send(done(1)).unwrap();
         drop(tx);
@@ -904,7 +934,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_cut_completion_answers_the_status_and_counts_the_cut() {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = engine::output_channel(1024);
         for _ in 0..3 {
             tx.send(token()).unwrap();
         }
