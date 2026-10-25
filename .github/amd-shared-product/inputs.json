@@ -1,9 +1,9 @@
 {
-  "ready": false,
-  "run_budget_admitted": false,
-  "artifacts_pinned": false,
+  "ready": true,
+  "run_budget_admitted": true,
+  "artifacts_pinned": true,
   "consumer_gpu_ready": false,
-  "runtime_cohort_accepted": false,
+  "runtime_cohort_accepted": true,
   "admitted_lane": "sglang-default-chat-full",
   "target_product_commit": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
   "artifacts": [
@@ -198,8 +198,8 @@
     "parser": ""
   },
   "budget": {
-    "admitted": false,
-    "reserved_runner_seconds": 0,
+    "admitted": true,
+    "reserved_runner_seconds": 2160,
     "proposed_new_max_seconds": 2160,
     "global_owned_max": 2,
     "one_lane_per_run": true,
@@ -219,13 +219,13 @@
     "run_binding": null,
     "watch_PID_or_session": null
   },
-  "pending_note": "DISABLED SOURCE PREVIEW ONLY, not applied, committed, published, admitted or executed. Original ledger target0 full chat directory/empty filter/36min job/28min pytest/floor204; no units or agentic services. Preserve original HTTP and gRPC parameterization; parser blank(default legacy). Complete original tests and current added tests/models/oracles remain. ZMQ223/eight-model/reference outcomes are not this row reference; actual selected node IDs, full model inventory and per-case skip/rerun outcomes remain unbound. Same1473/d5/b7 fourZIP/sixpayload/source19/compiled37/producer14/normal97a are provenance only. All five flags false, reservation0; a future independently granted window would cap the original36-minute job at2160seconds. No resource, runtime or coverage transfer. APPEND-ONLY REFERENCE BINDING: actual NV d5 default-chat reference is231uniqueIDs/223P8S/2rerun/nine models includingQwen3-VL-8B, source-joined to1473. These are reference data, not AMD acceptance or outcome quotas; complete raw skip reasons, deselected IDs andJUnit remain unavailable. All flags stayfalse/reservation0.",
+  "pending_note": "SOURCE-ONLY CONDITIONAL PREVIEW, NOT APPLIED OR ADMITTED. Root alone may apply the proposed execution flags and separate NEW2160 after current complete physical/API/source/producer/artifact-TTL checks, an explicit grant and exact one-run solewatch registration. Genuine root97a/Ddeba already accepts only the fixed1473/d5/b7 normal-install scope; no normalCPU re-test or new native is requested. Complete original default-chat231/nine models/all original HTTP and gRPC/default parser remain unaccepted; consumer_gpu_ready stays false. Original full directory,36min job/28min pytest/reruns2 delay5/no units/no agentic and floor204 guard are unchanged. Actual new nonce/child head/run/job/owner/watch/controller deployment and grant remain unbound. NV231 reference, SGZMQ223, Rust251 or TS173 outcomes do not transfer acceptance to this row; no retired budget or newer native/source result transfers.",
   "binding_preparation_evidence": {
     "producer_build_archive_integrity_sha256": "fa8e1be5899a9f5d74ade0f6de9cfa10eb5065a404f597c2ee95d55cfa03cb6f",
     "producer_policy_source_review_sha256": "707a143df969433664b923c54e9cc44ad511dba00bdde978c4b40b02d94901fb",
     "producer_policy_metadata_validation_sha256": "f352422414b7e3a2cab1a55701c3360bacfae7d20eb3be26df2b4b7077e62d2e",
     "normal_install_proof_available": true,
-    "normal_install_admission_metadata_bound": false,
+    "normal_install_admission_metadata_bound": true,
     "normal_install_root_acceptance_sha256": "97a2658237750a3c55b3f98a722077055428503cb8ad3b83ae8a01f4d377a571",
     "normal_install_independent_actual_peer_sha256": "deba14fd0db4270b317c25c23ecf1e0bde7b01b9ead92b1bf413014f06138cef"
   },
