@@ -90,10 +90,10 @@ impl CaptureQueue {
         let sender = self.sender.take().ok_or_else(incomplete)?;
         {
             let permit = sender.try_reserve().map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => {
+                mpsc::error::TrySendError::Full(()) => {
                     io::Error::new(io::ErrorKind::WouldBlock, "capture queue full")
                 }
-                mpsc::error::TrySendError::Closed(_) => {
+                mpsc::error::TrySendError::Closed(()) => {
                     io::Error::new(io::ErrorKind::BrokenPipe, "capture writer closed")
                 }
             })?;
