@@ -887,14 +887,16 @@ impl Engine {
         if per_sec == 0 {
             return;
         }
-        let slot = {
-            let mut next = faults.admit_next.lock().await;
-            let now = Instant::now();
-            let at = next.map_or(now, |next| next.max(now));
-            *next = Some(at + Duration::from_secs_f64(1.0 / per_sec as f64));
-            at
-        };
-        tokio::time::sleep_until(slot.into()).await;
+        // Serialize waits with the async mutex, committing a slot only after
+        // its sleep completes. Dropping a cancelled wait leaves the next slot
+        // available to the next waiter instead of consuming admission capacity.
+        let mut next = faults.admit_next.lock().await;
+        let now = Instant::now();
+        let at = next.map_or(now, |next| next.max(now));
+        if at > now {
+            tokio::time::sleep_until(at.into()).await;
+        }
+        *next = Some(at + Duration::from_secs_f64(1.0 / per_sec as f64));
     }
 
     /// Restart the publisher: sequence numbers start over, the replay buffer
@@ -3679,6 +3681,39 @@ mod tests {
             (0.2..30.0).contains(&age),
             "the batch keeps its creation time, so the delay is visible as lag: {age} s"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_admission_waits_do_not_consume_rate_slots() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let engine = live();
+            engine.fault_admit_per_sec(1);
+            let scheduled = Instant::now() + Duration::from_secs(60);
+            *engine.shared.faults.admit_next.lock().await = Some(scheduled);
+            for _ in 0..8 {
+                let mut first = Box::pin(engine.admit());
+                let mut queued = Box::pin(engine.admit());
+                assert!(futures::poll!(&mut first).is_pending());
+                assert!(futures::poll!(&mut queued).is_pending());
+                drop(first);
+                assert!(futures::poll!(&mut queued).is_pending());
+                drop(queued);
+                assert_eq!(
+                    *engine.shared.faults.admit_next.lock().await,
+                    Some(scheduled)
+                );
+            }
+            // A real completed admission still advances the schedule.
+            *engine.shared.faults.admit_next.lock().await = None;
+            let before = Instant::now();
+            engine.admit().await;
+            assert!(
+                engine.shared.faults.admit_next.lock().await.unwrap()
+                    >= before + Duration::from_secs(1)
+            );
+        })
+        .await
+        .expect("cancelled rate waits release their mutex and reserved time");
     }
 
     #[tokio::test]
