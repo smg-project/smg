@@ -401,7 +401,10 @@ async fn reader_capture_rejects_wrong_choice_and_abandoned_owner() {
                 .collect();
             let rejected = &prefix.last().unwrap()["payload"];
             assert_eq!(rejected["kind"], "rejected");
-            assert_eq!(rejected["reason"], "chat batch choice differs from reader choice");
+            assert_eq!(
+                rejected["reason"],
+                "chat batch choice differs from reader choice"
+            );
             assert_eq!(rejected["attempted_choice"], 1);
             assert_eq!(rejected["choice"], 0);
         }

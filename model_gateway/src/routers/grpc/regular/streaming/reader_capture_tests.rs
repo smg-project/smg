@@ -2,8 +2,7 @@
 
 use super::*;
 use crate::diagnostic_capture::{
-    CaptureLimits, CaptureObserver, CapturePool, CaptureReadLimits, CaptureSnapshot,
-    SharedCapture,
+    CaptureLimits, CaptureObserver, CapturePool, CaptureReadLimits, CaptureSnapshot, SharedCapture,
 };
 
 const PROMPT: &str = "<|im_start|>assistant\n<think>\n";
