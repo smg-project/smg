@@ -260,6 +260,63 @@ pub(crate) fn bound_port(endpoint: &str) -> u16 {
         .expect("a bound tcp endpoint ends with its port")
 }
 
+/// A publisher bound on a free local port for a KV-events relay test, with
+/// the `tcp://*:<port>` endpoint a model info names for it.
+pub(crate) async fn bound_publisher() -> (zeromq::PubSocket, String) {
+    use zeromq::prelude::*;
+
+    let mut publisher = zeromq::PubSocket::new();
+    let port = bound_port(
+        &publisher
+            .bind("tcp://127.0.0.1:0")
+            .await
+            .expect("publisher binds")
+            .to_string(),
+    );
+    (publisher, format!("tcp://*:{port}"))
+}
+
+/// The first two batches of a publisher the relay subscribed to at boot,
+/// before any gateway: publishes sequence 0 until the relay, with no
+/// subscriber of its own yet, has taken it (the SUB connect is asynchronous;
+/// repeats are duplicates), then sequence 1, and reads two relayed.
+pub(crate) async fn relay_takes_the_first_two_batches(
+    publisher: &mut zeromq::PubSocket,
+    relay: &KvEventRelay,
+) {
+    use zeromq::prelude::*;
+
+    use crate::kv_events::golden;
+
+    let batch1 = golden::bytes(golden::BATCH1);
+    for _ in 0..250 {
+        publisher
+            .send(golden::frame(b"kv", 0, &batch1))
+            .await
+            .expect("publish");
+        if relay.counts().relayed >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        relay.counts().relayed,
+        1,
+        "the relay took sequence 0 before any gateway subscribed"
+    );
+    publisher
+        .send(golden::frame(b"kv", 1, &golden::bytes(golden::BATCH2)))
+        .await
+        .expect("publish");
+    for _ in 0..250 {
+        if relay.counts().relayed >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(relay.counts().relayed, 2);
+}
+
 /// A publisher and a replay socket bound on free local ports for a KV-events
 /// relay test, with the two `tcp://*:<port>` endpoints a model info names
 /// for them.
@@ -267,14 +324,7 @@ pub(crate) async fn publisher_and_replay_socket(
 ) -> (zeromq::PubSocket, zeromq::RouterSocket, String, String) {
     use zeromq::prelude::*;
 
-    let mut publisher = zeromq::PubSocket::new();
-    let pub_port = bound_port(
-        &publisher
-            .bind("tcp://127.0.0.1:0")
-            .await
-            .expect("publisher binds")
-            .to_string(),
-    );
+    let (publisher, pub_endpoint) = bound_publisher().await;
     let mut router = zeromq::RouterSocket::new();
     let replay_port = bound_port(
         &router
@@ -286,7 +336,7 @@ pub(crate) async fn publisher_and_replay_socket(
     (
         publisher,
         router,
-        format!("tcp://*:{pub_port}"),
+        pub_endpoint,
         format!("tcp://*:{replay_port}"),
     )
 }
