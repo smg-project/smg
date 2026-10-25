@@ -1,5 +1,6 @@
 """Default-off, exact auxiliary inputs for the fixed-image MC4 job only."""
 import base64
+from contextlib import contextmanager
 import csv
 import hashlib
 import importlib
@@ -8,9 +9,11 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import struct
 import subprocess
 import sys
+import tempfile
 import zipfile
 
 SPEC_SHA = "f3519bade67f15b8bf0fe30f60b84313128175b14ca12d5c431168e3c1e50e7f"
@@ -251,6 +254,24 @@ def checkout_git_environment(environment):
     return env
 
 
+@contextmanager
+def checkout_git_path(environment):
+    """Keep exact checkout trust when SCM descendants discard GIT_CONFIG_* ."""
+    env = checkout_git_environment(environment)
+    git = Path("/usr/bin/git")
+    require(git.is_file() and os.access(git, os.X_OK), "fixed image Git executable missing")
+    # vcs_versioning intentionally strips GIT_CONFIG_* but preserves PATH. A
+    # private child-only command supplies the same reset + exact root in argv.
+    # Absolute exec prevents recursion and "$@" preserves every original argument.
+    with tempfile.TemporaryDirectory(prefix="checkout-git-", dir=state()) as directory:
+        wrapper = Path(directory) / "git"
+        wrapper.write_text("#!/bin/sh\nexec /usr/bin/git -c safe.directory= -c "
+                           + shlex.quote("safe.directory=" + str(ROOT)) + ' "$@"\n')
+        wrapper.chmod(0o700)
+        env["PATH"] = directory + os.pathsep + env.get("PATH", os.defpath)
+        yield env
+
+
 def bootstrap():
     value, root = verify_bundle()
     original = json.loads(state().with_name(state().name + "-original-image-environment.json").read_text())
@@ -264,27 +285,27 @@ def bootstrap():
     for name, version in value["image_versions"].items():
         require(metadata.version(name) == version, "fixed image metadata differs: " + name)
     require(metadata.version("setuptools") == "79.0.1", "stock build frontend changed")
-    env = checkout_git_environment(dict(os.environ, PIP_CONFIG_FILE="/dev/null", PIP_NO_INDEX="1", PIP_DISABLE_PIP_VERSION_CHECK="1", PYTHONDONTWRITEBYTECODE="1"))
     pip = [sys.executable, "-m", "pip", "install", "--no-compile", "--no-index", "--no-cache-dir", "--find-links=" + str(root / "wheels")]
     commands = [("tools", [*pip, "--ignore-installed", *value["tool_requirements"]]),
                 ("cairo", [*pip, str(root / value["packages"]["pycairo"]["wheel"])]),
                 ("grpc", [*pip, "--no-build-isolation", "vllm==" + value["image_versions"]["vllm"],
                           "grpcio-health-checking==1.78.0", str(root / value["packages"]["smg-grpc-proto"]["wheel"]), "-e", str(ROOT / "grpc_servicer")])]
-    for name, argv in commands:
-        with (state() / ("cohort-" + name + ".stdout")).open("xb") as stdout, (state() / ("cohort-" + name + ".stderr")).open("xb") as stderr:
-            try:
-                subprocess.run(argv, check=True, timeout=120, env=env, stdout=stdout, stderr=stderr)
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-                stdout.flush()
-                stderr.flush()
-                for suffix in ("stdout", "stderr"):
-                    with (state() / ("cohort-" + name + "." + suffix)).open("rb") as stream:
-                        stream.seek(max(0, os.fstat(stream.fileno()).st_size - 65536))
-                        raw = stream.read(65536)
-                    print(name + ":" + suffix + " (last 64KiB):\n" + raw.decode(errors="replace"), file=sys.stderr)
-                raise
-    subprocess.run([sys.executable, str(Path(__file__).resolve()), "bootstrap-proof"],
-                   check=True, timeout=30, env=env)
+    with checkout_git_path(dict(os.environ, PIP_CONFIG_FILE="/dev/null", PIP_NO_INDEX="1", PIP_DISABLE_PIP_VERSION_CHECK="1", PYTHONDONTWRITEBYTECODE="1")) as env:
+        for name, argv in commands:
+            with (state() / ("cohort-" + name + ".stdout")).open("xb") as stdout, (state() / ("cohort-" + name + ".stderr")).open("xb") as stderr:
+                try:
+                    subprocess.run(argv, check=True, timeout=120, env=env, stdout=stdout, stderr=stderr)
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                    stdout.flush()
+                    stderr.flush()
+                    for suffix in ("stdout", "stderr"):
+                        with (state() / ("cohort-" + name + "." + suffix)).open("rb") as stream:
+                            stream.seek(max(0, os.fstat(stream.fileno()).st_size - 65536))
+                            raw = stream.read(65536)
+                        print(name + ":" + suffix + " (last 64KiB):\n" + raw.decode(errors="replace"), file=sys.stderr)
+                    raise
+        subprocess.run([sys.executable, str(Path(__file__).resolve()), "bootstrap-proof"],
+                       check=True, timeout=30, env=env)
 
 
 def bootstrap_proof():

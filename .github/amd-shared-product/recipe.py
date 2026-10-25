@@ -50,7 +50,7 @@ def auxiliary_staging(inputs):
 
 
 POLICY = 'historical_c345_CPU_plus_reviewed_checkout_env_delta_scheduled_full_validation'
-BASIS_SHA = '15b22b08e0fce07e4c369011abf2490d32e556605414a4e3b117677c83ed92b4'
+BASIS_SHA = '41e236471515169490bb8c3b1d11384b4a92d218391929521090e4a9f34dd105'
 
 
 def historical_cpu_for_scheduled_validation(inputs):
@@ -73,7 +73,7 @@ def historical_cpu_for_scheduled_validation(inputs):
             or digest(value["historical_node_receipts"]) != basis["historical_CPU"]["node_receipts_sha256"]):
         raise ValueError("historical CPU/delta/cohort identity changed")
     root = Path(__file__).resolve().parents[2]
-    expected = basis["checkout_environment_delta"]["three_files"]
+    expected = basis["checkout_PATH_delta"]["two_files"]
     for name, key in [(".github/amd-nixl-environment/nixl_environment/runtime_inputs.py", "runtime_helper"),
                       (".github/amd-shared-product/private-runtime-overlay.json", "private_runtime_overlay")]:
         path = root / name

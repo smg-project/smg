@@ -67,5 +67,24 @@
     "reruns": 2
   },
   "candidate_CPU_accepted": false,
-  "coverage_increment": 0
+  "coverage_increment": 0,
+  "checkout_PATH_delta": {
+    "source_parent": "83e9290328f8774b7ab04a4290ab10a033743ea5",
+    "policy": "private_bootstrap_PATH_git_exact_argv_reset_then_ROOT_v1",
+    "reason": "stock vcs_versioning 2.5 removes GIT_CONFIG_*; PATH survives and Git calls use relative git",
+    "historical_environment_delta_only": true,
+    "candidate_CPU_accepted": false,
+    "new_real_metadata_validation_required": true,
+    "two_files": {
+      "runtime_helper": {
+        "old": "a32473928b7673d2f3093a9acc71915c27c9766d77a954db7e0f501d7cfa502f",
+        "new": "67924e120f74b58b9cf11139caca779ee726a7623d5933799de96c4c666dc15a"
+      },
+      "private_runtime_overlay": {
+        "old": "67b121743e00110510295552acd3f135d529fcffafdc906c5e6d5356bd0782b3",
+        "new": "add48085b57afb26f09ae175691dc7a8b9be214d402ad337df7ee459b23d5a0c"
+      }
+    },
+    "scope": "source-only exact-checkout bootstrap child PATH; historical CPU is not new-source acceptance; normal shared setup/Cairo/1602+14/original18 mandatory"
+  }
 }
