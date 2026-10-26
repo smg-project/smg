@@ -14,7 +14,7 @@
 //! replacement, stamps included.
 #![allow(clippy::expect_used, clippy::panic)]
 
-use image::{DynamicImage, RgbImage};
+use image::DynamicImage;
 use llm_multimodal::{
     media::{sampled_frame_indices, FrameSampling, VideoFetchConfig},
     registry::{MediaItemInfo, ModelMetadata, ModelRegistry, Tokenizer},
@@ -27,6 +27,8 @@ use llm_multimodal::{
 };
 use serde::Deserialize;
 use serde_json::json;
+
+use super::make_seeded_image;
 
 const GOLDEN: &str = include_str!("../fixtures/golden/muse_spark_preprocess_fingerprints.json");
 
@@ -149,16 +151,6 @@ fn decoded(replacement: &PromptReplacement) -> String {
         out.push_str(&String::from_utf8(bytes).expect("utf-8 stamp"));
     }
     out
-}
-
-fn make_seeded_image(width: u32, height: u32, seed: u8) -> DynamicImage {
-    DynamicImage::ImageRgb8(RgbImage::from_fn(width, height, |x, y| {
-        image::Rgb([
-            seed.wrapping_add(((x * 7 + y * 3) % 256) as u8),
-            seed.wrapping_add(((x * 5 + y * 11) % 256) as u8),
-            seed.wrapping_add(((x + y * 2) % 256) as u8),
-        ])
-    }))
 }
 
 fn fnv1a(bytes: impl IntoIterator<Item = u8>) -> String {

@@ -11,7 +11,7 @@
 //! This test reproduces every one of them, padding included.
 #![allow(clippy::expect_used, clippy::panic)]
 
-use image::{DynamicImage, RgbImage};
+use image::DynamicImage;
 use llm_multimodal::{
     registry::{ModelMetadata, ModelRegistry, Tokenizer},
     types::Modality,
@@ -23,6 +23,8 @@ use llm_multimodal::{
 };
 use serde::Deserialize;
 use serde_json::json;
+
+use super::make_seeded_image;
 
 /// SHA-256 of the reference `image_processing_gemma4.py` the fixtures were
 /// recorded from; a regeneration against a different file fails here.
@@ -91,19 +93,6 @@ enum Tokens {
 }
 
 const GOLDEN: &str = include_str!("../fixtures/golden/gemma4_preprocess_fingerprints.json");
-
-/// The seeded pattern shared with the other preprocessing goldens and the
-/// generator: `R=(x*7+y*3)%256`, `G=(x*5+y*11)%256`, `B=(x+y*2)%256`, each
-/// plus the seed with u8 wraparound.
-fn make_seeded_image(width: u32, height: u32, seed: u8) -> DynamicImage {
-    DynamicImage::ImageRgb8(RgbImage::from_fn(width, height, |x, y| {
-        image::Rgb([
-            seed.wrapping_add(((x * 7 + y * 3) % 256) as u8),
-            seed.wrapping_add(((x * 5 + y * 11) % 256) as u8),
-            seed.wrapping_add(((x + y * 2) % 256) as u8),
-        ])
-    }))
-}
 
 fn fnv1a(bytes: impl IntoIterator<Item = u8>) -> String {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
