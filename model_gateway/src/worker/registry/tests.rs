@@ -1789,7 +1789,15 @@ fn test_model_alias_tracks_shared_workers_through_removal() {
 
     registry.remove(&second_id).unwrap();
     assert!(registry.get_by_model("GLM-5.2-Coding").is_empty());
-    assert!(registry.resolve_model_alias("GLM-5.2-Coding").is_none());
+    // The model was served, so its alias stays known with it while nothing
+    // serves it (a request by either name is refused as a pool with no
+    // worker, not as an unknown name).
+    assert_eq!(
+        registry.resolve_model_alias("GLM-5.2-Coding").as_deref(),
+        Some("GLM-5.2")
+    );
+    assert!(!registry.contains_model("GLM-5.2-Coding"));
+    assert!(registry.has_served_model("GLM-5.2-Coding"));
 }
 
 #[test]
@@ -2992,4 +3000,149 @@ fn clear_all_overload_flags_resets_every_model() {
     assert!(!b.is_overloaded());
     assert_eq!(registry.overloaded_worker_count("m1"), 0);
     assert_eq!(registry.overloaded_worker_count("m2"), 0);
+}
+
+/// A model the gateway has served stays known after its last worker leaves
+/// (its only engine restarting under discovery, which removes the pod's
+/// worker while the pod is not ready): nothing serves it, so it is not
+/// `contains_model`, not listed and has no routing pool, but it is
+/// `has_served_model`, by its id and by its alias, and a request for it is
+/// refused as a pool with no worker rather than as an unknown name. A worker
+/// registered for it again serves it as before. The wildcard is served once
+/// any worker was.
+#[test]
+fn a_served_model_stays_known_after_its_last_worker_leaves() {
+    let registry = WorkerRegistry::new();
+    assert!(!registry.has_served_model("GLM-5.2"));
+    assert!(!registry.has_served_model(UNKNOWN_MODEL_ID));
+
+    let worker = worker_with_model_aliases(
+        "http://worker:8080",
+        "GLM-5.2",
+        &["GLM-5.2-Coding"],
+        WorkerType::Regular,
+    );
+    let worker_id = registry.register(worker).unwrap();
+    assert!(registry.has_served_model("GLM-5.2"));
+    assert!(registry.has_served_model("GLM-5.2-Coding"));
+    assert!(registry.has_served_model(UNKNOWN_MODEL_ID));
+    assert!(!registry.has_served_model("never-served"));
+
+    assert!(registry.remove(&worker_id).is_some());
+
+    for name in ["GLM-5.2", "GLM-5.2-Coding"] {
+        assert!(registry.has_served_model(name), "{name}");
+        assert!(!registry.contains_model(name), "{name}");
+        assert!(registry.get_by_model(name).is_empty(), "{name}");
+        assert!(
+            registry
+                .get_routing_pool(name, RoutingPool::HttpRegular)
+                .is_empty(),
+            "{name}"
+        );
+    }
+    assert!(registry.has_served_model(UNKNOWN_MODEL_ID));
+    assert!(!registry.has_served_model("never-served"));
+    assert!(registry.get_models().is_empty());
+    assert_eq!(registry.stats().total_models, 0);
+    assert_eq!(registry.model_count(), 0);
+
+    let returned = worker_with_model_aliases(
+        "http://worker:8080",
+        "GLM-5.2",
+        &["GLM-5.2-Coding"],
+        WorkerType::Regular,
+    );
+    registry.register(returned).unwrap();
+    assert!(registry.contains_model("GLM-5.2"));
+    assert!(registry.contains_model("GLM-5.2-Coding"));
+    assert_eq!(registry.get_by_model("GLM-5.2-Coding").len(), 1);
+    assert_eq!(
+        registry
+            .get_routing_pool("GLM-5.2", RoutingPool::HttpRegular)
+            .len(),
+        1
+    );
+    assert_eq!(registry.get_models(), vec!["GLM-5.2"]);
+}
+
+/// An alias left with a model nothing serves any more is the next model's
+/// that declares it; the returning model does not take it back from a model
+/// that serves under it.
+#[test]
+fn the_alias_of_a_model_without_workers_goes_to_the_next_model_that_declares_it() {
+    let registry = WorkerRegistry::new();
+    let first = worker_with_model_aliases(
+        "http://first:8080",
+        "GLM-5.2",
+        &["shared-alias"],
+        WorkerType::Regular,
+    );
+    let first_id = registry.register(first).unwrap();
+    assert!(registry.remove(&first_id).is_some());
+    assert_eq!(
+        registry.resolve_model_alias("shared-alias").as_deref(),
+        Some("GLM-5.2")
+    );
+
+    let second = worker_with_model_aliases(
+        "http://second:8080",
+        "Qwen3",
+        &["shared-alias"],
+        WorkerType::Regular,
+    );
+    registry.register(second).unwrap();
+    assert_eq!(
+        registry.resolve_model_alias("shared-alias").as_deref(),
+        Some("Qwen3"),
+        "the alias of a model without workers goes to the model that declares it"
+    );
+    assert_eq!(registry.get_by_model("shared-alias").len(), 1);
+    assert_eq!(
+        registry.get_by_model("shared-alias")[0].url(),
+        "http://second:8080"
+    );
+
+    let first_again = worker_with_model_aliases(
+        "http://first:8080",
+        "GLM-5.2",
+        &["shared-alias"],
+        WorkerType::Regular,
+    );
+    registry.register(first_again).unwrap();
+    assert_eq!(
+        registry.resolve_model_alias("shared-alias").as_deref(),
+        Some("Qwen3"),
+        "an alias a served model holds is not taken from it"
+    );
+}
+
+/// The name of a model the gateway served and nothing serves any more may
+/// become another model's alias: the model's empty entry goes, so the alias
+/// is not shadowed by it.
+#[test]
+fn a_served_models_name_becomes_an_alias_once_nothing_serves_it() {
+    let registry = WorkerRegistry::new();
+    let gone = worker_with_model_aliases("http://gone:8080", "GLM-5.2", &[], WorkerType::Regular);
+    let gone_id = registry.register(gone).unwrap();
+    assert!(registry.remove(&gone_id).is_some());
+    assert!(registry.has_served_model("GLM-5.2"));
+
+    let declaring = worker_with_model_aliases(
+        "http://declaring:8080",
+        "Qwen3",
+        &["GLM-5.2"],
+        WorkerType::Regular,
+    );
+    registry.register(declaring).unwrap();
+    assert_eq!(
+        registry.resolve_model_alias("GLM-5.2").as_deref(),
+        Some("Qwen3")
+    );
+    assert_eq!(registry.get_by_model("GLM-5.2").len(), 1);
+    assert_eq!(
+        registry.get_by_model("GLM-5.2")[0].url(),
+        "http://declaring:8080"
+    );
+    assert!(registry.contains_model("GLM-5.2"));
 }

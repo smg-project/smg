@@ -2218,3 +2218,71 @@ mod single_model_tests {
         ctx.shutdown().await;
     }
 }
+
+#[cfg(test)]
+mod served_model_without_workers_tests {
+    use super::*;
+
+    /// A served model whose only worker leaves the registry (discovery
+    /// removes a pod's worker while the pod is not ready) is refused as a
+    /// pool with no worker, the 503 a client retries, not as a model that
+    /// does not exist; a name nobody has served stays the 404.
+    #[tokio::test]
+    async fn test_served_model_without_workers_answers_503_not_404() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18215,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let app = ctx.create_app();
+        let completion = |model: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"model": model, "prompt": "Hello", "max_tokens": 4}).to_string(),
+                ))
+                .unwrap()
+        };
+        let error_code = |body: axum::body::Bytes| -> serde_json::Value {
+            serde_json::from_slice::<serde_json::Value>(&body)
+                .map(|body| body["error"]["code"].clone())
+                .unwrap_or_default()
+        };
+
+        let resp = app.clone().oneshot(completion("mock-model")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert!(ctx
+            .app_context
+            .worker_registry
+            .remove_by_url(&ctx.worker_urls[0])
+            .is_some());
+
+        let resp = app.clone().oneshot(completion("mock-model")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(error_code(body), "no_available_workers");
+
+        let resp = app.oneshot(completion("never-served")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(error_code(body), "model_not_found");
+
+        ctx.shutdown().await;
+    }
+}

@@ -13,7 +13,7 @@ use crate::{
     routers::{
         common::{
             header_utils::{apply_provider_headers, extract_auth_header},
-            overload,
+            overload, placement,
         },
         error,
     },
@@ -92,7 +92,7 @@ impl<'a> WorkerSelector<'a> {
                     ),
                 )
             } else {
-                error::model_not_found(req.model_id)
+                placement::model_refusal(self.registry, req.model_id)
             }
         })
     }

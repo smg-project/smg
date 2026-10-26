@@ -52,7 +52,9 @@ use crate::{
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
     observability::metrics::metrics_labels,
-    routers::{error, grpc::regular::symphony::template::Templates, RouterTrait},
+    routers::{
+        common::placement, error, grpc::regular::symphony::template::Templates, RouterTrait,
+    },
     worker::{RoutingPool, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
 };
 
@@ -851,7 +853,7 @@ impl GrpcRouter {
         record_media: bool,
     ) -> Result<u32, Response> {
         if !self.worker_registry.contains_model(model_id) {
-            return Err(error::model_not_found(model_id));
+            return Err(placement::model_refusal(&self.worker_registry, model_id));
         }
         let Some(tokenizer) = self.shared_components.tokenizer_registry.get(model_id) else {
             return Err(missing_tokenizer_response(
@@ -1060,8 +1062,11 @@ impl GrpcRouter {
         let Some(snapshot) = self.worker_registry.model_routing_snapshot(&canonical) else {
             return error::model_not_found(model_id);
         };
-        if !snapshot
-            .pool(RoutingPool::GrpcPipelineRegular)
+        let pool = snapshot.pool(RoutingPool::GrpcPipelineRegular);
+        if pool.is_empty() {
+            return placement::model_refusal(&self.worker_registry, model_id);
+        }
+        if !pool
             .iter()
             .any(|worker| supports_decisions_worker(worker.as_ref()))
         {

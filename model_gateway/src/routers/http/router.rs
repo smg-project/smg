@@ -620,7 +620,9 @@ impl Router {
                     RoutingPool::HttpRegular,
                     None,
                 ) {
-                    PlacementFailure::NoCandidates => error::model_not_found(model_id),
+                    PlacementFailure::NoCandidates => {
+                        placement::model_refusal(&self.worker_registry, model_id)
+                    }
                     PlacementFailure::AllOverloaded(shed) => shed,
                     PlacementFailure::Unavailable
                     | PlacementFailure::PolicyDeclined(_)

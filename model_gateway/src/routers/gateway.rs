@@ -40,7 +40,7 @@ use crate::{
     config::RoutingMode,
     middleware::TenantRequestMeta,
     routers::{
-        common::body_policy::REASON_MODEL_SELECTION,
+        common::{body_policy::REASON_MODEL_SELECTION, placement},
         error as route_error,
         factory::{router_ids, RouterId},
         grpc::regular::stages::decisions::supports_worker as supports_decisions_worker,
@@ -748,7 +748,7 @@ impl RouterTrait for Gateway {
         let router = if self.enable_igw {
             let snapshot = self.worker_registry.get_routing_snapshot(model_id);
             if snapshot.is_empty() {
-                return route_error::model_not_found(model_id);
+                return placement::model_refusal(&self.worker_registry, model_id);
             }
             // Weight only transports that can serve this endpoint. The gRPC
             // pipeline also filters its initial and retry worker selections.
@@ -802,7 +802,7 @@ impl RouterTrait for Gateway {
         let router = if self.enable_igw {
             let snapshot = self.worker_registry.get_routing_snapshot(model_id);
             if snapshot.is_empty() {
-                return route_error::model_not_found(model_id);
+                return placement::model_refusal(&self.worker_registry, model_id);
             }
             // Native SystemOne is supported only by regular HTTP workers.
             // Weighted family dispatch could select an unsupported transport.

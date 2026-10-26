@@ -457,6 +457,27 @@ pub(crate) fn no_available_workers_because(
     response
 }
 
+/// The refusal for a model nothing serves on the pool selection drew from.
+/// A model the gateway has served whose workers have all left (its only
+/// engine restarting under discovery, which removes a pod's worker while the
+/// pod is not ready; a roll) is a pool with no worker: the
+/// `no_available_workers` 503 with its `Retry-After`, the transient a client
+/// retries, as the same model answers while its workers are registered but
+/// unhealthy; a name nobody has served is the `model_not_found` 404. A 404
+/// here read as the model being gone (no retry, a negative cache, an alert)
+/// for the whole time an engine restarted, with a message that said the
+/// worker was unavailable.
+pub(crate) fn model_refusal(registry: &WorkerRegistry, model_id: &str) -> Response {
+    if registry.has_served_model(model_id) {
+        no_available_workers_because(
+            format!("No worker is registered for model '{model_id}' at the moment (its workers have left)"),
+            "no worker registered for the model",
+        )
+    } else {
+        error::model_not_found(model_id)
+    }
+}
+
 /// The 503 for a model whose registered workers include none that processes
 /// media references, under worker-side media placement. A capability
 /// verdict, not a pool state: terminal for the retry layer (what a worker
@@ -2244,6 +2265,71 @@ mod tests {
             event.record(&mut rendered);
             self.1.lock().unwrap().push(rendered.0);
         }
+    }
+
+    /// A model the gateway has served whose workers have all left is refused
+    /// as a pool with no worker: the `no_available_workers` 503 with its
+    /// `Retry-After`, the transient a client retries, by its id and by its
+    /// alias; so is the wildcard once a worker was registered. A name nobody
+    /// has served is the 404, and so is the wildcard on a gateway that never
+    /// had a worker.
+    #[tokio::test]
+    async fn a_served_model_without_workers_is_a_pool_with_no_worker_not_an_unknown_name() {
+        use crate::worker::UNKNOWN_MODEL_ID;
+
+        let registry = WorkerRegistry::new();
+        assert_eq!(
+            model_refusal(&registry, "m").status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            model_refusal(&registry, UNKNOWN_MODEL_ID).status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let worker = BasicWorkerBuilder::new("http://worker:8080")
+            .model(ModelCard::new("m").with_alias("m-alias"))
+            .worker_type(WorkerType::Regular)
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        let worker_id = registry.register(Arc::new(worker)).unwrap();
+        assert!(registry.remove(&worker_id).is_some());
+
+        for name in ["m", "m-alias", UNKNOWN_MODEL_ID] {
+            let refused = model_refusal(&registry, name);
+            assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE, "{name}");
+            assert_eq!(
+                error::extract_error_code_from_response(&refused),
+                NO_AVAILABLE_WORKERS_CODE,
+                "{name}"
+            );
+            assert_eq!(
+                refused
+                    .headers()
+                    .get(RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()),
+                Some("1"),
+                "{name}"
+            );
+        }
+        let body = axum::body::to_bytes(model_refusal(&registry, "m").into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["error"]["message"],
+            "No worker is registered for model 'm' at the moment (its workers have left)"
+        );
+
+        let unknown = model_refusal(&registry, "never-served");
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            error::extract_error_code_from_response(&unknown),
+            MODEL_NOT_FOUND_CODE
+        );
     }
 
     /// A refusal the gateway answers on its own is marked for the loggers

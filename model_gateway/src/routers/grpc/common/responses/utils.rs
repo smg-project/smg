@@ -31,6 +31,7 @@ use crate::{
                 persist_conversation_items, persist_conversation_items_if_open, PersistError,
                 PersistStep,
             },
+            placement,
         },
         error,
     },
@@ -163,7 +164,7 @@ pub(crate) fn validate_worker_availability(
     model: &str,
 ) -> Option<Response> {
     if !worker_registry.contains_model(model) {
-        return Some(error::model_not_found(model));
+        return Some(placement::model_refusal(worker_registry, model));
     }
 
     None
