@@ -423,7 +423,7 @@ jobs:
         continue-on-error: true
         run: |
           python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install transformers pillow numpy scipy
+          python -m pip install "transformers==5.20.2" pillow numpy scipy
           python crates/multimodal/scripts/generate_vision_golden.py --strict
 
       - name: Create isolated Postgres test database
