@@ -40,7 +40,7 @@ jobs:
           recipe = data["recipe"]
           assert recipe["test_dirs"] == "e2e_test/chat_completions" and recipe["test_filter"] == ""
           assert recipe["engine"] == "vllm" and recipe["gpu_tier"] == "1"
-          assert recipe["timeout"] == 32 and recipe["test_timeout"] == 24 and recipe["min_selected"] == 202
+          assert recipe["timeout"] == 60 and recipe["test_timeout"] == 45 and recipe["min_selected"] == 202
           assert recipe["servicer_unit_tests"] is True and recipe["reruns"] == 2 and recipe["reruns_delay"] == 5
           assert data["normal_base"]["input_ready"] is True
           import os, shlex
@@ -108,8 +108,8 @@ jobs:
       engine: vllm
       gpu_tier: '1'
       runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
-      timeout: 32
-      test_timeout: 24
+      timeout: 60
+      test_timeout: 45
       test_dirs: e2e_test/chat_completions
       test_filter: ''
       min_selected: 202

@@ -163,8 +163,8 @@
     "gpu_tier": "1",
     "test_dirs": "e2e_test/chat_completions",
     "test_filter": "",
-    "timeout": 32,
-    "test_timeout": 24,
+    "timeout": 60,
+    "test_timeout": 45,
     "min_selected": 202,
     "servicer_unit_tests": true,
     "parser": "",
@@ -181,7 +181,7 @@
   "budget": {
     "admitted": false,
     "reserved_runner_seconds": 0,
-    "proposed_new_max_seconds": 1920,
+    "proposed_new_max_seconds": 3600,
     "global_owned_max": 2,
     "one_lane_per_run": true,
     "old_retired_seconds_reused": 0
@@ -204,7 +204,7 @@
     "execute_input": "execute",
     "normal_input_mount": null
   },
-  "pending_note": "SOURCE ONLY: actual product11da3/disabled consumer094f are published. Node2 exactc49/config9fe6 UID995:985 readonly CDF/e006 mount and full hashes accepted74feba; this is historical metadata proof, not current capacity or GPU/model acceptance. Node1 equivalent image/bind proof is not supplied. Allfiveauthorityflags/input_ready/image_visibility_flags remainfalse and reserved0; future admission must bind eligible placement, exactimage/cache/mount, producer18/fourTTL, source/resource peers and independent NEW1920. Normal b4bae/d53e proves BASE/native69215/CPUfixtureRPC/PNG only. Fulloriginalchat andfullinstalledvLLMunits remain unrun. No currentmain qualification or other15vLLM/remaining12/fullQA contraction.",
+  "pending_note": "SOURCE ONLY: actual product11da3/disabled consumer094f are published. Node2 exactc49/config9fe6 UID995:985 readonly CDF/e006 mount and full hashes accepted74feba; this is historical metadata proof, not current capacity or GPU/model acceptance. Node1 equivalent image/bind proof is not supplied. Allfiveauthorityflags/input_ready/image_visibility_flags remainfalse and reserved0; future admission must bind eligible placement, exactimage/cache/mount, producer18/fourTTL, source/resource peers and independent PROPOSED NEW3600 (notgranted; AMD60job/45E2E differsfromNV32/24). Normal b4bae/d53e proves BASE/native69215/CPUfixtureRPC/PNG only. Fulloriginalchat andfullinstalledvLLMunits remain unrun. No currentmain qualification or other15vLLM/remaining12/fullQA contraction.",
   "binding_preparation_evidence": {
     "producer_build_archive_integrity_sha256": "671ca4d9b395dbf306cdc8f0885b4200c5c95cc3c28bf74ba2c53da2e4b24561",
     "producer_integrity_root_acceptance_sha256": "97cc1309c64e497dbd2d1b017cc99fe429612ef4fcf3e23636466de88e75edaa",
