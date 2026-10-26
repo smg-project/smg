@@ -203,6 +203,7 @@ def main():
         env = {"GITHUB_SHA": os.environ["GITHUB_SHA"], "GITHUB_RUN_ID": run_id, "GITHUB_RUN_ATTEMPT": "1",
                "GITHUB_REPOSITORY": "smg-project/smg", "E2E_JOB_MARKER": os.environ["E2E_JOB_MARKER"],
                "HF_HOME": "/models", "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HOME": "/evidence/home",
+               "AITER_JIT_DIR": "/evidence/cache/aiter-jit",
                "XDG_CACHE_HOME": "/evidence/cache", "CUDA_VISIBLE_DEVICES": "0", "HIP_VISIBLE_DEVICES": "0", "ROCR_VISIBLE_DEVICES": "0",
                "PYTHONDONTWRITEBYTECODE": "1", "SPT_NOENV": "1", "PYTHONPATH": "/source/e2e_test"}
         for path in (evidence / "home", evidence / "cache", evidence / "facts"):
