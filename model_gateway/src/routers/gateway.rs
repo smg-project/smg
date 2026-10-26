@@ -969,7 +969,7 @@ mod tests {
     use super::*;
     use crate::{
         middleware::{RouteRequestMeta, TenantKey},
-        routers::factory::router_ids,
+        routers::{factory::router_ids, tests::error_shape},
         worker::{
             BasicWorkerBuilder, CircuitBreakerConfig, RuntimeType, WorkerRegistry, WorkerType,
         },
@@ -1128,22 +1128,6 @@ mod tests {
 
     fn test_tenant_meta() -> TenantRequestMeta {
         RouteRequestMeta::new(TenantKey::from("test-tenant"))
-    }
-
-    /// The status of an answer and the code and message of its JSON error object.
-    async fn error_shape(answer: Response) -> (StatusCode, String, String) {
-        let status = answer.status();
-        let body = axum::body::to_bytes(answer.into_body(), usize::MAX)
-            .await
-            .expect("drain body");
-        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
-        let field = |name: &str| {
-            body["error"][name]
-                .as_str()
-                .unwrap_or_else(|| panic!("error.{name} in {body}"))
-                .to_owned()
-        };
-        (status, field("code"), field("message"))
     }
 
     fn body<T: serde::de::DeserializeOwned>(json: serde_json::Value) -> T {

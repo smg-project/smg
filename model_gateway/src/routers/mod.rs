@@ -374,7 +374,7 @@ mod tests {
     }
 
     /// The status of an answer and the code and message of its JSON error object.
-    async fn error_shape(answer: Response) -> (StatusCode, String, String) {
+    pub(crate) async fn error_shape(answer: Response) -> (StatusCode, String, String) {
         let status = answer.status();
         let body = axum::body::to_bytes(answer.into_body(), usize::MAX)
             .await
