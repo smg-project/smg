@@ -1093,6 +1093,20 @@ impl WorkerMonitor {
         worker: &Arc<dyn Worker>,
         native_loads_memo: Option<&DashMap<String, NativeLoadsMemo>>,
     ) -> Option<WorkerLoadResponse> {
+        if let Some((path, load)) = Self::fetch_native_loads(worker, native_loads_memo).await {
+            liveness::on_contact(worker);
+            return Some(Self::scoped_native_load(path, load, worker.dp_rank()));
+        }
+        Self::fetch_http_gauges(worker).await
+    }
+
+    /// The whole answer of the first native load route that has one (an
+    /// engine's every rank, or a gateway's fleet rollup) with the route it
+    /// came from, before it is scoped to a worker. `None` is a failed poll.
+    async fn fetch_native_loads(
+        worker: &Arc<dyn Worker>,
+        native_loads_memo: Option<&DashMap<String, NativeLoadsMemo>>,
+    ) -> Option<(NativeLoadsPath, WorkerLoadResponse)> {
         // Only workers already `Ready` are polled, so a definitive "no such
         // endpoint" cannot be a warm-up artifact and is safe to memoize.
         let known = native_loads_memo
@@ -1119,18 +1133,26 @@ impl WorkerMonitor {
                 store.insert(worker.url().to_string(), memo);
             }
         }
-        if let Some((path, load)) = response {
-            liveness::on_contact(worker);
-            // A native response with a missing rank is unavailable, not a
-            // reason to substitute the backend-wide Prometheus average.
-            return match path {
-                NativeLoadsPath::Engine => {
-                    Some(load.for_dp_rank(worker.dp_rank()).unwrap_or_default())
-                }
-                NativeLoadsPath::Gateway => Some(load),
-            };
-        }
+        response
+    }
 
+    /// A native answer as one worker's report. An engine's is scoped to the
+    /// worker's DP rank, if any: a missing rank is unavailable, not a reason
+    /// to substitute the backend-wide Prometheus average. A gateway's fleet
+    /// rollup keeps its worker annotations.
+    fn scoped_native_load(
+        path: NativeLoadsPath,
+        load: WorkerLoadResponse,
+        dp_rank: Option<usize>,
+    ) -> WorkerLoadResponse {
+        match path {
+            NativeLoadsPath::Engine => load.for_dp_rank(dp_rank).unwrap_or_default(),
+            NativeLoadsPath::Gateway => load,
+        }
+    }
+
+    /// The backend-wide gauges of a worker with no native load route.
+    async fn fetch_http_gauges(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
         // Backend-wide gauges cannot be attributed to a virtual DP worker.
         if worker.dp_rank().is_some() {
             return None;
@@ -1285,9 +1307,18 @@ impl WorkerMonitor {
     }
 
     /// Fetch load via the backend client's `GetLoads` (gRPC RPC or the ZMQ
-    /// engine's pushed scheduler stats). Returns `None` on missing client or
-    /// error, and an empty response when a successful poll omits this rank.
-    pub(crate) async fn fetch_backend_load(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
+    /// engine's pushed scheduler stats) for the workers of one engine: one
+    /// worker, or the rank workers of a data-parallel engine under
+    /// `--dp-aware` (one address, one answer naming every rank). The first
+    /// member asks; the outcome is every member's, as each one's own poll
+    /// would have had it: the whole answer (the caller scopes it to each
+    /// member's rank), the contact that ends an unreachable veto, a
+    /// transport failure. Returns `None` on no members, a missing client or
+    /// an error.
+    pub(crate) async fn fetch_backend_load(
+        members: &[Arc<dyn Worker>],
+    ) -> Option<WorkerLoadResponse> {
+        let worker = members.first()?;
         let backend_client = match worker.get_backend_client().await {
             Ok(Some(client)) => client,
             Ok(None) => {
@@ -1306,13 +1337,17 @@ impl WorkerMonitor {
         // on the connection is what reports those.
         match tokio::time::timeout(LOAD_POLL_DEADLINE, backend_client.get_loads()).await {
             Ok(Ok(load)) => {
-                liveness::on_contact(worker);
-                Some(load.for_dp_rank(worker.dp_rank()).unwrap_or_default())
+                for member in members {
+                    liveness::on_contact(member);
+                }
+                Some(load)
             }
             Ok(Err(e)) => {
                 debug!("backend GetLoads failed for {}: {e}", worker.url());
                 if liveness::is_connection_code(e.code()) {
-                    liveness::on_contact_failed(worker, "load poll");
+                    for member in members {
+                        liveness::on_contact_failed(member, "load poll");
+                    }
                 }
                 None
             }
@@ -1324,6 +1359,55 @@ impl WorkerMonitor {
                 None
             }
         }
+    }
+
+    /// One tick's fetch for the polled workers of one engine: one worker, or
+    /// the rank workers of a data-parallel engine under `--dp-aware`, which
+    /// share it. The engine answers once; each member's report is that
+    /// answer scoped to its own rank, as its own poll would have had it (a
+    /// rank the answer omits is an empty report).
+    async fn fetch_engine_loads(
+        members: Vec<Arc<dyn Worker>>,
+        connection_mode: ConnectionMode,
+        native_loads_memo: &DashMap<String, NativeLoadsMemo>,
+    ) -> Vec<(Arc<dyn Worker>, Option<WorkerLoadResponse>)> {
+        let mut reports = Vec::with_capacity(members.len());
+        match connection_mode {
+            ConnectionMode::Http => {
+                if let [worker] = members.as_slice() {
+                    reports.push(Self::fetch_http_load(worker, Some(native_loads_memo)).await);
+                } else {
+                    match Self::fetch_native_loads(&members[0], Some(native_loads_memo)).await {
+                        Some((path, load)) => {
+                            for member in &members {
+                                liveness::on_contact(member);
+                                reports.push(Some(Self::scoped_native_load(
+                                    path,
+                                    load.clone(),
+                                    member.dp_rank(),
+                                )));
+                            }
+                        }
+                        None => {
+                            for member in &members {
+                                reports.push(Self::fetch_http_gauges(member).await);
+                            }
+                        }
+                    }
+                }
+            }
+            ConnectionMode::Grpc | ConnectionMode::Zmq => {
+                let answer = Self::fetch_backend_load(&members).await;
+                for member in &members {
+                    reports.push(
+                        answer
+                            .clone()
+                            .map(|load| load.for_dp_rank(member.dp_rank()).unwrap_or_default()),
+                    );
+                }
+            }
+        }
+        members.into_iter().zip(reports).collect()
     }
 }
 
@@ -1362,6 +1446,32 @@ async fn eviction_flush_loop(load_state: Arc<LoadState>, monitor: Weak<WorkerMon
         monitor.flush_pending_evictions();
         drop(monitor);
     }
+}
+
+/// The polled workers as the fetches of one tick: one per worker, except the
+/// rank workers of one data-parallel engine, which share one. Under
+/// `--dp-aware` an engine of N ranks is N workers at one address, and each
+/// one's poll asked the engine for the same answer (N `GetLoads`, or N reads
+/// of the native load route, per engine per tick) and kept its own rank of
+/// it. One member asks, the lowest rank, so the native-route memo of an
+/// engine is one worker's tick after tick; the answer is scoped to each.
+fn polled_engines(polled: &[Arc<dyn Worker>]) -> Vec<Vec<Arc<dyn Worker>>> {
+    let mut engines: Vec<Vec<Arc<dyn Worker>>> = Vec::with_capacity(polled.len());
+    let mut by_address: HashMap<&str, usize> = HashMap::new();
+    for worker in polled {
+        if worker.dp_rank().is_some() {
+            if let Some(&engine) = by_address.get(worker.base_url()) {
+                engines[engine].push(Arc::clone(worker));
+                continue;
+            }
+            by_address.insert(worker.base_url(), engines.len());
+        }
+        engines.push(vec![Arc::clone(worker)]);
+    }
+    for members in &mut engines {
+        members.sort_by_key(|worker| worker.dp_rank());
+    }
+    engines
 }
 
 /// Compute the set of `WorkerGroupKey`s a worker participates in.
@@ -1590,26 +1700,22 @@ async fn poll_group_once(
         debug!("Every worker in group {group_key} pushed its load within {interval:?}; no poll");
         Vec::new()
     } else {
-        let futures: Vec<_> = polled
-            .iter()
-            .map(|worker| {
+        let futures: Vec<_> = polled_engines(&polled)
+            .into_iter()
+            .map(|members| {
                 let native_loads_memo = Arc::clone(&monitor.native_loads_memo);
-                let worker = Arc::clone(worker);
                 let connection_mode = group_key.connection_mode;
                 async move {
-                    let response = match connection_mode {
-                        ConnectionMode::Http => {
-                            WorkerMonitor::fetch_http_load(&worker, Some(&native_loads_memo)).await
-                        }
-                        ConnectionMode::Grpc | ConnectionMode::Zmq => {
-                            WorkerMonitor::fetch_backend_load(&worker).await
-                        }
-                    };
-                    (worker, response)
+                    WorkerMonitor::fetch_engine_loads(members, connection_mode, &native_loads_memo)
+                        .await
                 }
             })
             .collect();
-        future::join_all(futures).await
+        future::join_all(futures)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
     };
 
     let mut group_loads: HashMap<String, WorkerLoadResponse> = HashMap::new();
@@ -2901,6 +3007,138 @@ mod native_loads_tests {
                     .get(worker.url())
                     .is_none_or(|ranks| !ranks.contains_key(&1)));
             }
+        }
+    }
+
+    /// Two HTTP rank workers of one engine share one read of its native load
+    /// route per tick, and each one's published report is its own rank's
+    /// entry of the engine's two-rank answer: the shared snapshot, the DP
+    /// token cache and the overload verdict read the rank.
+    #[tokio::test]
+    async fn the_rank_workers_of_one_http_engine_share_one_native_read() {
+        const TWO_RANKS: &str = r#"{"loads":[
+            {"dp_rank":0,"num_running_reqs":3,"num_waiting_reqs":1,"num_used_tokens":300,"max_total_num_tokens":1000,"token_usage":0.3},
+            {"dp_rank":1,"num_running_reqs":9,"num_waiting_reqs":4,"num_used_tokens":900,"max_total_num_tokens":1000,"token_usage":0.9}]}"#;
+        let stub = spawn_engine(StatusCode::OK, TWO_RANKS).await;
+        let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
+        let workers = [
+            vllm_dp_worker(&stub.url, 0, 2),
+            vllm_dp_worker(&stub.url, 1, 2),
+        ];
+        for worker in &workers {
+            registry.register(Arc::clone(worker)).unwrap();
+        }
+        let key = WorkerGroupKey {
+            model_id: "a".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+        };
+        poll_group_once(&monitor, &key, Duration::from_secs(10), Instant::now()).await;
+
+        let snapshot = monitor.load_state.snapshot();
+        for (worker, expected) in workers.iter().zip([(0, 3, 1, 300), (1, 9, 4, 900)]) {
+            let report = snapshot.get(worker.url()).expect("published");
+            let ranks: Vec<(i32, i64, i64, i64)> = report
+                .loads
+                .iter()
+                .map(|rank| {
+                    (
+                        rank.dp_rank,
+                        i64::from(rank.num_running_reqs),
+                        i64::from(rank.num_waiting_reqs),
+                        i64::from(rank.num_used_tokens),
+                    )
+                })
+                .collect();
+            assert_eq!(ranks, vec![expected], "{}", worker.url());
+            assert_eq!(report.dp_rank_count, 1, "{}", worker.url());
+            assert_eq!(
+                monitor
+                    .worker_load_manager
+                    .select_and_increment_lowest_dp_load(worker.as_ref(), 0),
+                Some(expected.0 as isize),
+                "{}",
+                worker.url()
+            );
+        }
+        assert_eq!(
+            stub.probes.load(Ordering::SeqCst),
+            1,
+            "one read of the engine's native route for its two rank workers"
+        );
+    }
+
+    /// The rank workers of one gRPC engine share one `GetLoads` per tick: the
+    /// engine answers once, and every rank worker gets its contact and its
+    /// own rank's part of the answer, as its own poll would have had it (the
+    /// canned engine names rank 0 only, so rank 1 has no report).
+    #[tokio::test]
+    async fn the_rank_workers_of_one_grpc_engine_share_one_poll() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cfg = Arc::new(mock_worker::config::Config {
+            http_count: 0,
+            grpc_base_port: port,
+            grpc_count: 1,
+            model_id: "a".to_string(),
+            tokenizer_path: "a".to_string(),
+            gen_delay: Duration::ZERO,
+            output_tokens: 3,
+            realistic: false,
+            ..mock_worker::config::Config::default()
+        });
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test engine: the server task lives for the test process"
+        )]
+        let _engine = tokio::spawn(mock_worker::grpc::serve_with_listener(cfg, listener));
+        let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
+        let rank_worker = |rank: usize| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .runtime_type(RuntimeType::TokenSpeed)
+                    .model(ModelCard::new("a"))
+                    .dp_config(rank, 2)
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            )
+        };
+        let workers = [rank_worker(0), rank_worker(1)];
+        for worker in &workers {
+            registry.register(Arc::clone(worker)).unwrap();
+        }
+        let key = WorkerGroupKey {
+            model_id: "a".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Grpc,
+        };
+        let polls_before = mock_worker::overrides::for_port(port).loads_polls();
+        poll_group_once(&monitor, &key, Duration::from_secs(10), Instant::now()).await;
+        assert_eq!(
+            mock_worker::overrides::for_port(port).loads_polls() - polls_before,
+            1,
+            "one GetLoads for the engine's two rank workers"
+        );
+
+        let snapshot = monitor.load_state.snapshot();
+        let report = snapshot
+            .get(workers[0].url())
+            .expect("the rank the answer names has its report");
+        assert_eq!((report.loads.len(), report.loads[0].dp_rank), (1, 0));
+        assert!(
+            snapshot.get(workers[1].url()).is_none(),
+            "a rank the answer does not name has no report, as its own poll would have had it"
+        );
+        for worker in &workers {
+            assert!(
+                worker.contact_age() < Duration::from_secs(5),
+                "the contact is every member's"
+            );
         }
     }
 

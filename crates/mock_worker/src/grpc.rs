@@ -456,6 +456,7 @@ impl TokenSpeedScheduler for MockScheduler {
         &self,
         _request: Request<ts::GetLoadsRequest>,
     ) -> Result<Response<ts::GetLoadsResponse>, Status> {
+        self.overrides.note_loads_poll();
         let load = match &self.engine {
             Some(engine) => {
                 snapshot_to_scheduler_load(&engine.load().as_reported_by(self.cfg.loads_like))
