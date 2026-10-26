@@ -8,6 +8,17 @@ fn make_tokens(base: u32, pages: usize) -> Vec<TokenId> {
     (0..(pages * PAGE_SIZE)).map(|i| base + i as u32).collect()
 }
 
+/// Three page-aligned paths that share their first page and differ in the
+/// second: the branching shape the matching and eviction tests read.
+fn branching_paths() -> (Vec<TokenId>, Vec<TokenId>, Vec<TokenId>) {
+    let branch = |second: u32| {
+        let mut tokens = make_tokens(1, 1);
+        tokens.extend(make_tokens(second, 1));
+        tokens
+    };
+    (branch(100), branch(200), branch(300))
+}
+
 #[test]
 fn test_basic_insert_match() {
     let tree = TokenTree::new();
@@ -283,14 +294,7 @@ fn test_branching_paths() {
     let tree = TokenTree::new();
 
     // Common first page, different second page
-    let mut tokens1 = make_tokens(1, 1);
-    tokens1.extend(make_tokens(100, 1));
-
-    let mut tokens2 = make_tokens(1, 1);
-    tokens2.extend(make_tokens(200, 1));
-
-    let mut tokens3 = make_tokens(1, 1);
-    tokens3.extend(make_tokens(300, 1));
+    let (tokens1, tokens2, tokens3) = branching_paths();
 
     tree.insert_tokens(&tokens1, "tenant1");
     tree.insert_tokens(&tokens2, "tenant2");
@@ -582,12 +586,7 @@ fn test_advanced_eviction() {
     let tree = TokenTree::new();
 
     // Insert multiple paths for tenant1
-    let mut tokens1 = make_tokens(1, 1);
-    tokens1.extend(make_tokens(100, 1));
-    let mut tokens2 = make_tokens(1, 1);
-    tokens2.extend(make_tokens(200, 1));
-    let mut tokens3 = make_tokens(1, 1);
-    tokens3.extend(make_tokens(300, 1));
+    let (tokens1, tokens2, tokens3) = branching_paths();
 
     tree.insert_tokens(&tokens1, "tenant1");
     tree.insert_tokens(&tokens2, "tenant1");
@@ -740,12 +739,7 @@ fn test_complex_tenant_eviction() {
     let tree = TokenTree::new();
 
     // Create overlapping paths (common first page, different second pages)
-    let mut tokens1 = make_tokens(1, 1);
-    tokens1.extend(make_tokens(100, 1));
-    let mut tokens2 = make_tokens(1, 1);
-    tokens2.extend(make_tokens(200, 1));
-    let mut tokens3 = make_tokens(1, 1);
-    tokens3.extend(make_tokens(300, 1));
+    let (tokens1, tokens2, tokens3) = branching_paths();
 
     tree.insert_tokens(&tokens1, "tenant1");
     tree.insert_tokens(&tokens2, "tenant2");
