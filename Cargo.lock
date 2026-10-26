@@ -8032,6 +8032,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "smg-tokenizer-python"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "llm-tokenizer",
+ "pyo3",
+ "pyo3-build-config",
+ "serde_json",
+]
+
+[[package]]
 name = "smg-wasm"
 version = "1.1.4"
 dependencies = [
