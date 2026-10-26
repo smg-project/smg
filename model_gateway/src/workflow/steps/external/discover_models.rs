@@ -224,6 +224,8 @@ async fn fetch_models(
 ) -> Result<Vec<ModelCard>, String> {
     let base_url = url.trim_end_matches('/');
     let models_url = format!("{base_url}/v1/models");
+    // The address as the failures below name it: a userinfo in it masked.
+    let shown = Endpoint::redacted_str(&models_url);
 
     let mut req = HTTP_CLIENT.get(&models_url);
     if let Some(key) = api_key {
@@ -237,13 +239,12 @@ async fn fetch_models(
     let response = req
         .send()
         .await
-        .map_err(|e| format!("Failed to connect to {models_url}: {e}"))?;
+        .map_err(|e| format!("Failed to connect to {shown}: {e}"))?;
 
     if !response.status().is_success() {
         return Err(format!(
-            "Server returned status {} from {}",
-            response.status(),
-            models_url
+            "Server returned status {} from {shown}",
+            response.status()
         ));
     }
 

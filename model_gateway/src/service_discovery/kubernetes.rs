@@ -650,10 +650,11 @@ fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> 
             // A socket address always parses; the fallible form keeps the
             // provider honest if the address ever stops coming from one.
             let Ok(endpoint) = Endpoint::parse(&url) else {
+                // A socket address carries no userinfo, and the masked form of
+                // one the parser refused would only read as its marker.
                 warn!(
                     "Pod {} has an unusable worker address '{}', skipping",
-                    info.name,
-                    Endpoint::redacted_str(&url)
+                    info.name, url
                 );
                 continue;
             };

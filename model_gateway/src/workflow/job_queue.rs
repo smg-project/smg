@@ -101,6 +101,19 @@ impl Job {
     }
 
     /// Get worker URL, MCP server name, WASM module, or tokenizer identifier for logging and status tracking
+    /// `worker_url` as a log line writes it: a worker job's address with a
+    /// userinfo in it masked; the other jobs' names (a server, a module, a
+    /// tokenizer id) as they are, since they are not addresses and the
+    /// address parser would respell or refuse them.
+    pub fn shown_worker(job_type: &str, worker_url: &str) -> String {
+        match job_type {
+            "AddWorker" | "UpdateWorker" | "RefreshWorkerLabels" | "RemoveWorker" => {
+                Endpoint::redacted_str(worker_url)
+            }
+            _ => worker_url.to_string(),
+        }
+    }
+
     pub fn worker_url(&self) -> &str {
         match self {
             Job::AddWorker { config, .. } => &config.url,
@@ -365,7 +378,7 @@ impl JobQueue {
         debug!(
             "Job submitted: type={}, worker={}, queue_depth={}, available_slots={}",
             job_type,
-            Endpoint::redacted_str(&worker_url),
+            Job::shown_worker(job_type, &worker_url),
             queue_depth,
             available_permits
         );
@@ -405,7 +418,7 @@ impl JobQueue {
         debug!(
             "Processing job: type={}, worker={}",
             job_type,
-            Endpoint::redacted_str(&worker_url)
+            Job::shown_worker(job_type, &worker_url)
         );
 
         // Release concurrency slot immediately. The semaphore bounds how many
@@ -445,7 +458,7 @@ impl JobQueue {
                 error!(
                     "AppContext dropped, cannot process job: type={}, worker={}",
                     job_type,
-                    Endpoint::redacted_str(&worker_url)
+                    Job::shown_worker(job_type, &worker_url)
                 );
             }
         }
@@ -907,7 +920,7 @@ impl JobQueue {
                 debug!(
                     "Completed job: type={}, worker={}, result={}",
                     job_type,
-                    Endpoint::redacted_str(worker_url),
+                    Job::shown_worker(job_type, worker_url),
                     message
                 );
             }
@@ -921,7 +934,7 @@ impl JobQueue {
                 warn!(
                     "Failed job: type={}, worker={}, error={}",
                     job_type,
-                    Endpoint::redacted_str(worker_url),
+                    Job::shown_worker(job_type, worker_url),
                     error
                 );
             }
@@ -967,7 +980,7 @@ impl JobQueue {
                 debug!(
                     "Job status of type={} for worker={} left to the {} job under the key",
                     job_type,
-                    Endpoint::redacted_str(url),
+                    Job::shown_worker(job_type, url),
                     entry.get().job_type
                 );
             }

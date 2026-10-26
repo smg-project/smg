@@ -139,22 +139,24 @@ async fn get_json_with_fallback_classified<T: serde::de::DeserializeOwned>(
     api_key: Option<&str>,
 ) -> Result<T, MetadataError> {
     let url = format!("{base_url}/{endpoint}");
+    // The addresses as every failure below names them: a userinfo in them
+    // masked (the texts end in the step's failure message and its lines).
+    let shown = Endpoint::redacted_str(&url);
     let mut req = client.get(&url).timeout(METADATA_TIMEOUT);
     if let Some(key) = api_key {
         req = req.bearer_auth(key);
     }
 
-    let response = req.send().await.map_err(|e| {
-        MetadataError::Failed(format!(
-            "Failed to connect to {}: {e}",
-            Endpoint::redacted_str(&url)
-        ))
-    })?;
+    let response = req
+        .send()
+        .await
+        .map_err(|e| MetadataError::Failed(format!("Failed to connect to {shown}: {e}")))?;
 
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         // Fallback to deprecated /get_<endpoint> prefix
         warn!("'/{endpoint}' returned 404, falling back to deprecated '/get_{endpoint}'");
         let old_url = format!("{base_url}/get_{endpoint}");
+        let shown_old = Endpoint::redacted_str(&old_url);
         let mut req = client.get(&old_url).timeout(METADATA_TIMEOUT);
         if let Some(key) = api_key {
             req = req.bearer_auth(key);
@@ -162,37 +164,33 @@ async fn get_json_with_fallback_classified<T: serde::de::DeserializeOwned>(
         let resp = req
             .send()
             .await
-            .map_err(|e| MetadataError::Failed(format!("Failed to connect to {old_url}: {e}")))?;
+            .map_err(|e| MetadataError::Failed(format!("Failed to connect to {shown_old}: {e}")))?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(MetadataError::NotOffered);
         }
         if !resp.status().is_success() {
             return Err(MetadataError::Failed(format!(
-                "status {} from {}",
-                resp.status(),
-                old_url
+                "status {} from {shown_old}",
+                resp.status()
             )));
         }
         return resp
             .json::<T>()
             .await
-            .map_err(|e| MetadataError::Failed(format!("Failed to parse {old_url}: {e}")));
+            .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown_old}: {e}")));
     }
 
     if !response.status().is_success() {
         return Err(MetadataError::Failed(format!(
-            "status {} from {}",
-            response.status(),
-            url
+            "status {} from {shown}",
+            response.status()
         )));
     }
 
-    response.json::<T>().await.map_err(|e| {
-        MetadataError::Failed(format!(
-            "Failed to parse {}: {e}",
-            Endpoint::redacted_str(&url)
-        ))
-    })
+    response
+        .json::<T>()
+        .await
+        .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {e}")))
 }
 
 async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
@@ -200,32 +198,27 @@ async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
     url: &str,
     api_key: Option<&str>,
 ) -> Result<T, MetadataError> {
+    let shown = Endpoint::redacted_str(url);
     let mut req = client.get(url).timeout(METADATA_TIMEOUT);
     if let Some(key) = api_key {
         req = req.bearer_auth(key);
     }
-    let resp = req.send().await.map_err(|e| {
-        MetadataError::Failed(format!(
-            "Failed to connect to {}: {e}",
-            Endpoint::redacted_str(url)
-        ))
-    })?;
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| MetadataError::Failed(format!("Failed to connect to {shown}: {e}")))?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(MetadataError::NotOffered);
     }
     if !resp.status().is_success() {
         return Err(MetadataError::Failed(format!(
-            "status {} from {}",
-            resp.status(),
-            url
+            "status {} from {shown}",
+            resp.status()
         )));
     }
-    resp.json::<T>().await.map_err(|e| {
-        MetadataError::Failed(format!(
-            "Failed to parse {}: {e}",
-            Endpoint::redacted_str(url)
-        ))
-    })
+    resp.json::<T>()
+        .await
+        .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {e}")))
 }
 
 pub async fn get_server_info(
