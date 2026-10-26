@@ -173,8 +173,7 @@ impl Scanner {
     /// every byte is text. An empty string never matches, so the scan always moves forward, and of
     /// two equal markers the first in the list is the one reported.
     pub fn new(markers: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        let markers: Vec<String> = markers.into_iter().map(Into::into).collect();
-        Self::sharing(Arc::from(markers))
+        Self::sharing(markers.into_iter().map(Into::into).collect())
     }
 
     /// A scanner for a list of markers built once and shared: the same scanner as [`Self::new`]
