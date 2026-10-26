@@ -3725,6 +3725,28 @@ fn gate_at_mean(config: CacheAwareConfig) -> CacheAwareConfig {
     }
 }
 
+/// Two workers under the count-pressure gate of `config`, the feed skewed
+/// against the first: the policy initialised on them, the loads published.
+fn gated_pair(config: CacheAwareConfig) -> (CacheAwarePolicy, Vec<Arc<dyn Worker>>) {
+    let policy = CacheAwarePolicy::with_config(gate_at_mean(config));
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    policy.init_workers(&workers);
+    TestFeed::attached_to(&policy).publish(&skewed_rate_loads(&workers));
+    (policy, workers)
+}
+
+/// Eight routes of `route`, each counted in flight on the worker it picked
+/// (the router counts the dispatch; the gate reads it): how many each got.
+fn burst_picks(workers: &[Arc<dyn Worker>], mut route: impl FnMut(u32) -> usize) -> [usize; 2] {
+    let mut picks = [0usize; 2];
+    for i in 0..8 {
+        let idx = route(i);
+        workers[idx].increment_load();
+        picks[idx] += 1;
+    }
+    picks
+}
+
 /// A request at or below `cache_threshold` has no holder to spill from,
 /// and expected wait alone keeps no count bound: its queue and rate
 /// signals are a poll old, so a burst of misses followed one worker
@@ -3732,28 +3754,17 @@ fn gate_at_mean(config: CacheAwareConfig) -> CacheAwareConfig {
 /// the same count-pressure gate a hit spills at.
 #[test]
 fn miss_burst_is_bounded_by_the_count_pressure_gate() {
-    let policy = CacheAwarePolicy::with_config(gate_at_mean(test_config()));
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
-    TestFeed::attached_to(&policy).publish(&skewed_rate_loads(&workers));
-
-    let mut picks = [0usize; 2];
-    for i in 0..8 {
+    let (policy, workers) = gated_pair(test_config());
+    let picks = burst_picks(&workers, |i| {
         let text = format!("{i} novel prompt with nothing in common");
-        let idx = route_text(&policy, &workers, &text).unwrap();
-        // The router counts the dispatch in flight; the gate reads it.
-        workers[idx].increment_load();
-        picks[idx] += 1;
-    }
+        route_text(&policy, &workers, &text).unwrap()
+    });
     assert_eq!(picks, [4, 4]);
 }
 
 #[test]
 fn event_miss_burst_is_bounded_by_the_count_pressure_gate() {
-    let policy = CacheAwarePolicy::with_config(gate_at_mean(test_config()));
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
-    TestFeed::attached_to(&policy).publish(&skewed_rate_loads(&workers));
+    let (policy, workers) = gated_pair(test_config());
     let monitor = Arc::new(KvEventMonitor::new());
     monitor.indexers.insert(
         "unknown".to_string(),
@@ -3761,38 +3772,20 @@ fn event_miss_burst_is_bounded_by_the_count_pressure_gate() {
     );
     policy.set_kv_event_monitor(Some(monitor));
 
-    let mut picks = [0usize; 2];
-    for i in 0..8u32 {
+    let picks = burst_picks(&workers, |i| {
         let novel = [100 + i, 200, 300, 400];
-        let idx = policy
-            .select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    tokens: Some(&novel),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        workers[idx].increment_load();
-        picks[idx] += 1;
-    }
+        route_tokens(&policy, &workers, &novel)
+    });
     assert_eq!(picks, [4, 4]);
 }
 
 #[test]
 fn hash_miss_burst_is_bounded_by_the_count_pressure_gate() {
-    let policy = CacheAwarePolicy::with_config(gate_at_mean(hash_config(&[4])));
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
-    TestFeed::attached_to(&policy).publish(&skewed_rate_loads(&workers));
-
-    let mut picks = [0usize; 2];
-    for i in 0..8u32 {
+    let (policy, workers) = gated_pair(hash_config(&[4]));
+    let picks = burst_picks(&workers, |i| {
         let head = [i, i, i, i, 9];
-        let idx = route_tokens(&policy, &workers, &head);
-        workers[idx].increment_load();
-        picks[idx] += 1;
-    }
+        route_tokens(&policy, &workers, &head)
+    });
     assert_eq!(picks, [4, 4]);
 }
 
@@ -3800,18 +3793,11 @@ fn hash_miss_burst_is_bounded_by_the_count_pressure_gate() {
 /// there; the same bound applies.
 #[test]
 fn hash_untokenized_burst_is_bounded_by_the_count_pressure_gate() {
-    let policy = CacheAwarePolicy::with_config(gate_at_mean(hash_config(&[4])));
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
-    TestFeed::attached_to(&policy).publish(&skewed_rate_loads(&workers));
-
-    let mut picks = [0usize; 2];
-    for i in 0..8 {
+    let (policy, workers) = gated_pair(hash_config(&[4]));
+    let picks = burst_picks(&workers, |i| {
         let text = format!("{i} novel prompt with nothing in common");
-        let idx = route_text(&policy, &workers, &text).unwrap();
-        workers[idx].increment_load();
-        picks[idx] += 1;
-    }
+        route_text(&policy, &workers, &text).unwrap()
+    });
     assert_eq!(picks, [4, 4]);
 }
 
