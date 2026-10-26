@@ -2877,10 +2877,9 @@ mod tests {
     /// told what happened, not where the gateway's workers are.
     #[tokio::test]
     async fn a_side_that_failed_below_http_is_answered_without_the_workers_address() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        let worker = BasicWorkerBuilder::new(format!("http://{addr}")).build();
+        let (url, refusing) = refusing_url();
+        let addr = refusing.local_addr().unwrap();
+        let worker = BasicWorkerBuilder::new(url).build();
         let error = call_refused_by(addr).await;
         assert!(
             error.url().is_some(),
@@ -4001,6 +4000,20 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{addr}")
+    }
+
+    /// A loopback URL nothing answers at, with the socket that keeps it so:
+    /// bound and never listening, the socket has every connection refused at
+    /// once and holds the port while it lives. A dropped listener's port is
+    /// free again for the next `bind("127.0.0.1:0")` of the process, and that
+    /// test's stub would then answer in the unreachable side's place.
+    fn refusing_url() -> (String, tokio::net::TcpSocket) {
+        let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+        socket
+            .bind("127.0.0.1:0".parse().expect("loopback address"))
+            .expect("bind");
+        let url = format!("http://{}", socket.local_addr().expect("address"));
+        (url, socket)
     }
 
     fn register_pd_pair(router: &PDRouter, prefill_url: String, decode_url: String) {
@@ -5353,10 +5366,7 @@ mod tests {
     async fn vllm_pd_moriio_write_fails_fast_when_the_decode_is_unreachable() {
         let computing = std::time::Duration::from_secs(30);
         let (prefill_url, _) = spawn_delayed_stub(StatusCode::OK, json!({}), computing).await;
-        let decode_url = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            format!("http://{}", listener.local_addr().unwrap())
-        };
+        let (decode_url, _refusing) = refusing_url();
         let router = single_attempt_router();
         register_moriio_pair_with(
             &router,
@@ -5943,29 +5953,39 @@ mod tests {
         }
     }
 
+    /// Each side can fail while the other is still waiting for its head: a
+    /// missing route exercises HTTP errors, a port that refuses the connection
+    /// exercises transport errors, and a cancellation drops two pending
+    /// sides. The pending side's stub answers by itself only after
+    /// `PENDING_ANSWER`, far past `HANG_GUARD`, so the dispatch ending at all
+    /// is the router cancelling that side; the guard only turns a hung
+    /// dispatch into a failure. A loaded runner changes the test's duration,
+    /// never its verdict.
     #[tokio::test]
     async fn pd_prefill_release_on_error_or_cancellation() {
         use std::time::Duration;
 
-        use crate::routers::common::request_lease::test_probe::{
-            spawn_immediate_stub, spawn_release_gated_stub,
-        };
+        use crate::routers::common::request_lease::test_probe::spawn_immediate_stub;
 
-        // Each side can fail while the other is still waiting for its head.
-        // A missing route exercises HTTP errors; a dropped listener exercises
-        // transport errors. Cancellation drops two pending sides.
+        const HANG_GUARD: Duration = Duration::from_secs(30);
+        const PENDING_ANSWER: Duration = Duration::from_secs(3600);
+
         for failed_prefill in [false, true] {
             for failure in ["http", "transport", "cancel"] {
-                let probe = Arc::new(());
-                let hold = Arc::clone(&probe);
-                let (blocked_url, _) = spawn_release_gated_stub(Arc::downgrade(&probe)).await;
-                let failed_url = match failure {
-                    "http" => format!("{}/missing", spawn_immediate_stub().await),
+                let (blocked_url, _) =
+                    spawn_delayed_stub(StatusCode::OK, json!({}), PENDING_ANSWER).await;
+                let (failed_url, _refusing) = match failure {
+                    "http" => (format!("{}/missing", spawn_immediate_stub().await), None),
                     "transport" => {
-                        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                        format!("http://{}", listener.local_addr().unwrap())
+                        let (url, socket) = refusing_url();
+                        (url, Some(socket))
                     }
-                    _ => spawn_release_gated_stub(Arc::downgrade(&probe)).await.0,
+                    _ => (
+                        spawn_delayed_stub(StatusCode::OK, json!({}), PENDING_ANSWER)
+                            .await
+                            .0,
+                        None,
+                    ),
                 };
                 let (prefill_url, decode_url) = if failed_prefill {
                     (failed_url, blocked_url)
@@ -6010,7 +6030,7 @@ mod tests {
                         assert_eq!(prefill.load(), 1);
                         assert_eq!(decode.load(), 1);
                     } else {
-                        let response = tokio::time::timeout(Duration::from_secs(2), dispatch)
+                        let response = tokio::time::timeout(HANG_GUARD, dispatch)
                             .await
                             .expect("a failed side must cancel the pending side");
                         assert_eq!(
@@ -6025,7 +6045,6 @@ mod tests {
                 }
                 assert_eq!(prefill.load(), 0);
                 assert_eq!(decode.load(), 0);
-                drop(hold);
             }
         }
     }
@@ -6808,32 +6827,34 @@ mod tests {
         }
     }
 
-    /// A server with `fault` for the failing side.
-    async fn faulty_stub(fault: Fault) -> String {
+    /// A server with `fault` for the failing side; an unreachable side's
+    /// refusing socket comes along and holds its port for the row.
+    async fn faulty_stub(fault: Fault) -> (String, Option<tokio::net::TcpSocket>) {
         match fault {
             Fault::Unreachable => {
-                // The listener drops with the block: the port is closed.
-                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                format!("http://{}", listener.local_addr().unwrap())
+                let (url, socket) = refusing_url();
+                (url, Some(socket))
             }
-            Fault::Refuses(status) => {
+            Fault::Refuses(status) => (
                 spawn_delayed_stub(
                     status,
                     json!({"error": {"message": REFUSAL}}),
                     std::time::Duration::ZERO,
                 )
                 .await
-                .0
-            }
-            Fault::CutAfterHead => {
+                .0,
+                None,
+            ),
+            Fault::CutAfterHead => (
                 spawn_cut_stub(
                     "/v1/chat/completions",
                     "application/json",
                     &["{\"choices\":["],
                     true,
                 )
-                .await
-            }
+                .await,
+                None,
+            ),
         }
     }
 
@@ -6966,7 +6987,7 @@ mod tests {
         let mut mismatches = Vec::new();
         for (shape, side, fault, streamed, status, phase) in rows {
             let case = format!("{shape:?} {side:?} {fault:?} streamed={streamed}");
-            let failing = faulty_stub(fault).await;
+            let (failing, _refusing) = faulty_stub(fault).await;
             let healthy = healthy_stub(shape, side.partner()).await;
             let (prefill_url, decode_url) = match side {
                 Prefill => (failing, healthy),
