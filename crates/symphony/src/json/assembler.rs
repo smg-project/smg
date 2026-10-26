@@ -369,6 +369,7 @@ impl crate::engine::CallAssembler for Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::arguments;
 
     const CALL: &str = r#"{"name": "get_weather", "arguments": {"city": "Paris", "days": [1, 2]}}"#;
     const ARGUMENTS: &str = r#"{"city": "Paris", "days": [1, 2]}"#;
@@ -392,16 +393,6 @@ mod tests {
                 | Event::ToolCallEnd { source, .. } => &*source.text,
                 Event::Malformed { text, .. } => &*text.text,
                 _ => "",
-            })
-            .collect()
-    }
-
-    fn arguments(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|e| match e {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
-                _ => None,
             })
             .collect()
     }
@@ -1314,15 +1305,6 @@ mod tests {
         let mut whole = Events::new();
         Assembler::new(0, "call_0").feed(&call, &mut whole);
         let whole = whole.drain();
-        let arguments = |events: &[Event]| -> String {
-            events
-                .iter()
-                .filter_map(|event| match event {
-                    Event::ToolCallArguments { json, .. } => Some(json.as_str()),
-                    _ => None,
-                })
-                .collect()
-        };
         assert_eq!(arguments(&by_char), arguments(&whole));
         assert!(
             matches!(by_char.last(), Some(Event::ToolCallEnd { .. })),

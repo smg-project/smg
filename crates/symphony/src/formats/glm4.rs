@@ -52,7 +52,7 @@ mod tests {
         event::{DropReason, Event, FinishReason, MalformedReason, Text},
         testing::{
             a_forced_tag_begins_with_the_templates_text, arguments_of, bytes, content, drive,
-            drive_to, dropped, reasoning, said, the_same_at_every_cut, Said,
+            drive_to, dropped, malformed, reasoning, said, the_same_at_every_cut, Said,
         },
         Declared, EngineFinish,
     };
@@ -242,17 +242,6 @@ mod tests {
     /// The value of that shape, whole: every byte the model wrote between the tag and its end.
     const ANSWER: &str =
         "Logistic regression is a statistical method for a binary outcome.<|end_of_box|>\n";
-
-    /// The malformed events as (text, reason), in order.
-    fn malformed(events: &[Event]) -> Vec<(String, MalformedReason)> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
-                _ => None,
-            })
-            .collect()
-    }
 
     #[test]
     fn a_string_value_the_model_leaves_open_at_its_own_end_is_closed_there_and_said() {

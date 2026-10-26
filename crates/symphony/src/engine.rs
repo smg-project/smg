@@ -1388,7 +1388,7 @@ mod tests {
         formats::{glm, inkling, llama4, mistral, qwen3, xlam},
         input::TokenSpan,
         tagged::{Placement, Spelling},
-        testing::{arguments_of, bytes, weather_declared},
+        testing::{arguments_of, bytes, malformed, weather_declared},
     };
 
     /// GLM's last call, its closing marker not written: the stop token that would end it is
@@ -1699,17 +1699,6 @@ mod tests {
             }
         }
         calls
-    }
-
-    /// The malformed events as (text, reason), in order.
-    fn malformed(events: &[Event]) -> Vec<(String, MalformedReason)> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
-                _ => None,
-            })
-            .collect()
     }
 
     #[test]

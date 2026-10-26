@@ -5,7 +5,7 @@ use openai_protocol::common::{Function, Tool};
 use serde_json::{json as value, Value};
 
 use crate::{
-    event::{DropReason, Event, Events, FinishReason, Text},
+    event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
     format::Format,
     grammar::{GrammarStart, Options},
     input::{EngineFinish, Input},
@@ -57,6 +57,28 @@ pub(crate) fn arguments_of(events: &[Event], call: u32) -> String {
         .iter()
         .filter_map(|event| match event {
             Event::ToolCallArguments { index, json, .. } if *index == call => Some(json.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The argument fragments of every call, joined in order.
+pub(crate) fn arguments(events: &[Event]) -> String {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::ToolCallArguments { json, .. } => Some(json.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The malformed reports, each text with its reason, in order.
+pub(crate) fn malformed(events: &[Event]) -> Vec<(String, MalformedReason)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
             _ => None,
         })
         .collect()

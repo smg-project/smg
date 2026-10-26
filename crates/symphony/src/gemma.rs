@@ -900,7 +900,7 @@ impl crate::engine::CallAssembler for Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::bytes;
+    use crate::testing::{arguments, bytes, malformed};
 
     const CLOSE: &str = "<tool_call|>";
 
@@ -916,26 +916,6 @@ mod tests {
             assembler.close(CLOSE, &mut out);
         }
         out.drain()
-    }
-
-    fn arguments(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn malformed(events: &[Event]) -> Vec<(String, MalformedReason)> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
-                _ => None,
-            })
-            .collect()
     }
 
     const CALL: &str = concat!(

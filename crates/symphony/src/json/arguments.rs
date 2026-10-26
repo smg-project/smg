@@ -434,6 +434,7 @@ impl Arguments {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::arguments as fragments;
 
     /// The events for `pieces`, what the value took of each, and whether it is whole after the
     /// last piece and after `finish`.
@@ -447,16 +448,6 @@ mod tests {
         let fed = arguments.whole();
         let finished = arguments.finish(&mut out);
         (out.drain(), taken, fed, finished)
-    }
-
-    fn fragments(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
-                _ => None,
-            })
-            .collect()
     }
 
     /// The bytes the events account for.

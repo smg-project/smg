@@ -234,7 +234,7 @@ impl crate::engine::CallAssembler for Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::bytes;
+    use crate::testing::{arguments, bytes};
 
     const OBJECT_MARKER: &str = "<|content_invoke_tool_json|>";
     const OBJECT_CALL: &str = concat!(
@@ -273,16 +273,6 @@ mod tests {
     /// A call whose arguments alone follow the marker (the Mistral spelling).
     fn run_arguments(pieces: &[&str], cut: bool) -> (Vec<Event<'static>>, usize) {
         run(After::Arguments, ARGUMENTS_MARKER, pieces, cut)
-    }
-
-    fn arguments(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
-                _ => None,
-            })
-            .collect()
     }
 
     fn per_char(text: &str) -> Vec<&str> {

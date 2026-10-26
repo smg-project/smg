@@ -1209,7 +1209,7 @@ mod tests {
     use super::*;
     use crate::{
         tagged::{dropped, nothing_empty, refused, shown},
-        testing::bytes,
+        testing::{arguments, bytes, malformed},
     };
 
     fn declared() -> Declared {
@@ -1249,26 +1249,6 @@ mod tests {
             assembler.close(tags.invoke_close, &mut out);
         }
         out.drain()
-    }
-
-    fn arguments(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn malformed(events: &[Event]) -> Vec<(String, MalformedReason)> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
-                _ => None,
-            })
-            .collect()
     }
 
     /// A streamed string still open at the invoke's own closing marker, with the start of a cut

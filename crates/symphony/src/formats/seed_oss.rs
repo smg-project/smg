@@ -54,7 +54,7 @@ mod tests {
         ids::CallIds,
         input::{EngineFinish, Input},
         parser::Parser,
-        testing::{calls, content, drive, reasoning},
+        testing::{content, drive, reasoning, said, Said},
         Declared,
     };
 
@@ -614,30 +614,6 @@ mod tests {
             )
             .expect("end");
         out.into_owned().drain()
-    }
-
-    /// What the reader said of an output: the calls, the finish, the content and the reasoning.
-    #[derive(Debug, PartialEq)]
-    struct Said {
-        calls: Vec<(String, String)>,
-        finish: Option<(FinishReason, u32)>,
-        content: String,
-        reasoning: String,
-    }
-
-    fn said(events: &[Event]) -> Said {
-        let finish = events.iter().find_map(|event| match event {
-            Event::Finish {
-                reason, tool_calls, ..
-            } => Some((reason.clone(), *tool_calls)),
-            _ => None,
-        });
-        Said {
-            calls: calls(events),
-            finish,
-            content: content(events),
-            reasoning: reasoning(events),
-        }
     }
 
     /// `output` read whole and at every two-way cut says the same.

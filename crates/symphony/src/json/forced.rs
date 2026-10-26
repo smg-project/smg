@@ -139,7 +139,7 @@ impl crate::engine::CallAssembler for Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::names;
+    use crate::testing::{arguments, names};
 
     const ARGUMENTS: &str = "{\"city\": \"Paris\", \"days\": [1, 2]}";
 
@@ -152,16 +152,6 @@ mod tests {
         }
         assembler.finish(&mut out);
         (out.drain(), taken)
-    }
-
-    fn arguments(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|e| match e {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
-                _ => None,
-            })
-            .collect()
     }
 
     fn ends(events: &[Event]) -> usize {

@@ -122,6 +122,7 @@ impl Object {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::arguments;
 
     /// The object fed in `pieces` and finished, as the region's end or the stream's finishes it:
     /// its events and how many bytes it took.
@@ -152,16 +153,6 @@ mod tests {
                 }
                 Event::Malformed { text, .. } => &*text.text,
                 other => panic!("an event the object never pushes: {other:?}"),
-            })
-            .collect()
-    }
-
-    fn arguments(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
-                _ => None,
             })
             .collect()
     }

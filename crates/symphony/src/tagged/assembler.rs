@@ -828,7 +828,7 @@ mod tests {
     use super::*;
     use crate::{
         tagged::{dropped, nothing_empty, refused, shown},
-        testing::bytes,
+        testing::{arguments, bytes, malformed},
     };
 
     fn ids() -> CallIds {
@@ -892,32 +892,11 @@ mod tests {
         run(pieces, Placement::OwnLine, Assembler::close).0
     }
 
-    /// The arguments as the client sees them: every fragment, concatenated.
-    fn arguments(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
     fn name_of<'a>(events: &'a [Event<'_>]) -> Option<&'a str> {
         events.iter().find_map(|event| match event {
             Event::ToolCallStart { name, .. } => Some(name.as_str()),
             _ => None,
         })
-    }
-
-    fn malformed(events: &[Event]) -> Vec<(String, MalformedReason)> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
-                _ => None,
-            })
-            .collect()
     }
 
     fn ends(events: &[Event]) -> usize {
