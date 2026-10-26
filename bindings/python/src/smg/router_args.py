@@ -1497,7 +1497,13 @@ class RouterArgs:
         routing_group.add_argument(
             f"--{prefix}dp-minimum-tokens-scheduler",
             action="store_true",
-            help="Enable minimum tokens scheduler for data parallel group",
+            help=(
+                "Choose a data-parallel rank per request from the ranks' reported token"
+                " loads: the HTTP prefill-decode router, for an engine registered as one"
+                " worker. Under --dp-aware the engine's ranks are workers and the policy's"
+                " pick among them is the rank choice, so this flag chooses nothing there"
+                " (warned at start-up)"
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}enable-igw",

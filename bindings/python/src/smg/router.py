@@ -350,7 +350,11 @@ class Router:
             all workers; eviction keeps every tree at or under this bound.
             Default: 2^26
         dp_aware: Enable data parallelism aware schedule. Default: False
-        dp_minimum_tokens_scheduler: Enable minimum tokens scheduler for data parallel group. Default: False
+        dp_minimum_tokens_scheduler: Choose a data-parallel rank per request from the
+            ranks' reported token loads: the HTTP prefill-decode router, for an engine
+            registered as one worker. Under dp_aware the engine's ranks are workers and
+            the policy's pick among them is the rank choice, so this chooses nothing
+            there (warned at start-up). Default: False
         upstream_http2: Speak HTTP/2 to workers via prior knowledge (h2c on
             cleartext), multiplexing every request to a worker over one
             connection. Negotiated per worker at registration: a worker that

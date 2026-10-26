@@ -2912,10 +2912,10 @@ mod tests {
         }
     }
 
-    /// A count above a small multiple of the CPUs available to the process
-    /// is a warning, not a refusal: the pure rule names the advised count
-    /// and the CPUs, says nothing within it, counts an unreadable
-    /// parallelism as one CPU, and the validator passes such a count.
+    /// The minimum-tokens scheduler set with rank expansion is a warning,
+    /// not a refusal: the pure rule names the pair and the scheduler's
+    /// scope, says nothing for the other three settings, and the validator
+    /// passes the pair.
     #[test]
     fn the_minimum_tokens_scheduler_under_dp_aware_warns_without_a_refusal() {
         let warning = dp_minimum_tokens_scheduler_scope_warning(true, true).expect("a warning");
@@ -2941,6 +2941,10 @@ mod tests {
         assert!(ConfigValidator::validate(&config).is_ok());
     }
 
+    /// A count above a small multiple of the CPUs available to the process
+    /// is a warning, not a refusal: the pure rule names the advised count
+    /// and the CPUs, says nothing within it, counts an unreadable
+    /// parallelism as one CPU, and the validator passes such a count.
     #[test]
     fn runtime_worker_threads_above_four_per_cpu_warn_without_a_refusal() {
         assert_eq!(runtime_worker_threads_oversubscription(8, 2), None);
