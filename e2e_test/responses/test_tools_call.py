@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from infra import BRAVE_MCP_URL
 from infra.streams import collect_streamed_response
+from infra.web_search import skip_if_web_search_found_nothing
 
 logger = logging.getLogger(__name__)
 
@@ -509,6 +510,7 @@ class TestToolCallingCloud:
         assert len(mcp_calls) > 0
         assert_all_mcp_call_ids_prefixed(resp.output)
 
+        skip_if_web_search_found_nothing(resp.output)
         for mcp_call in mcp_calls:
             assert mcp_call.error is None
             assert mcp_call.status == "completed"
@@ -585,6 +587,7 @@ class TestToolCallingCloud:
         assert len(mcp_calls) > 0
         assert_all_mcp_call_ids_prefixed(final_output)
 
+        skip_if_web_search_found_nothing(final_response.output)
         for mcp_call in mcp_calls:
             assert mcp_call.error is None
             assert mcp_call.status == "completed"
@@ -659,6 +662,7 @@ class TestToolCallingCloud:
         list_tool_labels = {item.server_label for item in list_tools_items}
         assert list_tool_labels == {"brave", "deepwiki"}
 
+        skip_if_web_search_found_nothing(resp.output)
         mcp_calls = [item for item in resp.output if item.type == "mcp_call"]
         assert len(mcp_calls) > 0
         for mcp_call in mcp_calls:
@@ -701,6 +705,7 @@ class TestToolCallingCloud:
         final_labels = {item.server_label for item in final_list_tools}
         assert final_labels == {"brave", "deepwiki"}
 
+        skip_if_web_search_found_nothing(final_response.output)
         mcp_calls = [item for item in final_response.output if item.type == "mcp_call"]
         assert len(mcp_calls) > 0
         for mcp_call in mcp_calls:
@@ -1041,6 +1046,7 @@ class TestToolChoiceGptOss:
         mcp_calls = [item for item in resp.output if item.type == "mcp_call"]
         assert len(mcp_calls) > 0
 
+        skip_if_web_search_found_nothing(resp.output)
         for mcp_call in mcp_calls:
             assert mcp_call.id is not None
             assert mcp_call.error is None
@@ -1147,6 +1153,7 @@ class TestToolChoiceGptOss:
         list_tool_labels = {item.server_label for item in list_tools_items}
         assert list_tool_labels == {"brave", "deepwiki"}
 
+        skip_if_web_search_found_nothing(resp.output)
         mcp_calls = [item for item in resp.output if item.type == "mcp_call"]
         assert len(mcp_calls) > 0
         for mcp_call in mcp_calls:
@@ -1189,6 +1196,7 @@ class TestToolChoiceGptOss:
         final_labels = {item.server_label for item in final_list_tools}
         assert final_labels == {"brave", "deepwiki"}
 
+        skip_if_web_search_found_nothing(final_response.output)
         mcp_calls = [item for item in final_response.output if item.type == "mcp_call"]
         assert len(mcp_calls) > 0
         for mcp_call in mcp_calls:
@@ -1455,6 +1463,7 @@ class TestToolChoiceLocal:
         list_tool_labels = {item.server_label for item in list_tools_items}
         assert list_tool_labels == {"brave", "deepwiki"}
 
+        skip_if_web_search_found_nothing(resp.output)
         mcp_calls = [item for item in resp.output if item.type == "mcp_call"]
         assert len(mcp_calls) > 0
         for mcp_call in mcp_calls:
@@ -1497,6 +1506,7 @@ class TestToolChoiceLocal:
         final_labels = {item.server_label for item in final_list_tools}
         assert final_labels == {"brave", "deepwiki"}
 
+        skip_if_web_search_found_nothing(final_response.output)
         mcp_calls = [item for item in final_response.output if item.type == "mcp_call"]
         assert len(mcp_calls) > 0
         for mcp_call in mcp_calls:
