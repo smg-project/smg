@@ -1,0 +1,98 @@
+{
+  "result": "UNAPPLIED_DIAGNOSTIC_REQUEST_DATA",
+  "basis": "Original current class and actual Rust raw1466–1557, six requests per lane; old mixed x3 is not equivalent.",
+  "source_head": "7ec62252d95f075a8e7125f39485179c52567d3d",
+  "class_AST_sha256": "4724691b874f6b224963b84dd3239febfebc601d48d10d0a546539b0f79a91c4",
+  "model": "Qwen/Qwen3-VL-8B-Instruct",
+  "model_request_value": "Same actual fixture-resolved model path in both lanes; join /models/Qwen/Qwen3-VL-8B-Instruct and actual snapshot before running, not old forced alias.",
+  "all_images": "Original dog.jpg/pug.jpg; base64 data:image/jpeg;base64; original raw.githubusercontent.com/smg-project/smg/main/e2e_test/fixtures/images/{dog,pug}.jpg URLs unchanged.",
+  "fixture_pins": [
+    {
+      "path": "e2e_test/fixtures/images/dog.jpg",
+      "git_blob": "a1cf100bb00848c53d62cd1dc1a22b75de3725aa",
+      "sha256": "e1cd91db28149f21f3c410ffa074d0fb8bc8950740ba140c7eaae130f0493464",
+      "size_bytes": 14031,
+      "Rust_head_and_product1473_exact": true
+    },
+    {
+      "path": "e2e_test/fixtures/images/pug.jpg",
+      "git_blob": "85669747cf1747824db4f926e7bcaf5720c6babf",
+      "sha256": "9601bd492fd14ccea9adfe401135794adbf682f3354b3cdfed099fc20d6b3510",
+      "size_bytes": 14501,
+      "Rust_head_and_product1473_exact": true
+    }
+  ],
+  "requests": [
+    {
+      "order": 1,
+      "nodeid": "e2e_test/chat_completions/test_multimodal.py::TestMultimodalQwen3VL::test_multi_images_mixed[grpc]",
+      "temperature": 0,
+      "max_tokens": 300,
+      "stream": false,
+      "user_text": "How many images did I send? Describe each. Are any of them the same?",
+      "images_in_order": [
+        "base64:dog.jpg",
+        "URL:pug.jpg",
+        "base64:pug.jpg"
+      ]
+    },
+    {
+      "order": 2,
+      "nodeid": "e2e_test/chat_completions/test_multimodal.py::TestMultimodalQwen3VL::test_processing_location_matches_lane[grpc]",
+      "temperature": 0,
+      "max_tokens": 16,
+      "stream": false,
+      "user_text": "What animal is in this image?",
+      "images_in_order": [
+        "base64:dog.jpg"
+      ]
+    },
+    {
+      "order": 3,
+      "nodeid": "e2e_test/chat_completions/test_multimodal.py::TestMultimodalQwen3VL::test_single_image_base64[non_streaming-grpc]",
+      "temperature": 0,
+      "max_tokens": 100,
+      "stream": false,
+      "user_text": "What animal is in this image?",
+      "images_in_order": [
+        "base64:dog.jpg"
+      ]
+    },
+    {
+      "order": 4,
+      "nodeid": "e2e_test/chat_completions/test_multimodal.py::TestMultimodalQwen3VL::test_single_image_base64[streaming-grpc]",
+      "temperature": 0,
+      "max_tokens": 100,
+      "stream": true,
+      "user_text": "What animal is in this image?",
+      "images_in_order": [
+        "base64:dog.jpg"
+      ]
+    },
+    {
+      "order": 5,
+      "nodeid": "e2e_test/chat_completions/test_multimodal.py::TestMultimodalQwen3VL::test_single_image_url[non_streaming-grpc]",
+      "temperature": 0,
+      "max_tokens": 100,
+      "stream": false,
+      "user_text": "What animal is in this image?",
+      "images_in_order": [
+        "URL:dog.jpg"
+      ]
+    },
+    {
+      "order": 6,
+      "nodeid": "e2e_test/chat_completions/test_multimodal.py::TestMultimodalQwen3VL::test_single_image_url[streaming-grpc]",
+      "temperature": 0,
+      "max_tokens": 100,
+      "stream": true,
+      "user_text": "What animal is in this image?",
+      "images_in_order": [
+        "URL:dog.jpg"
+      ]
+    }
+  ],
+  "within_lane": "Same worker/gateway, no flush/restart between six requests. Capture exact response/first exception once; no automatic diagnostic retry. Original full-row reruns2/delay5 remain unchanged.",
+  "oracles": "Retain original keyword/positive usage/stream-multiple-chunks assertions. Mixed requires dog+pug+duplicate keywords, explicitly no exact count3. Processing-location request body is same in A/B; only B can evaluate original gateway processing metrics, A records not-applicable.",
+  "limits": "Twelve observational requests are not original six pytest execution, full251/full231, or acceptance credit."
+}

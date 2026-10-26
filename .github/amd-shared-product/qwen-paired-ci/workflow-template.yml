@@ -1,0 +1,51 @@
+name: Root-owned Qwen paired v5 diagnostic only
+on:
+  workflow_dispatch:
+    inputs:
+      admission_nonce:
+        description: Exact root-approved new2100 nonce; source defaults refuse execution
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: amd-qwen-paired-v5-single-owner
+  cancel-in-progress: false
+jobs:
+  qwen-paired-v5:
+    name: qwen-paired-v5 / run
+    runs-on: 1-gpu-mi300x
+    timeout-minutes: 35
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout the exact private admitted child
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Run paired v5 under this scheduled Runner.Worker
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ADMISSION_NONCE: ${{ inputs.admission_nonce }}
+        run: python3 .github/amd-shared-product/qwen-paired-ci/job_runner.py run
+      - name: Finalize only this run's exact nonce CID
+        if: always()
+        run: python3 .github/amd-shared-product/qwen-paired-ci/job_runner.py cleanup
+      - name: Preserve bounded raw paired diagnostic evidence
+        if: always()
+        timeout-minutes: 1
+        uses: actions/upload-artifact@v7
+        with:
+          name: qwen-paired-v5-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/qwen-paired-v5-${{ github.run_id }}-${{ github.run_attempt }}/evidence/
+            ${{ runner.temp }}/qwen-paired-v5-${{ github.run_id }}-${{ github.run_attempt }}/root-result.json
+            ${{ runner.temp }}/qwen-paired-v5-${{ github.run_id }}-${{ github.run_attempt }}/cleanup-result.json
+            ${{ runner.temp }}/qwen-paired-v5-${{ github.run_id }}-${{ github.run_attempt }}/state.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Require actual paired oracles and exact-CID cleanup
+        if: always()
+        run: python3 .github/amd-shared-product/qwen-paired-ci/job_runner.py require-result

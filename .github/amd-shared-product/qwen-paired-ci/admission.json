@@ -1,0 +1,65 @@
+{
+  "ready": false,
+  "root_manual_admission": false,
+  "run_budget_admitted": false,
+  "artifacts_pinned": false,
+  "reservation_seconds": 0,
+  "NEW_runner_seconds": 2100,
+  "source_parent": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
+  "repository": "smg-project/smg",
+  "approved_actor": null,
+  "approved_branch": null,
+  "admission_nonce": null,
+  "root_budget_receipt": null,
+  "root_budget_receipt_sha256": null,
+  "new_CI_peer_path": null,
+  "new_CI_peer_sha256": null,
+  "source_manifest_sha256": "4c3134f3ece7632fbc4de3fbe23e979affecf63aa634d77609a74ff6d9ceadae",
+  "nodes": {
+    "amd-mi300x-1": {
+      "GPU_index": "0",
+      "model": {
+        "snapshot": null,
+        "revision": null,
+        "config_and_tokenizer_files": [],
+        "shards": [],
+        "all_declared_weight_headers_valid": false,
+        "complete_index_tensor_names_match": false,
+        "source_receipt": null,
+        "index": null,
+        "fixture_resolved_model_path": null,
+        "fixture_HF_ref": {
+          "path": null,
+          "bytes": null,
+          "sha256": null
+        }
+      },
+      "permitted_background_processes": []
+    },
+    "amd-mi300x-2": {
+      "GPU_index": "0",
+      "model": {
+        "snapshot": null,
+        "revision": null,
+        "config_and_tokenizer_files": [],
+        "shards": [],
+        "all_declared_weight_headers_valid": false,
+        "complete_index_tensor_names_match": false,
+        "source_receipt": null,
+        "index": null,
+        "fixture_resolved_model_path": null,
+        "fixture_HF_ref": {
+          "path": null,
+          "bytes": null,
+          "sha256": null
+        }
+      },
+      "permitted_background_processes": []
+    }
+  },
+  "runtime_result": null,
+  "coverage_increment": 0,
+  "paired_observations": 12,
+  "original_pytest_cases_executed": 0,
+  "original_Qwen6_source_retained": true
+}

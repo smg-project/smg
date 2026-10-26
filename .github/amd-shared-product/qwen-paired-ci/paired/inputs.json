@@ -1,0 +1,304 @@
+{
+  "result": "SOURCE_ONLY_UNADMITTED_CURRENT1473_PAIRED_DIAGNOSTIC",
+  "source_parent": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
+  "image": "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d",
+  "consumer19": {
+    ".cargo": "8a9d55bb8edfa19d9f90b313fbdc24326d3f667b",
+    "Cargo.toml": "cb29df18a6eede1eed9f2d244367e804d20a2f14",
+    "Cargo.lock": "7022fa76a1f1e4ef7aa812ee7f2d3ac159fd6aa4",
+    "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+    "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+    "bindings": "a7570c34e19461de3579acc385541f7afc9de774",
+    "clients": "599d7ce2727e5d6287825271f464a3b7b5e64ee9",
+    "crates": "aa183216a4a450185252105434e4fe8f981ebd94",
+    "model_gateway": "c9b0a8e790c4f71a760c41fd4e311f546db6bf48",
+    "grpc_servicer": "7e23f8999c36292d7b0c8bfd11b29843352da2b0",
+    "e2e_test": "492e701db279e840457d832af81f5e0377112109",
+    "scripts": "2aaa0d62644a24b1580a7ef46ee6fd00499ff57b",
+    ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
+    ".github/workflows/e2e-gpu-job.yml": "453b36ebfd26262dc79c3f376dcb2469af6435a1",
+    "README.md": "83b7df25632da03f0184bd5b4628b9c9a3ace803",
+    "LICENSE": "9088c2872db9763b9e6533c6960e9adb0c9cb65f",
+    "rustfmt.toml": "19e1ab31f8958c31292f0f568976a036af7e683b",
+    "clippy.toml": "cfb9e85a5074e6b02e603df8da9653ee18dbcca3",
+    "examples/wasm": "fc10fea21779371f9de247209af2028cf8173236"
+  },
+  "compiled37": {
+    ".cargo": "8a9d55bb8edfa19d9f90b313fbdc24326d3f667b",
+    "Cargo.toml": "cb29df18a6eede1eed9f2d244367e804d20a2f14",
+    "Cargo.lock": "7022fa76a1f1e4ef7aa812ee7f2d3ac159fd6aa4",
+    "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+    "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+    "bindings": "a7570c34e19461de3579acc385541f7afc9de774",
+    "clients": "599d7ce2727e5d6287825271f464a3b7b5e64ee9",
+    "model_gateway": "c9b0a8e790c4f71a760c41fd4e311f546db6bf48",
+    "examples/wasm": "fc10fea21779371f9de247209af2028cf8173236",
+    "crates/auth": "642cfcb069e7a56f0637909b6bf67365f4c48d07",
+    "crates/data_connector": "2ca7833aab63d6f08f7bc0da901aab61afa21230",
+    "crates/engine_servicer": "ec24b9e50c3bfebfeafc9cd77b0543c5a4a9075e",
+    "crates/engine_zmq_adapter": "8249fedf64b9682d3a3f300578d9e1fceacd8cdd",
+    "crates/engine_zmq_client": "54191b437189593eb07d395f67de733031cfc4e0",
+    "crates/external_router": "203ff0abe44f03e23c0777da075befe3a170bf5b",
+    "crates/kv_index": "e06fc1ee0a365ad1bf8206c2b8b93097fa4521dd",
+    "crates/mcp": "4c7ba4ce0a2b299525230da4b8f709c1720f5bd7",
+    "crates/mesh": "5ea000e15527dbd3728257eb5515f30dc1e31b38",
+    "crates/mm_rdma": "5e42c1198e2f08f74061c398258971e7ecaa33aa",
+    "crates/mock_worker": "d746fa9732055d088918d5f3215fa9ec61d38935",
+    "crates/multimodal": "813c63d70c24910dd91559ccc887cee812eb15cb",
+    "crates/protocols": "2d2231cf4c98e5d3de8887fbbb95dcaf53f5828e",
+    "crates/radix_tree": "063bfb16dbbf4423b632fbc00aa79b01a3b06996",
+    "crates/reasoning_parser": "fad4e67c1082415ccf5975209cf6dbb4b4753651",
+    "crates/response_template": "51ea20dd99da5a89644f0960c64d8a383c144b02",
+    "crates/rl": "01aa1de7bdca3e37f94e1ba19c16aead3a9a540a",
+    "crates/symphony": "6ffa46daebe55f544d28ad241f132add630568e7",
+    "crates/tokenizer": "02d9079a02cbe7bfcd5213c71004fcb53642a84e",
+    "crates/tool_parser": "4f2b4246f15b1497fdf74f4c5683e0a57ff37db0",
+    "crates/wasm": "fb912247f8c792a58e7add6a04d69a3c492d3670",
+    "crates/workflow": "8ccb53659ecf1013f7f533db14f5cb9270c8ccfc",
+    "crates/grpc_client/Cargo.toml": "16ed107c1d32f668216ca23bc92f6862457ac14f",
+    "crates/grpc_client/build.rs": "946832e4554939503959adf7d0ee725beb6b65c8",
+    "crates/grpc_client/go": "89b5a2463e45e0f64d577e9ab74ec318653b9352",
+    "crates/grpc_client/proto": "a74e47fffa37e1f9a2448dd658544a97c0430686",
+    "crates/grpc_client/src": "29f6a377b334297582af8f01019192839a963b6a",
+    "crates/grpc_client/tests": "61ce3e030a193e2f118cedd213edcd82622bdf56"
+  },
+  "producer14": {
+    ".cargo": "8a9d55bb8edfa19d9f90b313fbdc24326d3f667b",
+    "Cargo.toml": "cb29df18a6eede1eed9f2d244367e804d20a2f14",
+    "Cargo.lock": "7022fa76a1f1e4ef7aa812ee7f2d3ac159fd6aa4",
+    "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+    "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+    "bindings": "a7570c34e19461de3579acc385541f7afc9de774",
+    "clients": "599d7ce2727e5d6287825271f464a3b7b5e64ee9",
+    "crates": "aa183216a4a450185252105434e4fe8f981ebd94",
+    "model_gateway": "c9b0a8e790c4f71a760c41fd4e311f546db6bf48",
+    "grpc_servicer": "7e23f8999c36292d7b0c8bfd11b29843352da2b0",
+    "e2e_test": "c255aac03c859b861907554808ebba71fcb9b30c",
+    "scripts": "a5f12792df38a4cb1f82ef724f8234360fddf99a",
+    ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
+    ".github/workflows": "dac1133ab809a4b6cdc7deddaed7cacbc029d696"
+  },
+  "producer_head": "d5f8f9e765dcdec1f56dd623b46e49e1e47862d4",
+  "four_artifacts": [
+    {
+      "name": "smg-wheel",
+      "id": 12609313653,
+      "bytes": 52600567,
+      "sha256": "ecce3937864f36c77ac5f08734bc73ef5795e5e8e23cd794fce8ea1cd30e2cb8",
+      "expires_at": "2026-10-26T18:20:49Z",
+      "files": {
+        "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl": {
+          "bytes": 52739343,
+          "sha256": "e2bd9a2325d4a9ef96d3d89ec91c41b2945019bbe3d511d2fbf7589caeebd750"
+        }
+      }
+    },
+    {
+      "name": "wasm-test-fixtures",
+      "id": 12609142504,
+      "bytes": 56596,
+      "sha256": "2169eab7ef97014996abb71a15eacfbd9217c77759c6fff16bafabfa5feb8ba3",
+      "expires_at": "2026-10-26T18:20:59Z",
+      "files": {
+        "storage_hook_guest.wasm": {
+          "bytes": 80680,
+          "sha256": "7e3a093e09bfe30244d128c1aaaf8558a1b13c05558cc81cff04021947445e11"
+        },
+        "storage_hook_passthrough.wasm": {
+          "bytes": 79153,
+          "sha256": "3a10ce115ea179026a00f3e85ce6b6a388bcc1f274bc7abfc074be876d7c3e55"
+        }
+      }
+    },
+    {
+      "name": "python-client-types",
+      "id": 12608937526,
+      "bytes": 34700,
+      "sha256": "19cb852722d76789e6e69a2f7f53b11e4a618dbacb9646f34158c6498928f78e",
+      "expires_at": "2026-10-26T18:20:57Z",
+      "files": {
+        "_generated.py": {
+          "bytes": 188140,
+          "sha256": "95c2ed8d194fc673d4695afa62542bc5fa801ac14e8af5d310920e329c3ea537"
+        }
+      }
+    },
+    {
+      "name": "go-ffi-library",
+      "id": 12608627976,
+      "bytes": 13845631,
+      "sha256": "30848e64a676f301ba428169ce96ede0106800d9114c5bca6db230fb31c6b876",
+      "expires_at": "2026-10-26T18:20:53Z",
+      "files": {
+        "libsmg_go.d": {
+          "bytes": 66105,
+          "sha256": "caa91d5d341e096bad353e1ac16fbd3000ae3c7f4560970b13a27fcb70efeb34"
+        },
+        "libsmg_go.so": {
+          "bytes": 35041680,
+          "sha256": "ef55ec047165f9f4c6226249538598b125c6fcd0ee459eaf3b18035697c77a12"
+        }
+      }
+    }
+  ],
+  "gateway_native": {
+    "name": "smg/smg_rs.abi3.so",
+    "bytes": 143064752,
+    "sha256": "b7d5ccb1d5e4c06cf93fc9f77ad405951b9d3def7038113f5435a0d57a170fd6"
+  },
+  "runtime_versions": {
+    "smg-grpc-proto": "0.4.28",
+    "smg": "1.13.0",
+    "smg-grpc-servicer": "0.14.1",
+    "grpcio-reflection": "1.81.1",
+    "protobuf": "6.33.6",
+    "grpcio-health-checking": "1.81.1",
+    "pillow": "11.3.0",
+    "sglang": "0.5.21",
+    "transformers": "5.12.1",
+    "grpcio": "1.84.0",
+    "torch": "2.11.0+rocm10.0.0"
+  },
+  "helpers": {
+    "http_observe.py": "c1b7d42917386a4cf3b3bf144680503eae3f9b4587b97b4c6e78e54254d3bba0",
+    "owned_processes.py": "04a8d619482bcd473c81ea98c0ad3aef91a32cced610dcb16edb99d14c873999",
+    "runtime_check.py": "98255bd35bac65f019f25af779758d89fcb53d64e874f800146cb9bd2f9effcb",
+    "root_container_envelope.py": "06589cd12a0547a4e1d5547f8e24afb6c849ec8e95854d997b73bf1180d1ccfd",
+    "six-request-matrix.json": "f9475f82fed3fafcd5497c5702e5f3390d045695276d41525b4d9938cc17f3dd"
+  },
+  "budget": {
+    "NEW_runner_seconds": 2100,
+    "combined_CI_setup_and_validation_seconds": 180,
+    "each_combined_engine_start_warmup_seconds": 600,
+    "number_requests": 12,
+    "cleanup_reserved_seconds": 120,
+    "arithmetic": 2580,
+    "slack_seconds": null,
+    "GPU_jobs": 1,
+    "GPU_devices_simultaneous": 1,
+    "lanes_sequential": 2,
+    "each_original_request_seconds": 90,
+    "absolute_total_seconds": 2100,
+    "absolute_work_seconds": 1980,
+    "completion_guaranteed": false,
+    "arithmetic_note": "12x90+2x600+180+120=2580 nominal phase maxima exceeds2100. Absolute2100/1980 remains binding; maxima are not an additional allowance. Complete all12 only if actual phases fit; deadline preserves partial data and fails. No request cap reduction or budget expansion is proposed."
+  },
+  "ready": false,
+  "run_budget_admitted": false,
+  "reservation_seconds": 0,
+  "coverage_increment": 0,
+  "URL_probe_boundary": "Real dog.jpg and pug.jpg original URLs through actual bound common.download_remote_media before/after each lane; fixture bytes pinned. This is not internal B Rust downloader raw-byte attestation. No redirects/proxies/MITM/CA/DNS/content substitution.",
+  "producer_run": 40218847194,
+  "runtime_pins_basis": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/SG-d5f8-b7-local-normal-CPU600-output-permission-child-C-20261025/captured/output/pip-inspect-final.stdout",
+  "runtime_pins_basis_sha256": "4b5609dfe4d1c0666bded9c69a259d6460feecce22a9164ae2599b3bdd9c1753",
+  "installed_source_files": [
+    {
+      "source_relative": "e2e_test/chat_completions/test_multimodal.py",
+      "bytes": 11447,
+      "sha256": "16bd2571a8d9054d9ec69c9f90aa7dcb4369fa5b387eee2a235001e7799f881e"
+    },
+    {
+      "source_relative": "e2e_test/infra/worker.py",
+      "bytes": 57360,
+      "sha256": "ca7218c4f7e9994ea7f1c83c615e32b6fe73ad45ed5d39175b8664c2d9c7a6ee"
+    },
+    {
+      "source_relative": "e2e_test/infra/model_specs.py",
+      "bytes": 12852,
+      "sha256": "b233a50a65c8fcf00ca80e08285208e6bf5ddb68d7331d900a3c16aaf4f303dd"
+    },
+    {
+      "source_relative": "e2e_test/fixtures/setup_backend.py",
+      "bytes": 36041,
+      "sha256": "77959eb1afde2aaeffd3d5b8b370f5f04011cef0fcf9da5ddf06e179e7238ed6"
+    },
+    {
+      "source_relative": "grpc_servicer/smg_grpc_servicer/sglang/rust.py",
+      "bytes": 29333,
+      "sha256": "8a6f6886c952a67b82d770699616f8741ebaf303ef17f3aa17b88ebaaaa1d9bf"
+    },
+    {
+      "source_relative": "grpc_servicer/smg_grpc_servicer/sglang/plugin.py",
+      "bytes": 5190,
+      "sha256": "c168f0677950a167f601fc7398f78c7a95f67a9b7d224dcf06cd2a57f579a464"
+    },
+    {
+      "source_relative": "grpc_servicer/smg_grpc_servicer/sglang/zmq_msgpack.py",
+      "bytes": 52364,
+      "sha256": "12c79e910aa465cb5f7e200ffb09ae257570d3e4afd81174cda84dd759fbe3a5"
+    },
+    {
+      "source_relative": "grpc_servicer/smg_grpc_servicer/sglang/request_traces.py",
+      "bytes": 5077,
+      "sha256": "c90abce6bcecc2e18107fe37af23c7e9283345f78fa38d68675d84f7f607ed60"
+    },
+    {
+      "source_relative": "crates/engine_zmq_adapter/src/sglang.rs",
+      "bytes": 92054,
+      "sha256": "3905f1d171c05541c6efd1d122812be6830a266a6019393e624e408d840f8ffb"
+    },
+    {
+      "source_relative": "crates/tokenizer/src/byte_level.rs",
+      "bytes": 28260,
+      "sha256": "05ff8b1249a8d079553130da96eac1ef2f91044372154135b55b23aac93a2d5e"
+    },
+    {
+      "source_relative": "model_gateway/src/routers/grpc/multimodal/mod.rs",
+      "bytes": 29672,
+      "sha256": "d5fd074a31ad71cc8f86fed46cc7a200e2a56cca8f2113a308190a4734cb6799"
+    },
+    {
+      "source_relative": "e2e_test/fixtures/images/dog.jpg",
+      "bytes": 14031,
+      "sha256": "e1cd91db28149f21f3c410ffa074d0fb8bc8950740ba140c7eaae130f0493464"
+    },
+    {
+      "source_relative": "e2e_test/fixtures/images/pug.jpg",
+      "bytes": 14501,
+      "sha256": "9601bd492fd14ccea9adfe401135794adbf682f3354b3cdfed099fc20d6b3510"
+    },
+    {
+      "source_relative": "e2e_test/infra/mm_processing.py",
+      "bytes": 2969,
+      "sha256": "d72d19c4063462cd97ce8591e6538c6c42f8f0504805e68ae19219220e1ba729"
+    }
+  ],
+  "metrics_source_sha256": "d72d19c4063462cd97ce8591e6538c6c42f8f0504805e68ae19219220e1ba729",
+  "required_engine_source_suffixes": [
+    "/sglang/launch_server.py",
+    "/sglang/srt/server_args.py",
+    "/sglang/srt/utils/common.py",
+    "/sglang/srt/entrypoints/http_server.py",
+    "/sglang/srt/multimodal/processors/base_processor.py",
+    "/sglang/srt/managers/scheduler.py",
+    "/sglang/srt/model_executor/forward_batch_info.py",
+    "/sglang/srt/managers/mm_schedule.py"
+  ],
+  "future_actual_engine_source_evidence": "Root must bind current exact4420 after-normal engine paths/SHA/RECORD relationship in preparation_proof.engine_source_files and native_download_common_sha256. No old private trace/engine hashes are imported. This is part of existing real preparation proof, not an executable collection framework or runtime acceptance.",
+  "model_request_value": "Root binds actual original fixture-resolved model path; no forced alias or served-name override.",
+  "original_class_source_sha256": "16bd2571a8d9054d9ec69c9f90aa7dcb4369fa5b387eee2a235001e7799f881e",
+  "original_class_AST_sha256": "4724691b874f6b224963b84dd3239febfebc601d48d10d0a546539b0f79a91c4",
+  "root_cause": "UNDETERMINED",
+  "original6pytest_full251_full231_or38credit": false,
+  "producer_policy": "exact_d5f8_main_push_build_leg_all_17_steps_success_v1",
+  "producer_build_job_id": 121246077837,
+  "producer_build_step_names": [
+    "Build Python wheel and Go FFI library",
+    "Build WASM test fixtures",
+    "Complete job",
+    "Generate Python client types",
+    "Post Run actions/checkout@v7",
+    "Post Set up Python",
+    "Post Setup Rust",
+    "Run actions/checkout@v7",
+    "Set up Python",
+    "Set up job",
+    "Setup Rust",
+    "Show sccache stats",
+    "Test wheel install",
+    "Upload Go FFI library artifact",
+    "Upload Python client types",
+    "Upload WASM test fixtures",
+    "Upload wheel artifact"
+  ]
+}
