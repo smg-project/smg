@@ -300,11 +300,16 @@ jobs:
         env:
           SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
         run: |
-          case "${SMG_SG4_PD_ALLOCATION_PHASE_DIAGNOSTIC:-0}" in
-            0|'') exit 0 ;;
-            1) ;;
-            *) echo "invalid explicit SG4 allocation diagnostic opt-in" >&2; exit 1 ;;
-          esac
+          for FLAG_VALUE in "${SMG_SG4_PD_ALLOCATION_PHASE_DIAGNOSTIC:-0}" "${SMG_SG4_PD_CU_EXISTING_RUNTIME:-0}"; do
+            case "$FLAG_VALUE" in
+              0|'') ;;
+              1) ;;
+              *) echo "invalid explicit SG4 phase/CU opt-in" >&2; exit 1 ;;
+            esac
+          done
+          if [ "${SMG_SG4_PD_ALLOCATION_PHASE_DIAGNOSTIC:-0}" != 1 ] && [ "${SMG_SG4_PD_CU_EXISTING_RUNTIME:-0}" != 1 ]; then
+            exit 0
+          fi
           DIRECTORY="$RUNNER_TEMP/sg4pd-allocation-phase-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           echo "directory=$DIRECTORY" >> "$GITHUB_OUTPUT"
           echo "AMD_DEPENDENCY_DIRECTORY=$DIRECTORY" >> "$GITHUB_ENV"
