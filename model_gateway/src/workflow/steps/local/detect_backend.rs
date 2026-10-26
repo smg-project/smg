@@ -17,7 +17,7 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use super::discover_metadata::ModelsResponse;
 use crate::{
-    worker::ConnectionMode,
+    worker::{endpoint::Endpoint, ConnectionMode},
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
         steps::util::{grpc_base_url, grpc_health_answer, http_base_url},
@@ -63,7 +63,8 @@ async fn detect_grpc_backend(
     }
 
     Err(format!(
-        "gRPC backend detection failed for {url} (tried sglang, vllm, trtllm, tokenspeed, mlx): {}",
+        "gRPC backend detection failed for {} (tried sglang, vllm, trtllm, tokenspeed, mlx): {}",
+        Endpoint::redacted_str(url),
         errors.join("; ")
     ))
 }
@@ -90,6 +91,9 @@ async fn probe_models_endpoint(
     api_key: Option<&str>,
 ) -> ModelsProbe {
     let models_url = format!("{}/v1/models", http_base_url(url));
+    // The address as the probe's failures name it: a userinfo in it masked
+    // (they end in the step's failure message and its lines).
+    let shown = Endpoint::redacted_str(&models_url);
 
     let mut req = client
         .get(&models_url)
@@ -100,25 +104,20 @@ async fn probe_models_endpoint(
 
     let response = match req.send().await {
         Ok(response) => response,
-        Err(e) => return ModelsProbe::Failed(format!("failed to reach {models_url}: {e}")),
+        Err(e) => return ModelsProbe::Failed(format!("failed to reach {shown}: {e}")),
     };
 
     if !response.status().is_success() {
-        return ModelsProbe::Failed(format!(
-            "{models_url} returned status {}",
-            response.status()
-        ));
+        return ModelsProbe::Failed(format!("{shown} returned status {}", response.status()));
     }
 
     let models: ModelsResponse = match response.json().await {
         Ok(models) => models,
-        Err(e) => {
-            return ModelsProbe::Failed(format!("failed to parse {models_url} response: {e}"))
-        }
+        Err(e) => return ModelsProbe::Failed(format!("failed to parse {shown} response: {e}")),
     };
 
     let Some(first_model) = models.data.first() else {
-        return ModelsProbe::Failed(format!("{models_url} returned an empty data array"));
+        return ModelsProbe::Failed(format!("{shown} returned an empty data array"));
     };
 
     match first_model.owned_by.as_deref() {
@@ -144,10 +143,12 @@ async fn try_vllm_version(
         req = req.bearer_auth(key);
     }
 
-    let response = req
-        .send()
-        .await
-        .map_err(|e| format!("Failed to reach {version_url}: {e}"))?;
+    let response = req.send().await.map_err(|e| {
+        format!(
+            "Failed to reach {}: {e}",
+            Endpoint::redacted_str(&version_url)
+        )
+    })?;
 
     if !response.status().is_success() {
         return Err(format!("/version returned {}", response.status()));
@@ -175,7 +176,7 @@ async fn try_sglang_server_info(
     let response = req
         .send()
         .await
-        .map_err(|e| format!("Failed to reach {info_url}: {e}"))?;
+        .map_err(|e| format!("Failed to reach {}: {e}", Endpoint::redacted_str(&info_url)))?;
 
     if !response.status().is_success() {
         return Err(format!("/server_info returned {}", response.status()));
@@ -233,7 +234,7 @@ async fn detect_http_backend(
             if sglang_result.is_ok() {
                 debug!(
                     "Both /version and /server_info succeeded for {}; /version is vLLM-specific, detecting as vllm",
-                    url
+                    Endpoint::redacted_str(url)
                 );
             }
             return Ok("vllm".to_string());
@@ -257,7 +258,7 @@ async fn detect_http_backend(
         // instead of rejecting a healthy worker.
         ModelsProbe::UnrecognizedOwnedBy(owned_by) => {
             warn!(
-                worker = %url,
+                worker = %Endpoint::redacted_str(url),
                 owned_by = ?owned_by,
                 "Could not identify backend engine: /v1/models responded but its \
                  owned_by is not a known engine, and neither /version (vllm) nor \
@@ -267,8 +268,9 @@ async fn detect_http_backend(
             Ok("generic".to_string())
         }
         ModelsProbe::Failed(models_failure) => Err(format!(
-            "Could not detect HTTP backend for {url}: /v1/models: {models_failure}; \
-             /version: {vllm_failure}; /server_info: {sglang_failure}"
+            "Could not detect HTTP backend for {}: /v1/models: {models_failure}; \
+             /version: {vllm_failure}; /server_info: {sglang_failure}",
+            Endpoint::redacted_str(url)
         )),
         // Detected returned early above.
         ModelsProbe::Detected(runtime) => Ok(runtime),
@@ -315,7 +317,8 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
         if config_runtime.is_specified() {
             debug!(
                 "Using explicitly configured runtime type: {} for {}",
-                config_runtime, config.url
+                config_runtime,
+                Endpoint::redacted_str(&config.url)
             );
             context.data.detected_runtime_type = Some(config_runtime.to_string());
             return Ok(StepResult::Success);
@@ -323,7 +326,8 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
 
         debug!(
             "Detecting backend for {} ({:?})",
-            config.url, connection_mode
+            Endpoint::redacted_str(&config.url),
+            connection_mode
         );
 
         let detected = match connection_mode {
@@ -333,14 +337,22 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
                     .await
                     .map_err(|e| WorkflowError::StepFailed {
                         step_id: wfaas::StepId::new("detect_backend"),
-                        message: format!("HTTP backend detection failed for {}: {}", config.url, e),
+                        message: format!(
+                            "HTTP backend detection failed for {}: {}",
+                            Endpoint::redacted_str(&config.url),
+                            e
+                        ),
                     })?
             }
             ConnectionMode::Grpc => detect_grpc_backend(&config.url, timeout, None)
                 .await
                 .map_err(|e| WorkflowError::StepFailed {
                     step_id: wfaas::StepId::new("detect_backend"),
-                    message: format!("gRPC backend detection failed for {}: {}", config.url, e),
+                    message: format!(
+                        "gRPC backend detection failed for {}: {}",
+                        Endpoint::redacted_str(&config.url),
+                        e
+                    ),
                 })?,
             // A ZMQ EngineCore handshake is shared across engine runtimes, so the
             // runtime cannot be probed here. An explicit `runtime_type` (vllm,
@@ -348,7 +360,7 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
             // worker that left it unspecified reaches this default of vLLM.
             ConnectionMode::Zmq => {
                 warn!(
-                    worker = %config.url,
+                    worker = %Endpoint::redacted_str(&config.url),
                     "runtime_type unspecified for ZMQ worker; defaulting to vLLM \
                      EngineCore. A TokenSpeed or SGLang engine must declare its \
                      runtime to speak the correct wire protocol: `--backend \
@@ -362,7 +374,9 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
 
         debug!(
             "Detected backend: {} for {} ({:?})",
-            detected, config.url, connection_mode
+            detected,
+            Endpoint::redacted_str(&config.url),
+            connection_mode
         );
         context.data.detected_runtime_type = Some(detected);
         Ok(StepResult::Success)
@@ -488,6 +502,39 @@ mod tests {
         server.abort();
 
         assert_eq!(runtime, "vllm");
+    }
+
+    /// A worker registered with credentials at a port nobody listens on: the
+    /// detector's error text and every line it wrote name the address masked,
+    /// never the secret (the probes' failures end in the step's failure
+    /// message, which a log line carries). The capture is the tracing
+    /// subscriber itself.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn http_detection_failures_name_the_worker_masked() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let err = detect_http_backend(
+            &format!("http://user:secret@127.0.0.1:{port}"),
+            1,
+            &crate::clients::http_client(),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(!err.contains("secret"), "{err}");
+        assert!(
+            err.contains(&format!("http://***@127.0.0.1:{port}/version")),
+            "{err}"
+        );
+        assert!(!logs_contain("secret"));
+        assert!(!logs_contain("user:"));
+        assert!(logs_contain(&format!(
+            "http://***@127.0.0.1:{port}/v1/models"
+        )));
     }
 
     #[tokio::test]

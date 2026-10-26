@@ -366,7 +366,7 @@ impl LoadBalancingPolicy for PrefixHashPolicy {
         debug!(
             branch = branch.as_str(),
             level,
-            worker = result.map_or("none", |idx| workers[idx].url()),
+            worker = result.map_or("none", |idx| workers[idx].redacted_url()),
             model_id = result.map_or("none", |idx| workers[idx].model_id()),
             "Prefix-hash selection"
         );

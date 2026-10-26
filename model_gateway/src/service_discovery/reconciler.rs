@@ -148,7 +148,7 @@ fn owned_workers(app_context: &AppContext, kind: DiscoveryKind) -> Vec<OwnedWork
                 Ok((endpoint, _)) => endpoint,
                 Err(e) => {
                     warn!(
-                        worker_url = %worker.url(),
+                        worker_url = %worker.redacted_url(),
                         error = %e,
                         "Skipping discovery-owned worker with an unparsable address"
                     );

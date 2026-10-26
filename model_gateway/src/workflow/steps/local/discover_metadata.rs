@@ -12,8 +12,8 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 use crate::{
     routers::grpc::client::{flat_labels, GrpcClient},
     worker::{
-        sampling_defaults::SamplingDefaults, ConnectionMode, DEFAULT_SAMPLING_PARAMS_LABEL,
-        UNKNOWN_MODEL_ID,
+        endpoint::Endpoint, sampling_defaults::SamplingDefaults, ConnectionMode,
+        DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
     },
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
@@ -144,10 +144,12 @@ async fn get_json_with_fallback_classified<T: serde::de::DeserializeOwned>(
         req = req.bearer_auth(key);
     }
 
-    let response = req
-        .send()
-        .await
-        .map_err(|e| MetadataError::Failed(format!("Failed to connect to {url}: {e}")))?;
+    let response = req.send().await.map_err(|e| {
+        MetadataError::Failed(format!(
+            "Failed to connect to {}: {e}",
+            Endpoint::redacted_str(&url)
+        ))
+    })?;
 
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         // Fallback to deprecated /get_<endpoint> prefix
@@ -185,10 +187,12 @@ async fn get_json_with_fallback_classified<T: serde::de::DeserializeOwned>(
         )));
     }
 
-    response
-        .json::<T>()
-        .await
-        .map_err(|e| MetadataError::Failed(format!("Failed to parse {url}: {e}")))
+    response.json::<T>().await.map_err(|e| {
+        MetadataError::Failed(format!(
+            "Failed to parse {}: {e}",
+            Endpoint::redacted_str(&url)
+        ))
+    })
 }
 
 async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
@@ -200,10 +204,12 @@ async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
     if let Some(key) = api_key {
         req = req.bearer_auth(key);
     }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| MetadataError::Failed(format!("Failed to connect to {url}: {e}")))?;
+    let resp = req.send().await.map_err(|e| {
+        MetadataError::Failed(format!(
+            "Failed to connect to {}: {e}",
+            Endpoint::redacted_str(url)
+        ))
+    })?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(MetadataError::NotOffered);
     }
@@ -214,9 +220,12 @@ async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
             url
         )));
     }
-    resp.json::<T>()
-        .await
-        .map_err(|e| MetadataError::Failed(format!("Failed to parse {url}: {e}")))
+    resp.json::<T>().await.map_err(|e| {
+        MetadataError::Failed(format!(
+            "Failed to parse {}: {e}",
+            Endpoint::redacted_str(url)
+        ))
+    })
 }
 
 pub async fn get_server_info(

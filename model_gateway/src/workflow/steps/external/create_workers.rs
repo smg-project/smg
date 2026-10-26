@@ -10,6 +10,7 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 use crate::{
     worker::{
         circuit_breaker::CircuitBreakerConfig,
+        endpoint::Endpoint,
         resilience::{resolve_resilience, ResolvedResilience},
         worker::{RuntimeType, WorkerType},
         BasicWorker, BasicWorkerBuilder, ConnectionMode, Worker,
@@ -150,12 +151,15 @@ impl StepExecutor<WorkerWorkflowData> for CreateExternalWorkersStep {
         let normalized_url = normalize_external_url(&config.url);
 
         if model_cards.is_empty() {
-            debug!("Creating wildcard worker (no models) for {}", config.url);
+            debug!(
+                "Creating wildcard worker (no models) for {}",
+                Endpoint::redacted_str(&config.url)
+            );
         } else {
             debug!(
                 "Creating one external worker with {} discovered models for {}",
                 model_cards.len(),
-                config.url
+                Endpoint::redacted_str(&config.url)
             );
         }
 
@@ -177,12 +181,12 @@ impl StepExecutor<WorkerWorkflowData> for CreateExternalWorkersStep {
         if model_cards.is_empty() {
             info!(
                 "Created wildcard worker at {} (accepts any model, user auth forwarded)",
-                normalized_url
+                Endpoint::redacted_str(&normalized_url)
             );
         } else {
             info!(
                 "Created external worker at {} with {} discovered models",
-                normalized_url,
+                Endpoint::redacted_str(&normalized_url),
                 model_cards.len()
             );
         }

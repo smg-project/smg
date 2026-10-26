@@ -13,7 +13,7 @@ use openai_protocol::worker::WorkerStatus;
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::workflow::data::WorkerRemovalWorkflowData;
+use crate::{worker::endpoint::Endpoint, workflow::data::WorkerRemovalWorkflowData};
 
 /// Step that transitions Ready workers to `Draining` and waits for the
 /// resolved drain settle window before downstream steps remove them.
@@ -51,13 +51,16 @@ impl StepExecutor<WorkerRemovalWorkflowData> for DrainWorkersStep {
             // remove step runs.
             let url = snapshot.url();
             let Some(worker_id) = app_context.worker_registry.get_id_by_url(url) else {
-                debug!("Worker {} not in registry, skipping drain transition", url);
+                debug!(
+                    "Worker {} not in registry, skipping drain transition",
+                    Endpoint::redacted_str(url)
+                );
                 continue;
             };
             let Some(current) = app_context.worker_registry.get(&worker_id) else {
                 debug!(
                     "Worker {} disappeared from registry, skipping drain transition",
-                    url
+                    Endpoint::redacted_str(url)
                 );
                 continue;
             };

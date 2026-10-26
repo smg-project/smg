@@ -40,6 +40,7 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     service_discovery::DISCOVERY_PROVIDER_LABEL,
     worker::{
+        endpoint::Endpoint,
         event::{WorkerConnected, WorkerEvent},
         liveness,
         load_state::LoadSnapshot,
@@ -753,7 +754,7 @@ async fn apply_probe_completion(
         Ok(()) => true,
         Err(err) => {
             warn!(
-                worker_url = %worker.url(),
+                worker_url = %worker.redacted_url(),
                 error = %err,
                 "Health probe failed"
             );
@@ -784,7 +785,7 @@ async fn apply_probe_completion(
         })
     else {
         debug!(
-            worker_url = %worker.url(),
+            worker_url = %worker.redacted_url(),
             expected_revision,
             "Discarding stale probe outcome after worker replacement"
         );
@@ -796,7 +797,7 @@ async fn apply_probe_completion(
         // outage is read from (a refusal names the pool's healthy count, not
         // why it moved); the probe failures behind it are WARN lines already.
         info!(
-            worker_url = %worker.url(),
+            worker_url = %worker.redacted_url(),
             ?old,
             ?new,
             "Worker status transition"
@@ -883,11 +884,11 @@ fn apply_connect_signal(
 ) -> Option<(WorkerId, Arc<dyn Worker>)> {
     let WorkerConnected { url, revision } = connected;
     let Some(worker_id) = registry.get_id_by_url(&url) else {
-        debug!(worker_url = %url, "Connect signal for an unknown worker; ignoring");
+        debug!(worker_url = %Endpoint::redacted_str(&url), "Connect signal for an unknown worker; ignoring");
         return None;
     };
     let Some(worker) = registry.get(&worker_id) else {
-        debug!(worker_url = %url, "Connect signal for a removed worker; ignoring");
+        debug!(worker_url = %Endpoint::redacted_str(&url), "Connect signal for a removed worker; ignoring");
         return None;
     };
     let slot = ProbeSlot::of_worker(
@@ -900,15 +901,15 @@ fn apply_connect_signal(
     // A Failed worker under removal is on its way out: the contact that
     // signalled it was a last poll, not a return.
     if slot == ProbeSlot::Removal {
-        debug!(worker_url = %url, "Connect signal for a worker being removed; ignoring");
+        debug!(worker_url = %Endpoint::redacted_str(&url), "Connect signal for a worker being removed; ignoring");
         return None;
     }
     if matches!(slot, ProbeSlot::Probe(_)) && *worker.connection_mode() != ConnectionMode::Zmq {
         if worker.revision() != revision {
-            debug!(worker_url = %url, "Connect signal for a replaced worker; ignoring");
+            debug!(worker_url = %Endpoint::redacted_str(&url), "Connect signal for a replaced worker; ignoring");
             return None;
         }
-        debug!(worker_url = %url, "Contact from a demoted worker: its health probe runs now");
+        debug!(worker_url = %Endpoint::redacted_str(&url), "Contact from a demoted worker: its health probe runs now");
         schedule_at(
             next_check,
             worker_id,
@@ -920,7 +921,7 @@ fn apply_connect_signal(
     }
     match registry.transition_status_if_revision(&worker_id, revision, WorkerStatus::Ready) {
         Some((old, new)) => {
-            debug!(worker_url = %url, ?old, ?new, "Promoted worker on connect signal");
+            debug!(worker_url = %Endpoint::redacted_str(&url), ?old, ?new, "Promoted worker on connect signal");
             // A promoted worker serves traffic, so it is on the schedule from
             // here whatever its slot was (a Failed worker's may have gone):
             // otherwise a later engine death would leave it Ready with a dead
@@ -939,7 +940,7 @@ fn apply_connect_signal(
         None => {
             // No transition: already Ready (idempotent), or a stale revision
             // after a same-URL replacement. Polling covers either case.
-            debug!(worker_url = %url, "Connect signal applied no transition");
+            debug!(worker_url = %Endpoint::redacted_str(&url), "Connect signal applied no transition");
             None
         }
     }
@@ -994,7 +995,7 @@ async fn refresh_kv_engine_id_after_recovery(worker: &Arc<dyn Worker>, timeout: 
             let previous = worker.kv_engine_id();
             if worker.refresh_kv_engine_id(Some(discovered.clone())) {
                 info!(
-                    worker_url = %worker.url(),
+                    worker_url = %worker.redacted_url(),
                     ?previous,
                     discovered,
                     "Recovered PD worker reports a new KV engine id"
@@ -1008,24 +1009,24 @@ async fn refresh_kv_engine_id_after_recovery(worker: &Arc<dyn Worker>, timeout: 
         Ok(Ok(None)) => {
             match worker.kv_engine_id() {
                 Some(previous) => warn!(
-                    worker_url = %worker.url(),
+                    worker_url = %worker.redacted_url(),
                     previous,
                     "Recovered PD worker reports no KV engine id; keeping the previous one"
                 ),
                 None => debug!(
-                    worker_url = %worker.url(),
+                    worker_url = %worker.redacted_url(),
                     "PD worker reports no KV engine id; handoffs carry none"
                 ),
             }
             worker.set_kv_engine_id_confirmed(true);
         }
         Ok(Err(error)) => warn!(
-            worker_url = %worker.url(),
+            worker_url = %worker.redacted_url(),
             %error,
             "Could not re-read the KV engine id of a recovered PD worker; keeping the previous one and retrying on the next probe"
         ),
         Err(_) => warn!(
-            worker_url = %worker.url(),
+            worker_url = %worker.redacted_url(),
             timeout_secs = timeout.as_secs(),
             "Re-reading the KV engine id of a recovered PD worker timed out; keeping the previous one and retrying on the next probe"
         ),
@@ -1067,15 +1068,15 @@ async fn submit_label_refresh(worker: &Arc<dyn Worker>, job_queue: &Arc<JobQueue
         .await
     {
         Ok(true) => debug!(
-            worker_url = %url,
+            worker_url = %Endpoint::redacted_str(&url),
             "Submitted a label refresh for a worker that came into service"
         ),
         Ok(false) => debug!(
-            worker_url = %url,
+            worker_url = %Endpoint::redacted_str(&url),
             "A job for the worker is in flight; its label refresh waits for the next transition into service"
         ),
         Err(error) => warn!(
-            worker_url = %url,
+            worker_url = %Endpoint::redacted_str(&url),
             %error,
             "Could not submit a label refresh for a worker that came into service"
         ),
@@ -1221,7 +1222,7 @@ async fn submit_removal_job(
     let url = worker_url.to_string();
     warn!(
         worker_id = %worker_id.as_str(),
-        worker_url = %url,
+        worker_url = %Endpoint::redacted_str(&url),
         expected_revision,
         "Removing failed worker from registry"
     );
@@ -1237,7 +1238,7 @@ async fn submit_removal_job(
         .await
     {
         error!(
-            worker_url = %url,
+            worker_url = %Endpoint::redacted_str(&url),
             error = %e,
             "Failed to submit worker removal job"
         );
@@ -1443,7 +1444,9 @@ impl WorkerManager {
                 failed: vec![],
                 total_workers,
                 message: match worker_url {
-                    Some(url) => format!("No worker matching url '{url}'"),
+                    Some(url) => {
+                        format!("No worker matching url '{}'", Endpoint::redacted_str(url))
+                    }
                     None => "No workers available for profiling".to_string(),
                 },
             };

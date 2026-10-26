@@ -762,8 +762,8 @@ impl PDRouter {
         debug!(
             "PD retry attempt {} using prefill={} decode={}",
             attempt,
-            prefill.url(),
-            decode.url()
+            prefill.redacted_url(),
+            decode.redacted_url()
         );
 
         // Dispatch-time re-check of both sides, the same one the regular HTTP
@@ -909,8 +909,8 @@ impl PDRouter {
                     } else {
                         "sequential"
                     },
-                    prefill.url(),
-                    decode.url()
+                    prefill.redacted_url(),
+                    decode.redacted_url()
                 );
             }
             lease.release_dispatch();
@@ -1150,7 +1150,7 @@ impl PDRouter {
         if !status.is_success() {
             error!(
                 "Decode server returned error status decode_url={} status={}",
-                decode.url(),
+                decode.redacted_url(),
                 status
             );
             return Self::side_refused(PdSide::Decode, decode_response).await;
@@ -1405,7 +1405,7 @@ impl PDRouter {
             Err(DispatchError::Decode(response)) => {
                 error!(
                     "Decode server returned error status decode_url={} status={}",
-                    decode.url(),
+                    decode.redacted_url(),
                     response.status()
                 );
                 return Self::side_refused(PdSide::Decode, response).await;
@@ -1654,7 +1654,7 @@ impl PDRouter {
             if !prefill_status.is_success() {
                 error!(
                     "Prefill server returned error status prefill_url={} status={}",
-                    prefill.url(),
+                    prefill.redacted_url(),
                     prefill_status
                 );
                 Self::record_sequential_side(
@@ -1859,7 +1859,7 @@ impl PDRouter {
             if !status.is_success() {
                 error!(
                     "Prefill server returned error status prefill_url={} status={}",
-                    prefill.url(),
+                    prefill.redacted_url(),
                     status
                 );
                 Self::record_sequential_side(
@@ -2311,7 +2311,8 @@ impl PDRouter {
         if !prefill_status.is_success() {
             error!(
                 "Prefill server returned error status prefill_url={} status={}",
-                prefill_url, prefill_status
+                Endpoint::redacted_str(prefill_url),
+                prefill_status
             );
             return Err(Self::side_refused(PdSide::Prefill, prefill_response).await);
         }
@@ -2551,7 +2552,7 @@ impl RouterTrait for PDRouter {
             Ok(res) if res.status().is_success() => {
                 debug!(
                     "Health generate passed for prefill server: {}",
-                    prefill.url()
+                    prefill.redacted_url()
                 );
             }
             Ok(res) => {
@@ -2568,7 +2569,10 @@ impl RouterTrait for PDRouter {
 
         match decode_result {
             Ok(res) if res.status().is_success() => {
-                debug!("Health generate passed for decode server: {}", decode.url());
+                debug!(
+                    "Health generate passed for decode server: {}",
+                    decode.redacted_url()
+                );
             }
             Ok(res) => {
                 errors.push(format!(

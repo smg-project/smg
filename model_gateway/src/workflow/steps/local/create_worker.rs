@@ -27,6 +27,7 @@ use crate::{
     },
     worker::{
         circuit_breaker::CircuitBreakerConfig,
+        endpoint::Endpoint,
         overload::OverloadThresholds,
         resilience::resolve_resilience,
         worker::{merge_labels, RuntimeType, WINDOW_LABELS},
@@ -67,7 +68,10 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         {
             return Err(WorkflowError::StepFailed {
                 step_id: StepId::new("create_worker"),
-                message: format!("Worker {} already exists", config.url),
+                message: format!(
+                    "Worker {} already exists",
+                    Endpoint::redacted_str(&config.url)
+                ),
             });
         }
 
@@ -147,7 +151,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             &flags,
             &app_context.worker_registry,
         ) {
-            warn!(model = %model_card.id, worker = %config.url, "{message}");
+            warn!(model = %model_card.id, worker = %Endpoint::redacted_str(&config.url), "{message}");
         }
         let runtime_type = match context.data.detected_runtime_type.as_deref() {
             Some(s) => s.parse::<RuntimeType>().unwrap_or(config.runtime_type),
@@ -162,7 +166,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         } else {
             debug!(
                 "Runtime type unresolved for {} after detection; defaulting to sglang",
-                config.url
+                Endpoint::redacted_str(&config.url)
             );
             RuntimeType::Sglang
         };
@@ -393,7 +397,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                      worker of it processes them"
                 };
                 warn!(
-                    url = %worker.url(),
+                    url = %worker.redacted_url(),
                     model = %worker.model_id(),
                     "worker reports a vision encoder but no worker-side media processor (no \
                      mm_processor label): under --mm-processing worker it receives no media \
@@ -405,7 +409,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         debug!(
             "Created {} worker(s) for {} ({:?}, {} labels)",
             workers.len(),
-            url,
+            Endpoint::redacted_str(&url),
             connection_mode,
             labels.len()
         );
@@ -435,7 +439,7 @@ pub(super) fn validate_constrained_decoding_label(
                 .map(drop)
                 .map_err(|why| WorkflowError::StepFailed {
                     step_id: StepId::new(step),
-                    message: format!("Worker {url}: {why}"),
+                    message: format!("Worker {}: {why}", Endpoint::redacted_str(url)),
                 })
         }
         None => Ok(()),
@@ -518,8 +522,8 @@ pub(super) fn warn_on_conflicting_parser_overrides(
                 if new_name != existing_name {
                     tracing::warn!(
                         model = %card.id,
-                        new_worker = worker_url,
-                        existing_worker = existing.url(),
+                        new_worker = %Endpoint::redacted_str(worker_url),
+                        existing_worker = existing.redacted_url(),
                         %kind,
                         new = %new_name,
                         existing = %existing_name,
@@ -930,8 +934,9 @@ fn resolve_zmq_health_config(
         return health_config;
     }
     warn!(
-        "Ignoring disabled health checks for ZMQ worker {url}: the ZMQ probe is a local liveness \
-         check and the only path that reconnects a restarted engine, so it stays enabled"
+        "Ignoring disabled health checks for ZMQ worker {}: the ZMQ probe is a local liveness \
+         check and the only path that reconnects a restarted engine, so it stays enabled",
+        Endpoint::redacted_str(url)
     );
     HealthCheckConfig {
         disable_health_check: false,

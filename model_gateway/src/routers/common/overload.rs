@@ -161,7 +161,7 @@ pub fn fallback_if_all_vetoed(
     debug!(
         branch,
         stage,
-        worker = worker.url(),
+        worker = worker.redacted_url(),
         model_id,
         "Veto fallback"
     );
@@ -182,7 +182,7 @@ pub fn shed_if_worker_overloaded(
     if !shedding || !worker.is_overloaded() {
         return None;
     }
-    let url = worker.url();
+    let url = worker.redacted_url();
     Some(shed(
         BRANCH_OVERLOADED_AT_DISPATCH,
         STAGE_DISPATCH,

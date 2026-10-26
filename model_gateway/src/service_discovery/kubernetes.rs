@@ -652,7 +652,8 @@ fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> 
             let Ok(endpoint) = Endpoint::parse(&url) else {
                 warn!(
                     "Pod {} has an unusable worker address '{}', skipping",
-                    info.name, url
+                    info.name,
+                    Endpoint::redacted_str(&url)
                 );
                 continue;
             };

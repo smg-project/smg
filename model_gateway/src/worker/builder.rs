@@ -444,11 +444,17 @@ fn parse_bootstrap_host(url: &str) -> String {
         host
     } else if !clean_url.contains("://") {
         try_parse(&format!("http://{clean_url}")).unwrap_or_else(|| {
-            tracing::warn!("Failed to parse URL '{}', defaulting to localhost", url);
+            tracing::warn!(
+                "Failed to parse URL '{}', defaulting to localhost",
+                Endpoint::redacted_str(url)
+            );
             "localhost".to_string()
         })
     } else {
-        tracing::warn!("Failed to parse URL '{}', defaulting to localhost", url);
+        tracing::warn!(
+            "Failed to parse URL '{}', defaulting to localhost",
+            Endpoint::redacted_str(url)
+        );
         "localhost".to_string()
     }
 }

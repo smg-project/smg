@@ -21,6 +21,7 @@ use wfaas::WorkflowId;
 use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
+    worker::endpoint::Endpoint,
     workflow::{
         create_mcp_workflow_data, create_tokenizer_workflow_data,
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
@@ -363,7 +364,10 @@ impl JobQueue {
         let (queue_depth, available_permits) = self.get_load_info();
         debug!(
             "Job submitted: type={}, worker={}, queue_depth={}, available_slots={}",
-            job_type, worker_url, queue_depth, available_permits
+            job_type,
+            Endpoint::redacted_str(&worker_url),
+            queue_depth,
+            available_permits
         );
         Ok(())
     }
@@ -398,7 +402,11 @@ impl JobQueue {
             Some(JobStatus::processing(job_type, &worker_url)),
         );
 
-        debug!("Processing job: type={}, worker={}", job_type, worker_url);
+        debug!(
+            "Processing job: type={}, worker={}",
+            job_type,
+            Endpoint::redacted_str(&worker_url)
+        );
 
         // Release concurrency slot immediately. The semaphore bounds how many
         // jobs can be dequeued concurrently (preventing thundering herd), but
@@ -436,7 +444,8 @@ impl JobQueue {
                 );
                 error!(
                     "AppContext dropped, cannot process job: type={}, worker={}",
-                    job_type, worker_url
+                    job_type,
+                    Endpoint::redacted_str(&worker_url)
                 );
             }
         }
@@ -470,7 +479,8 @@ impl JobQueue {
 
                 debug!(
                     "Started worker registration workflow for {} (instance: {})",
-                    config.url, instance_id
+                    Endpoint::redacted_str(&config.url),
+                    instance_id
                 );
 
                 engines
@@ -498,7 +508,8 @@ impl JobQueue {
 
                 debug!(
                     "Started worker update workflow for {} (instance: {})",
-                    url, instance_id
+                    Endpoint::redacted_str(url),
+                    instance_id
                 );
 
                 let timeout_duration = Duration::from_secs(30);
@@ -535,7 +546,8 @@ impl JobQueue {
 
                 debug!(
                     "Started worker label refresh workflow for {} (instance: {})",
-                    url, instance_id
+                    Endpoint::redacted_str(url),
+                    instance_id
                 );
 
                 engines
@@ -566,7 +578,8 @@ impl JobQueue {
 
                 debug!(
                     "Started worker removal workflow for {} (instance: {})",
-                    url, instance_id
+                    Endpoint::redacted_str(url),
+                    instance_id
                 );
 
                 // Caller wait must cover the worst-case `DrainWorkersStep`
@@ -893,7 +906,9 @@ impl JobQueue {
                 Self::record_own_status(status_map, worker_url, job_type, None);
                 debug!(
                     "Completed job: type={}, worker={}, result={}",
-                    job_type, worker_url, message
+                    job_type,
+                    Endpoint::redacted_str(worker_url),
+                    message
                 );
             }
             Err(error) => {
@@ -905,7 +920,9 @@ impl JobQueue {
                 );
                 warn!(
                     "Failed job: type={}, worker={}, error={}",
-                    job_type, worker_url, error
+                    job_type,
+                    Endpoint::redacted_str(worker_url),
+                    error
                 );
             }
         }
@@ -950,7 +967,7 @@ impl JobQueue {
                 debug!(
                     "Job status of type={} for worker={} left to the {} job under the key",
                     job_type,
-                    url,
+                    Endpoint::redacted_str(url),
                     entry.get().job_type
                 );
             }

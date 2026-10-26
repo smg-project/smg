@@ -20,6 +20,7 @@ use crate::{
     routers::provider_support,
     service_discovery::{DISCOVERY_LABEL_PREFIX, DISCOVERY_PROVIDER_LABEL},
     worker::{
+        endpoint::Endpoint,
         registry::WorkerId,
         worker::{merge_labels, worker_to_info},
         Worker, WorkerRegistry, WorkerType,
@@ -515,7 +516,7 @@ impl WorkerService {
                 the gateway's key ends at its auth middleware, so requests reach this worker \
                 with no credential. If the worker requires a key (the gateway's or its own), \
                 register it with that key explicitly.",
-                config.url
+                Endpoint::redacted_str(&config.url)
             );
         }
 

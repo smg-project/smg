@@ -9,7 +9,10 @@ use std::{fmt, sync::Arc};
 #[cfg(doc)]
 use super::stream::GuardedStream;
 use super::worker::Worker;
-use crate::{observability::metrics::Metrics, routers::common::header_utils::extract_routing_key};
+use crate::{
+    observability::metrics::Metrics, routers::common::header_utils::extract_routing_key,
+    worker::endpoint::Endpoint,
+};
 
 pub struct WorkerRoutingKeyLoad {
     url: String,
@@ -56,7 +59,7 @@ impl WorkerRoutingKeyLoad {
                     }
                 } else {
                     tracing::warn!(
-                        worker_url = %self.url,
+                        worker_url = %Endpoint::redacted_str(&self.url),
                         routing_key = %routing_key,
                         "Attempted to decrement routing key counter that is already at 0"
                     );
@@ -64,7 +67,7 @@ impl WorkerRoutingKeyLoad {
             }
             Entry::Vacant(_) => {
                 tracing::warn!(
-                    worker_url = %self.url,
+                    worker_url = %Endpoint::redacted_str(&self.url),
                     routing_key = %routing_key,
                     "Attempted to decrement non-existent routing key"
                 );

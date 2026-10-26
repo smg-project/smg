@@ -181,7 +181,7 @@ impl RelaySource {
         let error_type = error_type_from_status(cut.status);
         let reason = error_reason_from_status(cut.status);
         warn!(
-            worker = self.worker.url(),
+            worker = self.worker.redacted_url(),
             worker_type = self.worker_type,
             route = self.route,
             bytes_relayed,

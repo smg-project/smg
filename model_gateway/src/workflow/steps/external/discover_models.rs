@@ -13,6 +13,7 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use crate::{
     routers::provider_support,
+    worker::endpoint::Endpoint,
     workflow::data::{WorkerKind, WorkerWorkflowData},
 };
 
@@ -194,14 +195,21 @@ fn resolve_discovery_api_key(
     // 1. Try per-provider admin key from env var
     if let Some(env_name) = provider.and_then(|p| p.admin_key_env_var()) {
         if let Some(key) = std::env::var(env_name).ok().filter(|k| !k.is_empty()) {
-            debug!("Using {} for model discovery on {}", env_name, url);
+            debug!(
+                "Using {} for model discovery on {}",
+                env_name,
+                Endpoint::redacted_str(url)
+            );
             return Some(key);
         }
     }
 
     // 2. Fall back to config api_key (from --api-key)
     if let Some(key) = config_api_key {
-        debug!("Using --api-key for model discovery on {}", url);
+        debug!(
+            "Using --api-key for model discovery on {}",
+            Endpoint::redacted_str(url)
+        );
         return Some(key.to_string());
     }
 
@@ -247,7 +255,7 @@ async fn fetch_models(
     debug!(
         "Fetched {} raw models from {}",
         models_response.data.len(),
-        url
+        Endpoint::redacted_str(url)
     );
 
     let model_cards = group_models_into_cards(models_response.data);
@@ -284,25 +292,35 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverModelsStep {
             info!(
                 "No API key provided for {} - using wildcard mode (accepts any model). \
                  User's Authorization header will be forwarded to backend.",
-                config.url
+                Endpoint::redacted_str(&config.url)
             );
             // Leave model_cards empty for wildcard mode
             return Ok(StepResult::Success);
         }
 
-        debug!("Discovering models from external endpoint {}", config.url);
+        debug!(
+            "Discovering models from external endpoint {}",
+            Endpoint::redacted_str(&config.url)
+        );
 
         let model_cards = fetch_models(&config.url, discovery_key.as_deref(), provider.as_ref())
             .await
             .map_err(|e| WorkflowError::StepFailed {
                 step_id: StepId::new("discover_models"),
-                message: format!("Failed to discover models from {}: {}", config.url, e),
+                message: format!(
+                    "Failed to discover models from {}: {}",
+                    Endpoint::redacted_str(&config.url),
+                    e
+                ),
             })?;
 
         if model_cards.is_empty() {
             return Err(WorkflowError::StepFailed {
                 step_id: StepId::new("discover_models"),
-                message: format!("No models discovered from {}", config.url),
+                message: format!(
+                    "No models discovered from {}",
+                    Endpoint::redacted_str(&config.url)
+                ),
             });
         }
 
@@ -315,7 +333,10 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverModelsStep {
             warn!(
                 "Dropping model {} discovered from {}: this build carries no {} router; rebuild \
                  with the `{}` Cargo feature to serve it",
-                card.id, config.url, missing.label, missing.feature
+                card.id,
+                Endpoint::redacted_str(&config.url),
+                missing.label,
+                missing.feature
             );
         }
         if model_cards.is_empty() {
@@ -332,7 +353,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverModelsStep {
         info!(
             "Discovered {} models from {}: {:?}",
             model_cards.len(),
-            config.url,
+            Endpoint::redacted_str(&config.url),
             model_cards.iter().map(|c| &c.id).collect::<Vec<_>>()
         );
 

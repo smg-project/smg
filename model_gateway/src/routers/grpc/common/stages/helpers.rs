@@ -595,7 +595,7 @@ pub(crate) fn sampling_defaults_for_request(
         Ok(defaults) => defaults,
         Err(e) => {
             warn!(
-                worker_url = %worker.url(),
+                worker_url = %worker.redacted_url(),
                 error = %e,
                 "Ignoring invalid default sampling params label"
             );

@@ -1449,7 +1449,8 @@ impl BasicWorker {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "ZMQ backend handshake failed for {url}: {e}; will retry on the next health probe"
+                        "ZMQ backend handshake failed for {}: {e}; will retry on the next health probe",
+                        super::endpoint::Endpoint::redacted_str(&url)
                     );
                     started.store(false, Ordering::SeqCst);
                 }
@@ -1730,7 +1731,7 @@ impl Worker for BasicWorker {
     fn decrement_load(&self) {
         if !self.runtime.load().try_decrement_load() {
             tracing::warn!(
-                worker_url = %self.metadata.spec.url,
+                worker_url = %self.metadata.redacted_url,
                 "Attempted to decrement load counter that is already at 0"
             );
         }
@@ -2100,7 +2101,7 @@ impl Worker for BasicWorker {
         tracing::debug!(
             "Setting {} models for worker {} via lazy discovery",
             models.len(),
-            self.metadata.spec.url
+            self.metadata.redacted_url
         );
         self.models_override
             .store(Arc::new(WorkerModels::from(models)));
@@ -2130,7 +2131,7 @@ impl Worker for BasicWorker {
                             tracing::info!(
                                 "Lazily initializing gRPC client ({}) for worker: {}",
                                 runtime_str,
-                                self.metadata.spec.url
+                                self.metadata.redacted_url
                             );
                             // DP-expanded workers carry a `{base}@{rank}` URL; connect to the base
                             match GrpcClient::connect(self.metadata.base_url(), &runtime_str).await
@@ -2139,14 +2140,14 @@ impl Worker for BasicWorker {
                                     tracing::info!(
                                         "Successfully connected gRPC client ({}) for worker: {}",
                                         runtime_str,
-                                        self.metadata.spec.url
+                                        self.metadata.redacted_url
                                     );
                                     Ok(Arc::new(BackendClient::Grpc(client)))
                                 }
                                 Err(e) => {
                                     tracing::error!(
                                         "Failed to connect gRPC client for worker {}: {}",
-                                        self.metadata.spec.url,
+                                        self.metadata.redacted_url,
                                         e
                                     );
                                     Err(WorkerError::ConnectionFailed {
@@ -2187,7 +2188,7 @@ impl Worker for BasicWorker {
         // evicts a dead client and reconnects — see zmq_health_check.)
         tracing::debug!(
             "reset_grpc_client called for {} (no-op for gRPC workers)",
-            self.metadata.spec.url
+            self.metadata.redacted_url
         );
         Ok(())
     }
@@ -2198,7 +2199,7 @@ impl Worker for BasicWorker {
         let Some(backend_client) = maybe else {
             tracing::error!(
                 "Worker {} is not a gRPC worker but connection mode is gRPC",
-                self.metadata.spec.url
+                self.metadata.redacted_url
             );
             return Ok(false);
         };
@@ -2207,7 +2208,7 @@ impl Worker for BasicWorker {
             Ok(Ok(resp)) => {
                 tracing::debug!(
                     "gRPC health OK for {}: healthy={}",
-                    self.metadata.spec.url,
+                    self.metadata.redacted_url,
                     resp.healthy
                 );
                 Ok(resp.healthy)
@@ -2215,12 +2216,12 @@ impl Worker for BasicWorker {
             Ok(Err(err)) => {
                 tracing::warn!(
                     "gRPC health RPC error for {}: {err:?}",
-                    self.metadata.spec.url
+                    self.metadata.redacted_url
                 );
                 Ok(false)
             }
             Err(_) => {
-                tracing::warn!("gRPC health timed out for {}", self.metadata.spec.url);
+                tracing::warn!("gRPC health timed out for {}", self.metadata.redacted_url);
                 Ok(false)
             }
         }
@@ -2250,7 +2251,7 @@ impl Worker for BasicWorker {
             // cell another probe already swapped in.
             tracing::warn!(
                 "ZMQ engine for {} is no longer alive; evicting the dead client and rebinding on a later probe",
-                self.metadata.spec.url
+                self.metadata.redacted_url
             );
             self.backend_client
                 .compare_and_swap(&cell, Arc::new(OnceCell::new()));
@@ -2288,14 +2289,17 @@ impl Worker for BasicWorker {
                 } else {
                     tracing::warn!(
                         "HTTP health check returned non-success status for {}: {}",
-                        health_url,
+                        super::endpoint::Endpoint::redacted_str(&health_url),
                         status
                     );
                     Ok(false)
                 }
             }
             Err(err) => {
-                tracing::warn!("HTTP health check failed for {}: {err:?}", health_url);
+                tracing::warn!(
+                    "HTTP health check failed for {}: {err:?}",
+                    super::endpoint::Endpoint::redacted_str(&health_url)
+                );
                 Ok(false)
             }
         }

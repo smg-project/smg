@@ -21,7 +21,7 @@ use crate::{
     observability::metrics::Metrics,
     routers::grpc::backend_client::BackendClient,
     worker::{
-        kv_event_recovery::ResyncReason, kv_index_backend::KvIndex, liveness,
+        endpoint::Endpoint, kv_event_recovery::ResyncReason, kv_index_backend::KvIndex, liveness,
         monitor::WorkerMonitor, Worker,
     },
 };
@@ -365,7 +365,7 @@ impl KvEventMonitor {
             Ok(id) => id,
             Err(e) => {
                 error!(
-                    worker_url = %worker_url,
+                    worker_url = %Endpoint::redacted_str(&worker_url),
                     error = %e,
                     "Failed to intern worker; KV events from this worker will \
                      not feed cache-aware routing"
@@ -435,7 +435,7 @@ impl KvEventMonitor {
                 // be unreachable. Retry defensively rather than exiting and
                 // leaving a stale entry in worker_handles.
                 warn!(
-                    worker_url = %worker_url,
+                    worker_url = %Endpoint::redacted_str(worker_url),
                     delay_ms = backoff.delay_ms(),
                     "Worker has no backend client yet, retrying"
                 );
@@ -443,7 +443,7 @@ impl KvEventMonitor {
             }
             Err(e) => {
                 warn!(
-                    worker_url = %worker_url,
+                    worker_url = %Endpoint::redacted_str(worker_url),
                     error = %e,
                     delay_ms = backoff.delay_ms(),
                     "Failed to get backend client, retrying"
@@ -464,7 +464,7 @@ impl KvEventMonitor {
         let stream = match subscribed {
             Subscribed::Stream(stream) => {
                 info!(
-                    worker_url = %worker_url,
+                    worker_url = %Endpoint::redacted_str(worker_url),
                     start_seq,
                     "KV event stream connected"
                 );
@@ -484,7 +484,7 @@ impl KvEventMonitor {
                 // stop retrying — this RPC will never succeed.
                 if e.code() == tonic::Code::Unimplemented {
                     warn!(
-                        worker_url = %worker_url,
+                        worker_url = %Endpoint::redacted_str(worker_url),
                         "Backend does not implement SubscribeKvEvents, \
                          disabling KV event subscription for this worker; \
                          cache-aware routing sees nothing of its cache"
@@ -493,7 +493,7 @@ impl KvEventMonitor {
                 }
                 if e.code() == tonic::Code::OutOfRange {
                     warn!(
-                        worker_url = %worker_url,
+                        worker_url = %Endpoint::redacted_str(worker_url),
                         start_seq,
                         "KV event replay cursor expired; clearing worker state and requesting a current snapshot"
                     );
@@ -511,7 +511,7 @@ impl KvEventMonitor {
                     liveness::on_contact_failed(sub.worker, "kv subscribe");
                 }
                 warn!(
-                    worker_url = %worker_url,
+                    worker_url = %Endpoint::redacted_str(worker_url),
                     error = %e,
                     delay_ms = backoff.delay_ms(),
                     "Failed to subscribe to KV events, retrying"
@@ -530,7 +530,7 @@ impl KvEventMonitor {
         }
         if state.abandon_snapshot() {
             warn!(
-                worker_url = %worker_url,
+                worker_url = %Endpoint::redacted_str(worker_url),
                 "KV event stream ended during a relay snapshot; the next subscription \
                  starts over from zero"
             );
@@ -538,7 +538,7 @@ impl KvEventMonitor {
         match result {
             StreamResult::Ended => {
                 info!(
-                    worker_url = %worker_url,
+                    worker_url = %Endpoint::redacted_str(worker_url),
                     resume_from = state.resume_sequence(),
                     delay_ms = backoff.delay_ms(),
                     "KV event stream ended, reconnecting"
@@ -551,7 +551,7 @@ impl KvEventMonitor {
                 Metrics::record_kv_event_stream_error(worker_url, error_class(e.code()));
                 if e.code() == tonic::Code::DataLoss {
                     warn!(
-                        worker_url = %worker_url,
+                        worker_url = %Endpoint::redacted_str(worker_url),
                         error = %e,
                         resume_from = state.resume_sequence(),
                         "KV event subscriber fell behind; clearing worker state and requesting a current snapshot"
@@ -570,7 +570,7 @@ impl KvEventMonitor {
                     liveness::on_contact_failed(sub.worker, "kv stream");
                 }
                 warn!(
-                    worker_url = %worker_url,
+                    worker_url = %Endpoint::redacted_str(worker_url),
                     error = %e,
                     resume_from = state.resume_sequence(),
                     delay_ms = backoff.delay_ms(),
@@ -580,7 +580,7 @@ impl KvEventMonitor {
             }
             StreamResult::GapDetected { expected, received } => {
                 warn!(
-                    worker_url = %worker_url,
+                    worker_url = %Endpoint::redacted_str(worker_url),
                     expected,
                     received,
                     "Sequence gap detected, reconnecting for replay from seq {expected}"

@@ -36,7 +36,7 @@ impl UpdatePoliciesStep {
                 "cache_aware policy for model {model_id} includes ZMQ worker {}: the ZMQ \
                  transport has no KV-event stream, so cache tracking for it falls back to the \
                  approximate prefix tree",
-                worker.url()
+                worker.redacted_url()
             );
         }
     }

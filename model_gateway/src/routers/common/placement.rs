@@ -867,8 +867,8 @@ fn relaxed_pair(
     }
     debug!(
         branch,
-        prefill = %prefill.url(),
-        decode = %decode.url(),
+        prefill = %prefill.redacted_url(),
+        decode = %decode.redacted_url(),
         model_id,
         "Veto fallback"
     );
@@ -1189,8 +1189,8 @@ pub(crate) fn select_pair(
             branch = BRANCH_ALL_OVERLOADED_FALLBACK,
             prefill_pool = prefill_over,
             decode_pool = lift_decode,
-            prefill = %selected_prefill.url(),
-            decode = %selected_decode.url(),
+            prefill = %selected_prefill.redacted_url(),
+            decode = %selected_decode.redacted_url(),
             model_id,
             "Veto fallback: a prefill pool over the overload thresholds placed by its policy, or a decode pool by load"
         );
@@ -1212,8 +1212,8 @@ pub(crate) fn select_pair(
     }
 
     debug!(
-        prefill = %selected_prefill.url(),
-        decode = %selected_decode.url(),
+        prefill = %selected_prefill.redacted_url(),
+        decode = %selected_decode.redacted_url(),
         "Selected PD pair"
     );
     Ok(Pair {

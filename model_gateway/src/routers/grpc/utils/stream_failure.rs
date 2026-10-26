@@ -49,7 +49,7 @@ use crate::{
         error::error_type_for_status,
         grpc::context::{DispatchMetadata, WorkerSelection},
     },
-    worker::{worker::WorkerTypeExt, ConnectionModeExt, Worker},
+    worker::{endpoint::Endpoint, worker::WorkerTypeExt, ConnectionModeExt, Worker},
 };
 
 /// The SSE error `type` of a stream the worker failed: the engine's
@@ -446,14 +446,14 @@ impl StreamSource {
         match rendezvous {
             Some(DeadRendezvous(port)) => warn!(
                 request_id = %self.request_id,
-                worker = worker_url,
+                worker = %Endpoint::redacted_str(worker_url),
                 worker_type,
                 completion_tokens,
                 grpc_code = ?status.code(),
                 http_status = class.http.as_u16(),
                 error_type = class.error_type,
                 reason = class.reason,
-                prefill = self.prefill.as_ref().map_or("none", |prefill| prefill.url()),
+                prefill = self.prefill.as_ref().map_or("none", |prefill| prefill.redacted_url()),
                 bootstrap_host = port.host.as_str(),
                 bootstrap_port = port.port,
                 bootstrap_port_source = port.source.label(),
@@ -464,7 +464,7 @@ impl StreamSource {
             ),
             None => warn!(
                 request_id = %self.request_id,
-                worker = worker_url,
+                worker = %Endpoint::redacted_str(worker_url),
                 worker_type,
                 completion_tokens,
                 grpc_code = ?status.code(),

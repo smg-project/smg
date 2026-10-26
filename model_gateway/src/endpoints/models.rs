@@ -29,7 +29,7 @@ use crate::{
     app_context::AppContext,
     middleware::{into_messages_envelope, AuthConfig},
     routers::{common::header_utils::apply_provider_headers, error},
-    worker::{ProviderType, RuntimeType, WorkerRegistry},
+    worker::{endpoint::Endpoint, ProviderType, RuntimeType, WorkerRegistry},
 };
 
 /// The API family a models request speaks, read from its headers.
@@ -308,19 +308,21 @@ async fn fetch_models_from(
     auth: Option<HeaderValue>,
 ) -> Vec<ModelCard> {
     let url = format!("{base_url}/v1/models");
+    // The address as the lines below write it: a userinfo in it masked.
+    let shown = Endpoint::redacted_str(&url);
     let req = apply_provider_headers(client.get(&url), &url, auth.as_ref());
 
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            debug!("Failed to reach upstream {url}: {e}");
+            debug!("Failed to reach upstream {shown}: {e}");
             return Vec::new();
         }
     };
 
     if !resp.status().is_success() {
         debug!(
-            "Upstream {url} returned {} for model discovery",
+            "Upstream {shown} returned {} for model discovery",
             resp.status()
         );
         return Vec::new();
@@ -329,7 +331,7 @@ async fn fetch_models_from(
     match resp.json::<Value>().await {
         Ok(json) => ListModelsResponse::parse_upstream(&json, ProviderType::from_url(&url)),
         Err(e) => {
-            warn!("Failed to parse upstream models from {url}: {e}");
+            warn!("Failed to parse upstream models from {shown}: {e}");
             Vec::new()
         }
     }

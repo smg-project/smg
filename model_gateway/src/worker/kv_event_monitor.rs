@@ -40,7 +40,7 @@ use super::{kv_index_backend::KvIndex, monitor::WorkerMonitor};
 use crate::{
     observability::metrics::Metrics,
     policies::utils::PeriodicTask,
-    worker::{ConnectionMode, Worker, UNKNOWN_MODEL_ID},
+    worker::{endpoint::Endpoint, ConnectionMode, Worker, UNKNOWN_MODEL_ID},
 };
 
 mod admission;
@@ -223,7 +223,7 @@ impl KvEventMonitor {
         // EngineCore returns `unimplemented` for SubscribeKvEvents — subscribing
         // there would just be a wasted handshake + round-trip per registration.
         if *worker.connection_mode() != ConnectionMode::Grpc {
-            debug!(worker_url = %url, mode = %worker.connection_mode(), "non-gRPC worker, skipping KV event subscription");
+            debug!(worker_url = %Endpoint::redacted_str(&url), mode = %worker.connection_mode(), "non-gRPC worker, skipping KV event subscription");
             return;
         }
 
@@ -231,7 +231,7 @@ impl KvEventMonitor {
             let mut handles = self.worker_handles.lock().await;
             let mut done = match handles.get(&url) {
                 Some(Slot::Active(_)) => {
-                    debug!(worker_url = %url, "KV event subscription already active, skipping");
+                    debug!(worker_url = %Endpoint::redacted_str(&url), "KV event subscription already active, skipping");
                     return;
                 }
                 Some(Slot::Removing(reservation)) => reservation.done.clone(),
@@ -284,7 +284,7 @@ impl KvEventMonitor {
                 // gauge by the seed.
                 Metrics::set_kv_block_size(&model_id, known.tokens);
             } else {
-                warn!(worker_url = %url, "Worker reports kv_block_size=0, ignoring");
+                warn!(worker_url = %Endpoint::redacted_str(&url), "Worker reports kv_block_size=0, ignoring");
             }
         }
 
@@ -293,7 +293,7 @@ impl KvEventMonitor {
         let block_sizes = Arc::clone(&self.block_sizes);
 
         info!(
-            worker_url = %url,
+            worker_url = %Endpoint::redacted_str(&url),
             model_id = %model_id,
             "Starting KV event subscription"
         );
@@ -337,7 +337,7 @@ impl KvEventMonitor {
                     .or_else(|| payload.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "(non-string panic)".into());
                 error!(
-                    worker_url = %task_url,
+                    worker_url = %Endpoint::redacted_str(&task_url),
                     panic.message = %msg,
                     "KV event subscription task panicked; KV events from this \
                      worker no longer feed cache-aware routing"
@@ -443,7 +443,7 @@ impl KvEventMonitor {
         let Some(sub) = subscription else {
             return;
         };
-        info!(worker_url = %worker_url, "Stopping KV event subscription");
+        info!(worker_url = %Endpoint::redacted_str(worker_url), "Stopping KV event subscription");
         // Signal graceful shutdown — task cleans up its worker_blocks in the indexer.
         let _ = sub.shutdown_tx.send(());
         // The task lifts the reservation and drops the model's last index on
@@ -455,7 +455,7 @@ impl KvEventMonitor {
         let id = sub.id;
         if let Err(e) = sub.handle.await {
             error!(
-                worker_url = %worker_url,
+                worker_url = %Endpoint::redacted_str(worker_url),
                 error = %e,
                 "KV event subscription task failed"
             );
@@ -498,11 +498,11 @@ impl KvEventMonitor {
                 "Stopping all KV event subscriptions"
             );
             for (url, sub) in subscriptions {
-                debug!(worker_url = %url, "Stopping KV event subscription");
+                debug!(worker_url = %Endpoint::redacted_str(&url), "Stopping KV event subscription");
                 let _ = sub.shutdown_tx.send(());
                 if let Err(e) = sub.handle.await {
                     error!(
-                        worker_url = %url,
+                        worker_url = %Endpoint::redacted_str(&url),
                         error = %e,
                         "KV event subscription task failed"
                     );

@@ -59,8 +59,8 @@ use tracing::{debug, info, warn};
 use crate::{
     service_discovery::DISCOVERY_ID_LABEL,
     worker::{
-        endpoint_key, event::WorkerEvent, registry::WorkerId, ConnectionMode, EndpointKey, Worker,
-        WorkerOrigin, WorkerRegistry,
+        endpoint::Endpoint, endpoint_key, event::WorkerEvent, registry::WorkerId, ConnectionMode,
+        EndpointKey, Worker, WorkerOrigin, WorkerRegistry,
     },
 };
 
@@ -420,7 +420,7 @@ impl WorkerSyncAdapter {
                 if self.worker_registry.remove_remote(&id).is_some() {
                     info!(
                         owner = %state.owner,
-                        url = %state.url,
+                        url = %Endpoint::redacted_str(&state.url),
                         worker_id = %id.as_str(),
                         "removed mesh-imported worker: its owner node is down"
                     );
@@ -428,7 +428,7 @@ impl WorkerSyncAdapter {
             }
             None => debug!(
                 owner = %state.owner,
-                url = %state.url,
+                url = %Endpoint::redacted_str(&state.url),
                 "ignoring worker state published by a node that is down"
             ),
         }
@@ -444,7 +444,7 @@ impl WorkerSyncAdapter {
         if let Some(id) = self.import_of_key(state) {
             if self.worker_registry.remove_remote(&id).is_some() {
                 info!(
-                    url = %state.url,
+                    url = %Endpoint::redacted_str(&state.url),
                     worker_id = %id.as_str(),
                     "removed mesh-imported worker: this gateway removed its endpoint"
                 );
@@ -468,7 +468,7 @@ impl WorkerSyncAdapter {
             // and has new ones delayed by a pass at most.
             OwnerLiveness::GoneWithinGrace => debug!(
                 owner = %state.owner,
-                url = %state.url,
+                url = %Endpoint::redacted_str(&state.url),
                 "leaving worker state alone: its owner node is gone, inside the grace"
             ),
             OwnerLiveness::Live => {
@@ -547,7 +547,7 @@ impl WorkerSyncAdapter {
         if !entry.logged {
             entry.logged = true;
             info!(
-                url = %state.url,
+                url = %Endpoint::redacted_str(&state.url),
                 removed_instance = ?entry.instance,
                 incoming_instance = ?incoming,
                 "Ignoring a peer's state for an endpoint this gateway removed (logged once per endpoint)"
@@ -720,7 +720,7 @@ impl WorkerSyncAdapter {
 /// the minimal builder. JSON is self-describing and round-trips them.
 fn worker_state_of(worker_id: &WorkerId, worker: &Arc<dyn Worker>, owner: &str) -> WorkerState {
     let spec = serde_json::to_vec(&worker.metadata().spec).unwrap_or_else(|err| {
-        warn!(url = %worker.url(), %err, "failed to encode WorkerSpec; publishing without spec");
+        warn!(url = %worker.redacted_url(), %err, "failed to encode WorkerSpec; publishing without spec");
         Vec::new()
     });
     WorkerState {

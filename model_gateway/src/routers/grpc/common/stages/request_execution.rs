@@ -460,7 +460,10 @@ fn dispatch_timed_out(
     request_id: &str,
 ) -> Response {
     let status = deadline.status();
-    let urls: Vec<&str> = workers.workers().map(|worker| worker.url()).collect();
+    let urls: Vec<&str> = workers
+        .workers()
+        .map(|worker| worker.redacted_url())
+        .collect();
     warn!(
         request_id = %request_id,
         workers = ?urls,
@@ -1508,7 +1511,7 @@ fn retire_pd_side(
             Ok(stream) => {
                 debug!(
                     leg = side.name(),
-                    worker = worker.url(),
+                    worker = worker.redacted_url(),
                     cause,
                     "Aborting the room of an abandoned PD side"
                 );
@@ -1523,7 +1526,7 @@ fn retire_pd_side(
                 error!(
                     function = "retire_pd_side",
                     leg = side.name(),
-                    worker = worker.url(),
+                    worker = worker.redacted_url(),
                     cause,
                     error = %error,
                     "Abandoned PD side failed after its request had given up on it"
@@ -1532,7 +1535,7 @@ fn retire_pd_side(
             Err(error) => {
                 debug!(
                     leg = side.name(),
-                    worker = worker.url(),
+                    worker = worker.redacted_url(),
                     cause,
                     error = %error,
                     "Abandoned PD side failed late; its request had charged what it gave up on"
@@ -1651,7 +1654,7 @@ fn prefill_side_silent(
     let worker_last_handoff = ago(worker.prefill_handed_off_ago());
     warn!(
         request_id = %request_id,
-        worker = worker.url(),
+        worker = worker.redacted_url(),
         worker_type = metrics_labels::WORKER_PREFILL,
         phase,
         prompt_tokens,
@@ -1734,9 +1737,9 @@ fn decode_partner_silent(
 ) -> tonic::Status {
     warn!(
         request_id = %request_id,
-        worker = decode.url(),
+        worker = decode.redacted_url(),
         worker_type = metrics_labels::WORKER_DECODE,
-        prefill_worker = prefill.url(),
+        prefill_worker = prefill.redacted_url(),
         phase,
         bound_ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
         decode_silence_ms = u64::try_from(silence.as_millis()).unwrap_or(u64::MAX),
@@ -2056,7 +2059,7 @@ fn decode_side_silent(
 ) -> tonic::Status {
     warn!(
         request_id = %request_id,
-        worker = worker.url(),
+        worker = worker.redacted_url(),
         worker_type = metrics_labels::WORKER_DECODE,
         phase,
         prompt_tokens,

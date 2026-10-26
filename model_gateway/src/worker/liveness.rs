@@ -1039,7 +1039,7 @@ fn set(worker: &Arc<dyn Worker>, reason: Option<StallReason>, cause: &'static st
     match reason {
         Some(reason) => {
             warn!(
-                worker_url = %worker.url(),
+                worker_url = %worker.redacted_url(),
                 reason = reason.as_str(),
                 cause,
                 contact_age_ms = u64::try_from(worker.contact_age().as_millis()).unwrap_or(u64::MAX),
@@ -1058,7 +1058,7 @@ fn set(worker: &Arc<dyn Worker>, reason: Option<StallReason>, cause: &'static st
             Metrics::set_worker_stalled(worker.url(), reason.as_str(), true);
         }
         None => {
-            info!(worker_url = %worker.url(), cause, "Worker re-admitted by liveness");
+            info!(worker_url = %worker.redacted_url(), cause, "Worker re-admitted by liveness");
             worker.note_admitted();
             if let Some(previous) = previous {
                 // The outage's connection failures opened the circuit breaker

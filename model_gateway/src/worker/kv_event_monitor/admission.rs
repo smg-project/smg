@@ -16,6 +16,7 @@ use super::{
 use crate::{
     observability::metrics::Metrics,
     worker::{
+        endpoint::Endpoint,
         kv_event_recovery::{Admission, RankState, ResyncReason},
         kv_index_backend::KvIndex,
     },
@@ -175,13 +176,13 @@ impl KvEventMonitor {
         match admission {
             Admission::Apply => {}
             Admission::Stale => {
-                debug!(worker_url = %worker_url, rank, received = seq, "Skipping stale KV event batch");
+                debug!(worker_url = %Endpoint::redacted_str(worker_url), rank, received = seq, "Skipping stale KV event batch");
                 Metrics::record_kv_event_batch(worker_url, "stale");
                 return BatchOutcome::Skipped;
             }
             Admission::Restart if indexed => {
                 warn!(
-                    worker_url = %worker_url,
+                    worker_url = %Endpoint::redacted_str(worker_url),
                     rank,
                     received = seq,
                     "KV event publisher restarted; clearing the worker's index state"
@@ -206,7 +207,7 @@ impl KvEventMonitor {
                 // once, through its own rank's restart). A replay pending on
                 // that rank went with its old publisher.
                 warn!(
-                    worker_url = %worker_url,
+                    worker_url = %Endpoint::redacted_str(worker_url),
                     rank,
                     received = seq,
                     "KV event publisher of another rank restarted; this worker's index is kept"
@@ -229,7 +230,7 @@ impl KvEventMonitor {
             }
             Admission::Unrecovered { missed, cleared } => {
                 warn!(
-                    worker_url = %worker_url,
+                    worker_url = %Endpoint::redacted_str(worker_url),
                     rank,
                     missed,
                     cleared,
@@ -323,14 +324,14 @@ impl KvEventMonitor {
         if chunk.index == 0 || state.snapshot.is_none() {
             if chunk.index != 0 {
                 warn!(
-                    worker_url = %worker_url,
+                    worker_url = %Endpoint::redacted_str(worker_url),
                     rank,
                     index = chunk.index,
                     "KV event relay snapshot arrived without its first chunk; taking it as a resync"
                 );
             }
             info!(
-                worker_url = %worker_url,
+                worker_url = %Endpoint::redacted_str(worker_url),
                 rank,
                 chunks = chunk.count,
                 blocks = chunk.blocks,
@@ -340,7 +341,7 @@ impl KvEventMonitor {
             );
             if chunk.unknown_before > 0 {
                 warn!(
-                    worker_url = %worker_url,
+                    worker_url = %Endpoint::redacted_str(worker_url),
                     rank,
                     unknown_before = chunk.unknown_before,
                     "KV event relay snapshot starts late: the engine's blocks from before the \
@@ -392,7 +393,7 @@ impl KvEventMonitor {
             progress.applied += 1;
             if progress.applied >= progress.count {
                 info!(
-                    worker_url = %worker_url,
+                    worker_url = %Endpoint::redacted_str(worker_url),
                     chunks = progress.count,
                     blocks = progress.blocks,
                     through = batch.sequence_number,

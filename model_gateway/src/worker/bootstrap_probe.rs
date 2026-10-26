@@ -23,7 +23,7 @@ use super::{
     pd_pairing::KvTransferProfile, worker::WorkerTypeExt, Worker, DEFAULT_BOOTSTRAP_PORT,
     MOONCAKE_CONNECTOR,
 };
-use crate::observability::metrics::Metrics;
+use crate::{observability::metrics::Metrics, worker::endpoint::Endpoint};
 
 /// How long the probe waits for the connection: long enough for a far host,
 /// short enough that a black-holed port is reported promptly.
@@ -192,7 +192,7 @@ pub(crate) fn spawn_bootstrap_port_probe(worker: &dyn Worker) {
     if is_store_prefill_worker(worker) {
         if let Some(port) = worker.bootstrap_port() {
             info!(
-                worker = %worker.url(),
+                worker = %worker.redacted_url(),
                 bootstrap_port = port,
                 kv_connector = worker.metadata().spec.kv_connector.as_deref().unwrap_or(""),
                 "Bootstrap port registered on a prefill worker whose KV connector writes to a \
@@ -232,7 +232,7 @@ pub(crate) async fn report_bootstrap_port_probe(
     match probe_bootstrap_port(host, port, PROBE_TIMEOUT).await {
         Ok(()) => {
             debug!(
-                worker = url,
+                worker = %Endpoint::redacted_str(url),
                 worker_type = worker_type,
                 bootstrap_host = host,
                 bootstrap_port = port,
@@ -243,7 +243,7 @@ pub(crate) async fn report_bootstrap_port_probe(
         }
         Err(error) => {
             warn!(
-                worker = url,
+                worker = %Endpoint::redacted_str(url),
                 worker_type = worker_type,
                 bootstrap_host = host,
                 bootstrap_port = port,
