@@ -1,0 +1,60 @@
+{
+  "result": "PASS_SOURCE_ONLY_ACTUAL_DISABLED_1A0E_SINGLE_PRIVATE_JIT_ENV",
+  "findings": [],
+  "reviewer": "A nonauthor of root actual integration and D single-env preview; independent read-only actual Git/byte/AST/hash checks.",
+  "actual_head": "1a0e7518ac330446059f4b32847205c4375e2fd9",
+  "direct_parent": "0898cf993e4d2f44327a8b7c1e2b74a185cbee89",
+  "actual_worktree": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/amd-qwen-current1473-private-jit-20261026",
+  "working_tree_clean": true,
+  "source_parent": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
+  "driver_sha256": "7b0a98d25b7c0061d673556b0f6cf41e6b6da7311f1642a1d70145ece8f63591",
+  "envelope_sha256": "06589cd12a0547a4e1d5547f8e24afb6c849ec8e95854d997b73bf1180d1ccfd",
+  "inputs_sha256": "9f0359d170854c490fdc28c18b51a83b87c94b22331ceb56accee41179350925",
+  "CI_job_runner_sha256": "868be2e7b34627688ff9b68837b90faa3f0c74d80d518ff4f729eda5dd4f7aec",
+  "workflow_template_sha256": "aa77da40cedaa56aa6d4f02a2ec0f63c5f4cddabd781ba38adc2bacdfada2564",
+  "CI_source_manifest_sha256": "ca04992f2804ae90eaa7a2ee662f6584c3d20d8336ec3d887099297095e901ae",
+  "prepare_sha256": "b6e1e62cdb76a10ae09ad8c8a94f959a4f03b60fb4b386be22846990c76de04c",
+  "verified": {
+    "delta": "Exactly3 repository paths. Actual job_runner is byteexact D preview; deleting the single AITER_JIT_DIR env entry restores whole0898 file and AST. Only jobrunner member hash changes in manifest, only manifest hash changes in admission; both whole JSON inverses exact0898.",
+    "manifest": "All15 actual members match;14othermembers byteexact0898. Driver/envelope/innerinputs/prepare/model/identity/template/oracles retain original bytes. Registered workflow equals template; full e2e tree and1473 ancestry retained.",
+    "source_maps": {
+      "consumer19": 19,
+      "compiled37": 37,
+      "producer14": 14
+    },
+    "cohort": "Consumer19 actual1a0e+1473,compiled37 actual1a0e+d5,producer14 exactd5; sharedfivehelpers/inputs/fourarchives/sixpayload/nativeb7/producerpolicy/budget unchanged. Fixedcohort only, no latestmain qualification.",
+    "disabled": "Qwen fourexecutiongates false/res0; sharedfourauthorities+consumerGPUfalse andbudget.admittedfalse. Actor/branch/nonce/reviewbudget/model/background/runtime identities null/unbound. NEW2100 remains a proposed ceiling, not a grant.",
+    "runtime_scope": "New env is supplied to the same original container and inherited execs at /evidence/cache/aiter-jit. UID995/GID985/ownershipreturn/permissions/model/device/masks/paired12/2100absolute lifecycle unchanged."
+  },
+  "references": {
+    "root_actual_integration": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-private-JIT-actual-source-root-20261026.json",
+      "bytes": 1684,
+      "sha256": "9ab504eb89c2a152ff695d890146a799f626c11ae3430be7afbc17a1dbbb42ff"
+    },
+    "D_preview_delivery": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-K5-AITER-private-JIT-source-proposal-D-20261026/delivery.json",
+      "bytes": 1518,
+      "sha256": "d797bfe2a7c11af780baeee324817b15a1fead5d447b17ae6ba325eeddf81c3b"
+    },
+    "genuine_root_preview_peer": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-K5-AITER-private-JIT-source-proposal-D-20261026/peer-independent-root.json",
+      "bytes": 995,
+      "sha256": "2a196584536111fe8bb4d03443ea7a99d2430e8e607241893c34736ad258984d"
+    },
+    "antecedent_disabled0898_peer": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-preparation-0898-actual-source-peer-D-20261026.json",
+      "bytes": 5452,
+      "sha256": "54ab7df15c3c727e9600f07f12dda1a020970e452e71806ec1c60a4c490ce683"
+    }
+  },
+  "conditional_child_scope": "This actual source peer may be copied byteexact into a later root data-only child: Qwen admission, review/ci-source-peer.json, review/root-budget.json and four existing shared authority bits only. consumer_gpu_ready remainsfalse. All15 actual source members/manifest/registeredtemplate/19-37-14/artifacts/native/producer/model/request code remain unchanged. Fresh actualUID/model/background/TTL/budget/source-data/resource binding remains root work.",
+  "limits": [
+    "Source integration only. AITER_JIT_DIR changes cache location and may cause original JIT recompilation; cache/behavior equivalence is not claimed.",
+    "Next proof is real UID995/noGPU exact4420 branch/path/permission/import validation, followed separately by real GPU/model/paired behavior. Prior normalCPU does not prove the new cache branch.",
+    "No candidate/CLI/test/import/API/SSH/Docker/Gitmutation/C-M/formal/control action performed; no publication/grant/run/coverage authority."
+  ],
+  "executed": false,
+  "resource_authority": false,
+  "coverage_increment": 0
+}

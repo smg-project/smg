@@ -1,0 +1,74 @@
+{
+  "root_admitted": true,
+  "owner": "root",
+  "at_utc": "2026-10-26T04:59:51.431242+00:00",
+  "NEW_runner_seconds": 2100,
+  "GPU_jobs": 1,
+  "GPU_devices_simultaneous": 1,
+  "admission_nonce": "9568ede17dab4bfcaee254abe96f967d",
+  "no_retired_allowance_reused": true,
+  "registered_single_job_observer_source_reviewed": true,
+  "global_owned_GPU_runs_after_dispatch": 1,
+  "max_owned_GPU_runs": 2,
+  "old_finalized_seconds": 64386,
+  "old_reserved_seconds": 0,
+  "global_cap_before": 129939,
+  "global_cap_after": 129939,
+  "source_parent": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
+  "carrier_source": "1a0e7518ac330446059f4b32847205c4375e2fd9",
+  "observer_source_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen1a0e-original12-disabled-child-and-observer-source-proposal-D-20261026/peer-source-root.json",
+    "sha256": "5f2869b3a04824da3ad427049e94b265c126d67f57a2a3a407ccb69a4aaf2cba"
+  },
+  "source_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-private-JIT-actual-source-peer-A-20261026.json",
+    "sha256": "43616c94ab2178a98a8ce0ca61fbd6b4e159aa975fd565c86c7a3af3908fd0df"
+  },
+  "fresh_evidence": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-private-JIT-fresh-readiness-root-b80010a6e7254a9e8ad929302c868d8e/summary.json",
+    "sha256": "3822fe895e7d2aefb0a34498801629bbc4ff4f52a69bcb515303428faf45a57b"
+  },
+  "actual_active_DRM_UID995_CPU": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-active-DRM-UID995-CPU30-root-7cd16df78b1540e6b8a1b7ac3cc00eb6/root-closeout.json",
+    "sha256": "0000126eae388b2ec94d109252c5f9854d9d153b7b058acbba620e8462c35002"
+  },
+  "actual_active_DRM_UID995_CPU_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-active-DRM-UID995-CPU30-root-7cd16df78b1540e6b8a1b7ac3cc00eb6/peer-actual-A.json",
+    "sha256": "f0feb5052e9b0f766e0db25f831d96c3f1f21d68ce807b3a50e7a7975ce67787"
+  },
+  "prior_terminal_CU_run": 40258673029,
+  "prior_CU_settlement": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/sglang-pd4-current1473-b7-cu-20261026/actual-validation/root-terminal-resource-settlement.json",
+    "sha256": "9deb842d751671c6dbf9d5ad4b1e7e44c95eb8fc9e88052b48c00ecb57056cdb"
+  },
+  "absolute_GPU_job_seconds": 2100,
+  "absolute_work_seconds": 1920,
+  "cleanup_until_seconds": 2040,
+  "artifact_upload_reserved_seconds": 60,
+  "queue_seconds": 900,
+  "overall_seconds": 3600,
+  "coverage_increment": 0,
+  "original_pytest_cases_planned": 0,
+  "paired_observations_planned": 12,
+  "automatic_retry": false,
+  "preserve_ordinary_CI_PNL_health": true,
+  "preserved_ordinary_AMD_jobs": [],
+  "actual_full_preparation_CPU": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-0898-full-preparation-CPU600-root-a21c7855f3a3453fb50fb2e6ca830969/root-result.json",
+    "sha256": "a9773451f05e557ce8ce1864a1d14416435bcbe81deaea477b46c965ce0f73bf"
+  },
+  "actual_full_preparation_CPU_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-0898-full-preparation-CPU600-root-a21c7855f3a3453fb50fb2e6ca830969/peer-actual-D.json",
+    "sha256": "f069295ba12fb0c77d4bd227289966173403a8293c3496188cb872ba6a6977df"
+  },
+  "actual_private_JIT_function_CPU": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-private-JIT-real-account-UID995-CPU600-root-7a26e7e32f6e4d7aa89e1b02e3d42a76/root-result.json",
+    "sha256": "4b89cd3407c226d98814afa1fe811709fa8c4289898da7041e8be43b2de47eca"
+  },
+  "actual_private_JIT_CPU_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-private-JIT-real-account-UID995-CPU600-root-7a26e7e32f6e4d7aa89e1b02e3d42a76/peer-actual-C.json",
+    "sha256": "eaf238cf6fd8150a8d0be7b934bb1d4be3da039d887240f6dd861687b43b6735"
+  },
+  "private_JIT_complete_import_accepted": false,
+  "CPU_scope": "UID995 account/privatefunction positive; completeimport FAIL/noGPU rocminfo; no native/model inference"
+}
