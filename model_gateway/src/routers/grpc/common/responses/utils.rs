@@ -615,26 +615,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, UNKNOWN_MODEL_ID};
-
-    /// The terminal object of `request` with one output message.
-    fn completed_response(id: &str, request: &ResponsesRequest) -> ResponsesResponse {
-        let message = serde_json::from_value(json!({
-            "type": "message",
-            "id": "msg_1",
-            "role": "assistant",
-            "status": "completed",
-            "content": [{"type": "output_text", "text": "hello", "annotations": []}]
-        }))
-        .unwrap();
-        ResponsesResponse::builder(id, &request.model)
-            .copy_from_request(request)
-            .created_at(chrono::Utc::now().timestamp())
-            .completed_at(chrono::Utc::now().timestamp())
-            .status(ResponseStatus::Completed)
-            .add_output(message)
-            .build()
-    }
+    use crate::{
+        routers::grpc::common::responses::test_support::completed_response,
+        worker::{BasicWorkerBuilder, UNKNOWN_MODEL_ID},
+    };
 
     /// A chain ending in a record its client asked not to store is no
     /// previous response (the loaders of both model families call this; the
