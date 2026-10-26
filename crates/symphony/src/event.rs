@@ -86,6 +86,19 @@ pub(crate) fn runs_at(text: &str) -> impl Iterator<Item = (std::ops::Range<usize
     })
 }
 
+/// Carried bytes that are the template's wrapping (the whitespace a syntax holds after a tag it
+/// read or between two pieces of text, a wrapper's spacing): one `Dropped { Wrapper }` event of
+/// them, so a reader that counts reasons counts them once; nothing when there are none.
+pub(crate) fn drop_carried(carried: String, out: &mut Events) {
+    if carried.is_empty() {
+        return;
+    }
+    out.push(Event::Dropped {
+        text: Text::uncounted(carried),
+        why: DropReason::Wrapper,
+    });
+}
+
 /// Text a syntax has no place for where its structure stands (a word between tags, between a
 /// list's objects or between a block's calls, a tag out of its place, text after a call's object),
 /// released as `Malformed` with `why`, which the chat surface shows as content. `carried` holds
@@ -106,11 +119,8 @@ pub(crate) fn release_between<'d>(
     why: MalformedReason,
     out: &mut Events<'d>,
 ) {
-    if !*released && !carried.is_empty() {
-        out.push(Event::Dropped {
-            text: Text::uncounted(std::mem::take(carried)),
-            why: DropReason::Wrapper,
-        });
+    if !*released {
+        drop_carried(std::mem::take(carried), out);
     }
     let text = if carried.is_empty() {
         text

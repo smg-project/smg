@@ -868,13 +868,7 @@ impl Assembler {
     }
 
     fn drop_carried(&mut self, out: &mut Events) {
-        if self.carried.is_empty() {
-            return;
-        }
-        out.push(Event::Dropped {
-            text: Text::uncounted(std::mem::take(&mut self.carried)),
-            why: DropReason::Wrapper,
-        });
+        crate::event::drop_carried(std::mem::take(&mut self.carried), out);
     }
 
     /// The content held under the bare list, given back.

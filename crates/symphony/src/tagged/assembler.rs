@@ -412,13 +412,7 @@ impl Assembler {
     /// tag the syntax read, before text that is released ([`Self::release`]), which cannot wait
     /// for a later event's source.
     fn drop_carried(&mut self, out: &mut Events) {
-        let text = std::mem::take(&mut self.carried);
-        if !text.is_empty() {
-            out.push(Event::Dropped {
-                text: Text::uncounted(text),
-                why: DropReason::Wrapper,
-            });
-        }
+        crate::event::drop_carried(std::mem::take(&mut self.carried), out);
     }
 
     fn take(&mut self, piece: Piece<'_>, declared: &Declared, out: &mut Events) {

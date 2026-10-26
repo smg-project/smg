@@ -57,7 +57,7 @@
 //! a `;`, another object or prose after it (`docs/assemblers.md`).
 
 use crate::{
-    event::{release_between, DropReason, Event, Events, MalformedReason, Text},
+    event::{release_between, Event, Events, MalformedReason, Text},
     ids::CallIds,
     json,
 };
@@ -431,13 +431,7 @@ impl Assembler {
     }
 
     fn drop_carried(&mut self, out: &mut Events) {
-        if self.carried.is_empty() {
-            return;
-        }
-        out.push(Event::Dropped {
-            text: Text::uncounted(std::mem::take(&mut self.carried)),
-            why: DropReason::Wrapper,
-        });
+        crate::event::drop_carried(std::mem::take(&mut self.carried), out);
     }
 }
 
@@ -460,7 +454,7 @@ impl crate::engine::CallAssembler for Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::bytes;
+    use crate::{event::DropReason, testing::bytes};
 
     fn ids() -> CallIds {
         CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")

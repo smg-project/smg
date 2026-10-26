@@ -56,7 +56,9 @@
 
 use super::params::Params;
 use crate::{
-    event::{release_between, runs, DropReason, Event, Events, MalformedReason, Text},
+    event::{
+        drop_carried, release_between, runs, DropReason, Event, Events, MalformedReason, Text,
+    },
     format::CallId,
     json::{self, arguments::Strings},
     shape::{
@@ -585,18 +587,6 @@ impl Value {
         }
     }
 
-    /// The whitespace held after the last run of text under a shape with no trailer, as the
-    /// region closes or the stream ends: the template's spacing, dropped.
-    fn drop_carried(carried: String, out: &mut Events) {
-        if carried.is_empty() {
-            return;
-        }
-        out.push(Event::Dropped {
-            text: Text::uncounted(carried),
-            why: DropReason::Wrapper,
-        });
-    }
-
     /// The region closed: the bytes after the arguments and before the trailer are classified,
     /// and the trailer is returned for the call's end; or, for an object that named the call and
     /// ended it at its close, the trailer is the region's wrapping and nothing is returned.
@@ -621,7 +611,7 @@ impl Value {
                 true
             }
         };
-        Self::drop_carried(carried, out);
+        drop_carried(carried, out);
         wrapping(between, surplus, out);
         if enveloped {
             if !trailer.is_empty() {
@@ -655,7 +645,7 @@ impl Value {
                 false
             }
         };
-        Self::drop_carried(carried, out);
+        drop_carried(carried, out);
         wrapping(&after, MalformedReason::UnterminatedRegion, out);
         ends
     }
@@ -674,7 +664,7 @@ fn wrapping(text: &str, why: MalformedReason, out: &mut Events) {
             release_between(&mut carried, &mut released, run.to_owned().into(), why, out);
         }
     }
-    Value::drop_carried(carried, out);
+    drop_carried(carried, out);
 }
 
 #[cfg(test)]

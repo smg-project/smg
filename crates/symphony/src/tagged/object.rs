@@ -10,7 +10,7 @@
 //! that may be null held until its text says, any other value written whole at its close.
 
 use crate::{
-    event::{DropReason, Event, Events, MalformedReason, Text},
+    event::{Event, Events, MalformedReason, Text},
     tagged::{
         assembler::{push_escaped, push_quoted},
         value::NULL_WORDS,
@@ -85,13 +85,7 @@ impl Object {
     /// read, dropped so the report holds only the text (after text released already an assembler
     /// keeps it with the report instead); nothing when none.
     pub(super) fn drop_carried(&mut self, out: &mut Events) {
-        if self.carried.is_empty() {
-            return;
-        }
-        out.push(Event::Dropped {
-            text: Text::uncounted(std::mem::take(&mut self.carried)),
-            why: DropReason::Wrapper,
-        });
+        crate::event::drop_carried(std::mem::take(&mut self.carried), out);
     }
 
     /// The next bytes of the value under `key`, whose text starts at `start` in the carried
