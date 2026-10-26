@@ -96,19 +96,6 @@ const M2_RENDER_FIXTURES: &str = include_str!("../fixtures/minimax_m2/render_fix
 /// templates (the profile goes by the vendor's name, not the checkpoint).
 const MODEL: &str = "MiniMax-M3";
 
-/// A tokenizer.json that loads; the text checks never call into it.
-const MIN_TOKENIZER_JSON: &str = r#"{
-    "version": "1.0",
-    "truncation": null,
-    "padding": null,
-    "added_tokens": [],
-    "normalizer": null,
-    "pre_tokenizer": { "type": "Whitespace" },
-    "post_processor": null,
-    "decoder": null,
-    "model": { "type": "BPE", "vocab": { "hello": 0 }, "merges": [] }
-}"#;
-
 /// One request as a client sends it, with the template's prompt for it.
 /// Unknown fields are rejected so a regenerated fixture carrying a new knob
 /// fails here instead of rendering with it ignored.
@@ -164,7 +151,7 @@ fn tokenizer_with_template(tokenizer_json: &Path, template: &str) -> HuggingFace
 /// A minimal tokenizer rendering with the given fixture template.
 fn minimal_tokenizer_with_template(temp: &TempDir, template: &str) -> HuggingFaceTokenizer {
     let tokenizer_json = temp.path().join("tokenizer.json");
-    fs::write(&tokenizer_json, MIN_TOKENIZER_JSON).expect("tokenizer.json");
+    fs::write(&tokenizer_json, common::MIN_TOKENIZER_JSON).expect("tokenizer.json");
     tokenizer_with_template(&tokenizer_json, template)
 }
 

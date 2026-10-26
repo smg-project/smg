@@ -14,23 +14,8 @@ mod tests {
     use openai_protocol::common::{Function, Tool};
     use serde_json::json;
     use tempfile::TempDir;
-    /// A minimal tokenizer.json that loads cleanly. The only requirement is that
-    /// it parses; the encoder logic does not call back into the tokenizer here.
-    const MIN_TOKENIZER_JSON: &str = r#"{
-        "version": "1.0",
-        "truncation": null,
-        "padding": null,
-        "added_tokens": [],
-        "normalizer": null,
-        "pre_tokenizer": { "type": "Whitespace" },
-        "post_processor": null,
-        "decoder": null,
-        "model": {
-            "type": "BPE",
-            "vocab": { "hello": 0, "<s>": 1, "</s>": 2 },
-            "merges": []
-        }
-    }"#;
+
+    use crate::common::MIN_TOKENIZER_JSON_WITH_SENTINELS;
     fn write_dir(architectures: Option<&[&str]>) -> (TempDir, String) {
         write_model_dir(None, architectures, None, None)
     }
@@ -56,7 +41,7 @@ mod tests {
             None => temp.path().to_path_buf(),
         };
         let tok_path = model_dir.join("tokenizer.json");
-        fs::write(&tok_path, MIN_TOKENIZER_JSON).unwrap();
+        fs::write(&tok_path, MIN_TOKENIZER_JSON_WITH_SENTINELS).unwrap();
         if architectures.is_some() || model_type.is_some() {
             let mut config = serde_json::Map::new();
             if let Some(archs) = architectures {
@@ -156,7 +141,7 @@ mod tests {
     fn malformed_config_json_falls_back_to_jinja() {
         let temp = TempDir::new().unwrap();
         let tok_path = temp.path().join("tokenizer.json");
-        fs::write(&tok_path, MIN_TOKENIZER_JSON).unwrap();
+        fs::write(&tok_path, MIN_TOKENIZER_JSON_WITH_SENTINELS).unwrap();
         fs::write(temp.path().join("config.json"), "{ this is not json").unwrap();
         let tokenizer = HuggingFaceTokenizer::from_file(tok_path.to_str().unwrap()).unwrap();
         let messages = vec![json!({ "role": "user", "content": "Hello" })];

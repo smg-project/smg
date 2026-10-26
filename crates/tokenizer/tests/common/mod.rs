@@ -438,3 +438,35 @@ pub fn byte_level_bpe(merges: &[(&str, &str)], special_tokens: &[&str]) -> Token
         .expect("the special tokens");
     tokenizer
 }
+
+/// A minimal tokenizer.json that loads cleanly: a one-word BPE vocabulary. The only
+/// requirement is that it parses; the renderers under test do not call back into it.
+pub const MIN_TOKENIZER_JSON: &str = r#"{
+    "version": "1.0",
+    "truncation": null,
+    "padding": null,
+    "added_tokens": [],
+    "normalizer": null,
+    "pre_tokenizer": { "type": "Whitespace" },
+    "post_processor": null,
+    "decoder": null,
+    "model": { "type": "BPE", "vocab": { "hello": 0 }, "merges": [] }
+}"#;
+
+/// [`MIN_TOKENIZER_JSON`] with `<s>` and `</s>` in its vocabulary, for the renderers
+/// that look the sentinels up.
+pub const MIN_TOKENIZER_JSON_WITH_SENTINELS: &str = r#"{
+    "version": "1.0",
+    "truncation": null,
+    "padding": null,
+    "added_tokens": [],
+    "normalizer": null,
+    "pre_tokenizer": { "type": "Whitespace" },
+    "post_processor": null,
+    "decoder": null,
+    "model": {
+        "type": "BPE",
+        "vocab": { "hello": 0, "<s>": 1, "</s>": 2 },
+        "merges": []
+    }
+}"#;
