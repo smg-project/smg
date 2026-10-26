@@ -70,6 +70,7 @@ mod tests {
         grammar::{GrammarStart, Options},
         input::{EngineFinish, Input},
         parser::Parser,
+        testing::{bytes, calls, content, finish, reasoning},
         Declared,
     };
 
@@ -113,55 +114,6 @@ mod tests {
         out.into_owned().drain()
     }
 
-    /// Every byte the events carry, in order: the output, when the engine accounts for all of it.
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|event| match event {
-                Event::Content(text) | Event::Reasoning(text) => &*text.text,
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => &*text.text,
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => &*source.text,
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
-    }
-
-    fn calls(events: &[Event]) -> Vec<(String, String)> {
-        let mut calls: Vec<(String, String)> = Vec::new();
-        for event in events {
-            match event {
-                Event::ToolCallStart { name, .. } => calls.push((name.clone(), String::new())),
-                Event::ToolCallArguments { json, .. } => {
-                    calls.last_mut().expect("a call started").1.push_str(json);
-                }
-                _ => {}
-            }
-        }
-        calls
-    }
-
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(&*text.text),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn reasoning(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(&*text.text),
-                _ => None,
-            })
-            .collect()
-    }
-
     fn malformed<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
@@ -170,20 +122,6 @@ mod tests {
                 _ => None,
             })
             .collect()
-    }
-
-    /// The engine's finish: its reason as the engine gave it (the adapters refine it to
-    /// `tool_calls`), and the calls counted.
-    fn finish(events: &[Event]) -> (FinishReason, u32) {
-        events
-            .iter()
-            .find_map(|event| match event {
-                Event::Finish {
-                    reason, tool_calls, ..
-                } => Some((reason.clone(), *tool_calls)),
-                _ => None,
-            })
-            .expect("a finish")
     }
 
     /// A turn as the checkpoint's chat template renders it (`chat_template` of

@@ -200,7 +200,7 @@ mod tests {
         event::{DropReason, Event, FinishReason},
         grammar::{GrammarStart, Options},
         input::EngineFinish,
-        testing::{bytes, calls, content, drive, drive_to, reasoning},
+        testing::{bytes, calls, content, drive, drive_to, finish, reasoning},
         Declared,
     };
 
@@ -337,19 +337,6 @@ mod tests {
                 _ => None,
             })
             .collect()
-    }
-
-    /// The engine's finish: its reason as the engine gave it, and the calls counted.
-    fn finish(events: &[Event]) -> (FinishReason, u32) {
-        events
-            .iter()
-            .find_map(|event| match event {
-                Event::Finish {
-                    reason, tool_calls, ..
-                } => Some((reason.clone(), *tool_calls)),
-                _ => None,
-            })
-            .expect("a finish")
     }
 
     #[test]

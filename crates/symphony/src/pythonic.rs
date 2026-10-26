@@ -1012,7 +1012,7 @@ mod tests {
     use serde_json::json as value;
 
     use super::*;
-    use crate::testing::bytes;
+    use crate::testing::{bytes, content};
 
     fn ids() -> CallIds {
         CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
@@ -1344,16 +1344,6 @@ mod tests {
             }
         }
         calls
-    }
-
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(&*text.text),
-                _ => None,
-            })
-            .collect()
     }
 
     /// The text of every `Malformed` event, one entry per event, whatever its reason: an event of

@@ -88,6 +88,20 @@ pub(crate) fn calls(events: &[Event]) -> Vec<(String, String)> {
     calls
 }
 
+/// The engine's finish: its reason as the engine gave it (the adapters refine it to
+/// `tool_calls`), and the calls counted.
+pub(crate) fn finish(events: &[Event]) -> (FinishReason, u32) {
+    events
+        .iter()
+        .find_map(|event| match event {
+            Event::Finish {
+                reason, tool_calls, ..
+            } => Some((reason.clone(), *tool_calls)),
+            _ => None,
+        })
+        .expect("a finish")
+}
+
 /// One turn through `parser`: the prompt, the output in `pieces`, a stop; the
 /// events it produced.
 pub(crate) fn drive(
