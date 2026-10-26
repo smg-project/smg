@@ -117,8 +117,15 @@ impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
     /// ([`RequestDeadline::status`]), then the end.
     #[must_use]
     pub fn with_deadline(mut self, deadline: RequestDeadline) -> Self {
-        self.deadline = Some((deadline, Box::pin(tokio::time::sleep_until(deadline.at()))));
+        self.set_deadline(deadline);
         self
+    }
+
+    /// The same bound, set on a stream in place (the wrappers above a
+    /// transport stream apply a deadline through their boxes without
+    /// rebuilding them; see `ProtoStream::apply_deadline` in the gateway).
+    pub fn set_deadline(&mut self, deadline: RequestDeadline) {
+        self.deadline = Some((deadline, Box::pin(tokio::time::sleep_until(deadline.at()))));
     }
 
     /// Bound the wait for the worker's own end of a dropped stream (default

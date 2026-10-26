@@ -1587,31 +1587,29 @@ impl ExecutionResult {
     /// disaggregated pair, each result of a batch. An embedding is one
     /// answer, already in hand.
     #[must_use]
-    pub(crate) fn with_deadline(self, deadline: RequestDeadline) -> Self {
+    pub(crate) fn with_deadline(mut self, deadline: RequestDeadline) -> Self {
+        self.apply_deadline(deadline);
+        self
+    }
+
+    /// [`Self::with_deadline`] in place: the streams are bounded where they
+    /// are (a decode side through its box, a batch's results in their
+    /// vector), nothing is rebuilt.
+    pub(crate) fn apply_deadline(&mut self, deadline: RequestDeadline) {
         match self {
-            Self::Single { stream } => Self::Single {
-                stream: stream.with_deadline(deadline),
-            },
+            Self::Single { stream } => stream.apply_deadline(deadline),
             Self::PrefillDecode {
-                prefill,
-                decode,
-                prefill_guards,
-                pd_timing,
-                prefill_input_logprobs,
-            } => Self::PrefillDecode {
-                prefill: prefill.with_deadline(deadline),
-                decode: Box::new(decode.with_deadline(deadline)),
-                prefill_guards,
-                pd_timing,
-                prefill_input_logprobs,
-            },
-            Self::Embedding { .. } => self,
-            Self::Batch { results } => Self::Batch {
-                results: results
-                    .into_iter()
-                    .map(|result| result.with_deadline(deadline))
-                    .collect(),
-            },
+                prefill, decode, ..
+            } => {
+                prefill.apply_deadline(deadline);
+                decode.apply_deadline(deadline);
+            }
+            Self::Embedding { .. } => {}
+            Self::Batch { results } => {
+                for result in results {
+                    result.apply_deadline(deadline);
+                }
+            }
         }
     }
 }

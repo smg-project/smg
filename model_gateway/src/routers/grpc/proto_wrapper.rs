@@ -2055,66 +2055,35 @@ impl ProtoStream {
     /// bounds each child. The ZMQ wire's stream has no deadline hook and is
     /// left as it is.
     #[must_use]
-    pub fn with_deadline(self, deadline: RequestDeadline) -> Self {
+    pub fn with_deadline(mut self, deadline: RequestDeadline) -> Self {
+        self.apply_deadline(deadline);
+        self
+    }
+
+    /// [`Self::with_deadline`] in place: the wrappers (a tracked stream, a
+    /// decode side, a pulled-ahead item, a watched stream, a fan-out) reach
+    /// the transport stream(s) under them through their existing boxes, so a
+    /// deadline costs no allocation on the request.
+    pub fn apply_deadline(&mut self, deadline: RequestDeadline) {
         match self {
-            Self::Sglang(stream) => Self::Sglang(stream.with_deadline(deadline)),
-            Self::Vllm(stream) => Self::Vllm(stream.with_deadline(deadline)),
-            Self::Trtllm(stream) => Self::Trtllm(stream.with_deadline(deadline)),
-            Self::Mlx(stream) => Self::Mlx(stream.with_deadline(deadline)),
-            Self::TokenSpeed(stream) => Self::TokenSpeed(stream.with_deadline(deadline)),
-            Self::Zmq(stream) => Self::Zmq(stream),
-            Self::Fanout(stream) => Self::Fanout(stream.with_deadline(deadline)),
-            Self::Tracked(stream) => {
-                let TrackedStream {
-                    inner,
-                    worker,
-                    prefill,
-                    progress,
-                    output,
-                    samples_success,
-                    replay,
-                } = *stream;
-                Self::Tracked(Box::new(TrackedStream {
-                    inner: inner.with_deadline(deadline),
-                    worker,
-                    prefill,
-                    progress,
-                    output,
-                    samples_success,
-                    replay,
-                }))
-            }
-            Self::DecodeSide(side) => {
-                let DecodeStream { inner, prefill } = *side;
-                Self::DecodeSide(Box::new(DecodeStream {
-                    inner: inner.with_deadline(deadline),
-                    prefill,
-                }))
-            }
+            Self::Sglang(stream) => stream.set_deadline(deadline),
+            Self::Vllm(stream) => stream.set_deadline(deadline),
+            Self::Trtllm(stream) => stream.set_deadline(deadline),
+            Self::Mlx(stream) => stream.set_deadline(deadline),
+            Self::TokenSpeed(stream) => stream.set_deadline(deadline),
+            Self::Zmq(_) => {}
+            Self::Fanout(stream) => stream.apply_deadline(deadline),
+            Self::Tracked(stream) => stream.inner.apply_deadline(deadline),
+            Self::DecodeSide(side) => side.inner.apply_deadline(deadline),
             // The item pulled ahead is already in hand; the stream under it
             // is bounded.
-            Self::Ahead(ahead) => {
-                let AheadStream { inner, first } = *ahead;
-                Self::Ahead(Box::new(AheadStream {
-                    inner: inner.with_deadline(deadline),
-                    first,
-                }))
-            }
+            Self::Ahead(ahead) => ahead.inner.apply_deadline(deadline),
             // The watched stream's inner stream is bounded while the client is
             // still there; once it left, there is nothing left to bound.
             Self::Watched(watched) => {
-                let WatchedStream {
-                    inner,
-                    client,
-                    client_gone,
-                    request_id,
-                } = *watched;
-                Self::Watched(Box::new(WatchedStream {
-                    inner: inner.map(|inner| inner.with_deadline(deadline)),
-                    client,
-                    client_gone,
-                    request_id,
-                }))
+                if let Some(inner) = watched.inner.as_mut() {
+                    inner.apply_deadline(deadline);
+                }
             }
         }
     }
@@ -2204,8 +2173,8 @@ impl FanoutChild for ProtoStream {
         Self::defer_abort_until_first_item(self)
     }
 
-    fn with_deadline(self, deadline: RequestDeadline) -> Self {
-        Self::with_deadline(self, deadline)
+    fn apply_deadline(&mut self, deadline: RequestDeadline) {
+        Self::apply_deadline(self, deadline);
     }
 
     fn worker(&self) -> Option<&Arc<dyn Worker>> {
@@ -2228,16 +2197,10 @@ pub trait FanoutChild: Send {
     #[must_use]
     fn defer_abort_until_first_item(self) -> Self;
 
-    /// Bound the child by the request's `deadline` (see
-    /// [`ProtoStream::with_deadline`]); a child with no transport stream
+    /// Bound the child by the request's `deadline`, in place (see
+    /// [`ProtoStream::apply_deadline`]); a child with no transport stream
     /// under it is left as it is.
-    #[must_use]
-    fn with_deadline(self, _deadline: RequestDeadline) -> Self
-    where
-        Self: Sized,
-    {
-        self
-    }
+    fn apply_deadline(&mut self, _deadline: RequestDeadline) {}
 
     /// The one worker the child was dispatched to, when it is tracked; a
     /// fan-out over several workers answers `None`.
@@ -2356,16 +2319,10 @@ impl<C: FanoutChild> FanoutStream<C> {
         }
     }
 
-    /// Bound every open child by the request's `deadline`.
-    #[must_use]
-    pub fn with_deadline(self, deadline: RequestDeadline) -> Self {
-        Self {
-            children: self
-                .children
-                .into_iter()
-                .map(|child| child.map(|child| child.with_deadline(deadline)))
-                .collect(),
-            cursor: self.cursor,
+    /// Bound every open child by the request's `deadline`, in place.
+    pub fn apply_deadline(&mut self, deadline: RequestDeadline) {
+        for child in self.children.iter_mut().flatten() {
+            child.apply_deadline(deadline);
         }
     }
 }
