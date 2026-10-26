@@ -1238,7 +1238,7 @@ impl WorkerSelectionStage {
             }
             return Self::workers_unavailable(model_id);
         }
-        error::model_not_found(model_id)
+        placement::model_refusal(&self.worker_registry, model_id)
     }
 
     /// The refusal for a disaggregated request whose model has workers on
@@ -1317,7 +1317,7 @@ impl WorkerSelectionStage {
         if unavailable {
             return Self::workers_unavailable(model_id);
         }
-        error::model_not_found(model_id)
+        placement::model_refusal(&self.worker_registry, model_id)
     }
 
     /// Workers process the model's media references, but none runs the
@@ -1572,7 +1572,7 @@ impl WorkerSelectionStage {
                 if partner_registered {
                     Self::role_missing(model_id, &[role])
                 } else {
-                    error::model_not_found(model_id)
+                    placement::model_refusal(&self.worker_registry, model_id)
                 }
             }
         }

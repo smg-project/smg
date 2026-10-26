@@ -40,7 +40,7 @@ use crate::{
     middleware::ReportedRefusal,
     observability::log_throttle::KeyedLogThrottle,
     routers::{
-        common::sse,
+        common::{placement, sse},
         error,
         grpc::{
             context::RequestContext,
@@ -149,12 +149,20 @@ pub(crate) fn resolve_tokenizer(
         .tokenizer_registry
         .get(model_id)
         .ok_or_else(|| {
-            let served = ctx.components.worker_registry.contains_model(model_id);
+            // A model no worker serves is refused as the selection stage
+            // would refuse it (a served model whose workers left gets the
+            // pool's 503, an unknown name the 404), not as a tokenizer gap.
+            if !ctx.components.worker_registry.contains_model(model_id) {
+                return Box::new(placement::model_refusal(
+                    &ctx.components.worker_registry,
+                    model_id,
+                ));
+            }
             let failure = ctx.components.tokenizer_load_failures.get(model_id);
             Box::new(missing_tokenizer_response(
                 stage_name,
                 model_id,
-                served,
+                true,
                 ctx.components.tokenizer_autoload,
                 failure.as_ref(),
             ))
