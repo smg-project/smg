@@ -10,6 +10,15 @@ on:
     branches: [ main ]
     types: [opened, synchronize, reopened]
   workflow_dispatch:
+    inputs:
+      private_vllm_chat:
+        description: Run only separately admitted fixed-f103 original full vLLM chat and units
+        type: boolean
+        default: false
+      normal_input_mount:
+        description: Root-reviewed readonly bind of exact CDF/e006 inputs (private mode only)
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -19,8 +28,8 @@ permissions:
 # merges otherwise stack full GPU matrices on one runner pool and time each
 # other out. Re-run an intermediate commit via workflow_dispatch if needed.
 concurrency:
-  group: gateway-tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'main' }}
-  cancel-in-progress: true
+  group: ${{ inputs.private_vllm_chat && format('amd-private-vllm-chat-entry-{0}', github.ref) || format('gateway-tests-{0}', github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'main') }}
+  cancel-in-progress: ${{ !inputs.private_vllm_chat }}
 
 env:
   RUSTC_WRAPPER: sccache
@@ -28,7 +37,19 @@ env:
   GENAI_BENCH_IMAGE: ghcr.io/moirai-internal/genai-bench:0.0.4
 
 jobs:
+  private-vllm-chat:
+    if: github.event_name == 'workflow_dispatch' && inputs.private_vllm_chat
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/amd-vllm-chat-fixed-f103-private.yml
+    with:
+      execute: ${{ inputs.private_vllm_chat }}
+      normal_input_mount: ${{ inputs.normal_input_mount }}
+    secrets: inherit
+
   pre-commit:
+    if: ${{ !inputs.private_vllm_chat }}
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
       contents: read
@@ -61,6 +82,7 @@ jobs:
         run: pre-commit run --all-files --show-diff-on-failure
 
   python-lint:
+    if: ${{ !inputs.private_vllm_chat }}
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
       contents: read
@@ -88,6 +110,7 @@ jobs:
         run: mypy bindings/python/ --config-file mypy.ini
 
   grpc-proto-build-check:
+    if: ${{ !inputs.private_vllm_chat }}
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
       contents: read
@@ -131,6 +154,7 @@ jobs:
           pytest -q crates/grpc_client/python/tests
 
   build-wheel:
+    if: ${{ !inputs.private_vllm_chat }}
     # CPU-only Rust/wheel/Go-FFI/WASM compile — no GPU needed. Runs on the CPU
     # runner pool (which also tolerates the nvidia.com/gpu taint, so it can use
     # the abundant stranded CPU on GPU nodes) instead of competing for scarce
@@ -227,6 +251,7 @@ jobs:
           python3 -m smg.launch_router --help > /dev/null && echo "Entry point: OK"
 
   python-unit-tests:
+    if: ${{ !inputs.private_vllm_chat }}
     needs: build-wheel
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -296,6 +321,7 @@ jobs:
     name: rust-lint (${{ matrix.leg }})
     needs: [detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       always()
       && !cancelled()
       && needs.detect-changes.result == 'success'
@@ -381,6 +407,7 @@ jobs:
     name: rust-tests (${{ matrix.shard }})
     needs: [detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       always()
       && !cancelled()
       && needs.detect-changes.result == 'success'
@@ -481,6 +508,7 @@ jobs:
   cargo-audit:
     needs: [detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       always()
       && !cancelled()
       && needs.detect-changes.result == 'success'
@@ -535,6 +563,7 @@ jobs:
   rust-aarch64:
     needs: [detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       always()
       && !cancelled()
       && needs.detect-changes.result == 'success'
@@ -578,6 +607,7 @@ jobs:
   benchmarks:
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.symphony-only != 'true'
     runs-on: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
@@ -642,6 +672,7 @@ jobs:
           retention-days: 7
 
   detect-changes:
+    if: ${{ !inputs.private_vllm_chat }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -1204,6 +1235,7 @@ jobs:
     name: e2e-1gpu-chat (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
@@ -1263,6 +1295,7 @@ jobs:
     name: e2e-1gpu-chat-amd (vllm)
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       always()
       && !cancelled()
       && vars.SMG_RUN_AMD_LEGS == 'true'
@@ -1302,6 +1335,7 @@ jobs:
     name: e2e-1gpu-chat-symphony (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
@@ -1341,6 +1375,7 @@ jobs:
     name: e2e-1gpu-chat-rust-servicer (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
@@ -1395,6 +1430,7 @@ jobs:
   e2e-1gpu-chat-mm-worker:
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
@@ -1416,6 +1452,7 @@ jobs:
     name: e2e-1gpu-chat-zmq (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
@@ -1464,6 +1501,7 @@ jobs:
     name: e2e-1gpu-chat-zmq-amd (sglang)
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       always()
       && !cancelled()
       && vars.SMG_RUN_AMD_LEGS == 'true'
@@ -1491,6 +1529,7 @@ jobs:
     name: e2e-2gpu-chat-zmq-dp (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
@@ -1537,6 +1576,7 @@ jobs:
     name: e2e-1gpu-completions (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
@@ -1566,6 +1606,7 @@ jobs:
     name: e2e-1gpu-embeddings (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
@@ -1595,6 +1636,7 @@ jobs:
   e2e-1gpu-realtime:
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
@@ -1615,6 +1657,7 @@ jobs:
     name: e2e-1gpu-gateway (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
@@ -1650,6 +1693,7 @@ jobs:
   e2e-1gpu-responses:
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
@@ -1671,6 +1715,7 @@ jobs:
     name: e2e-2gpu-pd (${{ matrix.engine }}${{ matrix.kv_backend && format('-{0}', matrix.kv_backend) || '' }})
     needs: [e2e-1gpu-gateway, detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       always()
       && !cancelled()
       && needs.e2e-1gpu-gateway.result == 'success'
@@ -1728,6 +1773,7 @@ jobs:
   e2e-2gpu-pd-mm-worker:
     needs: [e2e-1gpu-chat-mm-worker, detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       always()
       && !cancelled()
       && needs.e2e-1gpu-chat-mm-worker.result == 'success'
@@ -1748,6 +1794,7 @@ jobs:
   # === 4 GPU ===
 
   e2e-4gpu-chat:
+    if: ${{ !inputs.private_vllm_chat }}
     name: e2e-4gpu-chat (${{ matrix.engine }})
     needs: [e2e-1gpu-chat]
     strategy:
@@ -1774,6 +1821,7 @@ jobs:
     secrets: inherit
 
   e2e-4gpu-gateway:
+    if: ${{ !inputs.private_vllm_chat }}
     name: e2e-4gpu-gateway
     needs: [e2e-1gpu-gateway]
     uses: ./.github/workflows/e2e-gpu-job.yml
@@ -1787,6 +1835,7 @@ jobs:
     secrets: inherit
 
   e2e-4gpu-epd:
+    if: ${{ !inputs.private_vllm_chat }}
     name: e2e-4gpu-epd (tokenspeed)
     needs: [e2e-1gpu-chat, detect-changes]
     uses: ./.github/workflows/e2e-gpu-job.yml
@@ -1810,6 +1859,7 @@ jobs:
     name: e2e-4gpu-pd (${{ matrix.engine }}${{ matrix.kv_backend && format('-{0}', matrix.kv_backend) || '' }})
     needs: [e2e-1gpu-gateway, detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       always()
       && !cancelled()
       && needs.e2e-1gpu-gateway.result == 'success'
@@ -1877,6 +1927,7 @@ jobs:
     name: ${{ matrix.name }}
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
@@ -1981,6 +2032,7 @@ jobs:
           bash scripts/ci_agentic_svc_deps.sh cleanup-oracle-user oracle-db
 
   go-unit-tests:
+    if: ${{ !inputs.private_vllm_chat }}
     name: go-unit-tests
     needs: build-wheel
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
@@ -2022,6 +2074,7 @@ jobs:
     name: go-bindings-e2e
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
@@ -2087,6 +2140,7 @@ jobs:
     name: go-bindings-e2e-amd
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_vllm_chat &&
       always()
       && !cancelled()
       && vars.SMG_RUN_AMD_LEGS == 'true'
@@ -2189,7 +2243,7 @@ jobs:
   go-bindings-benchmark:
     name: go-bindings-benchmark
     needs: build-wheel
-    if: false  # Disabled
+    if: ${{ !inputs.private_vllm_chat && (false) }}  # Disabled
     runs-on: ${{ vars.SMG_RUNNER_GPU || 'k8s-runner-gpu' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     timeout-minutes: 32
@@ -2243,7 +2297,7 @@ jobs:
 
   finish:
     needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-symphony, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-1gpu-chat-zmq-amd, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e, go-bindings-e2e-amd]
-    if: always()
+    if: ${{ !inputs.private_vllm_chat && (always()) }}
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
       contents: read
@@ -2344,7 +2398,7 @@ jobs:
   summarize-benchmarks:
     needs: [benchmarks]
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
-    if: always() && contains(fromJSON('["success", "failure"]'), needs.benchmarks.result)
+    if: ${{ !inputs.private_vllm_chat && (always() && contains(fromJSON('["success", "failure"]'), needs.benchmarks.result)) }}
     permissions:
       contents: read
     steps:

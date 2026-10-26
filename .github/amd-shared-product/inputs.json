@@ -1,0 +1,230 @@
+{
+  "ready": false,
+  "run_budget_admitted": false,
+  "artifacts_pinned": false,
+  "consumer_gpu_ready": false,
+  "runtime_cohort_accepted": false,
+  "admitted_lane": "vllm-chat-full-original",
+  "target_product_commit": "11da3ba8488f17a779df3d217be46f66d2554539",
+  "artifacts": [
+    {
+      "name": "wasm-test-fixtures",
+      "id": 12648205603,
+      "bytes": 56596,
+      "sha256": "0a368f243c0d9f3eab1e33857dcbe346aab5837d6c75425a63424ded4d974261",
+      "expires_at": "2026-10-27T11:52:31Z",
+      "files": {
+        "storage_hook_guest.wasm": {
+          "bytes": 80680,
+          "sha256": "7e3a093e09bfe30244d128c1aaaf8558a1b13c05558cc81cff04021947445e11"
+        },
+        "storage_hook_passthrough.wasm": {
+          "bytes": 79153,
+          "sha256": "3a10ce115ea179026a00f3e85ce6b6a388bcc1f274bc7abfc074be876d7c3e55"
+        }
+      }
+    },
+    {
+      "name": "smg-wheel",
+      "id": 12648055973,
+      "bytes": 52840514,
+      "sha256": "5b48e2fcd6b89e5647b240e462f08ddd29b6b80ba1f26a2e3d2ee4f91a877765",
+      "expires_at": "2026-10-27T11:52:25Z",
+      "files": {
+        "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl": {
+          "bytes": 52978564,
+          "sha256": "0a3299e78a0ddb6839b67935f9bbd01459eabb198fae0c285aa0cf5880c50065"
+        }
+      }
+    },
+    {
+      "name": "python-client-types",
+      "id": 12647686820,
+      "bytes": 34700,
+      "sha256": "17f6dedaccdc1954afd04d59103f5feb08f8d987c2ce45a5145ebd8b0f375b6e",
+      "expires_at": "2026-10-27T11:52:30Z",
+      "files": {
+        "_generated.py": {
+          "bytes": 188140,
+          "sha256": "44f1b72574fe1de78307cd059cb3fa531b5126a28cd0f93cb690dbc585be8aec"
+        }
+      }
+    },
+    {
+      "name": "go-ffi-library",
+      "id": 12646854498,
+      "bytes": 13852968,
+      "sha256": "47c4eefbcec6643dd86a4cba0aa77b8abfb1068a2dabce78c6cdc8068585efd4",
+      "expires_at": "2026-10-27T11:52:28Z",
+      "files": {
+        "libsmg_go.d": {
+          "bytes": 65464,
+          "sha256": "9cc3f3b3a255a3f2dd8bf2093d4b0cbc7e37b4e073396d5f3ef6f9688ccbd4c0"
+        },
+        "libsmg_go.so": {
+          "bytes": 35051064,
+          "sha256": "6cb8c0d7009a48a07b09b3c8cc321d6a8d26145c9a3258f5e99587c8ce8f2fde"
+        }
+      }
+    }
+  ],
+  "gateway_native": {
+    "name": "smg/smg_rs.abi3.so",
+    "bytes": 143968336,
+    "sha256": "2d743d6469f64da95a84a3cea16681f5f547ff1f0976829da3666daa44e1e729"
+  },
+  "producer_sha": "69215ef26afdaf1bdf7b61b4dfd635db906e1eeb",
+  "run_id": 40312852744,
+  "run_attempt": 1,
+  "build_job_id": 121538063467,
+  "producer_branch": "ci/amd-main-f103-native-preparation-20261026",
+  "producer_policy": "frozen_mainf103_complete_build_only_all_18_steps_success_v1",
+  "source_base": "f1038e99610647fa35a7e479e41f4dbc1821e481",
+  "source_trees": {
+    ".cargo": "8a9d55bb8edfa19d9f90b313fbdc24326d3f667b",
+    "Cargo.toml": "cb29df18a6eede1eed9f2d244367e804d20a2f14",
+    "Cargo.lock": "7022fa76a1f1e4ef7aa812ee7f2d3ac159fd6aa4",
+    "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+    "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+    "bindings": "a14dbb9ee27063e092522c6a62bbd6d1841d340c",
+    "clients": "599d7ce2727e5d6287825271f464a3b7b5e64ee9",
+    "crates": "a1c15ad0201ea773ca3ebd1cba98a9ebd93485e8",
+    "model_gateway": "43b1c9dadf297863b4d8afea601c17710393d8a9",
+    "grpc_servicer": "da5ebe8f3202a21e2c23ebbbacf7c2117cfe44e2",
+    "e2e_test": "52737557a71436eccac1f33266a4b6b9c438a2db",
+    "scripts": "52daf79832b793c18268da010bdb9cf6fa4ba568",
+    ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
+    ".github/workflows/e2e-gpu-job.yml": "fed4d9a880926cd95e01ad8e6c1e722b7ff56ce3",
+    "README.md": "83b7df25632da03f0184bd5b4628b9c9a3ace803",
+    "LICENSE": "9088c2872db9763b9e6533c6960e9adb0c9cb65f",
+    "rustfmt.toml": "19e1ab31f8958c31292f0f568976a036af7e683b",
+    "clippy.toml": "cfb9e85a5074e6b02e603df8da9653ee18dbcca3",
+    "examples/wasm": "fc10fea21779371f9de247209af2028cf8173236"
+  },
+  "compiled_source_trees": {
+    ".cargo": "8a9d55bb8edfa19d9f90b313fbdc24326d3f667b",
+    "Cargo.toml": "cb29df18a6eede1eed9f2d244367e804d20a2f14",
+    "Cargo.lock": "7022fa76a1f1e4ef7aa812ee7f2d3ac159fd6aa4",
+    "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+    "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+    "bindings": "a14dbb9ee27063e092522c6a62bbd6d1841d340c",
+    "clients": "599d7ce2727e5d6287825271f464a3b7b5e64ee9",
+    "model_gateway": "43b1c9dadf297863b4d8afea601c17710393d8a9",
+    "examples/wasm": "fc10fea21779371f9de247209af2028cf8173236",
+    "crates/auth": "642cfcb069e7a56f0637909b6bf67365f4c48d07",
+    "crates/data_connector": "a4ed77fbf2c8fa08712af6093423b5f572bac29e",
+    "crates/engine_servicer": "5e59dcf2a971d0f2142358719c3f50a148c1c82f",
+    "crates/engine_zmq_adapter": "46b16bd9fb0bfbf93a10595e27b42834312540f3",
+    "crates/engine_zmq_client": "fcd02a71fc26119f37df641f41d07e41fbe707ae",
+    "crates/external_router": "7b85bace1d6b4ee81e615cd20fbd3623fe740add",
+    "crates/kv_index": "fdc7aabc731dad878222e3bddf5540f8115ea8c1",
+    "crates/mcp": "2d747deacf5b827cfe22181b085d82bf2a1f200d",
+    "crates/mesh": "9f881ee2488913f6a5efe1f4c16dc0500a10b7ec",
+    "crates/mm_rdma": "5e42c1198e2f08f74061c398258971e7ecaa33aa",
+    "crates/mock_worker": "6e448e25765c8c317829f898cc82230ad3bb4fb8",
+    "crates/multimodal": "aed6c2872baac9ab67149fcbc985bdabc71c6ad7",
+    "crates/protocols": "a62934a57abd239644e91952d42c27c31f784a95",
+    "crates/radix_tree": "063bfb16dbbf4423b632fbc00aa79b01a3b06996",
+    "crates/reasoning_parser": "fad4e67c1082415ccf5975209cf6dbb4b4753651",
+    "crates/response_template": "51ea20dd99da5a89644f0960c64d8a383c144b02",
+    "crates/rl": "01aa1de7bdca3e37f94e1ba19c16aead3a9a540a",
+    "crates/symphony": "6ffa46daebe55f544d28ad241f132add630568e7",
+    "crates/tokenizer": "da424a58633fc2acb08e05bf657f3b259bbf8160",
+    "crates/tool_parser": "4f2b4246f15b1497fdf74f4c5683e0a57ff37db0",
+    "crates/wasm": "fb912247f8c792a58e7add6a04d69a3c492d3670",
+    "crates/workflow": "383ebffbd4a6adcd4a16a6faefec664b7e195ea0",
+    "crates/grpc_client/Cargo.toml": "16ed107c1d32f668216ca23bc92f6862457ac14f",
+    "crates/grpc_client/build.rs": "946832e4554939503959adf7d0ee725beb6b65c8",
+    "crates/grpc_client/go": "89b5a2463e45e0f64d577e9ab74ec318653b9352",
+    "crates/grpc_client/proto": "a74e47fffa37e1f9a2448dd658544a97c0430686",
+    "crates/grpc_client/src": "1cb4c8b5a1934ad4bc030ee52c5b86d9e2eb23e2",
+    "crates/grpc_client/tests": "e15c3383afe2c9aa7c184de7c387fa876935f1a1"
+  },
+  "producer_source_trees": {
+    ".cargo": "8a9d55bb8edfa19d9f90b313fbdc24326d3f667b",
+    "Cargo.toml": "cb29df18a6eede1eed9f2d244367e804d20a2f14",
+    "Cargo.lock": "7022fa76a1f1e4ef7aa812ee7f2d3ac159fd6aa4",
+    "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+    "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+    "bindings": "a14dbb9ee27063e092522c6a62bbd6d1841d340c",
+    "clients": "599d7ce2727e5d6287825271f464a3b7b5e64ee9",
+    "crates": "a1c15ad0201ea773ca3ebd1cba98a9ebd93485e8",
+    "model_gateway": "43b1c9dadf297863b4d8afea601c17710393d8a9",
+    "grpc_servicer": "da5ebe8f3202a21e2c23ebbbacf7c2117cfe44e2",
+    "e2e_test": "c2eefe37d3f1448506dc5a23a025f8d5f5c80b3e",
+    "scripts": "c4db3139a9f4d733b3cb3691d798f65158c9877a",
+    ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
+    ".github/workflows": "fbb8399484e0c1abf93ed84b9bed034b4df1bac7"
+  },
+  "prior_GPU_results_transferred": false,
+  "new_native_required": false,
+  "recipe": {
+    "engine": "vllm",
+    "gpu_tier": "1",
+    "test_dirs": "e2e_test/chat_completions",
+    "test_filter": "",
+    "timeout": 32,
+    "test_timeout": 24,
+    "min_selected": 202,
+    "servicer_unit_tests": true,
+    "parser": "",
+    "connection_mode": "",
+    "servicer_impl": "",
+    "mm_processing": "",
+    "reruns": 2,
+    "reruns_delay": 5,
+    "same_original_tests_models_protocols_and_oracles": true,
+    "floor_is_only_integrity_guard": true,
+    "original16_inventory_unchanged": true,
+    "fullQA_nonMLX_registry_retained": 17
+  },
+  "budget": {
+    "admitted": false,
+    "reserved_runner_seconds": 0,
+    "proposed_new_max_seconds": 1920,
+    "global_owned_max": 2,
+    "one_lane_per_run": true,
+    "old_retired_seconds_reused": 0
+  },
+  "dispatch_contract": {
+    "registered_workflow": ".github/workflows/pr-test-rust.yml",
+    "manual_only": true,
+    "execute_default": false,
+    "root_admission_required": true,
+    "one_GPU_job": "private-vllm-chat / vllm-chat / run (actual API identity must be bound after dispatch)",
+    "other_GPU_matrix_jobs": 0,
+    "private_ref": "ci/amd-vllm-chat-fixed-f103-validation-20261026",
+    "actual_dispatch_head": null,
+    "actual_run_id": null,
+    "controller_source": null,
+    "run_binding": null,
+    "watch_PID_or_session": null,
+    "reusable_leaf": ".github/workflows/amd-vllm-chat-fixed-f103-private.yml",
+    "private_input": "private_vllm_chat",
+    "execute_input": "execute",
+    "normal_input_mount": null
+  },
+  "pending_note": "SOURCE ONLY: targetproductHEAD/actualconsumerHEAD/run/job/node/grant/inputmount remain unbound. Both CI nodes reported NoSuchImage for exactc49; localCDF/e006 are not yet CI-visible. Root must bind actualproductHEAD+matching19, freshproducerTTL/physicalowner/source/resource peers and a separate NEW1920 cap; no retired reuse. Normal b4bae/d53e proves BASE/native69215/CPUfixtureRPC/PNG only. Fulloriginalchat+FULLinstalledvLLMunits remain actualGPU work; no current38/df17/native transfer.",
+  "binding_preparation_evidence": {
+    "producer_build_archive_integrity_sha256": "671ca4d9b395dbf306cdc8f0885b4200c5c95cc3c28bf74ba2c53da2e4b24561",
+    "producer_integrity_root_acceptance_sha256": "97cc1309c64e497dbd2d1b017cc99fe429612ef4fcf3e23636466de88e75edaa",
+    "producer_policy_source_review_sha256": "513fd59e64182bed6ce08f66a6ae75d4d133fc023e4a1c4495e2f94ab86e389f",
+    "producer_policy_actual_source_review_sha256": "6f0caf0fd82eedb4720ad23a394f404dc0189bfe4ea3caf302ae29a8f110cc75",
+    "prior_GPU_results_transferred": false,
+    "normal_install_verified": true,
+    "normal_install_root_acceptance_sha256": "b4bae63c180d6e6444b5a7fb4465286d827123a51be7282eee9d5e1f3e94a76b",
+    "normal_install_actual_peer_sha256": "d53e3134f033755107bca533f5e783ff2b33061bc1f12d79e187d15720d3e6c5",
+    "normal_scope": "CDF/e006 actual normal BASE + native69215 + CPUfixtureRPC + PNG only; nofullunits/model/GPU"
+  },
+  "normal_base": {
+    "input_ready": false,
+    "input_directory": "/opt/smg-vllm-normal-input",
+    "adapter_sha256": "0dec64583d133d40d363e3e1b08b2a31c844812d59ccd07a8c281b483373baa4",
+    "pins_sha256": "d9502c79fa2d7e603dd377f6ad24e670dcc4ed16060507a96a58ddb9849ddb00",
+    "root_acceptance_sha256": "b4bae63c180d6e6444b5a7fb4465286d827123a51be7282eee9d5e1f3e94a76b",
+    "actual_peer_sha256": "d53e3134f033755107bca533f5e783ff2b33061bc1f12d79e187d15720d3e6c5",
+    "scope": "Accepted f949/69215 BASE install+CPUfixtureRPC only, not the future fullunits/chat/GPU result",
+    "node_image_cache_verified": false,
+    "artifact_CI_visibility_verified": false
+  }
+}
