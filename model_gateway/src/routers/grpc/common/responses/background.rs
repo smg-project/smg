@@ -1191,6 +1191,21 @@ mod tests {
         }
     }
 
+    /// Work that never ends on its own; the receiver fires when it is dropped.
+    fn pending_work() -> (
+        impl Future<Output = Result<(), Value>>,
+        oneshot::Receiver<()>,
+    ) {
+        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
+        let flag = DropFlag(Some(dropped_tx));
+        let work = async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+            Ok(())
+        };
+        (work, dropped_rx)
+    }
+
     /// A memory store that counts its writes.
     struct CountingStorage {
         inner: MemoryResponseStorage,
@@ -1879,13 +1894,7 @@ mod tests {
         store_queued(&storage, "resp_1").await;
         let registry = Arc::new(BackgroundResponses::new(4));
         let slot = registry.admit("resp_1").unwrap();
-        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
-        let flag = DropFlag(Some(dropped_tx));
-        let work = async move {
-            let _flag = flag;
-            std::future::pending::<()>().await;
-            Ok(())
-        };
+        let (work, dropped_rx) = pending_work();
         #[expect(
             clippy::disallowed_methods,
             reason = "the test awaits the task it spawns"
@@ -1909,13 +1918,7 @@ mod tests {
         store_queued(&storage, "resp_1").await;
         let registry = Arc::new(BackgroundResponses::new(4));
         let slot = registry.admit("resp_1").unwrap();
-        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
-        let flag = DropFlag(Some(dropped_tx));
-        let work = async move {
-            let _flag = flag;
-            std::future::pending::<()>().await;
-            Ok(())
-        };
+        let (work, dropped_rx) = pending_work();
         #[expect(
             clippy::disallowed_methods,
             reason = "the test awaits the task it spawns"
@@ -1980,13 +1983,7 @@ mod tests {
         store_queued(&storage, "resp_1").await;
         let registry = Arc::new(BackgroundResponses::new(4));
         let slot = registry.admit("resp_1").unwrap();
-        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
-        let flag = DropFlag(Some(dropped_tx));
-        let work = async move {
-            let _flag = flag;
-            std::future::pending::<()>().await;
-            Ok(())
-        };
+        let (work, dropped_rx) = pending_work();
         // The in_progress write fails: the record stays queued and the run
         // starts without having seen it.
         flaky.fail_next(1);
@@ -2164,13 +2161,7 @@ mod tests {
         let owner = Arc::new(BackgroundResponses::new(4));
         let other = Arc::new(BackgroundResponses::new(4));
         let slot = owner.admit("resp_1").unwrap();
-        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
-        let flag = DropFlag(Some(dropped_tx));
-        let work = async move {
-            let _flag = flag;
-            std::future::pending::<()>().await;
-            Ok(())
-        };
+        let (work, dropped_rx) = pending_work();
         #[expect(
             clippy::disallowed_methods,
             reason = "the test awaits the task it spawns"
