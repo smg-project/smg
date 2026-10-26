@@ -1,9 +1,9 @@
 {
-  "ready": false,
-  "run_budget_admitted": false,
-  "artifacts_pinned": false,
+  "ready": true,
+  "run_budget_admitted": true,
+  "artifacts_pinned": true,
   "consumer_gpu_ready": false,
-  "runtime_cohort_accepted": false,
+  "runtime_cohort_accepted": true,
   "admitted_lane": "sglang-pd4-full-original",
   "target_product_commit": "d07a05d7e6acfc23a0c2796ffe2fb14b12e561a8",
   "artifacts": [
@@ -206,8 +206,8 @@
     }
   },
   "budget": {
-    "admitted": false,
-    "reserved_runner_seconds": 0,
+    "admitted": true,
+    "reserved_runner_seconds": 3000,
     "proposed_new_max_seconds": 3000,
     "global_owned_max": 2,
     "one_lane_per_run": true,
@@ -220,20 +220,20 @@
     "root_admission_required": true,
     "one_GPU_job": "amd-sglang-pd4 / run",
     "other_GPU_matrix_jobs": 0,
-    "private_ref": "ci/amd-sglang-pd4-main-d5f8-validation-20261025",
+    "private_ref": "ci/amd-sglang-pd4-current-cu-product-child-20261026",
     "actual_dispatch_head": null,
     "actual_run_id": null,
     "controller_source": null,
     "run_binding": null,
     "watch_PID_or_session": null
   },
-  "pending_note": "SOURCE-ONLY DEFAULT-OFF CU INTEGRATION; not applied/admitted. Product must be a new reviewed child of exact ef436; consumer derives original d6c full4PD caller and resets all five execution flags/budget to false/zero. Root must bind actual new product/head/source peer, fresh artifacts/owner facts and a separate budget within existing cap before any run. Full original target33 Llama8B TP1/2P2D/Mooncake/gRPC/filter/50job42pytest/floor14guard/reruns2/all17prefetch/skip/oracles are unchanged. allocation_phase_diagnostic and new cu_existing_runtime both default false and require separate explicit future POST values. CU code is exact A15-line current-device branch on captured4420 preimage, not oldSG2 credit. Prefill stream OOM remains independently unresolved; this source does not enable AMD_SERIALIZE_KERNEL=3 or change graph/stream/memory/model/timing. Normal97a is installation provenance only; new actual source/RECORD/apply/final/CU execution and all GPU case outcomes remain unproved. No resource or coverage credit.",
+  "pending_note": "SOURCE-ONLY CONDITIONAL CU PREVIEW; NOT APPLIED/ADMITTED. Root alone may make a new direct child of correct disabled consumer5daf (actual productd07, not bad ancestor104d), with an independent NEW3000 under unchanged129939 cap after fresh actual source/producer17/four-artifact TTL/API/physical ownership facts and a genuine grant. Full original target33 source projection16 remains complete: Llama3.1-8B TP1/2P2D/defaultMooncake/gRPC, original full filter/AssembledAtRuntime/SmallWindow/both mismatches/engine-death, 50job42pytest/floor14guard/reruns2delay5 with original per-test reruns0, all17tier4prefetch/no units/no agentic/no original oracle or timing changes. Source projection16 and floor14 are not an actual selected/pass quota; original conditional engine skips remain. Future single POST must explicitly request execute=true, allocation_phase_diagnostic=true AND cu_existing_runtime=true; all three source defaults stay false. CU exact4420 current-device15-line branch remains source-only: no actual GPU property/CU execution, RECORD before/final, apply-final installation or complete4PD row proof exists. Prefill-stream OOM remains a separate open failure; engineering purpose is to remove the observed decode rocminfo assertion via the reviewed CU branch and observe original prefill/phase boundaries, not blind retry or an OOM-fix claim. No AMD_SERIALIZE_KERNEL, model/memory/context/stream/graph override, oldSG2 plugin/credit or retired budget is introduced. 1473/d5/b7/fourpins/19-37-14 and normal97a/Ddeba are fixed provenance only; consumer_gpu_ready remains false. All future actual head/run/job/nonce/UID/owner/sourcepeer/budget/watch identities await root binding.",
   "binding_preparation_evidence": {
     "producer_build_archive_integrity_sha256": "fa8e1be5899a9f5d74ade0f6de9cfa10eb5065a404f597c2ee95d55cfa03cb6f",
     "producer_policy_source_review_sha256": "707a143df969433664b923c54e9cc44ad511dba00bdde978c4b40b02d94901fb",
     "producer_policy_metadata_validation_sha256": "f352422414b7e3a2cab1a55701c3360bacfae7d20eb3be26df2b4b7077e62d2e",
     "normal_install_proof_available": true,
-    "normal_install_admission_metadata_bound": false,
+    "normal_install_admission_metadata_bound": true,
     "normal_install_root_acceptance_sha256": "97a2658237750a3c55b3f98a722077055428503cb8ad3b83ae8a01f4d377a571",
     "normal_install_independent_actual_peer_sha256": "deba14fd0db4270b317c25c23ecf1e0bde7b01b9ead92b1bf413014f06138cef"
   },
