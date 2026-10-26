@@ -172,8 +172,9 @@ fn with_added_tokens_raw(json: &str) -> Result<String> {
     Ok(tokenizer.to_string())
 }
 
-// rc.2's reader can accept a Split without a usable regex engine. Check the
-// constructed pipeline, including its fused DeepSeek sequence, before selecting it.
+// The RC reader (rc.3 as rc.2) can accept a Split without a usable regex engine.
+// Check the constructed pipeline, including its fused DeepSeek sequence, before
+// selecting it.
 fn supported_splits(pre: &PipelinePreTokenizer) -> bool {
     match pre {
         PipelinePreTokenizer::Split(split) => {
@@ -200,7 +201,7 @@ fn clone_normalizer(n: &PipelineNormalizer) -> PipelineNormalizer {
         PipelineNormalizer::Lowercase(n) => PipelineNormalizer::Lowercase(*n),
         PipelineNormalizer::ByteLevel(n) => PipelineNormalizer::ByteLevel(n.clone()),
         PipelineNormalizer::Bert(n) => PipelineNormalizer::Bert(*n),
-        PipelineNormalizer::StripAccents(n) => PipelineNormalizer::StripAccents(*n),
+        PipelineNormalizer::StripAccents(n) => PipelineNormalizer::StripAccents(n.clone()),
         PipelineNormalizer::NFC(n) => PipelineNormalizer::NFC(*n),
         PipelineNormalizer::NFD(n) => PipelineNormalizer::NFD(*n),
         PipelineNormalizer::NFKC(n) => PipelineNormalizer::NFKC(*n),
@@ -250,8 +251,9 @@ impl V1Encoder {
                 supported_splits(pipeline.get_pre_tokenizer()),
                 "Split has no usable regex backend"
             );
-            // The rc.2 JSON reader ignores BPE cache_capacity. Rebuild just the
-            // model with the wrapper's bound, then reuse the parsed components.
+            // A tokenizer.json carries no BPE cache bound, so the RC reader builds
+            // the model without one. Rebuild just the model with the wrapper's
+            // bound, then reuse the parsed components.
             let PipelineModel::BPE(model) = pipeline.get_model() else {
                 return Err(anyhow!("expected a BPE pipeline"));
             };
