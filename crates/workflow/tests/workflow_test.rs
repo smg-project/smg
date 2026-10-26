@@ -17,7 +17,7 @@ use wfaas::{
     BackoffStrategy, FailureAction, LoggingSubscriber, RetryPolicy, StateStore, StepDefinition,
     StepExecutor, StepId, StepResult, StepStatus, ValidationError, WorkflowContext, WorkflowData,
     WorkflowDefinition, WorkflowEngine, WorkflowError, WorkflowInstanceId, WorkflowResult,
-    WorkflowStatus,
+    WorkflowState, WorkflowStatus,
 };
 
 /// Test workflow data type for integration tests.
@@ -416,6 +416,24 @@ fn timing_step(
     })
 }
 
+/// Poll until the workflow is neither pending nor running (without the
+/// engine's waiter, which cleans the state up), bounded at 5s total; the last
+/// state read comes back for inspection, or the status read's error.
+async fn wait_until_settled(
+    engine: &WorkflowEngine<TestWorkflowData>,
+    instance_id: WorkflowInstanceId,
+) -> WorkflowResult<WorkflowState<TestWorkflowData>> {
+    let mut state = engine.get_status(instance_id).await?;
+    for _ in 0..100 {
+        if state.status != WorkflowStatus::Running && state.status != WorkflowStatus::Pending {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+        state = engine.get_status(instance_id).await?;
+    }
+    Ok(state)
+}
+
 #[tokio::test]
 async fn test_parallel_execution_no_dependencies() {
     // Steps without dependencies should run in parallel
@@ -453,18 +471,9 @@ async fn test_parallel_execution_no_dependencies() {
         .await
         .unwrap();
 
-    // Wait for completion - give enough time for async scheduling
-    for _ in 0..50 {
-        sleep(Duration::from_millis(50)).await;
-        let state = engine.get_status(instance_id).await.unwrap();
-        if state.status != WorkflowStatus::Running {
-            break;
-        }
-    }
+    let state = wait_until_settled(&engine, instance_id).await.unwrap();
 
     let overall_duration = overall_start.elapsed();
-
-    let state = engine.get_status(instance_id).await.unwrap();
     assert_eq!(state.status, WorkflowStatus::Completed);
 
     // Check that all steps completed
@@ -528,16 +537,7 @@ async fn test_dag_with_dependencies() {
         .await
         .unwrap();
 
-    // Poll until workflow completes (or timeout)
-    for _ in 0..50 {
-        sleep(Duration::from_millis(50)).await;
-        let state = engine.get_status(instance_id).await.unwrap();
-        if state.status != WorkflowStatus::Running {
-            break;
-        }
-    }
-
-    let state = engine.get_status(instance_id).await.unwrap();
+    let state = wait_until_settled(&engine, instance_id).await.unwrap();
     assert_eq!(state.status, WorkflowStatus::Completed);
 
     // Verify step C started after both A and B finished
@@ -617,16 +617,7 @@ async fn test_dag_dependency_failure_blocks_dependents() {
         .await
         .unwrap();
 
-    // Poll until workflow completes (or timeout)
-    for _ in 0..50 {
-        sleep(Duration::from_millis(50)).await;
-        let state = engine.get_status(instance_id).await.unwrap();
-        if state.status != WorkflowStatus::Running {
-            break;
-        }
-    }
-
-    let state = engine.get_status(instance_id).await.unwrap();
+    let state = wait_until_settled(&engine, instance_id).await.unwrap();
     assert_eq!(state.status, WorkflowStatus::Failed);
 
     // Step B should not have executed
@@ -845,8 +836,6 @@ async fn test_run_if_true() {
 
 #[tokio::test]
 async fn test_run_if_false() {
-    use tokio::time::sleep;
-
     let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
 
     let executed = Arc::new(AtomicU32::new(0));
@@ -885,15 +874,7 @@ async fn test_run_if_false() {
         .await
         .unwrap();
 
-    // Use polling to check status (don't use wait_for_completion which cleans up state)
-    let mut state = engine.get_status(instance_id).await.unwrap();
-    for _ in 0..50 {
-        if state.status != WorkflowStatus::Running && state.status != WorkflowStatus::Pending {
-            break;
-        }
-        sleep(Duration::from_millis(50)).await;
-        state = engine.get_status(instance_id).await.unwrap();
-    }
+    let state = wait_until_settled(&engine, instance_id).await.unwrap();
 
     assert_eq!(state.status, WorkflowStatus::Completed);
 
@@ -1022,8 +1003,6 @@ async fn test_run_if_skip_chain_no_spurious_deadlock() {
 /// A -> B(run_if=false) -> C: the chain completes with B skipped and C executed.
 #[tokio::test]
 async fn test_run_if_false_mid_chain_completes() {
-    use tokio::time::sleep;
-
     let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
 
     let executed = Arc::new(AtomicU32::new(0));
@@ -1064,15 +1043,7 @@ async fn test_run_if_false_mid_chain_completes() {
         .await
         .unwrap();
 
-    // Poll instead of wait_for_completion so step states survive for inspection.
-    let mut state = engine.get_status(instance_id).await.unwrap();
-    for _ in 0..100 {
-        if state.status != WorkflowStatus::Running && state.status != WorkflowStatus::Pending {
-            break;
-        }
-        sleep(Duration::from_millis(50)).await;
-        state = engine.get_status(instance_id).await.unwrap();
-    }
+    let state = wait_until_settled(&engine, instance_id).await.unwrap();
 
     assert_eq!(state.status, WorkflowStatus::Completed);
     assert_eq!(
@@ -1249,7 +1220,6 @@ async fn test_depends_on_any_all_fail() {
     // When ALL depends_on_any dependencies fail, the step should be blocked
     // Workflow: A and B both fail, C depends_on_any([A, B])
     // Expected: C should not run, workflow should fail
-    use tokio::time::sleep;
 
     let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
 
@@ -1301,15 +1271,7 @@ async fn test_depends_on_any_all_fail() {
         .await
         .unwrap();
 
-    // Use polling to check status
-    let mut state = engine.get_status(instance_id).await.unwrap();
-    for _ in 0..50 {
-        if state.status != WorkflowStatus::Running && state.status != WorkflowStatus::Pending {
-            break;
-        }
-        sleep(Duration::from_millis(50)).await;
-        state = engine.get_status(instance_id).await.unwrap();
-    }
+    let state = wait_until_settled(&engine, instance_id).await.unwrap();
 
     // Workflow should have failed (because all depends_on_any deps failed)
     assert_eq!(state.status, WorkflowStatus::Failed);
@@ -1324,7 +1286,6 @@ async fn test_depends_on_any_one_fails_one_succeeds() {
     // the step should still run
     // Workflow: A fails, B succeeds, C depends_on_any([A, B])
     // Expected: C should run (B succeeded)
-    use tokio::time::sleep;
 
     let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
 
@@ -1378,15 +1339,7 @@ async fn test_depends_on_any_one_fails_one_succeeds() {
         .await
         .unwrap();
 
-    // Use polling to check status
-    let mut state = engine.get_status(instance_id).await.unwrap();
-    for _ in 0..50 {
-        if state.status != WorkflowStatus::Running && state.status != WorkflowStatus::Pending {
-            break;
-        }
-        sleep(Duration::from_millis(50)).await;
-        state = engine.get_status(instance_id).await.unwrap();
-    }
+    let state = wait_until_settled(&engine, instance_id).await.unwrap();
 
     // Workflow should have completed (B succeeded, so C could run)
     assert_eq!(state.status, WorkflowStatus::Completed);
