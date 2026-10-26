@@ -33,7 +33,7 @@ use tokio::{
     task::JoinHandle,
     time::Instant,
 };
-use tracing::{trace, warn};
+use tracing::{info, trace, warn};
 use zeromq::{RouterSendHalf, SocketRecv};
 
 use crate::{
@@ -564,6 +564,9 @@ struct ClientInner<P: EngineProtocol> {
     /// frame, for one log line when it does.
     refused: AtomicUsize,
     engines: Vec<ConnectedEngine>,
+    /// What `P` read off the engines' handshakes ([`connection_layout`]):
+    /// handed to every request it frames and every output it decodes.
+    layout: P::Layout,
     registry: Mutex<RequestRegistry<P::Output>>,
     routing: Mutex<RoutingState>,
     /// Rotates the selection scan start so all-zero ties (cold start, fresh
@@ -1067,24 +1070,38 @@ impl<P: EngineProtocol> ClientInner<P> {
     }
 }
 
-/// The output layout of a connection: what its engines declared for the
-/// optional output columns `P` knows. The ranks of one connection run one
-/// engine build and declare one layout; a group that disagrees reads none of
-/// the optional columns (the default layout) rather than a column at the
-/// wrong position on some rank, and says so once.
+/// The layout of a connection: what its engines declared for the optional
+/// output columns `P` knows and for its request decoder. The ranks of one
+/// connection run one engine build and declare one layout; a group that
+/// disagrees is read at the default layout (none of the optional columns,
+/// every tensor inline) rather than a column at the wrong position on some
+/// rank, and says so once. Every rank's declaration is logged with its id at
+/// the handshake: on a running connection that is the one place that tells
+/// which form the wire takes, and which rank fell behind when they disagree.
 fn connection_layout<P: EngineProtocol>(engines: &[ConnectedEngine]) -> P::Layout {
-    let mut layouts = engines
+    // Every rank is read, and logged, before the decision: the ranks behind a
+    // disagreeing one are the ones that tell which rank fell behind.
+    let layouts: Vec<P::Layout> = engines
         .iter()
-        .map(|engine| P::read_layout(&engine.ready_response));
-    let Some(first) = layouts.next() else {
+        .map(|engine| {
+            let layout = P::read_layout(&engine.ready_response);
+            info!(
+                engine_id = ?engine.engine_id,
+                ?layout,
+                "engine's wire layout declared at the handshake"
+            );
+            layout
+        })
+        .collect();
+    let Some(first) = layouts.first() else {
         return P::Layout::default();
     };
-    if layouts.all(|layout| layout == first) {
-        first
+    if layouts.iter().all(|layout| layout == first) {
+        first.clone()
     } else {
         warn!(
-            "the engines of this connection declare different output layouts; the optional \
-             output columns are not read"
+            "the engines of this connection declare different layouts; the optional output \
+             columns are not read and every tensor is sent inline"
         );
         P::Layout::default()
     }
@@ -1120,6 +1137,7 @@ impl<P: EngineProtocol> Client<P> {
         let lockstep = engines
             .iter()
             .any(|engine| engine.ready_response.data_parallel_size > 1);
+        let layout = connection_layout::<P>(&engines);
 
         let (abort_tx, abort_rx) = mpsc::unbounded_channel();
         let (input_tx, input_rx) = mpsc::unbounded_channel();
@@ -1137,6 +1155,7 @@ impl<P: EngineProtocol> Client<P> {
             writing_since: Mutex::new(None),
             refused: AtomicUsize::new(0),
             engines,
+            layout,
             registry: Mutex::new(RequestRegistry::default()),
             routing: Mutex::new(RoutingState::default()),
             scan_start: AtomicUsize::new(0),
@@ -1198,7 +1217,7 @@ impl<P: EngineProtocol> Client<P> {
         let output_task = tokio::spawn(run_output_loop::<P>(
             output_socket,
             out_tx,
-            connection_layout::<P>(&inner.engines),
+            inner.layout.clone(),
         ));
         #[expect(
             clippy::disallowed_methods,
@@ -1395,7 +1414,7 @@ impl<P: EngineProtocol> Client<P> {
             request_id,
             armed: true,
         };
-        let (payload, mut aux_frames) = match P::encode_add(&request) {
+        let (payload, mut aux_frames) = match P::encode_add(&request, &self.inner.layout) {
             Ok(encoded) => encoded,
             Err(error) => {
                 guard.take_back(false);

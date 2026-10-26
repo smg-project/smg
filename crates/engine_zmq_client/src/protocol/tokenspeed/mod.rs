@@ -123,7 +123,10 @@ impl EngineProtocol for TokenSpeedProtocol {
     /// resolves a tensor's frame index against the message's frames, the
     /// payload being frame 0, as it resolves its own encoder's. A text
     /// request, or one whose tensors are all small, keeps its one frame.
-    fn encode_add(request: &Self::Request) -> Result<(Vec<u8>, Vec<Bytes>)> {
+    fn encode_add(
+        request: &Self::Request,
+        _layout: &SlimOutputLayout,
+    ) -> Result<(Vec<u8>, Vec<Bytes>)> {
         encode_with_aux_frames(request)
     }
 
@@ -311,7 +314,7 @@ mod tests {
     fn large_media_tensors_ride_as_frames_the_payload_addresses() {
         let request = media_request();
         let inline = encode_msgpack(&request).unwrap();
-        let (payload, aux) = TokenSpeedProtocol::encode_add(&request).unwrap();
+        let (payload, aux) = TokenSpeedProtocol::encode_add(&request, &Default::default()).unwrap();
         assert_eq!(
             aux.iter().map(Bytes::len).collect::<Vec<_>>(),
             vec![4 * TENSOR_AUX_MIN_BYTES, TENSOR_AUX_MIN_BYTES]
@@ -366,7 +369,8 @@ mod tests {
             let mut request = media_request();
             request.multimodal_inputs.as_mut().unwrap().mm_items =
                 vec![media_item(1, size, size), media_item(2, size, 0)];
-            let (payload, aux) = TokenSpeedProtocol::encode_add(&request).unwrap();
+            let (payload, aux) =
+                TokenSpeedProtocol::encode_add(&request, &Default::default()).unwrap();
             assert!(aux.is_empty(), "size={size}");
             assert_eq!(payload, encode_msgpack(&request).unwrap(), "size={size}");
         }
@@ -375,7 +379,7 @@ mod tests {
             input_ids: vec![1, 2, 3],
             ..TokenizedGenerateReqInput::default()
         };
-        let (payload, aux) = TokenSpeedProtocol::encode_add(&text).unwrap();
+        let (payload, aux) = TokenSpeedProtocol::encode_add(&text, &Default::default()).unwrap();
         assert!(aux.is_empty());
         assert_eq!(payload, encode_msgpack(&text).unwrap());
     }
@@ -390,7 +394,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .data = WireArrayData::AuxIndex(1);
-        let (payload, aux) = TokenSpeedProtocol::encode_add(&request).unwrap();
+        let (payload, aux) = TokenSpeedProtocol::encode_add(&request, &Default::default()).unwrap();
         assert!(aux.is_empty());
         assert_eq!(payload, encode_msgpack(&request).unwrap());
     }

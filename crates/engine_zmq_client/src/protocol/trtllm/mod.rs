@@ -112,7 +112,7 @@ impl EngineProtocol for TrtllmProtocol {
         )
     }
 
-    fn encode_add(request: &Self::Request) -> Result<(Vec<u8>, Vec<Bytes>)> {
+    fn encode_add(request: &Self::Request, _layout: &()) -> Result<(Vec<u8>, Vec<Bytes>)> {
         // The payload is the positional array; each image is one auxiliary
         // frame behind it, in the order the array counts them.
         Ok((encode_msgpack(request)?, request.images.clone()))
@@ -184,7 +184,7 @@ mod tests {
         let images = vec![Bytes::from_static(b"img-a"), Bytes::from_static(b"img-b")];
         let request = request(true, images.clone());
         TrtllmProtocol::validate(&request).unwrap();
-        let (payload, aux) = TrtllmProtocol::encode_add(&request).unwrap();
+        let (payload, aux) = TrtllmProtocol::encode_add(&request, &()).unwrap();
         assert_eq!(aux, images);
         let decoded: TrtllmGenerateReqInput = decode_msgpack(&payload).unwrap();
         assert_eq!(decoded.image_frames, 2);

@@ -1040,7 +1040,7 @@ mod tests {
         assert_eq!(feature.dtype, "float32");
         assert_eq!(feature.shape, vec![2, 4]);
         assert_eq!(
-            feature.data.as_ptr(),
+            feature.data.as_raw_view().expect("inline bytes").as_ptr(),
             pixel_ptr,
             "the proto bytes are viewed"
         );
@@ -1691,6 +1691,70 @@ mod tests {
         assert!(subs
             .iter()
             .all(|s| s.sampling_params.as_ref().unwrap().n == 1));
+    }
+
+    /// End-to-end over ipc:// to a scheduler whose plugin declared it
+    /// resolves auxiliary frames: a media request's pixel tensor leaves the
+    /// payload as the frame behind it (the payload's slot addresses it
+    /// one-based), the small grid stays inline, and the metadata frame
+    /// closes the message. The same request to a scheduler that declares
+    /// nothing is one payload with every tensor inline.
+    #[tokio::test]
+    async fn media_tensors_ride_as_frames_to_a_scheduler_that_resolves_them() {
+        use engine_zmq_client::{
+            codec::tensor::{WireArrayData, TENSOR_AUX_MIN_BYTES},
+            protocol::handshake::EngineCoreReadyResponse,
+        };
+
+        use crate::test_support::connected_pair_declaring;
+
+        let floats = (TENSOR_AUX_MIN_BYTES / 4) as u32;
+        let pixels: Vec<u8> = (0..floats)
+            .flat_map(|i| (i as f32 * 0.5).to_le_bytes())
+            .collect();
+        let payload = |pixels: Vec<u8>| sglang_proto::MultimodalInputs {
+            pixel_values: Some(tensor("float32", vec![floats], pixels)),
+            ..media_payload()
+        };
+        for (resolves, frames_expected) in [(true, 4usize), (false, 2)] {
+            let ready = EngineCoreReadyResponse {
+                tensor_aux_frames: resolves,
+                ..default_ready_response()
+            };
+            let (client, engine, _dir) = connected_pair_declaring(RuntimeType::Sglang, ready).await;
+            let expected_pixels = pixels.clone();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "engine task ends after reading the request"
+            )]
+            let engine_task = tokio::spawn(async move {
+                let (mut input, output) = engine.split();
+                let frames = input.recv_frames().await.unwrap();
+                assert_eq!(frames.len(), frames_expected, "resolves={resolves}");
+                let request: WireRequest = decode_msgpack(frames[1].as_ref()).unwrap();
+                let item = &request.mm_inputs.expect("the processor output").mm_items[0];
+                let feature = item.feature.as_ref().expect("the pixel tensor");
+                let grid = &item.model_specific_data["image_grid_thw"];
+                assert!(grid.data.as_raw_view().is_some(), "the grid stays inline");
+                if resolves {
+                    assert_eq!(feature.data, WireArrayData::AuxIndex(1));
+                    assert_eq!(frames[2].as_ref(), expected_pixels.as_slice());
+                    assert_eq!(frames[3].as_ref(), b"\x80", "the metadata frame last");
+                } else {
+                    assert_eq!(
+                        feature.data.as_raw_view().map(|bytes| bytes.as_ref()),
+                        Some(expected_pixels.as_slice())
+                    );
+                }
+                (input, output)
+            });
+            let stream = client
+                .generate_sglang(media_request(payload(pixels.clone())))
+                .await
+                .expect("generate");
+            engine_task.await.unwrap();
+            drop(stream);
+        }
     }
 
     /// End-to-end over ipc:// for an SGLang backend: the adapter frames the

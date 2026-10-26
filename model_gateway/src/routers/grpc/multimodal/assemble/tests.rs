@@ -1325,11 +1325,25 @@ async fn the_zmq_sglang_arm_assembles_the_grpc_paths_payload_and_the_wire_carrie
     assert_eq!(item.offsets, Some(vec![(10, 13)]));
     let feature = item.feature.as_ref().expect("the pixel tensor");
     assert_eq!(feature.dtype, "float32");
-    assert_eq!(feature.data.as_ref(), pixel_values.as_slice());
+    assert_eq!(
+        feature
+            .data
+            .as_raw_view()
+            .expect("a pixel tensor this small stays inline")
+            .as_ref(),
+        pixel_values.as_slice()
+    );
     let widened = |shape: &[u32]| shape.iter().map(|&d| u64::from(d)).collect::<Vec<u64>>();
     assert_eq!(feature.shape, widened(&pixel_values_shape));
     let wire_grid = &item.model_specific_data["patches_per_image"];
     assert_eq!(wire_grid.dtype, grid.dtype);
     assert_eq!(wire_grid.shape, widened(&grid.shape));
-    assert_eq!(wire_grid.data.as_ref(), grid.data.as_slice());
+    assert_eq!(
+        wire_grid
+            .data
+            .as_raw_view()
+            .expect("the grid stays inline")
+            .as_ref(),
+        grid.data.as_slice()
+    );
 }

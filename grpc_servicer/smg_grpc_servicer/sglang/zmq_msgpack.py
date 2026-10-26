@@ -19,7 +19,11 @@ module adds the one thing it lacks, discovery, and keeps everything else:
   language-only worker's encode dispatch failed after its request went out),
   a plain list of request ids (``ABORT``), or a control call ``[call_id,
   method, args]`` (``CONTROL``) that becomes the scheduler's own control
-  request (``FlushCacheReqInput``, ``ProfileReq``);
+  request (``FlushCacheReqInput``, ``ProfileReq``); an ``ADD``'s large
+  tensors ride as frames behind the payload (their slots carry
+  :data:`EXT_TENSOR_FRAME`), resolved here into tensors over the frames
+  themselves (:class:`_RequestDecoder`), and its metadata map, when it has
+  one, is the last frame;
 * outputs leave as positional tagged structs: :class:`BatchTokenIDSlimOutput`
   (the token columns a frontend that detokenizes itself needs, plus a
   scheduler-load tail, so the output batch is the one in-band load channel),
@@ -36,6 +40,7 @@ scheduler ranks are started by :mod:`smg_grpc_servicer.sglang.headless`.
 from __future__ import annotations
 
 import logging
+import math
 import struct
 import time
 from array import array
@@ -150,6 +155,11 @@ class WireEngineCoreReadyResponse(msgspec.Struct):
     # None: the key goes out on every response (nothing is omitted here), and
     # an empty map is what SMG reads as "nothing declared".
     positional_layouts: dict[str, list[str]] = {}
+    # This side's request decoder resolves a tensor sent as an auxiliary
+    # frame of the request's message (:class:`_RequestDecoder`): SMG sends a
+    # tensor of 32 KiB or more that way to a scheduler that declares it, and
+    # inline to one that does not (an older plugin, which reads no such key).
+    tensor_aux_frames: bool = True
 
 
 # ----------------------------------------------------------------------------
@@ -488,19 +498,38 @@ _DEC_ABORT = msgspec.msgpack.Decoder(list[str])
 _DEC_CONTROL = msgspec.msgpack.Decoder(tuple[int, str, list])
 _DEC_INIT = msgspec.msgpack.Decoder(WireHandshakeInitMessage)
 _DEC_META = msgspec.msgpack.Decoder(dict)
-_DEC_ADD: msgspec.msgpack.Decoder | None = None
+_DEC_ADD: _RequestDecoder | None = None
+# SMG's msgpack extension type of a tensor whose bytes ride as an auxiliary
+# frame of the request's message (the Rust wire's `EXT_TENSOR_FRAME`): its
+# payload is `[shape, dtype, index]`. Well above the engine's own series.
+EXT_TENSOR_FRAME = 100
+_DEC_FRAME_REFERENCE = msgspec.msgpack.Decoder(list)
 
 
-def _request_decoder() -> msgspec.msgpack.Decoder:
-    """The scheduler's request structs (generation or embedding, told apart
-    by the tag) and its encode-dispatch failure notice
-    (``EncoderDispatchErrorReq``, which a language-only worker's frontend
-    sends after the request it names, for the scheduler's own receiver),
-    decoded with its own extension hooks plus one widening: SMG sends token
-    ids as a plain integer array where the tokenizer manager would send an
-    ``array('q')`` extension."""
-    global _DEC_ADD
-    if _DEC_ADD is None:
+class _RequestDecoder:
+    """The decoder of an ``ADD``'s payload: the scheduler's request structs
+    (generation or embedding, told apart by the tag) and its encode-dispatch
+    failure notice (``EncoderDispatchErrorReq``, which a language-only
+    worker's frontend sends after the request it names, for the scheduler's
+    own receiver), decoded with the engine's own hooks plus one widening of
+    each: SMG sends token ids as a plain integer array where the tokenizer
+    manager would send an ``array('q')`` extension (the decode hook), and a
+    tensor of 32 KiB or more as an auxiliary frame of the message, its slot
+    carrying SMG's own extension :data:`EXT_TENSOR_FRAME` whose payload is
+    ``[shape, dtype, index]``, the frame's index one-based behind the payload
+    (the extension hook; an extension because the decoder calls that hook
+    for every extension whatever the slot's declared type, while a plain
+    value in the untyped feature slot would reach no hook). The message's
+    last frame is the metadata map. Such a tensor is built over the frame
+    itself, without a copy (the frame is a writable buffer the tensor keeps
+    alive); an index outside the message or a frame of the wrong length is
+    refused by name, never read as a plausible tensor of wrong numbers. One
+    ``ADD`` is decoded at a time (the scheduler's event loop drains its
+    socket), so the frames of the one being decoded are held here for the
+    hook."""
+
+    def __init__(self) -> None:
+        import torch
         from sglang.srt.managers.io_struct import (
             EncoderDispatchErrorReq,
             TokenizedEmbeddingReqInput,
@@ -508,16 +537,67 @@ def _request_decoder() -> msgspec.msgpack.Decoder:
         )
         from sglang.srt.utils.msgpack_utils import dec_hook, ext_hook
 
-        def request_dec_hook(tp: type, obj: object) -> object:
-            if tp is array and isinstance(obj, list):
-                return array("q", obj)
-            return dec_hook(tp, obj)
-
-        _DEC_ADD = msgspec.msgpack.Decoder(
+        self._torch = torch
+        self._engine_dec_hook = dec_hook
+        self._engine_ext_hook = ext_hook
+        self._frames: list = []
+        self._decoder = msgspec.msgpack.Decoder(
             TokenizedGenerateReqInput | TokenizedEmbeddingReqInput | EncoderDispatchErrorReq,
-            dec_hook=request_dec_hook,
-            ext_hook=ext_hook,
+            dec_hook=self._dec_hook,
+            ext_hook=self._ext_hook,
         )
+
+    def decode(self, frames: list) -> object:
+        """The request in ``frames`` (``[type_byte, payload, *aux]``)."""
+        self._frames = frames
+        try:
+            return self._decoder.decode(frames[1])
+        finally:
+            self._frames = []
+
+    def _dec_hook(self, tp: type, obj: object) -> object:
+        if tp is array and isinstance(obj, list):
+            return array("q", obj)
+        return self._engine_dec_hook(tp, obj)
+
+    def _ext_hook(self, code: int, data: memoryview) -> object:
+        if code != EXT_TENSOR_FRAME:
+            return self._engine_ext_hook(code, data)
+        reference = _DEC_FRAME_REFERENCE.decode(data)
+        if not (len(reference) == 3 and isinstance(reference[2], int)):
+            raise ValueError(
+                f"a tensor frame reference is [shape, dtype, index], got {reference!r}"
+            )
+        return self._tensor_over_frame(*reference)
+
+    def _tensor_over_frame(self, shape: list, dtype: str, index: int):
+        torch = self._torch
+        # The tensor frames sit between the payload and the metadata map.
+        tensor_frames = len(self._frames) - 3
+        if not 1 <= index <= tensor_frames:
+            raise ValueError(
+                f"tensor frame index {index} is outside the {max(tensor_frames, 0)} tensor "
+                f"frame(s) of this message"
+            )
+        frame = self._frames[1 + index]
+        torch_dtype = getattr(torch, dtype)
+        count = math.prod(shape)
+        expected = count * torch_dtype.itemsize
+        if len(frame) != expected:
+            raise ValueError(
+                f"tensor frame {index} holds {len(frame)} bytes, {dtype} {list(shape)} "
+                f"needs {expected}"
+            )
+        if count == 0:
+            return torch.empty(shape, dtype=torch_dtype)
+        return torch.frombuffer(frame, dtype=torch_dtype).reshape(shape)
+
+
+def _request_decoder() -> _RequestDecoder:
+    """The one request decoder of this process (see :class:`_RequestDecoder`)."""
+    global _DEC_ADD
+    if _DEC_ADD is None:
+        _DEC_ADD = _RequestDecoder()
     return _DEC_ADD
 
 
@@ -590,21 +670,23 @@ def request_meta(frame: bytes) -> dict:
 def decode_request_frames(frames: list[bytes], traces: RequestTraces | None = None) -> list:
     """Decode one ``[type_byte, payload, *aux]`` message into io_structs. An
     ADD yields exactly one request (generation or embedding) and starts its
-    trace in ``traces`` when a metadata frame carries the caller's context,
-    or one ``EncoderDispatchErrorReq`` (a language-only worker's encode
-    dispatch failed after the request it names went out: the scheduler's own
-    receiver consumes it and aborts that request); an ABORT may carry several
-    request ids and yields one ``AbortReq`` each; a CONTROL yields the
-    scheduler's control request for the call."""
+    trace in ``traces`` when its metadata frame, the message's last frame
+    whenever any follows the payload (the request's large tensors ride as
+    the frames between), carries the caller's context, or one
+    ``EncoderDispatchErrorReq`` (a language-only worker's encode dispatch
+    failed after the request it names went out: the scheduler's own receiver
+    consumes it and aborts that request); an ABORT may carry several request
+    ids and yields one ``AbortReq`` each; a CONTROL yields the scheduler's
+    control request for the call."""
     from sglang.srt.managers.io_struct import AbortReq
 
     if len(frames) < 2:
         raise ValueError(f"request needs >= 2 frames (type, payload), got {len(frames)}")
     type_byte = bytes(frames[0])
     if type_byte == REQ_TYPE_ADD:
-        request = _request_decoder().decode(frames[1])
+        request = _request_decoder().decode(frames)
         if traces is not None and len(frames) > 2:
-            traces.attach(request, request_meta(frames[2]).get(TRACE_HEADERS_KEY))
+            traces.attach(request, request_meta(frames[-1]).get(TRACE_HEADERS_KEY))
         return [request]
     if type_byte == REQ_TYPE_ABORT:
         return [AbortReq(rid=rid) for rid in _DEC_ABORT.decode(frames[1])]
