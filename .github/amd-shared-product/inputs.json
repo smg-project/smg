@@ -201,10 +201,21 @@
     "watch_PID_or_session": null,
     "reusable_leaf": ".github/workflows/amd-vllm-chat-fixed-f103-private.yml",
     "private_input": "private_vllm_chat",
-    "execute_input": "execute",
-    "normal_input_mount": null
+    "execute_input": "private_vllm_chat",
+    "normal_input_mount": "--mount type=bind,source=/var/cache/smg-amd-qa/normal-cdfb7f9eaac4-e006d5e39469,target=/opt/smg-vllm-normal-input,readonly",
+    "registered_dispatch_input_semantics": {
+      "registered_inputs": [
+        "private_vllm_chat",
+        "normal_input_mount"
+      ],
+      "execution_trigger": "private_vllm_chat",
+      "private_default": false,
+      "workflow_call_internal_execute": "private leaf execute is supplied from private_vllm_chat by registered caller; execute is not a workflow_dispatch input",
+      "future_POSTs": 0,
+      "scope": "Correct data contract to actual717 registered YAML; no workflow/event/permissions/ordinary/NV behavior change."
+    }
   },
-  "pending_note": "SOURCE ONLY: actual product11da3/disabled consumer094f are published. Node2 exactc49/config9fe6 UID995:985 readonly CDF/e006 mount and full hashes accepted74feba; this is historical metadata proof, not current capacity or GPU/model acceptance. Node1 equivalent image/bind proof is not supplied. Allfiveauthorityflags/input_ready/image_visibility_flags remainfalse and reserved0; future admission must bind eligible placement, exactimage/cache/mount, producer18/fourTTL, source/resource peers and independent PROPOSED NEW3600 (notgranted; AMD60job/45E2E differsfromNV32/24). Normal b4bae/d53e proves BASE/native69215/CPUfixtureRPC/PNG only. Fulloriginalchat andfullinstalledvLLMunits remain unrun. No currentmain qualification or other15vLLM/remaining12/fullQA contraction.",
+  "pending_note": "SOURCE ONLY readiness-data proposal on actual disabled717f5d: both CI nodes now have accepted exactc49/config9fe6 UID995:985 readonly CDF/e006 mounts and complete fileSHA evidence, so three normal-input metadata flags may be acknowledged. Allfive execution/admission flags remainfalse, budgetadmittedfalse/reserved0 and futureHEAD/run/CID/watchnull. PriorBASEb4bae/d53e proves normalinstall/native69215/CPUfixtureRPC/PNG only. Freshcompletequeue/physical/model/source/producer18/fourTTL and independent source/resource peers plus distinctNEW3600+relayCPU accounting still required; Fresh queue, shared-node placement and artifact TTL must be revalidated immediately before admission. Currentprivate60job/45pytest/fullunits/fullchat is not strictNV32/24 time-parity proof. Preserve other15vLLM targets,remaining12/17nonMLX/fullQA. No execution/publication/grant by this source packet.",
   "binding_preparation_evidence": {
     "producer_build_archive_integrity_sha256": "671ca4d9b395dbf306cdc8f0885b4200c5c95cc3c28bf74ba2c53da2e4b24561",
     "producer_integrity_root_acceptance_sha256": "97cc1309c64e497dbd2d1b017cc99fe429612ef4fcf3e23636466de88e75edaa",
@@ -217,14 +228,94 @@
     "normal_scope": "CDF/e006 actual normal BASE + native69215 + CPUfixtureRPC + PNG only; nofullunits/model/GPU"
   },
   "normal_base": {
-    "input_ready": false,
+    "input_ready": true,
     "input_directory": "/opt/smg-vllm-normal-input",
     "adapter_sha256": "0dec64583d133d40d363e3e1b08b2a31c844812d59ccd07a8c281b483373baa4",
     "pins_sha256": "d9502c79fa2d7e603dd377f6ad24e670dcc4ed16060507a96a58ddb9849ddb00",
     "root_acceptance_sha256": "b4bae63c180d6e6444b5a7fb4465286d827123a51be7282eee9d5e1f3e94a76b",
     "actual_peer_sha256": "d53e3134f033755107bca533f5e783ff2b33061bc1f12d79e187d15720d3e6c5",
     "scope": "Accepted f949/69215 BASE install+CPUfixtureRPC only, not the future fullunits/chat/GPU result",
-    "node_image_cache_verified": false,
-    "artifact_CI_visibility_verified": false
+    "node_image_cache_verified": true,
+    "artifact_CI_visibility_verified": true,
+    "input_readiness_evidence": {
+      "asof_utc": "2026-10-26T23:30:13.599082+00:00",
+      "image_manifest": "sha256:c49bfef372b73213eb490a81c6b04d949d368ff4726999406696756fa4ca77c6",
+      "image_config": "sha256:9fe6eda0d94f5948d0350495ace5006910489dc884997f740427794f5425ffee",
+      "Docker29_identity_note": "Containerd-backed .Id/.Image is manifestc49; config9fe6 association is separate accepted CAS evidence, not an Id==config assertion or full layer-blob rehash.",
+      "host_source": "/var/cache/smg-amd-qa/normal-cdfb7f9eaac4-e006d5e39469",
+      "container_target": "/opt/smg-vllm-normal-input",
+      "readonly": true,
+      "expected_files": {
+        "vllm-0.32.1rc1.dev505+g00b6c4c56.rocm100.smggrpc1811-cp312-cp312-linux_x86_64.whl": {
+          "bytes": 317317515,
+          "sha256": "cdfb7f9eaac435a072fc2eeab3cf4ed8d8d624d405f5e689e1ec918589b63d77"
+        },
+        "pycairo-1.29.2-cp312-cp312-linux_x86_64.whl": {
+          "bytes": 132355,
+          "sha256": "e006d5e39469035fe615799dced8b7f3c267a43f256b07a551e6cf92a9f03bac"
+        }
+      },
+      "node_evidence": {
+        "amd-mi300x-1": {
+          "whole": {
+            "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/vllm-node1-readonly-mount-NEWCPU60-root-453cff4521d141f38f247e52d34d68b2/whole-window-result.json",
+            "bytes": 1585,
+            "sha256": "c7d7a4999e2034b874fbc930cdfac8b7924dc8e1c45ceba5c1c5a95eadcf0898"
+          },
+          "root_result": {
+            "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/vllm-node1-readonly-mount-NEWCPU60-root-453cff4521d141f38f247e52d34d68b2/root-result.json",
+            "bytes": 33551,
+            "sha256": "f42226132ed80fb5b36642e2ae671ee8762947a93d4974e8f235f05d1624d917"
+          },
+          "independent_actual_peer": {
+            "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/vllm-node1-readonly-mount-NEWCPU60-root-453cff4521d141f38f247e52d34d68b2/peer-actual-node1-mount-B.json",
+            "bytes": 17169,
+            "sha256": "0684662e5012178b0a150ca6fa68bbd7dc6a9ae30e51bb4197cb86de5e0c7f89"
+          },
+          "scope": "Actual exactimage UID995:985 readonly mount and two complete file hashes only; no model/GPU/fullchat/units/native/runtime acceptance.",
+          "static_scope_label_note": "Node1 leaf retained historical NODE2 label; actual node1 is proven by outer SSH target/pins/source as independently reviewed."
+        },
+        "amd-mi300x-2": {
+          "whole": {
+            "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/vllm-node2-readonly-mount-NEWCPU60-root-157bc929716e4f8f8f0c6985dc640e59/whole-window-result.json",
+            "bytes": 1582,
+            "sha256": "3bb4761d140541491f3ce3538818ed14911330413b903956a3d91316173be348"
+          },
+          "root_result": {
+            "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/vllm-node2-readonly-mount-NEWCPU60-root-157bc929716e4f8f8f0c6985dc640e59/root-result.json",
+            "bytes": 33553,
+            "sha256": "21f2785bc99dd97133c0dc567604708a863025a8c3e478e9cf7fbaea46f00f0d"
+          },
+          "independent_actual_peer": {
+            "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/vllm-node2-readonly-mount-NEWCPU60-root-157bc929716e4f8f8f0c6985dc640e59/peer-actual-mount-D.json",
+            "bytes": 17213,
+            "sha256": "3d8207bfcf3c6ff37e238a7dc46fdee8b457e7acf92cab2035058b8c03ca56b3"
+          },
+          "scope": "Actual exactimage UID995:985 readonly mount and two complete file hashes only; no model/GPU/fullchat/units/native/runtime acceptance.",
+          "static_scope_label_note": null
+        }
+      },
+      "node1_image_cache_C_peer": {
+        "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/vllm-node1-c49-image-cache-NEWCPU900-root-4bf158ecd3ab4943844ebffa1a0882ab/peer-actual-image-cache-C.json",
+        "bytes": 12903,
+        "sha256": "d74f7353d884dfeeafe860c15cd6c2d4f5ddf93cd81488d3c6f97b3ffec36e78"
+      },
+      "node2_manifest_config_CAS": {
+        "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/vllm-CI-manifest-config-CAS-read-root-f31fabf4b5984cbeb6f12b81cc8f9109/summary.json",
+        "bytes": 16778,
+        "sha256": "86bd69f5f17f46876bce3bf7ba4ec28e16110ec5a2932d03973183ee63f9d109"
+      },
+      "BASE_acceptance": {
+        "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/vllm00b6-CDF-e006-finalBASE-activated-data-NEWCPU900-root-ee8969a411e54019a5aa1831fd70410b/root-finalBASE-normal-native-RPC-acceptance.json",
+        "bytes": 3779,
+        "sha256": "b4bae63c180d6e6444b5a7fb4465286d827123a51be7282eee9d5e1f3e94a76b"
+      },
+      "BASE_actual_C_peer": {
+        "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/vllm00b6-CDF-e006-finalBASE-activated-data-NEWCPU900-root-ee8969a411e54019a5aa1831fd70410b/peer-actual-finalBASE-native-RPC-and-resource-C.json",
+        "bytes": 65697,
+        "sha256": "d53e3134f033755107bca533f5e783ff2b33061bc1f12d79e187d15720d3e6c5"
+      },
+      "scope": "Completed input visibility/read-only metadata and previously accepted normalBASE/native69215/CPUfixtureRPC/PNG only. Not fresh queue/placement/capacity, currentGPUidentity, fullunits/chat, original16/17model/fullQA or current-main acceptance."
+    }
   }
 }
