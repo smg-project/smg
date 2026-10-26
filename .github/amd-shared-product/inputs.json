@@ -193,7 +193,7 @@
     "root_admission_required": true,
     "one_GPU_job": "private-vllm-chat / vllm-chat / run (actual API identity must be bound after dispatch)",
     "other_GPU_matrix_jobs": 0,
-    "private_ref": "ci/amd-vllm-chat-fixed-f103-validation-20261026",
+    "private_ref": "ci/amd-vllm-original-chat-normal-f103-20261026",
     "actual_dispatch_head": null,
     "actual_run_id": null,
     "controller_source": null,
@@ -204,7 +204,7 @@
     "execute_input": "execute",
     "normal_input_mount": null
   },
-  "pending_note": "SOURCE ONLY: targetproductHEAD/actualconsumerHEAD/run/job/node/grant/inputmount remain unbound. Both CI nodes reported NoSuchImage for exactc49; localCDF/e006 are not yet CI-visible. Root must bind actualproductHEAD+matching19, freshproducerTTL/physicalowner/source/resource peers and a separate NEW1920 cap; no retired reuse. Normal b4bae/d53e proves BASE/native69215/CPUfixtureRPC/PNG only. Fulloriginalchat+FULLinstalledvLLMunits remain actualGPU work; no current38/df17/native transfer.",
+  "pending_note": "SOURCE ONLY: actual product11da3/disabled consumer094f are published. Node2 exactc49/config9fe6 UID995:985 readonly CDF/e006 mount and full hashes accepted74feba; this is historical metadata proof, not current capacity or GPU/model acceptance. Node1 equivalent image/bind proof is not supplied. Allfiveauthorityflags/input_ready/image_visibility_flags remainfalse and reserved0; future admission must bind eligible placement, exactimage/cache/mount, producer18/fourTTL, source/resource peers and independent NEW1920. Normal b4bae/d53e proves BASE/native69215/CPUfixtureRPC/PNG only. Fulloriginalchat andfullinstalledvLLMunits remain unrun. No currentmain qualification or other15vLLM/remaining12/fullQA contraction.",
   "binding_preparation_evidence": {
     "producer_build_archive_integrity_sha256": "671ca4d9b395dbf306cdc8f0885b4200c5c95cc3c28bf74ba2c53da2e4b24561",
     "producer_integrity_root_acceptance_sha256": "97cc1309c64e497dbd2d1b017cc99fe429612ef4fcf3e23636466de88e75edaa",
