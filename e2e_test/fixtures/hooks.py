@@ -483,6 +483,29 @@ class _SelectionReporter:
     ``pytest_report_collectionfinish`` here would never be discovered.
     """
 
+    def __init__(self) -> None:
+        self.require_passing_call = os.environ.get("E2E_AMD_REQUIRE_PASSING_CALL") == "1"
+        self.passing_calls = 0
+
+    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        if report.when == "call" and report.passed:
+            self.passing_calls += 1
+
+    @pytest.hookimpl(trylast=True)
+    def pytest_sessionfinish(self, session: pytest.Session) -> None:
+        if (
+            self.require_passing_call
+            and self.passing_calls == 0
+            and session.exitstatus == pytest.ExitCode.OK
+        ):
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
+            reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+            if reporter is not None:
+                reporter.write_line(
+                    "AMD_E2E_NO_PASSING_CALL: qualification incomplete; "
+                    "no test call passed (check prerequisite/infra skips)"
+                )
+
     def pytest_report_collectionfinish(self, config: pytest.Config) -> str | None:
         stats = config.stash.get(_SELECTION_STATS_KEY, None)
         if not stats:
