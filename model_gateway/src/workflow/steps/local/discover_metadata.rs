@@ -1025,4 +1025,47 @@ mod tests {
             Some("4096")
         );
     }
+
+    /// A credentialed worker that answers 401 (a wrong password): the error
+    /// text names the address masked, never the secret. The status error is
+    /// the likeliest failure of such a worker, and it ends in the DP
+    /// discovery's warning and the step's failure message.
+    #[tokio::test]
+    async fn a_status_error_names_the_address_masked() {
+        use axum::{http::StatusCode, Router};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only server answering 401; handle is aborted at test end"
+        )]
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(|| async { (StatusCode::UNAUTHORIZED, "no") }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let err = get_server_info(
+            &crate::clients::http_client(),
+            &format!("http://user:secret@127.0.0.1:{port}"),
+            None,
+        )
+        .await
+        .expect_err("401 is a failure");
+        server.abort();
+
+        assert!(!err.contains("secret"), "{err}");
+        assert!(!err.contains("user:"), "{err}");
+        assert!(
+            err.contains(&format!(
+                "401 Unauthorized from http://***@127.0.0.1:{port}/server_info"
+            )),
+            "{err}"
+        );
+    }
 }
