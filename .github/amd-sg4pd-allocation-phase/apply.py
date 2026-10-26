@@ -69,6 +69,7 @@ def main():
     if any(value not in ("0", "1") for value in flags.values()):
         raise RuntimeError("invalid explicit SG4 phase/CU opt-in")
     phase_enabled, cu_enabled = flags[FLAG] == "1", flags[CU_FLAG] == "1"
+    cu_source_enabled = cu_enabled or phase_enabled
     if os.environ.get("E2E_ENGINE") != "sglang" or os.environ.get("E2E_GPU_TIER") != "4":
         raise RuntimeError("only the complete SGLang four-GPU PD row is supported")
     if any(os.environ.get(key) == "1" for key in (
@@ -92,7 +93,7 @@ def main():
     plan = json.loads((HERE / "overlay.json").read_text())
     if os.environ.get("SMG_SGLANG_ROCM_IMAGE") != plan["image"]:
         raise RuntimeError("exact4420 image required")
-    # Preflight both requested source states before creating evidence or writing either.
+    # Preflight all requested source states before creating evidence or writing any.
     if phase_enabled:
         target, helper_target = Path(plan["target"]), Path(plan["helper_target"])
         raw, target_mode = read(target)
@@ -107,17 +108,37 @@ def main():
         if sha(raw) != plan["after_sha256"]:
             raise RuntimeError("unknown or unapplied engine source")
         if helper_target.exists() or helper_target.is_symlink():
-            if sha(read(helper_target)[0]) != plan["helper_sha256"]:
+            accepted_helpers = {plan["helper_sha256"]}
+            if mode == "apply":
+                accepted_helpers.add(plan["previous_helper_sha256"])
+            if sha(read(helper_target)[0]) not in accepted_helpers:
                 raise RuntimeError("refuse unrelated installed diagnostic helper")
         elif mode == "final":
             raise RuntimeError("diagnostic helper missing at final verification")
-    if cu_enabled:
+        scheduler_plan = plan["runtime_scheduler"]
+        scheduler_target = Path(scheduler_plan["target"])
+        scheduler_raw, scheduler_mode = read(scheduler_target)
+        if sha(scheduler_raw) == scheduler_plan["before_sha256"] and mode == "apply":
+            before = scheduler_plan["before"].encode()
+            if scheduler_raw.count(before) != 1:
+                raise RuntimeError("exact one original stream alias expression required")
+            scheduler_raw = scheduler_raw.replace(before, scheduler_plan["after"].encode())
+        if sha(scheduler_raw) != scheduler_plan["after_sha256"]:
+            raise RuntimeError("unknown or unapplied current4420 scheduler source")
+    if cu_source_enabled:
         cu_plan = json.loads((HERE / "cu-overlay.json").read_text())
+        if phase_enabled:
+            cu_plan = {**cu_plan, **cu_plan["diagnostic"]}
         if cu_plan["image"] != plan["image"] or cu_plan["flag"] != CU_FLAG:
             raise RuntimeError("CU source plan identity differs")
         cu_target = Path(cu_plan["target"])
         cu_raw, cu_mode = read(cu_target)
         record = package_record(cu_plan, cu_target)
+        if phase_enabled and sha(cu_raw) == cu_plan["current_applied_preimage_sha256"] and mode == "apply":
+            before = cu_plan["current_applied_before"].encode()
+            if cu_raw.count(before) != 1:
+                raise RuntimeError("exact one current CU function required")
+            cu_raw = cu_raw.replace(before, cu_plan["after"].encode())
         if sha(cu_raw) == cu_plan["before_sha256"] and mode == "apply":
             before = cu_plan["before"].encode()
             if cu_raw.count(before) != 1:
@@ -133,23 +154,28 @@ def main():
         if phase_enabled:
             atomic(helper_target, helper, 0o644)
             atomic(target, raw, target_mode)
-        if cu_enabled:
+            atomic(scheduler_target, scheduler_raw, scheduler_mode)
+        if cu_source_enabled:
             (directory / "cu-record-before.json").write_text(json.dumps(record, indent=2) + "\n")
             atomic(cu_target, cu_raw, cu_mode)
     if directory.is_symlink() or not directory.is_dir():
         raise RuntimeError("same-job evidence directory missing or replaced")
     if phase_enabled and (sha(read(target)[0]) != plan["after_sha256"] or sha(read(helper_target)[0]) != plan["helper_sha256"]):
         raise RuntimeError("installed engine or diagnostic source changed")
-    if cu_enabled and (sha(read(cu_target)[0]) != cu_plan["after_sha256"] or package_record(cu_plan, cu_target) != record):
+    if phase_enabled and sha(read(scheduler_target)[0]) != scheduler_plan["after_sha256"]:
+        raise RuntimeError("installed scheduler diagnostic source changed")
+    if cu_source_enabled and (sha(read(cu_target)[0]) != cu_plan["after_sha256"] or package_record(cu_plan, cu_target) != record):
         raise RuntimeError("installed AITER source/metadata changed")
     (directory / (mode + ".json")).write_text(json.dumps({
         "job_marker": marker, "enabled_flags": flags,
         "overlay_manifest_sha256": sha((HERE / "overlay.json").read_bytes()),
         "engine_source_sha256": plan["after_sha256"] if phase_enabled else None,
         "helper_sha256": plan["helper_sha256"] if phase_enabled else None,
-        "CU_source_sha256": cu_plan["after_sha256"] if cu_enabled else None,
-        "CU_overlay_manifest_sha256": sha((HERE / "cu-overlay.json").read_bytes()) if cu_enabled else None,
-        "CU_package_record": record if cu_enabled else None,
+        "scheduler_source_sha256": scheduler_plan["after_sha256"] if phase_enabled else None,
+        "CU_runtime_observation_enabled": phase_enabled,
+        "CU_source_sha256": cu_plan["after_sha256"] if cu_source_enabled else None,
+        "CU_overlay_manifest_sha256": sha((HERE / "cu-overlay.json").read_bytes()) if cu_source_enabled else None,
+        "CU_package_record": record if cu_source_enabled else None,
         "RECORD_rewritten": False,
         "actual_GPU_operation_or_cause_verified": False, "coverage_increment": 0,
     }, indent=2) + "\n")

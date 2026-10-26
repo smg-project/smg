@@ -141,3 +141,67 @@ def observe(stage, module, file, original_error, torch, device, pin_memory):
                 sys.stderr.write("SG2_ALLOCATION_FAILURE_DROP " + (_text(type(error).__name__) or "error") + "\n")
             except BaseException:
                 pass  # Observation failure cannot replace the original exception.
+
+
+_RUNTIME_STAGES = {"cu-before", "cu-return", "cu-error", "stream-left-before", "stream-left-return",
+                   "stream-right-before", "stream-right-return", "stream-error"}
+_runtime_pid, _runtime_calls, _runtime_seen = None, {}, set()
+_runtime_lock = threading.Lock()
+_RUNTIME_SOURCES = {'/sgl-workspace/aiter/aiter/jit/utils/chip_info.py': '5b8aedd33b5d081be4ceeb6fd211b5a77bbf7f5bdf0f6293304cef7ed0a5e7e6', '/sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py': 'de5fa91beee5b42ccd918ef7586b2bc9122b3862cdfd62653a6e65f38cea1294'}
+
+
+def runtime_event(stage, module, file, fields):
+    """First CU/stream invocation per PID; observations cannot replace its result."""
+    global _runtime_pid, _runtime_calls, _runtime_seen, _runtime_lock
+    if os.environ.get(FLAG) != "1":
+        return
+    try:
+        pid, call = os.getpid(), fields["observation_id"]
+        if stage not in _RUNTIME_STAGES or type(call) is not int or file not in _RUNTIME_SOURCES:
+            raise ValueError("exact runtime event required")
+        if pid != _runtime_pid:
+            _runtime_pid, _runtime_calls, _runtime_seen, _runtime_lock = pid, {}, set(), threading.Lock()
+        group = "cu" if stage.startswith("cu-") else "stream"
+        with _runtime_lock:
+            _runtime_calls.setdefault(group, fields)
+            if _runtime_calls[group] is not fields or stage in _runtime_seen:
+                return
+            _runtime_seen.add(stage)
+        marker = os.environ.get("E2E_JOB_MARKER", "")
+        if not re.fullmatch(r"e2e-[0-9]+-[0-9]+-amd-mi300x-[12]", marker):
+            raise ValueError("same-job marker required")
+        origin = _origin(module, file)
+        if origin["sha256"] != _RUNTIME_SOURCES[file]:
+            raise ValueError("exact observed source required")
+        torch = sys.modules.get("torch")
+        initialized = torch is not None and torch.cuda.is_initialized()
+        runtime = sys.modules.get("sglang.srt.runtime_context")
+        role = _query(lambda: _text(str(runtime.get_disagg().disaggregation_mode))) if runtime else None
+        ticks = _ticks()
+        row = {"kind": "sg4-runtime-event", "stage": stage, "pid": pid, "start_ticks": ticks,
+               "job_marker": marker, "role": role, "monotonic": time.monotonic(), "origin": origin,
+               "helper": _origin(__name__, __file__), "Torch_initialized": initialized, "fields": dict(fields),
+               "masks": {key: _text(os.environ.get(key)) for key in
+                         ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")}}
+        if stage == "stream-error" and initialized:
+            row["allocator_stats_after_error"] = _query(lambda: _stats(torch, None))
+            row["allocator_backend_after_error"] = _query(torch.cuda.memory.get_allocator_backend)
+            row["query_limit"] = "CPU allocator metadata only; possibly error-contaminated; no physical-memory query"
+        data = (json.dumps(row, ensure_ascii=True, allow_nan=False) + "\n").encode()
+        if len(data) > 4096 or ticks != _ticks():
+            raise ValueError("bounded same-PID event required")
+        directory = Path(os.environ["AMD_DEPENDENCY_DIRECTORY"]) / "sglang-startup"
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError("precreated same-job directory required")
+        fd = os.open(directory / f"{pid}-{ticks}.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            status = os.fstat(stream.fileno())
+            if not stat.S_ISREG(status.st_mode) or status.st_size + len(data) > 64 * 1024:
+                raise ValueError("bounded regular event file required")
+            stream.write(data)
+        logging.getLogger("smg.sg4.startup").warning("SG4_RUNTIME %s", data.decode().rstrip("\n"))
+    except BaseException as error:
+        try:
+            sys.stderr.write("SG4_RUNTIME_EVENT_DROP " + (_text(type(error).__name__) or "error") + "\n")
+        except BaseException:
+            pass
