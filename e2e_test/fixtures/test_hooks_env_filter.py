@@ -286,12 +286,15 @@ def test_floor_satisfied_from_collection_hook(monkeypatch):
     assert items == [match]
 
 
-def test_sglang_zmq_lane_keeps_multimodal_and_http_error_shapes_off_the_wire():
+def test_sglang_zmq_lane_runs_multimodal_and_keeps_http_error_shapes_off_the_wire():
+    """The wire carries the preprocessed media to the scheduler, so the
+    multimodal module runs on the lane; the error-shape cases exercise
+    SGLang's own HTTP server, which the wire has no counterpart of."""
     mm = _FakeItem("e2e_test/chat_completions/test_multimodal.py::test_image[grpc]")
     shape = _FakeItem("e2e_test/chat_completions/test_error_shapes.py::test_json[http]")
     text = _FakeItem("e2e_test/chat_completions/test_basic.py::test_chat[grpc]")
     kept, deselected = hooks._filter_sglang_zmq_items([mm, shape, text])
-    assert kept == [text] and deselected == [mm, shape]
+    assert kept == [mm, text] and deselected == [shape]
 
 
 def test_tokenspeed_rust_lane_keeps_prefill_decode_and_drops_encode_and_admin_ops():

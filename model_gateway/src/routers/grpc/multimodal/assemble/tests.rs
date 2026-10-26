@@ -1232,3 +1232,104 @@ fn vllm_layout_adapter_names_the_primary_tensor_by_the_spec_key() {
     );
     assert!(!flat_keys.contains_key("pixel_values"));
 }
+
+/// The direct-ZMQ SGLang arm reaches the SGLang assembly (the function the
+/// gRPC arm calls) instead of the "not supported" refusal, and what it
+/// assembles crosses the wire: sent through the client to a mock scheduler,
+/// the request the scheduler decodes carries one image item whose feature
+/// bytes, grid tensor, offsets and image token are the assembled payload's.
+#[tokio::test]
+async fn the_zmq_sglang_arm_assembles_the_grpc_paths_payload_and_the_wire_carries_it() {
+    use std::time::Duration;
+
+    use engine_zmq_client::{
+        codec::decode_msgpack,
+        mock_engine::{connect_to_frontend, default_ready_response},
+        protocol::sglang::request::{SglangRequestType, TokenizedGenerateReqInput},
+        EngineId,
+    };
+    use smg_grpc_client::sglang_proto;
+
+    use crate::routers::grpc::zmq_client::{EosTokenIds, ZmqEngineClient};
+
+    let dir = tempfile::tempdir().unwrap();
+    let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+    let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+    let (client, engine) = tokio::join!(
+        ZmqEngineClient::connect(
+            &handshake,
+            &input,
+            &output,
+            1,
+            "m".to_string(),
+            EosTokenIds::default(),
+            RuntimeType::Sglang,
+            Duration::from_secs(10)
+        ),
+        connect_to_frontend(
+            &handshake,
+            EngineId::from_engine_index(0),
+            default_ready_response()
+        ),
+    );
+    let engine = engine.expect("mock scheduler");
+    let client = BackendClient::Zmq(client.expect("adapter connect"));
+
+    let intermediate = MultimodalIntermediate::try_new(vec![single_image_intermediate()]).unwrap();
+    let MultimodalData::Sglang(assembled) = assemble_multimodal_data(intermediate, &client, None)
+        .await
+        .expect("the SGLang arm")
+    else {
+        panic!("the SGLang runtime over ZMQ assembles SGLang data");
+    };
+    assert_eq!(assembled.mm_placeholders, vec![(10, 4)]);
+    assert_eq!(assembled.im_token_id, Some(151655));
+    assert!(!assembled.pixel_values.is_empty());
+    let pixel_values = assembled.pixel_values.clone();
+    let pixel_values_shape = assembled.pixel_values_shape.clone();
+    let grid = assembled.model_specific_tensors["patches_per_image"].clone();
+
+    // The prompt the placeholders describe: the four image tokens at 10..14.
+    let mut input_ids: Vec<u32> = (1..=16).collect();
+    for id in &mut input_ids[10..14] {
+        *id = 151655;
+    }
+    let request = sglang_proto::GenerateRequest {
+        request_id: "mm-over-zmq".into(),
+        tokenized: Some(sglang_proto::TokenizedInput {
+            input_ids: input_ids.clone(),
+            original_text: String::new(),
+        }),
+        mm_inputs: Some(assembled.into_proto()),
+        ..Default::default()
+    };
+    let BackendClient::Zmq(zmq) = &client else {
+        panic!("built as the ZMQ backend above");
+    };
+    let (mut scheduler_input, _scheduler_output) = engine.split();
+    let (sent, received) =
+        tokio::join!(zmq.generate_sglang(request), scheduler_input.recv_frames());
+    let _stream = sent.expect("the request is admitted and sent");
+    let frames = received.expect("the scheduler receives the request");
+    assert_eq!(
+        SglangRequestType::from_frame(frames[0].as_ref()),
+        Some(SglangRequestType::Add)
+    );
+    let decoded: TokenizedGenerateReqInput =
+        decode_msgpack(frames[1].as_ref()).expect("the scheduler's own struct");
+    assert_eq!(decoded.input_ids, input_ids);
+    let media = decoded.mm_inputs.expect("the processor output");
+    assert_eq!(media.im_token_id, Some(151655));
+    assert_eq!(media.mm_items.len(), 1);
+    let item = &media.mm_items[0];
+    assert_eq!(item.offsets, Some(vec![(10, 13)]));
+    let feature = item.feature.as_ref().expect("the pixel tensor");
+    assert_eq!(feature.dtype, "float32");
+    assert_eq!(feature.data.as_ref(), pixel_values.as_slice());
+    let widened = |shape: &[u32]| shape.iter().map(|&d| u64::from(d)).collect::<Vec<u64>>();
+    assert_eq!(feature.shape, widened(&pixel_values_shape));
+    let wire_grid = &item.model_specific_data["patches_per_image"];
+    assert_eq!(wire_grid.dtype, grid.dtype);
+    assert_eq!(wire_grid.shape, widened(&grid.shape));
+    assert_eq!(wire_grid.data.as_ref(), grid.data.as_slice());
+}

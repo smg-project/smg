@@ -78,10 +78,7 @@ async fn assemble_multimodal_data_impl(
     // so assembly can never silently mishandle a modality the backend lacks.
     ensure_client_supports_intermediate(client, &intermediate)?;
     match client {
-        BackendClient::Grpc(GrpcClient::Sglang(_)) => {
-            let batch = into_single_batch(intermediate, "SGLang")?;
-            Ok(MultimodalData::Sglang(assemble_sglang(batch)?))
-        }
+        BackendClient::Grpc(GrpcClient::Sglang(_)) => assemble_sglang_data(intermediate),
         BackendClient::Grpc(GrpcClient::Vllm(_)) => Ok(MultimodalData::Vllm(
             assemble_vllm_batches(intermediate, workers)?,
         )),
@@ -109,8 +106,9 @@ async fn assemble_multimodal_data_impl(
             anyhow::bail!("MLX does not support multimodal inputs")
         }
         BackendClient::Zmq(client) => match client.runtime() {
-            // connect() admits only vLLM/TokenSpeed runtimes over ZMQ, so no
-            // Unspecified fallback: anything else is a hard error below.
+            // connect() resolves Unspecified to vLLM before the handshake, so
+            // no Unspecified arm here; a runtime without an arm is a hard
+            // error below.
             RuntimeType::Vllm => {
                 let mut data = assemble_vllm_batches(intermediate, workers)?;
                 // The ZMQ translate reads tensor bytes inline; this wire has no
@@ -145,11 +143,20 @@ async fn assemble_multimodal_data_impl(
                     spawn_tokenspeed_assembly(intermediate, options).await?,
                 ))
             }
+            // The same single batch the gRPC arm sends the servicer: the
+            // adapter frames it as the scheduler's processor output.
+            RuntimeType::Sglang => assemble_sglang_data(intermediate),
             runtime => anyhow::bail!(
                 "multimodal inputs are not supported over the {runtime} ZMQ backend yet"
             ),
         },
     }
+}
+
+/// The SGLang payload, one batch, as both the gRPC and the ZMQ arm send it.
+fn assemble_sglang_data(intermediate: MultimodalIntermediate) -> Result<MultimodalData> {
+    let batch = into_single_batch(intermediate, "SGLang")?;
+    Ok(MultimodalData::Sglang(assemble_sglang(batch)?))
 }
 
 /// Run TokenSpeed batch assembly on a blocking thread, guarding SHM output.
