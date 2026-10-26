@@ -34,8 +34,6 @@ def cli_source() -> str:
 # Flags of the Rust CLI the launcher does not take, with the reason.
 CLI_ONLY = {
     "--disable-audit-logging": "the launcher's switch is --control-plane-audit-enabled",
-    "--kv-indexer-max-entries": "deprecated and ignored by the CLI; the launcher never had it",
-    "--kv-indexer-ttl-secs": "deprecated and ignored by the CLI; the launcher never had it",
 }
 
 # Options of the launcher with no Rust CLI flag of that spelling, with the reason.

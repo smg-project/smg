@@ -316,23 +316,6 @@ pub struct RouterConfig {
     /// between selection and dispatch is part of the same opt-in.
     #[serde(default)]
     pub worker_overload_shed: bool,
-    /// Deprecated and ignored: the TTL prune of the positional indexer, which
-    /// the chain index replaced. The chain index holds what the engines report
-    /// and shrinks with their removals, so it has no prune. Still accepted so
-    /// that configurations written for the positional indexer load.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kv_indexer_ttl_secs: Option<u64>,
-    /// Deprecated and ignored: the capacity ceiling of the positional
-    /// indexer's prune; see `kv_indexer_ttl_secs`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kv_indexer_max_entries: Option<usize>,
-    /// Deprecated: the chain index is the only KV index behind cache-aware
-    /// routing, so the one value accepted is `chain`, which changes nothing;
-    /// `positional` names the index that was removed and is refused by
-    /// validation. Still accepted so that configurations written for the
-    /// switch load; the field goes in a later release.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kv_index: Option<String>,
     /// Force `GetLoads` polling for `smg_engine_*` gauges even when no
     /// load-aware routing policy is active. Successful routing-owned polls are
     /// always re-exported without an additional Engine RPC. A worker whose
@@ -2123,9 +2106,6 @@ impl Default for RouterConfig {
             worker_overload_waiting_requests: default_worker_overload_waiting_requests(),
             worker_overload_token_usage: default_worker_overload_token_usage(),
             worker_overload_shed: false,
-            kv_indexer_ttl_secs: None,
-            kv_indexer_max_entries: None,
-            kv_index: None,
             engine_metrics: false,
             multimodal_tensor_transport: None,
             multimodal_shm_min_bytes: None,

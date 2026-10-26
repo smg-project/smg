@@ -337,23 +337,6 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn kv_indexer_ttl_secs(mut self, ttl: Option<u64>) -> Self {
-        self.config.kv_indexer_ttl_secs = ttl;
-        self
-    }
-
-    pub fn kv_indexer_max_entries(mut self, max: Option<usize>) -> Self {
-        self.config.kv_indexer_max_entries = max;
-        self
-    }
-
-    /// Deprecated: the chain index is the only KV index; `chain` is accepted
-    /// and changes nothing, `positional` fails validation.
-    pub fn kv_index(mut self, kind: Option<String>) -> Self {
-        self.config.kv_index = kind;
-        self
-    }
-
     pub fn engine_metrics(mut self, enabled: bool) -> Self {
         self.config.engine_metrics = enabled;
         self

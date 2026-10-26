@@ -57,10 +57,10 @@ use cli::{
     url_port::CommandLine,
     value::{
         parse_access_log_field, parse_control_plane_api_key, parse_job_queue_capacity,
-        parse_job_queue_concurrency, parse_kv_index, parse_mm_processing, parse_mm_turbojpeg,
-        parse_model_alias, parse_model_id_from, parse_positive_usize,
-        parse_power_of_two_load_metric, parse_role_mapping, parse_routing_key_header,
-        parse_tenant_api_key, parse_transport_mode, parse_unit_fraction,
+        parse_job_queue_concurrency, parse_mm_processing, parse_mm_turbojpeg, parse_model_alias,
+        parse_model_id_from, parse_positive_usize, parse_power_of_two_load_metric,
+        parse_role_mapping, parse_routing_key_header, parse_tenant_api_key, parse_transport_mode,
+        parse_unit_fraction,
     },
 };
 
@@ -658,26 +658,6 @@ struct RoutingArgs {
     /// workload where every request has a holder. 0 disables.
     #[arg(long, default_value_t = 8, help_heading = "Routing Policy")]
     worker_warmup_divert_every: u64,
-
-    /// Deprecated and ignored: the TTL prune of the positional indexer, which
-    /// the chain index replaced. The chain index holds what the engines report
-    /// and shrinks with their removals, so it has no prune; the flag is still
-    /// accepted so that existing launch lines keep working, and goes in a
-    /// later release.
-    #[arg(long, help_heading = "Routing Policy")]
-    kv_indexer_ttl_secs: Option<u64>,
-
-    /// Deprecated and ignored: the capacity ceiling of the positional
-    /// indexer's prune; see --kv-indexer-ttl-secs.
-    #[arg(long, help_heading = "Routing Policy")]
-    kv_indexer_max_entries: Option<usize>,
-
-    /// Deprecated: the chain index is the only KV index behind cache-aware
-    /// routing, so this takes `chain` only and does nothing; the flag goes in
-    /// a later release. `positional` names the index that was removed and is
-    /// refused.
-    #[arg(long, value_parser = parse_kv_index, help_heading = "Routing Policy")]
-    kv_index: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -2945,9 +2925,6 @@ impl CliArgs {
             .worker_overload_waiting_requests(Some(self.routing.worker_overload_waiting_requests))
             .worker_overload_token_usage(Some(self.routing.worker_overload_token_usage))
             .worker_overload_shed(self.routing.worker_overload_shed)
-            .kv_indexer_ttl_secs(self.routing.kv_indexer_ttl_secs)
-            .kv_indexer_max_entries(self.routing.kv_indexer_max_entries)
-            .kv_index(self.routing.kv_index.clone())
             .engine_metrics(self.workers.engine_metrics)
             .multimodal_tensor_transport(self.workers.multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.workers.multimodal_shm_min_bytes)
@@ -4188,52 +4165,27 @@ mod tests {
         }
     }
 
-    /// The deprecated indexer prune flags are still accepted and flow into
-    /// `RouterConfig`, where nothing reads them but the startup warning.
+    /// The deprecated `--kv-index`, `--kv-indexer-ttl-secs` and
+    /// `--kv-indexer-max-entries` flags went with the positional indexer they
+    /// configured: a launch line that still carries one is refused at parse
+    /// time as an unknown argument, not accepted and ignored.
     #[test]
-    fn kv_indexer_prune_flags_flow_into_router_config() {
-        let cli = cli_args_from(&[
-            "--kv-indexer-ttl-secs",
-            "600",
-            "--kv-indexer-max-entries",
-            "500000",
-        ]);
-        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(router_config.kv_indexer_ttl_secs, Some(600));
-        assert_eq!(router_config.kv_indexer_max_entries, Some(500_000));
-
-        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(defaults.kv_indexer_ttl_secs, None);
-        assert_eq!(defaults.kv_indexer_max_entries, None);
-    }
-
-    /// `--kv-index` is deprecated: the chain index is the only KV index, so
-    /// `chain` is accepted (and flows into `RouterConfig` for the startup
-    /// warning), the removed `positional` index is refused with the reason,
-    /// and any other spelling is an invalid value.
-    #[test]
-    fn kv_index_flag_takes_chain_only() {
-        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(defaults.kv_index, None);
-
-        let cli = cli_args_from(&["--kv-index", "Chain"]);
-        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(router_config.kv_index.as_deref(), Some("chain"));
-        router_config.validate().unwrap();
-
-        let err = Cli::try_parse_from(["smg", "--kv-index", "positional"])
-            .expect_err("the removed positional index is refused");
-        let text = err.to_string();
-        assert!(
-            text.contains("positional KV index was removed") && text.contains("--kv-index"),
-            "the refusal names the removal and the flag: {text}"
-        );
-        for value in ["run", "tree"] {
-            let err = Cli::try_parse_from(["smg", "--kv-index", value])
-                .expect_err("only chain is accepted");
+    fn removed_kv_index_flags_are_refused_at_parse_time() {
+        for argv in [
+            ["smg", "--kv-index", "chain"],
+            ["smg", "--kv-indexer-ttl-secs", "600"],
+            ["smg", "--kv-indexer-max-entries", "500000"],
+        ] {
+            let err = Cli::try_parse_from(argv).expect_err("a removed flag is refused");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{}: {err}",
+                argv[1]
+            );
             assert!(
-                err.to_string().contains("takes chain only"),
-                "{value}: {err}"
+                err.to_string().contains(argv[1]),
+                "the refusal names the flag: {err}"
             );
         }
     }

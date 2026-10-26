@@ -510,7 +510,6 @@ struct Router {
     job_queue_concurrency: usize,
     kv_connector_annotation: String,
     kv_engine_id_annotation: String,
-    kv_index: Option<String>,
     least_load_default_throughput: f64,
     least_load_kv_pressure_weight: f64,
     least_load_max_waiting_requests: u32,
@@ -1152,8 +1151,6 @@ impl Router {
                 self.worker_warmup_thin_ratio,
                 self.worker_warmup_divert_every,
             )
-            // Deprecated: unset by default; `chain` is the only value, `positional` fails validation.
-            .kv_index(self.kv_index.clone())
             .disable_load_monitoring(self.disable_load_monitoring)
             .load_monitor_interval_secs(self.load_monitor_interval)
             .pd_admission_wait_secs(self.pd_admission_wait_secs)
@@ -1389,7 +1386,6 @@ impl Router {
         job_queue_concurrency = 200,
         kv_connector_annotation = String::from("smg.ai/kv-connector"),
         kv_engine_id_annotation = String::from("smg.ai/kv-engine-id"),
-        kv_index = None,
         least_load_default_throughput = 2000.0,
         least_load_kv_pressure_weight = 0.15,
         least_load_max_waiting_requests = 0,
@@ -1610,7 +1606,6 @@ impl Router {
         job_queue_concurrency: usize,
         kv_connector_annotation: String,
         kv_engine_id_annotation: String,
-        kv_index: Option<String>,
         least_load_default_throughput: f64,
         least_load_kv_pressure_weight: f64,
         least_load_max_waiting_requests: u32,
@@ -1867,7 +1862,6 @@ impl Router {
             job_queue_concurrency,
             kv_connector_annotation,
             kv_engine_id_annotation,
-            kv_index,
             least_load_default_throughput,
             least_load_kv_pressure_weight,
             least_load_max_waiting_requests,
