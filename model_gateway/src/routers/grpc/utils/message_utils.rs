@@ -375,10 +375,15 @@ pub(crate) async fn resolve_media(
             media: None,
         });
     }
-    let tokenizer_entry = components
-        .tokenizer_registry
-        .get_by_name(model_id)
-        .or_else(|| components.tokenizer_registry.get_by_id(model_id));
+    // The tokenizer's registry entry (its id and source) is read for the
+    // media paths alone, which need the multimodal components; a gateway
+    // without them looks nothing up.
+    let tokenizer_entry = components.multimodal.as_ref().and_then(|_| {
+        components
+            .tokenizer_registry
+            .get_by_name(model_id)
+            .or_else(|| components.tokenizer_registry.get_by_id(model_id))
+    });
     // The media-part order comes from the model registry so every path
     // renders a model consistently.
     let media_order = match (components.multimodal.as_ref(), tokenizer_entry.as_ref()) {
