@@ -1,6 +1,6 @@
 {
-  "ready": false,
-  "run_budget_admitted": false,
+  "ready": true,
+  "run_budget_admitted": true,
   "artifacts_pinned": false,
   "consumer_gpu_ready": false,
   "admitted_lane": null,
@@ -116,7 +116,7 @@
     "initial_queue_seconds": 900,
     "overall_seconds": 5100,
     "GPU_jobs": 0,
-    "reserved_CPU_seconds": 0,
+    "reserved_CPU_seconds": 3900,
     "automatic_retry": false
   },
   "native_artifact_contract": {
@@ -133,7 +133,7 @@
     "no_old_native_or_artifact_credit": true
   },
   "admission": {
-    "status": "SOURCE_ONLY_NOT_ADMITTED",
+    "status": "ROOT_ADMITTED_NEW_CPU3900_PENDING_EXACT_DISPATCH",
     "registered_workflow_path": ".github/workflows/pr-test-rust.yml",
     "normal_product_workflow_preserved": true,
     "manual_overlay_root_only": true,
