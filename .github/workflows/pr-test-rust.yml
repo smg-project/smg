@@ -20,6 +20,20 @@ jobs:
     env:
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
+      - name: Restore this assigned checkout's ownership
+        timeout-minutes: 1
+        run: |
+          test "$GITHUB_REPOSITORY" = smg-project/smg
+          test "$GITHUB_WORKSPACE" = "$RUNNER_WORKSPACE/smg"
+          test "$(realpath -e "$GITHUB_WORKSPACE")" = "$GITHUB_WORKSPACE"
+          docker run --rm --pull=never --network=none --read-only --user=0 \
+            --cpus=1 --memory=256m --pids-limit=32 --cap-drop=ALL --cap-add=CHOWN \
+            --name "smg-qwen-checkout-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --label "smg.qwen.checkout.run=$GITHUB_RUN_ID" \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/checkout" \
+            --entrypoint /usr/bin/timeout \
+            lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d \
+            --signal=TERM --kill-after=2 20 /bin/chown -R -h -P "$(id -u):$(id -g)" /checkout
       - name: Checkout the exact private admitted child
         uses: actions/checkout@v7
         with:
