@@ -77,6 +77,22 @@ pub fn qwen35_lineage(architectures: &[String], model_type: &str) -> bool {
         && QWEN35_MODEL_TYPES.contains(&model_type)
 }
 
+/// The Omni family's names: the engine dispatches these architectures to its
+/// own positions rule (not the Qwen3.5 one); a prefix, since the thinker-only
+/// checkpoints carry the same stem with a suffix.
+const QWEN3_OMNI_ARCHITECTURE_PREFIX: &str = "Qwen3OmniMoe";
+const QWEN3_OMNI_MODEL_TYPE_PREFIX: &str = "qwen3_omni_moe";
+
+/// Whether this checkpoint is of the Omni family, whose positions the engine
+/// computes by a rule this wire does not have: either marker names it (a
+/// refusal reads wider than a dispatch).
+pub fn qwen3_omni_family(architectures: &[String], model_type: &str) -> bool {
+    architectures
+        .iter()
+        .any(|arch| arch.starts_with(QWEN3_OMNI_ARCHITECTURE_PREFIX))
+        || model_type.starts_with(QWEN3_OMNI_MODEL_TYPE_PREFIX)
+}
+
 /// Read a grid tensor's `(t, h, w)` rows: shape `[n, 3]` or `[3]`, an
 /// integer dtype of either width. The engine reads the rows with `tolist()`,
 /// whatever the integer dtype.

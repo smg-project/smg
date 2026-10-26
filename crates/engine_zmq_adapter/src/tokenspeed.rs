@@ -32,7 +32,7 @@ use crate::{
 mod mrope;
 
 use mrope::{grid_rows, GridItem, GridKind};
-pub use mrope::{qwen35_lineage, MropeLayout};
+pub use mrope::{qwen35_lineage, qwen3_omni_family, MropeLayout};
 
 /// Streaming generate output for one TokenSpeed sub-request, mapping each
 /// `TokenSpeedOutput` to a vLLM-proto `GenerateResponse`, tagged with this
@@ -327,6 +327,12 @@ pub enum GridTensors {
     /// carries one is refused, since a 1-D fallback would silently degrade
     /// grounding.
     Positions,
+    /// A checkpoint of the engine's Omni family ([`qwen3_omni_family`]): its
+    /// positions follow a rule of the engine's own, not the Qwen3.5
+    /// lineage's, which this wire does not have, and an audio-only item
+    /// carries no grid for the grid rule to catch; every item of the family
+    /// is refused rather than shipped with empty position slots.
+    OmniPositions,
     /// The grid only describes the patch layout: the language model's rotary
     /// positions are 1-D (Muse Spark's `rope_type: default`), so the item
     /// passes through as the engine expects it.
@@ -344,13 +350,18 @@ impl GridTensors {
     /// lineage checkpoint takes its rule whatever `mrope_positions` says (a
     /// `Some(false)` there would otherwise ship empty position slots, which
     /// the engine fills with 1-D positions), and the reading decides only the
-    /// families without a rule.
+    /// families without a rule. The Omni family is refused by name before
+    /// either ([`qwen3_omni_family`]): no rule here, and no grid on its
+    /// audio items for the reading to act on.
     pub fn for_model(
         architectures: &[String],
         model_type: &str,
         mrope_positions: Option<bool>,
         layout: Option<MropeLayout>,
     ) -> Self {
+        if qwen3_omni_family(architectures, model_type) {
+            return Self::OmniPositions;
+        }
         if qwen35_lineage(architectures, model_type) {
             return layout.map_or(Self::Qwen35PositionsUnavailable, Self::Qwen35Positions);
         }
@@ -650,6 +661,16 @@ pub(crate) fn translate_tokenspeed_multimodal(
                 .to_string(),
         );
     }
+    if grid_tensors == GridTensors::OmniPositions {
+        return Err(
+            "multimodal items of this model follow its own MRoPE position rule, which this \
+             translation does not compute (the Qwen3.5 lineage's it does) and the engine does \
+             not fill on this wire; it would take 1-D positions silently, so every item, audio \
+             included, is refused: serve this model over the gRPC transport, whose input \
+             processor computes the positions"
+                .to_string(),
+        );
+    }
     let unpadded = input_ids.to_vec();
     let mut im_token_id = None;
     let mut video_token_id = None;
@@ -730,6 +751,7 @@ pub(crate) fn translate_tokenspeed_multimodal(
                 })
                 .transpose()?,
             GridTensors::Qwen35PositionsUnavailable
+            | GridTensors::OmniPositions
             | GridTensors::Positions
             | GridTensors::PatchLayout => None,
         };
@@ -778,6 +800,7 @@ pub(crate) fn translate_tokenspeed_multimodal(
             (Some(table.positions), Some(table.delta), Some(table.scalar))
         }
         GridTensors::Qwen35PositionsUnavailable
+        | GridTensors::OmniPositions
         | GridTensors::Positions
         | GridTensors::PatchLayout => {
             // Surface the position-tensor gap in the gateway's own logs (once
@@ -2357,5 +2380,113 @@ mod tests {
             }
         }
         engine_task.await.unwrap();
+    }
+
+    /// A checkpoint of the engine's Omni family is refused by name, every
+    /// item of it. The grid rule alone would not do: an audio-only item
+    /// carries no grid tensor, so under the conservative reading it went to
+    /// the engine with empty position slots (1-D positions engine-side,
+    /// silently); an image item with a grid is refused the same way. The
+    /// family is named by either marker, the thinker-only checkpoint
+    /// included; the families beside it keep their readings.
+    #[test]
+    fn an_omni_family_checkpoints_items_are_refused_by_name_audio_only_included() {
+        let arch = |a: &str| vec![a.to_string()];
+        for (architectures, model_type) in [
+            (
+                arch("Qwen3OmniMoeForConditionalGeneration"),
+                "qwen3_omni_moe",
+            ),
+            (
+                arch("Qwen3OmniMoeThinkerForConditionalGeneration"),
+                "qwen3_omni_moe_thinker",
+            ),
+            (arch("Qwen3OmniMoeForConditionalGeneration"), "unknown"),
+            (vec![], "qwen3_omni_moe"),
+        ] {
+            for (mrope_positions, layout) in [
+                (Some(true), Some(QWEN35)),
+                (Some(false), None),
+                (None, None),
+            ] {
+                assert_eq!(
+                    GridTensors::for_model(&architectures, model_type, mrope_positions, layout),
+                    GridTensors::OmniPositions,
+                    "{architectures:?} {model_type} {mrope_positions:?}"
+                );
+            }
+        }
+        assert_eq!(
+            GridTensors::for_model(
+                &arch("Qwen3VLForConditionalGeneration"),
+                "qwen3_vl",
+                None,
+                None
+            ),
+            GridTensors::Positions
+        );
+        assert_eq!(
+            GridTensors::for_model(
+                &arch("Qwen3_5ForConditionalGeneration"),
+                "qwen3_5",
+                None,
+                Some(QWEN35)
+            ),
+            GridTensors::Qwen35Positions(QWEN35)
+        );
+
+        let audio_only = || {
+            let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+            req.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 100, 100, 100, 8, 2];
+            let samples: u32 = 1_920;
+            req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs {
+                items: vec![tokenspeed_proto::MultimodalItem {
+                    modality: common::Modality::Audio as i32,
+                    content_hash: 0x0123_4567_89AB_CDEFu64.to_le_bytes().to_vec(),
+                    encoder_input: Some(tokenspeed_proto::TensorData {
+                        shape: vec![samples, 1],
+                        dtype: "bfloat16".to_string(),
+                        payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(
+                            vec![0x3Fu8; samples as usize * 2].into(),
+                        )),
+                    }),
+                    model_specific_tensors: [(
+                        "samples_per_audio".to_string(),
+                        tokenspeed_proto::TensorData {
+                            shape: vec![1],
+                            dtype: "int64".to_string(),
+                            payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(
+                                (samples as i64).to_le_bytes().to_vec().into(),
+                            )),
+                        },
+                    )]
+                    .into(),
+                    placeholders: vec![tokenspeed_proto::PlaceholderRange {
+                        offset: 2,
+                        length: 3,
+                    }],
+                    ..Default::default()
+                }],
+            });
+            req
+        };
+        // The gap the name closes: without a grid, the conservative reading
+        // let the audio item through with empty position slots.
+        let wire = translate_for(audio_only(), GridTensors::Positions).expect("passes unnamed");
+        let mm = wire.multimodal_inputs.expect("the audio item went through");
+        assert!(mm.mrope_positions.is_none() && mm.mrope_position_delta.is_none());
+        let err = translate_for(audio_only(), GridTensors::OmniPositions).unwrap_err();
+        assert!(
+            err.contains("audio included") && err.contains("gRPC transport"),
+            "{err}"
+        );
+
+        let mut with_grid = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        with_grid.tokenized.as_mut().unwrap().input_ids = vec![QWEN35.image_token_id; 9];
+        with_grid.mm_inputs = Some(tokenspeed_proto::MultimodalInputs {
+            items: vec![qwen35_grid_item(&[[1, 4, 6]], 2, 6)],
+        });
+        let err = translate_for(with_grid, GridTensors::OmniPositions).unwrap_err();
+        assert!(err.contains("own MRoPE position rule"), "{err}");
     }
 }
