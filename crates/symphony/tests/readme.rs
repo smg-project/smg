@@ -1379,7 +1379,13 @@ const GROUPS: &[Group] = &[
     Group {
         slug: "llama-3.1-8b-instruct",
         model: "meta-llama/Llama-3.1-8B-Instruct",
-        also: &["Llama-3.1-70B-Instruct", "Llama-3.1-405B-Instruct"],
+        also: &[
+            "Llama-3.1-70B-Instruct",
+            "Llama-3.1-405B-Instruct",
+            "Meta-Llama-3.1-8B-Instruct",
+            "Meta-Llama-3.1-70B-Instruct",
+            "Meta-Llama-3.1-405B-Instruct",
+        ],
         released: "2024-07-18",
         smg: (Some("json"), None),
         table: Some(Table::Json),

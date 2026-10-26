@@ -737,8 +737,19 @@ class TestOpenAIServerFunctionCalling:
 )
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
+@pytest.mark.skipif(
+    get_parser() == "symphony",
+    reason="the registry reads this model with the json table under --parser symphony; "
+    "the pythonic list is the legacy parsers' reading",
+)
 class TestOpenAIPythonicFunctionCalling:
-    """Tests for pythonic function calling format."""
+    """Tests for pythonic function calling format.
+
+    Under ``--parser symphony`` the registry reads this model with its own table (``json``)
+    whatever ``--tool-call-parser`` names, so the gateway-wide ``pythonic`` name this class
+    relies on does not apply there: the class runs where the legacy parsers read, and skips
+    under Symphony at collection, before any fixture starts a worker or a gateway.
+    """
 
     def test_pythonic_tool_call_prompt(self, model, api_client):
         """Test: Explicit prompt for pythonic tool call format without chat template."""

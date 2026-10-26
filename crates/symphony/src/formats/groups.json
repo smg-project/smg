@@ -88,7 +88,7 @@
   {"model": "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1", "also": [], "table": "llama_nemotron", "opener": null, "after": null},
   {"model": "nvidia/Llama-3_3-Nemotron-Super-49B-v1", "also": [], "table": "llama_nemotron", "opener": null, "after": null},
   {"model": "nvidia/Llama-3_3-Nemotron-Super-49B-v1_5", "also": [], "table": "llama_nemotron", "opener": null, "after": null},
-  {"model": "meta-llama/Llama-3.1-8B-Instruct", "also": ["Llama-3.1-70B-Instruct", "Llama-3.1-405B-Instruct"], "table": "json", "opener": "<|start_header_id|>assistant<|end_header_id|>", "after": null},
+  {"model": "meta-llama/Llama-3.1-8B-Instruct", "also": ["Llama-3.1-70B-Instruct", "Llama-3.1-405B-Instruct", "Meta-Llama-3.1-8B-Instruct", "Meta-Llama-3.1-70B-Instruct", "Meta-Llama-3.1-405B-Instruct"], "table": "json", "opener": "<|start_header_id|>assistant<|end_header_id|>", "after": null},
   {"model": "nvidia/Llama-3.1-Nemotron-8B-UltraLong-1M-Instruct", "also": [], "table": "json", "opener": "<|start_header_id|>assistant<|end_header_id|>", "after": null},
   {"model": "nvidia/Llama-3.1-Nemotron-8B-UltraLong-2M-Instruct", "also": [], "table": "json", "opener": "<|start_header_id|>assistant<|end_header_id|>", "after": null},
   {"model": "nvidia/Llama-3.1-Nemotron-8B-UltraLong-4M-Instruct", "also": [], "table": "json", "opener": "<|start_header_id|>assistant<|end_header_id|>", "after": null},
