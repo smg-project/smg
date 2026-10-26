@@ -704,6 +704,20 @@ mod tests {
     use super::*;
     use crate::worker::{endpoint::Endpoint, registry::WorkerId, EndpointKey};
 
+    /// The pod's Ready condition at `status` ("True", "False" or "Unknown"),
+    /// every other field unset.
+    fn ready_condition(status: &str) -> PodCondition {
+        PodCondition {
+            type_: "Ready".to_string(),
+            status: status.to_string(),
+            last_probe_time: None,
+            last_transition_time: None,
+            message: None,
+            reason: None,
+            observed_generation: None,
+        }
+    }
+
     fn create_k8s_pod(
         name: Option<&str>,
         ip: Option<&str>,
@@ -731,15 +745,7 @@ mod tests {
             };
 
             if let Some(status_str) = ready_status {
-                let condition = PodCondition {
-                    type_: "Ready".to_string(),
-                    status: status_str.to_string(),
-                    last_probe_time: None,
-                    last_transition_time: None,
-                    message: None,
-                    reason: None,
-                    observed_generation: None,
-                };
+                let condition = ready_condition(status_str);
                 pod_status.conditions = Some(vec![condition]);
             }
             pod.status = Some(pod_status);
@@ -769,15 +775,7 @@ mod tests {
             status: Some(PodStatus {
                 pod_ip: Some(ip.to_string()),
                 phase: Some("Running".to_string()),
-                conditions: Some(vec![PodCondition {
-                    type_: "Ready".to_string(),
-                    status: "True".to_string(),
-                    last_probe_time: None,
-                    last_transition_time: None,
-                    message: None,
-                    reason: None,
-                    observed_generation: None,
-                }]),
+                conditions: Some(vec![ready_condition("True")]),
                 ..Default::default()
             }),
         }
@@ -1278,15 +1276,7 @@ mod tests {
         let config = make_regular_config();
         let mut pod = pod_with_annotations("w", &[("smg.ai/worker-ports", "8080,8081")]);
         if let Some(status) = pod.status.as_mut() {
-            status.conditions = Some(vec![PodCondition {
-                type_: "Ready".to_string(),
-                status: "False".to_string(),
-                last_probe_time: None,
-                last_transition_time: None,
-                message: None,
-                reason: None,
-                observed_generation: None,
-            }]);
+            status.conditions = Some(vec![ready_condition("False")]);
         }
         let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
         let registered = [
@@ -1376,15 +1366,7 @@ mod tests {
         let config = make_regular_config();
         let mut pod = pod_with_annotations("w", &[("smg.ai/worker-ports", "8080,8081")]);
         if let Some(status) = pod.status.as_mut() {
-            status.conditions = Some(vec![PodCondition {
-                type_: "Ready".to_string(),
-                status: "False".to_string(),
-                last_probe_time: None,
-                last_transition_time: None,
-                message: None,
-                reason: None,
-                observed_generation: None,
-            }]);
+            status.conditions = Some(vec![ready_condition("False")]);
         }
         let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
         assert!(desired.workers.is_empty());
@@ -1395,15 +1377,7 @@ mod tests {
         let config = make_regular_config();
         let mut pod = make_labeled_pod("w", "10.0.0.1", &[("app", "sglang")]);
         if let Some(status) = pod.status.as_mut() {
-            status.conditions = Some(vec![PodCondition {
-                type_: "Ready".to_string(),
-                status: "Unknown".to_string(),
-                last_probe_time: None,
-                last_transition_time: None,
-                message: None,
-                reason: None,
-                observed_generation: None,
-            }]);
+            status.conditions = Some(vec![ready_condition("Unknown")]);
         }
         let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
         assert!(desired.workers.is_empty());
@@ -1681,15 +1655,7 @@ mod tests {
             status: Some(PodStatus {
                 pod_ip: Some(ip.to_string()),
                 phase: Some("Running".to_string()),
-                conditions: Some(vec![PodCondition {
-                    type_: "Ready".to_string(),
-                    status: "True".to_string(),
-                    last_probe_time: None,
-                    last_transition_time: None,
-                    message: None,
-                    reason: None,
-                    observed_generation: None,
-                }]),
+                conditions: Some(vec![ready_condition("True")]),
                 ..Default::default()
             }),
         }
