@@ -306,3 +306,63 @@ def memory_query_event(module, file, device, gpu_id, distributed, empty_cache,
                 sys.stderr.write("SG4_MEMORY_EVENT_DROP " + type(error).__name__ + "\n")
             except BaseException:
                 pass
+
+
+_POOL_SOURCES = {'/sgl-workspace/sglang/python/sglang/srt/mem_cache/kv_cache_configurator.py': 'a2493e2dcb2b1e1feb63665c2a896fe6c0079555a46d95953484eaef8600c122', '/sgl-workspace/sglang/python/sglang/srt/distributed/bootstrap.py': '6bda018bde5e3eb1f3b7665b39c4a1d26240c1f5c17cf7c286bc27756c9f2211'}
+_pool_pid, _pool_seen = None, set()
+_pool_lock = threading.Lock()
+
+
+def pool_budget_event(stage, module, file, fields):
+    """Existing consumed CPU locals only; no Torch, device or allocator query."""
+    global _pool_pid, _pool_seen, _pool_lock
+    if os.environ.get(FLAG) != "1":
+        return
+    try:
+        if stage not in ("preload-B", "kv-profile", "pool-before-init") or file not in _POOL_SOURCES:
+            raise ValueError("exact consumed pool stage required")
+        if type(fields) is not dict or len(fields) > 16:
+            raise ValueError("bounded scalar pool locals required")
+        if any(type(k) is not str or len(k) > 64 or type(v) not in (str, int, float, bool, type(None)) for k, v in fields.items()):
+            raise ValueError("CPU scalar locals only")
+        pid = os.getpid()
+        if pid != _pool_pid:
+            _pool_pid, _pool_seen, _pool_lock = pid, set(), threading.Lock()
+        with _pool_lock:
+            if stage in _pool_seen or len(_pool_seen) >= 3:
+                return
+            _pool_seen.add(stage)
+        marker = os.environ.get("E2E_JOB_MARKER", "")
+        if not re.fullmatch(r"e2e-[0-9]+-[0-9]+-amd-mi300x-[12]", marker):
+            raise ValueError("same-job pool marker required")
+        origin = _origin(module, file)
+        if origin["sha256"] != _POOL_SOURCES[file]:
+            raise ValueError("exact installed pool source required")
+        ticks = _ticks()
+        runtime = sys.modules.get("sglang.srt.runtime_context")
+        role = _query(lambda: _text(str(runtime.get_disagg().disaggregation_mode))) if runtime else None
+        row = {"kind": "consumed-pool-budget", "stage": stage, "pid": pid,
+               "start_ticks": ticks, "job_marker": marker, "monotonic": time.monotonic(),
+               "role": role, "origin": origin, "helper": _origin(__name__, __file__),
+               "fields": fields, "new_GPU_or_allocator_queries": 0,
+               "masks": {key: _text(os.environ.get(key)) for key in
+                         ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")},
+               "limit": "Planning locals before pool init; not physical counter correctness or allocation success."}
+        data = (json.dumps(row, ensure_ascii=True, allow_nan=False) + "\n").encode()
+        if len(data) > 4096 or ticks != _ticks():
+            raise ValueError("bounded same-PID pool event required")
+        directory = Path(os.environ["AMD_DEPENDENCY_DIRECTORY"]) / "sglang-startup"
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError("precreated same-job pool directory required")
+        fd = os.open(directory / f"{pid}-{ticks}.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            status = os.fstat(stream.fileno())
+            if not stat.S_ISREG(status.st_mode) or status.st_size + len(data) > 64 * 1024:
+                raise ValueError("bounded regular pool event file required")
+            stream.write(data)
+        logging.getLogger("smg.sg4.pool").warning("SG4_POOL %s", data.decode().rstrip("\n"))
+    except BaseException as error:
+        try:
+            sys.stderr.write("SG4_POOL_EVENT_DROP " + type(error).__name__ + "\n")
+        except BaseException:
+            pass

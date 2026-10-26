@@ -3,6 +3,11 @@ name: E2E GPU Job
 on:
   workflow_call:
     inputs:
+      external_product_commit:
+        required: false
+        type: string
+        default: ""
+        description: "Private admitted product SHA for the existing external-artifact verifier; empty keeps normal same-run build artifacts"
       engine:
         required: true
         type: string
@@ -137,6 +142,7 @@ jobs:
     timeout-minutes: ${{ inputs.timeout }}
     permissions:
       contents: read
+      actions: read
     env:
       E2E_ENGINE: ${{ inputs.engine }}
       E2E_RUNTIME: ${{ inputs.engine }}
@@ -160,6 +166,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+        with:
+          fetch-depth: ${{ inputs.external_product_commit != '' && '0' || '1' }}
 
       # Every process this job starts carries the job's marker in its
       # environment: exported here, before anything starts, so the harness's
@@ -181,6 +189,98 @@ jobs:
           git config --global \
             url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf \
             "https://github.com/"
+
+      - name: Require one separately admitted complete original TokenSpeed PD2 reference row
+        if: inputs.external_product_commit != ''
+        env:
+          EXPECTED_PRODUCT_COMMIT: ${{ inputs.external_product_commit }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          import os
+          import re
+          from pathlib import Path
+          data = json.loads(Path(".github/amd-shared-product/inputs.json").read_text())
+          assert data["admitted_lane"] == "tokenspeed-pd2-original-qwen-sglang-reference"
+          assert data["runtime_cohort_accepted"] is True
+          assert all(data[key] is True for key in ("ready", "run_budget_admitted", "artifacts_pinned"))
+          import hashlib
+          for name, expected in data["diagnostic_source_files"].items():
+              assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == expected
+          recipe = data["recipe"]
+          expected_product = os.environ["EXPECTED_PRODUCT_COMMIT"]
+          assert re.fullmatch(r"[0-9a-f]{40}", expected_product)
+          assert data["target_product_commit"] == expected_product
+          assert recipe["test_dirs"] == "e2e_test/router" and recipe["test_filter"] == ""
+          assert recipe["engine"] == recipe["actual_engine"] == "sglang"
+          assert recipe["reference_engine"] == "tokenspeed" and recipe["functional_equivalence_only"] is True
+          assert recipe["strict_native_TokenSpeed"] is False and recipe["gpu_tier"] == "2"
+          assert recipe["profile_env"] == {"SMG_AMD_TS_PD2_REFERENCE": "1"}
+          assert recipe["connection_mode"] == "" and recipe["kv_backend"] == ""
+          assert recipe["min_selected"] == 10 and recipe["servicer_unit_tests"] is False
+          assert recipe["models"] == ["Qwen/Qwen3.5-9B", "meta-llama/Llama-3.2-1B-Instruct"] and recipe["tp"] == 1
+          assert recipe["extra_models"] == "Qwen/Qwen3.5-9B"
+          assert recipe["job_minutes"] == 75 and recipe["pytest_minutes"] == 50
+          assert recipe["reruns"] == 2 and recipe["reruns_delay"] == 5
+          assert recipe["setup_agentic_deps"] is False and recipe["same_original_tests_and_oracles"] is True
+          PYTHON
+      - name: Verify external producer and relay payloads
+        id: external-relay
+        if: inputs.external_product_commit != ''
+        timeout-minutes: 10
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          DIRECTORY="$RUNNER_TEMP/shared-relay-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "directory=$DIRECTORY" >> "$GITHUB_OUTPUT"
+          python3 .github/amd-shared-product/relay.py --out "$DIRECTORY"
+      - name: Relay wheel without changing its bytes
+        if: inputs.external_product_commit != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: smg-wheel
+          path: ${{ steps.external-relay.outputs.directory }}/smg-wheel/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+      - name: Relay Go FFI without changing its bytes
+        if: inputs.external_product_commit != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-ffi-library
+          path: ${{ steps.external-relay.outputs.directory }}/go-ffi-library/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+      - name: Relay WASM without changing its bytes
+        if: inputs.external_product_commit != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: wasm-test-fixtures
+          path: ${{ steps.external-relay.outputs.directory }}/wasm-test-fixtures/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+      - name: Relay Python types without changing their bytes
+        if: inputs.external_product_commit != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-client-types
+          path: ${{ steps.external-relay.outputs.directory }}/python-client-types/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+      - name: Preserve external producer identity and verification
+        if: always() && inputs.external_product_commit != '' && steps.external-relay.outputs.directory != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: external-producer-relay-evidence
+          path: ${{ steps.external-relay.outputs.directory }}/evidence/
+          if-no-files-found: ignore
+          retention-days: 7
 
       # Engine-specific setup
       - name: Setup SGLang backend

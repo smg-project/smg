@@ -115,6 +115,7 @@ def main():
                 accepted_helpers.add(plan["previous_helper_sha256"])
                 accepted_helpers.add(plan["previous_runtime_helper_sha256"])
                 accepted_helpers.add(plan["previous_memory_helper_sha256"])
+                accepted_helpers.add(plan["previous_pool_helper_sha256"])
             if sha(read(helper_target)[0]) not in accepted_helpers:
                 raise RuntimeError("refuse unrelated installed diagnostic helper")
         elif mode == "final":
@@ -149,6 +150,19 @@ def main():
             memory_raw = memory_raw.replace(before, memory_plan["after"].encode())
         if sha(memory_raw) != memory_plan["after_sha256"]:
             raise RuntimeError("unknown or unapplied current4420 memory-query source")
+        pool_sources = {}
+        for name, entry in plan["runtime_pool_budget"].items():
+            pool_target = Path(entry["target"])
+            pool_raw, pool_mode = read(pool_target)
+            if sha(pool_raw) == entry["before_sha256"] and mode == "apply":
+                for replacement in entry["replacements"]:
+                    before = replacement["before"].encode()
+                    if pool_raw.count(before) != 1:
+                        raise RuntimeError("exact one original pool-budget expression required")
+                    pool_raw = pool_raw.replace(before, replacement["after"].encode())
+            if sha(pool_raw) != entry["after_sha256"]:
+                raise RuntimeError("unknown or unapplied current4420 pool-budget source")
+            pool_sources[name] = (pool_target, pool_raw, pool_mode)
     if cu_source_enabled:
         cu_plan = json.loads((HERE / "cu-overlay.json").read_text())
         if phase_enabled:
@@ -181,6 +195,8 @@ def main():
             atomic(scheduler_target, scheduler_raw, scheduler_mode)
             atomic(future_target, future_raw, future_mode)
             atomic(memory_target, memory_raw, memory_mode)
+            for pool_target, pool_raw, pool_mode in pool_sources.values():
+                atomic(pool_target, pool_raw, pool_mode)
         if cu_source_enabled:
             (directory / "cu-record-before.json").write_text(json.dumps(record, indent=2) + "\n")
             atomic(cu_target, cu_raw, cu_mode)
@@ -194,6 +210,10 @@ def main():
         raise RuntimeError("installed FutureMap diagnostic source changed")
     if phase_enabled and sha(read(memory_target)[0]) != memory_plan["after_sha256"]:
         raise RuntimeError("installed existing-memory-query source changed")
+    if phase_enabled:
+        for name, (pool_target, _, _) in pool_sources.items():
+            if sha(read(pool_target)[0]) != plan["runtime_pool_budget"][name]["after_sha256"]:
+                raise RuntimeError("installed consumed-pool-budget source changed")
     if cu_source_enabled and (sha(read(cu_target)[0]) != cu_plan["after_sha256"] or package_record(cu_plan, cu_target) != record):
         raise RuntimeError("installed AITER source/metadata changed")
     (directory / (mode + ".json")).write_text(json.dumps({
@@ -204,6 +224,7 @@ def main():
         "scheduler_source_sha256": scheduler_plan["after_sha256"] if phase_enabled else None,
         "futuremap_source_sha256": future_plan["after_sha256"] if phase_enabled else None,
         "existing_memory_query_source_sha256": memory_plan["after_sha256"] if phase_enabled else None,
+        "consumed_pool_budget_sources_sha256": {name: entry["after_sha256"] for name, entry in plan["runtime_pool_budget"].items()} if phase_enabled else None,
         "CU_runtime_observation_enabled": phase_enabled,
         "CU_source_sha256": cu_plan["after_sha256"] if cu_source_enabled else None,
         "CU_overlay_manifest_sha256": sha((HERE / "cu-overlay.json").read_bytes()) if cu_source_enabled else None,
