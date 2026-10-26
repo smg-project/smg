@@ -18,6 +18,8 @@ dependencies = [
   "pillow",
   "pytest",
   "pytest-rerunfailures",
+  # infra.worker imports yaml at module level (the TRT-LLM config dump)
+  "pyyaml",
   "requests",
   "tqdm",
   "uvicorn>=0.30",
