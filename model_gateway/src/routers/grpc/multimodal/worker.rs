@@ -814,6 +814,31 @@ mod tests {
         ]
     }
 
+    /// The settings every pipeline test starts from: a model at `model_dir`
+    /// served under its own path, normalized pixels in bfloat16, one-second
+    /// fetch timeouts, and no limit, budget or override of any kind; a test
+    /// names the fields it is about.
+    pub(super) fn pipeline_settings(model_dir: &str) -> WorkerMediaSettings {
+        WorkerMediaSettings {
+            model_dir: model_dir.to_string(),
+            model_id: model_dir.to_string(),
+            served_model_name: None,
+            pixel_format: PixelFormat::Normalized,
+            encoder_dtype: "bfloat16".to_string(),
+            processor_kwargs: serde_json::Map::new(),
+            max_items: None,
+            engine_item_limits: HashMap::new(),
+            max_item_bytes: None,
+            allowed_domains: None,
+            fetch_timeout: Duration::from_secs(1),
+            video_fetch_timeout: Duration::from_secs(1),
+            video_frame_budget: None,
+            video_loader_rule: None,
+            encoder_budget: None,
+            turbojpeg: None,
+        }
+    }
+
     /// The engine's `--limit-mm-per-prompt` caps the pipeline's own limits
     /// (`--mm-max-items`, the environment override, the spec's), which keep
     /// their precedence below it; without an engine limit nothing changes.
@@ -895,22 +920,10 @@ mod tests {
         )
         .unwrap();
         let settings = WorkerMediaSettings {
-            model_dir: dir.display().to_string(),
-            served_model_name: None,
-            model_id: dir.display().to_string(),
-            pixel_format: PixelFormat::Normalized,
             encoder_dtype: "float32".to_string(),
-            processor_kwargs: serde_json::Map::new(),
-            max_items: None,
-            engine_item_limits: HashMap::from([(Modality::Image, 1)]),
-            max_item_bytes: None,
-            allowed_domains: None,
-            fetch_timeout: Duration::from_secs(1),
-            video_fetch_timeout: Duration::from_secs(1),
-            video_frame_budget: None,
-            video_loader_rule: None,
+            engine_item_limits: limits(&[(Modality::Image, 1)]),
             encoder_budget: Some(192_000),
-            turbojpeg: None,
+            ..pipeline_settings(&dir.display().to_string())
         };
         let pipeline = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::new()))
             .await
@@ -965,22 +978,9 @@ mod tests {
         .unwrap();
         let path = dir.path().to_str().unwrap().to_string();
         let settings = |encoder_budget| WorkerMediaSettings {
-            model_dir: path.clone(),
-            model_id: path.clone(),
-            served_model_name: None,
-            pixel_format: PixelFormat::Normalized,
             encoder_dtype: "float32".to_string(),
-            processor_kwargs: serde_json::Map::new(),
-            max_items: None,
-            engine_item_limits: HashMap::new(),
-            max_item_bytes: None,
-            allowed_domains: None,
-            fetch_timeout: Duration::from_secs(1),
-            video_fetch_timeout: Duration::from_secs(1),
-            video_frame_budget: None,
-            video_loader_rule: None,
             encoder_budget,
-            turbojpeg: None,
+            ..pipeline_settings(&path)
         };
         let tokenizer = || Arc::new(MockTokenizer::new().with_tokens(&[("<image>", 32000)]));
         let items = vec![WorkerMediaItem {
@@ -1042,22 +1042,9 @@ mod tests {
         )
         .unwrap();
         let settings = WorkerMediaSettings {
-            model_dir: dir.display().to_string(),
-            served_model_name: None,
-            model_id: dir.display().to_string(),
-            pixel_format: PixelFormat::Normalized,
             encoder_dtype: "float32".to_string(),
-            processor_kwargs: serde_json::Map::new(),
-            max_items: None,
-            engine_item_limits: HashMap::new(),
             max_item_bytes: Some(4),
-            allowed_domains: None,
-            fetch_timeout: Duration::from_secs(1),
-            video_fetch_timeout: Duration::from_secs(1),
-            video_frame_budget: None,
-            video_loader_rule: None,
-            encoder_budget: None,
-            turbojpeg: None,
+            ..pipeline_settings(&dir.display().to_string())
         };
         let pipeline = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::new()))
             .await
@@ -1248,7 +1235,7 @@ mod processor_kwargs_tests {
 mod unsupported_model_tests {
     use llm_tokenizer::MockTokenizer;
 
-    use super::*;
+    use super::{tests::pipeline_settings, *};
 
     /// A spec whose encoder inputs vLLM does not read never preprocesses for
     /// this vLLM worker: the pipeline refuses to start.
@@ -1261,24 +1248,7 @@ mod unsupported_model_tests {
         )
         .unwrap();
         let path = dir.path().to_str().unwrap().to_string();
-        let settings = WorkerMediaSettings {
-            model_dir: path.clone(),
-            model_id: path,
-            served_model_name: None,
-            pixel_format: PixelFormat::Normalized,
-            encoder_dtype: "bfloat16".to_string(),
-            processor_kwargs: serde_json::Map::new(),
-            max_items: None,
-            engine_item_limits: HashMap::new(),
-            max_item_bytes: None,
-            allowed_domains: None,
-            fetch_timeout: Duration::from_secs(1),
-            video_fetch_timeout: Duration::from_secs(1),
-            video_frame_budget: None,
-            video_loader_rule: None,
-            encoder_budget: None,
-            turbojpeg: None,
-        };
+        let settings = pipeline_settings(&path);
         let error = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::default()))
             .await
             .err()
@@ -1302,22 +1272,8 @@ mod unsupported_model_tests {
         .unwrap();
         let path = dir.path().to_str().unwrap().to_string();
         let settings = WorkerMediaSettings {
-            model_dir: path.clone(),
-            model_id: path.clone(),
             served_model_name: Some("m6".to_string()),
-            pixel_format: PixelFormat::Normalized,
-            encoder_dtype: "bfloat16".to_string(),
-            processor_kwargs: serde_json::Map::new(),
-            max_items: None,
-            engine_item_limits: HashMap::new(),
-            max_item_bytes: None,
-            allowed_domains: None,
-            fetch_timeout: Duration::from_secs(1),
-            video_fetch_timeout: Duration::from_secs(1),
-            video_frame_budget: None,
-            video_loader_rule: None,
-            encoder_budget: None,
-            turbojpeg: None,
+            ..pipeline_settings(&path)
         };
         let error = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::default()))
             .await
@@ -1344,22 +1300,8 @@ mod unsupported_model_tests {
     #[test]
     fn the_served_name_is_omitted_when_it_is_the_path() {
         let settings = WorkerMediaSettings {
-            model_dir: "/models/x".to_string(),
-            model_id: "/models/x".to_string(),
             served_model_name: Some("/models/x".to_string()),
-            pixel_format: PixelFormat::Normalized,
-            encoder_dtype: "bfloat16".to_string(),
-            processor_kwargs: serde_json::Map::new(),
-            max_items: None,
-            engine_item_limits: HashMap::new(),
-            max_item_bytes: None,
-            allowed_domains: None,
-            fetch_timeout: Duration::from_secs(1),
-            video_fetch_timeout: Duration::from_secs(1),
-            video_frame_budget: None,
-            video_loader_rule: None,
-            encoder_budget: None,
-            turbojpeg: None,
+            ..pipeline_settings("/models/x")
         };
         let message = unsupported_model_message(
             &settings,
