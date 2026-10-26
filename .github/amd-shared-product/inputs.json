@@ -5,7 +5,7 @@
   "consumer_gpu_ready": false,
   "runtime_cohort_accepted": false,
   "admitted_lane": "vllm-chat-full-original",
-  "target_product_commit": "11da3ba8488f17a779df3d217be46f66d2554539",
+  "target_product_commit": "806f5c709ad1997f1399401708321c825fa94f5f",
   "artifacts": [
     {
       "name": "wasm-test-fixtures",
@@ -94,7 +94,7 @@
     "e2e_test": "52737557a71436eccac1f33266a4b6b9c438a2db",
     "scripts": "52daf79832b793c18268da010bdb9cf6fa4ba568",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
-    ".github/workflows/e2e-gpu-job.yml": "fed4d9a880926cd95e01ad8e6c1e722b7ff56ce3",
+    ".github/workflows/e2e-gpu-job.yml": "a04e5609b2615de0b615c65bd436b6c2390e9806",
     "README.md": "83b7df25632da03f0184bd5b4628b9c9a3ace803",
     "LICENSE": "9088c2872db9763b9e6533c6960e9adb0c9cb65f",
     "rustfmt.toml": "19e1ab31f8958c31292f0f568976a036af7e683b",
@@ -213,9 +213,20 @@
       "workflow_call_internal_execute": "private leaf execute is supplied from private_vllm_chat by registered caller; execute is not a workflow_dispatch input",
       "future_POSTs": 0,
       "scope": "Correct data contract to actual717 registered YAML; no workflow/event/permissions/ordinary/NV behavior change."
+    },
+    "shared_node_reserved_window": {
+      "UTC_start": "05:00",
+      "UTC_end": "06:30",
+      "actual_first_step_guard": true,
+      "precontainer_guard": false,
+      "cleanup_buffer_seconds": 300,
+      "whole_control_window_seconds": 5340,
+      "root_dispatch_requires_whole_window_plus_buffer_before_reserved_start": true,
+      "future_actual_reserved_start_utc": null,
+      "scope": "Firststepchecks actual clock before Checkout/setup only. Root solewatch absolute cutoff+queue900/overall5340 and conservative one-shot scheduling are independently required; recurringCI precontainer safety remains unimplemented."
     }
   },
-  "pending_note": "SOURCE ONLY readiness-data proposal on actual disabled717f5d: both CI nodes now have accepted exactc49/config9fe6 UID995:985 readonly CDF/e006 mounts and complete fileSHA evidence, so three normal-input metadata flags may be acknowledged. Allfive execution/admission flags remainfalse, budgetadmittedfalse/reserved0 and futureHEAD/run/CID/watchnull. PriorBASEb4bae/d53e proves normalinstall/native69215/CPUfixtureRPC/PNG only. Freshcompletequeue/physical/model/source/producer18/fourTTL and independent source/resource peers plus distinctNEW3600+relayCPU accounting still required; Fresh queue, shared-node placement and artifact TTL must be revalidated immediately before admission. Currentprivate60job/45pytest/fullunits/fullchat is not strictNV32/24 time-parity proof. Preserve other15vLLM targets,remaining12/17nonMLX/fullQA. No execution/publication/grant by this source packet.",
+  "pending_note": "SOURCE ONLY UTC-start/observer child of actual26312. Root must materialize the two workflow product paths, then bind this null target_product_commit to the real product SHA and recompute/verify all19 source entries;37compiled/14producer remain exactf103/69215 with successful18 policy, not Qwen17 renewal. Actual firststep UTC check is before Checkout/normalsetup but after job-container init; solewatch absolutepre05 cutoff plus root full5340window+300margin/queue900/actualphysicalcleanup are mandatory. Explicit private runner4 label is historical scheduling evidence only; fresh actualrunner/node ownership stillrequired. Full202integrityfloor/completeunits/chat/60whole45pytest/reruns2delay5/models/protocols/oracles retained. Bothreadonlymount and BASE proofs remain historical scopes; five authoritiesfalse/budget0/futureactualchild/run/job/CID/watchnull.",
   "binding_preparation_evidence": {
     "producer_build_archive_integrity_sha256": "671ca4d9b395dbf306cdc8f0885b4200c5c95cc3c28bf74ba2c53da2e4b24561",
     "producer_integrity_root_acceptance_sha256": "97cc1309c64e497dbd2d1b017cc99fe429612ef4fcf3e23636466de88e75edaa",
