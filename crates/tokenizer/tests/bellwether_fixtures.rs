@@ -13,10 +13,9 @@
 //!   contributes under the reference's incremental decode (tokenizers'
 //!   `DecodeStream`, special tokens kept): an empty piece for a token that
 //!   does not complete a character, the whole character on the token that
-//!   completes it. Feeding the ids one at a time through [`Sequence`], the
-//!   incremental decoder behind the gateway's stop-sequence decoder, must give
-//!   the same piece for every id, and the pieces joined must give the output
-//!   text.
+//!   completes it. The eager decoder must give the same piece for every id.
+//!   [`Sequence`], the client-output decoder, may hold ByteFallback runs until
+//!   they are stable; its completed text must still equal the reference text.
 //!
 //! The run is opt-in: `BELLWETHER_FIXTURES` points at the tree `bellwether
 //! unpack` writes (`fixtures-plain/` unless `--out` names another), where
@@ -1209,11 +1208,9 @@ fn check_encode(tok: &dyn Tokenizer, reference: &RenderReference) -> Result<(), 
     ))
 }
 
-/// Feed the output ids one at a time through a fresh [`Sequence`], the
-/// incremental decoder the gateway's stop-sequence decoder streams through,
-/// keeping special tokens as the reference did; compare the piece each id
-/// gives (empty when it emits nothing) with the recorded one, then the pieces
-/// joined with the recorded output text.
+/// Keep the recorded eager-piece contract and the completed client-text
+/// contract separate for ByteFallback, which intentionally delays byte runs.
+/// Both paths keep special tokens as the reference did.
 fn check_decode(tok: &Arc<dyn Tokenizer>, case: &ParseCase) -> Result<(), String> {
     if case.output_pieces.len() != case.output_ids.len() {
         return Err(format!(
@@ -1224,12 +1221,34 @@ fn check_decode(tok: &Arc<dyn Tokenizer>, case: &ParseCase) -> Result<(), String
     }
     let mut sequence = Sequence::new_with_options(Arc::clone(tok), false);
     let mut pieces = Vec::with_capacity(case.output_ids.len());
+    let mut text = String::new();
+    let byte_fallback = tok.uses_byte_fallback();
+    let (mut eager_ids, mut eager_prefix, mut eager_index) = (Vec::new(), String::new(), 0);
     for (index, &id) in case.output_ids.iter().enumerate() {
         let piece = sequence
             .append_token(id)
             .map_err(|e| format!("decoding id {id} at index {index} failed: {e}"))?;
+        text.push_str(&piece);
+        let piece = if byte_fallback {
+            tok.decode_step_eager(
+                id,
+                &mut eager_ids,
+                &mut eager_prefix,
+                &mut eager_index,
+                false,
+            )
+            .map_err(|e| format!("eager decoding id {id} at index {index} failed: {e}"))?
+            .unwrap_or_default()
+        } else {
+            piece
+        };
         pieces.push(piece);
     }
+    text.push_str(
+        &sequence
+            .finish()
+            .map_err(|e| format!("finishing decode failed: {e}"))?,
+    );
     let mut parts = Vec::new();
     if pieces != case.output_pieces {
         let at = first_difference(&pieces, &case.output_pieces);
@@ -1238,11 +1257,10 @@ fn check_decode(tok: &Arc<dyn Tokenizer>, case: &ParseCase) -> Result<(), String
             case.output_ids[at], pieces[at], case.output_pieces[at]
         ));
     }
-    let text = pieces.concat();
     if text != case.reference.text {
         let at = first_difference(text.as_bytes(), case.reference.text.as_bytes());
         parts.push(format!(
-            "the joined pieces part from the output text at byte {at}: decoded {:?}, recorded {:?}",
+            "the completed text differs from the output text at byte {at}: decoded {:?}, recorded {:?}",
             window(&text, at),
             window(&case.reference.text, at)
         ));
@@ -1659,6 +1677,44 @@ fn parse_line(id: &str, model: &str) -> String {
         "{{\"id\":\"{id}\",\"kind\":\"parse\",\"model\":\"{model}\",\"output_ids\":[1],\
          \"output_pieces\":[\"Hello\"],\"reference\":{{\"text\":\"Hello\"}}}}\n"
     )
+}
+
+#[test]
+fn byte_fallback_fixtures_check_eager_pieces_and_completed_text() {
+    let definition = serde_json::json!({
+        "version": "1.0",
+        "model": {"type": "WordLevel", "unk_token": "[UNK]", "vocab": {
+            "[UNK]": 0, "Hello": 1, "<0x0A>": 2
+        }},
+        "decoder": {"type": "Sequence", "decoders": [
+            {"type": "ByteFallback"}, {"type": "Fuse"}
+        ]}
+    });
+    let native =
+        tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&definition).unwrap()).unwrap();
+    let tok: Arc<dyn Tokenizer> =
+        Arc::new(llm_tokenizer::HuggingFaceTokenizer::from_tokenizer(native));
+    let mut case: ParseCase = serde_json::from_value(serde_json::json!({
+        "id": "bytes/parse/newlines", "kind": "parse", "model": "example/bytes",
+        "output_ids": [1, 2, 2], "output_pieces": ["Hello", "\n", "\n"],
+        "reference": {"text": "Hello\n\n"}
+    }))
+    .unwrap();
+    check_decode(&tok, &case).unwrap();
+
+    case.reference.text = "Hello\n".to_string();
+    assert!(check_decode(&tok, &case)
+        .unwrap_err()
+        .contains("completed text"));
+    case.reference.text = "Hello\n\n".to_string();
+    case.output_pieces[1] = String::new();
+    assert!(check_decode(&tok, &case)
+        .unwrap_err()
+        .contains("pieces part"));
+    case.output_pieces.pop();
+    assert!(check_decode(&tok, &case)
+        .unwrap_err()
+        .contains("pieces for"));
 }
 
 /// The tokenizer crate's mock tokenizer, and where a loader would say it
