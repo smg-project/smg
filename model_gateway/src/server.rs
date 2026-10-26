@@ -1245,15 +1245,16 @@ pub fn build_apps(
             // The three layers of these routes as ONE stack: axum boxes the
             // routes once per layer call and a request clones the boxed stack
             // at every level, so one call costs one level where three cost
-            // three (and their clones). Innermost first: the bound on the
-            // buffered body read (inside admission, so a stalled upload
-            // releases its permit, and inside the stream-vs-buffer decision,
-            // since the streamed relay has its own watchdog); the per-request
-            // buffer-vs-stream decision for typed-JSON bodies (declined
-            // requests pass to the handlers untouched); outermost, the
-            // keep-alive every SSE stream of these routes carries through an
-            // upstream silence (a comment; the Messages API's ping event),
-            // written between frames, nothing while frames flow.
+            // three (and their clones). Outermost first, as the builder reads:
+            // the keep-alive every SSE stream of these routes carries through
+            // an upstream silence (a comment; the Messages API's ping event),
+            // written between frames, nothing while frames flow; the
+            // per-request buffer-vs-stream decision for typed-JSON bodies
+            // (declined requests pass to the handlers untouched); innermost,
+            // the bound on the buffered body read (inside admission, so a
+            // stalled upload releases its permit, and inside the
+            // stream-vs-buffer decision, since the streamed relay has its own
+            // watchdog).
             .route_layer(
                 tower::ServiceBuilder::new()
                     .layer(
