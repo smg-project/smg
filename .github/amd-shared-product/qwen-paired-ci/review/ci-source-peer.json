@@ -1,0 +1,59 @@
+{
+  "result": "PASS_SOURCE_ONLY_ACTUAL_E65_QWEN_EXACT_CACHE_LAYOUT_CHILD",
+  "findings": [],
+  "reviewer": "A; nonauthor of root e65 integration; read-only Git/source/AST and saved root metadata data review. No candidate/helper import or execution.",
+  "at_utc": "2026-10-26T01:25:02.968942+00:00",
+  "source_parent": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
+  "actual_head": "e65bed1c6cc10a904c5048d9ddb82e7f1c7231d7",
+  "direct_parent": "9142805e943283fdaaebf2a8f7d1a5f726164ab9",
+  "actual_worktree": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/amd-qwen-current1473-paired-carrier-20261026",
+  "actual_branch": "ci/amd-qwen-current1473-paired-carrier-20261026",
+  "driver_sha256": "7b0a98d25b7c0061d673556b0f6cf41e6b6da7311f1642a1d70145ece8f63591",
+  "envelope_sha256": "06589cd12a0547a4e1d5547f8e24afb6c849ec8e95854d997b73bf1180d1ccfd",
+  "inputs_sha256": "9f0359d170854c490fdc28c18b51a83b87c94b22331ceb56accee41179350925",
+  "CI_job_runner_sha256": "858e381d4398c51163b16cee3c1282ff20d53d25b1f0dbff7214172bf7b7d5e8",
+  "workflow_template_sha256": "5f3e8bd61b0d6739fd2046a977a92a56b2cd9df48922704f204081beda3a9606",
+  "CI_source_manifest_sha256": "ef6f3ee2de952f1228213f47bcaade46bd5307182dafb167cf496cf95c1879c3",
+  "model_identity_sha256": "3595ea9ac2a519f69ae66440cb93cab69c6a02e645b83afb3e2ebdd1665cb55b",
+  "disabled_admission_sha256": "4b1bef63aa155869a728c3bcd8d66bddfc129d9fb5eeb8f4df7e9ea0b6432f09",
+  "actual_git_diff_sha256": "ad0939e6bb0d871f46b42f4276a27070875075744d8ba224196cb7a6faf53f38",
+  "checks": [
+    "Clean actual e65 direct 914 Git; exactly three paths, 9 insertions/3 deletions. Guard block inverse restores whole parent text; manifest changes only its model_identity hash; admission changes only manifest hash.",
+    "All 15 manifest source members match actual bytes; registered workflow equals reviewed template. Full e2e_test tree remains exact 1473. Existing inner/outer lifecycle, default model discovery, raw/SSE retention and source/producer checks inherited from prior genuine review.",
+    "Each declared shard must resolve to its exact root-pinned resolved_path. Allowed location is original repository or strict sibling blobs/<first-two-hex>/<64-lowercase-hex>. Original regular-file/size, header hash, index tensor-name join and offset bounds remain. No blanket /models access or tensor payload hashing.",
+    "New saved two-node records independently hash/join their stdout and summary, identical model pins: revision 0c351dd, seven metadata including actual chat_template.json, four declared shard headers and index. Reader source confirms bounded metadata/header-only reads; no model loaded or GPU seconds.",
+    "Disabled admission retains four false execution gates, reservation zero and null future identities. Existing source gates still require genuine manual budget/peer/actual runner ownership before execution."
+  ],
+  "new_node_pin_evidence": {
+    "summary_path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-actual-model-pins-read-root-ad60e7383aad4323b681db67450147ac/summary.json",
+    "summary_sha256": "54c112b6fb1fdfc61f0c1278708b7c6d0b2ab604f04d72a9be7571472bf01235",
+    "reader_sha256": "e75d6945b9015b3b33707e5f9ee25a3f8018a6966e2ed5423c2290d06e99f4db",
+    "nodes": [
+      {
+        "host": "smg_mi300x_1",
+        "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-actual-model-pins-read-root-ad60e7383aad4323b681db67450147ac/smg_mi300x_1.json",
+        "sha256": "fdc83a16a1955ae9d123c7e396145ab2e3c6108e2da1c19f25f6a134971a6c23",
+        "stdout_sha256": "30c6c3bcf0d64b08fa3945f5ad67ff520cfe7285d7ca749b196c101b694112ea"
+      },
+      {
+        "host": "smg_mi300x_2",
+        "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-actual-model-pins-read-root-ad60e7383aad4323b681db67450147ac/smg_mi300x_2.json",
+        "sha256": "4cd9ddc8183743f774eab8d97a5cfd1a1921811248ccd2ec39594b807c192ace",
+        "stdout_sha256": "9ca88732103731b1374389a044911781877d029090fc09414b0dd69f1604c204"
+      }
+    ],
+    "chat_template_sha256": "5c72a170d2a4a1a3bc5adad2e689ae28138a9700e5b8c96c0266331e86c0acce"
+  },
+  "inherited_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-carrier-root-local-fix-integration-aafa1743ad644f68987287904fd94f46/peer-source-integration-A.json",
+    "sha256": "a2f0208f0fa10ffbfb5fbee529a5c9d3de93c79bb36198000b6f771242ca857b",
+    "scope": "Parent carrier two-fix actual source integration; inner corrected build-leg/read1 and limited two real IO controls retain their original scopes."
+  },
+  "conditional_child_scope": "This genuine peer may be copied byte-exact to review/ci-source-peer.json for a subsequent conditional child changing only admission.json and the two review data files. The 15 source manifest members, manifest bytes, registered workflow and all hashes above must remain exact. Root must separately bind actual node pins and genuine fresh budget/identity facts; this source PASS does not grant them.",
+  "limits": [
+    "Metadata/header evidence is the saved root read, not an independent second remote read; tensor payload/full tensor hashes are unverified.",
+    "Parent d5 pipeline was cancelled; only its successful exact 17-step build leg is accepted as provenance, never the entire pipeline.",
+    "2100 absolute cap remains, including original partial-red caveat; no guarantee all 12 requests finish.",
+    "No engine/model/GPU execution, runtime/ABI/full original-row qualification or coverage increment is accepted by this peer."
+  ]
+}
