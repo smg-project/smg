@@ -118,6 +118,15 @@ kubectl patch crd ephemeralrunnersets.actions.github.com \
 Each values file explicitly references the shared controller service account in
 `org-actions-runner`. Install the required scale sets into `actions-runner-system`:
 
+The three accelerator scale sets share `runner-values-gpu-base.yaml` (the pod template:
+the init containers, the volumes, the node selector and tolerations); each
+`runner-values-<set>.yaml` is an overlay with the scale-set name, the runner bounds and the
+runner container, and Helm reads the base first, then the overlay. Helm replaces lists whole
+when it merges values files, which is why the whole runner container sits in the overlay.
+`check-runner-values.sh --against <rev>` renders each set from the base and its overlay and
+compares the render, byte for byte, with the files at `<rev>` (`CHART=<path>` renders from a
+local chart archive).
+
 ```bash
 helm upgrade --install k8s-runner-cpu \
   --namespace actions-runner-system \
@@ -130,6 +139,7 @@ helm upgrade --install 1-gpu-h100 \
   --namespace actions-runner-system \
   --create-namespace \
   --version 0.14.2 \
+  -f scripts/k8s-runner-resources/runner-values-gpu-base.yaml \
   -f scripts/k8s-runner-resources/runner-values-1-gpu-h100.yaml \
   oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
 
@@ -137,6 +147,7 @@ helm upgrade --install 2-gpu-h100 \
   --namespace actions-runner-system \
   --create-namespace \
   --version 0.14.2 \
+  -f scripts/k8s-runner-resources/runner-values-gpu-base.yaml \
   -f scripts/k8s-runner-resources/runner-values-2-gpu-h100.yaml \
   oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
 
@@ -144,6 +155,7 @@ helm upgrade --install 4-gpu-h100 \
   --namespace actions-runner-system \
   --create-namespace \
   --version 0.14.2 \
+  -f scripts/k8s-runner-resources/runner-values-gpu-base.yaml \
   -f scripts/k8s-runner-resources/runner-values-4-gpu-h100.yaml \
   oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
 ```
@@ -202,7 +214,9 @@ docker push fra.ocir.io/idqj093njucb/action-runner:2.337.0
 ```
 
 For a future runner release, substitute its version in the commands above and
-update **both** image references in all four active `runner-values-*.yaml` files
+update the image references in the six files: the runner image in the three accelerator
+overlays, the runner and dind images in `runner-values-gpu-base.yaml`, both in
+`runner-values-cpu.yaml`, and the runner image in `runner-values-bellwether-record.yaml`
 after publishing the image. Redeploy the scale sets using step 4.
 
 If runners report `Runner version ... is deprecated and cannot receive messages`,
