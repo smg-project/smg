@@ -2194,18 +2194,34 @@ fn explicit_thinking(params: &ChatTemplateParams) -> Option<bool> {
         .or(params.thinking)
 }
 
-/// Per DeepSeek's encoding README, preserve all reasoning when a system or
-/// developer message declares `tools`; otherwise drop earlier reasoning.
+/// Per DeepSeek's encoding README, preserve all reasoning when a system
+/// message declares `tools`; otherwise drop earlier reasoning. (A developer
+/// message is a system message by the time the shims read the list, see
+/// [`developer_messages_as_system_first`].)
 fn resolve_drop_thinking(messages: &[serde_json::Value]) -> bool {
     !messages.iter().any(|m| {
-        let role = m.get("role").and_then(|r| r.as_str());
-        matches!(role, Some("system" | "developer"))
+        m.get("role").and_then(|r| r.as_str()) == Some("system")
             && m.get("tools")
                 .and_then(|t| t.as_array())
                 .is_some_and(|arr| !arr.is_empty())
     })
 }
-/// Attach `tools` to a leading system/developer message so the V3.2/V4
+/// The messages as the engine's renderer hands them to its tokenizer wrapper:
+/// the developer messages rewritten as system ones and merged
+/// ([`crate::chat_template::developer_messages_as_system`]) BEFORE the wrapper
+/// attaches the request's tools to a system message, so the attached tools
+/// survive the merge. The native encoders repeat the rewrite at their own
+/// entry for direct callers; after this it finds nothing to do.
+fn developer_messages_as_system_first(
+    messages: &[serde_json::Value],
+) -> std::borrow::Cow<'_, [serde_json::Value]> {
+    match crate::chat_template::developer_messages_as_system(messages) {
+        Some(rewritten) => std::borrow::Cow::Owned(rewritten),
+        None => std::borrow::Cow::Borrowed(messages),
+    }
+}
+
+/// Attach `tools` to a leading system message so the V3.2/V4
 /// encoder can render the tools block. Mirrors the wrapper step in
 /// one engine's `tokenizers/deepseek_v32.py` and another engine's V4 serving path.
 /// Returns `None` when no rewrite is needed so callers can pass the input
@@ -2223,7 +2239,7 @@ fn inject_tools_into_messages(
         .first()
         .and_then(|m| m.get("role"))
         .and_then(|r| r.as_str());
-    if !matches!(first_role, Some("system" | "developer")) {
+    if first_role != Some("system") {
         owned.insert(0, serde_json::json!({ "role": "system", "content": "" }));
     }
     if let Some(obj) = owned[0].as_object_mut() {
@@ -2236,8 +2252,9 @@ fn apply_deepseek_v32(
     messages: &[serde_json::Value],
     params: &ChatTemplateParams,
 ) -> Result<String> {
-    let owned = inject_tools_into_messages(messages, params.tools);
-    let msgs: &[serde_json::Value] = owned.as_deref().unwrap_or(messages);
+    let messages = developer_messages_as_system_first(messages);
+    let owned = inject_tools_into_messages(&messages, params.tools);
+    let msgs: &[serde_json::Value] = owned.as_deref().unwrap_or(&messages);
     let thinking_mode = derive_thinking_mode(params);
     let encode_params = deepseek_v32::EncodeParams {
         add_default_bos_token: true,
@@ -2292,8 +2309,9 @@ fn apply_deepseek_v4(
     params: &ChatTemplateParams,
     effort_encoding: deepseek_v4::EffortEncoding,
 ) -> Result<String> {
-    let owned = inject_tools_into_messages(messages, params.tools);
-    let msgs: &[serde_json::Value] = owned.as_deref().unwrap_or(messages);
+    let messages = developer_messages_as_system_first(messages);
+    let owned = inject_tools_into_messages(&messages, params.tools);
+    let msgs: &[serde_json::Value] = owned.as_deref().unwrap_or(&messages);
     let effort_kwarg = params
         .template_kwargs
         .and_then(|k| k.get("reasoning_effort"))
@@ -2332,9 +2350,8 @@ fn apply_deepseek_v4(
 // ---------------------------------------------------------------------------
 /// Attach `tools` to the FIRST message whose role is `system`, wherever it
 /// appears in the conversation — the engine's V4.1 rule. This differs from V3.2/V4's
-/// [`inject_tools_into_messages`], which only rewrites a *leading*
-/// system/developer message. Synthesizes an empty leading system message when
-/// none exists.
+/// [`inject_tools_into_messages`], which only rewrites a *leading* system
+/// message. Synthesizes an empty leading system message when none exists.
 fn inject_tools_into_first_system_message(
     messages: &[serde_json::Value],
     tools: Option<&[serde_json::Value]>,
@@ -2479,8 +2496,9 @@ fn apply_deepseek_v41(
     // (structured output is enforced by the constraint), so the gateway's
     // projected kwarg is ignored here too. The encoder still renders a
     // per-message `response_format` for direct callers.
-    let owned = inject_tools_into_first_system_message(messages, params.tools);
-    let mut msgs: Vec<serde_json::Value> = owned.unwrap_or_else(|| messages.to_vec());
+    let messages = developer_messages_as_system_first(messages);
+    let owned = inject_tools_into_first_system_message(&messages, params.tools);
+    let mut msgs: Vec<serde_json::Value> = owned.unwrap_or_else(|| messages.into_owned());
 
     let effort_kwarg = params
         .template_kwargs
@@ -3431,6 +3449,55 @@ mod segment_tests {
         wrapped
     }
 
+    /// The same vocabulary served by the V3.2 renderer.
+    fn v32_like(added: &[&str]) -> HuggingFaceTokenizer {
+        let mut wrapped = v41_like(added);
+        wrapped.renderer = Renderer::DeepseekV32;
+        wrapped.profile = wrapped.renderer.profile();
+        wrapped
+    }
+
+    /// The engine rewrites a developer message as the system message BEFORE
+    /// its tokenizer wrapper attaches the request's tools, so a request with
+    /// both keeps its tools block; the shims keep that order and render the
+    /// request as its system-message twin.
+    #[test]
+    fn a_developer_message_with_request_tools_keeps_the_tools_block_on_the_gateway_path() {
+        let tools = [
+            json!({"type": "function", "function": {"name": "lookup_weather",
+            "description": "Look up", "parameters": {"type": "object",
+            "properties": {"query": {"type": "string"}}, "required": ["query"]}}}),
+        ];
+        let developer = [
+            json!({"role": "developer", "content": "Follow the policy."}),
+            json!({"role": "user", "content": "Question?"}),
+        ];
+        let system = [
+            json!({"role": "system", "content": "Follow the policy."}),
+            json!({"role": "user", "content": "Question?"}),
+        ];
+        for tok in [v32_like(&ADDED), v4_like(&ADDED), v41_like(&ADDED)] {
+            let params = || ChatTemplateParams {
+                add_generation_prompt: true,
+                tools: Some(&tools),
+                ..Default::default()
+            };
+            let rendered = tok
+                .apply_chat_template_with_encoding(&developer, params(), None)
+                .expect("the renderer renders the conversation");
+            let twin = tok
+                .apply_chat_template_with_encoding(&system, params(), None)
+                .expect("the renderer renders the conversation");
+            assert_eq!(rendered.text, twin.text);
+            assert!(
+                rendered.text.contains("lookup_weather")
+                    && rendered.text.contains("Follow the policy."),
+                "{}",
+                rendered.text
+            );
+        }
+    }
+
     fn chat_params() -> ChatTemplateParams<'static> {
         ChatTemplateParams {
             add_generation_prompt: true,
@@ -3588,9 +3655,9 @@ mod segment_tests {
             .expect("the renderer renders the conversation");
         assert!(rendered.text.ends_with("Be brief."), "{}", rendered.text);
         assert!(!rendered.generation_prompt);
-        // V4.1's thinking-drop removes a developer message before the final
-        // turn: the system message renders first, with no header; the report
-        // reads the render, not the request's message list.
+        // A developer message is rewritten as a system one and merged with
+        // the system message after it: one system turn, both texts, no
+        // header; the report reads the render, not the request's message list.
         let developer_then_system = [
             json!({"role": "developer", "content": "Be terse."}),
             json!({"role": "system", "content": "Answer in French."}),
@@ -3599,7 +3666,7 @@ mod segment_tests {
             .apply_chat_template_with_encoding(&developer_then_system, params(), None)
             .expect("the renderer renders the conversation");
         assert!(
-            rendered.text.ends_with("Answer in French."),
+            rendered.text.ends_with("Be terse.\n\nAnswer in French."),
             "{}",
             rendered.text
         );

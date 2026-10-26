@@ -43,8 +43,10 @@ enum ThinkingMode {
 }
 
 /// Which encoder recorded a case's text: the checkpoint's own `encoding.py`
-/// (`hf`) or the serving engine's port (`vllm_python`), used for the shapes the reference
-/// cannot render, such as a developer message it keeps.
+/// (`hf`) or the serving engine's port (`vllm_python`), for a shape the
+/// reference cannot render. A `developer` message is not one: the generator
+/// rewrites it as the engine's renderer does before either encoder sees the
+/// conversation (a system message, merged), as the shim under test does.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Oracle {
