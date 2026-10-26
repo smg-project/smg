@@ -1,0 +1,98 @@
+"""Default-off, exact-image SG4 PD diagnostic source installation; no engine imports."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+HERE = Path(__file__).resolve().parent
+FLAG = "SMG_SG4_PD_ALLOCATION_PHASE_DIAGNOSTIC"
+sha = lambda data: hashlib.sha256(data).hexdigest()
+
+
+def read(path):
+    status = path.lstat()
+    if not stat.S_ISREG(status.st_mode) or status.st_size > 512 * 1024:
+        raise RuntimeError("bounded regular source required")
+    return path.read_bytes(), stat.S_IMODE(status.st_mode)
+
+
+def atomic(path, data, mode):
+    temporary = path.with_name(path.name + f".sg4pd-phase-{os.getpid()}")
+    created = False
+    try:
+        with temporary.open("xb") as stream:
+            created = True
+            os.fchmod(stream.fileno(), mode)
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if created:
+            temporary.unlink(missing_ok=True)
+
+
+def main():
+    if os.environ.get(FLAG, "0") == "0":
+        return  # No source, helper or evidence access in the default path.
+    if os.environ.get(FLAG) != "1":
+        raise RuntimeError("invalid explicit SG4 allocation diagnostic opt-in")
+    if os.environ.get("E2E_ENGINE") != "sglang" or os.environ.get("E2E_GPU_TIER") != "4":
+        raise RuntimeError("only the complete SGLang four-GPU PD row is supported")
+    if any(os.environ.get(key) == "1" for key in (
+        "SMG_SGLANG_PD_PROOF", "SMG_SG2_STARTUP_DIAGNOSTIC", "SMG_SG2_CU_EXISTING_RUNTIME",
+        "SMG_SG2_PREFILL_STREAM_BUDGET", "SMG_SG2_ALLOCATION_FAILURE_DIAGNOSTIC",
+    )):
+        raise RuntimeError("legacy SG2 plugin and startup behavior must remain off")
+    marker = os.environ.get("E2E_JOB_MARKER", "")
+    expected = "e2e-{GITHUB_RUN_ID}-{GITHUB_RUN_ATTEMPT}-{RUNNER_NAME}".format_map(os.environ)
+    if marker != expected or not re.fullmatch(r"e2e-[0-9]+-[0-9]+-amd-mi300x-[12]", marker):
+        raise RuntimeError("exact current AMD job marker required")
+    mode, directory = sys.argv[1], Path(sys.argv[2])
+    if mode not in ("apply", "final") or not directory.is_absolute():
+        raise RuntimeError("apply/final and absolute same-job evidence directory required")
+    parent = Path(os.environ["RUNNER_TEMP"])
+    basename = "sg4pd-allocation-phase-{GITHUB_RUN_ID}-{GITHUB_RUN_ATTEMPT}".format_map(os.environ)
+    if directory.parent != parent or directory.name != basename or parent.is_symlink():
+        raise RuntimeError("unique same-job RUNNER_TEMP evidence directory required")
+    plan = json.loads((HERE / "overlay.json").read_text())
+    if os.environ.get("SMG_SGLANG_ROCM_IMAGE") != plan["image"]:
+        raise RuntimeError("exact4420 image required")
+    target, helper_target = Path(plan["target"]), Path(plan["helper_target"])
+    raw, target_mode = read(target)
+    helper = (HERE / "allocation_failure.py").read_bytes()
+    if sha(helper) != plan["helper_sha256"]:
+        raise RuntimeError("diagnostic helper source differs")
+    if sha(raw) == plan["before_sha256"] and mode == "apply":
+        before = plan["before"].encode()
+        if raw.count(before) != 1:
+            raise RuntimeError("exact one original tensor/.to expression required")
+        raw = raw.replace(before, plan["after"].encode())
+    if sha(raw) != plan["after_sha256"]:
+        raise RuntimeError("unknown or unapplied engine source")
+    if helper_target.exists() or helper_target.is_symlink():
+        if sha(read(helper_target)[0]) != plan["helper_sha256"]:
+            raise RuntimeError("refuse unrelated installed diagnostic helper")
+    elif mode == "final":
+        raise RuntimeError("diagnostic helper missing at final verification")
+    if mode == "apply":
+        directory.mkdir(mode=0o700)
+        (directory / "sglang-startup").mkdir(mode=0o700)
+        atomic(helper_target, helper, 0o644)
+        atomic(target, raw, target_mode)
+    if directory.is_symlink() or not directory.is_dir():
+        raise RuntimeError("same-job evidence directory missing or replaced")
+    if sha(read(target)[0]) != plan["after_sha256"] or sha(read(helper_target)[0]) != plan["helper_sha256"]:
+        raise RuntimeError("installed engine or diagnostic source changed")
+    (directory / (mode + ".json")).write_text(json.dumps({
+        "job_marker": marker, "overlay_manifest_sha256": sha((HERE / "overlay.json").read_bytes()),
+        "engine_source_sha256": plan["after_sha256"], "helper_sha256": plan["helper_sha256"],
+        "actual_GPU_operation_or_cause_verified": False, "coverage_increment": 0,
+    }, indent=2) + "\n")
+
+
+if __name__ == "__main__":
+    main()

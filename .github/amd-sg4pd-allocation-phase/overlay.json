@@ -1,0 +1,14 @@
+{
+  "enabled_by_default": false,
+  "flag": "SMG_SG4_PD_ALLOCATION_PHASE_DIAGNOSTIC",
+  "image": "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d",
+  "target": "/sgl-workspace/sglang/python/sglang/srt/managers/schedule_batch.py",
+  "before_sha256": "b2f78c781de88c36ce27cc5d44b343420338b4da299e885c575665d6fab843ca",
+  "after_sha256": "c136bb9a316144f17cc7108a7bb09d374bdd4afd063710be7ccdc8bdd9fe320d",
+  "before": "        seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(\n            self.device, non_blocking=True\n        )",
+  "after": "        _smg_sg2_allocation_stage = \"seq-lens-cpu-pin\"\n        try:\n            _smg_sg2_cpu_seq_lens = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin)\n            _smg_sg2_allocation_stage = \"seq-lens-to-device\"\n            try:\n                seq_lens_tensor = _smg_sg2_cpu_seq_lens.to(self.device, non_blocking=True)\n            finally:\n                del _smg_sg2_cpu_seq_lens\n        except BaseException as _smg_sg2_original_error:\n            try:\n                from smg_sg2_allocation_failure import observe as _smg_sg2_observe_failure\n\n                _smg_sg2_observe_failure(\n                    _smg_sg2_allocation_stage, __name__, __file__,\n                    _smg_sg2_original_error, torch, self.device, _pin,\n                )\n            except BaseException:\n                pass  # Diagnostic failure must not replace the original exception.\n            raise",
+  "helper_target": "/opt/venv/lib/python3.12/site-packages/smg_sg2_allocation_failure.py",
+  "helper_sha256": "ef014799e8230dc3de1162e3d04a523925420d0ba305efde23ca807185748480",
+  "origin_helper_sha256": "0131aa347d7729fec85c34d2faa7dd9b015f27c6fbce5c55eb882c92dbd1c363",
+  "scope": "First failure per initialized, same-marker prefill PID only. Two original operations and arguments; original exception re-raised. No synchronization, allocation query before failure, startup/CU/stream changes, model/request/oracle/fraction changes."
+}
