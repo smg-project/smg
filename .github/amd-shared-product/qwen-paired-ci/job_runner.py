@@ -245,6 +245,15 @@ def main():
         relay = json.loads((evidence / "relay/evidence/relay.json").read_text())
         inputs = json.loads((paired / "inputs.json").read_text())
         assert relay["source_trees"] == inputs["consumer19"] and relay["compiled_source_trees"] == inputs["compiled37"] and relay["producer_source_trees"] == inputs["producer14"]
+        if "artifact_delivery" in inputs:
+            delivery = relay["artifact_delivery"]
+            assert delivery["policy"] == inputs["artifact_delivery"]["policy"]
+            assert delivery["copy_owner"] == inputs["artifact_delivery"]["copy_owner"]
+            assert delivery["four_artifacts"] == inputs["four_artifacts"]
+            assert delivery["origin_artifacts"] == inputs["artifact_delivery"]["origin_artifacts"]
+            assert delivery["origin_evidence"] == inputs["artifact_delivery"]["origin_evidence"]
+            assert delivery["six_payloads_verified"] is True and delivery["origin17_preserved"] is True
+            assert delivery["new_build_executed"] is False and delivery["GPU_credit"] == 0
         for source_dir, destination in ((evidence / "relay/smg-wheel", workspace / "wheel"),
                 (evidence / "relay/python-client-types", workspace / "clients/python/smg_client/types"),
                 (evidence / "relay/wasm-test-fixtures", workspace / "crates/wasm/tests/fixtures")):
@@ -269,6 +278,12 @@ def main():
         for key, name in (("producer_run_api", "producer-run.json"), ("producer_build_job_api", "producer-build-job.json")):
             path = evidence / "relay/evidence" / name
             bound[key] = {"path": "/evidence/relay/evidence/" + name, "bytes": path.stat().st_size, "sha256": sha(path)}
+        if "artifact_delivery" in inputs:
+            bound["artifact_delivery"] = relay["artifact_delivery"]
+            for key, name in (("copy_run_api", "copy-run.json"), ("copy_job_api", "copy-job.json"),
+                              ("copy_origin_proof", "copy-origin/origin-copy-proof.json")):
+                path = evidence / "relay/evidence" / name
+                bound[key] = {"path": "/evidence/relay/evidence/" + name, "bytes": path.stat().st_size, "sha256": sha(path)}
         resources = {**common, "root_approved": True, "NEW_runner_seconds": 2100, "no_retired_allowance_reused": True,
             "one_selected_GPU": True, "ordinary_jobs_preserved": True, "original_raw_image_HTTPS_read_allowed": True, "external_model_API_calls": 0,
             "root_budget_receipt_sha256": sha(budget), "runner_ownership": "actual workflow_dispatch single selfhosted job + real Runner.Worker ancestry/agent join"}

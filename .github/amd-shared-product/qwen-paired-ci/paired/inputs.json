@@ -82,10 +82,10 @@
   "four_artifacts": [
     {
       "name": "smg-wheel",
-      "id": 12609313653,
+      "id": 12671394443,
       "bytes": 52600567,
-      "sha256": "ecce3937864f36c77ac5f08734bc73ef5795e5e8e23cd794fce8ea1cd30e2cb8",
-      "expires_at": "2026-10-26T18:20:49Z",
+      "sha256": "52eb291470e4ba37f40df62b603c8831407ffa9711e6b3b5c27f3d5dc2737b2c",
+      "expires_at": "2026-11-02T17:40:50Z",
       "files": {
         "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl": {
           "bytes": 52739343,
@@ -95,10 +95,10 @@
     },
     {
       "name": "wasm-test-fixtures",
-      "id": 12609142504,
+      "id": 12672711971,
       "bytes": 56596,
-      "sha256": "2169eab7ef97014996abb71a15eacfbd9217c77759c6fff16bafabfa5feb8ba3",
-      "expires_at": "2026-10-26T18:20:59Z",
+      "sha256": "2e4e738282f907d179e9fd9172955c17076d3accd7bc6cd8c66101e483427e8f",
+      "expires_at": "2026-11-02T17:40:58Z",
       "files": {
         "storage_hook_guest.wasm": {
           "bytes": 80680,
@@ -112,10 +112,10 @@
     },
     {
       "name": "python-client-types",
-      "id": 12608937526,
+      "id": 12671299803,
       "bytes": 34700,
-      "sha256": "19cb852722d76789e6e69a2f7f53b11e4a618dbacb9646f34158c6498928f78e",
-      "expires_at": "2026-10-26T18:20:57Z",
+      "sha256": "df79f4dfcf00c838434b0a5c940d29367987d62ecedc1030538f2f6268b294d0",
+      "expires_at": "2026-11-02T17:40:57Z",
       "files": {
         "_generated.py": {
           "bytes": 188140,
@@ -125,10 +125,10 @@
     },
     {
       "name": "go-ffi-library",
-      "id": 12608627976,
+      "id": 12671514143,
       "bytes": 13845631,
-      "sha256": "30848e64a676f301ba428169ce96ede0106800d9114c5bca6db230fb31c6b876",
-      "expires_at": "2026-10-26T18:20:53Z",
+      "sha256": "1157f1b1d7b3d56830cdea0aa4cadddb7975cfc75ebe055690c278005e9d338e",
+      "expires_at": "2026-11-02T17:40:54Z",
       "files": {
         "libsmg_go.d": {
           "bytes": 66105,
@@ -300,5 +300,163 @@
     "Upload Python client types",
     "Upload WASM test fixtures",
     "Upload wheel artifact"
-  ]
+  ],
+  "artifact_delivery": {
+    "policy": "exact_d5f8_origin17_copy40370788390_delivery_v1",
+    "copy_owner": {
+      "run_id": 40370788390,
+      "run_attempt": 1,
+      "head_sha": "f4e9d7cc4fed43fb547fd9764d8cff2427c43f0d",
+      "job_id": 121740660621,
+      "branch": "ci/amd-qwen-artifact-renewal-20261026",
+      "actor": "chunfangamd",
+      "workflow": ".github/workflows/pr-test-rust.yml",
+      "runner_id": 1000073964
+    },
+    "origin_artifacts": [
+      {
+        "name": "smg-wheel",
+        "id": 12609313653,
+        "bytes": 52600567,
+        "sha256": "ecce3937864f36c77ac5f08734bc73ef5795e5e8e23cd794fce8ea1cd30e2cb8",
+        "expires_at": "2026-10-26T18:20:49Z",
+        "files": {
+          "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl": {
+            "bytes": 52739343,
+            "sha256": "e2bd9a2325d4a9ef96d3d89ec91c41b2945019bbe3d511d2fbf7589caeebd750"
+          }
+        }
+      },
+      {
+        "name": "wasm-test-fixtures",
+        "id": 12609142504,
+        "bytes": 56596,
+        "sha256": "2169eab7ef97014996abb71a15eacfbd9217c77759c6fff16bafabfa5feb8ba3",
+        "expires_at": "2026-10-26T18:20:59Z",
+        "files": {
+          "storage_hook_guest.wasm": {
+            "bytes": 80680,
+            "sha256": "7e3a093e09bfe30244d128c1aaaf8558a1b13c05558cc81cff04021947445e11"
+          },
+          "storage_hook_passthrough.wasm": {
+            "bytes": 79153,
+            "sha256": "3a10ce115ea179026a00f3e85ce6b6a388bcc1f274bc7abfc074be876d7c3e55"
+          }
+        }
+      },
+      {
+        "name": "python-client-types",
+        "id": 12608937526,
+        "bytes": 34700,
+        "sha256": "19cb852722d76789e6e69a2f7f53b11e4a618dbacb9646f34158c6498928f78e",
+        "expires_at": "2026-10-26T18:20:57Z",
+        "files": {
+          "_generated.py": {
+            "bytes": 188140,
+            "sha256": "95c2ed8d194fc673d4695afa62542bc5fa801ac14e8af5d310920e329c3ea537"
+          }
+        }
+      },
+      {
+        "name": "go-ffi-library",
+        "id": 12608627976,
+        "bytes": 13845631,
+        "sha256": "30848e64a676f301ba428169ce96ede0106800d9114c5bca6db230fb31c6b876",
+        "expires_at": "2026-10-26T18:20:53Z",
+        "files": {
+          "libsmg_go.d": {
+            "bytes": 66105,
+            "sha256": "caa91d5d341e096bad353e1ac16fbd3000ae3c7f4560970b13a27fcb70efeb34"
+          },
+          "libsmg_go.so": {
+            "bytes": 35041680,
+            "sha256": "ef55ec047165f9f4c6226249538598b125c6fcd0ee459eaf3b18035697c77a12"
+          }
+        }
+      }
+    ],
+    "origin_evidence": {
+      "name": "d5-artifact-renewal-origin-evidence",
+      "id": 12671504010,
+      "bytes": 35942,
+      "sha256": "d98ee0714a465cf9e5555e5620c7388e8e076088e20efff194b6a882f2568f4d",
+      "expires_at": "2026-11-02T17:41:00Z",
+      "files": {
+        "copy-attempt-jobs-api.json": {
+          "bytes": 3303,
+          "sha256": "d11c288a60448844708a90856753bbda07dcb0d068e7ce96c44859493776bf8d"
+        },
+        "copy-attempt-pages/producer-attempt-jobs-page-1.json": {
+          "bytes": 3303,
+          "sha256": "d11c288a60448844708a90856753bbda07dcb0d068e7ce96c44859493776bf8d"
+        },
+        "copy-run-api.json": {
+          "bytes": 13778,
+          "sha256": "27987829581af61c24b4edaef2c8e4581d84c0b3f839a9c0b265e31b48fb0317"
+        },
+        "origin-artifact-12608627976.json": {
+          "bytes": 757,
+          "sha256": "0dbc7eb2cbb00706ddd99e224dd6d417f7eb87169405222eb5522c82273db95a"
+        },
+        "origin-artifact-12608937526.json": {
+          "bytes": 759,
+          "sha256": "61b7860034bff1324bea6447c019aa7481d17310b9e2d96a7867da83a9a9b373"
+        },
+        "origin-artifact-12609142504.json": {
+          "bytes": 758,
+          "sha256": "1922fdf7122d2290d1154335bf38bdb0a66b43abb0986455714b4820c44e711d"
+        },
+        "origin-artifact-12609313653.json": {
+          "bytes": 752,
+          "sha256": "c5e56479bfe81c92f37917f6f40ceb4faaa9c436180918a7a4083fe7e761790a"
+        },
+        "origin-artifacts-page-1.json": {
+          "bytes": 6014,
+          "sha256": "3acbbb81c02959af872c5d80ce6db2b0272742fc0ff773d4e52113e8bc0fd3f1"
+        },
+        "origin-attempt-pages/producer-attempt-jobs-page-1.json": {
+          "bytes": 239158,
+          "sha256": "cc44a7cd6f26d78056862b5d74ef9c504233f54c418062888bee45ee48ee4640"
+        },
+        "origin-copy-proof.json": {
+          "bytes": 9318,
+          "sha256": "aed0beab86cafa5f493ccd0142247dace8e87e210d34d39cd4b92b714e32b462"
+        },
+        "origin-frozen-producer-context.json": {
+          "bytes": 572,
+          "sha256": "72692ef5ab870799dc76906e219f58f8ad65715c56afc1b97f36036fb866cafd"
+        },
+        "producer-attempt-jobs.json": {
+          "bytes": 239158,
+          "sha256": "cc44a7cd6f26d78056862b5d74ef9c504233f54c418062888bee45ee48ee4640"
+        },
+        "producer-run.json": {
+          "bytes": 13964,
+          "sha256": "76cb7698cd7e6b328a5d05b541d63db4e8b5a278785a150c051020ff0bd128e4"
+        },
+        "wheel-RECORD.json": {
+          "bytes": 2528,
+          "sha256": "7e116e0f46b5069ab367be547508cd7893118f5468c0139a31dd419812a3f43c"
+        }
+      }
+    },
+    "origin_verified_step_completed_at": "2026-10-26T17:40:50Z",
+    "copy_step_names": [
+      "Set up job",
+      "Checkout exact isolated copy source",
+      "Verify actual old producer and immutable payload bytes only",
+      "Copy-upload original wheel payload",
+      "Copy-upload original Go payloads",
+      "Copy-upload original generated client types",
+      "Copy-upload original WASM payloads",
+      "Preserve origin verification evidence",
+      "Post Checkout exact isolated copy source",
+      "Complete job"
+    ],
+    "actual_copy_integrity_peer": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-d5-upload-only-NEWCPU900-root-ecb4f19f04ac46c18a4a480c7db32a42/peer-actual-renewal-A.json",
+      "sha256": "32118ca93e528461c0ef1b8ead6608d27d921f50c0742d14b9a2830c8f946822"
+    },
+    "scope": "Immutable existing d5/b7 payload delivery only; no new build/install/model/GPU qualification."
+  }
 }

@@ -63,6 +63,46 @@ def check_model_pin(item, snapshot):
     check_pin({**item, "path": str(resolved)})
 
 
+def check_renewed_delivery(bound, inputs):
+    expected, actual = inputs["artifact_delivery"], bound["artifact_delivery"]
+    require(actual["policy"] == expected["policy"] and
+            actual["copy_owner"] == expected["copy_owner"] and
+            actual["origin_artifacts"] == expected["origin_artifacts"] and
+            actual["origin_evidence"] == expected["origin_evidence"] and
+            actual["four_artifacts"] == inputs["four_artifacts"] and
+            actual["origin_verified_step_completed_at"] == expected["origin_verified_step_completed_at"] and
+            actual["six_payloads_verified"] is True and actual["origin17_preserved"] is True and
+            actual["new_build_executed"] is False and actual["GPU_credit"] == 0,
+            "exact renewed delivery, distinct from original17 provenance")
+    for name in ["copy_run_api", "copy_job_api", "copy_origin_proof"]:
+        check_pin(bound[name])
+    run, job, proof = [read_json(bound[name]["path"]) for name in
+                       ["copy_run_api", "copy_job_api", "copy_origin_proof"]]
+    owner = expected["copy_owner"]
+    require(run["id"] == owner["run_id"] and run["head_sha"] == owner["head_sha"] and
+            run["head_branch"] == owner["branch"] and run["run_attempt"] == 1 and
+            run["actor"]["login"] == owner["actor"] and run["event"] == "workflow_dispatch" and
+            run["path"] == owner["workflow"] and run["status"] == "completed" and run["conclusion"] == "success",
+            "actual successful renewed-copy run")
+    require(job["id"] == owner["job_id"] and job["run_id"] == run["id"] and
+            job["head_sha"] == run["head_sha"] and job["run_attempt"] == 1 and
+            job["name"] == "renew-d5-artifacts-only" and job["runner_id"] == owner["runner_id"] and
+            job["labels"] == ["ubuntu-latest"] and job["status"] == "completed" and job["conclusion"] == "success",
+            "actual hosted copy job; not a newbuild")
+    require([s["name"] for s in job["steps"]] == expected["copy_step_names"] and
+            all(s["status"] == "completed" and s["conclusion"] == "success" for s in job["steps"]) and
+            job["steps"][2]["completed_at"] == actual["origin_verified_step_completed_at"],
+            "copy validation/upload steps")
+    require(proof["passed"] is True and proof["original_producer"]["run_id"] == inputs["producer_run"] and
+            proof["original_producer"]["head_sha"] == inputs["producer_head"] and
+            proof["original_producer"]["artifacts"] == expected["origin_artifacts"] and
+            proof["original_producer"]["native"] == inputs["gateway_native"] and
+            proof["copy_job"]["run_id"] == run["id"] and proof["copy_job"]["job_id"] == job["id"] and
+            proof["copy_job"]["head_sha"] == run["head_sha"] and
+            proof["build_executed"] is False and proof["runtime_accepted"] is False and proof["coverage_increment"] == 0,
+            "pinned copy-origin proof; no execution credit transfer")
+
+
 def main(approval_path, output):
     started = time.monotonic()
     approval, inputs = read_json(approval_path), read_json(HERE / "inputs.json")
@@ -174,8 +214,10 @@ def main(approval_path, output):
     require(len(names) == len(set(names)) == 17 and set(names) == set(inputs["producer_build_step_names"]) and
             all(step["status"] == "completed" and step["conclusion"] == "success" for step in steps),
             "exact d5 build-leg all17 named steps must succeed")
+    if "artifact_delivery" in inputs:
+        check_renewed_delivery(bound, inputs)
     require(all(datetime.fromisoformat(item["expires_at"].replace("Z", "+00:00")) > datetime.now(timezone.utc)
-                for item in inputs["four_artifacts"]), "expired original producer artifacts")
+                for item in inputs["four_artifacts"]), "expired delivered artifact copies")
     require(resources["root_approved"] is True and resources["NEW_runner_seconds"] == 2100 and
             resources["no_retired_allowance_reused"] is True, "new root accounting required")
     require(resources["one_selected_GPU"] is True and resources["ordinary_jobs_preserved"] is True,

@@ -1,7 +1,7 @@
 {
   "artifact_io.py": "8b6093e610cf8038dd7f9f02c1f4dd4c91f9cd9b102b95b4b98627b61d1a6e5f",
-  "frozen_producer.py": "82ea258e55467867ef60d7022b9f883e97bf028d2b2257c3b2499be7f597e3c8",
-  "relay.py": "73128da0d10179248f7c19b34b62e91e5ff34b5c3bf94549c3bbec8c9c4eb04f",
+  "frozen_producer.py": "8f21dfd35255e0eef5b4bb3cc83be607a9d34c2d380afd0bfaf8d3c6bea0fb11",
+  "relay.py": "9192e58e8bce788ff6a8eb434d2af0c385d35ca2c77b02239132c4324cc717cf",
   "source.py": "4fa8896afdc52dfe89bbb66aa98a97c7da0dd34a4df84d5dcfdc80994d1e1c57",
   "wheel_record.py": "c2e069216392c9ecc154bb351f44bfafbbf4e63b889dad3e39217b77c5cf0928"
 }
