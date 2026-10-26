@@ -1,5 +1,6 @@
-//! The deadline of one request to a worker: the gateway's `--request-timeout-secs`,
-//! counted from the request's dispatch, over the call that opens the stream
+//! The deadline of one request to a worker: the gateway's
+//! `--grpc-request-timeout-secs`, counted from the request's dispatch, over
+//! the call that opens the stream
 //! and over every message on it. The gateway arms it on the stream it got
 //! back ([`crate::AbortOnDropStream::with_deadline`]); when it passes, the
 //! stream is dropped the way a client that left drops it, which sends the

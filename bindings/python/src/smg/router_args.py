@@ -390,6 +390,9 @@ class RouterArgs:
     engine_metrics: bool = False
     epd_disaggregation: bool = False  # Enable Encode-Prefill-Decode disaggregated mode
     eviction_interval_secs: int = 60
+    # Seconds a request to a gRPC worker may take from its dispatch to its last
+    # message; 0 (the default) arms no deadline
+    grpc_request_timeout_secs: int = 0
     # HTTP edge: seconds to receive a complete request head
     header_read_timeout_secs: int = 30
     # Health checks (disable_health_check switches them off)
@@ -576,7 +579,8 @@ class RouterArgs:
     remove_unhealthy_workers: bool | None = None
     request_id_headers: list[str] | None = None
     # Request timeout in seconds: the read of the body overall, and each
-    # request to a worker, HTTP or gRPC, from its dispatch to its last message
+    # request to an HTTP worker, or over a ZMQ worker's link, from its dispatch
+    # to its last message (a gRPC worker's bound is grpc_request_timeout_secs)
     request_timeout_secs: int = 1800
     # Retries (disable_retries switches them off)
     retry_backoff_multiplier: float = 1.5
@@ -2120,10 +2124,24 @@ class RouterArgs:
             default=RouterArgs.request_timeout_secs,
             help=(
                 "Request timeout in seconds: the read of the body overall, and "
-                "each attempt at a worker, HTTP or gRPC, from its dispatch to "
-                "its last message (504 call_upstream_timeout past it, the "
-                "request's answer on any worker; an HTTP worker's own pool "
-                "timeout_secs takes this value's place)"
+                "each attempt at an HTTP worker from its dispatch to its last "
+                "message (504 call_upstream_timeout past it, the request's "
+                "answer; a worker's own pool timeout_secs takes this value's "
+                "place, on an HTTP worker and on a ZMQ worker's link, whose "
+                "streams carry the same bound). A request to a gRPC worker is "
+                "bounded by --grpc-request-timeout-secs instead"
+            ),
+        )
+        request_group.add_argument(
+            f"--{prefix}grpc-request-timeout-secs",
+            type=int,
+            default=RouterArgs.grpc_request_timeout_secs,
+            help=(
+                "Seconds a request to a gRPC worker may take from its dispatch "
+                "to its last message (504 call_upstream_timeout past it, the "
+                "request's answer; the call to the worker is dropped, which "
+                "cancels the request on the worker). 0 arms no deadline (the "
+                "default): the bound is opt-in"
             ),
         )
         request_group.add_argument(

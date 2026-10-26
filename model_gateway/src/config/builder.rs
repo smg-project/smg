@@ -236,6 +236,13 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// The bound on a request to a gRPC worker, from its dispatch to its last
+    /// message; `0` arms no deadline.
+    pub fn grpc_request_timeout_secs(mut self, secs: u64) -> Self {
+        self.config.grpc_request_timeout_secs = secs;
+        self
+    }
+
     pub fn sse_keepalive_secs(mut self, secs: u64) -> Self {
         self.config.sse_keepalive_secs = secs;
         self

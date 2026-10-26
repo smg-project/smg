@@ -1170,16 +1170,25 @@ struct ServingArgs {
     /// Request timeout in seconds.
     ///
     /// Bounds the read of a request's body overall (a 408 past it), and each
-    /// attempt at a worker, HTTP or gRPC, from its dispatch to its last
-    /// message: an attempt the worker has not finished within it ends with
-    /// the gateway's 504 (`call_upstream_timeout`; on a stream, the error
-    /// event that ends it) and the call to the worker is dropped, which
-    /// cancels the request on a gRPC worker. On any worker that 504 is the
-    /// request's answer, not replayed; for an HTTP worker, a worker's own
+    /// attempt at an HTTP worker from its dispatch to its last message: an
+    /// attempt the worker has not finished within it ends with the gateway's
+    /// 504 (`call_upstream_timeout`; on a stream, the error event that ends
+    /// it). That 504 is the request's answer, not replayed. A worker's own
     /// `timeout_secs` in its HTTP pool configuration takes this value's
-    /// place.
+    /// place, on an HTTP worker and on a ZMQ worker's link, whose streams
+    /// carry the same bound. A request to a gRPC worker is bounded by
+    /// --grpc-request-timeout-secs instead.
     #[arg(long, default_value_t = 1800, help_heading = "Request Handling")]
     request_timeout_secs: u64,
+
+    /// Seconds a request to a gRPC worker may take, from its dispatch to its
+    /// last message: an attempt the worker has not finished within it ends
+    /// with the gateway's 504 (`call_upstream_timeout`; on a stream, the error
+    /// event that ends it) and the call to the worker is dropped, which
+    /// cancels the request on the worker; that 504 is the request's answer,
+    /// not replayed. 0 arms no deadline (the default): the bound is opt-in.
+    #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
+    grpc_request_timeout_secs: u64,
 
     /// Seconds of upstream silence after which an open SSE stream carries a
     /// keep-alive frame (an SSE comment on the OpenAI-shaped endpoints, the
@@ -2916,6 +2925,7 @@ impl CliArgs {
             .idle_connection_timeout_secs(self.serving.idle_connection_timeout_secs)
             .max_connections(self.serving.max_connections)
             .request_timeout_secs(self.serving.request_timeout_secs)
+            .grpc_request_timeout_secs(self.serving.grpc_request_timeout_secs)
             .sse_keepalive_secs(self.serving.sse_keepalive_secs)
             .upstream_pool_idle_timeout_secs(self.serving.upstream_pool_idle_timeout_secs)
             .worker_startup_timeout_secs(self.workers.worker_startup_timeout_secs)

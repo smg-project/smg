@@ -153,7 +153,7 @@ impl TonicStatusExt for tonic::Status {
     }
 
     fn to_http_error(&self, code: &str, msg: String) -> Response {
-        // The gateway's own request timeout (`--request-timeout-secs`): the
+        // The gateway's own request timeout (`--grpc-request-timeout-secs`): the
         // answer every path gives an upstream call its request timeout cut
         // (the 504 under `call_upstream_timeout`, terminal for the retry
         // layer: a replay would hold the client for a second timeout),

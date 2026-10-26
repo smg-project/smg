@@ -145,6 +145,13 @@ class TestRouterConfigValidation:
         assert args.request_timeout_secs == 1800
         assert args.queue_timeout_secs == 60
 
+    def test_grpc_request_timeout_is_opt_in(self):
+        """The bound on a request to a gRPC worker is off (0) unless set."""
+        assert RouterArgs().grpc_request_timeout_secs == 0
+        args = RouterArgs(request_timeout_secs=1800, grpc_request_timeout_secs=30)
+        assert args.request_timeout_secs == 1800
+        assert args.grpc_request_timeout_secs == 30
+
     def test_retry_config_validation(self):
         """Test retry configuration validation."""
         # Valid retry config

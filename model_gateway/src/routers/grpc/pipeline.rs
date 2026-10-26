@@ -127,8 +127,8 @@ pub(crate) struct PipelineDeps {
     /// `--queue-timeout-secs`: a request still ahead of worker selection this
     /// long after the gateway accepted it is refused instead of dispatched.
     queue_timeout: Duration,
-    /// `--request-timeout-secs`: the deadline of each attempt's calls to its
-    /// workers and of the streams they open, counted from the dispatch;
+    /// `--grpc-request-timeout-secs`: the deadline of each attempt's calls to
+    /// its workers and of the streams they open, counted from the dispatch;
     /// `None` leaves them unbounded.
     request_timeout: Option<Duration>,
 }
@@ -189,8 +189,8 @@ impl PipelineDeps {
     }
 
     /// Bound each attempt's calls to its workers, and the streams they open,
-    /// by `timeout` from the dispatch (`--request-timeout-secs`); zero leaves
-    /// them unbounded.
+    /// by `timeout` from the dispatch (`--grpc-request-timeout-secs`); zero
+    /// leaves them unbounded.
     #[must_use]
     pub(crate) fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = (!timeout.is_zero()).then_some(timeout);
@@ -485,6 +485,12 @@ impl RequestPipeline {
             tool_parser_factory: deps.tool_parser_factory.clone(),
             request_timeout: deps.request_timeout,
         })
+    }
+
+    /// The deadline each attempt's dispatch and streams run under, when set.
+    #[cfg(test)]
+    pub(crate) fn request_timeout(&self) -> Option<Duration> {
+        self.request_timeout
     }
 
     /// Ingress phase: run the request-owning stages through request building.

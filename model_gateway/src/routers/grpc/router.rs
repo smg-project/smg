@@ -142,9 +142,9 @@ impl GrpcRouter {
         // The admission queue's timeout also bounds how long an accepted
         // request may sit ahead of worker selection.
         let queue_timeout = Duration::from_secs(ctx.router_config.queue_timeout_secs);
-        // The request timeout bounds each attempt's calls to its workers and
-        // the streams they open, as it bounds the HTTP path's calls.
-        let request_timeout = Duration::from_secs(ctx.router_config.request_timeout_secs);
+        // The gRPC request timeout bounds each attempt's calls to its workers
+        // and the streams they open; zero, the default, arms no deadline.
+        let request_timeout = Duration::from_secs(ctx.router_config.grpc_request_timeout_secs);
         // Deps for the parser-consuming endpoints (chat/messages/harmony).
         let configured_deps = PipelineDeps::new(
             worker_registry.clone(),

@@ -2046,8 +2046,9 @@ impl ProtoStream {
         }
     }
 
-    /// Bound the stream by the request's `deadline` (`--request-timeout-secs`,
-    /// counted from the dispatch): polled at or past it, the transport stream
+    /// Bound the stream by the request's `deadline`
+    /// (`--grpc-request-timeout-secs`, counted from the dispatch): polled at
+    /// or past it, the transport stream
     /// ends with the deadline's status and is released as a dropped one is,
     /// so its abort reaches the engine at once (see
     /// [`smg_grpc_client::AbortOnDropStream::with_deadline`]). Every wrapper

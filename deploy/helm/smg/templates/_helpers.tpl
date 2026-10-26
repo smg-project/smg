@@ -416,6 +416,10 @@ Called from the router Deployment template.
 - {{ int .Values.router.maxPayloadSize | quote }}
 - "--request-timeout-secs"
 - {{ .Values.router.requestTimeoutSecs | quote }}
+{{- if .Values.router.grpcRequestTimeoutSecs }}
+- "--grpc-request-timeout-secs"
+- {{ .Values.router.grpcRequestTimeoutSecs | quote }}
+{{- end }}
 - "--shutdown-grace-period-secs"
 - {{ .Values.router.shutdownGracePeriodSeconds | quote }}
 - "--max-concurrent-requests"

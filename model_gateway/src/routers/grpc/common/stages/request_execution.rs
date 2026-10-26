@@ -260,7 +260,7 @@ fn pd_side_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
 ///
 /// `last_attempt` says whether a plan is still retained for a replay, which
 /// is what decides when the media bytes stop counting against the in-flight
-/// budget. `request_timeout` is `--request-timeout-secs`: the attempt's
+/// budget. `request_timeout` is `--grpc-request-timeout-secs`: the attempt's
 /// deadline, counted from its dispatch (after the admission gate below,
 /// which has a bound of its own) over the calls that open the streams and
 /// over every message on them (see [`RequestDeadline`]); `None` leaves the

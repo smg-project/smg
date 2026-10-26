@@ -25,7 +25,7 @@ use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
 
 use super::*;
 use crate::{
-    config::{ParserChoice, PolicyConfig, RouterConfig, RoutingMode},
+    config::{ParserChoice, PolicyConfig, RouterConfig, RouterConfigBuilder, RoutingMode},
     policies::PolicyRegistry,
     rate_limit::{
         RateLimitBackend, ReserveOutcome, ReserveRequest, SharedReservationHandle, UsageSettlement,
@@ -141,9 +141,20 @@ async fn grpc_ctx_with_parsers(
     parser: ParserChoice,
     tool_parser: Option<&str>,
 ) -> Arc<AppContext> {
-    let mut builder = RouterConfig::builder()
+    let mcp_orchestrator = mcp_orchestrator().await;
+    let mut builder = grpc_config(mode).parser(parser);
+    if let Some(name) = tool_parser {
+        builder = builder.tool_call_parser(name);
+    }
+    grpc_ctx_from(&builder.build_unchecked(), mcp_orchestrator)
+}
+
+/// The gRPC router configuration the tests start from: `mode` over the gRPC
+/// connection mode, the random policy, the HTTP request bound at 60 s and the
+/// gRPC one at its default.
+fn grpc_config(mode: RoutingMode) -> RouterConfigBuilder {
+    RouterConfig::builder()
         .mode(mode)
-        .parser(parser)
         .grpc_connection()
         .policy(PolicyConfig::Random)
         .host("127.0.0.1")
@@ -153,12 +164,13 @@ async fn grpc_ctx_with_parsers(
         .worker_startup_timeout_secs(10)
         .worker_startup_check_interval_secs(1)
         .max_concurrent_requests(64)
-        .queue_timeout_secs(60);
-    if let Some(name) = tool_parser {
-        builder = builder.tool_call_parser(name);
-    }
-    let config = builder.build_unchecked();
+        .queue_timeout_secs(60)
+}
 
+/// The initialized MCP orchestrator every test context carries: PD serves
+/// /v1/responses, which needs it. Awaited before the configuration is built,
+/// so no context future holds a `RouterConfig` across the await.
+async fn mcp_orchestrator() -> Arc<OnceLock<Arc<McpOrchestrator>>> {
     let mcp_orchestrator = Arc::new(OnceLock::new());
     mcp_orchestrator
         .set(Arc::new(
@@ -167,7 +179,14 @@ async fn grpc_ctx_with_parsers(
                 .expect("mcp orchestrator"),
         ))
         .ok();
+    mcp_orchestrator
+}
 
+/// Minimal `AppContext` over `config` for constructing a gRPC router.
+fn grpc_ctx_from(
+    config: &RouterConfig,
+    mcp_orchestrator: Arc<OnceLock<Arc<McpOrchestrator>>>,
+) -> Arc<AppContext> {
     Arc::new(
         AppContext::builder()
             .router_config(config.clone())
@@ -186,6 +205,51 @@ async fn grpc_ctx_with_parsers(
             .build()
             .expect("app context"),
     )
+}
+
+/// The bound on a request to a gRPC worker is opt-in: a router built from a
+/// configuration that leaves `grpc_request_timeout_secs` at its default arms
+/// no deadline on any of its pipelines, whatever the HTTP bound
+/// `request_timeout_secs` says; one that sets it arms that bound on every
+/// pipeline.
+#[tokio::test]
+async fn the_attempt_deadline_is_armed_only_by_grpc_request_timeout_secs() {
+    let mcp_orchestrator = mcp_orchestrator().await;
+    let config = grpc_config(regular_routing_mode()).build_unchecked();
+    let ctx = grpc_ctx_from(&config, Arc::clone(&mcp_orchestrator));
+    assert_eq!(ctx.router_config.request_timeout_secs, 60);
+    assert_eq!(ctx.router_config.grpc_request_timeout_secs, 0);
+    let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+    for pipeline in pipelines_of(&router) {
+        assert_eq!(pipeline.request_timeout(), None);
+    }
+
+    let config = grpc_config(regular_routing_mode())
+        .grpc_request_timeout_secs(30)
+        .build_unchecked();
+    let ctx = grpc_ctx_from(&config, mcp_orchestrator);
+    let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+    for pipeline in pipelines_of(&router) {
+        assert_eq!(pipeline.request_timeout(), Some(Duration::from_secs(30)));
+    }
+}
+
+/// Every pipeline `router` built: the three of every mode and the optional
+/// ones its mode serves.
+fn pipelines_of(router: &GrpcRouter) -> Vec<&RequestPipeline> {
+    [
+        Some(&router.pipeline),
+        Some(&router.messages_pipeline),
+        Some(&router.completion_pipeline),
+        router.harmony_pipeline.as_ref(),
+        router.embedding_pipeline.as_ref(),
+        router.classify_pipeline.as_ref(),
+        router.decisions_pipeline.as_ref(),
+        router.transcription_pipeline.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 fn responses_request(model: &str) -> ResponsesRequest {

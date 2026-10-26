@@ -171,13 +171,22 @@ pub struct RouterConfig {
     #[serde(default)]
     pub max_connections: usize,
     /// Seconds a request may take: the read of its body overall (`408` past
-    /// it), and each attempt at a worker, HTTP or gRPC, from its dispatch to
-    /// its last message (`504` `call_upstream_timeout` past it; on a stream,
-    /// the error event that ends it; the call to the worker is dropped, which
-    /// cancels the request on a gRPC worker). On any worker that `504` is
-    /// the request's answer, not replayed; for an HTTP worker, a worker's own
-    /// pool `timeout_secs` takes this value's place. Must be > 0.
+    /// it), and each attempt at an HTTP worker from its dispatch to its last
+    /// message (`504` `call_upstream_timeout` past it; on a stream, the error
+    /// event that ends it). That `504` is the request's answer, not replayed;
+    /// a worker's own pool `timeout_secs` takes this value's place, on an
+    /// HTTP worker and on a ZMQ worker's link, whose streams carry the same
+    /// bound. A request to a gRPC worker is bounded by
+    /// `grpc_request_timeout_secs` instead. Must be > 0.
     pub request_timeout_secs: u64,
+    /// Seconds a request to a gRPC worker may take, from its dispatch to its
+    /// last message: past it the attempt ends with `504`
+    /// `call_upstream_timeout` (on a stream, the error event that ends it),
+    /// the call to the worker is dropped, which cancels the request on the
+    /// worker, and that `504` is the request's answer, not replayed. `0` arms
+    /// no deadline, and is the default: the bound is opt-in.
+    #[serde(default)]
+    pub grpc_request_timeout_secs: u64,
     /// Seconds of upstream silence after which an open SSE stream carries a
     /// keep-alive frame (an SSE comment; the `ping` event on the Messages
     /// API), so an idle-timeout proxy does not cut a stream that is waiting
@@ -2037,6 +2046,7 @@ impl Default for RouterConfig {
             idle_connection_timeout_secs: default_idle_connection_timeout_secs(),
             max_connections: 0,
             request_timeout_secs: 1800, // 30 minutes
+            grpc_request_timeout_secs: 0,
             sse_keepalive_secs: default_sse_keepalive_secs(),
             upstream_pool_idle_timeout_secs: default_upstream_pool_idle_timeout_secs(),
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
@@ -2249,6 +2259,7 @@ mod tests {
         assert_eq!(config.max_payload_size, 536_870_912);
         assert_eq!(config.max_buffered_request_bytes, 1_048_576);
         assert_eq!(config.request_timeout_secs, 1800);
+        assert_eq!(config.grpc_request_timeout_secs, 0);
         assert_eq!(config.upstream_pool_idle_timeout_secs, 3);
         assert_eq!(config.worker_startup_timeout_secs, 1800);
         assert_eq!(config.zmq_startup_timeout_secs, 3600);
