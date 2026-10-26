@@ -1,9 +1,10 @@
-"""The harness's own dependency list covers what its infra package imports.
+"""The harness's own dependency list covers what its infra and fixtures packages import.
 
 ``pip install ./e2e_test`` is how CI (and a reader of ``e2e_test/pyproject.toml``)
-prepares the unit suite. A third-party module imported unconditionally at the
-top of an infra module and missing from that list breaks the whole suite's
-collection, unless another install of the job happens to bring it along.
+prepares the unit suite, which collects ``e2e_test/infra`` and ``e2e_test/fixtures``.
+A third-party module imported unconditionally at the top of a module of either
+package and missing from that list breaks the whole suite's collection, unless
+another install of the job happens to bring it along.
 """
 
 import ast
@@ -14,7 +15,8 @@ import tomllib
 from pathlib import Path
 
 E2E_ROOT = Path(__file__).resolve().parents[1]
-INFRA = E2E_ROOT / "infra"
+# The packages the CI command collects, both prepared by ``pip install ./e2e_test``.
+SCANNED_PACKAGES = (E2E_ROOT / "infra", E2E_ROOT / "fixtures")
 # This package's own names and the modules the ``PYTHONPATH=e2e_test`` layout serves.
 OWN_MODULES = {"infra", "fixtures", "e2e_test"}
 
@@ -45,11 +47,12 @@ def _unconditional_top_level_imports(module: Path) -> set[str]:
     return names
 
 
-def test_every_module_the_infra_package_imports_at_the_top_is_a_declared_dependency():
+def test_every_module_the_harness_packages_import_at_the_top_is_a_declared_dependency():
     declared = _declared_distributions()
     providers = importlib.metadata.packages_distributions()
     undeclared: dict[str, tuple[str, list[str]]] = {}
-    for module in sorted(INFRA.glob("*.py")):
+    modules = sorted(module for package in SCANNED_PACKAGES for module in package.glob("*.py"))
+    for module in modules:
         if module.name.startswith("test_"):
             continue
         for name in _unconditional_top_level_imports(module):
@@ -59,8 +62,8 @@ def test_every_module_the_infra_package_imports_at_the_top_is_a_declared_depende
             # unknown); the collection of this suite already needs the rest.
             distributions = sorted(_normalized(dist) for dist in providers.get(name, ()))
             if distributions and not set(distributions) & declared:
-                undeclared[name] = (module.name, distributions)
+                undeclared[name] = (module.relative_to(E2E_ROOT).as_posix(), distributions)
     assert not undeclared, (
-        "imported at the top of an infra module but missing from e2e_test/pyproject.toml "
+        "imported at the top of an infra or fixtures module but missing from e2e_test/pyproject.toml "
         f"dependencies (module: (file, distributions)): {undeclared}"
     )
