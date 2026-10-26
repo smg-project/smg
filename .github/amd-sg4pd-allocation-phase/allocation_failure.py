@@ -144,10 +144,10 @@ def observe(stage, module, file, original_error, torch, device, pin_memory):
 
 
 _RUNTIME_STAGES = {"cu-before", "cu-return", "cu-error", "stream-left-before", "stream-left-return",
-                   "stream-right-before", "stream-right-return", "stream-error"}
+                   "stream-right-before", "stream-right-return", "stream-error", "futuremap-second-allocation-error"}
 _runtime_pid, _runtime_calls, _runtime_seen = None, {}, set()
 _runtime_lock = threading.Lock()
-_RUNTIME_SOURCES = {'/sgl-workspace/aiter/aiter/jit/utils/chip_info.py': '5b8aedd33b5d081be4ceeb6fd211b5a77bbf7f5bdf0f6293304cef7ed0a5e7e6', '/sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py': 'de5fa91beee5b42ccd918ef7586b2bc9122b3862cdfd62653a6e65f38cea1294'}
+_RUNTIME_SOURCES = {'/sgl-workspace/aiter/aiter/jit/utils/chip_info.py': '5b8aedd33b5d081be4ceeb6fd211b5a77bbf7f5bdf0f6293304cef7ed0a5e7e6', '/sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py': 'de5fa91beee5b42ccd918ef7586b2bc9122b3862cdfd62653a6e65f38cea1294', '/sgl-workspace/sglang/python/sglang/srt/managers/overlap_utils.py': 'bd2c86072fa4edf41fa5ac41fdc73c2840c61b7282c39ac30305443f26e41648'}
 
 
 def runtime_event(stage, module, file, fields):
@@ -161,10 +161,10 @@ def runtime_event(stage, module, file, fields):
             raise ValueError("exact runtime event required")
         if pid != _runtime_pid:
             _runtime_pid, _runtime_calls, _runtime_seen, _runtime_lock = pid, {}, set(), threading.Lock()
-        group = "cu" if stage.startswith("cu-") else "stream"
+        group = "futuremap" if stage == "futuremap-second-allocation-error" else ("cu" if stage.startswith("cu-") else "stream")
         with _runtime_lock:
             _runtime_calls.setdefault(group, fields)
-            if _runtime_calls[group] is not fields or stage in _runtime_seen:
+            if _runtime_calls[group] is not fields or stage in _runtime_seen or len(_runtime_seen) >= 8:
                 return
             _runtime_seen.add(stage)
         marker = os.environ.get("E2E_JOB_MARKER", "")
@@ -183,10 +183,12 @@ def runtime_event(stage, module, file, fields):
                "helper": _origin(__name__, __file__), "Torch_initialized": initialized, "fields": dict(fields),
                "masks": {key: _text(os.environ.get(key)) for key in
                          ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")}}
-        if stage == "stream-error" and initialized:
+        if stage in ("stream-error", "futuremap-second-allocation-error") and initialized:
             row["allocator_stats_after_error"] = _query(lambda: _stats(torch, None))
             row["allocator_backend_after_error"] = _query(torch.cuda.memory.get_allocator_backend)
             row["query_limit"] = "CPU allocator metadata only; possibly error-contaminated; no physical-memory query"
+            if stage == "futuremap-second-allocation-error":
+                row["allocator_context"] = "implicit current Torch allocator (index=None); agreement with requested_device is unproved"
         data = (json.dumps(row, ensure_ascii=True, allow_nan=False) + "\n").encode()
         if len(data) > 4096 or ticks != _ticks():
             raise ValueError("bounded same-PID event required")

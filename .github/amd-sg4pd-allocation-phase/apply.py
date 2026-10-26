@@ -113,6 +113,7 @@ def main():
             accepted_helpers = {plan["helper_sha256"]}
             if mode == "apply":
                 accepted_helpers.add(plan["previous_helper_sha256"])
+                accepted_helpers.add(plan["previous_runtime_helper_sha256"])
             if sha(read(helper_target)[0]) not in accepted_helpers:
                 raise RuntimeError("refuse unrelated installed diagnostic helper")
         elif mode == "final":
@@ -127,6 +128,16 @@ def main():
             scheduler_raw = scheduler_raw.replace(before, scheduler_plan["after"].encode())
         if sha(scheduler_raw) != scheduler_plan["after_sha256"]:
             raise RuntimeError("unknown or unapplied current4420 scheduler source")
+        future_plan = plan["runtime_future_map"]
+        future_target = Path(future_plan["target"])
+        future_raw, future_mode = read(future_target)
+        if sha(future_raw) == future_plan["before_sha256"] and mode == "apply":
+            before = future_plan["before"].encode()
+            if future_raw.count(before) != 1:
+                raise RuntimeError("exact one original FutureMap second allocation required")
+            future_raw = future_raw.replace(before, future_plan["after"].encode())
+        if sha(future_raw) != future_plan["after_sha256"]:
+            raise RuntimeError("unknown or unapplied current4420 FutureMap source")
     if cu_source_enabled:
         cu_plan = json.loads((HERE / "cu-overlay.json").read_text())
         if phase_enabled:
@@ -157,6 +168,7 @@ def main():
             atomic(helper_target, helper, 0o644)
             atomic(target, raw, target_mode)
             atomic(scheduler_target, scheduler_raw, scheduler_mode)
+            atomic(future_target, future_raw, future_mode)
         if cu_source_enabled:
             (directory / "cu-record-before.json").write_text(json.dumps(record, indent=2) + "\n")
             atomic(cu_target, cu_raw, cu_mode)
@@ -166,6 +178,8 @@ def main():
         raise RuntimeError("installed engine or diagnostic source changed")
     if phase_enabled and sha(read(scheduler_target)[0]) != scheduler_plan["after_sha256"]:
         raise RuntimeError("installed scheduler diagnostic source changed")
+    if phase_enabled and sha(read(future_target)[0]) != future_plan["after_sha256"]:
+        raise RuntimeError("installed FutureMap diagnostic source changed")
     if cu_source_enabled and (sha(read(cu_target)[0]) != cu_plan["after_sha256"] or package_record(cu_plan, cu_target) != record):
         raise RuntimeError("installed AITER source/metadata changed")
     (directory / (mode + ".json")).write_text(json.dumps({
@@ -174,6 +188,7 @@ def main():
         "engine_source_sha256": plan["after_sha256"] if phase_enabled else None,
         "helper_sha256": plan["helper_sha256"] if phase_enabled else None,
         "scheduler_source_sha256": scheduler_plan["after_sha256"] if phase_enabled else None,
+        "futuremap_source_sha256": future_plan["after_sha256"] if phase_enabled else None,
         "CU_runtime_observation_enabled": phase_enabled,
         "CU_source_sha256": cu_plan["after_sha256"] if cu_source_enabled else None,
         "CU_overlay_manifest_sha256": sha((HERE / "cu-overlay.json").read_bytes()) if cu_source_enabled else None,
