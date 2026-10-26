@@ -2500,7 +2500,6 @@ impl WorkerRegistry {
         }
     }
 
-    /// Whether any worker still serving `canonical_id` declares `alias`.
     /// Re-judge every alias that maps to `canonical_id` against the model's
     /// workers as they are now. A served model with no workers keeps its
     /// aliases (`remove_model_alias_if_unused`); when a worker registers
@@ -2522,6 +2521,7 @@ impl WorkerRegistry {
         }
     }
 
+    /// Whether any worker still serving `canonical_id` declares `alias`.
     fn model_declares_alias(&self, canonical_id: &str, alias: &str) -> bool {
         self.model_index.get(canonical_id).is_some_and(|workers| {
             workers

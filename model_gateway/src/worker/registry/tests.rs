@@ -3198,10 +3198,13 @@ fn an_alias_a_model_held_while_empty_is_released_when_its_workers_return_without
     );
 }
 
-/// A replacement that drops an alias releases it as a registration does,
-/// even when the model was holding it from before.
+/// A replacement that moves a worker into a model holding an alias from
+/// its empty time, without declaring it, releases the alias as a
+/// registration does: the replaced worker declared nothing (its alias loop
+/// visits nothing) and the replacement adds nothing, so only the re-judge
+/// after the replacement's adds releases it.
 #[test]
-fn a_replacement_releases_an_alias_the_model_held_while_empty() {
+fn a_replacement_into_an_empty_model_releases_the_alias_it_held() {
     let registry = WorkerRegistry::new();
     let first = worker_with_model_aliases(
         "http://first:8080",
@@ -3211,19 +3214,22 @@ fn a_replacement_releases_an_alias_the_model_held_while_empty() {
     );
     let first_id = registry.register(first).unwrap();
     assert!(registry.remove(&first_id).is_some());
-    let second = worker_with_model_aliases(
-        "http://second:8080",
-        "GLM-5.2",
-        &["held-alias"],
-        WorkerType::Regular,
-    );
-    let second_id = registry.register(second).unwrap();
     assert_eq!(
         registry.resolve_model_alias("held-alias").as_deref(),
-        Some("GLM-5.2")
+        Some("GLM-5.2"),
+        "the alias stays with the served, empty model"
     );
-    let replacement =
+
+    let other = worker_with_model_aliases("http://second:8080", "Qwen3", &[], WorkerType::Regular);
+    let other_id = registry.register(other).unwrap();
+    let moved =
         worker_with_model_aliases("http://second:8080", "GLM-5.2", &[], WorkerType::Regular);
-    assert!(registry.replace(&second_id, replacement));
-    assert!(registry.resolve_model_alias("held-alias").is_none());
+    assert!(registry.replace(&other_id, moved));
+
+    assert!(
+        registry.resolve_model_alias("held-alias").is_none(),
+        "the model's only worker does not declare the alias: released"
+    );
+    assert!(registry.get_by_model("held-alias").is_empty());
+    assert_eq!(registry.get_by_model("GLM-5.2").len(), 1);
 }
