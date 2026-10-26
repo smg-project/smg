@@ -1361,7 +1361,9 @@ impl StreamingProcessor {
     }
 
     /// Write the chunks Symphony's events make for the choice at `index`: the
-    /// delta each event has, the chunk's logprobs on its first text delta. The
+    /// delta each event has, the chunk's logprobs on its first delta (or on an
+    /// empty delta after them, when the events made none: a thought's opener
+    /// alone, a call's end), as the engine's own server sends them. The
     /// `Finish` event writes nothing here: the finish chunk is the loop's, with
     /// the matched stop. The opening chunk carried the role, so the deltas do
     /// not repeat it, as the older path's do not (and are built without it, one
@@ -1387,9 +1389,14 @@ impl StreamingProcessor {
             if choice.finish_reason.is_some() {
                 continue;
             }
-            if choice.delta.content.is_some() || choice.delta.reasoning_content.is_some() {
-                choice.logprobs = logprobs.take();
-            }
+            choice.logprobs = logprobs.take();
+            Self::push_chunk(tx, buffer, frame, &choice, usage, emit_usage_null)
+                .await
+                .map_err(|()| "Failed to send chunk".to_string())?;
+        }
+        if utils::has_entries(logprobs.as_ref()) {
+            let mut choice = assistant_choice(index, None, None, None);
+            choice.logprobs = logprobs;
             Self::push_chunk(tx, buffer, frame, &choice, usage, emit_usage_null)
                 .await
                 .map_err(|()| "Failed to send chunk".to_string())?;
@@ -2739,6 +2746,34 @@ impl<'a> ChatStream<'a> {
         Ok(())
     }
 
+    /// The logprobs of an engine chunk whose text made no delta (a marker a
+    /// parser consumed, text a tool parser holds, tokens that decoded to
+    /// nothing) go out on a chunk with an empty delta, as the engine's own
+    /// server sends a step whose text made none: every generated token's
+    /// entry reaches the client once, in order. Nothing without entries.
+    async fn push_bare_logprobs(
+        &mut self,
+        index: u32,
+        logprobs: Option<ChatLogProbs>,
+        usage: Option<&Usage>,
+    ) -> Result<(), String> {
+        if !utils::has_entries(logprobs.as_ref()) {
+            return Ok(());
+        }
+        let mut choice = assistant_choice(index, None, None, None);
+        choice.logprobs = logprobs;
+        StreamingProcessor::push_chunk(
+            self.tx,
+            &mut self.sse_buffer,
+            &self.chunk_frame,
+            &choice,
+            usage,
+            self.emit_usage_null,
+        )
+        .await
+        .map_err(|()| "Failed to send logprobs chunk".to_string())
+    }
+
     /// The logprobs of an engine chunk, in the public API's shape.
     fn logprobs_of(&self, chunk: &ProtoGenerateStreamChunk) -> Option<ChatLogProbs> {
         chunk.output_logprobs().map(|ref proto_logprobs| {
@@ -2966,6 +3001,15 @@ impl<'a> ChatStream<'a> {
 
         if chunk_text.is_empty() {
             *self.held_tokens.entry(index).or_default() += chunk.token_ids().len() as u32;
+            // The chunk's logprobs still reach the client, on a chunk with
+            // an empty delta, as the engine's own server sends a step whose
+            // text made no delta: every generated token's entry goes out once.
+            let logprobs = self.logprobs_of(&chunk);
+            if utils::has_entries(logprobs.as_ref()) {
+                let usage = self.usage_snapshot();
+                self.push_bare_logprobs(index, logprobs, usage.as_ref())
+                    .await?;
+            }
             return Ok(None);
         }
 
@@ -3416,7 +3460,7 @@ impl<'a> ChatStream<'a> {
                 && tool_choice_enabled
                 && (self.tool_parser_available || self.used_json_schema)
             {
-                let tool_choices = if self.is_specific_function {
+                let mut tool_choices = if self.is_specific_function {
                     // Handle specific function case - emit tool call deltas with arguments
                     StreamingProcessor::process_specific_function_stream(
                         &delta,
@@ -3444,6 +3488,12 @@ impl<'a> ChatStream<'a> {
                         .await
                 };
 
+                // The chunk's logprobs ride on the first of its tool-call
+                // deltas, as on a content delta; a chunk the parser holds
+                // whole goes out as an empty delta with them.
+                if let Some(first) = tool_choices.first_mut() {
+                    first.logprobs = choice_logprobs.take();
+                }
                 for choice in &tool_choices {
                     StreamingProcessor::push_chunk(
                         self.tx,
@@ -3456,6 +3506,8 @@ impl<'a> ChatStream<'a> {
                     .await
                     .map_err(|()| "Failed to send tool call chunk".to_string())?;
                 }
+                self.push_bare_logprobs(index, choice_logprobs, usage.as_ref())
+                    .await?;
 
                 // Always skip regular content when tool parsing is active
                 // Parser either emitted chunks or buffered content
@@ -3466,7 +3518,7 @@ impl<'a> ChatStream<'a> {
         // Regular content emission
         if !delta.is_empty() {
             let mut choice = assistant_choice(index, Some(delta), None, None);
-            choice.logprobs = choice_logprobs;
+            choice.logprobs = choice_logprobs.take();
             StreamingProcessor::push_chunk(
                 self.tx,
                 &mut self.sse_buffer,
@@ -3478,6 +3530,10 @@ impl<'a> ChatStream<'a> {
             .await
             .map_err(|()| "Failed to send content chunk".to_string())?;
         }
+        // A chunk whose text made no delta (a marker the reasoning parser
+        // consumed) still carries its logprobs, on a chunk with an empty delta.
+        self.push_bare_logprobs(index, choice_logprobs, usage.as_ref())
+            .await?;
         Ok(())
     }
 

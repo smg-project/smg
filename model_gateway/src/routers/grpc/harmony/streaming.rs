@@ -1354,9 +1354,18 @@ impl ChatDecode {
             .parse_chunk(chunk.token_ids())
             .map_err(|e| format!("Parse error: {e}"))?;
 
-        // Emit SSE event if there's a delta
-        let Some(mut delta) = delta_result else {
-            return Ok(());
+        // Emit SSE event if there's a delta; a step whose tokens made none (a
+        // channel header the parser consumed) still carries its logprobs, on
+        // a chunk with an empty delta, as the engine's own server sends it.
+        let bare_logprobs = utils::has_entries(chunk_logprobs.as_ref());
+        let mut delta = match delta_result {
+            Some(delta) => delta,
+            None if bare_logprobs => HarmonyChannelDelta {
+                analysis_delta: None,
+                commentary_delta: None,
+                final_delta: None,
+            },
+            None => return Ok(()),
         };
         let mut stop_matched: Option<String> = None;
         if !router_stop_strings.is_empty() {
@@ -1393,7 +1402,7 @@ impl ChatDecode {
             || delta.final_delta.is_some()
             || delta.commentary_delta.is_some();
         let is_first = self.is_firsts.get(&index).copied().unwrap_or(false);
-        if has_payload || is_first {
+        if has_payload || is_first || bare_logprobs {
             HarmonyStreamingProcessor::emit_chunk_delta(
                 &delta,
                 index,
@@ -1674,6 +1683,8 @@ impl Default for HarmonyStreamingProcessor {
 mod client_leave_tests;
 #[cfg(test)]
 mod local_stop_tests;
+#[cfg(test)]
+mod logprobs_tests;
 #[cfg(test)]
 mod lone_complete_tests;
 #[cfg(test)]

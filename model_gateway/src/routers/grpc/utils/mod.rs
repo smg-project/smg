@@ -27,7 +27,7 @@ pub use chat_utils::{
 };
 pub(crate) use logprobs::{
     convert_generate_input_logprobs, convert_generate_output_logprobs, convert_proto_logprobs,
-    convert_proto_to_openai_logprobs,
+    convert_proto_to_openai_logprobs, has_entries,
 };
 pub use message_utils::{process_messages_with_encoding, template_tools};
 pub(crate) use message_utils::{resolve_media, MediaContext};

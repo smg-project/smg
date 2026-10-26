@@ -21,8 +21,8 @@ use symphony::{
 
 use super::{
     eof_tests::{
-        chat_spec, chat_text, chunk, collect_events, complete, dispatch, processor,
-        scripted_stream, CharacterTokenizer,
+        chat_spec, chat_text, chunk, chunk_with_logprobs, collect_events, complete, dispatch,
+        logprob_carriers, processor, scripted_stream, CharacterTokenizer,
     },
     *,
 };
@@ -150,6 +150,36 @@ async fn symphony_streams_reasoning_content_and_a_tool_call_from_a_qwen3_output(
     assert!(events[1..]
         .iter()
         .all(|event| event["choices"][0]["delta"]["role"].is_null()));
+}
+
+#[tokio::test]
+async fn symphony_streams_every_chunks_logprobs_once() {
+    // A chunk of the thought's opener alone makes no delta: its logprobs go out on a chunk with
+    // an empty delta, as the engine's own server sends such a step. Otherwise a chunk's
+    // logprobs ride on its first delta, a call's start included.
+    let spec = assigned(
+        chat_spec(true),
+        qwen3(CallSyntax::Json),
+        "<|im_start|>assistant\n",
+    );
+    let responses = vec![
+        chunk_with_logprobs(0, &QWEN3_OUTPUT[..7]),
+        chunk_with_logprobs(0, &QWEN3_OUTPUT[7..25]),
+        chunk_with_logprobs(0, &QWEN3_OUTPUT[25..]),
+        complete(0, "stop"),
+    ];
+    let (result, events) = stream_events(responses, true, spec).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(chat_text(&events, 0, "reasoning_content"), "plan");
+    assert_eq!(
+        logprob_carriers(&events),
+        [
+            ("empty", QWEN3_OUTPUT[..7].to_string()),
+            ("reasoning", QWEN3_OUTPUT[7..25].to_string()),
+            ("tool_calls", QWEN3_OUTPUT[25..].to_string()),
+        ],
+        "{events:?}"
+    );
 }
 
 /// A chat request with the conversation of a retry and no tools: the user asked for
