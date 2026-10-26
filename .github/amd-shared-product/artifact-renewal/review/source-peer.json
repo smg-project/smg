@@ -1,0 +1,121 @@
+{
+  "result": "PASS_SOURCE_ONLY_ACTUAL_DISABLED_CPU_UPLOAD_RENEWAL_INTEGRATION",
+  "findings": [],
+  "actual_head": "a91566d01d7b3cd5ee4186f4c7a981c713f75b00",
+  "leaf_sha256": "59ed8db992b680f9fb566dab09eb993a6b33d84d491a2a4c2768e25ba4571284",
+  "workflow_sha256": "e9de5b4afae58e4372531ac1ab3601269451014439d1338c891ce7f1df29c097",
+  "helper_sha256": {
+    "source.py": "4fa8896afdc52dfe89bbb66aa98a97c7da0dd34a4df84d5dcfdc80994d1e1c57",
+    "relay.py": "73128da0d10179248f7c19b34b62e91e5ff34b5c3bf94549c3bbec8c9c4eb04f",
+    "artifact_io.py": "8b6093e610cf8038dd7f9f02c1f4dd4c91f9cd9b102b95b4b98627b61d1a6e5f",
+    "frozen_producer.py": "82ea258e55467867ef60d7022b9f883e97bf028d2b2257c3b2499be7f597e3c8",
+    "wheel_record.py": "c2e069216392c9ecc154bb351f44bfafbbf4e63b889dad3e39217b77c5cf0928"
+  },
+  "reviewer": "/root/amd_joint_validation_prepare",
+  "reviewed_at_utc": "2026-10-26T17:32:44.863325+00:00",
+  "scope": "Independent actual root Git/file/index integration review only, following genuine reviewed D proposal. No CPU900 grant/publication/dispatch/download/candidate/test/build/install/GPU execution or old-helper algorithm reapproval.",
+  "actual_parent": "ad9922e45207c617be94d39c26bde6a38001408b",
+  "actual_tree": "d4e1260129aa5a23e63a9f37a56e580bbce323d1",
+  "branch": "ci/amd-qwen-artifact-renewal-20261026",
+  "worktree": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/amd-qwen-artifact-renewal-20261026",
+  "actual_materialization_receipt": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-renewal-disabled-actual-source-root-692e0ddcb3b54be2be8f8020368d9de6/root-materialization.json",
+    "bytes": 2714,
+    "sha256": "74d758f0a67478689e54acfae485c5c86b4d606861f75f4aeaa34a2ab7b58958"
+  },
+  "source_proposal_manifest": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-d5f8-upload-only-renewal-defaultoff-source-D-20261026/manifest.json",
+    "bytes": 7615,
+    "sha256": "a0dd5e3d3415c7c173ffa4a34380efedc5b0b6ef89e2add927e1a699ed9e7af6"
+  },
+  "source_proposal_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-d5f8-upload-only-renewal-defaultoff-source-D-20261026/peer-source-independent-A.json",
+    "bytes": 11829,
+    "sha256": "2b0ef103c538789033f731d56fd666765a4bc1a6bf025ec23b9bee712d947922"
+  },
+  "role_disclosure": "A reviewed D new171line upload-only source composition. Root independently authored this actualmaterialization/DCO commit. This peer measures actualintegration against that reviewedpreview; it does not duplicate sourcealgorithm approval or grant newruntime/sourcecohort authority.",
+  "actual_three_paths": [
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/amd-qwen-artifact-renewal-20261026/.github/workflows/pr-test-rust.yml",
+      "bytes": 3467,
+      "sha256": "e9de5b4afae58e4372531ac1ab3601269451014439d1338c891ce7f1df29c097",
+      "Git_mode": "100644",
+      "preview_exact": true
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/amd-qwen-artifact-renewal-20261026/.github/amd-shared-product/artifact-renewal/renew.py",
+      "bytes": 11680,
+      "sha256": "59ed8db992b680f9fb566dab09eb993a6b33d84d491a2a4c2768e25ba4571284",
+      "Git_mode": "100644",
+      "preview_exact": true
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/amd-qwen-artifact-renewal-20261026/.github/amd-shared-product/artifact-renewal/admission.json",
+      "bytes": 556,
+      "sha256": "5cb2664b72d0025c1b4d4cc576a77868027e9191e00412061889e91d8422a2e2",
+      "Git_mode": "100644",
+      "preview_exact": true
+    }
+  ],
+  "actual_Git_and_clean_checks": {
+    "method": "Only read Git ref/loose objects/binaryindex/pack-index+pack data through reviewer-owned stdlib. No Git process or write-tree/status/index-refresh was run.",
+    "HEAD_reference_and_commit_SHA1_verified": true,
+    "exact_direct_parent": true,
+    "DCO": "Signed-off-by: Chun Fang <chun.fang@amd.com>",
+    "commit_subject": "Add a disabled CPU-only copy of verified AMD CI products",
+    "tree_recursive_delta": "Only newartifact-renewal subtree containing admission.json/renew.py plus pr-test-rust.yml; allthree leafpaths mode100644. No other treepaths changed.",
+    "stage0_index_entries": 2519,
+    "all_index_blobSHA_and_Gitmodes_match_actual_worktree": true,
+    "untracked_files_without_ignore_exemptions": [],
+    "index_Merkle_SHA1_equals_HEAD_tree": true,
+    "worktree_clean_including_no_extra_untracked_files": true,
+    "Git_repository_or_index_written_by_reviewer": false
+  },
+  "source_map_roles_verified": {
+    "current_HEAD_source19": "Actual index→Merkle/path OIDs equal all19 source_trees.",
+    "target1473_source19": "Raw SHA1-verified Git commit/tree objects equal all19 source_trees at1473e2d4fae7084d0f744055ba29a1a4b9679ae3.",
+    "current_HEAD_compiled37": "Actualindex→Merkle/path OIDs equal all37 compiled_source_trees.",
+    "producer_d5_compiled37": "Raw SHA1-verified packed/loose Git objects atd5f8f9e765dcdec1f56dd623b46e49e1e47862d4 equal all37 compiled_source_trees.",
+    "producer_d5_source14": "Separate producer14 role resolved from reald5 objects and all14 equal; currentcopy workflow tree is not substituted for producerworkflows.",
+    "raw_Git_object_identity_verified_count": 15,
+    "packed_objects_read_including_delta_bases": 13,
+    "all5_helpers_match_proposal_and_parent_bytes": true,
+    "paired_inputs_and_shared_data_unchanged_from_ad992": true
+  },
+  "authority": {
+    "shared5_GPU_flags_false": true,
+    "Qwen4_GPU_admission_flags_false": true,
+    "GPU_reservation_seconds": 0,
+    "shared_budget_admitted": false,
+    "CPU_admission_PREVIEW_ONLY": true,
+    "root_manual_upload_only": false,
+    "CPU_seconds": 0,
+    "GPU_seconds": 0,
+    "nonce_actor_branch_source_parent_budget_sourcepeer_newrun_newartifact_fields": null,
+    "CPU_budget_or_GPU_grant_accepted": false,
+    "published_or_POST_by_reviewer": false,
+    "new_artifact_or_native_build_or_cohort_or_runtime_accepted": false,
+    "coverage_increment": 0
+  },
+  "next_actual_child_contract": {
+    "this_peer_actual_head_is_disabled_parent_for_future_data_child": true,
+    "futureCPUonlydatachild_must_direct_parent_this_a915_and_keep_all_code_helpers_identical": true,
+    "allowed_future_paths": [
+      ".github/amd-shared-product/artifact-renewal/admission.json",
+      ".github/amd-shared-product/artifact-renewal/review/source-peer.json",
+      ".github/amd-shared-product/artifact-renewal/review/root-CPU900-budget.json"
+    ],
+    "future_root_CPU900_grant_nonce_actor_branch_and_bound_peer_budget_required": true,
+    "all9_GPU_authorities_must_remain_false_and_GPUreservation0": true,
+    "old4ZIP_original_real_expiry_and17success_verify_remain_required": true,
+    "new_uploadonly_run_is_not_newbuild_and_new4ZIP6payload_integrity_must_be_measured": true,
+    "old_GPU_TTL_cutoff_not_waived": true
+  },
+  "evidence_scope_limits": [
+    "No candidate/validator imported or executed. The renewleaf originalprivate-memory artifacts_pinned projection was source-reviewed separately and remains identical here.",
+    "This actual disabledsource peer supplies runtime-required actual_head/leaf/workflow/helper fields only; root must bind a distinct realCPU900 grant and actual datachild before execution.",
+    "No external API/source state, artifactexpiry freshness, outputZIP or newrun was observed by this reviewer."
+  ],
+  "only_own_peer_written": true,
+  "no_actualsource_formal_CM_resource_or_Git_mutation": true
+}

@@ -1,19 +1,19 @@
 {
-  "PREVIEW_ONLY": true,
-  "root_manual_upload_only": false,
-  "NEW_CPU_seconds": 0,
+  "PREVIEW_ONLY": false,
+  "root_manual_upload_only": true,
+  "NEW_CPU_seconds": 900,
   "GPU_seconds": 0,
-  "admission_nonce": null,
-  "approved_actor": null,
-  "approved_branch": null,
-  "source_parent": null,
+  "admission_nonce": "0e0560c99481456189f8dd68cedeb26b",
+  "approved_actor": "chunfangamd",
+  "approved_branch": "ci/amd-qwen-artifact-renewal-20261026",
+  "source_parent": "a91566d01d7b3cd5ee4186f4c7a981c713f75b00",
   "CPU_budget": {
-    "path": null,
-    "sha256": null
+    "path": "review/root-CPU900-budget.json",
+    "sha256": "9f50e2a87ad09784349cabaf6c8babf8a4c5fd579e006fde3a3aa27f2819669e"
   },
   "source_peer": {
-    "path": null,
-    "sha256": null
+    "path": "review/source-peer.json",
+    "sha256": "6385ac75442bb90bc7fa0507b14c38204cc1e04a560d9d2a5b5688f4912d65b7"
   },
   "original_build_run": 40218847194,
   "original_build_job": 121246077837,

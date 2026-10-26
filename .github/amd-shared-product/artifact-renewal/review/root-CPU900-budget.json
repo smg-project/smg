@@ -1,0 +1,17 @@
+{
+  "root_admitted": true,
+  "NEW_CPU_seconds": 900,
+  "GPU_seconds": 0,
+  "admission_nonce": "0e0560c99481456189f8dd68cedeb26b",
+  "source_parent": "a91566d01d7b3cd5ee4186f4c7a981c713f75b00",
+  "at_utc": "2026-10-26T17:34:02.983462+00:00",
+  "scope": "One hosted CPU upload-only copy; no build/install/test/model/GPU or consumer admission",
+  "source_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-renewal-disabled-actual-source-root-692e0ddcb3b54be2be8f8020368d9de6/peer-actual-disabled-source-A.json",
+    "sha256": "6385ac75442bb90bc7fa0507b14c38204cc1e04a560d9d2a5b5688f4912d65b7"
+  },
+  "workflow_timeout_seconds": 600,
+  "automatic_retry": false,
+  "dispatch_attempts_max": 1,
+  "live_claim_required_before_POST": true
+}
