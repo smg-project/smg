@@ -1,8 +1,8 @@
 # cargo-audit configuration. `cargo audit` runs on every pull request that changes the dependency
 # graph (the cargo-audit job of pr-test-rust.yml) and daily on main (cargo-audit-nightly.yml), both
 # through scripts/ci_cargo_audit.sh. A vulnerability that is not listed here fails the job; an
-# unmaintained or yanked crate is printed as an allowed warning. Every entry needs a reason and a
-# review date, and goes when the fixed release is in the lockfile.
+# unmaintained, yanked or unsound crate is printed as an allowed warning. Every entry needs a reason
+# and a review date, and goes when the fixed release is in the lockfile.
 [advisories]
 ignore = [
     # RUSTSEC-2023-0071: rsa 0.9, a timing side channel on RSA private-key operations (Marvin),
@@ -28,9 +28,30 @@ ignore = [
     # when the backend changes. Review by 2027-01-15.
     "RUSTSEC-2026-0387",
 
-    # Unmaintained crates without a release that drops them. cargo-audit reports them as warnings
-    # (the job stays green); they are listed so that a new warning stands out in the job's output
-    # and each one carries its exit and a review date.
+    # RUSTSEC-2026-0391 (zstd 0.13.3), RUSTSEC-2026-0403 and RUSTSEC-2026-0398 (zstd-safe 7.2.4):
+    # data of an abandoned stream leaking into the next stream on a reused raw Encoder / Decoder
+    # context, uninitialized memory exposed when the streaming decompression of a legacy frame
+    # fails, and Seekable::decompress setting a Vec length past its capacity; fixed in zstd 0.14.3 /
+    # zstd-safe 8.2.0, which the rest of the lockfile already carries (under zip 9). The old pair
+    # stays in the graph through one path: wasmtime-internal-cache, the `cache` default feature of
+    # wasmtime (crates/wasm, model_gateway), whose every release through 50.0.0 requires zstd ^0.13,
+    # and no release of the 0.13 / 7.x lines carries the fixes (zstd-safe 7.3.0 predates them), so
+    # neither a lockfile bump nor a manifest bump reaches the fixed line. The gateway never
+    # configures wasmtime's compilation cache (wasmtime::Config::cache is not called; the default is
+    # none), so the cache crate's one-shot zstd::encode_all / decode_all calls never run; and the
+    # affected functions are not on its path anyway: no reused raw context, no legacy frame (no
+    # crate enables zstd's `legacy` feature) and no seekable API (zstd-safe's `seekable` feature,
+    # which nothing enables on that version). Goes when wasmtime's cache crate moves to zstd 0.14
+    # (then `cargo update` takes it, in the same pull request as the removal) or when the workspace
+    # drops wasmtime's default `cache` feature. Review by 2027-01-15.
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0403",
+    "RUSTSEC-2026-0398",
+
+    # Warning-level advisories: unmaintained crates without a release that drops them, and unsound
+    # entries on a path the code does not take. cargo-audit reports them as warnings (the job stays
+    # green); they are listed so that a new warning stands out in the job's output and each one
+    # carries its exit and a review date.
 
     # RUSTSEC-2025-0012: backoff 0.4, the retry policy of the workflow engine (crates/workflow;
     # crates/mcp declares it as well). RUSTSEC-2024-0384: instant 0.1, pulled by backoff alone.
@@ -75,4 +96,20 @@ ignore = [
     # on it in the three crates and in openapi-gen, and the kube release that dropped serde_yaml.
     # Review by 2027-01-15.
     "RUSTSEC-2024-0449",
+    # RUSTSEC-2026-0395, -0396, -0397, -0399, -0400, -0401, -0402, -0404, -0405, -0406: the unsound
+    # (warning-level) entries on the same zstd-safe 7.2.4 under wasmtime's cache crate: the
+    # seekable, dictionary, multithreaded-context and context-clone paths, and buffer positions a
+    # caller sets out of range, none of which the cache's one-shot calls take, in code the gateway
+    # never runs; the reasoning and the exit of the RUSTSEC-2026-0391 entry above apply. Review by
+    # 2027-01-15.
+    "RUSTSEC-2026-0395",
+    "RUSTSEC-2026-0396",
+    "RUSTSEC-2026-0397",
+    "RUSTSEC-2026-0399",
+    "RUSTSEC-2026-0400",
+    "RUSTSEC-2026-0401",
+    "RUSTSEC-2026-0402",
+    "RUSTSEC-2026-0404",
+    "RUSTSEC-2026-0405",
+    "RUSTSEC-2026-0406",
 ]
