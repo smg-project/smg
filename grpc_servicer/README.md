@@ -1296,10 +1296,10 @@ which the gateway creates itself at 0700 under its own uid and which lives as
 long as the pod (this needs the mount writable by the gateway's uid, as an
 `emptyDir` is when the kubelet creates it, mode 0777); or, when the mount
 point itself is the socket directory or the mount is not writable by that uid,
-an init container that `chown`s the socket directory to the gateway's uid
-(65532 in the published router image) before either container starts. With
-both, the scheduler connects to the sockets in that directory, so it runs as
-the same uid.
+an init container that creates the socket directory if needed and `chown`s it
+to the gateway's uid (65532 in the published router image) before either
+container starts. With both, the scheduler connects to the sockets in that
+directory, so it runs as the same uid.
 SMG's wait for the scheduler's HELLO, and for the READY and the registration
 that follow it, is bounded per stage by the router's
 `--zmq-startup-timeout-secs` (default 3600 s; `--router-zmq-startup-timeout-secs`
