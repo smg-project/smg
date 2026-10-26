@@ -93,8 +93,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - crate: llm-multimodal
-            path: crates/multimodal
           - crate: engine-zmq-adapter
             path: crates/engine_zmq_adapter
           - crate: smg-response-template

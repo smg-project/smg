@@ -73,10 +73,6 @@ data-connector:
   - changed-files:
       - any-glob-to-any-file: 'crates/data_connector/**/*'
 
-multimodal:
-  - changed-files:
-      - any-glob-to-any-file: 'crates/multimodal/**/*'
-
 protocols:
   - changed-files:
       - any-glob-to-any-file: 'crates/protocols/**/*'

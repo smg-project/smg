@@ -412,20 +412,6 @@ jobs:
           source "$HOME/.cargo/env"
           bash crates/wasm/tests/fixtures/build_fixtures.sh
 
-      # --strict makes a fixture that fails to generate fail this step (the Rust
-      # golden tests skip a missing fixture directory, so a silent skip here
-      # would silently drop coverage). The step does not block the Rust tests,
-      # because a transient hub or pip failure should still leave a test
-      # signal; the outcome is re-raised after the tests run.
-      - name: Generate vision golden fixtures
-        if: contains(matrix.needs, 'golden')
-        id: vision-golden
-        continue-on-error: true
-        run: |
-          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install transformers pillow numpy scipy
-          python crates/multimodal/scripts/generate_vision_golden.py --strict
-
       - name: Create isolated Postgres test database
         if: contains(matrix.needs, 'postgres')
         # No continue-on-error here: the Postgres regression suite must
@@ -435,15 +421,6 @@ jobs:
         run: |
           bash scripts/ci_agentic_svc_deps.sh check --postgres postgres-db
           bash scripts/ci_agentic_svc_deps.sh create-postgres-db postgres-db
-
-      # ffmpeg and ffprobe let the gated video sampling decode test run instead of returning early.
-      - name: Install ffmpeg
-        if: contains(matrix.needs, 'ffmpeg')
-        run: |
-          sudo=""; command -v sudo >/dev/null 2>&1 && sudo=sudo
-          export DEBIAN_FRONTEND=noninteractive
-          $sudo apt-get update
-          $sudo apt-get install -y --no-install-recommends ffmpeg
 
       - name: Build the Rust tests
         timeout-minutes: 40
@@ -456,12 +433,6 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           bash scripts/ci_rust_tests.sh run ${{ matrix.shard }}
-
-      - name: Fail if vision golden fixtures did not generate
-        if: steps.vision-golden.outcome == 'failure'
-        run: |
-          echo "::error::Vision golden fixture generation failed; see the 'Generate vision golden fixtures' step"
-          exit 1
 
       - name: Cleanup Postgres test database
         if: always() && contains(matrix.needs, 'postgres')
@@ -561,12 +532,12 @@ jobs:
         run: |
           source "$HOME/.cargo/env"
           rustup component add clippy
-          cargo clippy -p llm-multimodal -p kv-index --all-targets -- -D warnings
+          cargo clippy -p kv-index --all-targets -- -D warnings
 
       - name: Test the crates with AArch64-only code
         run: |
           source "$HOME/.cargo/env"
-          cargo test -p llm-multimodal -p kv-index
+          cargo test -p kv-index
 
   # --- Benchmarks (standalone) ---
 
@@ -794,9 +765,6 @@ jobs:
               - *rust-infra
               - 'crates/tokenizer/**'
               - 'crates/protocols/**'
-            rust-multimodal:
-              - *rust-infra
-              - 'crates/multimodal/**'
             rust-symphony:
               - *rust-infra
               - 'crates/symphony/**'
@@ -1105,7 +1073,6 @@ jobs:
               # the other two reach every lane)
               ("crates/tool_parser/**",                          CORE_GO),
               ("crates/reasoning_parser/**",                     CORE),
-              ("crates/multimodal/**",                           CORE),
               ("crates/kv_index/**",                             CORE_GO),
               ("crates/data_connector/**",                       CORE),
               ("crates/auth/**",                                 CORE),

@@ -44,7 +44,6 @@ gateway-2    rust-gateway    -                      20
 gateway-3    rust-gateway    -                      20
 bindings     rust-bindings   -                      20
 tokenizer    rust-tokenizer  -                      20
-multimodal   rust-multimodal golden,ffmpeg          20
 symphony     rust-symphony   -                      20
 agentic      rust-agentic    postgres,wasm-fixtures 20
 protocols    rust-protocols  -                      20
@@ -72,7 +71,6 @@ packages_of() {
         gateway-[0-9]*) echo smg ;;
         bindings)   echo smg-python smg-golang ;;
         tokenizer)  echo llm-tokenizer ;;
-        multimodal) echo llm-multimodal ;;
         symphony)   echo smg-symphony tool-parser reasoning-parser smg-response-template ;;
         agentic)    echo data-connector smg-mcp smg-wasm wfaas ;;
         protocols)  echo openai-protocol smg-external-router smg-auth smg-rl smg-client openapi-gen ;;
@@ -161,8 +159,6 @@ commands_of() {
         tokenizer)
             echo "-p llm-tokenizer"
             echo "-p llm-tokenizer --features tokenizers-v1" ;;
-        multimodal)
-            echo "-p llm-multimodal" ;;
         symphony)
             # Nothing else in the shard depends on the template crate, so its feature set here is exactly
             # its symphony feature: a second invocation of it alone would build and run the same units again.
@@ -224,9 +220,7 @@ lint() {
             (set -x; cargo clippy -p smg -p smg-external-router --no-default-features --features smg/grpc-client,smg/jemalloc-stats,smg/provider-anthropic --all-targets -- -D warnings) ;;
         # The default feature set needs no OpenCV: run where the OpenCV libraries are not installed.
         default-build)
-            (set -x; cargo check -p llm-multimodal)
-            # Standalone consumers that resolve model files themselves build without `hf-hub`.
-            (set -x; cargo check -p llm-multimodal --no-default-features --all-targets)
+            (set -x; bash scripts/check_multimodal_pin.sh)
             (set -x; cargo check --manifest-path bindings/python/Cargo.toml)
             (set -x; cargo check --manifest-path bindings/golang/Cargo.toml) ;;
         *) echo "ci_rust_tests.sh: unknown lint leg '$1' (all-features, self-hosted, anthropic-only, default-build)" >&2; exit 2 ;;

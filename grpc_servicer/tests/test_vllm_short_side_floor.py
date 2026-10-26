@@ -101,9 +101,11 @@ class TestRaisedDimensions:
         assert raised_dimensions(2, 400, 112) == (112, 22400)
 
 
+# Vendored from llm-multimodal's tests/fixtures/golden (the crate now
+# lives in smg-project/llm-multimodal); regenerate there and re-copy.
 GOLDEN = (
-    Path(__file__).resolve().parents[2]
-    / "crates/multimodal/tests/fixtures/golden/qwen_smart_resize.json"
+    Path(__file__).resolve().parents[1]
+    / "tests/fixtures/qwen_smart_resize.json"
 )
 
 

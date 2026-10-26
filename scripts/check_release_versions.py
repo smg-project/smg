@@ -80,7 +80,6 @@ CRATES = (
     crate("kv-index", "crates/kv_index", "kv-index"),
     crate("smg-radix-tree", "crates/radix_tree", "smg-radix-tree"),
     crate("data-connector", "crates/data_connector", "smg-data-connector"),
-    crate("llm-multimodal", "crates/multimodal", "llm-multimodal"),
     crate("smg-wasm", "crates/wasm", "smg-wasm"),
     crate("smg-mesh", "crates/mesh", "smg-mesh"),
     crate("smg-grpc-client", "crates/grpc_client", "smg-grpc-client"),

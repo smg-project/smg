@@ -1,6 +1,6 @@
 [workspace]
 members = ["model_gateway", "model_gateway/test_harness", "crates/protocols", "crates/reasoning_parser", "crates/response_template", "crates/tool_parser", "crates/symphony", "crates/workflow", "crates/tokenizer", "crates/auth", "crates/mcp",
-    "crates/external_router", "crates/kv_index", "crates/data_connector", "crates/multimodal", "crates/mm_rdma", "crates/wasm", "crates/mesh", "crates/grpc_client", "crates/engine_zmq_client", "crates/engine_zmq_adapter", "crates/engine_servicer", "bindings/python", "bindings/golang", "clients/rust", "clients/openapi-gen", "crates/mock_worker", "crates/rl", "crates/radix_tree"]
+    "crates/external_router", "crates/kv_index", "crates/data_connector", "crates/mm_rdma", "crates/wasm", "crates/mesh", "crates/grpc_client", "crates/engine_zmq_client", "crates/engine_zmq_adapter", "crates/engine_servicer", "bindings/python", "bindings/golang", "clients/rust", "clients/openapi-gen", "crates/mock_worker", "crates/rl", "crates/radix_tree"]
 resolver = "2"
 
 [workspace.package]
@@ -24,8 +24,13 @@ smg-external-router = { version = "0.3.0", path = "crates/external_router" }
 kv-index = { version = "2.0.0", path = "crates/kv_index" }
 smg-radix-tree = { version = "0.1.0", path = "crates/radix_tree" }
 smg-data-connector = { version = "2.4.0", path = "crates/data_connector", package = "data-connector" }
+# Consumed from the standalone repository (git pin until a crates.io release is cut there).
+# crates/multimodal is a source-only submodule mirror of it for browsing and IDE
+# navigation — the build uses the rev below, never the directory. Bump the two
+# together: edit rev, then `git -C crates/multimodal fetch origin && git -C
+# crates/multimodal checkout <rev>` (scripts/check_multimodal_pin.sh enforces).
 # Members build it with its default features (`hf-hub`): the gateway asks for `hf-hub` itself and the Python binding depends on the crate directly, taking the default.
-llm-multimodal = { version = "1.14.0", path = "crates/multimodal" }
+llm-multimodal = { version = "1.14.0", git = "https://github.com/smg-project/llm-multimodal", rev = "a4f0598ec67c800ca6f7564797ee4754c8669b97" }
 smg-wasm = { version = "1.1.4", path = "crates/wasm", package = "smg-wasm" }
 smg-mesh = { version = "1.4.4", path = "crates/mesh", package = "smg-mesh" }
 smg-grpc-client = { version = "1.15.0", path = "crates/grpc_client" }

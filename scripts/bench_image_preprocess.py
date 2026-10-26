@@ -2,7 +2,7 @@
 """Benchmark: HF transformers image preprocessing.
 
 Compare with Rust benchmark:
-    cargo bench -p llm-multimodal --bench image_preprocess
+    cargo bench -p llm-multimodal --bench image_preprocess   # run in smg-project/llm-multimodal
 
 Usage:
     python scripts/bench_image_preprocess.py
@@ -183,7 +183,7 @@ def main():
 
     print("Image Preprocessing Benchmark (HF transformers)")
     print("=" * 60)
-    print("Compare with: cargo bench -p llm-multimodal --bench image_preprocess")
+    print("Compare with: cargo bench -p llm-multimodal --bench image_preprocess (in smg-project/llm-multimodal)")
 
     bench_qwen3_vl(args)
     bench_qwen2_vl(args)
