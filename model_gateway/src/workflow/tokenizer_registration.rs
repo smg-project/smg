@@ -707,13 +707,10 @@ pub fn create_tokenizer_workflow_data(
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::{
-        model_card::ModelCard,
-        worker::{HealthCheckConfig, WorkerType},
-    };
+    use openai_protocol::{model_card::ModelCard, worker::WorkerType};
 
     use super::*;
-    use crate::worker::BasicWorkerBuilder;
+    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder};
 
     #[test]
     fn worker_tokenizer_bundle_preserves_configured_template() {
@@ -872,10 +869,7 @@ mod tests {
                     .worker_type(WorkerType::Regular)
                     .connection_mode(ConnectionMode::Grpc)
                     .model(ModelCard::new(model))
-                    .health_config(HealthCheckConfig {
-                        disable_health_check: true,
-                        ..Default::default()
-                    })
+                    .health_config(no_health_check())
                     .build(),
             ))
             .expect("register worker");

@@ -1194,10 +1194,7 @@ fn test_transition_status_emits_event_and_changes_status() {
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new("http://w1:8080")
             .worker_type(WorkerType::Regular)
-            .health_config(openai_protocol::worker::HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
+            .health_config(no_health_check())
             .build(),
     );
     let worker_id = registry.register(worker.clone()).unwrap();
@@ -1231,10 +1228,7 @@ fn test_transition_status_no_op_when_status_unchanged() {
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new("http://w1:8080")
             .worker_type(WorkerType::Regular)
-            .health_config(openai_protocol::worker::HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
+            .health_config(no_health_check())
             .build(),
     );
     let worker_id = registry.register(worker).unwrap();
@@ -1264,10 +1258,7 @@ fn test_get_id_by_url_returns_id_for_registered_worker() {
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new("http://w-by-url:8080")
             .worker_type(WorkerType::Regular)
-            .health_config(openai_protocol::worker::HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
+            .health_config(no_health_check())
             .build(),
     );
     let worker_id = registry.register(worker).unwrap();
@@ -1406,10 +1397,7 @@ fn test_transition_to_draining_emits_status_changed_event() {
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new("http://w-drain:8080")
             .worker_type(WorkerType::Regular)
-            .health_config(openai_protocol::worker::HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
+            .health_config(no_health_check())
             .build(),
     );
     let worker_id = registry.register(worker.clone()).unwrap();

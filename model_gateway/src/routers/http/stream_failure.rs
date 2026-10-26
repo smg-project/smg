@@ -275,11 +275,13 @@ pub(crate) fn note_sent(tail: &mut Vec<u8>, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use metrics_exporter_prometheus::PrometheusBuilder;
-    use openai_protocol::{messages::MessageStreamEvent, worker::HealthCheckConfig};
+    use openai_protocol::messages::MessageStreamEvent;
     use serde_json::Value;
 
     use super::*;
-    use crate::worker::{circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder};
+    use crate::worker::{
+        circuit_breaker::CircuitBreakerConfig, test_support::no_health_check, BasicWorkerBuilder,
+    };
 
     const CAUSE: &str = "error decoding response body: error reading a body from connection: \
                          connection reset";
@@ -292,10 +294,7 @@ mod tests {
                     failure_threshold: 1,
                     ..Default::default()
                 })
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         )
     }
