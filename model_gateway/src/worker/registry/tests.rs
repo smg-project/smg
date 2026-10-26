@@ -1961,10 +1961,9 @@ fn test_registered_model_id_evicts_a_colliding_alias() {
     assert!(registry.get_by_model("GLM-5.2").is_empty());
 }
 
-#[test]
-fn test_replace_same_url_refreshes_all_model_indexes() {
-    let registry = WorkerRegistry::new();
-
+/// Two workers at one URL, as a replacement sees them: the first serving one
+/// model, the second two others.
+fn replacement_pair() -> (Arc<dyn Worker>, Arc<dyn Worker>) {
     let first: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new("https://api.openai.com")
             .worker_type(WorkerType::Regular)
@@ -1979,6 +1978,14 @@ fn test_replace_same_url_refreshes_all_model_indexes() {
             .circuit_breaker_config(CircuitBreakerConfig::default())
             .build(),
     );
+    (first, second)
+}
+
+#[test]
+fn test_replace_same_url_refreshes_all_model_indexes() {
+    let registry = WorkerRegistry::new();
+
+    let (first, second) = replacement_pair();
 
     // First registration creates the worker
     let first_id = registry.register(first).unwrap();
@@ -2005,20 +2012,7 @@ fn test_replace_same_url_refreshes_all_model_indexes() {
 fn test_register_or_replace_upsert() {
     let registry = WorkerRegistry::new();
 
-    let first: Arc<dyn Worker> = Arc::new(
-        BasicWorkerBuilder::new("https://api.openai.com")
-            .worker_type(WorkerType::Regular)
-            .models(vec![ModelCard::new("gpt-4o")])
-            .circuit_breaker_config(CircuitBreakerConfig::default())
-            .build(),
-    );
-    let second: Arc<dyn Worker> = Arc::new(
-        BasicWorkerBuilder::new("https://api.openai.com")
-            .worker_type(WorkerType::Regular)
-            .models(vec![ModelCard::new("o3"), ModelCard::new("o4-mini")])
-            .circuit_breaker_config(CircuitBreakerConfig::default())
-            .build(),
-    );
+    let (first, second) = replacement_pair();
 
     let first_id = registry.register_or_replace(first);
     let second_id = registry.register_or_replace(second);
