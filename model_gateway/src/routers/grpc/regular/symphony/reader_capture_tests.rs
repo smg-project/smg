@@ -189,8 +189,7 @@ async fn reader_capture_reconstructs_bound_selector_before_prompt() {
     assert_eq!(records[0]["recipe"]["selector_model"], "skt/A.X-3.1-Light");
     assert_eq!(records[1]["kind"], "input");
     assert_eq!(records[1]["input"]["kind"], "prompt");
-    let recipe: FormatRecipe =
-        serde_json::from_value(records[0]["recipe"].clone()).unwrap();
+    let recipe: FormatRecipe = serde_json::from_value(records[0]["recipe"].clone()).unwrap();
     let replay_assignment = Assignment {
         format: recipe.resolve().unwrap(),
         prompt: records[1]["input"]["text"].as_str().unwrap().to_owned(),

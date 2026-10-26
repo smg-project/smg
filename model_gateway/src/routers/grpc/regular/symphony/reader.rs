@@ -2497,12 +2497,7 @@ mod tests {
         assert_eq!(assigned.format.name(), "response_template");
         #[cfg(feature = "diagnostic-capture")]
         assert_eq!(
-            assigned
-                .recipe
-                .unwrap()
-                .resolve()
-                .unwrap_err()
-                .kind(),
+            assigned.recipe.unwrap().resolve().unwrap_err().kind(),
             std::io::ErrorKind::Unsupported
         );
         assert_eq!(assigned.prompt, "<|im_start|>assistant\n<think>\n");
