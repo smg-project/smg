@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
 use super::*;
-use crate::{middleware::scheduler, policies::cost as selection_cost};
+use crate::{middleware::scheduler, policies::cost as selection_cost, worker::endpoint::Endpoint};
 
 /// Each listener needs its own port. `listeners` are `(field, flag, port)`
 /// in configuration order; the first two on one port are refused under the
@@ -210,12 +210,33 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     // same orphan failure as a schemeless URL.
     const ALLOWED_SCHEMES: &[&str] = &["http", "https", "grpc", "grpcs", "ipc"];
     let scheme = url.split_once("://").map_or("", |(s, _)| s);
+    // A refusal names the address through the gateway's masking: it is
+    // written to stderr at start-up and answered to the API caller, and
+    // the URL may carry credentials. What the address parser accepts (a
+    // schemeless address, a known scheme in upper case) is written with
+    // its userinfo masked and its scheme lowercase; what it refuses (an
+    // unknown scheme, no host, a parse failure) reads `<unparsable
+    // address>`. The scheme is what this refusal is about and the masked
+    // address no longer shows it as written, so the reason names it when
+    // it is one (RFC 3986 scheme characters): the prefix before a `://`
+    // further into a URL could be a userinfo, and is left out.
     if !ALLOWED_SCHEMES.contains(&scheme) {
+        let rule =
+            "URL must start with a lowercase http://, https://, grpc://, grpcs://, or ipc:// \
+                    scheme";
+        let is_a_scheme = !scheme.is_empty()
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+        let reason = if is_a_scheme {
+            format!("scheme '{scheme}://' is not allowed; {rule}")
+        } else {
+            rule.to_string()
+        };
         return Err(ConfigError::invalid_value(
             "worker_url",
-            url,
-            "URL must start with a lowercase http://, https://, grpc://, grpcs://, or ipc:// \
-             scheme",
+            Endpoint::redacted_str(url),
+            reason,
         ));
     }
 
@@ -226,7 +247,7 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
         if path.is_empty() {
             return Err(ConfigError::invalid_value(
                 "worker_url",
-                url,
+                Endpoint::redacted_str(url),
                 "ipc:// worker URL must include a socket path",
             ));
         }
@@ -238,7 +259,7 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
             if parsed.host_str().is_none() {
                 return Err(ConfigError::invalid_value(
                     "worker_url",
-                    url,
+                    Endpoint::redacted_str(url),
                     "URL must have a valid host",
                 ));
             }
@@ -246,7 +267,7 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
         Err(e) => {
             return Err(ConfigError::invalid_value(
                 "worker_url",
-                url,
+                Endpoint::redacted_str(url),
                 format!("Invalid URL format: {e}"),
             ));
         }
@@ -3299,6 +3320,55 @@ mod tests {
             validate_worker_url("10.0.0.5:8000"),
             Err(ConfigError::InvalidValue { ref field, .. }) if field == "worker_url"
         ));
+    }
+
+    /// A refusal never carries the URL raw: the secret of a URL's userinfo
+    /// reaches neither the start-up error nor the API caller's answer. The
+    /// masking writes an address the parser accepts with its userinfo masked
+    /// (a known scheme in upper case, rendered lowercase) or as written (a
+    /// schemeless address without credentials), and one it refuses (an
+    /// unknown scheme, an empty socket path, a parse failure) as
+    /// `<unparsable address>`. The scheme refusal names the scheme as
+    /// written, since the masked address no longer shows it; a prefix that
+    /// is not a scheme (it could be a userinfo) is left out of the reason.
+    #[test]
+    fn worker_url_refusals_never_carry_the_url_raw() {
+        let masked = validate_worker_url("HTTP://user:secret@10.0.0.5:8000")
+            .expect_err("refused")
+            .to_string();
+        assert!(masked.contains("http://***@10.0.0.5:8000"), "{masked}");
+        assert!(
+            masked.contains("scheme 'HTTP://' is not allowed"),
+            "{masked}"
+        );
+        assert!(!masked.contains("secret"), "{masked}");
+        let echoed = validate_worker_url("10.0.0.5:8000")
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            echoed.contains(": 10.0.0.5:8000 - URL must start"),
+            "{echoed}"
+        );
+        let refused = validate_worker_url("ws://user:secret@10.0.0.5:8000")
+            .expect_err("refused")
+            .to_string();
+        assert!(refused.contains("<unparsable address>"), "{refused}");
+        assert!(
+            refused.contains("scheme 'ws://' is not allowed"),
+            "{refused}"
+        );
+        assert!(!refused.contains("secret"), "{refused}");
+        let not_a_scheme = validate_worker_url("user:secret@host/x://y")
+            .expect_err("refused")
+            .to_string();
+        assert!(!not_a_scheme.contains("secret"), "{not_a_scheme}");
+        assert!(not_a_scheme.contains("- URL must start"), "{not_a_scheme}");
+        for url in ["ipc://", "http://user:secret@", "http://user:secret@[::1"] {
+            let error = validate_worker_url(url).expect_err("refused");
+            let text = error.to_string();
+            assert!(!text.contains("secret"), "{text}");
+            assert!(text.contains("<unparsable address>"), "{text}");
+        }
     }
 
     #[test]

@@ -88,6 +88,7 @@ use crate::{
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
         admin_json::AdminJson,
+        endpoint::Endpoint,
         manager::{WorkerManager, WorkerManagerConfig},
         ConnectionMode,
     },
@@ -2346,6 +2347,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     info!(
         "Router ready | workers: {:?}",
         WorkerManager::get_worker_urls(&app_state.context.worker_registry)
+            .iter()
+            .map(|url| Endpoint::redacted_str(url))
+            .collect::<Vec<_>>()
     );
 
     let request_id_headers = config.request_id_headers.clone().unwrap_or_else(|| {

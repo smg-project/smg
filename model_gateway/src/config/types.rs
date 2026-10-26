@@ -14,6 +14,7 @@ use crate::{
     routers::common::pd_admission::DEFAULT_PD_ADMISSION_WAIT_SECS,
     tenant::DEFAULT_TENANT_HEADER_NAME,
     worker::{
+        endpoint::Endpoint,
         overload::{DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS},
         ConnectionMode, RuntimeType,
     },
@@ -962,7 +963,7 @@ fn default_history_backend() -> HistoryBackend {
 }
 
 /// Routing mode configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum RoutingMode {
     #[serde(rename = "regular")]
@@ -998,6 +999,68 @@ pub enum RoutingMode {
     Anthropic { worker_urls: Vec<String> },
     #[serde(rename = "gemini")]
     Gemini { worker_urls: Vec<String> },
+}
+
+/// The derive, with every worker URL masked like [`Endpoint::redacted`]: the
+/// mode is in the gateway's start-up lines, and the derive would have written
+/// the configured URLs with their credentials.
+impl std::fmt::Debug for RoutingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn masked(urls: &[String]) -> Vec<String> {
+            urls.iter().map(|url| Endpoint::redacted_str(url)).collect()
+        }
+        fn masked_with_ports(urls: &[(String, Option<u16>)]) -> Vec<(String, Option<u16>)> {
+            urls.iter()
+                .map(|(url, port)| (Endpoint::redacted_str(url), *port))
+                .collect()
+        }
+        match self {
+            RoutingMode::Regular { worker_urls } => f
+                .debug_struct("Regular")
+                .field("worker_urls", &masked(worker_urls))
+                .finish(),
+            RoutingMode::PrefillDecode {
+                prefill_urls,
+                decode_urls,
+                prefill_policy,
+                decode_policy,
+            } => f
+                .debug_struct("PrefillDecode")
+                .field("prefill_urls", &masked_with_ports(prefill_urls))
+                .field("decode_urls", &masked(decode_urls))
+                .field("prefill_policy", prefill_policy)
+                .field("decode_policy", decode_policy)
+                .finish(),
+            RoutingMode::EncodePrefillDecode {
+                encode_urls,
+                prefill_urls,
+                decode_urls,
+                encode_policy,
+                prefill_policy,
+                decode_policy,
+            } => f
+                .debug_struct("EncodePrefillDecode")
+                .field("encode_urls", &masked_with_ports(encode_urls))
+                .field("prefill_urls", &masked_with_ports(prefill_urls))
+                .field("decode_urls", &masked(decode_urls))
+                .field("encode_policy", encode_policy)
+                .field("prefill_policy", prefill_policy)
+                .field("decode_policy", decode_policy)
+                .finish(),
+            RoutingMode::OpenAI { worker_urls } => f
+                .debug_struct("OpenAI")
+                .field("worker_urls", &masked(worker_urls))
+                .finish(),
+            RoutingMode::Anthropic { worker_urls } => f
+                .debug_struct("Anthropic")
+                .field("worker_urls", &masked(worker_urls))
+                .finish(),
+            RoutingMode::Gemini { worker_urls } => f
+                .debug_struct("Gemini")
+                .field("worker_urls", &masked(worker_urls))
+                .finish(),
+        }
+    }
 }
 
 impl RoutingMode {
@@ -2235,6 +2298,35 @@ impl RouterConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mode is in the gateway's start-up lines: a worker URL's secret is
+    /// never written there, the rest of the derive's form is kept.
+    #[test]
+    fn routing_mode_debug_masks_the_secret_of_a_worker_url() {
+        let regular = RoutingMode::Regular {
+            worker_urls: vec!["http://user:secret@127.0.0.1:1".to_string()],
+        };
+        assert_eq!(
+            format!("{regular:?}"),
+            r#"Regular { worker_urls: ["http://***@127.0.0.1:1"] }"#
+        );
+        let pd = RoutingMode::PrefillDecode {
+            prefill_urls: vec![("http://user:secret@127.0.0.1:8000".to_string(), Some(8998))],
+            decode_urls: vec!["http://127.0.0.1:8001".to_string()],
+            prefill_policy: None,
+            decode_policy: None,
+        };
+        let shown = format!("{pd:?}");
+        assert!(
+            shown.contains(r#"("http://***@127.0.0.1:8000", Some(8998))"#),
+            "{shown}"
+        );
+        assert!(
+            shown.contains(r#"decode_urls: ["http://127.0.0.1:8001"]"#),
+            "{shown}"
+        );
+        assert!(!shown.contains("secret"), "{shown}");
+    }
 
     #[test]
     fn test_router_config_default() {

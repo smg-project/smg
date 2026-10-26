@@ -2755,7 +2755,7 @@ mod tests {
     /// A failed call to a worker is logged log-safe as a whole: a worker
     /// registered with userinfo at a port nobody listens on fails the proxied
     /// GET, and the complete event (the message and every field) carries the
-    /// user and the mask, never the secret. The error's own text goes through
+    /// mask, never the user or the secret. The error's own text goes through
     /// `cause`, so the line names no address of its own either, whatever the
     /// HTTP client puts in its `Display`.
     #[tokio::test]
@@ -2790,10 +2790,11 @@ mod tests {
             .find(|text| text.contains("Failed to proxy GET request"))
             .expect("the failure line");
         assert!(
-            line.contains(&format!("alice:***@127.0.0.1:{port}")),
+            line.contains(&format!("http://***@127.0.0.1:{port}")),
             "{line}"
         );
         assert!(!line.contains("s3cret"), "{line}");
+        assert!(!line.contains("alice"), "{line}");
         assert!(
             texts.iter().all(|text| !text.contains("s3cret")),
             "{texts:?}"

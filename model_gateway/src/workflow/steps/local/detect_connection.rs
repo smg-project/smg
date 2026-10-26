@@ -13,7 +13,7 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use crate::{
     app_context::AppContext,
-    worker::ConnectionMode,
+    worker::{endpoint::Endpoint, ConnectionMode},
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
         steps::util::{try_grpc_reachable, try_http_reachable},
@@ -86,7 +86,7 @@ async fn probe_http(
                 }),
                 (Err(h2_err), Ok(())) => {
                     debug!(
-                        worker = %config.url,
+                        worker = %Endpoint::redacted_str(&config.url),
                         error = %h2_err,
                         "HTTP/2 prior-knowledge probe failed; staying on HTTP/1.1"
                     );
@@ -124,12 +124,15 @@ impl StepExecutor<WorkerWorkflowData> for DetectConnectionModeStep {
             .clone();
         let config = &context.data.config;
 
+        let url = config.url.clone();
+        // The address as the step's lines and messages write it: a secret in
+        // its userinfo masked.
+        let shown = Endpoint::redacted_str(&url);
         debug!(
-            "Detecting connection mode for {} (timeout: {:?}s, max_attempts: {})",
-            config.url, config.health.timeout_secs, config.max_connection_attempts
+            "Detecting connection mode for {shown} (timeout: {:?}s, max_attempts: {})",
+            config.health.timeout_secs, config.max_connection_attempts
         );
 
-        let url = config.url.clone();
         let timeout = config
             .health
             .timeout_secs
@@ -157,11 +160,11 @@ impl StepExecutor<WorkerWorkflowData> for DetectConnectionModeStep {
                 return Err(WorkflowError::StepFailed {
                     step_id: StepId::new("detect_connection_mode"),
                     message: format!(
-                        "{connection_mode} health check failed for explicitly configured worker URL {url}: {err}"
+                        "{connection_mode} health check failed for explicitly configured worker URL {shown}: {err}"
                     ),
                 });
             }
-            debug!("{url} explicitly configured as {connection_mode}");
+            debug!("{shown} explicitly configured as {connection_mode}");
             connection_mode
         } else {
             let (http_result, grpc_result) = tokio::join!(
@@ -171,19 +174,19 @@ impl StepExecutor<WorkerWorkflowData> for DetectConnectionModeStep {
 
             match (http_result, grpc_result) {
                 (Ok(probe), _) => {
-                    debug!("{url} detected as HTTP");
+                    debug!("{shown} detected as HTTP");
                     record_http(context, probe);
                     ConnectionMode::Http
                 }
                 (_, Ok(())) => {
-                    debug!("{url} detected as gRPC");
+                    debug!("{shown} detected as gRPC");
                     ConnectionMode::Grpc
                 }
                 (Err(http_err), Err(grpc_err)) => {
                     return Err(WorkflowError::StepFailed {
                         step_id: StepId::new("detect_connection_mode"),
                         message: format!(
-                            "Both HTTP and gRPC health checks failed for {url}: HTTP: {http_err}, gRPC: {grpc_err}"
+                            "Both HTTP and gRPC health checks failed for {shown}: HTTP: {http_err}, gRPC: {grpc_err}"
                         ),
                     });
                 }
@@ -195,7 +198,7 @@ impl StepExecutor<WorkerWorkflowData> for DetectConnectionModeStep {
             .http2
             .filter(|_| app_context.router_config.upstream_http2)
         {
-            info!(worker = %url, http2, "resolved worker HTTP version");
+            info!(worker = %shown, http2, "resolved worker HTTP version");
         }
         context.data.connection_mode = Some(connection_mode);
         Ok(StepResult::Success)
@@ -391,6 +394,39 @@ mod tests {
 
         assert!(matches!(err, WorkflowError::StepFailed { .. }), "{err:?}");
         assert_eq!(ctx.data.http2, None);
+    }
+
+    /// The step's lines and its failure message name the worker masked: a
+    /// worker registered with credentials at a port nobody listens on fails
+    /// its probe, and neither the failure message nor any line the step
+    /// wrote carries the credentials. The capture is the tracing subscriber
+    /// itself, so the rendering is read as a log reader would.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_failed_probe_names_the_worker_masked_in_its_lines_and_its_message() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr")
+            .port();
+        let url = format!("http://user:secret@127.0.0.1:{port}");
+        let mut ctx = local_context(app_context(false), WorkerSpec::new(url));
+
+        let err = DetectConnectionModeStep
+            .execute(&mut ctx)
+            .await
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("http://***@127.0.0.1:{port}")),
+            "{message}"
+        );
+        assert!(!message.contains("secret"), "{message}");
+        assert!(!message.contains("user:"), "{message}");
+        assert!(!logs_contain("secret"));
+        assert!(!logs_contain("user:"));
+        assert!(logs_contain(&format!("http://***@127.0.0.1:{port}")));
     }
 
     #[tokio::test]

@@ -309,14 +309,17 @@ impl Endpoint {
         }
     }
 
-    /// A form safe to log: the secret half of any userinfo is masked, and the
-    /// address ends at its path (a query or fragment is no part of the
-    /// address and may carry a token).
+    /// A form safe to log: any userinfo is masked whole, and the address
+    /// ends at its path (a query or fragment is no part of the address and
+    /// may carry a token).
     ///
-    /// The username is kept, because it distinguishes two registrations at one
-    /// address and is what makes a log line useful.
+    /// The username goes with the secret: a token is often the username (the
+    /// API-key shape `http://token@host`, or `https://token:x-oauth-basic@host`),
+    /// so a mask that kept it would print the credential. Two registrations
+    /// at one address are told apart by their key, never by a log line.
     pub fn redacted(&self) -> String {
-        let address = Endpoint {
+        Endpoint {
+            userinfo: self.userinfo.as_ref().map(|_| "***".to_string()),
             path: self
                 .path
                 .as_deref()
@@ -324,28 +327,17 @@ impl Endpoint {
                 .filter(|path| !path.is_empty() && *path != "/")
                 .map(str::to_string),
             ..self.clone()
-        };
-        let Some(userinfo) = address.userinfo.as_deref() else {
-            return address.render();
-        };
-        let masked = match userinfo.split_once(':') {
-            Some((user, _)) => format!("{user}:***"),
-            None => userinfo.to_string(),
-        };
-        let exact = address.render();
-        let Some((prefix, rest)) = exact.split_once(&format!("{userinfo}@")) else {
-            // Unreachable while `render` emits the userinfo it was built from;
-            // masking everything is the safe answer if that ever changes.
-            return exact.replace(userinfo, "***");
-        };
-        format!("{prefix}{masked}@{rest}")
+        }
+        .render()
     }
 
     /// `redacted` for an address string, as a log line writes a worker's
     /// address: parsed with the workflow's `@rank` suffix a DP-aware worker's
     /// address carries and masked, the rank written back after the masked
     /// address; one the parser refuses (no registered address is) is written
-    /// as a marker, never raw.
+    /// as a marker, never raw. The one rendering every log line, refusal
+    /// message and start-up line of the gateway writes a worker's address
+    /// through.
     pub fn redacted_str(input: &str) -> String {
         match Self::parse_with_rank(input) {
             Ok((endpoint, Some(rank))) => format!("{}@{rank}", endpoint.redacted()),
@@ -714,8 +706,8 @@ mod tests {
     fn a_password_is_masked_for_display_but_kept_for_lookup() {
         let endpoint = Endpoint::parse("http://user:pass@worker:3000").unwrap();
 
-        assert_eq!(endpoint.redacted(), "http://user:***@worker:3000");
-        assert_eq!(format!("{endpoint}"), "http://user:***@worker:3000");
+        assert_eq!(endpoint.redacted(), "http://***@worker:3000");
+        assert_eq!(format!("{endpoint}"), "http://***@worker:3000");
         assert!(!endpoint.redacted().contains("pass"));
 
         // Identity and lookup keep the exact value.
@@ -738,7 +730,7 @@ mod tests {
         let endpoint = Endpoint::parse("http://user:pass@worker:3000").unwrap();
         let shown = format!("{endpoint:?}");
         assert!(!shown.contains("pass"), "{shown}");
-        assert!(shown.contains("user:***"), "{shown}");
+        assert!(shown.contains("***@worker"), "{shown}");
 
         // A key cannot tell userinfo from the rest of its own string, so one
         // carrying an `@` is masked whole.
@@ -755,16 +747,46 @@ mod tests {
     }
 
     #[test]
-    fn redaction_leaves_addresses_without_secrets_alone() {
+    fn redaction_leaves_addresses_without_userinfo_alone() {
         for spelling in [
             "http://worker:3000",
             "grpc://[fd00::1]:8080/v1",
             "ipc:///tmp/w.sock",
-            // A bare username is not a secret and identifies the registration.
-            "http://user@worker:3000",
+            "http://Worker:3000/v1",
         ] {
             let endpoint = Endpoint::parse(spelling).expect(spelling);
             assert_eq!(endpoint.redacted(), endpoint.render(), "{spelling}");
+        }
+    }
+
+    /// A userinfo is masked whole, whatever its shape: a token used as the
+    /// username (the API-key shape) and the username of a `token:x-oauth-basic`
+    /// pair are credentials too, and a mask that kept the username printed
+    /// them. The same mask on every surface that calls the rendering.
+    #[test]
+    fn a_userinfo_is_masked_whole_whatever_its_shape() {
+        for (spelling, masked) in [
+            ("http://api-token@worker:8000", "http://***@worker:8000"),
+            (
+                "https://tok-123456:x-oauth-basic@worker:8000",
+                "https://***@worker:8000",
+            ),
+            (
+                "http://user:pass@worker:8000/v1",
+                "http://***@worker:8000/v1",
+            ),
+            ("grpc://user@[fd00::1]:8080", "grpc://***@[fd00::1]:8080"),
+        ] {
+            let endpoint = Endpoint::parse(spelling).expect(spelling);
+            assert_eq!(endpoint.redacted(), masked, "{spelling}");
+            assert_eq!(format!("{endpoint}"), masked, "{spelling}");
+            assert_eq!(Endpoint::redacted_str(spelling), masked, "{spelling}");
+            for credential in ["api-token", "tok-123456", "x-oauth-basic", "pass", "user"] {
+                assert!(!endpoint.redacted().contains(credential), "{spelling}");
+                assert!(!format!("{endpoint:?}").contains(credential), "{spelling}");
+            }
+            // Lookup and the exact form keep the registration's identity.
+            assert_eq!(endpoint.render(), spelling, "{spelling}");
         }
     }
 
@@ -835,8 +857,8 @@ mod tests {
         assert_eq!(unique.len(), keys.len(), "keys collided: {keys:?}");
     }
 
-    /// A log line writes a worker's address through `redacted_str`: the
-    /// secret half of any userinfo masked, a plain address as it is, a
+    /// A log line writes a worker's address through `redacted_str`: any
+    /// userinfo masked whole, a plain address as it is, a
     /// DP-aware worker's ranked address masked with its rank kept, a query or
     /// fragment cut, and an address the parser refuses as a marker rather than
     /// raw.
@@ -844,7 +866,7 @@ mod tests {
     fn redacted_str_masks_the_secret_and_never_writes_an_address_raw() {
         let masked = Endpoint::redacted_str("http://user:secret@worker:3000");
         assert!(!masked.contains("secret"), "{masked}");
-        assert!(masked.contains("user:***@"), "{masked}");
+        assert_eq!(masked, "http://***@worker:3000");
         assert_eq!(
             Endpoint::redacted_str("grpc://worker:30000"),
             Endpoint::parse("grpc://worker:30000").unwrap().render()
@@ -852,12 +874,12 @@ mod tests {
         // A DP-aware worker's address carries its rank: masked, the rank kept.
         assert_eq!(
             Endpoint::redacted_str("http://u:s@w:3000@2"),
-            "http://u:***@w:3000@2"
+            "http://***@w:3000@2"
         );
         // A query or a fragment carries no address and may carry a token: cut.
         assert_eq!(
             Endpoint::redacted_str("http://u:s@w:3000/v1?token=secret"),
-            "http://u:***@w:3000/v1"
+            "http://***@w:3000/v1"
         );
         assert_eq!(
             Endpoint::redacted_str("http://w:3000/v1#frag"),
