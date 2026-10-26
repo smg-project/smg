@@ -22,6 +22,7 @@ use openai_protocol::{generate::GenerateRequest, model_card::ModelCard};
 use portpicker::pick_unused_port;
 use serial_test::serial;
 use smg::{
+    config::ParserChoice,
     middleware::{RouteRequestMeta, TenantKey},
     routers::{grpc::backend_client::BackendClient, RouterTrait},
     worker::{BasicWorker, BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType},
@@ -451,9 +452,13 @@ async fn grammar_over_zmq(parser: &str, led: bool) {
     // A prompt that leaves the model inside its thought, and a worker that
     // says its grammar starts at the first token: a legacy tool parser with a
     // reasoning prefix leads the forced call's tag with the thought block.
+    // The legacy path's wire semantics: pinned to `--parser legacy`, since under
+    // the default parser a legacy name a table answers to (`glm47_moe`) reads
+    // with that table and the gateway shapes the response schema itself.
     let config = grpc_router_config()
         .regular_mode(vec![])
         .random_policy()
+        .parser(ParserChoice::Legacy)
         .tool_call_parser(parser)
         .worker_startup_timeout_secs(5)
         .worker_startup_check_interval_secs(1)

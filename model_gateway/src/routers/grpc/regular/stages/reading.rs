@@ -80,7 +80,11 @@ pub(crate) fn prepare(
     stage: &'static str,
 ) -> Result<Prepared, Response> {
     let model = asks.model();
-    let parser = ctx.state.parser.unwrap_or_default();
+    // Only the chat and messages preparations choose a parser; a request
+    // that chose none (transcription shares the chat preparation) keeps the
+    // legacy parsers here and at the two sites below, whatever the enum's
+    // default.
+    let parser = ctx.state.parser.unwrap_or(ParserChoice::Legacy);
     let names = ctx.components.parser_resolver.names(model);
     // A forced call's tag takes the start the model's workers name together;
     // a JSON answer's tag and the `auto` tag take the selected worker's own
@@ -195,7 +199,7 @@ pub(crate) fn reasoning_decision(
             .is_some_and(|tokenizer| switch(tokenizer.as_ref()))
     };
     match symphony::reasoning_open(
-        ctx.state.parser.unwrap_or_default(),
+        ctx.state.parser.unwrap_or(ParserChoice::Legacy),
         &ctx.components.parser_resolver.names(model),
         model,
         &ctx.components.templates,
@@ -281,7 +285,7 @@ pub(crate) fn decide(
 ) -> Result<Decided, Response> {
     let model = asks.model();
     let names = ctx.components.parser_resolver.names(model);
-    let parser = ctx.state.parser.unwrap_or_default();
+    let parser = ctx.state.parser.unwrap_or(ParserChoice::Legacy);
     let decoding = utils::WorkerDecoding::of(ctx.state.workers.as_ref());
     let decided = symphony::worker_constraint(
         decoding,

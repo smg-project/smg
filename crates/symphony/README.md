@@ -211,7 +211,7 @@ difference. **Pending** means no table yet.
 **SMG today** is what the gateway takes for the group's primary before Symphony is wired in: the
 `--tool-call-parser` and `--reasoning-parser` names its registries resolve from the model id, as
 in `smg serve --model-path Qwen/Qwen3-8B --tool-call-parser qwen --reasoning-parser qwen3`; none
-means passthrough, the output read as content. Under `--parser symphony`, a worker's parser labels
+means passthrough, the output read as content. Under `--parser symphony` (the gateway's default), a worker's parser labels
 decide for its model, else the registry's table for a model it knows, else the two flags, for the
 models the registry does not know: a table's name in them reads those models with that table, and
 the name `hf` reads each with the table its tokenizer's `response_template` compiles into
@@ -224,8 +224,8 @@ or renamed checkpoint is not listed: the flags, or its workers' labels, name its
 group names it, else it keeps the older parsers). The flags stay: under `--parser symphony` the gateway maps a legacy tool-call or reasoning parser's
 name whose format a table reads to that table (`qwen` for `qwen3`, `qwen_xml` for `qwen3_tagged`, a
 launcher's `muse` for `muse_spark`; the map is the gateway's `routers::grpc::utils::ALIASES`, beside
-its parser resolution), so a deployment's existing flags keep a working parser when the gateway's
-default parser changes; a legacy name no table answers to keeps the legacy parsers as a tool-call
+its parser resolution), so a deployment's existing flags keep a working parser under Symphony, the
+gateway's default parser; a legacy name no table answers to keeps the legacy parsers as a tool-call
 name and selects nothing as a reasoning name alone, and the gateway lists each such name with the
 reason (`utils::UNANSWERED`); its test over both legacy registries holds every legacy name to one of
 three: a table's own name (`qwen3`, `gemma4`), a row of `ALIASES`, or a row of `UNANSWERED`. The crate knows a table by its own name only (`Table::named`). The Harmony family (gpt-oss) has no

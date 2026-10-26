@@ -500,10 +500,10 @@ class RouterArgs:
     otlp_traces_endpoint: str = "localhost:4317"
     overlap_decay: float = 0.0
     overload_token_usage_threshold: float = 1.0
-    # Which parser reads a chat completion's reasoning and tool calls: the per-model parsers
-    # ("legacy") or Symphony ("symphony") for the models its registry knows; a request's
-    # X-SMG-Parser header overrides it
-    parser: str = "legacy"
+    # Which parser reads a chat completion's reasoning and tool calls: Symphony ("symphony",
+    # the default) for the models its registry knows, or the per-model parsers ("legacy"); a
+    # request's X-SMG-Parser header overrides it
+    parser: str = "symphony"
     # Seconds a PD dispatch waits for a slot in the decode engine's running
     # window before shedding; 0 sheds immediately
     pd_admission_wait_secs: int = 30
@@ -2548,8 +2548,9 @@ class RouterArgs:
             type=str,
             default=RouterArgs.parser,
             choices=["legacy", "symphony"],
-            help="Which parser reads a chat completion's reasoning and tool calls: the per-model "
-            "parsers (legacy, the default) or Symphony. With Symphony, a model's worker labels decide, "
+            help="Which parser reads a chat completion's reasoning and tool calls: Symphony "
+            "(symphony, the default) or the per-model parsers (legacy). With Symphony, a model's "
+            "worker labels decide, "
             "else Symphony's registry for a model it knows, else --tool-call-parser and --reasoning-parser: "
             "a Symphony table's name reads with that table, and so does a legacy parser's name whose format "
             "a table reads (qwen for qwen3, qwen_xml for qwen3_tagged: the table's aliases, so existing flags "

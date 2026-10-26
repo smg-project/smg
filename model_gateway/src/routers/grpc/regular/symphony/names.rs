@@ -866,6 +866,12 @@ mod tests {
 
     #[test]
     fn the_header_names_the_parser_over_the_flag_and_an_unknown_name_is_refused() {
+        // The configured default is Symphony; a gateway started with `--parser legacy`
+        // keeps the older parsers; either way the header decides for one request.
+        assert_eq!(
+            choice(ParserChoice::default(), None),
+            Ok(ParserChoice::Symphony)
+        );
         assert_eq!(choice(ParserChoice::Legacy, None), Ok(ParserChoice::Legacy));
         assert_eq!(
             choice(ParserChoice::Symphony, Some(&HeaderMap::new())),

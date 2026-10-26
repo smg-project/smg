@@ -16,7 +16,7 @@ import httpx
 import openai
 import pytest
 import smg_client
-from infra.constants import get_parser, get_runtime
+from infra.constants import effective_parser, get_runtime
 from infra.streams import collect_streamed_chat
 
 logger = logging.getLogger(__name__)
@@ -473,9 +473,16 @@ class TestOpenAIServerFunctionCalling:
 
         - When tool_choice is a specific ToolChoice, the model should return one or more tool_calls.
         """
-        # Under a named choice the gateway constrains the engine to that
-        # function's parameters object and names the call itself.
-        mock_answers.enqueue('{"city": "Paris"}')
+        # Under a named choice the gateway constrains the engine to the call it
+        # names: Symphony's json table, this model's under the default, gives
+        # the forced call its own structural tag, the list holding that one
+        # call, which the table reads; the legacy path constrains the engine to
+        # the function's parameters object and names the call itself.
+        mock_answers.enqueue(
+            '[{"name": "get_weather", "parameters": {"city": "Paris"}}]'
+            if effective_parser() == "symphony"
+            else '{"city": "Paris"}'
+        )
         tools = [
             {
                 "type": "function",
@@ -738,17 +745,18 @@ class TestOpenAIServerFunctionCalling:
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 @pytest.mark.skipif(
-    get_parser() == "symphony",
-    reason="the registry reads this model with the json table under --parser symphony; "
+    effective_parser() == "symphony",
+    reason="the registry reads this model with the json table under Symphony, the default; "
     "the pythonic list is the legacy parsers' reading",
 )
 class TestOpenAIPythonicFunctionCalling:
     """Tests for pythonic function calling format.
 
-    Under ``--parser symphony`` the registry reads this model with its own table (``json``)
+    Under Symphony (the default) the registry reads this model with its own table (``json``)
     whatever ``--tool-call-parser`` names, so the gateway-wide ``pythonic`` name this class
-    relies on does not apply there: the class runs where the legacy parsers read, and skips
-    under Symphony at collection, before any fixture starts a worker or a gateway.
+    relies on does not apply there: the class runs where the legacy parsers read (the
+    ``--parser legacy`` lane), and skips under Symphony at collection, before any fixture
+    starts a worker or a gateway.
     """
 
     def test_pythonic_tool_call_prompt(self, model, api_client):
@@ -1685,7 +1693,7 @@ class TestToolChoiceLlama(_TestToolChoiceBase):
         """Under --parser symphony the pair is served: the `llama` name reads the json table,
         whose forced call carries each tool's own `$defs`. On the legacy path the merged schema
         refuses the pair, as the base test expects."""
-        if get_parser() != "symphony":
+        if effective_parser() != "symphony":
             super().test_conflicting_defs_required_tool_choice(model, api_client)
             return
         self._assert_conflicting_defs_served(model, api_client)
@@ -1714,7 +1722,7 @@ class TestToolChoiceQwen(_TestToolChoiceBase):
         """Under --parser symphony the pair is served: the Qwen3 table gives the forced call a
         structural tag that carries each tool's own `$defs`. On the legacy path the merged schema
         refuses the pair, as the base test expects."""
-        if get_parser() != "symphony":
+        if effective_parser() != "symphony":
             super().test_conflicting_defs_required_tool_choice(model, api_client)
             return
         self._assert_conflicting_defs_served(model, api_client)

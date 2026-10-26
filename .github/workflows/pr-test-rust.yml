@@ -579,7 +579,6 @@ jobs:
     needs: [build-wheel, detect-changes]
     if: >-
       needs.detect-changes.outputs.docs-only != 'true'
-      && needs.detect-changes.outputs.symphony-only != 'true'
     runs-on: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     continue-on-error: true
@@ -648,10 +647,9 @@ jobs:
       pull-requests: read
       packages: read
     outputs:
-      # The two shortcuts (defined in the "Decide the e2e lanes" step): a docs-only
-      # pull request, a change confined to the Symphony crate.
+      # The docs-only shortcut (defined in the "Decide the e2e lanes" step): a
+      # pull request that changes docs alone.
       docs-only: ${{ steps.lanes.outputs.docs-only }}
-      symphony-only: ${{ steps.lanes.outputs.symphony-only }}
       rust-ci: ${{ steps.filter.outputs.rust-ci }}
       # The rust-tests matrix: the shards of scripts/ci_rust_tests.sh a pull
       # request can affect (every shard on a push or a dispatch); '[]' skips the job.
@@ -719,15 +717,6 @@ jobs:
             # Every changed file, for the tier table.
             all:
               - '**'
-            symphony:
-              - 'crates/symphony/**'
-            # Everything that is not Symphony's crate or the lock file. A PR is Symphony-only
-            # when `symphony` matched and this did not. The `!` patterns only exclude under
-            # `some-with-excludes` above; with the default quantifier `**` would match every file.
-            outside-symphony:
-              - '**'
-              - '!crates/symphony/**'
-              - '!Cargo.lock'
             rust-ci:
               - 'Cargo.toml'
               - 'Cargo.lock'
@@ -854,7 +843,7 @@ jobs:
               - 'scripts/ci_cargo_audit.sh'
               - '.github/workflows/pr-test-rust.yml'
 
-      # The two shortcuts and whether each GPU e2e lane skips, decided here once:
+      # The docs-only shortcut and whether each GPU e2e lane skips, decided here once:
       # the tier table below maps a changed path to the lanes it can reach. A
       # lane's `if:` reads its `skip-<area>` output and adds only what is its
       # own: `always() && !cancelled()`, its prerequisite's result and, on a pull
@@ -878,15 +867,13 @@ jobs:
           DOCS: ${{ steps.filter.outputs.docs }}
           NON_DOCS: ${{ steps.filter.outputs.non-docs }}
           TESTS: ${{ steps.filter.outputs.tests }}
-          SYMPHONY: ${{ steps.filter.outputs.symphony }}
-          OUTSIDE_SYMPHONY: ${{ steps.filter.outputs.outside-symphony }}
         run: |
           python3 - <<'EOF'
           import json, os, re, sys
 
           env = os.environ
           pull_request = env.get("PULL_REQUEST") == "true"
-          # The label: every lane, and neither shortcut.
+          # The label: every lane, and no docs-only shortcut.
           force_full = pull_request and env.get("FORCE_FULL") == "true"
 
           # Only pull requests take the docs-only shortcut; a push keeps its coverage.
@@ -897,14 +884,6 @@ jobs:
               and env.get("NON_DOCS") == "false"
               and env.get("TESTS") == "false"
           )
-          # Symphony is not wired into the gateway yet: a change confined to its crate and
-          # the lock file runs the CPU checks and the Symphony chat lane only.
-          symphony_only = (
-              not force_full
-              and env.get("SYMPHONY") == "true"
-              and env.get("OUTSIDE_SYMPHONY") == "false"
-          )
-
           # The areas, one per skip-<area> output, each the gate of a group of lanes:
           #   chat-one-engine   the chat and router suites on one engine, SGLang: the
           #                     sglang rows of the chat, Rust-servicer and gateway lanes
@@ -1099,10 +1078,11 @@ jobs:
               ("crates/mock_worker/**",                          NONE),
               ("crates/radix_tree/**",                           NONE),
               ("crates/tokenizer/**",                            "go-bindings"),
-              # Symphony and the response templates it compiles: read behind
-              # --parser symphony, the Symphony lane's flag
-              ("crates/symphony/**",                             "chat-symphony"),
-              ("crates/response_template/**",                    "chat-symphony"),
+              # Symphony and the response templates it compiles: the default
+              # parser, read on every lane's chat, messages and responses path
+              # (the Symphony lane pins it with --parser symphony)
+              ("crates/symphony/**",                             CORE_EVERY_ENGINE),
+              ("crates/response_template/**",                    CORE_EVERY_ENGINE),
               # the Rust servicer and the ZMQ wire: lanes of the chat family
               ("crates/engine_servicer/**",                      "chat-completions"),
               ("crates/engine_zmq_client/**",                    "chat-completions"),
@@ -1191,16 +1171,13 @@ jobs:
               reached.add("chat-one-engine")
           print(f"{why}: lanes reached: {named(reached)}")
 
-          # No lane for a docs-only or a Symphony-only change; otherwise the lanes
-          # of the areas the changed paths reach.
-          skip = {area: docs_only or symphony_only or area not in reached for area in AREAS}
-          # The Symphony chat lane runs for a Symphony-only change too: it is the one
-          # lane that exercises a table against a real engine.
-          skip["chat-symphony"] = docs_only or ("chat-symphony" not in reached and not symphony_only)
+          # No lane for a docs-only change; otherwise the lanes of the areas the
+          # changed paths reach (the tier table decides, Symphony's crate included).
+          skip = {area: docs_only or area not in reached for area in AREAS}
           # The vendor lanes have no docs-only shortcut.
-          skip["vendor"] = symphony_only or "vendor" not in reached
+          skip["vendor"] = "vendor" not in reached
 
-          decided = {"docs-only": docs_only, "symphony-only": symphony_only}
+          decided = {"docs-only": docs_only}
           decided.update((f"skip-{area}", skipped) for area, skipped in skip.items())
           with open(env["GITHUB_OUTPUT"], "a") as outputs:
               for name, value in decided.items():
@@ -1323,11 +1300,11 @@ jobs:
       container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
     secrets: inherit
 
-  # The chat cases with the gateway reading through Symphony (--parser symphony):
-  # the same workers and suite as e2e-1gpu-chat, the Symphony path for every
-  # model its registry knows. Runs for a chat or common change as the chat lane
-  # does, and for a Symphony-only change too, since this is the one lane that
-  # exercises a table against a real engine.
+  # The chat cases with the gateway pinned to Symphony (--parser symphony, the
+  # default; e2e-1gpu-chat leaves the flag unset and reads with it too): the
+  # same workers and suite as e2e-1gpu-chat, the Symphony path for every model
+  # its registry knows. Runs for a chat, common or Symphony change, as the tier
+  # table decides.
   e2e-1gpu-chat-symphony:
     name: e2e-1gpu-chat-symphony (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]

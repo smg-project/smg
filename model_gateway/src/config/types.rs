@@ -25,14 +25,17 @@ use crate::{
 /// name for `--tool-call-parser` and `--reasoning-parser`, as vLLM names it.
 pub const TEMPLATE_PARSER: &str = "hf";
 
-/// The parser that reads a chat completion's output.
+/// The parser that reads a chat completion's output: Symphony unless `--parser legacy` (the
+/// config key `parser: legacy`), or a request's `X-SMG-Parser: legacy` header, asks for the
+/// older parsers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ParserChoice {
-    /// The tool-call and reasoning parser crates, one parser per model family.
-    #[default]
+    /// The tool-call and reasoning parser crates, one parser per model family: the way back
+    /// from the default, for the whole gateway or for one request.
     Legacy,
-    /// Symphony's tables, by one precedence per model (`routers::grpc::regular::symphony::names::reads`):
+    /// Symphony's tables, the default, by one precedence per model
+    /// (`routers::grpc::regular::symphony::names::reads`):
     /// the table its worker labels select, when they select anything; else the registry's table
     /// for a model it knows; else the one the `--tool-call-parser` and `--reasoning-parser` flags
     /// select, for a model the registry does not know. Names select a table when it answers to
@@ -41,6 +44,7 @@ pub enum ParserChoice {
     /// for `muse_spark`); `hf` selects the model's response template's table; a reasoning name
     /// alone that no table answers to selects nothing, `passthrough` excepted; any other legacy
     /// tool-call parser's name, `passthrough`, and a model no table reads, keep the legacy parsers.
+    #[default]
     Symphony,
 }
 
@@ -546,9 +550,9 @@ pub struct RouterConfig {
     /// Disable automatic tokenizer loading at startup and worker registration
     #[serde(default)]
     pub disable_tokenizer_autoload: bool,
-    /// Which parser reads a chat completion's reasoning and tool calls: the per-model
-    /// parsers (`legacy`, the default) or Symphony (`symphony`) for the models its
-    /// registry knows. A request's `X-SMG-Parser` header overrides it for that request.
+    /// Which parser reads a chat completion's reasoning and tool calls: Symphony
+    /// (`symphony`, the default) for the models its registry knows, or the per-model
+    /// parsers (`legacy`). A request's `X-SMG-Parser` header overrides it for that request.
     #[serde(default)]
     pub parser: ParserChoice,
     #[serde(default = "default_history_backend")]
@@ -3961,5 +3965,28 @@ discovery:
         let json: PolicyConfig =
             serde_json::from_value(serde_json::json!({"type": "power_of_two"})).unwrap();
         assert_eq!(json.name(), "power_of_two");
+    }
+
+    #[test]
+    fn symphony_is_the_default_parser_and_legacy_spells_the_way_back() {
+        assert_eq!(ParserChoice::default(), ParserChoice::Symphony);
+        assert_eq!(RouterConfig::default().parser, ParserChoice::Symphony);
+        assert_eq!(ParserChoice::parse("legacy"), Some(ParserChoice::Legacy));
+        assert_eq!(
+            ParserChoice::parse(" Symphony "),
+            Some(ParserChoice::Symphony)
+        );
+        assert_eq!(ParserChoice::parse("fast"), None);
+
+        // A config document that names no parser reads with Symphony; `parser: legacy` is
+        // the way back; the choice survives a round trip under its own name.
+        let mut value = serde_json::to_value(RouterConfig::default()).unwrap();
+        assert_eq!(value["parser"], serde_json::json!("symphony"));
+        value.as_object_mut().unwrap().remove("parser");
+        let defaulted: RouterConfig = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(defaulted.parser, ParserChoice::Symphony);
+        value["parser"] = serde_json::json!("legacy");
+        let legacy: RouterConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.parser, ParserChoice::Legacy);
     }
 }
