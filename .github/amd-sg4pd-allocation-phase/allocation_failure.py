@@ -207,3 +207,102 @@ def runtime_event(stage, module, file, fields):
             sys.stderr.write("SG4_RUNTIME_EVENT_DROP " + (_text(type(error).__name__) or "error") + "\n")
         except BaseException:
             pass
+
+
+_MEMORY_TARGET = "/sgl-workspace/sglang/python/sglang/srt/utils/common.py"
+_MEMORY_SHA256 = "1d7f730cf63588278bf96dac091832b7620bd587868154c1dcd456d6a952127c"
+_memory_pid, _memory_attempts, _memory_drop = os.getpid(), 0, False
+_memory_lock = threading.Lock()
+
+
+def _memory_properties(props, integrated):
+    result = {"is_integrated": integrated if type(integrated) in (bool, int) else None}
+    for name in ("name", "total_memory", "multi_processor_count", "gcnArchName",
+                 "uuid", "pci_bus_id", "pci_device_id", "pci_domain_id"):
+        try:
+            value = getattr(props, name)
+            if name == "uuid" and type(value) not in (str, bytes):
+                raw = getattr(value, "bytes", None)
+                value = bytes(raw).hex() if isinstance(raw, (list, tuple)) and len(raw) == 16 and all(type(x) is int and 0 <= x <= 255 for x in raw) else None
+            if type(value) is bytes:
+                value = value.hex()
+            if type(value) is str:
+                value = value[:128]
+            result[name] = {"value": value if type(value) in (str, int, float, bool) else None,
+                            "status": "observed-existing-CPU-property" if type(value) in (str, int, float, bool) else "unavailable-or-unrecorded"}
+        except BaseException as error:
+            result[name] = {"value": None, "status": "missing-or-read-error", "error_type": type(error).__name__}
+    return result
+
+
+def memory_query_event(module, file, device, gpu_id, distributed, empty_cache,
+                       branch, integrated, props, raw_bytes, total_bytes,
+                       returned_bytes, original_error):
+    """Bounded existing-query values only; never issue a device or psutil query."""
+    global _memory_pid, _memory_attempts, _memory_drop, _memory_lock
+    if os.environ.get(FLAG) != "1":
+        return
+    try:
+        pid = os.getpid()
+        if pid != _memory_pid:
+            _memory_pid, _memory_attempts, _memory_drop, _memory_lock = pid, 0, False, threading.Lock()
+        with _memory_lock:
+            if _memory_attempts >= 8:
+                return
+            _memory_attempts += 1  # Even a failed observation consumes this PID's slot.
+            ordinal = _memory_attempts
+        # Preserve the original exception identity before diagnostic metadata work.
+        exception = None if original_error is None else {"type": type(original_error).__name__, "message": str(original_error)[:512]}
+        marker = os.environ.get("E2E_JOB_MARKER", "")
+        if not re.fullmatch(r"e2e-[0-9]+-[0-9]+-amd-mi300x-[12]", marker):
+            raise ValueError("same-job memory-query marker required")
+        if module != "sglang.srt.utils.common" or file != _MEMORY_TARGET or device != "cuda":
+            raise ValueError("exact existing CUDA memory-query source required")
+        origin = _origin(module, file)
+        if origin["sha256"] != _MEMORY_SHA256:
+            raise ValueError("exact current memory-query overlay required")
+        runtime = sys.modules.get("sglang.srt.runtime_context")
+        role = _query(lambda: _text(str(runtime.get_disagg().disaggregation_mode))) if runtime else None
+        caller = None
+        try:
+            frame = sys._getframe(3)
+            caller = {"file": frame.f_code.co_filename, "function": frame.f_code.co_name,
+                      "line": frame.f_lineno}
+            del frame
+        except BaseException:
+            pass
+        scalar = lambda value: value if type(value) in (int, float, bool) else None
+        ticks = _ticks()
+        row = {"kind": "existing-memory-query", "ordinal": ordinal, "pid": pid,
+               "start_ticks": ticks, "role": role, "job_marker": marker, "monotonic": time.monotonic(),
+               "origin": origin, "helper": _origin(__name__, __file__), "caller": caller,
+               "device_argument": device, "logical_gpu_id_argument": scalar(gpu_id),
+               "distributed_argument": scalar(distributed), "empty_cache_argument": scalar(empty_cache),
+               "branch": branch, "properties_from_existing_query": _memory_properties(props, integrated),
+               "existing_query_raw_available_bytes_before_MIN": scalar(raw_bytes),
+               "existing_query_raw_total_bytes": scalar(total_bytes),
+               "bytes_after_existing_MIN_before_original_GiB_division": scalar(returned_bytes),
+               "original_exception": exception,
+               "masks": {key: _text(os.environ.get(key)) for key in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")},
+               "new_device_or_psutil_queries": 0, "actual_resolved_pool_budget_observed": False,
+               "limits": "First8 existing queries/PID only; raw query versus post-MIN value are distinct. Caller/source identities do not prove physical counters correct or any allocation succeeds."}
+        data = (json.dumps(row, ensure_ascii=True, allow_nan=False) + "\n").encode()
+        if len(data) > 4096 or ticks != _ticks():
+            raise ValueError("bounded same-PID memory event required")
+        directory = Path(os.environ["AMD_DEPENDENCY_DIRECTORY"]) / "sglang-startup"
+        if directory.is_symlink() or not directory.is_dir():
+            raise ValueError("precreated same-job event directory required")
+        fd = os.open(directory / f"{pid}-{ticks}.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            status = os.fstat(stream.fileno())
+            if not stat.S_ISREG(status.st_mode) or status.st_size + len(data) > 64 * 1024:
+                raise ValueError("bounded regular memory event file required")
+            stream.write(data)
+        logging.getLogger("smg.sg4.memory").warning("SG4_MEMORY %s", data.decode().rstrip("\n"))
+    except BaseException as error:
+        if not _memory_drop:
+            _memory_drop = True
+            try:
+                sys.stderr.write("SG4_MEMORY_EVENT_DROP " + type(error).__name__ + "\n")
+            except BaseException:
+                pass
