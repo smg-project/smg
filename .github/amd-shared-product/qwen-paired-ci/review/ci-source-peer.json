@@ -1,0 +1,167 @@
+{
+  "result": "PASS_SOURCE_ONLY_ACTUAL_DISABLED_C2870_CHILD",
+  "findings": [],
+  "reviewer": "D /root/mc4_actual_independent",
+  "at_utc": "2026-10-26T08:26:44.870944+00:00",
+  "source_parent": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
+  "actual_head": "c2870c5d2cc141bdfdee29d55dd642d2065d7664",
+  "actual_head_direct_parent": "b38ae2c54c05282b0eb2766bdf1e80a7e1847c00",
+  "actual_tree": "78d29c03ee353e5f981fe086b7cc4e9208c0d68e",
+  "parent_tree": "bdd5cad047ce9b28453581ebbca45226c4eab62a",
+  "branch": "ci/amd-qwen-current1473-maxjobs2-20261026",
+  "worktree": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/amd-qwen-current1473-maxjobs2-20261026",
+  "driver_sha256": "16d9bdfd90e1b74b83597e3055f24812a6947d08047115deccdae37608b68e49",
+  "envelope_sha256": "06589cd12a0547a4e1d5547f8e24afb6c849ec8e95854d997b73bf1180d1ccfd",
+  "inputs_sha256": "ecdb8188c1d6e6cfb3aa84f4cdaba5f2bee183ec1e26e8fdc01d46e6c624dbd0",
+  "CI_job_runner_sha256": "657853dabdad54ef5e06f1063b50f1313fac21cf531dea3bc59c0ffd3f8c4d48",
+  "workflow_template_sha256": "aa77da40cedaa56aa6d4f02a2ec0f63c5f4cddabd781ba38adc2bacdfada2564",
+  "CI_source_manifest_sha256": "2a0cfaac9036f418765757eb26765b98a34ba6d9006a059821708084fc8fea38",
+  "scope": "Genuine nonauthor actual committed/index/worktree source integration review only. Read raw local Git object/index bytes and files, not Git CLI or candidate code. No tests/import, network/API/SSH/Docker, process operations, grant, publication, dispatch, state/formal edits or runtime acceptance.",
+  "actual_Git_checks": {
+    "raw_commit_hash_and_single_direct_parent_verified": true,
+    "symbolic_HEAD_and_branch_ref_verified": true,
+    "parent_child_tree_diff_exactly_three_paths": [
+      {
+        "path": ".github/amd-shared-product/qwen-paired-ci/admission.json",
+        "old_blob": "34c13f31eaaab3950426cfb5397fab48357732c6",
+        "new_blob": "d760aed1ae94b86a0c00d7674f878304014cab12",
+        "mode": "100644"
+      },
+      {
+        "path": ".github/amd-shared-product/qwen-paired-ci/job_runner.py",
+        "old_blob": "aac715e1ee959de51e535adfbe636dc85d4b7530",
+        "new_blob": "611597e85588ed44e72788440db2bb9e8da693a9",
+        "mode": "100644"
+      },
+      {
+        "path": ".github/amd-shared-product/qwen-paired-ci/source-manifest.json",
+        "old_blob": "42657017bcaf3234c10d8a0e8b8acb494d7f96fc",
+        "new_blob": "1a5b9144ebf2d53717ae99e748402e125fd00983",
+        "mode": "100644"
+      }
+    ],
+    "all_other_parent_tree_entries_unchanged": true,
+    "index_version": 2,
+    "index_checksum_verified": true,
+    "index_tree_independently_reconstructed_matches_actual_commit_tree": true,
+    "tracked_files_read": 2516,
+    "tracked_bytes_read": 49947047,
+    "all_tracked_blob_hashes_and_Git_modes_match_index": true,
+    "tracked_worktree_clean": true,
+    "untracked_ignored_workspace_cleanliness_not_claimed": true
+  },
+  "minimal_delta": {
+    "actual_three_file_bytes_exact_reviewed_proposal_preview": true,
+    "job_runner_only_line_added": "MAX_JOBS=2 to own-container env at line207",
+    "remove_single_line_restores_full_b38_text_and_AST": true,
+    "manifest_only_job_runner_hash_change": true,
+    "admission_only_source_manifest_sha256_change": true,
+    "all15_actual_manifest_members_verified": true,
+    "other14_members_unchanged": true,
+    "registered_pr_test_workflow_exact_template_and_unchanged_parent": true,
+    "actual_CI_file_set": "15 manifest members plus admission.json and source-manifest.json =17 files. Disabled base has no runtime review/ci-source-peer.json or root-budget.json yet; unchanged live admission guards require those only after root creates a distinct admitted data child.",
+    "owned_processes_sha256": "f8c84b7647ce218e3a73d42c1a0cc4982e67590c5f12c6cabda262f7284d8ad4",
+    "no_new_test_control_or_helper_algorithm_change": true
+  },
+  "contract_and_authority": {
+    "consumer19_compiled37_producer14_unchanged": true,
+    "native_b7": {
+      "name": "smg/smg_rs.abi3.so",
+      "bytes": 143064752,
+      "sha256": "b7d5ccb1d5e4c06cf93fc9f77ad405951b9d3def7038113f5435a0d57a170fd6"
+    },
+    "four_artifact_pins_unchanged": true,
+    "original12": "Two sequential lanes A-nativeHTTP/B-SMG-gRPC Rust; original ordered six-media request matrix, model Qwen/Qwen3-VL-8B-Instruct, request/oracle values unchanged.",
+    "original_limits_unchanged": {
+      "GPU_seconds": 2100,
+      "absolute_work_seconds": 1980,
+      "each_startup_seconds": 600,
+      "each_request_seconds": 90,
+      "pids_limit": 1024,
+      "CPUs": 8,
+      "memory_GiB": 96,
+      "UID_GID": "actual runner UID995:GID985 in CI"
+    },
+    "nominal_phase_maxima_not_added_to_budget": "Unchanged source documents2580 nominal sum but absolute2100/1980 governs; completion is not guaranteed and original requests are not shortened.",
+    "normal11_and_final3_gates_unchanged": true,
+    "admission_four_flags": {
+      "ready": false,
+      "root_manual_admission": false,
+      "run_budget_admitted": false,
+      "artifacts_pinned": false
+    },
+    "admission_reservation_seconds": 0,
+    "shared_authority_flags": {
+      "ready": false,
+      "run_budget_admitted": false,
+      "artifacts_pinned": false,
+      "consumer_gpu_ready": false,
+      "runtime_cohort_accepted": false
+    },
+    "shared_budget_admitted": false,
+    "shared_reserved_runner_seconds": 0,
+    "actual_model_nonce_actor_branch_budget_peer_bindings_not_granted": true,
+    "coverage_increment": 0,
+    "original12_runtime_accepted": false,
+    "prepared_AITER_source_identity_accepted": false,
+    "latest_main_qualified": false
+  },
+  "evidence_boundaries": [
+    "Previous CPU8 is exact unchanged process-helper lifecycle preflight; this env-only source does not create new CPU8 results or justify rerunning those same controls.",
+    "Saved exact4420 AITeR core/cpp-extension support MAX_JOBS-to-ninja-j mechanism. No actual prepared core/cpp hashes were captured in failed run40288726804; do not claim after-preparation exact identity or actual-j2 compilation.",
+    "No proof that reduced fanout cures the exact EAGAIN source or that original engine health and all12 fit existing deadlines. Future real bounded original12 validation remains required.",
+    "Root reports source materialization tool session8567 terminal0 consumed; this review independently checks committed/index/tracked bytes and does not claim to have run that tool."
+  ],
+  "evidence": [
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-MAX-JOBS2-actual-disabled-source-root-20261026.json",
+      "bytes": 3391,
+      "sha256": "b8d460eaab776d1d0cdc97cb3682dfd58ca7f429640657669d0ba8fbd23b6dad"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen402887-MAX-JOBS2-defaultoff-source-proposal-A-20261026/delivery.json",
+      "bytes": 1614,
+      "sha256": "304e16221f58f0f10f731384f68884e6849b8e041ab8005676e593f33d7347b1"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen402887-MAX-JOBS2-defaultoff-source-proposal-A-20261026/manifest.json",
+      "bytes": 8082,
+      "sha256": "1f965956f0ec198d36480d2a54474af6ce3c1202dff1bf399ad483cc4351bb0a"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen402887-MAX-JOBS2-defaultoff-source-proposal-A-20261026/peer-independent-D.json",
+      "bytes": 6016,
+      "sha256": "ea8ff62b9825455976e1d3fb063454418cdaad46d7b0fbf68083207bad82248d"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/amd-qwen-current1473-maxjobs2-20261026/.github/amd-shared-product/qwen-paired-ci/job_runner.py",
+      "bytes": 26241,
+      "sha256": "657853dabdad54ef5e06f1063b50f1313fac21cf531dea3bc59c0ffd3f8c4d48"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/amd-qwen-current1473-maxjobs2-20261026/.github/amd-shared-product/qwen-paired-ci/source-manifest.json",
+      "bytes": 1449,
+      "sha256": "2a0cfaac9036f418765757eb26765b98a34ba6d9006a059821708084fc8fea38"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/amd-qwen-current1473-maxjobs2-20261026/.github/amd-shared-product/qwen-paired-ci/admission.json",
+      "bytes": 1863,
+      "sha256": "646969e6b6814b4f937210713774f6102305d711231f0610592ace6e008d13bf"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/amd-qwen-current1473-maxjobs2-20261026/.github/amd-shared-product/qwen-paired-ci/paired/run_paired_ab.py",
+      "bytes": 31198,
+      "sha256": "16d9bdfd90e1b74b83597e3055f24812a6947d08047115deccdae37608b68e49"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/amd-qwen-current1473-maxjobs2-20261026/.github/amd-shared-product/qwen-paired-ci/paired/owned_processes.py",
+      "bytes": 11612,
+      "sha256": "f8c84b7647ce218e3a73d42c1a0cc4982e67590c5f12c6cabda262f7284d8ad4"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/amd-qwen-current1473-maxjobs2-20261026/.github/amd-shared-product/qwen-paired-ci/workflow-template.yml",
+      "bytes": 2979,
+      "sha256": "aa77da40cedaa56aa6d4f02a2ec0f63c5f4cddabd781ba38adc2bacdfada2564"
+    }
+  ]
+}
