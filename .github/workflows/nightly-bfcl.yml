@@ -651,12 +651,11 @@ jobs:
           path: ${{ runner.temp }}/bfcl_artifact/
           if-no-files-found: warn
           retention-days: 30
-      - name: Upload arm logs (failure only)
-        if: failure()
+      - name: Upload arm logs
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: bfcl-ab-${{ matrix.name }}-logs-${{ github.run_id }}
-          # vLLM/SMG logs — only useful on crash/timeout; noise on success.
           path: ${{ runner.temp }}/bfcl_run/*.log
           if-no-files-found: ignore
           retention-days: 14
