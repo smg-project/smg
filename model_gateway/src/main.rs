@@ -773,7 +773,8 @@ struct WorkerArgs {
     /// prompts may still need in prefill, up to 120 seconds. The pile is the
     /// streaming gRPC generations in flight; HTTP workers, PD sides and
     /// non-streaming generations give no signal and never form one. The
-    /// same bound, read per request, is how long a prefill side of a
+    /// same bound, read per request with twice the prefill time its prompt
+    /// needs behind the worker's backlog, is how long a prefill side of a
     /// disaggregated dispatch may produce nothing, with its worker answering
     /// no other side either, before its request fails over to another
     /// prefill worker (or fails, when there is none); a side queued on a

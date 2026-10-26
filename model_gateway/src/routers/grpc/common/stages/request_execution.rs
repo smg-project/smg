@@ -1566,6 +1566,11 @@ struct PrefillBound {
     dispatched: Instant,
     deadline: Instant,
     bound: Duration,
+    /// The silence a stalled decode partner is judged by (see
+    /// [`stalled_decode_partner`]): a decode side's bound for the same
+    /// prompt, which counts its prefill time once where `bound` counts it
+    /// twice (see [`liveness::decode_side_bound`]).
+    partner: Duration,
     backlog: Arc<OnceLock<Duration>>,
 }
 
@@ -1573,20 +1578,24 @@ impl PrefillBound {
     /// The bound for a side of `prompt_tokens` dispatched to `worker` at
     /// `dispatched`; `None` when the rule is off.
     fn at(worker: &Arc<dyn Worker>, prompt_tokens: u64, dispatched: Instant) -> Option<Self> {
+        let partner = liveness::decode_side_bound(worker, prompt_tokens)?;
         Self::of(
             liveness::prefill_side_bound(worker, prompt_tokens)?,
             dispatched,
         )
+        .map(|bound| Self { partner, ..bound })
     }
 
-    /// A bound of `bound` from `dispatched`. A bound past the clock's range
-    /// never expires: `None`, and the side stays unbounded.
+    /// A bound of `bound` from `dispatched`, a stalled decode partner judged
+    /// by the same. A bound past the clock's range never expires: `None`,
+    /// and the side stays unbounded.
     fn of(bound: Duration, dispatched: Instant) -> Option<Self> {
         let deadline = dispatched.checked_add(bound)?;
         Some(Self {
             dispatched,
             deadline,
             bound,
+            partner: bound,
             backlog: Arc::default(),
         })
     }
@@ -1684,8 +1693,9 @@ fn is_prefill_silence(status: &tonic::Status) -> bool {
 /// side's first response waits for the decode side, so a decode worker that
 /// stopped producing makes every prefill side look silent and the prefill
 /// worker answer no side at all. A decode worker that still holds streams it
-/// had been producing for and has produced nothing for the bound has
-/// stalled ([`Worker::output_silence`]); one that is still producing, or
+/// had been producing for and has produced nothing for `bound` (a decode
+/// side's bound for the prompt, see [`PrefillBound`]) has stalled
+/// ([`Worker::output_silence`]); one that is still producing, or
 /// holds no such stream (its streams ended, or its in-flight work has shown
 /// nothing yet: a frozen prefill in front of an idle decode looks like that,
 /// and the prefill keeps the verdict as before), is not read as the cause.
@@ -1843,13 +1853,13 @@ fn judge_prefill_side(
     let waited = bound.dispatched.elapsed();
     let standing = liveness::prefill_side_reprieve(worker, bound.bound, waited, &bound.backlog);
     if standing.past_bound() {
-        if let Some((decode, silence)) = stalled_decode_partner(partner, bound.bound) {
+        if let Some((decode, silence)) = stalled_decode_partner(partner, bound.partner) {
             return Err(decode_partner_silent(
                 worker,
                 &decode,
                 connection,
                 request_id,
-                bound.bound,
+                bound.partner,
                 silence,
                 phase,
             ));
@@ -3909,6 +3919,40 @@ mod tests {
             elapsed >= bound && elapsed < 2 * bound,
             "the decode verdict comes at the prefill's bound: {elapsed:?}"
         );
+        decode.note_output_ended();
+    }
+
+    /// The partner is judged by a decode side's bound for the prompt, which
+    /// counts its prefill time once, not by the prefill side's, which counts
+    /// it twice (see `PrefillBound`): past the prefill side's bound, a
+    /// decode quiet for the one and not the other takes the verdict. (Real
+    /// time, as above.)
+    #[test]
+    fn a_stalled_decode_partner_is_judged_by_a_decode_sides_bound() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let decode = Arc::clone(workers.decode_worker().expect("a pair"));
+        decode.note_output_started();
+        decode.note_token_progress();
+        std::thread::sleep(Duration::from_millis(600));
+        let dispatched = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("a clock two seconds old");
+        let bound = PrefillBound {
+            partner: Duration::from_millis(300),
+            ..bound_from(dispatched, Duration::from_secs(2))
+        };
+        let status = judge_prefill_side(
+            &prefill,
+            Some(&decode),
+            &bound,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-partner-bound",
+            32_768,
+            "first_response",
+        )
+        .expect_err("its worker answered nothing within the side's bound");
+        assert!(is_decode_silence(&status), "{status:?}");
         decode.note_output_ended();
     }
 

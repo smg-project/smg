@@ -92,10 +92,12 @@
 //!   met on such a prompt is caught at the cap instead of the threshold,
 //!   once per new longest prompt; a worker that has answered nothing is
 //!   judged as before. A zero threshold
-//!   turns the rule off. The same bound, read per request, caps how long a
-//!   disaggregated prefill side may stay silent ([`prefill_side_bound`]): a
-//!   side is not part of any pile, so its request is what fails, over to
-//!   another prefill worker when one is available. A side past its bound is
+//!   turns the rule off. The same bound, read per request with twice the
+//!   prefill time in it (the engine-reported rule's margin on an estimated
+//!   rate), caps how long a disaggregated prefill side may stay silent
+//!   ([`prefill_side_bound`]): a side is not part of any pile, so its
+//!   request is what fails, over to another prefill worker when one is
+//!   available. A side past its bound is
 //!   given up on only while its worker has answered nothing within the
 //!   bound ([`prefill_side_reprieve`]): a worker that keeps answering other
 //!   sides is backed up (on the parallel dispatch shape a side's first
@@ -208,12 +210,19 @@ fn bound_over(wedge: Duration, eta: Duration) -> Duration {
 /// How long a disaggregated prefill side of `prompt_tokens` dispatched to
 /// `worker` now may produce nothing before its request gives up on it: the
 /// wedge rule's bound, with the side's own prompt behind what the worker is
-/// already prefilling ([`Worker::prefill_eta`]), so a long prompt on a busy
-/// worker gets the time its measured rate says it needs, a short one the
-/// configured threshold, a prompt longer than any the worker has answered
-/// the cold-shape grace, and nothing more than the cap. A PD side joins no
-/// pile and is never vetoed by one; the request is what the bound ends.
-/// `None` when the rule is off (a zero threshold).
+/// already prefilling ([`Worker::prefill_eta`]) at twice the time the
+/// worker's rate gives, as the engine-reported rule allows for the prefill
+/// in hand ([`silence_allowance`]): the rate is an estimate, the answer can
+/// come an engine step after the prefill (a TokenSpeed prefill worker
+/// answers once it has polled the KV transfer, after its next forward), and
+/// a side's verdict fails its request where that rule's veto only steers.
+/// So a long prompt on a busy worker gets twice the time its measured rate
+/// says it needs, a short one the configured threshold, a prompt longer
+/// than any the worker has answered the cold-shape grace, and nothing more
+/// than the cap; a decode side counts that time once
+/// ([`decode_side_bound`]). A PD side joins no pile and is never vetoed by
+/// one; the request is what the bound ends. `None` when the rule is off (a
+/// zero threshold).
 pub(crate) fn prefill_side_bound(worker: &Arc<dyn Worker>, prompt_tokens: u64) -> Option<Duration> {
     let (_, wedge, _) = thresholds();
     prefill_side_bound_with(worker, prompt_tokens, wedge)
@@ -225,8 +234,21 @@ fn prefill_side_bound_with(
     prompt_tokens: u64,
     wedge: Duration,
 ) -> Option<Duration> {
+    side_bound_with(worker, prompt_tokens, wedge, 2)
+}
+
+/// A side's bound at the given wedge threshold: the threshold, `times` the
+/// time a prompt of `prompt_tokens` takes behind what `worker` is already
+/// prefilling, or the cold-shape grace, whichever is longest, capped.
+/// `None` when the rule is off (a zero threshold).
+fn side_bound_with(
+    worker: &Arc<dyn Worker>,
+    prompt_tokens: u64,
+    wedge: Duration,
+    times: u32,
+) -> Option<Duration> {
     (!wedge.is_zero()).then(|| {
-        let eta = worker.prefill_eta(prompt_tokens);
+        let eta = worker.prefill_eta(prompt_tokens).saturating_mul(times);
         bound_over(wedge, eta.max(cold_shape_grace(worker, prompt_tokens)))
     })
 }
@@ -238,7 +260,10 @@ fn prefill_side_bound_with(
 /// ([`prefill_side_bound`]): the prefill worker when the side was handed its
 /// KV (the handoff moves what that prefill produced), the decode worker when
 /// it recomputes the prompt itself (no handoff: a fan-out, or a prefill that
-/// returned no transfer parameters). The configured threshold for a short
+/// returned no transfer parameters), with that prefill's time once, not
+/// twice: the side's first token waits on a prefill that has answered, or
+/// on the decode worker's own at the cold rate, not on one still to come
+/// behind a busy worker's backlog. The configured threshold for a short
 /// prompt, the time the worker's measured prefill rate says a long prompt
 /// takes, and nothing more than the cap. The side was admitted to a room on
 /// its decode worker before its dispatch. `None` when the rule is off (a
@@ -247,7 +272,17 @@ pub(crate) fn decode_side_bound(
     prefills: &Arc<dyn Worker>,
     prompt_tokens: u64,
 ) -> Option<Duration> {
-    prefill_side_bound(prefills, prompt_tokens)
+    let (_, wedge, _) = thresholds();
+    decode_side_bound_with(prefills, prompt_tokens, wedge)
+}
+
+/// [`decode_side_bound`] at the given wedge threshold.
+fn decode_side_bound_with(
+    prefills: &Arc<dyn Worker>,
+    prompt_tokens: u64,
+    wedge: Duration,
+) -> Option<Duration> {
+    side_bound_with(prefills, prompt_tokens, wedge, 1)
 }
 
 /// Where a prefill side past its own bound stands (see
@@ -376,7 +411,11 @@ fn answered_or_handed_off(
 /// prefill rate (the cold prior until one is measured), capped. A side's
 /// own bound covers its prompt behind what was pending at its dispatch; the
 /// prompts of the run booked since, which the engine need not serve after
-/// it, are in the backlog by the time that bound passes.
+/// it, are in the backlog by the time that bound passes. The backlog's time
+/// counts once, as the pile rule counts it ([`wedge_bound`]), not twice as
+/// a side's bound counts its prompt's: it only ever lengthens a side's
+/// window past that bound, and a run that never answers is how a frozen
+/// worker looks, whose sides twice the backlog would hold twice as long.
 fn backlog_bound(worker: &Arc<dyn Worker>) -> Duration {
     worker.prefill_backlog().min(WEDGE_BOUND_CAP)
 }
@@ -1287,26 +1326,26 @@ mod tests {
 
     #[test]
     fn a_prefill_sides_bound_follows_its_prompt_the_workers_rate_and_the_cap() {
-        // A disaggregated prefill side is bounded like the pile rule bounds a
-        // worker: the threshold for a short prompt on an idle worker, the
-        // prefill time its prompt needs behind what is already pending at
-        // the worker's rate (the cold prior of 10k tokens/s until one is
-        // measured), never more than the cap.
+        // A disaggregated prefill side is bounded like the engine-reported
+        // rule allows a worker's prefill: the threshold for a short prompt
+        // on an idle worker, twice the prefill time its prompt needs behind
+        // what is already pending at the worker's rate (the cold prior of
+        // 10k tokens/s until one is measured), never more than the cap.
         let w = worker();
         assert_eq!(
             prefill_side_bound_with(&w, 256, DEFAULT_WEDGE),
             Some(DEFAULT_WEDGE),
-            "26 ms of prefill is inside the threshold"
+            "twice 26 ms of prefill is inside the threshold"
         );
         assert_eq!(
             prefill_side_bound_with(&w, 32_768, DEFAULT_WEDGE),
-            Some(Duration::from_millis(3_276)),
+            Some(Duration::from_millis(6_552)),
             "a 32k prompt on a cold worker"
         );
         w.note_prefill_started(8 * 32_768, true);
         assert_eq!(
             prefill_side_bound_with(&w, 32_768, DEFAULT_WEDGE),
-            Some(Duration::from_millis(29_491)),
+            Some(Duration::from_millis(58_982)),
             "behind eight pending 32k prompts"
         );
         w.note_prefill_ended(8 * 32_768, true, Some(0));
@@ -1324,6 +1363,96 @@ mod tests {
             prefill_side_bound_with(&w, 32_768, Duration::ZERO),
             None,
             "a zero threshold turns the bound off"
+        );
+    }
+
+    #[test]
+    fn a_decode_sides_bound_counts_the_prefill_time_once() {
+        // A sequential decode side's bound, and the silence a stalled decode
+        // partner is judged by on the parallel shape, count the prompt's
+        // prefill time once where its prefill side counts it twice: the
+        // threshold for a short prompt, the time a long one takes behind the
+        // worker's backlog at its rate.
+        let w = worker();
+        assert_eq!(
+            decode_side_bound_with(&w, 256, DEFAULT_WEDGE),
+            Some(DEFAULT_WEDGE)
+        );
+        assert_eq!(
+            decode_side_bound_with(&w, 32_768, DEFAULT_WEDGE),
+            Some(Duration::from_millis(3_276)),
+            "a 32k prompt on a cold worker, where its prefill side has 6.552 s"
+        );
+        w.note_prefill_started(8 * 32_768, true);
+        assert_eq!(
+            decode_side_bound_with(&w, 32_768, DEFAULT_WEDGE),
+            Some(Duration::from_millis(29_491)),
+            "behind eight pending 32k prompts, where its prefill side has 58.982 s"
+        );
+    }
+
+    /// A prefill worker that prefills 20k tokens per second of busy time,
+    /// its first tokens bunched (two 90k prompts answered together after
+    /// 10 s beside a 2k prompt a second; once read as 92k tokens/s), takes
+    /// a 90k uncached side: 4.5 s of prefill at its rate, and its answer
+    /// may come later still (on the parallel shape a TokenSpeed prefill
+    /// worker answers once it has polled the transfer, after its next
+    /// forward). The side gets twice the 4.5 s, as the engine-reported rule
+    /// allows the prefill in hand: a healthy worker still prefilling past
+    /// the 3 s the bunched rate gave keeps the side, a frozen one is given
+    /// up on at 9 s.
+    #[test]
+    fn a_long_uncached_side_waits_out_twice_its_eta_and_a_frozen_worker_is_given_up_on_there() {
+        let w = BasicWorkerBuilder::new("http://w1:8000").build();
+        let runtime = w.runtime.load_full();
+        runtime.note_prefill_started_at(90_000, true, 1_000);
+        runtime.note_prefill_started_at(90_000, true, 1_000);
+        for second in 0..11 {
+            let at = 1_000 + second * 1_000;
+            if at == 11_000 {
+                runtime.note_prefill_ended_at(90_000, true, Some(0), at);
+                runtime.note_prefill_ended_at(90_000, true, Some(0), at);
+            }
+            runtime.note_prefill_started_at(2_000, true, at);
+            runtime.note_prefill_ended_at(2_000, true, Some(0), at + 100);
+        }
+        assert_eq!(runtime.prefill_rate_tps(), 20_000);
+        let w: Arc<dyn Worker> = Arc::new(w);
+        let bound = prefill_side_bound_with(&w, 90_000, DEFAULT_WEDGE).unwrap();
+        assert_eq!(bound, Duration::from_secs(9), "twice the 4.5 s of prefill");
+        let dispatched = 11_100;
+        runtime.note_prefill_started_at(90_000, true, dispatched);
+        let judge = |waited: u64| {
+            let at = dispatched + waited;
+            let waited = Duration::from_millis(waited);
+            side_reprieve(
+                cold_shape_grace(&w, 0),
+                answered_or_handed_off(
+                    runtime.prefill_answered_ago_at(at),
+                    runtime.prefill_handed_off_ago_at(at),
+                    bound,
+                    waited,
+                ),
+                runtime.prefill_unanswered_run_at(at),
+                bound,
+                || backlog_bound(&w),
+                waited,
+            )
+        };
+        for waited in [3_000, 4_500, 6_000, 8_999] {
+            let standing = judge(waited);
+            assert!(
+                !matches!(standing, SideReprieve::Silent { .. }),
+                "{waited} ms into the prefill: {standing:?}"
+            );
+        }
+        assert_eq!(
+            judge(9_000),
+            SideReprieve::Silent {
+                silent: Some(Duration::from_secs(9)),
+                window: Duration::from_secs(9)
+            },
+            "frozen: given up on at twice its ETA"
         );
     }
 
@@ -2694,7 +2823,8 @@ mod tests {
     /// The first prompt on a worker is the longest it has seen as well;
     /// with nothing answered the gateway has no shape to go by and judges
     /// the worker as before, so an engine frozen from its first request is
-    /// caught at the threshold.
+    /// caught at the threshold, and a prefill side of the prompt at twice
+    /// its prefill time, not at the grace.
     #[test]
     fn a_worker_that_has_answered_nothing_gets_no_grace() {
         let w = worker();
@@ -2704,7 +2834,8 @@ mod tests {
         assert_eq!(wedge_bound(&w, DEFAULT_WEDGE), DEFAULT_WEDGE);
         assert_eq!(
             prefill_side_bound_with(&w, 8_192, DEFAULT_WEDGE),
-            Some(DEFAULT_WEDGE)
+            Some(Duration::from_millis(3_276)),
+            "no grace: twice the 1.6 s its prompt takes behind the pending one at the cold prior"
         );
         on_load_report_with(&w, 0, Some(DEFAULT_WEDGE), true, None, DEFAULT_WEDGE);
         assert_eq!(w.stall_reason(), Some(StallReason::Wedged));
