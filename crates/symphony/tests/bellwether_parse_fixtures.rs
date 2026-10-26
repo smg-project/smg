@@ -584,6 +584,11 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // thought; the model's `<|python_tag|>`, which the template never writes, is dropped.
     ("llama-3.2-1b-instruct", GenerationPrompt::Plain),
     ("llama-3.2-11b-vision-instruct", GenerationPrompt::Plain),
+    // Llama 3.1 8B/70B/405B Instruct and Llama 3.3 70B Instruct: one template, byte for byte the
+    // one the Nemotron Ultra CPT, UltraLong and Safety Guard rows above carry; bellwether has
+    // recorded neither slug yet, so each is skipped with the notice until the pin holds its sets.
+    ("llama-3.1-8b-instruct", GenerationPrompt::Plain),
+    ("llama-3.3-70b-instruct", GenerationPrompt::Plain),
     // FunctionGemma: Gemma's calls between `<start_function_call>` and `<end_function_call>`,
     // `<escape>` around a string and `None` for a null; the template has no thought.
     ("functiongemma-270m-it", GenerationPrompt::Plain),
@@ -849,6 +854,14 @@ const MEASURED_OPENERS: &[(&str, &str)] = &[
     ),
     (
         "llama-3.2-11b-vision-instruct",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "llama-3.1-8b-instruct",
+        "<|start_header_id|>assistant<|end_header_id|>",
+    ),
+    (
+        "llama-3.3-70b-instruct",
         "<|start_header_id|>assistant<|end_header_id|>",
     ),
     ("exaone-4.5-33b", "<|assistant|>"),

@@ -562,6 +562,10 @@ arguments, and never a list, content beside a call or a thought, since the templ
 the call token and the `;` between calls are what a served Llama 3.1 Instruct checkpoint writes,
 held verbatim in the table's unit tests, and the list and the wrapping after an object rest on the
 unit tests until a group writes them.
+Llama 3.1 8B/70B/405B Instruct and Llama 3.3 70B Instruct write it under their own ids too: their
+one template is, byte for byte, the one the Nemotron Ultra CPT, UltraLong 1M/2M/4M and Safety Guard
+8B v3 checkpoints carry, so those five recorded groups replay it already; bellwether has recorded
+none of the four, so their rows await fixtures.
 
 ## Llama 4 (`llama4`)
 

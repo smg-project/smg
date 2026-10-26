@@ -448,6 +448,24 @@ mod tests {
             table_for("nvidia/Llama-3_1-Nemotron-Ultra-253B-CPT-v1"),
             Some(Table::Json)
         );
+        // The Llama 3.1 and 3.3 Instruct checkpoints write that syntax under their own ids, the 3.3
+        // template byte for byte the 3.1 one: the json table, replayed from the Llama 3 header as
+        // the 3.2 rows are.
+        for llama in [
+            "meta-llama/Llama-3.1-8B-Instruct",
+            "meta-llama/Llama-3.1-70B-Instruct",
+            "meta-llama/Llama-3.1-405B-Instruct",
+            "meta-llama/Llama-3.3-70B-Instruct",
+            "llama-3.3-70b-instruct",
+        ] {
+            assert_eq!(table_for(llama), Some(Table::Json), "{llama}");
+            let format = for_model(llama).unwrap_or_else(|| panic!("{llama}"));
+            assert_eq!(
+                format.turn_opener(),
+                Some("<|start_header_id|>assistant<|end_header_id|>"),
+                "{llama}"
+            );
+        }
         assert_eq!(
             table_for("thinkingmachines/Inkling-NVFP4"),
             Some(Table::Inkling)
@@ -484,6 +502,10 @@ mod tests {
         for model in [
             "Qwen/QwQ-32B",
             "Qwen/Qwen3-8B-FP8",
+            // A base checkpoint without the Instruct template, and a repository's former name:
+            // neither is a name a group lists.
+            "meta-llama/Llama-3.1-8B",
+            "meta-llama/Meta-Llama-3.1-8B-Instruct",
             "Qwen",
             "Qwen/",
             "",

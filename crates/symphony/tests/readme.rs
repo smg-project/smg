@@ -1377,6 +1377,16 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
+        slug: "llama-3.1-8b-instruct",
+        model: "meta-llama/Llama-3.1-8B-Instruct",
+        also: &["Llama-3.1-70B-Instruct", "Llama-3.1-405B-Instruct"],
+        released: "2024-07-18",
+        smg: (Some("json"), None),
+        table: Some(Table::Json),
+        set: None,
+        status: Status::AwaitingFixtures,
+    },
+    Group {
         slug: "llama-3.1-nemotron-8b-ultralong-1m-instruct",
         model: "nvidia/Llama-3.1-Nemotron-8B-UltraLong-1M-Instruct",
         also: &[],
@@ -1465,6 +1475,16 @@ const GROUPS: &[Group] = &[
         table: Some(Table::Json),
         set: Some(458_185),
         status: Status::Replaying,
+    },
+    Group {
+        slug: "llama-3.3-70b-instruct",
+        model: "meta-llama/Llama-3.3-70B-Instruct",
+        also: &[],
+        released: "2024-11-26",
+        smg: (Some("json"), None),
+        table: Some(Table::Json),
+        set: None,
+        status: Status::AwaitingFixtures,
     },
     Group {
         slug: "llama-3.3-nemotron-70b-reward-principle",

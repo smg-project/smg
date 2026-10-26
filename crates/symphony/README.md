@@ -232,8 +232,8 @@ three: a table's own name (`qwen3`, `gemma4`), a row of `ALIASES`, or a row of `
 table and no alias: it stays on the Harmony pipeline, by the maintainers' decision of 2026-10-17.
 
 <!-- models: begin -->
-222 groups, 389 checkpoints, newest first.
-12 ready, 149 replaying a recorded set, 12 on main awaiting fixtures, 49 pending.
+224 groups, 393 checkpoints, newest first.
+12 ready, 149 replaying a recorded set, 14 on main awaiting fixtures, 49 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
@@ -453,9 +453,11 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2025-01-20 | [deepseek-r1-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-r1-bf16) | arcee-ai/DeepSeek-R1-bf16 |  | `deepseek_v3` | 3,110 | replaying the set | `pythonic`, `deepseek_r1` |
 | 2025-01-20 | [deepseek-r1-distill-llama-8b](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-r1-distill-llama-8b) | deepseek-ai/DeepSeek-R1-Distill-Llama-8B | DeepSeek-R1-Distill-Llama-70B | `deepseek_v3` | 94,830 | replaying the set | `pythonic`, `deepseek_r1` |
 | 2025-01-20 | [deepseek-r1-distill-qwen-1.5b](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-r1-distill-qwen-1.5b) | deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B | DeepSeek-R1-Distill-Qwen-7B, DeepSeek-R1-Distill-Qwen-14B, DeepSeek-R1-Distill-Qwen-32B | `deepseek_v3` | 94,830 | replaying the set | `pythonic`, `deepseek_r1` |
+| 2024-11-26 | [llama-3.3-70b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.3-70b-instruct) | meta-llama/Llama-3.3-70B-Instruct |  | `json` | — | awaiting fixtures | `json`, none |
 | 2024-09-18 | [llama-3.2-11b-vision-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.2-11b-vision-instruct) | meta-llama/Llama-3.2-11B-Vision-Instruct | Llama-3.2-90B-Vision-Instruct | `json` | 458,203 | replaying the set | `llama`, none |
 | 2024-09-18 | [llama-3.2-1b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.2-1b-instruct) | meta-llama/Llama-3.2-1B-Instruct | Llama-3.2-3B-Instruct | `json` | 458,185 | replaying the set | `llama`, none |
 | 2024-09-16 | [qwen2.5-0.5b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen2.5-0.5b-instruct) | Qwen/Qwen2.5-0.5B-Instruct | Qwen2.5-1.5B-Instruct, Qwen2.5-3B-Instruct, Qwen2.5-7B-Instruct, Qwen2.5-14B-Instruct, Qwen2.5-32B-Instruct, Qwen2.5-72B-Instruct, Qwen2.5-Coder-0.5B-Instruct, Qwen2.5-Coder-1.5B-Instruct, Qwen2.5-Coder-3B-Instruct, Qwen2.5-Coder-7B-Instruct, Qwen2.5-Coder-14B-Instruct, Qwen2.5-Coder-32B-Instruct | `qwen2.5` | 576,772 | replaying the set | `qwen`, `qwen3` |
+| 2024-07-18 | [llama-3.1-8b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.1-8b-instruct) | meta-llama/Llama-3.1-8B-Instruct | Llama-3.1-70B-Instruct, Llama-3.1-405B-Instruct | `json` | — | awaiting fixtures | `json`, none |
 | 2024-05-22 | [mistral-7b-instruct-v0.3](https://github.com/smg-project/bellwether/tree/main/fixtures/mistral-7b-instruct-v0.3) | mistralai/Mistral-7B-Instruct-v0.3 |  | `mistral` | — | awaiting fixtures | `mistral`, none |
 | 2023-12-30 | [tinyllama-1.1b-chat-v1.0](https://github.com/smg-project/bellwether/tree/main/fixtures/tinyllama-1.1b-chat-v1.0) | TinyLlama/TinyLlama-1.1B-Chat-v1.0 |  | `plain` | 27,865 | ready | `json`, none |
 | 2023-12-05 | [llava-1.5-7b-hf](https://github.com/smg-project/bellwether/tree/main/fixtures/llava-1.5-7b-hf) | llava-hf/llava-1.5-7b-hf |  | — | — | pending | none |
