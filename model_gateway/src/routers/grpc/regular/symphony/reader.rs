@@ -190,6 +190,7 @@ pub(crate) fn assign(
     #[cfg(feature = "diagnostic-capture")]
     let assigned = Assignment {
         recipe: Some(super::FormatRecipe {
+            selector_model: asks.model().into(),
             source: _source,
             no_calls: asks.no_calls(),
             no_reasoning: asks.no_reasoning(),

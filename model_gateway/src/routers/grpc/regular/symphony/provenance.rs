@@ -51,12 +51,15 @@ mod table_name {
 /// The resolved selector and request variants needed to rebuild an assigned Symphony format.
 ///
 /// This is only a format recipe. Its caller must bind it to the exact recorded SMG revision
-/// and model ID, and separately retain prompt/inputs, tools, call IDs and reader policies.
+/// and separately retain prompt/inputs, tools, call IDs and reader policies. The selector model
+/// is retained at assignment time; a canonical routing ID must never replace it. This does
+/// not authenticate the model string or bind it to a deployment or request.
 /// It neither attests capture completeness nor reproduces the decoder or API adapter.
 #[cfg(feature = "diagnostic-capture")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FormatRecipe {
+    pub(super) selector_model: std::sync::Arc<str>,
     pub(super) source: Source,
     pub(super) no_calls: bool,
     pub(super) no_reasoning: bool,
@@ -64,19 +67,21 @@ pub struct FormatRecipe {
 
 #[cfg(feature = "diagnostic-capture")]
 impl FormatRecipe {
-    /// Rebuild with the recorded model ID at the recorded source revision, on an offline path.
+    /// The original model string used to select the format, before canonical routing.
+    pub fn selector_model(&self) -> &str {
+        &self.selector_model
+    }
+
+    /// Rebuild using the bound selector model at the recorded source revision, offline.
     ///
     /// Registry selection preserves model-specific openers and text after reasoning. Named
     /// selection deliberately ignores the model's registry entry. Compiled templates need a
     /// fuller recipe and return `Unsupported`; an unknown registry model returns `InvalidData`.
-    pub fn resolve(
-        self,
-        recorded_model: &str,
-    ) -> std::io::Result<std::sync::Arc<symphony::Format>> {
+    pub fn resolve(&self) -> std::io::Result<std::sync::Arc<symphony::Format>> {
         let format = match self.source {
             Source::Named { table } => table.shared(),
             Source::Registry {} => {
-                symphony::formats::for_model_shared(recorded_model).ok_or_else(|| {
+                symphony::formats::for_model_shared(self.selector_model()).ok_or_else(|| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "recorded model has no Symphony table",
@@ -134,12 +139,13 @@ mod tests {
         assert_eq!(value["prompt"], assigned.prompt);
         let recipe: FormatRecipe = serde_json::from_value(value["recipe"].clone())
             .map_err(|error| format!("{}: deserialize: {error}", context()))?;
+        assert_eq!(recipe.selector_model(), model);
         assert_eq!(
             (recipe.no_calls, recipe.no_reasoning),
             (no_calls, no_reasoning)
         );
         let restored = recipe
-            .resolve(model)
+            .resolve()
             .map_err(|error| format!("{}: resolve {recipe:?}: {error}", context()))?;
         assert_eq!(*restored, *assigned.format, "{}", context());
         Ok(value["recipe"]["source"].clone())
@@ -208,14 +214,58 @@ mod tests {
     }
 
     #[test]
+    fn recipe_keeps_selector_after_request_drop_and_canonical_routing(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::routers::grpc::{context::DispatchMetadata, spec::ChatResponseSpec};
+
+        let original_model = "skt/A.X-3.1-Light";
+        let canonical_model = "Qwen/Qwen2.5-VL-72B-Instruct";
+        let request = request(json!({"model": original_model, "tools": tools()}));
+        let mut spec = ChatResponseSpec::from(&request);
+        spec.symphony = reader::assign(
+            ParserChoice::Symphony,
+            &names(None, None),
+            Asks::Chat(&request),
+            None,
+            "prefix<|im_start|><|assistant|>",
+            &templates(),
+        )?;
+        drop(request);
+        let dispatch = DispatchMetadata {
+            request_id: "format-binding-regression".to_owned(),
+            model: canonical_model.to_owned(),
+            created: 0,
+            weight_version: None,
+        };
+        let cloned = spec.clone();
+        let assigned = cloned.symphony.ok_or("missing assignment")?;
+        let recipe = assigned.recipe.as_ref().ok_or("missing recipe")?;
+        assert_eq!(recipe.selector_model(), original_model);
+        assert_ne!(recipe.selector_model(), dispatch.model);
+        assert!(Arc::ptr_eq(
+            &recipe.selector_model,
+            &spec.symphony.as_ref().ok_or("missing original assignment")?
+                .recipe.as_ref().ok_or("missing original recipe")?.selector_model,
+        ));
+        let stored = serde_json::to_vec(recipe)?;
+        let restored: FormatRecipe = serde_json::from_slice(&stored)?;
+        assert_eq!(*restored.resolve()?, *assigned.format);
+        let wrong = for_model_shared(&dispatch.model).ok_or("missing canonical fixture")?;
+        assert_eq!(wrong.name(), assigned.format.name());
+        assert_ne!(*wrong, *assigned.format);
+        Ok(())
+    }
+
+    #[test]
     fn unsupported_and_malformed_recipes_never_fall_back_to_a_named_table() {
         let registry = FormatRecipe {
+            selector_model: "unknown-model".into(),
             source: Source::Registry {},
             no_calls: false,
             no_reasoning: false,
         };
         assert_eq!(
-            registry.resolve("unknown-model").unwrap_err().kind(),
+            registry.resolve().unwrap_err().kind(),
             std::io::ErrorKind::InvalidData
         );
         let template = FormatRecipe {
@@ -225,7 +275,7 @@ mod tests {
         let restored: FormatRecipe =
             serde_json::from_str(&serde_json::to_string(&template).unwrap()).unwrap();
         assert_eq!(
-            restored.resolve("Qwen/Qwen3-8B").unwrap_err().kind(),
+            restored.resolve().unwrap_err().kind(),
             std::io::ErrorKind::Unsupported
         );
         let manual = assignment(Arc::new(Format::new("custom")), "model", "prompt");
@@ -233,12 +283,14 @@ mod tests {
         assert!(value["recipe"].is_null());
         assert!(serde_json::from_value::<FormatRecipe>(value["recipe"].clone()).is_err());
         for value in [
-            json!({"source": {"kind": "named", "table": "QWEN3"}, "no_calls": false, "no_reasoning": false}),
-            json!({"source": {"kind": "named", "table": "missing"}, "no_calls": false, "no_reasoning": false}),
-            json!({"source": {"kind": "registry", "extra": 1}, "no_calls": false, "no_reasoning": false}),
-            json!({"source": {"kind": "template", "extra": 1}, "no_calls": false, "no_reasoning": false}),
-            json!({"source": {"kind": "registry"}, "no_calls": false}),
-            json!({"source": {"kind": "registry"}, "no_calls": false, "no_reasoning": false, "extra": 1}),
+            json!({"source": {"kind": "registry"}, "no_calls": false, "no_reasoning": false}),
+            json!({"selector_model": null, "source": {"kind": "registry"}, "no_calls": false, "no_reasoning": false}),
+            json!({"selector_model": "Qwen/Qwen3-8B", "source": {"kind": "named", "table": "QWEN3"}, "no_calls": false, "no_reasoning": false}),
+            json!({"selector_model": "Qwen/Qwen3-8B", "source": {"kind": "named", "table": "missing"}, "no_calls": false, "no_reasoning": false}),
+            json!({"selector_model": "Qwen/Qwen3-8B", "source": {"kind": "registry", "extra": 1}, "no_calls": false, "no_reasoning": false}),
+            json!({"selector_model": "Qwen/Qwen3-8B", "source": {"kind": "template", "extra": 1}, "no_calls": false, "no_reasoning": false}),
+            json!({"selector_model": "Qwen/Qwen3-8B", "source": {"kind": "registry"}, "no_calls": false}),
+            json!({"selector_model": "Qwen/Qwen3-8B", "source": {"kind": "registry"}, "no_calls": false, "no_reasoning": false, "extra": 1}),
         ] {
             assert!(
                 serde_json::from_value::<FormatRecipe>(value.clone()).is_err(),

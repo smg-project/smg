@@ -58,7 +58,7 @@ async fn records(owner: SharedCapture) -> Vec<Value> {
         .map(|payload| serde_json::from_str(payload).unwrap())
         .collect();
     for (ordinal, record) in records.iter().enumerate() {
-        assert_eq!(record["schema"], "smg.symphony_reader.v1");
+        assert_eq!(record["schema"], "smg.symphony_reader.v2");
         assert_eq!(record["source"], 7);
         assert_eq!(record["choice"], 0);
         assert_eq!(record["ordinal"], ordinal);
@@ -144,6 +144,62 @@ async fn reader_capture_binds_nonce_prompt_tools_and_actual_policy_order() {
             let _: RecordedInput = serde_json::from_value(record["input"].clone()).unwrap();
         }
     }
+}
+
+#[tokio::test]
+async fn reader_capture_reconstructs_bound_selector_before_prompt() {
+    use crate::{
+        config::ParserChoice,
+        routers::grpc::regular::symphony::{testing, Asks},
+    };
+
+    let request = testing::request(json!({
+        "model": "skt/A.X-3.1-Light", "tools": tools()
+    }));
+    let assigned = assign(
+        ParserChoice::Symphony,
+        &testing::names(None, None),
+        Asks::Chat(&request),
+        None,
+        "prefix<|im_start|><|assistant|>",
+        &testing::templates(),
+    ).unwrap().unwrap();
+    drop(request);
+    let output = "<tool_call>{\"name\":\"lookup\",\"arguments\":{}}</tool_call>";
+    let (_root, owner, _pool) = capture(100_000, 1_000_000).await;
+    let mut events = Events::new();
+    let mut reader = observed(&assigned, &owner, &mut events).first_call_only(true);
+    let mut delta = Delta::default();
+    reader.tail(output.to_owned(), &mut delta, &mut events).unwrap();
+    reader.end(EngineFinish::Stop, who(), &mut events).unwrap();
+    reader.observe_chat_batch(0, &events);
+    let expected = serde_json::to_value(events.as_slice()).unwrap();
+    let message = serde_json::to_value(chat::message(0, events.as_slice())).unwrap();
+    assert_eq!(message["message"]["tool_calls"][0]["function"]["name"], "lookup");
+    drop(reader);
+    let records = records(owner).await;
+    assert_eq!(records[0]["kind"], "open");
+    assert_eq!(records[0]["recipe"]["selector_model"], "skt/A.X-3.1-Light");
+    assert_eq!(records[1]["kind"], "input");
+    assert_eq!(records[1]["input"]["kind"], "prompt");
+    let recipe: crate::diagnostic_capture::FormatRecipe =
+        serde_json::from_value(records[0]["recipe"].clone()).unwrap();
+    let replay_assignment = Assignment {
+        format: recipe.resolve().unwrap(),
+        prompt: records[1]["input"]["text"].as_str().unwrap().to_owned(),
+        recipe: Some(recipe),
+    };
+    let retained_tools: Vec<Tool> = serde_json::from_value(records[0]["tools"].clone()).unwrap();
+    let retained_ids = CallIds::from_nonce(records[0]["nonce"].as_str().unwrap()).unwrap();
+    let mut replay_events = Events::new();
+    let mut replay = Reader::with_call_ids(
+        &replay_assignment, retained_tools.into(), retained_ids, &mut replay_events,
+    ).unwrap().first_call_only(true);
+    let mut replay_delta = Delta::default();
+    replay.tail(output.to_owned(), &mut replay_delta, &mut replay_events).unwrap();
+    replay.end(EngineFinish::Stop, who(), &mut replay_events).unwrap();
+    assert_eq!(serde_json::to_value(replay_events.as_slice()).unwrap(), expected);
+    assert_eq!(serde_json::to_value(chat::message(0, replay_events.as_slice())).unwrap(), message);
 }
 
 #[tokio::test]

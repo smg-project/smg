@@ -150,7 +150,7 @@ impl Observation {
         // SharedCapture latches serialization/queue failures. The owner must check finish();
         // diagnostics must never replace inference output or its original error.
         let _ = self.capture.record(&Envelope {
-            schema: "smg.symphony_reader.v1",
+            schema: "smg.symphony_reader.v2",
             source: self.source,
             choice: self.choice,
             ordinal,
