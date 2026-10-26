@@ -6,6 +6,18 @@ import pytest
 from infra.constants import ConnectionMode
 from infra.worker import Worker
 
+
+@pytest.fixture(autouse=True)
+def _no_servicer_package(monkeypatch):
+    """Keep every command-builder test hermetic: whatever servicer package the
+    host can import, a lane that sets nothing reads no package default here, so
+    building a vLLM gRPC worker never reaches the real hook check. The one test
+    about the switch pins its own default."""
+    from infra import constants
+
+    monkeypatch.setattr(constants, "_package_servicer_switch", lambda: None)
+
+
 _VLLM_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 _TS_MODEL = "Qwen/Qwen3.5-9B"
 
