@@ -265,7 +265,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        test_support::create_test_image,
+        test_support::{assert_two_image_batch, create_test_image},
         vision::{preprocessor_config::PatchSize, processor::ModelSpecificValue},
     };
 
@@ -458,34 +458,7 @@ mod tests {
 
         let result = processor.preprocess(&images).unwrap();
 
-        // Both images processed
-        assert_eq!(result.item_sizes.len(), 2);
-        assert_eq!(result.feature_token_counts.len(), 2);
-
-        // encoder_input is 2D [total_patches, patch_features]
-        assert_eq!(result.encoder_input.ndim(), 2);
-
-        // Check grid_thw shape
-        if let Some(ModelSpecificValue::IntTensor { data, shape }) =
-            result.model_specific.get("image_grid_thw")
-        {
-            assert_eq!(shape, &[2, 3]); // 2 images, 3 values (T, H, W) each
-            assert_eq!(data.len(), 6);
-        } else {
-            panic!("Expected image_grid_thw to be IntTensor");
-        }
-
-        // Check patches_per_image
-        if let Some(ModelSpecificValue::IntTensor { data, shape }) =
-            result.model_specific.get("patches_per_image")
-        {
-            assert_eq!(shape, &[2]); // 2 images
-            assert_eq!(data.len(), 2);
-            let total: i64 = data.iter().sum();
-            assert_eq!(total as usize, result.encoder_input.shape()[0]);
-        } else {
-            panic!("Expected patches_per_image to be IntTensor");
-        }
+        assert_two_image_batch(&result);
     }
 
     #[test]

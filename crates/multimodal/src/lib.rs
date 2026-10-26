@@ -60,6 +60,8 @@ pub(crate) mod test_support {
     use image::{DynamicImage, Rgb, RgbImage};
     use rustls::crypto::ring;
 
+    use crate::vision::processor::{ModelSpecificValue, PreprocessedEncoderInputs};
+
     /// The HTTP client builder for the tests' media connectors. The library
     /// takes its client's builder from the caller; the tests make it here,
     /// with the process-level TLS crypto provider installed first (reqwest's
@@ -77,5 +79,32 @@ pub(crate) mod test_support {
     /// build their inputs with.
     pub(crate) fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
         DynamicImage::from(RgbImage::from_pixel(width, height, color))
+    }
+
+    /// The assertions the processors' two-image tests share: both images
+    /// present, a 2-D encoder input, a grid of two rows of (T, H, W) and a
+    /// per-image patch count that sums to the encoder input's rows.
+    pub(crate) fn assert_two_image_batch(result: &PreprocessedEncoderInputs) {
+        assert_eq!(result.item_sizes.len(), 2);
+        assert_eq!(result.feature_token_counts.len(), 2);
+        assert_eq!(result.encoder_input.ndim(), 2);
+        if let Some(ModelSpecificValue::IntTensor { data, shape }) =
+            result.model_specific.get("image_grid_thw")
+        {
+            assert_eq!(shape, &[2, 3]);
+            assert_eq!(data.len(), 6);
+        } else {
+            panic!("Expected image_grid_thw to be IntTensor");
+        }
+        if let Some(ModelSpecificValue::IntTensor { data, shape }) =
+            result.model_specific.get("patches_per_image")
+        {
+            assert_eq!(shape, &[2]);
+            assert_eq!(data.len(), 2);
+            let total: i64 = data.iter().sum();
+            assert_eq!(total as usize, result.encoder_input.shape()[0]);
+        } else {
+            panic!("Expected patches_per_image to be IntTensor");
+        }
     }
 }
