@@ -57,6 +57,18 @@ fn pending_tokenspeed_assembly_transfers_shm_ownership() {
     assert!(!path.exists());
 }
 
+/// A 1x1 inline image frame carrying `payload` under `hash`: the tests'
+/// image items differ in nothing else.
+fn inline_image(payload: &'static [u8], hash: &str) -> Arc<ImageFrame> {
+    Arc::new(ImageFrame::new(
+        image::DynamicImage::new_rgb8(1, 1),
+        bytes::Bytes::from_static(payload),
+        ImageDetail::Auto,
+        llm_multimodal::ImageSource::InlineBytes,
+        hash.to_string(),
+    ))
+}
+
 /// One image whose flat span is the whole encoder input: the tensor
 /// handed over by value moves into the item's payload, and the item is
 /// the same as the one written from a view of it.
@@ -82,13 +94,7 @@ fn single_image_intermediate() -> PrecomputedMultimodalIntermediate {
     };
     PrecomputedMultimodalIntermediate {
         preprocessed,
-        media: MediaBatch::Images(vec![Arc::new(ImageFrame::new(
-            image::DynamicImage::new_rgb8(1, 1),
-            bytes::Bytes::from_static(b"a"),
-            ImageDetail::Auto,
-            llm_multimodal::ImageSource::InlineBytes,
-            "hash-a".to_string(),
-        ))]),
+        media: MediaBatch::Images(vec![inline_image(b"a", "hash-a")]),
         bindings: vec![PromptBinding {
             item_index: 0,
             prompt_ordinal: 0,
@@ -241,22 +247,7 @@ fn two_image_intermediate() -> PrecomputedMultimodalIntermediate {
         model_specific,
     };
 
-    let images = vec![
-        Arc::new(ImageFrame::new(
-            image::DynamicImage::new_rgb8(1, 1),
-            bytes::Bytes::from_static(b"a"),
-            ImageDetail::Auto,
-            llm_multimodal::ImageSource::InlineBytes,
-            "hash-a".to_string(),
-        )),
-        Arc::new(ImageFrame::new(
-            image::DynamicImage::new_rgb8(1, 1),
-            bytes::Bytes::from_static(b"b"),
-            ImageDetail::Auto,
-            llm_multimodal::ImageSource::InlineBytes,
-            "hash-b".to_string(),
-        )),
-    ];
+    let images = vec![inline_image(b"a", "hash-a"), inline_image(b"b", "hash-b")];
 
     PrecomputedMultimodalIntermediate {
         preprocessed,
@@ -362,13 +353,7 @@ fn one_image_intermediate(
             item_sizes: vec![(1, 1)],
             model_specific,
         },
-        media: MediaBatch::Images(vec![Arc::new(ImageFrame::new(
-            image::DynamicImage::new_rgb8(1, 1),
-            bytes::Bytes::from_static(b"a"),
-            ImageDetail::Auto,
-            llm_multimodal::ImageSource::InlineBytes,
-            "hash-a".to_string(),
-        ))]),
+        media: MediaBatch::Images(vec![inline_image(b"a", "hash-a")]),
         bindings: vec![PromptBinding {
             item_index: 0,
             prompt_ordinal: 0,
@@ -477,22 +462,7 @@ fn assemble_tokenspeed_v41_layouts_stay_inline_when_shm_disabled() {
         model_specific,
     };
 
-    let images = vec![
-        Arc::new(ImageFrame::new(
-            image::DynamicImage::new_rgb8(1, 1),
-            bytes::Bytes::from_static(b"a"),
-            ImageDetail::Auto,
-            llm_multimodal::ImageSource::InlineBytes,
-            "hash-a".to_string(),
-        )),
-        Arc::new(ImageFrame::new(
-            image::DynamicImage::new_rgb8(1, 1),
-            bytes::Bytes::from_static(b"b"),
-            ImageDetail::Auto,
-            llm_multimodal::ImageSource::InlineBytes,
-            "hash-b".to_string(),
-        )),
-    ];
+    let images = vec![inline_image(b"a", "hash-a"), inline_image(b"b", "hash-b")];
 
     let intermediate = PrecomputedMultimodalIntermediate {
         preprocessed,
@@ -1055,13 +1025,7 @@ fn tokenspeed_epd_items_and_hashes_follow_prompt_binding_order() {
     };
     let image_batch = PrecomputedMultimodalIntermediate {
         preprocessed: one_item_inputs(),
-        media: MediaBatch::Images(vec![Arc::new(ImageFrame::new(
-            image::DynamicImage::new_rgb8(1, 1),
-            bytes::Bytes::from_static(b"image"),
-            ImageDetail::Auto,
-            llm_multimodal::ImageSource::InlineBytes,
-            "image-hash".to_string(),
-        ))]),
+        media: MediaBatch::Images(vec![inline_image(b"image", "image-hash")]),
         // Deliberately earlier by offset but later by explicit ordinal.
         bindings: vec![PromptBinding {
             item_index: 0,
