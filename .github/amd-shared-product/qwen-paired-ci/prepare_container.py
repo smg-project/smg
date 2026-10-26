@@ -8,6 +8,7 @@ from pathlib import Path
 import pwd
 import grp
 import subprocess
+import sysconfig
 import time
 
 
@@ -100,6 +101,35 @@ def main():
             path = source / item["source_relative"] if "source_relative" in item else Path(item["path"])
             assert path.is_file() and not path.is_symlink() and sha(path) == item["sha256"]
             result["installed_source_files"].append({"path": str(path), "sha256": sha(path)})
+        hf_dist = distribution("huggingface-hub")
+        purelib = Path(sysconfig.get_path("purelib")).resolve()
+        assert purelib.is_relative_to(Path("/opt/venv"))
+        hf_paths = {
+            "huggingface_hub/__init__.py": "source",
+            "huggingface_hub/constants.py": "source",
+            "huggingface_hub/utils/_auth.py": "source",
+            "huggingface_hub/utils/_headers.py": "source",
+        }
+        for name in ("METADATA", "RECORD"):
+            matches = [entry for entry in hf_dist.files or ()
+                       if len(entry.parts) == 2 and entry.parts[0].endswith(".dist-info")
+                       and entry.name == name]
+            assert len(matches) == 1
+            hf_paths[str(matches[0])] = "distribution"
+        hf_identity = {"distribution": "huggingface-hub", "version": hf_dist.version,
+                       "purelib": str(purelib), "files": [],
+                       "scope": "after-normal-preparation package identity capture only"}
+        for relative, kind in hf_paths.items():
+            path = Path(hf_dist.locate_file(relative))
+            assert path.is_file() and not path.is_symlink()
+            path = path.resolve()
+            assert path.is_relative_to(purelib)
+            hf_identity["files"].append({"kind": kind, "path": str(path),
+                                         "bytes": path.stat().st_size, "sha256": sha(path)})
+        hf_identity_path = out / "prepared-huggingface-hub-identity.json"
+        hf_identity_path.write_text(json.dumps(hf_identity, indent=2) + "\n")
+        result["prepared_huggingface_hub_identity"] = {
+            "path": str(hf_identity_path), "sha256": sha(hf_identity_path)}
         result["actual_success"] = True
     except BaseException as error:
         result["error"] = {"type": type(error).__name__, "message": str(error)[:2000]}
