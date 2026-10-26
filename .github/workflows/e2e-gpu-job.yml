@@ -114,6 +114,11 @@ on:
         required: false
         type: string
         default: ""
+      amd_vllm_normal_base:
+        description: "Use separately admitted fixed-f103 CDF/e006 normal BASE setup; default off"
+        required: false
+        type: boolean
+        default: false
       gpu_vendor:
         description: "GPU vendor of the runner: nvidia, or amd for a lane that runs in an engine's ROCm image"
         required: false
@@ -198,7 +203,7 @@ jobs:
         uses: ./.github/actions/setup-vllm
 
       - name: Setup vLLM backend (in vLLM's ROCm image)
-        if: inputs.engine == 'vllm' && inputs.gpu_vendor == 'amd'
+        if: inputs.engine == 'vllm' && inputs.gpu_vendor == 'amd' && !inputs.amd_vllm_normal_base
         run: bash scripts/ci_setup_vllm_rocm_image.sh
 
       - name: Setup TRT-LLM backend
@@ -215,6 +220,17 @@ jobs:
           wasm-fixtures: 'true'
           client-types: 'true'
 
+      - name: Normal BASE fixed-f103 vLLM setup and provenance
+        if: inputs.amd_vllm_normal_base
+        shell: bash
+        run: |
+          test "${{ inputs.engine }}" = vllm
+          test "${{ inputs.gpu_vendor }}" = amd
+          mkdir -p normal-base-proof
+          /usr/bin/python3 -I -B scripts/amd_vllm_normal_base/setup_normal_base.py \
+            --source "$GITHUB_WORKSPACE" --output "$GITHUB_WORKSPACE/normal-base-proof" \
+            --admission "$GITHUB_WORKSPACE/.github/amd-shared-product/inputs.json"
+
       # Agentic service dependencies (Oracle DB, Brave MCP)
       - name: Check shared services
         if: inputs.setup_agentic_deps
@@ -222,6 +238,7 @@ jobs:
 
       # Install
       - name: Install wheel and test dependencies
+        if: ${{ !inputs.amd_vllm_normal_base }}
         run: |
           pip uninstall -y smg || true
           pip install wheel/*.whl
@@ -386,6 +403,15 @@ jobs:
           path: e2e-logs/
           retention-days: 7
           if-no-files-found: ignore
+
+      - name: Preserve normal BASE provenance
+        if: always() && inputs.amd_vllm_normal_base
+        uses: actions/upload-artifact@v7
+        with:
+          name: vllm-fixed-f103-normal-base-proof
+          path: normal-base-proof/
+          if-no-files-found: error
+          retention-days: 7
 
       # Whatever the job started and did not stop ends here, found by the
       # marker in its environment: an engine or gateway that outlived a

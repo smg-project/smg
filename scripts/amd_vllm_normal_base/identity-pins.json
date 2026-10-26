@@ -1,0 +1,203 @@
+{
+  "PREVIEW_ONLY": true,
+  "source_base": "f1038e99610647fa35a7e479e41f4dbc1821e481",
+  "producer": {
+    "head": "69215ef26afdaf1bdf7b61b4dfd635db906e1eeb",
+    "run_id": 40312852744,
+    "job_id": 121538063467,
+    "run_attempt": 1,
+    "terminal_acceptance": {
+      "bytes": 1933,
+      "sha256": "4016c38922c3890cbb70b9d7a0ed4c66d9b6645ef3650b051d544253037a070a",
+      "scope": "ActualCPU18 terminal/resourcefacts only, no normal/ABI/RPC/GPU acceptance",
+      "actual_18_steps": {
+        "bytes": 5744,
+        "sha256": "6c4a03663c56dc470646e3a9980d3dc69f6dc8e4ca2b506edbe43000c132d308"
+      },
+      "actual_terminal_run": {
+        "bytes": 13778,
+        "sha256": "839c0e1c0f9d8f518847d1dd1a0383823c81d8192e27199637258bf5e2ebe780"
+      },
+      "resource_settlement": {
+        "bytes": 2349,
+        "sha256": "7bf49728134d524ec895b7a06c73563ed4da5002438638f00732b26ed4a4eb98"
+      },
+      "actual_step_names": [
+        "Set up job",
+        "Run actions/checkout@v7",
+        "Verify frozen build source",
+        "Setup Rust",
+        "Build Python wheel and Go FFI library",
+        "Generate Python client types",
+        "Build WASM test fixtures",
+        "Upload wheel artifact",
+        "Upload Go FFI library artifact",
+        "Upload Python client types",
+        "Upload WASM test fixtures",
+        "Show sccache stats",
+        "Set up Python",
+        "Test wheel install",
+        "Post Set up Python",
+        "Post Setup Rust",
+        "Post Run actions/checkout@v7",
+        "Complete job"
+      ]
+    },
+    "artifact_integrity_peer": {
+      "bytes": 19765,
+      "sha256": "671ca4d9b395dbf306cdc8f0885b4200c5c95cc3c28bf74ba2c53da2e4b24561",
+      "result": "PASS_ACTUAL_FIXED_F103_CPU18_TERMINAL_FOUR_ARTIFACT_INTEGRITY_AND_CPU_RESOURCE_CLOSURE_ONLY",
+      "scope": "Actualfourarchives/sixpayloads/17memberwheel16hashRECORD/producer-source-integrity and separate resourceclosure only; no installation/ABI/RPC/Go/GPU acceptance",
+      "root_canonical_integrity_acceptance": {
+        "bytes": 2551,
+        "sha256": "97cc1309c64e497dbd2d1b017cc99fe429612ef4fcf3e23636466de88e75edaa"
+      }
+    }
+  },
+  "installation_source": {
+    "head": "f949bd37c2062bfcf312e07008dcb00089b31e3b",
+    "tar_sha256": "d985b53b3f8a6a5d3160ad624f3fbcea4d3cd5e12aa89a32b4d8729f60bde730",
+    "tar_bytes": 52234240,
+    "source_manifest_sha256": "b95e889416620a6146f263623d2bb463dadf7ace3dad8e5b807e2a8c9b9230f7",
+    "compiled37_identity_receipt": {
+      "bytes": 7945,
+      "sha256": "82005f210c082698a9e158e08bc2adc3659a87df5206483ea6775871444b62b6",
+      "scope": "Sourceobjectequality only, no native/ABI/runtime acceptance"
+    },
+    "consumer19_identity_receipt": {
+      "bytes": 7945,
+      "sha256": "82005f210c082698a9e158e08bc2adc3659a87df5206483ea6775871444b62b6",
+      "scope": "Actualf949 installation consumer19 distinct from producer69215"
+    },
+    "meaning": "f949 baseline RPC/source-byte basis, not the future actual checkout; source.verify binds actual product19 and compiled37 separately"
+  },
+  "archives": [
+    {
+      "name": "wasm-test-fixtures",
+      "artifact_id": 12648205603,
+      "bytes": 56596,
+      "sha256": "0a368f243c0d9f3eab1e33857dcbe346aab5837d6c75425a63424ded4d974261",
+      "API_digest": "sha256:0a368f243c0d9f3eab1e33857dcbe346aab5837d6c75425a63424ded4d974261",
+      "created_at": "2026-10-26T11:52:31Z",
+      "updated_at": "2026-10-26T11:52:31Z",
+      "expires_at": "2026-10-27T11:52:31Z",
+      "workflow_run": {
+        "id": 40312852744,
+        "repository_id": 1101714630,
+        "head_repository_id": 1101714630,
+        "head_branch": "ci/amd-main-f103-native-preparation-20261026",
+        "head_sha": "69215ef26afdaf1bdf7b61b4dfd635db906e1eeb"
+      }
+    },
+    {
+      "name": "smg-wheel",
+      "artifact_id": 12648055973,
+      "bytes": 52840514,
+      "sha256": "5b48e2fcd6b89e5647b240e462f08ddd29b6b80ba1f26a2e3d2ee4f91a877765",
+      "API_digest": "sha256:5b48e2fcd6b89e5647b240e462f08ddd29b6b80ba1f26a2e3d2ee4f91a877765",
+      "created_at": "2026-10-26T11:52:27Z",
+      "updated_at": "2026-10-26T11:52:27Z",
+      "expires_at": "2026-10-27T11:52:25Z",
+      "workflow_run": {
+        "id": 40312852744,
+        "repository_id": 1101714630,
+        "head_repository_id": 1101714630,
+        "head_branch": "ci/amd-main-f103-native-preparation-20261026",
+        "head_sha": "69215ef26afdaf1bdf7b61b4dfd635db906e1eeb"
+      }
+    },
+    {
+      "name": "python-client-types",
+      "artifact_id": 12647686820,
+      "bytes": 34700,
+      "sha256": "17f6dedaccdc1954afd04d59103f5feb08f8d987c2ce45a5145ebd8b0f375b6e",
+      "API_digest": "sha256:17f6dedaccdc1954afd04d59103f5feb08f8d987c2ce45a5145ebd8b0f375b6e",
+      "created_at": "2026-10-26T11:52:30Z",
+      "updated_at": "2026-10-26T11:52:30Z",
+      "expires_at": "2026-10-27T11:52:30Z",
+      "workflow_run": {
+        "id": 40312852744,
+        "repository_id": 1101714630,
+        "head_repository_id": 1101714630,
+        "head_branch": "ci/amd-main-f103-native-preparation-20261026",
+        "head_sha": "69215ef26afdaf1bdf7b61b4dfd635db906e1eeb"
+      }
+    },
+    {
+      "name": "go-ffi-library",
+      "artifact_id": 12646854498,
+      "bytes": 13852968,
+      "sha256": "47c4eefbcec6643dd86a4cba0aa77b8abfb1068a2dabce78c6cdc8068585efd4",
+      "API_digest": "sha256:47c4eefbcec6643dd86a4cba0aa77b8abfb1068a2dabce78c6cdc8068585efd4",
+      "created_at": "2026-10-26T11:52:29Z",
+      "updated_at": "2026-10-26T11:52:29Z",
+      "expires_at": "2026-10-27T11:52:28Z",
+      "workflow_run": {
+        "id": 40312852744,
+        "repository_id": 1101714630,
+        "head_repository_id": 1101714630,
+        "head_branch": "ci/amd-main-f103-native-preparation-20261026",
+        "head_sha": "69215ef26afdaf1bdf7b61b4dfd635db906e1eeb"
+      }
+    }
+  ],
+  "payloads": [
+    {
+      "role": "wasm_guest",
+      "archive_name": "wasm-test-fixtures",
+      "member": "storage_hook_guest.wasm",
+      "bytes": 80680,
+      "sha256": "7e3a093e09bfe30244d128c1aaaf8558a1b13c05558cc81cff04021947445e11"
+    },
+    {
+      "role": "wasm_passthrough",
+      "archive_name": "wasm-test-fixtures",
+      "member": "storage_hook_passthrough.wasm",
+      "bytes": 79153,
+      "sha256": "3a10ce115ea179026a00f3e85ce6b6a388bcc1f274bc7abfc074be876d7c3e55"
+    },
+    {
+      "role": "smg_wheel",
+      "archive_name": "smg-wheel",
+      "member": "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl",
+      "bytes": 52978564,
+      "sha256": "0a3299e78a0ddb6839b67935f9bbd01459eabb198fae0c285aa0cf5880c50065"
+    },
+    {
+      "role": "client_types",
+      "archive_name": "python-client-types",
+      "member": "_generated.py",
+      "bytes": 188140,
+      "sha256": "44f1b72574fe1de78307cd059cb3fa531b5126a28cd0f93cb690dbc585be8aec"
+    },
+    {
+      "role": "go_ffi_depfile",
+      "archive_name": "go-ffi-library",
+      "member": "libsmg_go.d",
+      "bytes": 65464,
+      "sha256": "9cc3f3b3a255a3f2dd8bf2093d4b0cbc7e37b4e073396d5f3ef6f9688ccbd4c0"
+    },
+    {
+      "role": "go_ffi_so",
+      "archive_name": "go-ffi-library",
+      "member": "libsmg_go.so",
+      "bytes": 35051064,
+      "sha256": "6cb8c0d7009a48a07b09b3c8cc321d6a8d26145c9a3258f5e99587c8ce8f2fde"
+    }
+  ],
+  "installed_native": {
+    "sha256": "2d743d6469f64da95a84a3cea16681f5f547ff1f0976829da3666daa44e1e729",
+    "bytes": 143968336,
+    "wheel_member": "smg/smg_rs.abi3.so",
+    "prefix": "/usr"
+  },
+  "normal_postflight_inputs_sha256": "c811bad4eb25a0c4cbbc8067b2e21a428b8e115e622d588e3af5dec7459ce315",
+  "RPC_source_manifest_sha256": null,
+  "normal_install_result": null,
+  "native_identity_result": null,
+  "NEW_CPU_seconds_reserved": 0,
+  "resource_granted": false,
+  "executed": false,
+  "GPU_accepted": false,
+  "actual_baked_version_metadata": null
+}

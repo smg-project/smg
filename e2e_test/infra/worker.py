@@ -630,6 +630,11 @@ class Worker:
         extra = spec.get("vllm_args", [])
         if extra:
             cmd.extend(extra)
+        all_args = [*extra, *(self.extra_engine_args or [])]
+        if not any(
+            arg.split("=", 1)[0].replace("_", "-") == "--served-model-name" for arg in all_args
+        ):
+            cmd.extend(["--served-model-name", model_path])
         return cmd
 
     def _moriio_extra_config(self, tp_size: int) -> dict:
