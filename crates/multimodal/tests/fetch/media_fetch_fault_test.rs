@@ -5,7 +5,12 @@
 //! a fetch that runs out of its budget.
 #![allow(clippy::expect_used)]
 
-use std::{io::Write, net::TcpListener, thread, time::Duration};
+use std::{
+    io::{ErrorKind, Write},
+    net::{TcpListener, TcpStream},
+    thread,
+    time::Duration,
+};
 
 use llm_multimodal::{
     ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaFault, MediaSource,
@@ -86,12 +91,25 @@ async fn a_host_that_cannot_be_resolved_is_the_requests_fault() {
 
 #[tokio::test]
 async fn a_host_that_refuses_the_connection_is_the_requests_fault() {
-    let port = {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        listener.local_addr().expect("local addr").port()
-    };
-    let (fault, message) = fault_of(format!("http://127.0.0.1:{port}/picture.png"), BUDGET).await;
+    let refused = common::RefusedAddress::reserve();
+    let (fault, message) = fault_of(
+        format!("http://127.0.0.1:{}/picture.png", refused.port()),
+        BUDGET,
+    )
+    .await;
     assert_eq!(fault, MediaFault::Client, "{message}");
+}
+
+/// The refused-connection case's address: refused at once, and held, so no
+/// other test's one-shot server can take the port while the case runs.
+#[test]
+fn the_refused_address_refuses_connections_and_keeps_its_port() {
+    let refused = common::RefusedAddress::reserve();
+    let error = TcpStream::connect(refused.addr()).expect_err("nothing answers there");
+    assert_eq!(error.kind(), ErrorKind::ConnectionRefused, "{error}");
+    let taken = TcpListener::bind(refused.addr()).expect_err("the port is held");
+    assert_eq!(taken.kind(), ErrorKind::AddrInUse, "{taken}");
+    assert_eq!(refused.addr().port(), refused.port());
 }
 
 #[tokio::test]

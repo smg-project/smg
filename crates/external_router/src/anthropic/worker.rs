@@ -329,7 +329,9 @@ mod tests {
     use metrics_exporter_prometheus::PrometheusBuilder;
 
     use super::{probe::counted_failure, *};
-    use crate::test_support::{StubWorker, CREDENTIALED_WORKER_URL, MASKED_WORKER_URL};
+    use crate::test_support::{
+        RefusedAddress, StubWorker, CREDENTIALED_WORKER_URL, MASKED_WORKER_URL,
+    };
 
     const UPSTREAM_REFUSAL: &str = r#"{"error":{"message":"Rate limit reached for model in organization org-abc123 project proj_xyz789","type":"rate_limit","code":"rate_limit_exceeded"}}"#;
 
@@ -454,14 +456,8 @@ mod tests {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let _guard = metrics::set_default_local_recorder(&recorder);
-        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("a port");
-        let url = format!(
-            "http://{}/v1/messages",
-            closed.local_addr().expect("an address")
-        );
-        drop(closed);
+        let refused = RefusedAddress::reserve();
+        let url = format!("http://{}/v1/messages", refused.addr());
 
         let answer = send_request(
             &client_with_timeout(Duration::from_secs(5)),
