@@ -1,15 +1,22 @@
-name: AMD SGLang complete original ZMQ validation
+name: AMD SGLang complete original four-GPU PD validation
 on:
   workflow_dispatch:
     inputs:
       execute:
         type: boolean
         default: false
+      allocation_phase_diagnostic:
+        type: boolean
+        default: false
+      cu_existing_runtime:
+        description: Use initialized current-device HIP CU property (default off; prefill OOM unresolved)
+        type: boolean
+        default: false
 permissions:
   contents: read
   actions: read
 concurrency:
-  group: amd-sglang-zmq-original223
+  group: amd-sglang-pd4-original
   cancel-in-progress: false
 jobs:
   artifact-relay:
@@ -22,23 +29,24 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Require one separately admitted complete SGLang ZMQ row
+      - name: Require one separately admitted complete SGLang four-GPU PD row
         shell: bash
         run: |
           python3 - <<'PYTHON'
           import json
           from pathlib import Path
           data = json.loads(Path(".github/amd-shared-product/inputs.json").read_text())
-          assert data["admitted_lane"] == "sglang-zmq-full223"
+          assert data["admitted_lane"] == "sglang-pd4-full-original"
           assert data["runtime_cohort_accepted"] is True
           assert all(data[key] is True for key in ("ready", "run_budget_admitted", "artifacts_pinned"))
           recipe = data["recipe"]
-          assert recipe["test_dirs"] == "e2e_test/chat_completions" and recipe["test_filter"] == ""
-          assert recipe["engine"] == "sglang" and recipe["gpu_tier"] == "1"
-          assert recipe["connection_mode"] == "zmq" and recipe["min_selected"] == 204
-          assert recipe["servicer_unit_tests"] is True and recipe["unit_test_dirs"] == "grpc_servicer/tests"
-          assert recipe["reference_selected"] == 223 and len(recipe["models"]) == 8
-          assert recipe["job_minutes"] == 60 and recipe["pytest_minutes"] == 48
+          assert recipe["test_dirs"] == "e2e_test/router/test_pd_topologies.py"
+          assert recipe["test_filter"] == '-k "(2p2d and not http) or AssembledAtRuntime or SmallWindow or MismatchedTransport or MismatchedProtocol"'
+          assert recipe["engine"] == "sglang" and recipe["gpu_tier"] == "4"
+          assert recipe["connection_mode"] == "" and recipe["kv_backend"] == ""
+          assert recipe["min_selected"] == 14 and recipe["servicer_unit_tests"] is False
+          assert recipe["models"] == ["meta-llama/Llama-3.1-8B-Instruct"] and recipe["tp"] == 1
+          assert recipe["job_minutes"] == 50 and recipe["pytest_minutes"] == 42
           assert recipe["reruns"] == 2 and recipe["reruns_delay"] == 5
           assert recipe["setup_agentic_deps"] is False and recipe["same_original_tests_and_oracles"] is True
           PYTHON
@@ -90,33 +98,37 @@ jobs:
           path: ${{ steps.relay.outputs.directory }}/evidence/
           if-no-files-found: ignore
           retention-days: 7
-  amd-sglang-zmq:
+  amd-sglang-pd4:
     needs: artifact-relay
     if: inputs.execute && needs.artifact-relay.result == 'success'
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: sglang
-      gpu_tier: "1"
-      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
-      timeout: 60
-      test_timeout: 48
-      test_dirs: e2e_test/chat_completions
-      connection_mode: zmq
-      min_selected: 204
-      servicer_unit_tests: true
+      gpu_tier: "4"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_4 || '4-gpu-mi300x' }}
+      timeout: 50
+      test_timeout: 42
+      test_dirs: e2e_test/router/test_pd_topologies.py
+      test_filter: '-k "(2p2d and not http) or AssembledAtRuntime or SmallWindow or MismatchedTransport or MismatchedProtocol"'
+      connection_mode: ''
+      kv_backend: ''
+      vllm_kv_backend: nixl
+      min_selected: 14
+      servicer_unit_tests: false
+      setup_agentic_deps: false
       gpu_vendor: amd
       container_image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
-      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --ulimit memlock=-1:-1 --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }} --env SPT_NOENV=1 --env SGLANG_GPT_OSS_MXFP4_BF16=1 --env PYTHONDONTWRITEBYTECODE=1
+      container_options: --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband --ulimit memlock=-1:-1 --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN --env SPT_NOENV=1 --env SGLANG_GPT_OSS_MXFP4_BF16=1 --env PYTHONDONTWRITEBYTECODE=1 --env SMG_SG4_PD_ALLOCATION_PHASE_DIAGNOSTIC=${{ inputs.allocation_phase_diagnostic && '1' || '0' }} --env SMG_SG4_PD_CU_EXISTING_RUNTIME=${{ inputs.cu_existing_runtime && '1' || '0' }}
     secrets: inherit
 
   finish:
     if: always() && inputs.execute
-    needs: [artifact-relay, amd-sglang-zmq]
+    needs: [artifact-relay, amd-sglang-pd4]
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     timeout-minutes: 3
     steps:
-      - name: Require the relay and complete SGLang ZMQ row to succeed
+      - name: Require the relay and complete SGLang four-GPU PD row to succeed
         env:
           RELAY: ${{ needs.artifact-relay.result }}
-          SG: ${{ needs.amd-sglang-zmq.result }}
+          SG: ${{ needs.amd-sglang-pd4.result }}
         run: test "$RELAY" = success && test "$SG" = success
