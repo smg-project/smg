@@ -83,7 +83,7 @@ tracing-subscriber.workspace = true
 axum = { workspace = true, features = ["macros", "multipart", "ws", "tracing"] }
 bytemuck = { workspace = true, features = ["derive"] }
 reqwest = { workspace = true, features = ["stream", "blocking", "json", "rustls-no-provider", "multipart", "http2"] }
-serde = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive", "rc"] }
 tokio = { workspace = true, features = ["full"] }
 tokio-util.workspace = true
 uuid = { workspace = true, features = ["serde", "fast-rng"] }

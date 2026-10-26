@@ -150,7 +150,7 @@ async fn reader_capture_binds_nonce_prompt_tools_and_actual_policy_order() {
 async fn reader_capture_reconstructs_bound_selector_before_prompt() {
     use crate::{
         config::ParserChoice,
-        routers::grpc::regular::symphony::{testing, Asks},
+        routers::grpc::regular::symphony::{assign, testing, Asks},
     };
 
     let request = testing::request(json!({
@@ -189,7 +189,7 @@ async fn reader_capture_reconstructs_bound_selector_before_prompt() {
     assert_eq!(records[0]["recipe"]["selector_model"], "skt/A.X-3.1-Light");
     assert_eq!(records[1]["kind"], "input");
     assert_eq!(records[1]["input"]["kind"], "prompt");
-    let recipe: crate::diagnostic_capture::FormatRecipe =
+    let recipe: FormatRecipe =
         serde_json::from_value(records[0]["recipe"].clone()).unwrap();
     let replay_assignment = Assignment {
         format: recipe.resolve().unwrap(),

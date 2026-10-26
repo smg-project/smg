@@ -213,9 +213,9 @@ mod tests {
     }
 
     #[test]
-    fn recipe_keeps_selector_after_request_drop_and_canonical_routing(
+    fn recipe_keeps_selector_after_request_drop_and_spec_clone(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use crate::routers::grpc::{context::DispatchMetadata, spec::ChatResponseSpec};
+        use crate::routers::grpc::spec::ChatResponseSpec;
 
         let original_model = "skt/A.X-3.1-Light";
         let canonical_model = "Qwen/Qwen2.5-VL-72B-Instruct";
@@ -230,17 +230,10 @@ mod tests {
             &templates(),
         )?;
         drop(request);
-        let dispatch = DispatchMetadata {
-            request_id: "format-binding-regression".to_owned(),
-            model: canonical_model.to_owned(),
-            created: 0,
-            weight_version: None,
-        };
         let cloned = spec.clone();
         let assigned = cloned.symphony.ok_or("missing assignment")?;
         let recipe = assigned.recipe.as_ref().ok_or("missing recipe")?;
         assert_eq!(recipe.selector_model(), original_model);
-        assert_ne!(recipe.selector_model(), dispatch.model);
         assert!(Arc::ptr_eq(
             &recipe.selector_model,
             &spec
@@ -255,7 +248,7 @@ mod tests {
         let stored = serde_json::to_vec(recipe)?;
         let restored: FormatRecipe = serde_json::from_slice(&stored)?;
         assert_eq!(*restored.resolve()?, *assigned.format);
-        let wrong = for_model_shared(&dispatch.model).ok_or("missing canonical fixture")?;
+        let wrong = for_model_shared(canonical_model).ok_or("missing canonical fixture")?;
         assert_eq!(wrong.name(), assigned.format.name());
         assert_ne!(*wrong, *assigned.format);
         Ok(())

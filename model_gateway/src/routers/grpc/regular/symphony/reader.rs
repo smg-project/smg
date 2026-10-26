@@ -2500,7 +2500,7 @@ mod tests {
             assigned
                 .recipe
                 .unwrap()
-                .resolve(&kept.model)
+                .resolve()
                 .unwrap_err()
                 .kind(),
             std::io::ErrorKind::Unsupported
