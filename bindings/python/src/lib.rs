@@ -614,6 +614,7 @@ struct Router {
     service_discovery_namespace: Option<String>,
     service_discovery_port: u16,
     shutdown_grace_period_secs: u64,
+    shutdown_settle_secs: Option<u64>,
     sse_keepalive_secs: u64,
     storage_context_headers: HashMap<String, String>,
     storage_hook_wasm_path: Option<String>,
@@ -1487,6 +1488,7 @@ impl Router {
         service_discovery_namespace = None,
         service_discovery_port = 80,
         shutdown_grace_period_secs = 180,
+        shutdown_settle_secs = None,
         sse_keepalive_secs = 15,
         storage_context_headers = HashMap::new(),
         storage_hook_wasm_path = None,
@@ -1707,6 +1709,7 @@ impl Router {
         service_discovery_namespace: Option<String>,
         service_discovery_port: u16,
         shutdown_grace_period_secs: u64,
+        shutdown_settle_secs: Option<u64>,
         sse_keepalive_secs: u64,
         storage_context_headers: HashMap<String, String>,
         storage_hook_wasm_path: Option<String>,
@@ -1963,6 +1966,7 @@ impl Router {
             service_discovery_namespace,
             service_discovery_port,
             shutdown_grace_period_secs,
+            shutdown_settle_secs,
             sse_keepalive_secs,
             storage_context_headers,
             storage_hook_wasm_path,
@@ -2005,6 +2009,7 @@ impl Router {
         })
     }
 
+    /// Run the gateway with the configured propagation window and shared shutdown deadline.
     fn start(&self, py: Python<'_>) -> PyResult<()> {
         use observability::metrics::PrometheusConfig;
 
@@ -2083,6 +2088,7 @@ impl Router {
                 request_timeout_secs: self.request_timeout_secs,
                 request_id_headers: self.request_id_headers.clone(),
                 shutdown_grace_period_secs: self.shutdown_grace_period_secs,
+                shutdown_settle_secs: self.shutdown_settle_secs,
                 control_plane_auth: self
                     .control_plane_auth
                     .as_ref()

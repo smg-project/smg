@@ -1184,6 +1184,11 @@ struct ServingArgs {
     #[arg(long, default_value_t = 180, help_heading = "Request Handling")]
     shutdown_grace_period_secs: u64,
 
+    /// Keep accepting connections after readiness fails. Defaults to half the grace
+    /// period; configured seconds are capped at half the grace period.
+    #[arg(long, help_heading = "Request Handling")]
+    shutdown_settle_secs: Option<u64>,
+
     /// Maximum payload size in bytes
     #[arg(long, default_value_t = 536870912, help_heading = "Request Handling")]
     max_payload_size: usize,
@@ -3130,6 +3135,7 @@ impl CliArgs {
                 Some(self.serving.request_id_headers.clone())
             },
             shutdown_grace_period_secs: self.serving.shutdown_grace_period_secs,
+            shutdown_settle_secs: self.serving.shutdown_settle_secs,
             control_plane_auth,
             mesh_server_config,
             webrtc_bind_addr: self.integrations.webrtc_bind_addr,

@@ -1016,6 +1016,8 @@ pub struct ServerConfig {
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
     pub shutdown_grace_period_secs: u64,
+    /// Listener propagation window; defaults to half the shutdown grace period.
+    pub shutdown_settle_secs: Option<u64>,
     /// Control plane authentication configuration
     pub control_plane_auth: Option<smg_auth::ControlPlaneAuthConfig>,
     pub mesh_server_config: Option<MeshServerConfig>,
@@ -2040,6 +2042,7 @@ fn serve_listeners(
     Ok((data_serving, admin_serving))
 }
 
+/// Start the gateway listeners and drain them within the configured shutdown budget.
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     crate::clients::install_crypto_provider();
 
@@ -2482,7 +2485,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let admin_handle_clone = admin_handle.clone();
     let admin_stop = admin_handle.clone();
     let inflight_tracker = app_context.inflight_tracker.clone();
-    let budget = ShutdownBudget::from_grace_secs(config.shutdown_grace_period_secs);
+    let budget = ShutdownBudget::from_grace_secs(
+        config.shutdown_grace_period_secs,
+        config.shutdown_settle_secs,
+    );
     let drain_timeout = budget.drain;
     #[expect(
         clippy::disallowed_methods,
@@ -2585,12 +2591,13 @@ struct ShutdownBudget {
 
 impl ShutdownBudget {
     /// The settle window is carved out of the grace budget (never more than
-    /// half, capped at 5 s, the per-worker `drain_settle_secs` default) so
+    /// half, optionally capped by the configured settle seconds) so
     /// total shutdown stays within `shutdown_grace_period_secs` and never
     /// overruns terminationGracePeriod.
-    fn from_grace_secs(grace_secs: u64) -> Self {
+    fn from_grace_secs(grace_secs: u64, settle_secs: Option<u64>) -> Self {
         let grace = Duration::from_secs(grace_secs);
-        let settle = (grace / 2).min(Duration::from_secs(5));
+        let settle =
+            settle_secs.map_or(grace / 2, |secs| (grace / 2).min(Duration::from_secs(secs)));
         Self {
             grace,
             settle,
@@ -2680,21 +2687,21 @@ mod graceful_shutdown_tests {
 
     use super::{graceful_shutdown, InFlightRequestTracker, ShutdownBudget};
 
-    /// The settle window is half the grace, capped at 5 s; the drain is the
+    /// The settle window is half the grace; the drain is the
     /// rest; a zero grace has neither.
     #[test]
     fn the_budget_splits_the_grace() {
         let secs = |s| Duration::from_secs(s);
         assert_eq!(
-            ShutdownBudget::from_grace_secs(30),
+            ShutdownBudget::from_grace_secs(30, None),
             ShutdownBudget {
                 grace: secs(30),
-                settle: secs(5),
-                drain: secs(25)
+                settle: secs(15),
+                drain: secs(15)
             }
         );
         assert_eq!(
-            ShutdownBudget::from_grace_secs(6),
+            ShutdownBudget::from_grace_secs(6, None),
             ShutdownBudget {
                 grace: secs(6),
                 settle: secs(3),
@@ -2702,13 +2709,52 @@ mod graceful_shutdown_tests {
             }
         );
         assert_eq!(
-            ShutdownBudget::from_grace_secs(0),
+            ShutdownBudget::from_grace_secs(0, None),
             ShutdownBudget {
                 grace: secs(0),
                 settle: secs(0),
                 drain: secs(0)
             }
         );
+    }
+
+    /// Explicit windows preserve at least half the grace for draining, including zero and odd budgets.
+    #[test]
+    fn configured_settle_is_capped_at_half_the_grace() {
+        for (grace, configured, expected) in [
+            (180, None, 90),
+            (180, Some(30), 30),
+            (180, Some(120), 90),
+            (180, Some(0), 0),
+            (0, Some(30), 0),
+        ] {
+            let budget = ShutdownBudget::from_grace_secs(grace, configured);
+            assert_eq!(budget.settle, Duration::from_secs(expected));
+            assert_eq!(budget.settle + budget.drain, budget.grace);
+        }
+        assert_eq!(
+            ShutdownBudget::from_grace_secs(3, None).settle,
+            Duration::from_millis(1500)
+        );
+    }
+
+    /// Readiness fails immediately, but listener gating waits for the full default propagation window.
+    #[tokio::test(start_paused = true)]
+    async fn default_window_gates_listeners_after_half_the_grace() {
+        let tracker = InFlightRequestTracker::new();
+        let start = tokio::time::Instant::now();
+        graceful_shutdown(
+            &tracker,
+            ShutdownBudget::from_grace_secs(180, None),
+            async {},
+            || panic!("mesh leave completed"),
+            |remaining| {
+                assert!(tracker.is_draining());
+                assert_eq!(start.elapsed(), Duration::from_secs(90));
+                assert_eq!(remaining, Duration::from_secs(90));
+            },
+        )
+        .await;
     }
 
     /// The phases in order, on a paused clock: readiness drains at once;
@@ -2720,7 +2766,7 @@ mod graceful_shutdown_tests {
     async fn the_phases_run_in_order_within_the_grace() {
         let tracker = InFlightRequestTracker::new();
         let request = tracker.track();
-        let budget = ShutdownBudget::from_grace_secs(30);
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
         let start = tokio::time::Instant::now();
         let left = Arc::new(AtomicBool::new(false));
         let leave_mesh = {
@@ -2774,7 +2820,7 @@ mod graceful_shutdown_tests {
     async fn a_slow_leave_is_cut_short_and_a_stuck_request_holds_nothing_past_the_deadline() {
         let tracker = InFlightRequestTracker::new();
         let _stuck = tracker.track();
-        let budget = ShutdownBudget::from_grace_secs(10);
+        let budget = ShutdownBudget::from_grace_secs(10, None);
         let start = tokio::time::Instant::now();
         let mesh_stopped = Arc::new(AtomicBool::new(false));
         let gated = Arc::new(Mutex::new(None));
@@ -2826,7 +2872,7 @@ mod graceful_shutdown_tests {
         let gated = Arc::new(Mutex::new(None));
         graceful_shutdown(
             &tracker,
-            ShutdownBudget::from_grace_secs(0),
+            ShutdownBudget::from_grace_secs(0, None),
             std::future::pending::<()>(),
             {
                 let mesh_stopped = Arc::clone(&mesh_stopped);
@@ -3752,6 +3798,7 @@ mod tests {
         .expect("plain HTTP response test timed out");
     }
 
+    /// Build a loopback test server without discovery, mesh, or authentication.
     fn minimal_server_config(router_config: RouterConfig) -> ServerConfig {
         ServerConfig {
             host: "127.0.0.1".to_string(),
@@ -3769,6 +3816,7 @@ mod tests {
             request_timeout_secs: 60,
             request_id_headers: None,
             shutdown_grace_period_secs: 5,
+            shutdown_settle_secs: None,
             control_plane_auth: None,
             mesh_server_config: None,
             webrtc_bind_addr: None,

@@ -597,6 +597,7 @@ class RouterArgs:
     service_discovery_port: int = 80
     # Grace period in seconds to wait for in-flight requests during shutdown
     shutdown_grace_period_secs: int = 180
+    shutdown_settle_secs: int | None = None
     # Slurm discovery (discovery_provider="slurm"): the account whose jobs are
     # discovered, the encode and prefill bootstrap port, the job names whose
     # nodes are each worker type, the partition, the port of every node's
@@ -2106,6 +2107,13 @@ class RouterArgs:
                 "request's answer on any worker; an HTTP worker's own pool "
                 "timeout_secs takes this value's place)"
             ),
+        )
+        request_group.add_argument(
+            f"--{prefix}shutdown-settle-secs",
+            type=int,
+            default=RouterArgs.shutdown_settle_secs,
+            help="Keep accepting connections after readiness fails; defaults to half the "
+            "shutdown grace period and cannot exceed that half",
         )
         request_group.add_argument(
             f"--{prefix}shutdown-grace-period-secs",
