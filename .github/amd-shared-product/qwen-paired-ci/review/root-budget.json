@@ -1,0 +1,94 @@
+{
+  "root_admitted": true,
+  "owner": "root",
+  "at_utc": "2026-10-26T06:18:16.426435+00:00",
+  "NEW_runner_seconds": 2100,
+  "GPU_jobs": 1,
+  "GPU_devices_simultaneous": 1,
+  "admission_nonce": "e6b0c07879bb4a65836d51d47a86a26e",
+  "no_retired_allowance_reused": true,
+  "registered_single_job_observer_source_reviewed": true,
+  "global_owned_GPU_runs_after_dispatch": 1,
+  "max_owned_GPU_runs": 2,
+  "old_finalized_seconds": 64596,
+  "old_reserved_seconds": 0,
+  "global_cap_before": 129939,
+  "global_cap_after": 129939,
+  "source_parent": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
+  "carrier_source": "70ce80c830b1ff3c4af51f4e1b800d8223864735",
+  "observer_source_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-70ce-original12-next-GPU-binding-source-D-20261026/peer-source-root.json",
+    "sha256": "00ca20fada8b47bed5ff302e179d45155dbef22d9d2c64eeecd0a9b6503a30f6"
+  },
+  "source_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-prepared-HF-identity-actual-source-peer-C-20261026.json",
+    "sha256": "11e2df2d6b86bae88490ffd5056495e68c228cea723e9361e0a74055243706b1"
+  },
+  "fresh_evidence": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-prepared-HF-fresh-readiness-root-506b019fcee94403b95d43e36dc1df2b/summary.json",
+    "sha256": "f91ac356c9fea40bb110e9c44f7e0719c556aa1b65b595a7a0ba40a47da42509"
+  },
+  "actual_active_DRM_UID995_CPU": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-active-DRM-UID995-CPU30-root-7cd16df78b1540e6b8a1b7ac3cc00eb6/root-closeout.json",
+    "sha256": "0000126eae388b2ec94d109252c5f9854d9d153b7b058acbba620e8462c35002"
+  },
+  "actual_active_DRM_UID995_CPU_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-active-DRM-UID995-CPU30-root-7cd16df78b1540e6b8a1b7ac3cc00eb6/peer-actual-A.json",
+    "sha256": "f0feb5052e9b0f766e0db25f831d96c3f1f21d68ce807b3a50e7a7975ce67787"
+  },
+  "prior_terminal_CU_run": 40258673029,
+  "prior_CU_settlement": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/sglang-pd4-current1473-b7-cu-20261026/actual-validation/root-terminal-resource-settlement.json",
+    "sha256": "9deb842d751671c6dbf9d5ad4b1e7e44c95eb8fc9e88052b48c00ecb57056cdb"
+  },
+  "absolute_GPU_job_seconds": 2100,
+  "absolute_work_seconds": 1920,
+  "cleanup_until_seconds": 2040,
+  "artifact_upload_reserved_seconds": 60,
+  "queue_seconds": 900,
+  "overall_seconds": 3600,
+  "coverage_increment": 0,
+  "original_pytest_cases_planned": 0,
+  "paired_observations_planned": 12,
+  "automatic_retry": false,
+  "preserve_ordinary_CI_PNL_health": true,
+  "preserved_ordinary_AMD_jobs": [],
+  "prior_unchanged_normal_commands_CPU": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-0898-full-preparation-CPU600-root-a21c7855f3a3453fb50fb2e6ca830969/root-result.json",
+    "sha256": "a9773451f05e557ce8ce1864a1d14416435bcbe81deaea477b46c965ce0f73bf"
+  },
+  "prior_normal_commands_CPU_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-0898-full-preparation-CPU600-root-a21c7855f3a3453fb50fb2e6ca830969/peer-actual-D.json",
+    "sha256": "f069295ba12fb0c77d4bd227289966173403a8293c3496188cb872ba6a6977df"
+  },
+  "new_prepared_HF_capture_executed": false,
+  "current_full_normal_preparation_CPU_accepted": false,
+  "actual_private_JIT_function_CPU": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-private-JIT-real-account-UID995-CPU600-root-7a26e7e32f6e4d7aa89e1b02e3d42a76/root-result.json",
+    "sha256": "4b89cd3407c226d98814afa1fe811709fa8c4289898da7041e8be43b2de47eca"
+  },
+  "actual_private_JIT_CPU_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-private-JIT-real-account-UID995-CPU600-root-7a26e7e32f6e4d7aa89e1b02e3d42a76/peer-actual-C.json",
+    "sha256": "eaf238cf6fd8150a8d0be7b934bb1d4be3da039d887240f6dd861687b43b6735"
+  },
+  "private_JIT_complete_import_accepted": false,
+  "CPU_scope": "Baseimage UID995 realHF None/header/immutable configcache only; no prepared-package/wholemodel/original12 qualification",
+  "actual_config_lock_CPU": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-private-config-cache-CPU120-root-eb30228bef254c999114fbd9810e6eb8/root-result.json",
+    "sha256": "4fdf136965ed918f5b6a2d323bba12cdef3ad1472e5e14dc2deb851c92b14659"
+  },
+  "actual_config_lock_CPU_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-private-config-cache-CPU120-root-eb30228bef254c999114fbd9810e6eb8/peer-actual-C.json",
+    "sha256": "22f11336c3f45b2fb6a903d0247d5ed85b0479e0df0ce1bc225a92196009d187"
+  },
+  "whole18_CSV_merge_accepted": false,
+  "actual_HF_auth_cache_CPU": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-HF-auth-cache-CPU120-root-08b6554313814304bf0752c26ab5e5b0/root-result.json",
+    "sha256": "a9cd406f848d40d55d4272fb39cf3ca7d939067c2c6482f4559a4029ae5c9747"
+  },
+  "actual_HF_auth_cache_CPU_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-HF-auth-cache-CPU120-root-08b6554313814304bf0752c26ab5e5b0/peer-actual-A.json",
+    "sha256": "03fd80672678df0bdc7cd75b89b45d104c50b0774ab2489e096c0e6609702da0"
+  },
+  "prepared_HF_identity_accepted": false
+}

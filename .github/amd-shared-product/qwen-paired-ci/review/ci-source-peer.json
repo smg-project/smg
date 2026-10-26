@@ -1,0 +1,117 @@
+{
+  "result": "PASS_SOURCE_ONLY_ACTUAL_DISABLED_PREPARED_HF_IDENTITY_CAPTURE",
+  "findings": [],
+  "reviewer": "C nonauthor of D capture/root actual Git integration. Fresh actual hashes, no A705 signature reused. C authored separate HF leaf; actual base/cache proof solely genuine A03fd.",
+  "at_utc": "2026-10-26T06:15:33.466014+00:00",
+  "source_parent": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
+  "source_head": "70ce80c830b1ff3c4af51f4e1b800d8223864735",
+  "actual_head": "70ce80c830b1ff3c4af51f4e1b800d8223864735",
+  "actual_Git_parent": "587912fa496e95733b8b90a125e2687c02da097c",
+  "actual_tree": "9bfe833a71cf3d9a19c68fcd41aa0b09ee538e6d",
+  "actual_worktree": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/amd-qwen-current1473-prepared-HF-identity-20261026",
+  "working_tree_clean": true,
+  "driver_sha256": "7b0a98d25b7c0061d673556b0f6cf41e6b6da7311f1642a1d70145ece8f63591",
+  "envelope_sha256": "06589cd12a0547a4e1d5547f8e24afb6c849ec8e95854d997b73bf1180d1ccfd",
+  "inputs_sha256": "9f0359d170854c490fdc28c18b51a83b87c94b22331ceb56accee41179350925",
+  "CI_job_runner_sha256": "6046df1eb612541ec51f5d4001b05d7163f7b66d10e734e1db43f55877b0b36d",
+  "workflow_template_sha256": "aa77da40cedaa56aa6d4f02a2ec0f63c5f4cddabd781ba38adc2bacdfada2564",
+  "CI_source_manifest_sha256": "53447da2b4f336b55813384bd5fcae80209fbd707298eef1af0daab977789ca4",
+  "prepare_sha256": "6524c5ac7feeff383b546a0f09cd58714c927951500400513430122244140cc3",
+  "runtime_file_hashes": {
+    "http_observe.py": "c1b7d42917386a4cf3b3bf144680503eae3f9b4587b97b4c6e78e54254d3bba0",
+    "owned_processes.py": "04a8d619482bcd473c81ea98c0ad3aef91a32cced610dcb16edb99d14c873999",
+    "runtime_check.py": "98255bd35bac65f019f25af779758d89fcb53d64e874f800146cb9bd2f9effcb",
+    "root_container_envelope.py": "06589cd12a0547a4e1d5547f8e24afb6c849ec8e95854d997b73bf1180d1ccfd",
+    "six-request-matrix.json": "f9475f82fed3fafcd5497c5702e5f3390d045695276d41525b4d9938cc17f3dd"
+  },
+  "checks": {
+    "actual_paths": [
+      ".github/amd-shared-product/qwen-paired-ci/admission.json",
+      ".github/amd-shared-product/qwen-paired-ci/prepare_container.py",
+      ".github/amd-shared-product/qwen-paired-ci/source-manifest.json"
+    ],
+    "all_three_preview_bytes_exact": true,
+    "all15_manifest_and_5generic_helper_hashes_actual_exact": true,
+    "registered_workflow_equals_template": true,
+    "whole_prepare_inverse": "Remove one sysconfig import and exact29linecapture restores entire actual5879 parentbytes. Original11run AST/final3/error/finally/chown/180 setup budget unchanged, as independently checked proposal f47839.",
+    "capture": "After normal11/final3/native/source checks, before actual_success. Stdlib distribution/sysconfig only; actualversion plus four fixedsource files+own dist-info METADATA/RECORD hashes/size/path constrainedregularnonsymlink within /opt/venv purelib. No hardcoded version/hash acceptance.",
+    "no_added_sensitive_or_external_operation": "No added HF/Torch/AITer import, token/env/credential read, subprocess/network/GPU/install/repair. One owned evidenceJSON+result path/hashlink; failure red through existing finally.",
+    "source_maps": [
+      {
+        "map": "consumer19",
+        "ref": "70ce80c830b1ff3c4af51f4e1b800d8223864735",
+        "paths": 19,
+        "exact_Git_match": true
+      },
+      {
+        "map": "consumer19",
+        "ref": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
+        "paths": 19,
+        "exact_Git_match": true
+      },
+      {
+        "map": "compiled37",
+        "ref": "70ce80c830b1ff3c4af51f4e1b800d8223864735",
+        "paths": 37,
+        "exact_Git_match": true
+      },
+      {
+        "map": "compiled37",
+        "ref": "d5f8f9e765dcdec1f56dd623b46e49e1e47862d4",
+        "paths": 37,
+        "exact_Git_match": true
+      },
+      {
+        "map": "producer14",
+        "ref": "d5f8f9e765dcdec1f56dd623b46e49e1e47862d4",
+        "paths": 14,
+        "exact_Git_match": true
+      }
+    ],
+    "original_contract": "A-nativeHTTP then B-Rust ordered original sixmedia each/CLI/model/oracles, b7/fourarchive/sixpayload/image/source19/compiled37/producer14 preserved. Existing privateJIT/configtmpfs/HF_TOKEN_PATH unchanged. No latestmain or wholeparentpipeline qualification transferred.",
+    "disabled": "FourQwen +five shared authoritiesfalse/Qwen0/sharedbudget0/runtime_resultnull/coverage0."
+  },
+  "runtime_schema": "Fresh source_parent/driver/envelope/inputs/CI_runner/template/manifest satisfy unchanged job_runner111-115 and innerdriver77-79; all five runtime_file_hashes recomputed from actual70ce files. No runtime approval inherited.",
+  "conditional_child_scope": "May copy byteexact peer as future review/ci-source-peer.json in separately root-admitted direct70ce data child, preserving15manifest files/registeredWF. Root must bind true admission/model/source/artifactTTL/capacity/finiteNEW2100/rootbudget and resource/source integration peers; authority metadata changes only, no retiredreuse. This sourcepeer creates no grant.",
+  "references": [
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-prepared-HF-identity-actual-disabled-source-root-20261026.json",
+      "bytes": 2393,
+      "sha256": "f4b8dbd517034b936ef2cbe86f8138530a98cae9073fc1dba96830b91c9bb879"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-prepared-HF-identity-capture-source-proposal-D-20261026/delivery.json",
+      "bytes": 2825,
+      "sha256": "9d6e857f20288dff3b46fdeab5961a4c42830dabe3fec3609c837d8941fea37e"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-prepared-HF-identity-capture-source-proposal-D-20261026/manifest.json",
+      "bytes": 7315,
+      "sha256": "26862ce16ae79b33070f7b0caf563d200509615e73e7a116fc6a9cd4352d0d95"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-prepared-HF-identity-capture-source-proposal-D-20261026/peer-proposal-C.json",
+      "bytes": 5087,
+      "sha256": "f47839f0469331a26a9fdc659e72c17edec0192f64902687aeb16fe909aa4f95"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-private-HF-token-path-actual-source-peer-A-20261026.json",
+      "bytes": 6374,
+      "sha256": "a705096eaddbdb80ca7f4e607b883a2850f617d9620a883e930e3c801e12b6d0"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-HF-auth-cache-CPU120-root-08b6554313814304bf0752c26ab5e5b0/peer-actual-A.json",
+      "bytes": 7935,
+      "sha256": "03fd80672678df0bdc7cd75b89b45d104c50b0774ab2489e096c0e6609702da0"
+    }
+  ],
+  "scope": [
+    "Capture source has not executed; no preparedidentity/HFfunction/RECORDcontentvalidation/UID995access/model/paired12/GPU acceptance.",
+    "ActualHF CPU1.267 onlyA03fd base4420 functions/localconfig scope; C does not self-audit ownleaf actual.",
+    "Only local/Git/source/AST/data reads and ownreceipt write; no candidate/import/test/API/SSH/Docker/Gitmutation/resource/C-M/formal action."
+  ],
+  "executed": false,
+  "resource_granted": false,
+  "runtime_accepted": false,
+  "coverage_increment": 0
+}

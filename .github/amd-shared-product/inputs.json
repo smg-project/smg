@@ -1,9 +1,9 @@
 {
-  "ready": false,
-  "run_budget_admitted": false,
-  "artifacts_pinned": false,
+  "ready": true,
+  "run_budget_admitted": true,
+  "artifacts_pinned": true,
   "consumer_gpu_ready": false,
-  "runtime_cohort_accepted": false,
+  "runtime_cohort_accepted": true,
   "admitted_lane": "qwen-current1473-paired-diagnostic",
   "target_product_commit": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
   "artifacts": [
