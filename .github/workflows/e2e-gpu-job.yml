@@ -163,6 +163,38 @@ jobs:
       TOKENSPEED_PREBUILT_IMAGE: ${{ inputs.tokenspeed_prebuilt_image }}
       ROUTER_LOCAL_MODEL_PATH: /models
     steps:
+      - name: Check actual shared-node UTC window before normal BASE setup
+        if: inputs.amd_vllm_normal_base
+        shell: bash
+        env:
+          UTC_GUARD_ENGINE: ${{ inputs.engine }}
+          UTC_GUARD_VENDOR: ${{ inputs.gpu_vendor }}
+          UTC_GUARD_JOB_MINUTES: ${{ inputs.timeout }}
+        run: |
+          /usr/bin/python3 -I -B - <<'PYTHON'
+          import datetime as dt
+          import json
+          import os
+          if (os.environ["UTC_GUARD_ENGINE"], os.environ["UTC_GUARD_VENDOR"],
+                  os.environ["UTC_GUARD_JOB_MINUTES"]) != ("vllm", "amd", "60"):
+              raise SystemExit("UTC guard requires the unchanged private AMD vLLM whole60 contract")
+          now = dt.datetime.now(dt.timezone.utc)
+          reserved_start = now.replace(hour=5, minute=0, second=0, microsecond=0)
+          reserved_end = reserved_start.replace(hour=6, minute=30)
+          in_reserved_window = reserved_start <= now < reserved_end
+          if now >= reserved_end:
+              reserved_start += dt.timedelta(days=1)
+          cleanup_buffer_seconds = 300
+          allowed = (not in_reserved_window and
+                     now + dt.timedelta(seconds=3600 + cleanup_buffer_seconds) < reserved_start)
+          print(json.dumps({"actual_UTC": now.isoformat(), "reserved_start_UTC": reserved_start.isoformat(),
+                            "whole_job_seconds": 3600, "cleanup_buffer_seconds": cleanup_buffer_seconds,
+                            "allowed_before_setup": allowed,
+                            "scope": "actual first step; job-container pull/create already happened"}), flush=True)
+          if not allowed:
+              raise SystemExit("shared-node reserved UTC window or insufficient whole60 cleanup margin")
+          PYTHON
+
       - name: Checkout code
         uses: actions/checkout@v7
 

@@ -107,7 +107,7 @@ jobs:
     with:
       engine: vllm
       gpu_tier: '1'
-      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
+      runner: 4-gpu-mi300x
       timeout: 60
       test_timeout: 45
       test_dirs: e2e_test/chat_completions
