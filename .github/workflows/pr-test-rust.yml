@@ -5,6 +5,10 @@ on:
       execute:
         type: boolean
         default: false
+      cu_stream_diagnostic:
+        type: boolean
+        default: false
+        description: "Private exact4420 current-device CU repair and bounded first-event diagnostic"
 permissions:
   contents: read
   actions: read
@@ -32,8 +36,11 @@ jobs:
           assert data["admitted_lane"] == "tokenspeed-pd2-original-qwen-sglang-reference"
           assert data["runtime_cohort_accepted"] is True
           assert all(data[key] is True for key in ("ready", "run_budget_admitted", "artifacts_pinned"))
+          import hashlib
+          for name, expected in data["diagnostic_source_files"].items():
+              assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == expected
           recipe = data["recipe"]
-          assert data["target_product_commit"] == "565a4a00491afa3910eda66041533f184dc7d31b"
+          assert data["target_product_commit"] == "64f06800b5a500f352be451ba37c2ba0a84cec47"
           assert recipe["test_dirs"] == "e2e_test/router" and recipe["test_filter"] == ""
           assert recipe["engine"] == recipe["actual_engine"] == "sglang"
           assert recipe["reference_engine"] == "tokenspeed" and recipe["functional_equivalence_only"] is True
@@ -116,7 +123,7 @@ jobs:
       setup_agentic_deps: false
       gpu_vendor: amd
       container_image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
-      container_options: --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband --ulimit memlock=-1:-1 --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN --env SPT_NOENV=1 --env PYTHONDONTWRITEBYTECODE=1 --env SMG_AMD_TS_PD2_REFERENCE=1
+      container_options: --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband --ulimit memlock=-1:-1 --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN --env SPT_NOENV=1 --env PYTHONDONTWRITEBYTECODE=1 --env SMG_AMD_TS_PD2_REFERENCE=1 --env SMG_SG4_PD_CU_EXISTING_RUNTIME=${{ inputs.cu_stream_diagnostic && '1' || '0' }} --env SMG_SG4_PD_ALLOCATION_PHASE_DIAGNOSTIC=${{ inputs.cu_stream_diagnostic && '1' || '0' }}
     secrets: inherit
 
   finish:

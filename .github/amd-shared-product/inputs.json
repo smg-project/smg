@@ -5,7 +5,7 @@
   "consumer_gpu_ready": false,
   "runtime_cohort_accepted": false,
   "admitted_lane": "tokenspeed-pd2-original-qwen-sglang-reference",
-  "target_product_commit": "565a4a00491afa3910eda66041533f184dc7d31b",
+  "target_product_commit": "64f06800b5a500f352be451ba37c2ba0a84cec47",
   "artifacts": [
     {
       "name": "smg-wheel",
@@ -94,7 +94,7 @@
     "e2e_test": "1ae5671e9e6a9805a601be178ccf6aa8a7e07f09",
     "scripts": "2aaa0d62644a24b1580a7ef46ee6fd00499ff57b",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
-    ".github/workflows/e2e-gpu-job.yml": "453b36ebfd26262dc79c3f376dcb2469af6435a1",
+    ".github/workflows/e2e-gpu-job.yml": "5358abd1562a7f5b3de2035e14506c1ab9fe22da",
     "README.md": "83b7df25632da03f0184bd5b4628b9c9a3ace803",
     "LICENSE": "9088c2872db9763b9e6533c6960e9adb0c9cb65f",
     "rustfmt.toml": "19e1ab31f8958c31292f0f568976a036af7e683b",
@@ -230,7 +230,8 @@
     "original_window_memory": "OriginalQwen8192/.8 maps through reviewed SGLang profile; originalcontext cases append2048. Actual base4420 Namespace parser proof is available, finalresolved/runtime/model/PD remains unknown.",
     "original_responses_request": "Same original reasoning.effort=none branch under explicit reference profile; original asserts/requests preserved.",
     "skips_and_failures": "Original TS reference source skip/runtime marker semantics retained by reviewed5path profile; no allowed skip quota, no shrinking or mock.",
-    "no_private_173_plugin_or_allocation_overlay": true
+    "no_private_173_plugin": true,
+    "CU_firststream_diagnostic_default_enabled": false
   },
   "budget": {
     "admitted": false,
@@ -255,7 +256,7 @@
     "run_binding": null,
     "watch_PID_or_session": null
   },
-  "pending_note": "SOURCE ONLY: execute defaultfalse, all five authority flagsfalse, budgetfalse/res0/actual run null. The565a product already contains reviewed default-off reference profile; this privatecaller explicitly opts it in only for the intended whole TS PD2 functional row. Actual consumer materialization needs2custom files PLUS5 existing generic byteexact dependencies because base565a contains no amd-shared-product directory. These five are not new algorithms and excluded from19product map. Root must separately validate actual integrated profile collection/model/wholeWorker argv and final effective parameters; actual model/PD full15 remains unknown, current SGLang PD AITER/stream startup rootcause remains open. Normal97a is fixed1473/d5/b7 installation only; base rawparse is not fullprofile execution. No c559/d8/nativeTS/GPU credit transfer, no new grant/dispatch/solewatch is issued here.",
+  "pending_note": "Unexecuted default-off source integration proposal only. Root must materialize the product layer, bind its true Git commit, verify actual19/37/14 and four diagnostic files, independently review source and the new tier2 gate, then separately admit any NEW GPU phase. Old82f full15 remains startup HOLD; CU repair is not claimed to solve OOM. No previous CPU/retired/GPU credit transferred.",
   "binding_preparation_evidence": {
     "producer_build_archive_integrity_sha256": "fa8e1be5899a9f5d74ade0f6de9cfa10eb5065a404f597c2ee95d55cfa03cb6f",
     "producer_policy_source_review_sha256": "707a143df969433664b923c54e9cc44ad511dba00bdde978c4b40b02d94901fb",
@@ -268,5 +269,23 @@
     "actual_source_integration_and_base_raw_parser_peer_sha256": "c09977c300d22f5399401f6442c6c7588104adf68aeefeb3ab826be39019ccb1"
   },
   "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-2gpu-pd[3]/tokenspeed/nvidia",
-  "reference_contract_sha256": "f6db720219333ee5f2c9164edcf2cb323926ff3d5e797be44f3fd229a5d6774a"
+  "reference_contract_sha256": "f6db720219333ee5f2c9164edcf2cb323926ff3d5e797be44f3fd229a5d6774a",
+  "diagnostic_source_files": {
+    ".github/amd-sg4pd-allocation-phase/apply.py": "b13b570233bfad2f36ddb59f07844925ad3173b2553fc2183ce6dcc90c571a8c",
+    ".github/amd-sg4pd-allocation-phase/allocation_failure.py": "91a40c870cd484f0bcef5b8caac47dcbb933c0d6c052833cf768e95fc8af8d08",
+    ".github/amd-sg4pd-allocation-phase/overlay.json": "924785978aa989b8f157592c3becda061157e69a4e90ed5f4ed43409b8be663f",
+    ".github/amd-sg4pd-allocation-phase/cu-overlay.json": "c7b5fffeb31105c26677cc3ef6c946f17fdd887d17bba4ba68fe8469bd956048"
+  },
+  "diagnostic_source_binding": {
+    "manual_input": "cu_stream_diagnostic",
+    "default": false,
+    "same_4f86_helper_and_installed_source_bytes": true,
+    "TS2_gate": "engine=sglang,tier2,SMG_AMD_TS_PD2_REFERENCE=1 plus explicit existing CU/phase flags",
+    "current_source_evidence": "82f actual15 startup failure;4f86 donor source+six data controls only",
+    "runtime_accepted": false,
+    "new_source_peer_pending": true,
+    "actual_head": null,
+    "run_id": null,
+    "GPU_budget": 0
+  }
 }
