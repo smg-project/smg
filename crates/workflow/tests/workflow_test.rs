@@ -369,12 +369,15 @@ async fn test_workflow_context_sharing() {
 // DAG / Parallel Execution Tests
 // ============================================================================
 
+/// The (step name, instant) records the timing steps of one test share.
+type Timeline = Arc<parking_lot::RwLock<Vec<(String, std::time::Instant)>>>;
+
 // Step that records when it starts and ends (for testing parallel execution)
 struct TimingStep {
     step_name: String,
     duration_ms: u64,
-    start_times: Arc<parking_lot::RwLock<Vec<(String, std::time::Instant)>>>,
-    end_times: Arc<parking_lot::RwLock<Vec<(String, std::time::Instant)>>>,
+    start_times: Timeline,
+    end_times: Timeline,
 }
 
 #[async_trait::async_trait]
@@ -397,15 +400,29 @@ impl StepExecutor<TestWorkflowData> for TimingStep {
     }
 }
 
+/// A timing step named `name` that sleeps `duration_ms`, recording into the
+/// test's timelines.
+fn timing_step(
+    name: &str,
+    duration_ms: u64,
+    start_times: &Timeline,
+    end_times: &Timeline,
+) -> Arc<dyn StepExecutor<TestWorkflowData>> {
+    Arc::new(TimingStep {
+        step_name: name.to_string(),
+        duration_ms,
+        start_times: Arc::clone(start_times),
+        end_times: Arc::clone(end_times),
+    })
+}
+
 #[tokio::test]
 async fn test_parallel_execution_no_dependencies() {
     // Steps without dependencies should run in parallel
     let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
 
-    let start_times: Arc<parking_lot::RwLock<Vec<(String, std::time::Instant)>>> =
-        Arc::new(parking_lot::RwLock::new(Vec::new()));
-    let end_times: Arc<parking_lot::RwLock<Vec<(String, std::time::Instant)>>> =
-        Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let start_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let end_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
 
     // Three steps, each taking 100ms, no dependencies
     // If parallel: ~100ms total
@@ -414,32 +431,17 @@ async fn test_parallel_execution_no_dependencies() {
         .add_step(StepDefinition::new(
             "step_a",
             "Step A",
-            Arc::new(TimingStep {
-                step_name: "step_a".to_string(),
-                duration_ms: 100,
-                start_times: Arc::clone(&start_times),
-                end_times: Arc::clone(&end_times),
-            }),
+            timing_step("step_a", 100, &start_times, &end_times),
         ))
         .add_step(StepDefinition::new(
             "step_b",
             "Step B",
-            Arc::new(TimingStep {
-                step_name: "step_b".to_string(),
-                duration_ms: 100,
-                start_times: Arc::clone(&start_times),
-                end_times: Arc::clone(&end_times),
-            }),
+            timing_step("step_b", 100, &start_times, &end_times),
         ))
         .add_step(StepDefinition::new(
             "step_c",
             "Step C",
-            Arc::new(TimingStep {
-                step_name: "step_c".to_string(),
-                duration_ms: 100,
-                start_times: Arc::clone(&start_times),
-                end_times: Arc::clone(&end_times),
-            }),
+            timing_step("step_c", 100, &start_times, &end_times),
         ));
 
     let workflow_id = workflow.id.clone();
@@ -495,42 +497,25 @@ async fn test_dag_with_dependencies() {
     //   B ──┘
     let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
 
-    let start_times: Arc<parking_lot::RwLock<Vec<(String, std::time::Instant)>>> =
-        Arc::new(parking_lot::RwLock::new(Vec::new()));
-    let end_times: Arc<parking_lot::RwLock<Vec<(String, std::time::Instant)>>> =
-        Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let start_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let end_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
 
     let workflow = WorkflowDefinition::new("dag_workflow", "DAG Test")
         .add_step(StepDefinition::new(
             "step_a",
             "Step A",
-            Arc::new(TimingStep {
-                step_name: "step_a".to_string(),
-                duration_ms: 50,
-                start_times: Arc::clone(&start_times),
-                end_times: Arc::clone(&end_times),
-            }),
+            timing_step("step_a", 50, &start_times, &end_times),
         ))
         .add_step(StepDefinition::new(
             "step_b",
             "Step B",
-            Arc::new(TimingStep {
-                step_name: "step_b".to_string(),
-                duration_ms: 100,
-                start_times: Arc::clone(&start_times),
-                end_times: Arc::clone(&end_times),
-            }),
+            timing_step("step_b", 100, &start_times, &end_times),
         ))
         .add_step(
             StepDefinition::new(
                 "step_c",
                 "Step C",
-                Arc::new(TimingStep {
-                    step_name: "step_c".to_string(),
-                    duration_ms: 50,
-                    start_times: Arc::clone(&start_times),
-                    end_times: Arc::clone(&end_times),
-                }),
+                timing_step("step_c", 50, &start_times, &end_times),
             )
             .depends_on(&["step_a", "step_b"]),
         );
@@ -1105,10 +1090,8 @@ async fn test_depends_on_any() {
     //   B ──┘
     let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
 
-    let start_times: Arc<parking_lot::RwLock<Vec<(String, std::time::Instant)>>> =
-        Arc::new(parking_lot::RwLock::new(Vec::new()));
-    let end_times: Arc<parking_lot::RwLock<Vec<(String, std::time::Instant)>>> =
-        Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let start_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let end_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
 
     // A takes 50ms, B takes 200ms
     // C should start after A finishes (not wait for B)
@@ -1116,33 +1099,18 @@ async fn test_depends_on_any() {
         .add_step(StepDefinition::new(
             "step_a",
             "Step A",
-            Arc::new(TimingStep {
-                step_name: "step_a".to_string(),
-                duration_ms: 50,
-                start_times: Arc::clone(&start_times),
-                end_times: Arc::clone(&end_times),
-            }),
+            timing_step("step_a", 50, &start_times, &end_times),
         ))
         .add_step(StepDefinition::new(
             "step_b",
             "Step B",
-            Arc::new(TimingStep {
-                step_name: "step_b".to_string(),
-                duration_ms: 200,
-                start_times: Arc::clone(&start_times),
-                end_times: Arc::clone(&end_times),
-            }),
+            timing_step("step_b", 200, &start_times, &end_times),
         ))
         .add_step(
             StepDefinition::new(
                 "step_c",
                 "Step C",
-                Arc::new(TimingStep {
-                    step_name: "step_c".to_string(),
-                    duration_ms: 50,
-                    start_times: Arc::clone(&start_times),
-                    end_times: Arc::clone(&end_times),
-                }),
+                timing_step("step_c", 50, &start_times, &end_times),
             )
             .depends_on_any(&["step_a", "step_b"]),
         );
@@ -1186,52 +1154,30 @@ async fn test_depends_on_any_combined_with_depends_on() {
     // C should start after A AND (B or D) complete
     let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
 
-    let start_times: Arc<parking_lot::RwLock<Vec<(String, std::time::Instant)>>> =
-        Arc::new(parking_lot::RwLock::new(Vec::new()));
-    let end_times: Arc<parking_lot::RwLock<Vec<(String, std::time::Instant)>>> =
-        Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let start_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
+    let end_times: Timeline = Arc::new(parking_lot::RwLock::new(Vec::new()));
 
     let workflow = WorkflowDefinition::new("combined_deps_workflow", "Combined Dependencies Test")
         .add_step(StepDefinition::new(
             "step_a",
             "Step A",
-            Arc::new(TimingStep {
-                step_name: "step_a".to_string(),
-                duration_ms: 50,
-                start_times: Arc::clone(&start_times),
-                end_times: Arc::clone(&end_times),
-            }),
+            timing_step("step_a", 50, &start_times, &end_times),
         ))
         .add_step(StepDefinition::new(
             "step_b",
             "Step B",
-            Arc::new(TimingStep {
-                step_name: "step_b".to_string(),
-                duration_ms: 100,
-                start_times: Arc::clone(&start_times),
-                end_times: Arc::clone(&end_times),
-            }),
+            timing_step("step_b", 100, &start_times, &end_times),
         ))
         .add_step(StepDefinition::new(
             "step_d",
             "Step D",
-            Arc::new(TimingStep {
-                step_name: "step_d".to_string(),
-                duration_ms: 200,
-                start_times: Arc::clone(&start_times),
-                end_times: Arc::clone(&end_times),
-            }),
+            timing_step("step_d", 200, &start_times, &end_times),
         ))
         .add_step(
             StepDefinition::new(
                 "step_c",
                 "Step C",
-                Arc::new(TimingStep {
-                    step_name: "step_c".to_string(),
-                    duration_ms: 50,
-                    start_times: Arc::clone(&start_times),
-                    end_times: Arc::clone(&end_times),
-                }),
+                timing_step("step_c", 50, &start_times, &end_times),
             )
             .depends_on(&["step_a"]) // Must wait for A
             .depends_on_any(&["step_b", "step_d"]), // AND any of B or D
