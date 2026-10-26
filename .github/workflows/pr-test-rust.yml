@@ -1358,14 +1358,16 @@ jobs:
             timeout: 32
             test_timeout: 24
             min_selected: 202 # the vllm chat row's floor: the same selection
-          # The TokenSpeed row carries the admin-op and loads cases of its chat
-          # row too: the control plane the Python servicer serves in-engine
-          # (flush, profiling, the RL control app) has no other row.
+          # The TokenSpeed row carries the admin-op, loads and RL control-plane
+          # cases too: the control plane the Python servicer serves in-engine
+          # (flush, profiling, the RL control app) has no other row. The RL
+          # class starts its own gateway and may wait for a refit, hence the
+          # six minutes over the chat row's budgets.
           - engine: tokenspeed
-            timeout: 56
-            test_timeout: 26
-            test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py e2e_test/router/test_loads.py
-            min_selected: 114 # the tokenspeed chat row's floor: the same selection
+            timeout: 62
+            test_timeout: 32
+            test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py e2e_test/router/test_loads.py e2e_test/router/test_rl_control_plane.py
+            min_selected: 114 # the tokenspeed chat row's floor: a minimum, the RL cases only add
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
