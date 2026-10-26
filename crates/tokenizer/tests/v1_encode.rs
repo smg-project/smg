@@ -14,8 +14,13 @@ use llm_tokenizer::{
 use tokenizers::{
     decoders::byte_level::ByteLevel,
     models::bpe::{Merges, Vocab, BPE},
-    normalizers::{unicode::NFC, utils::Lowercase, Sequence as NormalizerSequence},
-    pre_tokenizers::split::{Split, SplitPattern},
+    normalizers::{
+        unicode::NFC, utils::Lowercase, NormalizerWrapper, Sequence as NormalizerSequence,
+    },
+    pre_tokenizers::{
+        metaspace::{Metaspace, PrependScheme},
+        split::{Split, SplitPattern},
+    },
     processors::template::TemplateProcessing,
     AddedToken, PaddingParams, PaddingStrategy, SplitDelimiterBehavior, Tokenizer,
     TruncationParams,
@@ -76,12 +81,16 @@ const TEXTS: &[&str] = &[
 ];
 
 fn compare(reference: &Tokenizer, ours: &HuggingFaceTokenizer) {
+    compare_texts(reference, ours, TEXTS);
+}
+
+fn compare_texts(reference: &Tokenizer, ours: &HuggingFaceTokenizer, texts: &[&str]) {
     for specials in [false, true] {
-        let batch = ours.encode_batch(TEXTS, specials).expect("batch");
+        let batch = ours.encode_batch(texts, specials).expect("batch");
         let expected = reference
-            .encode_batch(TEXTS.to_vec(), specials)
+            .encode_batch(texts.to_vec(), specials)
             .expect("reference batch");
-        for ((text, batch), expected) in TEXTS.iter().zip(batch).zip(expected) {
+        for ((text, batch), expected) in texts.iter().zip(batch).zip(expected) {
             let encoded = ours.encode(text, specials).expect("encode");
             assert_eq!(
                 encoded.token_ids(),
@@ -131,6 +140,223 @@ fn normalized_added_tokens_match_after_normalization() {
     let ours = HuggingFaceTokenizer::from_tokenizer(reference.clone());
     assert_eq!(ours.uses_v1_encoder(), cfg!(feature = "tokenizers-v1"));
     compare(&reference, &ours);
+}
+
+/// A sentencepiece-style vocabulary as a legacy conversion writes it (a
+/// single-character vocabulary, the markers added as tokens matched after
+/// normalization, among them a special one, and two raw special tokens),
+/// with the reference class's pipeline installed over it: no normalizer, and
+/// a `Metaspace` pre-tokenizer whose prepend scheme the test picks.
+const SENTENCEPIECE_STYLE_TOKENIZER_JSON: &str = r#"{
+    "version": "1.0", "truncation": null, "padding": null,
+    "added_tokens": [
+        {"id": 1, "content": "<s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": true, "special": true},
+        {"id": 3, "content": "<|im_start|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+        {"id": 4, "content": "<|im_end|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+        {"id": 5, "content": "</think>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": true, "special": false},
+        {"id": 6, "content": "<think>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": true, "special": false}],
+    "normalizer": null, "pre_tokenizer": null, "post_processor": null,
+    "decoder": {"type": "Sequence", "decoders": [
+        {"type": "Replace", "pattern": {"String": "▁"}, "content": " "},
+        {"type": "Fuse"}, {"type": "Strip", "content": " ", "start": 1, "stop": 0}]},
+    "model": {"type": "BPE", "dropout": null, "unk_token": "<unk>", "continuing_subword_prefix": null,
+        "end_of_word_suffix": null, "fuse_unk": true, "byte_fallback": false, "ignore_merges": false,
+        "vocab": {"<unk>": 0, "<s>": 1, "</s>": 2, "<|im_start|>": 3, "<|im_end|>": 4, "</think>": 5, "<think>": 6,
+            "▁": 7, "a": 8, "b": 9, "<": 10, "/": 11, ">": 12, "t": 13, "h": 14, "i": 15, "n": 16, "k": 17,
+            "g": 18, "d": 19, "o": 20, "e": 21, "\n": 22, "[": 23, "]": 24, "I": 25, "N": 26, "S": 27, "T": 28,
+            "c": 29, "f": 30, "x": 31, "y": 32, " ": 33},
+        "merges": []}
+}"#;
+
+/// Texts around the markers and the special tokens: a marker that opens the
+/// text (with the rest of a thinking turn behind it), a marker behind a
+/// space, after a newline, between letters; a special token matched after
+/// normalization that opens the text and one between letters (the split
+/// after each takes the word marker under `always`); the raw special tokens;
+/// plain text.
+const MARKER_TEXTS: &[&str] = &[
+    "<think>\nthinking </think> done<|im_end|>\n",
+    "</think>a",
+    "a </think> b",
+    "a\n</think>",
+    "a</think>b",
+    "<s>[INST] a",
+    "a<s>b",
+    "<|im_start|>a",
+    "ab<|im_end|>",
+    " a",
+    "a  b",
+    "",
+];
+
+/// The fixture with its markers matched raw (`normalized: false`) when
+/// `markers_after_normalization` is false: the library keeps an added token's
+/// flags once it is in the vocabulary, so the variant is read from the file.
+fn sentencepiece_fixture(scheme: PrependScheme, markers_after_normalization: bool) -> Tokenizer {
+    let json = if markers_after_normalization {
+        SENTENCEPIECE_STYLE_TOKENIZER_JSON.to_owned()
+    } else {
+        SENTENCEPIECE_STYLE_TOKENIZER_JSON
+            .replace(r#""normalized": true"#, r#""normalized": false"#)
+    };
+    let mut reference: Tokenizer = json.parse().expect("tokenizer.json");
+    reference
+        .with_normalizer(None::<NormalizerWrapper>)
+        .expect("no normalizer");
+    reference.with_pre_tokenizer(Some(Metaspace::new('\u{2581}', scheme, false)));
+    reference
+}
+
+/// Under a `Metaspace` pre-tokenizer and no normalizer, the pipeline cuts the
+/// added tokens matched after normalization where the reference does, before
+/// the word marker is prepended: no marker piece in front of a marker token
+/// that opens the text (`first`), the marker on the split after one
+/// (`always`); the same texts with the markers matched raw, the control.
+#[test]
+fn added_tokens_matched_after_normalization_are_cut_before_the_word_marker() {
+    for scheme in [
+        PrependScheme::First,
+        PrependScheme::Always,
+        PrependScheme::Never,
+    ] {
+        let reference = sentencepiece_fixture(scheme, true);
+        assert!(reference
+            .get_added_tokens_decoder()
+            .values()
+            .any(|token| token.normalized && token.content == "<think>"));
+        let ours = HuggingFaceTokenizer::from_tokenizer(reference.clone());
+        assert_eq!(
+            ours.uses_v1_encoder(),
+            cfg!(feature = "tokenizers-v1"),
+            "{scheme:?}"
+        );
+        compare_texts(&reference, &ours, MARKER_TEXTS);
+
+        let raw_markers = sentencepiece_fixture(scheme, false);
+        assert!(raw_markers
+            .get_added_tokens_decoder()
+            .values()
+            .all(|token| !token.normalized));
+        let ours = HuggingFaceTokenizer::from_tokenizer(raw_markers.clone());
+        assert_eq!(
+            ours.uses_v1_encoder(),
+            cfg!(feature = "tokenizers-v1"),
+            "{scheme:?}"
+        );
+        compare_texts(&raw_markers, &ours, MARKER_TEXTS);
+    }
+}
+
+/// An added token matched after normalization that could reach into a raw
+/// one (`a<|im_end|>` over `<|im_end|>`): the reference's raw pass takes the
+/// raw token first, a single pass would take the longer one, so the
+/// tokenizer keeps the established encoder, which agrees with the reference.
+#[test]
+fn an_added_token_that_could_reach_into_a_raw_one_keeps_the_established_encoder() {
+    let mut reference = sentencepiece_fixture(PrependScheme::First, true);
+    reference
+        .add_tokens([AddedToken::from("a<|im_end|>", false).normalized(true)])
+        .expect("added token");
+    let ours = HuggingFaceTokenizer::from_tokenizer(reference.clone());
+    assert!(!ours.uses_v1_encoder());
+    compare_texts(
+        &reference,
+        &ours,
+        &["a<|im_end|>", "ba<|im_end|>b", "<|im_end|>a"],
+    );
+}
+
+/// The fixture with more added tokens spliced into its `added_tokens` array
+/// (the library keeps a token's flags once it is in the vocabulary, so the
+/// variants are made in the file), under the reference class's pipeline.
+fn fixture_with_added_tokens(scheme: PrependScheme, tokens: &str) -> Tokenizer {
+    let json = SENTENCEPIECE_STYLE_TOKENIZER_JSON.replace(
+        r#""added_tokens": ["#,
+        &format!(r#""added_tokens": [{tokens},"#),
+    );
+    assert!(json.contains(tokens));
+    let mut reference: Tokenizer = json.parse().expect("tokenizer.json");
+    reference
+        .with_normalizer(None::<NormalizerWrapper>)
+        .expect("no normalizer");
+    reference.with_pre_tokenizer(Some(Metaspace::new('\u{2581}', scheme, false)));
+    reference
+}
+
+/// A `single_word` token among the tokens matched after normalization: one
+/// pass judges its boundary against the token after it over the whole text
+/// (`cd` before the raw `ef` in `cdef` is rejected), where the reference's
+/// second pass judges it at the end of the piece the raw cut leaves (`cd` is
+/// the piece, and is taken), so the tokenizer keeps the established encoder,
+/// which agrees with the reference.
+#[test]
+fn a_single_word_added_token_keeps_the_established_encoder() {
+    let reference = fixture_with_added_tokens(
+        PrependScheme::First,
+        r#"{"id": 34, "content": "cd", "single_word": true, "lstrip": false, "rstrip": false, "normalized": true, "special": false},
+           {"id": 35, "content": "ef", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": false}"#,
+    );
+    let ours = HuggingFaceTokenizer::from_tokenizer(reference.clone());
+    assert!(!ours.uses_v1_encoder());
+    assert_eq!(
+        reference
+            .encode("cdef", false)
+            .expect("reference")
+            .get_ids(),
+        &[34, 35]
+    );
+    compare_texts(&reference, &ours, &["cdef", "cd ef", "a cd", "cdefcd"]);
+    compare_texts(&reference, &ours, MARKER_TEXTS);
+}
+
+/// A strip that would take whitespace the neighbouring token's content
+/// holds: a raw `lstrip` token after a token matched after normalization
+/// that ends in a space (`b ` then `<a>` in `b <a>`), and a `rstrip` token
+/// matched after normalization before a raw token that starts with a space
+/// (`<x>` then ` <y>` in `<x> <y>`). The reference cuts the raw token
+/// first; one pass gives the space to whichever match comes first. Both
+/// shapes keep the established encoder, which agrees with the reference.
+#[test]
+fn a_strip_that_could_take_a_neighbours_whitespace_keeps_the_established_encoder() {
+    let lstrip_after = fixture_with_added_tokens(
+        PrependScheme::First,
+        r#"{"id": 34, "content": "b ", "single_word": false, "lstrip": false, "rstrip": false, "normalized": true, "special": false},
+           {"id": 35, "content": "<a>", "single_word": false, "lstrip": true, "rstrip": false, "normalized": false, "special": false}"#,
+    );
+    let ours = HuggingFaceTokenizer::from_tokenizer(lstrip_after.clone());
+    assert!(!ours.uses_v1_encoder());
+    compare_texts(&lstrip_after, &ours, &["b <a>", "b  <a>", "ab <a>b"]);
+
+    let rstrip_before = fixture_with_added_tokens(
+        PrependScheme::First,
+        r#"{"id": 34, "content": "<x>", "single_word": false, "lstrip": false, "rstrip": true, "normalized": true, "special": false},
+           {"id": 35, "content": " <y>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": false}"#,
+    );
+    let ours = HuggingFaceTokenizer::from_tokenizer(rstrip_before.clone());
+    assert!(!ours.uses_v1_encoder());
+    compare_texts(&rstrip_before, &ours, &["<x> <y>", "<x>  <y>", "a<x> <y>b"]);
+
+    // The mirror shapes agree in either order, so they take the pipeline.
+    let mirror = fixture_with_added_tokens(
+        PrependScheme::First,
+        r#"{"id": 34, "content": " b", "single_word": false, "lstrip": false, "rstrip": false, "normalized": true, "special": false},
+           {"id": 35, "content": "<a>", "single_word": false, "lstrip": false, "rstrip": true, "normalized": false, "special": false}"#,
+    );
+    let ours = HuggingFaceTokenizer::from_tokenizer(mirror.clone());
+    assert_eq!(ours.uses_v1_encoder(), cfg!(feature = "tokenizers-v1"));
+    compare_texts(&mirror, &ours, &["<a> b", "<a>  b", "a<a> bc"]);
+}
+
+/// `encode_special_tokens` set: the reference's raw pass leaves a special
+/// token's text to its second pass, one pass has moved on, so the tokenizer
+/// keeps the established encoder, which agrees with the reference.
+#[test]
+fn encode_special_tokens_with_added_tokens_after_normalization_keeps_the_established_encoder() {
+    let mut reference = sentencepiece_fixture(PrependScheme::First, true);
+    reference.set_encode_special_tokens(true);
+    let ours = HuggingFaceTokenizer::from_tokenizer(reference.clone());
+    assert!(!ours.uses_v1_encoder());
+    compare_texts(&reference, &ours, MARKER_TEXTS);
 }
 
 #[test]

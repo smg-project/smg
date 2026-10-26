@@ -107,15 +107,6 @@ const HAND_WRITTEN_SET: &str = "common";
 /// content would be.
 const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 
-/// The reason of the render sets of a Llama-class checkpoint whose
-/// tokenizer config sets `legacy: true`: the reference's ids are recorded
-/// through the tokenizer class, the loader's Llama-class rule maps the flag
-/// to the `always` prepend scheme (see
-/// `huggingface::HuggingFaceTokenizer::llama_class_pipeline`), and the v1
-/// encode path the job builds reads that scheme differently from the class.
-/// The tokenizer crate's fixture harness lists the same sets under the same reason.
-const LEGACY_FLAG_PIPELINE: &str = "this Llama-class checkpoint's tokenizer config sets `legacy: true`, which the loader's Llama-class rule maps to a Metaspace pre-tokenizer with the `always` prepend scheme (see `huggingface::HuggingFaceTokenizer::llama_class_pipeline`); the reference's ids are recorded through the tokenizer class (transformers 5.17.0, the version the engines run), which prepends the word marker at the start of every split, special tokens included, while the v1 encode path the job builds (`--features tokenizers-v1`) reads that scheme as one marker at the start of the input and none after a special token, so the ids differ at the splits that follow a special token (a marker token before a newline, `▁[` against `[`) while the text is equal; the render cases of the model whose text has such a split, until the v1 path declines or maps that scheme, when this entry heals and the run asks for its removal";
-
 /// Cases known to differ from the reference, each with the reason and where
 /// it is tracked: a fixture id, `<slug>/render/<name>`; a prefix ending in
 /// `*`, which stands for every case whose id begins with what is before it
@@ -381,8 +372,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          which the template, writing the string as recorded, renders otherwise: a \
          benchmark set in the tree's sample, every case with a call in its history",
     ),
-    ("nanbeige4-3b-thinking-2510/render/*", LEGACY_FLAG_PIPELINE),
-    ("nanbeige4-3b-thinking-2511/render/*", LEGACY_FLAG_PIPELINE),
     (
         "nft-7b/render/swehero-5.jsonl",
         "the gateway parses a history call's arguments into an object before rendering, \
@@ -457,10 +446,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "the gateway parses a history call's arguments into an object before rendering, \
          which the template, writing the string as recorded, renders otherwise: a \
          benchmark set in the tree's sample, every case with a call in its history",
-    ),
-    (
-        "spec-decoding-subfolder-fixture/render/*",
-        LEGACY_FLAG_PIPELINE,
     ),
 ];
 /// Models whose tokenizer is known not to load, with the reason and where it
