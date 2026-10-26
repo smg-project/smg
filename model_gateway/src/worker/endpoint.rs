@@ -346,6 +346,25 @@ impl Endpoint {
         }
     }
 
+    /// The address as a request's success path shows it: the routed-worker
+    /// response header, the cache-trace header and the request-sent event.
+    /// An address without userinfo, query or fragment is the registered
+    /// string, byte for byte, so the header a client matches against the
+    /// address it registered does not change; one with userinfo is
+    /// [`Self::redacted_str`]'s form (the userinfo masked whole, a DP rank
+    /// kept), one with a query or fragment is cut at its path like it (they
+    /// may carry a token), and so is one the parser refuses. A worker
+    /// computes it once at registration (`WorkerMetadata::redacted_url`);
+    /// nothing on a request path parses.
+    pub fn redacted_url(input: &str) -> String {
+        match Self::parse_with_rank(input) {
+            Ok((endpoint, _)) if endpoint.userinfo.is_none() && !input.contains(['?', '#']) => {
+                input.to_string()
+            }
+            _ => Self::redacted_str(input),
+        }
+    }
+
     /// Render this endpoint with the workflow's rank suffix.
     pub fn render_with_rank(&self, rank: usize) -> String {
         format!("{}@{rank}", self.render())
@@ -891,6 +910,49 @@ mod tests {
         );
         assert_eq!(
             Endpoint::redacted_str("not an address"),
+            "<unparsable address>"
+        );
+    }
+
+    /// `redacted_url` is what the request path renders: an address without
+    /// userinfo byte for byte as registered (its spelling, rank, path, IPC
+    /// and IPv6 forms included), one with userinfo in `redacted_str`'s form.
+    #[test]
+    fn redacted_url_keeps_an_address_without_userinfo_byte_for_byte() {
+        for plain in [
+            "http://worker:3000",
+            "http://Worker:3000/",
+            "grpc://10.0.0.1:30000@2",
+            "http://[0:0:0:0:0:0:0:1]:8000/v1",
+            "ipc:///tmp/engine.sock",
+            "worker:3000",
+        ] {
+            assert_eq!(Endpoint::redacted_url(plain), plain);
+        }
+        assert_eq!(
+            Endpoint::redacted_url("http://user:secret@worker:3000"),
+            "http://***@worker:3000"
+        );
+        assert_eq!(
+            Endpoint::redacted_url("http://user:secret@worker:3000@2"),
+            "http://***@worker:3000@2"
+        );
+        assert_eq!(
+            Endpoint::redacted_url("http://api-token@worker:3000"),
+            "http://***@worker:3000"
+        );
+        // A query or a fragment may carry a token: cut at the path, as the
+        // log rendering does.
+        assert_eq!(
+            Endpoint::redacted_url("http://worker:3000/v1?token=abc"),
+            "http://worker:3000/v1"
+        );
+        assert_eq!(
+            Endpoint::redacted_url("http://worker:3000/v1#frag"),
+            "http://worker:3000/v1"
+        );
+        assert_eq!(
+            Endpoint::redacted_url("not an address"),
             "<unparsable address>"
         );
     }

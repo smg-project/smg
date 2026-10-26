@@ -61,7 +61,6 @@ use crate::{
     },
     persistence_utils::persist_conversation_items,
     sse::{sse_channel, SseEncoder, SseSender},
-    worker::redacted_url,
 };
 
 /// Apply all transformations to event data in-place (rewrite + transform)
@@ -657,7 +656,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
     }
 
     let mut preserved_headers = preserve_response_headers(response.headers());
-    insert_routed_worker_id(&mut preserved_headers, &redacted_url(worker.url()));
+    insert_routed_worker_id(&mut preserved_headers, worker.redacted_url());
     let mut upstream_stream = response.bytes_stream();
 
     let (tx, rx) = sse_channel();

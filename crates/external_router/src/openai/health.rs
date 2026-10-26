@@ -8,10 +8,7 @@ use axum::{
 };
 use serde_json::json;
 
-use crate::{
-    error,
-    worker::{redacted_url, WorkerSource},
-};
+use crate::{error, worker::WorkerSource};
 
 pub(super) fn health_generate(source: &dyn WorkerSource) -> Response {
     let workers = source.external_workers();
@@ -30,7 +27,7 @@ pub(super) fn health_generate(source: &dyn WorkerSource) -> Response {
     } else {
         let unhealthy_info: Vec<_> = unhealthy
             .iter()
-            .map(|w| format!("{} ({})", w.model_id(), redacted_url(w.url())))
+            .map(|w| format!("{} ({})", w.model_id(), w.redacted_url()))
             .collect();
         error::service_unavailable(
             "service_unavailable",
@@ -47,7 +44,7 @@ pub(super) fn health_generate(source: &dyn WorkerSource) -> Response {
 pub(super) fn get_server_info(source: &dyn WorkerSource) -> Response {
     let stats = source.stats();
     let workers = source.external_workers();
-    let worker_urls: Vec<_> = workers.iter().map(|w| redacted_url(w.url())).collect();
+    let worker_urls: Vec<_> = workers.iter().map(|w| w.redacted_url()).collect();
 
     let info = json!({
         "router_type": "openai",

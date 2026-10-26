@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 
 use super::{
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
+    endpoint::Endpoint,
     event::WorkerConnected,
     http_client::LazyHttpClient,
     overload::OverloadThresholds,
@@ -345,6 +346,7 @@ impl BasicWorkerBuilder {
         let metadata = WorkerMetadata {
             overload: OverloadThresholds::resolve(&self.spec.overload, self.overload_defaults),
             pd_pairing: PdPairing::derive(&self.spec),
+            redacted_url: Endpoint::redacted_url(&self.spec.url),
             spec: Arc::new(self.spec),
             health_config,
             health_endpoint: self.health_endpoint,
@@ -479,6 +481,20 @@ mod tests {
         );
         assert_eq!(from_url.worker_type(), from_spec.worker_type());
         assert_eq!(from_url.is_healthy(), from_spec.is_healthy());
+    }
+
+    /// The rendered URL is computed once at build: a URL without userinfo is
+    /// the URL byte for byte (its spelling kept), one with userinfo masks it
+    /// whole and keeps the DP rank.
+    #[test]
+    fn the_rendered_url_masks_a_userinfo_and_keeps_a_plain_url_byte_for_byte() {
+        let plain = BasicWorkerBuilder::new("http://Worker:8080/").build();
+        assert_eq!(plain.redacted_url(), plain.url());
+        let with_secret = BasicWorkerBuilder::new("http://user:secret@worker:8080")
+            .dp_config(2, 4)
+            .build();
+        assert_eq!(with_secret.url(), "http://user:secret@worker:8080@2");
+        assert_eq!(with_secret.redacted_url(), "http://***@worker:8080@2");
     }
 
     #[test]

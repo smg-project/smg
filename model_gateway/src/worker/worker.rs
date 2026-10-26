@@ -225,6 +225,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Get the worker's URL
     fn url(&self) -> &str;
+    /// The URL as a request's success path shows it (the routed-worker
+    /// response header, the request-sent event): the registered URL byte for
+    /// byte, unless it carries userinfo, which is masked whole. Computed once
+    /// at registration (`WorkerMetadata::redacted_url`).
+    fn redacted_url(&self) -> &str {
+        &self.metadata().redacted_url
+    }
     /// Get the worker's API key
     fn api_key(&self) -> Option<&String>;
     /// Get the worker's type (Regular, Prefill, or Decode)
@@ -1553,6 +1560,10 @@ impl Worker for BasicWorker {
 
     fn url(&self) -> &str {
         &self.metadata.spec.url
+    }
+
+    fn redacted_url(&self) -> &str {
+        &self.metadata.redacted_url
     }
 
     fn api_key(&self) -> Option<&String> {
@@ -3346,6 +3357,7 @@ mod tests {
         let metadata = WorkerMetadata {
             pd_pairing: PdPairing::derive(&WorkerSpec::new("http://test:8080")),
             spec: Arc::new(WorkerSpec::new("http://test:8080")),
+            redacted_url: "http://test:8080".to_string(),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
             zmq_startup_timeout: Duration::from_secs(600),
@@ -3375,6 +3387,7 @@ mod tests {
         let metadata = WorkerMetadata {
             pd_pairing: PdPairing::derive(&spec),
             spec: Arc::new(spec),
+            redacted_url: "http://test:8080".to_string(),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
             zmq_startup_timeout: Duration::from_secs(600),

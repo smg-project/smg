@@ -39,6 +39,7 @@ pub(crate) fn http_client() -> reqwest::Client {
 /// A worker at one address, serving model `m`, with no API key of its own.
 pub(crate) struct StubWorker {
     url: String,
+    redacted: String,
     healthy: bool,
     client: reqwest::Client,
 }
@@ -48,6 +49,7 @@ impl StubWorker {
     pub(crate) fn at(url: &str) -> Arc<dyn ExternalWorker> {
         Arc::new(Self {
             url: url.to_string(),
+            redacted: crate::worker::redacted_url(url).into_owned(),
             healthy: true,
             client: http_client(),
         })
@@ -61,6 +63,7 @@ impl StubWorker {
     pub(crate) fn unhealthy_at(url: &str) -> Arc<dyn ExternalWorker> {
         Arc::new(Self {
             url: url.to_string(),
+            redacted: crate::worker::redacted_url(url).into_owned(),
             healthy: false,
             client: http_client(),
         })
@@ -79,6 +82,10 @@ impl fmt::Debug for StubWorker {
 impl ExternalWorker for StubWorker {
     fn url(&self) -> &str {
         &self.url
+    }
+
+    fn redacted_url(&self) -> &str {
+        &self.redacted
     }
 
     fn api_key(&self) -> Option<&String> {
