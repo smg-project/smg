@@ -1388,7 +1388,8 @@ struct ServingArgs {
 
     /// Consecutive probe successes before a worker returns to rotation (at
     /// least 1): a pending worker's reads are an interval apart, a demoted
-    /// worker's a probe timeout apart once one passes
+    /// worker's a probe timeout apart (or an interval, if that is shorter)
+    /// once one passes
     #[arg(long, default_value_t = 2, help_heading = "Health Checks")]
     health_success_threshold: u32,
 

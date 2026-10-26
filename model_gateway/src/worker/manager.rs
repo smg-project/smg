@@ -503,10 +503,11 @@ async fn run_health_loop(
                         }
                     }
                     // A demoted worker's probe passed short of its success
-                    // threshold: its next read is due a probe's timeout from
-                    // now (the immediate slot a contact uses, written at that
-                    // instant), so the threshold is consecutive reads a round
-                    // trip apart, not consecutive intervals. Whatever took
+                    // threshold: its next read is due at most a probe's
+                    // timeout from now, and never after a deadline the
+                    // schedule already holds (the interval's, or a contact's
+                    // immediate one), so the threshold is consecutive reads a
+                    // round trip apart, not consecutive intervals. Whatever took
                     // the worker out (its transport within seconds where
                     // something contacts it; the probes alone where nothing
                     // does, an HTTP worker or a gRPC worker under a policy
