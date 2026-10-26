@@ -6,9 +6,11 @@
 //! given comes from one decision, `ProbeSlot::of`: what the schedule does
 //! with a worker of a given status under the manager's configuration (a
 //! removed worker's slot and the lag recovery's rebuild are the only writes
-//! beside it). A worker's deadline is re-armed when its probe launches
-//! (never when it completes), and `in_flight` keeps a slow probe from being
-//! joined by a second one.
+//! beside it). A worker's deadline is re-armed when its probe launches, and
+//! on its completion only to bring the next read of a demoted worker whose
+//! probe just passed to now (its return is consecutive reads, not consecutive
+//! intervals); `in_flight` keeps a slow probe from being joined by a second
+//! one.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -386,8 +388,10 @@ impl ProbeSlot {
 }
 
 /// Writes `worker_id`'s slot. A probed worker is due at once (`immediate`: a
-/// registration or replacement is probed without waiting an interval) or
-/// after its interval; any other slot leaves the schedule.
+/// registration or replacement is probed without waiting an interval, and so
+/// is a demoted worker a contact or a passing probe short of its success
+/// threshold brings forward) or after its interval; any other slot leaves the
+/// schedule.
 fn schedule_at(
     next_check: &mut HashMap<WorkerId, tokio::time::Instant>,
     worker_id: WorkerId,
@@ -471,8 +475,9 @@ async fn run_health_loop(
             Some(completion) = probes.next(), if !probes.is_empty() => {
                 let worker_id = completion.worker_id.clone();
                 let worker = Arc::clone(&completion.worker);
+                let probe_ok = completion.probe_result.is_ok();
                 in_flight.remove(&worker_id);
-                if let ProbeApplyResult::Applied(Some((_, new))) = apply_probe_completion(
+                match apply_probe_completion(
                     &registry,
                     completion,
                     removal_queue.as_ref().map(|queue| (queue, config.remove_unhealthy)),
@@ -480,15 +485,59 @@ async fn run_health_loop(
                 )
                 .await
                 {
-                    // The one slot a probe's outcome changes: a worker that
-                    // just failed under removal leaves the schedule (its
-                    // removal is in flight). Every other transition keeps the
-                    // deadline armed at the probe's launch.
-                    if ProbeSlot::of_worker(&registry, &worker_id, worker.as_ref(), new, &config)
-                        == ProbeSlot::Removal
-                    {
-                        next_check.remove(&worker_id);
+                    ProbeApplyResult::Applied(Some((_, new))) => {
+                        // A worker that just failed under removal leaves the
+                        // schedule (its removal is in flight). Every other
+                        // transition keeps the deadline armed at the probe's
+                        // launch.
+                        if ProbeSlot::of_worker(
+                            &registry,
+                            &worker_id,
+                            worker.as_ref(),
+                            new,
+                            &config,
+                        ) == ProbeSlot::Removal
+                        {
+                            next_check.remove(&worker_id);
+                        }
                     }
+                    // A demoted worker's probe passed short of its success
+                    // threshold: its next read runs now, through the slot a
+                    // contact uses, so the threshold is consecutive reads and
+                    // not consecutive intervals. The engine behind it is back
+                    // (the outage was detected within seconds by its
+                    // transport); left to the schedule, each further read
+                    // waited a whole interval, and a worker the gateway kept
+                    // through a restart stayed out of routing for one to two
+                    // intervals after its engine answered while a worker
+                    // re-registered for the same engine served on one read.
+                    // A failed read, a stale outcome and a worker already
+                    // Ready keep the deadline armed at the launch.
+                    ProbeApplyResult::Applied(None)
+                        if probe_ok
+                            && matches!(
+                                worker.status(),
+                                WorkerStatus::NotReady | WorkerStatus::Failed
+                            ) =>
+                    {
+                        let slot = ProbeSlot::of_worker(
+                            &registry,
+                            &worker_id,
+                            worker.as_ref(),
+                            worker.status(),
+                            &config,
+                        );
+                        if matches!(slot, ProbeSlot::Probe(_)) {
+                            schedule_at(
+                                &mut next_check,
+                                worker_id,
+                                slot,
+                                tokio::time::Instant::now(),
+                                true,
+                            );
+                        }
+                    }
+                    ProbeApplyResult::Applied(None) | ProbeApplyResult::Stale => {}
                 }
             }
             () = tokio::time::sleep_until(sleep_until) => {}
@@ -2407,6 +2456,57 @@ mod tests {
         assert!(
             tokio::time::Instant::now() >= contact + Duration::from_secs(2),
             "the promoting probe was the scheduled one, an interval after the launch"
+        );
+
+        manager.shutdown().await;
+    }
+
+    /// A demoted worker whose health answers again returns on consecutive
+    /// reads, not consecutive intervals. Through the running loop, a
+    /// threshold of two reads and two seconds between probes: the stub is
+    /// held until the registration's probe has read it, so the next probe is
+    /// an interval away; it passes, and the read that promotes the worker
+    /// follows within its round trip (three reads, one interval) instead of
+    /// an interval later (three reads, two intervals).
+    #[tokio::test]
+    async fn a_demoted_worker_returns_on_consecutive_reads_not_consecutive_intervals() {
+        let serving = Arc::new(AtomicBool::new(false));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = start_health_stub(serving.clone(), hits.clone()).await;
+        let registry = Arc::new(WorkerRegistry::new());
+        let mut manager = manager_over(&registry);
+
+        // Registered under the running manager: probed at once, and held.
+        let worker = probed_worker_with(&url, ConnectionMode::Http, 2, 2);
+        worker.set_status(WorkerStatus::NotReady);
+        registry.register(worker.clone()).unwrap();
+        let registered = tokio::time::Instant::now();
+        wait_until(
+            registered + Duration::from_secs(5),
+            "the registration's probe did not read the health in time",
+            || hits.load(Ordering::SeqCst) > 0,
+        )
+        .await;
+        assert_eq!(worker.status(), WorkerStatus::NotReady);
+
+        // The engine is back; the next probe is a whole interval away.
+        serving.store(true, Ordering::SeqCst);
+        let back = tokio::time::Instant::now();
+        wait_until(
+            back + Duration::from_millis(3500),
+            "the worker did not return within one interval and a round trip",
+            || worker.status() == WorkerStatus::Ready,
+        )
+        .await;
+        let returned = tokio::time::Instant::now();
+        assert!(
+            returned >= back + Duration::from_millis(1500),
+            "the first passing read was the scheduled one, an interval after the launch"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            3,
+            "the held read, the scheduled pass and the pass brought forward to now"
         );
 
         manager.shutdown().await;

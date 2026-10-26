@@ -174,21 +174,35 @@ async fn request_status(router: &dyn RouterTrait) -> u16 {
 /// it. Its circuit breaker opens after `breaker_failures` failed requests;
 /// `retries` is the retry policy, none for a router that answers the first
 /// attempt.
-#[expect(
-    clippy::expect_used,
-    reason = "test helper: a router that does not build fails the fixture"
-)]
 async fn build_router(
     port: u16,
     breaker_failures: u32,
     retries: Option<RetryConfig>,
+) -> (Box<dyn RouterTrait>, Arc<dyn Worker>, WorkerManager) {
+    build_router_with(port, breaker_failures, retries, 1, PROBE_INTERVAL).await
+}
+
+/// [`build_router`] with the worker promoted on `success_threshold` passing
+/// probes `probe_interval` apart, under round robin (a policy that opens no
+/// stream to the worker and polls no demoted one: nothing contacts the
+/// worker while it is out, its probes alone see its engine return).
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a router that does not build fails the fixture"
+)]
+async fn build_router_with(
+    port: u16,
+    breaker_failures: u32,
+    retries: Option<RetryConfig>,
+    success_threshold: u32,
+    probe_interval: Duration,
 ) -> (Box<dyn RouterTrait>, Arc<dyn Worker>, WorkerManager) {
     let builder = RouterConfig::builder()
         .mode(RoutingMode::Regular {
             worker_urls: vec![],
         })
         .grpc_connection()
-        .random_policy()
+        .round_robin_policy()
         .host("127.0.0.1")
         .port(0)
         .max_payload_size(1024 * 1024);
@@ -209,8 +223,8 @@ async fn build_router(
             .model(ModelCard::new(MODEL))
             .health_config(HealthCheckConfig {
                 timeout_secs: 1,
-                check_interval_secs: PROBE_INTERVAL.as_secs(),
-                success_threshold: 1,
+                check_interval_secs: probe_interval.as_secs(),
+                success_threshold,
                 failure_threshold: 1,
                 disable_health_check: false,
                 drain_settle_secs: 0,
@@ -230,7 +244,7 @@ async fn build_router(
     let manager = WorkerManager::start(
         app_context.worker_registry.clone(),
         WorkerManagerConfig {
-            default_check_interval_secs: PROBE_INTERVAL.as_secs(),
+            default_check_interval_secs: probe_interval.as_secs(),
             remove_unhealthy: smg::config::UnhealthyRemovalScope::Disabled,
         },
         None,
@@ -302,6 +316,65 @@ async fn a_restarted_worker_is_routable_when_its_probes_pass_again() {
     assert!(
         first_success < RECOVERY_BOUND,
         "first success {first_success:?} after the restart"
+    );
+
+    engine.kill().await;
+    manager.shutdown().await;
+}
+
+/// Under a success threshold of two reads, a worker the gateway kept through
+/// its engine's restart is routable again one probe interval after the
+/// restart plus the second read's round trip, not two intervals: the probe
+/// that passes short of the threshold brings the next one to now. Nothing
+/// contacts the worker while it is out (round robin opens no stream and a
+/// demoted worker is not load-polled), so its probes alone see the return;
+/// the engine comes back right after the probe that demoted the worker, so
+/// the first passing probe is a whole interval away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kept_worker_returns_within_one_interval_under_a_success_threshold_of_two() {
+    const INTERVAL: Duration = Duration::from_secs(2);
+    let port = free_port().await;
+    let engine = MockEngine::start(port).await;
+    let (router, worker, mut manager) = build_router_with(port, 1, None, 2, INTERVAL).await;
+
+    // Two passing probes an interval apart: the registration's promotion.
+    wait_until("the worker's first promotion", RECOVERY_BOUND, || {
+        worker.status() == WorkerStatus::Ready
+    })
+    .await;
+    assert_eq!(request_status(router.as_ref()).await, 200);
+
+    // The engine dies; the next probe demotes the worker, and the engine is
+    // back right after it.
+    engine.kill().await;
+    wait_until("the worker's demotion", RECOVERY_BOUND, || {
+        worker.status() != WorkerStatus::Ready
+    })
+    .await;
+    let restarted = Instant::now();
+    let engine = MockEngine::start(port).await;
+
+    let mut first_success = None;
+    while restarted.elapsed() < RECOVERY_BOUND {
+        if request_status(router.as_ref()).await == 200 {
+            first_success = Some(restarted.elapsed());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let first_success = first_success.unwrap_or_else(|| {
+        panic!(
+            "no request succeeded within {RECOVERY_BOUND:?} of the restart (worker {:?})",
+            worker.status()
+        )
+    });
+    assert!(
+        first_success >= INTERVAL - Duration::from_millis(500),
+        "the first passing probe is the scheduled one, an interval after the demotion: {first_success:?}"
+    );
+    assert!(
+        first_success < INTERVAL + Duration::from_secs(1),
+        "the second read follows the first within its round trip, not an interval later: {first_success:?}"
     );
 
     engine.kill().await;
