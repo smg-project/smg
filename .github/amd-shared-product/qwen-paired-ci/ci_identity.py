@@ -20,7 +20,7 @@ def proc(pid):
     comm = (path / "comm").read_text().strip()
     again = (path / "stat").read_text().rsplit(")", 1)[1].split()
     assert (fields[1], fields[19]) == (again[1], again[19]), "process incarnation changed during observation"
-    return {"pid": pid, "ppid": int(fields[1]), "start_ticks": fields[19], "comm": comm}
+    return {"pid": pid, "ppid": int(fields[1]), "start_ticks": fields[19], "comm": comm, "uid": path.stat().st_uid}
 
 
 def get(path):
@@ -96,8 +96,12 @@ def check_kfd(admission, hostname):
         row = proc(int(path.name))
         expected = allowed.get(row["pid"])
         assert expected is not None and row["start_ticks"] == expected["start_ticks"] and row["ppid"] == 1 and row["comm"] == "gpuagent"
-        executable = Path("/proc", path.name, "exe").resolve(strict=True)
-        assert str(executable) == expected["executable"]
+        assert row["uid"] == expected["uid"] == 0
+        # Root admission joins this PID incarnation to its executable. The runner
+        # can rehash the public file, but cannot read a root process's proc exe link.
+        executable = Path(expected["executable"])
+        assert str(executable) == "/usr/local/bin/gpuagent" and not executable.is_symlink()
+        assert executable.is_file() and executable.stat().st_uid == 0
         assert hashlib.sha256(executable.read_bytes()).hexdigest() == expected["executable_sha256"]
         vram = {item.name: int(item.read_text().strip()) for item in path.glob("vram_*")}
         assert vram and not any(vram.values()), "reported active GPU allocation is not idle"
