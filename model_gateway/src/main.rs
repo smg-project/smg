@@ -1184,8 +1184,8 @@ struct ServingArgs {
     #[arg(long, default_value_t = 180, help_heading = "Request Handling")]
     shutdown_grace_period_secs: u64,
 
-    /// Keep accepting connections after readiness fails. Defaults to half the grace
-    /// period; configured seconds are capped at half the grace period.
+    /// Keep accepting connections after readiness fails. Defaults to 5 seconds;
+    /// the window is capped at half the shutdown grace period.
     #[arg(long, help_heading = "Request Handling")]
     shutdown_settle_secs: Option<u64>,
 

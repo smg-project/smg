@@ -245,12 +245,14 @@ A router that gets its workers at runtime through the admin API (`POST /workers`
 
 The gateway drains in-flight requests for `router.shutdownGracePeriodSeconds` (default 180, passed as `--shutdown-grace-period-secs`); the pod's `terminationGracePeriodSeconds` is that plus `router.terminationGraceMarginSeconds` (default 30), so the kubelet does not kill the drain at its default 30 s.
 
-During shutdown, readiness fails immediately while listeners stay open for half of
-`router.shutdownGracePeriodSeconds` by default (90 seconds with the default grace).
-Set `router.shutdownSettleSeconds` (`--shutdown-settle-secs`) to cap this propagation
-window; the effective window is the smaller of this value and half the grace.
-The remaining grace drains existing requests. A value of 0 skips the propagation
-wait (mesh departure still shares the total grace budget).
+During shutdown, readiness fails immediately while listeners stay open for
+`min(router.shutdownGracePeriodSeconds / 2, 5 seconds)` by default.
+Set `router.shutdownSettleSeconds` (`--shutdown-settle-secs`) to adjust this
+propagation window; the effective window is the smaller of this value and half
+the grace. For example, a 180-second grace and a 30-second window leaves
+150 seconds for draining existing requests. Longer windows also delay idle
+shutdowns and local Ctrl+C exits. A value of 0 skips the propagation wait
+(mesh departure still shares the total grace budget).
 
 #### Dashboard and Alerts
 

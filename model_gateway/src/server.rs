@@ -1016,7 +1016,7 @@ pub struct ServerConfig {
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
     pub shutdown_grace_period_secs: u64,
-    /// Listener propagation window; defaults to half the shutdown grace period.
+    /// Listener propagation window; defaults to 5 seconds, capped at half the grace period.
     pub shutdown_settle_secs: Option<u64>,
     /// Control plane authentication configuration
     pub control_plane_auth: Option<smg_auth::ControlPlaneAuthConfig>,
@@ -2591,13 +2591,12 @@ struct ShutdownBudget {
 
 impl ShutdownBudget {
     /// The settle window is carved out of the grace budget (never more than
-    /// half, optionally capped by the configured settle seconds) so
+    /// half, with a configurable window defaulting to 5 seconds) so
     /// total shutdown stays within `shutdown_grace_period_secs` and never
     /// overruns terminationGracePeriod.
     fn from_grace_secs(grace_secs: u64, settle_secs: Option<u64>) -> Self {
         let grace = Duration::from_secs(grace_secs);
-        let settle =
-            settle_secs.map_or(grace / 2, |secs| (grace / 2).min(Duration::from_secs(secs)));
+        let settle = (grace / 2).min(Duration::from_secs(settle_secs.unwrap_or(5)));
         Self {
             grace,
             settle,
@@ -2687,7 +2686,7 @@ mod graceful_shutdown_tests {
 
     use super::{graceful_shutdown, InFlightRequestTracker, ShutdownBudget};
 
-    /// The settle window is half the grace; the drain is the
+    /// The default settle window is half the grace, capped at 5 s; the drain is the
     /// rest; a zero grace has neither.
     #[test]
     fn the_budget_splits_the_grace() {
@@ -2696,8 +2695,8 @@ mod graceful_shutdown_tests {
             ShutdownBudget::from_grace_secs(30, None),
             ShutdownBudget {
                 grace: secs(30),
-                settle: secs(15),
-                drain: secs(15)
+                settle: secs(5),
+                drain: secs(25)
             }
         );
         assert_eq!(
@@ -2722,7 +2721,7 @@ mod graceful_shutdown_tests {
     #[test]
     fn configured_settle_is_capped_at_half_the_grace() {
         for (grace, configured, expected) in [
-            (180, None, 90),
+            (180, None, 5),
             (180, Some(30), 30),
             (180, Some(120), 90),
             (180, Some(0), 0),
@@ -2738,23 +2737,25 @@ mod graceful_shutdown_tests {
         );
     }
 
-    /// Readiness fails immediately, but listener gating waits for the full default propagation window.
+    /// Readiness fails immediately; listener gating uses the default or configured window.
     #[tokio::test(start_paused = true)]
-    async fn default_window_gates_listeners_after_half_the_grace() {
-        let tracker = InFlightRequestTracker::new();
-        let start = tokio::time::Instant::now();
-        graceful_shutdown(
-            &tracker,
-            ShutdownBudget::from_grace_secs(180, None),
-            async {},
-            || panic!("mesh leave completed"),
-            |remaining| {
-                assert!(tracker.is_draining());
-                assert_eq!(start.elapsed(), Duration::from_secs(90));
-                assert_eq!(remaining, Duration::from_secs(90));
-            },
-        )
-        .await;
+    async fn listener_gating_respects_default_and_configured_windows() {
+        for (configured, expected) in [(None, 5), (Some(30), 30), (Some(120), 90)] {
+            let tracker = InFlightRequestTracker::new();
+            let start = tokio::time::Instant::now();
+            graceful_shutdown(
+                &tracker,
+                ShutdownBudget::from_grace_secs(180, configured),
+                async {},
+                || panic!("a completed mesh leave must not be stopped again"),
+                |remaining| {
+                    assert!(tracker.is_draining());
+                    assert_eq!(start.elapsed(), Duration::from_secs(expected));
+                    assert_eq!(remaining, Duration::from_secs(180 - expected));
+                },
+            )
+            .await;
+        }
     }
 
     /// The phases in order, on a paused clock: readiness drains at once;

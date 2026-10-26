@@ -2112,8 +2112,8 @@ class RouterArgs:
             f"--{prefix}shutdown-settle-secs",
             type=int,
             default=RouterArgs.shutdown_settle_secs,
-            help="Keep accepting connections after readiness fails; defaults to half the "
-            "shutdown grace period and cannot exceed that half",
+            help="Keep accepting connections after readiness fails; defaults to 5 seconds "
+            "and is capped at half the shutdown grace period",
         )
         request_group.add_argument(
             f"--{prefix}shutdown-grace-period-secs",
