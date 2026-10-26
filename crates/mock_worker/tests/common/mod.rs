@@ -7,8 +7,9 @@
 
 use std::sync::Arc;
 
+use futures::StreamExt;
 use mock_worker::{config::Config, grpc::serve_with_listener};
-use smg_grpc_client::TokenSpeedSchedulerClient;
+use smg_grpc_client::{tokenspeed_proto as ts, TokenSpeedSchedulerClient};
 use tokio::net::TcpListener;
 
 /// The tests' HTTP client. The client takes the process-level TLS crypto
@@ -38,4 +39,18 @@ pub async fn start(cfg: Config) -> TokenSpeedSchedulerClient {
     TokenSpeedSchedulerClient::connect(&format!("http://127.0.0.1:{port}"))
         .await
         .expect("connect to the mock worker")
+}
+
+/// Send `req` and read every frame of the response.
+pub async fn generate(
+    client: &TokenSpeedSchedulerClient,
+    req: ts::GenerateRequest,
+) -> Vec<ts::GenerateResponse> {
+    let mut stream = client.generate(req).await.expect("generate");
+    let mut frames = Vec::new();
+    while let Some(frame) = stream.next().await {
+        frames.push(frame.expect("a response frame"));
+    }
+    stream.mark_completed();
+    frames
 }

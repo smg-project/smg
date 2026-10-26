@@ -16,12 +16,12 @@ use mock_worker::{
     grpc::serve_with_listener,
 };
 use serde_json::{json, Value};
-use smg_grpc_client::{tokenspeed_proto as ts, TokenSpeedSchedulerClient};
+use smg_grpc_client::tokenspeed_proto as ts;
 use tokio::net::TcpListener;
 use ts::generate_response::Response as GenResp;
 
 mod common;
-use common::start;
+use common::{generate, start};
 
 /// A canned worker that captures to `capture` when it is set.
 fn config(capture: Option<PathBuf>) -> Config {
@@ -60,20 +60,6 @@ fn request(request_id: &str, input_ids: &[u32], text: &str) -> ts::GenerateReque
         stream: true,
         ..Default::default()
     }
-}
-
-/// Send `req` and read every frame of the response.
-async fn generate(
-    client: &TokenSpeedSchedulerClient,
-    req: ts::GenerateRequest,
-) -> Vec<ts::GenerateResponse> {
-    let mut stream = client.generate(req).await.expect("generate");
-    let mut frames = Vec::new();
-    while let Some(frame) = stream.next().await {
-        frames.push(frame.expect("a response frame"));
-    }
-    stream.mark_completed();
-    frames
 }
 
 /// The capture file's lines, each parsed as JSON.
