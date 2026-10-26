@@ -1328,14 +1328,15 @@ jobs:
       parser: symphony
     secrets: inherit
 
-  # The chat cases against the Rust gRPC servicer (SMG_SGLANG_SERVICER_IMPL=rust,
-  # SMG_VLLM_SERVICER_IMPL=rust): the same workers, the Rust request path. A
-  # row for SGLang and one for vLLM (the TokenSpeed Rust servicer has no
-  # PR-time row yet, so this lane says nothing about it): every other lane of
-  # those engines runs the Python servicer, so a launcher or binding change
-  # that breaks the Rust servicer's start fails here and nowhere else.
-  e2e-1gpu-chat-rust-servicer:
-    name: e2e-1gpu-chat-rust-servicer (${{ matrix.engine }})
+  # The chat cases against the Python gRPC servicer, named explicitly
+  # (SMG_<ENGINE>_SERVICER_IMPL=python): the same workers and suite as the
+  # engine's e2e-1gpu-chat row, which runs the servicer package's default
+  # (the Rust servicer), so the two rows differ by the servicer only. One row
+  # per engine keeps the deprecated Python path covered until its removal; a
+  # launcher or binding change that breaks the Python servicer's start fails
+  # here and nowhere else.
+  e2e-1gpu-chat-python-servicer:
+    name: e2e-1gpu-chat-python-servicer (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
     if: >-
       always()
@@ -1343,34 +1344,27 @@ jobs:
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-chat-completions != 'true'
-    # Now also runs the previously-2-GPU chat tests (gpt-oss-20b,
-    # Qwen2.5-14B) since they're tp=1.
     strategy:
       fail-fast: false
       matrix:
         include:
+          # The suites, floors and budgets of e2e-1gpu-chat's rows: the Python
+          # servicer serves every case, so the harness deselects nothing here.
           - engine: sglang
-            timeout: 40
-            test_timeout: 32
-            # Chat lane plus the admin ops the Rust servicer serves through
-            # the wire's control calls.
-            test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py e2e_test/router/test_decisions.py
-            min_selected: 204 # floor ≈ 95% of the chat lane's measured effective (215 of 223 ran on the Rust servicer; audit 2026-10-04)
-          # The vLLM chat suite on the Rust servicer: the suite, floor and
-          # budgets of e2e-1gpu-chat's vllm row (the harness deselects nothing
-          # for this servicer), so the two rows differ by the servicer only.
+            timeout: 36
+            test_timeout: 28
+            min_selected: 204 # the sglang chat row's floor: the same selection
           - engine: vllm
             timeout: 32
             test_timeout: 24
             min_selected: 202 # the vllm chat row's floor: the same selection
-          # The TokenSpeed chat suite on the Rust servicer: the suite, floor
-          # and budgets of e2e-1gpu-chat's tokenspeed row (its prebuilt engine
-          # image, or the source build on a cold path, hence the budget), so
-          # the two rows differ by the servicer only. The admin-op and loads
-          # cases of that row stay on the Python servicer's row.
+          # The TokenSpeed row carries the admin-op and loads cases of its chat
+          # row too: the control plane the Python servicer serves in-engine
+          # (flush, profiling, the RL control app) has no other row.
           - engine: tokenspeed
             timeout: 56
             test_timeout: 26
+            test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py e2e_test/router/test_loads.py
             min_selected: 114 # the tokenspeed chat row's floor: the same selection
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
@@ -1382,7 +1376,7 @@ jobs:
       test_dirs: ${{ matrix.test_dirs || 'e2e_test/chat_completions' }}
       min_selected: ${{ matrix.min_selected }}
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
-      servicer_impl: rust
+      servicer_impl: python
     secrets: inherit
 
   # Worker-side media processing: the vLLM gRPC worker fetches and
@@ -2109,7 +2103,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-symphony, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-symphony, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -2182,7 +2176,7 @@ jobs:
                 "${{ needs.e2e-1gpu-chat.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-amd.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-symphony.result }}" =~ $bad || \
-                "${{ needs.e2e-1gpu-chat-rust-servicer.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat-python-servicer.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-mm-worker.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-zmq.result }}" =~ $bad || \
                 "${{ needs.e2e-2gpu-chat-zmq-dp.result }}" =~ $bad || \
