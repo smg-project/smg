@@ -1,9 +1,9 @@
 {
-  "ready": false,
-  "run_budget_admitted": false,
-  "artifacts_pinned": false,
+  "ready": true,
+  "run_budget_admitted": true,
+  "artifacts_pinned": true,
   "consumer_gpu_ready": false,
-  "runtime_cohort_accepted": false,
+  "runtime_cohort_accepted": true,
   "admitted_lane": "tokenspeed-pd2-original-qwen-sglang-reference",
   "target_product_commit": "565a4a00491afa3910eda66041533f184dc7d31b",
   "artifacts": [
@@ -233,12 +233,18 @@
     "no_private_173_plugin_or_allocation_overlay": true
   },
   "budget": {
-    "admitted": false,
-    "reserved_runner_seconds": 0,
+    "admitted": true,
+    "reserved_runner_seconds": 4500,
     "proposed_new_GPU_max_seconds_from_original75minute_job": 4500,
     "global_owned_max": 2,
     "one_lane_per_run": true,
-    "old_retired_seconds_reused": 0
+    "old_retired_seconds_reused": 0,
+    "root_owner": "root",
+    "root_nonce": "TS-PD2-original15-NEW4500-c65766b9cc7f4cd6826953b7b292d243",
+    "root_receipt": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/ts-pd2-original-qwen-reference-20261026/actual-validation/root-budget-before-inputs.json",
+      "sha256": "90820e7c80fb10ae0f2bd894e013538d0e95b7ecee2e3e25b5e39511874492dd"
+    }
   },
   "dispatch_contract": {
     "registered_workflow": ".github/workflows/pr-test-rust.yml",
@@ -255,17 +261,25 @@
     "run_binding": null,
     "watch_PID_or_session": null
   },
-  "pending_note": "SOURCE ONLY: execute defaultfalse, all five authority flagsfalse, budgetfalse/res0/actual run null. The565a product already contains reviewed default-off reference profile; this privatecaller explicitly opts it in only for the intended whole TS PD2 functional row. Actual consumer materialization needs2custom files PLUS5 existing generic byteexact dependencies because base565a contains no amd-shared-product directory. These five are not new algorithms and excluded from19product map. Root must separately validate actual integrated profile collection/model/wholeWorker argv and final effective parameters; actual model/PD full15 remains unknown, current SGLang PD AITER/stream startup rootcause remains open. Normal97a is fixed1473/d5/b7 installation only; base rawparse is not fullprofile execution. No c559/d8/nativeTS/GPU credit transfer, no new grant/dispatch/solewatch is issued here.",
+  "pending_note": "Root conditionally admitted NEW4500 for the complete original15 TS PD2 functional reference on SGLang, after actual normal preparation and exact collection metadata only. GPU/model/PD/runtime acceptance remains false. One POST and one exact-run observer after actual child and resource peers plus fresh ownership/TTL. Historical normal97a/deba remains provenance; current normal9ce1 proves preparation/collection, not inference. No native TokenSpeed or latest-main qualification claim.",
   "binding_preparation_evidence": {
     "producer_build_archive_integrity_sha256": "fa8e1be5899a9f5d74ade0f6de9cfa10eb5065a404f597c2ee95d55cfa03cb6f",
     "producer_policy_source_review_sha256": "707a143df969433664b923c54e9cc44ad511dba00bdde978c4b40b02d94901fb",
     "producer_policy_metadata_validation_sha256": "f352422414b7e3a2cab1a55701c3360bacfae7d20eb3be26df2b4b7077e62d2e",
     "normal_install_proof_available": true,
-    "normal_install_admission_metadata_bound": false,
+    "normal_install_admission_metadata_bound": true,
     "normal_install_root_acceptance_sha256": "97a2658237750a3c55b3f98a722077055428503cb8ad3b83ae8a01f4d377a571",
     "normal_install_independent_actual_peer_sha256": "deba14fd0db4270b317c25c23ecf1e0bde7b01b9ead92b1bf413014f06138cef",
     "source_profile_independent_peer_sha256": "33cc78f22ed88a30bb38aea064e3fcfc5426eab961eb86a37dd8b0056f791a9e",
-    "actual_source_integration_and_base_raw_parser_peer_sha256": "c09977c300d22f5399401f6442c6c7588104adf68aeefeb3ab826be39019ccb1"
+    "actual_source_integration_and_base_raw_parser_peer_sha256": "c09977c300d22f5399401f6442c6c7588104adf68aeefeb3ab826be39019ccb1",
+    "current_full_original15_normal_CPU_root_acceptance": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/TS-PD2-3e03-normal-focused-readable-output-CPU600-root-6ce25c2608354b539c89504117a0321c/root-accepted-normal-and-original15-CPU-metadata.json",
+      "sha256": "58326dccbe60171a244dd86f29fc6fdceffdbdc904a2df0d67745e721049279f"
+    },
+    "current_full_original15_normal_CPU_peer": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/TS-PD2-3e03-normal-focused-readable-output-CPU600-root-6ce25c2608354b539c89504117a0321c/peer-actual-D.json",
+      "sha256": "9ce1377c3c48a48b6249432bd7a1477095b68aee3366e59fdde347ecd7c1ebe0"
+    }
   },
   "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-2gpu-pd[3]/tokenspeed/nvidia",
   "reference_contract_sha256": "f6db720219333ee5f2c9164edcf2cb323926ff3d5e797be44f3fd229a5d6774a"
