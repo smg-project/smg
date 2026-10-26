@@ -291,8 +291,12 @@ def _fleet_logs(sizes: dict[Path, int], gateway: Gateway) -> str:
 
 
 def _vllm_transport_installed(*packages: str) -> bool:
-    """Whether every KV transport package is importable from this interpreter."""
-    return all(importlib.util.find_spec(package) is not None for package in packages)
+    """Whether every transport is discoverable, including ROCm's NIXL module name."""
+    return all(
+        importlib.util.find_spec(package) is not None
+        or (package == "nixl" and importlib.util.find_spec("nixl_rocm") is not None)
+        for package in packages
+    )
 
 
 def _vllm_transports_requested() -> set[str]:
