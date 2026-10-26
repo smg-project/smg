@@ -102,7 +102,7 @@ jobs:
     with:
       engine: sglang
       gpu_tier: "2"
-      runner: ${{ vars.SMG_RUNNER_AMD_GPU_2 || '2-gpu-mi300x' }}
+      runner: 4-gpu-mi300x
       timeout: 75
       test_timeout: 50
       test_dirs: e2e_test/router
