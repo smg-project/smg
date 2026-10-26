@@ -129,9 +129,15 @@ on:
         required: false
         type: string
         default: ""
+      enabled:
+        description: "Whether this row runs: false skips the job before it takes a runner (a caller's matrix row the changed paths do not reach)"
+        required: false
+        type: boolean
+        default: true
 
 jobs:
   run:
+    if: ${{ inputs.enabled }}
     runs-on: ${{ inputs.runner }}
     container: ${{ inputs.container_image != '' && fromJSON(format('{{"image":{0},"options":{1}}}', toJSON(inputs.container_image), toJSON(inputs.container_options))) || vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     timeout-minutes: ${{ inputs.timeout }}

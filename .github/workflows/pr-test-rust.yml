@@ -658,6 +658,7 @@ jobs:
       rust-shards: ${{ steps.rust-shards.outputs.rust-shards }}
       dependencies: ${{ steps.filter.outputs.dependencies }}
       # The GPU e2e lanes' decisions, one per area, from the tier table (the same step).
+      skip-chat-one-engine: ${{ steps.lanes.outputs.skip-chat-one-engine }}
       skip-chat-completions: ${{ steps.lanes.outputs.skip-chat-completions }}
       skip-chat-symphony: ${{ steps.lanes.outputs.skip-chat-symphony }}
       skip-completions: ${{ steps.lanes.outputs.skip-completions }}
@@ -857,7 +858,10 @@ jobs:
       # the tier table below maps a changed path to the lanes it can reach. A
       # lane's `if:` reads its `skip-<area>` output and adds only what is its
       # own: `always() && !cancelled()`, its prerequisite's result and, on a pull
-      # request, this job's success. The step runs when the filter failed too:
+      # request, this job's success; a lane with a row per engine passes the
+      # reusable job `enabled` per row, read from the same outputs (the
+      # representative engine's row from chat-one-engine, the other rows from
+      # chat-completions). The step runs when the filter failed too:
       # its outputs then skip nothing, so a push still runs every lane, and a
       # pull request runs none through the lanes' own condition on this job's
       # result.
@@ -902,6 +906,9 @@ jobs:
           )
 
           # The areas, one per skip-<area> output, each the gate of a group of lanes:
+          #   chat-one-engine   the chat and router suites on one engine, SGLang: the
+          #                     sglang rows of the chat, Rust-servicer and gateway lanes
+          #                     (chat-completions implies it)
           #   chat-completions  the chat and router suites on every engine: the chat,
           #                     Rust-servicer, worker-side multimodal, ZMQ, gateway, PD,
           #                     EPD and 4-GPU lanes
@@ -910,19 +917,28 @@ jobs:
           #   agentic           the Responses suite on an engine
           #   vendor            the Responses, Messages and realtime suites on the cloud
           #                     providers (CPU)
-          AREAS = ("chat-completions", "chat-symphony", "completions", "embeddings",
-                   "realtime", "agentic", "vendor", "go-bindings")
+          AREAS = ("chat-one-engine", "chat-completions", "chat-symphony", "completions",
+                   "embeddings", "realtime", "agentic", "vendor", "go-bindings")
           FULL = " ".join(AREAS)
           NONE = ""
-          # A gateway module no suite targets: the chat, Symphony and Responses suites
-          # and the vendor rows read every response through it and witness a
-          # regression; the completions, embeddings, realtime and Go suites drive
-          # paths of their own, named below where a change reaches them.
-          CORE = "chat-completions chat-symphony agentic vendor"
+          # A gateway module no suite targets: one engine's chat and router suites, the
+          # Symphony and Responses suites and the vendor rows read every response
+          # through it and witness a regression; the other engines' rows run the
+          # same gateway code and add nothing for it, and the completions,
+          # embeddings, realtime and Go suites drive paths of their own, named
+          # below where a change reaches them.
+          CORE = "chat-one-engine chat-symphony agentic vendor"
           # The core, and the Go suite: the Go library links the gateway crate whole
-          # and calls these paths itself (the policies and the KV index behind the
-          # cache-aware one, the crypto provider, the allocator setting).
+          # and calls these paths itself.
           CORE_GO = CORE + " go-bindings"
+          # The core on every engine's chat family: the modules whose behaviour only
+          # the other engines' rows or the PD, EPD, DP and worker-side media lanes
+          # exercise (the policies the PD and EPD routers resolve, the KV index the
+          # cache-aware policy of the EPD suite reads, the media pipeline with its
+          # worker-side and 4-GPU classes, the tool parser whose forced-call grammars
+          # each engine's own backend compiles).
+          CORE_EVERY_ENGINE = "chat-completions chat-symphony agentic vendor"
+          CORE_EVERY_ENGINE_GO = CORE_EVERY_ENGINE + " go-bindings"
           # One engine's own files reach the lanes with a row for that engine.
           SGLANG = "chat-completions chat-symphony completions embeddings agentic go-bindings"
           VLLM = "chat-completions chat-symphony completions embeddings realtime"
@@ -1041,9 +1057,10 @@ jobs:
               ("bindings/golang/**",                             "go-bindings"),
               # the gateway: its test trees none; the Responses and conversations
               # endpoints their lanes; the modules no suite targets the core; the
-              # routers (the Symphony seam among them: it chooses the parser of every
-              # request), the workers, the configuration, the registration workflow,
-              # the server and the entry points every lane
+              # policies the core on every engine (the PD and EPD routers resolve
+              # them); the routers (the Symphony seam among them: it chooses the
+              # parser of every request), the workers, the configuration, the
+              # registration workflow, the server and the entry points every lane
               ("model_gateway/tests/**",                         NONE),
               ("model_gateway/test_harness/**",                  NONE),
               ("model_gateway/benches/**",                       NONE),
@@ -1053,7 +1070,7 @@ jobs:
               ("model_gateway/src/middleware/**",                CORE),
               ("model_gateway/src/observability/**",             CORE_GO),
               ("model_gateway/src/rate_limit/**",                CORE),
-              ("model_gateway/src/policies/**",                  CORE_GO),
+              ("model_gateway/src/policies/**",                  CORE_EVERY_ENGINE_GO),
               ("model_gateway/src/mesh/**",                      CORE),
               ("model_gateway/src/mesh_discovery/**",            CORE),
               ("model_gateway/src/service_discovery/**",         CORE),
@@ -1102,11 +1119,16 @@ jobs:
               # crates the gateway links on every suite's path: the core; the Go
               # library links the tool parser directly too (and the tokenizer, the
               # protocols and the gRPC client: the tokenizer's row names the Go lane,
-              # the other two reach every lane)
-              ("crates/tool_parser/**",                          CORE_GO),
+              # the other two reach every lane); the tool parser, the media pipeline
+              # and the KV index the core on every engine (the forced-call grammars
+              # the parser builds, structural tags and JSON schemas, are compiled by
+              # each engine's own grammar backend and the tool-choice cases run them
+              # on every engine; the worker-side media lanes and the 4-GPU Llama-4
+              # class; the EPD suite's cache-aware policy)
+              ("crates/tool_parser/**",                          CORE_EVERY_ENGINE_GO),
               ("crates/reasoning_parser/**",                     CORE),
-              ("crates/multimodal/**",                           CORE),
-              ("crates/kv_index/**",                             CORE_GO),
+              ("crates/multimodal/**",                           CORE_EVERY_ENGINE),
+              ("crates/kv_index/**",                             CORE_EVERY_ENGINE_GO),
               ("crates/data_connector/**",                       CORE),
               ("crates/auth/**",                                 CORE),
               ("crates/mesh/**",                                 CORE),
@@ -1164,6 +1186,10 @@ jobs:
                   print(f"{path}: {pattern or 'no row'} -> {named(areas)}")
                   reached |= areas
               why = f"{len(files)} changed files"
+          # The chat family implies its one-engine rows: what every engine's chat
+          # lanes witness, the representative engine's rows witness too.
+          if "chat-completions" in reached:
+              reached.add("chat-one-engine")
           print(f"{why}: lanes reached: {named(reached)}")
 
           # No lane for a docs-only or a Symphony-only change; otherwise the lanes
@@ -1197,6 +1223,13 @@ jobs:
 
   # === 1 GPU ===
 
+  # The chat suite per engine. The sglang row is the representative engine's:
+  # a change the tier table places in the core (chat-one-engine) runs it, the
+  # sglang row of the Rust-servicer lane and the sglang row of the gateway
+  # lane, and nothing else of the chat family; the other rows run when every
+  # engine's family (chat-completions) is reached, as the family's other lanes
+  # do. A row that is not enabled skips inside the reusable job, before it
+  # takes a runner.
   e2e-1gpu-chat:
     name: e2e-1gpu-chat (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
@@ -1205,7 +1238,7 @@ jobs:
       && !cancelled()
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
-      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+      && needs.detect-changes.outputs.skip-chat-one-engine != 'true'
     # Now also runs the previously-2-GPU chat tests (gpt-oss-20b,
     # Qwen2.5-14B) since they're tp=1.
     strategy:
@@ -1249,6 +1282,7 @@ jobs:
       min_selected: ${{ matrix.min_selected }}
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
       servicer_unit_tests: ${{ matrix.engine == 'vllm' }}
+      enabled: ${{ matrix.engine == 'sglang' || needs.detect-changes.outputs.skip-chat-completions != 'true' }}
     secrets: inherit
 
   # The vLLM row of e2e-1gpu-chat on an AMD Instinct self-hosted runner, in
@@ -1333,7 +1367,8 @@ jobs:
   # row for SGLang and one for vLLM (the TokenSpeed Rust servicer has no
   # PR-time row yet, so this lane says nothing about it): every other lane of
   # those engines runs the Python servicer, so a launcher or binding change
-  # that breaks the Rust servicer's start fails here and nowhere else.
+  # that breaks the Rust servicer's start fails here and nowhere else. The
+  # sglang row is the representative engine's (the chat lane says how).
   e2e-1gpu-chat-rust-servicer:
     name: e2e-1gpu-chat-rust-servicer (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
@@ -1342,7 +1377,7 @@ jobs:
       && !cancelled()
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
-      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+      && needs.detect-changes.outputs.skip-chat-one-engine != 'true'
     # Now also runs the previously-2-GPU chat tests (gpt-oss-20b,
     # Qwen2.5-14B) since they're tp=1.
     strategy:
@@ -1383,6 +1418,7 @@ jobs:
       min_selected: ${{ matrix.min_selected }}
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
       servicer_impl: rust
+      enabled: ${{ matrix.engine == 'sglang' || needs.detect-changes.outputs.skip-chat-completions != 'true' }}
     secrets: inherit
 
   # Worker-side media processing: the vLLM gRPC worker fetches and
@@ -1581,6 +1617,8 @@ jobs:
       min_selected: 3 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     secrets: inherit
 
+  # The router suite per engine; the sglang row is the representative engine's
+  # (the chat lane says how).
   e2e-1gpu-gateway:
     name: e2e-1gpu-gateway (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
@@ -1589,7 +1627,7 @@ jobs:
       && !cancelled()
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
-      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+      && needs.detect-changes.outputs.skip-chat-one-engine != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -1610,6 +1648,7 @@ jobs:
       timeout: ${{ matrix.timeout }}
       test_dirs: e2e_test/router
       min_selected: ${{ matrix.min_selected }}
+      enabled: ${{ matrix.engine == 'sglang' || needs.detect-changes.outputs.skip-chat-completions != 'true' }}
     secrets: inherit
 
   # === 2 GPU ===
@@ -1717,9 +1756,18 @@ jobs:
 
   # === 4 GPU ===
 
+  # The 4-GPU lanes follow their 1-GPU prerequisite and, like the PD lanes,
+  # run for every engine's family only: in the core tier the prerequisite runs
+  # its representative row alone and these lanes skip.
   e2e-4gpu-chat:
     name: e2e-4gpu-chat (${{ matrix.engine }})
-    needs: [e2e-1gpu-chat]
+    needs: [e2e-1gpu-chat, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.e2e-1gpu-chat.result == 'success'
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -1745,7 +1793,13 @@ jobs:
 
   e2e-4gpu-gateway:
     name: e2e-4gpu-gateway
-    needs: [e2e-1gpu-gateway]
+    needs: [e2e-1gpu-gateway, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.e2e-1gpu-gateway.result == 'success'
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: sglang
@@ -1759,6 +1813,12 @@ jobs:
   e2e-4gpu-epd:
     name: e2e-4gpu-epd (tokenspeed)
     needs: [e2e-1gpu-chat, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && needs.e2e-1gpu-chat.result == 'success'
+      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: tokenspeed
@@ -2166,8 +2226,9 @@ jobs:
           # not pass, and finish stays a verdict on every head.
           bad='^(failure|cancelled)$'
           # detect-changes selects the lanes: when it fails or is cancelled, the
-          # Rust lint and test jobs, the benchmarks and the EPD lane skip on every event
-          # (and, on a pull request, every e2e lane); a skipped job passes this
+          # Rust lint and test jobs and the benchmarks skip on every event, and
+          # every e2e lane skips on a pull request (on a push the e2e lanes, the
+          # EPD lane included, run on its empty outputs); a skipped job passes this
           # check, so its own result gates here (smg-project/smg-lab#172).
           if [[ "${{ needs.detect-changes.result }}" =~ $bad || \
                 "${{ needs.pre-commit.result }}" =~ $bad || \
