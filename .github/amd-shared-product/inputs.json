@@ -1,9 +1,9 @@
 {
-  "ready": false,
-  "run_budget_admitted": false,
-  "artifacts_pinned": false,
+  "ready": true,
+  "run_budget_admitted": true,
+  "artifacts_pinned": true,
   "consumer_gpu_ready": false,
-  "runtime_cohort_accepted": false,
+  "runtime_cohort_accepted": true,
   "admitted_lane": "tokenspeed-pd2-original-qwen-sglang-reference",
   "target_product_commit": "906e0730e767f3b9f3eff4b4660d847ef4f04c39",
   "artifacts": [
@@ -234,12 +234,18 @@
     "CU_firststream_diagnostic_default_enabled": false
   },
   "budget": {
-    "admitted": false,
-    "reserved_runner_seconds": 0,
+    "admitted": true,
+    "reserved_runner_seconds": 4500,
     "proposed_new_GPU_max_seconds_from_original75minute_job": 4500,
     "global_owned_max": 2,
     "one_lane_per_run": true,
-    "old_retired_seconds_reused": 0
+    "old_retired_seconds_reused": 0,
+    "root_owner": "root",
+    "root_nonce": "TS-PD2-futuremap-original15-NEW4500-fda4a9ef08944da2ad1fb9d2c9e22f80",
+    "root_receipt": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/ts-pd2-original-qwen-futuremap-20261026/actual-validation/root-budget-before-inputs.json",
+      "sha256": "86e7232a5799dc5349664ee5a5b4278669048de05ecb33f32b095107f0ba0659"
+    }
   },
   "dispatch_contract": {
     "registered_workflow": ".github/workflows/pr-test-rust.yml",
@@ -256,7 +262,7 @@
     "run_binding": null,
     "watch_PID_or_session": null
   },
-  "pending_note": "Unexecuted default-off source integration proposal only. Root must materialize the product layer, bind its true Git commit, verify actual19/37/14 and four diagnostic files, independently review source and the new tier2 gate, then separately admit any NEW GPU phase. Old82f full15 remains startup HOLD; CU repair is not claimed to solve OOM. No previous CPU/retired/GPU credit transferred.",
+  "pending_note": "Root separately admits NEW4500 for full original15 TS PD2 functional reference on SGLang with current CU/stream/FutureMap diagnostic. Historical3e03 normal CPU proves original preparation/collection only; new4+3 are temporary-source data controls, not current installed preparation. GPU setup must actually pass its original normal gates and apply/final checks. Models/topology/.8/context/reruns/oracles unchanged; no model/runtime/nativeTS/latestmain or coverage acceptance. One POST execute=true and cu_stream_diagnostic=true only after source/resource peers and fresh ownership/TTL; preserve every existing Qwen/ordinary run/watch and reservation.",
   "binding_preparation_evidence": {
     "producer_build_archive_integrity_sha256": "fa8e1be5899a9f5d74ade0f6de9cfa10eb5065a404f597c2ee95d55cfa03cb6f",
     "producer_policy_source_review_sha256": "707a143df969433664b923c54e9cc44ad511dba00bdde978c4b40b02d94901fb",
@@ -266,7 +272,24 @@
     "normal_install_root_acceptance_sha256": "97a2658237750a3c55b3f98a722077055428503cb8ad3b83ae8a01f4d377a571",
     "normal_install_independent_actual_peer_sha256": "deba14fd0db4270b317c25c23ecf1e0bde7b01b9ead92b1bf413014f06138cef",
     "source_profile_independent_peer_sha256": "33cc78f22ed88a30bb38aea064e3fcfc5426eab961eb86a37dd8b0056f791a9e",
-    "actual_source_integration_and_base_raw_parser_peer_sha256": "c09977c300d22f5399401f6442c6c7588104adf68aeefeb3ab826be39019ccb1"
+    "actual_source_integration_and_base_raw_parser_peer_sha256": "c09977c300d22f5399401f6442c6c7588104adf68aeefeb3ab826be39019ccb1",
+    "historical_original15_normal_CPU_root_acceptance": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/TS-PD2-3e03-normal-focused-readable-output-CPU600-root-6ce25c2608354b539c89504117a0321c/root-accepted-normal-and-original15-CPU-metadata.json",
+      "sha256": "58326dccbe60171a244dd86f29fc6fdceffdbdc904a2df0d67745e721049279f"
+    },
+    "historical_original15_normal_CPU_peer": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/TS-PD2-3e03-normal-focused-readable-output-CPU600-root-6ce25c2608354b539c89504117a0321c/peer-actual-D.json",
+      "sha256": "9ce1377c3c48a48b6249432bd7a1477095b68aee3366e59fdde347ecd7c1ebe0"
+    },
+    "current_installed_preparation_complete": false,
+    "current_four_group_data_controls": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/TS-PD2-tier2-profile-CPU60-walk-ENOENT-child-C-20261026/actual-root-faa25fb58b064c6ab6b1a87de9e6a820/actual-audit-D.json",
+      "sha256": "b73bc2f64d06444b4c6ece065fe184ef06e1b921c53a349c7573a80235dad53b"
+    },
+    "current_three_group_data_controls": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/TS-PD2-FutureMap-CPU60-root-bound-b8454c8c8d0e44dfbf9d21b7078cd9fe/actual-root-3d01d4931d194b92a4a3bf5ec0408bec/actual-audit-D.json",
+      "sha256": "56d04a83899376267f6b630c300b23ffb9f9cc90f6a2f0a08ce4e26056d1f54e"
+    }
   },
   "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-2gpu-pd[3]/tokenspeed/nvidia",
   "reference_contract_sha256": "f6db720219333ee5f2c9164edcf2cb323926ff3d5e797be44f3fd229a5d6774a",
