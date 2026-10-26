@@ -3033,10 +3033,20 @@ mod native_loads_tests {
             worker_type: WorkerType::Regular,
             connection_mode: ConnectionMode::Http,
         };
+        // A transport failure noted on each rank worker: the one read's
+        // contact must clear it on both.
+        for worker in &workers {
+            worker.note_transport_failure();
+        }
         poll_group_once(&monitor, &key, Duration::from_secs(10), Instant::now()).await;
 
         let snapshot = monitor.load_state.snapshot();
         for (worker, expected) in workers.iter().zip([(0, 3, 1, 300), (1, 9, 4, 900)]) {
+            assert!(
+                !worker.transport_failure_pending(),
+                "the contact is every member's: {}",
+                worker.url()
+            );
             let report = snapshot.get(worker.url()).expect("published");
             let ranks: Vec<(i32, i64, i64, i64)> = report
                 .loads
@@ -3118,6 +3128,11 @@ mod native_loads_tests {
             connection_mode: ConnectionMode::Grpc,
         };
         let polls_before = mock_worker::overrides::for_port(port).loads_polls();
+        // A transport failure noted on each rank worker: the one GetLoads'
+        // contact must clear it on both.
+        for worker in &workers {
+            worker.note_transport_failure();
+        }
         poll_group_once(&monitor, &key, Duration::from_secs(10), Instant::now()).await;
         assert_eq!(
             mock_worker::overrides::for_port(port).loads_polls() - polls_before,
@@ -3136,8 +3151,9 @@ mod native_loads_tests {
         );
         for worker in &workers {
             assert!(
-                worker.contact_age() < Duration::from_secs(5),
-                "the contact is every member's"
+                !worker.transport_failure_pending(),
+                "the contact is every member's: {}",
+                worker.url()
             );
         }
     }
