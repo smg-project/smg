@@ -110,7 +110,7 @@ on:
         default: false
         description: "Also run grpc_servicer/tests here, where the importorskip('vllm') / importorskip('sglang') cases meet a real engine; set on one lane per engine"
       servicer_impl:
-        description: "Which gRPC servicer the workers of the job's engine run (rust or python), handed to that engine's harness flag; empty keeps the engine default"
+        description: "Which gRPC servicer the workers of the job's engine run (rust or python), handed to that engine's harness flag; empty follows the servicer package's default"
         required: false
         type: string
         default: ""
@@ -319,8 +319,8 @@ jobs:
           if [ -n "$MM" ]; then
             SUFFIX="${SUFFIX}-mm-${MM}"
           fi
-          # A Rust-servicer leg runs the same suite as the engine's Python
-          # servicer leg; keep their log artifacts apart.
+          # A leg that names its servicer runs the same suite as the engine's
+          # default leg; keep their log artifacts apart.
           IMPL="${{ inputs.servicer_impl }}"
           if [ -n "$IMPL" ]; then
             SUFFIX="${SUFFIX}-${IMPL}-servicer"

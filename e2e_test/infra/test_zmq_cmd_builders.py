@@ -103,11 +103,19 @@ def test_rust_servicer_impl_is_a_worker_env_flag(monkeypatch):
     worker command and selects the Rust path through the servicer package's
     flag in the worker environment, so every test case runs unchanged."""
     import infra.worker as worker_module
+    from infra import constants
     from infra.constants import ENV_VLLM_SERVICER_IMPL
 
     hook_checks: list[bool] = []
     monkeypatch.setattr(
         worker_module, "_require_rust_servicer_hook", lambda: hook_checks.append(True)
+    )
+    # The servicer package's default (a launch that names nothing) is python
+    # here; a lane that sets nothing follows it and exports nothing.
+    monkeypatch.setattr(
+        constants,
+        "_package_servicer_switch",
+        lambda: lambda variable, environ=None, **_: ("python", "default"),
     )
 
     w = Worker(
