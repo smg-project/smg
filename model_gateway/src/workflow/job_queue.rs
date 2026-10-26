@@ -100,20 +100,25 @@ impl Job {
         }
     }
 
-    /// Get worker URL, MCP server name, WASM module, or tokenizer identifier for logging and status tracking
-    /// `worker_url` as a log line writes it: a worker job's address with a
-    /// userinfo in it masked; the other jobs' names (a server, a module, a
-    /// tokenizer id) as they are, since they are not addresses and the
-    /// address parser would respell or refuse them.
+    /// `worker_url` as a log line writes it: the names that are not addresses
+    /// (the start-up marker, an MCP server, a WASM module, a tokenizer id) as
+    /// they are, since the address parser would respell or refuse them;
+    /// anything else is a worker's address, written with a userinfo in it
+    /// masked, so a worker job added later cannot write its address raw.
     pub fn shown_worker(job_type: &str, worker_url: &str) -> String {
         match job_type {
-            "AddWorker" | "UpdateWorker" | "RefreshWorkerLabels" | "RemoveWorker" => {
-                Endpoint::redacted_str(worker_url)
-            }
-            _ => worker_url.to_string(),
+            "InitializeWorkersFromConfig"
+            | "InitializeMcpServers"
+            | "RegisterMcpServer"
+            | "AddWasmModule"
+            | "RemoveWasmModule"
+            | "AddTokenizer"
+            | "RemoveTokenizer" => worker_url.to_string(),
+            _ => Endpoint::redacted_str(worker_url),
         }
     }
 
+    /// Get worker URL, MCP server name, WASM module, or tokenizer identifier for logging and status tracking
     pub fn worker_url(&self) -> &str {
         match self {
             Job::AddWorker { config, .. } => &config.url,
@@ -1118,6 +1123,36 @@ fn build_external_worker_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A job line writes a worker's address masked and a non-address name as
+    /// it is; a job type the list does not name counts as a worker's, so a
+    /// type added later cannot write a credential into the six job lines.
+    #[test]
+    fn a_job_line_masks_every_address_and_keeps_the_names() {
+        let credentialed = "http://user:secret@127.0.0.1:8000";
+        for job_type in [
+            "AddWorker",
+            "UpdateWorker",
+            "RefreshWorkerLabels",
+            "RemoveWorker",
+            "ReplaceWorker",
+        ] {
+            let shown = Job::shown_worker(job_type, credentialed);
+            assert!(!shown.contains("secret"), "{job_type}: {shown}");
+            assert!(shown.contains("***@127.0.0.1:8000"), "{job_type}: {shown}");
+        }
+        for (job_type, name) in [
+            ("InitializeWorkersFromConfig", "startup"),
+            ("InitializeMcpServers", "startup"),
+            ("RegisterMcpServer", "search-tools"),
+            ("AddWasmModule", "my_module"),
+            ("RemoveWasmModule", "0f1e2d3c"),
+            ("AddTokenizer", "org/tokenizer"),
+            ("RemoveTokenizer", "org/tokenizer"),
+        ] {
+            assert_eq!(Job::shown_worker(job_type, name), name, "{job_type}");
+        }
+    }
 
     fn spec_for(url: &str, router_config: &RouterConfig) -> WorkerSpec {
         let mut spec = WorkerSpec::new(url);

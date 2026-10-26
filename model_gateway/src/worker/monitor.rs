@@ -534,7 +534,7 @@ impl WorkerMonitor {
         let waiting = load.map_or(0, WorkerLoadResponse::total_waiting_reqs);
         let kv_pressure = load.map_or(0.0, WorkerLoadResponse::effective_kv_pressure);
         info!(
-            worker_url = %worker.url(),
+            worker_url = %worker.redacted_url(),
             overloaded = verdict,
             waiting_requests = waiting,
             kv_pressure,
@@ -1322,11 +1322,14 @@ impl WorkerMonitor {
         let backend_client = match worker.get_backend_client().await {
             Ok(Some(client)) => client,
             Ok(None) => {
-                debug!("No backend client for worker {}", worker.url());
+                debug!("No backend client for worker {}", worker.redacted_url());
                 return None;
             }
             Err(e) => {
-                debug!("Failed to get backend client for {}: {e}", worker.url());
+                debug!(
+                    "Failed to get backend client for {}: {e}",
+                    worker.redacted_url()
+                );
                 return None;
             }
         };
@@ -1343,7 +1346,7 @@ impl WorkerMonitor {
                 Some(load)
             }
             Ok(Err(e)) => {
-                debug!("backend GetLoads failed for {}: {e}", worker.url());
+                debug!("backend GetLoads failed for {}: {e}", worker.redacted_url());
                 if liveness::is_connection_code(e.code()) {
                     for member in members {
                         liveness::on_contact_failed(member, "load poll");
@@ -1354,7 +1357,7 @@ impl WorkerMonitor {
             Err(_) => {
                 debug!(
                     "backend GetLoads for {} did not answer within {LOAD_POLL_DEADLINE:?}",
-                    worker.url()
+                    worker.redacted_url()
                 );
                 None
             }
