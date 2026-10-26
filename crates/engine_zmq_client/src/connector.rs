@@ -127,6 +127,10 @@ struct RequestRegistry<O> {
     /// silence [`Client::output_silence`] counts is theirs. A request the
     /// engine reports at intervals is quiet while healthy and counts none.
     every_step: usize,
+    /// Registered requests the engine may step: every one but the
+    /// transfer-pending ones ([`InFlight::transfer_pending`]). The busy
+    /// period follows these.
+    active: usize,
 }
 
 /// One registered request: its output stream, whether the engine reports it
@@ -139,6 +143,23 @@ struct InFlight<O> {
     handed: bool,
     started: bool,
     every_step: bool,
+    /// The request waits for a KV transfer on a wire that does not report
+    /// its steps ([`EngineProtocol::transfer_pending`]): until its first
+    /// output it is not in flight on the engine (no silence counted over it,
+    /// no busy period started on it). On a wire that reports every step the
+    /// stats-only steps keep the clock while it waits, so it registers active
+    /// like any request and a frozen engine is still seen over it.
+    transfer_pending: bool,
+    /// The request's prompt KV is pulled from a prefill side: this engine
+    /// prefills none of it, so no prefill is booked for its prompt, whatever
+    /// the wire reports.
+    pulled: bool,
+    /// Whether the request counts in the every-step tally
+    /// ([`RequestRegistry::reported_every_step`]).
+    counted: bool,
+    /// Whether the prompt was booked as prefill work in hand
+    /// ([`RequestRegistry::prefill_pending_tokens`]).
+    prefill_booked: bool,
 }
 
 /// Completes one utility call with its value, or the error that ended it.
@@ -159,6 +180,7 @@ impl<O> Default for RequestRegistry<O> {
             busy_started: Arc::new(Notify::new()),
             prefill_pending: 0,
             every_step: 0,
+            active: 0,
         }
     }
 }
@@ -167,13 +189,17 @@ impl<O: EngineOutput> RequestRegistry<O> {
     /// Register a new request of `prompt_tokens`, reported by the engine on
     /// every step or at intervals (`every_step`), returning the receiver for
     /// its output stream. The busy period and the every-step count start
-    /// here; the prompt joins the prefill work in hand when the engine
-    /// accepts its frame ([`Self::handed`]).
+    /// here, unless the request is `transfer_pending` (they start at its
+    /// first output, [`Self::admitted`]); the prompt joins the prefill work
+    /// in hand when the engine accepts its frame ([`Self::handed`]), unless
+    /// it is `pulled` (this engine prefills none of it).
     fn register(
         &mut self,
         request_id: String,
         prompt_tokens: u64,
         every_step: bool,
+        transfer_pending: bool,
+        pulled: bool,
     ) -> Result<OutputReceiver<O>> {
         if self.closed {
             return Err(Error::ClientClosed {
@@ -185,7 +211,9 @@ impl<O: EngineOutput> RequestRegistry<O> {
         }
         let (sender, receiver) = mpsc::unbounded_channel();
         let now = Instant::now();
-        if self.requests.is_empty() {
+        // A transfer-pending request is not in flight on the engine until
+        // its first output ([`Self::admitted`]): it starts no busy period.
+        if !transfer_pending && self.active == 0 {
             // A busy period begins. After a whole window idle, the ones before
             // it say nothing about the engine now: the count starts over.
             if self
@@ -198,6 +226,7 @@ impl<O: EngineOutput> RequestRegistry<O> {
             self.in_flight_since = Some(now);
             self.busy_started.notify_one();
         }
+        let counted = every_step && !transfer_pending;
         self.requests.insert(
             request_id,
             InFlight {
@@ -206,9 +235,16 @@ impl<O: EngineOutput> RequestRegistry<O> {
                 handed: false,
                 started: false,
                 every_step,
+                transfer_pending,
+                pulled,
+                counted,
+                prefill_booked: false,
             },
         );
-        if every_step {
+        if !transfer_pending {
+            self.active += 1;
+        }
+        if counted {
             self.every_step += 1;
         }
         Ok(receiver)
@@ -229,9 +265,12 @@ impl<O: EngineOutput> RequestRegistry<O> {
             return;
         }
         entry.handed = true;
-        if entry.started {
+        if entry.started || entry.pulled {
+            // A pulled side's prompt is the prefill side's work, moved over
+            // as KV: this engine prefills none of it.
             return;
         }
+        entry.prefill_booked = true;
         let prompt_tokens = entry.prompt_tokens;
         self.prefill_pending = self.prefill_pending.saturating_add(prompt_tokens);
         // The prompt's prefill queues behind the work in hand.
@@ -245,9 +284,24 @@ impl<O: EngineOutput> RequestRegistry<O> {
     fn prefilled(&mut self, entry: &mut InFlight<O>) {
         if !entry.started {
             entry.started = true;
-            if entry.handed {
+            if entry.prefill_booked {
                 self.prefill_pending = self.prefill_pending.saturating_sub(entry.prompt_tokens);
             }
+        }
+    }
+
+    /// A transfer-pending request's first output came: its transfer is done
+    /// and the engine stepped it, so from here it is in flight like any
+    /// request (the busy period starts on it if none is on, and it joins the
+    /// every-step tally if its wire reports it every step).
+    fn admitted(&mut self, every_step: bool, now: Instant) {
+        if self.active == 0 {
+            self.in_flight_since = Some(now);
+            self.busy_started.notify_one();
+        }
+        self.active += 1;
+        if every_step {
+            self.every_step += 1;
         }
     }
 
@@ -264,10 +318,17 @@ impl<O: EngineOutput> RequestRegistry<O> {
         let mut entry = self.requests.remove(request_id)?;
         let now = Instant::now();
         self.prefilled(&mut entry);
-        if entry.every_step {
+        if entry.counted {
             self.every_step = self.every_step.saturating_sub(1);
         }
-        if self.requests.is_empty() {
+        let was_active = !entry.transfer_pending;
+        if was_active {
+            self.active = self.active.saturating_sub(1);
+        }
+        // The last active one ends the busy period (a transfer-pending side
+        // left behind is not in flight on the engine); the last of all marks
+        // the registry idle as before.
+        if (was_active && self.active == 0) || self.requests.is_empty() {
             if let Some(since) = self.in_flight_since.take() {
                 self.unanswered_before += now.saturating_duration_since(since.max(self.work_end));
             }
@@ -338,16 +399,30 @@ impl<O: EngineOutput> RequestRegistry<O> {
             );
             return;
         };
+        let mut admitted = None;
         if !entry.started {
             // The first output: the prompt is prefilled (one that overtook the
             // hand-over was never counted).
             entry.started = true;
-            if entry.handed {
+            if entry.prefill_booked {
                 self.prefill_pending = self.prefill_pending.saturating_sub(entry.prompt_tokens);
             }
+            if entry.transfer_pending {
+                // The transfer is done and the engine stepped the side: in
+                // flight like any request from here.
+                entry.transfer_pending = false;
+                entry.counted = entry.every_step;
+                admitted = Some(entry.every_step);
+            }
+        }
+        if let Some(every_step) = admitted {
+            self.admitted(every_step, Instant::now());
         }
         // A failed send hands the output back, so the receiver-gone (stream
         // dropped) path retires the entry without an owned key either.
+        let Some(entry) = self.requests.get_mut(output.request_id()) else {
+            return;
+        };
         if let Err(mpsc::error::SendError(Ok(undelivered))) = entry.sender.send(Ok(output)) {
             self.retire(undelivered.request_id());
         }
@@ -1377,15 +1452,27 @@ impl<P: EngineProtocol> Client<P> {
         // reservation taken before that gate could collide with the live
         // request's own slot and release it on rollback.
         let every_step = P::reported_every_step(&request);
+        let pulled = P::transfer_pending(&request);
+        // A pulled side is quiet until its first output only on a wire that
+        // does not report its steps: on one that does, the stats-only steps
+        // keep the clock while the side waits, so it counts like any request
+        // and a frozen engine is still seen over it.
+        let transfer_pending = pulled && !self.reports_steps();
         let receiver = {
             let mut registry = self.inner.registry.lock();
             let quiet = registry.reported_every_step() == 0;
-            let receiver =
-                registry.register(request_id.clone(), P::prompt_tokens(&request), every_step)?;
+            let receiver = registry.register(
+                request_id.clone(),
+                P::prompt_tokens(&request),
+                every_step,
+                transfer_pending,
+                pulled,
+            )?;
             // The silence a request sees counts from its dispatch: an engine
             // with nothing it reports every step had nothing to say until
-            // now.
-            if quiet && every_step {
+            // now. A transfer-pending side's clock starts at its first
+            // output instead ([`RequestRegistry::admitted`]).
+            if quiet && every_step && !transfer_pending {
                 self.inner.note_output();
             }
             receiver

@@ -767,7 +767,12 @@ struct WorkerArgs {
     /// response also waits for the decode side (its bootstrap, and KV
     /// pre-allocation under decode pressure), so the threshold must cover
     /// that wait for a prefill worker with nothing else to answer
-    /// meanwhile. 0 disables both.
+    /// meanwhile. A sequential decode side that pulls its prompt KV from the
+    /// prefill side is not judged by this threshold: it waits on a transfer,
+    /// bounded by the KV-transfer timeout its decode worker declares (the
+    /// `kv_transfer_timeout_secs` worker label, whole seconds), else by the
+    /// request timeout alone; a decode side that recomputes its prompt is
+    /// bounded as a prefill side is. 0 disables both.
     #[arg(long, default_value_t = 3, help_heading = "Load Monitoring")]
     worker_wedge_secs: u64,
 
