@@ -212,6 +212,7 @@ def main():
             "--label", "smg.qwen.ab.owner=root", "--label", "smg.qwen.ab.nonce=" + nonce, "--label", "smg.qwen.ab.window=" + window,
             "--device=/dev/kfd", "--device=/dev/dri", "--group-add=video", "--ipc=private", "--shm-size=32g",
             "--network=bridge", "--cpus=8", "--memory=96g", "--pids-limit=1024", "--ulimit", "memlock=-1:-1",
+            "--tmpfs", "/tmp/aiter_configs:rw,nosuid,nodev,mode=0700,uid=" + str(os.getuid()) + ",gid=" + str(os.getgid()),
             "--user", str(os.getuid()) + ":" + str(os.getgid()), "--workdir=/source"]
         execution_stage = "active_KFD_DRM_character_device_guard"
         result["device_guard"] = {}
