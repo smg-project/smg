@@ -19,7 +19,7 @@
 //! pieces ([`Scanned`]) and takes them back once they are read ([`Scanner::reclaim`]), so a stream
 //! that holds a byte at every delta allocates nothing for it after its first.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc};
 
 /// What a piece of the model's text turned out to be.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,7 +44,9 @@ impl Piece<'_> {
 /// Splits a growing text into content and markers, holding back only what may still be a marker.
 #[derive(Clone, Debug)]
 pub struct Scanner {
-    markers: Vec<String>,
+    /// The markers, shared with every other scanner of the same list: a format builds its list
+    /// once and every request's scanner holds a reference to it, not a copy.
+    markers: Arc<[String]>,
     /// The bytes held back because they may still become a marker: fewer than the longest marker.
     held: String,
     /// The bytes the markers start with: a marker can begin at no other byte, so the scan looks
@@ -172,8 +174,14 @@ impl Scanner {
     /// two equal markers the first in the list is the one reported.
     pub fn new(markers: impl IntoIterator<Item = impl Into<String>>) -> Self {
         let markers: Vec<String> = markers.into_iter().map(Into::into).collect();
+        Self::sharing(Arc::from(markers))
+    }
+
+    /// A scanner for a list of markers built once and shared: the same scanner as [`Self::new`]
+    /// would make for them, with nothing of the list copied.
+    pub fn sharing(markers: Arc<[String]>) -> Self {
         let mut starts = Starts::default();
-        for marker in &markers {
+        for marker in markers.iter() {
             if let Some(&first) = marker.as_bytes().first() {
                 starts.add(first);
             }

@@ -409,7 +409,7 @@ impl Engine {
         }
         let at_turn_start = format.start().is_some();
         let mut engine = Self {
-            scanner: Scanner::new(format.terminal_texts()),
+            scanner: format.scanner(),
             format,
             declared,
             names: None,
