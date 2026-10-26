@@ -15,8 +15,10 @@ pub type LoadHold = Box<dyn Any + Send + Sync>;
 /// One worker as an external router may use it.
 pub trait ExternalWorker: Send + Sync + Debug {
     fn url(&self) -> &str;
-    /// The URL as a response header or an event line shows it: a userinfo in
-    /// it is masked.
+    /// The URL as a response header or an event line shows it: the
+    /// registered URL byte for byte when it has no userinfo, query or
+    /// fragment, otherwise the gateway's masked rendering (the userinfo
+    /// masked whole, a query or fragment cut at the path).
     fn redacted_url(&self) -> &str;
     fn api_key(&self) -> Option<&String>;
     fn model_id(&self) -> &str;

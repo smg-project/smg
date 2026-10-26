@@ -226,9 +226,11 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Get the worker's URL
     fn url(&self) -> &str;
     /// The URL as a request's success path shows it (the routed-worker
-    /// response header, the request-sent event): the registered URL byte for
-    /// byte, unless it carries userinfo, which is masked whole. Computed once
-    /// at registration (`WorkerMetadata::redacted_url`).
+    /// response header, the cache-trace header, the request-sent event): the
+    /// registered URL byte for byte when it has no userinfo, query or
+    /// fragment, otherwise `Endpoint::redacted_str`'s form (see
+    /// `Endpoint::redacted_url`). Computed once at construction
+    /// (`WorkerMetadata::redacted_url`).
     fn redacted_url(&self) -> &str {
         &self.metadata().redacted_url
     }
