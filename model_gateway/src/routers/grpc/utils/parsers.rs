@@ -463,7 +463,7 @@ pub fn chat_reasoning_starts_in_prefill(
     )
 }
 
-/// [`reasoning_starts_in_prefill`] for a chat request whose prompt is
+/// `reasoning_starts_in_prefill` for a chat request whose prompt is
 /// rendered: `generation_prompt` and `continued_final_message` are the
 /// rendered prompt's (`ProcessedMessages`), not the request's. A renderer
 /// with an encoder of its own writes the generation header whatever the
