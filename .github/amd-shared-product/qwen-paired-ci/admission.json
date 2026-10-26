@@ -1,60 +1,248 @@
 {
-  "ready": false,
-  "root_manual_admission": false,
-  "run_budget_admitted": false,
-  "artifacts_pinned": false,
-  "reservation_seconds": 0,
+  "ready": true,
+  "root_manual_admission": true,
+  "run_budget_admitted": true,
+  "artifacts_pinned": true,
+  "reservation_seconds": 2100,
   "NEW_runner_seconds": 2100,
   "source_parent": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
   "repository": "smg-project/smg",
-  "approved_actor": null,
-  "approved_branch": null,
-  "admission_nonce": null,
-  "root_budget_receipt": null,
-  "root_budget_receipt_sha256": null,
-  "new_CI_peer_path": null,
-  "new_CI_peer_sha256": null,
+  "approved_actor": "chunfangamd",
+  "approved_branch": "ci/amd-qwen-current1473-checkout-permissions-20261026",
+  "admission_nonce": "e99311b6518540be8c284f7a847c2dc9",
+  "root_budget_receipt": "review/root-budget.json",
+  "root_budget_receipt_sha256": "732974ef797fb2c459582cc7378cd970a848802797fdd6e586988fd21961f91f",
+  "new_CI_peer_path": "review/ci-source-peer.json",
+  "new_CI_peer_sha256": "781750b6f6a030a86d92a39814df228d7229984c5bc7068f5481f1930f3dc4cb",
   "source_manifest_sha256": "08f31576190bf22128ebd9d848102356144a56be7edd16076c5ff3def0b47d85",
   "nodes": {
     "amd-mi300x-1": {
       "GPU_index": "0",
       "model": {
-        "snapshot": null,
-        "revision": null,
-        "config_and_tokenizer_files": [],
-        "shards": [],
-        "all_declared_weight_headers_valid": false,
-        "complete_index_tensor_names_match": false,
-        "source_receipt": null,
-        "index": null,
-        "fixture_resolved_model_path": null,
+        "snapshot": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
+        "revision": "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
+        "config_and_tokenizer_files": [
+          {
+            "path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b/config.json",
+            "resolved_path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/blobs/0e2df614c5fe1ad2b6b540c8625bebf2d7ec43ca",
+            "bytes": 1474,
+            "sha256": "5cd452860dc1e9c29dd71cc3cef7f39b338b7a40793f7a260655c2d3568f3661"
+          },
+          {
+            "path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b/tokenizer.json",
+            "resolved_path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/blobs/c6cc1014128b19d1fc46b1d30a23e3b1d35db421",
+            "bytes": 7032403,
+            "sha256": "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7"
+          },
+          {
+            "path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b/tokenizer_config.json",
+            "resolved_path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/blobs/d3d3763207692c78780f4bf42d4dadf49a5c8012",
+            "bytes": 10868,
+            "sha256": "c2da771801886ad9ae98181793ffd3dfb7f1af30f6f7c6a4e15d7dbba52e2399"
+          },
+          {
+            "path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b/preprocessor_config.json",
+            "resolved_path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/blobs/2ea84a437d448ff71b08df68fdd949d5cc4ebb64",
+            "bytes": 390,
+            "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+          },
+          {
+            "path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b/video_preprocessor_config.json",
+            "resolved_path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/blobs/3ba673a5ad7d4d13f54155ecd38b2a94a6dac8fe",
+            "bytes": 385,
+            "sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+          },
+          {
+            "path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b/chat_template.json",
+            "resolved_path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/blobs/1081bacf1af7c7c6de4a585ce02cd0fd34e382da",
+            "bytes": 5499,
+            "sha256": "5c72a170d2a4a1a3bc5adad2e689ae28138a9700e5b8c96c0266331e86c0acce"
+          },
+          {
+            "path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b/generation_config.json",
+            "resolved_path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/blobs/e116347d7ef42621c7a5957f82c015c38d939c1f",
+            "bytes": 269,
+            "sha256": "8469742d1fce0de951c8909b26a2c0c0d8490837ce476efb114da9e0cefc4d44"
+          }
+        ],
+        "shards": [
+          {
+            "name": "model-00001-of-00004.safetensors",
+            "resolved_path": "/models/hub/blobs/f4/f43fe9499002ea3e53be00514099a55c71fe5ee7bd0a5a4675a00e58093a31fd",
+            "bytes": 4902275944,
+            "header_bytes": 14176,
+            "header_sha256": "29c6e3ee7391b9cd7917e8d6a7c252d0face169060fa8f334e56b43f5f836b9b",
+            "tensor_count": 109
+          },
+          {
+            "name": "model-00002-of-00004.safetensors",
+            "resolved_path": "/models/hub/blobs/2f/2f0baa7e043ad74fe914338ec39145dca2c3c4497a6c239de5a148f8f8b1fbc0",
+            "bytes": 4915962496,
+            "header_bytes": 18552,
+            "header_sha256": "c3667b7b28097300ff4ade11c8e3c299f4e00d712a573dc22325cebb949533d4",
+            "tensor_count": 142
+          },
+          {
+            "name": "model-00003-of-00004.safetensors",
+            "resolved_path": "/models/hub/blobs/d9/d9de8e6c9115c9e90a41c1ce5429868ec3ca0792890a7279de04d1935a463d79",
+            "bytes": 4999831048,
+            "header_bytes": 17920,
+            "header_sha256": "043ac56c5b6de46994f9b89c4c183f1e24d85c881597c817a98549c14b3ee6de",
+            "tensor_count": 137
+          },
+          {
+            "name": "model-00004-of-00004.safetensors",
+            "resolved_path": "/models/hub/blobs/85/8599198904e418c5e31a51dc2f3ead0a4cf9f4cedd3b0d0dc686a85ab6a71bfc",
+            "bytes": 2716270024,
+            "header_bytes": 41440,
+            "header_sha256": "66010cce64ae4bcbd55cb77d3cae234da4bdd84f716157860817c0f66bd43852",
+            "tensor_count": 362
+          }
+        ],
+        "index": {
+          "path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b/model.safetensors.index.json",
+          "resolved_path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/blobs/5857ec62530eb589b1876034dd5386f1d98131a6",
+          "bytes": 67759,
+          "sha256": "520b2e05079402e9468a8701d03d1154d14b2599593afb6effa7fb60c1bff070"
+        },
+        "fixture_resolved_model_path": "Qwen/Qwen3-VL-8B-Instruct",
         "fixture_HF_ref": {
-          "path": null,
-          "bytes": null,
-          "sha256": null
+          "path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/refs/main",
+          "bytes": 40,
+          "sha256": "b977aaac705eb8c0ad6cb1c08e92631a340da86153d879ca4c79063f97b23124"
+        },
+        "all_declared_weight_headers_valid": true,
+        "complete_index_tensor_names_match": true,
+        "full_tensor_hashes_verified": false,
+        "source_receipt": {
+          "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-actual-model-pins-read-root-ad60e7383aad4323b681db67450147ac/smg_mi300x_1.json",
+          "sha256": "fdc83a16a1955ae9d123c7e396145ab2e3c6108e2da1c19f25f6a134971a6c23"
         }
       },
-      "permitted_background_processes": []
+      "permitted_background_processes": [
+        {
+          "pid": 1894092,
+          "ppid": 1,
+          "start_ticks": "633833182",
+          "comm": "gpuagent",
+          "executable": "/usr/local/bin/gpuagent",
+          "executable_sha256": "d997dd36a1cec1ac6f6b1c3b0fe527551ba98c19c2626f424b200ee29f014e6e"
+        }
+      ]
     },
     "amd-mi300x-2": {
       "GPU_index": "0",
       "model": {
-        "snapshot": null,
-        "revision": null,
-        "config_and_tokenizer_files": [],
-        "shards": [],
-        "all_declared_weight_headers_valid": false,
-        "complete_index_tensor_names_match": false,
-        "source_receipt": null,
-        "index": null,
-        "fixture_resolved_model_path": null,
+        "snapshot": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
+        "revision": "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
+        "config_and_tokenizer_files": [
+          {
+            "path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b/config.json",
+            "resolved_path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/blobs/0e2df614c5fe1ad2b6b540c8625bebf2d7ec43ca",
+            "bytes": 1474,
+            "sha256": "5cd452860dc1e9c29dd71cc3cef7f39b338b7a40793f7a260655c2d3568f3661"
+          },
+          {
+            "path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b/tokenizer.json",
+            "resolved_path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/blobs/c6cc1014128b19d1fc46b1d30a23e3b1d35db421",
+            "bytes": 7032403,
+            "sha256": "a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7"
+          },
+          {
+            "path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b/tokenizer_config.json",
+            "resolved_path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/blobs/d3d3763207692c78780f4bf42d4dadf49a5c8012",
+            "bytes": 10868,
+            "sha256": "c2da771801886ad9ae98181793ffd3dfb7f1af30f6f7c6a4e15d7dbba52e2399"
+          },
+          {
+            "path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b/preprocessor_config.json",
+            "resolved_path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/blobs/2ea84a437d448ff71b08df68fdd949d5cc4ebb64",
+            "bytes": 390,
+            "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+          },
+          {
+            "path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b/video_preprocessor_config.json",
+            "resolved_path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/blobs/3ba673a5ad7d4d13f54155ecd38b2a94a6dac8fe",
+            "bytes": 385,
+            "sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+          },
+          {
+            "path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b/chat_template.json",
+            "resolved_path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/blobs/1081bacf1af7c7c6de4a585ce02cd0fd34e382da",
+            "bytes": 5499,
+            "sha256": "5c72a170d2a4a1a3bc5adad2e689ae28138a9700e5b8c96c0266331e86c0acce"
+          },
+          {
+            "path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b/generation_config.json",
+            "resolved_path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/blobs/e116347d7ef42621c7a5957f82c015c38d939c1f",
+            "bytes": 269,
+            "sha256": "8469742d1fce0de951c8909b26a2c0c0d8490837ce476efb114da9e0cefc4d44"
+          }
+        ],
+        "shards": [
+          {
+            "name": "model-00001-of-00004.safetensors",
+            "resolved_path": "/models/hub/blobs/f4/f43fe9499002ea3e53be00514099a55c71fe5ee7bd0a5a4675a00e58093a31fd",
+            "bytes": 4902275944,
+            "header_bytes": 14176,
+            "header_sha256": "29c6e3ee7391b9cd7917e8d6a7c252d0face169060fa8f334e56b43f5f836b9b",
+            "tensor_count": 109
+          },
+          {
+            "name": "model-00002-of-00004.safetensors",
+            "resolved_path": "/models/hub/blobs/2f/2f0baa7e043ad74fe914338ec39145dca2c3c4497a6c239de5a148f8f8b1fbc0",
+            "bytes": 4915962496,
+            "header_bytes": 18552,
+            "header_sha256": "c3667b7b28097300ff4ade11c8e3c299f4e00d712a573dc22325cebb949533d4",
+            "tensor_count": 142
+          },
+          {
+            "name": "model-00003-of-00004.safetensors",
+            "resolved_path": "/models/hub/blobs/d9/d9de8e6c9115c9e90a41c1ce5429868ec3ca0792890a7279de04d1935a463d79",
+            "bytes": 4999831048,
+            "header_bytes": 17920,
+            "header_sha256": "043ac56c5b6de46994f9b89c4c183f1e24d85c881597c817a98549c14b3ee6de",
+            "tensor_count": 137
+          },
+          {
+            "name": "model-00004-of-00004.safetensors",
+            "resolved_path": "/models/hub/blobs/85/8599198904e418c5e31a51dc2f3ead0a4cf9f4cedd3b0d0dc686a85ab6a71bfc",
+            "bytes": 2716270024,
+            "header_bytes": 41440,
+            "header_sha256": "66010cce64ae4bcbd55cb77d3cae234da4bdd84f716157860817c0f66bd43852",
+            "tensor_count": 362
+          }
+        ],
+        "index": {
+          "path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/snapshots/0c351dd01ed87e9c1b53cbc748cba10e6187ff3b/model.safetensors.index.json",
+          "resolved_path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/blobs/5857ec62530eb589b1876034dd5386f1d98131a6",
+          "bytes": 67759,
+          "sha256": "520b2e05079402e9468a8701d03d1154d14b2599593afb6effa7fb60c1bff070"
+        },
+        "fixture_resolved_model_path": "Qwen/Qwen3-VL-8B-Instruct",
         "fixture_HF_ref": {
-          "path": null,
-          "bytes": null,
-          "sha256": null
+          "path": "/models/hub/models--Qwen--Qwen3-VL-8B-Instruct/refs/main",
+          "bytes": 40,
+          "sha256": "b977aaac705eb8c0ad6cb1c08e92631a340da86153d879ca4c79063f97b23124"
+        },
+        "all_declared_weight_headers_valid": true,
+        "complete_index_tensor_names_match": true,
+        "full_tensor_hashes_verified": false,
+        "source_receipt": {
+          "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-actual-model-pins-read-root-ad60e7383aad4323b681db67450147ac/smg_mi300x_2.json",
+          "sha256": "4cd9ddc8183743f774eab8d97a5cfd1a1921811248ccd2ec39594b807c192ace"
         }
       },
-      "permitted_background_processes": []
+      "permitted_background_processes": [
+        {
+          "pid": 5052,
+          "ppid": 1,
+          "start_ticks": "6177",
+          "comm": "gpuagent",
+          "executable": "/usr/local/bin/gpuagent",
+          "executable_sha256": "d997dd36a1cec1ac6f6b1c3b0fe527551ba98c19c2626f424b200ee29f014e6e"
+        }
+      ]
     }
   },
   "runtime_result": null,

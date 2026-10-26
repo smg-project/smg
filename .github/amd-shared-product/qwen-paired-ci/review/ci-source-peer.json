@@ -1,0 +1,41 @@
+{
+  "result": "PASS_SOURCE_ONLY_ACTUAL_QWEN_CHECKOUT548_CPU_BOOTSTRAP",
+  "findings": [],
+  "reviewer": "A; nonauthor of root checkout bootstrap. Prior genuine A893e source scopes inherited; no candidate/helper or shell/container execution performed.",
+  "at_utc": "2026-10-26T01:41:36.198103+00:00",
+  "source_parent": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
+  "actual_head": "548656bf7f753bcca1236e182b8b34d91a89ef3b",
+  "source_base": "e65bed1c6cc10a904c5048d9ddb82e7f1c7231d7",
+  "direct_parent": "60d9e8b73c8b301cfd33779d1f140c76c6449b55",
+  "actual_worktree": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/amd-qwen-current1473-checkout-permissions-20261026",
+  "driver_sha256": "7b0a98d25b7c0061d673556b0f6cf41e6b6da7311f1642a1d70145ece8f63591",
+  "envelope_sha256": "06589cd12a0547a4e1d5547f8e24afb6c849ec8e95854d997b73bf1180d1ccfd",
+  "inputs_sha256": "9f0359d170854c490fdc28c18b51a83b87c94b22331ceb56accee41179350925",
+  "CI_job_runner_sha256": "858e381d4398c51163b16cee3c1282ff20d53d25b1f0dbff7214172bf7b7d5e8",
+  "workflow_template_sha256": "aa77da40cedaa56aa6d4f02a2ec0f63c5f4cddabd781ba38adc2bacdfada2564",
+  "CI_source_manifest_sha256": "08f31576190bf22128ebd9d848102356144a56be7edd16076c5ff3def0b47d85",
+  "admission_sha256": "36d1ed861db843856965853577792ef3edc1499c8236608fe0f653db274862cd",
+  "bootstrap_sha256": "2589f9857a3e3c7327a029ef100136be3497283592194b310c5a2e4f1a3060df",
+  "git_diff_sha256": "3cf3006fcf6ce9c9b74445da9155835b0efc5f170edf1b489f59f1c518db0ba9",
+  "checks": [
+    "Actual clean548/e65\u219260d9\u2192548 lineage and exactly4 changed paths. Registered workflow and template byteequal; removing exact14-line bootstrap restores whole e65 workflow. Manifest changes only template SHA; admission changes only manifest SHA. All15 source members independently hash-match.",
+    "Bootstrap occurs before host checkout only in this private workflow_dispatch job. Guards require exact smg-project/smg, GITHUB_WORKSPACE==RUNNER_WORKSPACE/smg and canonical existing workspace; its only bind is that workspace at /checkout. No hosthook or generic CI source changed.",
+    "Root container uses exact cached4420 image, pull=never, explicit ordinary runc/no devices, network none/read-only rootfs, CPU1/RAM256m/PIDs32, all caps dropped except CHOWN. Numeric runner UID/GID target and chown -R -h -P avoid symlink traversal; 20s timeout plus2s KILL grace and one-minute step bound. No sudo/rootSSH assumption.",
+    "Existing35-minute/2100 total job bound still includes precheckout, normal preparation, paired requests, cleanup and upload. Inner/current source checks, source1473/d5/b7 provenance and seven-metadata/header guard unchanged.",
+    "Qwen admission four execution gates false/res0; shared inputs five flags false unchanged. No actual model pin/nonce/actor/branch/peer/grant filled; runtime_result null/coverage0. Full e2e source tree and original12 diagnostic request semantics unchanged."
+  ],
+  "conditional_child_scope": "Allows a later root-authored data-only child touching only .github/amd-shared-product/qwen-paired-ci/admission.json, review/ci-source-peer.json, review/root-budget.json and shared .github/amd-shared-product/inputs.json four gate bits ready/run_budget_admitted/artifacts_pinned/runtime_cohort_accepted. consumer_gpu_ready must remain false; all other shared data and the15 source members/manifest/registered workflow must remain byteexact. Root must obtain independent resource peer and actual source-data integration peer before dispatch. This source PASS grants no resource.",
+  "inherited_source_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-e65-cache-layout-source-review-A-20261026/peer-independent-A.json",
+    "sha256": "893e0a7fd150ec4d6e31aa76693e217f4b473c8c46386f8f8607e20ebeb11da9"
+  },
+  "limits": [
+    "No runner-UID995 Docker/chown sandbox validation performed by this reviewer; source PASS does not imply successful permission repair on actual filesystem.",
+    "Bootstrap is manual-job workspace repair and runs before admission.json can be checked out; engine/model execution remains gated by the existing explicit admission checks.",
+    "20s command timeout has2s forced-kill grace; one-minute step and original35-minute job remain outer bounds.",
+    "No GPU/model/ABI/full original suite success, tensor payload hashing or coverage credit; cancelled producer parent is not accepted as a whole pipeline."
+  ],
+  "executed": false,
+  "resource_authority": false,
+  "coverage_increment": 0
+}
