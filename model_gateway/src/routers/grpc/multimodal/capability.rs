@@ -468,10 +468,12 @@ mod tests {
         use std::sync::Arc;
 
         use llm_multimodal::MediaContentPart;
-        use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+        use openai_protocol::model_card::ModelCard;
 
         use super::*;
-        use crate::worker::{BasicWorkerBuilder, ConnectionMode, WorkerType};
+        use crate::worker::{
+            test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, WorkerType,
+        };
 
         const MODEL: &str = "pool-test-model";
 
@@ -482,10 +484,7 @@ mod tests {
                 .worker_type(WorkerType::Regular)
                 .runtime_type(runtime)
                 .connection_mode(ConnectionMode::Grpc)
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                });
+                .health_config(no_health_check());
             for (key, value) in labels {
                 builder = builder.label(*key, *value);
             }

@@ -202,10 +202,11 @@ mod tests {
     use std::sync::Arc;
 
     use llm_multimodal::MediaContentPart;
-    use openai_protocol::worker::HealthCheckConfig;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, WorkerType};
+    use crate::worker::{
+        test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, ModelCard, WorkerType,
+    };
 
     const MODEL: &str = "vision-model";
 
@@ -215,10 +216,7 @@ mod tests {
             .worker_type(WorkerType::Regular)
             .runtime_type(runtime)
             .connection_mode(ConnectionMode::Grpc)
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            });
+            .health_config(no_health_check());
         for (key, value) in labels {
             builder = builder.label(*key, *value);
         }

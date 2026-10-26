@@ -705,20 +705,15 @@ fn compute_shm_namespace_id() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::HealthCheckConfig;
-
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, ModelCard, WorkerType};
+    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder, ModelCard, WorkerType};
 
     fn worker(url: &str, runtime: RuntimeType, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
         let mut builder = BasicWorkerBuilder::new(url)
             .model(ModelCard::new("qwen3-vl"))
             .worker_type(WorkerType::Regular)
             .runtime_type(runtime)
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            });
+            .health_config(no_health_check());
         for (key, value) in labels {
             builder = builder.label(*key, *value);
         }
@@ -872,10 +867,7 @@ mod tests {
                         .worker_type(WorkerType::Regular)
                         .connection_mode(ConnectionMode::Grpc)
                         .runtime_type(RuntimeType::TokenSpeed)
-                        .health_config(HealthCheckConfig {
-                            disable_health_check: true,
-                            ..Default::default()
-                        })
+                        .health_config(no_health_check())
                         .build(),
                 ))
                 .expect("register");
@@ -924,10 +916,7 @@ mod tests {
                         .worker_type(worker_type)
                         .connection_mode(ConnectionMode::Grpc)
                         .runtime_type(runtime)
-                        .health_config(HealthCheckConfig {
-                            disable_health_check: true,
-                            ..Default::default()
-                        })
+                        .health_config(no_health_check())
                         .build(),
                 )
             };
