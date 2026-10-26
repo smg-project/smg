@@ -52,7 +52,7 @@ mod tests {
         event::{DropReason, Event, FinishReason, MalformedReason, Text},
         testing::{
             a_forced_tag_begins_with_the_templates_text, arguments_of, bytes, content, drive,
-            drive_to, reasoning, said, the_same_at_every_cut, Said,
+            drive_to, dropped, reasoning, said, the_same_at_every_cut, Said,
         },
         Declared, EngineFinish,
     };
@@ -104,13 +104,6 @@ mod tests {
 
     fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         drive(&mut Engine::new(glm4(), declared()), prompt, pieces)
-    }
-
-    fn dropped(text: &str) -> Event<'static> {
-        Event::Dropped {
-            text: Text::uncounted(text.to_owned()),
-            why: DropReason::Wrapper,
-        }
     }
 
     #[test]

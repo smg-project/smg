@@ -61,7 +61,7 @@ mod tests {
         ids::CallIds,
         testing::{
             a_forced_tag_begins_with_the_templates_text, arguments_of, bytes, content, drive,
-            reasoning, the_same_at_every_cut, Said,
+            dropped, reasoning, the_same_at_every_cut, weather_declared, Said,
         },
     };
 
@@ -135,13 +135,6 @@ mod tests {
             }
         }
         out
-    }
-
-    fn dropped(text: &str) -> Event<'static> {
-        Event::Dropped {
-            text: Text::uncounted(text.to_owned()),
-            why: DropReason::Wrapper,
-        }
     }
 
     /// A call whose arguments are not JSON carries them as the model wrote them and says once,
@@ -333,7 +326,7 @@ mod tests {
     /// The content deltas a client of the stream receives when `pieces` arrive one by one after
     /// `prompt`: the content of each feed's events, the end's included, empty ones left out.
     fn content_deltas(format: Format, prompt: &str, pieces: &[&str]) -> Vec<String> {
-        let mut parser = Engine::new(format, declared());
+        let mut parser = Engine::new(format, weather_declared());
         let mut out = Events::new();
         parser
             .feed(
@@ -1042,25 +1035,6 @@ mod tests {
         );
     }
 
-    /// A tool `get_weather` with a string `city` and an integer `days`.
-    fn declared() -> Declared {
-        use openai_protocol::common::{Function, Tool};
-        use serde_json::json as value;
-        Declared::of(&[Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "get_weather".to_string(),
-                description: None,
-                parameters: value!({"type": "object", "properties": {
-                    "city": {"type": "string"},
-                    "days": {"type": "integer"},
-                }}),
-                strict: None,
-                extra: Default::default(),
-            },
-        }])
-    }
-
     const TAGGED_CALL: &str = concat!(
         "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>",
         "\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>"
@@ -1069,7 +1043,7 @@ mod tests {
     fn run_tagged(pieces: &[&str], finish: EngineFinish) -> Vec<Event<'static>> {
         let mut parser = engine(
             qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
-            declared(),
+            weather_declared(),
         );
         let mut out = Events::new();
         for piece in pieces {
@@ -1402,7 +1376,7 @@ mod tests {
     fn after_prompt(prompt: &str, output: &str) -> Vec<Event<'static>> {
         let mut parser = engine(
             qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
-            declared(),
+            weather_declared(),
         );
         let mut out = Events::new();
         parser
@@ -1769,7 +1743,7 @@ mod tests {
         ));
     }
 
-    /// The tool `get_weather` of [`declared()`] and one without parameters, as a request lists
+    /// The tool `get_weather` of [`weather_declared()`] and one without parameters, as a request lists
     /// them.
     fn weather_tools() -> Vec<openai_protocol::common::Tool> {
         use openai_protocol::common::{Function, Tool};
@@ -1813,7 +1787,7 @@ mod tests {
     /// The events of `pieces` after the turn's opener, read by `format` with the weather tool.
     fn read_with(format: &Format, pieces: &[&str]) -> Vec<Event<'static>> {
         drive(
-            &mut engine(format.clone(), declared()),
+            &mut engine(format.clone(), weather_declared()),
             "<|im_start|>assistant\n",
             pieces,
         )

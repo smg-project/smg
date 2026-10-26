@@ -5,11 +5,12 @@ use openai_protocol::common::{Function, Tool};
 use serde_json::{json as value, Value};
 
 use crate::{
-    event::{Event, Events, FinishReason},
+    event::{DropReason, Event, Events, FinishReason, Text},
     format::Format,
     grammar::{GrammarStart, Options},
     input::{EngineFinish, Input},
     parser::Parser,
+    Declared,
 };
 
 /// The output bytes the events account for, in order: content, reasoning,
@@ -403,4 +404,25 @@ pub(crate) fn weather_tools() -> Vec<Tool> {
         ),
         tool("ping", value!({"type": "object"})),
     ]
+}
+
+/// Wrapper text the engine dropped: uncounted, dropped as a wrapper, the
+/// event the formats' tests expect around a call.
+pub(crate) fn dropped(text: &str) -> Event<'static> {
+    Event::Dropped {
+        text: Text::uncounted(text.to_owned()),
+        why: DropReason::Wrapper,
+    }
+}
+
+/// One declared tool, `get_weather` with a city and days: the fixture the
+/// engine's tests and several formats' parse against.
+pub(crate) fn weather_declared() -> Declared {
+    Declared::of(&[tool(
+        "get_weather",
+        value!({"type": "object", "properties": {
+            "city": {"type": "string"},
+            "days": {"type": "integer"},
+        }}),
+    )])
 }

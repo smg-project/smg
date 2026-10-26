@@ -49,9 +49,9 @@ mod tests {
     use crate::{
         adapt::chat,
         engine::Engine,
-        event::{DropReason, Event, MalformedReason, Text},
+        event::{DropReason, Event, MalformedReason},
         input::EngineFinish,
-        testing::{arguments_of, bytes, content, drive, drive_to, names, reasoning},
+        testing::{arguments_of, bytes, content, drive, drive_to, dropped, names, reasoning},
         Declared,
     };
 
@@ -145,13 +145,6 @@ mod tests {
             .iter()
             .filter(|event| matches!(event, Event::ToolCallEnd { .. }))
             .count()
-    }
-
-    fn dropped(text: &str) -> Event<'static> {
-        Event::Dropped {
-            text: Text::uncounted(text.to_owned()),
-            why: DropReason::Wrapper,
-        }
     }
 
     /// Prose where the invoke has tags, before its first child or after its last: refused word by

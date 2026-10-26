@@ -1388,24 +1388,8 @@ mod tests {
         formats::{glm, inkling, llama4, mistral, qwen3, xlam},
         input::TokenSpan,
         tagged::{Placement, Spelling},
-        testing::{arguments_of, bytes},
+        testing::{arguments_of, bytes, weather_declared},
     };
-
-    fn declared() -> Declared {
-        Declared::of(&[Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "get_weather".to_string(),
-                description: None,
-                parameters: value!({"type": "object", "properties": {
-                    "city": {"type": "string"},
-                    "days": {"type": "integer"},
-                }}),
-                strict: None,
-                extra: Default::default(),
-            },
-        }])
-    }
 
     /// GLM's last call, its closing marker not written: the stop token that would end it is
     /// hidden by the stop decoder.
@@ -1419,7 +1403,7 @@ mod tests {
     }
 
     fn run(format: Format, output: &str, finish: EngineFinish) -> Vec<Event<'static>> {
-        let mut engine = Engine::with_call_ids(Arc::new(format), declared(), ids());
+        let mut engine = Engine::with_call_ids(Arc::new(format), weather_declared(), ids());
         let mut out = Events::new();
         for input in [
             Input::Delta {
@@ -1436,7 +1420,7 @@ mod tests {
 
     /// The events of `output` after `prompt`, ended by a stop.
     fn run_after(format: Format, prompt: &str, output: &str) -> Vec<Event<'static>> {
-        let mut engine = Engine::with_call_ids(Arc::new(format), declared(), ids());
+        let mut engine = Engine::with_call_ids(Arc::new(format), weather_declared(), ids());
         let mut out = Events::new();
         for input in [
             Input::Prompt {
@@ -1556,7 +1540,12 @@ mod tests {
         for (table, format, prompt, written) in cases {
             let format = Arc::new(format);
             let declared_arguments = {
-                let events = read_with(&format, declared(), prompt, &[&written("get_weather")]);
+                let events = read_with(
+                    &format,
+                    weather_declared(),
+                    prompt,
+                    &[&written("get_weather")],
+                );
                 assert!(
                     !events
                         .iter()
@@ -1578,7 +1567,7 @@ mod tests {
                         .map(|cut| vec![&output[..cut], &output[cut..]]),
                 );
                 for pieces in plans {
-                    let events = read_with(&format, declared(), prompt, &pieces);
+                    let events = read_with(&format, weather_declared(), prompt, &pieces);
                     let place = || format!("{table} {name} in {} pieces: {events:?}", pieces.len());
                     assert_eq!(bytes(&events), output, "{}", place());
                     let unknown = unknown_tool_at(&events);
@@ -2435,7 +2424,7 @@ mod tests {
             (["<resp", "onse>\nHi"], ["Hi", ""]),
             (["<resp", "ite"], ["", "<respite"]),
         ] {
-            let mut engine = Engine::new(ernie(), declared());
+            let mut engine = Engine::new(ernie(), weather_declared());
             let mut out = Events::new();
             for piece in pieces {
                 engine
@@ -2491,7 +2480,7 @@ mod tests {
     /// output's bytes.
     fn same_at_every_cut(format: &Format, prompt: &str, output: &str) -> [String; 4] {
         let replay = |cuts: &[usize]| {
-            let mut engine = Engine::new(format.clone(), declared());
+            let mut engine = Engine::new(format.clone(), weather_declared());
             let mut out = Events::new();
             engine
                 .feed(
@@ -2726,7 +2715,7 @@ mod tests {
         // The content of each feed's events, the end's included, empty ones left out: the
         // content deltas a client of the stream receives.
         let deltas = |pieces: &[&str]| -> Vec<String> {
-            let mut engine = Engine::new(qwen3(CallSyntax::Json), declared());
+            let mut engine = Engine::new(qwen3(CallSyntax::Json), weather_declared());
             let mut out = Events::new();
             let mut deltas = Vec::new();
             for piece in pieces {
@@ -2854,7 +2843,7 @@ mod tests {
                 span
             })
             .collect();
-        let mut engine = Engine::new(format(), declared());
+        let mut engine = Engine::new(format(), weather_declared());
         let mut out = Events::new();
         engine
             .feed(
@@ -2928,7 +2917,7 @@ mod tests {
         );
         assert_eq!(malformed, "");
         for cut in (1..held.len()).filter(|&cut| held.is_char_boundary(cut)) {
-            let mut engine = Engine::new(inkling(), declared());
+            let mut engine = Engine::new(inkling(), weather_declared());
             let mut out = Events::new();
             for input in [
                 Input::Prompt {
@@ -3004,7 +2993,7 @@ mod tests {
         };
         let read = |pieces: &[&str]| -> Vec<Event<'static>> {
             let spans: Vec<Vec<TokenSpan>> = pieces.iter().map(|piece| char_spans(piece)).collect();
-            let mut engine = Engine::new(format(), declared());
+            let mut engine = Engine::new(format(), weather_declared());
             let mut out = Events::new();
             for (piece, spans) in pieces.iter().zip(&spans) {
                 engine
@@ -3143,7 +3132,7 @@ mod tests {
         // The gateway makes one engine per request, so a conversation's turns never share a
         // nonce: four calls over two turns are four ids, each of the shape the older parsers mint.
         let turn = || {
-            let mut engine = Engine::new(qwen3(CallSyntax::Json), declared());
+            let mut engine = Engine::new(qwen3(CallSyntax::Json), weather_declared());
             let mut out = Events::new();
             engine
                 .feed(
@@ -3182,7 +3171,7 @@ mod tests {
     fn one_nonce_gives_an_output_the_same_ids_whole_or_cut_character_by_character() {
         let replay = |pieces: Vec<&str>| {
             let mut engine =
-                Engine::with_call_ids(Arc::new(qwen3(CallSyntax::Json)), declared(), ids());
+                Engine::with_call_ids(Arc::new(qwen3(CallSyntax::Json)), weather_declared(), ids());
             let mut out = Events::new();
             for piece in pieces {
                 engine

@@ -57,7 +57,7 @@ mod tests {
     use super::*;
     use crate::{
         ids::CallIds,
-        testing::{arguments_of, bytes, calls, content, reasoning},
+        testing::{arguments_of, bytes, calls, content, dropped, reasoning},
     };
 
     fn ids() -> CallIds {
@@ -118,13 +118,6 @@ mod tests {
             )
             .expect("end");
         out.into_owned().drain()
-    }
-
-    fn dropped(text: &str) -> Event<'static> {
-        Event::Dropped {
-            text: Text::uncounted(text.to_owned()),
-            why: DropReason::Wrapper,
-        }
     }
 
     #[test]
