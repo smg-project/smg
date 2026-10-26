@@ -753,6 +753,7 @@ def test_model_info_mirrors_the_python_servicer(monkeypatch):
     assert info["pairing_protocol"] == "nixl"
     # No KV connector configured: the PD identity is empty, as in Python.
     assert (info["kv_connector"], info["kv_role"], info["kv_engine_id"]) == ("", "", "")
+    assert info["runs_mooncake"] is False
     assert info["block_size"] == 0 and info["model_dtype"] == ""
     # No KV-event publisher configured, backend unset, and the host's shm id.
     assert info["kv_events_endpoint"] == "" and info["kv_events_topic"] == ""
@@ -808,6 +809,77 @@ def test_model_info_names_the_mooncake_mover_the_rust_servicer_withholds_the_not
         "kv_consumer",
         "decode-engine",
     )
+    assert info["runs_mooncake"] is True
+
+
+@pytest.mark.parametrize(
+    "connectors",
+    [
+        # a second P2P child beside it: the projection stays at the wrapper
+        [
+            {"kv_connector": "NixlConnector", "engine_id": "decode-engine"},
+            {"kv_connector": "MooncakeConnector", "engine_id": "decode-engine"},
+        ],
+        # an empty child engine id: the projection stays at the wrapper
+        [{"kv_connector": "MooncakeConnector", "engine_id": ""}],
+        # a malformed sibling: the projection stays at the wrapper
+        [{"kv_connector": "MooncakeConnector", "engine_id": "decode-engine"}, "not a child"],
+        # a wrapper inside the wrapper (vLLM builds each child from its own dict):
+        # the Mooncake grandchild counts, the projection stays at the wrapper
+        [
+            {
+                "kv_connector": "MultiConnector",
+                "engine_id": "decode-engine",
+                "kv_connector_extra_config": {
+                    "connectors": [
+                        {"kv_connector": "MooncakeConnector", "engine_id": "decode-engine"},
+                        {"kv_connector": "SharedStorageConnector"},
+                    ]
+                },
+            },
+        ],
+    ],
+    ids=["second-p2p-child", "empty-engine-id", "malformed-sibling", "nested-wrapper"],
+)
+def test_model_info_flags_a_mooncake_child_the_projection_does_not_name(connectors):
+    """A Mooncake child under a wrapper whose projection stays at the wrapper,
+    at any depth, is flagged off the raw config: the Rust servicer withholds
+    the notice on the flag, not on the projected name it reports."""
+    config = _config()
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="MultiConnector",
+        kv_role="kv_consumer",
+        engine_id="eng-d",
+        kv_connector_extra_config={"connectors": connectors},
+    )
+    info = rust.model_info_from_config(config)
+    assert (info["kv_connector"], info["kv_engine_id"]) == ("MultiConnector", "eng-d")
+    assert info["runs_mooncake"] is True
+
+
+def test_model_info_leaves_the_mooncake_flag_off_without_a_mooncake_connector():
+    """A plain NIXL engine and a wrapper without a Mooncake child (NIXL beside
+    a store) keep the flag off: the notice stays on those paths."""
+    plain = _config()
+    plain.kv_transfer_config = SimpleNamespace(
+        kv_connector="NixlConnector", kv_role="kv_consumer", engine_id="eng-d"
+    )
+    assert rust.model_info_from_config(plain)["runs_mooncake"] is False
+    wrapper = _config()
+    wrapper.kv_transfer_config = SimpleNamespace(
+        kv_connector="MultiConnector",
+        kv_role="kv_consumer",
+        engine_id="eng-d",
+        kv_connector_extra_config={
+            "connectors": [
+                {"kv_connector": "NixlConnector", "engine_id": "decode-engine"},
+                {"kv_connector": "SharedStorageConnector"},
+            ]
+        },
+    )
+    info = rust.model_info_from_config(wrapper)
+    assert info["kv_connector"] == "NixlConnector"
+    assert info["runs_mooncake"] is False
 
 
 def test_model_info_projects_a_multi_connector_onto_the_child_that_moves_the_kv():
