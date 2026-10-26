@@ -2083,6 +2083,109 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  go-bindings-e2e-amd:
+    name: go-bindings-e2e-amd
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_GO_BINDINGS_E2E == 'true'
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-go-bindings != 'true'
+    runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
+    container:
+      image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
+      options: >-
+        ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --ulimit memlock=-1:-1 --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+        --env SPT_NOENV=1 --env PYTHONDONTWRITEBYTECODE=1
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      SMG_SGLANG_ROCM_IMAGE: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
+      CGO_ENABLED: '1'
+      E2E_RUNTIME: sglang
+      E2E_GPU_VENDOR: amd
+      E2E_AMD_REQUIRE_PASSING_CALL: '1'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Mark this job's processes
+        run: echo "E2E_JOB_MARKER=go-amd-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}" >> "$GITHUB_ENV"
+
+      - name: Setup SGLang ROCm backend
+        run: bash scripts/ci_setup_sglang_rocm_e2e.sh
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.24'
+          cache: true
+          cache-dependency-path: bindings/golang/go.sum
+
+      - name: Download build artifacts
+        uses: ./.github/actions/download-build-artifacts
+        with:
+          go-ffi-library: 'true'
+          client-types: 'true'
+
+      - name: Install wheel and test dependencies
+        run: |
+          pip uninstall -y smg || true
+          pip install wheel/*.whl
+          bash scripts/ci_install_e2e_deps.sh
+
+      - name: Verify final native environment and record Go FFI
+        run: |
+          mkdir -p e2e-go-results
+          python3 scripts/ci_repair_sglang_rocm_native.py --verify-only e2e-go-results/native-environment.json
+          python3 -m pip check
+          test -s bindings/golang/target/release/libsmg_go.so
+          sha256sum bindings/golang/target/release/libsmg_go.so > e2e-go-results/go-ffi.sha256
+
+      - name: Run Go OAI server E2E tests
+        run: |
+          export CGO_LDFLAGS="-L$(pwd)/bindings/golang/target/release"
+          export LD_LIBRARY_PATH="$(pwd)/bindings/golang/target/release:${LD_LIBRARY_PATH:-}"
+          SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1 ROUTER_LOCAL_MODEL_PATH="/models" \
+          E2E_LOG_DIR=e2e-logs \
+            pytest --reruns 2 --reruns-delay 5 e2e_test/bindings_go -s -vv --junitxml=e2e-go-results/junit.xml
+
+      - name: Record Go OAI binary
+        if: always()
+        run: |
+          if [ -f bindings/golang/examples/oai_server/oai_server ]; then
+            mkdir -p e2e-go-results
+            sha256sum bindings/golang/examples/oai_server/oai_server > e2e-go-results/go-oai.sha256
+          fi
+
+      - name: Reap this job's processes
+        if: always()
+        run: python3 scripts/ci_reap_job_processes.py "${E2E_JOB_MARKER:-}"
+
+      - name: Worker failure diagnostics
+        if: failure() || cancelled()
+        run: bash scripts/ci_dump_worker_logs.sh e2e-logs "e2e-worker-logs-go-bindings-amd"
+
+      - name: Upload Go E2E results and worker logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-results-go-bindings-amd
+          path: |
+            e2e-go-results/
+            e2e-logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+
   go-bindings-benchmark:
     name: go-bindings-benchmark
     needs: build-wheel
@@ -2139,7 +2242,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-symphony, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-1gpu-chat-zmq-amd, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-symphony, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-1gpu-chat-zmq-amd, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e, go-bindings-e2e-amd]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -2230,7 +2333,8 @@ jobs:
                 "${{ needs.e2e-4gpu-pd.result }}" =~ $bad || \
                 "${{ needs.e2e-vendor.result }}" =~ $bad || \
                 "${{ needs.go-unit-tests.result }}" =~ $bad || \
-                "${{ needs.go-bindings-e2e.result }}" =~ $bad ]]; then
+                "${{ needs.go-bindings-e2e.result }}" =~ $bad || \
+                "${{ needs.go-bindings-e2e-amd.result }}" =~ $bad ]]; then
             echo "One or more jobs failed or were cancelled"
             exit 1
           else
