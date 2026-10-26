@@ -1,6 +1,6 @@
 //! What the crate's tests build their workers with: a health-check
-//! configuration that leaves the worker as the test built it, and a ready
-//! worker built with it.
+//! configuration that leaves the worker as the test built it, a ready
+//! worker built with it, and the admission attempt that selects one worker.
 
 use std::sync::Arc;
 
@@ -9,7 +9,10 @@ use openai_protocol::{
     worker::{HealthCheckConfig, WorkerStatus, WorkerType},
 };
 
-use crate::worker::{BasicWorkerBuilder, ConnectionMode, Worker};
+use crate::worker::{
+    prefill_admission::{PrefillAdmissionAttempt, PrefillSelectionContext},
+    BasicWorkerBuilder, ConnectionMode, Worker,
+};
 
 /// The health checker disabled, everything else default: a test's worker
 /// keeps the state it was built with, with no probe behind it.
@@ -31,4 +34,13 @@ pub(crate) fn ready_worker(url: &str, model: &str) -> Arc<dyn Worker> {
         .build();
     worker.set_status(WorkerStatus::Ready);
     Arc::new(worker)
+}
+
+/// The attempt a test makes when it wants exactly `worker`: it is selected,
+/// with a unit payload, whenever it has capacity.
+pub(crate) fn select_worker(
+    worker: &Arc<dyn Worker>,
+) -> impl for<'a> FnMut(&PrefillSelectionContext<'a>) -> PrefillAdmissionAttempt<()> + Send {
+    let worker = Arc::clone(worker);
+    move |capacity| capacity.select(Arc::clone(&worker), ())
 }
