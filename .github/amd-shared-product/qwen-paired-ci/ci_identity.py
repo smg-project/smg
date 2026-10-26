@@ -101,7 +101,7 @@ def check_kfd(admission, hostname):
         # can rehash the public file, but cannot read a root process's proc exe link.
         executable = Path(expected["executable"])
         assert str(executable) == "/usr/local/bin/gpuagent" and not executable.is_symlink()
-        assert executable.is_file() and executable.stat().st_uid == 0
+        assert executable.is_file() and executable.stat().st_uid == expected["executable_owner_uid"]
         assert hashlib.sha256(executable.read_bytes()).hexdigest() == expected["executable_sha256"]
         vram = {item.name: int(item.read_text().strip()) for item in path.glob("vram_*")}
         assert vram and not any(vram.values()), "reported active GPU allocation is not idle"
