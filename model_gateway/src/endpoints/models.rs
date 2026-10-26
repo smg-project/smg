@@ -343,12 +343,11 @@ mod tests {
     };
 
     use axum::http::{Request, StatusCode};
-    use openai_protocol::worker::HealthCheckConfig;
 
     use super::*;
     use crate::{
         config::types::TenantApiKeyEntry,
-        worker::{BasicWorkerBuilder, Worker, WorkerType},
+        worker::{test_support::no_health_check, BasicWorkerBuilder, Worker, WorkerType},
     };
 
     /// An inventory with no model in it answers the gateway's JSON error
@@ -415,10 +414,7 @@ mod tests {
             BasicWorkerBuilder::new(format!("http://{addr}"))
                 .worker_type(WorkerType::Regular)
                 .runtime_type(RuntimeType::External)
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         );
         registry.register(external_worker);
@@ -428,10 +424,7 @@ mod tests {
             BasicWorkerBuilder::new("http://internal.invalid:8000")
                 .worker_type(WorkerType::Regular)
                 .models(vec![ModelCard::new("internal-model")])
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         );
         registry.register(internal_worker);
@@ -498,10 +491,7 @@ mod tests {
             BasicWorkerBuilder::new(url)
                 .worker_type(WorkerType::Regular)
                 .models(cards)
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         );
         registry.register(worker);

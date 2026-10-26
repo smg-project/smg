@@ -338,12 +338,12 @@ mod tests {
 
     use axum::http::{header::RETRY_AFTER, StatusCode};
     use futures::future::join_all;
-    use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+    use openai_protocol::model_card::ModelCard;
 
     use super::*;
     use crate::{
         routers::{common::retry::is_retryable_response, error::extract_error_code_from_response},
-        worker::{BasicWorkerBuilder, ConnectionMode, WorkerType},
+        worker::{test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, WorkerType},
     };
 
     fn decode_worker(url: &str, window: Option<u16>) -> Arc<dyn Worker> {
@@ -357,10 +357,7 @@ mod tests {
                 .worker_type(WorkerType::Decode)
                 .connection_mode(ConnectionMode::Grpc)
                 .labels(labels)
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         )
     }
@@ -561,10 +558,7 @@ mod tests {
                 .model(ModelCard::new("m"))
                 .worker_type(WorkerType::Prefill)
                 .connection_mode(ConnectionMode::Grpc)
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         );
         let rendered = render_with_recorder(|| announce_decode_window(prefill.as_ref()));

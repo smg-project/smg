@@ -159,13 +159,13 @@ mod tests {
     use std::time::Duration;
 
     use axum::response::IntoResponse;
-    use openai_protocol::worker::HealthCheckConfig;
 
     use super::*;
     use crate::{
         routers::common::retry::is_retryable_response,
         worker::{
             circuit_breaker::{CircuitBreakerConfig, CircuitState},
+            test_support::no_health_check,
             BasicWorkerBuilder,
         },
     };
@@ -179,10 +179,7 @@ mod tests {
                     timeout_duration: Duration::from_secs(60),
                     window_duration: Duration::from_secs(60),
                 })
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         )
     }
@@ -270,10 +267,7 @@ mod tests {
         Arc::new(
             BasicWorkerBuilder::new(url)
                 .worker_type(worker_type)
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         )
     }
