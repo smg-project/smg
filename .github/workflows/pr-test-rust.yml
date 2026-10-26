@@ -1,65 +1,101 @@
-name: Root-owned Qwen paired v5 diagnostic only
+name: Exact d5 artifact upload-only renewal
+
 on:
   workflow_dispatch:
     inputs:
+      root_manual_upload_only:
+        description: Root separately reviewed CPU-only copy admission
+        type: boolean
+        default: false
       admission_nonce:
-        description: Exact root-approved new2100 nonce; source defaults refuse execution
-        required: true
+        description: Exact independently admitted CPU-only nonce
         type: string
+        required: false
+        default: ''
+
 permissions:
   contents: read
   actions: read
+
 concurrency:
-  group: amd-qwen-paired-v5-single-owner
+  group: smg-d5-artifact-renewal-${{ github.ref }}
   cancel-in-progress: false
+
 jobs:
-  qwen-paired-v5:
-    name: qwen-paired-v5 / run
-    runs-on: 1-gpu-mi300x
-    timeout-minutes: 35
+  renew-d5-artifacts-only:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.root_manual_upload_only == true }}
+    name: renew-d5-artifacts-only
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
+      CUDA_VISIBLE_DEVICES: ''
+      HIP_VISIBLE_DEVICES: ''
+      ROCR_VISIBLE_DEVICES: ''
+      NVIDIA_VISIBLE_DEVICES: void
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
-      - name: Restore this assigned checkout's ownership
-        timeout-minutes: 1
-        run: |
-          test "$GITHUB_REPOSITORY" = smg-project/smg
-          test "$GITHUB_WORKSPACE" = "$RUNNER_WORKSPACE/smg"
-          test "$(realpath -e "$GITHUB_WORKSPACE")" = "$GITHUB_WORKSPACE"
-          docker run --rm --pull=never --runtime=runc --network=none --read-only --user=0 \
-            --cpus=1 --memory=256m --pids-limit=32 --cap-drop=ALL --cap-add=CHOWN \
-            --name "smg-qwen-checkout-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
-            --label "smg.qwen.checkout.run=$GITHUB_RUN_ID" \
-            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/checkout" \
-            --entrypoint /usr/bin/timeout \
-            lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d \
-            --signal=TERM --kill-after=2 20 /bin/chown -R -h -P "$(id -u):$(id -g)" /checkout
-      - name: Checkout the exact private admitted child
+      - name: Checkout exact isolated copy source
         uses: actions/checkout@v7
+        timeout-minutes: 1
         with:
-          fetch-depth: 0
+          ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Run paired v5 under this scheduled Runner.Worker
+          fetch-depth: 0
+      - name: Verify actual old producer and immutable payload bytes only
+        timeout-minutes: 5
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          ADMISSION_NONCE: ${{ inputs.admission_nonce }}
-        run: python3 .github/amd-shared-product/qwen-paired-ci/job_runner.py run
-      - name: Finalize only this run's exact nonce CID
-        if: always()
-        run: python3 .github/amd-shared-product/qwen-paired-ci/job_runner.py cleanup
-      - name: Preserve bounded raw paired diagnostic evidence
-        if: always()
+          SMG_RENEWAL_NONCE: ${{ inputs.admission_nonce }}
+        run: >-
+          python3 -I -B .github/amd-shared-product/artifact-renewal/renew.py
+          --out "$RUNNER_TEMP/smg-renewal-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Copy-upload original wheel payload
+        id: wheel
         timeout-minutes: 1
         uses: actions/upload-artifact@v7
         with:
-          name: qwen-paired-v5-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/qwen-paired-v5-${{ github.run_id }}-${{ github.run_attempt }}/evidence/
-            ${{ runner.temp }}/qwen-paired-v5-${{ github.run_id }}-${{ github.run_attempt }}/root-result.json
-            ${{ runner.temp }}/qwen-paired-v5-${{ github.run_id }}-${{ github.run_attempt }}/cleanup-result.json
-            ${{ runner.temp }}/qwen-paired-v5-${{ github.run_id }}-${{ github.run_attempt }}/state.json
+          name: smg-wheel
+          path: ${{ runner.temp }}/smg-renewal-${{ github.run_id }}-${{ github.run_attempt }}/smg-wheel/
           if-no-files-found: error
           retention-days: 7
-      - name: Require actual paired oracles and exact-CID cleanup
-        if: always()
-        run: python3 .github/amd-shared-product/qwen-paired-ci/job_runner.py require-result
+          overwrite: false
+      - name: Copy-upload original Go payloads
+        id: go
+        timeout-minutes: 1
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-ffi-library
+          path: ${{ runner.temp }}/smg-renewal-${{ github.run_id }}-${{ github.run_attempt }}/go-ffi-library/
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: false
+      - name: Copy-upload original generated client types
+        id: types
+        timeout-minutes: 1
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-client-types
+          path: ${{ runner.temp }}/smg-renewal-${{ github.run_id }}-${{ github.run_attempt }}/python-client-types/
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: false
+      - name: Copy-upload original WASM payloads
+        id: wasm
+        timeout-minutes: 1
+        uses: actions/upload-artifact@v7
+        with:
+          name: wasm-test-fixtures
+          path: ${{ runner.temp }}/smg-renewal-${{ github.run_id }}-${{ github.run_attempt }}/wasm-test-fixtures/
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: false
+      - name: Preserve origin verification evidence
+        if: ${{ always() }}
+        timeout-minutes: 1
+        uses: actions/upload-artifact@v7
+        with:
+          name: d5-artifact-renewal-origin-evidence
+          path: ${{ runner.temp }}/smg-renewal-${{ github.run_id }}-${{ github.run_attempt }}/evidence/
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: false

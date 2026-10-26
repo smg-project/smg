@@ -1,0 +1,24 @@
+{
+  "PREVIEW_ONLY": true,
+  "root_manual_upload_only": false,
+  "NEW_CPU_seconds": 0,
+  "GPU_seconds": 0,
+  "admission_nonce": null,
+  "approved_actor": null,
+  "approved_branch": null,
+  "source_parent": null,
+  "CPU_budget": {
+    "path": null,
+    "sha256": null
+  },
+  "source_peer": {
+    "path": null,
+    "sha256": null
+  },
+  "original_build_run": 40218847194,
+  "original_build_job": 121246077837,
+  "original_build_head": "d5f8f9e765dcdec1f56dd623b46e49e1e47862d4",
+  "new_upload_run": null,
+  "new_artifacts": null,
+  "GPU_or_model_credit": 0
+}
