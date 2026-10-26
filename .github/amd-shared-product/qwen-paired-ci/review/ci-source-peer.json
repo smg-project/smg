@@ -1,0 +1,108 @@
+{
+  "result": "PASS_SOURCE_ONLY_ACTUAL_DISABLED_CARRIER",
+  "findings": [],
+  "reviewer": "/root/mc4_actual_independent/getfix_checkpoint_refs/bfcl_source_guard",
+  "reviewed_at_utc": "2026-10-26T20:15:56.559563+00:00",
+  "source_parent": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
+  "actual_head": "b4d76333ce101ea476d760ebec0705ae9b2b45b1",
+  "actual_parent": "909aff75832550918f2ab8b6fd07eb5e234cd442",
+  "actual_tree": "64b3e31a86c69d7609cf765e97a46e05fd9d4850",
+  "actual_branch": "ci/amd-qwen-launcher-identity-ready-20261026",
+  "driver_sha256": "1f0e4b9fab461ad4c51bb134f244b2a4f0700b51dd34cb4d16fd996836e9eb6c",
+  "envelope_sha256": "06589cd12a0547a4e1d5547f8e24afb6c849ec8e95854d997b73bf1180d1ccfd",
+  "inputs_sha256": "9dc08aca6b5a1e9ea0cabe0bad9d589cb5c1fee8706e3a62cb1cc394c01733ec",
+  "CI_job_runner_sha256": "9455e2ff912affa1ca1750bcd243f395c3a0dfe86744826054b7cfe41be1e89a",
+  "workflow_template_sha256": "aa77da40cedaa56aa6d4f02a2ec0f63c5f4cddabd781ba38adc2bacdfada2564",
+  "CI_source_manifest_sha256": "32e237d74a26f7f68ea01796b656432e797f5bf5a7ed4c150ff00c1fd3544c75",
+  "scope": "Independent actual disabled carrier materialization and complete CI source-peer schema. Underlying readiness/deadline algorithm inherits genuine A source peer; no candidate, controls, native, model, GPU, publication or dispatch execution performed by reviewer.",
+  "actual_materialization": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-identity-ready-carrier-actual-root-6e5135cc94d6420baf5715149048fbb3/root-materialization.json",
+    "bytes": 6098,
+    "sha256": "445d8193dbac02d275f6c95cbee3acc4198f6f1e2cfeb26d44da2c689bb56605"
+  },
+  "independent_algorithm_source_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen403866-same-Popen-identity-deadline-child-source-D-20261026/peer-source-independent-A.json",
+    "bytes": 5808,
+    "sha256": "e40be8979b05ccd7e2ee3d81065223fe75d8e8423fa6c63fec332256a487c4a7"
+  },
+  "reviewed_source_manifest": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen403866-same-Popen-identity-deadline-child-source-D-20261026/manifest.json",
+    "bytes": 4182,
+    "sha256": "c7d48912e63a126e6a79556eba6202927baeb43001cc3efce954413e4e3c730f"
+  },
+  "inherited_actual_source_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-renewed-consumer-actual-source-root-4819449cde694bddb472b8849d3bc23f/peer-actual-source-C.json",
+    "bytes": 5490,
+    "sha256": "6a83e60abb1a16a62904f7768871cd147a46e090699d888eec5537b446da5cfe"
+  },
+  "changed_paths": [
+    {
+      "path": ".github/amd-shared-product/qwen-paired-ci/admission.json",
+      "git_mode": "100644",
+      "git_blob": "17a97761d38e4fa1d58d83db137f3af635ce597c",
+      "sha256": "badaf9c1eb4b239cc4a630a859ebff831ef94418c60d229aedb893b6ce3ecc7a",
+      "physical_mode": "0o664"
+    },
+    {
+      "path": ".github/amd-shared-product/qwen-paired-ci/paired/run_paired_ab.py",
+      "git_mode": "100644",
+      "git_blob": "ee577e979bbdbfedd386555ee881e7f58ba4ccd8",
+      "sha256": "1f0e4b9fab461ad4c51bb134f244b2a4f0700b51dd34cb4d16fd996836e9eb6c",
+      "physical_mode": "0o664"
+    },
+    {
+      "path": ".github/amd-shared-product/qwen-paired-ci/source-manifest.json",
+      "git_mode": "100644",
+      "git_blob": "5ce8d065212c3fa709d26c2f30db387ef573933f",
+      "sha256": "32e237d74a26f7f68ea01796b656432e797f5bf5a7ed4c150ff00c1fd3544c75",
+      "physical_mode": "0o664"
+    }
+  ],
+  "verification": {
+    "direct_git_objects_and_index_only_no_Git_CLI": true,
+    "DCO": true,
+    "only_three_paths_changed": true,
+    "reviewed_preview_bytes_exact": true,
+    "index_mathematical_tree_equals_HEAD": true,
+    "tracked_files_hashed": 2517,
+    "tracked_bytes_hashed": 49989235,
+    "tracked_WT_clean": true,
+    "untracked_files": [],
+    "all15_manifest_members_verified": true,
+    "manifest_only_driver_hash_changed": true,
+    "admission_only_manifest_hash_changed": true,
+    "shared5_verified": true,
+    "registered_workflow_equals_template": true,
+    "maps_inherited_unchanged_19_37_14": [
+      19,
+      37,
+      14
+    ],
+    "fixed1473_d5_b7_original12_and_original_timing_preserved": true,
+    "old_executed_ref_unchanged": "1cd9ded952f870349888e5ed9b23a0c3e3f834af"
+  },
+  "default_off": {
+    "CI_authorities_false": [
+      "ready",
+      "root_manual_admission",
+      "run_budget_admitted",
+      "artifacts_pinned"
+    ],
+    "global_authorities": {
+      "ready": false,
+      "run_budget_admitted": false,
+      "artifacts_pinned": false,
+      "runtime_cohort_accepted": false,
+      "consumer_gpu_ready": false
+    },
+    "reserved_runner_seconds": 0,
+    "future_NEW2100_intent_only": true,
+    "actual_run_nonce_model_grant_fields_unbound": true
+  },
+  "physical_mode_note": "Reviewed three Git modes remain100644 and WT files are non-executable. Local shared-workspace POSIX modes are0664; no chmod or source/ref mutation was performed.",
+  "schema_usable_for_future_CI_data_binding": true,
+  "CPU_controls_executed": false,
+  "resource_grant": false,
+  "runtime_accepted": false,
+  "new_GPU_credit": 0
+}
