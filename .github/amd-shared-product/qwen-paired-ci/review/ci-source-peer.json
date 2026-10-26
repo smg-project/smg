@@ -1,0 +1,126 @@
+{
+  "result": "PASS_SOURCE_ONLY_ACTUAL_DISABLED_PRIVATE_CONFIG_CACHE",
+  "findings": [],
+  "at_utc": "2026-10-26T05:16:32.459630+00:00",
+  "reviewer": "C, nonauthor of D cache proposal/root actual Git integration; no inherited signature or execution authority",
+  "source_parent": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
+  "source_head": "d69438dd47ce1d62d20f02ec3b0b721c54f253d2",
+  "actual_head": "d69438dd47ce1d62d20f02ec3b0b721c54f253d2",
+  "actual_Git_parent": "1a0e7518ac330446059f4b32847205c4375e2fd9",
+  "actual_worktree": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/amd-qwen-current1473-private-config-cache-20261026",
+  "working_tree_clean": true,
+  "driver_sha256": "7b0a98d25b7c0061d673556b0f6cf41e6b6da7311f1642a1d70145ece8f63591",
+  "envelope_sha256": "06589cd12a0547a4e1d5547f8e24afb6c849ec8e95854d997b73bf1180d1ccfd",
+  "inputs_sha256": "9f0359d170854c490fdc28c18b51a83b87c94b22331ceb56accee41179350925",
+  "runtime_file_hashes": {
+    "http_observe.py": "c1b7d42917386a4cf3b3bf144680503eae3f9b4587b97b4c6e78e54254d3bba0",
+    "owned_processes.py": "04a8d619482bcd473c81ea98c0ad3aef91a32cced610dcb16edb99d14c873999",
+    "runtime_check.py": "98255bd35bac65f019f25af779758d89fcb53d64e874f800146cb9bd2f9effcb",
+    "root_container_envelope.py": "06589cd12a0547a4e1d5547f8e24afb6c849ec8e95854d997b73bf1180d1ccfd",
+    "six-request-matrix.json": "f9475f82fed3fafcd5497c5702e5f3390d045695276d41525b4d9938cc17f3dd"
+  },
+  "CI_job_runner_sha256": "f4a7c241fc6636491b7ace935645daef21e6e502af4be2e760062a90811bfbda",
+  "workflow_template_sha256": "aa77da40cedaa56aa6d4f02a2ec0f63c5f4cddabd781ba38adc2bacdfada2564",
+  "CI_source_manifest_sha256": "6cbea3d413815883048b580ca4a68ad7d081f0a4f9b7513f0676af8e717586ab",
+  "prepare_sha256": "b6e1e62cdb76a10ae09ad8c8a94f959a4f03b60fb4b386be22846990c76de04c",
+  "checks": {
+    "actual3path_delta": "job_runner one two-argv --tmpfs insertion; source-manifest only job_runner hash; admission only source_manifest_sha256. Entire inverse to actual1a0e exact;14 other manifest members byteequal.",
+    "manifest": "15 actualmembers independently hashed; registered workflow equals original template; e2e tree492e701d unchanged.",
+    "source_maps": {
+      "consumer19": {
+        "entries": 19,
+        "exact_source_commit": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
+        "all_object_ids_equal": true
+      },
+      "compiled37": {
+        "entries": 37,
+        "exact_source_commit": "d5f8f9e765dcdec1f56dd623b46e49e1e47862d4",
+        "all_object_ids_equal": true
+      },
+      "producer14": {
+        "entries": 14,
+        "exact_source_commit": "d5f8f9e765dcdec1f56dd623b46e49e1e47862d4",
+        "all_object_ids_equal": true
+      }
+    },
+    "producer_boundary": "producer14 matches exactd5 producer, not every current consumer tree; expected producer/consumer differences e2e_test/scripts/workflows remain unchanged. No migration to latestmain.",
+    "dynamic_identity": "tmpfs uid/gid use the same actual os.getuid/getgid as existing container --user; normal GHA actual995:985 is prior-runtime evidence, not a new execution. Parent actualCI identity guards remain.",
+    "private_isolation": "New per-container /tmp/aiter_configs tmpfs rw,nosuid,nodev,0700; no host cache mount/delete/chmod or AITER source patch, no elevated model UID/new capability; removed with exact ownedCID. Container memory96g/CPU8/finite2100/1920 cleanup/marker/normalprepare/12request matrix unchanged.",
+    "JIT_and_configs": "Original AITER_JIT_DIR/evidence private JIT unchanged. core.get_config_file470-496 still chooses same default/env/model-config CSVs; update_config_files452-466 still uses fixed/tmp/aiter_configs, FileBaton lock, temporaryCSV then os.replace. Mount changes cache ownership/isolation, not input selection or merge/duplicate algorithm.",
+    "lock": "FileBaton0483 try_acquire O_CREAT|O_EXCL|O_WRONLY catches only FileExistsError; EACCES propagates. Existing same-container processes still share same mount/lock and original mp_lock wait/release/stale semantics.",
+    "disabled_nine_flags": {
+      "qwen.ready": false,
+      "qwen.root_manual_admission": false,
+      "qwen.run_budget_admitted": false,
+      "qwen.artifacts_pinned": false,
+      "shared.ready": false,
+      "shared.run_budget_admitted": false,
+      "shared.artifacts_pinned": false,
+      "shared.consumer_gpu_ready": false,
+      "shared.budget.admitted": false
+    },
+    "reservation_seconds": 0,
+    "source_cohort_native_and_normal_protection": "paired inputs unchanged,4archives/6payload/nativeb7/source19compiled37producer14/normal11+final3/HTTP+Rust original12/first-failure capture and oracles untouched."
+  },
+  "causal_evidence": {
+    "actual_run": 40272273412,
+    "RCA": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/qwen-paired-private-jit-current1473-b7-20261026/actual-validation/peer-terminal-failure-D.json",
+      "bytes": 15186,
+      "sha256": "5c289232e63ab8e46c1941f3a13a7879bc183017dfdc9a6bdbd43e0bfb7796e2"
+    },
+    "raw_engine_log": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/qwen-paired-private-jit-current1473-b7-20261026/actual-validation/terminal-capture/artifact-12628893503/evidence/paired/A-nativeHTTP-engine.log",
+      "bytes": 4980,
+      "sha256": "4ccb9a92d10540738c32914fc95b05ce5c1cdecb92fb93589de9c5b569515d36"
+    },
+    "raw_lines": [
+      4,
+      7,
+      8,
+      40,
+      43,
+      45,
+      48,
+      51
+    ],
+    "observed": "Real private-JIT compile/import progressed; subsequent BF16 tuned-config merge failed at lock creation /tmp/aiter_configs/bf16_tuned_gemm.csv.lock. No model requests or B lane completed.",
+    "not_observed": "Old cache ancestor UID/mode/ACL was not captured; do not assert a particular directory owner or that fresh tmpfs already passed."
+  },
+  "source_refs": {
+    "AITER_core": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/failure-review-20261023/sglang-plugin-regression/startup-rca/image-source/aiter/jit/core.py",
+      "bytes": 88329,
+      "sha256": "ec2e1e51ddace53ec7999515bf8753fa76369915b29e834d81923916bec49e4f"
+    },
+    "FileBaton": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/failure-review-20261023/sglang-plugin-regression/startup-rca/image-source/aiter/jit/utils/file_baton.py",
+      "bytes": 5843,
+      "sha256": "0483680d78c77caf3d69babbdb51a70019db8b624c44df75037025c63e4ab188"
+    },
+    "D_proposal_delivery": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-private-config-cache-source-proposal-D-20261026/delivery.json",
+      "bytes": 1181,
+      "sha256": "7bab753a7d629ef44a020b88879f803f07df05b3301b185387ad7d2c9aee21c2"
+    },
+    "root_actual_integration": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-private-config-cache-actual-disabled-source-root-20261026.json",
+      "bytes": 2245,
+      "sha256": "469360f5a697c345688c2aa31f4141e16395a81d6c44689bfca5ab12892d6041"
+    },
+    "prior1a0e_source_peer_reference_only": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-private-JIT-actual-source-peer-A-20261026.json",
+      "bytes": 5148,
+      "sha256": "43616c94ab2178a98a8ce0ca61fbd6b4e159aa975fd565c86c7a3af3908fd0df"
+    }
+  },
+  "nonblocking_precision": "The unchanged duplicate-resolution branch may write its source CSVs before raising; this patch adds no such write and does not certify that stock CSV bytes can never change. Future function validation should hash selected input CSVs before/after and preserve failures.",
+  "conditional_child_scope": "This source peer may be installed byteexact in later root data-only admission: genuine CI-source peer path, root-budget and exact source-manifest hash with actual newnonce/owner/model/TTL/budget facts. It grants no CPU/GPU or consumer readiness. Root must separately validate the new mount with realUID/wholeconfig-lock function before model attempt.",
+  "limits": [
+    "No source/candidate/helper/test/import/API/SSH/Docker/Git mutation/C-M/formal/resource action performed.",
+    "Source-only. Private-cache write/lock/atomic replacement and complete AITER import/model/paired12 remain unverified for this source; no normal/native/runtime/GPU/coverage acceptance inherited."
+  ],
+  "executed": false,
+  "resource_authority": false,
+  "coverage_increment": 0
+}
