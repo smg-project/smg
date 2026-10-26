@@ -5,7 +5,7 @@
   "consumer_gpu_ready": false,
   "runtime_cohort_accepted": false,
   "admitted_lane": "tokenspeed-pd2-original-qwen-sglang-reference",
-  "target_product_commit": "64f06800b5a500f352be451ba37c2ba0a84cec47",
+  "target_product_commit": "906e0730e767f3b9f3eff4b4660d847ef4f04c39",
   "artifacts": [
     {
       "name": "smg-wheel",
@@ -271,21 +271,22 @@
   "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-2gpu-pd[3]/tokenspeed/nvidia",
   "reference_contract_sha256": "f6db720219333ee5f2c9164edcf2cb323926ff3d5e797be44f3fd229a5d6774a",
   "diagnostic_source_files": {
-    ".github/amd-sg4pd-allocation-phase/apply.py": "b13b570233bfad2f36ddb59f07844925ad3173b2553fc2183ce6dcc90c571a8c",
-    ".github/amd-sg4pd-allocation-phase/allocation_failure.py": "91a40c870cd484f0bcef5b8caac47dcbb933c0d6c052833cf768e95fc8af8d08",
-    ".github/amd-sg4pd-allocation-phase/overlay.json": "924785978aa989b8f157592c3becda061157e69a4e90ed5f4ed43409b8be663f",
+    ".github/amd-sg4pd-allocation-phase/apply.py": "00ef760dd817e9f6db72e6b7948bb1248dd9672957f45b0968375f9b5c6adb7d",
+    ".github/amd-sg4pd-allocation-phase/allocation_failure.py": "0da655706c0924b1e75ccb85d278d23d3a984e9b8c57239608c0aa9cb21e95cd",
+    ".github/amd-sg4pd-allocation-phase/overlay.json": "292a69da9408a56069f473dff99b61304d7153c11fbd2024628262d320c394c1",
     ".github/amd-sg4pd-allocation-phase/cu-overlay.json": "c7b5fffeb31105c26677cc3ef6c946f17fdd887d17bba4ba68fe8469bd956048"
   },
   "diagnostic_source_binding": {
     "manual_input": "cu_stream_diagnostic",
     "default": false,
-    "same_4f86_helper_and_installed_source_bytes": true,
     "TS2_gate": "engine=sglang,tier2,SMG_AMD_TS_PD2_REFERENCE=1 plus explicit existing CU/phase flags",
-    "current_source_evidence": "82f actual15 startup failure;4f86 donor source+six data controls only",
+    "current_source_evidence": "Exact4420 overlap_utils9703/spec_info43e5 capture plus originallabel4 traceback285; metadata/control proposals only. No future helper/runtime/native validation claimed.",
     "runtime_accepted": false,
     "new_source_peer_pending": true,
     "actual_head": null,
     "run_id": null,
-    "GPU_budget": 0
+    "GPU_budget": 0,
+    "inherits_4f86_CU_stream_and_seq_lens_operations": true,
+    "adds_only_bounded_FutureMap_second_allocation_failure": true
   }
 }

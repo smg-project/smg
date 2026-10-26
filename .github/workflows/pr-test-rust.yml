@@ -40,7 +40,7 @@ jobs:
           for name, expected in data["diagnostic_source_files"].items():
               assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == expected
           recipe = data["recipe"]
-          assert data["target_product_commit"] == "64f06800b5a500f352be451ba37c2ba0a84cec47"
+          assert data["target_product_commit"] == "906e0730e767f3b9f3eff4b4660d847ef4f04c39"
           assert recipe["test_dirs"] == "e2e_test/router" and recipe["test_filter"] == ""
           assert recipe["engine"] == recipe["actual_engine"] == "sglang"
           assert recipe["reference_engine"] == "tokenspeed" and recipe["functional_equivalence_only"] is True
