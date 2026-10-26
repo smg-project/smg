@@ -367,6 +367,10 @@ class RouterArgs:
     # spelling of discovery_provider="kubernetes"; set one or the other.
     discovery_provider: str | None = None
     dp_aware: bool = False
+    # Choose a data-parallel rank per request from the ranks' reported token
+    # loads: the HTTP prefill-decode router, for an engine registered as one
+    # worker. Under dp_aware the ranks are workers and the policy's pick among
+    # them is the rank choice, so this chooses nothing there (warned at start-up)
     dp_minimum_tokens_scheduler: bool = False
     # Seconds a Ready worker is kept in Draining before it leaves the registry,
     # on every removal (a discovery deletion, an unhealthy worker's removal, the

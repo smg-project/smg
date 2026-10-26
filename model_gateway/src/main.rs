@@ -622,7 +622,11 @@ struct RoutingArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     enable_igw: bool,
 
-    /// Enable minimum tokens scheduler for data parallel group
+    /// Choose a data-parallel rank per request from the ranks' reported token
+    /// loads: the HTTP prefill-decode router, for an engine registered as one
+    /// worker. Under --dp-aware the engine's ranks are workers and the policy's
+    /// pick among them is the rank choice, so this flag chooses nothing there
+    /// (warned at start-up)
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_minimum_tokens_scheduler: bool,
 

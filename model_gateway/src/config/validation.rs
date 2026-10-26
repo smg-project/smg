@@ -324,6 +324,31 @@ pub fn runtime_worker_threads_oversubscription(threads: usize, cpus: usize) -> O
     })
 }
 
+/// The warning for `--dp-minimum-tokens-scheduler` set with `--dp-aware`,
+/// `None` for every other pair. The scheduler chooses a data-parallel rank
+/// for a request from the ranks' reported token loads where an engine is
+/// registered as one worker (the HTTP prefill-decode router's rank choice
+/// for an engine the gateway does not expand); under `--dp-aware` an engine
+/// registers as one worker per rank, the routing policy's pick among those
+/// workers is the rank choice, and the scheduler, asked about a worker that
+/// is one rank, can only answer that rank: it chooses nothing. Advice at
+/// start-up, not a refusal: the pair runs as `--dp-aware` alone does, and
+/// the flag's cache of per-rank token loads is kept up for nothing. Pure
+/// over the two settings so the rule is testable; start-up logs it with the
+/// configuration's other warnings.
+pub fn dp_minimum_tokens_scheduler_scope_warning(
+    dp_aware: bool,
+    dp_minimum_tokens_scheduler: bool,
+) -> Option<String> {
+    (dp_aware && dp_minimum_tokens_scheduler).then(|| {
+        "dp_minimum_tokens_scheduler chooses nothing under dp_aware: the engine's ranks are \
+         registered as workers and the routing policy's pick among them is the rank choice; \
+         the scheduler applies to the HTTP prefill-decode router for an engine registered as \
+         one worker"
+            .to_string()
+    })
+}
+
 /// The CPUs available to this process, as the runtime's own default reads
 /// them (the affinity mask and the cgroup quota included); 1 when the count
 /// cannot be read.
@@ -2891,6 +2916,31 @@ mod tests {
     /// is a warning, not a refusal: the pure rule names the advised count
     /// and the CPUs, says nothing within it, counts an unreadable
     /// parallelism as one CPU, and the validator passes such a count.
+    #[test]
+    fn the_minimum_tokens_scheduler_under_dp_aware_warns_without_a_refusal() {
+        let warning = dp_minimum_tokens_scheduler_scope_warning(true, true).expect("a warning");
+        assert!(
+            warning.contains("chooses nothing under dp_aware")
+                && warning.contains("HTTP prefill-decode router"),
+            "{warning}"
+        );
+        for (dp_aware, scheduler) in [(false, false), (true, false), (false, true)] {
+            assert_eq!(
+                dp_minimum_tokens_scheduler_scope_warning(dp_aware, scheduler),
+                None,
+                "dp_aware {dp_aware}, scheduler {scheduler}"
+            );
+        }
+        // The pair validates: advice, not a refusal.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .round_robin_policy()
+            .dp_aware(true)
+            .dp_minimum_tokens_scheduler(true)
+            .build_unchecked();
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
     #[test]
     fn runtime_worker_threads_above_four_per_cpu_warn_without_a_refusal() {
         assert_eq!(runtime_worker_threads_oversubscription(8, 2), None);

@@ -2118,6 +2118,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     }) {
         tracing::warn!("{warning}");
     }
+    // A rank scheduler under rank expansion chooses nothing: the operator's
+    // configuration runs, with the word that one of its flags does nothing.
+    if let Some(warning) = crate::config::dp_minimum_tokens_scheduler_scope_warning(
+        config.router_config.dp_aware,
+        config.router_config.dp_minimum_tokens_scheduler,
+    ) {
+        tracing::warn!("{warning}");
+    }
 
     // Who else can read the private key files: checked here, once the
     // subscriber exists, so the line reaches the log (the configuration is
