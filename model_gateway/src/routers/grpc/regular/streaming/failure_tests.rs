@@ -6,7 +6,6 @@
 //! the pair's bootstrap port before the client is told.
 use std::{net::TcpListener, time::Instant};
 
-use openai_protocol::worker::HealthCheckConfig;
 use smg_grpc_client::vllm_engine::proto;
 use tracing_test::traced_test;
 
@@ -22,7 +21,9 @@ use crate::{
         test_engine::closed_port,
         utils::{stream_failure::UpstreamStream, StreamFailure, StreamSource},
     },
-    worker::{BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType},
+    worker::{
+        test_support::no_health_check, BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType,
+    },
 };
 
 const REQUEST_ID: &str = "chatcmpl-failure";
@@ -53,10 +54,7 @@ fn dispatch() -> context::DispatchMetadata {
 fn worker(url: &str) -> Arc<dyn Worker> {
     Arc::new(
         BasicWorkerBuilder::new(url)
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
+            .health_config(no_health_check())
             .build(),
     )
 }
@@ -85,10 +83,7 @@ fn loopback_prefill(bootstrap_port: u16) -> Arc<dyn Worker> {
         BasicWorkerBuilder::new(LOOPBACK_PREFILL_URL)
             .worker_type(WorkerType::Prefill)
             .bootstrap_port(Some(bootstrap_port))
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
+            .health_config(no_health_check())
             .build(),
     )
 }

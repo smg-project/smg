@@ -1,6 +1,7 @@
 //! GLM-5.3 media reminders through the normal gRPC pipelines.
 
 use super::*;
+use crate::worker::test_support::no_health_check;
 
 /// Build a checkpoint-backed tokenizer without any multimodal components.
 async fn glm53_components(worker_registry: Arc<WorkerRegistry>) -> Arc<SharedComponents> {
@@ -148,10 +149,7 @@ async fn glm53_sglang_pd_builds_text_only_for_chat_and_messages() {
                 .runtime_type(RuntimeType::Sglang)
                 .model(ModelCard::new(MODEL))
                 .label(SUPPORTS_VISION_LABEL, "false")
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build();
             registry.register(Arc::new(worker)).unwrap();
         }

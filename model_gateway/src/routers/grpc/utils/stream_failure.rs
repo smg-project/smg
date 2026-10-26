@@ -537,13 +537,14 @@ mod tests {
     use std::net::TcpListener;
 
     use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-    use openai_protocol::worker::{HealthCheckConfig, WorkerType};
+    use openai_protocol::worker::WorkerType;
 
     use super::*;
     use crate::{
         routers::grpc::{proto_wrapper::ENGINE_ERROR_MESSAGE, test_engine::closed_port},
         worker::{
             circuit_breaker::{CircuitBreakerConfig, CircuitState},
+            test_support::no_health_check,
             BasicWorkerBuilder, ConnectionMode,
         },
     };
@@ -566,10 +567,7 @@ mod tests {
                     failure_threshold: 1,
                     ..Default::default()
                 })
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         )
     }
@@ -1006,10 +1004,7 @@ mod tests {
                 .worker_type(WorkerType::Prefill)
                 .connection_mode(ConnectionMode::Grpc)
                 .bootstrap_port(Some(port))
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         )
     }
