@@ -163,19 +163,26 @@ async fn reader_capture_reconstructs_bound_selector_before_prompt() {
         None,
         "prefix<|im_start|><|assistant|>",
         &testing::templates(),
-    ).unwrap().unwrap();
+    )
+    .unwrap()
+    .unwrap();
     drop(request);
     let output = "<tool_call>{\"name\":\"lookup\",\"arguments\":{}}</tool_call>";
     let (_root, owner, _pool) = capture(100_000, 1_000_000).await;
     let mut events = Events::new();
     let mut reader = observed(&assigned, &owner, &mut events).first_call_only(true);
     let mut delta = Delta::default();
-    reader.tail(output.to_owned(), &mut delta, &mut events).unwrap();
+    reader
+        .tail(output.to_owned(), &mut delta, &mut events)
+        .unwrap();
     reader.end(EngineFinish::Stop, who(), &mut events).unwrap();
     reader.observe_chat_batch(0, &events);
     let expected = serde_json::to_value(events.as_slice()).unwrap();
     let message = serde_json::to_value(chat::message(0, events.as_slice())).unwrap();
-    assert_eq!(message["message"]["tool_calls"][0]["function"]["name"], "lookup");
+    assert_eq!(
+        message["message"]["tool_calls"][0]["function"]["name"],
+        "lookup"
+    );
     drop(reader);
     let records = records(owner).await;
     assert_eq!(records[0]["kind"], "open");
@@ -193,13 +200,28 @@ async fn reader_capture_reconstructs_bound_selector_before_prompt() {
     let retained_ids = CallIds::from_nonce(records[0]["nonce"].as_str().unwrap()).unwrap();
     let mut replay_events = Events::new();
     let mut replay = Reader::with_call_ids(
-        &replay_assignment, retained_tools.into(), retained_ids, &mut replay_events,
-    ).unwrap().first_call_only(true);
+        &replay_assignment,
+        retained_tools.into(),
+        retained_ids,
+        &mut replay_events,
+    )
+    .unwrap()
+    .first_call_only(true);
     let mut replay_delta = Delta::default();
-    replay.tail(output.to_owned(), &mut replay_delta, &mut replay_events).unwrap();
-    replay.end(EngineFinish::Stop, who(), &mut replay_events).unwrap();
-    assert_eq!(serde_json::to_value(replay_events.as_slice()).unwrap(), expected);
-    assert_eq!(serde_json::to_value(chat::message(0, replay_events.as_slice())).unwrap(), message);
+    replay
+        .tail(output.to_owned(), &mut replay_delta, &mut replay_events)
+        .unwrap();
+    replay
+        .end(EngineFinish::Stop, who(), &mut replay_events)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(replay_events.as_slice()).unwrap(),
+        expected
+    );
+    assert_eq!(
+        serde_json::to_value(chat::message(0, replay_events.as_slice())).unwrap(),
+        message
+    );
 }
 
 #[tokio::test]

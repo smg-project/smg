@@ -80,14 +80,13 @@ impl FormatRecipe {
     pub fn resolve(&self) -> std::io::Result<std::sync::Arc<symphony::Format>> {
         let format = match self.source {
             Source::Named { table } => table.shared(),
-            Source::Registry {} => {
-                symphony::formats::for_model_shared(self.selector_model()).ok_or_else(|| {
+            Source::Registry {} => symphony::formats::for_model_shared(self.selector_model())
+                .ok_or_else(|| {
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "recorded model has no Symphony table",
                     )
-                })?
-            }
+                })?,
             Source::Template {} => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
@@ -244,8 +243,14 @@ mod tests {
         assert_ne!(recipe.selector_model(), dispatch.model);
         assert!(Arc::ptr_eq(
             &recipe.selector_model,
-            &spec.symphony.as_ref().ok_or("missing original assignment")?
-                .recipe.as_ref().ok_or("missing original recipe")?.selector_model,
+            &spec
+                .symphony
+                .as_ref()
+                .ok_or("missing original assignment")?
+                .recipe
+                .as_ref()
+                .ok_or("missing original recipe")?
+                .selector_model,
         ));
         let stored = serde_json::to_vec(recipe)?;
         let restored: FormatRecipe = serde_json::from_slice(&stored)?;
