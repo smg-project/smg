@@ -61,6 +61,7 @@ use crate::{
     },
     persistence_utils::persist_conversation_items,
     sse::{sse_channel, SseEncoder, SseSender},
+    worker::redacted_url,
 };
 
 /// Apply all transformations to event data in-place (rewrite + transform)
@@ -656,7 +657,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
     }
 
     let mut preserved_headers = preserve_response_headers(response.headers());
-    insert_routed_worker_id(&mut preserved_headers, worker.url());
+    insert_routed_worker_id(&mut preserved_headers, &redacted_url(worker.url()));
     let mut upstream_stream = response.bytes_stream();
 
     let (tx, rx) = sse_channel();
@@ -1422,5 +1423,83 @@ mod tests {
                 "{status} {body}"
             );
         }
+    }
+
+    /// The routed-worker header of a streaming answer names the worker
+    /// masked: the header reaches every client of the stream and the access
+    /// log copies it, so a credential in a worker URL never reaches either.
+    #[tokio::test]
+    async fn the_routed_worker_header_names_the_worker_masked() {
+        use std::sync::Arc;
+
+        use axum::{
+            http::{header::CONTENT_TYPE, StatusCode},
+            routing::any,
+            Router,
+        };
+        use openai_protocol::responses::ResponsesRequest;
+        use serde_json::json;
+        use smg_data_connector::{
+            MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+        };
+
+        use crate::{
+            openai::context::StorageHandles,
+            test_support::{http_client, StubWorker},
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a listener");
+        let port = listener.local_addr().expect("an address").port();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub upstream answering one event stream; aborted at the test's end"
+        )]
+        let upstream = tokio::spawn(async move {
+            let app = Router::new().fallback(any(|| async {
+                (
+                    [(CONTENT_TYPE, "text/event-stream")],
+                    "event: response.completed\ndata: {}\n\n",
+                )
+            }));
+            axum::serve(listener, app).await.expect("the stub serves");
+        });
+        let worker_url = format!("http://user:secret@127.0.0.1:{port}");
+        let request: ResponsesRequest =
+            serde_json::from_value(json!({"model": "m", "input": "hi", "stream": true}))
+                .expect("a request");
+        let req = StreamingRequest {
+            url: format!("{worker_url}/v1/responses"),
+            payload: json!({}),
+            original_body: request,
+            previous_response_id: None,
+            existing_mcp_list_tools_labels: Vec::new(),
+            storage: StorageHandles {
+                response: Arc::new(MemoryResponseStorage::new()),
+                conversation: Arc::new(MemoryConversationStorage::new()),
+                conversation_item: Arc::new(MemoryConversationItemStorage::new()),
+                request_context: None,
+                tenant: None,
+            },
+        };
+
+        let response = handle_simple_streaming_passthrough(
+            &http_client(),
+            &StubWorker::at(&worker_url),
+            None,
+            req,
+        )
+        .await;
+        upstream.abort();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let header = response
+            .headers()
+            .get("x-smg-routed-worker-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("the routed-worker header");
+        assert!(!header.contains("secret"), "{header}");
+        assert_eq!(header, format!("http://***@127.0.0.1:{port}"));
     }
 }

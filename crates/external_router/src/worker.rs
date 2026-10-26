@@ -1,6 +1,6 @@
 //! What an external router sees of the gateway's workers.
 
-use std::{any::Any, fmt::Debug, sync::Arc};
+use std::{any::Any, borrow::Cow, fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
 use axum::{http::HeaderMap, response::Response};
@@ -83,4 +83,114 @@ pub trait WorkerSource: Send + Sync + Debug {
     fn stats(&self) -> WorkerStats;
     /// Every worker that fronts a third-party provider.
     fn external_workers(&self) -> Vec<Arc<dyn ExternalWorker>>;
+}
+
+/// A worker's URL as a log line or a message shows it.
+///
+/// A URL without userinfo, query or fragment is returned as it is, byte for
+/// byte and without an allocation: the common case, so a plain address
+/// reads in the logs exactly as it was configured. Otherwise the userinfo is
+/// masked whole and the address is cut at its path:
+/// `https://user:secret@host:8000/v1/messages?k=v` reads
+/// `https://***@host:8000/v1/messages`. The username goes with the secret,
+/// since a token is often the username (`https://token@host`,
+/// `https://token:x-oauth-basic@host`); a query or a fragment is no part of
+/// the address and may carry a token. The gateway renders a worker's own URL
+/// the same way through its worker type; until that rendering is reachable
+/// from a worker held here, every site writes through this rule, which then
+/// stays for the strings that are not a worker's rendering: an MCP server
+/// URL, a request URL composed from a worker's address and a path. It works
+/// on the string alone: nothing is parsed, and an `@` before the first `/` of
+/// a schemeless string counts as userinfo as well.
+pub(crate) fn redacted_url(url: &str) -> Cow<'_, str> {
+    // The authority runs from the scheme separator (when the text before it
+    // is a scheme) to the first `/`, `?` or `#`.
+    let authority_start = url
+        .find("://")
+        .filter(|&at| {
+            url[..at]
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"+-.".contains(&byte))
+        })
+        .map_or(0, |at| at + 3);
+    let authority_end = url[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |at| authority_start + at);
+    let host_start = url[authority_start..authority_end]
+        .rfind('@')
+        .map(|at| authority_start + at + 1);
+    let cut = url[authority_end..]
+        .find(['?', '#'])
+        .map(|at| authority_end + at);
+    if host_start.is_none() && cut.is_none() {
+        return Cow::Borrowed(url);
+    }
+    let mut path_end = cut.unwrap_or(url.len());
+    // As the gateway renders it: a lone `/` is no path.
+    if &url[authority_end..path_end] == "/" {
+        path_end = authority_end;
+    }
+    let mut masked = String::with_capacity(path_end);
+    masked.push_str(&url[..authority_start]);
+    if host_start.is_some() {
+        masked.push_str("***@");
+    }
+    masked.push_str(&url[host_start.unwrap_or(authority_start)..path_end]);
+    Cow::Owned(masked)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redacted_url;
+
+    /// A URL without userinfo, query or fragment is the text as given,
+    /// borrowed: whatever its scheme, host form, path or trailing slash.
+    #[test]
+    fn a_plain_url_reads_byte_for_byte() {
+        for plain in [
+            "https://api.example.com",
+            "http://127.0.0.1:8000/v1",
+            "http://[::1]:8000/v1/messages",
+            "http://Worker:3000/",
+            "wss://host/v1/realtime",
+            "127.0.0.1:8000",
+            "",
+        ] {
+            let shown = redacted_url(plain);
+            assert!(matches!(shown, std::borrow::Cow::Borrowed(_)), "{plain}");
+            assert_eq!(shown, plain);
+        }
+    }
+
+    /// A userinfo is masked whole, whatever its shape, and a query or a
+    /// fragment is cut; nothing of the credential survives.
+    #[test]
+    fn a_userinfo_is_masked_whole_and_a_query_is_cut() {
+        for (url, masked) in [
+            (
+                "https://user:secret@127.0.0.1:1/v1/messages",
+                "https://***@127.0.0.1:1/v1/messages",
+            ),
+            ("https://api-token@host:8000", "https://***@host:8000"),
+            ("https://tok-123:x-oauth-basic@host", "https://***@host"),
+            (
+                "wss://user:secret@127.0.0.1:1/v1/realtime?model=m",
+                "wss://***@127.0.0.1:1/v1/realtime",
+            ),
+            ("http://user:secret@host:8000/", "http://***@host:8000"),
+            ("http://host:8000/v1?token=secret", "http://host:8000/v1"),
+            ("http://host:8000/v1#secret", "http://host:8000/v1"),
+            ("http://host:8000/?x=1", "http://host:8000"),
+            // Schemeless: an `@` before the first `/` is a userinfo too.
+            ("user:secret@host/sse", "***@host/sse"),
+            // A `://` inside a path or a query is not a scheme separator.
+            ("host/x?next=http://user:secret@y", "host/x"),
+        ] {
+            let shown = redacted_url(url);
+            assert_eq!(shown, masked, "{url}");
+            for credential in ["secret", "user", "api-token", "tok-123", "x-oauth-basic"] {
+                assert!(!shown.contains(credential), "{url} -> {shown}");
+            }
+        }
+    }
 }
