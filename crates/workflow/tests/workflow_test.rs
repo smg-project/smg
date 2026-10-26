@@ -88,6 +88,22 @@ impl StepExecutor<TestWorkflowData> for AlwaysFailStep {
     }
 }
 
+/// A step that counts its executions and succeeds.
+struct TrackingStep {
+    counter: Arc<AtomicU32>,
+}
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for TrackingStep {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        self.counter.fetch_add(1, Ordering::SeqCst);
+        Ok(StepResult::Success)
+    }
+}
+
 #[tokio::test]
 async fn test_simple_workflow_execution() {
     let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
@@ -578,21 +594,6 @@ async fn test_dag_dependency_failure_blocks_dependents() {
         }
     }
 
-    struct TrackingStep {
-        counter: Arc<AtomicU32>,
-    }
-
-    #[async_trait::async_trait]
-    impl StepExecutor<TestWorkflowData> for TrackingStep {
-        async fn execute(
-            &self,
-            _context: &mut WorkflowContext<TestWorkflowData>,
-        ) -> WorkflowResult<StepResult> {
-            self.counter.fetch_add(1, Ordering::SeqCst);
-            Ok(StepResult::Success)
-        }
-    }
-
     let workflow = WorkflowDefinition::new("blocked_workflow", "Blocked Test")
         .add_step(
             StepDefinition::new("step_a", "Step A", Arc::new(FailingStep))
@@ -791,21 +792,6 @@ async fn test_run_if_true() {
     let executed = Arc::new(AtomicU32::new(0));
     let executed_clone = Arc::clone(&executed);
 
-    struct TrackingStep {
-        counter: Arc<AtomicU32>,
-    }
-
-    #[async_trait::async_trait]
-    impl StepExecutor<TestWorkflowData> for TrackingStep {
-        async fn execute(
-            &self,
-            _context: &mut WorkflowContext<TestWorkflowData>,
-        ) -> WorkflowResult<StepResult> {
-            self.counter.fetch_add(1, Ordering::SeqCst);
-            Ok(StepResult::Success)
-        }
-    }
-
     // Step with run_if that always returns true
     let workflow = WorkflowDefinition::new("run_if_true_workflow", "Run If True Test").add_step(
         StepDefinition::new(
@@ -840,21 +826,6 @@ async fn test_run_if_false() {
 
     let executed = Arc::new(AtomicU32::new(0));
     let executed_clone = Arc::clone(&executed);
-
-    struct TrackingStep {
-        counter: Arc<AtomicU32>,
-    }
-
-    #[async_trait::async_trait]
-    impl StepExecutor<TestWorkflowData> for TrackingStep {
-        async fn execute(
-            &self,
-            _context: &mut WorkflowContext<TestWorkflowData>,
-        ) -> WorkflowResult<StepResult> {
-            self.counter.fetch_add(1, Ordering::SeqCst);
-            Ok(StepResult::Success)
-        }
-    }
 
     // Step with run_if that always returns false
     let workflow = WorkflowDefinition::new("run_if_false_workflow", "Run If False Test").add_step(
@@ -909,21 +880,6 @@ async fn test_run_if_context_based() {
 
     let executed = Arc::new(AtomicU32::new(0));
     let executed_clone = Arc::clone(&executed);
-
-    struct TrackingStep {
-        counter: Arc<AtomicU32>,
-    }
-
-    #[async_trait::async_trait]
-    impl StepExecutor<TestWorkflowData> for TrackingStep {
-        async fn execute(
-            &self,
-            _context: &mut WorkflowContext<TestWorkflowData>,
-        ) -> WorkflowResult<StepResult> {
-            self.counter.fetch_add(1, Ordering::SeqCst);
-            Ok(StepResult::Success)
-        }
-    }
 
     // Workflow where second step only runs if first step sets the right key
     let workflow = WorkflowDefinition::new("context_run_if_workflow", "Context Run If Test")
@@ -1007,21 +963,6 @@ async fn test_run_if_false_mid_chain_completes() {
 
     let executed = Arc::new(AtomicU32::new(0));
     let executed_clone = Arc::clone(&executed);
-
-    struct TrackingStep {
-        counter: Arc<AtomicU32>,
-    }
-
-    #[async_trait::async_trait]
-    impl StepExecutor<TestWorkflowData> for TrackingStep {
-        async fn execute(
-            &self,
-            _context: &mut WorkflowContext<TestWorkflowData>,
-        ) -> WorkflowResult<StepResult> {
-            self.counter.fetch_add(1, Ordering::SeqCst);
-            Ok(StepResult::Success)
-        }
-    }
 
     let workflow = WorkflowDefinition::new("run_if_mid_chain_workflow", "Run If Mid Chain Test")
         .add_step(StepDefinition::new("a", "A", Arc::new(AlwaysSucceedStep)))
@@ -1226,21 +1167,6 @@ async fn test_depends_on_any_all_fail() {
     let c_executed = Arc::new(AtomicU32::new(0));
     let c_executed_clone = Arc::clone(&c_executed);
 
-    struct TrackingStep {
-        counter: Arc<AtomicU32>,
-    }
-
-    #[async_trait::async_trait]
-    impl StepExecutor<TestWorkflowData> for TrackingStep {
-        async fn execute(
-            &self,
-            _context: &mut WorkflowContext<TestWorkflowData>,
-        ) -> WorkflowResult<StepResult> {
-            self.counter.fetch_add(1, Ordering::SeqCst);
-            Ok(StepResult::Success)
-        }
-    }
-
     let workflow = WorkflowDefinition::new("all_any_fail_workflow", "All Any Fail Test")
         .add_step(StepDefinition::new(
             "step_a",
@@ -1291,21 +1217,6 @@ async fn test_depends_on_any_one_fails_one_succeeds() {
 
     let c_executed = Arc::new(AtomicU32::new(0));
     let c_executed_clone = Arc::clone(&c_executed);
-
-    struct TrackingStep {
-        counter: Arc<AtomicU32>,
-    }
-
-    #[async_trait::async_trait]
-    impl StepExecutor<TestWorkflowData> for TrackingStep {
-        async fn execute(
-            &self,
-            _context: &mut WorkflowContext<TestWorkflowData>,
-        ) -> WorkflowResult<StepResult> {
-            self.counter.fetch_add(1, Ordering::SeqCst);
-            Ok(StepResult::Success)
-        }
-    }
 
     // Note: Step A uses ContinueNextStep so its failure doesn't fail the workflow.
     // This is the correct way to model "any of" semantics where a failing path
