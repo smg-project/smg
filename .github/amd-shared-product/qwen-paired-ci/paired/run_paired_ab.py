@@ -229,9 +229,12 @@ def main(approval_path, output):
             log.close()
         children.append(child)
         logs.append(path)
-        row = proc.identity(child.pid)
-        require(row and row["env"].get(proc.KEY) == nonce and row["pgrp"] == child.pid, "own launcher identity")
-        report["operations"].append({"label": label, "started_at_utc": utc(), "process": proc.public(row), "log": str(path)})
+        snapshot = proc.launcher_snapshot(child, nonce)
+        child.smg_identity = snapshot["process"] or snapshot["stat"]
+        record = {"label": label, "started_at_utc": utc(), **snapshot, "log": str(path)}
+        report["operations"].append(record)
+        (output / (label + "-launcher.json")).write_text(json.dumps(record, indent=2) + "\n")
+        require(snapshot["terminal_reaped"] or snapshot["live_identity_verified"], "own launcher identity")
         return child
 
     def operation(label, argv, limit, until=None):

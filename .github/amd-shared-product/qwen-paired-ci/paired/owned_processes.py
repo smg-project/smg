@@ -9,19 +9,39 @@ import time
 KEY = "SMG_QWEN_AB_NONCE"
 
 
+def stat_identity(pid):
+    try:
+        text = (Path("/proc") / str(pid) / "stat").read_text()
+        tail = text[text.rfind(")") + 2:].split()
+        return {"pid": pid, "ppid": int(tail[1]), "pgrp": int(tail[2]),
+                "start_ticks": int(tail[19]), "state": tail[0]}
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+
+
 def identity(pid):
     root = Path("/proc") / str(pid)
     try:
-        text = (root / "stat").read_text()
-        tail = text[text.rfind(")") + 2:].split()
-        with (root / "environ").open("rb") as stream:
-            env = stream.read(262145)
+        row = stat_identity(pid)
+        if row is None:
+            return None
+        if row["state"] == "Z":
+            return {**row, "argv": [], "env": {}}
+        try:
+            with (root / "environ").open("rb") as stream:
+                env = stream.read(262145)
+        except PermissionError:
+            after = stat_identity(pid)
+            if after is None:
+                return None
+            if after["state"] == "Z" and after["start_ticks"] == row["start_ticks"]:
+                return {**after, "argv": [], "env": {}}
+            raise
         with (root / "cmdline").open("rb") as stream:
             argv = stream.read(16385)
         if len(env) > 262144 or len(argv) > 16384:
             raise ValueError("proc identity cap")
-        return {"pid": pid, "ppid": int(tail[1]), "pgrp": int(tail[2]),
-                "start_ticks": int(tail[19]), "state": tail[0],
+        return {**row,
                 "argv": argv.rstrip(b"\0").decode(errors="replace").split("\0"),
                 "env": dict(item.decode(errors="replace").split("=", 1)
                             for item in env.split(b"\0") if b"=" in item)}
@@ -29,17 +49,38 @@ def identity(pid):
         return None
 
 
-def owned(nonce):
-    result = []
+def scan_owned(nonce, groups=(), known=None):
+    rows, errors = [], []
+    known = known or {}
     for root in Path("/proc").iterdir():
-        if root.name.isdigit():
-            try:
-                row = identity(int(root.name))
-                if row and row["env"].get(KEY) == nonce and row["state"] != "Z":
-                    result.append(row)
-            except PermissionError:
-                continue
-    return result
+        if not root.name.isdigit():
+            continue
+        pid = int(root.name)
+        before = stat_identity(pid)
+        if before is None or before["state"] == "Z":
+            continue
+        scoped = (before["pgrp"] in groups or
+                  known.get(pid, {}).get("start_ticks") == before["start_ticks"])
+        try:
+            row = identity(pid)
+        except PermissionError as error:
+            after = stat_identity(pid)
+            if scoped and after and after["state"] != "Z":
+                errors.append({"stage": "scan_owned", "process": after,
+                               "error_type": type(error).__name__, "error": str(error)[:512]})
+            continue
+        if row is None or row["state"] == "Z":
+            continue
+        if row["env"].get(KEY) == nonce:
+            rows.append(row)
+        elif scoped:
+            errors.append({"stage": "scan_owned", "process": before,
+                           "error_type": "OwnershipError", "error": "live scoped member has different nonce"})
+    return rows, errors
+
+
+def owned(nonce):
+    return scan_owned(nonce)[0]
 
 
 def public(row):
@@ -47,6 +88,31 @@ def public(row):
             "marker": row["env"].get(KEY),
             "gpu_masks": {k: row["env"].get(k) for k in
                           ["CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES"]}}
+
+
+def launcher_snapshot(child, nonce):
+    row, error = None, None
+    try:
+        row = identity(child.pid)
+    except (OSError, ValueError) as failure:
+        error = {"type": type(failure).__name__, "message": str(failure)[:512]}
+    stat, stat_error = None, None
+    try:
+        stat = stat_identity(child.pid)
+    except OSError as failure:
+        stat_error = {"type": type(failure).__name__, "message": str(failure)[:512]}
+    code = child.poll()
+    terminal = code is not None
+    if terminal:
+        code = child.wait()
+    return {"pid": child.pid, "process": public(row) if row else None,
+            "stat": stat, "stat_error": stat_error,
+            "identity_error": error, "returncode": code,
+            "checks": {"nonce": row["env"].get(KEY) == nonce if row and row["state"] != "Z" else None,
+                       "pgrp": stat["pgrp"] == child.pid if stat else None},
+            "terminal_reaped": terminal,
+            "live_identity_verified": bool(not terminal and row and row["state"] != "Z" and
+                                           row["env"].get(KEY) == nonce and row["pgrp"] == child.pid)}
 
 
 def signal_exact(row, signum, nonce):
@@ -84,11 +150,25 @@ def signal_group(leader, signum, nonce):
 
 
 def cleanup(nonce, deadline, leaders):
-    actions = []
-    # Individual identities cover descendants that change process group/session.
-    # Never signal a guessed process-group number after its launcher disappeared.
+    actions, errors = [], []
+    known = {child.pid: child.smg_identity for child in leaders
+             if getattr(child, "smg_identity", None) is not None}
+    groups = {child.pid for child in leaders}
+
+    def remember(error):
+        if error not in errors and len(errors) < 32:
+            errors.append(error)
+
+    def scan():
+        rows, unknown = scan_owned(nonce, groups, known)
+        for row in rows:
+            known[row["pid"]] = row
+        for error in unknown:
+            remember(error)
+        return rows, unknown
+
     for sig, grace in [(signal.SIGTERM, 5), (signal.SIGKILL, 5)]:
-        rows = owned(nonce)
+        rows, unknown = scan()
         for row in rows:
             if row["pgrp"] == row["pid"]:
                 try:
@@ -96,24 +176,34 @@ def cleanup(nonce, deadline, leaders):
                         actions.append({"signal": int(sig), "owned_process_group": row["pid"], "start_ticks": row["start_ticks"]})
                 except ProcessLookupError:
                     pass
+                except (PermissionError, RuntimeError) as error:
+                    remember({"stage": "signal_group", "process": public(row),
+                              "error_type": type(error).__name__, "error": str(error)[:512]})
         for row in rows:
             try:
                 signal_exact(row, sig, nonce)
                 actions.append({"signal": int(sig), **public(row)})
             except ProcessLookupError:
                 pass
+            except (PermissionError, RuntimeError) as error:
+                remember({"stage": "signal_exact", "process": public(row),
+                          "error_type": type(error).__name__, "error": str(error)[:512]})
         end = min(deadline, time.monotonic() + grace)
-        while owned(nonce) and time.monotonic() < end:
+        while time.monotonic() < end:
+            remaining, unknown = scan()
+            if not remaining and not unknown:
+                break
             time.sleep(min(0.1, max(0, end - time.monotonic())))
         for child in leaders:
             if child.poll() is not None:
                 child.wait()
-        if not owned(nonce):
-            return {"passed": True, "signals": actions, "remaining": []}
+        remaining, unknown = scan()
+        if not remaining and not unknown:
+            return {"passed": not errors, "signals": actions, "remaining": [], "errors": errors}
         if time.monotonic() >= deadline:
             break
     return {"passed": False, "signals": actions,
-            "remaining": [public(row) for row in owned(nonce)]}
+            "remaining": [public(row) for row in remaining], "unresolved": unknown, "errors": errors}
 
 
 def mapped_native(pid, expected):
