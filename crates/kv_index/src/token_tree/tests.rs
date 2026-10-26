@@ -2,6 +2,18 @@ use std::{sync::Arc, thread};
 
 use super::*;
 
+/// `body(tree, t)` on `num_threads` scoped threads at once, `t` the thread's
+/// index; every thread is joined, and a panic in one re-raised, before this
+/// returns.
+fn on_threads(tree: &TokenTree, num_threads: usize, body: impl Fn(&TokenTree, usize) + Sync) {
+    let body = &body;
+    thread::scope(|scope| {
+        for t in 0..num_threads {
+            scope.spawn(move || body(tree, t));
+        }
+    });
+}
+
 /// Helper to create a page-aligned token sequence starting from `base`.
 /// Creates `pages` full pages of tokens.
 fn make_tokens(base: u32, pages: usize) -> Vec<TokenId> {
@@ -410,109 +422,73 @@ fn test_exact_match_seq() {
 
 #[test]
 fn test_exact_match_concurrent() {
-    let tree = Arc::new(TokenTree::new());
+    let tree = TokenTree::new();
     let num_threads = 8;
     let entries_per_thread = 100;
 
     // Insert phase
-    let mut handles = vec![];
-    for t in 0..num_threads {
-        let tree = Arc::clone(&tree);
-        handles.push(thread::spawn(move || {
-            for i in 0..entries_per_thread {
-                let base = (t * 1000000 + i * 1000) as u32;
-                let tokens = make_tokens(base, 2);
-                tree.insert_tokens(&tokens, &format!("tenant{t}"));
-            }
-        }));
-    }
-    for handle in handles {
-        handle.join().unwrap();
-    }
+    on_threads(&tree, num_threads, |tree, t| {
+        for i in 0..entries_per_thread {
+            let base = (t * 1000000 + i * 1000) as u32;
+            let tokens = make_tokens(base, 2);
+            tree.insert_tokens(&tokens, &format!("tenant{t}"));
+        }
+    });
 
     // Match phase
-    let mut handles = vec![];
-    for t in 0..num_threads {
-        let tree = Arc::clone(&tree);
-        handles.push(thread::spawn(move || {
-            for i in 0..entries_per_thread {
-                let base = (t * 1000000 + i * 1000) as u32;
-                let tokens = make_tokens(base, 2);
-                let result = tree.match_prefix_with_counts(&tokens);
-                assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
-                assert_eq!(result.tenant.as_ref(), &format!("tenant{t}"));
-            }
-        }));
-    }
-    for handle in handles {
-        handle.join().unwrap();
-    }
+    on_threads(&tree, num_threads, |tree, t| {
+        for i in 0..entries_per_thread {
+            let base = (t * 1000000 + i * 1000) as u32;
+            let tokens = make_tokens(base, 2);
+            let result = tree.match_prefix_with_counts(&tokens);
+            assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
+            assert_eq!(result.tenant.as_ref(), &format!("tenant{t}"));
+        }
+    });
 }
 
 #[test]
 fn test_partial_match_concurrent() {
-    let tree = Arc::new(TokenTree::new());
+    let tree = TokenTree::new();
     let num_threads = 8;
     let entries_per_thread = 100;
 
     // Insert full sequences (3 pages)
-    let mut handles = vec![];
-    for t in 0..num_threads {
-        let tree = Arc::clone(&tree);
-        handles.push(thread::spawn(move || {
-            for i in 0..entries_per_thread {
-                let base = (t * 1000000 + i * 1000) as u32;
-                let tokens = make_tokens(base, 3);
-                tree.insert_tokens(&tokens, &format!("tenant{t}"));
-            }
-        }));
-    }
-    for handle in handles {
-        handle.join().unwrap();
-    }
+    on_threads(&tree, num_threads, |tree, t| {
+        for i in 0..entries_per_thread {
+            let base = (t * 1000000 + i * 1000) as u32;
+            let tokens = make_tokens(base, 3);
+            tree.insert_tokens(&tokens, &format!("tenant{t}"));
+        }
+    });
 
     // Match with partial (1 page)
-    let mut handles = vec![];
-    for t in 0..num_threads {
-        let tree = Arc::clone(&tree);
-        handles.push(thread::spawn(move || {
-            for i in 0..entries_per_thread {
-                let base = (t * 1000000 + i * 1000) as u32;
-                let partial = make_tokens(base, 1);
-                let result = tree.match_prefix_with_counts(&partial);
-                assert_eq!(result.matched_token_count, PAGE_SIZE);
-            }
-        }));
-    }
-    for handle in handles {
-        handle.join().unwrap();
-    }
+    on_threads(&tree, num_threads, |tree, t| {
+        for i in 0..entries_per_thread {
+            let base = (t * 1000000 + i * 1000) as u32;
+            let partial = make_tokens(base, 1);
+            let result = tree.match_prefix_with_counts(&partial);
+            assert_eq!(result.matched_token_count, PAGE_SIZE);
+        }
+    });
 }
 
 #[test]
 fn test_group_prefix_insert_match_concurrent() {
-    let tree = Arc::new(TokenTree::new());
+    let tree = TokenTree::new();
     let num_threads = 8;
 
     // All threads share the same prefix (1 page)
     let common_prefix = make_tokens(100, 1);
 
-    let mut handles = vec![];
-    for t in 0..num_threads {
-        let tree = Arc::clone(&tree);
-        let prefix = common_prefix.clone();
-        handles.push(thread::spawn(move || {
-            for i in 0..50 {
-                let mut tokens = prefix.clone();
-                let suffix = make_tokens((t * 10000 + i * 100) as u32, 1);
-                tokens.extend(suffix);
-                tree.insert_tokens(&tokens, &format!("tenant{t}"));
-            }
-        }));
-    }
-    for handle in handles {
-        handle.join().unwrap();
-    }
+    on_threads(&tree, num_threads, |tree, t| {
+        for i in 0..50 {
+            let mut tokens = common_prefix.clone();
+            let suffix = make_tokens((t * 10000 + i * 100) as u32, 1);
+            tokens.extend(suffix);
+            tree.insert_tokens(&tokens, &format!("tenant{t}"));
+        }
+    });
 
     // Verify prefix matching works
     let result = tree.match_prefix_with_counts(&common_prefix);
@@ -956,27 +932,18 @@ fn test_multiple_splits_same_path() {
 
 #[test]
 fn test_high_contention_same_prefix() {
-    let tree = Arc::new(TokenTree::new());
+    let tree = TokenTree::new();
     let prefix = make_tokens(100, 1);
     let num_threads = 16;
 
-    let mut handles = vec![];
-    for t in 0..num_threads {
-        let tree = Arc::clone(&tree);
-        let p = prefix.clone();
-        handles.push(thread::spawn(move || {
-            for i in 0..100 {
-                let mut tokens = p.clone();
-                let suffix = make_tokens((t * 10000 + i * 100) as u32, 1);
-                tokens.extend(suffix);
-                tree.insert_tokens(&tokens, &format!("tenant{t}"));
-            }
-        }));
-    }
-
-    for handle in handles {
-        handle.join().unwrap();
-    }
+    on_threads(&tree, num_threads, |tree, t| {
+        for i in 0..100 {
+            let mut tokens = prefix.clone();
+            let suffix = make_tokens((t * 10000 + i * 100) as u32, 1);
+            tokens.extend(suffix);
+            tree.insert_tokens(&tokens, &format!("tenant{t}"));
+        }
+    });
 
     // Verify prefix matching
     let result = tree.match_prefix_with_counts(&prefix);
@@ -985,30 +952,22 @@ fn test_high_contention_same_prefix() {
 
 #[test]
 fn test_rapid_insert_remove_cycles() {
-    let tree = Arc::new(TokenTree::new());
+    let tree = TokenTree::new();
     let num_threads = 4;
 
-    let mut handles = vec![];
-    for t in 0..num_threads {
-        let tree = Arc::clone(&tree);
-        handles.push(thread::spawn(move || {
-            let tenant_id: TenantId = Arc::from(format!("tenant{t}"));
-            for cycle in 0..10 {
-                // Insert
-                for i in 0..20 {
-                    let base = (t * 10000000 + cycle * 100000 + i * 1000) as u32;
-                    let tokens = make_tokens(base, 2);
-                    tree.insert_tokens(&tokens, &format!("tenant{t}"));
-                }
-                // Evict
-                tree.evict_tenant(&tenant_id, 10);
+    on_threads(&tree, num_threads, |tree, t| {
+        let tenant_id: TenantId = Arc::from(format!("tenant{t}"));
+        for cycle in 0..10 {
+            // Insert
+            for i in 0..20 {
+                let base = (t * 10000000 + cycle * 100000 + i * 1000) as u32;
+                let tokens = make_tokens(base, 2);
+                tree.insert_tokens(&tokens, &format!("tenant{t}"));
             }
-        }));
-    }
-
-    for handle in handles {
-        handle.join().unwrap();
-    }
+            // Evict
+            tree.evict_tenant(&tenant_id, 10);
+        }
+    });
 }
 
 #[test]
@@ -1124,26 +1083,17 @@ fn test_token_count_consistency_after_operations() {
 
 #[test]
 fn test_tree_structure_integrity_after_stress() {
-    let tree = Arc::new(TokenTree::new());
+    let tree = TokenTree::new();
     let num_threads = 8;
 
-    let mut handles = vec![];
-
     // Stress insert
-    for t in 0..num_threads {
-        let tree = Arc::clone(&tree);
-        handles.push(thread::spawn(move || {
-            for i in 0..200 {
-                let base = (t * 10000000 + i * 1000) as u32;
-                let tokens = make_tokens(base, 2);
-                tree.insert_tokens(&tokens, &format!("tenant{t}"));
-            }
-        }));
-    }
-
-    for handle in handles {
-        handle.join().unwrap();
-    }
+    on_threads(&tree, num_threads, |tree, t| {
+        for i in 0..200 {
+            let base = (t * 10000000 + i * 1000) as u32;
+            let tokens = make_tokens(base, 2);
+            tree.insert_tokens(&tokens, &format!("tenant{t}"));
+        }
+    });
 
     // Verify structure by matching
     for t in 0..num_threads {
