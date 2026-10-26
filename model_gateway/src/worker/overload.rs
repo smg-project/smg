@@ -36,7 +36,8 @@ pub const BRANCH_OVERLOADED_AT_DISPATCH: &str = "overloaded_at_dispatch";
 /// Decision-log branch: every worker selection could have used is over the
 /// thresholds and shedding is off, so the request goes to the least-loaded
 /// of them instead of being refused (a cache-aware prefill pool of a
-/// prefill/decode pair is placed by its policy instead).
+/// prefill/decode pair, or a regular request that consistent_hashing places
+/// by its routing key, is placed by its policy instead).
 pub const BRANCH_ALL_OVERLOADED_FALLBACK: &str = "all_overloaded_fallback";
 
 /// Decision-log branch: every worker selection could have used is vetoed and

@@ -656,7 +656,8 @@ class RouterArgs:
     worker_overload_protection: bool = True
     # Refuse with a 503 when every worker a request could use is overloaded,
     # instead of routing it to the least-loaded one (or, for a cache-aware
-    # prefill pool of a prefill/decode pair, by its policy)
+    # prefill pool of a prefill/decode pair or a regular request that
+    # consistent_hashing places by its routing key, by its policy)
     worker_overload_shed: bool = False
     # Absolute per-worker overload thresholds (token usage, waiting requests), as
     # the Rust CLI defaults them; None switches one signal off
@@ -1116,7 +1117,9 @@ class RouterArgs:
                 " request goes to the least-loaded one (see"
                 " --worker-overload-shed). Unless --worker-overload-shed is"
                 " set, a cache-aware prefill pool of a prefill/decode pair is"
-                " not steered by the thresholds: its spill gate balances it."
+                " not steered by the thresholds: its spill gate balances it;"
+                " nor is a regular request that consistent_hashing places by"
+                " its routing key, which stays on its ring owner."
                 " The signal is the queued (waiting)"
                 " request count, summed across DP ranks. Must be >= 1: the"
                 " comparison is inclusive, so 0 would veto every worker"
@@ -1170,7 +1173,9 @@ class RouterArgs:
                 "Refuse a request with a 503 (worker_overload_protection_shed,"
                 " Retry-After the load poll interval) when every worker it could"
                 " use is overloaded, instead of routing it to the least-loaded one"
-                " (or, for a cache-aware prefill pool, by its policy); also sheds"
+                " (or, for a cache-aware prefill pool or a regular request that"
+                " consistent_hashing places by its routing key, by its policy);"
+                " also sheds"
                 " a worker that crossed a threshold between selection"
                 " and dispatch. Off by default."
             ),

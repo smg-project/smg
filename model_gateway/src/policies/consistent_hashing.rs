@@ -73,10 +73,17 @@ impl ConsistentHashingPolicy {
         key: &str,
     ) -> Option<usize> {
         // Build URL→index map for healthy workers: O(n) once, O(1) lookups
+        // A lifted overload veto keeps an owner over the thresholds.
         let healthy_url_to_idx: std::collections::HashMap<&str, usize> = workers
             .iter()
             .enumerate()
-            .filter(|(_, w)| w.is_healthy_and_eligible())
+            .filter(|(_, w)| {
+                if info.overload_lifted {
+                    w.routing_state().eligible_ignoring_overload()
+                } else {
+                    w.is_healthy_and_eligible()
+                }
+            })
             .map(|(i, w)| (w.url(), i))
             .collect();
 
@@ -111,6 +118,16 @@ impl ConsistentHashingPolicy {
         Some(healthy_indices[idx])
     }
 
+    /// The explicit session key the request hashes on. Explicit routing-key
+    /// headers outrank the rid-derived session key (populated only under the
+    /// routing-key override). Both header sides apply the hint caps: an
+    /// over-cap or non-UTF-8 key must not influence placement on any path.
+    fn session_key<'a>(info: &SelectWorkerInfo<'a>) -> Option<&'a str> {
+        info.routing_key
+            .or_else(|| extract_routing_key_hint(info.headers))
+            .or(info.rid_key)
+    }
+
     #[expect(
         clippy::unused_self,
         reason = "consistent with LoadBalancingPolicy trait pattern; may use self in future"
@@ -125,14 +142,7 @@ impl ConsistentHashingPolicy {
         }
 
         let target_worker = extract_target_worker(info.headers);
-        // Explicit routing-key headers outrank the rid-derived session key
-        // (populated only under the routing-key override).
-        // Both header sides apply the hint caps: an over-cap or non-UTF-8 key
-        // must not influence placement on any path.
-        let routing_key = info
-            .routing_key
-            .or_else(|| extract_routing_key_hint(info.headers))
-            .or(info.rid_key);
+        let routing_key = Self::session_key(info);
 
         // Priority 1: X-SMG-Target-Worker - direct routing by worker index
         // O(1) parse + O(1) bounds check + O(1) health check
@@ -203,6 +213,14 @@ impl LoadBalancingPolicy for ConsistentHashingPolicy {
         "consistent_hashing"
     }
 
+    /// A session key places the request on its ring owner. An explicit
+    /// target worker outranks it, and the implicit client key
+    /// (`x-forwarded-for`, `cookie`) identifies a client rather than a
+    /// session, so neither counts.
+    fn routes_by_session_key(&self, info: &SelectWorkerInfo) -> bool {
+        extract_target_worker(info.headers).is_none() && Self::session_key(info).is_some()
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -264,7 +282,7 @@ mod tests {
     /// Every consistent-hashing entry point gathers on
     /// `is_healthy_and_eligible()`, so a vetoed worker must drop out of the
     /// ring, out of an explicit target-worker probe, and out of the random
-    /// fallback alike.
+    /// fallback alike (only the ring lookup honours a lifted overload veto).
     #[test]
     fn overloaded_worker_is_skipped_by_every_selection_path() {
         let policy = ConsistentHashingPolicy::new();
@@ -301,6 +319,27 @@ mod tests {
             Some(owner),
             "recovery re-admits the ring owner"
         );
+    }
+
+    /// Only an explicit session key places a request by its owner: a target
+    /// worker outranks it, and the implicit client key does not count.
+    #[test]
+    fn only_an_explicit_session_key_routes_by_session_key() {
+        let policy = ConsistentHashingPolicy::new();
+        let keyed = headers_with_routing_key("user-1");
+        let mut targeted = headers_with_target_worker(0);
+        targeted.insert("x-smg-routing-key", "user-1".parse().unwrap());
+        let mut client = http::HeaderMap::new();
+        client.insert("x-forwarded-for", "10.0.0.1".parse().unwrap());
+
+        let routes = |info: SelectWorkerInfo| policy.routes_by_session_key(&info);
+        assert!(routes(with_headers(&keyed)));
+        assert!(routes(SelectWorkerInfo {
+            rid_key: Some("conv-1"),
+            ..Default::default()
+        }));
+        assert!(!routes(with_headers(&targeted)));
+        assert!(!routes(with_headers(&client)));
     }
 
     #[test]

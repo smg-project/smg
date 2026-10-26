@@ -300,7 +300,9 @@ pub struct RouterConfig {
     /// request goes to the least-loaded one (see `worker_overload_shed` for
     /// refusing instead). Unless `worker_overload_shed` is set, a
     /// cache-aware prefill pool of gRPC and HTTP prefill/decode pair
-    /// placement is not steered by them: its spill gate balances it.
+    /// placement is not steered by them: its spill gate balances it; nor is
+    /// a regular request that consistent_hashing places by its routing key,
+    /// which stays on its ring owner.
     /// Evaluated once per ingested load report, never per request. `false`
     /// switches both gateway thresholds off; per-worker `overload` blocks on
     /// a WorkerSpec still apply.
@@ -320,7 +322,8 @@ pub struct RouterConfig {
     /// Refuse a request with a 503 (`worker_overload_protection_shed`,
     /// Retry-After the poll interval) when every worker it could use is
     /// overloaded, instead of steering it to the least-loaded one (or, for a
-    /// cache-aware prefill pool, placing it by its policy). Off by
+    /// cache-aware prefill pool or a regular request that consistent_hashing
+    /// places by its routing key, placing it by its policy). Off by
     /// default: a fleet that is uniformly over the thresholds is still a
     /// fleet, and the dispatch-time re-check that sheds a worker flagged
     /// between selection and dispatch is part of the same opt-in.
