@@ -88,7 +88,22 @@ def api_get(path):
             "User-Agent": "smg-shared-product-relay",
         },
     )
-    return urllib.request.build_opener(NoRedirect()).open(request, timeout=30)
+    opener = urllib.request.build_opener(NoRedirect())
+    # Retry only opening this read-only API request, never a response-body read.
+    # The caller's existing overall deadline still bounds all relay requests.
+    for attempt in range(2):
+        try:
+            return opener.open(request, timeout=30)
+        except urllib.error.HTTPError as exc:
+            if attempt == 1 or exc.code not in (502, 503, 504):
+                raise
+            exc.close()
+        except urllib.error.URLError as exc:
+            if attempt == 1 or not isinstance(exc.reason, TimeoutError):
+                raise
+        except TimeoutError:
+            if attempt == 1:
+                raise
 
 
 def archive_bytes(artifact):
