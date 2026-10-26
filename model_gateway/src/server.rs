@@ -1242,23 +1242,34 @@ pub fn build_apps(
             .route("/v1/classify", post(v1_classify))
             .route("/v1/decisions", post(v1_decisions))
             .route("/v1/systemone", post(v1_systemone))
-            // Bound the buffered body read: inside admission, so a stalled
-            // upload releases its permit, and inside the stream-vs-buffer
-            // decision, since the streamed relay has its own watchdog.
-            .route_layer(
-                middleware::RequestBodyTimeouts::from_config(&app_state.context.router_config)
-                    .layer(),
-            )
-            // Per-request buffer-vs-stream decision for typed-JSON bodies;
-            // declined requests pass to the handlers untouched.
-            .route_layer(
-                StreamBodyState::new(app_state.router.clone(), app_state.context.clone()).layer(),
-            )
-            // Every SSE stream of these routes carries a keep-alive through an
+            // The three layers of these routes as ONE stack: axum boxes the
+            // routes once per layer call and a request clones the boxed stack
+            // at every level, so one call costs one level where three cost
+            // three (and their clones). Innermost first: the bound on the
+            // buffered body read (inside admission, so a stalled upload
+            // releases its permit, and inside the stream-vs-buffer decision,
+            // since the streamed relay has its own watchdog); the per-request
+            // buffer-vs-stream decision for typed-JSON bodies (declined
+            // requests pass to the handlers untouched); outermost, the
+            // keep-alive every SSE stream of these routes carries through an
             // upstream silence (a comment; the Messages API's ping event),
             // written between frames, nothing while frames flow.
             .route_layer(
-                middleware::SseKeepAlive::from_config(&app_state.context.router_config).layer(),
+                tower::ServiceBuilder::new()
+                    .layer(
+                        middleware::SseKeepAlive::from_config(&app_state.context.router_config)
+                            .layer(),
+                    )
+                    .layer(
+                        StreamBodyState::new(app_state.router.clone(), app_state.context.clone())
+                            .layer(),
+                    )
+                    .layer(
+                        middleware::RequestBodyTimeouts::from_config(
+                            &app_state.context.router_config,
+                        )
+                        .layer(),
+                    ),
             )
             // Tokenize / Detokenize endpoints
             .route("/v1/tokenize", post(v1_tokenize))
@@ -1475,21 +1486,29 @@ where
 {
     app.fallback(sink_handler)
         .method_not_allowed_fallback(method_not_allowed_handler)
-        .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
-        // The payload limit on the request body: a declared over-limit
-        // length is refused here, in the gateway's envelope, before any
-        // layer inside runs; a chunked upload is capped on its way in.
-        .layer(middleware::RequestBodyLimitLayer::new(max_payload_size))
-        // The Messages envelope once more, outside the body-size limit: a
-        // declared over-limit length is refused by the limit layer before any
-        // route layer runs, and still leaves in the envelope.
-        .layer(middleware::MessagesErrorEnvelopeLayer)
-        .layer(tower::util::MapResponseLayer::new(
-            middleware::trace_context_on_response,
-        ))
-        .layer(middleware::create_logging_layer(access_log_fields))
-        .layer(middleware::HttpMetricsLayer::new(inflight_tracker))
-        .layer(middleware::RequestIdLayer::new(request_id_headers))
+        // The application-wide layers as ONE stack: axum boxes every route
+        // once per layer call and a request clones the boxed stack at every
+        // level, so one call costs one level where seven cost seven (and
+        // their clones). Outermost first: the request id; the HTTP metrics;
+        // the access log; the trace context on the response; the Messages
+        // envelope outside the body-size limit (a declared over-limit length
+        // is refused by the limit layer before any route layer runs, and
+        // still leaves in the envelope); the payload limit on the request
+        // body (a declared over-limit length is refused there, in the
+        // gateway's envelope, before any layer inside runs; a chunked upload
+        // is capped on its way in); innermost, the default body limit.
+        .layer(
+            tower::ServiceBuilder::new()
+                .layer(middleware::RequestIdLayer::new(request_id_headers))
+                .layer(middleware::HttpMetricsLayer::new(inflight_tracker))
+                .layer(middleware::create_logging_layer(access_log_fields))
+                .layer(tower::util::MapResponseLayer::new(
+                    middleware::trace_context_on_response,
+                ))
+                .layer(middleware::MessagesErrorEnvelopeLayer)
+                .layer(middleware::RequestBodyLimitLayer::new(max_payload_size))
+                .layer(axum::extract::DefaultBodyLimit::max(max_payload_size)),
+        )
         // CORS runs only with allowed origins configured; the layer is not
         // installed otherwise.
         .layer_if_some(create_cors_layer(cors_allowed_origins))
