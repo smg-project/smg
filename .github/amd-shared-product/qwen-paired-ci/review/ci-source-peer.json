@@ -1,0 +1,151 @@
+{
+  "result": "PASS_SOURCE_ONLY_ACTUAL_DISABLED_SIGNALLED_TERMINAL_CLEANUP",
+  "findings": [],
+  "reviewer": "C nonauthor of A four-path cleanup product proposal and root Git integration. C performed direct local Git object/index/worktree byte reads without any Git CLI/tool. CPU8 leaf and actual execution are separate D/root scopes, not reviewed as passed by C.",
+  "reviewed_at_utc": "2026-10-26T07:33:46.579122+00:00",
+  "source_parent": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
+  "source_head": "b38ae2c54c05282b0eb2766bdf1e80a7e1847c00",
+  "actual_head": "b38ae2c54c05282b0eb2766bdf1e80a7e1847c00",
+  "actual_Git_parent": "5164d403e54f489fa2bf89debf6de92b47f9fd54",
+  "actual_tree": "bdd5cad047ce9b28453581ebbca45226c4eab62a",
+  "actual_worktree": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/amd-qwen-current1473-process-cleanup-20261026",
+  "branch": "ci/amd-qwen-current1473-process-cleanup-20261026",
+  "working_tree_clean": true,
+  "driver_sha256": "16d9bdfd90e1b74b83597e3055f24812a6947d08047115deccdae37608b68e49",
+  "envelope_sha256": "06589cd12a0547a4e1d5547f8e24afb6c849ec8e95854d997b73bf1180d1ccfd",
+  "inputs_sha256": "ecdb8188c1d6e6cfb3aa84f4cdaba5f2bee183ec1e26e8fdc01d46e6c624dbd0",
+  "CI_job_runner_sha256": "6046df1eb612541ec51f5d4001b05d7163f7b66d10e734e1db43f55877b0b36d",
+  "workflow_template_sha256": "aa77da40cedaa56aa6d4f02a2ec0f63c5f4cddabd781ba38adc2bacdfada2564",
+  "CI_source_manifest_sha256": "ba000bfb5c672ce7618f1db4a122167ddd18e09d0bd214f026c88ec9509c08b9",
+  "prepare_sha256": "6524c5ac7feeff383b546a0f09cd58714c927951500400513430122244140cc3",
+  "runtime_file_hashes": {
+    "http_observe.py": "c1b7d42917386a4cf3b3bf144680503eae3f9b4587b97b4c6e78e54254d3bba0",
+    "owned_processes.py": "f8c84b7647ce218e3a73d42c1a0cc4982e67590c5f12c6cabda262f7284d8ad4",
+    "runtime_check.py": "98255bd35bac65f019f25af779758d89fcb53d64e874f800146cb9bd2f9effcb",
+    "root_container_envelope.py": "06589cd12a0547a4e1d5547f8e24afb6c849ec8e95854d997b73bf1180d1ccfd",
+    "six-request-matrix.json": "f9475f82fed3fafcd5497c5702e5f3390d045695276d41525b4d9938cc17f3dd"
+  },
+  "checks": {
+    "actual_paths": [
+      ".github/amd-shared-product/qwen-paired-ci/admission.json",
+      ".github/amd-shared-product/qwen-paired-ci/paired/inputs.json",
+      ".github/amd-shared-product/qwen-paired-ci/paired/owned_processes.py",
+      ".github/amd-shared-product/qwen-paired-ci/source-manifest.json"
+    ],
+    "all_four_actual_blob_bytes_equal_A_preview_and_worktree": true,
+    "Git_object_method": "Read-only loose-object zlib/type/length/SHA1 validation; recursively diffed only changed tree OIDs. Complete actual commit/parent/branch/root tree read directly. All unchanged subtrees retain exact Git mode/object identity. No git executable/library invoked.",
+    "actual_commit_tree_diff_exact_four_paths": true,
+    "all_other_tracked_modes_objects_unchanged": true,
+    "worktree_clean_method": "Actual v2index checksum/2516entries validated; complete cached root-tree matches HEAD. All2516working-tree file/symlink contents and executable modes match index blobIDs; no extra untracked files apart from .git link.",
+    "index_sha256": "f69547b913ba80e31666af42388def5ec912335ae7dd4404ea227b89c8a32c35",
+    "all15_manifest_and5generic_helpers_recomputed_match": true,
+    "registered_workflow_equals_template": true,
+    "whole_driver16d9_unchanged": true,
+    "paired_inputs_inverse_only_helper_hash": true,
+    "admission_inverse_only_manifest_hash": true,
+    "actual_source_map_reads": [
+      {
+        "map": "consumer19",
+        "actual_local_tree_paths_verified": 18,
+        "unread_packed_subtrees": [
+          "examples/wasm"
+        ]
+      },
+      {
+        "map": "compiled37",
+        "actual_local_tree_paths_verified": 8,
+        "unread_packed_subtrees": [
+          "examples/wasm",
+          "crates/auth",
+          "crates/data_connector",
+          "crates/engine_servicer",
+          "crates/engine_zmq_adapter",
+          "crates/engine_zmq_client",
+          "crates/external_router",
+          "crates/kv_index",
+          "crates/mcp",
+          "crates/mesh",
+          "crates/mm_rdma",
+          "crates/mock_worker",
+          "crates/multimodal",
+          "crates/protocols",
+          "crates/radix_tree",
+          "crates/reasoning_parser",
+          "crates/response_template",
+          "crates/rl",
+          "crates/symphony",
+          "crates/tokenizer",
+          "crates/tool_parser",
+          "crates/wasm",
+          "crates/workflow",
+          "crates/grpc_client/Cargo.toml",
+          "crates/grpc_client/build.rs",
+          "crates/grpc_client/go",
+          "crates/grpc_client/proto",
+          "crates/grpc_client/src",
+          "crates/grpc_client/tests"
+        ]
+      }
+    ],
+    "fixed_maps_boundary": "All19/37/14 map values, producer17 policy, four archives/sixpayload/nativeb7/normal11-final3 remain exact prior5164 input data except helper hash. Four actual changedpaths lie outside consumer19 and compiled37 scopes. Parent5164 fresh C18bb independently closed fixed1473/d5 map joins; no actual engine acceptance is inherited.",
+    "nine_authority_flags": {
+      "Qwen.ready": false,
+      "Qwen.root_manual_admission": false,
+      "Qwen.run_budget_admitted": false,
+      "Qwen.artifacts_pinned": false,
+      "shared.ready": false,
+      "shared.run_budget_admitted": false,
+      "shared.artifacts_pinned": false,
+      "shared.runtime_cohort_accepted": false,
+      "shared.consumer_gpu_ready": false
+    },
+    "reservation_seconds": 0,
+    "shared_budget_admitted": false,
+    "gateway_native": {
+      "name": "smg/smg_rs.abi3.so",
+      "bytes": 143064752,
+      "sha256": "b7d5ccb1d5e4c06cf93fc9f77ad405951b9d3def7038113f5435a0d57a170fd6"
+    },
+    "source_semantic_peer_sha256": "80a625e94397657cae13a99c698380baf89862a6e40bca601444dba8e3012e55"
+  },
+  "semantics": "New exact/member signal certificates only follow actual successful kill/killpg; same-round certified group members skip duplicate per-PID signals. Original errors stay. Only post-certificate PermissionError may resolve on later actual same PID/start Z or gone. Live/unknown/wrongbirth/no certificate/non-Permission/truncated cases remain red. No change to identity/driver/model/protocol/UID995/original12/oracles/HF/JIT/config/token preparation/timings/native checks or outer exact-CID fallback.",
+  "runtime_schema": "Fresh source_parent/driver/envelope/inputs/CI_job_runner/template/manifest and all five runtime_file_hashes satisfy unchanged job_runner111-115 and innerdriver77-79 source-binding checks. Actual Git parent5164 is distinct from fixed product source_parent1473.",
+  "conditional_child_scope": "A separately root-admitted direct-b38 data child may copy this byteexact source peer to review/ci-source-peer.json only while preserving15manifest files and registered workflow. Future actual CPU8 PASS, genuine new observer source/resource/model/TTL/capacity facts and independent finite NEW2100 are not supplied by this receipt. No CPUaccepted flag or grant is bound here.",
+  "references": [
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-process-cleanup-actual-disabled-source-root-20261026.json",
+      "bytes": 2646,
+      "sha256": "e7ee5a2f04ddb36f8dceed2ae3b2941e01900b798cd96a046b426805edb341d8"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-process-cleanup-signalled-terminal-source-A-20261026/delivery.json",
+      "bytes": 2451,
+      "sha256": "feda6d3ca040c9495bb46a5e17851317e524761677196a27a7c3d7810752699c"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-process-cleanup-signalled-terminal-source-A-20261026/manifest.json",
+      "bytes": 8574,
+      "sha256": "ab83c9193e48cacabb190adcdff20c63cda7769286f4cc5d67468174c25d6ee4"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-process-cleanup-signalled-terminal-source-A-20261026/peer-source-C.json",
+      "bytes": 4942,
+      "sha256": "80a625e94397657cae13a99c698380baf89862a6e40bca601444dba8e3012e55"
+    },
+    {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-process-postread-actual-source-peer-C-20261026.json",
+      "bytes": 8121,
+      "sha256": "18bb4d7fdea13de563125fa769782342a7ed58e0183f3128d6a43f03cf3cdda8"
+    }
+  ],
+  "limits": [
+    "Actual disabled source only. Root receipt reports unpushed/undispatched; this reviewer performed no publication or runtime action.",
+    "Old actual5P1F and6P1F remain failed. New CPU8 has not executed or been accepted by this audit. No blanket transient-EACCES waiver or proof of unique old kernel cause is claimed.",
+    "No complete prepared-install/wholeAITER/nativeABI/model/original12/currentmain/GPU qualification or coverage.",
+    "Only direct local source/object/index/file/data reads and ownreceipt write. No candidate/import/test/Git tool/API/SSH/Docker/process/C-M/formal mutation."
+  ],
+  "executed": false,
+  "resource_granted": false,
+  "runtime_accepted": false,
+  "coverage_increment": 0
+}
