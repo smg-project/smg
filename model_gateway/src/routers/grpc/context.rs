@@ -1583,18 +1583,9 @@ impl ExecutionResult {
     }
 
     /// Every stream of the result under the request's `deadline` (see
-    /// [`ProtoStream::with_deadline`]): the one worker's, both sides of a
+    /// [`ProtoStream::apply_deadline`]), in place: the one worker's, both sides of a
     /// disaggregated pair, each result of a batch. An embedding is one
     /// answer, already in hand.
-    #[must_use]
-    pub(crate) fn with_deadline(mut self, deadline: RequestDeadline) -> Self {
-        self.apply_deadline(deadline);
-        self
-    }
-
-    /// [`Self::with_deadline`] in place: the streams are bounded where they
-    /// are (a decode side through its box, a batch's results in their
-    /// vector), nothing is rebuilt.
     pub(crate) fn apply_deadline(&mut self, deadline: RequestDeadline) {
         match self {
             Self::Single { stream } => stream.apply_deadline(deadline),

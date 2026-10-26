@@ -425,11 +425,11 @@ pub(crate) async fn execute_plan(
         }
     };
     // The same deadline bounds every stream the dispatch opened (see
-    // `ProtoStream::with_deadline`).
-    let result = match deadline {
-        Some(deadline) => result.with_deadline(deadline),
-        None => result,
-    };
+    // `ProtoStream::apply_deadline`).
+    let mut result = result;
+    if let Some(deadline) = deadline {
+        result.apply_deadline(deadline);
+    }
     if let Some(guards) = ctx.load_guards.take() {
         ctx.load_guards = Some(LoadGuards::traced(span, guards));
     }

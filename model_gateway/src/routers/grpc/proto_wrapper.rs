@@ -2050,20 +2050,12 @@ impl ProtoStream {
     /// counted from the dispatch): polled at or past it, the transport stream
     /// ends with the deadline's status and is released as a dropped one is,
     /// so its abort reaches the engine at once (see
-    /// [`smg_grpc_client::AbortOnDropStream::with_deadline`]). Every wrapper
-    /// hands the deadline down to the transport stream(s) under it; a fan-out
-    /// bounds each child. The ZMQ wire's stream has no deadline hook and is
-    /// left as it is.
-    #[must_use]
-    pub fn with_deadline(mut self, deadline: RequestDeadline) -> Self {
-        self.apply_deadline(deadline);
-        self
-    }
-
-    /// [`Self::with_deadline`] in place: the wrappers (a tracked stream, a
-    /// decode side, a pulled-ahead item, a watched stream, a fan-out) reach
-    /// the transport stream(s) under them through their existing boxes, so a
-    /// deadline costs no allocation on the request.
+    /// [`smg_grpc_client::AbortOnDropStream::set_deadline`]). The wrappers (a
+    /// tracked stream, a decode side, a pulled-ahead item, a watched stream, a
+    /// fan-out) reach the transport stream(s) under them through their
+    /// existing boxes, so a deadline costs no allocation on the request; a
+    /// fan-out bounds each child. The ZMQ wire's stream has no deadline hook
+    /// and is left as it is.
     pub fn apply_deadline(&mut self, deadline: RequestDeadline) {
         match self {
             Self::Sglang(stream) => stream.set_deadline(deadline),
