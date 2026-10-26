@@ -14,7 +14,7 @@
   "root_budget_receipt_sha256": null,
   "new_CI_peer_path": null,
   "new_CI_peer_sha256": null,
-  "source_manifest_sha256": "4c3134f3ece7632fbc4de3fbe23e979affecf63aa634d77609a74ff6d9ceadae",
+  "source_manifest_sha256": "ef6f3ee2de952f1228213f47bcaade46bd5307182dafb167cf496cf95c1879c3",
   "nodes": {
     "amd-mi300x-1": {
       "GPU_index": "0",

@@ -43,7 +43,13 @@ def validate(value):
     for name, item in declared.items():
         path = snapshot / name
         resolved = path.resolve(strict=True)
-        assert resolved.is_relative_to(snapshot.parent.parent.resolve()) and resolved.is_file() and resolved.stat().st_size == item["bytes"]
+        assert str(resolved) == item["resolved_path"]
+        repository = snapshot.parent.parent.resolve()
+        shared_blobs = repository.parent / "blobs"
+        content_addressed = bool(re.fullmatch("[a-f0-9]{64}", resolved.name))
+        shared_blob = content_addressed and resolved.parent == shared_blobs / resolved.name[:2]
+        assert resolved.is_relative_to(repository) or shared_blob
+        assert resolved.is_file() and resolved.stat().st_size == item["bytes"]
         with resolved.open("rb") as stream:
             raw = stream.read(8)
             assert len(raw) == 8
