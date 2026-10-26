@@ -5,12 +5,7 @@
 //! a fetch that runs out of its budget.
 #![allow(clippy::expect_used)]
 
-use std::{
-    io::{Read, Write},
-    net::TcpListener,
-    thread,
-    time::Duration,
-};
+use std::{io::Write, net::TcpListener, thread, time::Duration};
 
 use llm_multimodal::{
     ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaFault, MediaSource,
@@ -33,18 +28,7 @@ fn serve_once(
     let port = listener.local_addr().expect("local addr").port();
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
-        let mut head = Vec::new();
-        let mut buf = [0u8; 4096];
-        loop {
-            let read = stream.read(&mut buf).unwrap_or(0);
-            if read == 0 {
-                break;
-            }
-            head.extend_from_slice(&buf[..read]);
-            if head.windows(4).any(|window| window == b"\r\n\r\n") {
-                break;
-            }
-        }
+        common::read_head(&mut stream);
         thread::sleep(header_delay);
         let headers = format!(
             "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {declared}\r\n\
