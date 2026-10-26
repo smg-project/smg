@@ -477,6 +477,17 @@ mod tests {
         )
     }
 
+    /// A fresh inventory holding `tool1` of `server1`.
+    fn inventory_with_tool1() -> ToolInventory {
+        let inventory = ToolInventory::new();
+        inventory.insert_tool(
+            "tool1".to_string(),
+            "server1".to_string(),
+            create_test_tool("tool1"),
+        );
+        inventory
+    }
+
     // Helper to create a test prompt
     fn create_test_prompt(name: &str) -> Prompt {
         Prompt::new(name, Some(format!("Test prompt: {name}")), None)
@@ -518,13 +529,7 @@ mod tests {
 
     #[test]
     fn test_list_tools() {
-        let inventory = ToolInventory::new();
-
-        inventory.insert_tool(
-            "tool1".to_string(),
-            "server1".to_string(),
-            create_test_tool("tool1"),
-        );
+        let inventory = inventory_with_tool1();
         inventory.insert_tool(
             "tool2".to_string(),
             "server1".to_string(),
@@ -542,13 +547,7 @@ mod tests {
 
     #[test]
     fn test_clear_server_tools() {
-        let inventory = ToolInventory::new();
-
-        inventory.insert_tool(
-            "tool1".to_string(),
-            "server1".to_string(),
-            create_test_tool("tool1"),
-        );
+        let inventory = inventory_with_tool1();
         inventory.insert_tool(
             "tool2".to_string(),
             "server2".to_string(),
@@ -639,13 +638,7 @@ mod tests {
 
     #[test]
     fn test_clear_all() {
-        let inventory = ToolInventory::new();
-
-        inventory.insert_tool(
-            "tool1".to_string(),
-            "server1".to_string(),
-            create_test_tool("tool1"),
-        );
+        let inventory = inventory_with_tool1();
         inventory.insert_prompt(
             "prompt1".to_string(),
             "server1".to_string(),
@@ -805,13 +798,7 @@ mod tests {
 
     #[test]
     fn test_list_tools_qualified() {
-        let inventory = ToolInventory::new();
-
-        inventory.insert_tool(
-            "tool1".to_string(),
-            "server1".to_string(),
-            create_test_tool("tool1"),
-        );
+        let inventory = inventory_with_tool1();
         inventory.insert_tool(
             "tool2".to_string(),
             "server2".to_string(),
@@ -837,13 +824,7 @@ mod tests {
 
     #[test]
     fn test_unique_tool_name_count() {
-        let inventory = ToolInventory::new();
-
-        inventory.insert_tool(
-            "tool1".to_string(),
-            "server1".to_string(),
-            create_test_tool("tool1"),
-        );
+        let inventory = inventory_with_tool1();
         inventory.insert_tool(
             "tool1".to_string(),
             "server2".to_string(),
@@ -975,13 +956,7 @@ mod tests {
 
     #[test]
     fn test_index_counts() {
-        let inventory = ToolInventory::new();
-
-        inventory.insert_tool(
-            "tool1".to_string(),
-            "server1".to_string(),
-            create_test_tool("tool1"),
-        );
+        let inventory = inventory_with_tool1();
         inventory.register_alias(
             "alias1".to_string(),
             QualifiedToolName::new("server1", "tool1"),
@@ -1016,13 +991,7 @@ mod tests {
 
     #[test]
     fn test_clear_server_removes_aliases_to_server() {
-        let inventory = ToolInventory::new();
-
-        inventory.insert_tool(
-            "tool1".to_string(),
-            "server1".to_string(),
-            create_test_tool("tool1"),
-        );
+        let inventory = inventory_with_tool1();
 
         inventory.register_alias(
             "alias1".to_string(),
