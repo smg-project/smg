@@ -9,10 +9,12 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tarfile
 import time
+import traceback
 
 import ci_identity
 import model_identity
@@ -33,6 +35,39 @@ def stamp():
 
 def save(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
+
+
+def active_drm_devices(topology, proof):
+    """Match active KFD GPUs to their real DRM character devices."""
+    proof.update({"visible_render_entries": sum(1 for _ in Path("/dev/dri").glob("renderD*")),
+                  "topology": topology, "devices": []})
+    assert len(topology) == len({row["node"] for row in topology}) == len({row["gpu_id"] for row in topology}) == 8
+    paths = [Path("/dev/kfd")]
+    for row in topology:
+        assert row["node"].isdigit()
+        node = Path("/sys/class/kfd/kfd/topology/nodes") / row["node"]
+        assert int((node / "gpu_id").read_text()) == row["gpu_id"]
+        props = dict(line.split(None, 1) for line in (node / "properties").read_text().splitlines() if line.strip())
+        assert int(props["gfx_target_version"]) == row["gfx_target_version"] == 90402
+        minor = int(props["drm_render_minor"])
+        assert minor >= 0
+        path = Path("/dev/dri") / ("renderD" + str(minor))
+        proof["checking_path"] = str(path)
+        info = path.stat()
+        device = (os.major(info.st_rdev), os.minor(info.st_rdev))
+        sysfs = tuple(int(v) for v in (Path("/sys/class/drm") / path.name / "dev").read_text().strip().split(":"))
+        proof["devices"].append({"node": row["node"], "gpu_id": row["gpu_id"],
+                                 "path": str(path), "drm_render_minor": minor,
+                                 "character": stat.S_ISCHR(info.st_mode),
+                                 "device": list(device), "sysfs_device": list(sysfs), "gid": info.st_gid})
+        assert stat.S_ISCHR(info.st_mode) and device == sysfs and device[1] == minor
+        paths.append(path)
+    assert len({path.name for path in paths}) == 9
+    proof["checking_path"] = str(paths[0])
+    info = paths[0].stat()
+    proof["kfd"] = {"path": str(paths[0]), "character": stat.S_ISCHR(info.st_mode), "gid": info.st_gid}
+    assert stat.S_ISCHR(info.st_mode)
+    return paths
 
 
 def main():
@@ -126,15 +161,19 @@ def main():
 
     previous = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGALRM)}
     signal.setitimer(signal.ITIMER_REAL, max(0.001, origin + 1920 - time.monotonic()))
+    execution_stage = "precreate_identity_and_model_metadata"
     try:
         assert not command(["docker", "ps", "-q"]).stdout.splitlines(), "preserve every foreign/ordinary container"
-        save(evidence / "KFD-before-create.json", ci_identity.check_kfd(admission, socket.gethostname()))
+        kfd_before = ci_identity.check_kfd(admission, socket.gethostname())
+        save(evidence / "KFD-before-create.json", kfd_before)
         node = admission["nodes"][socket.gethostname()]
         assert node["GPU_index"] == "0", "this minimal carrier admits only the one root-checked GPU0"
         model = model_identity.validate(node["model"])
+        execution_stage = "image_identity"
         image = json.loads(command(["docker", "image", "inspect", state["image"]]).stdout)[0]
         assert "lmsysorg/sglang@" + state["image"].split("@", 1)[1] in image["RepoDigests"]
         state["actual_image_id"] = image["Id"]
+        execution_stage = "source_archive_extract"
         workspace = stage / "source"
         workspace.mkdir(mode=0o755)
         tarpath = stage / "source.tar"
@@ -156,6 +195,7 @@ def main():
                     assert member.isfile()
                     target.write_bytes(archive.extractfile(member).read())
                     target.chmod(member.mode & 0o777)
+        execution_stage = "source_archive_symlink_containment"
         for path, target in links:
             assert not Path(target).is_absolute() and (path.parent / target).resolve().is_relative_to(workspace)
             path.symlink_to(target)
@@ -172,8 +212,10 @@ def main():
             "--device=/dev/kfd", "--device=/dev/dri", "--group-add=video", "--ipc=private", "--shm-size=32g",
             "--network=bridge", "--cpus=8", "--memory=96g", "--pids-limit=1024", "--ulimit", "memlock=-1:-1",
             "--user", str(os.getuid()) + ":" + str(os.getgid()), "--workdir=/source"]
-        device_paths = [Path("/dev/kfd"), *Path("/dev/dri").glob("renderD*")]
-        assert 1 < len(device_paths) <= 33 and all(path.is_char_device() for path in device_paths)
+        execution_stage = "active_KFD_DRM_character_device_guard"
+        result["device_guard"] = {}
+        device_paths = active_drm_devices(kfd_before["topology"], result["device_guard"])
+        save(evidence / "active-DRM-before-create.json", result["device_guard"])
         for group in sorted({path.stat().st_gid for path in device_paths}):
             argv += ["--group-add", str(group)]
         for key, value in env.items():
@@ -181,6 +223,7 @@ def main():
         for host, target, readonly in ((ROOT, "/checkout", True), (workspace, "/source", False), (evidence, "/evidence", False), (Path("/models"), "/models", True)):
             argv += ["--mount", "type=bind,src=" + str(host) + ",dst=" + target + (",readonly" if readonly else "")]
         argv += [state["image"], "/bin/sleep", "infinity"]
+        execution_stage = "container_create_and_following_execution"
         state["create_attempted"] = True
         save(stage / "state.json", state)
         cid = command(argv).stdout.decode().strip()
@@ -261,7 +304,8 @@ def main():
         result["envelope"] = envelope
         result["passed"] = code == 0 and envelope["passed"] is True and not result.get("outer_work_deadline_reached", False)
     except BaseException as error:
-        result["error"] = {"type": type(error).__name__, "message": str(error)[:2000]}
+        result["error"] = {"type": type(error).__name__, "message": str(error)[:2000],
+                           "stage": execution_stage, "traceback": traceback.format_exc(limit=12)[-8192:]}
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         try:
