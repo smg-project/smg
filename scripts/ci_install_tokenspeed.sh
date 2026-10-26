@@ -158,6 +158,13 @@ PY
     fi
     python3 -c "from importlib import metadata; \
         print('Installed tokenspeed-scheduler==' + metadata.version('tokenspeed-scheduler'))"
+    # Since the engine's ranks moved onto its Rust control plane, each rank is
+    # the ``ts-host`` binary of the ``tokenspeed-engine`` package the nightly
+    # requires. Prove it is installed and executable here, where the install
+    # is cheap to read, not at the first engine start twenty minutes later.
+    python3 -c "import os, tokenspeed_engine; path = tokenspeed_engine.host_binary(); \
+        assert os.access(path, os.X_OK), f'ts-host is not executable: {path}'; \
+        print(f'Installed tokenspeed-engine ts-host: {path}')"
     $RETRY 3 10 python3 "${SCRIPT_DIR}/ci_install_flashinfer.py"
 }
 
@@ -234,8 +241,13 @@ print('quack version   ->', getattr(quack, '__version__', '?'))
 
 # ── Verification ──────────────────────────────────────────────────────────
 echo "=== TokenSpeed verification ==="
-python3 -c "from tokenspeed.runtime.engine.async_llm import AsyncLLM; \
-    print('AsyncLLM bases:', [b.__name__ for b in AsyncLLM.__bases__])"
+# The engine's ranks run on its Rust control plane behind a headless
+# launcher; the Rust gRPC servicer starts them through it. The in-process
+# Python frontend (AsyncLLM) is gone from the engine, so nothing imports it.
+python3 -c "from tokenspeed.runtime.entrypoints.engine import launch_scheduler_headless; \
+    print('headless launcher: importable')"
+python3 -c "from smg_grpc_servicer.tokenspeed import serve_rust; \
+    print('Rust gRPC servicer: importable')"
 python3 -c "from smg_grpc_servicer.tokenspeed.servicer import TokenSpeedSchedulerServicer; \
     print('gRPC servicer: importable')"
 python3 -c "from smg_grpc_servicer.tokenspeed.encoder_servicer import _lazy_encode_request; \

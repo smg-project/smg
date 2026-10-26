@@ -1247,6 +1247,9 @@ jobs:
             test_timeout: 26
             test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py e2e_test/router/test_loads.py
             min_selected: 114 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
+            # The pinned engine runs on its Rust control plane and carries no
+            # in-process Python frontend, so its workers run the Rust servicer.
+            servicer_impl: rust
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -1257,6 +1260,7 @@ jobs:
       test_dirs: ${{ matrix.test_dirs || 'e2e_test/chat_completions' }}
       min_selected: ${{ matrix.min_selected }}
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
+      servicer_impl: ${{ matrix.servicer_impl || '' }}
       servicer_unit_tests: ${{ matrix.engine == 'vllm' }}
       enabled: ${{ matrix.engine == 'sglang' || needs.detect-changes.outputs.skip-chat-completions != 'true' }}
     secrets: inherit
@@ -1374,15 +1378,9 @@ jobs:
             timeout: 32
             test_timeout: 24
             min_selected: 202 # the vllm chat row's floor: the same selection
-          # The TokenSpeed chat suite on the Rust servicer: the suite, floor
-          # and budgets of e2e-1gpu-chat's tokenspeed row (its prebuilt engine
-          # image, or the source build on a cold path, hence the budget), so
-          # the two rows differ by the servicer only. The admin-op and loads
-          # cases of that row stay on the Python servicer's row.
-          - engine: tokenspeed
-            timeout: 56
-            test_timeout: 26
-            min_selected: 114 # the tokenspeed chat row's floor: the same selection
+          # No tokenspeed row: e2e-1gpu-chat's tokenspeed row runs the Rust
+          # servicer itself (the pinned engine has no Python frontend), so a
+          # second row here would repeat it.
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -1694,6 +1692,7 @@ jobs:
             timeout: 75
             test_timeout: 50
             min_selected: 10 # floor ≈ 95% of the 11 gRPC PD cases marked for tokenspeed
+            servicer_impl: rust # the pinned engine has no Python frontend
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -1704,6 +1703,7 @@ jobs:
       test_dirs: e2e_test/router
       vllm_kv_backend: ${{ matrix.kv_backend || 'nixl' }}
       min_selected: ${{ matrix.min_selected }}
+      servicer_impl: ${{ matrix.servicer_impl || '' }}
       extra_models: ${{ matrix.engine == 'tokenspeed' && 'Qwen/Qwen3.5-9B' || '' }}
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
     secrets: inherit
@@ -1807,6 +1807,7 @@ jobs:
       extra_models: "Qwen/Qwen3.5-9B"
       min_selected: 6 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
       tokenspeed_prebuilt_image: ${{ needs.detect-changes.outputs.tokenspeed-image }}
+      servicer_impl: rust # the pinned engine has no Python frontend
     secrets: inherit
 
   # PD disaggregation under one 4-GPU topology (2 prefill + 2 decode) plus a
@@ -1837,6 +1838,7 @@ jobs:
           - engine: tokenspeed
             timeout: 85
             test_timeout: 60
+            servicer_impl: rust # the pinned engine has no Python frontend
           # The other KV transport of each engine (TokenSpeed only has
           # Mooncake): the same slice on vLLM over Mooncake, and a 1p1d
           # smoke of SGLang over NIXL (its venv gets NIXL only on this row,
@@ -1876,6 +1878,7 @@ jobs:
       # The mixed-transport fleet needs both vLLM backends installed whatever the lane's own
       vllm_extra_kv_backends: ${{ matrix.engine == 'vllm' && 'mooncake' || '' }}
       tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
+      servicer_impl: ${{ matrix.servicer_impl || '' }}
     secrets: inherit
 
   # --- CPU E2E: the classes on the scripted mock worker ---

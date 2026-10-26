@@ -301,11 +301,11 @@ def test_sglang_zmq_lane_runs_multimodal_and_keeps_http_error_shapes_off_the_wir
     assert kept == [mm, text] and deselected == [shape]
 
 
-def test_tokenspeed_rust_lane_keeps_prefill_decode_and_drops_encode_and_admin_ops():
-    """The TokenSpeed Rust servicer serves the prefill/decode topologies and
-    refuses the encode role: a Rust lane keeps the PD cases, drops the
-    encode-prefill-decode ones, the admin operations the wire has no control
-    message for, and a fleet of plain workers."""
+def test_tokenspeed_rust_lane_drops_only_unserved_wires_and_plain_fleets():
+    """The TokenSpeed Rust servicer serves what the engine's handshake declares
+    (control messages, the encode role, the logprob columns): a Rust lane keeps
+    the PD and EPD cases and the admin operations, and drops a fleet of plain
+    workers and a wire it does not serve."""
     workers = lambda **kwargs: SimpleNamespace(kwargs=kwargs)  # noqa: E731
     pd = _FakeItem(
         "router/test_pd_topologies.py::T::t[1p1d]", params={"setup_backend": ("pd_grpc", (1, 1))}
@@ -324,13 +324,14 @@ def test_tokenspeed_rust_lane_keeps_prefill_decode_and_drops_encode_and_admin_op
     kept, deselected = hooks._filter_tokenspeed_rust_items(
         [pd, pd_workers, epd, admin, fleet, plain, other]
     )
-    assert [item.nodeid for item in kept] == [pd.nodeid, pd_workers.nodeid, plain.nodeid]
-    assert [item.nodeid for item in deselected] == [
+    assert [item.nodeid for item in kept] == [
+        pd.nodeid,
+        pd_workers.nodeid,
         epd.nodeid,
         admin.nodeid,
-        fleet.nodeid,
-        other.nodeid,
+        plain.nodeid,
     ]
+    assert [item.nodeid for item in deselected] == [fleet.nodeid, other.nodeid]
 
 
 def test_sglang_rust_lane_drops_only_what_the_msgpack_wire_lacks():
@@ -389,8 +390,11 @@ def _rust_lane_items(runtime: str):
     """One case the Rust path serves and one it does not, for ``runtime``."""
     plain = _FakeItem(f"{runtime}/test_basic.py::test_chat[grpc]", params={"setup_backend": "grpc"})
     if runtime == "tokenspeed":
+        # The engine declares control, encode and logprobs on its handshake;
+        # what the lane still drops is a fleet of plain workers.
         refused = _FakeItem(
-            "router/test_admin_ops.py::test_flush", params={"setup_backend": "grpc"}
+            "router/test_loads.py::test_fleet",
+            markers={"workers": SimpleNamespace(kwargs={"count": 2})},
         )
     else:
         refused = _FakeItem(
