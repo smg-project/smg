@@ -185,6 +185,27 @@ pub(crate) const COLD_PREFILL_TOKENS_PER_SEC: u64 = 10_000;
 /// one request's time to first token (which includes its wait in the batch).
 const PREFILL_WINDOW_MS: u64 = 1_000;
 
+/// The busy time the busy-time average behind the prefill rate holds (see
+/// [`PrefillBook`]): past it, the average's tokens and busy time are scaled
+/// back to it together, so older windows weigh less as the engine works on.
+/// Long enough to hold the prefill of prompts answered together (long
+/// prompts prefilled side by side for many seconds; the longer their
+/// prefill against the span, the further their answers lift the average
+/// above the engine's throughput), short enough that a slow spell (a kernel
+/// the engine built) fades within a minute or two of busy time.
+///
+/// That fade is the price of the cap, on every worker whose prefill is
+/// timed and in every rule that reads its rate (the pile rule's bound, the
+/// engine-reported allowance, the PD sides' bounds): after a slow spell the
+/// rate climbs back at the average's pace, not the halved sample's, in
+/// about 50 s of busy time from half the engine's throughput to within a
+/// tenth of it, where the halved sample took three windows. Counted in busy
+/// time, the climb is longer on the clock on a lightly loaded worker (over
+/// three minutes, busy a quarter of the time). Meanwhile those bounds give
+/// the engine more time than it needs, never past their 120 s cap: patience,
+/// where an overestimate fails healthy requests.
+const PREFILL_AVERAGE_SPAN_MS: u64 = 30_000;
+
 /// The prefill books of one worker: what is pending, how long the engine
 /// has been prefilling, and the rate window. One struct under one lock, so
 /// that a request's end racing another's start cannot lose the busy
@@ -199,6 +220,31 @@ const PREFILL_WINDOW_MS: u64 = 1_000;
 /// first token that completes it, whether or not the pending count ever
 /// touches zero: a worker that is never idle still updates its rate at
 /// every first token past a second of prefill.
+///
+/// Each window's sample halves into the estimate, which never exceeds the
+/// busy-time average: the tokens of the windows that made samples over
+/// their busy time, scaled back together to [`PREFILL_AVERAGE_SPAN_MS`] of
+/// it once they hold more. A window counts the first tokens that came back
+/// in it, and their prompts may have been prefilled in the windows before:
+/// prompts answered together (a batch the engine finishes at once, long
+/// prompts prefilled side by side) leave the windows that timed their
+/// prefill short of their tokens and put them in the window they come back
+/// in, a second or so long. Halved into the estimate, that window's sample
+/// put it at several times the engine's throughput (over four times, for
+/// two 90k prompts answered together after 10 s beside a 2k prompt a
+/// second), and every bound read from it short of the prefill it allows
+/// for: a prefill side's request failed while the engine was still
+/// prefilling. The average divides those tokens by the busy time that held
+/// their prefill, as far as it still holds that time: until the book has
+/// held the span, it never exceeds the engine's throughput. Once older
+/// windows are scaled back, a prefill's busy time weighs less than the
+/// tokens it comes back with, and the average reads above the throughput
+/// by a margin that grows with the prefill's length against the span. On a
+/// book that has held the span: 4% for the pair above, a quarter for two
+/// 245k prompts prefilled side by side for 27 s, over four fifths for four
+/// of them (55 s), where the halved sample read the same shapes at 4.6 to
+/// 24.6 times. An engine that slows down still pulls the estimate down at
+/// its next sample.
 ///
 /// Only the prompts whose first token the gateway will see (streaming
 /// generations) are timed. A non-streaming generation answers once, at its
@@ -219,8 +265,8 @@ const PREFILL_WINDOW_MS: u64 = 1_000;
 /// counts a pending prompt at full length, since its hit is known only
 /// when the engine answers; and the time to first token of a mostly cached
 /// prompt is the engine's step latency more than prefill, so a worker fed
-/// mostly hits learns a rate below its cold one. An underestimate is
-/// halved away by the next cold first token; an overestimate vetoes a
+/// mostly hits learns a rate below its cold one. An underestimate gives
+/// way as the engine prefills cold prompts; an overestimate vetoes a
 /// healthy worker, and nothing corrects it.
 #[derive(Debug, Default)]
 struct PrefillBook {
@@ -232,8 +278,13 @@ struct PrefillBook {
     /// first token the gateway will see.
     timed: u64,
     /// Observed prefill rate in tokens per second; zero until a window of
-    /// first tokens has been seen.
+    /// first tokens has been seen. Never above the busy-time average.
     rate_tps: u64,
+    /// The busy-time average: the tokens of the windows that made samples
+    /// and their busy time, scaled back together to
+    /// [`PREFILL_AVERAGE_SPAN_MS`] of busy time once they hold more.
+    average_tokens: u64,
+    average_busy_ms: u64,
     /// Gateway clock at which the timed tokens left zero; `None` while
     /// none is pending.
     busy_since_ms: Option<u64>,
@@ -337,9 +388,10 @@ impl PrefillBook {
     /// Fold `tokens` computed for a prompt whose first token came back at
     /// `now_ms` into the observed rate: once the window holds
     /// [`PREFILL_WINDOW_MS`] of busy time its tokens over that time are a
-    /// sample, and each sample halves into the running estimate. A window
-    /// in which the engine computed nothing (every prompt a whole cache
-    /// hit) makes no sample.
+    /// sample, and each sample halves into the running estimate, held at
+    /// the busy-time average (see [`Self::average_with`]). A window in
+    /// which the engine computed nothing (every prompt a whole cache hit)
+    /// makes no sample.
     fn observe(&mut self, tokens: u64, now_ms: u64) {
         self.window_tokens = self.window_tokens.saturating_add(tokens);
         let span_ms = self.window_span_ms(now_ms);
@@ -348,12 +400,13 @@ impl PrefillBook {
         }
         if self.window_tokens > 0 {
             let sample = self.window_tokens.saturating_mul(1000) / span_ms;
-            self.rate_tps = if self.rate_tps == 0 {
+            let estimate = if self.rate_tps == 0 {
                 sample
             } else {
                 self.rate_tps.midpoint(sample)
-            }
-            .max(1);
+            };
+            let average = self.average_with(self.window_tokens, span_ms);
+            self.rate_tps = estimate.min(average).max(1);
         }
         self.window_busy_ms = 0;
         self.window_tokens = 0;
@@ -361,6 +414,23 @@ impl PrefillBook {
             // Still prefilling: the next window's busy time starts here.
             self.busy_since_ms = Some(now_ms);
         }
+    }
+
+    /// Add a window of `tokens` over `busy_ms` (at least
+    /// [`PREFILL_WINDOW_MS`]) to the busy-time average and return the
+    /// average in tokens per second. Past [`PREFILL_AVERAGE_SPAN_MS`] of
+    /// busy time both sums are then scaled back to it together: the
+    /// average stands, and the windows to come weigh more against it.
+    fn average_with(&mut self, tokens: u64, busy_ms: u64) -> u64 {
+        self.average_tokens = self.average_tokens.saturating_add(tokens);
+        self.average_busy_ms = self.average_busy_ms.saturating_add(busy_ms);
+        let average = self.average_tokens.saturating_mul(1000) / self.average_busy_ms;
+        if self.average_busy_ms > PREFILL_AVERAGE_SPAN_MS {
+            self.average_tokens =
+                self.average_tokens.saturating_mul(PREFILL_AVERAGE_SPAN_MS) / self.average_busy_ms;
+            self.average_busy_ms = PREFILL_AVERAGE_SPAN_MS;
+        }
+        average
     }
 
     /// The time to prefill what is pending plus `extra` tokens at the
@@ -1469,6 +1539,133 @@ mod tests {
         );
         // Two prompts pending (1,000 tokens): a bound well under a second.
         assert!(runtime.prefill_backlog() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn first_tokens_that_come_back_together_never_raise_the_rate_past_the_busy_time_average() {
+        // An engine that prefills 20k tokens per second of busy time, whose
+        // first tokens come back bunched: the windows that timed a bunch's
+        // prefill hold few of its tokens, and the window it comes back in
+        // holds the rest over a second or so. Halved into the estimate,
+        // that window's sample put it at over four times the engine's
+        // throughput (92k and 81k tokens/s in the two shapes below), and a
+        // 90k prompt then had an ETA of a second for the 4.5 s it takes.
+        // However they bunch, the answers are never more than the engine
+        // prefilled in the busy time behind them, and on a book that has not
+        // held the span yet, as in both shapes here, neither is the estimate.
+        const RATE: u64 = 20_000;
+        let answer = |runtime: &WorkerRuntime, tokens: u64, at: u64| {
+            runtime.note_prefill_ended_at(tokens, true, Some(0), at);
+            let rate = runtime.prefill_rate_tps();
+            assert!(rate <= RATE, "{rate} tokens/s at {at} ms, over {RATE}");
+        };
+        // Two 90k prompts prefilled side by side for 10 s beside a 2k prompt
+        // dispatched every second and answered 100 ms later (18k of the long
+        // ones and the short one per second), the long ones answered
+        // together at 11 s; then the short ones alone.
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        runtime.note_prefill_started_at(90_000, true, 1_000);
+        runtime.note_prefill_started_at(90_000, true, 1_000);
+        for second in 0..30 {
+            let at = 1_000 + second * 1_000;
+            if at == 11_000 {
+                answer(&runtime, 90_000, at);
+                answer(&runtime, 90_000, at);
+            }
+            runtime.note_prefill_started_at(2_000, true, at);
+            answer(&runtime, 2_000, at + 100);
+        }
+        assert_eq!(runtime.prefill_rate_tps(), RATE);
+        assert_eq!(
+            runtime.prefill_eta(90_000),
+            Duration::from_millis(4_500),
+            "the prefill a 90k prompt takes"
+        );
+        // A batch of eight 20k prompts the engine finishes at once, 8 s
+        // after their dispatch, then a 2k prompt every second.
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        for _ in 0..8 {
+            runtime.note_prefill_started_at(20_000, true, 1_000);
+        }
+        for _ in 0..8 {
+            answer(&runtime, 20_000, 9_000);
+        }
+        for second in 0..20 {
+            let at = 9_000 + second * 1_000;
+            runtime.note_prefill_started_at(2_000, true, at);
+            answer(&runtime, 2_000, at + 100);
+        }
+        assert_eq!(runtime.prefill_rate_tps(), RATE);
+    }
+
+    /// A worker whose engine has prefilled a 2k prompt a second, each
+    /// answered 100 ms after its dispatch (20k tokens per second of busy
+    /// time), for 40 s of busy time: a book that has held the span. Returned
+    /// with the clock of its next second.
+    fn warmed_at_20k_tokens_per_sec() -> (WorkerRuntime, u64) {
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        let mut at = 1_000;
+        for _ in 0..400 {
+            runtime.note_prefill_started_at(2_000, true, at);
+            runtime.note_prefill_ended_at(2_000, true, Some(0), at + 100);
+            at += 1_000;
+        }
+        assert_eq!(runtime.prefill_rate_tps(), 20_000);
+        (runtime, at)
+    }
+
+    #[test]
+    fn a_pair_answered_together_after_a_warm_spell_lifts_the_rate_less_than_five_percent() {
+        // The pair of 90k prompts above, prefilled side by side for 10 s
+        // beside a 2k prompt a second, on a worker that has prefilled at the
+        // same 20k tokens per second for longer than the span: each window of
+        // the pair's prefill scales back the windows before it, the pair's
+        // earlier ones among them, while the pair's tokens come back at full
+        // weight. The estimate reads above the engine's throughput (20,775
+        // tokens/s here, 3.9% over), within 5% of it for a prefill a third of
+        // the span long; longer ones read further above (see `PrefillBook`),
+        // all far below the 92k the halved sample read.
+        const RATE: u64 = 20_000;
+        let (runtime, start) = warmed_at_20k_tokens_per_sec();
+        runtime.note_prefill_started_at(90_000, true, start);
+        runtime.note_prefill_started_at(90_000, true, start);
+        for second in 0..30 {
+            let at = start + second * 1_000;
+            if second == 10 {
+                runtime.note_prefill_ended_at(90_000, true, Some(0), at);
+                runtime.note_prefill_ended_at(90_000, true, Some(0), at);
+            }
+            runtime.note_prefill_started_at(2_000, true, at);
+            runtime.note_prefill_ended_at(2_000, true, Some(0), at + 100);
+            let rate = runtime.prefill_rate_tps();
+            assert!(
+                rate <= RATE * 105 / 100,
+                "{rate} tokens/s {second} s into the pair: over 5% above {RATE}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_engine_that_slows_down_pulls_the_rate_down_at_its_next_sample() {
+        // The average caps the estimate and never holds it up: a worker at
+        // 20k tokens per second whose engine slows to half that (its 2k
+        // prompts answered 200 ms after their dispatch) has each sample
+        // halved into the estimate at once, as before, while the average,
+        // still holding the span at the old pace, stands above it.
+        let (runtime, mut at) = warmed_at_20k_tokens_per_sec();
+        for rate in [15_000, 12_500, 11_250] {
+            // Five such prompts are a window: 10k tokens over 1 s of busy time.
+            for _ in 0..5 {
+                runtime.note_prefill_started_at(2_000, true, at);
+                runtime.note_prefill_ended_at(2_000, true, Some(0), at + 200);
+                at += 1_000;
+            }
+            assert_eq!(
+                runtime.prefill_rate_tps(),
+                rate,
+                "halfway to the 10k sample at each window"
+            );
+        }
     }
 
     #[test]
