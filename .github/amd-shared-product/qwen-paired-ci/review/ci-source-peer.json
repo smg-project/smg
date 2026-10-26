@@ -1,0 +1,107 @@
+{
+  "result": "PASS_SOURCE_ONLY",
+  "findings": [],
+  "source_parent": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
+  "actual_head": "909aff75832550918f2ab8b6fd07eb5e234cd442",
+  "driver_sha256": "b902e63bd0bda5701a54f114341151475d2783c8bc9b65a596e94f468d0a81ea",
+  "envelope_sha256": "06589cd12a0547a4e1d5547f8e24afb6c849ec8e95854d997b73bf1180d1ccfd",
+  "inputs_sha256": "9dc08aca6b5a1e9ea0cabe0bad9d589cb5c1fee8706e3a62cb1cc394c01733ec",
+  "CI_job_runner_sha256": "9455e2ff912affa1ca1750bcd243f395c3a0dfe86744826054b7cfe41be1e89a",
+  "workflow_template_sha256": "aa77da40cedaa56aa6d4f02a2ec0f63c5f4cddabd781ba38adc2bacdfada2564",
+  "CI_source_manifest_sha256": "dcf15ec5b0783ef140effeda7968f34baa3a86f5b6e06732d936b25e90086eca",
+  "reviewer": "/root/mc4_actual_independent/getfix_checkpoint_refs",
+  "at_utc": "2026-10-26T18:47:16.673534+00:00",
+  "scope": "Actual disabled9path source integration and compatibleCI-source-peer schema only. No grant/runtime/native/model/GPU acceptance.",
+  "actual_source_receipt": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-renewed-consumer-actual-source-root-4819449cde694bddb472b8849d3bc23f/result.json",
+    "sha256": "d5004792631da1f99fd5096b6ebedf918494ff4c341796f7ecd35e2c9456089b",
+    "bytes": 8117
+  },
+  "proposal_source_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-d5-renewed-copy-consumer-defaultoff-source-A-20261026/peer-source-independent-C.json",
+    "sha256": "ca62c02bfbb25f4284332cfb4f15387f6f4e130e227dff828aa01f3f151d1364",
+    "bytes": 7190
+  },
+  "CPU_leaf_source_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-d5-renewed-copy-consumer-defaultoff-source-A-20261026/peer-CPU-controls-source-C.json",
+    "sha256": "3b98d481cfbe5750964994d18dc3c2fcd3485e666d99081ee70ca96e794586cf",
+    "bytes": 3885
+  },
+  "actual_parent": "ad9922e45207c617be94d39c26bde6a38001408b",
+  "actual_tree": "fdbd0c21e7850af56bea1911926c61e8e3632294",
+  "DCO_trailer_present": true,
+  "source_Git_read_method": "Read-only .gitref/loosecommit/tree/index objects; no Git CLI or mutation. Exactly9 tree leaf paths differ from parent; eachselected actualWT blob/index/mode equals reviewedpreview.",
+  "changed_paths": [
+    {
+      "path": ".github/amd-shared-product/frozen_producer.py",
+      "mode": "100644",
+      "git_blob": "77a66d2ddb3541ab1df90be9885a1e25659e6a7d",
+      "sha256": "8f21dfd35255e0eef5b4bb3cc83be607a9d34c2d380afd0bfaf8d3c6bea0fb11"
+    },
+    {
+      "path": ".github/amd-shared-product/inputs.json",
+      "mode": "100644",
+      "git_blob": "3204fb6a949c5138e286eca3d6a733674b6a297c",
+      "sha256": "32e975cfa5a3de979c007e97883cb1c0c19b93bc7b32210e925442e1815d0092"
+    },
+    {
+      "path": ".github/amd-shared-product/qwen-paired-ci/admission.json",
+      "mode": "100644",
+      "git_blob": "82b1e16cf93b48ac4057b230b64c377f8cb0645a",
+      "sha256": "7c0c88c80914f89f1dd7264012e26eef71653ff5ede6ba2ea03f347646d6b14b"
+    },
+    {
+      "path": ".github/amd-shared-product/qwen-paired-ci/job_runner.py",
+      "mode": "100644",
+      "git_blob": "77826e3ad18102b7fe984ea936ca3c5d5d5b08bb",
+      "sha256": "9455e2ff912affa1ca1750bcd243f395c3a0dfe86744826054b7cfe41be1e89a"
+    },
+    {
+      "path": ".github/amd-shared-product/qwen-paired-ci/paired/inputs.json",
+      "mode": "100644",
+      "git_blob": "a83e202de1617f534c8f8fa0934a34fe70975e85",
+      "sha256": "9dc08aca6b5a1e9ea0cabe0bad9d589cb5c1fee8706e3a62cb1cc394c01733ec"
+    },
+    {
+      "path": ".github/amd-shared-product/qwen-paired-ci/paired/run_paired_ab.py",
+      "mode": "100644",
+      "git_blob": "5286ff7ded52eca38463c7780d344116e00b2a47",
+      "sha256": "b902e63bd0bda5701a54f114341151475d2783c8bc9b65a596e94f468d0a81ea"
+    },
+    {
+      "path": ".github/amd-shared-product/qwen-paired-ci/shared-product-sources.json",
+      "mode": "100644",
+      "git_blob": "f1a19dd85a815090ebc736ec04d645e2bf0825c3",
+      "sha256": "4607377dd43f09a0dabf6bb92cb6cb3011a1fff95817feca3e73df7cd43af3f7"
+    },
+    {
+      "path": ".github/amd-shared-product/qwen-paired-ci/source-manifest.json",
+      "mode": "100644",
+      "git_blob": "f6095daa62ad522ae6ec9235500695ab77becb03",
+      "sha256": "dcf15ec5b0783ef140effeda7968f34baa3a86f5b6e06732d936b25e90086eca"
+    },
+    {
+      "path": ".github/amd-shared-product/relay.py",
+      "mode": "100644",
+      "git_blob": "6f05f674eea41615b2cba47a48cadfb04d47a4ac",
+      "sha256": "9192e58e8bce788ff6a8eb434d2af0c385d35ca2c77b02239132c4324cc717cf"
+    }
+  ],
+  "source_integrity": {
+    "CI_manifest_members": 15,
+    "shared_helpers": 5,
+    "source19_compiled37_producer14": [
+      19,
+      37,
+      14
+    ],
+    "all9authority_false_reservation0": true,
+    "registered_GPU_workflow_unchanged": true,
+    "original12_contract_and_fixed1473_d5_b7_preserved": true
+  },
+  "schema_usable_for_future_CI_data_binding": true,
+  "future_root_requirements": "This peer may be copied as review/ci-source-peer.json and bound by a new revieweddatachild, but admission remainsdisabled. Actual7CPUresult/resource/queue/model/TTL and newfiniteGPUphase remain independent.",
+  "candidate_or_tests_executed": false,
+  "resource_grant": false,
+  "GPU_credit": 0
+}
