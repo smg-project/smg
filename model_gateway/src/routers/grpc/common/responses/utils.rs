@@ -1138,15 +1138,22 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
+    /// An alias whose model has no worker behind it any more is refused as
+    /// the model is: the pool's transient 503 (the model was served), not
+    /// the 404 of a name nobody serves.
     #[test]
-    fn worker_availability_rejects_alias_once_its_worker_is_gone() {
+    fn worker_availability_refuses_an_alias_whose_workers_are_gone_as_transient() {
         let registry = registry_with_aliased_worker();
         let worker_id = registry.get_id_by_url("http://worker:8080").unwrap();
         assert!(registry.remove(&worker_id).is_some());
 
         let response = validate_worker_availability(&registry, "model-alias")
-            .expect("alias must stop resolving with no workers behind it");
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            .expect("alias must stop being servable with no workers behind it");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "no_available_workers"
+        );
     }
     #[test]
     fn namespace_function_identity_roundtrips_and_preserves_literal_names() {

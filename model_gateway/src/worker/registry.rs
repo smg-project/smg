@@ -1528,6 +1528,9 @@ impl WorkerRegistry {
                 self.add_model_alias(&alias, &model.id);
             }
         }
+        for model_id in Self::worker_model_ids(&new_worker) {
+            self.release_undeclared_aliases(&model_id);
+        }
 
         self.warn_on_sampling_defaults_divergence_for_worker(&new_worker);
 
@@ -2094,6 +2097,9 @@ impl WorkerRegistry {
                 self.add_model_alias(&alias, &model.id);
             }
         }
+        for model_id in Self::worker_model_ids(&worker) {
+            self.release_undeclared_aliases(&model_id);
+        }
         self.warn_on_sampling_defaults_divergence_for_worker(&worker);
 
         // Update type index (clone needed for DashMap key ownership)
@@ -2495,6 +2501,27 @@ impl WorkerRegistry {
     }
 
     /// Whether any worker still serving `canonical_id` declares `alias`.
+    /// Re-judge every alias that maps to `canonical_id` against the model's
+    /// workers as they are now. A served model with no workers keeps its
+    /// aliases (`remove_model_alias_if_unused`); when a worker registers
+    /// into the model again, the aliases its workers declare stay and the
+    /// rest go to a model that declares them or away, as a removal would
+    /// have judged them, so an alias a roll dropped does not outlive its
+    /// last declaration and block another model's claim to the name. The
+    /// alias index is read first and released before each alias is judged
+    /// (the lock order on `model_alias_index`).
+    fn release_undeclared_aliases(&self, canonical_id: &str) {
+        let held: Vec<String> = self
+            .model_alias_index
+            .iter()
+            .filter(|entry| entry.value().as_ref() == canonical_id)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for alias in held {
+            self.remove_model_alias_if_unused(&alias, canonical_id);
+        }
+    }
+
     fn model_declares_alias(&self, canonical_id: &str, alias: &str) -> bool {
         self.model_index.get(canonical_id).is_some_and(|workers| {
             workers

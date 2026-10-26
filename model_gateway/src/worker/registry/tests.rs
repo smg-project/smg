@@ -3146,3 +3146,84 @@ fn a_served_models_name_becomes_an_alias_once_nothing_serves_it() {
     );
     assert!(registry.contains_model("GLM-5.2"));
 }
+
+/// The four steps of a roll that drops an alias: a worker serving the model
+/// with the alias leaves (the alias stays with the served, empty model); a
+/// worker for the model registers without the alias (the alias is released:
+/// the model's workers do not declare it); another model declares it and
+/// gets it. The kept alias never outlives its last declaration once the
+/// model has workers again.
+#[test]
+fn an_alias_a_model_held_while_empty_is_released_when_its_workers_return_without_it() {
+    let registry = WorkerRegistry::new();
+    let first = worker_with_model_aliases(
+        "http://first:8080",
+        "GLM-5.2",
+        &["shared-alias"],
+        WorkerType::Regular,
+    );
+    let first_id = registry.register(first).unwrap();
+    assert!(registry.remove(&first_id).is_some());
+    assert_eq!(
+        registry.resolve_model_alias("shared-alias").as_deref(),
+        Some("GLM-5.2"),
+        "the alias stays with the served, empty model"
+    );
+
+    let second =
+        worker_with_model_aliases("http://second:8080", "GLM-5.2", &[], WorkerType::Regular);
+    registry.register(second).unwrap();
+    assert!(
+        registry.resolve_model_alias("shared-alias").is_none(),
+        "the returning worker does not declare the alias: released"
+    );
+    assert!(registry.get_by_model("shared-alias").is_empty());
+    assert!(!registry.has_served_model("shared-alias"));
+
+    let third = worker_with_model_aliases(
+        "http://third:8080",
+        "Qwen3",
+        &["shared-alias"],
+        WorkerType::Regular,
+    );
+    registry.register(third).unwrap();
+    assert_eq!(
+        registry.resolve_model_alias("shared-alias").as_deref(),
+        Some("Qwen3"),
+        "the name is free for the model that declares it"
+    );
+    assert_eq!(
+        registry.get_by_model("shared-alias")[0].url(),
+        "http://third:8080"
+    );
+}
+
+/// A replacement that drops an alias releases it as a registration does,
+/// even when the model was holding it from before.
+#[test]
+fn a_replacement_releases_an_alias_the_model_held_while_empty() {
+    let registry = WorkerRegistry::new();
+    let first = worker_with_model_aliases(
+        "http://first:8080",
+        "GLM-5.2",
+        &["held-alias"],
+        WorkerType::Regular,
+    );
+    let first_id = registry.register(first).unwrap();
+    assert!(registry.remove(&first_id).is_some());
+    let second = worker_with_model_aliases(
+        "http://second:8080",
+        "GLM-5.2",
+        &["held-alias"],
+        WorkerType::Regular,
+    );
+    let second_id = registry.register(second).unwrap();
+    assert_eq!(
+        registry.resolve_model_alias("held-alias").as_deref(),
+        Some("GLM-5.2")
+    );
+    let replacement =
+        worker_with_model_aliases("http://second:8080", "GLM-5.2", &[], WorkerType::Regular);
+    assert!(registry.replace(&second_id, replacement));
+    assert!(registry.resolve_model_alias("held-alias").is_none());
+}

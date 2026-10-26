@@ -983,7 +983,7 @@ impl Router {
             let resp = self.report_refusal(
                 "Router::route_multipart_transcription",
                 model_id,
-                error::model_not_found(model_id),
+                placement::model_refusal(&self.worker_registry, model_id),
             );
             outcome.pre_send_error(&resp);
             return resp;

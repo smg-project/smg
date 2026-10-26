@@ -39,6 +39,7 @@ use crate::{
         overload::{BRANCH_ALL_OVERLOADED_FALLBACK, BRANCH_ALL_STALLED_FALLBACK, STAGE_SELECTION},
         ConnectionMode, ConnectionModeExt, PdPairIndex, PrefillCandidateError,
         PrefillSelectionContext, RoutingPool, RuntimeType, Worker, WorkerRegistry,
+        UNKNOWN_MODEL_ID,
     },
 };
 
@@ -463,12 +464,19 @@ pub(crate) fn no_available_workers_because(
 /// pod is not ready; a roll) is a pool with no worker: the
 /// `no_available_workers` 503 with its `Retry-After`, the transient a client
 /// retries, as the same model answers while its workers are registered but
-/// unhealthy; a name nobody has served is the `model_not_found` 404. A 404
-/// here read as the model being gone (no retry, a negative cache, an alert)
-/// for the whole time an engine restarted, with a message that said the
-/// worker was unavailable.
+/// unhealthy. A 404 here read as the model being gone (no retry, a negative
+/// cache, an alert) for the whole time an engine restarted, with a message
+/// that said the worker was unavailable. A name nobody has served is the
+/// `model_not_found` 404, and so is a model that has workers, none of them
+/// in the pool asked about (another transport, another role): that refusal
+/// is not transient, and it stays what the site answered before.
 pub(crate) fn model_refusal(registry: &WorkerRegistry, model_id: &str) -> Response {
-    if registry.has_served_model(model_id) {
+    let served_now = if model_id == UNKNOWN_MODEL_ID {
+        !registry.get_routing_workers().is_empty()
+    } else {
+        registry.contains_model(model_id)
+    };
+    if !served_now && registry.has_served_model(model_id) {
         no_available_workers_because(
             format!("No worker is registered for model '{model_id}' at the moment (its workers have left)"),
             "no worker registered for the model",
@@ -2275,8 +2283,6 @@ mod tests {
     /// had a worker.
     #[tokio::test]
     async fn a_served_model_without_workers_is_a_pool_with_no_worker_not_an_unknown_name() {
-        use crate::worker::UNKNOWN_MODEL_ID;
-
         let registry = WorkerRegistry::new();
         assert_eq!(
             model_refusal(&registry, "m").status(),
@@ -2330,6 +2336,26 @@ mod tests {
             error::extract_error_code_from_response(&unknown),
             MODEL_NOT_FOUND_CODE
         );
+
+        // A model with workers (none in the pool a site asked about) is not
+        // the transient refusal: the site's previous answer stands, and so
+        // does the wildcard's while any worker is registered.
+        let serving = BasicWorkerBuilder::new("http://worker:8080")
+            .model(ModelCard::new("m").with_alias("m-alias"))
+            .worker_type(WorkerType::Regular)
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        registry.register(Arc::new(serving)).unwrap();
+        for name in ["m", "m-alias", UNKNOWN_MODEL_ID] {
+            assert_eq!(
+                model_refusal(&registry, name).status(),
+                StatusCode::NOT_FOUND,
+                "{name}"
+            );
+        }
     }
 
     /// A refusal the gateway answers on its own is marked for the loggers

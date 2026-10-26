@@ -1062,11 +1062,13 @@ impl GrpcRouter {
         let Some(snapshot) = self.worker_registry.model_routing_snapshot(&canonical) else {
             return error::model_not_found(model_id);
         };
-        let pool = snapshot.pool(RoutingPool::GrpcPipelineRegular);
-        if pool.is_empty() {
+        // A served model with no worker at all is the transient refusal; a
+        // model with workers but none that scores decisions keeps the 501.
+        if snapshot.is_empty() {
             return placement::model_refusal(&self.worker_registry, model_id);
         }
-        if !pool
+        if !snapshot
+            .pool(RoutingPool::GrpcPipelineRegular)
             .iter()
             .any(|worker| supports_decisions_worker(worker.as_ref()))
         {
