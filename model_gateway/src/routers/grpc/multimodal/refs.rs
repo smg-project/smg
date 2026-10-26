@@ -729,7 +729,10 @@ mod tests {
         routers::grpc::multimodal::{
             config::MultimodalConfigRegistry, settings::MultimodalSettings,
         },
-        worker::{test_support::no_health_check, BasicWorkerBuilder, ModelCard, WorkerType},
+        worker::{
+            test_support::{no_health_check, registry_with},
+            BasicWorkerBuilder, ModelCard, WorkerType,
+        },
     };
 
     const MODEL: &str = "qwen3-vl";
@@ -794,14 +797,6 @@ mod tests {
                 (MM_MEDIA_REF_SCHEMES_LABEL, "http,https,data"),
             ],
         )
-    }
-
-    fn registry_with(workers: Vec<Arc<dyn Worker>>) -> WorkerRegistry {
-        let registry = WorkerRegistry::new();
-        for worker in workers {
-            registry.register(worker).expect("register");
-        }
-        registry
     }
 
     type AcceptCase = (
