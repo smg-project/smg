@@ -7,18 +7,19 @@ use crate::worker::{
     load_state::TestFeed, test_support::no_health_check, BasicWorkerBuilder, Worker, WorkerType,
 };
 
+/// A healthy worker (health checks disabled) at `url`.
+pub(crate) fn make_worker(url: &str) -> Arc<dyn Worker> {
+    Arc::new(
+        BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .build(),
+    )
+}
+
 /// Healthy workers (health checks disabled) for the given URLs.
 pub(crate) fn make_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
-    urls.iter()
-        .map(|u| {
-            Arc::new(
-                BasicWorkerBuilder::new(*u)
-                    .worker_type(WorkerType::Regular)
-                    .health_config(no_health_check())
-                    .build(),
-            ) as Arc<dyn Worker>
-        })
-        .collect()
+    urls.iter().map(|url| make_worker(url)).collect()
 }
 
 /// The `a`/`b` worker pair under `policy` with a test feed attached; the

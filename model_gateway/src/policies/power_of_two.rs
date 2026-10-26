@@ -118,27 +118,14 @@ mod tests {
 
     use super::*;
     use crate::{
-        policies::test_support::fed_pair,
-        worker::{
-            load_state::{one_rank_load, one_rank_load_reqs_only, TestFeed},
-            test_support::no_health_check,
-            BasicWorkerBuilder, WorkerType,
-        },
+        policies::test_support::{fed_pair, make_worker},
+        worker::load_state::{one_rank_load, one_rank_load_reqs_only, TestFeed},
     };
-
-    fn mk(url: &str) -> Arc<dyn Worker> {
-        Arc::new(
-            BasicWorkerBuilder::new(url)
-                .worker_type(WorkerType::Regular)
-                .health_config(no_health_check())
-                .build(),
-        )
-    }
 
     #[test]
     fn single_worker_always_selected() {
         let policy = PowerOfTwoPolicy::new();
-        let workers = vec![mk("http://w1:8000")];
+        let workers = vec![make_worker("http://w1:8000")];
         assert_eq!(
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
             Some(0)
@@ -263,8 +250,8 @@ mod tests {
         // comparable to a's KV barrier (0.15 · 0.9/0.1 = 1.35s) -> pick a.
         let policy = PowerOfTwoPolicy::new();
         let feed = TestFeed::attached_to(&policy);
-        let a = mk("http://a:8000");
-        let b = mk("http://b:8000");
+        let a = make_worker("http://a:8000");
+        let b = make_worker("http://b:8000");
         for _ in 0..5 {
             b.increment_load();
         }
@@ -282,8 +269,8 @@ mod tests {
     fn dark_pair_joins_shortest_queue() {
         // Neither sampled worker reports loads: fall back to live in-flight.
         let policy = PowerOfTwoPolicy::new();
-        let a = mk("http://a:8000");
-        let b = mk("http://b:8000");
+        let a = make_worker("http://a:8000");
+        let b = make_worker("http://b:8000");
         for _ in 0..5 {
             a.increment_load();
         }
@@ -303,9 +290,9 @@ mod tests {
         // picks w3, the {w1,w2} pair picks w2, and w1 never wins.
         let policy = PowerOfTwoPolicy::new();
         let counts = {
-            let w1 = mk("http://w1:8000");
-            let w2 = mk("http://w2:8000");
-            let w3 = mk("http://w3:8000");
+            let w1 = make_worker("http://w1:8000");
+            let w2 = make_worker("http://w2:8000");
+            let w3 = make_worker("http://w3:8000");
             for _ in 0..10 {
                 w1.increment_load();
             }
@@ -358,7 +345,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, &requests)| {
-                let worker = mk(&format!("http://w{i}:8000"));
+                let worker = make_worker(&format!("http://w{i}:8000"));
                 (0..requests).for_each(|_| worker.increment_load());
                 worker
             })
