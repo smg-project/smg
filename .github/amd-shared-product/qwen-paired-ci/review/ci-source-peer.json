@@ -1,0 +1,46 @@
+{
+  "result": "PASS_SOURCE_ONLY_ACTUAL_D8EC_ROOT_ATTESTED_PUBLIC_FILE_OWNER",
+  "findings": [],
+  "reviewer": "A; nonauthor of root d8ec source correction. Prior9591 source inherited with executable-owner-zero assumption superseded only by this exact change. No source/test/helper execution.",
+  "at_utc": "2026-10-26T01:54:22.180789+00:00",
+  "source_parent": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
+  "actual_head": "d8ec61748f32c81eac82cf83929de5a922203858",
+  "direct_parent": "d9549854d8669cd14f83e3c3e94fd0782d4de830",
+  "actual_worktree": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/amd-qwen-current1473-kfd-attestation-20261026",
+  "driver_sha256": "7b0a98d25b7c0061d673556b0f6cf41e6b6da7311f1642a1d70145ece8f63591",
+  "envelope_sha256": "06589cd12a0547a4e1d5547f8e24afb6c849ec8e95854d997b73bf1180d1ccfd",
+  "inputs_sha256": "9f0359d170854c490fdc28c18b51a83b87c94b22331ceb56accee41179350925",
+  "CI_job_runner_sha256": "858e381d4398c51163b16cee3c1282ff20d53d25b1f0dbff7214172bf7b7d5e8",
+  "workflow_template_sha256": "aa77da40cedaa56aa6d4f02a2ec0f63c5f4cddabd781ba38adc2bacdfada2564",
+  "CI_source_manifest_sha256": "88448cbd7803712c39d73bab94d4502d960964605e230cb411facf299a9be53f",
+  "CI_identity_sha256": "81a4ec81227227d1af86e0c5c46d15e5564db5a72e8f86e9add8adc48003a874",
+  "disabled_admission_sha256": "873e1fe3881de67c32a8b22ef5ae4f5a813e41735bb8c7d90a4901eb255b6a79",
+  "git_diff_sha256": "21d8bd64543c6da96d5a12543fe1a4ccc8b009ff7cb8e56d4254596a23292d77",
+  "checks": [
+    "Actualclean d8ec directd954; exactly3 paths. One executable-owner comparison inverse restores entire prior ci_identity; only corresponding manifest hash and admission manifest hash change. All15 source hashes match.",
+    "Public gpuagent remains fixed /usr/local/bin/gpuagent, regular/non-symlink, exact SHA; its file UID must equal explicitly supplied fresh executable_owner_uid. No hardcoded owner0 and no default owner fallback. Process UID remains independently required expecteduid==observeduid==0, with original exactPID/start/PPID1/commgpuagent/zeroVRAM/unknownPID refusal.",
+    "Bootstrap/template, inner driver/envelope, model pin checks, full e2e tree and all shared inputs unchanged. Default four Qwen execution gates false/res0, no node model/process fields filled."
+  ],
+  "conditional_child_scope": "Same four data-path boundary as prior reviewed source: qwen admission + review source peer/root budget + shared four authority bits only, with consumer_gpu_ready false. All15 source members/manifest/template and other shared data remain exact. Fresh root background attestation must explicitly supply BOTH process uid0 and actual public-file executable_owner_uid, plus exact PID/start/PPID/comm/executable SHA; neither UID may be inferred from the other. Actual data integration/resource peer required separately.",
+  "preserved_failed_control": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-real-ghrunner-KFD-CPU30-root-2710be7b0b5e4076b0990c66d04bddd5/root-closeout.json",
+    "sha256": "e5e2d222d52b7f6f9a983b6b8339315ac80d73c1730d1325a5d07af714e628ef",
+    "result": "FAIL_PRESERVED",
+    "actual_wall_seconds": 0.8471162429777905,
+    "GPU_seconds": 0,
+    "evidence": "Both saved child stderr point to original check_kfd104 owner0 assertion; stdout empty. No d8ec runtime success is asserted.",
+    "owner_value_scope": "Root reports public file UID1001 and processUID0; this source-only peer checks the explicit new field contract, not an independent remote ownership measurement."
+  },
+  "inherited_source_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-KFD-d954-source-peer-A-20261026.json",
+    "sha256": "9591e9181eeba77ba6ee41882ada77e7117c70e5dc41e9f25f99275e14e761d2"
+  },
+  "limits": [
+    "Fresh actual executable_owner_uid pin and new real ghrunner positive/negative controls remain pending; old failed control is not relabelled or overwritten.",
+    "Public-file hash plus fresh root process/executable attestation is not independent running /proc/PID/exe inspection by ghrunner.",
+    "No candidate import/CLI/test/API/SSH/Docker execution, GPU/model/runtime/ABI/full-row acceptance, tensorpayload hash or coverage increment."
+  ],
+  "executed": false,
+  "resource_authority": false,
+  "coverage_increment": 0
+}

@@ -1,0 +1,42 @@
+{
+  "root_admitted": true,
+  "owner": "root",
+  "at_utc": "2026-10-26T02:01:36.972253+00:00",
+  "NEW_runner_seconds": 2100,
+  "GPU_jobs": 1,
+  "GPU_devices_simultaneous": 1,
+  "admission_nonce": "b8ac5be8d89043c097e06a03b5181304",
+  "no_retired_allowance_reused": true,
+  "registered_single_job_observer_source_reviewed": true,
+  "global_owned_GPU_runs_after_dispatch": 1,
+  "max_owned_GPU_runs": 2,
+  "old_finalized_seconds": 63583,
+  "old_reserved_seconds": 0,
+  "global_cap_before": 129939,
+  "global_cap_after": 129939,
+  "source_parent": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
+  "carrier_source": "d8ec61748f32c81eac82cf83929de5a922203858",
+  "observer_source_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-current1473-singlejob-observer-source-D-20261026/peer-independent-C.json",
+    "sha256": "07e2276ee5e622006bcc4c6a6dcfda5b81a271a5cdf1ec4bcad2323ae3eeb011"
+  },
+  "source_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-KFD-d8ec-source-peer-A-20261026.json",
+    "sha256": "02d6b1346b45b95e38cdac15898f20976c6d69712995e8cac4af191f78f924b5"
+  },
+  "fresh_evidence": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-fresh-readiness-root-b9941f0a226a40a89dfac81984ca9fc0/summary.json",
+    "sha256": "7a7ee19da1a3f5543dd05587167362cc5aa7465770d4cf711ea22f808a0ce9e6"
+  },
+  "absolute_GPU_job_seconds": 2100,
+  "absolute_work_seconds": 1920,
+  "cleanup_until_seconds": 2040,
+  "artifact_upload_reserved_seconds": 60,
+  "queue_seconds": 900,
+  "overall_seconds": 3600,
+  "coverage_increment": 0,
+  "original_pytest_cases_planned": 0,
+  "paired_observations_planned": 12,
+  "automatic_retry": false,
+  "preserve_ordinary_CI_PNL_health": true
+}
