@@ -204,6 +204,7 @@ def main():
                "GITHUB_REPOSITORY": "smg-project/smg", "E2E_JOB_MARKER": os.environ["E2E_JOB_MARKER"],
                "HF_HOME": "/models", "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HOME": "/evidence/home",
                "AITER_JIT_DIR": "/evidence/cache/aiter-jit",
+               "MAX_JOBS": "2",
                "HF_TOKEN_PATH": "/evidence/home/hf-token",
                "XDG_CACHE_HOME": "/evidence/cache", "CUDA_VISIBLE_DEVICES": "0", "HIP_VISIBLE_DEVICES": "0", "ROCR_VISIBLE_DEVICES": "0",
                "PYTHONDONTWRITEBYTECODE": "1", "SPT_NOENV": "1", "PYTHONPATH": "/source/e2e_test"}
