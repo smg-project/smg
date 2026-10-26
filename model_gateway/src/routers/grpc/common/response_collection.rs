@@ -332,10 +332,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        routers::grpc::{
-            proto_wrapper::{ProtoGenerateResponse, ENGINE_ERROR_MESSAGE},
-            test_engine::closed_port,
-        },
+        routers::grpc::proto_wrapper::{ProtoGenerateResponse, ENGINE_ERROR_MESSAGE},
+        test_support::RefusedAddress,
         worker::{BasicWorkerBuilder, ConnectionMode, WorkerType},
     };
 
@@ -519,7 +517,8 @@ mod tests {
     /// nothing is counted under the request phase, dead port or not.
     #[tokio::test]
     async fn a_decode_leg_failed_after_a_response_came_keeps_the_engines_report() {
-        let prefill = prefill_on(closed_port());
+        let refused = RefusedAddress::reserve();
+        let prefill = prefill_on(refused.port());
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let answer = {
@@ -558,7 +557,8 @@ mod tests {
     /// answer keeps nothing of it: the port is not probed, dead or not.
     #[tokio::test]
     async fn a_decode_side_failed_after_a_chunk_came_keeps_the_engines_report() {
-        let prefill = prefill_on(closed_port());
+        let refused = RefusedAddress::reserve();
+        let prefill = prefill_on(refused.port());
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let answer = {
@@ -600,7 +600,8 @@ mod tests {
         let report = || tonic::Status::internal(ENGINE_ERROR_MESSAGE);
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let live = listener.local_addr().expect("address").port();
-        let dead = closed_port();
+        let refused = RefusedAddress::reserve();
+        let dead = refused.port();
 
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();

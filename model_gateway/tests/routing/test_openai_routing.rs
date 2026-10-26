@@ -915,16 +915,11 @@ async fn assert_streaming_json_error_content_type(status: StatusCode) {
 #[tokio::test]
 async fn test_openai_router_circuit_breaker() {
     let ctx = create_test_app_context().await;
-    // A loopback port that refuses connections: bound once to be handed out,
-    // then released. Every attempt fails at connect, with no resolver and no
-    // proxy involved, whatever the environment.
-    let refused = {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        format!("http://127.0.0.1:{port}")
-    };
-    register_external_worker(&ctx, &refused, None);
+    // A loopback port that refuses connections, held for the whole test.
+    // Every attempt fails at connect, with no resolver and no proxy involved,
+    // whatever the environment.
+    let refused = smg::test_support::RefusedAddress::reserve();
+    register_external_worker(&ctx, &refused.http_url(), None);
     let router = OpenAIRouter::new(&external_context(&ctx)).await.unwrap();
 
     let chat_request = create_minimal_chat_request();

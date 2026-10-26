@@ -225,6 +225,7 @@ mod tests {
     use crate::{
         config::RouterConfig,
         policies::PolicyRegistry,
+        test_support::RefusedAddress,
         worker::WorkerRegistry,
         workflow::{data::WorkerRegistrationMode, steps::create_worker_workflow_data},
     };
@@ -404,11 +405,8 @@ mod tests {
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn a_failed_probe_names_the_worker_masked_in_its_lines_and_its_message() {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("bind")
-            .local_addr()
-            .expect("addr")
-            .port();
+        let refused = RefusedAddress::reserve();
+        let port = refused.port();
         let url = format!("http://user:secret@127.0.0.1:{port}");
         let mut ctx = local_context(app_context(false), WorkerSpec::new(url));
 

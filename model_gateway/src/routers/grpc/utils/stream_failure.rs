@@ -541,7 +541,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        routers::grpc::{proto_wrapper::ENGINE_ERROR_MESSAGE, test_engine::closed_port},
+        routers::grpc::proto_wrapper::ENGINE_ERROR_MESSAGE,
+        test_support::RefusedAddress,
         worker::{
             circuit_breaker::{CircuitBreakerConfig, CircuitState},
             test_support::no_health_check,
@@ -1039,7 +1040,8 @@ mod tests {
     /// on the prefill side.
     #[tokio::test]
     async fn a_decode_leg_failed_before_its_first_token_is_explained_by_the_dead_bootstrap_port() {
-        let (source, decode) = pd_source_with(prefill_on(closed_port()));
+        let refused = RefusedAddress::reserve();
+        let (source, decode) = pd_source_with(prefill_on(refused.port()));
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let explained = {
@@ -1112,7 +1114,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let live = listener.local_addr().expect("address").port();
         let (live_source, _) = pd_source_with(prefill_on(live));
-        let (dead_source, _) = pd_source_with(prefill_on(closed_port()));
+        let refused = RefusedAddress::reserve();
+        let (dead_source, _) = pd_source_with(prefill_on(refused.port()));
         let single = WorkerSelection::Single { worker: worker() };
         let single_source =
             StreamSource::new(Some(&single), &dispatch(), metrics_labels::ENDPOINT_CHAT);

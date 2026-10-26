@@ -1138,6 +1138,7 @@ fn validate_zmq_dp(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::RefusedAddress;
 
     /// Under `--parser symphony`, a gRPC worker's registration resolves the table whose failure
     /// classes are published at zero: the registry's table for an unlabeled worker of a model it
@@ -1586,12 +1587,6 @@ mod tests {
         }
     }
 
-    /// A loopback port nothing listens on.
-    fn closed_loopback_port() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        listener.local_addr().expect("address").port()
-    }
-
     /// A registration context for a disaggregated worker at a loopback URL.
     fn worker_context(
         worker_type: WorkerType,
@@ -1664,7 +1659,8 @@ mod tests {
     async fn a_prefill_workers_bootstrap_port_is_probed_once_the_worker_is_registered() {
         use crate::workflow::steps::RegisterWorkersStep;
 
-        let closed_port = closed_loopback_port();
+        let closed = RefusedAddress::reserve();
+        let closed_port = closed.port();
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let _guard = metrics::set_default_local_recorder(&recorder);
@@ -1711,7 +1707,8 @@ mod tests {
     ) {
         use crate::workflow::steps::RegisterWorkersStep;
 
-        let closed_port = closed_loopback_port();
+        let closed = RefusedAddress::reserve();
+        let closed_port = closed.port();
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let _guard = metrics::set_default_local_recorder(&recorder);
@@ -1803,7 +1800,8 @@ mod tests {
     async fn a_store_prefill_workers_registered_bootstrap_port_is_not_probed() {
         use crate::workflow::steps::RegisterWorkersStep;
 
-        let closed_port = closed_loopback_port();
+        let closed = RefusedAddress::reserve();
+        let closed_port = closed.port();
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let _guard = metrics::set_default_local_recorder(&recorder);

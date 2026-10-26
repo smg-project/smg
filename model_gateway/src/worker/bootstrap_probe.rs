@@ -268,16 +268,9 @@ mod tests {
     use crate::{
         observability::metrics::metrics_labels,
         routers::common::kv_transfer::{kv_connector_mode, KvConnectorMode},
+        test_support::RefusedAddress,
         worker::BasicWorkerBuilder,
     };
-
-    /// A loopback port nothing listens on.
-    fn closed_port() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("address").port();
-        drop(listener);
-        port
-    }
 
     /// A worker of one type and runtime, with the connector and the
     /// bootstrap port it was registered with.
@@ -524,7 +517,8 @@ mod tests {
     /// are probed.
     #[tokio::test]
     async fn a_port_the_request_path_does_not_hand_is_not_probed_for_a_request() {
-        let port = closed_port();
+        let refused = RefusedAddress::reserve();
+        let port = refused.port();
         for connector in [None, Some("NixlConnector"), Some("MoRIIOConnector")] {
             let worker = loopback_leg(RuntimeType::Vllm, connector, port);
             assert_eq!(
@@ -560,7 +554,8 @@ mod tests {
     /// accepted; a side no partner is handed a port for is not probed.
     #[tokio::test]
     async fn the_partners_port_probe_names_a_dead_port_and_passes_a_live_one() {
-        let port = closed_port();
+        let refused = RefusedAddress::reserve();
+        let port = refused.port();
         let dead = probe_partners_bootstrap_port(&loopback_prefill(port))
             .await
             .expect("a prefill side is probed")
@@ -586,7 +581,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_bootstrap_port_probe_fails_a_closed_port_and_counts_it() {
-        let port = closed_port();
+        let refused = RefusedAddress::reserve();
+        let port = refused.port();
         let error = probe_bootstrap_port("127.0.0.1", port, PROBE_TIMEOUT)
             .await
             .expect_err("nothing listens there");

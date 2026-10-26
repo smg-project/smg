@@ -492,11 +492,10 @@ mod tests {
 
     #[tokio::test]
     async fn http_detection_fails_when_models_endpoint_unreachable() {
-        // Bind then drop to get a port that refuses connections: a backend that
-        // is not up must stay an error so the retryable step keeps polling.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        // A port that refuses connections: a backend that is not up must stay
+        // an error so the retryable step keeps polling.
+        let refused = crate::test_support::RefusedAddress::reserve();
+        let addr = refused.addr();
 
         let err = detect_http_backend(
             &format!("http://{addr}"),

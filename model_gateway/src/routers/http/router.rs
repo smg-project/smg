@@ -2606,6 +2606,7 @@ mod tests {
             request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
         },
         service_discovery::testing::create_test_app_context,
+        test_support::RefusedAddress,
         worker::{circuit_breaker::CircuitState, BasicWorkerBuilder},
     };
 
@@ -2762,11 +2763,8 @@ mod tests {
     async fn a_failed_call_to_a_worker_with_userinfo_is_logged_log_safe() {
         let texts = EventTexts::default();
         let _subscriber = test_subscriber(texts.clone());
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let refused = RefusedAddress::reserve();
+        let port = refused.port();
         let worker_registry = Arc::new(WorkerRegistry::new());
         worker_registry.register_or_replace(Arc::new(
             BasicWorkerBuilder::new(format!("http://alice:s3cret@127.0.0.1:{port}"))
@@ -4793,9 +4791,8 @@ mod tests {
     /// outer error, and the converter leaves it out.
     #[tokio::test]
     async fn an_upstream_failures_answer_names_the_reason_and_not_the_worker() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let refused = RefusedAddress::reserve();
+        let addr = refused.addr();
         let err = crate::clients::http_client_builder()
             .build()
             .unwrap()
@@ -4820,10 +4817,9 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_connection_failure_keeps_its_own_code() {
-        // Bind, then drop: the port is free, so the connect is refused.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        // A reserved port nobody listens at: the connect is refused.
+        let refused = RefusedAddress::reserve();
+        let addr = refused.addr();
         let err = crate::clients::http_client()
             .get(format!("http://{addr}/generate"))
             .send()

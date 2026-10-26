@@ -18,9 +18,9 @@ use crate::{
     routers::grpc::{
         context::WorkerSelection,
         proto_wrapper::ENGINE_ERROR_MESSAGE,
-        test_engine::closed_port,
         utils::{stream_failure::UpstreamStream, StreamFailure, StreamSource},
     },
+    test_support::RefusedAddress,
     worker::{
         test_support::no_health_check, BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType,
     },
@@ -276,7 +276,8 @@ fn a_decode_side_the_engine_fails_is_an_engine_error_of_the_decode_worker() {
 #[test]
 #[traced_test]
 fn a_decode_leg_failed_before_its_first_token_names_the_pairs_dead_bootstrap_port() {
-    let port = closed_port();
+    let refused = RefusedAddress::reserve();
+    let port = refused.port();
     let source = pd_source_with(loopback_prefill(port));
     let rt = runtime();
     let failure = decode_leg_failed_before_its_first_token(&rt);
