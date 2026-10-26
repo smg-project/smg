@@ -41,7 +41,14 @@ def identity(pid):
             argv = stream.read(16385)
         if len(env) > 262144 or len(argv) > 16384:
             raise ValueError("proc identity cap")
-        return {**row,
+        after = stat_identity(pid)
+        if after is None:
+            return None
+        if after["start_ticks"] != row["start_ticks"]:
+            raise ValueError("proc birth identity changed while reading")
+        if after["state"] == "Z":
+            return {**after, "argv": [], "env": {}}
+        return {**after,
                 "argv": argv.rstrip(b"\0").decode(errors="replace").split("\0"),
                 "env": dict(item.decode(errors="replace").split("=", 1)
                             for item in env.split(b"\0") if b"=" in item)}
