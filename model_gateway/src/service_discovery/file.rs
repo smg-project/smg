@@ -769,6 +769,15 @@ mod tests {
                 "{case}: expected '{expected}' in '{reason}'"
             );
         }
+        // Exact: the plain duplicate carries no default-id hint (the table's
+        // `contains` would accept the hint's longer message as well).
+        assert_eq!(
+            parse_err(
+                &manifest(r#"{"url": "10.0.0.11:8000"}, {"url": "10.0.0.11:8000"}"#),
+                Roles::Regular,
+            ),
+            "workers[1]: duplicate id '10.0.0.11:8000'",
+        );
     }
 
     #[test]
