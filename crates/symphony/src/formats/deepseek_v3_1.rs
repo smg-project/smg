@@ -59,7 +59,7 @@ pub fn deepseek_v3_1() -> Format {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::common::{Function, Tool};
+    use openai_protocol::common::Tool;
     use serde_json::{json as value, Value};
 
     use super::*;
@@ -70,7 +70,7 @@ mod tests {
         grammar::{GrammarStart, Options},
         input::{EngineFinish, Input},
         parser::Parser,
-        testing::{bytes, calls, content, finish, reasoning},
+        testing::{bytes, calls, content, finish, reasoning, tool},
         Declared,
     };
 
@@ -487,19 +487,6 @@ mod tests {
     /// The required case's answer under the older path: the list of calls the older constraint
     /// asks for.
     const FORCED_REQUIRED_LIST: &str = "[{\"name\": \"metropolitan_museum_get_top_artworks\", \"parameters\": {\"number\": 5, \"sort_by\": \"popularity\"}}]";
-
-    fn tool(name: &str, parameters: Value) -> Tool {
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: name.to_string(),
-                description: None,
-                parameters,
-                strict: None,
-                extra: Default::default(),
-            },
-        }
-    }
 
     /// The tools of the two forced cases, with the schemas their calls were recorded under.
     fn forecast() -> Tool {

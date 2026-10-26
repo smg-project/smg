@@ -444,44 +444,15 @@ fn words(words: &[&str]) -> Grammar {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::common::Function;
     use serde_json::json as value;
 
     use super::*;
-    use crate::formats;
+    use crate::{
+        formats,
+        testing::{tool, weather_tools},
+    };
 
     const SEP: &str = "]<]minimax[>[";
-
-    fn tool(name: &str, parameters: Value) -> Tool {
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: name.to_string(),
-                description: None,
-                parameters,
-                strict: None,
-                extra: Default::default(),
-            },
-        }
-    }
-
-    fn weather_tools() -> Vec<Tool> {
-        vec![
-            tool(
-                "get_weather",
-                value!({
-                    "type": "object",
-                    "properties": {
-                        "city": {"type": "string"},
-                        "days": {"type": "integer", "minimum": 1},
-                        "units": {"type": "string", "enum": ["c", "f"]},
-                    },
-                    "required": ["city", "days"],
-                }),
-            ),
-            tool("ping", value!({"type": "object"})),
-        ]
-    }
 
     /// The markers that end a call wherever they stand, in the order of the table's rows.
     fn exits() -> Vec<&'static str> {

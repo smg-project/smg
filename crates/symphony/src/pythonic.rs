@@ -1008,11 +1008,10 @@ impl crate::engine::CallAssembler for Assembler {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::common::{Function, Tool};
     use serde_json::json as value;
 
     use super::*;
-    use crate::testing::{bytes, content};
+    use crate::testing::{bytes, content, tool};
 
     fn ids() -> CallIds {
         CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
@@ -1385,19 +1384,6 @@ mod tests {
         }
         assembler.finish(&mut out);
         out.drain()
-    }
-
-    fn tool(name: &str, parameters: serde_json::Value) -> Tool {
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: name.to_string(),
-                description: None,
-                parameters,
-                strict: None,
-                extra: Default::default(),
-            },
-        }
     }
 
     fn tools() -> Declared {

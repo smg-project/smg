@@ -191,7 +191,7 @@ fn call_shape() -> CallShape {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::common::{Function, Tool};
+    use openai_protocol::common::Tool;
     use serde_json::{json as value, Value};
 
     use super::*;
@@ -200,7 +200,7 @@ mod tests {
         event::{DropReason, Event, FinishReason},
         grammar::{GrammarStart, Options},
         input::EngineFinish,
-        testing::{bytes, calls, content, drive, drive_to, finish, reasoning},
+        testing::{bytes, calls, content, drive, drive_to, finish, reasoning, tool},
         Declared,
     };
 
@@ -691,19 +691,6 @@ mod tests {
         let table = kimi_k2();
         assert_eq!(table.validate(), Ok(()));
         assert_eq!(table.name(), "kimi_k2");
-    }
-
-    fn tool(name: &str, parameters: Value) -> Tool {
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: name.to_string(),
-                description: None,
-                parameters,
-                strict: None,
-                extra: Default::default(),
-            },
-        }
     }
 
     /// The tool of the recorded named case: a forecast with three required parameters.

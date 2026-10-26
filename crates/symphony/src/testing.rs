@@ -1,7 +1,7 @@
 //! Test support the crate's modules share: readers of an event list, and a
 //! driver that feeds a parser one turn.
 
-use openai_protocol::common::Tool;
+use openai_protocol::common::{Function, Tool};
 use serde_json::{json as value, Value};
 
 use crate::{
@@ -369,4 +369,38 @@ pub(crate) fn a_forced_tag_after_a_prompt_that_wrote_the_templates_text(
             );
         }
     }
+}
+
+/// A function tool named `name` with `parameters` as its schema.
+pub(crate) fn tool(name: &str, parameters: Value) -> Tool {
+    Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: name.to_string(),
+            description: None,
+            parameters,
+            strict: None,
+            extra: Default::default(),
+        },
+    }
+}
+
+/// The grammar tests' pair of tools: `get_weather` with a city, days and
+/// units, and `ping` without parameters.
+pub(crate) fn weather_tools() -> Vec<Tool> {
+    vec![
+        tool(
+            "get_weather",
+            value!({
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "days": {"type": "integer", "minimum": 1},
+                    "units": {"type": "string", "enum": ["c", "f"]},
+                },
+                "required": ["city", "days"],
+            }),
+        ),
+        tool("ping", value!({"type": "object"})),
+    ]
 }

@@ -524,7 +524,6 @@ fn sequence(parts: Vec<Grammar>) -> Grammar {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::common::Function;
     use serde_json::json as value;
 
     use super::*;
@@ -536,21 +535,9 @@ mod tests {
         input::{EngineFinish, Input},
         parser::Parser as _,
         shape::{intern, CallLayout, Class, Message, NameSource, Pattern, ValueParser, Written},
+        testing::tool,
         CallSyntax, Declared,
     };
-
-    fn tool(name: &str, parameters: Value) -> Tool {
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: name.to_string(),
-                description: None,
-                parameters,
-                strict: None,
-                extra: Default::default(),
-            },
-        }
-    }
 
     /// A tool with a required string, an optional integer and a required boolean.
     fn lookup() -> Tool {
