@@ -24,7 +24,7 @@ use llm_multimodal::{
 use serde::Deserialize;
 use serde_json::json;
 
-use super::make_seeded_image;
+use super::{fnv1a, make_seeded_image};
 
 /// SHA-256 of the reference `image_processing_gemma4.py` the fixtures were
 /// recorded from; a regeneration against a different file fails here.
@@ -93,15 +93,6 @@ enum Tokens {
 }
 
 const GOLDEN: &str = include_str!("../fixtures/golden/gemma4_preprocess_fingerprints.json");
-
-fn fnv1a(bytes: impl IntoIterator<Item = u8>) -> String {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{hash:016x}")
-}
 
 fn images_for(case: &GoldenCase) -> Vec<DynamicImage> {
     match &case.source {

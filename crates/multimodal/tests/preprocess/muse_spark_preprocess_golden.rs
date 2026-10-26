@@ -28,7 +28,7 @@ use llm_multimodal::{
 use serde::Deserialize;
 use serde_json::json;
 
-use super::make_seeded_image;
+use super::{fnv1a, make_seeded_image};
 
 const GOLDEN: &str = include_str!("../fixtures/golden/muse_spark_preprocess_fingerprints.json");
 
@@ -151,15 +151,6 @@ fn decoded(replacement: &PromptReplacement) -> String {
         out.push_str(&String::from_utf8(bytes).expect("utf-8 stamp"));
     }
     out
-}
-
-fn fnv1a(bytes: impl IntoIterator<Item = u8>) -> String {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{hash:016x}")
 }
 
 fn images_for(case: &GoldenCase) -> Vec<DynamicImage> {
