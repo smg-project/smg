@@ -19,6 +19,7 @@ use crate::{
     routers::grpc::{
         context::WorkerSelection,
         proto_wrapper::ENGINE_ERROR_MESSAGE,
+        test_engine::closed_port,
         utils::{stream_failure::UpstreamStream, StreamFailure, StreamSource},
     },
     worker::{BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType},
@@ -90,14 +91,6 @@ fn loopback_prefill(bootstrap_port: u16) -> Arc<dyn Worker> {
             })
             .build(),
     )
-}
-
-/// A loopback port nothing listens on.
-fn closed_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().expect("address").port();
-    drop(listener);
-    port
 }
 
 /// The decode side of a disaggregated chat answer, ended by the engine's own

@@ -40,3 +40,11 @@ pub(crate) async fn mock_engine(model_id: &str) -> (String, JoinHandle<()>) {
     let server = tokio::spawn(mock_worker::grpc::serve_with_listener(config, listener));
     (format!("http://127.0.0.1:{port}"), server)
 }
+
+/// A loopback port nothing listens on.
+pub(crate) fn closed_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("address").port();
+    drop(listener);
+    port
+}

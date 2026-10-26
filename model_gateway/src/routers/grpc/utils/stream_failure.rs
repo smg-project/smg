@@ -541,7 +541,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        routers::grpc::proto_wrapper::ENGINE_ERROR_MESSAGE,
+        routers::grpc::{proto_wrapper::ENGINE_ERROR_MESSAGE, test_engine::closed_port},
         worker::{
             circuit_breaker::{CircuitBreakerConfig, CircuitState},
             BasicWorkerBuilder, ConnectionMode,
@@ -996,14 +996,6 @@ mod tests {
             "{}",
             handle.render()
         );
-    }
-
-    /// A loopback port nothing listens on.
-    fn closed_port() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("address").port();
-        drop(listener);
-        port
     }
 
     /// A prefill side on the loopback host whose partners are handed `port`,

@@ -135,15 +135,10 @@ mod tests {
     use openai_protocol::worker::{RuntimeType, WorkerType};
 
     use super::*;
-    use crate::{routers::grpc::proto_wrapper::ENGINE_ERROR_MESSAGE, worker::BasicWorkerBuilder};
-
-    /// A loopback port nothing listens on.
-    fn closed_port() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("address").port();
-        drop(listener);
-        port
-    }
+    use crate::{
+        routers::grpc::{proto_wrapper::ENGINE_ERROR_MESSAGE, test_engine::closed_port},
+        worker::BasicWorkerBuilder,
+    };
 
     /// A prefill side on the loopback host whose partners are handed `port`.
     fn prefill_on(port: u16) -> Arc<dyn Worker> {
