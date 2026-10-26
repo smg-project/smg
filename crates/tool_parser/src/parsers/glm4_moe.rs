@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use async_trait::async_trait;
 use openai_protocol::common::Tool;
 use regex::Regex;
@@ -195,7 +193,7 @@ impl Glm4MoeParser {
     fn parse_arguments(
         &self,
         args_text: &str,
-        param_types: &HashMap<String, String>,
+        param_types: &helpers::ParamTypes<'_>,
     ) -> serde_json::Map<String, Value> {
         let mut arguments = serde_json::Map::new();
 
@@ -203,9 +201,8 @@ impl Glm4MoeParser {
             let key = capture.get(1).map_or("", |m| m.as_str()).trim();
             let value_str = capture.get(2).map_or("", |m| m.as_str());
 
-            let value =
-                helpers::coerce_by_schema_type(value_str, param_types.get(key).map(String::as_str))
-                    .unwrap_or_else(|| infer_value(value_str.trim()));
+            let value = helpers::coerce_by_schema_type(value_str, param_types.get(key))
+                .unwrap_or_else(|| infer_value(value_str.trim()));
 
             arguments.insert(key.to_string(), value);
         }
@@ -222,7 +219,7 @@ impl Glm4MoeParser {
             // Get arguments text
             let args_text = captures.get(2).map_or("", |m| m.as_str());
 
-            let param_types = helpers::param_types_for_function(tools, func_name);
+            let param_types = helpers::ParamTypes::for_function(tools, func_name);
             let arguments = self.parse_arguments(args_text, &param_types);
 
             let arguments_str = serde_json::to_string(&arguments)
