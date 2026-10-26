@@ -81,38 +81,14 @@ fn test_cache_aware_with_balanced_load() {
     policy.init_workers(&workers);
 
     // First request should be distributed
-    let idx1 = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                request_text: Some("hello world"),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let idx1 = route_text(&policy, &workers, "hello world").unwrap();
 
     // Same request should go to same worker (cache hit)
-    let idx2 = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                request_text: Some("hello world"),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let idx2 = route_text(&policy, &workers, "hello world").unwrap();
     assert_eq!(idx1, idx2);
 
     // Similar request should also go to same worker
-    let idx3 = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                request_text: Some("hello"),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let idx3 = route_text(&policy, &workers, "hello").unwrap();
     assert_eq!(idx1, idx3);
 }
 
@@ -707,13 +683,7 @@ fn a_report_the_snapshot_dropped_is_no_longer_scored() {
         expected_wait_load(1_000, 0.1, 100.0),
     )]));
 
-    let selected = policy.select_worker(
-        &workers,
-        &SelectWorkerInfo {
-            request_text: Some("snapshot-pruning miss"),
-            ..Default::default()
-        },
-    );
+    let selected = route_text(&policy, &workers, "snapshot-pruning miss");
     assert_eq!(
         selected,
         Some(1),
@@ -936,15 +906,7 @@ fn string_tree_miss_uses_expected_wait_and_records_final_worker() {
     update_expected_wait_loads(&policy, &workers, &[10_000, 0]);
     let text = "novel string-tree miss with no shared prefix";
 
-    let selected = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                request_text: Some(text),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let selected = route_text(&policy, &workers, text).unwrap();
     assert_eq!(selected, 1, "expected wait must beat raw request count");
     assert_only_final_worker_credited(&policy, &workers, 1, 1024);
 
@@ -979,15 +941,7 @@ fn string_tree_spill_uses_expected_wait_and_records_only_final_worker() {
     // count is the higher: the spill must follow the wait, not the count.
     update_expected_wait_loads_counting_held(&policy, &workers, &[20_000, 10_000, 1_000]);
 
-    let selected = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                request_text: Some(text),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let selected = route_text(&policy, &workers, text).unwrap();
     assert_only_final_worker_credited(&policy, &workers, 2, 1024);
     assert_eq!(selected, 2, "spill must use expected wait over the fleet");
 
@@ -1018,15 +972,7 @@ fn string_tree_equal_affinity_tie_uses_expected_wait_only_among_holders() {
     }
     update_expected_wait_loads(&policy, &workers, &[10_000, 0, 0]);
 
-    let selected = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                request_text: Some(text),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let selected = route_text(&policy, &workers, text).unwrap();
     assert_eq!(selected, 1);
     assert_only_final_worker_credited(&policy, &workers, 1, 1024);
 }
@@ -1057,15 +1003,7 @@ fn token_tree_miss_uses_expected_wait_and_records_final_worker() {
     update_expected_wait_loads(&policy, &workers, &[10_000, 0]);
     let tokens: Vec<u32> = (100..108).collect();
 
-    let selected = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&tokens),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let selected = route_tokens(&policy, &workers, &tokens);
     assert_eq!(selected, 1, "expected wait must beat raw request count");
     assert_only_final_worker_credited(&policy, &workers, 1, 8);
 
@@ -1100,15 +1038,7 @@ fn token_tree_spill_uses_expected_wait_and_records_only_final_worker() {
     // count is the higher: the spill must follow the wait, not the count.
     update_expected_wait_loads_counting_held(&policy, &workers, &[20_000, 10_000, 1_000]);
 
-    let selected = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&tokens),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let selected = route_tokens(&policy, &workers, &tokens);
     assert_eq!(selected, 2, "spill must use expected wait over the fleet");
     assert_only_final_worker_credited(&policy, &workers, 2, 8);
 
@@ -1139,15 +1069,7 @@ fn token_tree_equal_affinity_tie_uses_expected_wait_only_among_holders() {
     }
     update_expected_wait_loads(&policy, &workers, &[10_000, 0, 0]);
 
-    let selected = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&tokens),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let selected = route_tokens(&policy, &workers, &tokens);
     assert_eq!(selected, 1);
     assert_only_final_worker_credited(&policy, &workers, 1, 8);
 }
@@ -1170,15 +1092,7 @@ fn cache_hit_prefers_least_loaded_matched_tenant() {
     // w2 and w3 are equally idle, but only w1/w2 hold the prefix: the
     // selection must stay within the matched tenants and take the less
     // loaded one.
-    let idx = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&tokens),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let idx = route_tokens(&policy, &workers, &tokens);
     assert_eq!(idx, 1, "least-loaded matched tenant, not any idle worker");
 }
 
@@ -1193,15 +1107,7 @@ fn gated_hot_tenant_spills_to_expected_wait_and_replicates() {
         workers[0].increment_load();
     }
 
-    let idx = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&tokens),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let idx = route_tokens(&policy, &workers, &tokens);
     assert_eq!(idx, 1, "gated selection must spill to expected wait");
 
     // The spill inserted for w2, so the prefix now has a second tenant.
@@ -1223,28 +1129,12 @@ fn token_tree_selection_emits_decision_line() {
     let tokens: Vec<u32> = (0..32).collect();
     seed_token_tenants(&policy, &workers, &tokens, &["http://w1:8000"]);
 
-    policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&tokens),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    route_tokens(&policy, &workers, &tokens);
     assert!(logs_contain("Cache-aware selection"));
     assert!(logs_contain("tree_match"));
 
     let novel: Vec<u32> = (1000..1064).collect();
-    policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&novel),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    route_tokens(&policy, &workers, &novel);
     assert!(logs_contain("expected_wait_fallback"));
 }
 
@@ -1273,15 +1163,7 @@ fn token_tree_selection_records_branch_and_match_ratio_metrics() {
         // A full-prefix hit (1.0), a novel prompt (0.0), and a prompt
         // sharing only the seeded 32 tokens of 320 (0.1).
         for request in [&tokens, &novel, &decile] {
-            policy
-                .select_worker(
-                    &workers,
-                    &SelectWorkerInfo {
-                        tokens: Some(request),
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
+            route_tokens(&policy, &workers, request);
         }
     });
     let rendered = handle.render();
@@ -1314,15 +1196,7 @@ fn count_spread_elsewhere_keeps_cache_affinity() {
         workers[1].increment_load();
     }
 
-    let idx = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&tokens),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let idx = route_tokens(&policy, &workers, &tokens);
     assert_eq!(
         idx, 0,
         "a deep queue on another worker must not break this request's affinity"
@@ -1748,30 +1622,23 @@ fn cold_pick_after_cached_hits(balance_uncached_credit: bool) -> usize {
     let context: Vec<u32> = (0..99_000).collect();
     seed_token_tenants(&policy, &workers, &context, &["http://w1:8000"]);
     update_expected_wait_loads(&policy, &workers, &[0, 0]);
-    let route = |tokens: &[u32]| {
-        policy
-            .select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    tokens: Some(tokens),
-                    ..Default::default()
-                },
-            )
-            .unwrap()
-    };
     for turn in 0..5u32 {
         let mut prompt = context.clone();
         prompt.extend(1_000_000 + turn * 1_000..1_000_000 + (turn + 1) * 1_000);
-        assert_eq!(route(&prompt), 0, "hit {turn} stays with its holder");
+        assert_eq!(
+            route_tokens(&policy, &workers, &prompt),
+            0,
+            "hit {turn} stays with its holder"
+        );
     }
     let first_cold: Vec<u32> = (2_000_000..2_020_000).collect();
     assert_eq!(
-        route(&first_cold),
+        route_tokens(&policy, &workers, &first_cold),
         1,
         "the first cold prompt takes the idle worker"
     );
     let second_cold: Vec<u32> = (3_000_000..3_010_000).collect();
-    route(&second_cold)
+    route_tokens(&policy, &workers, &second_cold)
 }
 
 /// The token-work LeastLoad books on w1 after it takes a `prompt_len`-token
@@ -1869,15 +1736,7 @@ fn kv_pressure_still_forces_expected_wait_fallback() {
     // KV spread 0.8 > 0.3: shed fleet-wide despite the w1 cache hit.
     let _tx = inject_kv(&policy, &workers, &[0.9, 0.1]);
 
-    let idx = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&tokens),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let idx = route_tokens(&policy, &workers, &tokens);
     assert_eq!(idx, 1, "KV pressure must still override cache affinity");
 }
 
@@ -1893,35 +1752,15 @@ fn test_cache_aware_worker_removal() {
     policy.init_workers(&workers);
 
     // Route some requests
-    policy.select_worker(
-        &workers,
-        &SelectWorkerInfo {
-            request_text: Some("test1"),
-            ..Default::default()
-        },
-    );
-    policy.select_worker(
-        &workers,
-        &SelectWorkerInfo {
-            request_text: Some("test2"),
-            ..Default::default()
-        },
-    );
+    route_text(&policy, &workers, "test1");
+    route_text(&policy, &workers, "test2");
 
     // Remove a worker
     policy.remove_worker_by_url("http://w1:8000");
     workers[0].set_status(WorkerStatus::NotReady);
 
     // All requests should now go to worker2
-    let idx = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                request_text: Some("test1"),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let idx = route_text(&policy, &workers, "test1").unwrap();
     assert_eq!(idx, 1);
 }
 
@@ -2167,15 +2006,7 @@ fn test_apply_known_remote_insert_from_request_hot_path() {
     // Drive a string request through select_worker — populates
     // the string-side hash_index with a matched-prefix value.
     let text = "the quick brown fox jumps over the lazy dog";
-    policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                request_text: Some(text),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    route_text(&policy, &workers, text).unwrap();
     let text_hash = kv_index::hash_node_path(text);
 
     // Drive a token request — populates the token-side
@@ -2183,15 +2014,7 @@ fn test_apply_known_remote_insert_from_request_hot_path() {
     // first worker's `model_id()`, which the builder leaves
     // empty → UNKNOWN_MODEL_ID after normalization.
     let tokens: Vec<u32> = (0..32).collect();
-    policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&tokens),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    route_tokens(&policy, &workers, &tokens);
     let token_hash = kv_index::hash_token_path(&tokens);
 
     // Both populate sites use UNKNOWN_MODEL_ID for these
@@ -2222,15 +2045,7 @@ fn test_cache_aware_without_mesh() {
     policy.init_workers(&workers);
 
     // Should work without mesh
-    let idx = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                request_text: Some("test request"),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let idx = route_text(&policy, &workers, "test request").unwrap();
     assert_eq!(idx, 0);
 }
 
@@ -2678,15 +2493,7 @@ fn an_event_driven_decision_observes_its_match_ratio() {
     let novel = [101, 102, 103, 104, 105, 106, 107, 108];
     metrics::with_local_recorder(&recorder, || {
         for request in [&cached, &novel] {
-            policy
-                .select_worker(
-                    &workers,
-                    &SelectWorkerInfo {
-                        tokens: Some(request),
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
+            route_tokens(&policy, &workers, request);
         }
     });
     let rendered = handle.render();
@@ -2764,17 +2571,7 @@ fn a_worker_with_an_emptied_index_gets_the_warm_up_slice_whatever_its_age() {
     let handle = recorder.handle();
     let picks: Vec<usize> = metrics::with_local_recorder(&recorder, || {
         (0..8)
-            .map(|_| {
-                policy
-                    .select_worker(
-                        &workers,
-                        &SelectWorkerInfo {
-                            tokens: Some(&request),
-                            ..Default::default()
-                        },
-                    )
-                    .unwrap()
-            })
+            .map(|_| route_tokens(&policy, &workers, &request))
             .collect()
     });
     assert!(
@@ -2826,17 +2623,7 @@ fn a_thin_worker_that_holds_more_than_the_gate_allows_gets_no_slice() {
     let mut request: Vec<u32> = heads[0][..4].to_vec();
     request.extend(90_000..90_044);
     let picks: Vec<usize> = (0..8)
-        .map(|_| {
-            policy
-                .select_worker(
-                    &workers,
-                    &SelectWorkerInfo {
-                        tokens: Some(&request),
-                        ..Default::default()
-                    },
-                )
-                .unwrap()
-        })
+        .map(|_| route_tokens(&policy, &workers, &request))
         .collect();
     assert_eq!(
         picks,
@@ -2946,15 +2733,7 @@ fn an_emptied_worker_gets_its_share_of_hits_until_it_refills() {
     let mut received = 0usize;
     while decisions < 1_000 && indexer.worker_block_count(emptied) < 550 {
         let tokens = request(decisions);
-        let idx = policy
-            .select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    tokens: Some(&tokens),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let idx = route_tokens(&policy, &workers, &tokens);
         decisions += 1;
         if idx == 7 {
             received += 1;
@@ -2989,15 +2768,7 @@ fn an_emptied_worker_gets_its_share_of_hits_until_it_refills() {
     let hits_before = policy.divert_hits.load(Ordering::Relaxed);
     for i in 0..32 {
         let tokens = request(decisions + i);
-        policy
-            .select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    tokens: Some(&tokens),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        route_tokens(&policy, &workers, &tokens);
     }
     assert_eq!(
         policy.divert_hits.load(Ordering::Relaxed),
@@ -3044,17 +2815,6 @@ fn a_thin_worker_keeps_its_share_past_the_warm_up_blocks_until_the_ratio() {
         tokens.extend((0..16).map(|t| 90_000_000 + i as u32 * 16 + t));
         tokens
     };
-    let select = |tokens: &[u32]| -> usize {
-        policy
-            .select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    tokens: Some(tokens),
-                    ..Default::default()
-                },
-            )
-            .unwrap()
-    };
     let mut rebuilds = 1u64;
     let mut decisions = 0usize;
     let mut first = None;
@@ -3069,7 +2829,7 @@ fn a_thin_worker_keeps_its_share_past_the_warm_up_blocks_until_the_ratio() {
             );
         }
         let tokens = request(decisions);
-        let idx = select(&tokens);
+        let idx = route_tokens(&policy, &workers, &tokens);
         decisions += 1;
         if idx != 7 {
             continue;
@@ -3090,7 +2850,7 @@ fn a_thin_worker_keeps_its_share_past_the_warm_up_blocks_until_the_ratio() {
             // diversion: the hit counter runs on without a reset.
             let hits = policy.divert_hits.load(Ordering::Relaxed);
             for i in 0..16 {
-                select(&request(10_000 + i));
+                route_tokens(&policy, &workers, &request(10_000 + i));
             }
             assert_eq!(
                 policy.divert_hits.load(Ordering::Relaxed),
@@ -3128,7 +2888,7 @@ fn a_thin_worker_keeps_its_share_past_the_warm_up_blocks_until_the_ratio() {
     assert!(table.thin.is_empty(), "no longer thin: {:?}", table.thin);
     let hits = policy.divert_hits.load(Ordering::Relaxed);
     for i in 0..32 {
-        select(&request(20_000 + i));
+        route_tokens(&policy, &workers, &request(20_000 + i));
     }
     assert_eq!(
         policy.divert_hits.load(Ordering::Relaxed),
@@ -3155,20 +2915,9 @@ fn a_deep_continuation_stays_with_its_idle_holder() {
         tokens.extend((0..16).map(|t| 90_000_000 + i as u32 * 16 + t));
         tokens
     };
-    let select = |tokens: &[u32]| -> usize {
-        policy
-            .select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    tokens: Some(tokens),
-                    ..Default::default()
-                },
-            )
-            .unwrap()
-    };
     for i in 0..64 {
         assert_eq!(
-            select(&request(i)),
+            route_tokens(&policy, &workers, &request(i)),
             i % 7,
             "a deep hit left its idle holder for the thin worker (decision {i})"
         );
@@ -3180,7 +2929,7 @@ fn a_deep_continuation_stays_with_its_idle_holder() {
         holder.increment_load();
     }
     assert_eq!(
-        select(&request(64)),
+        route_tokens(&policy, &workers, &request(64)),
         7,
         "with busy holders a due deep hit goes to the thin worker"
     );
@@ -3222,15 +2971,7 @@ fn event_no_overlap_uses_expected_wait() {
     policy.set_kv_event_monitor(Some(monitor));
 
     let novel = [100, 200, 300, 400];
-    let selected = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&novel),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let selected = route_tokens(&policy, &workers, &novel);
     assert_eq!(selected, 1, "expected wait must beat raw request count");
     assert_only_final_worker_credited(&policy, &workers, 1, 4);
 }
@@ -3258,15 +2999,7 @@ fn event_spill_credits_only_expected_wait_final_worker() {
     policy.set_kv_event_monitor(Some(monitor));
 
     let tokens = [1, 2, 3, 4];
-    let selected = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&tokens),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let selected = route_tokens(&policy, &workers, &tokens);
     assert_only_final_worker_credited(&policy, &workers, 2, 4);
     assert_eq!(selected, 2, "spill must use expected wait over the fleet");
 }
@@ -3287,15 +3020,7 @@ fn event_equal_overlap_tie_uses_expected_wait_only_among_holders() {
     policy.set_kv_event_monitor(Some(monitor));
 
     let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
-    let selected = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&tokens),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let selected = route_tokens(&policy, &workers, &tokens);
     assert_eq!(selected, 1);
     assert_only_final_worker_credited(&policy, &workers, 1, 8);
 }
@@ -3329,15 +3054,7 @@ fn event_decay_keeps_strict_affinity_ahead_of_expected_wait() {
     policy.set_kv_event_monitor(Some(monitor));
 
     let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
-    let selected = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&tokens),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let selected = route_tokens(&policy, &workers, &tokens);
     assert_eq!(selected, 0, "strict decayed affinity must remain primary");
     assert_only_final_worker_credited(&policy, &workers, 0, 8);
 }
@@ -3360,15 +3077,7 @@ fn event_temperature_keeps_equal_score_group_for_expected_wait() {
     policy.set_kv_event_monitor(Some(monitor));
 
     let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
-    let selected = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&tokens),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let selected = route_tokens(&policy, &workers, &tokens);
     assert_eq!(selected, 1, "LeastLoad must break the sampled-score tie");
     assert_only_final_worker_credited(&policy, &workers, 1, 8);
 }
@@ -3384,15 +3093,7 @@ fn test_event_driven_overlap_selects_cached_worker() {
     policy.set_kv_event_monitor(Some(monitor));
 
     // Full dispatch: should use event-driven and select w1
-    let idx = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&[1, 2, 3, 4, 5, 6, 7, 8]),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let idx = route_tokens(&policy, &workers, &[1, 2, 3, 4, 5, 6, 7, 8]);
     assert_eq!(idx, 0); // w1 (has cached blocks)
 }
 
@@ -3415,15 +3116,7 @@ fn test_event_driven_no_overlap_uses_dark_fleet_expected_wait() {
     policy.set_kv_event_monitor(Some(monitor));
 
     // No overlap → event-driven falls back to expected wait (not token tree).
-    let idx = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&[100, 200, 300, 400]),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let idx = route_tokens(&policy, &workers, &[100, 200, 300, 400]);
     assert_eq!(idx, 1); // w2 (dark-fleet expected wait), not token tree
 }
 
@@ -3445,15 +3138,7 @@ fn test_event_driven_gated_hot_winner_spills_to_expected_wait() {
     policy.set_kv_event_monitor(Some(monitor));
 
     // w1 wins the overlap score but is over both load margins: spill.
-    let idx = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&[1, 2, 3, 4]),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let idx = route_tokens(&policy, &workers, &[1, 2, 3, 4]);
     assert_eq!(idx, 1, "gated overlap winner must spill to expected wait");
 }
 
@@ -3474,15 +3159,7 @@ fn test_event_driven_short_request_uses_dark_fleet_expected_wait() {
     policy.set_kv_event_monitor(Some(monitor));
 
     // Request shorter than block_size → no full blocks → expected-wait fallback.
-    let idx = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&[1, 2, 3]),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let idx = route_tokens(&policy, &workers, &[1, 2, 3]);
     assert_eq!(idx, 1); // w2 (dark-fleet expected wait)
 }
 
@@ -3494,15 +3171,7 @@ fn test_no_monitor_uses_token_tree() {
     assert!(!policy.has_event_indexer("unknown"));
 
     // Should still route (via token tree, not event-driven)
-    let idx = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&[1, 2, 3, 4]),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let idx = route_tokens(&policy, &workers, &[1, 2, 3, 4]);
     assert!(idx < 2); // valid worker selected
 }
 
@@ -3561,15 +3230,7 @@ fn test_event_driven_uses_monitor_block_size() {
 
     // Query with 8 tokens — with block_size=8, this is one full block
     // With config block_size=4, this would be two blocks and wouldn't match
-    let idx = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&[1, 2, 3, 4, 5, 6, 7, 8]),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let idx = route_tokens(&policy, &workers, &[1, 2, 3, 4, 5, 6, 7, 8]);
     assert_eq!(idx, 0); // w1 has the cached block
 }
 
@@ -3599,15 +3260,7 @@ fn test_imbalanced_skips_event_driven() {
     policy.set_kv_event_monitor(Some(monitor));
 
     // With imbalance, select_worker should pick expected wait (w2), not event-driven.
-    let idx = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&[1, 2, 3, 4]),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let idx = route_tokens(&policy, &workers, &[1, 2, 3, 4]);
     assert_eq!(idx, 1); // w2 (expected wait), regardless of event data
 }
 
@@ -3635,27 +3288,11 @@ fn test_empty_indexer_falls_through_to_token_tree() {
     let tokens: Vec<u32> = (1..=16).collect();
 
     // First request populates the token tree for the selected worker.
-    let idx = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&tokens),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let idx = route_tokens(&policy, &workers, &tokens);
     assert!(idx < 2); // valid worker via token tree
 
     // Same tokens again — token-tree cache hit routes to the same worker.
-    let idx2 = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&tokens),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let idx2 = route_tokens(&policy, &workers, &tokens);
     assert_eq!(idx, idx2); // token tree cache affinity preserved
 }
 
@@ -3955,15 +3592,7 @@ fn hash_mode_never_touches_trees() {
 
     let tokens: Vec<u32> = (0..32).collect();
     route_tokens(&policy, &workers, &tokens);
-    policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                request_text: Some("a text prompt long enough to insert"),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    route_text(&policy, &workers, "a text prompt long enough to insert").unwrap();
 
     assert!(policy.string_trees.is_empty());
     assert!(policy.token_trees.is_empty());
@@ -4756,25 +4385,9 @@ fn every_catalog_policy_routes_tree_matches() {
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         policy.init_workers(&workers);
         let text = "a shared system prompt that is long enough to match";
-        let first = policy
-            .select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    request_text: Some(text),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let first = route_text(&policy, &workers, text).unwrap();
         policy.on_request_complete(workers[first].url(), true);
-        let second = policy
-            .select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    request_text: Some(text),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let second = route_text(&policy, &workers, text).unwrap();
         assert_eq!(first, second, "{name}: an idle holder keeps its prefix");
     }
 }
@@ -4794,15 +4407,7 @@ fn accounting_books_the_dispatch_until_completion() {
     let accounting = policy.accounting.as_ref().expect("accounting enabled");
 
     let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
-    let selected = policy
-        .select_worker(
-            &workers,
-            &SelectWorkerInfo {
-                tokens: Some(&tokens),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let selected = route_tokens(&policy, &workers, &tokens);
     assert_eq!(selected, 0);
     // One block cached, one block (4 tokens) booked as uncached prefill.
     assert_eq!(accounting.pending_prefill_tokens("http://w1:8000"), 4);
