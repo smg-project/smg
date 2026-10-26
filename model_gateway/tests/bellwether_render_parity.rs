@@ -286,17 +286,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          string",
     ),
     (
-        "phi-3-mini-4k-instruct/render/text-developer-role",
-        "the reference of this group was recorded before the developer-as-system rule, when its \
-         template dropped the developer message; its re-record follows (smg-project/bellwether#217)",
-    ),
-    (
-        "phi-tiny-moe-instruct/render/text-developer-role",
-        "the reference of this group was recorded before the developer-as-system rule, when its \
-         template wrote the developer turn under its own role tag; its re-record follows \
-         (smg-project/bellwether#217)",
-    ),
-    (
         "qwen2.5-7b-instruct-1m/render/hermes-func-calling-*",
         "the gateway parses tool-call arguments into objects before rendering and this \
          template writes them as the API's string, so a call in the history renders \
@@ -325,13 +314,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "the gateway parses a history call's arguments into an object before rendering, \
          which the template, writing the string as recorded, renders otherwise: a \
          benchmark set in the tree's sample, every case with a call in its history",
-    ),
-    (
-        "smolvlm2-2.2b-instruct/render/text-developer-role",
-        "the reference of this group was recorded before the developer-as-system rule and keeps \
-         the role as written (`Developer:`): its processor needs a package the recorder's \
-         environment lacked; the re-record with the processor built is \
-         smg-project/bellwether#218",
     ),
 ];
 /// Models whose tokenizer is known not to load, with the reason and where it
