@@ -293,6 +293,28 @@ jobs:
           EXTRA_MODELS: ${{ inputs.extra_models }}
         run: bash scripts/ci_download_model.sh $EXTRA_MODELS
 
+      - name: Apply private SG4 PD allocation phase diagnostic
+        if: inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd' && (inputs.gpu_tier == '4' || inputs.gpu_tier == '2')
+        id: sg4pd-allocation-phase
+        shell: bash
+        env:
+          SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
+        run: |
+          for FLAG_VALUE in "${SMG_SG4_PD_ALLOCATION_PHASE_DIAGNOSTIC:-0}" "${SMG_SG4_PD_CU_EXISTING_RUNTIME:-0}"; do
+            case "$FLAG_VALUE" in
+              0|'') ;;
+              1) ;;
+              *) echo "invalid explicit SG4 phase/CU opt-in" >&2; exit 1 ;;
+            esac
+          done
+          if [ "${SMG_SG4_PD_ALLOCATION_PHASE_DIAGNOSTIC:-0}" != 1 ] && [ "${SMG_SG4_PD_CU_EXISTING_RUNTIME:-0}" != 1 ]; then
+            exit 0
+          fi
+          DIRECTORY="$RUNNER_TEMP/sg4pd-allocation-phase-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "directory=$DIRECTORY" >> "$GITHUB_OUTPUT"
+          echo "AMD_DEPENDENCY_DIRECTORY=$DIRECTORY" >> "$GITHUB_ENV"
+          python3 .github/amd-sg4pd-allocation-phase/apply.py apply "$DIRECTORY"
+
       # Run tests
       - name: Run E2E tests
         timeout-minutes: ${{ inputs.test_timeout }}
@@ -394,6 +416,23 @@ jobs:
       - name: Stop every process this job started
         if: always() && env.E2E_JOB_MARKER != ''
         run: python3 scripts/ci_reap_job_processes.py "$E2E_JOB_MARKER"
+
+      - name: Verify private SG4 PD allocation diagnostic sources
+        if: always() && steps.sg4pd-allocation-phase.outputs.directory != ''
+        shell: bash
+        env:
+          SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
+          PHASE_DIRECTORY: ${{ steps.sg4pd-allocation-phase.outputs.directory }}
+        run: python3 .github/amd-sg4pd-allocation-phase/apply.py final "$PHASE_DIRECTORY"
+
+      - name: Preserve private SG4 PD allocation phase evidence
+        if: always() && steps.sg4pd-allocation-phase.outputs.directory != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: sg4pd-allocation-phase
+          path: ${{ steps.sg4pd-allocation-phase.outputs.directory }}/
+          if-no-files-found: warn
+          retention-days: 7
 
       # The prebuilt TokenSpeed payload is a per-job copy on the node's shared
       # NVMe cache (scripts/ci_fetch_tokenspeed_prebuilt.sh); drop it so the
