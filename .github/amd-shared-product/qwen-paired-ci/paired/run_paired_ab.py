@@ -273,10 +273,50 @@ def main(approval_path, output):
         logs.append(path)
         snapshot = proc.launcher_snapshot(child, nonce)
         child.smg_identity = snapshot["process"] or snapshot["stat"]
-        record = {"label": label, "started_at_utc": utc(), **snapshot, "log": str(path)}
+        initial = snapshot
+        anchor = snapshot["stat"]
+        identity_begin = time.monotonic()
+        identity_end = min(work_deadline, identity_begin + 1.0)
+        record = {"label": label, "started_at_utc": utc(), **snapshot, "log": str(path),
+                  "identity_wait": {"initial_snapshot": initial, "attempts": 1,
+                                    "limit_seconds": 1.0, "elapsed_seconds": 0.0}}
         report["operations"].append(record)
-        (output / (label + "-launcher.json")).write_text(json.dumps(record, indent=2) + "\n")
-        require(snapshot["terminal_reaped"] or snapshot["live_identity_verified"], "own launcher identity")
+        evidence = output / (label + "-launcher.json")
+        evidence.write_text(json.dumps(record, indent=2) + "\n")
+        while not (snapshot["terminal_reaped"] or snapshot["live_identity_verified"]):
+            row, stat = snapshot["process"], snapshot["stat"]
+            pending = bool(anchor and row and stat and
+                           snapshot["identity_error"] is None and snapshot["stat_error"] is None and
+                           row["pid"] == stat["pid"] == anchor["pid"] == child.pid and
+                           row["start_ticks"] == stat["start_ticks"] == anchor["start_ticks"] and
+                           row["ppid"] == stat["ppid"] == anchor["ppid"] == os.getpid() and
+                           row["pgrp"] == stat["pgrp"] == anchor["pgrp"] == child.pid and
+                           row["state"] not in {"Z", "X"} and stat["state"] not in {"Z", "X"} and
+                           row["argv"] in ([], [""]) and row["marker"] is None and
+                           all(value is None for value in row["gpu_masks"].values()))
+            if not pending or time.monotonic() >= identity_end:
+                break
+            alive_and_bounded()
+            time.sleep(min(0.01, max(0, identity_end - time.monotonic())))
+            if time.monotonic() >= identity_end:
+                break
+            snapshot = proc.launcher_snapshot(child, nonce)
+            observed_after_deadline = time.monotonic() >= identity_end
+            record.update(snapshot)
+            record["identity_wait"]["attempts"] += 1
+            record["identity_wait"]["elapsed_seconds"] = time.monotonic() - identity_begin
+            record["identity_wait"]["observed_after_deadline"] = observed_after_deadline
+            evidence.write_text(json.dumps(record, indent=2) + "\n")
+            if observed_after_deadline:
+                break
+        row, stat = snapshot["process"], snapshot["stat"]
+        same_birth = bool(anchor and row and stat and
+                          row["pid"] == stat["pid"] == anchor["pid"] == child.pid and
+                          row["start_ticks"] == stat["start_ticks"] == anchor["start_ticks"] and
+                          row["ppid"] == stat["ppid"] == anchor["ppid"] == os.getpid())
+        require((record["identity_wait"]["attempts"] == 1 or time.monotonic() < identity_end) and
+                (snapshot["terminal_reaped"] or
+                 (snapshot["live_identity_verified"] and same_birth)), "own launcher identity")
         return child
 
     def operation(label, argv, limit, until=None):
