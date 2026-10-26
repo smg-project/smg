@@ -356,27 +356,10 @@ impl LoadState {
 mod tests {
     use std::sync::Barrier;
 
-    use openai_protocol::{
-        model_card::ModelCard,
-        worker::{HealthCheckConfig, SchedulerLoadSnapshot, WorkerType},
-    };
+    use openai_protocol::worker::SchedulerLoadSnapshot;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, ConnectionMode};
-
-    fn ready_worker(url: &str, model: &str) -> Arc<dyn Worker> {
-        let worker = BasicWorkerBuilder::new(url)
-            .worker_type(WorkerType::Regular)
-            .connection_mode(ConnectionMode::Http)
-            .model(ModelCard::new(model))
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
-            .build();
-        worker.set_status(WorkerStatus::Ready);
-        Arc::new(worker)
-    }
+    use crate::worker::test_support::ready_worker;
 
     /// A load report distinguishable by its waiting-token count.
     fn load(waiting: i32) -> Arc<WorkerLoadResponse> {

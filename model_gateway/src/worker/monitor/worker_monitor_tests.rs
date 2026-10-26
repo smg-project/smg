@@ -10,22 +10,11 @@ use crate::{
     config::types::PolicyConfig,
     observability::metrics::test_support::render_with_recorder,
     policies::PolicyRegistry,
-    worker::{overload::OverloadThresholds, BasicWorkerBuilder, ConnectionMode, WorkerType},
+    worker::{
+        overload::OverloadThresholds, test_support::ready_worker, BasicWorkerBuilder,
+        ConnectionMode, WorkerType,
+    },
 };
-
-fn ready_worker(url: &str, model: &str) -> Arc<dyn Worker> {
-    let worker = BasicWorkerBuilder::new(url)
-        .worker_type(WorkerType::Regular)
-        .connection_mode(ConnectionMode::Http)
-        .model(ModelCard::new(model))
-        .health_config(HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        })
-        .build();
-    worker.set_status(WorkerStatus::Ready);
-    Arc::new(worker)
-}
 
 /// Build an isolated monitor and registry with round-robin routing for tests.
 fn build_monitor() -> (Arc<WorkerRegistry>, Arc<WorkerMonitor>) {
