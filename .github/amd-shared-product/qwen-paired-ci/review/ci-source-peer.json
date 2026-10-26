@@ -1,0 +1,39 @@
+{
+  "result": "PASS_SOURCE_ONLY_ACTUAL_DISABLED_8121_ACTIVE_DRM_INTEGRATION",
+  "findings": [],
+  "reviewer": "A; nonauthor of root actual8121 integration. Prior D patch source review A f5fb inherited; no candidate/helper/test execution.",
+  "at_utc": "2026-10-26T02:24:34.992356+00:00",
+  "source_parent": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
+  "actual_head": "8121b2bdbe862ea2d153914c5890405d8d4a723e",
+  "direct_parent": "d8ec61748f32c81eac82cf83929de5a922203858",
+  "actual_worktree": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/amd-qwen-current1473-active-drm-20261026",
+  "actual_branch": "ci/amd-qwen-current1473-active-drm-20261026",
+  "root_integration_receipt_sha256": "ef1c53525a1d088a55257546ff52a6b6f951430dca4ea71259be881a22b9bc0b",
+  "driver_sha256": "7b0a98d25b7c0061d673556b0f6cf41e6b6da7311f1642a1d70145ece8f63591",
+  "envelope_sha256": "06589cd12a0547a4e1d5547f8e24afb6c849ec8e95854d997b73bf1180d1ccfd",
+  "inputs_sha256": "9f0359d170854c490fdc28c18b51a83b87c94b22331ceb56accee41179350925",
+  "CI_job_runner_sha256": "d9a04036e775522123b68043f0c5e2c2a1cdb7543a44dfe0bc2a67e13356164b",
+  "workflow_template_sha256": "aa77da40cedaa56aa6d4f02a2ec0f63c5f4cddabd781ba38adc2bacdfada2564",
+  "CI_source_manifest_sha256": "db3fdc2f45a780f5e6b855fe2db4033065d3df275741706158b8cc1c4e0e8d4e",
+  "disabled_admission_sha256": "124bed5d3307a39e8fa1e110762fee04302f30b7dda600fa39d0f4c99795a307",
+  "git_diff_sha256": "516ba58af274fb6994b03ca745bc811a6863cee850aac632f642cfc8cd7520fd",
+  "checks": [
+    "Actualclean8121 directd8ec, exactly three paths. Whole actual jobrunner/source-manifest/admission bytes equal frozen D preview. No other repository changes.",
+    "All15 actual source-manifest member hashes match; registered workflow byteequals template. Genuine f5fb runtime peer fields independently join actual driver/envelope/pairedinputs/jobrunner/template/manifest, with source_parent1473 rather than CI sourcebase d8ec.",
+    "Both shared and inner19/37/14 maps identical. ActualHEAD consumer19 matches fixed1473; compiled37 match actualHEAD+exactd5; producer14 match exactd5. Five shared helpers actualbyte hashes match their declaration. Fixed1473 is an ancestor and complete e2e tree unchanged.",
+    "Four Qwen execution flags false/res0; allfive shared flags false; innerready/runbudgetfalse/res0. No future model/background/actor/nonce/peer/budget/run identities filled, runtime_result null/coverage0."
+  ],
+  "inherited_source_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-KFD-active-DRM-and-first-error-source-D-20261026/peer-independent-A.json",
+    "sha256": "f5fb0a6faaa35ba37c3affeb07f31f1cded67067ffdc2a9dbcfc8af0291ae01d"
+  },
+  "conditional_child_scope": "This actual source peer may be copied byteexact into review/ci-source-peer.json for a future root data-only conditional child: only qwen admission, review source peer/root-budget, plus four existing shared authority bits may change. consumer_gpu_ready staysfalse; all other shared19/37/14/artifact/native/producer data and15 source members/manifest/registered template remain exact. Root must separately bind fresh real metadata, grant, actual child/source-data peer and resource peer.",
+  "limits": [
+    "Source integration only: no publication/dispatch/deployment/resource grant or new metadata-helper runtime proof.",
+    "Eight KFD GPUs remain distinct from65 render entries; extra records not declared invalid, and missing old K3 first stack remains missing.",
+    "No Qwen model/paired/GPU/ABI/full original-row outcome or coverage acceptance; existing failed attempts/retired budgets stay preserved."
+  ],
+  "executed": false,
+  "resource_authority": false,
+  "coverage_increment": 0
+}
