@@ -24,16 +24,16 @@ from .constants import (
     HEALTH_CHECK_INTERVAL,
     LAUNCH_STAGGER_DELAY,
     MM_PROCESSING_WORKER,
+    SERVICER_IMPL_VARIABLES,
     ConnectionMode,
     WorkerType,
     effective_startup_timeout,
     get_gpu_offset,
     get_mm_processing,
     get_runtime,
-    get_sglang_servicer_impl,
-    get_tokenspeed_servicer_impl,
+    get_servicer_impl,
+    get_servicer_impl_setting,
     get_vllm_mm_processor,
-    get_vllm_servicer_impl,
     get_zmq_engine_count,
     host_port,
     moriio_host,
@@ -886,26 +886,23 @@ class Worker:
 
         # The servicer implementation of a gRPC worker is a flag inside the smg
         # servicer package, read by the engine's own entrypoint (the command
-        # stays): per engine, the variable the worker reads and the lane's
-        # choice for it. Built here, not at import, so the getters and the hook
-        # check are the module's current ones (a test replaces them).
-        servicer_impl = {
-            "vllm": ("SMG_VLLM_SERVICER_IMPL", get_vllm_servicer_impl),
-            "tokenspeed": ("SMG_TOKENSPEED_SERVICER_IMPL", get_tokenspeed_servicer_impl),
-            "sglang": ("SMG_SGLANG_SERVICER_IMPL", get_sglang_servicer_impl),
-        }
+        # stays). The lane's explicit choice is exported as given; a lane that
+        # sets nothing exports nothing and the worker runs the package's
+        # default, which is what the harness read for its own decisions
+        # (infra.constants.get_servicer_impl), so an inherited value is
+        # removed rather than letting the worker and the harness disagree.
         # The engines whose Rust servicer needs a hook in the engine package: a
         # worker without it would run Python while the lane reports Rust coverage.
         rust_servicer_needs_hook = {"vllm"}
-        if self.mode == ConnectionMode.GRPC and self.engine in servicer_impl:
-            variable, lane_choice = servicer_impl[self.engine]
-            if lane_choice() == "rust":
-                if self.engine in rust_servicer_needs_hook:
-                    _require_rust_servicer_hook()
-                env[variable] = "rust"
-            else:
-                # The lane setting is authoritative over an inherited value.
+        if self.mode == ConnectionMode.GRPC and self.engine in SERVICER_IMPL_VARIABLES:
+            _setting, variable = SERVICER_IMPL_VARIABLES[self.engine]
+            choice = get_servicer_impl_setting(self.engine)
+            if choice is None:
                 env.pop(variable, None)
+            else:
+                env[variable] = choice
+            if self.engine in rust_servicer_needs_hook and get_servicer_impl(self.engine) == "rust":
+                _require_rust_servicer_hook()
 
         if (
             self.engine == "vllm"
@@ -1149,12 +1146,15 @@ class Worker:
 
 
 def _require_rust_servicer_hook() -> None:
-    """Fail the Rust lane up front when the installed vLLM cannot select it."""
+    """Fail a lane whose vLLM workers would run the Rust servicer (by
+    ``E2E_VLLM_SERVICER_IMPL=rust`` or by the servicer package's default) up
+    front when the installed vLLM cannot select it."""
     try:
         from smg_grpc_servicer.vllm.rust import require_upstream_hook
     except ImportError as error:
         raise RuntimeError(
-            f"{ENV_VLLM_SERVICER_IMPL}=rust needs the smg-grpc-servicer package"
+            f"the Rust vLLM servicer ({ENV_VLLM_SERVICER_IMPL}=rust, or the servicer "
+            f"package's default) needs the smg-grpc-servicer package and its vLLM hook: {error}"
         ) from error
     require_upstream_hook()
 

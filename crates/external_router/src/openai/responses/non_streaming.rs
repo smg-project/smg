@@ -23,6 +23,7 @@ use crate::{
     openai_bridge,
     persistence_utils::{persist_conversation_items, PersistStep},
     tenant::storage_tenant,
+    worker::redacted_url,
 };
 
 /// Handle a non-streaming responses request
@@ -137,7 +138,7 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
             Err(e) => {
                 worker.record_outcome(502);
                 tracing::error!(
-                    url = %url,
+                    url = %redacted_url(&url),
                     error = %e,
                     "Failed to forward request to OpenAI"
                 );
@@ -214,4 +215,66 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
     }
 
     (StatusCode::OK, Json(response_json)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::http::StatusCode;
+    use openai_protocol::responses::ResponsesRequest;
+    use serde_json::json;
+
+    use super::handle_non_streaming_response;
+    use crate::{
+        openai::{
+            context::{
+                ComponentRefs, PayloadState, RequestContext, SharedComponents, WorkerSelection,
+            },
+            provider::OpenAIProvider,
+        },
+        test_support::{http_client, StubWorker, CREDENTIALED_WORKER_URL, MASKED_WORKER_URL},
+    };
+
+    /// A request context past worker selection with its payload ready, the
+    /// worker at `worker_url`; the request names no tool, so the plain
+    /// forward is taken.
+    fn context_for(worker_url: &str) -> RequestContext {
+        let request: ResponsesRequest =
+            serde_json::from_value(json!({"model": "m", "input": "hi"})).expect("a request");
+        let mut ctx = RequestContext::for_responses(
+            Arc::new(request),
+            None,
+            Some("m".to_string()),
+            ComponentRefs::Shared(Arc::new(SharedComponents {
+                client: http_client(),
+            })),
+        );
+        ctx.state.worker = Some(WorkerSelection {
+            worker: StubWorker::at(worker_url),
+            provider: Arc::new(OpenAIProvider),
+        });
+        ctx.state.payload = Some(PayloadState {
+            json: json!({}),
+            url: format!("{worker_url}/v1/responses"),
+        });
+        ctx
+    }
+
+    /// The forward's failure line names the worker masked: a worker
+    /// registered with credentials at a port nobody listens on fails the
+    /// send, and the line carries the masked address, never the
+    /// credentials. The capture is the tracing subscriber itself, so the
+    /// rendering is read as a log reader would.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_failed_forward_names_the_worker_masked_in_its_line() {
+        let response = handle_non_streaming_response(context_for(CREDENTIALED_WORKER_URL)).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(!logs_contain("secret"));
+        assert!(!logs_contain("user:"));
+        assert!(logs_contain("Failed to forward request to OpenAI"));
+        assert!(logs_contain(&format!("{MASKED_WORKER_URL}/v1/responses")));
+    }
 }

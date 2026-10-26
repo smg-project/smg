@@ -542,9 +542,7 @@ fn cache_aware_always_requests_backend_load_updates() {
 
 #[test]
 fn cache_aware_load_update_resets_atomic_inflight_credit() {
-    let policy = CacheAwarePolicy::with_config(test_config());
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
+    let (policy, workers) = initialised_pair();
     // `w2` holds one request the router dispatched, and its report counts
     // it: one waiting request of 500 uncached tokens. Right after the
     // update `w2` is the busier worker by count (1 vs 0) and the more
@@ -606,9 +604,7 @@ fn a_miss_avoids_the_worker_whose_report_hides_the_requests_the_router_holds() {
     // live rate standing in for its idle gauge) for the requests its
     // report hides, it loses every miss to `w1` until `w1`'s own credit
     // has grown to as much.
-    let policy = CacheAwarePolicy::with_config(test_config());
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
+    let (policy, workers) = initialised_pair();
     for _ in 0..6 {
         workers[1].increment_load();
     }
@@ -640,9 +636,7 @@ fn a_request_the_report_already_counts_is_not_priced_again() {
     // 31 s at `w1`'s live rate (its own idle gauge does not count).
     // Charged a second time for the three, `w1` would read as 61.44 s
     // and lose.
-    let policy = CacheAwarePolicy::with_config(test_config());
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
+    let (policy, workers) = initialised_pair();
     for _ in 0..3 {
         workers[0].increment_load();
     }
@@ -661,9 +655,7 @@ fn a_request_the_report_already_counts_is_not_priced_again() {
     // nothing is charged on top of the credit either. Both reports carry
     // the fixture's one running request (10.24 s each), so it cancels:
     // 40.96 s against `w2`'s 41.24 s.
-    let policy = CacheAwarePolicy::with_config(test_config());
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
+    let (policy, workers) = initialised_pair();
     TestFeed::attached_to(&policy).publish(&HashMap::from([
         (
             workers[0].url().to_string(),
@@ -691,9 +683,7 @@ fn a_request_the_report_already_counts_is_not_priced_again() {
 
 #[test]
 fn a_report_the_snapshot_dropped_is_no_longer_scored() {
-    let policy = CacheAwarePolicy::with_config(test_config());
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
+    let (policy, workers) = initialised_pair();
     let feed = TestFeed::attached_to(&policy);
     feed.publish(&HashMap::from([
         (
@@ -734,9 +724,7 @@ fn a_report_the_snapshot_dropped_is_no_longer_scored() {
 
 #[test]
 fn the_shared_snapshot_is_the_score_source() {
-    let policy = CacheAwarePolicy::with_config(test_config());
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
+    let (policy, workers) = initialised_pair();
     let feed = TestFeed::attached_to(&policy);
     feed.publish(&HashMap::from([
         (
@@ -770,9 +758,7 @@ fn the_shared_snapshot_is_the_score_source() {
 
 #[test]
 fn cache_aware_reset_discards_the_in_flight_credit() {
-    let policy = CacheAwarePolicy::with_config(test_config());
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
+    let (policy, workers) = initialised_pair();
     update_expected_wait_loads(&policy, &workers, &[100_000, 0]);
 
     let first = SelectWorkerInfo {
@@ -802,9 +788,7 @@ fn cache_aware_reset_discards_the_in_flight_credit() {
 
 #[test]
 fn cache_aware_worker_removal_prunes_expected_wait_state() {
-    let policy = CacheAwarePolicy::with_config(test_config());
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
+    let (policy, workers) = initialised_pair();
     for _ in 0..5 {
         workers[1].increment_load();
     }
@@ -945,9 +929,7 @@ fn prefill_miss_ignores_generation_rate() {
 
 #[test]
 fn string_tree_miss_uses_expected_wait_and_records_final_worker() {
-    let policy = CacheAwarePolicy::with_config(test_config());
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
+    let (policy, workers) = initialised_pair();
     for _ in 0..5 {
         workers[1].increment_load();
     }
@@ -1068,9 +1050,7 @@ fn token_tree_unique_hit_keeps_affinity_and_credits_expected_wait() {
 
 #[test]
 fn token_tree_miss_uses_expected_wait_and_records_final_worker() {
-    let policy = CacheAwarePolicy::with_config(test_config());
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
+    let (policy, workers) = initialised_pair();
     for _ in 0..5 {
         workers[1].increment_load();
     }
@@ -2290,9 +2270,7 @@ fn test_config() -> CacheAwareConfig {
 
 #[test]
 fn test_overlap_affinity_group_selects_best_match() {
-    let policy = CacheAwarePolicy::with_config(test_config());
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
+    let (_policy, workers) = initialised_pair();
 
     // Store 4 blocks for w1: tokens [1..16] in blocks of 4
     let indexer = setup_indexer_with_blocks(
@@ -2563,9 +2541,7 @@ fn test_raw_load_does_not_break_equal_affinity() {
 
 #[test]
 fn test_tree_size_does_not_break_equal_affinity() {
-    let policy = CacheAwarePolicy::with_config(test_config());
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
+    let (_policy, workers) = initialised_pair();
 
     let indexer = Arc::new(KvIndex::chain());
     let w1_id = indexer.intern_worker("http://w1:8000").unwrap();
@@ -2624,9 +2600,7 @@ fn test_overlap_affinity_group_short_request_is_empty() {
 
 #[test]
 fn test_overlap_affinity_group_prefers_deeper_partial_match() {
-    let policy = CacheAwarePolicy::with_config(test_config());
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
+    let (_policy, workers) = initialised_pair();
 
     let indexer = Arc::new(KvIndex::chain());
     let w1_id = indexer.intern_worker("http://w1:8000").unwrap();
@@ -2685,9 +2659,7 @@ fn test_overlap_affinity_group_prefers_deeper_partial_match() {
 /// request 0, so the histogram is the production signal of the prediction.
 #[test]
 fn an_event_driven_decision_observes_its_match_ratio() {
-    let policy = CacheAwarePolicy::with_config(test_config());
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
+    let (policy, workers) = initialised_pair();
     update_expected_wait_loads(&policy, &workers, &[0, 0]);
     let monitor = Arc::new(KvEventMonitor::new());
     let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4], &[5, 6, 7, 8]]);
@@ -2735,9 +2707,7 @@ fn an_event_driven_decision_observes_its_match_ratio() {
 
 #[test]
 fn event_unique_hit_keeps_affinity_and_credits_expected_wait() {
-    let policy = CacheAwarePolicy::with_config(test_config());
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
+    let (policy, workers) = initialised_pair();
     workers[1].increment_load();
     update_expected_wait_loads(&policy, &workers, &[10_000, 0]);
 
@@ -2767,9 +2737,7 @@ fn a_worker_with_an_emptied_index_gets_the_warm_up_slice_whatever_its_age() {
     // every request shares a head with w1, so affinity alone would never
     // send w2 a request again. The slice does, on the thin overlap: w2 is
     // thin against the fleet's level whatever its age.
-    let policy = CacheAwarePolicy::with_config(test_config());
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
+    let (policy, workers) = initialised_pair();
     update_expected_wait_loads(&policy, &workers, &[0, 0]);
     let held: Vec<u32> = (1..=4_400).collect();
     let monitor = Arc::new(KvEventMonitor::new());
@@ -3242,9 +3210,7 @@ fn a_fleet_without_a_thin_worker_sees_no_diversion() {
 
 #[test]
 fn event_no_overlap_uses_expected_wait() {
-    let policy = CacheAwarePolicy::with_config(test_config());
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
+    let (policy, workers) = initialised_pair();
     for _ in 0..5 {
         workers[1].increment_load();
     }
@@ -3409,9 +3375,7 @@ fn event_temperature_keeps_equal_score_group_for_expected_wait() {
 
 #[test]
 fn test_event_driven_overlap_selects_cached_worker() {
-    let policy = CacheAwarePolicy::with_config(test_config());
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
+    let (policy, workers) = initialised_pair();
 
     // Set up monitor with indexer data for "unknown" model
     let monitor = Arc::new(KvEventMonitor::new());
@@ -3524,9 +3488,7 @@ fn test_event_driven_short_request_uses_dark_fleet_expected_wait() {
 
 #[test]
 fn test_no_monitor_uses_token_tree() {
-    let policy = CacheAwarePolicy::with_config(test_config());
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
+    let (policy, workers) = initialised_pair();
 
     // No kv_monitor → has_event_indexer returns false → uses token tree
     assert!(!policy.has_event_indexer("unknown"));
@@ -3654,9 +3616,7 @@ fn test_empty_indexer_falls_through_to_token_tree() {
     // When the monitor has an indexer for a model but the indexer is empty
     // (startup, reconnect), routing should fall through to the token tree
     // instead of taking the event-driven path and landing on a fallback.
-    let policy = CacheAwarePolicy::with_config(test_config());
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
+    let (policy, workers) = initialised_pair();
 
     // Set up monitor with an empty indexer
     let monitor = Arc::new(KvEventMonitor::new());
@@ -3725,6 +3685,37 @@ fn gate_at_mean(config: CacheAwareConfig) -> CacheAwareConfig {
     }
 }
 
+/// The w1/w2 pair with the policy of `test_config()` initialised on them:
+/// what most of the tests start from, before their own loads and blocks.
+fn initialised_pair() -> (CacheAwarePolicy, Vec<Arc<dyn Worker>>) {
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    policy.init_workers(&workers);
+    (policy, workers)
+}
+
+/// Two workers under the count-pressure gate of `config`, the feed skewed
+/// against the first: the policy initialised on them, the loads published.
+fn gated_pair(config: CacheAwareConfig) -> (CacheAwarePolicy, Vec<Arc<dyn Worker>>) {
+    let policy = CacheAwarePolicy::with_config(gate_at_mean(config));
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    policy.init_workers(&workers);
+    TestFeed::attached_to(&policy).publish(&skewed_rate_loads(&workers));
+    (policy, workers)
+}
+
+/// Eight routes of `route`, each counted in flight on the worker it picked
+/// (the router counts the dispatch; the gate reads it): how many each got.
+fn burst_picks(workers: &[Arc<dyn Worker>], mut route: impl FnMut(u32) -> usize) -> [usize; 2] {
+    let mut picks = [0usize; 2];
+    for i in 0..8 {
+        let idx = route(i);
+        workers[idx].increment_load();
+        picks[idx] += 1;
+    }
+    picks
+}
+
 /// A request at or below `cache_threshold` has no holder to spill from,
 /// and expected wait alone keeps no count bound: its queue and rate
 /// signals are a poll old, so a burst of misses followed one worker
@@ -3732,28 +3723,17 @@ fn gate_at_mean(config: CacheAwareConfig) -> CacheAwareConfig {
 /// the same count-pressure gate a hit spills at.
 #[test]
 fn miss_burst_is_bounded_by_the_count_pressure_gate() {
-    let policy = CacheAwarePolicy::with_config(gate_at_mean(test_config()));
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
-    TestFeed::attached_to(&policy).publish(&skewed_rate_loads(&workers));
-
-    let mut picks = [0usize; 2];
-    for i in 0..8 {
+    let (policy, workers) = gated_pair(test_config());
+    let picks = burst_picks(&workers, |i| {
         let text = format!("{i} novel prompt with nothing in common");
-        let idx = route_text(&policy, &workers, &text).unwrap();
-        // The router counts the dispatch in flight; the gate reads it.
-        workers[idx].increment_load();
-        picks[idx] += 1;
-    }
+        route_text(&policy, &workers, &text).unwrap()
+    });
     assert_eq!(picks, [4, 4]);
 }
 
 #[test]
 fn event_miss_burst_is_bounded_by_the_count_pressure_gate() {
-    let policy = CacheAwarePolicy::with_config(gate_at_mean(test_config()));
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
-    TestFeed::attached_to(&policy).publish(&skewed_rate_loads(&workers));
+    let (policy, workers) = gated_pair(test_config());
     let monitor = Arc::new(KvEventMonitor::new());
     monitor.indexers.insert(
         "unknown".to_string(),
@@ -3761,38 +3741,20 @@ fn event_miss_burst_is_bounded_by_the_count_pressure_gate() {
     );
     policy.set_kv_event_monitor(Some(monitor));
 
-    let mut picks = [0usize; 2];
-    for i in 0..8u32 {
+    let picks = burst_picks(&workers, |i| {
         let novel = [100 + i, 200, 300, 400];
-        let idx = policy
-            .select_worker(
-                &workers,
-                &SelectWorkerInfo {
-                    tokens: Some(&novel),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        workers[idx].increment_load();
-        picks[idx] += 1;
-    }
+        route_tokens(&policy, &workers, &novel)
+    });
     assert_eq!(picks, [4, 4]);
 }
 
 #[test]
 fn hash_miss_burst_is_bounded_by_the_count_pressure_gate() {
-    let policy = CacheAwarePolicy::with_config(gate_at_mean(hash_config(&[4])));
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
-    TestFeed::attached_to(&policy).publish(&skewed_rate_loads(&workers));
-
-    let mut picks = [0usize; 2];
-    for i in 0..8u32 {
+    let (policy, workers) = gated_pair(hash_config(&[4]));
+    let picks = burst_picks(&workers, |i| {
         let head = [i, i, i, i, 9];
-        let idx = route_tokens(&policy, &workers, &head);
-        workers[idx].increment_load();
-        picks[idx] += 1;
-    }
+        route_tokens(&policy, &workers, &head)
+    });
     assert_eq!(picks, [4, 4]);
 }
 
@@ -3800,18 +3762,11 @@ fn hash_miss_burst_is_bounded_by_the_count_pressure_gate() {
 /// there; the same bound applies.
 #[test]
 fn hash_untokenized_burst_is_bounded_by_the_count_pressure_gate() {
-    let policy = CacheAwarePolicy::with_config(gate_at_mean(hash_config(&[4])));
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
-    TestFeed::attached_to(&policy).publish(&skewed_rate_loads(&workers));
-
-    let mut picks = [0usize; 2];
-    for i in 0..8 {
+    let (policy, workers) = gated_pair(hash_config(&[4]));
+    let picks = burst_picks(&workers, |i| {
         let text = format!("{i} novel prompt with nothing in common");
-        let idx = route_text(&policy, &workers, &text).unwrap();
-        workers[idx].increment_load();
-        picks[idx] += 1;
-    }
+        route_text(&policy, &workers, &text).unwrap()
+    });
     assert_eq!(picks, [4, 4]);
 }
 
@@ -3823,9 +3778,7 @@ fn hash_untokenized_burst_is_bounded_by_the_count_pressure_gate() {
 /// water-fill without the gate's help.
 #[test]
 fn idle_rate_residual_does_not_herd_misses() {
-    let policy = CacheAwarePolicy::with_config(test_config());
-    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    policy.init_workers(&workers);
+    let (policy, workers) = initialised_pair();
     let idle = |gen_throughput| WorkerLoadResponse {
         loads: vec![SchedulerLoadSnapshot {
             num_running_reqs: 0,

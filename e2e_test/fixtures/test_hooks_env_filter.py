@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 from fixtures import hooks
+from infra import constants
 
 
 class _FakeItem:
@@ -65,6 +66,9 @@ def _clean_env(monkeypatch):
         "E2E_RUNTIME",
         "E2E_ZMQ_ENGINE_COUNT",
         "E2E_MIN_SELECTED",
+        "E2E_SGLANG_SERVICER_IMPL",
+        "E2E_TOKENSPEED_SERVICER_IMPL",
+        "E2E_VLLM_SERVICER_IMPL",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -357,3 +361,70 @@ def test_sglang_rust_lane_drops_only_what_the_msgpack_wire_lacks():
     # ride the wire (the bootstrap slots, the scheduler's processor output,
     # control calls, embedding requests); the EPD encode dispatch does not.
     assert kept == [chat, pd, mm, admin, embed] and deselected == [epd]
+
+
+# ---------------------------------------------------------------------------
+# pytest_collection_modifyitems: the Rust-path filters key on the implementation
+# the lane's workers run (the lane's setting, else the servicer package's default)
+# ---------------------------------------------------------------------------
+
+
+def _lane(monkeypatch, runtime: str, package_default: str | None, setting: str | None):
+    """A lane of ``runtime`` whose servicer package defaults to
+    ``package_default`` (None: the package is absent) and whose own setting is
+    ``setting`` (None: unset)."""
+    monkeypatch.setenv("E2E_RUNTIME", runtime)
+    monkeypatch.setattr(constants, "_RUNTIME_CACHE", None)
+    switch = (
+        None
+        if package_default is None
+        else (lambda variable, environ=None, **_: (package_default, "default"))
+    )
+    monkeypatch.setattr(constants, "_package_servicer_switch", lambda: switch)
+    if setting is not None:
+        monkeypatch.setenv(f"E2E_{runtime.upper()}_SERVICER_IMPL", setting)
+
+
+def _rust_lane_items(runtime: str):
+    """One case the Rust path serves and one it does not, for ``runtime``."""
+    plain = _FakeItem(f"{runtime}/test_basic.py::test_chat[grpc]", params={"setup_backend": "grpc"})
+    if runtime == "tokenspeed":
+        refused = _FakeItem(
+            "router/test_admin_ops.py::test_flush", params={"setup_backend": "grpc"}
+        )
+    else:
+        refused = _FakeItem(
+            "chat_completions/test_epd.py::test_epd[1e1p1d]",
+            params={"setup_backend": ("epd_grpc", (1, 1, 1))},
+        )
+    return plain, refused
+
+
+@pytest.mark.parametrize("runtime", ["tokenspeed", "sglang"])
+@pytest.mark.parametrize(
+    ("package_default", "setting", "filtered"),
+    [
+        ("rust", None, True),  # unset lane on a package whose default is the Rust servicer
+        ("python", None, False),  # unset lane on a package whose default is the Python servicer
+        (None, None, False),  # unset lane, package absent: nothing known, nothing dropped
+        ("rust", "python", False),  # an explicit python lane keeps the Rust-refused cases
+        ("python", "rust", True),  # an explicit rust lane drops them whatever the default
+    ],
+)
+def test_rust_path_filters_follow_the_effective_servicer(
+    monkeypatch, runtime, package_default, setting, filtered
+):
+    _lane(monkeypatch, runtime, package_default, setting)
+    plain, refused = _rust_lane_items(runtime)
+    config = _FakeConfig()
+    items = _run(config, [plain, refused])
+    if filtered:
+        assert items == [plain] and config.deselected == [refused]
+        assert f"1 by {runtime}-rust-servicer" in _summary(config)
+    else:
+        # The hook also orders the kept items for the worker pool.
+        assert sorted(items, key=lambda i: i.nodeid) == sorted(
+            [plain, refused], key=lambda i: i.nodeid
+        )
+        assert config.deselected == []
+        assert "rust-servicer" not in _summary(config)

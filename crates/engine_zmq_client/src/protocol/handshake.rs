@@ -116,6 +116,16 @@ pub struct EngineCoreReadyResponse {
     /// out or sends it as nil.
     #[serde(default, deserialize_with = "nil_as_empty_map")]
     pub positional_layouts: BTreeMap<String, Vec<String>>,
+    /// Whether the engine's request decoder resolves a tensor the request
+    /// addresses as an auxiliary frame of its message (the typed-tensor
+    /// wires' convention: the payload is frame 0 and a tensor's slot carries
+    /// the one-based index of its frame). Declared by the SGLang plugin,
+    /// which decodes with the engine's own hooks and resolves the frames
+    /// itself; an SGLang scheduler that declares nothing is sent every tensor
+    /// inline. The vLLM and TokenSpeed decoders resolve them on every
+    /// release and declare nothing.
+    #[serde(default)]
+    pub tensor_aux_frames: bool,
 }
 
 /// A map an engine may send as nil (a Python `None` in a struct that omits

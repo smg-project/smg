@@ -89,6 +89,12 @@ pub struct VllmModelInfo {
     pub kv_connector: String,
     pub kv_role: String,
     pub kv_engine_id: String,
+    /// Whether a Mooncake connector runs in the engine at all, as the
+    /// launcher reads it off the raw `kv_transfer_config` (the top-level
+    /// connector or any child a wrapper lists, whatever `kv_connector`
+    /// projects): a PD decode side's KV-transfer rejection notice is
+    /// withheld there (see `generate.rs`).
+    pub runs_mooncake: bool,
     /// PD pairing facts the Router matches before a handoff: requested KV
     /// cache dtype and attention backend (empty when auto), and the model
     /// dtype / block size the handshake confirms (these two are fallbacks

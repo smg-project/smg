@@ -107,11 +107,11 @@ fn usage(events: &[Value]) -> Value {
         .expect("the usage chunk")
 }
 
-#[tokio::test]
-async fn a_local_stop_ends_the_chat_read_and_the_engine_request() {
-    // The engine streams on past the stop (the `zzzz` chunk: a stop it did
-    // not see); the rest of its tail and its Complete wait behind the gate,
-    // and a read past the tail's first chunk would wait with them.
+/// A single-choice stream that streams on past the local stop (`ab`, `cSTOPd`,
+/// then `zzzz`: a stop the engine did not see); the rest of its tail and its
+/// Complete wait behind the returned gate, and a read past the tail's first
+/// chunk would wait with them.
+async fn stream_past_a_local_stop() -> (oneshot::Sender<()>, ProtoStream, JoinHandle<()>) {
     let (gate_tx, gate) = oneshot::channel::<()>();
     let (stream, server) = gated_stream(
         vec![
@@ -124,6 +124,12 @@ async fn a_local_stop_ends_the_chat_read_and_the_engine_request() {
         "0",
     )
     .await;
+    (gate_tx, stream, server)
+}
+
+#[tokio::test]
+async fn a_local_stop_ends_the_chat_read_and_the_engine_request() {
+    let (gate_tx, stream, server) = stream_past_a_local_stop().await;
     let (tx, rx) = sse_channel();
     let result = timeout(
         Duration::from_secs(5),
@@ -230,18 +236,7 @@ async fn a_local_stop_ends_the_completion_read_and_the_engine_request() {
     }))
     .unwrap();
     let spec = CompletionResponseSpec::from(&request);
-    let (gate_tx, gate) = oneshot::channel::<()>();
-    let (stream, server) = gated_stream(
-        vec![
-            counted_chunk(0, "ab", 7),
-            counted_chunk(0, "cSTOPd", 7),
-            counted_chunk(0, "zzzz", 7),
-        ],
-        gate,
-        vec![counted_chunk(0, "more", 7), complete(0, "length")],
-        "0",
-    )
-    .await;
+    let (gate_tx, stream, server) = stream_past_a_local_stop().await;
     let (tx, rx) = sse_channel();
     let outcome = timeout(
         Duration::from_secs(5),
@@ -297,18 +292,7 @@ fn messages_spec() -> MessagesResponseSpec {
 
 #[tokio::test]
 async fn a_local_stop_ends_the_messages_read_and_the_engine_request() {
-    let (gate_tx, gate) = oneshot::channel::<()>();
-    let (stream, server) = gated_stream(
-        vec![
-            counted_chunk(0, "ab", 7),
-            counted_chunk(0, "cSTOPd", 7),
-            counted_chunk(0, "zzzz", 7),
-        ],
-        gate,
-        vec![counted_chunk(0, "more", 7), complete(0, "length")],
-        "0",
-    )
-    .await;
+    let (gate_tx, stream, server) = stream_past_a_local_stop().await;
     let (tx, rx) = sse_channel();
     let result = timeout(
         Duration::from_secs(5),

@@ -202,8 +202,8 @@ def test_an_add_with_a_metadata_frame_starts_the_requests_trace(monkeypatch, sgl
 
     class Decoder:
         @staticmethod
-        def decode(payload):
-            request = _request(rid=msgspec.msgpack.decode(payload)[1])
+        def decode(frames):
+            request = _request(rid=msgspec.msgpack.decode(frames[1])[1])
             decoded.append(request)
             return request
 

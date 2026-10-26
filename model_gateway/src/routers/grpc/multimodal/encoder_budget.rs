@@ -140,31 +140,14 @@ mod tests {
 
     use super::*;
     use crate::worker::{
-        test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, ModelCard, RuntimeType,
-        WorkerType,
+        test_support::{grpc_worker, registry_with},
+        RuntimeType,
     };
 
     const MODEL: &str = "vision-model";
 
     fn worker(url: &str, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
-        let mut builder = BasicWorkerBuilder::new(url)
-            .model(ModelCard::new(MODEL))
-            .worker_type(WorkerType::Regular)
-            .runtime_type(RuntimeType::Vllm)
-            .connection_mode(ConnectionMode::Grpc)
-            .health_config(no_health_check());
-        for (key, value) in labels {
-            builder = builder.label(*key, *value);
-        }
-        Arc::new(builder.build())
-    }
-
-    fn registry_with(workers: Vec<Arc<dyn Worker>>) -> WorkerRegistry {
-        let registry = WorkerRegistry::new();
-        for worker in workers {
-            registry.register(worker).expect("register");
-        }
-        registry
+        grpc_worker(url, MODEL, RuntimeType::Vllm, labels)
     }
 
     fn sampled(frames: usize) -> MediaItemInfo {

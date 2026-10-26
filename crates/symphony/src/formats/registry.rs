@@ -172,7 +172,10 @@ impl Table {
     /// other text. The gateway's older parser names are the gateway's to map (`qwen` for `qwen3`):
     /// the crate knows a table by its own name.
     pub fn named(name: &str) -> Option<Self> {
-        Self::exactly_named(&name.trim().to_ascii_lowercase())
+        let name = name.trim();
+        ROWS.iter()
+            .find(|row| row.name.eq_ignore_ascii_case(name))
+            .map(|row| row.table)
     }
 
     /// The table named `name` exactly, as [`Self::name`] spells it; `None` for any other text. A

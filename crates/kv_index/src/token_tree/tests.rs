@@ -1261,19 +1261,23 @@ fn test_reset_via_trait() {
     assert!(tree.get_tenant_token_counts().is_empty());
 }
 
+/// Three one-page paths of `tenant1`, inserted in order: the first is the
+/// oldest by creation and by access, the third the newest.
+fn three_inserted_pages(tree: &TokenTree) -> [Vec<TokenId>; 3] {
+    let pages = [make_tokens(1, 1), make_tokens(100, 1), make_tokens(200, 1)];
+    for tokens in &pages {
+        tree.insert_tokens(tokens, "tenant1");
+    }
+    pages
+}
+
 #[test]
 fn test_eviction_policy_lru() {
     // LRU: Evict oldest by last access time
     let tree = TokenTree::with_policy(EvictionPolicy::Lru);
 
     // Insert 3 paths, access them in order (oldest first)
-    let tokens1 = make_tokens(1, 1);
-    let tokens2 = make_tokens(100, 1);
-    let tokens3 = make_tokens(200, 1);
-
-    tree.insert_tokens(&tokens1, "tenant1"); // Oldest
-    tree.insert_tokens(&tokens2, "tenant1");
-    tree.insert_tokens(&tokens3, "tenant1"); // Newest
+    let [tokens1, tokens2, tokens3] = three_inserted_pages(&tree);
 
     // Access tokens2 to make it newer
     let _ = tree.match_prefix_with_counts(&tokens2);
@@ -1306,13 +1310,7 @@ fn test_eviction_policy_mru() {
     // MRU: Evict newest by last access time (opposite of LRU)
     let tree = TokenTree::with_policy(EvictionPolicy::Mru);
 
-    let tokens1 = make_tokens(1, 1);
-    let tokens2 = make_tokens(100, 1);
-    let tokens3 = make_tokens(200, 1);
-
-    tree.insert_tokens(&tokens1, "tenant1"); // Oldest
-    tree.insert_tokens(&tokens2, "tenant1");
-    tree.insert_tokens(&tokens3, "tenant1"); // Newest
+    let [tokens1, _, tokens3] = three_inserted_pages(&tree);
 
     // Evict 1 page - should evict tokens3 (newest by last_access_time)
     tree.evict_tenant(&Arc::from("tenant1"), 2 * PAGE_SIZE);
@@ -1336,13 +1334,7 @@ fn test_eviction_policy_fifo() {
     // FIFO: Evict oldest by creation time (not affected by access)
     let tree = TokenTree::with_policy(EvictionPolicy::Fifo);
 
-    let tokens1 = make_tokens(1, 1);
-    let tokens2 = make_tokens(100, 1);
-    let tokens3 = make_tokens(200, 1);
-
-    tree.insert_tokens(&tokens1, "tenant1"); // First created
-    tree.insert_tokens(&tokens2, "tenant1");
-    tree.insert_tokens(&tokens3, "tenant1"); // Last created
+    let [tokens1, _, _] = three_inserted_pages(&tree);
 
     // Access tokens1 multiple times (shouldn't affect FIFO)
     for _ in 0..10 {
@@ -1365,13 +1357,7 @@ fn test_eviction_policy_filo() {
     // FILO: Evict newest by creation time (stack-like)
     let tree = TokenTree::with_policy(EvictionPolicy::Filo);
 
-    let tokens1 = make_tokens(1, 1);
-    let tokens2 = make_tokens(100, 1);
-    let tokens3 = make_tokens(200, 1);
-
-    tree.insert_tokens(&tokens1, "tenant1"); // First created
-    tree.insert_tokens(&tokens2, "tenant1");
-    tree.insert_tokens(&tokens3, "tenant1"); // Last created
+    let [tokens1, _, tokens3] = three_inserted_pages(&tree);
 
     // Evict 1 page - should evict tokens3 (newest by creation_time)
     tree.evict_tenant(&Arc::from("tenant1"), 2 * PAGE_SIZE);
@@ -1395,13 +1381,7 @@ fn test_eviction_policy_lfu() {
     // LFU: Evict least frequently used (by hit_count)
     let tree = TokenTree::with_policy(EvictionPolicy::Lfu);
 
-    let tokens1 = make_tokens(1, 1);
-    let tokens2 = make_tokens(100, 1);
-    let tokens3 = make_tokens(200, 1);
-
-    tree.insert_tokens(&tokens1, "tenant1");
-    tree.insert_tokens(&tokens2, "tenant1");
-    tree.insert_tokens(&tokens3, "tenant1");
+    let [tokens1, tokens2, tokens3] = three_inserted_pages(&tree);
 
     // Access tokens1 many times to increase its hit_count
     for _ in 0..20 {

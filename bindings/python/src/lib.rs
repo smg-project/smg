@@ -510,7 +510,6 @@ struct Router {
     job_queue_concurrency: usize,
     kv_connector_annotation: String,
     kv_engine_id_annotation: String,
-    kv_index: Option<String>,
     least_load_default_throughput: f64,
     least_load_kv_pressure_weight: f64,
     least_load_max_waiting_requests: u32,
@@ -615,6 +614,7 @@ struct Router {
     service_discovery_namespace: Option<String>,
     service_discovery_port: u16,
     shutdown_grace_period_secs: u64,
+    shutdown_settle_secs: Option<u64>,
     sse_keepalive_secs: u64,
     storage_context_headers: HashMap<String, String>,
     storage_hook_wasm_path: Option<String>,
@@ -1152,8 +1152,6 @@ impl Router {
                 self.worker_warmup_thin_ratio,
                 self.worker_warmup_divert_every,
             )
-            // Deprecated: unset by default; `chain` is the only value, `positional` fails validation.
-            .kv_index(self.kv_index.clone())
             .disable_load_monitoring(self.disable_load_monitoring)
             .load_monitor_interval_secs(self.load_monitor_interval)
             .pd_admission_wait_secs(self.pd_admission_wait_secs)
@@ -1389,7 +1387,6 @@ impl Router {
         job_queue_concurrency = 200,
         kv_connector_annotation = String::from("smg.ai/kv-connector"),
         kv_engine_id_annotation = String::from("smg.ai/kv-engine-id"),
-        kv_index = None,
         least_load_default_throughput = 2000.0,
         least_load_kv_pressure_weight = 0.15,
         least_load_max_waiting_requests = 0,
@@ -1491,6 +1488,7 @@ impl Router {
         service_discovery_namespace = None,
         service_discovery_port = 80,
         shutdown_grace_period_secs = 180,
+        shutdown_settle_secs = None,
         sse_keepalive_secs = 15,
         storage_context_headers = HashMap::new(),
         storage_hook_wasm_path = None,
@@ -1610,7 +1608,6 @@ impl Router {
         job_queue_concurrency: usize,
         kv_connector_annotation: String,
         kv_engine_id_annotation: String,
-        kv_index: Option<String>,
         least_load_default_throughput: f64,
         least_load_kv_pressure_weight: f64,
         least_load_max_waiting_requests: u32,
@@ -1712,6 +1709,7 @@ impl Router {
         service_discovery_namespace: Option<String>,
         service_discovery_port: u16,
         shutdown_grace_period_secs: u64,
+        shutdown_settle_secs: Option<u64>,
         sse_keepalive_secs: u64,
         storage_context_headers: HashMap<String, String>,
         storage_hook_wasm_path: Option<String>,
@@ -1867,7 +1865,6 @@ impl Router {
             job_queue_concurrency,
             kv_connector_annotation,
             kv_engine_id_annotation,
-            kv_index,
             least_load_default_throughput,
             least_load_kv_pressure_weight,
             least_load_max_waiting_requests,
@@ -1969,6 +1966,7 @@ impl Router {
             service_discovery_namespace,
             service_discovery_port,
             shutdown_grace_period_secs,
+            shutdown_settle_secs,
             sse_keepalive_secs,
             storage_context_headers,
             storage_hook_wasm_path,
@@ -2011,6 +2009,7 @@ impl Router {
         })
     }
 
+    /// Run the gateway with the configured propagation window and shared shutdown deadline.
     fn start(&self, py: Python<'_>) -> PyResult<()> {
         use observability::metrics::PrometheusConfig;
 
@@ -2089,6 +2088,7 @@ impl Router {
                 request_timeout_secs: self.request_timeout_secs,
                 request_id_headers: self.request_id_headers.clone(),
                 shutdown_grace_period_secs: self.shutdown_grace_period_secs,
+                shutdown_settle_secs: self.shutdown_settle_secs,
                 control_plane_auth: self
                     .control_plane_auth
                     .as_ref()

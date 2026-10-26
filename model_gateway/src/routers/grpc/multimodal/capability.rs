@@ -472,23 +472,15 @@ mod tests {
 
         use super::*;
         use crate::worker::{
-            test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, WorkerType,
+            test_support::{grpc_worker, registry_with},
+            BasicWorkerBuilder, ConnectionMode, WorkerType,
         };
 
         const MODEL: &str = "pool-test-model";
 
         /// A gRPC-pipeline worker of `runtime` serving the model, with `labels`.
         fn worker_of(url: &str, runtime: RuntimeType, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
-            let mut builder = BasicWorkerBuilder::new(url)
-                .model(ModelCard::new(MODEL))
-                .worker_type(WorkerType::Regular)
-                .runtime_type(runtime)
-                .connection_mode(ConnectionMode::Grpc)
-                .health_config(no_health_check());
-            for (key, value) in labels {
-                builder = builder.label(*key, *value);
-            }
-            Arc::new(builder.build())
+            grpc_worker(url, MODEL, runtime, labels)
         }
 
         fn worker(url: &str, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
@@ -497,14 +489,6 @@ mod tests {
 
         fn engine_worker(url: &str, runtime: RuntimeType) -> Arc<dyn Worker> {
             worker_of(url, runtime, &[])
-        }
-
-        fn registry_with(workers: Vec<Arc<dyn Worker>>) -> WorkerRegistry {
-            let registry = WorkerRegistry::new();
-            for worker in workers {
-                registry.register(worker).expect("register");
-            }
-            registry
         }
 
         fn image_part() -> MediaContentPart {

@@ -20,6 +20,9 @@ use smg_grpc_client::{tokenspeed_proto as ts, TokenSpeedSchedulerClient};
 use tokio::net::TcpListener;
 use ts::generate_response::Response as GenResp;
 
+mod common;
+use common::start;
+
 /// A canned worker that captures to `capture` when it is set.
 fn config(capture: Option<PathBuf>) -> Config {
     Config {
@@ -43,22 +46,6 @@ fn config(capture: Option<PathBuf>) -> Config {
         },
         ..Config::default()
     }
-}
-
-/// Serve `cfg` on a free port and connect the gateway's client to it.
-async fn start(cfg: Config) -> TokenSpeedSchedulerClient {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind a free port");
-    let port = listener.local_addr().expect("listener address").port();
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the server serves until the test process exits"
-    )]
-    let _server = tokio::spawn(serve_with_listener(Arc::new(cfg), listener));
-    TokenSpeedSchedulerClient::connect(&format!("http://127.0.0.1:{port}"))
-        .await
-        .expect("connect to the mock worker")
 }
 
 /// A streamed request with every sampling field unset.

@@ -86,8 +86,8 @@ mod tests {
     use crate::{
         routers::grpc::mode::Mode,
         worker::{
-            test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, ModelCard, Worker,
-            WorkerType,
+            test_support::{no_health_check, registry_with},
+            BasicWorkerBuilder, ConnectionMode, ModelCard, Worker, WorkerType,
         },
     };
 
@@ -109,14 +109,6 @@ mod tests {
                 .health_config(no_health_check())
                 .build(),
         )
-    }
-
-    fn registry_with(workers: Vec<Arc<dyn Worker>>) -> WorkerRegistry {
-        let registry = WorkerRegistry::new();
-        for worker in workers {
-            registry.register(worker).expect("register");
-        }
-        registry
     }
 
     /// One engine family per test: what each loader does with alpha.

@@ -1402,13 +1402,23 @@ async fn multimodal_inputs_reach_the_scheduler_as_its_processor_output() {
             (feature.dtype.as_str(), feature.shape.as_slice()),
             ("float32", &[2, 4][..])
         );
-        assert_eq!(feature.data.as_ref(), pixels.as_slice());
+        assert_eq!(
+            feature.data.as_raw_view().expect("inline bytes").as_ref(),
+            pixels.as_slice()
+        );
         let grid_tensor = &item.model_specific_data["image_grid_thw"];
         assert_eq!(
             (grid_tensor.dtype.as_str(), grid_tensor.shape.as_slice()),
             ("int64", &[1, 3][..])
         );
-        assert_eq!(grid_tensor.data.as_ref(), grid.as_slice());
+        assert_eq!(
+            grid_tensor
+                .data
+                .as_raw_view()
+                .expect("inline bytes")
+                .as_ref(),
+            grid.as_slice()
+        );
         assert_eq!(engine_request.input_ids, vec![1, 7, 7, 7, 2, 3, 4, 5, 6]);
         rids.push(engine_request.rid);
     }

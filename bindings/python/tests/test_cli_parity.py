@@ -34,8 +34,6 @@ def cli_source() -> str:
 # Flags of the Rust CLI the launcher does not take, with the reason.
 CLI_ONLY = {
     "--disable-audit-logging": "the launcher's switch is --control-plane-audit-enabled",
-    "--kv-indexer-max-entries": "deprecated and ignored by the CLI; the launcher never had it",
-    "--kv-indexer-ttl-secs": "deprecated and ignored by the CLI; the launcher never had it",
 }
 
 # Options of the launcher with no Rust CLI flag of that spelling, with the reason.
@@ -356,3 +354,16 @@ def test_every_option_has_its_router_prefixed_spelling():
         if expected not in prefixed and option not in prefixed:
             missing.append(option)
     assert not missing, f"options without a --router- spelling: {missing}"
+
+
+@pytest.mark.parametrize("use_router_prefix", [False, True])
+@pytest.mark.parametrize("settle", [None, 0, 5, 30, 120])
+def test_shutdown_settle_option(use_router_prefix, settle):
+    """Both launcher spellings preserve an omitted window and explicit zero or seconds."""
+    parser = argparse.ArgumentParser()
+    RouterArgs.add_cli_args(parser, use_router_prefix=use_router_prefix)
+    prefix = "router-" if use_router_prefix else ""
+    flags = [] if settle is None else [f"--{prefix}shutdown-settle-secs", str(settle)]
+    args = RouterArgs.from_cli_args(parser.parse_args(flags), use_router_prefix=use_router_prefix)
+    assert args.shutdown_settle_secs == settle
+    assert args.shutdown_grace_period_secs == 180

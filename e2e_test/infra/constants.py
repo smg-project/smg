@@ -3,6 +3,7 @@
 import os
 import shutil
 import socket
+from collections.abc import Callable
 from enum import StrEnum
 
 
@@ -71,15 +72,11 @@ ENV_CONNECTION_MODE = (
 ENV_ZMQ_ENGINE_COUNT = (
     "E2E_ZMQ_ENGINE_COUNT"  # DP engines per ZMQ worker (grouped vLLM launch; empty = 1)
 )
-ENV_VLLM_SERVICER_IMPL = (
-    "E2E_VLLM_SERVICER_IMPL"  # vLLM gRPC servicer implementation: python (default) or rust
-)
-ENV_SGLANG_SERVICER_IMPL = (
-    "E2E_SGLANG_SERVICER_IMPL"  # SGLang gRPC servicer implementation: python (default) or rust
-)
-ENV_TOKENSPEED_SERVICER_IMPL = (
-    "E2E_TOKENSPEED_SERVICER_IMPL"  # TokenSpeed gRPC servicer implementation: python or rust
-)
+# The gRPC servicer implementation of a lane's workers, per engine: python or
+# rust; unset follows the servicer package's default — see get_servicer_impl.
+ENV_VLLM_SERVICER_IMPL = "E2E_VLLM_SERVICER_IMPL"
+ENV_SGLANG_SERVICER_IMPL = "E2E_SGLANG_SERVICER_IMPL"
+ENV_TOKENSPEED_SERVICER_IMPL = "E2E_TOKENSPEED_SERVICER_IMPL"
 ENV_MM_PROCESSING = (
     "E2E_MM_PROCESSING"  # Per-lane multimodal processing location — see get_mm_processing
 )
@@ -204,7 +201,14 @@ def get_mm_processing() -> str | None:
     return value
 
 
-VLLM_SERVICER_IMPLS = ("python", "rust")
+SERVICER_IMPLS = ("python", "rust")
+# Per engine: the lane's setting and the variable the servicer package's
+# launchers read it under in the worker's environment.
+SERVICER_IMPL_VARIABLES = {
+    "vllm": (ENV_VLLM_SERVICER_IMPL, "SMG_VLLM_SERVICER_IMPL"),
+    "sglang": (ENV_SGLANG_SERVICER_IMPL, "SMG_SGLANG_SERVICER_IMPL"),
+    "tokenspeed": (ENV_TOKENSPEED_SERVICER_IMPL, "SMG_TOKENSPEED_SERVICER_IMPL"),
+}
 VLLM_MM_PROCESSORS = ("inprocess", "smg")
 
 
@@ -235,73 +239,73 @@ def get_vllm_mm_processor() -> str:
             f"{ENV_VLLM_MM_PROCESSOR}={value!r} is not a valid processor; "
             f"use one of {VLLM_MM_PROCESSORS}"
         )
-    if value == "smg" and get_vllm_servicer_impl() != "rust":
+    if value == "smg" and get_servicer_impl("vllm") != "rust":
         raise ValueError(
-            f"{ENV_VLLM_MM_PROCESSOR}=smg needs {ENV_VLLM_SERVICER_IMPL}=rust: smg's pipeline "
-            "runs inside the Rust servicer"
+            f"{ENV_VLLM_MM_PROCESSOR}=smg needs the Rust servicer ({ENV_VLLM_SERVICER_IMPL}=rust, "
+            "or the servicer package's default): smg's pipeline runs inside it"
         )
     return value
 
 
-def get_vllm_servicer_impl() -> str:
-    """Which implementation serves the vLLM gRPC contract on gRPC lanes.
+def get_servicer_impl_setting(engine: str) -> str | None:
+    """The lane's own choice of gRPC servicer implementation for ``engine``'s
+    workers: ``python`` or ``rust`` from ``E2E_<ENGINE>_SERVICER_IMPL``, or
+    None when the variable is unset or blank and the lane leaves the choice to
+    the servicer package's default. A set-but-unrecognized value raises.
 
-    Set ``E2E_VLLM_SERVICER_IMPL=rust`` to run vLLM gRPC workers with the
-    Rust servicer: the worker command stays upstream's gRPC entrypoint and the
-    flag travels to it as ``SMG_VLLM_SERVICER_IMPL`` in the worker's
-    environment. The Router and every test case stay the same. Unset/blank
-    means python.
+    The worker command never changes: the choice travels to the engine's own
+    entrypoint as ``SMG_<ENGINE>_SERVICER_IMPL`` in the worker's environment
+    (``infra.worker``), and the Router and every test case stay the same.
     """
-    value = os.environ.get(ENV_VLLM_SERVICER_IMPL, "").strip().lower()
+    setting, _variable = SERVICER_IMPL_VARIABLES[engine]
+    value = os.environ.get(setting, "").strip().lower()
     if not value:
-        return "python"
-    if value not in VLLM_SERVICER_IMPLS:
+        return None
+    if value not in SERVICER_IMPLS:
         raise ValueError(
-            f"{ENV_VLLM_SERVICER_IMPL}={value!r} is not a valid servicer impl; "
-            f"use one of {VLLM_SERVICER_IMPLS}"
+            f"{setting}={value!r} is not a valid servicer impl; use one of {SERVICER_IMPLS}"
         )
     return value
 
 
-def get_tokenspeed_servicer_impl() -> str:
-    """Which implementation serves the TokenSpeed gRPC contract on gRPC lanes.
-
-    Set ``E2E_TOKENSPEED_SERVICER_IMPL=rust`` to run TokenSpeed gRPC workers
-    with the Rust servicer: the worker command stays
-    ``python -m smg_grpc_servicer.tokenspeed`` and the flag travels to it as
-    ``SMG_TOKENSPEED_SERVICER_IMPL`` in the worker's environment. The Router
-    and every test case stay the same. Unset/blank means python.
-    """
-    value = os.environ.get(ENV_TOKENSPEED_SERVICER_IMPL, "").strip().lower()
-    if not value:
-        return "python"
-    if value not in VLLM_SERVICER_IMPLS:
-        raise ValueError(
-            f"{ENV_TOKENSPEED_SERVICER_IMPL}={value!r} is not a valid servicer impl; "
-            f"use one of {VLLM_SERVICER_IMPLS}"
-        )
-    return value
+def _package_servicer_switch() -> Callable[..., tuple[str, str]] | None:
+    """The servicer package's own switch, the one its three launchers share
+    (``smg_grpc_servicer.rust_lifecycle.servicer_switch``), or None when the
+    package is not importable here. Imported late: the harness runs on hosts
+    without it (its own unit tests), where no gRPC worker starts either."""
+    try:
+        from smg_grpc_servicer.rust_lifecycle import servicer_switch
+    except ImportError:
+        return None
+    return servicer_switch
 
 
-def get_sglang_servicer_impl() -> str:
-    """Which implementation serves the SGLang gRPC contract on gRPC lanes.
+def get_servicer_impl_default(engine: str) -> str | None:
+    """The implementation the servicer package selects for ``engine`` when a
+    launch names none (no ``--servicer-impl``, no ``SMG_<ENGINE>_SERVICER_IMPL``):
+    read from the package's own switch against an empty environment, so the
+    harness and the workers it starts agree by construction. None when the
+    package is not importable here."""
+    switch = _package_servicer_switch()
+    if switch is None:
+        return None
+    _setting, variable = SERVICER_IMPL_VARIABLES[engine]
+    impl, _origin = switch(variable, environ={})
+    return impl
 
-    Set ``E2E_SGLANG_SERVICER_IMPL=rust`` to run SGLang gRPC workers
-    with the Rust servicer: the worker command stays
-    ``sglang.launch_server --grpc-mode`` and the flag travels to it as
-    ``SMG_SGLANG_SERVICER_IMPL`` in the worker's environment, read at the
-    smg entry that mode calls. The Router and every test case stay the
-    same. Unset/blank means python.
-    """
-    value = os.environ.get(ENV_SGLANG_SERVICER_IMPL, "").strip().lower()
-    if not value:
-        return "python"
-    if value not in VLLM_SERVICER_IMPLS:
-        raise ValueError(
-            f"{ENV_SGLANG_SERVICER_IMPL}={value!r} is not a valid servicer impl; "
-            f"use one of {VLLM_SERVICER_IMPLS}"
-        )
-    return value
+
+def get_servicer_impl(engine: str) -> str | None:
+    """Which implementation serves ``engine``'s gRPC contract on this lane: the
+    lane's setting (:func:`get_servicer_impl_setting`), else the servicer
+    package's default (:func:`get_servicer_impl_default`). None only when the
+    lane sets nothing and the package is not importable here. The collection
+    filters (``fixtures.hooks``), the skip conditions of the cases one
+    implementation does not serve and the worker's hook check all read this,
+    never a belief about what unset means."""
+    setting = get_servicer_impl_setting(engine)
+    if setting is not None:
+        return setting
+    return get_servicer_impl_default(engine)
 
 
 def get_zmq_engine_count() -> int:

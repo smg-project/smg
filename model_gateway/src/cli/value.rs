@@ -18,24 +18,6 @@ pub(crate) fn parse_transport_mode(value: &str) -> Result<TransportMode, String>
         .ok_or_else(|| format!("invalid value '{value}'; expected inline, shm, auto, or rdma"))
 }
 
-/// Parse the deprecated `--kv-index` value. The chain index is the only KV
-/// index, so `chain` is the one value accepted; `positional` names the index
-/// that went with kv-index 2.0.0 and is refused with the reason.
-pub(crate) fn parse_kv_index(value: &str) -> Result<String, String> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "chain" => Ok("chain".to_string()),
-        "positional" => Err(
-            "the positional KV index was removed (kv-index 2.0.0): the chain index is the \
-             only KV index, drop --kv-index"
-                .to_string(),
-        ),
-        _ => Err(format!(
-            "invalid value '{value}'; the chain index is the only KV index, so --kv-index \
-             takes chain only (and is deprecated)"
-        )),
-    }
-}
-
 /// Parse the `--power-of-two-load-metric` value into a `PowerOfTwoLoadMetric`.
 pub(crate) fn parse_power_of_two_load_metric(value: &str) -> Result<PowerOfTwoLoadMetric, String> {
     PowerOfTwoLoadMetric::parse(value).ok_or_else(|| {

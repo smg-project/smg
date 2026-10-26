@@ -208,8 +208,7 @@ fn batch(
         num_waiting,
         kv_active_pages,
         kv_total_pages,
-        finished_status_codes: Vec::new(),
-        finished_messages: Vec::new(),
+        ..Default::default()
     }
 }
 

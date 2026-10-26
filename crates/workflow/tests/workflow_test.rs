@@ -88,6 +88,22 @@ impl StepExecutor<TestWorkflowData> for AlwaysFailStep {
     }
 }
 
+/// A step that counts its executions and succeeds.
+struct TrackingStep {
+    counter: Arc<AtomicU32>,
+}
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for TrackingStep {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        self.counter.fetch_add(1, Ordering::SeqCst);
+        Ok(StepResult::Success)
+    }
+}
+
 #[tokio::test]
 async fn test_simple_workflow_execution() {
     let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
@@ -111,14 +127,7 @@ async fn test_simple_workflow_execution() {
             Arc::new(AlwaysSucceedStep),
         ));
 
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-
-    // Start workflow
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
+    let instance_id = started(&engine, workflow).await.unwrap();
 
     // Wait for completion
     sleep(Duration::from_millis(100)).await;
@@ -156,14 +165,7 @@ async fn test_workflow_with_retry() {
         .with_timeout(Duration::from_secs(5)),
     );
 
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-
-    // Start workflow
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
+    let instance_id = started(&engine, workflow).await.unwrap();
 
     // Wait for completion
     sleep(Duration::from_millis(500)).await;
@@ -207,14 +209,7 @@ async fn test_workflow_failure_after_max_retries() {
         .with_failure_action(FailureAction::FailWorkflow),
     );
 
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-
-    // Start workflow
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
+    let instance_id = started(&engine, workflow).await.unwrap();
 
     // Wait for completion
     sleep(Duration::from_millis(500)).await;
@@ -264,14 +259,7 @@ async fn test_workflow_continue_on_failure() {
             Arc::new(AlwaysSucceedStep),
         ));
 
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-
-    // Start workflow
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
+    let instance_id = started(&engine, workflow).await.unwrap();
 
     // Wait for completion
     sleep(Duration::from_millis(500)).await;
@@ -351,13 +339,7 @@ async fn test_workflow_context_sharing() {
             }),
         ));
 
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
+    let instance_id = started(&engine, workflow).await.unwrap();
 
     sleep(Duration::from_millis(100)).await;
 
@@ -414,6 +396,23 @@ fn timing_step(
         start_times: Arc::clone(start_times),
         end_times: Arc::clone(end_times),
     })
+}
+
+/// Registers `workflow` with `engine` and starts an instance of it with the
+/// default data: the instance id, or the registration's or the start's error
+/// as text (a helper outside the test functions neither unwraps nor panics).
+async fn started(
+    engine: &WorkflowEngine<TestWorkflowData>,
+    workflow: WorkflowDefinition<TestWorkflowData>,
+) -> Result<WorkflowInstanceId, String> {
+    let workflow_id = workflow.id.clone();
+    engine
+        .register_workflow(workflow)
+        .map_err(|error| error.to_string())?;
+    engine
+        .start_workflow(workflow_id, TestWorkflowData::default())
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Poll until the workflow is neither pending nor running (without the
@@ -529,13 +528,7 @@ async fn test_dag_with_dependencies() {
             .depends_on(&["step_a", "step_b"]),
         );
 
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
+    let instance_id = started(&engine, workflow).await.unwrap();
 
     let state = wait_until_settled(&engine, instance_id).await.unwrap();
     assert_eq!(state.status, WorkflowStatus::Completed);
@@ -578,21 +571,6 @@ async fn test_dag_dependency_failure_blocks_dependents() {
         }
     }
 
-    struct TrackingStep {
-        counter: Arc<AtomicU32>,
-    }
-
-    #[async_trait::async_trait]
-    impl StepExecutor<TestWorkflowData> for TrackingStep {
-        async fn execute(
-            &self,
-            _context: &mut WorkflowContext<TestWorkflowData>,
-        ) -> WorkflowResult<StepResult> {
-            self.counter.fetch_add(1, Ordering::SeqCst);
-            Ok(StepResult::Success)
-        }
-    }
-
     let workflow = WorkflowDefinition::new("blocked_workflow", "Blocked Test")
         .add_step(
             StepDefinition::new("step_a", "Step A", Arc::new(FailingStep))
@@ -609,13 +587,7 @@ async fn test_dag_dependency_failure_blocks_dependents() {
             .depends_on(&["step_a"]),
         );
 
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
+    let instance_id = started(&engine, workflow).await.unwrap();
 
     let state = wait_until_settled(&engine, instance_id).await.unwrap();
     assert_eq!(state.status, WorkflowStatus::Failed);
@@ -791,21 +763,6 @@ async fn test_run_if_true() {
     let executed = Arc::new(AtomicU32::new(0));
     let executed_clone = Arc::clone(&executed);
 
-    struct TrackingStep {
-        counter: Arc<AtomicU32>,
-    }
-
-    #[async_trait::async_trait]
-    impl StepExecutor<TestWorkflowData> for TrackingStep {
-        async fn execute(
-            &self,
-            _context: &mut WorkflowContext<TestWorkflowData>,
-        ) -> WorkflowResult<StepResult> {
-            self.counter.fetch_add(1, Ordering::SeqCst);
-            Ok(StepResult::Success)
-        }
-    }
-
     // Step with run_if that always returns true
     let workflow = WorkflowDefinition::new("run_if_true_workflow", "Run If True Test").add_step(
         StepDefinition::new(
@@ -816,13 +773,7 @@ async fn test_run_if_true() {
         .run_if(|_ctx| true),
     );
 
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
+    let instance_id = started(&engine, workflow).await.unwrap();
 
     engine
         .wait_for_completion(instance_id, "test", Duration::from_secs(5))
@@ -841,21 +792,6 @@ async fn test_run_if_false() {
     let executed = Arc::new(AtomicU32::new(0));
     let executed_clone = Arc::clone(&executed);
 
-    struct TrackingStep {
-        counter: Arc<AtomicU32>,
-    }
-
-    #[async_trait::async_trait]
-    impl StepExecutor<TestWorkflowData> for TrackingStep {
-        async fn execute(
-            &self,
-            _context: &mut WorkflowContext<TestWorkflowData>,
-        ) -> WorkflowResult<StepResult> {
-            self.counter.fetch_add(1, Ordering::SeqCst);
-            Ok(StepResult::Success)
-        }
-    }
-
     // Step with run_if that always returns false
     let workflow = WorkflowDefinition::new("run_if_false_workflow", "Run If False Test").add_step(
         StepDefinition::new(
@@ -866,13 +802,7 @@ async fn test_run_if_false() {
         .run_if(|_ctx| false),
     );
 
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
+    let instance_id = started(&engine, workflow).await.unwrap();
 
     let state = wait_until_settled(&engine, instance_id).await.unwrap();
 
@@ -910,21 +840,6 @@ async fn test_run_if_context_based() {
     let executed = Arc::new(AtomicU32::new(0));
     let executed_clone = Arc::clone(&executed);
 
-    struct TrackingStep {
-        counter: Arc<AtomicU32>,
-    }
-
-    #[async_trait::async_trait]
-    impl StepExecutor<TestWorkflowData> for TrackingStep {
-        async fn execute(
-            &self,
-            _context: &mut WorkflowContext<TestWorkflowData>,
-        ) -> WorkflowResult<StepResult> {
-            self.counter.fetch_add(1, Ordering::SeqCst);
-            Ok(StepResult::Success)
-        }
-    }
-
     // Workflow where second step only runs if first step sets the right key
     let workflow = WorkflowDefinition::new("context_run_if_workflow", "Context Run If Test")
         .add_step(StepDefinition::new(
@@ -942,13 +857,7 @@ async fn test_run_if_context_based() {
             .run_if(|ctx| ctx.data.test_key.as_deref() == Some("execute_next")),
         );
 
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
+    let instance_id = started(&engine, workflow).await.unwrap();
 
     engine
         .wait_for_completion(instance_id, "test", Duration::from_secs(5))
@@ -985,13 +894,7 @@ async fn test_run_if_skip_chain_no_spurious_deadlock() {
             StepDefinition::new("leaf", "Leaf", Arc::new(AlwaysSucceedStep)).depends_on(&["mid"]),
         );
 
-        let workflow_id = workflow.id.clone();
-        engine.register_workflow(workflow).unwrap();
-
-        let instance_id = engine
-            .start_workflow(workflow_id, TestWorkflowData::default())
-            .await
-            .unwrap();
+        let instance_id = started(&engine, workflow).await.unwrap();
 
         let result = engine
             .wait_for_completion(instance_id, "skip-chain", Duration::from_secs(5))
@@ -1008,21 +911,6 @@ async fn test_run_if_false_mid_chain_completes() {
     let executed = Arc::new(AtomicU32::new(0));
     let executed_clone = Arc::clone(&executed);
 
-    struct TrackingStep {
-        counter: Arc<AtomicU32>,
-    }
-
-    #[async_trait::async_trait]
-    impl StepExecutor<TestWorkflowData> for TrackingStep {
-        async fn execute(
-            &self,
-            _context: &mut WorkflowContext<TestWorkflowData>,
-        ) -> WorkflowResult<StepResult> {
-            self.counter.fetch_add(1, Ordering::SeqCst);
-            Ok(StepResult::Success)
-        }
-    }
-
     let workflow = WorkflowDefinition::new("run_if_mid_chain_workflow", "Run If Mid Chain Test")
         .add_step(StepDefinition::new("a", "A", Arc::new(AlwaysSucceedStep)))
         .add_step(
@@ -1035,13 +923,7 @@ async fn test_run_if_false_mid_chain_completes() {
                 .depends_on(&["b"]),
         );
 
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
+    let instance_id = started(&engine, workflow).await.unwrap();
 
     let state = wait_until_settled(&engine, instance_id).await.unwrap();
 
@@ -1086,13 +968,7 @@ async fn test_depends_on_any() {
             .depends_on_any(&["step_a", "step_b"]),
         );
 
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
+    let instance_id = started(&engine, workflow).await.unwrap();
 
     engine
         .wait_for_completion(instance_id, "test", Duration::from_secs(5))
@@ -1154,13 +1030,7 @@ async fn test_depends_on_any_combined_with_depends_on() {
             .depends_on_any(&["step_b", "step_d"]), // AND any of B or D
         );
 
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
+    let instance_id = started(&engine, workflow).await.unwrap();
 
     engine
         .wait_for_completion(instance_id, "test", Duration::from_secs(5))
@@ -1226,21 +1096,6 @@ async fn test_depends_on_any_all_fail() {
     let c_executed = Arc::new(AtomicU32::new(0));
     let c_executed_clone = Arc::clone(&c_executed);
 
-    struct TrackingStep {
-        counter: Arc<AtomicU32>,
-    }
-
-    #[async_trait::async_trait]
-    impl StepExecutor<TestWorkflowData> for TrackingStep {
-        async fn execute(
-            &self,
-            _context: &mut WorkflowContext<TestWorkflowData>,
-        ) -> WorkflowResult<StepResult> {
-            self.counter.fetch_add(1, Ordering::SeqCst);
-            Ok(StepResult::Success)
-        }
-    }
-
     let workflow = WorkflowDefinition::new("all_any_fail_workflow", "All Any Fail Test")
         .add_step(StepDefinition::new(
             "step_a",
@@ -1263,13 +1118,7 @@ async fn test_depends_on_any_all_fail() {
             .depends_on_any(&["step_a", "step_b"]),
         );
 
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
+    let instance_id = started(&engine, workflow).await.unwrap();
 
     let state = wait_until_settled(&engine, instance_id).await.unwrap();
 
@@ -1291,21 +1140,6 @@ async fn test_depends_on_any_one_fails_one_succeeds() {
 
     let c_executed = Arc::new(AtomicU32::new(0));
     let c_executed_clone = Arc::clone(&c_executed);
-
-    struct TrackingStep {
-        counter: Arc<AtomicU32>,
-    }
-
-    #[async_trait::async_trait]
-    impl StepExecutor<TestWorkflowData> for TrackingStep {
-        async fn execute(
-            &self,
-            _context: &mut WorkflowContext<TestWorkflowData>,
-        ) -> WorkflowResult<StepResult> {
-            self.counter.fetch_add(1, Ordering::SeqCst);
-            Ok(StepResult::Success)
-        }
-    }
 
     // Note: Step A uses ContinueNextStep so its failure doesn't fail the workflow.
     // This is the correct way to model "any of" semantics where a failing path
@@ -1331,13 +1165,7 @@ async fn test_depends_on_any_one_fails_one_succeeds() {
             .depends_on_any(&["step_a", "step_b"]),
         );
 
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
+    let instance_id = started(&engine, workflow).await.unwrap();
 
     let state = wait_until_settled(&engine, instance_id).await.unwrap();
 
@@ -1400,12 +1228,7 @@ async fn test_skip_does_not_clobber_parallel_context_mutation() {
             Arc::new(SlowSkipStep),
         ));
 
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
+    let instance_id = started(&engine, workflow).await.unwrap();
 
     sleep(Duration::from_millis(250)).await;
 
@@ -1477,12 +1300,7 @@ async fn test_sweep_reclaims_state_after_waiter_timeout() {
     let notify = Arc::new(Notify::new());
 
     let workflow = blocked_workflow("waiter_timeout", Arc::clone(&notify));
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
+    let instance_id = started(&engine, workflow).await.unwrap();
 
     let err = engine
         .wait_for_completion(instance_id, "test", Duration::from_millis(50))
@@ -1533,12 +1351,7 @@ async fn test_waiter_timeout_reclaims_already_terminal_state() {
     let notify = Arc::new(Notify::new());
 
     let workflow = blocked_workflow("timeout_terminal", Arc::clone(&notify));
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
+    let instance_id = started(&engine, workflow).await.unwrap();
 
     // The waiter sees Running at t=0 and sleeps 100ms, past its 50ms timeout;
     // the workflow terminates mid-sleep (notify at t=20ms), so the timeout
@@ -1566,12 +1379,7 @@ async fn test_wait_for_completion_removes_terminal_state() {
     let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
 
     let workflow = single_step_workflow("terminal_cleanup");
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
+    let instance_id = started(&engine, workflow).await.unwrap();
 
     engine
         .wait_for_completion(instance_id, "test", Duration::from_secs(5))
@@ -1590,12 +1398,7 @@ async fn test_cleanup_task_reclaims_state_and_stops_on_shutdown() {
     let handle = engine.start_cleanup_task(Some(Duration::ZERO), Some(Duration::from_millis(20)));
 
     let workflow = single_step_workflow("cleanup_task");
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
+    let instance_id = started(&engine, workflow).await.unwrap();
 
     // No waiter runs; only the cleanup task can reclaim the terminal state.
     let mut reclaimed = false;
@@ -1670,12 +1473,7 @@ async fn a_cancelled_workflow_stops_before_the_next_attempt() {
             .with_timeout(Duration::from_secs(5)),
         );
 
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
+    let instance_id = started(&engine, workflow).await.unwrap();
 
     timeout(Duration::from_secs(5), first_attempt_running.notified())
         .await
@@ -1729,12 +1527,7 @@ async fn a_retry_indefinitely_step_keeps_retrying_past_the_policy_s_attempts() {
             .with_timeout(Duration::from_secs(5)),
         );
 
-    let workflow_id = workflow.id.clone();
-    engine.register_workflow(workflow).unwrap();
-    let instance_id = engine
-        .start_workflow(workflow_id, TestWorkflowData::default())
-        .await
-        .unwrap();
+    let instance_id = started(&engine, workflow).await.unwrap();
 
     let mut completed = false;
     for _ in 0..250 {

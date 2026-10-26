@@ -295,6 +295,9 @@ router:
   #    terminationGracePeriodSeconds is this plus terminationGraceMarginSeconds,
   #    so the drain is not cut short by the kubelet's default 30 s.
   shutdownGracePeriodSeconds: 180
+  # -- Listener propagation window; null retains the default 5 seconds.
+  #    Explicit seconds are capped at half the grace period; 0 skips the window.
+  shutdownSettleSeconds: null
   terminationGraceMarginSeconds: 30
 
   # -- Optional features

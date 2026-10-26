@@ -7792,6 +7792,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tokio-util",
  "tracing",
+ "tracing-test",
  "url",
  "uuid",
  "webpki-roots",

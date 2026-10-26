@@ -128,36 +128,6 @@ const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 /// alone, an id of one of its cases among them.
 const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     (
-        "*/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template \
-         has no developer branch, as the engine's renderer does (smg-project/smg#3022); \
-         the recorded template run keeps or drops the role: one case of every such model",
-    ),
-    (
-        "*/render/tools-history-content-and-call",
-        "the gateway parses a history call's arguments into an object before rendering, \
-         which the templates that write the string as recorded render otherwise: one \
-         case of every such model",
-    ),
-    (
-        "*/render/tools-history-parallel-calls",
-        "the gateway parses a history call's arguments into an object before rendering, \
-         which the templates that write the string as recorded render otherwise: one \
-         case of every such model",
-    ),
-    (
-        "*/render/tools-history-results-reordered",
-        "the gateway parses a history call's arguments into an object before rendering, \
-         which the templates that write the string as recorded render otherwise: one \
-         case of every such model",
-    ),
-    (
-        "*/render/tools-history-single-call",
-        "the gateway parses a history call's arguments into an object before rendering, \
-         which the templates that write the string as recorded render otherwise: one \
-         case of every such model",
-    ),
-    (
         "deepseek-v3.1/render/bfcl-*",
         "the checkpoint's template never reads the request's tools and the reference is \
          its own render; the gateway writes the family's tools block into the system prompt \
@@ -183,30 +153,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     ),
     (
         "deepseek-v3.1/render/tools-declared-user-asks",
-        "the checkpoint's template never reads the request's tools and the reference is \
-         its own render; the gateway writes the family's tools block into the system prompt \
-         as the engines' tool chat templates do (smg-project/smg#3946)",
-    ),
-    (
-        "deepseek-v3.1/render/tools-history-content-and-call",
-        "the checkpoint's template never reads the request's tools and the reference is \
-         its own render; the gateway writes the family's tools block into the system prompt \
-         as the engines' tool chat templates do (smg-project/smg#3946)",
-    ),
-    (
-        "deepseek-v3.1/render/tools-history-parallel-calls",
-        "the checkpoint's template never reads the request's tools and the reference is \
-         its own render; the gateway writes the family's tools block into the system prompt \
-         as the engines' tool chat templates do (smg-project/smg#3946)",
-    ),
-    (
-        "deepseek-v3.1/render/tools-history-results-reordered",
-        "the checkpoint's template never reads the request's tools and the reference is \
-         its own render; the gateway writes the family's tools block into the system prompt \
-         as the engines' tool chat templates do (smg-project/smg#3946)",
-    ),
-    (
-        "deepseek-v3.1/render/tools-history-single-call",
         "the checkpoint's template never reads the request's tools and the reference is \
          its own render; the gateway writes the family's tools block into the system prompt \
          as the engines' tool chat templates do (smg-project/smg#3946)",
@@ -269,34 +215,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          closed",
     ),
     (
-        "deepseek-v4.1-flash/render/tools-history-content-and-call",
-        "the checkpoint's own encoder, which this renderer follows and the engines port, \
-         parses a history call's `arguments` string into one DSML parameter per key; the \
-         checkpoint's Jinja template writes the string whole as a single `arguments` \
-         parameter",
-    ),
-    (
-        "deepseek-v4.1-flash/render/tools-history-parallel-calls",
-        "the checkpoint's own encoder, which this renderer follows and the engines port, \
-         parses a history call's `arguments` string into one DSML parameter per key; the \
-         checkpoint's Jinja template writes the string whole as a single `arguments` \
-         parameter",
-    ),
-    (
-        "deepseek-v4.1-flash/render/tools-history-results-reordered",
-        "the checkpoint's own encoder, which this renderer follows and the engines port, \
-         parses a history call's `arguments` string into one DSML parameter per key; the \
-         checkpoint's Jinja template writes the string whole as a single `arguments` \
-         parameter",
-    ),
-    (
-        "deepseek-v4.1-flash/render/tools-history-single-call",
-        "the checkpoint's own encoder, which this renderer follows and the engines port, \
-         parses a history call's `arguments` string into one DSML parameter per key; the \
-         checkpoint's Jinja template writes the string whole as a single `arguments` \
-         parameter",
-    ),
-    (
         "hermes-4-14b/render/hermes-func-calling-*",
         "the gateway parses tool-call arguments into objects before rendering and this \
          template writes them as the API's string, so a call in the history renders \
@@ -307,26 +225,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "the gateway parses tool-call arguments into objects before rendering and this \
          template writes them as the API's string, so a call in the history renders \
          differently (smg-project/smg#2783)",
-    ),
-    (
-        "hermes-4-14b/render/tools-history-content-and-call",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "hermes-4-14b/render/tools-history-parallel-calls",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "hermes-4-14b/render/tools-history-results-reordered",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "hermes-4-14b/render/tools-history-single-call",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
     ),
     (
         "kimi-k3/render/continue-final-message",
@@ -370,26 +268,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          differently (smg-project/smg#2783)",
     ),
     (
-        "llama-xlam-2-8b-fc-r/render/tools-history-content-and-call",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "llama-xlam-2-8b-fc-r/render/tools-history-parallel-calls",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "llama-xlam-2-8b-fc-r/render/tools-history-results-reordered",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "llama-xlam-2-8b-fc-r/render/tools-history-single-call",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
         "mimo-vl-7b-rl-2508/render/glaive-v2-61.jsonl",
         "the gateway parses a history call's arguments into an object before rendering, \
          which the template, writing the string as recorded, renders otherwise: a \
@@ -408,6 +286,17 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          string",
     ),
     (
+        "phi-3-mini-4k-instruct/render/text-developer-role",
+        "the reference of this group was recorded before the developer-as-system rule, when its \
+         template dropped the developer message; its re-record follows (smg-project/bellwether#217)",
+    ),
+    (
+        "phi-tiny-moe-instruct/render/text-developer-role",
+        "the reference of this group was recorded before the developer-as-system rule, when its \
+         template wrote the developer turn under its own role tag; its re-record follows \
+         (smg-project/bellwether#217)",
+    ),
+    (
         "qwen2.5-7b-instruct-1m/render/hermes-func-calling-*",
         "the gateway parses tool-call arguments into objects before rendering and this \
          template writes them as the API's string, so a call in the history renders \
@@ -418,34 +307,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "the gateway parses tool-call arguments into objects before rendering and this \
          template writes them as the API's string, so a call in the history renders \
          differently (smg-project/smg#2783)",
-    ),
-    (
-        "qwen2.5-7b-instruct-1m/render/tools-history-content-and-call",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "qwen2.5-7b-instruct-1m/render/tools-history-parallel-calls",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "qwen2.5-7b-instruct-1m/render/tools-history-results-reordered",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "qwen2.5-7b-instruct-1m/render/tools-history-single-call",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "qwen3-omni-30b-a3b-instruct/render/continue-final-message",
-        "the reference was recorded with string content, while the gateway hands this template \
-         text parts, as the engine does (smg-project/bellwether#105 recorded the Thinking \
-         variant that way, not this one); the template finds the last user query only in \
-         string content, so only the reference opens an empty thought block in the continued \
-         turn",
     ),
     (
         "qwq-32b/render/hermes-func-calling-*",
@@ -460,15 +321,17 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          differently (smg-project/smg#2783)",
     ),
     (
-        "qwq-32b/render/tools-history-content-and-call",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
         "shieldvlm-7b-qwen/render/glaive-v2-12.jsonl",
         "the gateway parses a history call's arguments into an object before rendering, \
          which the template, writing the string as recorded, renders otherwise: a \
          benchmark set in the tree's sample, every case with a call in its history",
+    ),
+    (
+        "smolvlm2-2.2b-instruct/render/text-developer-role",
+        "the reference of this group was recorded before the developer-as-system rule and keeps \
+         the role as written (`Developer:`): its processor needs a package the recorder's \
+         environment lacked; the re-record with the processor built is \
+         smg-project/bellwether#218",
     ),
 ];
 /// Models whose tokenizer is known not to load, with the reason and where it

@@ -2602,8 +2602,11 @@ async fn an_abandoned_typed_tensor_submit_aborts_its_request_on_the_tagged_wire(
     let (client, mut engine, _ns) = connect_tagged().await;
     client.set_send_timeout(SEND_WINDOW);
     for _ in 0..3 {
-        let (payload, aux) =
-            TokenSpeedProtocol::encode_add(&large_tagged_request("queue-saturation")).unwrap();
+        let (payload, aux) = TokenSpeedProtocol::encode_add(
+            &large_tagged_request("queue-saturation"),
+            &Default::default(),
+        )
+        .unwrap();
         client
             .inner
             .queue_frame(
@@ -3106,4 +3109,37 @@ fn the_default_prefill_allowance_is_500_s_per_million_tokens() {
     );
     registry.prefill_tokens_per_sec = 0;
     assert_eq!(registry.prefill_allowance(1_000_000), Duration::ZERO);
+}
+
+/// The connection's layout is the one every rank declared; a rank that
+/// disagrees anywhere in the group, the middle included, fails the agreement
+/// and the connection falls back to the default layout; no engines read as
+/// the default.
+#[test]
+fn a_disagreeing_rank_in_the_middle_of_the_group_fails_the_agreement() {
+    use crate::protocol::sglang::{SglangLayout, SglangProtocol};
+
+    let engine = |index: u32, tensor_aux_frames: bool| ConnectedEngine {
+        engine_id: EngineId::from_engine_index(index),
+        ready_response: EngineCoreReadyResponse {
+            tensor_aux_frames,
+            ..default_ready_response()
+        },
+    };
+    let agreeing = [engine(0, true), engine(1, true), engine(2, true)];
+    assert_eq!(
+        connection_layout::<SglangProtocol>(&agreeing),
+        SglangLayout {
+            tensor_aux_frames: true
+        }
+    );
+    let middle_rank_behind = [engine(0, true), engine(1, false), engine(2, true)];
+    assert_eq!(
+        connection_layout::<SglangProtocol>(&middle_rank_behind),
+        SglangLayout::default()
+    );
+    assert_eq!(
+        connection_layout::<SglangProtocol>(&[]),
+        SglangLayout::default()
+    );
 }

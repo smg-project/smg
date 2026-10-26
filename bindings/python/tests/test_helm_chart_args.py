@@ -834,3 +834,17 @@ def test_chart_workers_without_discovery_are_passed_as_worker_urls():
 def test_every_example_renders_arguments_the_launcher_parses(example):
     _, documents = render(files=(example,))
     launcher_args(router_container(documents)["args"])
+
+
+@needs_helm
+@pytest.mark.parametrize("settle", [None, 0, 5, 30])
+def test_shutdown_settle_window(settle):
+    """Omit the optional window by default and preserve explicit values, including zero."""
+    settings = () if settle is None else (f"router.shutdownSettleSeconds={settle}",)
+    _, documents = render(*settings)
+    args = router_pod(documents)["spec"]["containers"][0]["args"]
+    flag = "--shutdown-settle-secs"
+    if settle is None:
+        assert flag not in args
+    else:
+        assert args[args.index(flag) + 1] == str(settle)

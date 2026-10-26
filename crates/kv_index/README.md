@@ -199,10 +199,7 @@ The servicer relays the engine's publisher into `SubscribeKvEvents` through one 
 
 ## Flags and settings
 
-Gateway: `--kv-index chain` (deprecated: the chain index is the only KV index, so the flag takes
-`chain` only and goes in a later release; `positional` is refused), `--kv-indexer-ttl-secs`,
-`--kv-indexer-max-entries` (deprecated, accepted and ignored: the chain index has no prune);
-`--worker-stall-secs` (2), `--worker-wedge-secs` (3); `--worker-warmup-secs` (60),
+Gateway: `--worker-stall-secs` (2), `--worker-wedge-secs` (3); `--worker-warmup-secs` (60),
 `--worker-warmup-share` (0.25), `--worker-warmup-blocks` (1024), `--worker-warmup-thin-ratio`
 (0.5); `--worker-overload-protection` (on), `--disable-worker-overload-protection`,
 `--worker-overload-waiting-requests` (8), `--worker-overload-token-usage` (0.8),

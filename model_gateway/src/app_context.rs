@@ -15,7 +15,7 @@ use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
 use tokio::sync::broadcast::error::RecvError;
 use tool_parser::ParserFactory as ToolParserFactory;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::{
     config::{ParserChoice, RouterConfig},
@@ -952,27 +952,12 @@ impl AppContextBuilder {
                 _ => false,
             };
 
-        if config.kv_index.is_some() {
-            warn!(
-                "--kv-index is deprecated: the chain index is the only KV index; the flag goes \
-                 in a later release"
-            );
-        }
         if is_cache_aware {
             let monitor = Arc::new(KvEventMonitor::new());
             debug!("Created KV event monitor for event-driven cache-aware routing");
             // The load records on the event streams are polls of the worker.
             if let Some(worker_monitor) = &self.worker_monitor {
                 monitor.set_load_sink(worker_monitor);
-            }
-            if config.kv_indexer_ttl_secs.is_some_and(|ttl| ttl > 0)
-                || config.kv_indexer_max_entries.is_some_and(|max| max > 0)
-            {
-                warn!(
-                    "--kv-indexer-ttl-secs and --kv-indexer-max-entries are ignored: the chain \
-                     index has no prune, it holds what the engines report and shrinks with \
-                     their removals"
-                );
             }
             monitor.start_stats_task();
 

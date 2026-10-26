@@ -14,7 +14,7 @@ import logging
 
 import httpx
 import pytest
-from infra import get_tokenspeed_servicer_impl
+from infra import get_servicer_impl
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +136,7 @@ class TestRlControlPlaneSglang(RlControlPlaneBehavior):
 
 
 @pytest.mark.skipif(
-    get_tokenspeed_servicer_impl() == "rust",
+    get_servicer_impl("tokenspeed") == "rust",
     reason="the Rust TokenSpeed servicer runs a headless scheduler with no in-engine "
     "control app, so its worker advertises no rl.control_url",
 )

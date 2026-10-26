@@ -48,19 +48,6 @@ ENCODE_POLICY_CHOICES = ["random", "round_robin", "consistent_hashing"]
 DISCOVERY_PROVIDER_CHOICES = ["kubernetes", "file", "slurm", "consul"]
 
 
-def _parse_kv_index(value: str) -> str:
-    """The deprecated --kv-index value, as the Rust CLI reads it: any case, trimmed;
-    the removed positional index is refused with the reason (the choices refuse
-    the rest)."""
-    normalized = value.strip().lower()
-    if normalized == "positional":
-        raise argparse.ArgumentTypeError(
-            "the positional KV index was removed (kv-index 2.0.0): the chain index is the"
-            " only KV index, drop --kv-index"
-        )
-    return normalized
-
-
 def _parse_int_csv(value: str) -> list[int]:
     """Parse a comma-separated integer list (mirrors the CLI value_delimiter)."""
     return [int(item) for item in value.split(",") if item]
@@ -432,10 +419,6 @@ class RouterArgs:
     jwt_role_mapping: dict[str, str] = dataclasses.field(default_factory=dict)
     kv_connector_annotation: str = "smg.ai/kv-connector"
     kv_engine_id_annotation: str = "smg.ai/kv-engine-id"
-    # Deprecated: the chain index is the only KV index behind cache-aware
-    # routing, so "chain" is the one value and changes nothing; unset by
-    # default so that only a launch line that still passes it is warned
-    kv_index: str | None = None
     least_load_default_throughput: float = 2000.0
     least_load_kv_pressure_weight: float = 0.15
     least_load_max_waiting_requests: int = 0
@@ -614,6 +597,7 @@ class RouterArgs:
     service_discovery_port: int = 80
     # Grace period in seconds to wait for in-flight requests during shutdown
     shutdown_grace_period_secs: int = 180
+    shutdown_settle_secs: int | None = None
     # Slurm discovery (discovery_provider="slurm"): the account whose jobs are
     # discovered, the encode and prefill bootstrap port, the job names whose
     # nodes are each worker type, the partition, the port of every node's
@@ -1185,18 +1169,6 @@ class RouterArgs:
                 " (or, for a cache-aware prefill pool, by its policy); also sheds"
                 " a worker that crossed a threshold between selection"
                 " and dispatch. Off by default."
-            ),
-        )
-        routing_group.add_argument(
-            f"--{prefix}kv-index",
-            type=_parse_kv_index,
-            choices=["chain"],
-            default=RouterArgs.kv_index,
-            help=(
-                "Deprecated: the chain index is the only KV index behind cache-aware"
-                " routing, so 'chain' is the one value and changes nothing; the flag"
-                " goes in a later release. 'positional' names the index that was"
-                " removed and is refused."
             ),
         )
         routing_group.add_argument(
@@ -2135,6 +2107,13 @@ class RouterArgs:
                 "request's answer on any worker; an HTTP worker's own pool "
                 "timeout_secs takes this value's place)"
             ),
+        )
+        request_group.add_argument(
+            f"--{prefix}shutdown-settle-secs",
+            type=int,
+            default=RouterArgs.shutdown_settle_secs,
+            help="Keep accepting connections after readiness fails; defaults to 5 seconds "
+            "and is capped at half the shutdown grace period",
         )
         request_group.add_argument(
             f"--{prefix}shutdown-grace-period-secs",

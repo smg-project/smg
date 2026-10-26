@@ -1283,6 +1283,23 @@ python -m smg_grpc_servicer.sglang.headless \
 
 `smg serve --backend sglang --connection-mode zmq` runs exactly this for each
 worker, with the handshake port SMG derives from the worker's `ipc://` URL.
+The gateway binds its `ipc://` sockets in a directory it must own: it creates
+the directory itself (mode 0700) when it is missing, and refuses an existing
+one that is not a real directory owned by its own uid (`ipc socket dir ... is
+owned by uid 0 (expected 65532); refusing to bind unauthenticated ZMQ sockets
+in a directory owned by another user`). The check is on the socket path's
+parent, so a pod that shares an `emptyDir` (created by the kubelet, owned by
+root) between the gateway and a headless scheduler has two shapes that pass
+it: point the worker's `ipc://` URL into a subdirectory of the mount that does
+not exist yet (mount at `/run/smg`, register `ipc:///run/smg/zmq/worker0`),
+which the gateway creates itself at 0700 under its own uid and which lives as
+long as the pod (this needs the mount writable by the gateway's uid, as an
+`emptyDir` is when the kubelet creates it, mode 0777); or, when the mount
+point itself is the socket directory or the mount is not writable by that uid,
+an init container that creates the socket directory if needed and `chown`s it
+to the gateway's uid (65532 in the published router image) before either
+container starts. With both, the scheduler connects to the sockets in that
+directory, so it runs as the same uid.
 SMG's wait for the scheduler's HELLO, and for the READY and the registration
 that follow it, is bounded per stage by the router's
 `--zmq-startup-timeout-secs` (default 3600 s; `--router-zmq-startup-timeout-secs`

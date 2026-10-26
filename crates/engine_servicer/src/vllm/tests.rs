@@ -3897,12 +3897,25 @@ async fn drain_refuses_new_decode_requests_but_keeps_the_rejection_notice() {
 /// A PD decode side on `connector`, with the request the adapter refuses
 /// after admission closed and before the engine got it (a negative
 /// temperature fails its own check of the sampling params): the refusal
-/// path of the notice.
+/// path of the notice. The Mooncake flag is what the launcher hands for a
+/// top-level connector of that name.
 fn decode_side_on(connector: &str) -> VllmModelInfo {
     let mut model = model_info();
     model.kv_connector = connector.to_string();
     model.kv_role = "kv_consumer".to_string();
     model.kv_engine_id = "decode-engine".to_string();
+    model.runs_mooncake = connector == "MooncakeConnector";
+    model
+}
+
+/// A PD decode side behind a `MultiConnector` whose projection stays at the
+/// wrapper (a second P2P child beside the mover, an empty child engine id, a
+/// malformed sibling: the launcher reports the wrapper's own name), with
+/// `runs_mooncake` as the launcher reads it off the raw config.
+fn wrapper_projected_decode_side(runs_mooncake: bool) -> VllmModelInfo {
+    let mut model = decode_side_on("MultiConnector");
+    model.kv_engine_id = "eng-d".to_string();
+    model.runs_mooncake = runs_mooncake;
     model
 }
 
@@ -3970,6 +3983,55 @@ async fn a_mooncake_decode_side_withholds_the_notice_with_one_warning_line() {
     assert_eq!(accepted.request_id, "pd-mooncake");
     assert!(!accepted.abort_immediately);
     assert_eq!(logs.lines_containing("pd-mooncake").len(), 1);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A decode side behind a wrapper whose projection stays at the wrapper
+/// withholds the notice when a Mooncake child runs under it: the flag the
+/// launcher reads off the raw config decides, not the projected name (the
+/// wrapper hands the notice's allocation to every child and merges every
+/// child's finished transfers, so the Mooncake child would die on it).
+#[tokio::test]
+async fn a_wrapper_projected_decode_side_that_runs_mooncake_withholds_the_notice() {
+    let logs = captured_logs();
+    let mut h = harness(wrapper_projected_decode_side(true), None).await;
+    let status = h
+        .client
+        .generate(refused_decode_request("pd-wrapper-mooncake"))
+        .await
+        .expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_engine_idle(&mut h.engine_in).await;
+    let lines = logs.lines_containing("pd-wrapper-mooncake");
+    assert_eq!(lines.len(), 1, "one warning line: {lines:?}");
+    assert!(lines[0].contains("WARN"), "{}", lines[0]);
+    assert!(
+        lines[0].contains("KV-transfer rejection notice withheld on the Mooncake connector"),
+        "{}",
+        lines[0]
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The same wrapper-projected decode side without a Mooncake child (NIXL
+/// beside a store) still sends the notice.
+#[tokio::test]
+async fn a_wrapper_projected_decode_side_without_a_mooncake_child_still_sends_the_notice() {
+    let mut h = harness(wrapper_projected_decode_side(false), None).await;
+    let status = h
+        .client
+        .generate(refused_decode_request("pd-wrapper-nixl"))
+        .await
+        .expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    let notice = recv_add(&mut h.engine_in).await;
+    assert_eq!(notice.request_id, "pd-wrapper-nixl");
+    assert!(notice.abort_immediately);
+    assert_eq!(
+        recv_abort(&mut h.engine_in).await,
+        vec!["pd-wrapper-nixl".to_string()]
+    );
+    assert_engine_idle(&mut h.engine_in).await;
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
