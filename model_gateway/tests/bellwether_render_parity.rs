@@ -338,6 +338,29 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          template does not render as the reference does (smg-project/smg#2783)",
     ),
     (
+        "kimi-k3/render/continue-final-message",
+        "the checkpoint's own encoder, which the gateway ports (smg-project/smg#1968), reads no \
+         `continue_final_message`: the vendor-code reference renders the final assistant \
+         message closed (an empty thought, the response, the end of the message), while the \
+         gateway appends the prefill after the generation prompt as the serving engine's \
+         prefix append does (smg-project/smg#2434)",
+    ),
+    (
+        "kimi-k3/render/thinking-kwarg-off",
+        "the checkpoint's own encoder reads `thinking`, not the engine's `enable_thinking` \
+         alias, so the vendor-code reference of `enable_thinking: false` keeps thinking on with \
+         the default effort directive; the gateway resolves the alias before rendering as the \
+         engine's own server does (smg-project/smg#3004): no directive, the response channel \
+         opened",
+    ),
+    (
+        "kimi-k3/render/thinking-reasoning-effort-kwarg",
+        "the checkpoint's own encoder reads `thinking_effort`, not the request's \
+         `reasoning_effort`, so the vendor-code reference of `reasoning_effort: low` writes the \
+         default `max`; the gateway maps the request's level to the directive \
+         (smg-project/smg#1968)",
+    ),
+    (
         "llama-3.1-nemotron-nano-8b-v1/render/glaive-v2-32.jsonl",
         "the gateway parses a history call's arguments into an object before rendering, \
          which the template, writing the string as recorded, renders otherwise: a \
@@ -539,12 +562,6 @@ const KNOWN_UNLOADED: &[(&str, &str)] = &[
         "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
          files behind the gate are not fetched (bellwether recorded the group with its \
          own secret)",
-    ),
-    (
-        "kimi-k3",
-        "the checkpoint ships tiktoken.model and no tokenizer.json; this harness fetches \
-         tokenizer.json only (the tokenizer harness reads the tiktoken file since \
-         smg-project/smg#2923)",
     ),
     (
         "llama-3.2-11b-vision-instruct",
@@ -1722,9 +1739,16 @@ fn recorded_with(provenance: &Value) -> String {
 }
 
 /// The vocabulary files a checkpoint may ship, in the order they are tried:
-/// a `tokenizers` file, or the `vocab.json` + `merges.txt` pair of the models
-/// that have no `tokenizer.json` (Qwen3-Omni), which counts only whole.
-const VOCABULARIES: [&[&str]; 2] = [&["tokenizer.json"], &["vocab.json", "merges.txt"]];
+/// a `tokenizers` file; a tiktoken file for the models that have no
+/// `tokenizer.json` (Kimi); the `vocab.json` + `merges.txt` pair of the
+/// models that ship neither (Qwen3-Omni), which counts only whole. The same
+/// list, in the same order, as the tokenizer harness's: the two harnesses
+/// share one cache directory, so each asks for what the other would.
+const VOCABULARIES: [&[&str]; 3] = [
+    &["tokenizer.json"],
+    &["tiktoken.model"],
+    &["vocab.json", "merges.txt"],
+];
 
 /// The checkpoint's tokenizer files at the manifest's revision: the Hugging
 /// Face cache snapshot when it is there, else a one-time download of the files
@@ -1773,7 +1797,7 @@ fn tokenizer_dir(model: &str, revision: &str, slug: &str) -> Result<PathBuf, Str
     Ok(dir)
 }
 
-/// [`VOCABULARIES`] for a message: `tokenizer.json, vocab.json + merges.txt`.
+/// [`VOCABULARIES`] for a message: `tokenizer.json, tiktoken.model, vocab.json + merges.txt`.
 fn vocabularies() -> String {
     VOCABULARIES
         .iter()
@@ -2172,6 +2196,7 @@ fn a_cache_snapshot_with_any_whole_vocabulary_is_the_tokenizer_dir() {
     };
     let files = [
         snapshot("org/json", &["tokenizer_config.json", "tokenizer.json"]),
+        snapshot("org/tiktoken", &["tokenizer_config.json", "tiktoken.model"]),
         snapshot(
             "org/pair",
             &["tokenizer_config.json", "vocab.json", "merges.txt"],
@@ -2187,6 +2212,7 @@ fn a_cache_snapshot_with_any_whole_vocabulary_is_the_tokenizer_dir() {
     let hub = tree(&files).unwrap();
     for (model, found) in [
         ("org/json", true),
+        ("org/tiktoken", true),
         ("org/pair", true),
         ("org/half-pair", false),
         ("org/no-config", false),
