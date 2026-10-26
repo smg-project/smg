@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from infra.amd_ts_pd2_profile import ts_pd2_reference_engine
 
 
 def resolve_class_marker(
@@ -95,6 +96,7 @@ def model_id_for_engine(marker: pytest.Mark | None, engine: str | None, default:
     """
     if marker is None:
         return default
+    engine = ts_pd2_reference_engine(engine)
     if engine and engine in marker.kwargs:
         return marker.kwargs[engine]
     if marker.args:

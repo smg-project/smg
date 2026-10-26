@@ -24,6 +24,10 @@ from infra import (
     get_tokenspeed_servicer_impl,
     get_zmq_engine_count,
 )
+from infra.amd_ts_pd2_profile import (
+    ts_pd2_reference_engine,
+    validate_ts_pd2_reference,
+)
 from infra.worker_pool import get_pool
 
 from .markers import model_id_for_engine, resolve_class_marker
@@ -64,6 +68,7 @@ def pytest_runtest_makereport(item: pytest.Item, call):
 
 def pytest_configure(config: pytest.Config) -> None:
     """Register custom markers."""
+    validate_ts_pd2_reference()
     config.addinivalue_line(
         "markers",
         "engine(*names): engines this test runs on (sglang, vllm, trtllm)",
@@ -143,7 +148,7 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
     drops the others. Iterate every mark so a runtime that's named in any of
     them gets skipped, regardless of which is "closest".
     """
-    current_runtime = get_runtime()
+    current_runtime = ts_pd2_reference_engine(get_runtime())
     for marker in item.iter_markers(name="skip_for_runtime"):
         if current_runtime in marker.args:
             reason = marker.kwargs.get("reason", f"Not supported on {current_runtime}")
@@ -453,6 +458,8 @@ def _enforce_selection_floor(selected_count: int) -> None:
 def _format_selection_line(stats: dict) -> str:
     """Render the one-line, greppable ``e2e selection:`` summary."""
     header = f"e2e selection: engine={stats['engine'] or '-'}"
+    if stats.get("reference_engine"):
+        header += f" reference_engine={stats['reference_engine']}"
     if stats.get("vendor"):
         header += f" vendor={stats['vendor']}"
     header += f" tier={stats['tier'] or '-'}"
@@ -535,6 +542,7 @@ def pytest_collection_modifyitems(
     instead of evicting on every boundary.
     """
     engine = os.environ.get("E2E_ENGINE") or None
+    reference_engine = ts_pd2_reference_engine(engine)
     vendor = os.environ.get("E2E_VENDOR") or None
     gpu_tier = os.environ.get("E2E_GPU_TIER") or None
 
@@ -553,8 +561,10 @@ def pytest_collection_modifyitems(
         "by_sglang_zmq": 0,
     }
 
-    if any([engine, vendor, gpu_tier]):
-        selected, deselected_by = _filter_env_items(items, engine, vendor, gpu_tier)
+    if reference_engine != engine:
+        stats["reference_engine"] = reference_engine
+    if any([reference_engine, vendor, gpu_tier]):
+        selected, deselected_by = _filter_env_items(items, reference_engine, vendor, gpu_tier)
         stats["by_engine"] = len(deselected_by["engine"])
         stats["by_vendor"] = len(deselected_by["vendor"])
         stats["by_tier"] = len(deselected_by["tier"])

@@ -16,6 +16,7 @@ from typing import IO, Any
 
 import yaml
 
+from .amd_ts_pd2_profile import ts_pd2_reference_enabled, ts_pd2_sglang_args
 from .constants import (
     DEFAULT_HOST,
     DEFAULT_STARTUP_TIMEOUT,
@@ -540,6 +541,13 @@ class Worker:
             cmd.extend(["--base-gpu-id", "0"])
             if self.ib_device:
                 cmd.extend(["--disaggregation-ib-device", self.ib_device])
+
+        if ts_pd2_reference_enabled():
+            cmd.extend(
+                ts_pd2_sglang_args(
+                    self.model_id, tp_size, self.mode, self.worker_type, self.effective_kv_backend()
+                )
+            )
 
         # Additional SGLang args from model spec (e.g., --context-length)
         sglang_args = spec.get("sglang_args", [])
