@@ -1,0 +1,47 @@
+{
+  "result": "PASS_SOURCE_ONLY_ACTUAL_DISABLED_0898_COMPLETE_PREPARATION_CI_CHILD",
+  "findings": [],
+  "reviewer": "D nonauthor of root81fa/0898 preparation fixes; inherits genuine A8121 source integration only. Independent actual Git/inverse/hash review; CPU actual audit is separate.",
+  "at_utc": "2026-10-26T03:10:16.962966+00:00",
+  "source_parent": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
+  "actual_head": "0898cf993e4d2f44327a8b7c1e2b74a185cbee89",
+  "direct_parent": "81fa6c2fd15c465deab5c5d9bc09fb56121129f2",
+  "reviewed_antecedent": "8121b2bdbe862ea2d153914c5890405d8d4a723e",
+  "actual_worktree": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/amd-qwen-current1473-preparation-output-20261026",
+  "driver_sha256": "7b0a98d25b7c0061d673556b0f6cf41e6b6da7311f1642a1d70145ece8f63591",
+  "envelope_sha256": "06589cd12a0547a4e1d5547f8e24afb6c849ec8e95854d997b73bf1180d1ccfd",
+  "inputs_sha256": "9f0359d170854c490fdc28c18b51a83b87c94b22331ceb56accee41179350925",
+  "CI_job_runner_sha256": "d9a04036e775522123b68043f0c5e2c2a1cdb7543a44dfe0bc2a67e13356164b",
+  "workflow_template_sha256": "aa77da40cedaa56aa6d4f02a2ec0f63c5f4cddabd781ba38adc2bacdfada2564",
+  "CI_source_manifest_sha256": "58c2e31af79ff8f0e9011fa6a28218137856ad5338fd8bef02ee34af9590fc0b",
+  "prepare_sha256": "b6e1e62cdb76a10ae09ad8c8a94f959a4f03b60fb4b386be22846990c76de04c",
+  "disabled_admission_sha256": "b18d6aef0bfc9dffb73893ad1d20c6540ab4827b83acce947e63fd6e8a912579",
+  "inherited_source_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-active-DRM-actual-source-peer-A-20261026.json",
+    "sha256": "d46f0faf95f49fa3c83a42ab9d8c8eca0ba18bba657219493918c0b31825e00c",
+    "bytes": 3842
+  },
+  "separate_actual_CPU_preparation_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-0898-full-preparation-CPU600-root-a21c7855f3a3453fb50fb2e6ca830969/peer-actual-D.json",
+    "sha256": "f069295ba12fb0c77d4bd227289966173403a8293c3496188cb872ba6a6977df",
+    "bytes": 24496
+  },
+  "actual_CI_interface": "Actual job_runner L103-115 checks this source_parent1473 and exact driver/envelope/inputs/jobrunner/template/manifest fields. These fields are independently populated from actual0898 Git; no product self-approval or CPU peer substituted for CI source peer.",
+  "checks": [
+    "Clean actual0898 direct81fa direct8121. Against genuine A8121 source base, exactly3 private paths differ: prepare replaces nonexistent script with real pipcheck and creates native report parent; remaining source statements exact. Fulltext and AST inverse restores whole8121 prepare. No tests/models/requests/oracles changed.",
+    "All15 source-manifest hashes match actual0898 files; only prepare member differs from8121. Admission changes only manifestSHA, all4 execution gates false/res0 and real actor/branch/nonce/peer/budget/model/background identities remain null/unbound.",
+    "Registered pr-test-rust.yml is byteexact original reviewed workflow-template aa77: manual-only,35min,oneGPUjob,existing checkout ownership bootstrap, same-CID finally/artifact/require-result and noncancelling concurrency. Originaljobrunnerd9a identity/KFD8/activeDRM/firsttraceback/source15/budget checks untouched.",
+    "Five generic shared helpers byteexact declared hashes. Shared and paired19/37/14 equal each other;19 matches actual1473,37 matches exactd5 andactual0898,14 matches exactd5. Complete e2e tree/product1473 ancestry and all shared fivefalse/res0/b7/fourarchive producer data unchanged.",
+    "CPU full0898 preparation has genuine separate actualpeer f069: all11commands0/finalRPC-runtime-pip-native-source evidence. This source peer preserves that scoped fact but does not certify GHA permissions/KFD/model/SMG ABI or12paired observations.",
+    "Fixedinner7b0a sixrequest shapes/order perlane, actualHTTP versus SMGgRPC/Rust,originalQwen3VL model/currentCLI/unmodifiedprivatehooksabsent source contract and absoluteNEW2100/1980+cleanup budget remain unchanged. Nominalphase maxima need not fit absolute cap; complete12 observations are not guaranteed."
+  ],
+  "conditional_child_scope": "This actual source peer may be copied byteexact to review/ci-source-peer.json in a future root data-only conditional child. Only Qwen admission, review sourcepeer/rootbudget and four existing shared authority bits may change. consumer_gpu_ready remainsfalse; all15 source members/manifest/registeredtemplate/shared19-37-14/artifacts/native/producer/model/request data remain exact. Root separately supplies fresh true ownership/TTL/model/background metadata, new independent NEW2100 within unchanged129939 cap, actual source-data/resource peers and sole actual binding. No reused retired window.",
+  "limits": [
+    "Source acceptance only; no publication/ref/POST/controller deployment/resource grant or actualGHA/model/paired/ABI/fullrow acceptance.",
+    "OldK1-K4 failures and old81faHOLD remain truthful history. FullCPU preparation success closes preparation only and does not solve observed garbled output/flake.",
+    "No helper/candidate/test/API/SSH/Docker/native import/Gitmutation/C-M/formal/source modifications executed by reviewer."
+  ],
+  "executed": false,
+  "resource_authority": false,
+  "coverage_increment": 0
+}

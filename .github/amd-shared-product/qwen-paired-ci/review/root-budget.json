@@ -1,0 +1,73 @@
+{
+  "root_admitted": true,
+  "owner": "root",
+  "at_utc": "2026-10-26T03:10:35.645589+00:00",
+  "NEW_runner_seconds": 2100,
+  "GPU_jobs": 1,
+  "GPU_devices_simultaneous": 1,
+  "admission_nonce": "02437d87f30242c39373f4b4f5afac57",
+  "no_retired_allowance_reused": true,
+  "registered_single_job_observer_source_reviewed": true,
+  "global_owned_GPU_runs_after_dispatch": 1,
+  "max_owned_GPU_runs": 2,
+  "old_finalized_seconds": 64014,
+  "old_reserved_seconds": 0,
+  "global_cap_before": 129939,
+  "global_cap_after": 129939,
+  "source_parent": "1473e2d4fae7084d0f744055ba29a1a4b9679ae3",
+  "carrier_source": "0898cf993e4d2f44327a8b7c1e2b74a185cbee89",
+  "observer_source_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-current1473-singlejob-observer-source-D-20261026/peer-independent-C.json",
+    "sha256": "07e2276ee5e622006bcc4c6a6dcfda5b81a271a5cdf1ec4bcad2323ae3eeb011"
+  },
+  "source_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-preparation-0898-actual-source-peer-D-20261026.json",
+    "sha256": "54ab7df15c3c727e9600f07f12dda1a020970e452e71806ec1c60a4c490ce683"
+  },
+  "fresh_evidence": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-preparation-output-fresh-readiness-root-13c4510868fe45d69760fec9b5b5b9cb/summary.json",
+    "sha256": "96fea01c6285af30d09d45031256076b7966aa17701fcef66c0db570bfcf1c57"
+  },
+  "actual_active_DRM_UID995_CPU": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-active-DRM-UID995-CPU30-root-7cd16df78b1540e6b8a1b7ac3cc00eb6/root-closeout.json",
+    "sha256": "0000126eae388b2ec94d109252c5f9854d9d153b7b058acbba620e8462c35002"
+  },
+  "actual_active_DRM_UID995_CPU_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-active-DRM-UID995-CPU30-root-7cd16df78b1540e6b8a1b7ac3cc00eb6/peer-actual-A.json",
+    "sha256": "f0feb5052e9b0f766e0db25f831d96c3f1f21d68ce807b3a50e7a7975ce67787"
+  },
+  "prior_terminal_CU_run": 40258673029,
+  "prior_CU_settlement": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/validation/sglang-pd4-current1473-b7-cu-20261026/actual-validation/root-terminal-resource-settlement.json",
+    "sha256": "9deb842d751671c6dbf9d5ad4b1e7e44c95eb8fc9e88052b48c00ecb57056cdb"
+  },
+  "absolute_GPU_job_seconds": 2100,
+  "absolute_work_seconds": 1920,
+  "cleanup_until_seconds": 2040,
+  "artifact_upload_reserved_seconds": 60,
+  "queue_seconds": 900,
+  "overall_seconds": 3600,
+  "coverage_increment": 0,
+  "original_pytest_cases_planned": 0,
+  "paired_observations_planned": 12,
+  "automatic_retry": false,
+  "preserve_ordinary_CI_PNL_health": true,
+  "preserved_ordinary_AMD_jobs": [
+    {
+      "run_id": 40259094962,
+      "id": 121374794929,
+      "name": "e2e-1gpu-chat-amd (vllm) / run",
+      "status": "in_progress",
+      "runner_id": 331464,
+      "runner_name": "amd-mi300x-1"
+    }
+  ],
+  "actual_full_preparation_CPU": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-0898-full-preparation-CPU600-root-a21c7855f3a3453fb50fb2e6ca830969/root-result.json",
+    "sha256": "a9773451f05e557ce8ce1864a1d14416435bcbe81deaea477b46c965ce0f73bf"
+  },
+  "actual_full_preparation_CPU_peer": {
+    "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/Qwen-0898-full-preparation-CPU600-root-a21c7855f3a3453fb50fb2e6ca830969/peer-actual-D.json",
+    "sha256": "f069295ba12fb0c77d4bd227289966173403a8293c3496188cb872ba6a6977df"
+  }
+}
