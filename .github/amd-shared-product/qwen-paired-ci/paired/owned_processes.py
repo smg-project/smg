@@ -125,13 +125,14 @@ def launcher_snapshot(child, nonce):
 def signal_exact(row, signum, nonce):
     now = identity(row["pid"])
     if now is None or now["state"] == "Z":
-        return
+        return False
     if now["start_ticks"] != row["start_ticks"] or now["env"].get(KEY) != nonce:
         raise RuntimeError("refuse signal after PID/nonce identity change")
     os.kill(row["pid"], signum)
+    return True
 
 
-def signal_group(leader, signum, nonce):
+def signal_group(leader, signum, nonce, signalled_members=None):
     current = identity(leader["pid"])
     if current is None or current["state"] == "Z":
         return False
@@ -153,18 +154,49 @@ def signal_group(leader, signum, nonce):
     if not members or any(row["env"].get(KEY) != nonce for row in members):
         raise RuntimeError("refuse group with unowned member")
     os.killpg(current["pid"], signum)
+    if signalled_members is not None:
+        signalled_members.extend(members)
     return True
 
 
 def cleanup(nonce, deadline, leaders):
     actions, errors = [], []
+    sent, resolutions, changed_birth = {}, {}, set()
+    errors_truncated = False
     known = {child.pid: child.smg_identity for child in leaders
              if getattr(child, "smg_identity", None) is not None}
     groups = {child.pid for child in leaders}
 
     def remember(error):
-        if error not in errors and len(errors) < 32:
-            errors.append(error)
+        nonlocal errors_truncated
+        row = error["process"]
+        certificate = sent.get((row["pid"], row["start_ticks"]))
+        if error["error_type"] == "PermissionError" and certificate is not None:
+            error = {**error, "successful_signal_before_error": certificate}
+        if error not in errors:
+            if len(errors) < 32:
+                errors.append(error)
+            else:
+                errors_truncated = True
+
+    def unresolved_errors():
+        pending = []
+        for index, error in enumerate(errors):
+            row = error["process"]
+            if (error["error_type"] != "PermissionError" or
+                    "successful_signal_before_error" not in error or index in changed_birth):
+                pending.append(error)
+                continue
+            now = stat_identity(row["pid"])
+            if now is not None and now["start_ticks"] != row["start_ticks"]:
+                changed_birth.add(index)
+                pending.append(error)
+            elif now is None or now["state"] == "Z":
+                resolutions[index] = {"error_index": index, "expected_start_ticks": row["start_ticks"],
+                                      "terminal_stat": now, "terminal_basis": "gone" if now is None else "same-birth-Z"}
+            else:
+                pending.append(error)
+        return pending
 
     def scan():
         rows, unknown = scan_owned(nonce, groups, known)
@@ -176,20 +208,32 @@ def cleanup(nonce, deadline, leaders):
 
     for sig, grace in [(signal.SIGTERM, 5), (signal.SIGKILL, 5)]:
         rows, unknown = scan()
+        group_members = set()
         for row in rows:
             if row["pgrp"] == row["pid"]:
                 try:
-                    if signal_group(row, sig, nonce):
-                        actions.append({"signal": int(sig), "owned_process_group": row["pid"], "start_ticks": row["start_ticks"]})
+                    certified = []
+                    if signal_group(row, sig, nonce, certified):
+                        action = {"signal": int(sig), "owned_process_group": row["pid"], "start_ticks": row["start_ticks"]}
+                        actions.append(action)
+                        for member in certified:
+                            key = (member["pid"], member["start_ticks"])
+                            group_members.add(key)
+                            known[member["pid"]] = member
+                            sent[key] = action
                 except ProcessLookupError:
                     pass
                 except (PermissionError, RuntimeError) as error:
                     remember({"stage": "signal_group", "process": public(row),
                               "error_type": type(error).__name__, "error": str(error)[:512]})
         for row in rows:
+            if (row["pid"], row["start_ticks"]) in group_members:
+                continue
             try:
-                signal_exact(row, sig, nonce)
-                actions.append({"signal": int(sig), **public(row)})
+                if signal_exact(row, sig, nonce):
+                    action = {"signal": int(sig), **public(row)}
+                    actions.append(action)
+                    sent[(row["pid"], row["start_ticks"])] = action
             except ProcessLookupError:
                 pass
             except (PermissionError, RuntimeError) as error:
@@ -206,11 +250,15 @@ def cleanup(nonce, deadline, leaders):
                 child.wait()
         remaining, unknown = scan()
         if not remaining and not unknown:
-            return {"passed": not errors, "signals": actions, "remaining": [], "errors": errors}
+            pending = unresolved_errors()
+            return {"passed": not pending and not errors_truncated, "signals": actions, "remaining": [], "errors": errors,
+                    "unresolved_errors": pending, "error_resolutions": list(resolutions.values()), "errors_truncated": errors_truncated}
         if time.monotonic() >= deadline:
             break
+    pending = unresolved_errors()
     return {"passed": False, "signals": actions,
-            "remaining": [public(row) for row in remaining], "unresolved": unknown, "errors": errors}
+            "remaining": [public(row) for row in remaining], "unresolved": unknown, "errors": errors,
+            "unresolved_errors": pending, "error_resolutions": list(resolutions.values()), "errors_truncated": errors_truncated}
 
 
 def mapped_native(pid, expected):
