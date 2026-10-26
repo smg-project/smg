@@ -5,7 +5,7 @@
   "consumer_gpu_ready": false,
   "runtime_cohort_accepted": false,
   "admitted_lane": "tokenspeed-pd2-original-qwen-sglang-reference",
-  "target_product_commit": "64f06800b5a500f352be451ba37c2ba0a84cec47",
+  "target_product_commit": "52d8cbc5fe506dbbc647f9e3c16fdd48e7a5b2be",
   "artifacts": [
     {
       "name": "smg-wheel",
@@ -94,7 +94,7 @@
     "e2e_test": "1ae5671e9e6a9805a601be178ccf6aa8a7e07f09",
     "scripts": "2aaa0d62644a24b1580a7ef46ee6fd00499ff57b",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
-    ".github/workflows/e2e-gpu-job.yml": "5358abd1562a7f5b3de2035e14506c1ab9fe22da",
+    ".github/workflows/e2e-gpu-job.yml": "8195892b41d072029a2c9bd100aa0e02f0d2d8a5",
     "README.md": "83b7df25632da03f0184bd5b4628b9c9a3ace803",
     "LICENSE": "9088c2872db9763b9e6533c6960e9adb0c9cb65f",
     "rustfmt.toml": "19e1ab31f8958c31292f0f568976a036af7e683b",
@@ -256,7 +256,7 @@
     "run_binding": null,
     "watch_PID_or_session": null
   },
-  "pending_note": "Unexecuted default-off source integration proposal only. Root must materialize the product layer, bind its true Git commit, verify actual19/37/14 and four diagnostic files, independently review source and the new tier2 gate, then separately admit any NEW GPU phase. Old82f full15 remains startup HOLD; CU repair is not claimed to solve OOM. No previous CPU/retired/GPU credit transferred.",
+  "pending_note": "Disabled current75b2/54db source composition proposal: three consumed-local stages plus the already reviewed same-GPU-job external relay. Root must create true product then bind actual target/source19 and independently review. No GPU grant/installed-native/current pool/runtime/original15 acceptance; all prior failures and retired allowances remain closed.",
   "binding_preparation_evidence": {
     "producer_build_archive_integrity_sha256": "fa8e1be5899a9f5d74ade0f6de9cfa10eb5065a404f597c2ee95d55cfa03cb6f",
     "producer_policy_source_review_sha256": "707a143df969433664b923c54e9cc44ad511dba00bdde978c4b40b02d94901fb",
@@ -271,21 +271,25 @@
   "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-2gpu-pd[3]/tokenspeed/nvidia",
   "reference_contract_sha256": "f6db720219333ee5f2c9164edcf2cb323926ff3d5e797be44f3fd229a5d6774a",
   "diagnostic_source_files": {
-    ".github/amd-sg4pd-allocation-phase/apply.py": "b13b570233bfad2f36ddb59f07844925ad3173b2553fc2183ce6dcc90c571a8c",
-    ".github/amd-sg4pd-allocation-phase/allocation_failure.py": "91a40c870cd484f0bcef5b8caac47dcbb933c0d6c052833cf768e95fc8af8d08",
-    ".github/amd-sg4pd-allocation-phase/overlay.json": "924785978aa989b8f157592c3becda061157e69a4e90ed5f4ed43409b8be663f",
+    ".github/amd-sg4pd-allocation-phase/apply.py": "6488e3e90fcde0a440cfed8fc5d33362be2840f9de3469576c9236e2a1d0dea3",
+    ".github/amd-sg4pd-allocation-phase/allocation_failure.py": "32a7f905cc84dd093aa43c331174780a23178a4219825104a12a33849c7b8e77",
+    ".github/amd-sg4pd-allocation-phase/overlay.json": "8abd3ad991cc07496bf2fcc54cc45dffb907b4c65729d73ae346f85b41095b61",
     ".github/amd-sg4pd-allocation-phase/cu-overlay.json": "c7b5fffeb31105c26677cc3ef6c946f17fdd887d17bba4ba68fe8469bd956048"
   },
   "diagnostic_source_binding": {
     "manual_input": "cu_stream_diagnostic",
     "default": false,
-    "same_4f86_helper_and_installed_source_bytes": true,
     "TS2_gate": "engine=sglang,tier2,SMG_AMD_TS_PD2_REFERENCE=1 plus explicit existing CU/phase flags",
-    "current_source_evidence": "82f actual15 startup failure;4f86 donor source+six data controls only",
+    "current_source_evidence": "Current75b2 memory-query mechanism plus exact4420 bootstrap2931 and KV27ea consumed-local stages. All proposed source only; no new installed or physical-counter acceptance.",
     "runtime_accepted": false,
     "new_source_peer_pending": true,
     "actual_head": null,
     "run_id": null,
-    "GPU_budget": 0
+    "GPU_budget": 0,
+    "inherits_4f86_CU_stream_and_seq_lens_operations": true,
+    "adds_only_bounded_FutureMap_second_allocation_failure": false,
+    "adds_bounded_existing_memory_query_values": true,
+    "actual_resolved_pool_budget_observed": false,
+    "adds_bounded_consumed_pool_budget_values": true
   }
 }

@@ -16,97 +16,11 @@ concurrency:
   group: amd-tokenspeed-pd2-original-qwen-reference
   cancel-in-progress: false
 jobs:
-  artifact-relay:
-    if: inputs.execute
-    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
-    timeout-minutes: 10
-    env:
-      PYTHONDONTWRITEBYTECODE: '1'
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - name: Require one separately admitted complete original TokenSpeed PD2 reference row
-        shell: bash
-        run: |
-          python3 - <<'PYTHON'
-          import json
-          from pathlib import Path
-          data = json.loads(Path(".github/amd-shared-product/inputs.json").read_text())
-          assert data["admitted_lane"] == "tokenspeed-pd2-original-qwen-sglang-reference"
-          assert data["runtime_cohort_accepted"] is True
-          assert all(data[key] is True for key in ("ready", "run_budget_admitted", "artifacts_pinned"))
-          import hashlib
-          for name, expected in data["diagnostic_source_files"].items():
-              assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == expected
-          recipe = data["recipe"]
-          assert data["target_product_commit"] == "64f06800b5a500f352be451ba37c2ba0a84cec47"
-          assert recipe["test_dirs"] == "e2e_test/router" and recipe["test_filter"] == ""
-          assert recipe["engine"] == recipe["actual_engine"] == "sglang"
-          assert recipe["reference_engine"] == "tokenspeed" and recipe["functional_equivalence_only"] is True
-          assert recipe["strict_native_TokenSpeed"] is False and recipe["gpu_tier"] == "2"
-          assert recipe["profile_env"] == {"SMG_AMD_TS_PD2_REFERENCE": "1"}
-          assert recipe["connection_mode"] == "" and recipe["kv_backend"] == ""
-          assert recipe["min_selected"] == 10 and recipe["servicer_unit_tests"] is False
-          assert recipe["models"] == ["Qwen/Qwen3.5-9B", "meta-llama/Llama-3.2-1B-Instruct"] and recipe["tp"] == 1
-          assert recipe["extra_models"] == "Qwen/Qwen3.5-9B"
-          assert recipe["job_minutes"] == 75 and recipe["pytest_minutes"] == 50
-          assert recipe["reruns"] == 2 and recipe["reruns_delay"] == 5
-          assert recipe["setup_agentic_deps"] is False and recipe["same_original_tests_and_oracles"] is True
-          PYTHON
-      - name: Verify external producer and relay payloads
-        id: relay
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          DIRECTORY="$RUNNER_TEMP/shared-relay-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          echo "directory=$DIRECTORY" >> "$GITHUB_OUTPUT"
-          python3 .github/amd-shared-product/relay.py --out "$DIRECTORY"
-      - name: Relay wheel without changing its bytes
-        uses: actions/upload-artifact@v7
-        with:
-          name: smg-wheel
-          path: ${{ steps.relay.outputs.directory }}/smg-wheel/
-          compression-level: 0
-          if-no-files-found: error
-          retention-days: 1
-      - name: Relay Go FFI without changing its bytes
-        uses: actions/upload-artifact@v7
-        with:
-          name: go-ffi-library
-          path: ${{ steps.relay.outputs.directory }}/go-ffi-library/
-          compression-level: 0
-          if-no-files-found: error
-          retention-days: 1
-      - name: Relay WASM without changing its bytes
-        uses: actions/upload-artifact@v7
-        with:
-          name: wasm-test-fixtures
-          path: ${{ steps.relay.outputs.directory }}/wasm-test-fixtures/
-          compression-level: 0
-          if-no-files-found: error
-          retention-days: 1
-      - name: Relay Python types without changing their bytes
-        uses: actions/upload-artifact@v7
-        with:
-          name: python-client-types
-          path: ${{ steps.relay.outputs.directory }}/python-client-types/
-          compression-level: 0
-          if-no-files-found: error
-          retention-days: 1
-      - name: Preserve external producer identity and verification
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: external-producer-relay-evidence
-          path: ${{ steps.relay.outputs.directory }}/evidence/
-          if-no-files-found: ignore
-          retention-days: 7
   amd-ts-pd2-reference:
-    needs: artifact-relay
-    if: inputs.execute && needs.artifact-relay.result == 'success'
+    if: inputs.execute
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
+      external_product_commit: 52d8cbc5fe506dbbc647f9e3c16fdd48e7a5b2be
       engine: sglang
       gpu_tier: "2"
       runner: 4-gpu-mi300x
@@ -128,12 +42,11 @@ jobs:
 
   finish:
     if: always() && inputs.execute
-    needs: [artifact-relay, amd-ts-pd2-reference]
+    needs: [amd-ts-pd2-reference]
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     timeout-minutes: 3
     steps:
-      - name: Require the relay and complete original TokenSpeed PD2 reference row to succeed
+      - name: Require the complete original TokenSpeed PD2 reference row including its artifact verification to succeed
         env:
-          RELAY: ${{ needs.artifact-relay.result }}
           SG: ${{ needs.amd-ts-pd2-reference.result }}
-        run: test "$RELAY" = success && test "$SG" = success
+        run: test "$SG" = success
