@@ -483,17 +483,24 @@ impl WireEngineCoreOutputs {
             wave_complete,
             start_wave,
         ) {
-            (true, None, None, None) => Ok(RequestBatchOutputs {
-                engine_index,
-                outputs: outputs
-                    .into_iter()
-                    .map(|output| output.resolve(frames))
-                    .collect::<Result<Vec<_>>>()?,
-                scheduler_stats,
-                timestamp,
-                finished_requests,
+            (true, None, None, None) => {
+                // Resolved into a vector sized to the batch: a fallible
+                // `collect` cannot trust the iterator's length and starts at
+                // the allocator's minimum capacity (four outputs, about
+                // 1 KiB) for every message, most of which carry one output.
+                let mut resolved = Vec::with_capacity(outputs.len());
+                for output in outputs {
+                    resolved.push(output.resolve(frames)?);
+                }
+                Ok(RequestBatchOutputs {
+                    engine_index,
+                    outputs: resolved,
+                    scheduler_stats,
+                    timestamp,
+                    finished_requests,
+                }
+                .into())
             }
-            .into()),
             (false, Some(TrailingTolerant(output)), None, None) => Ok(UtilityCallOutput {
                 engine_index,
                 timestamp,
