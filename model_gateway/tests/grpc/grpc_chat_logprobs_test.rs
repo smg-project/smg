@@ -1,6 +1,7 @@
 //! Chat Completions logprobs over a real gRPC worker connection: a unary
-//! response's `logprobs.content` covers the same tokens as the logprobs on a
-//! stream's content deltas.
+//! response's `logprobs.content` has one entry per generated token, as the
+//! engine's own server returns them; the stream's content deltas carry the
+//! content tokens' entries among them.
 
 use std::{sync::Arc, time::Duration};
 
@@ -134,16 +135,20 @@ async fn chat_logprobs(stream: bool) -> Vec<(String, f64)> {
         .collect()
 }
 
-/// A unary response's logprobs cover its content's tokens, as a stream's
-/// content deltas do: not the reasoning, its delimiters or the EOS token.
+/// A unary response's logprobs have one entry per generated token, as the
+/// engine's own server returns them: the reasoning and its delimiters, the
+/// content and the EOS token, in order. The stream's content deltas carry
+/// the content tokens' entries among them.
 #[tokio::test]
-async fn unary_logprobs_cover_the_content_as_a_stream_does() {
-    // Token `100 + i` (chunk `i`) reports logprob `-(i + 1)`.
-    let content: Vec<(String, f64)> = ["Hello", " my", " friend", "."]
+async fn unary_logprobs_cover_every_generated_token() {
+    // Token `100 + i` (chunk `i`) reports logprob `-(i + 1)`; the last token
+    // decodes to nothing, like an EOS token.
+    let every_token: Vec<(String, f64)> = CHUNKS
         .iter()
-        .map(|token| token.to_string())
-        .zip([-6.0, -7.0, -8.0, -9.0])
+        .chain(std::iter::once(&""))
+        .enumerate()
+        .map(|(i, token)| (token.to_string(), -((i + 1) as f64)))
         .collect();
-    assert_eq!(chat_logprobs(false).await, content);
-    assert_eq!(chat_logprobs(true).await, content);
+    assert_eq!(chat_logprobs(false).await, every_token);
+    assert_eq!(chat_logprobs(true).await, every_token[5..9].to_vec());
 }

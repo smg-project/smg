@@ -583,9 +583,8 @@ pub fn reasoning_text_tokens(events: &[Event]) -> u32 {
 
 /// One call only (`parallel_tool_calls: false`, `disable_parallel_tool_use`): the events of
 /// every call after the first become its dropped text, so every byte of the output still lands
-/// in one event and the content ranges after the call hold
-/// ([`content_spans`](crate::adapt::chat::content_spans)); the finish counts at most one. A
-/// table's grammar limits a forced call; this limits a free one.
+/// in one event; the finish counts at most one. A table's grammar limits a forced call; this
+/// limits a free one.
 pub fn first_call_only(events: &mut [Event]) {
     for event in events {
         match event {

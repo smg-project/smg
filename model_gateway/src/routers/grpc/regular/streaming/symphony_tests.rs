@@ -448,7 +448,7 @@ fn kept_logprob_tokens(choice: &ChatChoice) -> String {
 
 #[tokio::test]
 async fn symphony_folds_a_whole_output_into_the_message() {
-    // One logprob per output token: the choice keeps the content's alone, as the older path does.
+    // One logprob per output token: the choice keeps every one of them, as the older path does.
     let (choice, reasoning_tokens) = fold(QWEN3_OUTPUT).await;
     assert_eq!(choice.message.reasoning_content.as_deref(), Some("plan"));
     assert_eq!(
@@ -467,8 +467,8 @@ async fn symphony_folds_a_whole_output_into_the_message() {
     assert_eq!(reasoning_tokens, 4);
     assert_eq!(
         kept_logprob_tokens(&choice),
-        "Hello ",
-        "the content's tokens alone keep their logprobs"
+        QWEN3_OUTPUT,
+        "every token keeps its logprob: the thought's, the markers' and the call's too"
     );
 }
 
@@ -577,11 +577,11 @@ async fn a_block_the_token_limit_cut_before_a_call_was_named_is_released_whole_a
 }
 
 #[tokio::test]
-async fn a_refused_block_released_as_the_answer_keeps_its_tokens_logprobs() {
+async fn a_refused_block_released_as_the_answer_keeps_every_tokens_logprobs() {
     // The whole answer after the thought is a call written as Python inside the call tag: the
-    // reader releases the block, from its opener, as the content, and its tokens keep their
-    // logprobs, placed where the output wrote them, not where the released event stands. Two
-    // closed blocks with the template's newline between them the same, over the one slice.
+    // reader releases the block, from its opener, as the content; the logprobs are the engine's
+    // whole list, the thought's tokens and the block's alike. Two closed blocks with the
+    // template's newline between them the same.
     let output = "plan</think><tool_call>get_stock_info(company=\"Apple\")</tool_call>";
     let (choice, reasoning_tokens) = fold_with(output, glm(), "<|assistant|><think>").await;
     let released = "<tool_call>get_stock_info(company=\"Apple\")</tool_call>";
@@ -590,47 +590,48 @@ async fn a_refused_block_released_as_the_answer_keeps_its_tokens_logprobs() {
     assert!(choice.message.tool_calls.is_none());
     assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
     assert_eq!(reasoning_tokens, 4);
-    assert_eq!(kept_logprob_tokens(&choice), released);
+    assert_eq!(kept_logprob_tokens(&choice), output);
     let output = "plan</think><tool_call>a(x=1)</tool_call>\n<tool_call>b(y=2)</tool_call>";
     let (choice, _) = fold_with(output, glm(), "<|assistant|><think>").await;
     let released = "<tool_call>a(x=1)</tool_call>\n<tool_call>b(y=2)</tool_call>";
     assert_eq!(choice.message.content.as_deref(), Some(released));
     assert!(choice.message.tool_calls.is_none());
-    assert_eq!(kept_logprob_tokens(&choice), released);
-    // The answer's text, then the block: the text's tokens and the block's keep their logprobs,
-    // the block's where the output wrote them.
+    assert_eq!(kept_logprob_tokens(&choice), output);
+    // The answer's text, then the block: the whole list all the same.
     let output = "plan</think>Let me look:<tool_call>get_stock_info(company=\"Apple\")</tool_call>";
     let (choice, _) = fold_with(output, glm(), "<|assistant|><think>").await;
     let content = "Let me look:<tool_call>get_stock_info(company=\"Apple\")</tool_call>";
     assert_eq!(choice.message.content.as_deref(), Some(content));
     assert!(choice.message.tool_calls.is_none());
     assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
-    assert_eq!(kept_logprob_tokens(&choice), content);
+    assert_eq!(kept_logprob_tokens(&choice), output);
 }
 
 #[tokio::test]
-async fn a_message_without_content_keeps_no_logprobs() {
+async fn a_message_without_content_keeps_every_tokens_logprobs() {
     // The template's newlines between the thought and the call are content to the engine, but
-    // whitespace alone is no message content: no token keeps its logprob, as on the older path.
-    let (choice, _) = fold(concat!(
+    // whitespace alone is no message content; the logprobs are the engine's whole list all the
+    // same, as on the older path: the thought's, the newlines' and the call's tokens.
+    let output = concat!(
         "<think>plan</think>\n\n<tool_call>\n",
         "{\"name\": \"lookup\", \"arguments\": {\"q\": 1}}\n</tool_call>"
-    ))
-    .await;
+    );
+    let (choice, _) = fold(output).await;
     assert_eq!(choice.message.content, None);
     assert_eq!(choice.message.tool_calls.as_ref().map(Vec::len), Some(1));
-    assert_eq!(kept_logprob_tokens(&choice), "");
+    assert_eq!(kept_logprob_tokens(&choice), output);
 }
 
 #[tokio::test]
 async fn malformed_call_text_is_content_and_keeps_its_logprobs() {
     // A call region that never forms a call comes back malformed and reaches the client as
-    // content, so its tokens keep their logprobs with the rest of the content's.
-    let (choice, _) = fold("<think>plan</think>Hello <tool_call>\nnot a call\n</tool_call>").await;
+    // content; the logprobs are the engine's whole list, its tokens among them.
+    let output = "<think>plan</think>Hello <tool_call>\nnot a call\n</tool_call>";
+    let (choice, _) = fold(output).await;
     let content = choice.message.content.clone().expect("content");
     assert!(content.contains("not a call"), "{content}");
     assert!(choice.message.tool_calls.is_none());
-    assert_eq!(kept_logprob_tokens(&choice), content);
+    assert_eq!(kept_logprob_tokens(&choice), output);
 }
 
 /// The `lookup` tool the outputs call.

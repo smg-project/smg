@@ -130,8 +130,9 @@ impl HarmonyResponseProcessor {
                     )
                 })?;
 
-            // Convert output logprobs if present (narrowed to the content below)
-            let mut logprobs: Option<ChatLogProbs> = if request_logprobs {
+            // Convert output logprobs if present: the engine's, one entry per
+            // generated token, as the engine's own server returns them.
+            let logprobs: Option<ChatLogProbs> = if request_logprobs {
                 let encoding = try_harmony_encoding()
                     .map_err(|e| error::internal_error("harmony_encoding_unavailable", e))?;
                 complete
@@ -172,17 +173,6 @@ impl HarmonyResponseProcessor {
                     finish_reason = "stop".to_string();
                     matched_stop = Some(serde_json::Value::String(stop.to_string()));
                 }
-            }
-
-            // The logprobs cover the tokens of `message.content` only, as a
-            // stream's content deltas do: not the analysis, the tool calls,
-            // the channel markers, or the text a stop sequence cut off.
-            if let Some(ChatLogProbs::Detailed {
-                content: Some(items),
-                ..
-            }) = &mut logprobs
-            {
-                retain_final_text_tokens(items, &parsed.final_text_tokens, final_text.len());
             }
 
             // Build response message (assistant)
@@ -236,25 +226,6 @@ impl HarmonyResponseProcessor {
         });
         Ok((response, counts))
     }
-}
-
-/// Keep the items of the output tokens that carry the first `content_len`
-/// bytes of the final text (`final_text_tokens` as `parse_complete` gives it).
-fn retain_final_text_tokens<T>(
-    items: &mut Vec<T>,
-    final_text_tokens: &[Option<usize>],
-    content_len: usize,
-) {
-    let mut tokens = final_text_tokens.iter();
-    let mut start = 0;
-    items.retain(|_| match tokens.next() {
-        Some(Some(bytes)) => {
-            let keep = start < content_len;
-            start += bytes;
-            keep
-        }
-        _ => false,
-    });
 }
 
 impl Default for HarmonyResponseProcessor {
@@ -440,23 +411,6 @@ impl HarmonyResponseProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn retain_keeps_the_final_text_tokens_up_to_the_content() {
-        // Tokens: a marker, "Hel", a held byte, "lo", " STOP", " more", a stop token.
-        let tokens = [None, Some(3), Some(0), Some(2), Some(5), Some(5), None];
-        let mut items: Vec<usize> = (0..tokens.len()).collect();
-        retain_final_text_tokens(&mut items, &tokens, 15);
-        assert_eq!(items, [1, 2, 3, 4, 5]);
-        // A stop sequence cut the content after "Hello STOP".
-        let mut items: Vec<usize> = (0..tokens.len()).collect();
-        retain_final_text_tokens(&mut items, &tokens, 10);
-        assert_eq!(items, [1, 2, 3, 4]);
-        // No content, no logprobs.
-        let mut items: Vec<usize> = (0..tokens.len()).collect();
-        retain_final_text_tokens(&mut items, &tokens, 0);
-        assert!(items.is_empty());
-    }
 
     fn counts(reasoning: u32) -> response_formatting::TokenCounts {
         response_formatting::TokenCounts {
