@@ -1243,7 +1243,7 @@ impl Router {
             return Err(self.report_refusal(
                 "Router::route_multipart_transcription",
                 model_id,
-                error::model_not_found(model_id),
+                placement::model_refusal(&self.worker_registry, model_id),
             ));
         }
         let non_dp_workers: Vec<Arc<dyn Worker>> = all_workers
