@@ -389,9 +389,10 @@ impl ProbeSlot {
 
 /// Writes `worker_id`'s slot. A probed worker is due at once (`immediate`: a
 /// registration or replacement is probed without waiting an interval, and so
-/// is a demoted worker a contact or a passing probe short of its success
-/// threshold brings forward) or after its interval; any other slot leaves the
-/// schedule.
+/// is a demoted worker a contact brings forward) or after its interval; any
+/// other slot leaves the schedule. (A demoted worker's passing probe short of
+/// its success threshold brings the next read to a probe timeout away, or
+/// leaves an earlier deadline standing; that write is the health loop's own.)
 fn schedule_at(
     next_check: &mut HashMap<WorkerId, tokio::time::Instant>,
     worker_id: WorkerId,
@@ -534,16 +535,19 @@ async fn run_health_loop(
                             &config,
                         );
                         if matches!(slot, ProbeSlot::Probe(_)) {
+                            // Brought forward, never pushed back: a deadline
+                            // the schedule already holds earlier (the
+                            // interval's, armed at the launch, or the immediate
+                            // one a connect signal wrote while the probe was in
+                            // flight) stands.
                             let gap = Duration::from_secs(
                                 worker.metadata().health_config.timeout_secs.max(1),
                             );
-                            schedule_at(
-                                &mut next_check,
-                                worker_id,
-                                slot,
-                                tokio::time::Instant::now() + gap,
-                                true,
-                            );
+                            let due = tokio::time::Instant::now() + gap;
+                            next_check
+                                .entry(worker_id)
+                                .and_modify(|deadline| *deadline = (*deadline).min(due))
+                                .or_insert(due);
                         }
                     }
                     ProbeApplyResult::Applied(None) | ProbeApplyResult::Stale => {}
@@ -1924,6 +1928,22 @@ mod tests {
         success_threshold: u32,
         check_interval_secs: u64,
     ) -> Arc<dyn Worker> {
+        probed_worker_with_timeout(
+            url,
+            connection_mode,
+            success_threshold,
+            check_interval_secs,
+            1,
+        )
+    }
+
+    fn probed_worker_with_timeout(
+        url: &str,
+        connection_mode: ConnectionMode,
+        success_threshold: u32,
+        check_interval_secs: u64,
+        timeout_secs: u64,
+    ) -> Arc<dyn Worker> {
         Arc::new(
             BasicWorkerBuilder::new(url)
                 .worker_type(WorkerType::Regular)
@@ -1931,7 +1951,7 @@ mod tests {
                 .health_config(HealthCheckConfig {
                     success_threshold,
                     failure_threshold: 1,
-                    timeout_secs: 1,
+                    timeout_secs,
                     check_interval_secs,
                     disable_health_check: false,
                     drain_settle_secs: 0,
@@ -2518,6 +2538,54 @@ mod tests {
             hits.load(Ordering::SeqCst),
             3,
             "the held read, the scheduled pass and the pass brought forward"
+        );
+
+        manager.shutdown().await;
+    }
+
+    /// The read a pass brings forward never lands after the one the schedule
+    /// already holds. With two seconds between probes and a five-second probe
+    /// timeout, a demoted worker's promoting read follows the interval, not
+    /// the timeout: three reads over two intervals (the held read, the
+    /// scheduled pass, the pass an interval later), not two intervals and a
+    /// timeout.
+    #[tokio::test]
+    async fn a_brought_forward_read_never_lands_after_the_scheduled_one() {
+        let serving = Arc::new(AtomicBool::new(false));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = start_health_stub(serving.clone(), hits.clone()).await;
+        let registry = Arc::new(WorkerRegistry::new());
+        let mut manager = manager_over(&registry);
+
+        let worker = probed_worker_with_timeout(&url, ConnectionMode::Http, 2, 2, 5);
+        worker.set_status(WorkerStatus::NotReady);
+        registry.register(worker.clone()).unwrap();
+        let registered = tokio::time::Instant::now();
+        wait_until(
+            registered + Duration::from_secs(5),
+            "the registration's probe did not read the health in time",
+            || hits.load(Ordering::SeqCst) > 0,
+        )
+        .await;
+        assert_eq!(worker.status(), WorkerStatus::NotReady);
+
+        serving.store(true, Ordering::SeqCst);
+        let back = tokio::time::Instant::now();
+        wait_until(
+            back + Duration::from_millis(5500),
+            "the worker did not return within two intervals: the brought-forward read landed \
+             after the scheduled one",
+            || worker.status() == WorkerStatus::Ready,
+        )
+        .await;
+        assert!(
+            tokio::time::Instant::now() >= back + Duration::from_millis(3500),
+            "the scheduled pass an interval after the launch, the promoting read an interval later"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            3,
+            "the held read, the scheduled pass and the pass an interval later"
         );
 
         manager.shutdown().await;
