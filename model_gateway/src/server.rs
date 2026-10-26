@@ -63,7 +63,7 @@ use crate::{
     endpoints::{conversations, models, parse, responses as response_handlers, tokenize},
     mesh::MeshAdapters,
     mesh_discovery::{start_mesh_discovery, MeshDiscoveryConfig},
-    middleware::{self, AdmissionQueue, AuthConfig},
+    middleware::{self, inert::InertLayer, AdmissionQueue, AuthConfig},
     observability::{
         heap_profile, history_metrics,
         inflight_tracker::InFlightRequestTracker,
@@ -1034,21 +1034,19 @@ pub struct ServerConfig {
     pub secret_sources: posture::SecretSources,
 }
 
-/// `Router::layer` and `Router::route_layer` for a layer a configuration may
-/// leave out.
+/// `Router::layer` for an application-wide layer a configuration may leave
+/// out.
 ///
 /// axum wraps every route in a fresh boxed service for whatever layer it is
 /// given, an identity layer included, and each wrapper costs a clone of the
-/// service and a boxed future per request; a layer with nothing to do is left
-/// uninstalled rather than installed empty.
+/// service and a boxed future per request; an application-wide layer with
+/// nothing to do is left uninstalled rather than installed empty (a route
+/// layer with nothing to do is an inert member of its routes' one stack:
+/// `middleware::inert`).
 trait LayerIfSome<L> {
     /// `Router::layer` with `layer` when there is one; the router unchanged
     /// otherwise.
     fn layer_if_some(self, layer: Option<L>) -> Self;
-
-    /// `Router::route_layer` with `layer` when there is one; the router
-    /// unchanged otherwise.
-    fn route_layer_if_some(self, layer: Option<L>) -> Self;
 }
 
 impl<S, L> LayerIfSome<L> for Router<S>
@@ -1065,48 +1063,6 @@ where
             Some(layer) => self.layer(layer),
             None => self,
         }
-    }
-
-    fn route_layer_if_some(self, layer: Option<L>) -> Self {
-        match layer {
-            Some(layer) => self.route_layer(layer),
-            None => self,
-        }
-    }
-}
-
-/// Apply the request-admission layer to a protected route group.
-///
-/// `AdmissionMode::Priority` installs the priority scheduler middleware
-/// (carrying its own `Arc<SchedulerState>`); `AdmissionMode::Legacy` installs
-/// the original concurrency limit (`ConcurrencyLimitLayer`) when a rate
-/// limiter is configured, and nothing otherwise (it would pass every request
-/// through). Either runs innermost of the protective layers (closest to the
-/// handler), after tenant resolution has populated `RouteRequestMeta`.
-///
-/// Invariant: a request parked at admission keeps its body unread — bodies
-/// are collected only at handler extraction, after a permit is granted.
-fn with_admission_layer(
-    router: Router<Arc<AppState>>,
-    admission_mode: &middleware::scheduler::AdmissionMode,
-    app_state: Arc<AppState>,
-) -> Router<Arc<AppState>> {
-    match admission_mode {
-        middleware::scheduler::AdmissionMode::Priority(scheduler_state) => {
-            router.route_layer(axum::middleware::from_fn_with_state(
-                scheduler_state.clone(),
-                middleware::scheduler::priority_admission_middleware,
-            ))
-        }
-        // Without a rate limiter the legacy layer passes every request through;
-        // it is not installed then (axum wraps every route in a boxed service
-        // for any layer it is given, this lean one included).
-        middleware::scheduler::AdmissionMode::Legacy
-            if app_state.context.rate_limiter.is_some() =>
-        {
-            router.route_layer(middleware::ConcurrencyLimitLayer::new(app_state))
-        }
-        middleware::scheduler::AdmissionMode::Legacy => router,
     }
 }
 
@@ -1182,10 +1138,10 @@ pub fn build_apps(
         middleware::TenantResolutionState::new(&app_state.context.router_config)?;
     // The serving auth layer, built once for every route group that takes
     // it: with no serving key configured it would pass every request through,
-    // so it is not installed then (a from_fn layer clones and boxes per request
-    // whatever it does, and axum wraps every route in a boxed service for an
-    // empty layer as well). The keys are fixed at start-up, so the decision at
-    // build time is the one the layer made per request.
+    // so it is an inert member of those groups' stacks then (a from_fn layer
+    // clones its state and boxes its future per request whatever it does; an
+    // inert member is one match). The keys are fixed at start-up, so the
+    // decision at build time is the one the layer made per request.
     let serving_auth_layer = serving_auth_config.is_enabled().then(|| {
         axum::middleware::from_fn_with_state(
             serving_auth_config.clone(),
@@ -1201,135 +1157,172 @@ pub fn build_apps(
         app_state.context.rate_limiter.clone(),
     );
 
-    let protected_routes = with_admission_layer(
-        Router::new()
-            .route("/v1/responses", post(v1_responses))
-            .route("/v1/responses/{response_id}", get(v1_responses_get))
-            .route(
-                "/v1/responses/{response_id}/cancel",
-                post(v1_responses_cancel),
+    // The admission members of the protected stacks, from the mode chosen
+    // above: the priority scheduler's middleware (carrying its own
+    // `Arc<SchedulerState>`), or the legacy concurrency limit when a rate
+    // limiter is configured (without one it would pass every request
+    // through), or neither. Either runs innermost of the protective layers
+    // (closest to the handler), after tenant resolution has populated
+    // `RouteRequestMeta`. Invariant: a request parked at admission keeps its
+    // body unread; bodies are collected only at handler extraction, after a
+    // permit is granted.
+    let (priority_admission, legacy_limit) = match &admission_mode {
+        middleware::scheduler::AdmissionMode::Priority(scheduler_state) => (
+            Some(axum::middleware::from_fn_with_state(
+                scheduler_state.clone(),
+                middleware::scheduler::priority_admission_middleware,
+            )),
+            None,
+        ),
+        middleware::scheduler::AdmissionMode::Legacy
+            if app_state.context.rate_limiter.is_some() =>
+        {
+            (
+                None,
+                Some(middleware::ConcurrencyLimitLayer::new(app_state.clone())),
             )
-            .route("/v1/responses/{response_id}", delete(v1_responses_delete))
-            .route(
-                "/v1/responses/{response_id}/input_items",
-                get(v1_responses_list_input_items),
-            )
-            .route("/v1/conversations", post(v1_conversations_create))
-            .route(
-                "/v1/conversations/{conversation_id}",
-                get(v1_conversations_get)
-                    .post(v1_conversations_update)
-                    .delete(v1_conversations_delete),
-            )
-            .route(
-                "/v1/conversations/{conversation_id}/items",
-                get(v1_conversations_list_items).post(v1_conversations_create_items),
-            )
-            .route(
-                "/v1/conversations/{conversation_id}/items/{item_id}",
-                get(v1_conversations_get_item).delete(v1_conversations_delete_item),
-            )
-            .route_layer(axum::middleware::from_fn_with_state(
-                app_state.clone(),
-                middleware::storage_context_middleware,
-            ))
-            .route("/generate", post(generate))
-            .route("/v1/chat/completions", post(v1_chat_completions))
-            .route("/v1/completions", post(v1_completions))
-            .route("/rerank", post(rerank))
-            .route("/v1/rerank", post(v1_rerank))
-            .route("/v1/embeddings", post(v1_embeddings))
-            .route("/v1/messages", post(v1_messages))
-            .route("/v1/messages/count_tokens", post(v1_messages_count_tokens))
-            .route("/v1/interactions", post(v1_interactions))
-            .route("/v1/classify", post(v1_classify))
-            .route("/v1/decisions", post(v1_decisions))
-            .route("/v1/systemone", post(v1_systemone))
-            // The three layers of these routes as ONE stack: axum boxes the
-            // routes once per layer call and a request clones the boxed stack
-            // at every level, so one call costs one level where three cost
-            // three (and their clones). Outermost first, as the builder reads:
-            // the keep-alive every SSE stream of these routes carries through
-            // an upstream silence (a comment; the Messages API's ping event),
-            // written between frames, nothing while frames flow; the
-            // per-request buffer-vs-stream decision for typed-JSON bodies
-            // (declined requests pass to the handlers untouched); innermost,
-            // the bound on the buffered body read (inside admission, so a
-            // stalled upload releases its permit, and inside the
-            // stream-vs-buffer decision, since the streamed relay has its own
-            // watchdog).
-            .route_layer(
-                tower::ServiceBuilder::new()
-                    .layer(
-                        middleware::SseKeepAlive::from_config(&app_state.context.router_config)
-                            .layer(),
-                    )
-                    .layer(
-                        StreamBodyState::new(app_state.router.clone(), app_state.context.clone())
-                            .layer(),
-                    )
-                    .layer(
-                        middleware::RequestBodyTimeouts::from_config(
-                            &app_state.context.router_config,
-                        )
-                        .layer(),
-                    ),
-            )
-            // Tokenize / Detokenize endpoints
-            .route("/v1/tokenize", post(v1_tokenize))
-            .route("/v1/detokenize", post(v1_detokenize))
-            // Realtime REST endpoints (same middleware as other protected routes)
-            .route("/v1/realtime/sessions", post(v1_realtime_session))
-            .route(
-                "/v1/realtime/client_secrets",
-                post(v1_realtime_client_secret),
-            )
-            .route(
-                "/v1/realtime/transcription_sessions",
-                post(v1_realtime_transcription_session),
-            ),
-        &admission_mode,
-        app_state.clone(),
-    )
-    .route_layer(tenant_resolution_state.clone().layer())
-    .route_layer_if_some(serving_auth_layer.clone())
-    // The wasm hooks run only with wasm enabled and a module manager; the
-    // layer is not installed otherwise.
-    .route_layer_if_some(
-        (app_state.context.router_config.enable_wasm && app_state.context.wasm_manager.is_some())
-            .then(|| {
-                axum::middleware::from_fn_with_state(app_state.clone(), middleware::wasm_middleware)
-            }),
-    )
-    // Outermost on these routes: a refusal by any layer inside (authentication,
-    // admission, the body timeout) leaves in the Messages envelope as well.
-    .route_layer(middleware::MessagesErrorEnvelopeLayer);
+        }
+        middleware::scheduler::AdmissionMode::Legacy => (None, None),
+    };
+    // The wasm hooks run only with wasm enabled and a module manager.
+    let wasm_layer = (app_state.context.router_config.enable_wasm
+        && app_state.context.wasm_manager.is_some())
+    .then(|| axum::middleware::from_fn_with_state(app_state.clone(), middleware::wasm_middleware));
 
-    // WebSocket and WebRTC routes: auth + concurrency but NO WASM middleware.
+    // The protection of the typed routes as ONE stack: axum boxes the routes
+    // once per `route_layer` call and a request clones the boxed stack at
+    // every level, so one call costs one level where six cost six (and their
+    // clones); a layer that is not configured is an inert member of the
+    // stack (`middleware::inert`), not a level of its own. Outermost first,
+    // as the builder reads: the Messages envelope (a refusal by any layer
+    // inside, authentication, admission, the body timeout, leaves in the
+    // envelope as well); the wasm hooks; the serving auth; the tenant
+    // resolution; the admission; then the keep-alive every SSE stream of
+    // these routes carries through an upstream silence (a comment; the
+    // Messages API's ping event), written between frames, nothing while
+    // frames flow; the per-request buffer-vs-stream decision for typed-JSON
+    // bodies (declined requests pass to the handlers untouched); innermost,
+    // the bound on the buffered body read (inside admission, so a stalled
+    // upload releases its permit, and inside the stream-vs-buffer decision,
+    // since the streamed relay has its own watchdog).
+    let typed_routes = Router::new()
+        .route("/v1/responses", post(v1_responses))
+        .route("/v1/responses/{response_id}", get(v1_responses_get))
+        .route(
+            "/v1/responses/{response_id}/cancel",
+            post(v1_responses_cancel),
+        )
+        .route("/v1/responses/{response_id}", delete(v1_responses_delete))
+        .route(
+            "/v1/responses/{response_id}/input_items",
+            get(v1_responses_list_input_items),
+        )
+        .route("/v1/conversations", post(v1_conversations_create))
+        .route(
+            "/v1/conversations/{conversation_id}",
+            get(v1_conversations_get)
+                .post(v1_conversations_update)
+                .delete(v1_conversations_delete),
+        )
+        .route(
+            "/v1/conversations/{conversation_id}/items",
+            get(v1_conversations_list_items).post(v1_conversations_create_items),
+        )
+        .route(
+            "/v1/conversations/{conversation_id}/items/{item_id}",
+            get(v1_conversations_get_item).delete(v1_conversations_delete_item),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            middleware::storage_context_middleware,
+        ))
+        .route("/generate", post(generate))
+        .route("/v1/chat/completions", post(v1_chat_completions))
+        .route("/v1/completions", post(v1_completions))
+        .route("/rerank", post(rerank))
+        .route("/v1/rerank", post(v1_rerank))
+        .route("/v1/embeddings", post(v1_embeddings))
+        .route("/v1/messages", post(v1_messages))
+        .route("/v1/messages/count_tokens", post(v1_messages_count_tokens))
+        .route("/v1/interactions", post(v1_interactions))
+        .route("/v1/classify", post(v1_classify))
+        .route("/v1/decisions", post(v1_decisions))
+        .route("/v1/systemone", post(v1_systemone))
+        .route_layer(
+            tower::ServiceBuilder::new()
+                .layer(middleware::MessagesErrorEnvelopeLayer)
+                .layer(InertLayer(wasm_layer.clone()))
+                .layer(InertLayer(serving_auth_layer.clone()))
+                .layer(tenant_resolution_state.clone().layer())
+                .layer(InertLayer(priority_admission.clone()))
+                .layer(InertLayer(legacy_limit.clone()))
+                .layer(
+                    middleware::SseKeepAlive::from_config(&app_state.context.router_config).layer(),
+                )
+                .layer(
+                    StreamBodyState::new(app_state.router.clone(), app_state.context.clone())
+                        .layer(),
+                )
+                .layer(
+                    middleware::RequestBodyTimeouts::from_config(&app_state.context.router_config)
+                        .layer(),
+                ),
+        );
+    // Tokenize / Detokenize and the Realtime REST endpoints: the same
+    // protection without the three stream-and-body layers of the typed
+    // routes (none of these routes answers an SSE stream; this change keeps
+    // the set of layers each route had and adds none).
+    let plain_protected_routes = Router::new()
+        .route("/v1/tokenize", post(v1_tokenize))
+        .route("/v1/detokenize", post(v1_detokenize))
+        .route("/v1/realtime/sessions", post(v1_realtime_session))
+        .route(
+            "/v1/realtime/client_secrets",
+            post(v1_realtime_client_secret),
+        )
+        .route(
+            "/v1/realtime/transcription_sessions",
+            post(v1_realtime_transcription_session),
+        )
+        .route_layer(
+            tower::ServiceBuilder::new()
+                .layer(middleware::MessagesErrorEnvelopeLayer)
+                .layer(InertLayer(wasm_layer))
+                .layer(InertLayer(serving_auth_layer.clone()))
+                .layer(tenant_resolution_state.clone().layer())
+                .layer(InertLayer(priority_admission.clone()))
+                .layer(InertLayer(legacy_limit.clone())),
+        );
+    let protected_routes = typed_routes.merge(plain_protected_routes);
+
+    // WebSocket and WebRTC routes: auth + admission but NO WASM middleware.
     // WASM OnResponse reconstructs the response from status/headers/body,
     // dropping the response extensions that carry the WebSocket upgrade future.
-    let realtime_routes = with_admission_layer(
-        Router::new()
-            .route("/v1/realtime", get(v1_realtime_ws))
-            .route("/v1/realtime/calls", post(v1_realtime_webrtc)),
-        &admission_mode,
-        app_state.clone(),
-    )
-    .route_layer(tenant_resolution_state.clone().layer())
-    .route_layer_if_some(serving_auth_layer.clone());
+    let realtime_routes = Router::new()
+        .route("/v1/realtime", get(v1_realtime_ws))
+        .route("/v1/realtime/calls", post(v1_realtime_webrtc))
+        .route_layer(
+            tower::ServiceBuilder::new()
+                .layer(InertLayer(serving_auth_layer.clone()))
+                .layer(tenant_resolution_state.clone().layer())
+                .layer(InertLayer(priority_admission.clone()))
+                .layer(InertLayer(legacy_limit.clone())),
+        );
 
-    // Multipart upload routes: auth + concurrency but NO WASM middleware.
+    // Multipart upload routes: auth + admission but NO WASM middleware.
     // The WASM OnRequest phase buffers the full body into a `Vec<u8>` subject
     // to the WASM manager's `max_body_size` (10MB default). Audio uploads
     // routinely exceed that, so WASM middleware would reject them with 400
     // before reaching the handler.
-    let multipart_upload_routes = with_admission_layer(
-        Router::new().route("/v1/audio/transcriptions", post(v1_audio_transcriptions)),
-        &admission_mode,
-        app_state.clone(),
-    )
-    .route_layer(tenant_resolution_state.layer())
-    .route_layer_if_some(serving_auth_layer.clone());
+    let multipart_upload_routes = Router::new()
+        .route("/v1/audio/transcriptions", post(v1_audio_transcriptions))
+        .route_layer(
+            tower::ServiceBuilder::new()
+                .layer(InertLayer(serving_auth_layer.clone()))
+                .layer(tenant_resolution_state.layer())
+                .layer(InertLayer(priority_admission))
+                .layer(InertLayer(legacy_limit)),
+        );
 
     let public_routes = Router::new()
         .route("/liveness", get(liveness))
