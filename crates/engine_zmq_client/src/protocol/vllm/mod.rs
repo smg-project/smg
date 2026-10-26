@@ -90,6 +90,21 @@ impl EngineProtocol for VllmProtocol {
         true
     }
 
+    fn transfer_pending(request: &Self::Request) -> bool {
+        // The decode side of a prefill/decode pair carries the connector's
+        // `do_remote_prefill` in its KV-transfer params: the engine schedules
+        // it once its prompt KV has been pulled from the prefill side, and
+        // steps nothing for it before.
+        request
+            .sampling_params
+            .as_ref()
+            .and_then(|params| params.extra_args.as_ref())
+            .and_then(|extra| extra.get("kv_transfer_params"))
+            .and_then(|params| params.get("do_remote_prefill"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+
     fn request_id(request: &Self::Request) -> &str {
         &request.request_id
     }

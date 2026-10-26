@@ -2069,46 +2069,78 @@ async fn first_prefill_response_within(
     }
 }
 
+/// What bounds a sequential decode side's first token (see
+/// [`DecodeBound::for_side`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecodeBoundSource {
+    /// The side pulls its prompt KV from the prefill side: the KV-transfer
+    /// timeout its decode worker declares
+    /// ([`liveness::declared_kv_transfer_timeout`]).
+    DeclaredTransferTimeout,
+    /// The side recomputes its prompt on the decode worker: the prefill
+    /// bound for the prompt there ([`liveness::decode_side_bound`]).
+    PromptPrefill,
+}
+
+impl DecodeBoundSource {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::DeclaredTransferTimeout => "the decode worker's declared KV-transfer timeout",
+            Self::PromptPrefill => "the prefill bound of its recomputed prompt",
+        }
+    }
+}
+
 /// The bound on a sequential decode side's first token, counted from its
-/// dispatch (see [`liveness::decode_side_bound`]).
+/// dispatch (see [`DecodeBound::for_side`]).
 #[derive(Clone, Copy, Debug)]
 struct DecodeBound {
     deadline: Instant,
     bound: Duration,
+    source: DecodeBoundSource,
 }
 
 impl DecodeBound {
-    /// The bound for a side of `prompt_tokens` dispatched at `dispatched`,
-    /// sized from `prefills`, the worker whose prefill of the prompt stands
-    /// before the side's first token (see [`liveness::decode_side_bound`]);
-    /// `None` when the rule is off.
-    fn at(prefills: &Arc<dyn Worker>, prompt_tokens: u64, dispatched: Instant) -> Option<Self> {
-        let bound = liveness::decode_side_bound(prefills, prompt_tokens)?;
+    /// The bound for a side of `prompt_tokens` dispatched at `dispatched` to
+    /// the decode worker of `workers`. A side that pulls its prompt KV from
+    /// the prefill side, which takes both a handoff and a request the KV
+    /// parameters were relayed for (`handed_off` alone does not say so: the
+    /// legacy Mooncake arm hands off a fan-out in name only and the decode
+    /// engine recomputes the prompt), waits on a KV transfer, which only the
+    /// transfer timeout its decode worker declares bounds below the request's
+    /// own timeout ([`liveness::declared_kv_transfer_timeout`]); a side that
+    /// recomputes the prompt (a fan-out, or a prefill that returned no
+    /// transfer parameters) waits on a prefill, bounded as a prefill side is
+    /// on the decode worker ([`liveness::decode_side_bound`]; that worker's
+    /// prefill rate is never measured under PD, so the bound follows the cold
+    /// rate with an empty backlog, the conservative side). `None` when
+    /// nothing bounds the side below the request's timeout.
+    fn for_side(
+        workers: &WorkerSelection,
+        handed_off: bool,
+        relay_kv_params: bool,
+        prompt_tokens: u64,
+        dispatched: Instant,
+    ) -> Option<Self> {
+        let decode = workers.decode_worker()?;
+        let (bound, source) = if handed_off && relay_kv_params {
+            (
+                liveness::declared_kv_transfer_timeout(decode)?,
+                DecodeBoundSource::DeclaredTransferTimeout,
+            )
+        } else {
+            (
+                liveness::decode_side_bound(decode, prompt_tokens)?,
+                DecodeBoundSource::PromptPrefill,
+            )
+        };
         // A bound past the clock's range never expires: the side stays unbounded.
         let deadline = dispatched.checked_add(bound)?;
-        Some(Self { deadline, bound })
-    }
-}
-
-/// The worker whose prefill of the prompt stands before a sequential decode
-/// side's first token, which sizes the side's bound: the prefill worker when
-/// the decode side pulls its prompt KV from it, which takes both a handoff
-/// and a request the KV parameters were relayed for (`handed_off` alone does
-/// not say so: the legacy Mooncake arm hands off a fan-out in name only and
-/// the decode engine recomputes the prompt); else the decode worker, which
-/// recomputes the prompt itself (a fan-out, or a prefill that returned no
-/// transfer parameters). The decode worker's prefill rate is never measured
-/// under PD (its decode sides book no prefill), so that bound follows the
-/// cold rate with an empty backlog, the conservative side.
-fn worker_prefilling_before_decode(
-    workers: &WorkerSelection,
-    handed_off: bool,
-    relay_kv_params: bool,
-) -> Option<&Arc<dyn Worker>> {
-    if handed_off && relay_kv_params {
-        workers.prefill_worker()
-    } else {
-        workers.decode_worker()
+        Some(Self {
+            deadline,
+            bound,
+            source,
+        })
     }
 }
 
@@ -2129,9 +2161,10 @@ fn decode_side_silent(
     connection: &'static str,
     request_id: &str,
     prompt_tokens: u64,
-    bound: Duration,
+    bound: DecodeBound,
     phase: &'static str,
 ) -> tonic::Status {
+    let DecodeBound { bound, source, .. } = bound;
     warn!(
         request_id = %request_id,
         worker = worker.redacted_url(),
@@ -2139,6 +2172,7 @@ fn decode_side_silent(
         phase,
         prompt_tokens,
         bound_ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
+        bound_source = source.describe(),
         "PD decode side produced nothing within its first-token bound after the prefill side had answered (the handoff did not complete, or the decode engine never scheduled it); giving up on it"
     );
     Metrics::record_worker_error(
@@ -2147,7 +2181,8 @@ fn decode_side_silent(
         metrics_labels::ERROR_TIMEOUT,
     );
     tonic::Status::deadline_exceeded(format!(
-        "{DECODE_SIDE_SILENCE_MESSAGE} {bound:.1?} of its dispatch ({phase})"
+        "{DECODE_SIDE_SILENCE_MESSAGE} {bound:.1?} of its dispatch ({phase}; {})",
+        source.describe()
     ))
 }
 
@@ -2164,10 +2199,12 @@ fn is_decode_side_silence(status: &tonic::Status) -> bool {
 /// deadline the still-pending call is retired off the request path (its
 /// room is aborted once the handoff it may be in the middle of has produced
 /// a first item, or the deferral's cap passes) and the silence verdict takes
-/// its place. Without a bound or a worker to charge, the call is awaited as
-/// it is. No reprieve: unlike a prefill side queued on a busy worker, a
-/// decode side was admitted to a room before its dispatch, so nothing of the
-/// worker's other sides stands between it and its first token.
+/// its place. Without a bound (a pulled side on a decode worker that declares
+/// no KV-transfer timeout: the request's own timeout bounds it, see
+/// [`DecodeBound::for_side`]) or a worker to charge, the call is awaited as
+/// it is. No reprieve: the bound is the declared transfer timeout, or the
+/// prefill bound of a recomputed prompt on a side admitted to its room before
+/// its dispatch.
 async fn dispatch_decode_within(
     bound: Option<DecodeBound>,
     mut dispatch: SideDispatch,
@@ -2194,7 +2231,7 @@ async fn dispatch_decode_within(
                 connection,
                 &request_id,
                 prompt_tokens,
-                bound.bound,
+                bound,
                 "dispatch",
             ))
         }
@@ -2224,7 +2261,7 @@ async fn first_decode_response_within(
             connection,
             request_id,
             prompt_tokens,
-            bound.bound,
+            bound,
             "first_response",
         )),
     }
@@ -2916,20 +2953,26 @@ async fn sequential_decode_side(
     // still lands in the decode phase.
     let decode_sent = Instant::now();
     // The decode side owes its first token within a bound counted from here
-    // (see `liveness::decode_side_bound`): the KV handoff from the prefill
-    // side and the decode engine's first step. The prefill side has answered,
-    // so its silence bound no longer covers the request, and nothing else
-    // bounds this wait below the request's own timeout while the engines'
-    // health probes keep passing (a prefill engine that stalls right after
-    // answering leaves the handoff waiting on it).
-    // The bound covers a streaming request only: a non-streaming side's first
-    // item is its whole generation (the servicers send nothing of a
-    // non-streaming request before it finishes), no first-token signal. Its
-    // size follows the worker whose prefill of the prompt stands before the
-    // first token (see `worker_prefilling_before_decode`).
+    // (see `DecodeBound::for_side`): the KV handoff from the prefill side and
+    // the decode engine's first step. The prefill side has answered, so its
+    // silence bound no longer covers the request; a pulled side waits on a
+    // transfer, which the decode worker's declared KV-transfer timeout bounds
+    // when it declares one and the request's own timeout bounds otherwise
+    // (the engines' health probes keep passing while a handoff waits on a
+    // prefill engine that stalled right after answering, so the timeout is
+    // what ends that wait), and a recomputed prompt waits on a prefill,
+    // bounded as a prefill side is. The bound covers a streaming request
+    // only: a non-streaming side's first item is its whole generation (the
+    // servicers send nothing of a non-streaming request before it finishes),
+    // no first-token signal.
     let decode_bound = if plan.streaming {
-        worker_prefilling_before_decode(workers, handed_off, plan.relay_kv_params)
-            .and_then(|worker| DecodeBound::at(worker, sides.prompt_tokens, decode_sent))
+        DecodeBound::for_side(
+            workers,
+            handed_off,
+            plan.relay_kv_params,
+            sides.prompt_tokens,
+            decode_sent,
+        )
     } else {
         None
     };
@@ -4324,6 +4367,7 @@ mod tests {
         DecodeBound {
             deadline: Instant::now() + Duration::from_secs(3),
             bound: Duration::from_secs(3),
+            source: DecodeBoundSource::DeclaredTransferTimeout,
         }
     }
 
@@ -4484,51 +4528,63 @@ mod tests {
         );
     }
 
-    /// The decode side's first-token bound is sized from the prefill worker
-    /// only when the decode side pulls its prompt KV from it: a handoff on a
-    /// request the KV parameters were relayed for. A fan-out the legacy
+    /// A pulled side (a handoff on a request the KV parameters were relayed
+    /// for) is bounded by the KV-transfer timeout its decode worker declares
+    /// (`kv_transfer_timeout_secs`), and by nothing below the request timeout
+    /// when it declares none or declares nonsense; a fan-out the legacy
     /// Mooncake arm hands off in name only, and any side without a handoff,
-    /// recompute the prompt on the decode worker, whose rate sizes the bound.
+    /// recompute the prompt on the decode worker and get the prefill bound
+    /// there (the default wedge threshold for a short prompt).
     #[test]
-    fn the_decode_bound_follows_the_worker_that_prefills_the_prompt() {
-        let prefill: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("grpc://prefill:30000")
-                .worker_type(WorkerType::Prefill)
-                .connection_mode(ConnectionMode::Grpc)
-                .build(),
-        );
-        let decode: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("grpc://decode:30000")
+    fn the_decode_bound_is_the_declared_transfer_timeout_for_a_pulled_side_and_the_prefill_bound_otherwise(
+    ) {
+        let selection = |label: Option<&str>| {
+            let prefill: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new("grpc://prefill:30000")
+                    .worker_type(WorkerType::Prefill)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .build(),
+            );
+            let decode = BasicWorkerBuilder::new("grpc://decode:30000")
                 .worker_type(WorkerType::Decode)
-                .connection_mode(ConnectionMode::Grpc)
-                .build(),
-        );
-        let selection = WorkerSelection::Disaggregated {
-            encode_assignments: None,
-            prefill,
-            decode,
-            runtime_type: RuntimeType::Vllm,
+                .connection_mode(ConnectionMode::Grpc);
+            let decode = match label {
+                Some(value) => decode.label(liveness::KV_TRANSFER_TIMEOUT_LABEL, value),
+                None => decode,
+            };
+            WorkerSelection::Disaggregated {
+                encode_assignments: None,
+                prefill,
+                decode: Arc::new(decode.build()),
+                runtime_type: RuntimeType::Vllm,
+            }
         };
-        let prefilling = |handed_off, relay_kv_params| {
-            worker_prefilling_before_decode(&selection, handed_off, relay_kv_params)
-                .map(|worker| worker.url().to_string())
+        let bound = |selection: &WorkerSelection, handed_off, relay_kv_params| {
+            DecodeBound::for_side(selection, handed_off, relay_kv_params, 256, Instant::now())
+                .map(|bound| (bound.bound, bound.source))
         };
+
+        let declared = selection(Some(" 7 "));
         assert_eq!(
-            prefilling(true, true).as_deref(),
-            Some("grpc://prefill:30000")
+            bound(&declared, true, true),
+            Some((
+                Duration::from_secs(7),
+                DecodeBoundSource::DeclaredTransferTimeout
+            ))
         );
-        assert_eq!(
-            prefilling(true, false).as_deref(),
-            Some("grpc://decode:30000")
-        );
-        assert_eq!(
-            prefilling(false, true).as_deref(),
-            Some("grpc://decode:30000")
-        );
-        assert_eq!(
-            prefilling(false, false).as_deref(),
-            Some("grpc://decode:30000")
-        );
+        let undeclared = selection(None);
+        assert_eq!(bound(&undeclared, true, true), None);
+        for nonsense in ["0", "-3", "soon", ""] {
+            assert_eq!(
+                bound(&selection(Some(nonsense)), true, true),
+                None,
+                "{nonsense:?} declares no timeout"
+            );
+        }
+        let prefill_bound = Some((Duration::from_secs(3), DecodeBoundSource::PromptPrefill));
+        assert_eq!(bound(&declared, true, false), prefill_bound);
+        assert_eq!(bound(&declared, false, true), prefill_bound);
+        assert_eq!(bound(&undeclared, false, false), prefill_bound);
     }
 
     #[test]
