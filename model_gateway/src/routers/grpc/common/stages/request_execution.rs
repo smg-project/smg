@@ -1570,7 +1570,7 @@ struct PrefillBound {
     /// [`stalled_decode_partner`]): a decode side's bound for the same
     /// prompt, which counts its prefill time once where `bound` counts it
     /// twice (see [`liveness::decode_side_bound`]).
-    partner: Duration,
+    partner_bound: Duration,
     backlog: Arc<OnceLock<Duration>>,
 }
 
@@ -1578,12 +1578,15 @@ impl PrefillBound {
     /// The bound for a side of `prompt_tokens` dispatched to `worker` at
     /// `dispatched`; `None` when the rule is off.
     fn at(worker: &Arc<dyn Worker>, prompt_tokens: u64, dispatched: Instant) -> Option<Self> {
-        let partner = liveness::decode_side_bound(worker, prompt_tokens)?;
+        let partner_bound = liveness::decode_side_bound(worker, prompt_tokens)?;
         Self::of(
             liveness::prefill_side_bound(worker, prompt_tokens)?,
             dispatched,
         )
-        .map(|bound| Self { partner, ..bound })
+        .map(|bound| Self {
+            partner_bound,
+            ..bound
+        })
     }
 
     /// A bound of `bound` from `dispatched`, a stalled decode partner judged
@@ -1595,7 +1598,7 @@ impl PrefillBound {
             dispatched,
             deadline,
             bound,
-            partner: bound,
+            partner_bound: bound,
             backlog: Arc::default(),
         })
     }
@@ -1853,13 +1856,13 @@ fn judge_prefill_side(
     let waited = bound.dispatched.elapsed();
     let standing = liveness::prefill_side_reprieve(worker, bound.bound, waited, &bound.backlog);
     if standing.past_bound() {
-        if let Some((decode, silence)) = stalled_decode_partner(partner, bound.partner) {
+        if let Some((decode, silence)) = stalled_decode_partner(partner, bound.partner_bound) {
             return Err(decode_partner_silent(
                 worker,
                 &decode,
                 connection,
                 request_id,
-                bound.partner,
+                bound.partner_bound,
                 silence,
                 phase,
             ));
@@ -3939,7 +3942,7 @@ mod tests {
             .checked_sub(Duration::from_secs(2))
             .expect("a clock two seconds old");
         let bound = PrefillBound {
-            partner: Duration::from_millis(300),
+            partner_bound: Duration::from_millis(300),
             ..bound_from(dispatched, Duration::from_secs(2))
         };
         let status = judge_prefill_side(
