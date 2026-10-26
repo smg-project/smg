@@ -646,9 +646,11 @@ pub(crate) fn on_contact(worker: &Arc<dyn Worker>) {
 }
 
 /// A health probe passed: contact, and the end of an unreachable veto, but
-/// no promotion. The health state machine promotes on its success threshold;
-/// a probe that short-circuited it would make one passing probe out of a
-/// flapping engine's run a return to service.
+/// no promotion. The health state machine promotes on its success threshold
+/// (a pending worker's reads an interval apart, a demoted worker's a probe
+/// timeout apart once one passes); a probe that short-circuited it would
+/// make one passing probe out of a flapping engine's run a return to
+/// service.
 pub(crate) fn on_probe_passed(worker: &Arc<dyn Worker>) {
     worker.note_contact();
     if worker.stall_reason() == Some(StallReason::Unreachable) {

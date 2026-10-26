@@ -8,9 +8,9 @@
 //! removed worker's slot and the lag recovery's rebuild are the only writes
 //! beside it). A worker's deadline is re-armed when its probe launches, and
 //! on its completion only to bring the next read of a demoted worker whose
-//! probe just passed to now (its return is consecutive reads, not consecutive
-//! intervals); `in_flight` keeps a slow probe from being joined by a second
-//! one.
+//! probe just passed to a probe's timeout from now (its return is
+//! consecutive reads, not consecutive intervals); `in_flight` keeps a slow
+//! probe from being joined by a second one.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -502,17 +502,23 @@ async fn run_health_loop(
                         }
                     }
                     // A demoted worker's probe passed short of its success
-                    // threshold: its next read runs now, through the slot a
-                    // contact uses, so the threshold is consecutive reads and
-                    // not consecutive intervals. The engine behind it is back
-                    // (the outage was detected within seconds by its
-                    // transport); left to the schedule, each further read
-                    // waited a whole interval, and a worker the gateway kept
-                    // through a restart stayed out of routing for one to two
-                    // intervals after its engine answered while a worker
-                    // re-registered for the same engine served on one read.
-                    // A failed read, a stale outcome and a worker already
-                    // Ready keep the deadline armed at the launch.
+                    // threshold: its next read is due a probe's timeout from
+                    // now (the immediate slot a contact uses, written at that
+                    // instant), so the threshold is consecutive reads a round
+                    // trip apart, not consecutive intervals. Whatever took
+                    // the worker out (its transport within seconds where
+                    // something contacts it; the probes alone where nothing
+                    // does, an HTTP worker or a gRPC worker under a policy
+                    // that opens no stream), its return was read by the
+                    // schedule alone: each further read waited a whole
+                    // interval, and a worker the gateway kept through a
+                    // restart stayed out of routing for one to two intervals
+                    // after its engine answered while a worker re-registered
+                    // for the same engine served on one read. The gap keeps a
+                    // run of passes a run of reads (a flapping engine has to
+                    // answer across it); a failed read, a stale outcome and a
+                    // worker already Ready keep the deadline armed at the
+                    // launch.
                     ProbeApplyResult::Applied(None)
                         if probe_ok
                             && matches!(
@@ -528,11 +534,14 @@ async fn run_health_loop(
                             &config,
                         );
                         if matches!(slot, ProbeSlot::Probe(_)) {
+                            let gap = Duration::from_secs(
+                                worker.metadata().health_config.timeout_secs.max(1),
+                            );
                             schedule_at(
                                 &mut next_check,
                                 worker_id,
                                 slot,
-                                tokio::time::Instant::now(),
+                                tokio::time::Instant::now() + gap,
                                 true,
                             );
                         }
@@ -2463,11 +2472,12 @@ mod tests {
 
     /// A demoted worker whose health answers again returns on consecutive
     /// reads, not consecutive intervals. Through the running loop, a
-    /// threshold of two reads and two seconds between probes: the stub is
-    /// held until the registration's probe has read it, so the next probe is
-    /// an interval away; it passes, and the read that promotes the worker
-    /// follows within its round trip (three reads, one interval) instead of
-    /// an interval later (three reads, two intervals).
+    /// threshold of two reads, three seconds between probes and a one-second
+    /// probe timeout: the stub is held until the registration's probe has
+    /// read it, so the next probe is an interval away; it passes, and the
+    /// read that promotes the worker follows a probe's timeout later (three
+    /// reads, one interval and a second) instead of an interval later (three
+    /// reads, two intervals).
     #[tokio::test]
     async fn a_demoted_worker_returns_on_consecutive_reads_not_consecutive_intervals() {
         let serving = Arc::new(AtomicBool::new(false));
@@ -2477,7 +2487,7 @@ mod tests {
         let mut manager = manager_over(&registry);
 
         // Registered under the running manager: probed at once, and held.
-        let worker = probed_worker_with(&url, ConnectionMode::Http, 2, 2);
+        let worker = probed_worker_with(&url, ConnectionMode::Http, 2, 3);
         worker.set_status(WorkerStatus::NotReady);
         registry.register(worker.clone()).unwrap();
         let registered = tokio::time::Instant::now();
@@ -2493,20 +2503,21 @@ mod tests {
         serving.store(true, Ordering::SeqCst);
         let back = tokio::time::Instant::now();
         wait_until(
-            back + Duration::from_millis(3500),
-            "the worker did not return within one interval and a round trip",
+            back + Duration::from_millis(5500),
+            "the worker did not return within one interval and a probe timeout",
             || worker.status() == WorkerStatus::Ready,
         )
         .await;
         let returned = tokio::time::Instant::now();
         assert!(
-            returned >= back + Duration::from_millis(1500),
-            "the first passing read was the scheduled one, an interval after the launch"
+            returned >= back + Duration::from_millis(3500),
+            "the first passing read was the scheduled one, an interval after the launch, and the \
+             promoting read a probe timeout after it"
         );
         assert_eq!(
             hits.load(Ordering::SeqCst),
             3,
-            "the held read, the scheduled pass and the pass brought forward to now"
+            "the held read, the scheduled pass and the pass brought forward"
         );
 
         manager.shutdown().await;

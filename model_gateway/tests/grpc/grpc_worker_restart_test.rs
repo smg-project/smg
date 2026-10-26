@@ -324,15 +324,15 @@ async fn a_restarted_worker_is_routable_when_its_probes_pass_again() {
 
 /// Under a success threshold of two reads, a worker the gateway kept through
 /// its engine's restart is routable again one probe interval after the
-/// restart plus the second read's round trip, not two intervals: the probe
-/// that passes short of the threshold brings the next one to now. Nothing
+/// restart plus a probe timeout, not two intervals: the probe that passes
+/// short of the threshold brings the next one to a timeout from now. Nothing
 /// contacts the worker while it is out (round robin opens no stream and a
 /// demoted worker is not load-polled), so its probes alone see the return;
 /// the engine comes back right after the probe that demoted the worker, so
 /// the first passing probe is a whole interval away.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_kept_worker_returns_within_one_interval_under_a_success_threshold_of_two() {
-    const INTERVAL: Duration = Duration::from_secs(2);
+    const INTERVAL: Duration = Duration::from_secs(3);
     let port = free_port().await;
     let engine = MockEngine::start(port).await;
     let (router, worker, mut manager) = build_router_with(port, 1, None, 2, INTERVAL).await;
@@ -373,8 +373,9 @@ async fn a_kept_worker_returns_within_one_interval_under_a_success_threshold_of_
         "the first passing probe is the scheduled one, an interval after the demotion: {first_success:?}"
     );
     assert!(
-        first_success < INTERVAL + Duration::from_secs(1),
-        "the second read follows the first within its round trip, not an interval later: {first_success:?}"
+        first_success < INTERVAL + Duration::from_secs(2),
+        "the second read follows the first a probe timeout (one second) later, not an interval \
+         later: {first_success:?}"
     );
 
     engine.kill().await;
