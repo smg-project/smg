@@ -2353,6 +2353,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
 mod tests {
     use std::{thread, time::Duration};
 
+    use engine_zmq_client::protocol::handshake::EngineCoreReadyResponse;
     use metrics_exporter_prometheus::PrometheusBuilder;
     use openai_protocol::worker::{HealthCheckConfig, WorkerSpec};
 
@@ -3630,7 +3631,7 @@ mod tests {
     /// it, plus the rank itself for the test to answer what the worker sends.
     async fn zmq_worker_on_a_mock_rank(
         dir: &std::path::Path,
-        ready: engine_zmq_client::protocol::handshake::EngineCoreReadyResponse,
+        ready: EngineCoreReadyResponse,
     ) -> (BasicWorker, engine_zmq_client::mock_engine::MockEngine) {
         use engine_zmq_client::{mock_engine::connect_to_frontend, EngineId};
 
@@ -3670,8 +3671,8 @@ mod tests {
     }
 
     /// The handshake of a rank whose wire carries control calls.
-    fn control_ready() -> engine_zmq_client::protocol::handshake::EngineCoreReadyResponse {
-        engine_zmq_client::protocol::handshake::EngineCoreReadyResponse {
+    fn control_ready() -> EngineCoreReadyResponse {
+        EngineCoreReadyResponse {
             positional_layouts: std::collections::BTreeMap::from([(
                 "ControlReplySlim".to_string(),
                 ["call_id", "success", "message", "engine_index"]
