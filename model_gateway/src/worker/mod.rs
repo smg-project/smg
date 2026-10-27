@@ -56,6 +56,7 @@ pub use kv_event_monitor::KvEventMonitor;
 pub use kv_index_backend::{KvIndex, WorkerBlocks};
 pub use liveness::{budgets as liveness_budgets, Budgets as LivenessBudgets};
 pub use manager::WorkerManager;
+pub use metadata::DecodingLabels;
 pub use monitor::{WorkerLoadManager, WorkerMonitor};
 // Re-export UNKNOWN_MODEL_ID from protocols
 pub use openai_protocol::UNKNOWN_MODEL_ID;

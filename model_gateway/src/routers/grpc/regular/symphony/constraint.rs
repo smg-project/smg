@@ -174,7 +174,9 @@ pub(crate) fn grammar_start_from(start: WorkerGrammarStart) -> GrammarStart {
 }
 
 /// Where the model's `workers` start a grammar, before one is selected: the start every one of
-/// them names in its `constrained_decoding_start` label, a prefill or encode worker left out
+/// them names in its `constrained_decoding_start` label (parsed once at its construction,
+/// [`WorkerMetadata::decoding`](crate::worker::metadata::WorkerMetadata::decoding): this walk runs on every
+/// request and looks nothing up), a prefill or encode worker left out
 /// since it generates no token a grammar constrains (the roles that do are allow-listed, so a
 /// role added later is left out until it is named); `Either` when one that starts at the first
 /// token stands beside one that does not, since no one tag fits both (the answer keeps the
@@ -185,16 +187,7 @@ pub(crate) fn grammar_start_of(workers: &[Arc<dyn Worker>]) -> GrammarStart {
     let mut starts = workers
         .iter()
         .filter(|worker| generates(worker.as_ref()))
-        .map(|worker| {
-            WorkerGrammarStart::from_label(
-                worker
-                    .metadata()
-                    .spec
-                    .labels
-                    .get(WorkerGrammarStart::LABEL)
-                    .map(String::as_str),
-            )
-        });
+        .map(|worker| worker.metadata().decoding.start);
     let Some(first) = starts.next() else {
         return GrammarStart::Unknown;
     };
@@ -222,7 +215,8 @@ fn generates(worker: &dyn Worker) -> bool {
 /// The vocabulary of structural-tag nodes the model's `workers` take together, before one is
 /// selected, for a tag every one of them takes as it is (a forced call's, [`constraint`]): the
 /// older one when any worker that generates tokens ([`generates`]) advertises it in its
-/// `structural_tag_vocabulary` label, since every compiler takes that spelling and the worker
+/// `structural_tag_vocabulary` label (read as parsed at its construction, like the start above),
+/// since every compiler takes that spelling and the worker
 /// that needs it may be the one selected; the current one otherwise, the tag then as the table
 /// built it ([`TagVocabulary`]). The tags derived for the selected worker take its own label
 /// ([`WorkerDecoding::vocabulary`]).
@@ -230,16 +224,7 @@ pub(crate) fn vocabulary_of(workers: &[Arc<dyn Worker>]) -> TagVocabulary {
     let older = workers
         .iter()
         .filter(|worker| generates(worker.as_ref()))
-        .any(|worker| {
-            TagVocabulary::from_label(
-                worker
-                    .metadata()
-                    .spec
-                    .labels
-                    .get(TagVocabulary::LABEL)
-                    .map(String::as_str),
-            ) == TagVocabulary::Older
-        });
+        .any(|worker| worker.metadata().decoding.vocabulary == TagVocabulary::Older);
     if older {
         TagVocabulary::Older
     } else {

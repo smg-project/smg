@@ -16,6 +16,7 @@ use super::{
     endpoint::Endpoint,
     event::WorkerConnected,
     http_client::LazyHttpClient,
+    metadata::DecodingLabels,
     overload::OverloadThresholds,
     resilience::ResolvedResilience,
 };
@@ -347,6 +348,7 @@ impl BasicWorkerBuilder {
             overload: OverloadThresholds::resolve(&self.spec.overload, self.overload_defaults),
             pd_pairing: PdPairing::derive(&self.spec),
             redacted_url: Endpoint::redacted_url(&self.spec.url),
+            decoding: DecodingLabels::of(&self.spec),
             spec: Arc::new(self.spec),
             health_config,
             health_endpoint: self.health_endpoint,

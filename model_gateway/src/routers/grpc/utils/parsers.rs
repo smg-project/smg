@@ -6,6 +6,9 @@ use llm_tokenizer::{
     chat_template::{ThinkingKeyName, ThinkingToggle},
     traits::Tokenizer,
 };
+/// The structural-tag vocabulary label lives beside `ConstrainedDecoding` in the
+/// protocol crate; it is re-exported here, where the routers read it.
+pub use openai_protocol::worker::TagVocabulary;
 use openai_protocol::{
     chat::{thinking_from_reasoning_effort, ChatCompletionRequest},
     model_card::ModelCard,
@@ -519,39 +522,6 @@ pub fn grammar_start_for(workers: Option<&WorkerSelection>) -> GrammarStart {
     WorkerDecoding::of(workers).start
 }
 
-/// The vocabulary of structural-tag nodes a worker's grammar compiler
-/// takes, from its `structural_tag_vocabulary` label: the current one unless
-/// the label says `older`, for a compiler that predates the `optional`,
-/// `plus` and `star` nodes and refuses a tag that carries one. The tables'
-/// tags go to such a worker spelled without them
-/// (`Grammar::in_older_vocabulary`), the same language, which every compiler
-/// takes; a worker without the label gets the tag as the table built it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum TagVocabulary {
-    /// Every node the tables use.
-    #[default]
-    Current,
-    /// Without the `optional`, `plus` and `star` nodes; a `token` node stays
-    /// as derived.
-    Older,
-}
-
-impl TagVocabulary {
-    /// The worker label that carries it.
-    pub const LABEL: &'static str = "structural_tag_vocabulary";
-    /// The label's value for [`Self::Older`].
-    pub const OLDER: &'static str = "older";
-
-    /// The vocabulary a worker's `structural_tag_vocabulary` label names;
-    /// anything else, the label's absence included, is [`Self::Current`].
-    pub fn from_label(value: Option<&str>) -> Self {
-        match value {
-            Some(Self::OLDER) => Self::Older,
-            _ => Self::Current,
-        }
-    }
-}
-
 /// The selected worker's constrained decoding; under PD the decode worker's,
 /// whose engine generates the tokens the grammar constrains. Request building
 /// decides a request's constraint on it (`regular::symphony::worker_constraint`).
@@ -585,16 +555,14 @@ impl WorkerDecoding {
         }
     }
 
+    /// The worker's labels as its metadata parsed them at construction
+    /// (`WorkerMetadata::decoding`): no lookup on a request path.
     fn of_worker(worker: &dyn Worker) -> Self {
-        let spec = &worker.metadata().spec;
+        let labels = worker.metadata().decoding;
         Self {
-            policy: ConstrainedDecoding::of(spec),
-            start: GrammarStart::from_label(
-                spec.labels.get(GrammarStart::LABEL).map(String::as_str),
-            ),
-            vocabulary: TagVocabulary::from_label(
-                spec.labels.get(TagVocabulary::LABEL).map(String::as_str),
-            ),
+            policy: labels.policy,
+            start: labels.start,
+            vocabulary: labels.vocabulary,
         }
     }
 

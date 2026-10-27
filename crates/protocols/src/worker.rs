@@ -660,6 +660,39 @@ impl ConstrainedDecoding {
     }
 }
 
+/// The vocabulary of structural-tag nodes a worker's grammar compiler
+/// takes, from its `structural_tag_vocabulary` label: the current one unless
+/// the label says `older`, for a compiler that predates the `optional`,
+/// `plus` and `star` nodes and refuses a tag that carries one. The tables'
+/// tags go to such a worker spelled without them, the same language, which
+/// every compiler takes; a worker without the label gets the tag as the
+/// table built it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TagVocabulary {
+    /// Every node the tables use.
+    #[default]
+    Current,
+    /// Without the `optional`, `plus` and `star` nodes; a `token` node stays
+    /// as derived.
+    Older,
+}
+
+impl TagVocabulary {
+    /// The worker label that carries it.
+    pub const LABEL: &'static str = "structural_tag_vocabulary";
+    /// The label's value for [`Self::Older`].
+    pub const OLDER: &'static str = "older";
+
+    /// The vocabulary a worker's `structural_tag_vocabulary` label names;
+    /// anything else, the label's absence included, is [`Self::Current`].
+    pub fn from_label(value: Option<&str>) -> Self {
+        match value {
+            Some(Self::OLDER) => Self::Older,
+            _ => Self::Current,
+        }
+    }
+}
+
 // ── Core identity ────────────────────────────────────────────────────
 
 /// Core worker identity and configuration.
