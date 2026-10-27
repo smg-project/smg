@@ -235,21 +235,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          prefix append does (smg-project/smg#2434)",
     ),
     (
-        "kimi-k3/render/thinking-kwarg-off",
-        "the checkpoint's own encoder reads `thinking`, not the engine's `enable_thinking` \
-         alias, so the vendor-code reference of `enable_thinking: false` keeps thinking on with \
-         the default effort directive; the gateway resolves the alias before rendering as the \
-         engine's own server does (smg-project/smg#3004): no directive, the response channel \
-         opened",
-    ),
-    (
-        "kimi-k3/render/thinking-reasoning-effort-kwarg",
-        "the checkpoint's own encoder reads `thinking_effort`, not the request's \
-         `reasoning_effort`, so the vendor-code reference of `reasoning_effort: low` writes the \
-         default `max`; the gateway maps the request's level to the directive \
-         (smg-project/smg#1968)",
-    ),
-    (
         "llama-3.1-nemotron-nano-8b-v1/render/glaive-v2-32.jsonl",
         "the gateway parses a history call's arguments into an object before rendering, \
          which the template, writing the string as recorded, renders otherwise: a \

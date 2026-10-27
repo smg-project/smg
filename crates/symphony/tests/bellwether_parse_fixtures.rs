@@ -287,10 +287,11 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("deepseek-r1-bf16", GenerationPrompt::Plain),
     ("deepseek-r1-distill-llama-8b", GenerationPrompt::Plain),
     ("deepseek-r1-distill-qwen-1.5b", GenerationPrompt::Plain),
-    // Kimi K3 writes XTML and opens the thought in the prompt, whatever the request says: its
-    // recorded requests carry no switch. The shared tail adds a newline the template does not
-    // write; it is prompt text inside the thought and moves nothing.
-    ("kimi-k3", GenerationPrompt::AlwaysOpensTheThought),
+    // Kimi K3 writes XTML and opens the thought in the prompt; a request that turns thinking off
+    // (the engine's renderer hands `enable_thinking` to the vendor class as `thinking`) gets the
+    // answer opened instead, and the output starts in content. The shared tail adds a newline the
+    // template does not write; it is prompt text inside the thought and moves nothing.
+    ("kimi-k3", GenerationPrompt::OpensTheThoughtOrTheAnswer),
     // Muse Spark and Muse Glimmer: the generation prompt ends at the turn's opener, and the model
     // writes the thought's message itself. Glimmer's template writes the same messages (to self,
     // to the tool, to the user) and the same block; its recorded set reads with the Spark table.
@@ -752,6 +753,10 @@ impl Recorded for Table {
     }
 }
 
+/// The answer's opener in Kimi K3's spelling: what its template writes after the assistant's
+/// turn opener when the request turns thinking off, in place of the thought's opener.
+const K3_ANSWER_OPEN: &str = "<|open|>response<|sep|>";
+
 /// How a template ends the generation prompt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GenerationPrompt {
@@ -762,6 +767,10 @@ enum GenerationPrompt {
     /// the request says; their templates have no switch, so the output always starts inside the
     /// thought.
     AlwaysOpensTheThought,
+    /// Kimi K3: `<|open|>think<|sep|>` (the thought opened) unless the request turns thinking
+    /// off, when the template opens the answer instead (`<|open|>response<|sep|>`): the engine's
+    /// renderer hands the request's switch to the vendor class, and the output starts in content.
+    OpensTheThoughtOrTheAnswer,
     /// Qwen3.5-2B: `<think>\n` only when the request turns thinking on (`enable_thinking: true`);
     /// otherwise `<think>\n\n</think>\n\n`, and the output starts in content. The reverse of
     /// [`Self::OpensTheThought`]'s default, so a request without the switch gets no thought.
@@ -801,6 +810,8 @@ impl GenerationPrompt {
             }
             (Self::OpensTheThought | Self::ModelWritesTheThought, true) => closed,
             (Self::OpensTheThought, false) | (Self::AlwaysOpensTheThought, _) => opened,
+            (Self::OpensTheThoughtOrTheAnswer, true) => K3_ANSWER_OPEN.to_string(),
+            (Self::OpensTheThoughtOrTheAnswer, false) => opened,
             (Self::OpensTheThoughtWhenAsked, _) if request.thinking_on() => opened,
             (Self::OpensTheThoughtWhenAsked, _) => closed,
             (Self::MarkerAlone, _) if request.thinking_on() => open.to_string(),
