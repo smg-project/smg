@@ -585,8 +585,10 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("llama-3.2-1b-instruct", GenerationPrompt::Plain),
     ("llama-3.2-11b-vision-instruct", GenerationPrompt::Plain),
     // Llama 3.1 8B/70B/405B Instruct and Llama 3.3 70B Instruct: one template, byte for byte the
-    // one the Nemotron Ultra CPT, UltraLong and Safety Guard rows above carry; bellwether has
-    // recorded neither slug yet, so each is skipped with the notice until the pin holds its sets.
+    // one the Nemotron Ultra CPT, UltraLong and Safety Guard rows above carry. bellwether records
+    // the 3.3 group's hand-written sets; the 3.1 manifest is a member of its group (the same
+    // inputs) with no sets of its own, so that slug keeps its notice until the member is followed
+    // to its primary.
     ("llama-3.1-8b-instruct", GenerationPrompt::Plain),
     ("llama-3.3-70b-instruct", GenerationPrompt::Plain),
     // FunctionGemma: Gemma's calls between `<start_function_call>` and `<end_function_call>`,

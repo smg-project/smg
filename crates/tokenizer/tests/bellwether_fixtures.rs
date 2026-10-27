@@ -227,6 +227,12 @@ const KNOWN_UNLOADED: &[(&str, &str)] = &[
          own secret)",
     ),
     (
+        "llama-3.3-70b-instruct",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
         "llama-4-maverick-17b-128e-instruct",
         "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
          files behind the gate are not fetched (bellwether recorded the group with its \
