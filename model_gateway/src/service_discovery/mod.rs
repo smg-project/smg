@@ -24,7 +24,7 @@
 //!   starts that provider.
 //!
 //! SMG mesh-router peer discovery is a different concern — it discovers router
-//! peers, not inference workers — and lives in [`crate::mesh_discovery`].
+//! peers, not inference workers — and lives in [`crate::mesh::discovery`].
 
 mod consul;
 mod file;

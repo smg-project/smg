@@ -61,8 +61,10 @@ use crate::{
     app_context::AppContext,
     config::{ParserChoice, RouterConfig},
     endpoints::{conversations, models, parse, responses as response_handlers, tokenize},
-    mesh::MeshAdapters,
-    mesh_discovery::{start_mesh_discovery, MeshDiscoveryConfig},
+    mesh::{
+        discovery::{start_mesh_discovery, MeshDiscoveryConfig},
+        MeshAdapters,
+    },
     middleware::{self, inert::InertLayer, AdmissionQueue, AuthConfig},
     observability::{
         heap_profile, history_metrics,

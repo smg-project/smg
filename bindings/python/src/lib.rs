@@ -2042,7 +2042,7 @@ impl Router {
         let mesh_discovery_config = router_config
             .discovery
             .as_ref()
-            .and_then(mesh_discovery::MeshDiscoveryConfig::from_discovery);
+            .and_then(mesh::discovery::MeshDiscoveryConfig::from_discovery);
 
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port.unwrap_or(29000),

@@ -1072,7 +1072,6 @@ jobs:
               ("model_gateway/src/rate_limit/**",                CORE),
               ("model_gateway/src/policies/**",                  CORE_EVERY_ENGINE_GO),
               ("model_gateway/src/mesh/**",                      CORE),
-              ("model_gateway/src/mesh_discovery/**",            CORE),
               ("model_gateway/src/service_discovery/**",         CORE),
               ("model_gateway/src/wasm/**",                      CORE),
               ("model_gateway/src/server/tls.rs",                CORE),

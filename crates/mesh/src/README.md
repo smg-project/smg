@@ -101,7 +101,7 @@ discovery on) watches the gateway Pods matching the selector and writes
 them into the membership table; a Pod's mesh port is read from its
 `sglang.ai/mesh-port` annotation (`router_mesh_port_annotation` in the
 configuration file) and falls back to this gateway's own `--mesh-port` when
-the annotation is missing or invalid (`model_gateway/src/mesh_discovery`).
+the annotation is missing or invalid (`model_gateway/src/mesh/discovery`).
 The Helm chart's `deploy/helm/smg/examples/with-mesh-ha.yaml` is a two-replica
 example.
 

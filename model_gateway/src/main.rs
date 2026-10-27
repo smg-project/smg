@@ -36,7 +36,7 @@ use smg::{
         RoutingMode, SchemaConfig, SlurmDiscoveryConfig, TokenizerCacheConfig, TraceConfig,
         TurboJpegPolicy, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     },
-    mesh_discovery::MeshDiscoveryConfig,
+    mesh::discovery::MeshDiscoveryConfig,
     observability::metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
     policies::cost::DEFAULT_POLICY as DEFAULT_SELECTION_POLICY,
     server::{self, posture::SecretSources, ServerConfig},

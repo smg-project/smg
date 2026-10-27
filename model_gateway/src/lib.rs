@@ -8,8 +8,7 @@
 //! - [`config`]: the router configuration: its types, builder, bounds and validation.
 //! - [`endpoints`]: handlers that do not route inference: tokenize, parse, conversations, stored responses, the model inventory.
 //! - [`health`]: liveness and readiness, the readiness snapshot and the optional probe listener.
-//! - [`mesh`]: gateway-side glue for the router mesh: the adapters and their wiring.
-//! - [`mesh_discovery`]: discovery of the mesh's router peers.
+//! - [`mesh`]: gateway-side glue for the router mesh: the adapters and their wiring, and the discovery of its router peers.
 //! - [`middleware`]: the serving routes' tower layers: authentication, limits, logging, the scheduler, tenant resolution.
 //! - [`observability`]: metrics, logging, tracing, heap profiles, the in-flight tracker.
 //! - [`policies`]: worker selection policies and their registry.
@@ -30,7 +29,6 @@ pub mod config;
 pub mod endpoints;
 pub mod health;
 pub mod mesh;
-pub mod mesh_discovery;
 pub mod middleware;
 pub mod observability;
 pub mod policies;
