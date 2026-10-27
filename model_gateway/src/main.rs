@@ -1209,9 +1209,11 @@ struct ServingArgs {
     /// WASM request hooks, missing Content-Length, PD/batch backends) always
     /// buffers, bounded by max-payload-size; an eligible request buffers up
     /// to this many bytes when router retries are enabled, and otherwise
-    /// streams to the worker verbatim — forfeiting router-level retries,
-    /// with JSON validation deferring to the worker. 0 never buffers for
-    /// retries
+    /// streams to the worker verbatim — forfeiting router-level retries. A
+    /// streamed request reaches the worker as the client sent it: JSON
+    /// validation defers to the worker, and the provider profile's request
+    /// normalization (which the buffered path applies) is skipped. 0 never
+    /// buffers for retries
     #[arg(long, default_value_t = 1_048_576, help_heading = "Request Handling")]
     max_buffered_request_bytes: u64,
 

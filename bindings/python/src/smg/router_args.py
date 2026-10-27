@@ -1404,8 +1404,10 @@ class RouterArgs:
                 " regardless (bounded by max-payload-size); other eligible"
                 " requests buffer up to this many bytes when router retries"
                 " are enabled and otherwise stream to the worker verbatim,"
-                " forfeiting router-level retries. 0 never buffers for"
-                " retries"
+                " forfeiting router-level retries; a streamed request reaches"
+                " the worker as the client sent it: JSON validation defers to"
+                " the worker, and the provider profile's request normalization"
+                " is skipped. 0 never buffers for retries"
             ),
         )
         routing_group.add_argument(
