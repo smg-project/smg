@@ -2109,3 +2109,49 @@ def test_smg_media_options_forward_download_timeouts(source, monkeypatch):
     )
     assert options["fetch_timeout_ms"] == 60000
     assert options["video_fetch_timeout_ms"] == 120000
+
+
+@pytest.mark.parametrize("policy", [None, "requested", "always"])
+def test_rust_launch_carries_decoding_policy(monkeypatch, policy):
+    """The Rust binding receives the same engine-side declaration as the Python RPC."""
+    from smg_grpc_servicer.vllm.decoding_policy import POLICY_ENV
+
+    monkeypatch.delenv(POLICY_ENV, raising=False)
+    if policy is not None:
+        monkeypatch.setenv(POLICY_ENV, policy)
+    info = rust.model_info_from_config(_config())
+    if policy is None:
+        assert "constrained_decoding" not in info  # Older bindings still accept the default launch.
+    else:
+        assert info["constrained_decoding"] == policy
+
+
+@pytest.mark.parametrize("policy", [None, "requested", "always"])
+@pytest.mark.parametrize("supported", [False, True])
+def test_rust_launcher_checks_policy_capability_without_a_version_floor(
+    monkeypatch, policy, supported
+):
+    """Old bindings keep default/requested launches; unsupported always fails before launch."""
+    from smg_grpc_servicer.vllm.decoding_policy import POLICY_ENV
+
+    class LegacyServer:
+        def __init__(self):
+            pass
+
+    class CurrentServer:
+        def __init__(self, *, constrained_decoding=""):
+            pass
+
+    _stub_engine_core_launch(monkeypatch, _parallel())
+    _install_fake_servicer(monkeypatch, CurrentServer if supported else LegacyServer)
+    monkeypatch.delenv(POLICY_ENV, raising=False)
+    if policy is not None:
+        monkeypatch.setenv(POLICY_ENV, policy)
+    args = argparse.Namespace(model="org/m", model_tag="org/m")
+    launcher = rust.VllmLauncher()
+    if policy == "always" and not supported:
+        with pytest.raises(ValueError, match="VllmGrpcServer cannot advertise"):
+            launcher.facts(args)
+    else:
+        facts = launcher.facts(args)
+        assert facts.get("constrained_decoding") == (policy if supported else None)

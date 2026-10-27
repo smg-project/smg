@@ -44,6 +44,32 @@ router routes by and workers that share a host do not collide; an explicit
 configuration is kept as given, its endpoint and off included, and
 `SMG_VLLM_SERVICER_KV_EVENTS=0` leaves the publisher off.
 
+#### Declaring a constrained-decoding policy
+
+To have SMG also constrain optional tool calls, declare the policy on the engine:
+
+```bash
+vllm serve <model> --grpc --constrained-decoding always
+```
+
+The general plugin adds `--constrained-decoding {requested,always}` to the gRPC
+launchers. The flag overrides `SMG_VLLM_CONSTRAINED_DECODING`; without either,
+the worker leaves the gateway's default (`requested`) unchanged. Python and
+Rust servicers advertise the declaration through `GetServerInfo`, and SMG
+discovers it as the `constrained_decoding` worker label. Explicit gateway
+worker configuration still takes precedence. Under PD, set it on the decode
+engines consistently across ranks and replicas.
+
+`always` uses SMG's available model grammar for optional tool calls; it does
+not force a call, override `tool_choice: none`, or provide a grammar for an
+unsupported model. It is separate from vLLM's HTTP `--tool-strict-level` and
+from `constrained_decoding_start`, which says where a supplied grammar starts.
+Compatibility is checked by capability, not package version. Older Python
+protos and Rust bindings remain usable with the default or `requested` policy.
+An explicit `always` fails servicer initialization if the installed proto or
+binding cannot carry the declaration. An older gateway ignores the new field;
+check `/workers` for `constrained_decoding: always` before relying on the policy.
+
 #### Worker-side multimodal processing (media refs)
 
 By default the smg router fetches and preprocesses images itself and sends

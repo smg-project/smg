@@ -686,6 +686,7 @@ impl PyVllmGrpcServer {
         max_num_seqs = 0,
         engine_reasoning_parser = String::new(),
         constrained_decoding_start = String::new(),
+        constrained_decoding = String::new(),
         log_stats = None,
         media_processor = None,
         smg_media_processor = None,
@@ -739,6 +740,7 @@ impl PyVllmGrpcServer {
         max_num_seqs: i32,
         engine_reasoning_parser: String,
         constrained_decoding_start: String,
+        constrained_decoding: String,
         log_stats: Option<bool>,
         media_processor: Option<Bound<'_, PyAny>>,
         smg_media_processor: Option<Bound<'_, PyDict>>,
@@ -799,6 +801,7 @@ impl PyVllmGrpcServer {
             max_num_seqs,
             engine_reasoning_parser,
             constrained_decoding_start,
+            constrained_decoding,
             log_stats,
         };
         let servicer = ServicerConfig {

@@ -4998,3 +4998,21 @@ async fn server_info_and_the_zero_filled_loads_count_the_connected_ranks() {
         vec![0, 1]
     );
 }
+
+/// Both declared policies survive the RPC; an old launcher remains silent.
+#[tokio::test]
+async fn server_info_advertises_decoding_policy() {
+    for policy in ["", "requested", "always"] {
+        let mut model = model_info();
+        model.constrained_decoding = policy.to_string();
+        let mut h = harness_with(model, None, None).await;
+        let info = h
+            .client
+            .get_server_info(vllm::GetServerInfoRequest::default())
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(info.constrained_decoding, policy);
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
+}
