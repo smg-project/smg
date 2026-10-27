@@ -993,9 +993,11 @@ def test_bump_main_after_a_patch_of_an_older_line_keeps_mains_higher_version(rep
         assert repo.version_of(path) == "1.16.0-rc.1", path
 
 
-def grpc_selection(tmp_path: Path, pypi: str, packages: str = "auto") -> dict[str, str]:
+def grpc_detect(
+    tmp_path: Path, pypi: str, packages: str = "auto", ref_type: str = "tag"
+) -> tuple[subprocess.CompletedProcess[str], Path]:
     """The detect step of release-grpc.yml over a tree whose two pyproject files read 1.14.0, with a curl that
-    answers for PyPI."""
+    answers for PyPI, dispatched on a ref of the given type; the step's result and its output file."""
     workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "release-grpc.yml").read_text())
     step = next(s for s in workflow["jobs"]["detect"]["steps"] if s.get("id") == "changes")
     tree = tmp_path / f"selection-{len(list(tmp_path.iterdir()))}"
@@ -1015,14 +1017,31 @@ def grpc_selection(tmp_path: Path, pypi: str, packages: str = "auto") -> dict[st
                 [str(bin_dir), str(Path(sys.executable).parent), "/usr/bin", "/bin"]
             ),
             "GITHUB_OUTPUT": str(output),
+            "GITHUB_REF_TYPE": ref_type,
+            "GITHUB_REF_NAME": "v1.14.0" if ref_type == "tag" else "release/1.14",
             "CURL_STUB": pypi,
             "PACKAGES": packages,
         },
         capture_output=True,
         text=True,
     )
+    return done, output
+
+
+def grpc_selection(tmp_path: Path, pypi: str, packages: str = "auto") -> dict[str, str]:
+    """The step's selection on a tag dispatch."""
+    done, output = grpc_detect(tmp_path, pypi, packages)
     assert done.returncode == 0, done.stderr
     return dict(line.split("=", 1) for line in output.read_text().splitlines())
+
+
+def test_the_grpc_release_refuses_a_dispatch_against_a_branch(tmp_path: Path) -> None:
+    """A branch can move between a failed upload and its retry, and the retry would complete the version on PyPI with
+    the missing file built from another commit; the step refuses a ref that is not a tag before it selects anything."""
+    done, output = grpc_detect(tmp_path, "", ref_type="branch")
+    assert done.returncode == 1
+    assert "release tag" in done.stderr and "release/1.14 is a branch" in done.stderr
+    assert not output.exists()
 
 
 def test_the_grpc_release_selects_a_package_until_pypi_holds_both_its_files(tmp_path: Path) -> None:
