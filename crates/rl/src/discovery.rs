@@ -12,7 +12,12 @@ use axum::{
 use openai_protocol::rl::{RlWorkerEntry, RlWorkersResponse, RL_PROTOCOL_VERSION};
 use serde::Serialize;
 
-use crate::{capability::capabilities_for, error::RlError, state::RlState, view::RlWorkerInfo};
+use crate::{
+    capability::capabilities_for,
+    error::RlError,
+    state::RlState,
+    view::{RlWorkerInfo, RlWorkerView},
+};
 
 /// Serialize an enum through serde to get its canonical wire string.
 pub(crate) fn enum_str<T: Serialize>(v: &T) -> String {
@@ -122,7 +127,7 @@ pub fn entry(info: &RlWorkerInfo, dp_ranks: usize) -> RlWorkerEntry {
 }
 
 pub(crate) async fn list_workers(State(state): State<Arc<RlState>>) -> Response {
-    let workers: Vec<RlWorkerEntry> = collapse(state.view.list())
+    let workers: Vec<RlWorkerEntry> = collapse(state.list())
         .iter()
         .map(|(w, n)| entry(w, *n))
         .collect();
@@ -142,7 +147,7 @@ pub(crate) async fn get_worker(
     State(state): State<Arc<RlState>>,
     Path(id): Path<String>,
 ) -> Response {
-    match state.view.get(&id) {
+    match state.get(&id) {
         Some(w) => {
             let ranks = if w.is_dp_aware {
                 state

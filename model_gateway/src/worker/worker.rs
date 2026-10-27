@@ -252,6 +252,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         Vec::new()
     }
 
+    /// Moves each time the worker is marked `NotReady` or `Failed`. A change
+    /// means its engine may have restarted, so state observed before it no
+    /// longer holds.
+    fn downs(&self) -> u64 {
+        0
+    }
+
     /// Set the worker's lifecycle status.
     fn set_status(&self, status: WorkerStatus);
 
@@ -1593,6 +1600,10 @@ impl Worker for BasicWorker {
         self.publish_state();
     }
 
+    fn downs(&self) -> u64 {
+        self.runtime.load().downs()
+    }
+
     fn inherit_shared_state_from(&self, other: &dyn Worker) -> bool {
         let Some(other) = other.as_any().downcast_ref::<BasicWorker>() else {
             return false;
@@ -2318,6 +2329,29 @@ mod tests {
             assert_eq!(new.circuit_breaker_state(), CircuitState::Open);
             assert_eq!(cb_state_gauge(&handle.render()), Some(1.0));
         });
+    }
+
+    #[test]
+    fn a_worker_counts_each_time_it_goes_down() {
+        let worker = BasicWorkerBuilder::new("http://worker:8000").build();
+        assert_eq!(worker.downs(), 0);
+
+        worker.set_status(WorkerStatus::NotReady);
+        worker.set_status(WorkerStatus::Ready);
+        assert_eq!(worker.downs(), 1);
+
+        worker.set_status(WorkerStatus::Failed);
+        assert_eq!(worker.downs(), 2);
+    }
+
+    #[test]
+    fn a_replacement_keeps_the_count_of_downs() {
+        let old = BasicWorkerBuilder::new("http://worker:8000").build();
+        old.set_status(WorkerStatus::NotReady);
+        let new = BasicWorkerBuilder::new("http://worker:8000").build();
+
+        assert!(new.inherit_shared_state_from(&old));
+        assert_eq!(new.downs(), 1);
     }
 
     /// Health config that skips health checks — workers start Ready immediately.
