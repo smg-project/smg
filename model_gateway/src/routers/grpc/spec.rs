@@ -106,6 +106,18 @@ pub(crate) struct ChatResponseSpec {
     pub symphony: Option<Assignment>,
 }
 
+impl ChatResponseSpec {
+    /// Whether text can precede Prefill accounting without exposing incomplete
+    /// per-chunk usage. Dispatch and the streaming reader share this boundary.
+    pub(crate) fn allows_early_pd_output(&self) -> bool {
+        self.expected_choices == 1
+            && self.provider != ProviderProfile::DeepSeek
+            && !self.stream_options.as_ref().is_some_and(|o| {
+                o.include_usage.unwrap_or(false) && o.continuous_usage_stats.unwrap_or(false)
+            })
+    }
+}
+
 /// Whether the response to a chat `request` is scanned for tool calls: the
 /// request declares tools (an empty list included), a message declares one,
 /// or the model's provider reads tool calls without any

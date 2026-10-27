@@ -1389,6 +1389,48 @@ mod tracked_tests {
         );
     }
 
+    /// Decode progress never resets a silent Prefill worker's breaker.
+    #[tokio::test]
+    async fn deferred_prefill_success_requires_its_own_response() {
+        use crate::{
+            routers::grpc::regular::streaming::eof_tests::{chunk, scripted_stream},
+            worker::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        };
+        for answered in [false, true] {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new("grpc://prefill:30000")
+                    .circuit_breaker_config(CircuitBreakerConfig {
+                        failure_threshold: 2,
+                        ..Default::default()
+                    })
+                    .build(),
+            );
+            worker.record_outcome(504);
+            let (stream, server) = scripted_stream(
+                if answered {
+                    vec![chunk(0, "hi")]
+                } else {
+                    vec![]
+                },
+                "0",
+            )
+            .await;
+            let mut stream = stream.tracked_prefill_side(Arc::clone(&worker), 256);
+            stream.sample_success_on_first_response();
+            assert_eq!(stream.next().await.is_some(), answered);
+            worker.record_outcome(504);
+            assert_eq!(
+                worker.circuit_breaker_state(),
+                if answered {
+                    CircuitState::Closed
+                } else {
+                    CircuitState::Open
+                }
+            );
+            server.abort();
+        }
+    }
+
     #[test]
     fn a_prefill_side_booked_at_dispatch_is_pending_before_its_stream_exists() {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p1:8000").build());
@@ -1721,6 +1763,14 @@ impl ProtoStream {
             samples_success: false,
             replay: None,
         }))
+    }
+
+    /// Defer a tracked dispatch's breaker success until its first response.
+    /// Used when real Decode output lets routing proceed before Prefill answers.
+    pub(crate) fn sample_success_on_first_response(&mut self) {
+        if let Self::Tracked(tracked) = self {
+            tracked.samples_success = true;
+        }
     }
 
     /// Track this stream as the decode side of a disaggregated dispatch to

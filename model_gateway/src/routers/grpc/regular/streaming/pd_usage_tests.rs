@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use openai_protocol::chat::ChatCompletionRequest;
 use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as GenerationEvent};
+use tokio::{sync::oneshot, task::JoinHandle};
 
 use super::{
     eof_tests::{
@@ -39,7 +40,7 @@ fn pd_timing() -> context::PdTiming {
     context::PdTiming {
         prefill_start: Instant::now(),
         decode_sent: Instant::now(),
-        runtime: "test",
+        runtime: "sglang",
     }
 }
 
@@ -255,4 +256,289 @@ fn a_prefill_that_completed_once_covers_every_sample_of_its_request() {
     hit.note(&complete(1, 20));
     assert_eq!(hit.for_index(1), Some(20));
     assert_eq!(hit.for_index(3), None);
+}
+
+/// The usage fixtures encoded as real SGLang frames, with a gate between
+/// stages. Only fields used by these fixtures are translated.
+async fn sglang_gated_stream(
+    first: Vec<proto::GenerateResponse>,
+    gate: oneshot::Receiver<()>,
+    rest: Vec<proto::GenerateResponse>,
+    status: &'static str,
+) -> (ProtoStream, JoinHandle<()>) {
+    use futures::{stream, StreamExt as _};
+    use smg_grpc_client::sglang_scheduler::{
+        proto as sg, proto::generate_response::Response as Event, AbortOnDropStream,
+        SglangSchedulerClient,
+    };
+
+    use super::eof_tests::{data_frame, decoded_stream, mock_worker_endpoint, trailers_frame};
+
+    let frames = |responses: Vec<proto::GenerateResponse>| {
+        responses
+            .into_iter()
+            .map(|r| {
+                let response = match r.response.expect("fixture event") {
+                    GenerationEvent::Chunk(c) => Event::Chunk(sg::GenerateStreamChunk {
+                        index: c.index,
+                        token_ids: c.token_ids,
+                        prompt_tokens: c.prompt_tokens,
+                        completion_tokens: c.completion_tokens,
+                        cached_tokens: c.cached_tokens,
+                        ..Default::default()
+                    }),
+                    GenerationEvent::Complete(c) => Event::Complete(sg::GenerateComplete {
+                        index: c.index,
+                        finish_reason: c.finish_reason,
+                        prompt_tokens: c.prompt_tokens,
+                        completion_tokens: c.completion_tokens,
+                        cached_tokens: c.cached_tokens,
+                        ..Default::default()
+                    }),
+                };
+                Ok::<_, tonic::Status>(data_frame(&sg::GenerateResponse {
+                    response: Some(response),
+                    ..Default::default()
+                }))
+            })
+            .collect::<Vec<_>>()
+    };
+    let body = stream::iter(frames(first))
+        .chain(
+            stream::once(async move {
+                let _ = gate.await;
+                stream::iter(frames(rest))
+            })
+            .flatten(),
+        )
+        .chain(stream::iter([Ok(trailers_frame(status))]));
+    let (url, server) = mock_worker_endpoint().await;
+    let client = SglangSchedulerClient::connect(&url)
+        .await
+        .expect("connect mock");
+    let stream = AbortOnDropStream::new(decoded_stream(body), "pd-usage".into(), client);
+    stream.mark_completed(); // No generation was dispatched to this mock.
+    (ProtoStream::Sglang(stream), server)
+}
+
+/// A late Prefill control completion must not hold back real Decode text,
+/// but its cache accounting must still precede successful final usage.
+#[tokio::test]
+async fn sglang_decode_text_precedes_prefill_completion_but_usage_waits() {
+    for late_error in [false, true] {
+        use std::time::Duration;
+
+        let (release, gate) = oneshot::channel();
+        let (prefill, p_server) = sglang_gated_stream(
+            vec![],
+            gate,
+            if late_error {
+                vec![]
+            } else {
+                vec![complete_with_cached(PREFILL_HIT)]
+            },
+            if late_error { "13" } else { "0" },
+        )
+        .await;
+        let (decode_release, decode_gate) = oneshot::channel();
+        decode_release.send(()).expect("open Decode gate");
+        let (decode, d_server) = sglang_gated_stream(
+            vec![
+                chunk_with_cached("hi", DECODE_VIEW),
+                complete_with_cached(DECODE_VIEW),
+            ],
+            decode_gate,
+            vec![],
+            "0",
+        )
+        .await;
+        let (tx, mut rx) = sse_channel();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test joins this task before returning"
+        )]
+        let task = tokio::spawn(async move {
+            let mut timing = pd_timing();
+            timing.runtime = "sglang";
+            processor(false)
+                .process_prefill_decode_streaming_chunks(
+                    prefill,
+                    decode,
+                    dispatch(),
+                    Arc::new(CharacterTokenizer::default()),
+                    (None, None, false, false, false),
+                    spec(false),
+                    &tx,
+                    timing,
+                    vec![None],
+                    None,
+                )
+                .await
+        });
+        let first = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = rx
+                    .recv()
+                    .await
+                    .expect("SSE remains open")
+                    .expect("successful frame");
+                let text = std::str::from_utf8(&frame).expect("UTF8");
+                if text.contains("hi") {
+                    break text.to_owned();
+                }
+            }
+        })
+        .await
+        .expect("Decode text must not wait for Prefill");
+        assert!(first.contains("hi"));
+        assert!(
+            !task.is_finished(),
+            "terminal accounting still waits for Prefill"
+        );
+        release.send(()).expect("Prefill is still awaited");
+        let events = collect_events(rx).await;
+        let result = task.await.expect("task");
+        if late_error {
+            assert!(
+                matches!(result, Err(utils::StreamFailure::Upstream { completion_tokens, .. }) if completion_tokens > 0)
+            );
+            assert!(
+                events.iter().all(|e| e["usage"].is_null()),
+                "failed stream must not emit successful final usage"
+            );
+        } else {
+            result.expect("successful stream");
+            let usage = &events.last().expect("final usage")["usage"];
+            assert_eq!(cached_tokens_of(usage), PREFILL_HIT);
+        }
+        p_server.abort();
+        d_server.abort();
+    }
+}
+
+/// Dropping the HTTP body wakes both silent sides and releases their load,
+/// including when Decode has already supplied its terminal response.
+#[tokio::test]
+async fn disconnect_during_pending_prefill_releases_both_sides() {
+    use std::time::Duration;
+
+    use crate::worker::{BasicWorkerBuilder, Worker};
+
+    for decode_complete in [false, true] {
+        let p: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p:1").build());
+        let d: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://d:1").build());
+        let (_p_release, p_gate) = oneshot::channel();
+        let (_d_release, d_gate) = oneshot::channel();
+        let (prefill, ps) = sglang_gated_stream(vec![], p_gate, vec![], "0").await;
+        let mut frames = vec![chunk_with_cached("hi", DECODE_VIEW)];
+        if decode_complete {
+            frames.push(complete_with_cached(DECODE_VIEW));
+        }
+        let (decode, ds) = sglang_gated_stream(frames, d_gate, vec![], "0").await;
+        let (tx, mut rx) = sse_channel();
+        let prefill = prefill
+            .tracked(Arc::clone(&p), 0, true)
+            .until_client_gone(&tx, "cancel-pd");
+        let decode = decode
+            .tracked(Arc::clone(&d), 0, true)
+            .until_client_gone(&tx, "cancel-pd");
+        #[expect(clippy::disallowed_methods, reason = "test joins the task")]
+        let task = tokio::spawn(async move {
+            processor(false)
+                .process_prefill_decode_streaming_chunks(
+                    prefill,
+                    decode,
+                    dispatch(),
+                    Arc::new(CharacterTokenizer::default()),
+                    (None, None, false, false, false),
+                    spec(false),
+                    &tx,
+                    pd_timing(),
+                    vec![None],
+                    None,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(frame) = rx.recv().await {
+                let frame = frame.expect("successful frame");
+                if std::str::from_utf8(&frame).expect("UTF8").contains("hi") {
+                    return;
+                }
+            }
+            panic!("Decode text missing");
+        })
+        .await
+        .expect("early Decode text");
+        drop(rx);
+        let _result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("disconnect ends the reader without opening either gate")
+            .expect("joined reader");
+        assert_eq!(p.tracked_load(), 0, "Prefill load released");
+        assert_eq!(d.tracked_load(), 0, "Decode load released");
+        ps.abort();
+        ds.abort();
+    }
+}
+
+/// Continuous usage must not expose Decode's KV-transfer count in early chunks.
+#[tokio::test]
+async fn continuous_usage_waits_for_prefill_before_emitting_chunks() {
+    use std::time::Duration;
+
+    let (release, gate) = oneshot::channel();
+    let (prefill, ps) =
+        sglang_gated_stream(vec![], gate, vec![complete_with_cached(PREFILL_HIT)], "0").await;
+    let (decode_release, decode_gate) = oneshot::channel();
+    decode_release.send(()).expect("open Decode gate");
+    let (decode, ds) = sglang_gated_stream(
+        vec![
+            chunk_with_cached("hi", DECODE_VIEW),
+            complete_with_cached(DECODE_VIEW),
+        ],
+        decode_gate,
+        vec![],
+        "0",
+    )
+    .await;
+    let (tx, mut rx) = sse_channel();
+    #[expect(clippy::disallowed_methods, reason = "test joins the reader")]
+    let task = tokio::spawn(async move {
+        processor(false)
+            .process_prefill_decode_streaming_chunks(
+                prefill,
+                decode,
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                (None, None, false, false, false),
+                spec(true),
+                &tx,
+                pd_timing(),
+                vec![None],
+                None,
+            )
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .is_err(),
+        "continuous-usage chunks wait for exact Prefill accounting"
+    );
+    release.send(()).expect("Prefill is awaited");
+    let events = collect_events(rx).await;
+    task.await
+        .expect("joined reader")
+        .expect("successful stream");
+    let usages: Vec<_> = events
+        .iter()
+        .filter_map(|event| event.get("usage").filter(|u| !u.is_null()))
+        .collect();
+    assert!(!usages.is_empty());
+    for usage in usages {
+        assert_eq!(cached_tokens_of(usage), PREFILL_HIT);
+    }
+    ps.abort();
+    ds.abort();
 }

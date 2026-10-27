@@ -264,12 +264,14 @@ fn pd_side_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
 /// deadline, counted from its dispatch (after the admission gate below,
 /// which has a bound of its own) over the calls that open the streams and
 /// over every message on them (see [`RequestDeadline`]); `None` leaves the
-/// attempt unbounded.
+/// attempt unbounded. `early_pd_output` is set only for chat readers that
+/// can drain Prefill concurrently without exposing incomplete usage.
 pub(crate) async fn execute_plan(
     ctx: &mut DispatchContext,
     mut execution_plan: ExecutionPlan,
     last_attempt: bool,
     request_timeout: Option<Duration>,
+    early_pd_output: bool,
 ) -> Result<(), Response> {
     // One bootstrap room per backend request the plan will post: a batched
     // completion fans out one PD dispatch per sub-request, so admission has
@@ -368,7 +370,16 @@ pub(crate) async fn execute_plan(
             },
             ExecutionPlan::PrefillDecode(req) => {
                 let prefill_guard = require_prefill_guard(prefill_guard)?;
-                execute_pd_dispatch(req, clients, workers, model, prefill_guard, ledger).await
+                execute_pd_dispatch(
+                    req,
+                    clients,
+                    workers,
+                    model,
+                    prefill_guard,
+                    ledger,
+                    early_pd_output,
+                )
+                .await
             }
             ExecutionPlan::EncodePrefillDecode { request } => {
                 // Bootstrap info was injected into the prefill request during
@@ -501,6 +512,7 @@ fn require_prefill_guard(guard: Option<PrefillLoadGuard>) -> Result<PrefillLoadG
     })
 }
 
+/// Dispatch a PD pair; only eligible streaming chat may bypass the Prefill response wait.
 async fn execute_pd_dispatch(
     proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
@@ -508,6 +520,7 @@ async fn execute_pd_dispatch(
     model: &str,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    early_pd_output: bool,
 ) -> Result<ExecutionResult, Response> {
     let Some(runtime_type) = workers.disaggregated_runtime_type() else {
         error!(
@@ -551,7 +564,15 @@ async fn execute_pd_dispatch(
                 execute_fanout_pd(proto_request, n, clients, workers, prefill_guard, ledger).await
             }
             None => {
-                execute_parallel_pd(proto_request, clients, workers, prefill_guard, ledger).await
+                execute_parallel_pd(
+                    proto_request,
+                    clients,
+                    workers,
+                    prefill_guard,
+                    ledger,
+                    early_pd_output,
+                )
+                .await
             }
         },
     }?;
@@ -630,7 +651,7 @@ async fn execute_fanout_pd(
     let guards = prefill_guard.replicate_to(subs.len());
     let dispatches = subs.into_iter().zip(guards).map(|(sub, guard)| {
         let mut clients = clients.clone();
-        async move { execute_parallel_pd(sub, &mut clients, workers, guard, ledger).await }
+        async move { execute_parallel_pd(sub, &mut clients, workers, guard, ledger, false).await }
     });
     let results = try_join_all(dispatches).await?;
 
@@ -702,6 +723,7 @@ async fn execute_epd_dispatch(
         model,
         prefill_guard,
         ledger,
+        false,
     )
     .await
 }
@@ -793,6 +815,7 @@ async fn execute_batch_dispatch(
                             model,
                             prefill_guard,
                             ledger,
+                            false,
                         )
                         .await
                     }
@@ -979,9 +1002,11 @@ struct PdSides<'a> {
     decode_label: &'static str,
     request_id: String,
     prompt_tokens: u64,
+    allow_decode_handoff: bool,
 }
 
 impl<'a> PdSides<'a> {
+    /// Address the pair with the conservative Prefill response barrier by default.
     fn of(
         workers: &'a WorkerSelection,
         ledger: &'a AttemptLedger,
@@ -997,6 +1022,7 @@ impl<'a> PdSides<'a> {
             decode_label,
             request_id,
             prompt_tokens,
+            allow_decode_handoff: false,
         }
     }
 }
@@ -1011,6 +1037,7 @@ async fn execute_parallel_pd(
     workers: &WorkerSelection,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    early_pd_output: bool,
 ) -> Result<ExecutionResult, Response> {
     let runtime = workers
         .disaggregated_runtime_type()
@@ -1024,7 +1051,8 @@ async fn execute_parallel_pd(
     // it on this path), so prefill duration cannot be measured — only TTFT,
     // recorded at the first decode token in streaming. prefill_start anchors it.
     let prefill_start = Instant::now();
-    let sides = PdSides::of(workers, ledger, &prefill_request);
+    let mut sides = PdSides::of(workers, ledger, &prefill_request);
+    sides.allow_decode_handoff = early_pd_output && runtime == "sglang";
     // The prefill side's silence is bounded from its dispatch: a call that
     // returns no stream, or a stream with nothing on it, within the bound
     // fails the attempt instead of holding the request (and the decode room
@@ -1116,9 +1144,9 @@ fn parallel_pd_requests(
 }
 
 /// Both sides answered their dispatch: each verdict is translated before either
-/// is propagated, the prefill side's first response is waited for within what is
-/// left of its bound, and the pair goes to the response with the decode's abort
-/// deferred until its first item.
+/// is propagated. Wait for Prefill within its remaining bound, unless this
+/// reader can proceed on real Decode output. The pair retains Decode's
+/// deferred abort until its first item.
 async fn parallel_sides_answered(
     sides: &PdSides<'_>,
     prefill_result: StreamResult,
@@ -1172,6 +1200,7 @@ async fn parallel_sides_answered(
         None => prefill_stream,
     };
     match first_prefill_response_within(
+        sides.allow_decode_handoff,
         &mut prefill_stream,
         bound,
         prefill_worker,
@@ -1204,8 +1233,9 @@ async fn parallel_sides_answered(
         // where its reader meets it (the streaming layer's
         // accounting); a stream that ended with nothing on it is no
         // success of the side either.
-        Ok(FirstItem::Response) => workers.record_outcome_prefill(sides.ledger, 200),
-        Ok(FirstItem::Failure | FirstItem::End) => {}
+        Ok(Some(FirstItem::Response)) => workers.record_outcome_prefill(sides.ledger, 200),
+        Ok(Some(FirstItem::Failure | FirstItem::End)) => {}
+        Ok(None) => prefill_stream.sample_success_on_first_response(),
     }
 
     // A client disconnect drops both side streams, which normally fires an
@@ -1947,19 +1977,36 @@ async fn dispatch_prefill_within(
 /// counts as answered, as its dispatch did. The decode `partner` comes with
 /// its stream: its first output, pulled ahead once, is a handoff of the
 /// prefill worker's (see [`dispatch_pd_sides`]); an item its dispatch already
-/// pulled was credited then, not again.
+/// pulled was credited then, not again. When `allow_decode_handoff` is set,
+/// real Decode output returns `None` without inventing a Prefill response;
+/// its control stream remains live for concurrent draining by the reader.
+/// With this handoff enabled, an unbounded wait also leaves the success
+/// sample to the reader instead of crediting a silent Prefill dispatch.
+#[expect(clippy::too_many_arguments)]
 async fn first_prefill_response_within(
+    allow_decode_handoff: bool,
     stream: &mut ProtoStream,
     bound: Option<PrefillBound>,
     worker: Option<&Arc<dyn Worker>>,
-    partner: Option<(&Arc<dyn Worker>, &mut ProtoStream)>,
+    mut partner: Option<(&Arc<dyn Worker>, &mut ProtoStream)>,
     connection: &'static str,
     request_id: &str,
     prompt_tokens: u64,
-) -> Result<FirstItem, tonic::Status> {
+) -> Result<Option<FirstItem>, tonic::Status> {
     let (Some(bound), Some(worker)) = (bound, worker) else {
-        return Ok(FirstItem::Response);
+        return Ok((!allow_decode_handoff).then_some(FirstItem::Response));
     };
+    // A real Decode output proves KV readiness; a control frame
+    // alone never does. Preserve the pulled output for the streaming reader.
+    if allow_decode_handoff {
+        if let Some((_, decode)) = partner.as_mut() {
+            if decode.holds_item_ahead()
+                && matches!(decode.first_item_ahead().await, Some(Ok(r)) if r.is_output())
+            {
+                return Ok(None);
+            }
+        }
+    }
     let partner_worker = partner.as_ref().map(|(partner, _)| *partner);
     let mut decode = partner
         .map(|(_, decode)| decode)
@@ -1971,13 +2018,14 @@ async fn first_prefill_response_within(
             handed_off = decode_handed_off(decode.as_deref_mut()), if decode.is_some() => {
                 if handed_off {
                     worker.note_prefill_handoff();
+                    if allow_decode_handoff { return Ok(None); }
                 }
                 decode = None;
                 continue;
             }
             first = stream.first_response_within(deadline) => {
                 if let Ok(first) = first {
-                    return Ok(first);
+                    return Ok(Some(first));
                 }
             }
         }
@@ -2632,6 +2680,7 @@ async fn sequential_prefill_side(
         None => prefill_stream,
     };
     if let Err(e) = first_prefill_response_within(
+        false,
         &mut prefill_stream,
         bound,
         prefill_worker,
@@ -2914,6 +2963,7 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use smg_grpc_client::{sglang_proto as sglang, tokenspeed_proto as ts, vllm_proto as vllm};
+    use tokio::sync::oneshot;
 
     use super::*;
     use crate::{
@@ -3445,6 +3495,85 @@ mod tests {
         );
     }
 
+    /// Pulled-ahead and newly read output both bypass a silent Prefill safely.
+    #[tokio::test]
+    async fn real_decode_output_bypasses_prefill_first_response_without_consuming_it() {
+        use crate::routers::grpc::regular::streaming::eof_tests::{
+            chunk, gated_stream, scripted_stream,
+        };
+        for held in [false, true] {
+            let workers = tokenspeed_pair();
+            let p = workers.prefill_worker().expect("prefill");
+            let d = workers.decode_worker().expect("decode");
+            let (_release, gate) = oneshot::channel();
+            let (prefill, ps) = gated_stream(vec![], gate, vec![], "0").await;
+            let mut prefill = prefill.tracked_prefill_side(Arc::clone(p), 256);
+            let (mut decode, ds) = scripted_stream(vec![chunk(0, "hi")], "0").await;
+            if held {
+                assert!(decode.first_item_ahead().await.is_some());
+            }
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                first_prefill_response_within(
+                    true,
+                    &mut prefill,
+                    Some(three_second_bound()),
+                    Some(p),
+                    Some((d, &mut decode)),
+                    "grpc",
+                    "test-handoff",
+                    256,
+                ),
+            )
+            .await
+            .expect("must not wait for Prefill")
+            .expect("handoff");
+            assert_eq!(result, None);
+            assert!(decode
+                .next()
+                .await
+                .expect("preserved output")
+                .expect("output")
+                .is_output());
+            ps.abort();
+            ds.abort();
+        }
+    }
+
+    /// An empty control frame is preserved but cannot release the Prefill wait.
+    #[tokio::test]
+    async fn decode_control_frame_does_not_bypass_prefill() {
+        use crate::routers::grpc::regular::streaming::eof_tests::{
+            chunk, gated_stream, scripted_stream,
+        };
+        let workers = tokenspeed_pair();
+        let (release, gate) = oneshot::channel();
+        let (prefill, ps) = gated_stream(vec![], gate, vec![chunk(0, "p")], "0").await;
+        let mut prefill = prefill
+            .tracked_prefill_side(Arc::clone(workers.prefill_worker().expect("Prefill")), 256);
+        let (mut decode, ds) = scripted_stream(vec![Default::default()], "0").await;
+        let mut wait = std::pin::pin!(first_prefill_response_within(
+            true,
+            &mut prefill,
+            Some(three_second_bound()),
+            workers.prefill_worker(),
+            workers.decode_worker().map(|d| (d, &mut decode)),
+            "grpc",
+            "control",
+            256,
+        ));
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut wait)
+            .await
+            .is_err());
+        release.send(()).expect("reader still waits for Prefill");
+        assert_eq!(
+            wait.await.expect("Prefill response"),
+            Some(FirstItem::Response)
+        );
+        ps.abort();
+        ds.abort();
+    }
+
     /// The failure a dispatch ended with (a stream has no `Debug`).
     fn failure(result: StreamResult) -> tonic::Status {
         match result {
@@ -3563,6 +3692,7 @@ mod tests {
         let mut stream = ProtoStream::Fanout(FanoutStream::new(Vec::new()))
             .tracked_prefill_side(Arc::clone(&prefill), 256);
         let first = first_prefill_response_within(
+            false,
             &mut stream,
             Some(three_second_bound()),
             Some(&prefill),
@@ -3573,7 +3703,7 @@ mod tests {
         )
         .await
         .expect("ended within the bound");
-        assert_eq!(first, FirstItem::End);
+        assert_eq!(first, Some(FirstItem::End));
         assert!(stream.next().await.is_none(), "the end is replayed");
     }
 
