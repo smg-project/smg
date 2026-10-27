@@ -1352,6 +1352,35 @@ mod tests {
         assert!(usage.get("completion_tokens").is_none());
     }
 
+    /// Runs chat SSE frames through the Responses transform as an unstored
+    /// request over empty memory storages (no tenant, no request context) and
+    /// hands back the client's receiver once the transform has returned.
+    async fn transformed_chat_stream(
+        frames: Vec<String>,
+    ) -> mpsc::Receiver<Result<Bytes, std::io::Error>> {
+        let body = Body::from_stream(futures_util::stream::iter(
+            frames.into_iter().map(Ok::<_, std::convert::Infallible>),
+        ));
+        let (tx, rx) = mpsc::channel(64);
+        process_and_transform_sse_stream(
+            body,
+            ResponsesRequest {
+                store: Some(false),
+                ..Default::default()
+            },
+            None,
+            Arc::new(smg_data_connector::MemoryResponseStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
+            None,
+            tx,
+        )
+        .await
+        .unwrap();
+        rx
+    }
+
     #[tokio::test]
     async fn terminal_stream_preserves_cache_and_reasoning_usage() {
         for cached in [Some(0), Some(6), None] {
@@ -1366,26 +1395,7 @@ mod tests {
                 format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap()),
                 "data: [DONE]\n\n".into(),
             ];
-            let body = Body::from_stream(futures_util::stream::iter(
-                frames.into_iter().map(Ok::<_, std::convert::Infallible>),
-            ));
-            let (tx, mut rx) = mpsc::channel(64);
-            process_and_transform_sse_stream(
-                body,
-                ResponsesRequest {
-                    store: Some(false),
-                    ..Default::default()
-                },
-                None,
-                Arc::new(smg_data_connector::MemoryResponseStorage::new()),
-                Arc::new(smg_data_connector::MemoryConversationStorage::new()),
-                Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
-                None,
-                None,
-                tx,
-            )
-            .await
-            .unwrap();
+            let mut rx = transformed_chat_stream(frames).await;
             let mut terminal = None;
             while let Some(Ok(bytes)) = rx.recv().await {
                 let text = std::str::from_utf8(&bytes).unwrap();
@@ -1547,26 +1557,7 @@ mod tests {
         let frames = vec![format!("data: {reasoning}\n\n"),
             "data: {\"error\":{\"message\":\"engine unavailable\",\"type\":\"internal_error\"}}\n\n".into(),
             "data: [DONE]\n\n".into()];
-        let body = Body::from_stream(futures_util::stream::iter(
-            frames.into_iter().map(Ok::<_, std::convert::Infallible>),
-        ));
-        let (tx, mut rx) = mpsc::channel(64);
-        process_and_transform_sse_stream(
-            body,
-            ResponsesRequest {
-                store: Some(false),
-                ..Default::default()
-            },
-            None,
-            Arc::new(smg_data_connector::MemoryResponseStorage::new()),
-            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
-            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
-            None,
-            None,
-            tx,
-        )
-        .await
-        .unwrap();
+        let mut rx = transformed_chat_stream(frames).await;
         let mut events: Vec<Value> = Vec::new();
         while let Some(Ok(bytes)) = rx.recv().await {
             let text = std::str::from_utf8(&bytes).unwrap();
@@ -1926,26 +1917,7 @@ mod tests {
             ]
             .concat(),
         ];
-        let body = Body::from_stream(futures_util::stream::iter(
-            frames.into_iter().map(Ok::<_, std::convert::Infallible>),
-        ));
-        let (tx, mut rx) = mpsc::channel(64);
-        process_and_transform_sse_stream(
-            body,
-            ResponsesRequest {
-                store: Some(false),
-                ..Default::default()
-            },
-            None,
-            Arc::new(smg_data_connector::MemoryResponseStorage::new()),
-            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
-            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
-            None,
-            None,
-            tx,
-        )
-        .await
-        .unwrap();
+        let mut rx = transformed_chat_stream(frames).await;
         let mut events: Vec<Value> = Vec::new();
         while let Some(Ok(bytes)) = rx.recv().await {
             let text = std::str::from_utf8(&bytes).unwrap();
