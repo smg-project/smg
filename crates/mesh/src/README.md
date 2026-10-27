@@ -158,10 +158,6 @@ their descriptions):
 | `router_mesh_peer_nack_total` | counter, `peer` | The accepting end, per NACK frame from `peer`. |
 | `router_mesh_sync_round_duration_seconds` | histogram, `peer` | The dialing end, the time of each sender round towards `peer`. |
 
-`router_mesh_store_cardinality`, `router_mesh_store_hash`,
-`router_rl_drift_ratio` and `router_lb_drift_ratio` are described in
-`metrics.rs` but nothing records them, so they do not appear in a scrape.
-
 ## Example: two gateways on one host
 
 ```bash
