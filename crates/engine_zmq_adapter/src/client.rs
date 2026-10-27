@@ -638,12 +638,23 @@ impl ZmqEngineClient {
     /// `registered`, the role its worker is registered for (`None` for one
     /// that serves whole requests): a prefill engine registered as a decode
     /// worker, or a whole-request engine as either, fails its connection with
-    /// both roles named instead of failing every request it takes. An engine
-    /// that predates the declaration (it lists no request types) is not
-    /// checked.
+    /// both roles named instead of failing every request it takes. An encode
+    /// worker needs the wire's encode request, so an engine that does not
+    /// list it (one before the request, or a scheduler) fails the connection
+    /// of an `encode` registration whatever else it declares, as the servicer
+    /// refuses the same engine at its link. An engine that predates the
+    /// declaration (it lists no request types) is otherwise not checked.
     pub fn check_declared_role(&self, registered: Option<&str>) -> Result<(), String> {
         for engine in self.engines() {
             let ready = &engine.ready_response;
+            if registered == Some("encode") && !ready.lists_request_kind(REQUEST_KIND_ENCODE) {
+                return Err(format!(
+                    "engine {:?} lists no encode request on its wire (request_types {:?}) but \
+                     its worker is registered as an encode worker: a newer engine, or the \
+                     Python servicer (--servicer-impl python), serves this worker",
+                    engine.engine_id, ready.request_types,
+                ));
+            }
             if ready.request_types.is_empty() {
                 continue;
             }
@@ -2373,7 +2384,8 @@ mod tests {
     /// that declared that role: a prefill rank among a decode worker's, or a
     /// whole-request engine behind a prefill worker, fails the check with both
     /// roles named. An engine that declares no request types predates the
-    /// declaration and is taken as registered.
+    /// declaration and is taken as registered, except for an encode worker,
+    /// which needs the encode request listed and is refused by such an engine.
     #[tokio::test]
     async fn a_worker_connects_only_to_engines_of_its_registered_role() {
         let declaring = |role: Option<&str>| EngineCoreReadyResponse {
@@ -2420,6 +2432,32 @@ mod tests {
         silent
             .check_declared_role(Some("prefill"))
             .expect("an engine that declares nothing is not checked");
+
+        // An encode worker needs the wire's encode request: an engine that
+        // lists none fails the connection whether it declares nothing (one
+        // before the request) or a scheduler's request types, as the servicer
+        // refuses the same engine at its link; one that lists it connects.
+        let error = silent.check_declared_role(Some("encode")).unwrap_err();
+        assert!(
+            error.contains("lists no encode request") && error.contains("--servicer-impl python"),
+            "{error}"
+        );
+        let scheduler =
+            tokenspeed_ranks(&dir.path().join("e"), vec![declaring(Some("encode"))]).await;
+        let error = scheduler.check_declared_role(Some("encode")).unwrap_err();
+        assert!(error.contains("lists no encode request"), "{error}");
+        let encoder = tokenspeed_ranks(
+            &dir.path().join("f"),
+            vec![EngineCoreReadyResponse {
+                request_types: vec!["encode".into()],
+                disaggregation_mode: Some("encode".to_string()),
+                ..default_ready_response()
+            }],
+        )
+        .await;
+        encoder
+            .check_declared_role(Some("encode"))
+            .expect("an encode worker that lists the encode request");
     }
 
     /// An RL operation rides the TokenSpeed control wire as a control call
