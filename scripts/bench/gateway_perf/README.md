@@ -128,6 +128,20 @@ to 8 cores, over the five paths ((max - min) / median of the per-side repeats):
 | CPU time per request | 6.8 - 18.8 % | load-dependent: report only; read it with the load line under the table |
 | cycles per request | 9 - 29 % | load-dependent: report only |
 
+## The pull-request job (advisory)
+
+`.github/workflows/benchmark-gateway-perf.yml` runs the deterministic subset on every pull
+request that touches `model_gateway/` or `crates/` (tests and benches excluded): the merge
+commit's first parent against the pull request, `cpu` mode on the chat, stream and tools
+paths, 4,000 requests per cell at half the bed's rates, 3+3 interleaved cells, judged by
+`.github/bench-gates/gateway-perf.toml` (allocation calls, KiB and user instructions at 2 %,
+RSS at 5 %; CPU time and cycles report only). The job is ADVISORY: the tables go to the step
+summary, to a comment on the pull request when the token may write one, and to the
+`gateway-perf-<sha>` artifact (with `results.json`, the per-repeat values); its verdict never
+fails the job. A hosted runner exposes no hardware counters, so the instruction ids are
+absent there and the exact allocation counts carry the judgement; the artifact's
+`results.json` is where the runner's own spread is read before any threshold turns blocking.
+
 ## The capacity rule of `perf-live`
 
 A step holds when TTFT p99, end-to-end p99 and the error rate are within the SLO flags and
