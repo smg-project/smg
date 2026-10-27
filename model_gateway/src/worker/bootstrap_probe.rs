@@ -20,7 +20,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
 use super::{
-    pd_pairing::KvTransferProfile, worker::WorkerTypeExt, Worker, DEFAULT_BOOTSTRAP_PORT,
+    basic::WorkerTypeExt, pd_pairing::KvTransferProfile, Worker, DEFAULT_BOOTSTRAP_PORT,
     MOONCAKE_CONNECTOR,
 };
 use crate::observability::metrics::Metrics;

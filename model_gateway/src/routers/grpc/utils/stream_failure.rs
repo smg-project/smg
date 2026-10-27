@@ -49,7 +49,7 @@ use crate::{
         error::error_type_for_status,
         grpc::context::{DispatchMetadata, WorkerSelection},
     },
-    worker::{worker::WorkerTypeExt, ConnectionModeExt, Worker},
+    worker::{basic::WorkerTypeExt, ConnectionModeExt, Worker},
 };
 
 /// The SSE error `type` of a stream the worker failed: the engine's

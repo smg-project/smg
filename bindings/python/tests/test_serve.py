@@ -646,10 +646,10 @@ class TestFilterBackendArgs:
 
 
 class TestZmqHandshakePort:
-    """Handshake-port derivation must mirror derive_handshake_port in worker.rs."""
+    """Handshake-port derivation must mirror derive_handshake_port in sockets.rs."""
 
     def test_matches_pinned_rust_vectors(self):
-        # These MUST equal derive_handshake_port() in worker.rs for the same path.
+        # These MUST equal derive_handshake_port() in sockets.rs for the same path.
         assert _zmq_handshake_port("ipc:///tmp/smg-zmq/ts0.ipc") == 25152
         assert _zmq_handshake_port("ipc:///tmp/smg-zmq/ts1.ipc") == 22735
         assert _zmq_handshake_port("ipc:///tmp/smg-zmq/engine-31000") == 22714

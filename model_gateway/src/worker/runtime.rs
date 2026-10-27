@@ -21,8 +21,8 @@ use tokio::sync::Notify;
 
 // The trait is named only by the doc links of this module.
 #[cfg(doc)]
-use super::worker::Worker;
-use super::worker::WorkerRoutingKeyLoad;
+use super::basic::Worker;
+use super::basic::WorkerRoutingKeyLoad;
 
 /// Why the liveness tracker vetoes a worker (see the `liveness` module).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

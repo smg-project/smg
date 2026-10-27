@@ -54,8 +54,8 @@ use crate::{
         },
     },
     worker::{
+        basic::WorkerTypeExt,
         liveness::{self, SideReprieve},
-        worker::WorkerTypeExt,
         ConnectionModeExt, PrefillLoadGuard, Worker,
     },
 };

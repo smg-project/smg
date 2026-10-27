@@ -40,12 +40,12 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     service_discovery::DISCOVERY_PROVIDER_LABEL,
     worker::{
+        basic::WorkerTypeExt,
         event::{WorkerConnected, WorkerEvent},
         liveness,
         load_state::LoadSnapshot,
         metrics_aggregator::{self, MetricPack},
         registry::WorkerId,
-        worker::WorkerTypeExt,
         ConnectionMode, RuntimeType, Worker, WorkerOrigin, WorkerRegistry, WorkerResult,
         WorkerType,
     },

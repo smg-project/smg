@@ -28,10 +28,10 @@ use smg::{
     },
     routers::grpc::backend_client::BackendClient,
     worker::{
+        basic::{RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad},
         circuit_breaker::{CircuitBreaker, CircuitState},
         endpoint::Endpoint,
         resilience::ResolvedResilience,
-        worker::{RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad},
         ConnectionMode, OverloadThresholds, PdPairing, Worker, WorkerResult, WorkerType,
     },
 };
