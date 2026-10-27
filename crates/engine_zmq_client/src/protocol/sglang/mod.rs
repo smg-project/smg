@@ -26,7 +26,7 @@
 //! The positional-array helpers (`next_field`, `expect_tag`, `drain_trailing`)
 //! are shared with the TokenSpeed dialect, whose structs follow the same
 //! `msgspec` convention; the slim-output decoder
-//! ([`output::decode_slim_batch`]) with the TensorRT-LLM dialect, whose
+//! (`output::decode_slim_batch`) with the TensorRT-LLM dialect, whose
 //! engine-side shim answers with the same records.
 
 pub mod multimodal;

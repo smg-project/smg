@@ -1488,7 +1488,7 @@ impl<P: EngineProtocol> Client<P> {
     /// wire carries). Nothing answers it, no stream is opened, no registration
     /// or in-flight slot is taken; the frame is admitted against the input
     /// queue bound and counted while it waits, as an add frame is (see
-    /// [`ClientInner::admit_add`]): once the engine has stopped reading for
+    /// `ClientInner::admit_add`): once the engine has stopped reading for
     /// a whole send window, a frame that would take the waiting payload past
     /// the bound is refused at once rather than parked and delivered later.
     pub async fn send_typed(

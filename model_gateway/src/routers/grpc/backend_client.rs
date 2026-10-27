@@ -5,7 +5,7 @@
 //! same-host engine — vLLM EngineCore or TokenSpeed ([`ZmqEngineClient`]).
 //! `BackendClient` keeps those
 //! first-class siblings — `GrpcClient` stays pure gRPC — while the execution
-//! pipeline (which works against [`ProtoStream`]/[`ProtoGenerateRequest`]) is
+//! pipeline (which works against `ProtoStream`/`ProtoGenerateRequest`) is
 //! shared unchanged.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

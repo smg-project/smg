@@ -889,7 +889,7 @@ impl PreparedTools {
     pub const KEPT_TOJSON_TEXTS_PER_TOOL: usize = KEPT_TOJSON_TEXTS_PER_TOOL;
 
     /// Converts `tools` as a render converts [`ChatTemplateParams::tools`]:
-    /// the same values, each tool read through a [`PreparedTool`] that keeps
+    /// the same values, each tool read through a `PreparedTool` that keeps
     /// its `tojson` text once written.
     pub fn new(tools: Vec<JsonValue>) -> Self {
         let value = Value::from(
