@@ -128,7 +128,7 @@ mod tests {
                         source: more_source,
                     },
                 ) if *i == j => {
-                    json.push_str(&more);
+                    json.to_mut().push_str(&more);
                     source.text.to_mut().push_str(&more_source.text);
                 }
                 (_, event) => out.push(event),

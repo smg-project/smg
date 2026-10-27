@@ -760,7 +760,7 @@ impl Assembler {
     fn push_fragment<'d>(&self, json: String, source: Text<'d>, out: &mut Events<'d>) {
         out.push(Event::ToolCallArguments {
             index: self.index,
-            json,
+            json: json.into(),
             source,
         });
     }
@@ -796,7 +796,7 @@ pub(crate) fn push_escaped(out: &mut String, text: &str) {
 }
 
 impl crate::engine::CallAssembler for Assembler {
-    fn feed(&mut self, text: &str, declared: &Declared, out: &mut Events) -> usize {
+    fn feed<'d>(&mut self, text: &'d str, declared: &Declared, out: &mut Events<'d>) -> usize {
         self.feed(text, declared, out)
     }
 
@@ -909,7 +909,7 @@ mod tests {
     fn fragment(json: &str, source: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index: 0,
-            json: json.to_string(),
+            json: json.to_string().into(),
             source: Text::uncounted(source.to_owned()),
         }
     }
@@ -1176,7 +1176,7 @@ mod tests {
         };
         let fragment_of = |index: u32, json: &str, source: &str| Event::ToolCallArguments {
             index,
-            json: json.to_string(),
+            json: json.to_string().into(),
             source: Text::uncounted(source.to_owned()),
         };
         let end_of = |index: u32| Event::ToolCallEnd {

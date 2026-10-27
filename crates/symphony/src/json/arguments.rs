@@ -31,9 +31,11 @@
 //! the caller's too, since it knows the name and where the call closes: a forced function starts
 //! its call at the value's first byte, a format at its header.
 
+use std::borrow::Cow;
+
 use crate::{
     event::{DropReason, Event, Events, MalformedReason, Text},
-    json::{prefix::json_space, Prefix},
+    json::{fragments::Arrived, prefix::json_space, Prefix},
 };
 
 /// What the reader does with a member of the value's top-level object whose value is a string:
@@ -265,7 +267,12 @@ impl Arguments {
     /// Append the next bytes, push the events they complete, holding the string values `strings`
     /// holds, and return how many of them the value took: all of them before its end, up to its
     /// end in the piece that carries it, and none once it is whole.
-    pub fn feed(&mut self, bytes: &str, strings: &dyn Strings, out: &mut Events) -> usize {
+    pub fn feed<'d>(
+        &mut self,
+        bytes: &'d str,
+        strings: &dyn Strings,
+        out: &mut Events<'d>,
+    ) -> usize {
         if self.over() {
             return 0;
         }
@@ -290,6 +297,10 @@ impl Arguments {
         }
         let before = self.value.len();
         self.value.push_str(rest);
+        let arrived = Some(Arrived {
+            at: before,
+            text: rest,
+        });
         let sound_so_far = self.invalid_from.is_none();
         let refused = self.prefix.feed(rest);
         // The judge ends none but a value a strict reader takes whole, so the value is whole where
@@ -330,6 +341,7 @@ impl Arguments {
             reported,
             breaks_here,
             strings,
+            arrived,
             out,
         );
         self.value.truncate(end);
@@ -353,7 +365,7 @@ impl Arguments {
             self.whole = Some(self.value.len());
         }
         let end = self.value.len();
-        self.emit(end, end, false, &AsWritten, out);
+        self.emit(end, end, false, &AsWritten, None, out);
         // A value that broke said so at the break, whether it sent the rest or handed it back
         // (`ends_where_refused`); one that never broke and is no whole value is said to be none
         // here.
@@ -371,13 +383,14 @@ impl Arguments {
     /// `strings` says, the break said once where the prefix broke (`breaks_here`, by a `Malformed`
     /// event of no bytes), and the part after it as the model wrote it. A held string the prefix
     /// broke in, or one the bytes end in, is sent as the model wrote it.
-    fn emit(
+    fn emit<'d>(
         &mut self,
         upto: usize,
         end: usize,
         breaks_here: bool,
         strings: &dyn Strings,
-        out: &mut Events,
+        arrived: Option<Arrived<'d>>,
+        out: &mut Events<'d>,
     ) {
         let valid_end = self.invalid_from.unwrap_or(upto).min(upto);
         let ready = self
@@ -388,17 +401,20 @@ impl Arguments {
             .count();
         let closed: Vec<(usize, usize, String)> = self.members.closed.drain(..ready).collect();
         for (start, close, key) in closed {
-            self.fragment(start, out);
-            let raw = &self.value[start..close];
-            let typed = strings.typed(&key, raw);
+            self.fragment(start, arrived, out);
+            let raw = Arrived::bytes(&self.value, start, close, arrived);
+            let json = match strings.typed(&key, &raw) {
+                Some(typed) => Cow::Owned(typed),
+                None => Arrived::escaped(&self.prefix, start, &raw),
+            };
             out.push(Event::ToolCallArguments {
                 index: self.index,
-                json: typed.unwrap_or_else(|| self.prefix.escaped(start, raw).into_owned()),
-                source: Text::uncounted(raw.to_owned()),
+                json,
+                source: Text::uncounted(raw),
             });
             self.emitted = close;
         }
-        self.fragment(valid_end, out);
+        self.fragment(valid_end, arrived, out);
         if breaks_here {
             out.push(Event::Malformed {
                 text: Text::default(),
@@ -406,11 +422,11 @@ impl Arguments {
             });
         }
         if self.invalid_from.is_some() && self.emitted < end {
-            let rest = &self.value[self.emitted..end];
+            let rest = Arrived::bytes(&self.value, self.emitted, end, arrived);
             out.push(Event::ToolCallArguments {
                 index: self.index,
-                json: rest.to_string(),
-                source: Text::uncounted(rest.to_owned()),
+                json: rest.clone(),
+                source: Text::uncounted(rest),
             });
             self.emitted = end;
         }
@@ -418,13 +434,13 @@ impl Arguments {
 
     /// The value's bytes from what was sent up to `upto`, as a fragment of the model's bytes, a
     /// raw control character inside a string written as its escape.
-    fn fragment(&mut self, upto: usize, out: &mut Events) {
+    fn fragment<'d>(&mut self, upto: usize, arrived: Option<Arrived<'d>>, out: &mut Events<'d>) {
         if self.emitted < upto {
-            let fresh = &self.value[self.emitted..upto];
+            let fresh = Arrived::bytes(&self.value, self.emitted, upto, arrived);
             out.push(Event::ToolCallArguments {
                 index: self.index,
-                json: self.prefix.escaped(self.emitted, fresh).into_owned(),
-                source: Text::uncounted(fresh.to_owned()),
+                json: Arrived::escaped(&self.prefix, self.emitted, &fresh),
+                source: Text::uncounted(fresh),
             });
             self.emitted = upto;
         }
@@ -447,7 +463,7 @@ mod tests {
             .collect();
         let fed = arguments.whole();
         let finished = arguments.finish(&mut out);
-        (out.drain(), taken, fed, finished)
+        (out.into_owned().drain(), taken, fed, finished)
     }
 
     /// The bytes the events account for.

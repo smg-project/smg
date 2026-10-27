@@ -151,7 +151,7 @@ impl Assembler {
     /// Append the next bytes of the region, push the events they complete, and return how many of
     /// the bytes the call took: all of them before the object closes, up to its closing brace in
     /// the piece that carries it, none after it.
-    pub fn feed(&mut self, bytes: &str, out: &mut Events) -> usize {
+    pub fn feed<'d>(&mut self, bytes: &'d str, out: &mut Events<'d>) -> usize {
         if let Some(body) = &mut self.body {
             return body.feed(bytes, out);
         }
@@ -159,7 +159,13 @@ impl Assembler {
             return bytes.len();
         };
         let mut body = self.after.open(self.index, &self.id, framing, at, out);
-        let taken = body.feed(&after, out);
+        // What followed the marker is the header's own text, so the events of this first piece
+        // are taken owned; every later piece is the delta's and its fragments borrow it.
+        let mut first = Events::new();
+        let taken = body.feed(&after, &mut first);
+        for event in first.drain() {
+            out.push(event.into_owned());
+        }
         self.body = Some(body);
         bytes.len() - (after.len() - taken)
     }
@@ -199,7 +205,7 @@ impl Body {
         }
     }
 
-    fn feed(&mut self, bytes: &str, out: &mut Events) -> usize {
+    fn feed<'d>(&mut self, bytes: &'d str, out: &mut Events<'d>) -> usize {
         match self {
             Self::Object(object) => object.feed(bytes, out),
             Self::Arguments(arguments) => arguments.feed(bytes, out),
@@ -215,7 +221,12 @@ impl Body {
 }
 
 impl crate::engine::CallAssembler for Assembler {
-    fn feed(&mut self, text: &str, _declared: &crate::Declared, out: &mut Events) -> usize {
+    fn feed<'d>(
+        &mut self,
+        text: &'d str,
+        _declared: &crate::Declared,
+        out: &mut Events<'d>,
+    ) -> usize {
         self.feed(text, out)
     }
 
@@ -262,7 +273,7 @@ mod tests {
         } else {
             assembler.close(&mut out);
         }
-        (out.drain(), taken)
+        (out.into_owned().drain(), taken)
     }
 
     /// A call whose object follows the marker (the Inkling spelling).

@@ -841,7 +841,7 @@ impl Assembler {
         }
         out.push(Event::ToolCallArguments {
             index: self.index,
-            json,
+            json: json.into(),
             source,
         });
     }
@@ -881,7 +881,12 @@ fn push_bare(json: &mut String, literal: &str, null: &str) {
 }
 
 impl crate::engine::CallAssembler for Assembler {
-    fn feed(&mut self, text: &str, _declared: &crate::Declared, out: &mut Events) -> usize {
+    fn feed<'d>(
+        &mut self,
+        text: &'d str,
+        _declared: &crate::Declared,
+        out: &mut Events<'d>,
+    ) -> usize {
         self.feed(text, out);
         text.len()
     }
@@ -1178,7 +1183,7 @@ mod tests {
         let fragments: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallArguments { json, .. } if !json.is_empty() => Some(json.as_str()),
+                Event::ToolCallArguments { json, .. } if !json.is_empty() => Some(json.as_ref()),
                 _ => None,
             })
             .collect();

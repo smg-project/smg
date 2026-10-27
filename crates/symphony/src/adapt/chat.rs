@@ -36,7 +36,7 @@ pub fn delta_without_role(choice: u32, event: &Event<'_>) -> Option<ChatStreamCh
         Event::ToolCallStart {
             index, id, name, ..
         } => Some(call_start(choice, *index, id.clone(), name.clone())),
-        Event::ToolCallArguments { index, json, .. } => arguments(choice, *index, json.clone()),
+        Event::ToolCallArguments { index, json, .. } => arguments(choice, *index, json.to_string()),
         Event::Finish {
             reason, tool_calls, ..
         } => Some(finish(choice, reason, *tool_calls)),
@@ -64,7 +64,7 @@ pub fn into_delta_without_role(choice: u32, event: Event<'_>) -> Option<ChatStre
         Event::ToolCallStart {
             index, id, name, ..
         } => Some(call_start(choice, index, id, name)),
-        Event::ToolCallArguments { index, json, .. } => arguments(choice, index, json),
+        Event::ToolCallArguments { index, json, .. } => arguments(choice, index, json.into_owned()),
         Event::Finish {
             reason, tool_calls, ..
         } => Some(finish(choice, &reason, tool_calls)),
@@ -326,12 +326,12 @@ mod tests {
             },
             Event::ToolCallArguments {
                 index: 1,
-                json: "{\"q\":".to_string(),
+                json: "{\"q\":".into(),
                 source: Text::uncounted("{\"q\":"),
             },
             Event::ToolCallArguments {
                 index: 1,
-                json: String::new(),
+                json: "".into(),
                 source: Text::uncounted(""),
             },
             Event::ToolCallEnd {
@@ -539,7 +539,7 @@ mod tests {
             Event::Reasoning(Text::uncounted("")),
             Event::ToolCallArguments {
                 index: 0,
-                json: String::new(),
+                json: "".into(),
                 source: Text::default(),
             },
         ];
@@ -560,7 +560,7 @@ mod tests {
     fn arguments(index: u32, json: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index,
-            json: json.into(),
+            json: json.to_owned().into(),
             source: Text::default(),
         }
     }
@@ -588,7 +588,7 @@ mod tests {
                 },
                 Event::ToolCallArguments {
                     index: 0,
-                    json: "{\"q\":1}".to_string(),
+                    json: "{\"q\":1}".into(),
                     source: Text::uncounted(""),
                 },
                 Event::ToolCallEnd {

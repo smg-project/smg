@@ -56,7 +56,7 @@ pub(crate) fn arguments_of(events: &[Event], call: u32) -> String {
     events
         .iter()
         .filter_map(|event| match event {
-            Event::ToolCallArguments { index, json, .. } if *index == call => Some(json.as_str()),
+            Event::ToolCallArguments { index, json, .. } if *index == call => Some(json.as_ref()),
             _ => None,
         })
         .collect()
@@ -67,7 +67,7 @@ pub(crate) fn arguments(events: &[Event]) -> String {
     events
         .iter()
         .filter_map(|event| match event {
-            Event::ToolCallArguments { json, .. } => Some(json.as_str()),
+            Event::ToolCallArguments { json, .. } => Some(json.as_ref()),
             _ => None,
         })
         .collect()

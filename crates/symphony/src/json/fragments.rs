@@ -16,10 +16,70 @@
 //! ([`Assembler`](super::Assembler), [`named_arguments`](super::named_arguments)) keep their
 //! accounting here, so that the two say the same of the same bytes.
 
+use std::borrow::Cow;
+
 use crate::{
     event::{Event, Events, MalformedReason, Text},
     json::prefix::Prefix,
 };
+
+/// The bytes of the value that arrived with the delta being read, where they stand in the
+/// value: `at` is the offset of their first byte and `text` the delta's own slice from there. A
+/// fragment that lies within them borrows the delta ([`Event::ToolCallArguments`]'s `json` and
+/// `source`), as a text event borrows it; one that reaches back into bytes an earlier delta
+/// carried, or that a reader holds past the delta, is copied.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Arrived<'d> {
+    pub(super) at: usize,
+    pub(super) text: &'d str,
+}
+
+impl<'d> Arrived<'d> {
+    /// The same bytes placed against a value that begins `start` bytes into the text they were
+    /// placed against: the part of them from the value's start on.
+    pub(super) fn from(self, start: usize) -> Self {
+        if self.at >= start {
+            Self {
+                at: self.at - start,
+                text: self.text,
+            }
+        } else {
+            let skip = (start - self.at).min(self.text.len());
+            Self {
+                at: 0,
+                text: &self.text[skip..],
+            }
+        }
+    }
+}
+
+impl<'d> Arrived<'d> {
+    /// `value[from..to]`, borrowed from the delta where the whole of it arrived with it, copied
+    /// where it did not.
+    pub(super) fn bytes(
+        value: &str,
+        from: usize,
+        to: usize,
+        arrived: Option<Self>,
+    ) -> Cow<'d, str> {
+        match arrived {
+            Some(Arrived { at, text }) if from >= at && to <= at + text.len() => {
+                Cow::Borrowed(&text[from - at..to - at])
+            }
+            _ => Cow::Owned(value[from..to].to_owned()),
+        }
+    }
+
+    /// `bytes`, a fragment that begins `from` bytes into the value, with the raw control
+    /// characters inside strings written as their escapes ([`Prefix::escaped`]); the borrow kept
+    /// where nothing is written.
+    pub(super) fn escaped(prefix: &Prefix, from: usize, bytes: &Cow<'d, str>) -> Cow<'d, str> {
+        match bytes {
+            Cow::Borrowed(text) => prefix.escaped(from, text),
+            Cow::Owned(text) => Cow::Owned(prefix.escaped(from, text).into_owned()),
+        }
+    }
+}
 
 /// The argument bytes of one value, accounted for as they arrive.
 #[derive(Clone, Debug, Default)]
@@ -61,12 +121,13 @@ impl Fragments {
     /// the bytes from there on are the caller's: to send as the model wrote them
     /// ([`Self::send_rest`]), or to hand back. Where the sent bytes end, the held ones excluded;
     /// `None` when every byte of `value` was accounted for already.
-    pub(super) fn send(
+    pub(super) fn send<'d>(
         &mut self,
         value: &str,
+        arrived: Option<Arrived<'d>>,
         open: bool,
         index: u32,
-        out: &mut Events,
+        out: &mut Events<'d>,
     ) -> Option<usize> {
         if value.len() <= self.emitted {
             return None;
@@ -89,11 +150,11 @@ impl Fragments {
             _ => valid_end,
         };
         if self.emitted < valid_end {
-            let fresh = &value[self.emitted..valid_end];
+            let fresh = Arrived::bytes(value, self.emitted, valid_end, arrived);
             out.push(Event::ToolCallArguments {
                 index,
-                json: self.prefix.escaped(self.emitted, fresh).into_owned(),
-                source: Text::uncounted(fresh.to_owned()),
+                json: Arrived::escaped(&self.prefix, self.emitted, &fresh),
+                source: Text::uncounted(fresh),
             });
             self.emitted = valid_end;
         }
@@ -108,13 +169,19 @@ impl Fragments {
 
     /// Past the break, the bytes of `value` not yet sent go as a fragment of the call at `index`,
     /// as the model wrote them; before any break nothing is said, since what is not sent is held.
-    pub(super) fn send_rest(&mut self, value: &str, index: u32, out: &mut Events) {
+    pub(super) fn send_rest<'d>(
+        &mut self,
+        value: &str,
+        arrived: Option<Arrived<'d>>,
+        index: u32,
+        out: &mut Events<'d>,
+    ) {
         if self.invalid_from.is_some() && self.emitted < value.len() {
-            let rest = &value[self.emitted..];
+            let rest = Arrived::bytes(value, self.emitted, value.len(), arrived);
             out.push(Event::ToolCallArguments {
                 index,
-                json: rest.to_string(),
-                source: Text::uncounted(rest.to_owned()),
+                json: rest.clone(),
+                source: Text::uncounted(rest),
             });
             self.emitted = value.len();
         }
@@ -122,13 +189,19 @@ impl Fragments {
 
     /// The bytes held back ([`Self::send`]), sent as the prefix they are when the value can take
     /// no more bytes: at its end, or the stream's.
-    pub(super) fn send_held(&mut self, value: &str, index: u32, out: &mut Events) {
+    pub(super) fn send_held<'d>(
+        &mut self,
+        value: &str,
+        arrived: Option<Arrived<'d>>,
+        index: u32,
+        out: &mut Events<'d>,
+    ) {
         if self.invalid_from.is_none() && self.emitted < value.len() {
-            let held = &value[self.emitted..];
+            let held = Arrived::bytes(value, self.emitted, value.len(), arrived);
             out.push(Event::ToolCallArguments {
                 index,
-                json: self.prefix.escaped(self.emitted, held).into_owned(),
-                source: Text::uncounted(held.to_owned()),
+                json: Arrived::escaped(&self.prefix, self.emitted, &held),
+                source: Text::uncounted(held),
             });
             self.emitted = value.len();
         }
@@ -155,13 +228,16 @@ mod tests {
         let mut fragments = Fragments::default();
         let mut out = Events::new();
         let value = r#"{"a": nu"#;
-        assert_eq!(fragments.send(value, true, 0, &mut out), Some(6));
+        assert_eq!(fragments.send(value, None, true, 0, &mut out), Some(6));
         assert_eq!(said(&out.drain()), ["fragment {\"a\": "]);
         // Nothing new: nothing said, the word still held.
-        assert_eq!(fragments.send(value, true, 0, &mut out), Some(6));
+        assert_eq!(fragments.send(value, None, true, 0, &mut out), Some(6));
         assert!(out.drain().is_empty());
         let value = r#"{"a": null}"#;
-        assert_eq!(fragments.send(value, false, 0, &mut out), Some(value.len()));
+        assert_eq!(
+            fragments.send(value, None, false, 0, &mut out),
+            Some(value.len())
+        );
         assert_eq!(said(&out.drain()), ["fragment null}"]);
         assert!(!fragments.refused());
     }
@@ -171,9 +247,9 @@ mod tests {
         let mut fragments = Fragments::default();
         let mut out = Events::new();
         let value = r#"{"a": 1} tail"#;
-        assert_eq!(fragments.send(value, true, 0, &mut out), Some(8));
+        assert_eq!(fragments.send(value, None, true, 0, &mut out), Some(8));
         assert!(fragments.refused());
-        fragments.send_rest(value, 0, &mut out);
+        fragments.send_rest(value, None, 0, &mut out);
         assert_eq!(
             said(&out.drain()),
             [
@@ -185,11 +261,11 @@ mod tests {
         // More bytes after the break: fragments as written, the break not said again, nothing
         // sent twice, and a broken value is never whole.
         let value = r#"{"a": 1} tail more"#;
-        assert_eq!(fragments.send(value, true, 0, &mut out), Some(8));
-        fragments.send_rest(value, 0, &mut out);
+        assert_eq!(fragments.send(value, None, true, 0, &mut out), Some(8));
+        fragments.send_rest(value, None, 0, &mut out);
         assert_eq!(said(&out.drain()), ["fragment  more"]);
         assert!(!fragments.whole());
-        fragments.send_held(value, 0, &mut out);
+        fragments.send_held(value, None, 0, &mut out);
         assert!(out.drain().is_empty(), "a broken value holds nothing");
     }
 
@@ -198,11 +274,11 @@ mod tests {
         let mut fragments = Fragments::default();
         let mut out = Events::new();
         let value = r#"{"a": tr"#;
-        assert_eq!(fragments.send(value, true, 0, &mut out), Some(6));
+        assert_eq!(fragments.send(value, None, true, 0, &mut out), Some(6));
         out.drain();
-        fragments.send_held(value, 0, &mut out);
+        fragments.send_held(value, None, 0, &mut out);
         assert_eq!(said(&out.drain()), ["fragment tr"]);
-        fragments.send_held(value, 0, &mut out);
+        fragments.send_held(value, None, 0, &mut out);
         assert!(out.drain().is_empty(), "sent once");
     }
 
@@ -211,7 +287,10 @@ mod tests {
         let mut fragments = Fragments::default();
         let mut out = Events::new();
         let value = "{\"a\": \"x\ny\"}";
-        assert_eq!(fragments.send(value, false, 0, &mut out), Some(value.len()));
+        assert_eq!(
+            fragments.send(value, None, false, 0, &mut out),
+            Some(value.len())
+        );
         assert_eq!(said(&out.drain()), ["fragment {\"a\": \"x\\ny\"}"]);
         assert!(fragments.whole() && !fragments.refused());
     }

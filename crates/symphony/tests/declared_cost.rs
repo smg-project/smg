@@ -3,13 +3,17 @@
 //! their schemas, and a parameter's schema is read in place. And a steady stream costs nothing per
 //! delta: a delta read as text whole allocates nothing, its event borrows it and the buffer is the
 //! stream's, and the engine's hold-back of a possible marker costs the delta after a held byte one
-//! copy, the held bytes joined to it. A separate executable, so it can declare the counting
-//! allocator the pins need.
+//! copy, the held bytes joined to it; inside a streamed call, a delta of the call's arguments the
+//! JSON syntax passes on whole allocates nothing of its own either, its fragment borrows the delta
+//! (the assembler's own copy of the call's bytes still grows by doubling as the value lengthens,
+//! the one cost that remains, outside the pin). A separate executable, so it can declare the
+//! counting allocator the pins need.
 
 #![expect(unsafe_code, reason = "a global allocator that counts allocations")]
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
+    borrow::Cow,
     cell::Cell,
     hint::black_box,
     sync::Arc,
@@ -17,7 +21,7 @@ use std::{
 
 use openai_protocol::common::{Function, Tool};
 use serde_json::json;
-use symphony::{formats::Table, Declared, Engine, EngineFinish, Events, Input, Parser};
+use symphony::{formats::Table, Declared, Engine, EngineFinish, Event, Events, Input, Parser};
 
 struct Counting;
 
@@ -198,4 +202,94 @@ fn a_delta_read_as_text_allocates_nothing_and_one_after_a_held_byte_one_copy() {
         )
         .expect("end");
     black_box(out.drain());
+}
+
+#[test]
+fn a_delta_of_a_calls_arguments_read_whole_allocates_nothing() {
+    let mut engine = Engine::new(Table::Qwen3.format(), Declared::shared(tools()));
+    let mut out = Events::new();
+    engine
+        .feed(
+            Input::Prompt {
+                token_ids: &[],
+                text: "<|im_start|>assistant\n",
+            },
+            &mut out,
+        )
+        .expect("prompt");
+    black_box(out.drain());
+    // The call's opener and name: the start's events own the id, the name and the bytes before
+    // the arguments; the event list, the scanner's buffers, the object's outline and the judge's
+    // own buffers take their capacity as the first members, the first container and the first
+    // number arrive.
+    for text in [
+        "Let me look that up.\n",
+        "<tool_call>\n",
+        "{\"name\": \"lookup_0\", ",
+        "\"arguments\": {\"key\": ",
+        "\"k7-1\", \"fields\": [\"a\", \"b\", \"c\"], ",
+        "\"limit\": 10, \"note\": \"the ",
+    ] {
+        allocations_for_delta(&mut engine, &mut out, text);
+    }
+    // The assembler keeps its own copy of the call's bytes in a buffer that grows by doubling, so
+    // a long run of the string value sets that buffer's length and the short delta after it is
+    // where the doubling lands: the measured deltas below stay a few hundred bytes within the room
+    // that leaves, and the pin reads the fragments' cost, not the buffer's growth (which is what
+    // remains of an arguments delta's cost, outside the pin).
+    let long_run = "x".repeat(512);
+    allocations_for_delta(&mut engine, &mut out, &long_run);
+    allocations_for_delta(&mut engine, &mut out, "record ");
+    // Deltas inside a string value, each a fragment the JSON syntax passes on as the model wrote
+    // it: the fragment is a slice of the delta, as a content delta's event is, json and source
+    // alike. Each delta is fed twice: the first feed is where the fragment's borrow is read, the
+    // second, of the same bytes, where the count is read.
+    for text in ["record is ", "open and ", "current, as ", "it always was"] {
+        let mut events = std::mem::take(&mut out);
+        engine
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text,
+                    spans: &[],
+                },
+                &mut events,
+            )
+            .expect("the delta is taken");
+        assert!(
+            matches!(
+                events.as_slice(),
+                [Event::ToolCallArguments { json: Cow::Borrowed(json), source, .. }]
+                    if *json == text && matches!(source.text, Cow::Borrowed(bytes) if bytes == text)
+            ),
+            "the arguments delta {text:?} gave {:?}: one fragment, borrowed whole",
+            events.as_slice()
+        );
+        out = events.recycle();
+        let again = allocations_for_delta(&mut engine, &mut out, text);
+        assert_eq!(
+            again, 0,
+            "the arguments delta {text:?} allocated {again} times: its fragment borrows the delta \
+             and the buffer is the stream's"
+        );
+    }
+    for text in ["\", \"filter\": {\"status\": \"open\"}}\n", "</tool_call>"] {
+        allocations_for_delta(&mut engine, &mut out, text);
+    }
+    engine
+        .feed(
+            Input::End {
+                finish: EngineFinish::Stop,
+            },
+            &mut out,
+        )
+        .expect("end");
+    assert!(
+        matches!(
+            out.as_slice().last(),
+            Some(Event::Finish { tool_calls: 1, .. })
+        ),
+        "the output ends with its one call counted: {:?}",
+        out.as_slice()
+    );
 }

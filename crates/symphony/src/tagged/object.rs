@@ -64,7 +64,7 @@ impl Object {
     pub(super) fn push_fragment<'d>(&self, json: String, source: Text<'d>, out: &mut Events<'d>) {
         out.push(Event::ToolCallArguments {
             index: self.index,
-            json,
+            json: json.into(),
             source,
         });
     }
@@ -173,7 +173,7 @@ mod tests {
             .iter()
             .map(|event| match event {
                 Event::ToolCallArguments { json, source, .. } => {
-                    (json.clone(), source.text.to_string())
+                    (json.to_string(), source.text.to_string())
                 }
                 Event::Dropped { text, .. } => ("dropped".to_string(), text.text.to_string()),
                 Event::Malformed { text, .. } => ("malformed".to_string(), text.text.to_string()),
