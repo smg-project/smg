@@ -5,7 +5,7 @@
   "consumer_gpu_ready": false,
   "runtime_cohort_accepted": false,
   "admitted_lane": "tokenspeed-pd2-original-qwen-sglang-reference",
-  "target_product_commit": "52d8cbc5fe506dbbc647f9e3c16fdd48e7a5b2be",
+  "target_product_commit": "0bd73870ae7c7aeb09c5b55fc411f3f958627981",
   "artifacts": [
     {
       "name": "smg-wheel",
@@ -92,7 +92,7 @@
     "model_gateway": "c9b0a8e790c4f71a760c41fd4e311f546db6bf48",
     "grpc_servicer": "7e23f8999c36292d7b0c8bfd11b29843352da2b0",
     "e2e_test": "1ae5671e9e6a9805a601be178ccf6aa8a7e07f09",
-    "scripts": "2aaa0d62644a24b1580a7ef46ee6fd00499ff57b",
+    "scripts": "86a166d16386d9f61113a77ec753e55de8bf6786",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows/e2e-gpu-job.yml": "8195892b41d072029a2c9bd100aa0e02f0d2d8a5",
     "README.md": "83b7df25632da03f0184bd5b4628b9c9a3ace803",
@@ -256,7 +256,7 @@
     "run_binding": null,
     "watch_PID_or_session": null
   },
-  "pending_note": "Default-off source only: existing TS product52d8/source19 and compiled37/producer14/b7 unchanged. Preserve original d5 run40218847194/job121246077837 successful17 build-leg provenance with cancelled parent; separately verify exact renewed-copy run40370788390/job121740660621/f4, four current ZIPs plus immutable origin proof. Historical copy-proof Qwen consumer19 is an exact fixed role, not current TS19; source.verify independently checks TS HEAD/target19. CPU consumed-budget4 and prior controls prove data semantics only, not installed preparation/OOM repair. No current full15 result, new4500 grant, publication, POST, watch or runtime acceptance. Root must obtain actual child/source/resource peers, correctly bound two-job observer, complete fresh queue/physical/model/source/current-five-copy TTL, and separately admit finite4500/q900/overall6300; original75/50,14Qwen3.5+1Llama,1P1D/.8/context/reruns2/floor10/oracles unchanged.",
+  "pending_note": "Default-off source: current TS source19 includes shared-lock preservation and binds this consumer's actual product commit; compiled37/producer14/b7 and historical artifact-origin roles are unchanged. Preserve original d5 run40218847194/job121246077837 successful17 build-leg provenance with cancelled parent; separately verify exact renewed-copy run40370788390/job121740660621/f4, four current ZIPs plus immutable origin proof. Historical copy-proof Qwen consumer19 is an exact fixed role, not current TS19; source.verify independently checks TS HEAD/target19. CPU consumed-budget4 and prior controls prove data semantics only, not installed preparation/OOM repair. This lock-preservation child has no current full15 result, new4500 grant, POST, watch or runtime acceptance. Root must obtain actual child/source/resource peers, correctly bound two-job observer, complete fresh queue/physical/model/source/current-five-copy TTL, and separately admit finite4500/q900/overall6300; original75/50,14Qwen3.5+1Llama,1P1D/.8/context/reruns2/floor10/oracles unchanged.",
   "binding_preparation_evidence": {
     "producer_build_archive_integrity_sha256": "fa8e1be5899a9f5d74ade0f6de9cfa10eb5065a404f597c2ee95d55cfa03cb6f",
     "producer_policy_source_review_sha256": "707a143df969433664b923c54e9cc44ad511dba00bdde978c4b40b02d94901fb",
