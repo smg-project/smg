@@ -14,6 +14,8 @@ pub(crate) mod reading;
 pub(crate) mod rendered_prompt;
 pub(crate) mod request_building;
 pub(crate) mod response_processing;
+#[cfg(test)]
+pub(crate) mod testing;
 pub(crate) mod transcription;
 
 // Re-export chat+generate dispatcher stages

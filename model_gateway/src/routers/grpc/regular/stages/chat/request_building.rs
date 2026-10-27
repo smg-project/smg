@@ -314,3 +314,58 @@ impl ChatRequestBuildingStage {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use openai_protocol::chat::ChatCompletionRequest;
+    use serde_json::json;
+
+    use super::*;
+    use crate::routers::grpc::{
+        context::ClientSelection,
+        regular::stages::testing::{
+            assert_fixed_request_plan, components, mock_backend_client, FORCED_CALL_TAG,
+        },
+    };
+
+    const MODEL: &str = "test-model";
+
+    /// The builder's sequence on the fixed request of
+    /// [`assert_fixed_request_plan`], asked as a chat request with no worker
+    /// selected: the plan and the stamp read as pinned there, with the id
+    /// under the chat prefix, and the prompt leaves no thought open.
+    #[tokio::test]
+    async fn a_fixed_chat_request_builds_the_pinned_plan_and_stamp() {
+        let (client, engine) = mock_backend_client(MODEL).await;
+        let chat: Arc<ChatCompletionRequest> = Arc::new(
+            serde_json::from_value(json!({
+                "model": MODEL, "temperature": 0.5, "max_tokens": 7,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .expect("a chat request"),
+        );
+        let mut ctx =
+            RequestContext::for_chat(Arc::clone(&chat), None, MODEL.to_string(), components());
+        ctx.state.clients = Some(ClientSelection::Single { client });
+        let (plan, stamp, reasoning_in_prefill) = build_chat_backed_plan(
+            &mut ctx,
+            &chat,
+            "<prompt>".to_string(),
+            true,
+            false,
+            vec![1, 2, 3],
+            Some(("structural_tag".to_string(), FORCED_CALL_TAG.to_string())),
+            None,
+            false,
+            "chatcmpl-",
+            false,
+            ExecutionPlanKind::Single,
+        )
+        .await
+        .map_err(|refusal| refusal.status())
+        .expect("built");
+        engine.abort();
+        assert!(!reasoning_in_prefill);
+        assert_fixed_request_plan(&plan, &stamp, "chatcmpl-");
+    }
+}
