@@ -22,6 +22,7 @@ else
 endif
 
 .PHONY: help build test clean docs check fmt opencv-deps dev-setup pre-commit setup-sccache sccache-stats sccache-clean sccache-stop \
+        perf-build perf-base perf-bed perf-cpu perf-alloc perf-mem perf-live perf-report \
         python-dev python-build python-build-release python-install python-clean python-test python-check \
         generate-openapi generate-python-types generate-java-types generate-clients \
         show-version bump-version check-versions \
@@ -261,3 +262,58 @@ release-publish-plan: ## The publishing steps for vVERSION: the workflow dispatc
 
 release-check: ## The release gate for vVERSION: what the repository can read (versions at the branch head, its CI, the tag, main's drift) and the lines the release owner fills (the four model-provider verifiers) (usage: make release-check VERSION=1.14.0-rc.1)
 	@$(RELEASE_TOOL) check "$(VERSION)"
+
+# Gateway perf bed (scripts/bench/gateway_perf): the gateway's cost per request on a CPU
+# mock bed, base against head. PERF_OUT is the run root (one stamp per make invocation;
+# each target writes under it: PERF_OUT/perf-cpu, PERF_OUT/perf-alloc, ...); the cell
+# targets (perf-cpu, perf-alloc, perf-mem) take PERF_PATHS, PERF_REQUESTS, PERF_REPEATS and
+# PERF_GATES; PERF_ARGS holds extra driver flags valid for the target's mode (the cell
+# targets take the cell flags such as "--rate-scale 0.5", perf-bed and perf-live the bed
+# flags only, such as "--gw-cores 0-7"); TOKENIZER selects a tokenizer directory (default:
+# a synthetic one).
+PERF := python3 scripts/bench/gateway_perf/gateway_perf.py
+ifeq ($(origin PERF_OUT),undefined)
+PERF_OUT := target/gateway-perf/$(shell date -u +%Y%m%dT%H%M%SZ)
+endif
+PERF_HEAD ?= target/gateway-perf/head/smg
+PERF_BASE ?= target/gateway-perf/base/smg
+PERF_BASE_REV ?= origin/main
+PERF_BASE_TARGET ?= target/gateway-perf/base-target
+PERF_PATHS ?= chat,stream,tools,json,messages
+PERF_REQUESTS ?= 10000
+PERF_REPEATS ?= 3
+PERF_MEM_PATHS ?= stream
+PERF_MEM_REQUESTS ?= 5000
+PERF_ARGS ?=
+PERF_GATES ?=
+PERF_COMMON = --head $(PERF_HEAD) --out $(PERF_OUT)/$@ $(PERF_ARGS)
+PERF_GATE_FLAG = $(if $(PERF_GATES),--gates $(PERF_GATES),)
+PERF_CELLS = --base $(PERF_BASE) --paths $(PERF_PATHS) --requests $(PERF_REQUESTS) --repeats $(PERF_REPEATS) $(PERF_GATE_FLAG)
+
+perf-build: ## Release binaries of the perf bed: the gateway alone (one cargo line, the same as perf-base), then the mock engine and the load client; copies under target/gateway-perf/head
+	@cargo build --release -p smg --bin smg
+	@mkdir -p target/gateway-perf/head && cp target/release/smg target/gateway-perf/head/smg
+	@cargo build --release -p mock-worker --bin mock-worker --bin stress_load
+	@git rev-parse HEAD > target/gateway-perf/head/commit 2>/dev/null || true
+
+perf-base: ## The base revision's gateway for an A/B (usage: make perf-base [PERF_BASE_REV=origin/main]); its own target directory, so a full release build
+	@bash scripts/bench/gateway_perf/build_base.sh $(PERF_BASE_REV) $(PERF_BASE) $(PERF_BASE_TARGET)
+
+perf-bed: perf-build ## Bring the bed up (the gateway + mock engines), one request per path with the answer shown and the script counts, bed down
+	@$(PERF) bed smoke $(PERF_COMMON) --paths $(PERF_PATHS)
+
+perf-cpu: perf-build ## Instructions, cycles and CPU time per request, base vs head, interleaved repeats (needs perf-base)
+	@$(PERF) cpu $(PERF_COMMON) $(PERF_CELLS)
+
+perf-alloc: perf-build ## Allocation calls and KiB requested per request (jemalloc exit statistics), base vs head (needs perf-base)
+	@$(PERF) alloc $(PERF_COMMON) $(PERF_CELLS)
+
+perf-mem: perf-build ## RSS over windows on one gateway, growth per 10k requests, the peak after a burst, base vs head (needs perf-base; PERF_MEM_PATHS, default stream)
+	@$(PERF) mem $(PERF_COMMON) --base $(PERF_BASE) --paths $(PERF_MEM_PATHS) --requests $(PERF_MEM_REQUESTS) $(PERF_GATE_FLAG)
+
+perf-live: perf-build ## An open-loop ramp with the capacity rule (the head; the base too when its binary exists)
+	@$(PERF) live $(PERF_COMMON) $(if $(wildcard $(PERF_BASE)),--base $(PERF_BASE),)
+
+perf-report: ## The Numbers table and the gate verdicts of a run (usage: make perf-report PERF_OUT=target/gateway-perf/<stamp>/perf-cpu [PERF_GATES=<toml>])
+	@case "$(origin PERF_OUT)" in command\ line|environment) ;; *) echo "perf-report: name the run: make perf-report PERF_OUT=target/gateway-perf/<stamp>/perf-cpu" >&2; exit 2 ;; esac
+	@$(PERF) report --out $(PERF_OUT) $(PERF_GATE_FLAG)
