@@ -31,6 +31,7 @@ mod calls;
 mod gemma;
 mod json;
 mod keyed;
+mod older;
 mod output;
 mod pythonic;
 mod schema;
@@ -228,13 +229,14 @@ impl Grammar {
     }
 
     /// Whether the grammar may match text of any length, as the engines' parsers count it: free
-    /// text, a repetition, tags with free text between or around them; a sequence or a choice
-    /// with such an element; not a JSON value, a regular expression or an EBNF grammar, which
-    /// the parsers take as bounded whatever they accept.
+    /// text without excluded strings (with them, the parsers take it as held by them), a
+    /// repetition, tags with free text between or around them; a sequence or a choice with such
+    /// an element; not a JSON value, a regular expression or an EBNF grammar, which the parsers
+    /// take as bounded whatever they accept.
     fn unbounded(&self) -> bool {
         match self {
-            Self::AnyText { .. }
-            | Self::Star(_)
+            Self::AnyText { excludes } => excludes.is_empty(),
+            Self::Star(_)
             | Self::Plus(_)
             | Self::TriggeredTags { .. }
             | Self::TagsWithSeparator { .. } => true,
