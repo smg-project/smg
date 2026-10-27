@@ -300,7 +300,7 @@ mod tests {
     use crate::{
         routers::{grpc::backend_client::BackendClient, http::set_request_model},
         worker::{
-            circuit_breaker::CircuitState, worker::WorkerMetadata, BasicWorker, BasicWorkerBuilder,
+            basic::WorkerMetadata, circuit_breaker::CircuitState, BasicWorker, BasicWorkerBuilder,
             ResolvedResilience, WorkerResult, WorkerType,
         },
     };
