@@ -429,12 +429,11 @@ impl HarmonyBuilder {
         let mut user_messages = self.convert_chat_messages(&request.messages);
         all_messages.append(&mut user_messages);
 
-        let conversation = Conversation::from_messages(all_messages.clone());
+        let selection_text = self.extract_selection_text(&all_messages);
+        let conversation = Conversation::from_messages(all_messages);
         let token_ids = encoding
             .render_conversation_for_completion(&conversation, Role::Assistant, None)
             .map_err(|e| format!("Failed to encode Harmony conversation: {e}"))?;
-
-        let selection_text = self.extract_selection_text(&all_messages);
 
         // Get stop tokens for Harmony assistant actions (<|return|> and <|call|>)
         let stop_token_ids: Vec<u32> = encoding
@@ -466,12 +465,11 @@ impl HarmonyBuilder {
         let encoding = try_harmony_encoding()?;
         let all_messages = self.construct_input_messages_with_harmony(request)?;
 
-        let conversation = Conversation::from_messages(all_messages.clone());
+        let selection_text = self.extract_selection_text(&all_messages);
+        let conversation = Conversation::from_messages(all_messages);
         let token_ids = encoding
             .render_conversation_for_completion(&conversation, Role::Assistant, None)
             .map_err(|e| format!("Failed to encode Harmony conversation: {e}"))?;
-
-        let selection_text = self.extract_selection_text(&all_messages);
 
         // Get stop tokens for Harmony assistant actions (<|return|> and <|call|>)
         let stop_token_ids: Vec<u32> = encoding
