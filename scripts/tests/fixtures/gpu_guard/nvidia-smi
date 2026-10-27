@@ -6,8 +6,9 @@
 #   free_after   epoch seconds after which every card reads idle
 #   visible_pid  a pid of this pid namespace: in the process table and the
 #                compute-app list while it lives; the cards read idle once it is gone
-#   host_pids    "<index> <pid> <name> <MiB>" per compute app of another pid
-#                namespace: in the compute-app list, never in the process table
+#   other_pids   "<index> <pid> <name> <MiB>" per compute app the driver lists that
+#                this pid namespace does not know: in the compute-app list, never
+#                in the process table
 #   fail_queries present: every --query-* call fails
 # Every call's arguments are appended to $FAKE_SMI_STATE/calls.
 state=${FAKE_SMI_STATE:?}
@@ -59,10 +60,10 @@ case "$1" in
                     if [ -f "$state/visible_pid" ]; then
                         echo "$(uuid_of 0), $(cat "$state/visible_pid"), /usr/bin/python3, $(used_of 0)"
                     fi
-                    if [ -f "$state/host_pids" ]; then
+                    if [ -f "$state/other_pids" ]; then
                         while read -r idx pid name mib; do
                             echo "$(uuid_of "$idx"), $pid, $name, $mib"
-                        done < "$state/host_pids"
+                        done < "$state/other_pids"
                     fi
                 fi ;;
             *) echo "fake nvidia-smi: unsupported query: $*" >&2; exit 2 ;;

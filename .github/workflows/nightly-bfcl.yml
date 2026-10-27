@@ -532,7 +532,8 @@ jobs:
           # always() Teardown step is a leg-scoped backstop for when this trap can't run.
           cleanup() {
             bash scripts/bfcl/launch_arm.sh stop 9>&- || true
-            bash scripts/ci_killall_sglang.sh "${NUKE[@]}" 9>&- || true
+            # the verdict is discarded here: one reading, no wait for a draining card
+            CI_GPU_GUARD_WAIT_SECS=0 bash scripts/ci_killall_sglang.sh "${NUKE[@]}" 9>&- || true
           }
           trap cleanup EXIT
           trap 'cleanup; exit 143' INT TERM

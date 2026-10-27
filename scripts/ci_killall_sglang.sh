@@ -85,12 +85,14 @@ else
     }
 
     # Who holds the cards, from every view this container has; sets GPU_HOLDERS
-    # to a short summary for the verdict line. The driver's compute-app list
-    # carries host pids: one absent from this /proc runs in another pid
-    # namespace (a previous job's pod on its way out, or another container),
-    # which is also why the process table above reads "No running processes
-    # found" beside a full card. The processes of this container holding a
-    # device file are named with the job marker they carry, and the container
+    # to a short summary for the verdict line. The driver's compute-app list is
+    # the list behind the process table above, its pids translated into this
+    # container's pid namespace and the ones it cannot translate dropped: from
+    # inside a pod it is usually empty beside a full card (which is why the
+    # table reads "No running processes found"), and the fallback text then
+    # names the holder; a pid it does list that this /proc lacks runs in
+    # another pid namespace. The processes of this container holding a device
+    # file are named with the job marker they carry, and the container
     # runtime's view is added when a docker daemon is reachable.
     gpu_holders() {
         local root map apps idx pid name mem view containers
@@ -110,7 +112,7 @@ else
             else
                 view="not in this job's pid namespace"
             fi
-            echo "gpu guard: GPU $idx: host pid $pid ($name) holds $mem MiB; $view"
+            echo "gpu guard: GPU $idx: pid $pid ($name) holds $mem MiB; $view"
         done <<< "$(echo "$apps" | awk -F', ' -v map="$map" '
             BEGIN { n = split(map, rows, "\n"); for (i = 1; i <= n; i++) { split(rows[i], f, ", "); index_of[f[2]] = f[1] } }
             NF >= 4 { print (($1 in index_of) ? index_of[$1] : "?") "\t" $2 "\t" $3 "\t" $4 }')"

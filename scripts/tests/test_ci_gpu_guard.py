@@ -48,10 +48,10 @@ class Guard:
     def visible(self, pid: int) -> None:
         (self.state / "visible_pid").write_text(str(pid))
 
-    def host_app(
+    def listed_app(
         self, card: int, pid: int, name: str = "/usr/bin/python3", mib: int = 80327
     ) -> None:
-        with (self.state / "host_pids").open("a") as f:
+        with (self.state / "other_pids").open("a") as f:
             f.write(f"{card} {pid} {name} {mib}\n")
 
     def container(self, line: str) -> None:
@@ -115,19 +115,18 @@ def test_free_cards_pass_on_the_first_reading(guard: Guard) -> None:
 
 def test_full_cards_with_no_visible_process_pass_once_the_memory_drains(guard: Guard) -> None:
     guard.busy()
-    guard.host_app(0, 4242)
+    guard.listed_app(0, 4242)
     guard.free_after(5)
     result = guard.run(wait=30)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "No running processes found" in result.stdout
-    assert READING.findall(result.stdout)[0] == (
-        "0",
-        "GPU 0: 80327 MiB used; GPU 1: 80327 MiB used",
-    )
+    # the reading's text; its second is bash's SECONDS, whole seconds from the
+    # second the loop started in, so it may read 0 or 1
+    assert READING.findall(result.stdout)[0][1] == "GPU 0: 80327 MiB used; GPU 1: 80327 MiB used"
     # the holders, once, at the first dirty reading
     assert result.stdout.count(REPORT_HEADER) == 1
     assert (
-        "gpu guard: GPU 0: host pid 4242 (/usr/bin/python3) holds 80327 MiB; "
+        "gpu guard: GPU 0: pid 4242 (/usr/bin/python3) holds 80327 MiB; "
         "not in this job's pid namespace" in result.stdout
     )
     assert re.search(r"^gpu guard: every GPU clean after [1-9]\d*s$", result.stdout, re.M)
@@ -139,14 +138,16 @@ def test_full_cards_that_never_drain_fail_after_the_window_naming_an_outside_hol
     guard: Guard,
 ) -> None:
     guard.busy()
-    guard.host_app(0, 4242)
-    guard.host_app(1, 4243)
+    guard.listed_app(0, 4242)
+    guard.listed_app(1, 4243)
     guard.container("0123abcd bench:latest bench-1 up 3 hours")
     result = guard.run(wait=4)
     assert result.returncode == 1
     assert 4 <= result.elapsed < 20
     seconds = [int(at) for at, _ in READING.findall(result.stdout)]
-    assert seconds[0] == 0 and seconds[-1] >= 4 and len(seconds) >= 5
+    # what the window guarantees: a reading at or past 4 s and one per second,
+    # less the one SECONDS skips when the loop's own time crosses a boundary
+    assert seconds[-1] >= 4 and len(seconds) >= 4
     (error,) = error_lines(result.stdout)
     assert error.startswith(f"::error::GPU not clean on node '{NODE}' after ")
     assert error.endswith(
@@ -156,7 +157,7 @@ def test_full_cards_that_never_drain_fail_after_the_window_naming_an_outside_hol
     lines = result.stdout.splitlines()
     assert lines[lines.index(error) + 1 :] == ["GPU 0: 80327 MiB used", "GPU 1: 80327 MiB used"]
     assert (
-        "gpu guard: GPU 1: host pid 4243 (/usr/bin/python3) holds 80327 MiB; "
+        "gpu guard: GPU 1: pid 4243 (/usr/bin/python3) holds 80327 MiB; "
         "not in this job's pid namespace" in result.stdout
     )
     assert (
@@ -188,11 +189,11 @@ def test_a_holder_in_this_job_view_is_named_with_the_job_that_started_it(guard: 
     guard.busy(cards=(0,))
     guard.process(777, "python -m engine.server --port 1", marker=OLD_JOB, device="/dev/nvidia0")
     guard.process(778, "bash run.sh", marker=THIS_JOB, device=None)
-    guard.host_app(0, 777, name="python")
+    guard.listed_app(0, 777, name="python")
     result = guard.run(wait=1)
     assert result.returncode == 1
     assert (
-        "gpu guard: GPU 0: host pid 777 (python) holds 80327 MiB; in this job's view: "
+        "gpu guard: GPU 0: pid 777 (python) holds 80327 MiB; in this job's view: "
         f"python -m engine.server --port 1 E2E_JOB_MARKER={OLD_JOB}" in result.stdout
     )
     assert (
@@ -212,7 +213,9 @@ def test_a_zero_window_keeps_the_single_reading(guard: Guard) -> None:
     assert len(READING.findall(result.stdout)) == 1
     assert result.stdout.count(REPORT_HEADER) == 1
     (error,) = error_lines(result.stdout)
-    assert error.startswith(f"::error::GPU not clean on node '{NODE}' after 0s, held by ")
+    assert re.match(
+        rf"::error::GPU not clean on node '{re.escape(NODE)}' after \d+s, held by ", error
+    )
     assert result.elapsed < 10
 
 
