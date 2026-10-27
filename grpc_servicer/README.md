@@ -708,8 +708,9 @@ beside the engine predates the `optional`, `plus`, `star` and `token` nodes
 (0.1.33 is the first release with them) under `xgrammar` or `auto`, read off
 the distribution's metadata at start-up without importing it; absent for a
 current xgrammar or another backend. A router spells such a worker's structural
-tags without those nodes, the same language, instead of a compile-time refusal
-per request.
+tags without `optional`, `plus` and `star`, the same language, instead of a
+compile-time refusal per request; a `token` node stays as derived, so a table
+that writes single-token markers still meets the older compiler's refusal.
 
 #### CUDA-graph capture cap
 
@@ -1002,7 +1003,8 @@ The Rust servicer's launcher also writes the `structural_tag_vocabulary` key
 (`older`) when the xgrammar installed beside the engine predates the
 `optional`, `plus`, `star` and `token` structural-tag nodes (0.1.33 is the
 first release with them), under `xgrammar` or a backend not yet resolved; a
-router spells such a worker's structural tags without those nodes.
+router spells such a worker's structural tags without `optional`, `plus` and
+`star` (a `token` node stays as derived).
 
 Both TokenSpeed servicers also report the engine's constrained-decoding policy,
 when it declares one, as `GetServerInfo.constrained_decoding` (a field of its
@@ -1117,7 +1119,8 @@ The Rust servicer's launcher also writes the `structural_tag_vocabulary` key
 (`older`) when the xgrammar installed beside the engine predates the
 `optional`, `plus`, `star` and `token` structural-tag nodes (0.1.33 is the
 first release with them), under `xgrammar` or an unresolved backend; a router
-spells such a worker's structural tags without those nodes.
+spells such a worker's structural tags without `optional`, `plus` and `star` (a
+`token` node stays as derived).
 
 #### KV-event recovery
 
@@ -1454,8 +1457,8 @@ label): `older` when the xgrammar installed beside the engine predates the
 `optional`, `plus`, `star` and `token` nodes (0.1.33 is the first release with
 them) under `guided_decoding_backend: xgrammar`, read off the distribution's
 metadata at start-up; absent otherwise. A router spells such a worker's
-structural tags without those nodes. The engine's own servicer does not report
-the field.
+structural tags without `optional`, `plus` and `star` (a `token` node stays as
+derived). The engine's own servicer does not report the field.
 
 ## Architecture
 

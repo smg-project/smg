@@ -526,7 +526,9 @@ message GetServerInfoResponse {
   // first release with them) and refuses a tag that carries one at compile
   // time; "" for a current one, another backend, or a servicer that does not
   // say. Flattened into the `structural_tag_vocabulary` worker label, by
-  // which the router spells such a worker's structural tags without those
-  // nodes, the same language.
+  // which the router spells such a worker's structural tags without
+  // `optional`, `plus` and `star`, the same language; a `token` node stays as
+  // derived, so a table that writes single-token markers still meets the
+  // older compiler's refusal.
   string structural_tag_vocabulary = 7;
 }

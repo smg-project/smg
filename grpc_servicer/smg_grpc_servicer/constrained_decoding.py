@@ -19,8 +19,10 @@ The ``structural_tag_vocabulary`` key beside them: ``older`` when the xgrammar
 installed beside the engine predates the ``optional``, ``plus``, ``star`` and
 ``token`` structural-tag nodes (0.1.33 is the first release with them) and so
 refuses a tag that carries one at compile time; the Router spells such a
-worker's structural tags without them, the same language. Read off the
-distribution's metadata once, at start-up, never by importing xgrammar.
+worker's structural tags without ``optional``, ``plus`` and ``star``, the same
+language (a ``token`` node stays as derived, so a table that writes single-token
+markers still meets the older compiler's refusal). Read off the distribution's
+metadata once, at start-up, never by importing xgrammar.
 
 Engine-free at import: the readers take the parsed server arguments. The vLLM
 servicers read the same facts off their engine's structured-outputs config
@@ -60,8 +62,9 @@ SGLANG_DEFAULT_GRAMMAR_BACKEND = "xgrammar"
 # (vLLM, TensorRT-LLM) naming the vocabulary of structural-tag nodes the
 # engine's grammar compiler takes, and its one value: `older` for an xgrammar
 # that predates the `optional`, `plus`, `star` and `token` nodes and refuses a
-# tag that carries one. Absent for a current xgrammar, so the Router sends the
-# tags as its tables build them.
+# tag that carries one (the Router's older spelling leaves out `optional`,
+# `plus` and `star`; a `token` node stays as derived). Absent for a current
+# xgrammar, so the Router sends the tags as its tables build them.
 STRUCTURAL_TAG_VOCABULARY_KEY = "structural_tag_vocabulary"
 STRUCTURAL_TAG_VOCABULARY_OLDER = "older"
 # The first xgrammar release whose structural tags take every node the Router

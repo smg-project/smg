@@ -985,8 +985,9 @@ const SGLANG_GRPC_KEYS: &[&str] = &[
     // The vocabulary of structural-tag nodes the engine's grammar compiler
     // takes (`older` for an xgrammar that predates the `optional`, `plus`,
     // `star` and `token` nodes), which the servicer reads off the installed
-    // xgrammar: the label by which a worker's structural tags are spelled in
-    // the vocabulary its compiler takes.
+    // xgrammar: the label by which a worker's structural tags are spelled
+    // without `optional`, `plus` and `star` (`TagVocabulary::Older`; a `token`
+    // node stays as derived).
     "structural_tag_vocabulary",
     // A servicer's own vision verdict. `GetModelInfo.supports_vision` is a
     // proto3 bool, so a `false` there cannot be told from a field the servicer
@@ -1040,8 +1041,9 @@ const TOKENSPEED_GRPC_KEYS: &[&str] = &[
     // The vocabulary of structural-tag nodes the engine's grammar compiler
     // takes (`older` for an xgrammar that predates the `optional`, `plus`,
     // `star` and `token` nodes), which the servicer reads off the installed
-    // xgrammar: the label by which a worker's structural tags are spelled in
-    // the vocabulary its compiler takes.
+    // xgrammar: the label by which a worker's structural tags are spelled
+    // without `optional`, `plus` and `star` (`TagVocabulary::Older`; a `token`
+    // node stays as derived).
     "structural_tag_vocabulary",
     // RL control plane (crates/rl): where the engine's SGLang-compatible
     // control app listens and what it implements. The engine advertises
