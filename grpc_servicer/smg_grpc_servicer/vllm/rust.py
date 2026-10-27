@@ -49,6 +49,8 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
+from smg_grpc_servicer.constrained_decoding import structural_tag_vocabulary
+
 # The lifecycle's defaults and the switch's choices, re-exported: this
 # launcher's own documented values.
 from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
@@ -131,6 +133,7 @@ def model_info_from_config(
     # KV-event publishing, as the Python servicer resolves it: only vLLM's ZMQ
     # publisher can be relayed; anything else leaves SubscribeKvEvents off.
     events = view.kv_events
+    structured_outputs_backend = str(view.structured_outputs.backend or "auto")
     return {
         **facts,
         # The Rust servicer stops on the full set vLLM's frontend assembles
@@ -142,7 +145,7 @@ def model_info_from_config(
         "attention_backend": str(facts.get("attention_backend", "")),
         "model_dtype": str(facts.get("model_dtype", "")),
         "block_size": int(facts.get("block_size", 0) or 0),
-        "structured_outputs_backend": str(view.structured_outputs.backend or "auto"),
+        "structured_outputs_backend": structured_outputs_backend,
         "kv_events_endpoint": events.endpoint if events.relayed else "",
         "kv_events_replay_endpoint": events.replay_endpoint if events.relayed else "",
         "kv_events_topic": events.topic if events.relayed else "",
@@ -158,6 +161,10 @@ def model_info_from_config(
         ),
         "engine_reasoning_parser": engine_reasoning_parser(vllm_config),
         "constrained_decoding_start": constrained_decoding_start(vllm_config),
+        # The vocabulary of structural-tag nodes that backend takes, when the
+        # xgrammar installed beside the engine predates the current one: the
+        # Router spells such a worker's structural tags in the older vocabulary.
+        "structural_tag_vocabulary": structural_tag_vocabulary(structured_outputs_backend),
         # Whether a Mooncake connector runs in the engine at all, off the raw
         # `kv_transfer_config` (the top-level connector or any child a wrapper
         # lists): the servicer withholds a PD decode side's KV-transfer rejection

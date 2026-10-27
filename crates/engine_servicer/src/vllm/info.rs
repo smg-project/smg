@@ -169,6 +169,7 @@ fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
         max_num_seqs: state.shared.running_window(model.max_num_seqs),
         engine_reasoning_parser: model.engine_reasoning_parser.clone(),
         constrained_decoding_start: model.constrained_decoding_start.clone(),
+        structural_tag_vocabulary: model.structural_tag_vocabulary.clone(),
         ..Default::default()
     }
 }

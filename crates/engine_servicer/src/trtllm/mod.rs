@@ -78,6 +78,13 @@ pub struct TrtllmModelInfo {
     /// (`xgrammar`, `llguidance`, `none` when unset, "" when the launcher
     /// cannot tell).
     pub guided_decoding_backend: String,
+    /// The vocabulary of structural-tag nodes that backend takes, as the
+    /// launcher read it off the xgrammar installed beside the engine
+    /// (`structural_tag_vocabulary` label): `older` for one that predates
+    /// the `optional`, `plus`, `star` and `token` nodes and refuses a tag
+    /// that carries one; empty for a current one, another backend, or
+    /// nothing known.
+    pub structural_tag_vocabulary: String,
     /// The engine's admission window, reported in the pushed load record;
     /// the handshake's figure is the fallback.
     pub max_running_requests: i32,

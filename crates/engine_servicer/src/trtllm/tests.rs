@@ -52,6 +52,7 @@ fn model_info() -> TrtllmModelInfo {
         context_parallel_size: 1,
         data_parallel_size: 1,
         guided_decoding_backend: "xgrammar".to_string(),
+        structural_tag_vocabulary: "older".to_string(),
         max_running_requests: 64,
         ..Default::default()
     }
@@ -534,9 +535,13 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
     assert_eq!(info.pipeline_parallel_size, 1);
     assert_eq!(info.context_parallel_size, 1);
     assert_eq!(info.world_size, 2);
+    // The vocabulary of structural-tag nodes the launcher read off the
+    // engine's xgrammar rides along for the router's label.
+    assert_eq!(info.structural_tag_vocabulary, "older");
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 
-    // A launcher that reported no bounds and no sizes: the handshake's.
+    // A launcher that reported no bounds and no sizes: the handshake's; one
+    // that said nothing of the structural-tag vocabulary advertises nothing.
     let bare = TrtllmModelInfo {
         max_input_len: 0,
         max_seq_len: 0,
@@ -546,6 +551,7 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
         context_parallel_size: 0,
         trtllm_version: String::new(),
         backend: String::new(),
+        structural_tag_vocabulary: String::new(),
         ..model_info()
     };
     let ready = EngineCoreReadyResponse {
@@ -577,6 +583,7 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
     assert_eq!(info.tensor_parallel_size, 4);
     assert_eq!(info.pipeline_parallel_size, 2);
     assert_eq!(info.world_size, 8);
+    assert_eq!(info.structural_tag_vocabulary, "");
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 

@@ -21,6 +21,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from smg_grpc_servicer import constrained_decoding as cd
 from smg_grpc_servicer import rust_lifecycle
 from smg_grpc_servicer.vllm import rust
 
@@ -2109,3 +2110,24 @@ def test_smg_media_options_forward_download_timeouts(source, monkeypatch):
     )
     assert options["fetch_timeout_ms"] == 60000
     assert options["video_fetch_timeout_ms"] == 120000
+
+
+def test_model_info_carries_the_structural_tag_vocabulary_of_an_older_xgrammar(monkeypatch):
+    # The Rust servicer advertises the vocabulary of structural-tag nodes the
+    # engine's xgrammar takes, read off the installed distribution: `older`
+    # below 0.1.33 (the first release with the optional, plus, star and token
+    # nodes) under `xgrammar` and under `auto`, which runs xgrammar for a
+    # structural tag; nothing for a current one or another backend.
+    monkeypatch.setattr(cd, "installed_xgrammar_version", lambda: "0.1.32")
+    info = rust.model_info_from_config(_config())
+    assert info["structured_outputs_backend"] == "auto"
+    assert info["structural_tag_vocabulary"] == "older"
+    config = _config()
+    config.structured_outputs_config = SimpleNamespace(backend="xgrammar", reasoning_parser="")
+    info = rust.model_info_from_config(config)
+    assert info["structured_outputs_backend"] == "xgrammar"
+    assert info["structural_tag_vocabulary"] == "older"
+    config.structured_outputs_config = SimpleNamespace(backend="guidance", reasoning_parser="")
+    assert rust.model_info_from_config(config)["structural_tag_vocabulary"] == ""
+    monkeypatch.setattr(cd, "installed_xgrammar_version", lambda: "0.2.7")
+    assert rust.model_info_from_config(_config())["structural_tag_vocabulary"] == ""

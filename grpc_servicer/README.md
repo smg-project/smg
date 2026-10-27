@@ -701,6 +701,16 @@ the engine's own server would: the bare calls behind the parser's gate, so the
 call is forced right there; the thought and then the calls from the first
 token.
 
+The Rust servicer's launcher also advertises the vocabulary of structural-tag
+nodes the engine's grammar compiler takes (`GetServerInfo.structural_tag_vocabulary`,
+the `structural_tag_vocabulary` label): `older` when the xgrammar installed
+beside the engine predates the `optional`, `plus`, `star` and `token` nodes
+(0.1.33 is the first release with them) under `xgrammar` or `auto`, read off
+the distribution's metadata at start-up without importing it; absent for a
+current xgrammar or another backend. A router spells such a worker's structural
+tags without those nodes, the same language, instead of a compile-time refusal
+per request.
+
 #### CUDA-graph capture cap
 
 The engine replays a captured CUDA graph for a step that fits one of its
@@ -988,6 +998,12 @@ with a 400 that its slim wire reports as a bare `abort`, an empty answer to the
 caller), and a JSON-schema feature xgrammar drops under `xgrammar`; with no key
 it judges nothing ahead of the engine.
 
+The Rust servicer's launcher also writes the `structural_tag_vocabulary` key
+(`older`) when the xgrammar installed beside the engine predates the
+`optional`, `plus`, `star` and `token` structural-tag nodes (0.1.33 is the
+first release with them), under `xgrammar` or a backend not yet resolved; a
+router spells such a worker's structural tags without those nodes.
+
 Both TokenSpeed servicers also report the engine's constrained-decoding policy,
 when it declares one, as `GetServerInfo.constrained_decoding` (a field of its
 own, not a `server_args` key): `always` for a model that takes a grammar on
@@ -1096,6 +1112,12 @@ an EBNF grammar or a structural tag under `outlines`, which compiles JSON
 schemas and regular expressions only, and a JSON-schema feature xgrammar drops
 under `xgrammar`; a backend it does not know (a plugin of the scheduler's) is
 left to the engine.
+
+The Rust servicer's launcher also writes the `structural_tag_vocabulary` key
+(`older`) when the xgrammar installed beside the engine predates the
+`optional`, `plus`, `star` and `token` structural-tag nodes (0.1.33 is the
+first release with them), under `xgrammar` or an unresolved backend; a router
+spells such a worker's structural tags without those nodes.
 
 #### KV-event recovery
 
@@ -1424,6 +1446,16 @@ start-up and silence bounds, prefill allowance); `--metrics-port` (and
 `--metrics-host`, `SMG_TRTLLM_SERVICER_METRICS_PORT/_HOST`) serves the Rust
 servicer's Prometheus metrics, the families every engine's Rust servicer
 exposes (see the vLLM section above), with `wire="trtllm"`.
+
+Its launcher also advertises the vocabulary of structural-tag nodes the
+engine's guided-decoding backend takes
+(`GetServerInfo.structural_tag_vocabulary`, the `structural_tag_vocabulary`
+label): `older` when the xgrammar installed beside the engine predates the
+`optional`, `plus`, `star` and `token` nodes (0.1.33 is the first release with
+them) under `guided_decoding_backend: xgrammar`, read off the distribution's
+metadata at start-up; absent otherwise. A router spells such a worker's
+structural tags without those nodes. The engine's own servicer does not report
+the field.
 
 ## Architecture
 
