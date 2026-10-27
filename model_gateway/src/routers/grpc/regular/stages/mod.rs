@@ -2,6 +2,7 @@
 //!
 //! This module defines stages specific to regular tokenizer-based models.
 
+pub(crate) mod backed_plan;
 pub(crate) mod chat;
 pub(crate) mod classify;
 pub(crate) mod completion;
