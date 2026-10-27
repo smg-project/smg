@@ -1690,18 +1690,7 @@ mod tests {
 
     #[test]
     fn test_list_label_selector_pd_mode_common_labels() {
-        let mut prefill = HashMap::new();
-        prefill.insert("app".to_string(), "sglang".to_string());
-        prefill.insert("component".to_string(), "prefill".to_string());
-        let mut decode = HashMap::new();
-        decode.insert("app".to_string(), "sglang".to_string());
-        decode.insert("component".to_string(), "decode".to_string());
-        let config = ServiceDiscoveryConfig {
-            disaggregated_mode: true,
-            prefill_selector: prefill,
-            decode_selector: decode,
-            ..Default::default()
-        };
+        let config = create_pd_config();
         // Only the common label "app=sglang" should be in the selector.
         assert_eq!(config.list_label_selector(), "app=sglang");
     }
@@ -1756,18 +1745,7 @@ mod tests {
 
     #[test]
     fn test_build_watcher_config_for_pd_mode_pushes_intersection() {
-        let mut prefill = HashMap::new();
-        prefill.insert("app".to_string(), "sglang".to_string());
-        prefill.insert("component".to_string(), "prefill".to_string());
-        let mut decode = HashMap::new();
-        decode.insert("app".to_string(), "sglang".to_string());
-        decode.insert("component".to_string(), "decode".to_string());
-        let config = ServiceDiscoveryConfig {
-            disaggregated_mode: true,
-            prefill_selector: prefill,
-            decode_selector: decode,
-            ..Default::default()
-        };
+        let config = create_pd_config();
         let watcher_config = build_watcher_config(&config.list_label_selector());
         assert_eq!(watcher_config.label_selector.as_deref(), Some("app=sglang"));
     }
