@@ -1473,14 +1473,18 @@ impl StreamingProcessor {
     /// then the engine's `finish`; the events go through the machine ([`Self::send_symphony_blocks`],
     /// `thinking_text` as there) and the reasoning tokens they cost are added to `thinking_tokens`,
     /// under `who` for the telemetry of the output's end. The stream's `delta` and `spare` buffer
-    /// are read as a step's are, so events that wait in the buffer (the prompt's, when the
-    /// message ends before any chunk) go out in their order.
+    /// are read as a step's are, so events that wait in `spare` (the prompt's, when the message
+    /// ends before any chunk) go out in their order; the machine writes into `blocks` as a step's does.
     #[expect(clippy::too_many_arguments)]
     async fn end_symphony_message(
         tx: &SseSender,
         buffer: &mut Vec<u8>,
         (reader, machine): (&mut Reader, &mut adapt::messages::Stream),
-        (delta, spare): (&mut Delta, &mut Events<'static>),
+        (delta, spare, blocks): (
+            &mut Delta,
+            &mut Events<'static>,
+            &mut Vec<MessageStreamEvent>,
+        ),
         flushed: Option<String>,
         finish: EngineFinish,
         who: Who<'_>,
@@ -1493,8 +1497,14 @@ impl StreamingProcessor {
         }
         reader.end(finish, who, &mut events)?;
         *thinking_tokens += reasoning_text_tokens(events.as_slice());
-        let stop =
-            Self::send_symphony_blocks(tx, buffer, machine, events.as_slice(), thinking_text).await;
+        let stop = Self::send_symphony_blocks(
+            tx,
+            buffer,
+            (machine, blocks),
+            events.as_slice(),
+            thinking_text,
+        )
+        .await;
         *spare = events.recycle();
         stop
     }
@@ -1502,20 +1512,21 @@ impl StreamingProcessor {
     /// Feeds Symphony's `events` to the content-block `machine` and sends the stream events it
     /// gives, in order, the `thinking_delta`s only when `thinking_text` (a `thinking.display` of
     /// `omitted` keeps the thinking block, its start and its stop, and no text); the stop reason
-    /// when a `Finish` was among the events.
+    /// when a `Finish` was among the events. The machine writes into the stream's `blocks`
+    /// buffer, emptied here before the step: one buffer serves every step, as `buffer` does.
     async fn send_symphony_blocks(
         tx: &SseSender,
         buffer: &mut Vec<u8>,
-        machine: &mut adapt::messages::Stream,
+        (machine, blocks): (&mut adapt::messages::Stream, &mut Vec<MessageStreamEvent>),
         events: &[Event<'_>],
         thinking_text: bool,
     ) -> Result<Option<messages::StopReason>, utils::StreamFailure> {
         let mut stop = None;
-        let mut blocks = Vec::new();
+        blocks.clear();
         for event in events {
-            stop = machine.feed(event, &mut blocks).or(stop);
+            stop = machine.feed(event, blocks).or(stop);
         }
-        for block in &blocks {
+        for block in blocks.iter() {
             let thinking_delta = matches!(
                 block,
                 MessageStreamEvent::ContentBlockDelta {
@@ -3957,6 +3968,9 @@ struct MessagesStream<'a> {
     /// keeps them; the prompt's events wait in the buffer for the first step's.
     delta: Delta,
     spare: Events<'static>,
+    /// The machine's step buffer: the stream events a step's Symphony events
+    /// become, kept across steps like `sse_buffer` and `spare`.
+    machine_blocks: Vec<MessageStreamEvent>,
 
     // Token tracking
     completion_tokens: CompletionTokenTracker,
@@ -4141,6 +4155,7 @@ impl<'a> MessagesStream<'a> {
             stop_decoder,
             symphony,
             symphony_stop: None,
+            machine_blocks: Vec::new(),
             delta: Delta::default(),
             spare,
             completion_tokens: CompletionTokenTracker::new(),
@@ -4332,7 +4347,7 @@ impl<'a> MessagesStream<'a> {
             self.symphony_stop = StreamingProcessor::send_symphony_blocks(
                 self.tx,
                 &mut self.sse_buffer,
-                machine,
+                (machine, &mut self.machine_blocks),
                 events.as_slice(),
                 self.spec.thinking_text_returned,
             )
@@ -4412,7 +4427,7 @@ impl<'a> MessagesStream<'a> {
                 self.tx,
                 &mut self.sse_buffer,
                 (reader, machine),
-                (&mut self.delta, &mut self.spare),
+                (&mut self.delta, &mut self.spare, &mut self.machine_blocks),
                 flushed,
                 engine_finish(&self.finish_reason_str),
                 Who {
@@ -4468,7 +4483,7 @@ impl<'a> MessagesStream<'a> {
                 self.tx,
                 &mut self.sse_buffer,
                 (reader, machine),
-                (&mut self.delta, &mut self.spare),
+                (&mut self.delta, &mut self.spare, &mut self.machine_blocks),
                 flushed,
                 finish,
                 Who {
