@@ -19,6 +19,8 @@ pub(crate) mod router; // Used by routers/factory
 pub(crate) mod spec;
 #[cfg(test)]
 pub(crate) mod test_engine;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod utils; // Used by routers/http and bindings/golang
 pub mod zmq_client; // ZMQ backend adapter behind the vLLM client surface
 
