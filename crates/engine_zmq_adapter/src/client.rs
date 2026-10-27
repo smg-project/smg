@@ -1394,6 +1394,12 @@ impl ZmqEngineClient {
                 "{method} is served over the engine connection by a TokenSpeed scheduler only"
             )));
         }
+        if !self.tokenspeed_wire_carries_control_calls() {
+            return Err(tonic::Status::unimplemented(format!(
+                "{method} cannot ride this engine's connection: its handshake declares no \
+                 control reply, so the msgpack wire carries generate and abort only"
+            )));
+        }
         let args = body.map(json_to_msgpack).into_iter().collect();
         self.control_calls(method, method, args, wait).await
     }
@@ -2511,6 +2517,25 @@ mod tests {
                 assert!(replies[0].1.contains("not paused"), "{replies:?}");
             }
         }
+    }
+
+    /// An RL operation on a TokenSpeed connection whose ranks declared no
+    /// control reply is refused by name before anything is sent: the wire
+    /// carries generate and abort only.
+    #[tokio::test]
+    async fn an_rl_operation_on_a_wire_without_control_calls_is_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = tokenspeed_ranks(&dir.path().join("n"), vec![default_ready_response()]).await;
+        let error = client
+            .rl_control_call("pause_generation", None, Duration::from_secs(1))
+            .await
+            .expect_err("refused");
+        assert_eq!(error.code(), Code::Unimplemented);
+        assert!(
+            error.message().contains("declares no control reply"),
+            "{}",
+            error.message()
+        );
     }
 
     #[tokio::test]

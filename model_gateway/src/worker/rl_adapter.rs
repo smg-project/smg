@@ -112,9 +112,17 @@ impl RegistryRlView {
         let spec = &worker.metadata().spec;
         let (control_url, control_client) = self.control_endpoint(worker);
         // A TokenSpeed engine on the direct ZMQ lane takes the RL routes as
-        // control calls on the worker's own connection.
+        // control calls on the worker's own connection, when its handshake
+        // declared the control reply: a connected engine that declared none
+        // has no call to take (its wire carries generate and abort only), so
+        // discovery reports it without and a call answers as for a worker
+        // without a control endpoint. An engine still handshaking is taken
+        // at its word until it lands.
         let control_calls = (*worker.connection_mode() == ConnectionMode::Zmq
-            && spec.runtime_type == RuntimeType::TokenSpeed)
+            && spec.runtime_type == RuntimeType::TokenSpeed
+            && worker.backend_client_if_initialized().is_none_or(|client| {
+                matches!(client.as_ref(), BackendClient::Zmq(client) if client.carries_control_calls())
+            }))
             .then(|| {
                 Arc::new(EngineConnectionControl {
                     worker: Arc::clone(worker),
@@ -183,6 +191,11 @@ impl RlControlCalls for EngineConnectionControl {
                 .collect()),
             Err(status) if status.code() == tonic::Code::DeadlineExceeded => {
                 Err(CallFailure::Timeout)
+            }
+            // The wire carries no control calls (declared at the handshake):
+            // not a failure of a reachable engine, the route's 422.
+            Err(status) if status.code() == tonic::Code::Unimplemented => {
+                Err(CallFailure::Unsupported(status.message().to_string()))
             }
             Err(status) => Err(CallFailure::Failed(status.message().to_string())),
         }
@@ -306,7 +319,10 @@ mod tests {
     }
 
     /// A TokenSpeed engine on the direct ZMQ lane is controlled over its own
-    /// connection; another runtime's ZMQ worker and a gRPC worker are not.
+    /// connection (one still handshaking is taken at its word; a connected one
+    /// that declared no control reply is not, which needs a live handshake to
+    /// show: the adapter's own test covers that refusal); another runtime's
+    /// ZMQ worker and a gRPC worker are not.
     #[test]
     fn a_tokenspeed_zmq_worker_is_controlled_over_its_engine_connection() {
         let zmq = |url: &str, runtime: RuntimeType| -> Arc<dyn Worker> {

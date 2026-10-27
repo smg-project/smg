@@ -865,6 +865,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// entry alive.
     fn http_client_handle_if_initialized(&self) -> Option<Arc<reqwest::Client>>;
 
+    /// Strong handle to the worker's backend client (gRPC or ZMQ), if its
+    /// lazy connect landed. Never drives the connect: a worker still
+    /// connecting, or an HTTP worker, has none.
+    fn backend_client_if_initialized(&self) -> Option<Arc<BackendClient>> {
+        None
+    }
+
     // ── Metadata convenience delegates ──────────────────────────────
     //
     // These default impls forward to the canonical implementation on
@@ -2070,6 +2077,10 @@ impl Worker for BasicWorker {
 
     fn http_client_handle_if_initialized(&self) -> Option<Arc<reqwest::Client>> {
         self.http_client.handle_if_initialized()
+    }
+
+    fn backend_client_if_initialized(&self) -> Option<Arc<BackendClient>> {
+        self.backend_client.load_full().get().cloned()
     }
 
     fn supports_model(&self, model_id: &str) -> bool {
