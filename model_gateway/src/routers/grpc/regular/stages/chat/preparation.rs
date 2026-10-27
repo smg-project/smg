@@ -169,6 +169,7 @@ pub(crate) async fn prepare_chat_like(
             constraint: tool_call_constraint,
             json_schema: json_schema_constraint,
             keeps_special_tokens: preserve_reasoning_special_tokens,
+            names: parser_names,
         } = reading::prepare(
             ctx,
             symphony::Asks::Chat(request),
@@ -183,6 +184,7 @@ pub(crate) async fn prepare_chat_like(
             &tokenizer,
             "ChatPreparationStage::execute",
         )?;
+        ctx.state.parser_names = Some(parser_names);
 
         let skip_special_tokens = skips_special_tokens(
             request,
