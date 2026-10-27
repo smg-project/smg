@@ -842,32 +842,26 @@ mod tests {
                 ns.input_endpoint(),
                 ns.output_endpoint(),
             );
-            let rank = |index: u32, declares: usize| {
-                let handshake = handshake.clone();
-                async move {
-                    hello_in_group(
-                        &handshake,
-                        EngineId::from_engine_index(index),
-                        Some(declares),
-                    )
-                    .await?
-                    .ready(default_ready_response())
-                    .await
-                }
-            };
             // The first rank to speak settles the size at two; the second
-            // declares three.
-            let (transport, first, second) = tokio::join!(
+            // declares three, dialing only once the first holds its INIT (the
+            // frontend answers INIT per HELLO), so the order never depends on
+            // timing. Both READYs then run together.
+            let ranks = async {
+                let first =
+                    hello_in_group(&handshake, EngineId::from_engine_index(0), Some(2)).await?;
+                let second =
+                    hello_in_group(&handshake, EngineId::from_engine_index(1), Some(3)).await?;
+                tokio::try_join!(
+                    first.ready(default_ready_response()),
+                    second.ready(default_ready_response())
+                )
+            };
+            let (transport, engines) = tokio::join!(
                 connect_handshake(&handshake, count, &input, &output, TIMEOUT),
-                rank(0, 2),
-                async {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    rank(1, 3).await
-                },
+                ranks,
             );
             let transport = transport.expect("frontend handshake");
-            first.expect("first mock engine");
-            second.expect("second mock engine");
+            engines.expect("both mock engines");
             assert_eq!(transport.engines.len(), 2, "{count:?}");
         }
     }
