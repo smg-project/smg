@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 from collections.abc import Mapping
+from typing import Any
+
+from smg_grpc_servicer.constrained_decoding import CONSTRAINED_DECODING_POLICIES as POLICIES
 
 POLICY_ENV = "SMG_VLLM_CONSTRAINED_DECODING"
-POLICIES = ("requested", "always")
 
 
 def constrained_decoding_policy(environ: Mapping[str, str] | None = None) -> str:
@@ -43,3 +46,20 @@ def carry_decoding_policy(parsed: argparse.Namespace) -> str:
             raise ValueError(f"--constrained-decoding must be one of {POLICIES}, got {value!r}")
         os.environ[POLICY_ENV] = value
     return constrained_decoding_policy()
+
+
+def binding_decoding_policy(server_type: Any, policy: str) -> str:
+    """Keep old Rust bindings usable unless the requested policy needs the new field."""
+    if not policy:
+        return ""
+    parameters = inspect.signature(server_type).parameters
+    if "constrained_decoding" in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    ):
+        return policy
+    if policy == "always":
+        raise ValueError(
+            "The installed VllmGrpcServer cannot advertise constrained_decoding; "
+            "update the smg Rust binding to use --constrained-decoding always"
+        )
+    return ""

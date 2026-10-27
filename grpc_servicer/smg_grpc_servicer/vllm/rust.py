@@ -72,7 +72,10 @@ from smg_grpc_servicer.vllm.config_view import (
     mm_processor_kwargs,
     multimodal_config,
 )
-from smg_grpc_servicer.vllm.decoding_policy import constrained_decoding_policy
+from smg_grpc_servicer.vllm.decoding_policy import (
+    binding_decoding_policy,
+    constrained_decoding_policy,
+)
 from smg_grpc_servicer.vllm.kv_transfer import runs_mooncake
 from smg_grpc_servicer.vllm.launcher_switch import LAUNCHER_MODULES, SUPPORTED_VLLM_RELEASES
 from smg_grpc_servicer.vllm.media_refs import FETCHABLE_MODALITIES
@@ -558,6 +561,7 @@ class VllmLauncher(RustLauncher):
         return default_kv_events_config(args)
 
     def facts(self, args: argparse.Namespace) -> dict[str, Any]:
+        """Build metadata and check that the binding can carry an explicit policy."""
         from vllm.engine.arg_utils import AsyncEngineArgs
         from vllm.usage.usage_lib import UsageContext
 
@@ -578,11 +582,17 @@ class VllmLauncher(RustLauncher):
             if self.encoder_budget
             else "none (item sizes are left to the engine)",
         )
-        return model_info_from_config(
+        facts = model_info_from_config(
             self.vllm_config,
             log_stats=None if disable_log_stats is None else not disable_log_stats,
             encoder_budget=self.encoder_budget,
         )
+        if policy := facts.get("constrained_decoding"):
+            from smg.servicer import VllmGrpcServer
+
+            if not binding_decoding_policy(VllmGrpcServer, policy):
+                facts.pop("constrained_decoding")
+        return facts
 
     def tokenizer_dir(self, args: argparse.Namespace) -> str | None:
         model = EngineConfigView(self.vllm_config).model

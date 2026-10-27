@@ -64,10 +64,11 @@ engines consistently across ranks and replicas.
 not force a call, override `tool_choice: none`, or provide a grammar for an
 unsupported model. It is separate from vLLM's HTTP `--tool-strict-level` and
 from `constrained_decoding_start`, which says where a supplied grammar starts.
-Use matching updated proto, servicer and gateway packages. An older gateway
-ignores the new field; check `/workers` for `constrained_decoding: always`
-before relying on the policy. An old Python proto that cannot carry `always`
-is refused instead of silently dropping the declaration.
+Compatibility is checked by capability, not package version. Older Python
+protos and Rust bindings remain usable with the default or `requested` policy.
+An explicit `always` fails servicer initialization if the installed proto or
+binding cannot carry the declaration. An older gateway ignores the new field;
+check `/workers` for `constrained_decoding: always` before relying on the policy.
 
 #### Worker-side multimodal processing (media refs)
 

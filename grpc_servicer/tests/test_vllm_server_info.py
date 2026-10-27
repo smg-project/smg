@@ -31,7 +31,6 @@ def _server_info_method(response_type):
     namespace = {
         "vllm_engine_pb2": SimpleNamespace(GetServerInfoResponse=response_type),
         "server_facts": model_info.server_facts,
-        "constrained_decoding_policy": constrained_decoding_policy,
         "mm_device_do_normalize": model_info.mm_device_do_normalize,
         "mm_item_limits": model_info.mm_item_limits,
         "engine_reasoning_parser": model_info.engine_reasoning_parser,
@@ -89,7 +88,10 @@ def test_get_server_info_reports_encoder_dtype_with_current_and_legacy_protos(
         model_config=model_config, parallel_config=SimpleNamespace(data_parallel_size=1)
     )
     servicer = SimpleNamespace(
-        engine=SimpleNamespace(vllm_config=config), _mm_processor=None, _mm_encoder_budget=0
+        engine=SimpleNamespace(vllm_config=config),
+        _mm_processor=None,
+        _mm_encoder_budget=0,
+        _constrained_decoding="",
     )
     info = asyncio.run(_server_info_method(response_type)(servicer, None, None))
     assert info.model_dtype == (dtype or "")
@@ -135,7 +137,10 @@ def test_get_server_info_reports_where_the_engine_starts_a_grammar(legacy):
         ),
     )
     servicer = SimpleNamespace(
-        engine=SimpleNamespace(vllm_config=config), _mm_processor=None, _mm_encoder_budget=0
+        engine=SimpleNamespace(vllm_config=config),
+        _mm_processor=None,
+        _mm_encoder_budget=0,
+        _constrained_decoding="",
     )
     info = asyncio.run(_server_info_method(response_type)(servicer, None, None))
     if legacy:
@@ -156,7 +161,10 @@ def test_get_server_info_reports_the_engines_encoder_budget(legacy):
         model_config=model_config, parallel_config=SimpleNamespace(data_parallel_size=1)
     )
     servicer = SimpleNamespace(
-        engine=SimpleNamespace(vllm_config=config), _mm_processor=None, _mm_encoder_budget=192000
+        engine=SimpleNamespace(vllm_config=config),
+        _mm_processor=None,
+        _mm_encoder_budget=192000,
+        _constrained_decoding="",
     )
     info = asyncio.run(_server_info_method(response_type)(servicer, None, None))
     if legacy:
@@ -168,10 +176,10 @@ def test_get_server_info_reports_the_engines_encoder_budget(legacy):
     assert info.mm_encoder_budget == 0
 
 
-@pytest.mark.parametrize("policy", [None, "requested", "always"])
+@pytest.mark.parametrize("policy", [None, "requested", "always", "invalid"])
 @pytest.mark.parametrize("legacy", [False, True])
 def test_get_server_info_reports_decoding_policy(monkeypatch, policy, legacy):
-    """Discovery carries the declaration; an old proto cannot silently lose always."""
+    """Bad declarations fail initialization; metadata RPCs keep serving the startup policy."""
     monkeypatch.delenv(POLICY_ENV, raising=False)
     if policy is not None:
         monkeypatch.setenv(POLICY_ENV, policy)
@@ -183,13 +191,45 @@ def test_get_server_info_reports_decoding_policy(monkeypatch, policy, legacy):
         parallel_config=SimpleNamespace(data_parallel_size=1),
     )
     servicer = SimpleNamespace(
-        engine=SimpleNamespace(vllm_config=config), _mm_processor=None, _mm_encoder_budget=0
+        engine=SimpleNamespace(vllm_config=config),
+        _mm_processor=None,
+        _mm_encoder_budget=0,
+        _constrained_decoding="",
     )
-    call = _server_info_method(response_type)(servicer, None, None)
-    if legacy and policy == "always":
-        with pytest.raises(ValueError, match="updated smg-grpc-proto"):
-            asyncio.run(call)
+    initialize = _policy_initializer(response_type)
+    if policy == "invalid" or (legacy and policy == "always"):
+        with pytest.raises(ValueError, match="SMG_VLLM_CONSTRAINED_DECODING|smg-grpc-proto"):
+            initialize(servicer, None, 0)
     else:
-        info = asyncio.run(call)
+        initialize(servicer, None, 0)
+        monkeypatch.setenv(POLICY_ENV, "invalid-after-start")
+        info = asyncio.run(_server_info_method(response_type)(servicer, None, None))
         if not legacy:
             assert info.constrained_decoding == (policy or "")
+
+
+def _policy_initializer(response_type):
+    """Run the real constructor up to engine setup, without importing vLLM/torch."""
+    tree = ast.parse(_SERVICER.read_text())
+    cls = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "VllmEngineServicer"
+    )
+    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    engine_setup = next(
+        i
+        for i, node in enumerate(method.body)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Attribute) and target.attr == "engine" for target in node.targets
+        )
+    )
+    method.body = method.body[:engine_setup]
+    for arg in method.args.args:
+        arg.annotation = None
+    namespace = {
+        "vllm_engine_pb2": SimpleNamespace(GetServerInfoResponse=response_type),
+        "constrained_decoding_policy": constrained_decoding_policy,
+        "settle_logging": lambda: None,
+    }
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(_SERVICER), "exec"), namespace)
+    return namespace["__init__"]

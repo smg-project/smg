@@ -229,6 +229,16 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         from smg_grpc_servicer.vllm.rust import require_python_impl
 
         require_python_impl()
+        self._constrained_decoding = constrained_decoding_policy()
+        if (
+            self._constrained_decoding == "always"
+            and "constrained_decoding"
+            not in vllm_engine_pb2.GetServerInfoResponse.DESCRIPTOR.fields_by_name
+        ):
+            raise ValueError(
+                "The installed smg-grpc-proto cannot advertise constrained_decoding; "
+                "update it to use --constrained-decoding always"
+            )
         # vLLM 0.31+ configures logging after this module is imported: attach
         # again, and end the hold of what was logged before (the launcher
         # configured logging by now, if it was going to).
@@ -929,11 +939,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         if "constrained_decoding_start" in info.DESCRIPTOR.fields_by_name:
             info.engine_reasoning_parser = engine_reasoning_parser(self.engine.vllm_config)
             info.constrained_decoding_start = constrained_decoding_start(self.engine.vllm_config)
-        policy = constrained_decoding_policy()
         if "constrained_decoding" in info.DESCRIPTOR.fields_by_name:
-            info.constrained_decoding = policy
-        elif policy == "always":
-            raise ValueError("--constrained-decoding always requires an updated smg-grpc-proto")
+            info.constrained_decoding = self._constrained_decoding
         return info
 
     async def GetLoads(
