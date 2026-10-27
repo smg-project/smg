@@ -542,3 +542,79 @@ async fn continuous_usage_waits_for_prefill_before_emitting_chunks() {
     ps.abort();
     ds.abort();
 }
+
+/// A locally stopped Decode must release its slot while Prefill's final
+/// accounting is still gated, rather than generating tail tokens for nobody.
+#[tokio::test]
+async fn local_stop_releases_decode_before_pending_prefill_finishes() {
+    use std::time::Duration;
+
+    use crate::worker::{BasicWorkerBuilder, Worker};
+
+    let p: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://p:1").build());
+    let d: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://d:1").build());
+    let (release, gate) = oneshot::channel();
+    let (prefill, ps) =
+        sglang_gated_stream(vec![], gate, vec![complete_with_cached(PREFILL_HIT)], "0").await;
+    let (_decode_release, decode_gate) = oneshot::channel();
+    let (decode, ds) = sglang_gated_stream(
+        vec![
+            chunk_with_cached("hiSTOP", DECODE_VIEW),
+            chunk_with_cached("tail", DECODE_VIEW),
+        ],
+        decode_gate,
+        vec![],
+        "0",
+    )
+    .await;
+    let prefill = prefill.tracked(Arc::clone(&p), 0, true);
+    let decode = decode.tracked(Arc::clone(&d), 0, true);
+    let (tx, rx) = sse_channel();
+    #[expect(clippy::disallowed_methods, reason = "test joins the reader")]
+    let task = tokio::spawn(async move {
+        processor(false)
+            .process_prefill_decode_streaming_chunks(
+                prefill,
+                decode,
+                dispatch(),
+                Arc::new(CharacterTokenizer::default()),
+                (
+                    Some(StringOrArray::String("STOP".into())),
+                    None,
+                    false,
+                    false,
+                    false,
+                ),
+                spec(false),
+                &tx,
+                pd_timing(),
+                vec![None],
+                None,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while d.tracked_load() != 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("local stop must release Decode before Prefill finishes");
+    assert_eq!(p.tracked_load(), 1, "Prefill remains gated");
+    assert!(
+        !task.is_finished(),
+        "terminal usage still waits for Prefill"
+    );
+    release.send(()).expect("release Prefill");
+    let events = collect_events(rx).await;
+    task.await
+        .expect("joined reader")
+        .expect("successful stream");
+    assert_eq!(
+        cached_tokens_of(&events.last().expect("final usage")["usage"]),
+        PREFILL_HIT
+    );
+    assert_eq!(p.tracked_load(), 0);
+    ps.abort();
+    ds.abort();
+}

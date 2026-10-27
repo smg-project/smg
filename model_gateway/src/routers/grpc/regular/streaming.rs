@@ -413,6 +413,10 @@ impl StreamingProcessor {
         stream
             .read_engine_with_prefill(&mut grpc_stream, prefill.as_mut())
             .await?;
+        // The stream's verdict, before the engine side is released.
+        let client_left = grpc_stream.client_left();
+        // A local stop releases Decode before waiting for Prefill accounting.
+        stream.release_engine(grpc_stream, metrics_labels::ENDPOINT_CHAT);
         if let Some(prefill) = &mut prefill {
             let cached = prefill.finish(stream.completion_tokens.delivered()).await?;
             for (index, value) in &mut stream.cached_tokens {
@@ -421,9 +425,6 @@ impl StreamingProcessor {
                 }
             }
         }
-        // The stream's verdict, before the engine side is released.
-        let client_left = grpc_stream.client_left();
-        stream.release_engine(grpc_stream, metrics_labels::ENDPOINT_CHAT);
         // Nothing reaches a client that left, so its read ends with `Ok`
         // here; a sender closed between the read and the sends fails them.
         // Either way the reservation is settled with the stream's actual
