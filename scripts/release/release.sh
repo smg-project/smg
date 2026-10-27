@@ -43,10 +43,11 @@ MAKE=${MAKE:-make}
 VERSION_RE='^([0-9]+)\.([0-9]+)\.([0-9]+)(-rc\.([0-9]+))?$'
 RELEASE_RE='^[0-9]+\.[0-9]+$'
 GATEWAY_MANIFEST=model_gateway/Cargo.toml
-# The originals picked into a release branch, one "<sha> <subject>" per line, written by the pick's pull request: the
-# repository squash-merges a pull request under its title alone, so the picked commits' `(cherry picked from commit …)`
-# trailers never reach the branch; this file does.
-PICKS_FILE=scripts/release/picks.txt
+# The originals picked into a release branch, one file per original named by its sha and holding its subject, written by
+# the pick's pull request: the repository squash-merges a pull request under its title alone, so the picked commits'
+# `(cherry picked from commit …)` trailers never reach the branch; these files do, and files of different names never
+# conflict when several pick pull requests are open against one branch.
+PICKS_DIR=scripts/release/picks
 
 say() { printf '%s\n' "$*"; }
 note() { printf 'release: %s\n' "$*" >&2; }
@@ -104,26 +105,31 @@ since_tag() { # <ref> <version>: the tag a bump or a check compares the versions
 manifest_version() { # the version a ref's gateway manifest carries (empty when it is not there)
   git show "$1:$GATEWAY_MANIFEST" 2>/dev/null | grep -m1 '^version = ' | sed 's/version = "\(.*\)"/\1/' || true
 }
-picked_into() { # <ref>: the originals picked into <ref>, space-bounded: the picks file at <ref> and the trailers reachable from it
-  # A pick's pull request records its originals in $PICKS_FILE on the branch (the squash merge keeps the title alone);
+picked_into() { # <ref>: the originals picked into <ref>, space-bounded: the picks directory at <ref> and the trailers reachable from it
+  # A pick's pull request records its originals under $PICKS_DIR on the branch (the squash merge keeps the title alone);
   # a pick landed as its own commits (a fast-forward, the older process) carries the `(cherry picked from commit …)`
   # trailers in its history. Both are read.
-  printf ' %s ' "$({ git show "$1:$PICKS_FILE" 2>/dev/null | cut -d' ' -f1; git log --format=%b "$1" | grep -o 'cherry picked from commit [0-9a-f]*' | sed 's/.* //'; } | sort -u | tr '\n' ' ' || true)"
+  printf ' %s ' "$({ git ls-tree --name-only "$1" -- "$PICKS_DIR/" 2>/dev/null | sed 's|.*/||'; git log --format=%b "$1" | grep -o 'cherry picked from commit [0-9a-f]*' | sed 's/.* //'; } | sort -u | tr '\n' ' ' || true)"
 }
-record_picks() { # <x.y> <base>: the originals of the picks in <base>..HEAD appended to the branch's picks file, in one commit
+picked_in() { # <base>..HEAD: the originals named by the cherry-pick trailers of a pick branch, oldest first
+  git log --reverse --format=%b "$1..HEAD" | grep -o 'cherry picked from commit [0-9a-f]*' | sed 's/.* //' || true
+}
+record_picks() { # <x.y> <base>: the originals of the picks in <base>..HEAD recorded under the picks directory, in one commit
+  # The directory alone is staged and committed: a tracked file left modified by a conflict resolution stays out.
   local release=$1 base=$2 full subject added=0 word
   while read -r full; do
     [ -n "$full" ] || continue
-    grep -q "^$full " "$root/$PICKS_FILE" 2>/dev/null && continue
+    [ -f "$root/$PICKS_DIR/$full" ] && continue
     subject=$(git log -1 --format=%s "$full" 2>/dev/null || true)
-    printf '%s %s\n' "$full" "${subject:-(not fetched)}" >> "$root/$PICKS_FILE"
+    mkdir -p "$root/$PICKS_DIR"
+    printf '%s\n' "${subject:-(not fetched)}" > "$root/$PICKS_DIR/$full"
     added=$((added + 1))
-  done < <(git log --reverse --format=%b "$base..HEAD" | grep -o 'cherry picked from commit [0-9a-f]*' | sed 's/.* //' || true)
+  done < <(picked_in "$base")
   [ "$added" -gt 0 ] || return 0
   [ "$added" -eq 1 ] && word=pick || word=picks
-  git add -- "$root/$PICKS_FILE"
-  commit_all "chore(release): record $added $word into release/$release" \
-    "The originals of this pull request's cherry-picks, in $PICKS_FILE: the squash merge keeps the title alone, and status, check and notes read the branch's picks from the file."
+  git add -- "$root/$PICKS_DIR"
+  git commit --quiet --signoff --message "chore(release): record $added $word into release/$release" \
+    --message "The originals of this pull request's cherry-picks, one file each under $PICKS_DIR: the squash merge keeps the title alone, and status, check and notes read the branch's picks from them."
 }
 
 require_identity() {
@@ -312,17 +318,20 @@ cmd_pick_pr() {
   case "$topic" in pick/"$release"-*) ;; *) die "not on a pick/$release-* branch (on $topic)" ;; esac
   has_ref CHERRY_PICK_HEAD && die "a cherry-pick is still in progress: git cherry-pick --continue (or --abort) first"
   [ ! -d "$(git rev-parse --git-path sequencer)" ] || die "a cherry-pick sequence is still in progress: git cherry-pick --continue (or --abort) first"
+  require_clean
   fetch
   pick_pr "$release" "$topic"
 }
 
 pick_pr() { # <x.y> <topic>: the pull request of a pick branch
+  # The picks are the commits that carry a cherry-pick trailer: a record commit of an earlier run (a pull request
+  # creation that failed) changes neither the count, the title nor the body.
   local release=$1 topic=$2 base count title body
   base=$(release_base "$release")
-  count=$(git rev-list --count "$base..HEAD")
-  [ "$count" -gt 0 ] || die "$topic has no commits beyond $base"
+  count=$(picked_in "$base" | grep -c . || true)
+  [ "$count" -gt 0 ] || die "$topic has no cherry-picks beyond $base"
   if [ "$count" -eq 1 ]; then
-    title=$(git log -1 --format=%s)
+    title=$(git log -1 --format=%s "$(picked_in "$base")" 2>/dev/null || git log --format=%s --grep='cherry picked from commit' -1)
   else
     title="chore(release): pick $count commits from main into release/$release"
   fi
@@ -330,7 +339,7 @@ pick_pr() { # <x.y> <topic>: the pull request of a pick branch
   {
     say "Cherry-picks from main into \`release/$release\` (\`git cherry-pick -x -s\`):"
     say ""
-    git log --reverse --format='- %h %s' "$base..HEAD"
+    git log --reverse --format='- %h %s' --grep='cherry picked from commit' "$base..HEAD"
     say ""
     say "Picked from:"
     say ""
@@ -399,7 +408,7 @@ cmd_notes() {
   local version=${1:-} since=${2:-}
   [ -n "$version" ] || die "usage: release.sh notes <version> [<since>]"
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
-  local release tagname ref subject type count picked full original unknown line seen=' '
+  local release tagname ref subject type count picked full original unknown line path seen=' '
   local lines=() subjects=()
   local feat=() fix=() perf=() docs=() maint=() other=()
   release=$(release_of "$version"); tagname="v$version"
@@ -419,7 +428,7 @@ cmd_notes() {
   # previous release's branch, and the originals of the fixes picked into it are not news here.
   # A pick lands as one squash commit whose patch matches none of the originals, so --cherry-pick alone would list
   # them again: the commits named in the trailers reachable from $since are left out too (picked_into).
-  # On this side a pick's squash commit stands for the originals it recorded in the picks file (the lines it added;
+  # On this side a pick's squash commit stands for the originals it recorded under the picks directory (the files it added;
   # "chore(release): pick 2 commits …" says nothing of them): each is listed under its own type, once, left out when
   # $since carries it; a pick landed as its own commits reads the same through its trailer, and a trailer whose
   # original the fetch did not bring keeps the commit's own subject.
@@ -427,7 +436,7 @@ cmd_notes() {
   count=0
   while read -r full subject; do
     case "$picked" in *" $full "*) continue ;; esac
-    mapfile -t lines < <({ git show --format= "$full" -- "$PICKS_FILE" | grep '^+[0-9a-f]\{40\} ' | cut -c2-; git log -1 --format=%b "$full" | grep -o 'cherry picked from commit [0-9a-f]*' | sed 's/.* //'; } 2>/dev/null || true)
+    mapfile -t lines < <({ for path in $(git show --format= --name-only --diff-filter=A "$full" -- "$PICKS_DIR/"); do printf '%s %s\n' "${path##*/}" "$(git show "$full:$path" | head -n 1)"; done; git log -1 --format=%b "$full" | grep -o 'cherry picked from commit [0-9a-f]*' | sed 's/.* //'; } 2>/dev/null || true)
     subjects=(); unknown=0
     for line in ${lines[@]+"${lines[@]}"}; do
       original=${line%% *}

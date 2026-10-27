@@ -410,7 +410,21 @@ def test_pick_cherry_picks_from_main_and_opens_the_pull_request(repo: Sandbox) -
     assert repo.git("rev-parse", "HEAD~2") == branch_head
     # The branch records its picks in a file the squash merge keeps (the repository merges under the title alone).
     assert repo.git("log", "-1", "--format=%s") == "chore(release): record 1 pick into release/1.14"
-    assert repo.read("scripts/release/picks.txt") == f"{three} fix(router): three (#123)\n"
+    assert repo.read(f"scripts/release/picks/{three}") == "fix(router): three (#123)\n"
+    # A second run of pick-pr (a pull request creation that failed): the record commit is no pick, so the title,
+    # the count and the body read the one cherry-pick as before, and nothing is recorded twice.
+    repo.tool("pick-pr", "1.14")
+    assert repo.git("log", "-1", "--format=%s") == "chore(release): record 1 pick into release/1.14"
+    assert repo.git("rev-parse", "HEAD~2") == branch_head, "no second record commit"
+    assert repo.gh_calls()[-1].startswith(
+        f"gh pr create --base release/1.14 --head {topic} --title fix(router): three (#123) --body-file"
+    )
+    assert repo.pr_body().count("cherry picked from commit") == 1
+    # A tracked file left modified (a conflict resolution's leftovers) is refused, never swept into the record.
+    repo.put("Cargo.toml", repo.read("Cargo.toml") + "# edited\n")
+    refused = repo.tool("pick-pr", "1.14", check=False)
+    assert refused.returncode == 1 and "uncommitted changes" in refused.stderr
+    repo.git("checkout", "--", "Cargo.toml")
     assert repo.origin_ref(f"refs/heads/{topic}") == repo.git("rev-parse", "HEAD")
     assert repo.origin_ref("refs/heads/release/1.14") == branch_head
     assert repo.gh_calls()[-1].startswith(
@@ -427,10 +441,8 @@ def test_pick_takes_several_commits_oldest_first(repo: Sandbox) -> None:
     assert repo.git("log", "--format=%s", "-3") == (
         "chore(release): record 2 picks into release/1.14\nfix(b): second\nfix(a): first"
     )
-    assert (
-        repo.read("scripts/release/picks.txt")
-        == f"{first} fix(a): first\n{second} fix(b): second\n"
-    )
+    assert repo.read(f"scripts/release/picks/{first}") == "fix(a): first\n"
+    assert repo.read(f"scripts/release/picks/{second}") == "fix(b): second\n"
     assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == f"pick/1.14-{first[:7]}-{second[:7]}"
     assert (
         repo.gh_calls()[-1]
@@ -674,10 +686,13 @@ def test_a_squash_landed_pick_is_read_as_picked_by_status_and_the_next_notes(rep
     repo.tool("pick", "1.14", f"{three},{four}")
     land_on_release_squashed(repo)
     assert "cherry picked" not in repo.git("log", "-1", "--format=%B", "origin/release/1.14")
-    assert sorted(
-        repo.read("scripts/release/picks.txt", "origin/release/1.14").splitlines()
-    ) == sorted([f"{three} fix(router): three (#123)", f"{four} fix(router): four (#126)"]), (
-        "the pick order follows the commit dates, which the sandbox writes within one second"
+    assert (
+        repo.read(f"scripts/release/picks/{three}", "origin/release/1.14")
+        == "fix(router): three (#123)"
+    )
+    assert (
+        repo.read(f"scripts/release/picks/{four}", "origin/release/1.14")
+        == "fix(router): four (#126)"
     )
     status = repo.tool("status", "1.14").stdout
     assert "fix(router): three" not in status and "fix(router): four" not in status
@@ -702,6 +717,42 @@ def test_a_squash_landed_pick_is_read_as_picked_by_status_and_the_next_notes(rep
     notes = repo.tool("notes", "1.15.0-rc.1").stdout
     assert "fix(router): three" not in notes and "fix(router): four" not in notes
     assert "- fix(tool_parser): after the release (#125)\n" in notes
+
+
+def test_two_pick_pull_requests_against_one_branch_land_in_turn_without_a_conflict(
+    repo: Sandbox,
+) -> None:
+    """One file per original: the second pick pull request, opened before the first merged, squash-merges onto the
+    branch the first moved without touching the same path; both picks are read."""
+    repo.cut()
+    three = repo.commit_main(
+        "fix(router): three (#123)",
+        "model_gateway/src/main.rs",
+        'fn main() {\n    println!("three");\n}\n',
+    )
+    four = repo.commit_main(
+        "fix(tool_parser): four (#126)", "crates/tool_parser/src/lib.rs", "pub fn four() {}\n"
+    )
+    repo.tool("pick", "1.14", three)
+    first = repo.git("rev-parse", "--abbrev-ref", "HEAD")
+    repo.git("switch", "--quiet", "main")
+    repo.tool("pick", "1.14", four)
+    second = repo.git("rev-parse", "--abbrev-ref", "HEAD")
+    for topic in (first, second):
+        repo.git("switch", "--quiet", "--detach", "origin/release/1.14")
+        repo.git("merge", "--quiet", "--squash", topic)  # no conflict: different paths under picks/
+        repo.git("commit", "--quiet", "-m", f"{topic} squashed (#9)")
+        repo.git("push", "--quiet", "origin", "HEAD:refs/heads/release/1.14")
+    repo.git("switch", "--quiet", "main")
+    assert (
+        repo.read(f"scripts/release/picks/{three}", "origin/release/1.14")
+        == "fix(router): three (#123)"
+    )
+    assert (
+        repo.read(f"scripts/release/picks/{four}", "origin/release/1.14")
+        == "fix(tool_parser): four (#126)"
+    )
+    assert "  (0 commit(s))" in repo.tool("status", "1.14").stdout
 
 
 def test_notes_of_the_next_release_skip_the_fixes_picked_into_the_previous_one(
