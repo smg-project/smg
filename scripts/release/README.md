@@ -109,6 +109,12 @@ A candidate or a final is tagged when, on the branch head:
 
 ## When something goes wrong
 
+- A pick's pull request squash-merges under its title alone (the repository's setting), so the
+  picked commits' `(cherry picked from commit …)` trailers never reach the branch: the tool
+  records the picked originals in `scripts/release/picks.txt` on the pick branch, one commit the
+  squash keeps, and `status`, `check` and `notes` read the branch's picks from the file (the
+  notes name the originals under their types). The file is the release branch's; `bump-main`
+  moves version files only.
 - A pick conflicts: the tool leaves you on the pick branch and prints the three steps
   (`git add`, `git cherry-pick --continue`, `make release-pick-pr RELEASE=<x.y>`);
   `git cherry-pick --abort` gives it up.

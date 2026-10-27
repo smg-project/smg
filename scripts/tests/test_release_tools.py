@@ -403,11 +403,14 @@ def test_pick_cherry_picks_from_main_and_opens_the_pull_request(repo: Sandbox) -
     repo.tool("pick", "1.14", three)
     topic = f"pick/1.14-{three[:7]}"
     assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == topic
-    message = repo.git("log", "-1", "--format=%B")
+    message = repo.git("log", "-1", "--format=%B", "HEAD~1")
     assert message.startswith("fix(router): three (#123)\n")
     assert f"(cherry picked from commit {three})" in message
     assert "Signed-off-by: Release Owner <owner@example.invalid>" in message
-    assert repo.git("rev-parse", "HEAD~1") == branch_head
+    assert repo.git("rev-parse", "HEAD~2") == branch_head
+    # The branch records its picks in a file the squash merge keeps (the repository merges under the title alone).
+    assert repo.git("log", "-1", "--format=%s") == "chore(release): record 1 pick into release/1.14"
+    assert repo.read("scripts/release/picks.txt") == f"{three} fix(router): three (#123)\n"
     assert repo.origin_ref(f"refs/heads/{topic}") == repo.git("rev-parse", "HEAD")
     assert repo.origin_ref("refs/heads/release/1.14") == branch_head
     assert repo.gh_calls()[-1].startswith(
@@ -421,7 +424,13 @@ def test_pick_takes_several_commits_oldest_first(repo: Sandbox) -> None:
     first = repo.commit_main("fix(a): first", "a.txt", "a\n")
     second = repo.commit_main("fix(b): second", "b.txt", "b\n")
     repo.tool("pick", "1.14", f"{second},{first}")
-    assert repo.git("log", "--format=%s", "-2") == "fix(b): second\nfix(a): first"
+    assert repo.git("log", "--format=%s", "-3") == (
+        "chore(release): record 2 picks into release/1.14\nfix(b): second\nfix(a): first"
+    )
+    assert (
+        repo.read("scripts/release/picks.txt")
+        == f"{first} fix(a): first\n{second} fix(b): second\n"
+    )
     assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == f"pick/1.14-{first[:7]}-{second[:7]}"
     assert (
         repo.gh_calls()[-1]
@@ -634,10 +643,10 @@ def test_a_cut_before_the_previous_releases_bump_main_merged_is_refused(repo: Sa
 
 
 def land_on_release_squashed(repo: Sandbox, release: str = "1.14") -> None:
-    """The checked-out pick pull request merges as a squash: one commit on origin's branch whose message carries
-    the pull request body, the `(cherry picked from commit …)` lines among it, as the squash merge writes it."""
+    """The checked-out pick pull request merges as a squash: one commit on origin's branch under the pull request's
+    title alone, no body (the repository's `squash_merge_commit_message` is BLANK), so no `(cherry picked from
+    commit …)` line reaches the branch; the picks file the pull request carries does."""
     topic = repo.git("rev-parse", "--abbrev-ref", "HEAD")
-    body = repo.pr_body()
     repo.git("switch", "--quiet", "--detach", f"origin/release/{release}")
     repo.git("merge", "--quiet", "--squash", topic)
     repo.git(
@@ -645,8 +654,6 @@ def land_on_release_squashed(repo: Sandbox, release: str = "1.14") -> None:
         "--quiet",
         "-m",
         f"chore(release): pick 2 commits from main into release/{release} (#9)",
-        "-m",
-        body,
     )
     repo.git("push", "--quiet", "origin", f"HEAD:refs/heads/release/{release}")
     repo.git("switch", "--quiet", "main")
@@ -666,6 +673,12 @@ def test_a_squash_landed_pick_is_read_as_picked_by_status_and_the_next_notes(rep
     )
     repo.tool("pick", "1.14", f"{three},{four}")
     land_on_release_squashed(repo)
+    assert "cherry picked" not in repo.git("log", "-1", "--format=%B", "origin/release/1.14")
+    assert sorted(
+        repo.read("scripts/release/picks.txt", "origin/release/1.14").splitlines()
+    ) == sorted([f"{three} fix(router): three (#123)", f"{four} fix(router): four (#126)"]), (
+        "the pick order follows the commit dates, which the sandbox writes within one second"
+    )
     status = repo.tool("status", "1.14").stdout
     assert "fix(router): three" not in status and "fix(router): four" not in status
     assert "  (0 commit(s))" in status, "two picks in one squash commit: both read off its trailers"

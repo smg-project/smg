@@ -43,6 +43,10 @@ MAKE=${MAKE:-make}
 VERSION_RE='^([0-9]+)\.([0-9]+)\.([0-9]+)(-rc\.([0-9]+))?$'
 RELEASE_RE='^[0-9]+\.[0-9]+$'
 GATEWAY_MANIFEST=model_gateway/Cargo.toml
+# The originals picked into a release branch, one "<sha> <subject>" per line, written by the pick's pull request: the
+# repository squash-merges a pull request under its title alone, so the picked commits' `(cherry picked from commit …)`
+# trailers never reach the branch; this file does.
+PICKS_FILE=scripts/release/picks.txt
 
 say() { printf '%s\n' "$*"; }
 note() { printf 'release: %s\n' "$*" >&2; }
@@ -100,10 +104,26 @@ since_tag() { # <ref> <version>: the tag a bump or a check compares the versions
 manifest_version() { # the version a ref's gateway manifest carries (empty when it is not there)
   git show "$1:$GATEWAY_MANIFEST" 2>/dev/null | grep -m1 '^version = ' | sed 's/version = "\(.*\)"/\1/' || true
 }
-picked_into() { # <ref>: the commits named in the `(cherry picked from commit …)` trailers reachable from <ref>, space-bounded
-  # A pick lands on a release branch as its own commits (a fast-forward) or as one squash commit whose message carries
-  # the trailers from the pull request body; either way the picked originals are read off the branch's history.
-  printf ' %s ' "$(git log --format=%b "$1" | grep -o 'cherry picked from commit [0-9a-f]*' | sed 's/.* //' | tr '\n' ' ' || true)"
+picked_into() { # <ref>: the originals picked into <ref>, space-bounded: the picks file at <ref> and the trailers reachable from it
+  # A pick's pull request records its originals in $PICKS_FILE on the branch (the squash merge keeps the title alone);
+  # a pick landed as its own commits (a fast-forward, the older process) carries the `(cherry picked from commit …)`
+  # trailers in its history. Both are read.
+  printf ' %s ' "$({ git show "$1:$PICKS_FILE" 2>/dev/null | cut -d' ' -f1; git log --format=%b "$1" | grep -o 'cherry picked from commit [0-9a-f]*' | sed 's/.* //'; } | sort -u | tr '\n' ' ' || true)"
+}
+record_picks() { # <x.y> <base>: the originals of the picks in <base>..HEAD appended to the branch's picks file, in one commit
+  local release=$1 base=$2 full subject added=0 word
+  while read -r full; do
+    [ -n "$full" ] || continue
+    grep -q "^$full " "$root/$PICKS_FILE" 2>/dev/null && continue
+    subject=$(git log -1 --format=%s "$full" 2>/dev/null || true)
+    printf '%s %s\n' "$full" "${subject:-(not fetched)}" >> "$root/$PICKS_FILE"
+    added=$((added + 1))
+  done < <(git log --reverse --format=%b "$base..HEAD" | grep -o 'cherry picked from commit [0-9a-f]*' | sed 's/.* //' || true)
+  [ "$added" -gt 0 ] || return 0
+  [ "$added" -eq 1 ] && word=pick || word=picks
+  git add -- "$root/$PICKS_FILE"
+  commit_all "chore(release): record $added $word into release/$release" \
+    "The originals of this pull request's cherry-picks, in $PICKS_FILE: the squash merge keeps the title alone, and status, check and notes read the branch's picks from the file."
 }
 
 require_identity() {
@@ -316,6 +336,7 @@ pick_pr() { # <x.y> <topic>: the pull request of a pick branch
     say ""
     git log --format=%b "$base..HEAD" | grep -o '(cherry picked from commit [0-9a-f]*)' | sed 's/^/- /' || true
   } > "$body"
+  record_picks "$release" "$base"
   open_pr "$topic" "release/$release" "$title" "$body"
 }
 
@@ -378,8 +399,8 @@ cmd_notes() {
   local version=${1:-} since=${2:-}
   [ -n "$version" ] || die "usage: release.sh notes <version> [<since>]"
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
-  local release tagname ref subject type count picked full original unknown
-  local originals=() subjects=()
+  local release tagname ref subject type count picked full original unknown line seen=' '
+  local lines=() subjects=()
   local feat=() fix=() perf=() docs=() maint=() other=()
   release=$(release_of "$version"); tagname="v$version"
   fetch
@@ -398,21 +419,25 @@ cmd_notes() {
   # previous release's branch, and the originals of the fixes picked into it are not news here.
   # A pick lands as one squash commit whose patch matches none of the originals, so --cherry-pick alone would list
   # them again: the commits named in the trailers reachable from $since are left out too (picked_into).
-  # On this side a squash commit stands for the originals its trailers name ("chore(release): pick 2 commits …"
-  # says nothing of them): each is listed under its own type, left out when $since carries it; a pick landed as
-  # its own commits reads the same through its trailer, and a named original the fetch did not bring keeps the
-  # commit's own subject.
+  # On this side a pick's squash commit stands for the originals it recorded in the picks file (the lines it added;
+  # "chore(release): pick 2 commits …" says nothing of them): each is listed under its own type, once, left out when
+  # $since carries it; a pick landed as its own commits reads the same through its trailer, and a trailer whose
+  # original the fetch did not bring keeps the commit's own subject.
   picked=$(picked_into "$since")
   count=0
   while read -r full subject; do
     case "$picked" in *" $full "*) continue ;; esac
-    mapfile -t originals < <(git log -1 --format=%b "$full" | grep -o 'cherry picked from commit [0-9a-f]*' | sed 's/.* //' || true)
+    mapfile -t lines < <({ git show --format= "$full" -- "$PICKS_FILE" | grep '^+[0-9a-f]\{40\} ' | cut -c2-; git log -1 --format=%b "$full" | grep -o 'cherry picked from commit [0-9a-f]*' | sed 's/.* //'; } 2>/dev/null || true)
     subjects=(); unknown=0
-    for original in ${originals[@]+"${originals[@]}"}; do
-      case "$picked" in *" $original "*) continue ;; esac
-      if has_ref "$original"; then subjects+=("$(git log -1 --format=%s "$original")"); else unknown=1; fi
+    for line in ${lines[@]+"${lines[@]}"}; do
+      original=${line%% *}
+      case "$picked$seen" in *" $original "*) continue ;; esac
+      seen="$seen$original "
+      if [ "$line" != "$original" ]; then subjects+=("${line#* }")
+      elif has_ref "$original"; then subjects+=("$(git log -1 --format=%s "$original")")
+      else unknown=1; fi
     done
-    if [ ${#originals[@]} = 0 ] || [ "$unknown" = 1 ]; then subjects+=("$subject"); fi
+    if [ ${#lines[@]} = 0 ] || [ "$unknown" = 1 ]; then subjects+=("$subject"); fi
     for subject in ${subjects[@]+"${subjects[@]}"}; do
       count=$((count + 1))
       case "$subject" in 'chore(release): bump versions'*) continue ;; esac
