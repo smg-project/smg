@@ -1076,8 +1076,8 @@ jobs:
               ("model_gateway/src/wasm/**",                      CORE),
               ("model_gateway/src/server/tls.rs",                CORE),
               ("model_gateway/src/version.rs",                   CORE),
-              ("model_gateway/src/posture.rs",                   CORE),
-              ("model_gateway/src/tenant.rs",                    CORE),
+              ("model_gateway/src/server/posture.rs",            CORE),
+              ("model_gateway/src/tenant/**",                    CORE),
               ("model_gateway/src/rl_adapter.rs",                CORE),
               ("model_gateway/**",                               FULL),
               # the crates: test trees, benches, fuzzers, examples and tooling none (the
