@@ -61,6 +61,9 @@ release_of() { # 1.14.0-rc.1 -> 1.14
 }
 release_ok() { [[ $1 =~ $RELEASE_RE ]] || die "not a release: '$1' (X.Y, the minor version of release/X.Y)"; }
 is_final() { [[ $1 != *-* ]]; }
+version_above() { # <a> <b>: a reads above b (a candidate sorts below its final: 1.14.0-rc.1 < 1.14.0)
+  [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sed 's/-rc\./~rc./' | sort -V | tail -n 1 | sed 's/~rc\./-rc./')" = "$1" ]
+}
 
 fetch() { git fetch --quiet --tags "$REMOTE" || die "cannot fetch $REMOTE"; }
 has_ref() { git rev-parse --verify --quiet "$1^{commit}" >/dev/null 2>&1; }
@@ -192,8 +195,8 @@ cmd_cut() {
   # The previous release's final is the right tag only once main carries that release's versions: a cut before the
   # release-bump-main pull request merged (or from an older commit) would read a crate bumped for that release as
   # bumped already, leave main's lower version, and ship nothing for it while every check passes.
-  if ! git merge-base --is-ancestor "$since" "$from_sha" && [ "$(manifest_version "$from_sha")" != "${since#v}" ]; then
-    die "$from reads $(manifest_version "$from_sha"), not ${since#v}: merge the release-bump-main pull request for $since first (release.sh bump-main ${since#v}), or cut from a commit after it"
+  if ! git merge-base --is-ancestor "$since" "$from_sha" && version_above "${since#v}" "$(manifest_version "$from_sha")"; then
+    die "$from reads $(manifest_version "$from_sha"), below ${since#v}: merge the release-bump-main pull request for $since first (release.sh bump-main ${since#v}), or cut from a commit after it"
   fi
   note "cut: $branch from $(git rev-parse --short "$from_sha") ($from); the versions move from $since to $version"
   git switch --quiet --no-track -c "$branch" "$from_sha"
@@ -375,7 +378,8 @@ cmd_notes() {
   local version=${1:-} since=${2:-}
   [ -n "$version" ] || die "usage: release.sh notes <version> [<since>]"
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
-  local release tagname ref subject type count picked full
+  local release tagname ref subject type count picked full original unknown
+  local originals=() subjects=()
   local feat=() fix=() perf=() docs=() maint=() other=()
   release=$(release_of "$version"); tagname="v$version"
   fetch
@@ -394,21 +398,34 @@ cmd_notes() {
   # previous release's branch, and the originals of the fixes picked into it are not news here.
   # A pick lands as one squash commit whose patch matches none of the originals, so --cherry-pick alone would list
   # them again: the commits named in the trailers reachable from $since are left out too (picked_into).
+  # On this side a squash commit stands for the originals its trailers name ("chore(release): pick 2 commits …"
+  # says nothing of them): each is listed under its own type, left out when $since carries it; a pick landed as
+  # its own commits reads the same through its trailer, and a named original the fetch did not bring keeps the
+  # commit's own subject.
   picked=$(picked_into "$since")
   count=0
   while read -r full subject; do
     case "$picked" in *" $full "*) continue ;; esac
-    count=$((count + 1))
-    case "$subject" in 'chore(release): bump versions'*) continue ;; esac
-    type=${subject%%[(:!]*}
-    case "$type" in
-      feat) feat+=("$subject") ;;
-      fix) fix+=("$subject") ;;
-      perf) perf+=("$subject") ;;
-      docs) docs+=("$subject") ;;
-      ci | chore | build | test | refactor | style) maint+=("$subject") ;;
-      *) other+=("$subject") ;;
-    esac
+    mapfile -t originals < <(git log -1 --format=%b "$full" | grep -o 'cherry picked from commit [0-9a-f]*' | sed 's/.* //' || true)
+    subjects=(); unknown=0
+    for original in ${originals[@]+"${originals[@]}"}; do
+      case "$picked" in *" $original "*) continue ;; esac
+      if has_ref "$original"; then subjects+=("$(git log -1 --format=%s "$original")"); else unknown=1; fi
+    done
+    if [ ${#originals[@]} = 0 ] || [ "$unknown" = 1 ]; then subjects+=("$subject"); fi
+    for subject in ${subjects[@]+"${subjects[@]}"}; do
+      count=$((count + 1))
+      case "$subject" in 'chore(release): bump versions'*) continue ;; esac
+      type=${subject%%[(:!]*}
+      case "$type" in
+        feat) feat+=("$subject") ;;
+        fix) fix+=("$subject") ;;
+        perf) perf+=("$subject") ;;
+        docs) docs+=("$subject") ;;
+        ci | chore | build | test | refactor | style) maint+=("$subject") ;;
+        *) other+=("$subject") ;;
+      esac
+    done
   done < <(git log --cherry-pick --right-only --first-parent --no-merges --format='%H %s' "$since...$ref")
   say "## SMG $tagname"
   say ""
@@ -446,7 +463,7 @@ cmd_bump_main() {
   [ -n "$version" ] || die "usage: release.sh bump-main <version>"
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
   is_final "$version" || die "main follows a final release (X.Y.Z), not a candidate"
-  local release source topic body
+  local release source topic body current moved
   release=$(release_of "$version")
   require_identity; require_clean; fetch
   if has_ref "refs/tags/v$version"; then
@@ -458,13 +475,28 @@ cmd_bump_main() {
   topic="chore/main-versions-$version"
   has_ref "refs/heads/$topic" && die "the branch $topic exists: delete it or finish it"
   git switch --quiet --no-track -c "$topic" "$REMOTE/main"
-  note "bump-main: make bump-version VERSION=$version"
-  "$MAKE" --no-print-directory -C "$root" bump-version "VERSION=$version" >/dev/null
+  current=$(manifest_version "$REMOTE/main")
+  # Main never goes back: after a patch of an older line (v1.14.1 once v1.15.0 is out), the gateway and its mirrors
+  # keep main's higher version (the nightly and the next cut derive from it) and only the crates and packages the
+  # patch raised move, as sync_versions.py moves them: to at least the release's, never lower.
+  if version_above "$current" "$version"; then
+    note "bump-main: main reads $current, above $version: the gateway keeps it; the crates and packages v$version raised move"
+    moved="The gateway keeps $current on main (above v$version)"
+  else
+    note "bump-main: make bump-version VERSION=$version"
+    "$MAKE" --no-print-directory -C "$root" bump-version "VERSION=$version" >/dev/null
+    moved="The gateway reads $version on main"
+  fi
   note "bump-main: scripts/release/sync_versions.py $source $version (every crate and package at least the release's)"
   "$PYTHON" "$root/scripts/release/sync_versions.py" "$source" "$version"
   refresh_lock
+  if git diff --quiet && git diff --cached --quiet; then
+    git switch --quiet - 2>/dev/null || git switch --quiet --detach '@{-1}'
+    git branch --quiet -D "$topic"
+    die "bump-main: main carries v$version's versions already (the gateway at $current, every crate and package at least the release's): nothing to move"
+  fi
   commit_all "chore(release): main's versions follow v$version" \
-    "The gateway reads $version on main and every crate and package at least the version released from release/$release (crates.io and PyPI never take a version twice). Main's artifacts are not published; the release branches' are."
+    "$moved and every crate and package at least the version released from release/$release (crates.io and PyPI never take a version twice). Main's artifacts are not published; the release branches' are."
   body=$(mktemp)
   {
     say "After the v$version release: main's version files follow the release (\`$source\`), so the next cut starts above what crates.io and PyPI already carry."

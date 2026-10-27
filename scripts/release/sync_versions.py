@@ -5,7 +5,9 @@ After a release ships from its branch, main's version files follow it: the gatew
 files that mirror its version read the release's version, and every other crate or package
 reads the release's version when that is higher than main's (crates.io and PyPI never take a
 version twice, so the next cut must start above what the release published). A component
-main already carries at a higher version keeps it.
+main already carries at a higher version keeps it, the gateway included: after a patch of an
+older line (v1.14.1 once v1.15.0 is out) main never goes back, since the nightly and the next
+cut derive their versions from it.
 
 Usage:
     sync_versions.py <ref> <gateway-version>
@@ -93,10 +95,21 @@ def main(argv: list[str] | None = None) -> int:
         moved.append(f"Cargo.toml {dep_key}: {old} -> {new}")
 
     gateway = next(c for c in crv.CRATES if c.name == crv.GATEWAY)
-    set_version(gateway.version_file, "cargo", gateway_version)
-    for mirror in crv.MIRRORS:
-        set_version(mirror.file, mirror.kind, gateway_version)
-    set_version(VERSION_PY, "python", gateway_version)
+    ours = (
+        crv.read_version("cargo", repo.read(gateway.version_file), gateway.version_file)
+        if (ROOT / gateway.version_file).is_file()
+        else gateway_version
+    )
+    if version_key(ours) > version_key(gateway_version):
+        print(
+            f"sync_versions: the gateway reads {ours}, above {gateway_version}:"
+            " it and its mirrors keep that (main never goes back)"
+        )
+    else:
+        set_version(gateway.version_file, "cargo", gateway_version)
+        for mirror in crv.MIRRORS:
+            set_version(mirror.file, mirror.kind, gateway_version)
+        set_version(VERSION_PY, "python", gateway_version)
 
     for component in (*crv.CRATES, *crv.PACKAGES):
         if component.name == crv.GATEWAY:

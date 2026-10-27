@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOL = "scripts/release/release.sh"
@@ -70,6 +71,17 @@ echo ""
 echo "- stub images for $1"
 """
 
+
+CURL_STUB = r"""#!/usr/bin/env bash
+# PyPI as the release-grpc selection reads it: CURL_STUB lists "<name>/<version>=complete|wheel";
+# anything else is a 404.
+url=${*: -1}; key=${url#https://pypi.org/pypi/}; key=${key%/json}
+case " $CURL_STUB " in
+  *" $key=complete "*) printf '{"urls": [{"packagetype": "bdist_wheel"}, {"packagetype": "sdist"}]}' ;;
+  *" $key=wheel "*) printf '{"urls": [{"packagetype": "bdist_wheel"}]}' ;;
+  *) exit 22 ;;
+esac
+"""
 
 # The lines of the engine-image workflow the tooling reads: the release line the version checker
 # bumps and the release-base table the publishing plan turns into dispatches.
@@ -615,7 +627,7 @@ def test_a_cut_before_the_previous_releases_bump_main_merged_is_refused(repo: Sa
     refused = repo.tool("cut", "1.15.0-rc.1", check=False)
     assert refused.returncode == 1
     assert (
-        "origin/main reads 1.13.0, not 1.14.0: merge the release-bump-main pull request for v1.14.0 first"
+        "origin/main reads 1.13.0, below 1.14.0: merge the release-bump-main pull request for v1.14.0 first"
         in refused.stderr
     )
     assert repo.git("branch", "--list", "release/1.15") == "", "nothing was cut"
@@ -660,6 +672,12 @@ def test_a_squash_landed_pick_is_read_as_picked_by_status_and_the_next_notes(rep
     repo.tool("bump", "1.14.0")
     repo.land_on_release()
     repo.tool("tag", "1.14.0", PUSH="1")
+    # The release's own notes name the two fixes, under Fixes, not the squash commit's subject under Maintenance.
+    notes = repo.tool("notes", "1.14.0").stdout
+    assert "- fix(router): three (#123)\n" in notes and "- fix(router): four (#126)\n" in notes
+    assert "chore(release): pick 2 commits" not in notes
+    assert notes.index("### Fixes") < notes.index("- fix(router): three (#123)")
+    assert "6 commits since v1.13.0" in notes, "the two originals count, the squash commit does not"
     repo.tool("bump-main", "1.14.0")
     repo.git("push", "--quiet", "origin", "HEAD:refs/heads/main")  # the pull request merges
     repo.commit_main(
@@ -846,6 +864,116 @@ def test_bump_main_moves_mains_versions_to_the_release(repo: Sandbox) -> None:
 def test_bump_main_refuses_a_candidate(repo: Sandbox) -> None:
     repo.cut()
     assert "follows a final release" in repo.tool("bump-main", "1.14.0-rc.1", check=False).stderr
+
+
+def test_bump_main_after_a_patch_of_an_older_line_keeps_mains_higher_version(repo: Sandbox) -> None:
+    """v1.15.0 is out and main follows it; a v1.14.1 patch of the older line releases a tool-parser fix. bump-main for
+    the patch moves that crate alone: main's gateway stays at 1.15.0 (the nightly and the next cut derive from it) and
+    the next cut is accepted against v1.15.0. Run again once merged, it has nothing to move and says so."""
+    repo.cut()  # 1.14.0-rc.1: tool-parser 0.6.0 for the feat on main since v1.13.0
+    repo.tool("tag", "1.14.0-rc.1", PUSH="1")
+    repo.tool("bump", "1.14.0")
+    repo.land_on_release()
+    repo.tool("tag", "1.14.0", PUSH="1")
+    repo.tool("bump-main", "1.14.0")
+    repo.git("push", "--quiet", "origin", "HEAD:refs/heads/main")
+    repo.commit_main(  # nothing of tool-parser changes on main before 1.15: it stays 0.6.0 there
+        "fix(router): gateway only (#130)",
+        "model_gateway/src/main.rs",
+        'fn main() {\n    println!("five");\n}\n',
+    )
+    repo.cut("1.15.0-rc.1")
+    repo.tool("bump", "1.15.0")
+    repo.land_on_release("1.15")
+    repo.tool("tag", "1.15.0", PUSH="1")
+    repo.tool("bump-main", "1.15.0")
+    repo.git("push", "--quiet", "origin", "HEAD:refs/heads/main")
+    assert repo.version_of("model_gateway/Cargo.toml", "origin/main") == "1.15.0"
+    assert repo.version_of("crates/tool_parser/Cargo.toml", "origin/main") == "0.6.0"
+    # The patch of the older line: a tool-parser fix picked into release/1.14, bumped there, released as v1.14.1.
+    fix = repo.commit_main(
+        "fix(tool_parser): patch (#131)",
+        "crates/tool_parser/src/lib.rs",
+        "pub fn x() {}\npub fn patch() {}\n",
+    )
+    repo.tool("pick", "1.14", fix)
+    repo.land_on_release("1.14")
+    repo.tool("bump", "1.14.1")
+    repo.land_on_release("1.14")
+    repo.tool("tag", "1.14.1", PUSH="1")
+    assert repo.version_of("crates/tool_parser/Cargo.toml", "v1.14.1") == "0.6.1"
+    done = repo.tool("bump-main", "1.14.1")
+    assert "main reads 1.15.0, above 1.14.1: the gateway keeps it" in done.stderr
+    assert "the gateway reads 1.15.0, above 1.14.1: it and its mirrors keep that" in done.stdout
+    for path in VERSION_FILES:
+        assert repo.version_of(path) == "1.15.0", path
+    assert repo.version_of("crates/tool_parser/Cargo.toml") == "0.6.1"
+    assert 'tool-parser = { version = "0.6.1"' in repo.read("Cargo.toml")
+    assert repo.git("log", "-1", "--format=%b").startswith(
+        "The gateway keeps 1.15.0 on main (above v1.14.1)"
+    )
+    repo.git("push", "--quiet", "origin", "HEAD:refs/heads/main")  # the pull request merges
+    repo.git("switch", "--quiet", "main")
+    repo.git("branch", "--quiet", "-D", "chore/main-versions-1.14.1")
+    again = repo.tool("bump-main", "1.14.1", check=False)
+    assert again.returncode == 1 and "nothing to move" in again.stderr
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert repo.git("branch", "--list", "chore/main-versions-1.14.1") == ""
+    repo.cut("1.16.0-rc.1")  # accepted: main reads the previous final's version, v1.15.0's
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "release/1.16"
+    for path in VERSION_FILES:
+        assert repo.version_of(path) == "1.16.0-rc.1", path
+
+
+def grpc_selection(tmp_path: Path, pypi: str, packages: str = "auto") -> dict[str, str]:
+    """The detect step of release-grpc.yml over a tree whose two pyproject files read 1.14.0, with a curl that
+    answers for PyPI."""
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "release-grpc.yml").read_text())
+    step = next(s for s in workflow["jobs"]["detect"]["steps"] if s.get("id") == "changes")
+    tree = tmp_path / f"selection-{len(list(tmp_path.iterdir()))}"
+    for file in ("crates/grpc_client/python/pyproject.toml", "grpc_servicer/pyproject.toml"):
+        (tree / file).parent.mkdir(parents=True)
+        (tree / file).write_text('[project]\nversion = "1.14.0"\n')
+    bin_dir = tree / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "curl").write_text(CURL_STUB)
+    (bin_dir / "curl").chmod(0o755)
+    output = tree / "output"
+    done = subprocess.run(
+        ["bash", "-eo", "pipefail", "-c", step["run"]],
+        cwd=tree,
+        env={
+            "PATH": os.pathsep.join(
+                [str(bin_dir), str(Path(sys.executable).parent), "/usr/bin", "/bin"]
+            ),
+            "GITHUB_OUTPUT": str(output),
+            "CURL_STUB": pypi,
+            "PACKAGES": packages,
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert done.returncode == 0, done.stderr
+    return dict(line.split("=", 1) for line in output.read_text().splitlines())
+
+
+def test_the_grpc_release_selects_a_package_until_pypi_holds_both_its_files(tmp_path: Path) -> None:
+    """A version PyPI shows after a failed upload may hold one of its two files; a selection by the version's presence
+    alone would skip the package for good. Selected unless the wheel and the sdist are both there; the packages input
+    names them outright."""
+    complete = "smg-grpc-proto/1.14.0=complete smg-grpc-servicer/1.14.0=complete"
+    assert grpc_selection(tmp_path, complete) == {"proto": "false", "servicer": "false"}
+    half = "smg-grpc-proto/1.14.0=wheel smg-grpc-servicer/1.14.0=complete"
+    assert grpc_selection(tmp_path, half) == {"proto": "true", "servicer": "false"}
+    assert grpc_selection(tmp_path, "") == {"proto": "true", "servicer": "true"}
+    assert grpc_selection(tmp_path, complete, packages="servicer") == {
+        "proto": "false",
+        "servicer": "true",
+    }
+    assert grpc_selection(tmp_path, complete, packages="both") == {
+        "proto": "true",
+        "servicer": "true",
+    }
 
 
 def test_sync_versions_never_lowers_a_version_main_already_raised(repo: Sandbox) -> None:

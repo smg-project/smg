@@ -45,8 +45,10 @@ Every commit, pick and tag carries the caller's git identity and sign-off.
   other crate or package to the release's version where that is higher than main's (crates.io
   and PyPI never take a version twice, so the next cut starts above what was published). The
   nightly and dev builds derive their versions from main's plain `X.Y.Z`, which is why main
-  carries no suffix. A cut from a `main` that does not read the previous final's version yet is refused:
-  merge that pull request first, or cut from a commit after it.
+  carries no suffix. A cut from a `main` that reads below the previous final's version is refused:
+  merge that pull request first, or cut from a commit after it. `main` never goes back: after a
+  patch of an older line (v1.14.1 once v1.15.0 is out), `make release-bump-main` keeps the
+  gateway's higher version and moves only the crates and packages the patch raised.
 
 ## What publishes, and when
 
@@ -56,7 +58,8 @@ image on a push to `main` or `release/**` that touches the Dockerfile and pushes
 dispatch only. The release owner dispatches each against the tag once the gate is green;
 `make release-publish-plan VERSION=<x.y.z>` prints the exact commands and the artifact names
 (the gateway image's `latest` moves only for a final; a crate publishes when its exact version
-is not on crates.io yet; a PyPI version that exists is skipped). The nightly prerelease and the
+is not on crates.io yet; a PyPI version that is complete, wheel and sdist, is skipped, and
+`-f packages=proto|servicer|both` on `release-grpc` names a package outright for a retry). The nightly prerelease and the
 CI images are unchanged by this process.
 
 ## The gate
@@ -113,7 +116,8 @@ A candidate or a final is tagged when, on the branch head:
   tags are never moved.
 - A dispatched workflow fails: dispatch it again against the same tag; every publish step skips
   what exists already (PyPI with `--skip-existing`, the crate action by version, the image tags
-  are overwritten with the same build).
+  are overwritten with the same build); a PyPI version left with one of its two files is selected
+  again and `--skip-existing` uploads the missing one.
 - `make release-tag` refuses: the branch head does not read the version (merge the bump first)
   or `scripts/check_release_versions.py --check <previous tag>` finds a crate changed and not
   bumped (a bump pull request fixes it).

@@ -4,12 +4,20 @@ name: Release gRPC packages to PyPI
 # (scripts/release/README.md): no push publishes.
 on:
   workflow_dispatch:
+    inputs:
+      packages:
+        description: >-
+          auto: the packages whose version at this ref is not complete on PyPI (wheel and sdist);
+          proto, servicer or both: named outright, for a retry
+        type: choice
+        options: [auto, proto, servicer, both]
+        default: auto
 
 permissions:
   contents: read
 
 jobs:
-  # ── The packages whose version at the dispatched ref is not on PyPI build and upload (--skip-existing covers a race) ──
+  # ── The packages whose version at the dispatched ref is not complete on PyPI (or the ones named) build and upload; --skip-existing passes the files PyPI has ──
   detect:
     name: Select packages
     runs-on: ubuntu-latest
@@ -24,21 +32,34 @@ jobs:
       - name: Select packages
         id: changes
         run: |
-          # A package is selected when the version its pyproject.toml carries at this ref is not on PyPI yet, so a
-          # servicer-only release never runs the proto upload (and a proto token failure cannot hold it up).
+          # A package is selected when the version its pyproject.toml carries at this ref is not complete on PyPI yet:
+          # both files there, the wheel and the sdist. A servicer-only release never runs the proto upload (a proto
+          # token failure cannot hold it up), and a run that failed after one of the two files uploaded is retried
+          # as it is (--skip-existing passes the file PyPI has). The packages input names them outright.
           selected() {
-            local name=$1 file=$2 version
+            local name=$1 file=$2 package=$3 version
+            case "${PACKAGES:-auto}" in
+              auto) ;;
+              both | "$package") echo "${name}: selected by the packages input (${PACKAGES})" >&2; echo true; return ;;
+              *) echo "${name}: not selected (packages=${PACKAGES})" >&2; echo false; return ;;
+            esac
             version=$(grep -m1 '^version = ' "$file" | sed 's/version = "\(.*\)"/\1/; s/-rc\./rc/')
-            if curl -fsS "https://pypi.org/pypi/${name}/${version}/json" > /dev/null 2>&1; then
-              echo "${name} ${version} is on PyPI already: not selected" >&2
+            if curl -fsS "https://pypi.org/pypi/${name}/${version}/json" 2>/dev/null | python3 -c '
+          import json, sys
+          kinds = {file["packagetype"] for file in json.load(sys.stdin)["urls"]}
+          sys.exit(0 if {"bdist_wheel", "sdist"} <= kinds else 1)
+          ' 2>/dev/null; then
+              echo "${name} ${version} is complete on PyPI (wheel and sdist): not selected" >&2
               echo false
             else
-              echo "${name} ${version} is not on PyPI: selected" >&2
+              echo "${name} ${version} is not complete on PyPI: selected" >&2
               echo true
             fi
           }
-          echo "proto=$(selected smg-grpc-proto crates/grpc_client/python/pyproject.toml)" >> "$GITHUB_OUTPUT"
-          echo "servicer=$(selected smg-grpc-servicer grpc_servicer/pyproject.toml)" >> "$GITHUB_OUTPUT"
+          echo "proto=$(selected smg-grpc-proto crates/grpc_client/python/pyproject.toml proto)" >> "$GITHUB_OUTPUT"
+          echo "servicer=$(selected smg-grpc-servicer grpc_servicer/pyproject.toml servicer)" >> "$GITHUB_OUTPUT"
+        env:
+          PACKAGES: ${{ inputs.packages }}
 
   # ── Tier 1: Proto (no dependencies) ──
   build-proto:
