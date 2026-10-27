@@ -8,8 +8,7 @@
 //! pipeline (which works against `ProtoStream`/`ProtoGenerateRequest`) is
 //! shared unchanged.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
+use engine_zmq_adapter::admin::{flush_reply_wait, PROFILE_WAIT};
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
     messages::CreateMessageRequest, worker::WorkerLoadResponse,
@@ -70,22 +69,6 @@ type SglangMmBuilder<B> = fn(
 /// The SGLang counterpart of [`VllmPlainBuilder`] without a client.
 type SglangPlainBuilder<B, T> =
     fn(String, &B, T, Vec<u32>) -> Result<sglang_proto::GenerateRequest, String>;
-
-/// How long a ZMQ engine's profiler start or stop may take to answer: the
-/// servicers' `PROFILE_COMM_TIMEOUT`.
-const PROFILE_WAIT: Duration = Duration::from_secs(600);
-
-/// The profile id a start is stamped with, as the servicers stamp it: the
-/// wall-clock start time in seconds.
-fn profile_id() -> String {
-    format!(
-        "{:.6}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64()
-    )
-}
 
 impl BackendClient {
     /// Runtime type backing this client.
@@ -208,12 +191,11 @@ impl BackendClient {
     ) -> Result<common_proto::FlushCacheResponse, tonic::Status> {
         match self {
             Self::Grpc(client) => client.flush_cache(timeout_s).await,
-            // The scheduler waits up to `timeout_s` for an idle moment; the
-            // reply wait is that plus slack, as the servicers wait.
+            // The reply wait is the servicers' rule, read from the adapter.
             Self::Zmq(client) => {
-                let wait = Duration::try_from_secs_f32(timeout_s.max(20.0) + 10.0)
-                    .unwrap_or(Duration::MAX);
-                let (success, message) = client.flush_cache_control(timeout_s, wait).await?;
+                let (success, message) = client
+                    .flush_cache_control(timeout_s, flush_reply_wait(timeout_s))
+                    .await?;
                 Ok(common_proto::FlushCacheResponse { success, message })
             }
         }
@@ -226,17 +208,9 @@ impl BackendClient {
         match self {
             Self::Grpc(client) => client.start_profile(req).await,
             Self::Zmq(client) => {
-                let start = SglangProfileStart {
-                    output_dir: req.output_dir,
-                    start_step: req.start_step.map(i64::from),
-                    num_steps: req.num_steps.map(i64::from),
-                    activities: req.activities,
-                    with_stack: req.with_stack,
-                    record_shapes: req.record_shapes,
-                    profile_by_stage: req.profile_by_stage,
-                    profile_id: profile_id(),
-                };
-                let (success, message) = client.profile_control(Some(start), PROFILE_WAIT).await?;
+                let (success, message) = client
+                    .profile_control(Some(SglangProfileStart::from_request(req)), PROFILE_WAIT)
+                    .await?;
                 Ok(common_proto::ProfileResponse { success, message })
             }
         }

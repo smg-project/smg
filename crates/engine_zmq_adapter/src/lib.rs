@@ -22,6 +22,7 @@
 //! params an `Embed` request carries ([`translate_embed_request`]).
 
 mod abort_status;
+pub mod admin;
 mod client;
 mod context_window;
 mod embed;
