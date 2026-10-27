@@ -3006,7 +3006,8 @@ async fn an_encode_request_outside_the_rules_is_refused_in_the_servicers_words()
 /// the reset, or, when the listener is already gone, is refused until the
 /// rank's own connect timeout. The refusal is read off the link the moment
 /// the servicer reports it, never off the rank's connect, which runs beside
-/// the wait and is dropped with it.
+/// the wait and is not polled again once the refusal is in (it is dropped at
+/// the helper's end, after the servicer stops).
 async fn link_failure_for(model: TokenSpeedModelInfo, ready: EngineCoreReadyResponse) -> String {
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
