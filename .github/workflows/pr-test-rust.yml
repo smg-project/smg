@@ -20,7 +20,7 @@ jobs:
     if: inputs.execute
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
-      external_product_commit: 52d8cbc5fe506dbbc647f9e3c16fdd48e7a5b2be
+      external_product_commit: 0bd73870ae7c7aeb09c5b55fc411f3f958627981
       engine: sglang
       gpu_tier: "2"
       runner: 4-gpu-mi300x
