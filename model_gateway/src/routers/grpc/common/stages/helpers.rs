@@ -381,9 +381,14 @@ impl SamplingBaseline {
 /// attempt stamp asks it for the worker each retry takes, as request building
 /// asked it for the first.
 pub(crate) trait TagForStart: fmt::Debug + Send + Sync {
-    /// The tag for an engine whose grammar starts at `start`, or `None` where
-    /// the table gives that engine no tag.
-    fn tag_for(&self, start: GrammarStart) -> Result<Option<String>, String>;
+    /// The tag for an engine whose grammar starts at `start`, in the
+    /// `vocabulary` of structural-tag nodes its compiler takes, or `None`
+    /// where the table gives that engine no tag.
+    fn tag_for(
+        &self,
+        start: GrammarStart,
+        vocabulary: utils::TagVocabulary,
+    ) -> Result<Option<String>, String>;
 
     /// The request's own JSON schema, where the tag is a JSON answer's: the
     /// constraint a worker the table gives no tag takes in its place, the
@@ -512,9 +517,11 @@ impl ToolConstraintStamp {
                 led || *first_token
             }
             Self::Table(tag) => {
-                let start = utils::WorkerDecoding::of(Some(workers)).start;
-                let shaped = tag.tag_for(start).map_err(failed)?;
-                let first_token = shaped.is_some() && start == GrammarStart::FirstToken;
+                let decoding = utils::WorkerDecoding::of(Some(workers));
+                let shaped = tag
+                    .tag_for(decoding.start, decoding.vocabulary)
+                    .map_err(failed)?;
+                let first_token = shaped.is_some() && decoding.start == GrammarStart::FirstToken;
                 match (shaped, tag.schema()) {
                     // A JSON answer's: the tag, or the request's own schema
                     // where the table gives this worker none, the one in the
@@ -1944,7 +1951,11 @@ mod tool_constraint_restamp_tests {
     struct TableTag;
 
     impl TagForStart for TableTag {
-        fn tag_for(&self, start: GrammarStart) -> Result<Option<String>, String> {
+        fn tag_for(
+            &self,
+            start: GrammarStart,
+            _vocabulary: utils::TagVocabulary,
+        ) -> Result<Option<String>, String> {
             Ok(match start {
                 GrammarStart::AfterReasoning => Some(BARE_TABLE_TAG.to_string()),
                 GrammarStart::FirstToken => Some(THOUGHT_TABLE_TAG.to_string()),
@@ -1965,7 +1976,11 @@ mod tool_constraint_restamp_tests {
     struct AnswerTag(Value);
 
     impl TagForStart for AnswerTag {
-        fn tag_for(&self, start: GrammarStart) -> Result<Option<String>, String> {
+        fn tag_for(
+            &self,
+            start: GrammarStart,
+            _vocabulary: utils::TagVocabulary,
+        ) -> Result<Option<String>, String> {
             Ok((start == GrammarStart::FirstToken).then(|| THOUGHT_ANSWER_TAG.to_string()))
         }
 

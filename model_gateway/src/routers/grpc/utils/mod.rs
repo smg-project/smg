@@ -43,7 +43,7 @@ pub(crate) use parsers::{
     check_reasoning_parser_availability, check_tool_parser_availability, create_reasoning_parser,
     create_tool_parser, get_tool_parser, messages_reasoning_starts_in_prefill,
     reasoning_parser_requires_special_tokens, rendered_prompt_reasoning_in_prefill,
-    tool_constraints_for_worker, ModelNames, Names, ParserResolver, WorkerDecoding,
+    tool_constraints_for_worker, ModelNames, Names, ParserResolver, TagVocabulary, WorkerDecoding,
 };
 pub(crate) use pd_bootstrap::{account_pd_side_failure, dead_rendezvous_of, DeadRendezvous};
 pub(crate) use stream_failure::{send_stream_failure, StreamFailure, StreamSource};

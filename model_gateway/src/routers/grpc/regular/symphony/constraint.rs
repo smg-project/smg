@@ -27,7 +27,7 @@ use crate::{
     routers::grpc::{
         common::stages::helpers::TagForStart,
         spec::scans_for_tool_calls,
-        utils::{ModelNames, Names, WorkerDecoding},
+        utils::{ModelNames, Names, TagVocabulary, WorkerDecoding},
     },
     worker::{Worker, WorkerType},
 };
@@ -41,15 +41,28 @@ fn answer_schema(response_format: Option<&ResponseFormat>) -> Option<Value> {
     }
 }
 
-/// The constraint `grammar` gives, written straight from the tree as the request carries it
+/// `grammar` as the engine's structural tag, written straight from the tree
 /// ([`Grammar::payload_text`], the bytes of `payload().to_string()` without the JSON tree in
-/// between), for the response template's table too (`compiled`, [`TEMPLATE_PARSER`](crate::config::TEMPLATE_PARSER)): a registry
+/// between) in the `vocabulary` the worker's grammar compiler takes: spelled without the newer
+/// nodes first for a worker that advertises the older one ([`Grammar::in_older_vocabulary`]), as
+/// the table built it otherwise ([`TagVocabulary`]).
+fn structural_tag(grammar: Grammar, vocabulary: TagVocabulary) -> ToolConstraint {
+    ToolConstraint::StructuralTag(match vocabulary {
+        TagVocabulary::Current => grammar.payload_text(),
+        TagVocabulary::Older => grammar.in_older_vocabulary().payload_text(),
+    })
+}
+
+/// The constraint `grammar` gives, written straight from the tree as the request carries it, in
+/// the `vocabulary` the worker's grammar compiler takes ([`structural_tag`]), for the response
+/// template's table too (`compiled`, [`TEMPLATE_PARSER`](crate::config::TEMPLATE_PARSER)): a registry
 /// table with no tag leaves the older registry to decide, as before; the template's table refuses
 /// instead, since its output has no other syntax the older path could constrain and the table
 /// still read, and so does a prompt that `continues` the assistant's message, since the tag
 /// writes a turn from its start.
 pub(super) fn tagged(
     grammar: Option<Grammar>,
+    vocabulary: TagVocabulary,
     compiled: bool,
     model: &str,
     asked: &str,
@@ -60,7 +73,7 @@ pub(super) fn tagged(
             "model '{model}' constrains {asked} from the start of a new assistant message, as its \
              response template writes one, so it cannot continue the assistant's message"
         ))),
-        Some(grammar) => Ok(Some(ToolConstraint::StructuralTag(grammar.payload_text()))),
+        Some(grammar) => Ok(Some(structural_tag(grammar, vocabulary))),
         None if compiled => Err(SymphonyError::Constraint(format!(
             "model '{model}' reads its output with its response template, whose table has no \
              structural tag for {asked}"
@@ -71,10 +84,12 @@ pub(super) fn tagged(
 
 /// The tag of a forced call to one of `tools`, at most one when `one_call`, with
 /// `reasoning_open` when the prompt leaves the model inside its thought and `thought_closed` when
-/// it closed the thought itself and wrote the template's text after it ([`tagged`]).
+/// it closed the thought itself and wrote the template's text after it, in the `vocabulary` the
+/// worker's grammar compiler takes ([`tagged`]).
 #[expect(
     clippy::too_many_arguments,
-    reason = "the table, the request's ask, where the prompt and the engine leave the model"
+    reason = "the table, the request's ask, where the prompt and the engine leave the model, \
+              the vocabulary its compiler takes"
 )]
 fn calls_tag(
     format: &Format,
@@ -85,6 +100,7 @@ fn calls_tag(
     reasoning_open: bool,
     thought_closed: bool,
     start: GrammarStart,
+    vocabulary: TagVocabulary,
     continues: bool,
 ) -> Result<Option<ToolConstraint>, SymphonyError> {
     let grammar = format.grammar_for(
@@ -97,7 +113,14 @@ fn calls_tag(
             start,
         },
     );
-    tagged(grammar, compiled, model, "a forced tool choice", continues)
+    tagged(
+        grammar,
+        vocabulary,
+        compiled,
+        model,
+        "a forced tool choice",
+        continues,
+    )
 }
 
 /// The tag of a JSON answer following `schema`, with `reasoning_open` when the prompt leaves the
@@ -109,7 +132,12 @@ fn calls_tag(
 /// tag is the schema alone, the engine's own constraint, leaves it to the engine as before, and
 /// so does one with no tag, or a prompt that `continues` the assistant's message, since the tag
 /// writes a turn from its start; the template's table takes its tag either way and refuses what
-/// it cannot constrain ([`tagged`]).
+/// it cannot constrain ([`tagged`]). `vocabulary` is the one the worker's grammar compiler takes.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the table, the request's ask, where the prompt and the engine leave the model, \
+              the vocabulary its compiler takes"
+)]
 fn answer_tag(
     format: &Format,
     compiled: bool,
@@ -117,13 +145,21 @@ fn answer_tag(
     schema: &Value,
     reasoning_open: bool,
     start: GrammarStart,
+    vocabulary: TagVocabulary,
     continues: bool,
 ) -> Result<Option<ToolConstraint>, SymphonyError> {
     let grammar = format.answer_grammar_for(schema, reasoning_open, start);
     if !compiled && (continues || matches!(grammar, Some(Grammar::JsonSchema { .. }))) {
         return Ok(None);
     }
-    tagged(grammar, compiled, model, "a JSON answer", continues)
+    tagged(
+        grammar,
+        vocabulary,
+        compiled,
+        model,
+        "a JSON answer",
+        continues,
+    )
 }
 
 /// Where a worker's engine starts a request's grammar on a prompt that leaves the model inside
@@ -148,12 +184,7 @@ pub(crate) fn grammar_start_from(start: WorkerGrammarStart) -> GrammarStart {
 pub(crate) fn grammar_start_of(workers: &[Arc<dyn Worker>]) -> GrammarStart {
     let mut starts = workers
         .iter()
-        .filter(|worker| {
-            matches!(
-                worker.worker_type(),
-                WorkerType::Regular | WorkerType::Decode
-            )
-        })
+        .filter(|worker| generates(worker.as_ref()))
         .map(|worker| {
             WorkerGrammarStart::from_label(
                 worker
@@ -176,6 +207,43 @@ pub(crate) fn grammar_start_of(workers: &[Arc<dyn Worker>]) -> GrammarStart {
     } else {
         // After the reasoning parser beside not saying: the unknown start's tags fit both.
         GrammarStart::Unknown
+    }
+}
+
+/// `worker` generates tokens a grammar constrains: a prefill or encode worker does not (the roles
+/// that do are allow-listed, so a role added later is left out until it is named).
+fn generates(worker: &dyn Worker) -> bool {
+    matches!(
+        worker.worker_type(),
+        WorkerType::Regular | WorkerType::Decode
+    )
+}
+
+/// The vocabulary of structural-tag nodes the model's `workers` take together, before one is
+/// selected, for a tag every one of them takes as it is (a forced call's, [`constraint`]): the
+/// older one when any worker that generates tokens ([`generates`]) advertises it in its
+/// `structural_tag_vocabulary` label, since every compiler takes that spelling and the worker
+/// that needs it may be the one selected; the current one otherwise, the tag then as the table
+/// built it ([`TagVocabulary`]). The tags derived for the selected worker take its own label
+/// ([`WorkerDecoding::vocabulary`]).
+pub(crate) fn vocabulary_of(workers: &[Arc<dyn Worker>]) -> TagVocabulary {
+    let older = workers
+        .iter()
+        .filter(|worker| generates(worker.as_ref()))
+        .any(|worker| {
+            TagVocabulary::from_label(
+                worker
+                    .metadata()
+                    .spec
+                    .labels
+                    .get(TagVocabulary::LABEL)
+                    .map(String::as_str),
+            ) == TagVocabulary::Older
+        });
+    if older {
+        TagVocabulary::Older
+    } else {
+        TagVocabulary::Current
     }
 }
 
@@ -367,9 +435,10 @@ pub(super) fn callable<'t>(choice: Option<&ToolChoice>, declared: &'t [Tool]) ->
 /// What the table gives a request's forced or required call to one of `tools`, or a chat request's
 /// JSON `response_format`, with `reasoning_open` when the prompt leaves the model inside its
 /// thought: the call's structural tag, built for `start`, where the model's workers start the
-/// grammar together ([`calls_tag`], [`grammar_start_of`]); the answer's as it derives for the
-/// selected worker's own start ([`Prepared::Answer`], [`AnswerTag`]), since a pool whose workers
-/// start the grammar at different places has no one answer tag that fits them all.
+/// grammar together ([`calls_tag`], [`grammar_start_of`]), in the `vocabulary` they take together
+/// ([`vocabulary_of`]); the answer's as it derives for the selected worker's own start and
+/// vocabulary ([`Prepared::Answer`], [`AnswerTag`]), since a pool whose workers start the grammar
+/// at different places has no one answer tag that fits them all.
 /// [`Prepared::None`] when no table reads the response ([`reads`]), the request asks neither, or
 /// the table has no tag for the call; the older registry then decides as before. An error refuses
 /// the request: the response template's table cannot constrain the call it is asked (the answer's
@@ -388,6 +457,7 @@ pub(crate) fn constraint(
     reasoning_open: bool,
     thought_closed: bool,
     start: GrammarStart,
+    vocabulary: TagVocabulary,
     templates: &Templates,
 ) -> PreparedConstraint {
     let Some((format, compiled)) = table_reading(parser, names, asks.model(), templates)? else {
@@ -411,6 +481,7 @@ pub(crate) fn constraint(
             reasoning_open,
             thought_closed,
             start,
+            vocabulary,
             continues,
         )
         .map(|tag| match tag {
@@ -453,6 +524,7 @@ pub(crate) fn auto_constraint(
     reasoning_open: bool,
     thought_closed: bool,
     start: GrammarStart,
+    vocabulary: TagVocabulary,
     templates: &Templates,
 ) -> Result<Option<ToolConstraint>, SymphonyError> {
     let Some(format) = reads(parser, names, asks.model(), templates)? else {
@@ -465,19 +537,22 @@ pub(crate) fn auto_constraint(
             reasoning_open,
             thought_closed,
             start,
+            vocabulary,
             one_call,
         )
     }))
 }
 
 /// The tag of the calls `format` lets a model make under `auto`: no call required, one at most
-/// when `one_call`; `None` when the table has no tag for them.
+/// when `one_call`, in the `vocabulary` the worker's grammar compiler takes; `None` when the
+/// table has no tag for them.
 pub(super) fn auto_tag(
     format: &Format,
     tools: &[Tool],
     reasoning_open: bool,
     thought_closed: bool,
     start: GrammarStart,
+    vocabulary: TagVocabulary,
     one_call: bool,
 ) -> Option<ToolConstraint> {
     format
@@ -491,7 +566,7 @@ pub(super) fn auto_tag(
                 start,
             },
         )
-        .map(|grammar| ToolConstraint::StructuralTag(grammar.payload_text()))
+        .map(|grammar| structural_tag(grammar, vocabulary))
 }
 
 /// The constraint preparation finds for what a request asks, before its worker is known
@@ -526,18 +601,20 @@ pub(crate) enum Prepared {
 }
 
 impl Prepared {
-    /// The constraint a worker whose engine starts the grammar at `start` takes: a JSON answer's
-    /// tag derived for it, what was found as it is otherwise. The tests read what preparation
-    /// found through it; the decision ([`worker_constraint`]) reads each variant itself.
+    /// The constraint a worker whose engine starts the grammar at `start` and whose compiler
+    /// takes `vocabulary` takes: a JSON answer's tag derived for it, what was found as it is
+    /// otherwise. The tests read what preparation found through it; the decision
+    /// ([`worker_constraint`]) reads each variant itself.
     #[cfg(test)]
     pub(crate) fn for_start(
         self,
         start: GrammarStart,
+        vocabulary: TagVocabulary,
     ) -> Result<Option<ToolConstraint>, SymphonyError> {
         match self {
             Self::None => Ok(None),
             Self::Constraint { constraint, .. } => Ok(Some(constraint)),
-            Self::Answer(answer) => answer.for_start(start),
+            Self::Answer(answer) => answer.for_start(start, vocabulary),
         }
     }
 }
@@ -576,12 +653,14 @@ pub(crate) struct AnswerTag {
 }
 
 impl AnswerTag {
-    /// The tag for an engine whose grammar starts at `start`; `None` where the answer is the
-    /// schema alone, the engine's own constraint, or the table has no tag for it; an error where
-    /// the response template's table cannot constrain the answer.
+    /// The tag for an engine whose grammar starts at `start`, in the `vocabulary` its compiler
+    /// takes; `None` where the answer is the schema alone, the engine's own constraint, or the
+    /// table has no tag for it; an error where the response template's table cannot constrain
+    /// the answer.
     pub(crate) fn for_start(
         &self,
         start: GrammarStart,
+        vocabulary: TagVocabulary,
     ) -> Result<Option<ToolConstraint>, SymphonyError> {
         answer_tag(
             &self.format,
@@ -590,14 +669,19 @@ impl AnswerTag {
             &self.schema,
             self.reasoning_open,
             start,
+            vocabulary,
             self.continues,
         )
     }
 }
 
 impl TagForStart for AnswerTag {
-    fn tag_for(&self, start: WorkerGrammarStart) -> Result<Option<String>, String> {
-        self.for_start(grammar_start_from(start))
+    fn tag_for(
+        &self,
+        start: WorkerGrammarStart,
+        vocabulary: TagVocabulary,
+    ) -> Result<Option<String>, String> {
+        self.for_start(grammar_start_from(start), vocabulary)
             .map(tag_text)
             .map_err(String::from)
     }
@@ -692,11 +776,12 @@ pub(crate) enum AutoRequest {
 }
 
 impl AutoTag {
-    /// The tag for an engine whose grammar starts at `start`; `None` where the table gives that
-    /// engine none.
+    /// The tag for an engine whose grammar starts at `start`, in the `vocabulary` its compiler
+    /// takes; `None` where the table gives that engine none.
     pub(crate) fn for_start(
         &self,
         start: GrammarStart,
+        vocabulary: TagVocabulary,
     ) -> Result<Option<ToolConstraint>, SymphonyError> {
         let (asks, tools) = match &self.request {
             AutoRequest::Chat(request) => (Asks::Chat(request), request.callable_tools()),
@@ -723,6 +808,7 @@ impl AutoTag {
             self.reasoning_open,
             self.thought_closed,
             start,
+            vocabulary,
             &self.templates,
         )
     }
@@ -737,8 +823,12 @@ impl AutoTag {
 }
 
 impl TagForStart for AutoTag {
-    fn tag_for(&self, start: WorkerGrammarStart) -> Result<Option<String>, String> {
-        self.for_start(grammar_start_from(start))
+    fn tag_for(
+        &self,
+        start: WorkerGrammarStart,
+        vocabulary: TagVocabulary,
+    ) -> Result<Option<String>, String> {
+        self.for_start(grammar_start_from(start), vocabulary)
             .map(tag_text)
             .map_err(String::from)
     }
@@ -768,11 +858,12 @@ impl fmt::Debug for AutoTag {
 }
 
 /// What constrains a request's output on the worker selected for it, whose engine takes a grammar
-/// on every turn or only when the request asks and starts it where its label says (`decoding`,
-/// under PD the decode worker's). The one place a worker's policy decides:
+/// on every turn or only when the request asks, starts it where its label says and takes the
+/// tags in the vocabulary its label says (`decoding`, under PD the decode worker's). The one
+/// place a worker's policy decides:
 ///
 /// - `requested`, the default: what preparation found (`prepared`), its refusal included; a JSON
-///   answer's tag derived for the worker's start ([`AnswerTag::for_start`]).
+///   answer's tag derived for the worker's start and vocabulary ([`AnswerTag::for_start`]).
 /// - `always`, on an engine that starts the grammar at the first token: the whole turn's grammar
 ///   (`turn`, [`turn_constraint`]) where it starts; its refusal refuses the request.
 /// - `always` otherwise, or where the whole turn's grammar does not start: what preparation found,
@@ -801,6 +892,7 @@ pub(crate) fn worker_constraint(
         }
     }
     let start = grammar_start_from(decoding.start);
+    let vocabulary = decoding.vocabulary;
     // A tag derived here is shaped for the selected worker's start; a prepared constraint says
     // for itself whether the table built it for the first token, and the older registry's is
     // shaped and spoken for at request building (`utils::tool_constraints_for_worker`).
@@ -809,14 +901,14 @@ pub(crate) fn worker_constraint(
     let (constraint, by_policy, table_tag, first_token) = match prepared? {
         Prepared::None if always => {
             let auto = auto();
-            let tag = auto.for_start(start)?;
+            let tag = auto.for_start(start, vocabulary)?;
             let by_policy = tag.is_some();
             let first_token = derived_for_first_token(&tag);
             let table_tag = by_policy.then(|| -> Arc<dyn TagForStart> { Arc::new(auto) });
             (tag, by_policy, table_tag, first_token)
         }
         Prepared::Answer(answer) => {
-            let tag = answer.for_start(start)?;
+            let tag = answer.for_start(start, vocabulary)?;
             let first_token = derived_for_first_token(&tag);
             (
                 tag,
@@ -843,18 +935,20 @@ pub(crate) fn worker_constraint(
 /// The whole turn's grammar for a request ([`Format::turn_grammar`]), where the response
 /// template's table reads the response ([`TEMPLATE_PARSER`](crate::config::TEMPLATE_PARSER)); `declared` is the tools the template
 /// sees (a chat request's effective tool list, a Messages request's chat tools) and `prompt` the
-/// rendered prompt. `Ok(None)` for any other table, and where the turn's grammar does not start;
-/// an error refuses what it cannot hold.
+/// rendered prompt; `vocabulary` the one the worker's grammar compiler takes. `Ok(None)` for any
+/// other table, and where the turn's grammar does not start; an error refuses what it cannot
+/// hold.
 pub(crate) fn turn_constraint(
     parser: ParserChoice,
     names: &ModelNames<'_>,
     asks: Asks<'_>,
     declared: &[Tool],
     prompt: &str,
+    vocabulary: TagVocabulary,
     templates: &Templates,
 ) -> Result<Option<ToolConstraint>, SymphonyError> {
     match table_reading(parser, names, asks.model(), templates)? {
-        Some((format, true)) => turn_of(&format, asks, declared, prompt),
+        Some((format, true)) => turn_of(&format, asks, declared, prompt, vocabulary),
         _ => Ok(None),
     }
 }
@@ -867,6 +961,7 @@ pub(super) fn turn_of(
     asks: Asks<'_>,
     declared: &[Tool],
     prompt: &str,
+    vocabulary: TagVocabulary,
 ) -> Result<Option<ToolConstraint>, SymphonyError> {
     let choice = asks.choice();
     let callable = callable(choice.as_deref(), declared);
@@ -882,6 +977,7 @@ pub(super) fn turn_of(
             parallel: asks.parallel(),
             answer: asks.answer(schema.as_ref()),
         },
+        vocabulary,
     )
 }
 
@@ -895,15 +991,17 @@ fn output_choice(choice: Option<&ToolChoice>) -> OutputChoice {
     }
 }
 
-/// `format`'s grammar for `turn` as the engine's structural tag.
+/// `format`'s grammar for `turn` as the engine's structural tag, in the `vocabulary` the
+/// worker's grammar compiler takes.
 pub(super) fn whole_turn(
     format: &Format,
     turn: &Turn<'_>,
+    vocabulary: TagVocabulary,
 ) -> Result<Option<ToolConstraint>, SymphonyError> {
     Ok(format
         .turn_grammar(turn)
         .map_err(SymphonyError::Constraint)?
-        .map(|grammar| ToolConstraint::StructuralTag(grammar.payload_text())))
+        .map(|grammar| structural_tag(grammar, vocabulary)))
 }
 
 #[cfg(test)]
@@ -937,6 +1035,7 @@ mod tests {
             true,
             false,
             symphony::GrammarStart::Either,
+            TagVocabulary::Current,
             &templates(),
         );
         let Ok(Prepared::Answer(answer)) = prepared else {
@@ -944,7 +1043,7 @@ mod tests {
         };
         let tag_of = |start| {
             answer
-                .for_start(start)
+                .for_start(start, TagVocabulary::Current)
                 .expect("no hf")
                 .map(|constraint| match constraint {
                     ToolConstraint::StructuralTag(tag) => {
@@ -986,6 +1085,7 @@ mod tests {
                 true,
                 false,
                 start,
+                TagVocabulary::Current,
                 &templates(),
             )
             else {
@@ -1040,6 +1140,7 @@ mod tests {
                 false,
                 false,
                 symphony::GrammarStart::AfterReasoning,
+                TagVocabulary::Current,
                 &templates(),
             )
             else {
@@ -1115,6 +1216,7 @@ mod tests {
                 false,
                 false,
                 symphony::GrammarStart::AfterReasoning,
+                TagVocabulary::Current,
                 &templates(),
             )
             else {
@@ -1319,9 +1421,10 @@ mod tests {
                 is_open(ParserChoice::Symphony, prompt) == Some(true),
                 false,
                 symphony::GrammarStart::Unknown,
+                TagVocabulary::Current,
                 &templates(),
             )
-            .and_then(|prepared| prepared.for_start(start))
+            .and_then(|prepared| prepared.for_start(start, TagVocabulary::Current))
         };
         let first = tag_of(answer(unopened, symphony::GrammarStart::FirstToken));
         assert_eq!(
@@ -1432,9 +1535,12 @@ mod tests {
                 reasoning_open,
                 false,
                 symphony::GrammarStart::Unknown,
+                TagVocabulary::Current,
                 &templates(),
             )
-            .and_then(|prepared| prepared.for_start(symphony::GrammarStart::Unknown))
+            .and_then(|prepared| {
+                prepared.for_start(symphony::GrammarStart::Unknown, TagVocabulary::Current)
+            })
         };
         // The named table, for a model the registry does not know: `json_object` asks for any
         // object, written in the message to the user.
@@ -1590,6 +1696,7 @@ mod tests {
             false,
             false,
             symphony::GrammarStart::Unknown,
+            TagVocabulary::Current,
             &templates(),
         )
         .expect("no hf");
@@ -1617,6 +1724,7 @@ mod tests {
             false,
             false,
             symphony::GrammarStart::Unknown,
+            TagVocabulary::Current,
             &templates()
         )
         .expect("no hf")
@@ -1629,6 +1737,7 @@ mod tests {
             false,
             false,
             symphony::GrammarStart::Unknown,
+            TagVocabulary::Current,
             &templates()
         )
         .expect("legacy")
@@ -1641,6 +1750,7 @@ mod tests {
             false,
             false,
             symphony::GrammarStart::Unknown,
+            TagVocabulary::Current,
             &templates()
         )
         .expect("no hf")
@@ -1666,6 +1776,7 @@ mod tests {
                     false,
                     false,
                     symphony::GrammarStart::Unknown,
+                    TagVocabulary::Current,
                     &templates()
                 )
                 .expect("no hf")
@@ -1693,6 +1804,7 @@ mod tests {
                 false,
                 false,
                 symphony::GrammarStart::Unknown,
+                TagVocabulary::Current,
                 &templates()
             )
             .expect("no hf"),
@@ -1709,6 +1821,7 @@ mod tests {
             false,
             false,
             symphony::GrammarStart::Unknown,
+            TagVocabulary::Current,
             &templates()
         )
         .expect("no hf")
@@ -1728,6 +1841,7 @@ mod tests {
             false,
             false,
             symphony::GrammarStart::Unknown,
+            TagVocabulary::Current,
             &templates()
         )
         .expect("no hf")
@@ -1753,9 +1867,12 @@ mod tests {
                 false,
                 false,
                 symphony::GrammarStart::Unknown,
+                TagVocabulary::Current,
                 templates,
             )
-            .and_then(|prepared| prepared.for_start(symphony::GrammarStart::Unknown))
+            .and_then(|prepared| {
+                prepared.for_start(symphony::GrammarStart::Unknown, TagVocabulary::Current)
+            })
         };
         // A forced call, one call for a named function, and a JSON answer take the table's tags.
         let required = tag_of(constrain(&with_layout, json!({"tool_choice": "required"})));
@@ -1802,9 +1919,10 @@ mod tests {
                 false,
                 false,
                 symphony::GrammarStart::Unknown,
+                TagVocabulary::Current,
                 &templates(),
             )
-            .and_then(|prepared| prepared.for_start(symphony::GrammarStart::Unknown))
+            .and_then(|prepared| prepared.for_start(symphony::GrammarStart::Unknown, TagVocabulary::Current))
             .expect("read")
             .is_none(),
             "the Qwen3 table's answer tag is the schema alone, the engine's own constraint, so the \
@@ -1882,9 +2000,12 @@ mod tests {
                 false,
                 false,
                 symphony::GrammarStart::Unknown,
+                TagVocabulary::Current,
                 &templates(),
             )
-            .and_then(|prepared| prepared.for_start(symphony::GrammarStart::Unknown))
+            .and_then(|prepared| {
+                prepared.for_start(symphony::GrammarStart::Unknown, TagVocabulary::Current)
+            })
         };
         let any = tag_of(constrain(json!({"tool_choice": {"type": "any"}})));
         let one = tag_of(constrain(
@@ -1932,6 +2053,7 @@ mod tests {
             false,
             false,
             symphony::GrammarStart::Unknown,
+            TagVocabulary::Current,
             &unrendered,
         )
         .expect_err("no tag");
@@ -1961,7 +2083,11 @@ mod tests {
         };
         let decided = |policy, start, turn: Option<ToolConstraint>| {
             worker_constraint(
-                WorkerDecoding { policy, start },
+                WorkerDecoding {
+                    policy,
+                    start,
+                    vocabulary: TagVocabulary::Current,
+                },
                 Ok(Prepared::None),
                 || Ok(turn),
                 auto_tag,
@@ -1993,6 +2119,7 @@ mod tests {
                     WorkerDecoding {
                         policy: Requested,
                         start,
+                        vocabulary: TagVocabulary::Current,
                     },
                     Ok(Prepared::Constraint {
                         constraint: ToolConstraint::StructuralTag("prepared".to_string()),
@@ -2039,7 +2166,11 @@ mod tests {
                       turn: Result<Option<ToolConstraint>, SymphonyError>| {
             let built = std::cell::RefCell::new(Vec::new());
             let decided = worker_constraint(
-                WorkerDecoding { policy, start },
+                WorkerDecoding {
+                    policy,
+                    start,
+                    vocabulary: TagVocabulary::Current,
+                },
                 prepared,
                 || {
                     built.borrow_mut().push("turn");
@@ -2067,7 +2198,7 @@ mod tests {
         // plan for a retry's worker.
         let auto = |start| {
             let text = auto_tag()
-                .for_start(grammar_start_from(start))
+                .for_start(grammar_start_from(start), TagVocabulary::Current)
                 .expect("a table")
                 .map(|constraint| constraint.to_tuple().1);
             assert!(text.is_some(), "{start:?}");
@@ -2180,6 +2311,7 @@ mod tests {
             WorkerDecoding {
                 policy: Always,
                 start: AfterReasoning,
+                vocabulary: TagVocabulary::Current,
             },
             Ok(Prepared::None),
             || Ok(None),
@@ -2234,6 +2366,7 @@ mod tests {
             true,
             false,
             grammar_start_of(&pool),
+            vocabulary_of(&pool),
             &templates(),
         );
         let Ok(Prepared::Answer(answer)) = prepared else {
@@ -2245,6 +2378,7 @@ mod tests {
                 WorkerDecoding {
                     policy: ConstrainedDecoding::Requested,
                     start,
+                    vocabulary: TagVocabulary::Current,
                 },
                 Ok(Prepared::Answer(Arc::clone(&answer))),
                 || panic!("requested: the whole turn is not asked"),
@@ -2263,7 +2397,13 @@ mod tests {
             let stamp = decided
                 .table_tag
                 .expect("the derivation goes with the plan");
-            assert_eq!(stamp.tag_for(start).expect("a table"), None, "{start:?}");
+            assert_eq!(
+                stamp
+                    .tag_for(start, TagVocabulary::Current)
+                    .expect("a table"),
+                None,
+                "{start:?}"
+            );
             assert_eq!(stamp.schema(), Some(&schema), "{start:?}");
         }
         let first = decided(FirstToken);
@@ -2277,10 +2417,23 @@ mod tests {
         assert!(!first.by_policy && !first.whole_turn);
         // The worker a retry takes, of the other kind, and back.
         let stamp = first.table_tag.expect("the derivation goes with the plan");
-        assert_eq!(stamp.tag_for(AfterReasoning).expect("a table"), None);
-        assert_eq!(stamp.tag_for(Unknown).expect("a table"), None);
         assert_eq!(
-            stamp.tag_for(FirstToken).expect("a table").as_deref(),
+            stamp
+                .tag_for(AfterReasoning, TagVocabulary::Current)
+                .expect("a table"),
+            None
+        );
+        assert_eq!(
+            stamp
+                .tag_for(Unknown, TagVocabulary::Current)
+                .expect("a table"),
+            None
+        );
+        assert_eq!(
+            stamp
+                .tag_for(FirstToken, TagVocabulary::Current)
+                .expect("a table")
+                .as_deref(),
             Some(text.as_str())
         );
         assert_eq!(stamp.schema(), Some(&schema));
@@ -2297,6 +2450,7 @@ mod tests {
             true,
             false,
             grammar_start_of(&pool),
+            vocabulary_of(&pool),
             &templates(),
         )
         else {
@@ -2359,6 +2513,7 @@ mod tests {
                         true,
                         false,
                         start,
+                        TagVocabulary::Current,
                         &templates,
                     ),
                     AutoRequest::Messages { .. } => auto_constraint(
@@ -2372,13 +2527,14 @@ mod tests {
                         true,
                         false,
                         start,
+                        TagVocabulary::Current,
                         &templates,
                     ),
                 };
                 tag_of(constraint)
             };
             let derived = |start| {
-                let tag = TagForStart::tag_for(auto_tag, start)
+                let tag = TagForStart::tag_for(auto_tag, start, TagVocabulary::Current)
                     .expect("a table")
                     .expect("a tag");
                 serde_json::from_str::<Value>(&tag).expect("a tag as JSON")
@@ -2409,7 +2565,10 @@ mod tests {
             templates,
         };
         for start in [Unknown, AfterReasoning, FirstToken] {
-            assert_eq!(TagForStart::tag_for(&none, start), Ok(None));
+            assert_eq!(
+                TagForStart::tag_for(&none, start, TagVocabulary::Current),
+                Ok(None)
+            );
         }
         assert!(format!("{none:?}").contains("Qwen/Qwen3-8B"));
     }
@@ -2591,12 +2750,14 @@ mod tests {
                     },
                     &messages.chat_tools(),
                     prompt,
+                    TagVocabulary::Current,
                 )),
                 tag(turn_of(
                     &turn_table(),
                     Asks::Chat(&chat),
                     &chat.effective_tool_list(),
                     prompt,
+                    TagVocabulary::Current,
                 )),
                 "{choice}"
             );
@@ -2620,6 +2781,7 @@ mod tests {
                     Asks::Chat(&request),
                     &request.effective_tool_list(),
                     PROMPT,
+                    TagVocabulary::Current,
                     &templates()
                 ),
                 Ok(None)
@@ -2633,6 +2795,7 @@ mod tests {
             Asks::Chat(&request),
             &request.effective_tool_list(),
             PROMPT,
+            TagVocabulary::Current,
             &templates(),
         )
         .expect_err("refused");
@@ -2642,5 +2805,145 @@ mod tests {
                 "no tokenizer is registered for model 'Qwen/Qwen3-8B'".to_string()
             )
         );
+    }
+
+    /// The model's workers name the vocabulary of structural-tag nodes a forced call's tag is
+    /// spelled in together: the current one unless a worker that generates tokens advertises the
+    /// older one, which every compiler takes, so one such worker beside others takes it for all;
+    /// a prefill or encode worker's label does not count.
+    #[test]
+    fn the_models_workers_name_the_vocabulary_when_one_takes_the_older() {
+        use WorkerType::{Decode, Encode, Prefill, Regular};
+        let worker = |kind: WorkerType, vocabulary: Option<&str>| -> Arc<dyn Worker> {
+            let mut builder = BasicWorkerBuilder::new("grpc://engine:50051").worker_type(kind);
+            if let Some(vocabulary) = vocabulary {
+                builder = builder.label(TagVocabulary::LABEL, vocabulary);
+            }
+            Arc::new(builder.build())
+        };
+        assert_eq!(vocabulary_of(&[]), TagVocabulary::Current);
+        assert_eq!(
+            vocabulary_of(&[worker(Regular, None)]),
+            TagVocabulary::Current
+        );
+        assert_eq!(
+            vocabulary_of(&[worker(Regular, Some("current"))]),
+            TagVocabulary::Current
+        );
+        assert_eq!(
+            vocabulary_of(&[worker(Regular, Some("older"))]),
+            TagVocabulary::Older
+        );
+        assert_eq!(
+            vocabulary_of(&[worker(Regular, None), worker(Decode, Some("older"))]),
+            TagVocabulary::Older
+        );
+        assert_eq!(
+            vocabulary_of(&[
+                worker(Regular, None),
+                worker(Prefill, Some("older")),
+                worker(Encode, Some("older"))
+            ]),
+            TagVocabulary::Current
+        );
+    }
+
+    /// A worker that advertises the older vocabulary gets its tags spelled without the
+    /// `optional`, `plus`, `star` and `token` nodes its compiler refuses (a forced call's, the
+    /// `auto` tag's, the whole turn's), the same language in the nodes it takes
+    /// ([`Grammar::in_older_vocabulary`]: a tag without those nodes may still lose the excludes
+    /// its tag end makes redundant); a worker that does not advertise it gets every tag as the
+    /// table built it (the tests above read those).
+    #[test]
+    fn a_worker_of_the_older_vocabulary_gets_its_tags_without_the_newer_nodes() {
+        fn newer_nodes(value: &Value) -> usize {
+            match value {
+                Value::Object(map) => {
+                    let own = usize::from(matches!(
+                        map.get("type").and_then(Value::as_str),
+                        Some("optional" | "plus" | "star" | "token")
+                    ));
+                    own + map.values().map(newer_nodes).sum::<usize>()
+                }
+                Value::Array(items) => items.iter().map(newer_nodes).sum(),
+                _ => 0,
+            }
+        }
+        let parsed = |constraint: Result<Option<ToolConstraint>, SymphonyError>| -> Value {
+            let Ok(Some(ToolConstraint::StructuralTag(text))) = constraint else {
+                panic!("a structural tag, not {constraint:?}");
+            };
+            serde_json::from_str(&text).expect("JSON")
+        };
+        let qwen = ModelNames::default();
+        let kimi = names(Some("kimi_k2"), Some("kimi_k2"));
+        let forced = request(json!({"tool_choice": "required"}));
+        let one = request(json!({"tool_choice": "required", "parallel_tool_calls": false}));
+        let auto = request(json!({"tool_choice": "auto"}));
+        let turn = request(json!({"tools": weather(), "tool_choice": "required"}));
+        let tags = |vocabulary: TagVocabulary| -> Vec<(String, Value)> {
+            let mut tags = Vec::new();
+            for (table, names) in [("qwen3", &qwen), ("kimi_k2", &kimi)] {
+                for (ask, request) in [("required", &forced), ("one call", &one)] {
+                    for reasoning_open in [false, true] {
+                        for (start_name, start) in [
+                            ("unknown", symphony::GrammarStart::Unknown),
+                            ("first token", symphony::GrammarStart::FirstToken),
+                        ] {
+                            let calls = super::constraint(
+                                ParserChoice::Symphony,
+                                names,
+                                Asks::Chat(request),
+                                &tools(),
+                                reasoning_open,
+                                false,
+                                start,
+                                vocabulary,
+                                &templates(),
+                            )
+                            .and_then(|prepared| prepared.for_start(start, vocabulary));
+                            tags.push((
+                                format!(
+                                    "{table}, {ask}, thought open {reasoning_open}, {start_name}"
+                                ),
+                                parsed(calls),
+                            ));
+                        }
+                    }
+                }
+                let allowed = auto_constraint(
+                    ParserChoice::Symphony,
+                    names,
+                    Asks::Chat(&auto),
+                    &tools(),
+                    false,
+                    false,
+                    symphony::GrammarStart::Unknown,
+                    vocabulary,
+                    &templates(),
+                );
+                tags.push((format!("{table}, auto"), parsed(allowed)));
+            }
+            let whole = turn_of(
+                &turn_table(),
+                Asks::Chat(&turn),
+                &turn.effective_tool_list(),
+                "user<|head|>assistant",
+                vocabulary,
+            );
+            tags.push(("the whole turn".to_string(), parsed(whole)));
+            tags
+        };
+        let current = tags(TagVocabulary::Current);
+        let older = tags(TagVocabulary::Older);
+        let mut spelled = 0;
+        for ((name, built), (_, older)) in current.iter().zip(&older) {
+            assert_eq!(newer_nodes(older), 0, "{name}: {older}");
+            if newer_nodes(built) > 0 {
+                assert_ne!(older, built, "{name}");
+                spelled += 1;
+            }
+        }
+        assert!(spelled > 0, "no tag carried a newer node");
     }
 }

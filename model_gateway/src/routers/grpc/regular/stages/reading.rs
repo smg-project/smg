@@ -112,6 +112,7 @@ pub(crate) fn prepare(
         reasoning,
         thought_closed,
         symphony::grammar_start_of(&workers),
+        symphony::vocabulary_of(&workers),
         &ctx.components.templates,
     );
     let choice = asks.choice();
@@ -292,6 +293,7 @@ pub(crate) fn decide(
                 asks,
                 declared,
                 processed_text,
+                decoding.vocabulary,
                 &ctx.components.templates,
             )
         },
