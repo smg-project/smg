@@ -2849,8 +2849,8 @@ mod tests {
     }
 
     /// A worker that advertises the older vocabulary gets its tags spelled without the
-    /// `optional`, `plus`, `star` and `token` nodes its compiler refuses (a forced call's, the
-    /// `auto` tag's, the whole turn's), the same language in the nodes it takes
+    /// `optional`, `plus` and `star` nodes its compiler refuses (a forced call's, the `auto`
+    /// tag's, the whole turn's), the same language in the nodes it takes
     /// ([`Grammar::in_older_vocabulary`]: a tag without those nodes may still lose the excludes
     /// its tag end makes redundant); a worker that does not advertise it gets every tag as the
     /// table built it (the tests above read those).
@@ -2861,7 +2861,7 @@ mod tests {
                 Value::Object(map) => {
                     let own = usize::from(matches!(
                         map.get("type").and_then(Value::as_str),
-                        Some("optional" | "plus" | "star" | "token")
+                        Some("optional" | "plus" | "star")
                     ));
                     own + map.values().map(newer_nodes).sum::<usize>()
                 }

@@ -101,13 +101,9 @@ fn in_tag(tag: Tag) -> Tag {
     }
 }
 
-/// `content` or nothing: a choice with the empty text where the content is limited; a list of
-/// tags that stops after the first where it is not; a list that may repeat with `at_least_one`
-/// off.
+/// `content` or nothing: a list that may repeat with `at_least_one` off; a choice with the
+/// empty text otherwise.
 fn optional(content: Grammar) -> Grammar {
-    if !unlimited(&content) {
-        return Grammar::Or(vec![content, Grammar::ConstString(String::new())]);
-    }
     match content {
         Grammar::TagsWithSeparator {
             tags,
@@ -120,15 +116,7 @@ fn optional(content: Grammar) -> Grammar {
             at_least_one: false,
             stop_after_first: false,
         },
-        content => match tags_of(&content) {
-            Some(tags) => Grammar::TagsWithSeparator {
-                tags,
-                separator: String::new(),
-                at_least_one: false,
-                stop_after_first: true,
-            },
-            None => Grammar::Or(vec![content, Grammar::ConstString(String::new())]),
-        },
+        content => Grammar::Or(vec![content, Grammar::ConstString(String::new())]),
     }
 }
 

@@ -522,8 +522,8 @@ pub fn grammar_start_for(workers: Option<&WorkerSelection>) -> GrammarStart {
 /// The vocabulary of structural-tag nodes a worker's grammar compiler
 /// takes, from its `structural_tag_vocabulary` label: the current one unless
 /// the label says `older`, for a compiler that predates the `optional`,
-/// `plus`, `star` and `token` nodes and refuses a tag that carries one. The
-/// tables' tags go to such a worker spelled without them
+/// `plus` and `star` nodes and refuses a tag that carries one. The tables'
+/// tags go to such a worker spelled without them
 /// (`Grammar::in_older_vocabulary`), the same language, which every compiler
 /// takes; a worker without the label gets the tag as the table built it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -531,7 +531,8 @@ pub enum TagVocabulary {
     /// Every node the tables use.
     #[default]
     Current,
-    /// Without the `optional`, `plus`, `star` and `token` nodes.
+    /// Without the `optional`, `plus` and `star` nodes; a `token` node stays
+    /// as derived.
     Older,
 }
 
@@ -604,18 +605,22 @@ impl WorkerDecoding {
     }
 
     /// Whether `worker` decides a request's constraint as this one does: the
-    /// same policy, and the whole turn's grammar on both or on neither. A plan
-    /// whose constraint the policy chose holds a retry to such workers, since
-    /// the decision reads the request, which is gone once the plan is built;
-    /// the attempt stamp shapes a tag for the start of the worker the retry
-    /// takes (`helpers::ToolConstraintStamp`). A prefill worker generates no
-    /// token a grammar constrains.
+    /// same policy, the whole turn's grammar on both or on neither, and, where
+    /// the whole turn's applies, the same vocabulary of structural-tag nodes.
+    /// A plan whose constraint the policy chose holds a retry to such workers,
+    /// since the decision reads the request, which is gone once the plan is
+    /// built; the attempt stamp shapes a tag for the start of the worker the
+    /// retry takes (`helpers::ToolConstraintStamp`), and the whole turn's tag,
+    /// spelled once for the first worker's compiler, for its start only. A
+    /// prefill worker generates no token a grammar constrains.
     pub fn decides_alike(self, worker: &dyn Worker) -> bool {
         if *worker.worker_type() == WorkerType::Prefill {
             return true;
         }
         let other = Self::of_worker(worker);
-        other.policy == self.policy && other.takes_the_whole_turn() == self.takes_the_whole_turn()
+        other.policy == self.policy
+            && other.takes_the_whole_turn() == self.takes_the_whole_turn()
+            && (!self.takes_the_whole_turn() || other.vocabulary == self.vocabulary)
     }
 }
 
@@ -944,22 +949,31 @@ mod tests {
     }
 
     /// A retry takes only workers that decide a request's constraint as the
-    /// first attempt's did: under `requested` whatever the start, under
-    /// `always` the whole turn's grammar on both or on neither; and any
-    /// prefill worker, which generates no token a grammar constrains.
+    /// first attempt's did: under `requested` whatever the start or the
+    /// vocabulary, under `always` the whole turn's grammar on both or on
+    /// neither, and where it is on both, in the same vocabulary (its tag is
+    /// spelled once, for the first worker's compiler); and any prefill
+    /// worker, which generates no token a grammar constrains.
     #[test]
     fn a_retry_takes_only_workers_that_decide_the_constraint_alike() {
         let always = ("constrained_decoding", "always");
-        let labels: [&[(&str, &str)]; 5] = [
+        let first_token = ("constrained_decoding_start", "first_token");
+        let older = ("structural_tag_vocabulary", "older");
+        let labels: [&[(&str, &str)]; 8] = [
             &[],
-            &[("constrained_decoding_start", "first_token")],
-            &[always, ("constrained_decoding_start", "first_token")],
+            &[first_token],
+            &[always, first_token],
             &[always, ("constrained_decoding_start", "after_reasoning")],
             &[always],
+            &[always, first_token, older],
+            &[older],
+            &[always, older],
         ];
-        // The workers alike: both `requested` ones; the whole turn's alone;
-        // the two `always` ones that start the grammar later or do not say.
-        let alike = [0, 0, 1, 2, 2];
+        // The workers alike: the `requested` ones, whatever their vocabulary;
+        // the whole turn's in the current vocabulary; the `always` ones that
+        // start the grammar later or do not say, whatever their vocabulary;
+        // the whole turn's in the older vocabulary, alone.
+        let alike = [0, 0, 1, 2, 2, 3, 0, 2];
         let engine = |labels: &[(&str, &str)]| match worker(labels) {
             WorkerSelection::Single { worker } => worker,
             WorkerSelection::Disaggregated { .. } => panic!("expected one worker"),
