@@ -39,7 +39,12 @@ Every commit, pick and tag carries the caller's git identity and sign-off.
   tag when it has one (the last candidate, for the next one), else the highest final below the
   version (the previous release's, on its own branch: no release tag is reachable from `main`
   under this process, and the checker diffs `tag..HEAD`, so none has to be), else the newest
-  tag reachable from the branch (a release made before this process).
+  tag reachable from the branch (a release made before this process). Two live release lines
+  share the crate versions: a crate bumped by a patch of the older line after the newer line was
+  cut reads as bumped already against that patch's tag (the checker treats any difference from
+  the tag's version as a bump), and a bump computed against the newer line's own final can land
+  on the version the patch published; until the bump starts above the highest version any
+  release tag carries, the release owner checks such a crate against the registry before the tag.
 - `main` keeps the last final release's versions. After a final, `make release-bump-main` opens
   the pull request that moves them: the gateway and its mirrors to the release's version, every
   other crate or package to the release's version where that is higher than main's (crates.io
