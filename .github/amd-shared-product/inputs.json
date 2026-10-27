@@ -5,7 +5,7 @@
   "consumer_gpu_ready": false,
   "runtime_cohort_accepted": false,
   "admitted_lane": "vllm-chat-full-original",
-  "target_product_commit": "806f5c709ad1997f1399401708321c825fa94f5f",
+  "target_product_commit": "9400783ac04f70d548fed62c95f98beff28e9204",
   "artifacts": [
     {
       "name": "wasm-test-fixtures",
@@ -92,7 +92,7 @@
     "model_gateway": "43b1c9dadf297863b4d8afea601c17710393d8a9",
     "grpc_servicer": "da5ebe8f3202a21e2c23ebbbacf7c2117cfe44e2",
     "e2e_test": "52737557a71436eccac1f33266a4b6b9c438a2db",
-    "scripts": "52daf79832b793c18268da010bdb9cf6fa4ba568",
+    "scripts": "e70451f36f57058f250a79e5e65ab7b40b6ed4f0",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows/e2e-gpu-job.yml": "a04e5609b2615de0b615c65bd436b6c2390e9806",
     "README.md": "83b7df25632da03f0184bd5b4628b9c9a3ace803",
