@@ -7,6 +7,7 @@ pub mod builder;
 pub mod capacity;
 pub mod circuit_breaker;
 pub mod endpoint;
+mod engine_admin;
 pub mod error;
 pub mod event;
 pub mod expected_wait;

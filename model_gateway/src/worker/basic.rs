@@ -27,8 +27,14 @@ use tokio::{
 
 pub(crate) use super::runtime::COLD_PREFILL_TOKENS_PER_SEC;
 use super::{
-    event::WorkerConnected, http_client::LazyHttpClient, pd_pairing::PdPairing, CircuitBreaker,
-    ResolvedResilience, WorkerError, WorkerResult,
+    engine_admin::{
+        admin_backend_client, admin_grpc_result, admin_http_post, FLUSH_HTTP_TIMEOUT,
+        PROFILE_HTTP_TIMEOUT,
+    },
+    event::WorkerConnected,
+    http_client::LazyHttpClient,
+    pd_pairing::PdPairing,
+    CircuitBreaker, ResolvedResilience, WorkerError, WorkerResult,
 };
 pub use super::{
     load::{WorkerLoadGuard, WorkerRoutingKeyLoad},
@@ -39,15 +45,6 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     routers::grpc::{backend_client::BackendClient, client::GrpcClient, zmq_client},
 };
-
-/// Timeout for worker HTTP `flush_cache` requests. Matches the gRPC
-/// client's local flush deadline.
-const FLUSH_HTTP_TIMEOUT: Duration = Duration::from_secs(45);
-
-/// Timeout for worker HTTP profile requests. Stopping a profile can take
-/// a long time while the backend serializes large traces. Matches the
-/// gRPC client's profile deadline.
-const PROFILE_HTTP_TIMEOUT: Duration = Duration::from_secs(630);
 
 /// Connect the ZMQ backend for this worker URL. All connect mechanics —
 /// address derivation, socket-dir prep, EOS resolution, handshake — live in
@@ -108,102 +105,6 @@ pub const MORIIO_CONNECTOR: &str = "MoRIIOConnector";
 
 /// Worker label naming a MoRI-IO engine's transfer mode, `read` or `write`.
 pub const MORIIO_MODE_LABEL: &str = "moriio_mode";
-
-/// POST an admin endpoint on an HTTP worker and map the outcome to a
-/// [`WorkerResult`].
-async fn admin_http_post(
-    client: &reqwest::Client,
-    url: String,
-    api_key: Option<&String>,
-    body: Option<serde_json::Value>,
-    operation: &str,
-    timeout: Duration,
-) -> WorkerResult<()> {
-    let mut req = client.post(&url).timeout(timeout);
-    if let Some(key) = api_key {
-        req = req.bearer_auth(key);
-    }
-    if let Some(body) = body {
-        req = req.json(&body);
-    }
-    match req.send().await {
-        Ok(resp) if resp.status().is_success() => Ok(()),
-        Ok(resp) => Err(WorkerError::OperationFailed {
-            url,
-            operation: operation.to_string(),
-            reason: format!("HTTP {}", resp.status()),
-        }),
-        Err(e) => Err(WorkerError::OperationFailed {
-            url,
-            operation: operation.to_string(),
-            reason: e.to_string(),
-        }),
-    }
-}
-
-/// Unwrap the optional gRPC client for an admin op, erroring when absent.
-fn require_backend_client(
-    url: &str,
-    operation: &str,
-    client: Option<Arc<BackendClient>>,
-) -> WorkerResult<Arc<BackendClient>> {
-    client.ok_or_else(|| WorkerError::OperationFailed {
-        url: url.to_string(),
-        operation: operation.to_string(),
-        reason: "no backend client available".to_string(),
-    })
-}
-
-/// A ZMQ engine whose wire carries no control calls (vLLM's EngineCore, a
-/// TokenSpeed scheduler that declares none) has no admin RPC: refused before
-/// anything is sent.
-fn zmq_admin_unsupported(url: &str, operation: &str) -> WorkerError {
-    WorkerError::OperationFailed {
-        url: url.to_string(),
-        operation: operation.to_string(),
-        reason: format!("{operation} is not supported over this engine's ZMQ wire"),
-    }
-}
-
-/// The worker's backend client for an admin op, refused when the backend
-/// answers none ([`zmq_admin_unsupported`]).
-fn admin_backend_client(
-    url: &str,
-    operation: &str,
-    client: Option<Arc<BackendClient>>,
-) -> WorkerResult<Arc<BackendClient>> {
-    let client = require_backend_client(url, operation, client)?;
-    if !client.carries_admin_calls() {
-        return Err(zmq_admin_unsupported(url, operation));
-    }
-    Ok(client)
-}
-
-/// Map a gRPC admin-op outcome (`success` flag plus message) to a
-/// [`WorkerResult`].
-fn admin_grpc_result(
-    url: &str,
-    operation: &str,
-    result: Result<(bool, String), tonic::Status>,
-) -> WorkerResult<()> {
-    match result {
-        Ok((true, _)) => Ok(()),
-        Ok((false, message)) => Err(WorkerError::OperationFailed {
-            url: url.to_string(),
-            operation: operation.to_string(),
-            reason: if message.is_empty() {
-                "backend reported failure".to_string()
-            } else {
-                message
-            },
-        }),
-        Err(status) => Err(WorkerError::OperationFailed {
-            url: url.to_string(),
-            operation: operation.to_string(),
-            reason: status.to_string(),
-        }),
-    }
-}
 
 /// Context window advertised for `model_id` in `models`: the matching card's
 /// (aliases included), else the primary card's. Borrows only, so it is safe on
