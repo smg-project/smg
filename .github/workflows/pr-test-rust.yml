@@ -2,24 +2,24 @@ name: PR Test (SMG)
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, release/** ]
     paths-ignore:
       - "docs/**"
       - "*.md"
   pull_request:
-    branches: [ main ]
+    branches: [ main, release/** ]
     types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# One group per PR and one for main: a newer push cancels the superseded run.
-# On main this tests HEAD rather than every intermediate commit: back-to-back
+# One group per PR and one per branch (main, release/*): a newer push cancels the
+# superseded run. On a branch this tests HEAD rather than every intermediate commit: back-to-back
 # merges otherwise stack full GPU matrices on one runner pool and time each
 # other out. Re-run an intermediate commit via workflow_dispatch if needed.
 concurrency:
-  group: gateway-tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'main' }}
+  group: gateway-tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}
   cancel-in-progress: true
 
 env:

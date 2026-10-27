@@ -1,21 +1,17 @@
 name: Release gRPC packages to PyPI
 
+# Published only on a maintainer's dispatch against a release tag or branch
+# (scripts/release/README.md): no push publishes.
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - crates/grpc_client/python/pyproject.toml
-      - grpc_servicer/pyproject.toml
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  # ── Detect which packages changed ──
+  # ── Both packages build; a version PyPI already has is skipped at upload (--skip-existing) ──
   detect:
-    name: Detect changed packages
+    name: Select packages
     runs-on: ubuntu-latest
     outputs:
       proto: ${{ steps.changes.outputs.proto }}
@@ -25,21 +21,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Detect changes
+      - name: Select packages
         id: changes
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "proto=true" >> "$GITHUB_OUTPUT"
-            echo "servicer=true" >> "$GITHUB_OUTPUT"
-          else
-            base="${{ github.event.before }}"
-            head="${{ github.sha }}"
-            changed="$(git diff --name-only "$base" "$head")"
-            proto=$(echo "$changed" | grep -q '^crates/grpc_client/python/pyproject.toml$' && echo true || echo false)
-            servicer=$(echo "$changed" | grep -q '^grpc_servicer/pyproject.toml$' && echo true || echo false)
-            echo "proto=$proto" >> "$GITHUB_OUTPUT"
-            echo "servicer=$servicer" >> "$GITHUB_OUTPUT"
-          fi
+          echo "proto=true" >> "$GITHUB_OUTPUT"
+          echo "servicer=true" >> "$GITHUB_OUTPUT"
 
   # ── Tier 1: Proto (no dependencies) ──
   build-proto:

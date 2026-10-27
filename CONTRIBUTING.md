@@ -217,6 +217,15 @@ opt-in — a fork should not publish artifacts or manage upstream's issues.
 
 ---
 
+## Releases
+
+A release is cut from `main` onto a `release/<x.y>` branch and moves there by pull requests
+(cherry-picks from `main`, candidate and final bumps); `main` never pauses, and nothing is
+published without a maintainer's dispatch. The steps, the `make release-*` targets and the
+gate are in [`scripts/release/README.md`](./scripts/release/README.md).
+
+---
+
 ## Reporting security issues
 
 Please do **not** open a public issue for security vulnerabilities. Contact the
