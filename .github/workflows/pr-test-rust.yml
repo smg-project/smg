@@ -1078,7 +1078,7 @@ jobs:
               ("model_gateway/src/version.rs",                   CORE),
               ("model_gateway/src/server/posture.rs",            CORE),
               ("model_gateway/src/tenant/**",                    CORE),
-              ("model_gateway/src/rl_adapter.rs",                CORE),
+              ("model_gateway/src/worker/rl_adapter.rs",         CORE),
               ("model_gateway/**",                               FULL),
               # the crates: test trees, benches, fuzzers, examples and tooling none (the
               # WASM fixtures directory builds the storage-hook guests); crates no lane's

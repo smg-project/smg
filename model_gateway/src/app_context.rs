@@ -37,8 +37,8 @@ use crate::{
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
     worker::{
         http_client::{build_client, connect_timeout_secs_below, DEFAULT_CONNECT_TIMEOUT_SECS},
-        liveness, KvEventMonitor, PrefillAdmission, WorkerHttpClientCache, WorkerMonitor,
-        WorkerRegistry, WorkerService,
+        liveness, rl_adapter, KvEventMonitor, PrefillAdmission, WorkerHttpClientCache,
+        WorkerMonitor, WorkerRegistry, WorkerService,
     },
     workflow::{JobQueue, TokenizerLoadFailures, WorkflowEngines},
 };
@@ -531,11 +531,7 @@ impl AppContextBuilder {
             &router_config.tenant_api_keys,
         );
 
-        let rl = crate::rl_adapter::build_rl_state(
-            &worker_registry,
-            &worker_client_cache,
-            &router_config,
-        );
+        let rl = rl_adapter::build_rl_state(&worker_registry, &worker_client_cache, &router_config);
 
         Ok(AppContext {
             gateway_auth,

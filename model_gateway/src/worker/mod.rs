@@ -27,6 +27,7 @@ pub mod pd_pairing;
 pub mod prefill_admission;
 pub mod registry;
 pub mod resilience;
+pub mod rl_adapter;
 pub mod runtime;
 pub mod sampling_defaults;
 pub mod service;

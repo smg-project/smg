@@ -13,14 +13,13 @@
 //! - [`observability`]: metrics, logging, tracing, heap profiles, the in-flight tracker.
 //! - [`policies`]: worker selection policies and their registry.
 //! - [`rate_limit`]: per-tenant token and request rate limiting.
-//! - [`rl_adapter`]: the RL control plane's read-only view of the worker registry.
 //! - [`routers`]: the request paths (HTTP, gRPC, external providers) and what they share.
 //! - [`server`]: start-up and its phases, the route table, the listeners and their limits, graceful shutdown, the posture log, the private-key-file check.
 //! - [`service_discovery`]: worker discovery providers and the reconciler.
 //! - [`tenant`]: tenant identity, keys and per-request metadata.
 //! - [`version`]: the build identity.
 //! - [`wasm`]: WebAssembly module support and its routes.
-//! - [`worker`]: the worker domain: identity, registry, health, load, resilience, monitoring.
+//! - [`worker`]: the worker domain: identity, registry, health, load, resilience, monitoring, and the RL control plane's read-only view of the registry.
 //! - [`workflow`]: the workflow engine and its steps: worker registration and lifecycle, tokenizer, MCP and WASM registration.
 
 pub mod app_context;
@@ -33,7 +32,6 @@ pub mod middleware;
 pub mod observability;
 pub mod policies;
 pub mod rate_limit;
-pub mod rl_adapter;
 pub mod routers;
 pub mod server;
 pub mod service_discovery;
