@@ -204,7 +204,7 @@ fn unsupported_modality_message(runtimes: &[RuntimeType], modality: Modality) ->
 /// per-backend assembly arms:
 /// - Image: SGLang, vLLM, TRT-LLM, TokenSpeed
 /// - ImageEmbeds: TokenSpeed only (pre-computed embeddings are an EPD feature)
-/// - Video: vLLM, TokenSpeed
+/// - Video: SGLang, vLLM, TokenSpeed
 /// - Audio: TokenSpeed
 /// - MLX: none
 ///
@@ -219,7 +219,10 @@ pub(crate) fn runtime_supports_modality(runtime: RuntimeType, modality: Modality
             RuntimeType::Sglang | RuntimeType::Vllm | RuntimeType::Trtllm | RuntimeType::TokenSpeed
         ),
         Modality::ImageEmbeds => matches!(runtime, RuntimeType::TokenSpeed),
-        Modality::Video => matches!(runtime, RuntimeType::Vllm | RuntimeType::TokenSpeed),
+        Modality::Video => matches!(
+            runtime,
+            RuntimeType::Sglang | RuntimeType::Vllm | RuntimeType::TokenSpeed
+        ),
         Modality::Audio => matches!(runtime, RuntimeType::TokenSpeed),
     }
 }
@@ -315,7 +318,7 @@ mod tests {
         // (runtime, modality, expected_supported)
         let cases = [
             (Sglang, Image, true),
-            (Sglang, Video, false),
+            (Sglang, Video, true),
             (Sglang, Audio, false),
             (Vllm, Image, true),
             (Vllm, Video, true),
@@ -552,15 +555,19 @@ mod tests {
         async fn video_to_a_pool_whose_engines_take_no_video_is_refused_before_the_decode() {
             let pool = registry_with(vec![engine_worker(
                 "grpc://10.0.0.1:1",
-                RuntimeType::Sglang,
+                RuntimeType::Trtllm,
             )]);
             let response = ensure_model_accepts_media(&pool, MODEL, &video_plan()).unwrap_err();
             let (code, message) = refusal(response).await;
             assert_eq!(code, "multimodal_not_supported");
-            assert_eq!(message, "backend sglang does not support video inputs");
+            assert_eq!(message, "backend trtllm does not support video inputs");
 
             assert!(ensure_model_accepts_media(&pool, MODEL, &image_plan()).is_ok());
-            for runtime in [RuntimeType::Vllm, RuntimeType::TokenSpeed] {
+            for runtime in [
+                RuntimeType::Sglang,
+                RuntimeType::Vllm,
+                RuntimeType::TokenSpeed,
+            ] {
                 let pool = registry_with(vec![engine_worker("grpc://10.0.0.1:1", runtime)]);
                 assert!(
                     ensure_model_accepts_media(&pool, MODEL, &video_plan()).is_ok(),
@@ -585,14 +592,11 @@ mod tests {
 
             let two = registry_with(vec![
                 engine_worker("grpc://10.0.0.1:1", RuntimeType::Trtllm),
-                engine_worker("grpc://10.0.0.2:1", RuntimeType::Sglang),
+                engine_worker("grpc://10.0.0.2:1", RuntimeType::Mlx),
             ]);
             let response = ensure_model_accepts_media(&two, MODEL, &video_plan()).unwrap_err();
             let (_, message) = refusal(response).await;
-            assert_eq!(
-                message,
-                "backends sglang, trtllm do not support video inputs"
-            );
+            assert_eq!(message, "backends mlx, trtllm do not support video inputs");
         }
 
         /// Audio follows the matrix in preparation as it did at selection,

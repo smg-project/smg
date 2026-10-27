@@ -156,6 +156,7 @@ impl SglangScheduler for ScoringWorker {
     type GetTokenizerStream = RpcStream<common_proto::GetTokenizerChunk>;
     type SubscribeKvEventsStream = RpcStream<common_proto::KvEventBatch>;
 
+    /// Serve deterministic fake scheduler output for routing decision tests.
     async fn generate(
         &self,
         request: GrpcRequest<sg::GenerateRequest>,
@@ -237,6 +238,7 @@ impl SglangScheduler for ScoringWorker {
             complete.prompt_tokens -= 1;
         }
         let response = sg::GenerateResponse {
+            media_identity: None,
             request_id: request.request_id,
             response: Some(sg::generate_response::Response::Complete(complete)),
         };

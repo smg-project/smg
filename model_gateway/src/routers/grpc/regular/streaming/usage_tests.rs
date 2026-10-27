@@ -105,6 +105,7 @@ fn scheduler_choice_frames(
             let token_ids: Vec<u32> = text.chars().map(u32::from).collect();
             generated += token_ids.len() as u32;
             scheduler::GenerateResponse {
+                media_identity: None,
                 request_id: String::new(),
                 response: Some(SchedulerEvent::Chunk(scheduler::GenerateStreamChunk {
                     index,
@@ -116,6 +117,7 @@ fn scheduler_choice_frames(
         })
         .collect();
     frames.push(scheduler::GenerateResponse {
+        media_identity: None,
         request_id: String::new(),
         response: Some(SchedulerEvent::Complete(scheduler::GenerateComplete {
             index,

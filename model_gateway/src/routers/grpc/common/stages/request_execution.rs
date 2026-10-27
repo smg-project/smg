@@ -10,6 +10,7 @@ use std::{
 use axum::response::Response;
 use futures::future::{join_all, try_join_all};
 use smg_grpc_client::{is_transport_failure, vllm_proto as vllm, RequestDeadline};
+use tokio::sync::oneshot;
 use tracing::{debug, error, info_span, warn, Instrument};
 
 use super::{
@@ -43,8 +44,8 @@ use crate::{
             multimodal::worker_language_model_only,
             proto_wrapper::{
                 DispatchBooking, FanoutStream, FirstItem, PrefillCachedTokens, PrefillTicket,
-                ProtoEmbedRequest, ProtoGenerateRequest, ProtoInputLogProbs, ProtoRequest,
-                ProtoResponseVariant, ProtoStream,
+                ProtoEmbedRequest, ProtoGenerateRequest, ProtoGenerateResponse, ProtoInputLogProbs,
+                ProtoRequest, ProtoResponseVariant, ProtoStream,
             },
             utils::{
                 account_pd_side_failure, mark_error_reason,
@@ -1018,7 +1019,16 @@ async fn execute_parallel_pd(
         .unwrap_or("");
     let (prefill_client, decode_client) =
         clients.disaggregated_or_mismatch("execute_parallel_pd")?;
-    let (prefill_request, decode_request) = parallel_pd_requests(proto_request, workers);
+
+    let (mut prefill_request, mut decode_request) = parallel_pd_requests(proto_request, workers);
+    let reuse_key = sglang_media_reuse_key(&prefill_request, workers);
+    if reuse_key.is_some() {
+        if let ProtoGenerateRequest::Sglang(req) = &mut prefill_request {
+            req.return_media_identity = true;
+        }
+    }
+    let (identity_tx, identity_rx) = oneshot::channel();
+    let await_identity = reuse_key.is_some();
 
     // `generate` only establishes the prefill stream here (SMG does not drain
     // it on this path), so prefill duration cannot be measured — only TTFT,
@@ -1052,15 +1062,50 @@ async fn execute_parallel_pd(
         prefill_worker.and_then(|worker| PrefillTicket::book(worker, sides.prompt_tokens));
     let prefill_dispatch: SideDispatch = Box::pin(dispatch_prefill_within(
         bound.clone(),
-        Box::pin(async move { prefill_client.generate(prefill_request).await }),
+        Box::pin(async move {
+            let mut stream = prefill_client.generate(prefill_request).await?;
+            if await_identity {
+                // This is a preprocessing control item, not a token or proof
+                // that KV transfer completed. Consume it before tracking TTFT.
+                let identity =
+                    match tokio::time::timeout(Duration::from_secs(5), stream.first_item_ahead())
+                        .await
+                    {
+                        Ok(Some(Ok(ProtoGenerateResponse::Sglang(response))))
+                            if response.response.is_none() && response.media_identity.is_some() =>
+                        {
+                            let identity = response.media_identity.clone();
+                            let _ = stream.next().await;
+                            identity
+                        }
+                        _ => None,
+                    };
+                let _ = identity_tx.send(identity);
+            }
+            Ok(stream)
+        }),
         prefill_worker.cloned(),
         workers.decode_worker().cloned(),
         sides.prefill_label,
         sides.request_id.clone(),
         sides.prompt_tokens,
     ));
-    let decode_dispatch: SideDispatch =
-        Box::pin(async move { decode_client.generate(decode_request).await });
+    let decode_dispatch: SideDispatch = Box::pin(async move {
+        if let Some(key) = reuse_key {
+            // Bound the optimization, not just inference. Stale capability
+            // metadata or a legacy worker must not deadlock the PD rendezvous.
+            if let Ok(Ok(Some(identity))) =
+                tokio::time::timeout(Duration::from_secs(5), identity_rx).await
+            {
+                if let ProtoGenerateRequest::Sglang(req) = &mut decode_request {
+                    if smg_grpc_client::sglang_media_identity::validate(&identity, req, &key) {
+                        req.media_identity = Some(identity);
+                    }
+                }
+            }
+        }
+        decode_client.generate(decode_request).await
+    });
 
     // The prefill worker's handoffs are watched for only where its side has a bound.
     let handoff_to = bound.as_ref().and(prefill_worker);
@@ -1089,6 +1134,31 @@ async fn execute_parallel_pd(
             partner,
         } => Err(parallel_side_failed_first(&sides, side, &error, partner)),
     }
+}
+
+/// Both sides explicitly advertise the same supported processor contract.
+fn sglang_media_reuse_key(req: &ProtoGenerateRequest, workers: &WorkerSelection) -> Option<String> {
+    let ProtoGenerateRequest::Sglang(req) = req else {
+        return None;
+    };
+    if !smg_grpc_client::sglang_media_identity::reusable_request(req) {
+        return None;
+    }
+    let prefill = workers.prefill_worker()?;
+    let decode = workers.decode_worker()?;
+    let key = prefill
+        .metadata()
+        .spec
+        .labels
+        .get(smg_grpc_client::sglang_media_identity::LABEL)?;
+    (!key.is_empty()
+        && decode
+            .metadata()
+            .spec
+            .labels
+            .get(smg_grpc_client::sglang_media_identity::LABEL)
+            == Some(key))
+    .then(|| key.clone())
 }
 
 /// The parallel dispatch's two requests from the client's: the prefill side is
@@ -3010,6 +3080,62 @@ mod tests {
         }))
     }
 
+    #[test]
+    /// Require matching worker contracts and preserve Decode references for failed reuse.
+    fn sglang_identity_requires_matching_capabilities_and_keeps_fallback_refs() {
+        use smg_grpc_client::{sglang_media_identity as contract, sglang_proto as sg};
+        let request = ProtoGenerateRequest::Sglang(Box::new(sg::GenerateRequest {
+            request_id: "identity".into(),
+            tokenized: Some(sg::TokenizedInput {
+                input_ids: vec![1, 7, 2],
+                ..Default::default()
+            }),
+            mm_inputs: Some(sg::MultimodalInputs {
+                image_urls: vec!["data:image/png;base64,AA==".into()],
+                ..Default::default()
+            }),
+            disaggregated_params: Some(sg::DisaggregatedParams {
+                bootstrap_host: "prefill".into(),
+                bootstrap_port: 8998,
+                bootstrap_room: 1,
+            }),
+            ..Default::default()
+        }));
+        for (pk, dk, expected) in [
+            ("", "", false),
+            ("key", "", false),
+            ("key", "other", false),
+            ("key", "key", true),
+        ] {
+            let leg = |role, key: &str| -> Arc<dyn Worker> {
+                Arc::new(
+                    BasicWorkerBuilder::new("grpc://worker:30000")
+                        .worker_type(role)
+                        .runtime_type(RuntimeType::Sglang)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .label(contract::LABEL, key)
+                        .build(),
+                )
+            };
+            let workers = WorkerSelection::Disaggregated {
+                encode_assignments: None,
+                prefill: leg(WorkerType::Prefill, pk),
+                decode: leg(WorkerType::Decode, dk),
+                runtime_type: RuntimeType::Sglang,
+            };
+            assert_eq!(
+                sglang_media_reuse_key(&request, &workers).is_some(),
+                expected
+            );
+            let (_, decode) = parallel_pd_requests(request.clone(), &workers);
+            let ProtoGenerateRequest::Sglang(decode) = decode else {
+                panic!("expected SGLang decode request")
+            };
+            assert!(contract::has_media_refs(&decode));
+            assert_eq!(decode.tokenized.unwrap().input_ids, [1, 7, 2]);
+        }
+    }
+
     fn tokenspeed_pair() -> WorkerSelection {
         let worker = |url: &str, worker_type: WorkerType| -> Arc<dyn Worker> {
             Arc::new(
@@ -4455,6 +4581,7 @@ mod tests {
     }
 
     #[test]
+    /// Preserve vLLM reference requests when constructing the pixel-free Decode leg.
     fn clone_without_mm_pixels_keeps_vllm_media_refs() {
         // The clone keeps the references; on the sequential path they are
         // replaced by the prefill side's identity before decode is sent.
@@ -4469,7 +4596,7 @@ mod tests {
             ..Default::default()
         }));
         request
-            .set_vllm_media_refs(refs.clone())
+            .set_media_refs(refs.clone())
             .expect("vLLM request accepts media refs");
         assert!(request.has_vllm_media_refs());
         let clone = request.clone_without_mm_pixels();
@@ -4480,6 +4607,7 @@ mod tests {
         assert!(decode.mm_inputs.is_none());
     }
 
+    /// Build a reference request for the PD clone and routing regression tests.
     fn media_refs_request(id: &str, n: u32) -> ProtoGenerateRequest {
         let mut request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
             request_id: id.to_string(),
@@ -4496,7 +4624,7 @@ mod tests {
             ..Default::default()
         }));
         request
-            .set_vllm_media_refs(vllm::MediaRefs {
+            .set_media_refs(vllm::MediaRefs {
                 items: vec![vllm::MediaRef {
                     modality: smg_grpc_client::common_proto::Modality::Image as i32,
                     url: "https://a/1.png".to_string(),
@@ -4819,7 +4947,7 @@ mod tests {
         }));
         request.set_kv_transfer_params_json("{\"do_remote_prefill\":true}".to_string());
         request
-            .set_vllm_media_refs(vllm::MediaRefs {
+            .set_media_refs(vllm::MediaRefs {
                 items: vec![vllm::MediaRef {
                     modality: smg_grpc_client::common_proto::Modality::Image as i32,
                     url: "https://a/1.png".to_string(),

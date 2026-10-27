@@ -32,6 +32,7 @@ mod embed;
 mod engine;
 mod generate;
 mod info;
+mod media_identity;
 mod service;
 #[cfg(test)]
 mod tests;
@@ -229,6 +230,21 @@ pub(super) fn hidden_states_cap(model: &SglangModelInfo) -> Option<HiddenStatesC
     }
 }
 
+/// Native worker-side media preprocessing. Implementations retain the
+/// SGLang request and replace only its unexpanded prompt and media inputs.
+pub trait SglangMediaProcessor: Send + Sync {
+    /// Identical only for processors with compatible pixel-less Decode metadata.
+    fn identity_key(&self) -> Option<&str> {
+        None
+    }
+
+    /// Resolve references before dispatch, preserving the request's generation options.
+    fn process(
+        &self,
+        request: smg_grpc_client::sglang_proto::GenerateRequest,
+    ) -> crate::BoxFuture<Result<smg_grpc_client::sglang_proto::GenerateRequest, tonic::Status>>;
+}
+
 /// How to bind, where the engines dial in, and what to advertise.
 #[derive(Clone)]
 pub struct SglangServicerConfig {
@@ -236,8 +252,8 @@ pub struct SglangServicerConfig {
     /// the start-up bounds. `handshake_address` is what the headless
     /// scheduler dials (the launcher's `--zmq-handshake-address`),
     /// `engine_count` the data-parallel size; `tokenizer_dir` is bundled by
-    /// `GetTokenizer` only, the scheduler keeps its own tokenizer for stop
-    /// strings.
+    /// `GetTokenizer` and the native media launcher uses it for expansion.
+    /// The scheduler keeps its own tokenizer for stop strings.
     pub servicer: ServicerConfig,
     pub model: SglangModelInfo,
     /// The encode dispatch of a language-side worker under encode/prefill
@@ -246,6 +262,8 @@ pub struct SglangServicerConfig {
     /// as the engine's own frontend sends them ([`SglangEncodeDispatcher`]).
     /// `None` on every other worker: a request of references is refused.
     pub encode_dispatcher: Option<Arc<dyn SglangEncodeDispatcher>>,
+    /// Optional native image/video processor; mutually exclusive with encode dispatch.
+    pub media_processor: Option<Arc<dyn SglangMediaProcessor>>,
 }
 
 impl std::fmt::Debug for SglangServicerConfig {
@@ -282,6 +300,10 @@ pub(super) struct State {
     pub(super) shared: Shared,
     /// The language-side encode dispatch, when this worker runs one.
     pub(super) encode: Option<Arc<dyn SglangEncodeDispatcher>>,
+    pub(super) media: Option<Arc<dyn SglangMediaProcessor>>,
+    pub(super) media_identity_enabled: bool,
+    pub(super) media_identity_key: Option<String>,
+    pub(super) mm_hasher: Option<engine_zmq_adapter::SglangCpuMmHasher>,
 }
 
 impl WireState for State {
@@ -300,8 +322,33 @@ pub struct SglangServicerServer {
 impl SglangServicerServer {
     /// Validate, bind, and serve on a dedicated runtime thread.
     pub fn start(config: SglangServicerConfig) -> Result<Self, ServicerError> {
+        // Only processors with an engine-tested identity contract auto-enable
+        // CPU hashing/reuse. Unknown models retain scheduler-side processing.
+        let supported = config
+            .media_processor
+            .as_ref()
+            .and_then(|processor| processor.identity_key())
+            .is_some();
+        let enabled = media_reuse_enabled(
+            std::env::var("SMG_SGLANG_PD_MEDIA_REUSE").ok().as_deref(),
+            supported,
+        )?;
+        Self::start_with_media_options(config, mm_hash_config(supported)?, enabled)
+    }
+
+    /// Start with explicit hash/reuse settings after validating the worker configuration.
+    fn start_with_media_options(
+        config: SglangServicerConfig,
+        mm_hasher: Option<engine_zmq_adapter::SglangCpuMmHasher>,
+        media_identity_enabled: bool,
+    ) -> Result<Self, ServicerError> {
         let invalid = |message: &str| ServicerError::InvalidConfig(message.to_string());
         config.servicer.validate()?;
+        if config.encode_dispatcher.is_some() && config.media_processor.is_some() {
+            return Err(invalid(
+                "native media processing cannot be combined with encode disaggregation",
+            ));
+        }
         if config.model.model_path.trim().is_empty() {
             return Err(invalid("model_path must not be empty"));
         }
@@ -331,15 +378,24 @@ impl SglangServicerServer {
                 max_model_len: u32::try_from(config.model.max_context_length).unwrap_or(0),
                 // The scheduler matches string stops itself.
                 matches_string_stops: false,
-                // No media reach this scheduler through the servicer yet.
+                // Native SGLang stage timing is emitted by its processor.
                 processes_media: false,
             },
             config.servicer.metrics_bind_address.is_some(),
         )?;
+        let media_identity_key = config
+            .media_processor
+            .as_ref()
+            .and_then(|processor| processor.identity_key())
+            .map(|key| format!("v1:{}:{key}", config.model.sglang_version));
         let state = Arc::new(State {
+            media_identity_key,
             model: config.model,
             shared: Shared::new(kv_relay, metrics, config.servicer.tokenizer_dir.clone()),
             encode: config.encode_dispatcher,
+            media: config.media_processor,
+            mm_hasher,
+            media_identity_enabled,
         });
         let routes = Routes::new(
             SglangSchedulerServer::new(service::SglangService {
@@ -431,4 +487,52 @@ impl SglangServicerServer {
     pub fn stop(&self, timeout: Duration) -> Result<(), ServicerError> {
         self.server.stop(&self.state.shared, timeout)
     }
+}
+
+/// Resolve the reuse override without enabling unsupported processors by default.
+fn media_reuse_enabled(value: Option<&str>, supported: bool) -> Result<bool, ServicerError> {
+    match value {
+        None => Ok(supported),
+        Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(_) => Err(ServicerError::InvalidConfig(
+            "SMG_SGLANG_PD_MEDIA_REUSE must be 0 or 1".into(),
+        )),
+    }
+}
+
+/// The identity contract is the CPU SHA256 path in supported engines.
+/// Never override configured GPU hashing or the engine's skip-hash semantics.
+fn mm_hash_config(
+    supported: bool,
+) -> Result<Option<engine_zmq_adapter::SglangCpuMmHasher>, ServicerError> {
+    let threads = std::env::var("SMG_SGLANG_MM_HASH_THREADS").ok();
+    let gpu_buffer = std::env::var("SGLANG_MM_BUFFER_SIZE_MB").unwrap_or_else(|_| "0".into());
+    let skip = std::env::var("SGLANG_MM_SKIP_COMPUTE_HASH").unwrap_or_else(|_| "0".into());
+    let count = mm_hash_threads(threads.as_deref(), supported, &gpu_buffer, &skip)?;
+    Ok(std::num::NonZeroUsize::new(count).map(engine_zmq_adapter::SglangCpuMmHasher::new))
+}
+
+/// Validate bounded hash concurrency while honoring engine GPU and skip-hash settings.
+fn mm_hash_threads(
+    threads: Option<&str>,
+    supported: bool,
+    gpu_buffer: &str,
+    skip: &str,
+) -> Result<usize, ServicerError> {
+    let threads = threads.unwrap_or(if supported { "16" } else { "0" });
+    let count = threads
+        .parse::<usize>()
+        .ok()
+        .filter(|n| *n <= 32)
+        .ok_or_else(|| {
+            ServicerError::InvalidConfig(
+                "SMG_SGLANG_MM_HASH_THREADS must be between 0 and 32".into(),
+            )
+        })?;
+    // Unknown values conservatively retain the engine's own hashing path.
+    if count == 0 || gpu_buffer.parse::<u64>() != Ok(0) || skip != "0" {
+        return Ok(0);
+    }
+    Ok(count)
 }

@@ -990,13 +990,13 @@ pub(crate) fn finish_generate_request(
         if builder.is_zmq() {
             return Err(error::bad_request(
                 "multimodal_not_supported",
-                "media references require a gRPC vLLM worker",
+                "media references require a supported gRPC worker",
             ));
         }
         let refs =
             assemble_media_refs(plan).map_err(|e| error::bad_request(e.code(), e.to_string()))?;
         proto_request
-            .set_vllm_media_refs(refs)
+            .set_media_refs(refs)
             .map_err(|e| error::bad_request("multimodal_not_supported", e))?;
         ctx.state.media_refs_forwarded = true;
     }

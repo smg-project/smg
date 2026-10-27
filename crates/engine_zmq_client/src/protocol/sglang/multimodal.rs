@@ -9,7 +9,7 @@
 //! contract**; the plugin declares both structs' field order at the handshake
 //! and `SglangProtocol::check_layouts` compares these lists against it.
 //!
-//! The sender does none of the scheduler's work: the item hashes, the pad
+//! An opt-in sender may carry the engine-compatible CPU feature hash. Pad
 //! values, the padded prompt and the M-RoPE positions are the scheduler's
 //! (`MultimodalInputs.from_processor_output`, the model's pad pattern,
 //! `_maybe_compute_mrope_positions`), as they are behind the Python servicer,
@@ -57,6 +57,19 @@ pub const MULTIMODAL_DATA_ITEM_NAME: &str = "MultimodalDataItem";
 /// `recorded::PROCESSOR_OUTPUT_FIELDS_0_5_22`.
 pub const PROCESSOR_OUTPUT_WIRE_FIELDS: [&str; 4] =
     ["mm_items", "input_ids", "padded_input_ids", "im_token_id"];
+
+/// Videos also need their token id so the scheduler replaces their placeholders.
+pub const VIDEO_PROCESSOR_OUTPUT_WIRE_FIELDS: [&str; 9] = [
+    "mm_items",
+    "input_ids",
+    "padded_input_ids",
+    "im_token_id",
+    "im_start_id",
+    "im_end_id",
+    "slice_start_id",
+    "slice_end_id",
+    "video_token_id",
+];
 
 /// The same for `MultimodalDataItem`.
 pub const DATA_ITEM_WIRE_FIELDS: [&str; 9] = [
@@ -304,11 +317,13 @@ impl TensorFields for SglangWireTensor {
 /// One multimodal item, the scheduler's `MultimodalDataItem`: a 9-slot
 /// positional array `[modality, hash, pad_value, offsets, format, feature,
 /// precomputed_embeddings, keep_device_embedding, model_specific_data]`. The
-/// hash and the pad value are left to the scheduler, which derives them from
-/// the feature (the Python servicer leaves them too).
+/// hash may be computed by the sender using the engine CPU identity algorithm.
+/// The pad value remains the scheduler's responsibility.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SglangWireMmItem {
     pub modality: SglangWireModality,
+    /// Engine-compatible CPU feature identity, or None for scheduler hashing.
+    pub hash: Option<u64>,
     /// Inclusive `[start, end]` token ranges of the item's placeholder tokens
     /// in the prompt; `None` when the sender found none (the Python servicer's
     /// rule, which warns and leaves the slot unset).
@@ -339,7 +354,7 @@ impl Serialize for SglangWireMmItem {
         const NIL: Option<()> = None;
         let mut tuple = serializer.serialize_tuple(DATA_ITEM_WIRE_FIELDS.len())?;
         tuple.serialize_element(&self.modality)?;
-        tuple.serialize_element(&NIL)?; // hash: the scheduler hashes the feature
+        tuple.serialize_element(&self.hash)?; // trusted sender-computed feature hash
         tuple.serialize_element(&NIL)?; // pad_value: derived from the hash there
         tuple.serialize_element(&self.offsets)?;
         tuple.serialize_element(&FORMAT_NORMAL)?;
@@ -367,7 +382,7 @@ impl<'de> Deserialize<'de> for SglangWireMmItem {
                 let modality = SglangWireModality::from_value(modality).ok_or_else(|| {
                     A::Error::custom(format!("unknown multimodal modality value {modality}"))
                 })?;
-                let _hash: IgnoredAny = next_field(&mut seq, "hash")?;
+                let hash = next_field(&mut seq, "hash")?;
                 let _pad_value: IgnoredAny = next_field(&mut seq, "pad_value")?;
                 let offsets = next_field(&mut seq, "offsets")?;
                 let _format: IgnoredAny = next_field(&mut seq, "format")?;
@@ -378,6 +393,7 @@ impl<'de> Deserialize<'de> for SglangWireMmItem {
                 drain_trailing(&mut seq)?;
                 Ok(SglangWireMmItem {
                     modality,
+                    hash,
                     offsets,
                     feature,
                     model_specific_data,
@@ -391,15 +407,15 @@ impl<'de> Deserialize<'de> for SglangWireMmItem {
 
 /// The request's multimodal payload, the scheduler's
 /// `MultimodalProcessorOutput`: a positional array of which this side sends the
-/// prefix through `im_token_id` (the token the model's pad pattern replaces),
-/// with `mm_items` filled and the prompt-side slots (`input_ids`,
-/// `padded_input_ids`) at their defaults; the other token ids and the position
-/// tensors are the scheduler's defaults past the prefix, which computes what it
-/// needs of them itself.
+/// prefix through `im_token_id` for images, extended through `video_token_id`
+/// for videos. Both ids tell the scheduler which modality's placeholders to
+/// pad. The prompt-side slots and position tensors retain their defaults;
+/// the scheduler computes positions itself.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SglangWireMmInputs {
     pub mm_items: Vec<SglangWireMmItem>,
     pub im_token_id: Option<u32>,
+    pub video_token_id: Option<u32>,
 }
 
 impl TensorFields for SglangWireMmInputs {
@@ -415,11 +431,22 @@ impl TensorFields for SglangWireMmInputs {
 impl Serialize for SglangWireMmInputs {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         const NIL: Option<()> = None;
-        let mut tuple = serializer.serialize_tuple(PROCESSOR_OUTPUT_WIRE_FIELDS.len())?;
+        let fields = if self.video_token_id.is_some() {
+            VIDEO_PROCESSOR_OUTPUT_WIRE_FIELDS.len()
+        } else {
+            PROCESSOR_OUTPUT_WIRE_FIELDS.len()
+        };
+        let mut tuple = serializer.serialize_tuple(fields)?;
         tuple.serialize_element(&self.mm_items)?;
         tuple.serialize_element(&NIL)?; // input_ids
         tuple.serialize_element(&NIL)?; // padded_input_ids
         tuple.serialize_element(&self.im_token_id)?;
+        if self.video_token_id.is_some() {
+            for _ in 0..4 {
+                tuple.serialize_element(&NIL)?;
+            }
+            tuple.serialize_element(&self.video_token_id)?;
+        }
         tuple.end()
     }
 }
@@ -440,10 +467,15 @@ impl<'de> Deserialize<'de> for SglangWireMmInputs {
                 let _input_ids: IgnoredAny = next_field(&mut seq, "input_ids")?;
                 let _padded_input_ids: IgnoredAny = next_field(&mut seq, "padded_input_ids")?;
                 let im_token_id = next_field(&mut seq, "im_token_id")?;
+                for _ in 0..4 {
+                    let _: Option<IgnoredAny> = seq.next_element()?;
+                }
+                let video_token_id = seq.next_element::<Option<u32>>()?.flatten();
                 drain_trailing(&mut seq)?;
                 Ok(SglangWireMmInputs {
                     mm_items,
                     im_token_id,
+                    video_token_id,
                 })
             }
         }
@@ -518,6 +550,20 @@ mod tests {
     /// The same with `offsets` left unset and no model-specific tensors.
     const PYTHON_OUTPUT_NO_OFFSETS: &str = "94919901c0c0c001c734020000001093920204a7666c6f61743332a3637075000000000000003f0000803f0000c03f00000040000020400000404000006040c0c280c0c0c0";
 
+    #[test]
+    /// Round-trip the entire unsigned hash while leaving pad values engine-owned.
+    fn optional_cpu_hash_preserves_full_u64_and_leaves_padding_to_engine() {
+        let mut mm = inputs();
+        mm.mm_items[0].hash = Some(u64::MAX);
+        let encoded = encode_msgpack(&mm).unwrap();
+        let decoded: SglangWireMmInputs = decode_msgpack(&encoded).unwrap();
+        assert_eq!(decoded, mm);
+        let value = decode_value(&encoded).unwrap();
+        let item = &value.as_array().unwrap()[0].as_array().unwrap()[0];
+        assert_eq!(item.as_array().unwrap()[1].as_u64(), Some(u64::MAX));
+        assert!(item.as_array().unwrap()[2].is_nil());
+    }
+
     fn pixels() -> SglangWireTensor {
         let data: Vec<u8> = (0..8)
             .flat_map(|i| (i as f32 * 0.5).to_le_bytes())
@@ -530,15 +576,18 @@ mod tests {
         SglangWireTensor::new("int64", vec![1, 3], Bytes::from(data)).unwrap()
     }
 
+    /// Construct one media item for hash serialization regression coverage.
     fn inputs() -> SglangWireMmInputs {
         SglangWireMmInputs {
             mm_items: vec![SglangWireMmItem {
                 modality: SglangWireModality::Image,
+                hash: None,
                 offsets: Some(vec![(1, 3)]),
                 feature: Some(pixels()),
                 model_specific_data: BTreeMap::from([("image_grid_thw".to_string(), grid())]),
             }],
             im_token_id: Some(7),
+            video_token_id: None,
         }
     }
 
@@ -593,11 +642,13 @@ mod tests {
         let no_offsets = SglangWireMmInputs {
             mm_items: vec![SglangWireMmItem {
                 modality: SglangWireModality::Image,
+                hash: None,
                 offsets: None,
                 feature: Some(pixels()),
                 model_specific_data: BTreeMap::new(),
             }],
             im_token_id: None,
+            video_token_id: None,
         };
         assert_eq!(
             encode_msgpack(&no_offsets).unwrap(),
@@ -695,6 +746,7 @@ mod tests {
             mm_items: vec![
                 SglangWireMmItem {
                     modality: SglangWireModality::Image,
+                    hash: None,
                     offsets: None,
                     feature: Some(tensor(1)),
                     model_specific_data: BTreeMap::from([
@@ -704,12 +756,14 @@ mod tests {
                 },
                 SglangWireMmItem {
                     modality: SglangWireModality::Image,
+                    hash: None,
                     offsets: None,
                     feature: None,
                     model_specific_data: BTreeMap::from([("grid".to_string(), tensor(4))]),
                 },
             ],
             im_token_id: None,
+            video_token_id: None,
         };
         let mut seen = Vec::new();
         inputs.for_each_tensor(&mut |data| {
