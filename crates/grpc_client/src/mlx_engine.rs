@@ -15,6 +15,8 @@ use crate::BoxedTraceInjector;
 pub mod proto {
     #![allow(clippy::all, clippy::absolute_paths, unused_qualifications)]
     tonic::include_proto!("mlx.grpc.engine");
+    // The client, generated apart with the clients' codec (see build.rs).
+    include!(concat!(env!("OUT_DIR"), "/client/mlx.grpc.engine.rs"));
 }
 
 /// Streaming `generate()` response that auto-aborts on drop. Concrete

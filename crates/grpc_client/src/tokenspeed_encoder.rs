@@ -46,6 +46,11 @@ static ENCODE_CONN_CURSOR: AtomicUsize = AtomicUsize::new(0);
 pub mod tokenspeed_encoder_proto {
     #![allow(clippy::all, clippy::absolute_paths, unused_qualifications)]
     tonic::include_proto!("tokenspeed.grpc.encoder");
+    // The client, generated apart with the clients' codec (see build.rs).
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/client/tokenspeed.grpc.encoder.rs"
+    ));
 }
 
 /// gRPC client for the TokenSpeed encode worker.

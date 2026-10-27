@@ -25,6 +25,8 @@ pub mod proto {
         unused_qualifications
     )]
     tonic::include_proto!("trtllm");
+    // The client, generated apart with the clients' codec (see build.rs).
+    include!(concat!(env!("OUT_DIR"), "/client/trtllm.rs"));
 }
 
 /// Streaming `generate()` response that auto-aborts on drop. Concrete

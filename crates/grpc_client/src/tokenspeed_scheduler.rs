@@ -32,6 +32,11 @@ pub mod tokenspeed_proto {
         unused_qualifications
     )]
     tonic::include_proto!("tokenspeed.grpc.scheduler");
+    // The client, generated apart with the clients' codec (see build.rs).
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/client/tokenspeed.grpc.scheduler.rs"
+    ));
 }
 
 /// Streaming `generate()` response that auto-aborts on drop. Concrete
