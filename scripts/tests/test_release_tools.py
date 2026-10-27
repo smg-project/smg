@@ -423,7 +423,11 @@ def test_pick_cherry_picks_from_main_and_opens_the_pull_request(repo: Sandbox) -
     # A tracked file left modified (a conflict resolution's leftovers) is refused, never swept into the record.
     repo.put("Cargo.toml", repo.read("Cargo.toml") + "# edited\n")
     refused = repo.tool("pick-pr", "1.14", check=False)
-    assert refused.returncode == 1 and "uncommitted changes" in refused.stderr
+    assert (
+        refused.returncode == 1
+        and "uncommitted changes: discard them (git restore <file>)" in refused.stderr
+    )
+    assert f"commit them on {topic} and say so in the pull request" in refused.stderr
     repo.git("checkout", "--", "Cargo.toml")
     assert repo.origin_ref(f"refs/heads/{topic}") == repo.git("rev-parse", "HEAD")
     assert repo.origin_ref("refs/heads/release/1.14") == branch_head

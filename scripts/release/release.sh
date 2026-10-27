@@ -136,9 +136,9 @@ require_identity() {
   [ -n "${GIT_COMMITTER_EMAIL:-}" ] || git config --get user.email >/dev/null \
     || die "git user.name and user.email are not set: the commits and the tag carry your sign-off"
 }
-require_clean() {
+require_clean() { # [<advice>]: the bump's by default (its commit must carry only the bump)
   [ -z "$(git status --porcelain --untracked-files=no)" ] \
-    || die "the working tree has uncommitted changes: commit them first (the bump commit must carry only the bump)"
+    || die "the working tree has uncommitted changes: ${1:-commit them first (the bump commit must carry only the bump)}"
 }
 sign_off() { # "Name <email>", as git commit -s writes it
   local ident
@@ -318,7 +318,8 @@ cmd_pick_pr() {
   case "$topic" in pick/"$release"-*) ;; *) die "not on a pick/$release-* branch (on $topic)" ;; esac
   has_ref CHERRY_PICK_HEAD && die "a cherry-pick is still in progress: git cherry-pick --continue (or --abort) first"
   [ ! -d "$(git rev-parse --git-path sequencer)" ] || die "a cherry-pick sequence is still in progress: git cherry-pick --continue (or --abort) first"
-  require_clean
+  # A stray change (a lock file a build rewrote after the conflict resolution) would ride into the squash unnamed.
+  require_clean "discard them (git restore <file>) or, if the pick needs them, commit them on $topic and say so in the pull request"
   fetch
   pick_pr "$release" "$topic"
 }
