@@ -820,7 +820,7 @@ async fn execute_single(
     let streaming = proto_request.stream();
     let worker = workers.single();
     if let Some(worker) = worker {
-        Metrics::record_worker_request(worker.url(), worker.model_id());
+        Metrics::record_worker_request(worker.redacted_url(), worker.model_id());
     }
     // The call's future is boxed, as the disaggregated sides' are: it is the
     // large part of the dispatch, and inlined in the pipeline's future it
@@ -943,7 +943,7 @@ async fn execute_single_embed(
     let client = clients.single_or_mismatch("execute_single_embed")?;
 
     if let Some(worker) = workers.single() {
-        Metrics::record_worker_request(worker.url(), worker.model_id());
+        Metrics::record_worker_request(worker.redacted_url(), worker.model_id());
     }
     let result = client.embed(proto_request).await;
     if let Some(status) = result.breaker_status() {
@@ -1041,7 +1041,7 @@ async fn execute_parallel_pd(
         .into_iter()
         .flatten()
     {
-        Metrics::record_worker_request(worker.url(), worker.model_id());
+        Metrics::record_worker_request(worker.redacted_url(), worker.model_id());
     }
     // The side is booked on its worker here, before its call is polled: a
     // servicer that sends its headers with the first message answers the
@@ -2604,7 +2604,7 @@ async fn sequential_prefill_side(
     let bound = prefill_worker
         .and_then(|worker| PrefillBound::at(worker, sides.prompt_tokens, prefill_start));
     if let Some(prefill) = prefill_worker {
-        Metrics::record_worker_request(prefill.url(), prefill.model_id());
+        Metrics::record_worker_request(prefill.redacted_url(), prefill.model_id());
     }
     // Booked before the call is polled, for the servicers that send their
     // headers with the first message (see `PrefillTicket::book`); the bound
@@ -2832,7 +2832,7 @@ async fn sequential_decode_side(
     let workers = sides.workers;
     // Send request to decode
     if let Some(decode) = workers.decode_worker() {
-        Metrics::record_worker_request(decode.url(), decode.model_id());
+        Metrics::record_worker_request(decode.redacted_url(), decode.model_id());
     }
     // The relay phase ends at the decode dispatch. Everything after this
     // instant, including the engines' KV transfer and the decode scheduling,

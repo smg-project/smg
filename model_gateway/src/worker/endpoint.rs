@@ -350,8 +350,9 @@ impl Endpoint {
         }
     }
 
-    /// The address as a request's success path shows it: the routed-worker
-    /// response header, the cache-trace header and the request-sent event.
+    /// The address as a request's success path shows it (the routed-worker
+    /// response header, the cache-trace header and the request-sent event)
+    /// and the `worker` label of the worker's metric series.
     /// An address without userinfo, query or fragment is the registered
     /// string, byte for byte, so the header a client matches against the
     /// address it registered does not change; one with userinfo is

@@ -1,7 +1,9 @@
 //! Per-worker series that leave `/metrics` with their worker.
 //!
-//! Every family labelled `worker` is keyed by the worker URL, and with
-//! pod-based discovery a replaced engine pod comes back under a new address.
+//! Every family labelled `worker` is keyed by the worker's rendering of its
+//! URL (`Worker::redacted_url`: the registered URL, a userinfo masked), and
+//! with pod-based discovery a replaced engine pod comes back under a new
+//! address.
 //! The Prometheus exporter cannot delete a series (metrics-rs/metrics#653),
 //! so each replacement left the old address's full set of series in the
 //! scrape for the life of the process, and sums over the per-worker gauges
@@ -37,7 +39,8 @@ use metrics_util::{
 use parking_lot::{Mutex, RwLock};
 use quanta::Instant;
 
-/// The label that keys a series to a worker; its value is the worker URL.
+/// The label that keys a series to a worker; its value is the worker's
+/// rendering (`Worker::redacted_url`).
 const WORKER_LABEL: &str = "worker";
 
 /// The store the installed recorder routes per-worker series to.
@@ -68,7 +71,7 @@ pub(crate) fn run_upkeep() {
     }
 }
 
-/// The per-worker series of the process, keyed by the worker URL.
+/// The per-worker series of the process, keyed by the worker label.
 pub(crate) struct WorkerSeries {
     /// Addresses whose registration was removed; their writes are dropped
     /// until the address registers again. Handle creation holds the read

@@ -3053,3 +3053,38 @@ fn clear_all_overload_flags_resets_every_model() {
     assert_eq!(registry.overloaded_worker_count("m1"), 0);
     assert_eq!(registry.overloaded_worker_count("m2"), 0);
 }
+
+/// Two registrations at one address that differ only by their credentials
+/// render to one label (`Worker::redacted_url` masks a userinfo whole): the
+/// label is shared while a registration at another URL renders to it; a
+/// worker's own registration and a neighbour at another address are not
+/// another one.
+#[test]
+fn a_label_is_shared_while_a_registration_at_another_url_renders_to_it() {
+    let registry = WorkerRegistry::new();
+    let worker = |url: &str| -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .build(),
+        )
+    };
+    let old = worker("http://user:old@worker:8080");
+    let new = worker("http://user:new@worker:8080");
+    let plain = worker("http://other:8080");
+    assert_eq!(old.redacted_url(), "http://***@worker:8080");
+    assert_eq!(old.redacted_url(), new.redacted_url());
+    registry.register(Arc::clone(&old)).unwrap();
+    let new_id = registry.register(Arc::clone(&new)).unwrap();
+    registry.register(Arc::clone(&plain)).unwrap();
+    assert!(registry.label_shared_with(&old));
+    assert!(registry.label_shared_with(&new));
+    assert!(!registry.label_shared_with(&plain));
+
+    assert!(registry.remove(&new_id).is_some());
+    assert!(
+        !registry.label_shared_with(&old),
+        "the worker's own registration is not another one"
+    );
+}

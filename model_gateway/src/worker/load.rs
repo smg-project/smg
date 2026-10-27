@@ -15,6 +15,8 @@ use crate::{
 };
 
 pub struct WorkerRoutingKeyLoad {
+    /// The worker's rendering (`Worker::redacted_url`): the label of its
+    /// series and the address its log lines write.
     url: String,
     active_routing_keys: dashmap::DashMap<String, usize>,
 }

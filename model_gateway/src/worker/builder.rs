@@ -381,8 +381,12 @@ impl BasicWorkerBuilder {
                 } else {
                     WorkerStatus::Pending
                 });
-        Metrics::set_worker_health(&metadata.spec.url, initial_status == WorkerStatus::Ready);
-        Metrics::set_worker_http2(&metadata.spec.url, metadata.http2);
+        // The worker's series are labelled with its rendering, never the raw URL.
+        Metrics::set_worker_health(
+            &metadata.redacted_url,
+            initial_status == WorkerStatus::Ready,
+        );
+        Metrics::set_worker_http2(&metadata.redacted_url, metadata.http2);
 
         let http_client = Arc::new(match self.http_client {
             Some(client) => LazyHttpClient::ready(client),
@@ -396,10 +400,13 @@ impl BasicWorkerBuilder {
                 metadata.spec.kv_engine_id.clone().map(Arc::new),
             )),
             kv_engine_id_unconfirmed: Arc::new(AtomicBool::new(false)),
-            runtime: ArcSwap::from_pointee(WorkerRuntime::new(&metadata.spec.url, initial_status)),
+            runtime: ArcSwap::from_pointee(WorkerRuntime::new(
+                &metadata.redacted_url,
+                initial_status,
+            )),
             circuit_breaker: ArcSwap::from_pointee(CircuitBreaker::with_config_and_label(
                 self.circuit_breaker_config,
-                metadata.spec.url.clone(),
+                metadata.redacted_url.clone(),
             )),
             metadata,
             backend_client,

@@ -254,7 +254,8 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Get the worker's URL
     fn url(&self) -> &str;
     /// The URL as a request's success path shows it (the routed-worker
-    /// response header, the cache-trace header, the request-sent event): the
+    /// response header, the cache-trace header, the request-sent event) and
+    /// the `worker` label of the worker's metric series: the
     /// registered URL byte for byte when it has no userinfo, query or
     /// fragment, otherwise `Endpoint::redacted_str`'s form (see
     /// `Endpoint::redacted_url`). Computed once at construction
@@ -1249,6 +1250,16 @@ const ROUTING_STATE_SERIES: [(&str, &str); 9] = [
     ("excluded", "circuit_open"),
 ];
 
+/// Lower every `smg_worker_state` series of `label`. The registry's removal
+/// of one of two registrations that share a label (one address, rotated
+/// credentials) clears the family before the registration that stays
+/// publishes its pair again.
+pub(crate) fn lower_routing_state_series(label: &str) {
+    for (state, reason) in ROUTING_STATE_SERIES {
+        Metrics::set_worker_state(label, state, reason, false);
+    }
+}
+
 /// The published-state code of the `circuit_open` series (its index plus
 /// one): the one series a read of the breaker can end, when the breaker's
 /// timeout moves it from open to half-open.
@@ -1379,7 +1390,7 @@ impl BasicWorker {
 
     fn update_running_requests_metrics(&self) {
         let load = self.load();
-        Metrics::set_worker_requests_active(self.url(), load);
+        Metrics::set_worker_requests_active(self.redacted_url(), load);
     }
 
     fn shared_runtime(&self) -> Arc<WorkerRuntime> {
@@ -1499,10 +1510,10 @@ impl BasicWorker {
             return;
         }
         let (state, reason) = ROUTING_STATE_SERIES[index];
-        Metrics::set_worker_state(self.url(), state, reason, true);
+        Metrics::set_worker_state(self.redacted_url(), state, reason, true);
         if let Some(left) = (previous as usize).checked_sub(1) {
             let (state, reason) = ROUTING_STATE_SERIES[left];
-            Metrics::set_worker_state(self.url(), state, reason, false);
+            Metrics::set_worker_state(self.redacted_url(), state, reason, false);
         }
     }
 
@@ -1511,7 +1522,7 @@ impl BasicWorker {
         shared_runtime.bump_revision();
         let shared_status = shared_runtime.status();
         self.runtime.store(shared_runtime);
-        Metrics::set_worker_health(self.url(), shared_status == WorkerStatus::Ready);
+        Metrics::set_worker_health(self.redacted_url(), shared_status == WorkerStatus::Ready);
 
         let existing_cb = self.circuit_breaker.load();
         let other_cb = other.circuit_breaker.load_full();
@@ -1650,7 +1661,7 @@ impl Worker for BasicWorker {
 
     fn set_status(&self, status: WorkerStatus) {
         self.runtime.load().set_status(status);
-        Metrics::set_worker_health(self.url(), status == WorkerStatus::Ready);
+        Metrics::set_worker_health(self.redacted_url(), status == WorkerStatus::Ready);
         self.publish_state();
     }
 

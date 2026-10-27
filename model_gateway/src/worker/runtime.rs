@@ -561,7 +561,9 @@ impl PdQueue {
 }
 
 impl WorkerRuntime {
-    pub fn new(url: &str, initial_status: WorkerStatus) -> Self {
+    /// `label` is the worker's rendering (`Worker::redacted_url`): the label
+    /// of the routing-key load's series.
+    pub fn new(label: &str, initial_status: WorkerStatus) -> Self {
         Self {
             status: AtomicU8::new(initial_status as u8),
             cache_trace_epochs_valid: AtomicBool::new(!matches!(
@@ -575,7 +577,7 @@ impl WorkerRuntime {
             pd_admitted: AtomicUsize::new(0),
             pd_queue: Mutex::new(PdQueue::default()),
             processed_counter: AtomicUsize::new(0),
-            worker_routing_key_load: WorkerRoutingKeyLoad::new(url),
+            worker_routing_key_load: WorkerRoutingKeyLoad::new(label),
             revision: AtomicU64::new(0),
             overloaded: AtomicBool::new(false),
             stall: AtomicU8::new(0),

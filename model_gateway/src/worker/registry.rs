@@ -1755,6 +1755,23 @@ impl WorkerRegistry {
     // 7. Remove
     // ───────────────────────────────────────────────────────────────────
 
+    /// Whether a registration at another URL renders to `worker`'s label
+    /// (`Worker::redacted_url`): two registrations at one address that
+    /// differ only by their credentials share one, and a leaving
+    /// registration then leaves the label's series to the one that stays
+    /// (the retirement in `remove_inner`, the load monitor's eviction
+    /// sentinel). By URL: the worker's own object and a same-URL successor
+    /// (a `replace`, whose old object is evicted while the successor sits in
+    /// the map) are not another registration. In `remove_inner` the leaving
+    /// URL still maps to the leaving id under the per-id lock, so no other
+    /// registration at that URL is in the map.
+    pub(crate) fn label_shared_with(&self, worker: &Arc<dyn Worker>) -> bool {
+        let label = worker.redacted_url();
+        self.workers.iter().any(|other| {
+            other.value().url() != worker.url() && other.value().redacted_url() == label
+        })
+    }
+
     /// Remove a worker by ID and clean up every index entry.
     ///
     /// Returns `Some(worker)` if the ID existed, `None` otherwise. Tears
@@ -1824,10 +1841,44 @@ impl WorkerRegistry {
             removed
         };
         if let Some((_, worker)) = removed {
-            // Retire the URL's series while the URL still maps to this id: a
+            // Retire the label's series while the URL still maps to this id: a
             // registration of the same URL cannot slip in between and have its
-            // fresh series retired under it.
-            Metrics::remove_worker_metrics(worker.url());
+            // fresh series retired under it. A registration at another URL that
+            // renders to the same label (the same address under rotated
+            // credentials, registered before this one leaves) keeps the label's
+            // series: they are retired with the last registration rendering to it.
+            let label = worker.redacted_url();
+            {
+                // The scan and the retirement under the membership-order write
+                // guard: a registration of another URL that renders to this
+                // label inserts under the read side, so it lands before the
+                // scan (the label reads shared) or after the retirement (its
+                // `worker_registered` brings the label back), never between
+                // them with its fresh series retired under it.
+                let _order = self.global_membership_order.write();
+                if self.label_shared_with(&worker) {
+                    // The leaving registration's demotion wrote the gauges the
+                    // label shares and left its state pair at 1: every pair of
+                    // the label is lowered once, then the registrations that
+                    // stay write their gauges and publish their pair again, so
+                    // the family ends one-hot on theirs.
+                    super::worker::lower_routing_state_series(label);
+                    for other in self.workers.iter() {
+                        let other = other.value();
+                        if other.redacted_url() == label {
+                            Metrics::set_worker_health(label, other.is_healthy());
+                            Metrics::set_worker_cb_state(
+                                label,
+                                other.circuit_breaker_state().as_int(),
+                            );
+                            Metrics::set_worker_requests_active(label, other.load());
+                            other.republish_state();
+                        }
+                    }
+                } else {
+                    Metrics::remove_worker_metrics(label);
+                }
+            }
             self.url_to_id.remove(worker.url());
             // We hold _guard; drop the DashMap entry but the Mutex stays alive via Arc.
             self.worker_mutation_locks.remove(worker_id);
@@ -2066,15 +2117,18 @@ impl WorkerRegistry {
         // writes for health, HTTP/2 and breaker state preceded this
         // registration and were dropped if the address was retired by an
         // earlier removal, so they are repeated here.
-        Metrics::worker_registered(worker.url());
-        Metrics::set_worker_health(worker.url(), worker.is_healthy());
-        Metrics::set_worker_http2(worker.url(), worker.http2());
-        Metrics::set_worker_cb_state(worker.url(), worker.circuit_breaker_state().as_int());
+        Metrics::worker_registered(worker.redacted_url());
+        Metrics::set_worker_health(worker.redacted_url(), worker.is_healthy());
+        Metrics::set_worker_http2(worker.redacted_url(), worker.http2());
+        Metrics::set_worker_cb_state(
+            worker.redacted_url(),
+            worker.circuit_breaker_state().as_int(),
+        );
         worker.republish_state();
 
         // The worker's request counter starts at zero with its registration,
         // so a worker that gets no traffic shows as such.
-        Metrics::init_worker_requests(worker.url(), worker.model_id());
+        Metrics::init_worker_requests(worker.redacted_url(), worker.model_id());
 
         // Update model index for O(1) lookups using copy-on-write.
         for model_id in Self::worker_model_ids(&worker) {
@@ -2516,7 +2570,7 @@ impl WorkerRegistry {
         // one trial per promotion, and the next promotion costs it a full
         // demotion first. The breaker logs the transition itself.
         if worker.readmit_circuit_breaker() {
-            Metrics::record_worker_cb_health_readmission(worker.url());
+            Metrics::record_worker_cb_health_readmission(worker.redacted_url());
         }
     }
 

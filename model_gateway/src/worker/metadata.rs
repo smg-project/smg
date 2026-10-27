@@ -28,8 +28,9 @@ pub struct WorkerMetadata {
     /// `GET /workers`) without a per-worker deep clone. Set once at construction
     /// and not mutated afterwards.
     pub spec: Arc<WorkerSpec>,
-    /// The URL as a request's success path shows it: the routed-worker
-    /// response header, the cache-trace header and the request-sent event.
+    /// The URL as a request's success path shows it (the routed-worker
+    /// response header, the cache-trace header and the request-sent event)
+    /// and the `worker` label of the worker's metric series.
     /// The registered URL byte for byte when it has no userinfo, query or
     /// fragment; otherwise `endpoint::Endpoint::redacted_str`'s form (see
     /// `Endpoint::redacted_url`). Computed once at construction (the worker

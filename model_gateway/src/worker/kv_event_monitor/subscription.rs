@@ -184,6 +184,9 @@ impl Backoff {
 /// every round: the worker, its index handles and its contact source.
 struct WorkerSubscription<'a> {
     worker: &'a Arc<dyn Worker>,
+    /// The worker's rendering (`Worker::redacted_url`): the label of its
+    /// series and the address its log lines write. The index is keyed by
+    /// the URL, through `worker_id`.
     worker_url: &'a str,
     worker_id: u32,
     indexer: &'a KvIndex,
@@ -315,7 +318,7 @@ impl KvEventMonitor {
     async fn remove_indexer_worker(
         indexer: Arc<KvIndex>,
         worker_id: u32,
-        worker_url: &str,
+        label: &str,
         worker_blocks: WorkerIndexState,
     ) {
         let Ok(permit) = INDEX_REMOVAL_PERMITS.acquire().await else {
@@ -341,7 +344,7 @@ impl KvEventMonitor {
         if let Err(error) = result {
             error!(worker_id, %error, "Index worker cleanup task failed");
         }
-        Metrics::set_kv_index_blocks(worker_url, 0);
+        Metrics::set_kv_index_blocks(label, 0);
     }
 
     /// Main subscription loop for a single worker.
@@ -361,6 +364,10 @@ impl KvEventMonitor {
         mut shutdown_rx: oneshot::Receiver<()>,
         load_sink: Option<Weak<WorkerMonitor>>,
     ) {
+        // The label of the worker's series and the address its log lines
+        // write: the worker's rendering (`Worker::redacted_url`), a userinfo
+        // masked. The index and the monitor's slot stay keyed by the URL.
+        let label = worker.redacted_url();
         let worker_id = match indexer.intern_worker(&worker_url) {
             Ok(id) => id,
             Err(e) => {
@@ -370,7 +377,7 @@ impl KvEventMonitor {
                     "Failed to intern worker; KV events from this worker will \
                      not feed cache-aware routing"
                 );
-                Metrics::record_kv_event_subscription_failure(&worker_url, "intern_failed");
+                Metrics::record_kv_event_subscription_failure(label, "intern_failed");
                 return;
             }
         };
@@ -381,7 +388,7 @@ impl KvEventMonitor {
         let wake = worker.contact_wake();
         let subscription = WorkerSubscription {
             worker: &worker,
-            worker_url: &worker_url,
+            worker_url: label,
             worker_id,
             indexer: &indexer,
             block_sizes: &block_sizes,
@@ -411,10 +418,9 @@ impl KvEventMonitor {
                 Round::Unsupported => break true,
             }
         };
-        Self::remove_indexer_worker(Arc::clone(&indexer), worker_id, &worker_url, state.index)
-            .await;
+        Self::remove_indexer_worker(Arc::clone(&indexer), worker_id, label, state.index).await;
         if unsupported {
-            Metrics::set_kv_events_unavailable(&worker_url, true);
+            Metrics::set_kv_events_unavailable(label, true);
         }
     }
 
