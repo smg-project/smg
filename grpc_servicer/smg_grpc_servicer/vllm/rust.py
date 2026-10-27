@@ -72,6 +72,7 @@ from smg_grpc_servicer.vllm.config_view import (
     mm_processor_kwargs,
     multimodal_config,
 )
+from smg_grpc_servicer.vllm.decoding_policy import constrained_decoding_policy
 from smg_grpc_servicer.vllm.kv_transfer import runs_mooncake
 from smg_grpc_servicer.vllm.launcher_switch import LAUNCHER_MODULES, SUPPORTED_VLLM_RELEASES
 from smg_grpc_servicer.vllm.media_refs import FETCHABLE_MODALITIES
@@ -121,6 +122,7 @@ def model_info_from_config(
     engine's encoder budget when the caller derived it already
     (:func:`~smg_grpc_servicer.vllm.model_info.mm_encoder_budget`); ``None``
     derives it here."""
+    policy = constrained_decoding_policy()
     view = EngineConfigView(vllm_config)
     model_config = vllm_config.model_config
     facts = {**model_facts(model_config), **server_facts(vllm_config)}
@@ -158,6 +160,7 @@ def model_info_from_config(
         ),
         "engine_reasoning_parser": engine_reasoning_parser(vllm_config),
         "constrained_decoding_start": constrained_decoding_start(vllm_config),
+        **({"constrained_decoding": policy} if policy else {}),
         # Whether a Mooncake connector runs in the engine at all, off the raw
         # `kv_transfer_config` (the top-level connector or any child a wrapper
         # lists): the servicer withholds a PD decode side's KV-transfer rejection

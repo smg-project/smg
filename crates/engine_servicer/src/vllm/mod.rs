@@ -152,6 +152,8 @@ pub struct VllmModelInfo {
     /// parser to see the thought's end, `first_token` when the grammar runs
     /// from the first generated token; empty when the config does not say.
     pub constrained_decoding_start: String,
+    /// Gateway policy declared by the launcher: requested, always, or unset.
+    pub constrained_decoding: String,
     /// Whether the engine's scheduler statistics are on (vLLM's
     /// `--disable-log-stats` not given), as the launcher started it: such an
     /// engine's wire reports every scheduler step, and the pushed load record

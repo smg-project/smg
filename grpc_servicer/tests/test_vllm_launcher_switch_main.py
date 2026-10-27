@@ -235,3 +235,54 @@ def test_the_flag_selects_rust_on_the_launcher_run_as_main():
     assert {result.case.form for result in flagged} == {"module", "cli"}
     for result in flagged:
         assert '"servicer_impl": "rust"' in result.stdout
+
+
+@pytest.mark.parametrize("grpc", [False, True, None])
+@pytest.mark.parametrize(
+    "flag,env,expected",
+    [
+        (None, None, ""),
+        (None, "always", "always"),
+        ("always", "requested", "always"),
+        ("requested", "always", "requested"),
+    ],
+)
+def test_plugin_carries_decoding_policy_only_for_grpc(monkeypatch, grpc, flag, env, expected):
+    """A gRPC flag overrides the environment; HTTP parses leave it untouched."""
+    from smg_grpc_servicer.vllm.decoding_policy import POLICY_ENV, constrained_decoding_policy
+
+    class FlexibleArgumentParser(argparse.ArgumentParser):
+        pass
+
+    module = types.ModuleType("vllm.utils.argparse_utils")
+    module.FlexibleArgumentParser = FlexibleArgumentParser
+    monkeypatch.setitem(sys.modules, "vllm.utils.argparse_utils", module)
+    monkeypatch.setattr(plugin, "install_launcher_switch", lambda: None)
+    monkeypatch.setattr(plugin, "check_servicer_impl", lambda *_: None)
+    monkeypatch.setattr(plugin, "handoff_mm_flags", lambda *_: None)
+    monkeypatch.setattr(plugin, "handoff_capture_cap", lambda *_: None)
+    monkeypatch.delenv(POLICY_ENV, raising=False)
+    if env is not None:
+        monkeypatch.setenv(POLICY_ENV, env)
+    else:
+        monkeypatch.setenv(POLICY_ENV, "")
+    plugin.register()
+    parser = FlexibleArgumentParser()
+    if grpc is None:
+        monkeypatch.setitem(sys.modules, "__main__", _main_module(OLD))
+        parser.add_argument("--port", default=50051)
+    else:
+        parser.add_argument("--grpc", action="store_true")
+    args = ["--grpc"] if grpc else []
+    if flag:
+        args += ["--constrained-decoding", flag]
+    parser.parse_args(args)
+    assert constrained_decoding_policy() == (expected if grpc is not False else (env or ""))
+
+
+def test_invalid_decoding_policy_is_rejected():
+    """An invalid engine declaration must not silently become requested."""
+    from smg_grpc_servicer.vllm.decoding_policy import POLICY_ENV, constrained_decoding_policy
+
+    with pytest.raises(ValueError, match=POLICY_ENV):
+        constrained_decoding_policy({POLICY_ENV: "sometimes"})

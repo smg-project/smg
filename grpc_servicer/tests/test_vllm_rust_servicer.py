@@ -2109,3 +2109,18 @@ def test_smg_media_options_forward_download_timeouts(source, monkeypatch):
     )
     assert options["fetch_timeout_ms"] == 60000
     assert options["video_fetch_timeout_ms"] == 120000
+
+
+@pytest.mark.parametrize("policy", [None, "requested", "always"])
+def test_rust_launch_carries_decoding_policy(monkeypatch, policy):
+    """The Rust binding receives the same engine-side declaration as the Python RPC."""
+    from smg_grpc_servicer.vllm.decoding_policy import POLICY_ENV
+
+    monkeypatch.delenv(POLICY_ENV, raising=False)
+    if policy is not None:
+        monkeypatch.setenv(POLICY_ENV, policy)
+    info = rust.model_info_from_config(_config())
+    if policy is None:
+        assert "constrained_decoding" not in info  # Older bindings still accept the default launch.
+    else:
+        assert info["constrained_decoding"] == policy

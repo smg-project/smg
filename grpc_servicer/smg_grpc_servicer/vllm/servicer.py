@@ -38,6 +38,7 @@ from smg_grpc_servicer.trace_context import trace_headers
 from smg_grpc_servicer.vllm import attach_vllm_logging, settle_logging
 from smg_grpc_servicer.vllm.admin import flush_cache, start_profile, stop_profile
 from smg_grpc_servicer.vllm.config_view import EngineConfigView, uses_mrope
+from smg_grpc_servicer.vllm.decoding_policy import constrained_decoding_policy
 from smg_grpc_servicer.vllm.errors import GracefulHTTPError, VLLMClientError, grpc_code_for
 from smg_grpc_servicer.vllm.kv_events import (
     rank_sources_for,
@@ -928,6 +929,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         if "constrained_decoding_start" in info.DESCRIPTOR.fields_by_name:
             info.engine_reasoning_parser = engine_reasoning_parser(self.engine.vllm_config)
             info.constrained_decoding_start = constrained_decoding_start(self.engine.vllm_config)
+        policy = constrained_decoding_policy()
+        if "constrained_decoding" in info.DESCRIPTOR.fields_by_name:
+            info.constrained_decoding = policy
+        elif policy == "always":
+            raise ValueError("--constrained-decoding always requires an updated smg-grpc-proto")
         return info
 
     async def GetLoads(

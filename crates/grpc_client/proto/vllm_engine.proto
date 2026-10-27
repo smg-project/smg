@@ -509,6 +509,11 @@ message GetServerInfoResponse {
   // holds each item to; the worker-side pipeline takes the same number from
   // its launcher.
   int32 mm_encoder_budget = 25;
+
+  // The engine's requested gateway policy: "requested" or "always".
+  // Empty leaves the gateway default unchanged. Flattened into the
+  // constrained_decoding worker label; explicit worker configuration wins.
+  string constrained_decoding = 26;
 }
 
 // =====================

@@ -10,6 +10,7 @@ from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 from smg_grpc_proto import vllm_engine_pb2
 from smg_grpc_proto.generated import common_pb2
 from smg_grpc_servicer.vllm import model_info
+from smg_grpc_servicer.vllm.decoding_policy import POLICY_ENV, constrained_decoding_policy
 
 _SERVICER = Path(__file__).parents[1] / "smg_grpc_servicer" / "vllm" / "servicer.py"
 
@@ -30,6 +31,7 @@ def _server_info_method(response_type):
     namespace = {
         "vllm_engine_pb2": SimpleNamespace(GetServerInfoResponse=response_type),
         "server_facts": model_info.server_facts,
+        "constrained_decoding_policy": constrained_decoding_policy,
         "mm_device_do_normalize": model_info.mm_device_do_normalize,
         "mm_item_limits": model_info.mm_item_limits,
         "engine_reasoning_parser": model_info.engine_reasoning_parser,
@@ -164,3 +166,30 @@ def test_get_server_info_reports_the_engines_encoder_budget(legacy):
     servicer._mm_encoder_budget = 0
     info = asyncio.run(_server_info_method(response_type)(servicer, None, None))
     assert info.mm_encoder_budget == 0
+
+
+@pytest.mark.parametrize("policy", [None, "requested", "always"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_get_server_info_reports_decoding_policy(monkeypatch, policy, legacy):
+    """Discovery carries the declaration; an old proto cannot silently lose always."""
+    monkeypatch.delenv(POLICY_ENV, raising=False)
+    if policy is not None:
+        monkeypatch.setenv(POLICY_ENV, policy)
+    response_type = (
+        _response_type_without("constrained_decoding") if legacy else _response_type(False)
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(dtype="torch.bfloat16", is_multimodal_model=False),
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+    )
+    servicer = SimpleNamespace(
+        engine=SimpleNamespace(vllm_config=config), _mm_processor=None, _mm_encoder_budget=0
+    )
+    call = _server_info_method(response_type)(servicer, None, None)
+    if legacy and policy == "always":
+        with pytest.raises(ValueError, match="updated smg-grpc-proto"):
+            asyncio.run(call)
+    else:
+        info = asyncio.run(call)
+        if not legacy:
+            assert info.constrained_decoding == (policy or "")

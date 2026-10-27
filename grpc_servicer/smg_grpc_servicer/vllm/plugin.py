@@ -1,6 +1,6 @@
-"""smg's vLLM general plugin: ``--servicer-impl``, the ``--metrics-*`` flags
-and the ``--mm-*`` flags on vLLM's gRPC server parsers, defined by this
-package.
+"""smg's vLLM general plugin: ``--servicer-impl``, ``--constrained-decoding``,
+the ``--metrics-*`` flags and the ``--mm-*`` flags on vLLM's gRPC server
+parsers, defined by this package.
 
 vLLM loads ``vllm.general_plugins`` entry points while it builds the engine
 CLI (``AsyncEngineArgs.add_cli_args``), for plugins that extend the parser.
@@ -212,7 +212,18 @@ def register() -> None:
         add_servicer_impl_argument(self)
         add_metrics_arguments(self)
         add_mm_arguments_to_grpc_parser(self)
+        if serves_grpc(self):
+            from smg_grpc_servicer.vllm.decoding_policy import add_decoding_argument
+
+            add_decoding_argument(self)
         parsed, extras = original(self, args, namespace)
+        if serves_grpc(self) and getattr(parsed, "grpc", None) is not False:
+            from smg_grpc_servicer.vllm.decoding_policy import carry_decoding_policy
+
+            try:
+                carry_decoding_policy(parsed)
+            except ValueError as error:
+                self.error(str(error))
         impl = getattr(parsed, "servicer_impl", None)
         if impl:
             # The Python servicer's guard reads only the environment: carry the
