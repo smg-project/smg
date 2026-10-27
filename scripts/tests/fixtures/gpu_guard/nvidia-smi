@@ -1,0 +1,93 @@
+#!/bin/bash
+# A stand-in for nvidia-smi, for the tests of scripts/ci_killall_sglang.sh. It
+# plays the shape the files of $FAKE_SMI_STATE describe (the test writes them):
+#   cards        "<index> <uuid>" per card
+#   used         "<index> <MiB>" per busy card; absent: every card reads idle
+#   free_after   epoch seconds after which every card reads idle
+#   visible_pid  a pid of this pid namespace: in the process table and the
+#                compute-app list while it lives; the cards read idle once it is gone
+#   host_pids    "<index> <pid> <name> <MiB>" per compute app of another pid
+#                namespace: in the compute-app list, never in the process table
+#   fail_queries present: every --query-* call fails
+# Every call's arguments are appended to $FAKE_SMI_STATE/calls.
+state=${FAKE_SMI_STATE:?}
+echo "$*" >> "$state/calls"
+
+busy() {
+    [ -f "$state/used" ] || return 1
+    if [ -f "$state/free_after" ] && [ "$(date +%s)" -ge "$(cat "$state/free_after")" ]; then
+        return 1
+    fi
+    if [ -f "$state/visible_pid" ] && ! alive "$(cat "$state/visible_pid")"; then
+        return 1
+    fi
+    return 0
+}
+
+# Whether the process runs; one that exited but awaits its parent's wait (a
+# zombie) has released its memory and does not count, as on a card.
+alive() {
+    local stat
+    stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+    stat=${stat##*) }
+    [ "${stat:0:1}" != Z ]
+}
+
+# MiB used by card $1: its `used` line while busy, 1 otherwise.
+used_of() {
+    if busy; then
+        awk -v i="$1" '$1 == i { print $2; found = 1 } END { if (!found) print 1 }' "$state/used"
+    else
+        echo 1
+    fi
+}
+
+uuid_of() {
+    awk -v i="$1" '$1 == i { print $2 }' "$state/cards"
+}
+
+case "$1" in
+    --query-*)
+        [ -f "$state/fail_queries" ] && exit 1
+        case "$1" in
+            --query-gpu=index,memory.used)
+                while read -r idx _; do echo "$idx, $(used_of "$idx")"; done < "$state/cards" ;;
+            --query-gpu=index,uuid)
+                while read -r idx uuid; do echo "$idx, $uuid"; done < "$state/cards" ;;
+            --query-compute-apps=gpu_uuid,pid,process_name,used_memory)
+                if busy; then
+                    if [ -f "$state/visible_pid" ]; then
+                        echo "$(uuid_of 0), $(cat "$state/visible_pid"), /usr/bin/python3, $(used_of 0)"
+                    fi
+                    if [ -f "$state/host_pids" ]; then
+                        while read -r idx pid name mib; do
+                            echo "$(uuid_of "$idx"), $pid, $name, $mib"
+                        done < "$state/host_pids"
+                    fi
+                fi ;;
+            *) echo "fake nvidia-smi: unsupported query: $*" >&2; exit 2 ;;
+        esac ;;
+    "")
+        # The table, in the real tool's shape: the cards, then the processes.
+        echo "+-----------------------------------------------------------------------------------------+"
+        echo "| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |"
+        echo "|=========================================+========================+======================|"
+        while read -r idx _; do
+            printf '|   %s  NVIDIA Graphics Device          On  |   00000000:0%s:00.0 Off |                    0 |\n' "$idx" "$idx"
+            printf '| N/A   36C    P0            130W /  700W |   %5sMiB /  81559MiB |      0%%      Default |\n' "$(used_of "$idx")"
+            echo "+-----------------------------------------+------------------------+----------------------+"
+        done < "$state/cards"
+        echo
+        echo "+-----------------------------------------------------------------------------------------+"
+        echo "| Processes:                                                                              |"
+        echo "|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |"
+        echo "|        ID   ID                                                               Usage      |"
+        echo "|=========================================================================================|"
+        if busy && [ -f "$state/visible_pid" ]; then
+            printf '|    0   N/A  N/A    %12s      C   /usr/bin/python3                         %6sMiB |\n' "$(cat "$state/visible_pid")" "$(used_of 0)"
+        else
+            echo "|  No running processes found                                                             |"
+        fi
+        echo "+-----------------------------------------------------------------------------------------+" ;;
+    *) echo "fake nvidia-smi: unsupported arguments: $*" >&2; exit 2 ;;
+esac
