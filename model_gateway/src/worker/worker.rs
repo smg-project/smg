@@ -2056,37 +2056,46 @@ impl Worker for BasicWorker {
             ConnectionMode::Grpc => {
                 // OnceCell provides lock-free reads after initialization.
                 // get_or_try_init only acquires internal lock on first call.
+                // The initializer's future is boxed: this method's own future
+                // (boxed once per call by the trait) would otherwise carry the
+                // connect path's whole state machine on every call, although
+                // only the first call per worker runs it. The cold path pays
+                // its allocation once; every later call's future holds a
+                // pointer where it held kilobytes.
                 let cell = self.backend_client.load_full();
                 let client = cell
-                    .get_or_try_init(|| async {
-                        let runtime_str = self.metadata.spec.runtime_type.to_string();
-                        tracing::info!(
-                            "Lazily initializing gRPC client ({}) for worker: {}",
-                            runtime_str,
-                            self.metadata.spec.url
-                        );
-                        // DP-expanded workers carry a `{base}@{rank}` URL; connect to the base
-                        match GrpcClient::connect(self.metadata.base_url(), &runtime_str).await {
-                            Ok(client) => {
-                                tracing::info!(
-                                    "Successfully connected gRPC client ({}) for worker: {}",
-                                    runtime_str,
-                                    self.metadata.spec.url
-                                );
-                                Ok(Arc::new(BackendClient::Grpc(client)))
+                    .get_or_try_init(|| {
+                        Box::pin(async {
+                            let runtime_str = self.metadata.spec.runtime_type.to_string();
+                            tracing::info!(
+                                "Lazily initializing gRPC client ({}) for worker: {}",
+                                runtime_str,
+                                self.metadata.spec.url
+                            );
+                            // DP-expanded workers carry a `{base}@{rank}` URL; connect to the base
+                            match GrpcClient::connect(self.metadata.base_url(), &runtime_str).await
+                            {
+                                Ok(client) => {
+                                    tracing::info!(
+                                        "Successfully connected gRPC client ({}) for worker: {}",
+                                        runtime_str,
+                                        self.metadata.spec.url
+                                    );
+                                    Ok(Arc::new(BackendClient::Grpc(client)))
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "Failed to connect gRPC client for worker {}: {}",
+                                        self.metadata.spec.url,
+                                        e
+                                    );
+                                    Err(WorkerError::ConnectionFailed {
+                                        url: self.metadata.spec.url.clone(),
+                                        reason: format!("Failed to connect to gRPC server: {e}"),
+                                    })
+                                }
                             }
-                            Err(e) => {
-                                tracing::error!(
-                                    "Failed to connect gRPC client for worker {}: {}",
-                                    self.metadata.spec.url,
-                                    e
-                                );
-                                Err(WorkerError::ConnectionFailed {
-                                    url: self.metadata.spec.url.clone(),
-                                    reason: format!("Failed to connect to gRPC server: {e}"),
-                                })
-                            }
-                        }
+                        })
                     })
                     .await?;
                 Ok(Some(Arc::clone(client)))
