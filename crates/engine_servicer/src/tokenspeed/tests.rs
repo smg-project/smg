@@ -2835,14 +2835,18 @@ fn encode_request(request_id: &str, room: i64) -> enc::EncodeRequest {
 
 /// The link's failure, once it is reported (a generous bound: the handshake
 /// and the check behind it run on the servicer's own runtime, under whatever
-/// load the test host carries).
-async fn link_error(server: &TokenSpeedServicerServer) -> String {
+/// load the test host carries). `rank` is what the mock rank's own connect
+/// read, named when no failure comes: the cause of a silent link is there.
+async fn link_error(server: &TokenSpeedServicerServer, rank: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(error) = server.last_error().unwrap() {
             return error;
         }
-        assert!(Instant::now() < deadline, "no link failure reported");
+        assert!(
+            Instant::now() < deadline,
+            "no link failure reported (the rank's connect: {rank})"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -2996,17 +3000,35 @@ async fn an_encode_request_outside_the_rules_is_refused_in_the_servicers_words()
 }
 
 /// A servicer launched for `model` whose engine dials in with `ready`: the
-/// link's failure, with the servicer never ready.
+/// link's failure, with the servicer never ready. The servicer judges the
+/// role the moment the rank registers and drops its sockets when it refuses,
+/// so the rank's last handshake step (its output connect) completes, reads
+/// the reset, or, when the listener is already gone, is refused until the
+/// rank's own connect timeout. The refusal is read off the link the moment
+/// the servicer reports it, never off the rank's connect, which runs beside
+/// the wait and is dropped with it.
 async fn link_failure_for(model: TokenSpeedModelInfo, ready: EngineCoreReadyResponse) -> String {
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
     let server = TokenSpeedServicerServer::start(config(dir.path(), &handshake, model)).unwrap();
-    let _engine = connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready)
-        .await
-        .expect("the handshake completes before the role is judged");
-    let error = link_error(&server).await;
+    let connect = connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready);
+    tokio::pin!(connect);
+    let (error, engine) = tokio::select! {
+        // The servicer reported the refusal: done, whatever the rank's
+        // connect is still doing.
+        error = link_error(&server, "still dialing") => (error, None),
+        // The rank's connect finished first (completed, or the reset): the
+        // link failure follows; its absence names the connect's outcome.
+        outcome = &mut connect => {
+            let rank = outcome
+                .as_ref()
+                .map_or_else(|err| format!("{err:?}"), |_| "completed".to_string());
+            (link_error(&server, &rank).await, Some(outcome))
+        }
+    };
     assert!(!server.engine_ready(), "{error}");
     server.stop(Duration::from_secs(5)).unwrap();
+    drop(engine);
     error
 }
 
