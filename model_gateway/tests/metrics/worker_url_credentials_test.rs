@@ -375,6 +375,9 @@ async fn a_removal_retires_the_masked_labels_series_and_a_re_registration_starts
 /// removes the old one: the label's series stay for the live registration
 /// and read its state (one `smg_worker_state` pair at 1, the leaving
 /// registration's demotion lowered again), and are retired with the last.
+/// A request in flight on the leaving registration ends after its removal:
+/// that late write lands on the shared label until the live registration
+/// writes the family again (the overlap the registry's comment states).
 #[tokio::test]
 async fn a_credential_rotation_at_one_address_keeps_the_labels_series() {
     let handle = crate::metrics::recorder();
@@ -385,17 +388,27 @@ async fn a_credential_rotation_at_one_address_keeps_the_labels_series() {
     let old = "http://user:old@10.255.255.2:1";
     let new = "http://user:new@10.255.255.2:1";
     let label = "http://***@10.255.255.2:1";
+    let (old_worker, new_worker) = (worker(old), worker(new));
     let old_id = registry
-        .register(worker(old))
+        .register(Arc::clone(&old_worker))
         .expect("the old URL registers");
     let new_id = registry
-        .register(worker(new))
+        .register(Arc::clone(&new_worker))
         .expect("the new URL registers");
     let body = scrape(metrics_addr).await;
     assert_eq!(
         gauge(&body, "smg_worker_health", label),
         Some(1.0),
         "{body}"
+    );
+    // One request in flight on each registration across the rotation.
+    old_worker.increment_load();
+    new_worker.increment_load();
+    let body = scrape(metrics_addr).await;
+    assert_eq!(
+        gauge(&body, "smg_worker_requests_active", label),
+        Some(1.0),
+        "the shared label carries the last writer's own load:\n{body}"
     );
 
     assert!(registry.remove(&old_id).is_some());
@@ -423,12 +436,38 @@ async fn a_credential_rotation_at_one_address_keeps_the_labels_series() {
     );
     assert_eq!(
         gauge(&body, "smg_worker_requests_active", label),
-        Some(0.0),
-        "{body}"
+        Some(1.0),
+        "the removal republishes the live registration's load:\n{body}"
     );
     assert!(
         !body.contains("user:old@") && !body.contains("user:new@"),
         "a series carries a credential:\n{body}"
+    );
+
+    // The leaving registration's request ends after its removal: the late
+    // write lands on the label (the leaving object's load, 0) until the live
+    // registration's next write of the family.
+    old_worker.decrement_load();
+    let body = scrape(metrics_addr).await;
+    assert_eq!(
+        gauge(&body, "smg_worker_requests_active", label),
+        Some(0.0),
+        "the leaving registration's late write lands on the shared label:\n{body}"
+    );
+    new_worker.increment_load();
+    let body = scrape(metrics_addr).await;
+    assert_eq!(
+        gauge(&body, "smg_worker_requests_active", label),
+        Some(2.0),
+        "the live registration's next write is the label's value again:\n{body}"
+    );
+    new_worker.decrement_load();
+    new_worker.decrement_load();
+    let body = scrape(metrics_addr).await;
+    assert_eq!(
+        gauge(&body, "smg_worker_requests_active", label),
+        Some(0.0),
+        "{body}"
     );
 
     assert!(registry.remove(&new_id).is_some());

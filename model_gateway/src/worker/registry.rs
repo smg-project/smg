@@ -1847,6 +1847,16 @@ impl WorkerRegistry {
             // renders to the same label (the same address under rotated
             // credentials, registered before this one leaves) keeps the label's
             // series: they are retired with the last registration rendering to it.
+            // While two registrations share the label (the rotation's overlap)
+            // its series carry the last writer's value, and a write of the
+            // leaving registration that completes after this removal (an
+            // in-flight request's end, a breaker outcome, a probe's answer)
+            // lands on the label once more, until the registration that stays
+            // writes that family again or the label retires with it. Nothing
+            // fences those late writes: a flag read on every metric write of
+            // every worker, for a case that exists only during a credential
+            // rotation, is more mechanism than this fix, and both objects are
+            // the same engine behind the same address.
             let label = worker.redacted_url();
             {
                 // The scan and the retirement under the membership-order write
