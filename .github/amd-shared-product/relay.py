@@ -76,6 +76,26 @@ def get_attempt_jobs(inputs, evidence):
     raise ValueError("attempt jobs pagination cap")
 
 
+def get_copy_artifacts(owner, evidence):
+    records, total = [], None
+    for page in range(1, 11):
+        batch = get(f"actions/runs/{owner['run_id']}/artifacts?per_page=100&page={page}")
+        (evidence / f"copy-artifacts-page-{page}.json").write_text(json.dumps(batch, indent=2) + "\n")
+        count, items = batch["total_count"], batch["artifacts"]
+        io.require(type(count) is int and 0 <= count <= 1000 and isinstance(items, list) and len(items) <= 100,
+                   "copy artifacts page metadata")
+        if total is None:
+            total = count
+        io.require(count == total, "copy artifacts total changed")
+        records.extend(items)
+        io.require(len(records) <= total and len({a["id"] for a in records}) == len(records),
+                   "copy artifacts repeated or extra")
+        if len(records) == total:
+            return records
+        io.require(len(items) == 100, "copy artifacts incomplete page")
+    raise ValueError("copy artifact pagination cap")
+
+
 def main(inputs, output):
     admitted(inputs)  # Fail before any network request, even for an incomplete candidate.
     io.require(
@@ -94,28 +114,61 @@ def main(inputs, output):
     (evidence / "producer-attempt-jobs.json").write_text(json.dumps(attempt_jobs, indent=2) + "\n")
     for name, value in (("producer-run", run), ("producer-build-job", job)):
         (evidence / f"{name}.json").write_text(json.dumps(value, indent=2) + "\n")
-    records = []
-    for page in range(1, 11):
-        batch = get(f"actions/runs/{inputs['run_id']}/artifacts?per_page=100&page={page}")[
-            "artifacts"
-        ]
-        records.extend(batch)
-        if len(batch) < 100:
-            break
+    metadata_owner, artifact_job, delivery_context = inputs, job, None
+    if "artifact_delivery" in inputs:
+        metadata_owner = frozen_producer.renewed_delivery_owner(inputs)
+        copy_evidence = evidence / "copy-api"
+        copy_evidence.mkdir()
+        copy_run = get(f"actions/runs/{metadata_owner['run_id']}")
+        copy_attempt = get_attempt_jobs(metadata_owner, copy_evidence)
+        records = get_copy_artifacts(metadata_owner, copy_evidence)
+        io.require(copy_attempt["total_count"] == len(copy_attempt["jobs"]) == 1, "complete copy job")
+        artifact_job = copy_attempt["jobs"][0]
+        origin_pin = inputs["artifact_delivery"]["origin_evidence"]
+        origin_meta = get(f"actions/artifacts/{origin_pin['id']}")
+        metadata(origin_meta, origin_pin, metadata_owner)
+        io.require(origin_meta in records, "origin evidence metadata differs from complete copy page")
+        origin_files = io.unpack(io.archive_bytes(origin_pin), origin_pin)
+        origin_dir = evidence / "copy-origin"
+        origin_dir.mkdir()
+        for name, payload in origin_files.items():
+            path = origin_dir / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("xb") as stream:
+                stream.write(payload)
+        context, delivery_context = frozen_producer.verify_renewed_delivery(
+            run, jobs, inputs, copy_run, copy_attempt["jobs"], records, origin_files,
+            datetime.datetime.now(datetime.UTC)
+        )
+        for name, value in (("copy-run", copy_run), ("copy-job", artifact_job)):
+            (evidence / f"{name}.json").write_text(json.dumps(value, indent=2) + "\n")
     else:
-        raise ValueError("artifact pagination cap")
-    context = frozen_producer.verify_completed(
-        run, jobs, inputs, records, datetime.datetime.now(datetime.UTC)
-    )
+        records = []
+        for page in range(1, 11):
+            batch = get(f"actions/runs/{inputs['run_id']}/artifacts?per_page=100&page={page}")[
+                "artifacts"
+            ]
+            records.extend(batch)
+            if len(batch) < 100:
+                break
+        else:
+            raise ValueError("artifact pagination cap")
+        context = frozen_producer.verify_completed(
+            run, jobs, inputs, records, datetime.datetime.now(datetime.UTC)
+        )
     (evidence / "frozen-producer-context.json").write_text(json.dumps(context, indent=2) + "\n")
-    (evidence / "producer-artifacts.json").write_text(json.dumps(records, indent=2) + "\n")
+    origin_records = [json.loads(origin_files[f"origin-artifact-{p['id']}.json"])
+                      for p in inputs["artifact_delivery"]["origin_artifacts"]] if delivery_context else records
+    (evidence / "producer-artifacts.json").write_text(json.dumps(origin_records, indent=2) + "\n")
+    if delivery_context:
+        (evidence / "copy-artifacts.json").write_text(json.dumps(records, indent=2) + "\n")
     verified = []
     for artifact in inputs["artifacts"]:
         meta = get(f"actions/artifacts/{artifact['id']}")
-        metadata(meta, artifact, inputs)
+        metadata(meta, artifact, metadata_owner)
         io.require(
-            job["started_at"] <= meta["created_at"] <= job["completed_at"],
-            "artifact was not created during this successful build attempt",
+            artifact_job["started_at"] <= meta["created_at"] <= artifact_job["completed_at"],
+            "artifact was not created during the selected successful build or copy attempt",
         )
         (evidence / f"artifact-{artifact['id']}.json").write_text(json.dumps(meta, indent=2) + "\n")
         files = io.unpack(io.archive_bytes(artifact), artifact)
@@ -133,6 +186,9 @@ def main(inputs, output):
             {"id": artifact["id"], "name": artifact["name"], "files": artifact["files"]}
         )
     io.require((evidence / "wheel-RECORD.json").is_file(), "wheel RECORD proof missing")
+    if delivery_context:
+        delivery_context["six_payloads_verified"] = True
+        (evidence / "copy-delivery-context.json").write_text(json.dumps(delivery_context, indent=2) + "\n")
     (evidence / "relay.json").write_text(
         json.dumps(
             {
@@ -147,6 +203,7 @@ def main(inputs, output):
                     "source_base": inputs["source_base"],
                     "source_maps_verified": True,
                 },
+                "artifact_delivery": delivery_context,
                 "relay_consumer": {
                     "run": os.environ["GITHUB_RUN_ID"],
                     "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
