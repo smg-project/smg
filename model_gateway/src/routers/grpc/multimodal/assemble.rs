@@ -1083,4 +1083,4 @@ fn hash_hex_strings<'a>(hashes: impl Iterator<Item = &'a str>) -> Vec<u8> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

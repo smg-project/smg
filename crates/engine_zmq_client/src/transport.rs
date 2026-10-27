@@ -829,6 +829,49 @@ mod tests {
         assert_eq!(transport.engines.len(), 2);
     }
 
+    /// A rank that declares a different group size than the handshake
+    /// awaits (the size the first rank declared, or the caller's count) is
+    /// warned about, not refused: the size already settled stands and the
+    /// handshake completes with that many ranks.
+    #[tokio::test]
+    async fn a_rank_declaring_another_group_size_is_warned_about_and_the_handshake_proceeds() {
+        for count in [EngineCount::Declared, EngineCount::Exactly(2)] {
+            let ns = IpcNamespace::new().unwrap();
+            let (handshake, input, output) = (
+                ns.handshake_endpoint(),
+                ns.input_endpoint(),
+                ns.output_endpoint(),
+            );
+            let rank = |index: u32, declares: usize| {
+                let handshake = handshake.clone();
+                async move {
+                    hello_in_group(
+                        &handshake,
+                        EngineId::from_engine_index(index),
+                        Some(declares),
+                    )
+                    .await?
+                    .ready(default_ready_response())
+                    .await
+                }
+            };
+            // The first rank to speak settles the size at two; the second
+            // declares three.
+            let (transport, first, second) = tokio::join!(
+                connect_handshake(&handshake, count, &input, &output, TIMEOUT),
+                rank(0, 2),
+                async {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    rank(1, 3).await
+                },
+            );
+            let transport = transport.expect("frontend handshake");
+            first.expect("first mock engine");
+            second.expect("second mock engine");
+            assert_eq!(transport.engines.len(), 2, "{count:?}");
+        }
+    }
+
     /// An engine that declares no group dials alone: a handshake not told its
     /// count connects it by itself, as a handshake told one does.
     #[tokio::test]

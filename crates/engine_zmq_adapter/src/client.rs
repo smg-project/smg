@@ -1852,6 +1852,55 @@ mod tests {
     use super::*;
     use crate::{eos::EosTokenIds, test_support::connected_pair};
 
+    /// A route's JSON body becomes the control call's msgpack argument field
+    /// by field: integers stay integers (one above `i64` included), floats
+    /// floats, strings, booleans and nulls their own kind; arrays and nested
+    /// objects recurse.
+    #[test]
+    fn a_json_body_becomes_a_msgpack_argument_field_by_field() {
+        let value = json_to_msgpack(serde_json::json!({
+            "steps": 3,
+            "big": u64::MAX,
+            "neg": -2,
+            "ratio": 0.25,
+            "name": "w",
+            "flag": false,
+            "none": null,
+            "list": [1, 2.5, "x"],
+            "inner": {"k": [true]}
+        }));
+        let fields = value.as_map().expect("a map");
+        let field = |key: &str| {
+            fields
+                .iter()
+                .find(|(name, _)| name.as_str() == Some(key))
+                .map(|(_, value)| value)
+                .unwrap_or_else(|| panic!("{key}"))
+        };
+        assert_eq!(*field("steps"), OpaqueValue::from(3i64));
+        assert_eq!(*field("big"), OpaqueValue::from(u64::MAX));
+        assert_eq!(*field("neg"), OpaqueValue::from(-2i64));
+        assert_eq!(*field("ratio"), OpaqueValue::F64(0.25));
+        assert_eq!(*field("name"), OpaqueValue::from("w"));
+        assert_eq!(*field("flag"), OpaqueValue::Boolean(false));
+        assert_eq!(*field("none"), OpaqueValue::Nil);
+        assert_eq!(
+            *field("list"),
+            OpaqueValue::Array(vec![
+                OpaqueValue::from(1i64),
+                OpaqueValue::F64(2.5),
+                OpaqueValue::from("x"),
+            ])
+        );
+        let inner = field("inner").as_map().expect("a nested map");
+        assert_eq!(inner.len(), 1);
+        assert_eq!(inner[0].0.as_str(), Some("k"));
+        assert_eq!(
+            inner[0].1,
+            OpaqueValue::Array(vec![OpaqueValue::Boolean(true)])
+        );
+    }
+
     /// A request that reaches the connector once it is shutting down (its
     /// engine died and the servicer is on its way out) is answered the way a
     /// dead engine core answers it, UNAVAILABLE, so the gateway retries it on

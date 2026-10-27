@@ -430,6 +430,17 @@ mod tests {
         );
     }
 
+    /// A `tcp://` worker named by hostname keeps the name on its data plane:
+    /// the engines resolve it as they resolved the handshake address.
+    #[test]
+    fn a_tcp_worker_named_by_hostname_keeps_the_name_on_its_data_plane() {
+        let (handshake, input, output) =
+            zmq_socket_addresses("tcp://node0:31000", Handshake::Derived).unwrap();
+        assert_eq!(handshake, "tcp://node0:31000");
+        assert_eq!(input, "tcp://node0:0");
+        assert_eq!(output, "tcp://node0:0");
+    }
+
     /// The INIT hands the engines the bound addresses, so a wildcard host (no
     /// engine can dial it), a missing port, and a second handshake address
     /// are each refused.

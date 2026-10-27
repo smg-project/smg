@@ -1697,6 +1697,61 @@ mod tests {
         }
     }
 
+    /// A disaggregated selection's wire is the prefill side's, which builds
+    /// the request: a direct-ZMQ prefill worker pins the plan to the ZMQ wire
+    /// of the pair's runtime whatever the decode side's transport, and a gRPC
+    /// prefill worker to gRPC.
+    #[test]
+    fn a_disaggregated_selections_wire_is_the_prefill_sides() {
+        use crate::worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType};
+
+        let worker = |url: &str, mode: ConnectionMode, role: WorkerType| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .connection_mode(mode)
+                    .runtime_type(RuntimeType::TokenSpeed)
+                    .worker_type(role)
+                    .build(),
+            )
+        };
+        let pair =
+            |prefill: Arc<dyn Worker>, decode: Arc<dyn Worker>| WorkerSelection::Disaggregated {
+                encode_assignments: None,
+                prefill,
+                decode,
+                runtime_type: RuntimeType::TokenSpeed,
+            };
+
+        let zmq_prefill = pair(
+            worker(
+                "ipc:///tmp/prefill.ipc",
+                ConnectionMode::Zmq,
+                WorkerType::Prefill,
+            ),
+            worker("grpc://decode:1", ConnectionMode::Grpc, WorkerType::Decode),
+        );
+        let wire = WireConstraint::of(&zmq_prefill, false, PipelinePin::Any);
+        assert_eq!(wire.connection, ConnectionMode::Zmq);
+        assert_eq!(wire.runtime, RuntimeType::TokenSpeed);
+        assert!(!wire.requires_media_refs);
+
+        let grpc_prefill = pair(
+            worker(
+                "grpc://prefill:1",
+                ConnectionMode::Grpc,
+                WorkerType::Prefill,
+            ),
+            worker(
+                "ipc:///tmp/decode.ipc",
+                ConnectionMode::Zmq,
+                WorkerType::Decode,
+            ),
+        );
+        let wire = WireConstraint::of(&grpc_prefill, true, PipelinePin::Any);
+        assert_eq!(wire.connection, ConnectionMode::Grpc);
+        assert!(wire.requires_media_refs);
+    }
+
     #[tokio::test]
     async fn a_missing_preparation_output_is_one_failure_whichever_stage_reads_it() {
         let mut slot: Option<PreparationOutput> = None;
