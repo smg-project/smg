@@ -13,6 +13,8 @@ fn branches_on_source_geometry_then_aligns_like_the_model() {
         ((100, 50, 1000), (224, 112)),
         ((1000, 500, 1009), (1008, 504)),
         ((70, 112, 1000), (112, 168)),
+        ((1125, 500, 1022), (1008, 448)),
+        ((2067, 1000, 2030), (2016, 980)),
     ] {
         assert_eq!(
             dimensions(w, h, cap).unwrap(),
@@ -20,7 +22,12 @@ fn branches_on_source_geometry_then_aligns_like_the_model() {
             "{w}x{h} cap {cap}"
         );
     }
-    assert!(dimensions(100, 100, 0).is_err());
+    let error = dimensions(100, 100, 0).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "image max_long_side_pixel must be positive, got 0"
+    );
+    assert_eq!(error.code(), crate::MediaErrorCode::FetchFailed);
 }
 
 /// Ensure planned grids bypass legacy short-side staging and area shrinking.
@@ -100,11 +107,11 @@ fn rejects_image_budget_before_decoding_pixels() {
     assert!(budget(IMAGE_MAX_TOTAL_PIXELS, IMAGE_MAX_TOTAL_PIXELS, "image").is_ok());
 }
 
-/// Compare floating-point planning with an independent rational ties-to-even oracle.
+/// Check source planning across shrink and enlargement half-grid ties.
 #[test]
 fn geometry_matrix_and_ties_obey_the_source_contract() {
-    // Independent rational calculation, avoiding the production floating-point
-    // scale. This also exercises asymmetric, exact-cap and sub-patch inputs.
+    // Calculate the branch's rational scale separately, including caps exactly
+    // halfway between grid points after shrinking and sub-patch inputs.
     let round_grid = |side: u64, numerator: u64, denominator: u64| {
         let n = side * numerator;
         let d = denominator * 28;
@@ -114,12 +121,14 @@ fn geometry_matrix_and_ties_obey_the_source_contract() {
         (rounded.max(1) * 28) as u32
     };
     for w in [
-        1, 27, 28, 42, 70, 111, 112, 113, 999, 1000, 1008, 3584, 8192,
+        1, 27, 28, 42, 70, 111, 112, 113, 999, 1000, 1008, 1125, 2067, 3584, 8192,
     ] {
         for h in [
-            1, 27, 28, 42, 70, 111, 112, 113, 999, 1000, 1008, 3584, 8192,
+            1, 27, 28, 42, 70, 111, 112, 113, 999, 1000, 1008, 1125, 2067, 3584, 8192,
         ] {
-            for cap in [1, 27, 112, 150, 999, 1000, 1008, 2016, 3584, 8192] {
+            for cap in [
+                1, 27, 112, 150, 999, 1000, 1008, 1022, 2016, 2030, 3584, 8192,
+            ] {
                 let (num, den) = if w.max(h) > cap {
                     (cap, w.max(h))
                 } else if w.min(h) < 112 {
@@ -185,6 +194,16 @@ async fn encoded_pixels_match_direct_resize_after_transparency() {
                 let actual = image(original.clone(), cap).unwrap();
                 assert_eq!(actual.image().unwrap().as_bytes(), expected.as_bytes());
                 assert_eq!(actual.transparency(), transparency);
+                let decoded = actual.image().unwrap();
+                assert_eq!(
+                    decoded.color().has_alpha(),
+                    original.image().unwrap().color().has_alpha()
+                );
+                let rgb_reference = resize_bicubic_torch_aa(original.image().unwrap(), w, h);
+                assert_eq!(decoded.to_rgb8(), rgb_reference.to_rgb8());
+                if decoded.color().has_alpha() {
+                    assert!(decoded.to_rgba8().pixels().any(|p| p[3] != 255));
+                }
             }
         }
     }

@@ -262,9 +262,8 @@ impl MiniMaxM3VisionProcessor {
         } else {
             config.min_pixels.unwrap_or_else(|| self.inner.min_pixels())
         };
-        // Track an explicit `max_pixels` in both directions: flooring the video
-        // budget at the default would leave video six times an image's budget
-        // for an operator who lowered `max_pixels` to bound encoder memory.
+        // Videos retain the explicit legacy area limit, even when image source
+        // planning is enabled. Do not floor a lower video limit at the default.
         let video_max_pixels = config
             .max_pixels
             .unwrap_or_else(|| self.inner.video_max_pixels());

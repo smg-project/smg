@@ -33,10 +33,7 @@ pub(crate) fn dimensions(
     cap: u32,
 ) -> Result<(u32, u32), MediaConnectorError> {
     if cap == 0 {
-        return Err(MediaConnectorError::InvalidMaxLongSidePixel {
-            value: cap,
-            factor: 28,
-        });
+        return Err(MediaConnectorError::InvalidImageLongSideCap { value: cap });
     }
     if width == 0 || height == 0 {
         return Err(MediaConnectorError::Image(ImageError::Parameter(
@@ -45,15 +42,23 @@ pub(crate) fn dimensions(
     }
     let long = width.max(height);
     let short = width.min(height);
-    let scale = if long > cap {
-        f64::from(cap) / f64::from(long)
+    let (numerator, denominator) = if long > cap {
+        (cap, long)
     } else if short < MIN_SHORT_SIDE {
-        f64::from(MIN_SHORT_SIDE) / f64::from(short)
+        (MIN_SHORT_SIDE, short)
     } else {
-        1.0
+        (1, 1)
     };
-    let align =
-        |side: u32| ((f64::from(side) * scale / 28.0).round_ties_even().max(1.0) as u64) * 28;
+    // A float scale can move an exact half-grid tie above or below the tie.
+    // u32 * u32 fits u64, including the largest positive source and cap.
+    let align = |side: u32| {
+        let n = u64::from(side) * u64::from(numerator);
+        let d = u64::from(denominator) * 28;
+        let q = n / d;
+        let r = n % d;
+        let rounded = q + u64::from(r * 2 > d || (r * 2 == d && q % 2 == 1));
+        rounded.max(1) * 28
+    };
     let w = align(width);
     let h = align(height);
     if w > u64::from(u32::MAX) || h > u64::from(u32::MAX) {
@@ -82,6 +87,20 @@ fn budget(pixels: u64, limit: u64, modality: &'static str) -> Result<(), MediaCo
 pub(crate) fn resize_image(image: DynamicImage, width: u32, height: u32) -> DynamicImage {
     if (image.width(), image.height()) == (width, height) {
         image
+    } else if image.color().has_alpha() {
+        // Resize straight RGB and alpha independently: the model consumes RGB,
+        // while the shared frame must still honor KeepAlpha for other readers.
+        let rgba = image.to_rgba8();
+        let alpha = image::RgbImage::from_fn(image.width(), image.height(), |x, y| {
+            image::Rgb([rgba.get_pixel(x, y)[3]; 3])
+        });
+        let rgb = resize_bicubic_torch_aa(&image, width, height).into_rgb8();
+        let alpha =
+            resize_bicubic_torch_aa(&DynamicImage::ImageRgb8(alpha), width, height).into_rgb8();
+        DynamicImage::ImageRgba8(image::RgbaImage::from_fn(width, height, |x, y| {
+            let p = rgb.get_pixel(x, y);
+            image::Rgba([p[0], p[1], p[2], alpha.get_pixel(x, y)[0]])
+        }))
     } else {
         resize_bicubic_torch_aa(&image, width, height)
     }
