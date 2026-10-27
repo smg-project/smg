@@ -45,7 +45,8 @@ Every commit, pick and tag carries the caller's git identity and sign-off.
   other crate or package to the release's version where that is higher than main's (crates.io
   and PyPI never take a version twice, so the next cut starts above what was published). The
   nightly and dev builds derive their versions from main's plain `X.Y.Z`, which is why main
-  carries no suffix.
+  carries no suffix. A cut from a `main` that does not read the previous final's version yet is refused:
+  merge that pull request first, or cut from a commit after it.
 
 ## What publishes, and when
 
@@ -62,8 +63,10 @@ CI images are unchanged by this process.
 
 A candidate or a final is tagged when, on the branch head:
 
-1. CI is green (the `PR Test (SMG)` matrix runs on every push to `release/**` and on every
-   pull request against it, as it does for `main`);
+1. CI is green on the head commit itself: a successful run of the `PR Test (SMG)` matrix for
+   that commit (it runs on every push to `release/**` and every pull request against it, as for
+   `main`; a documentation-only merge runs none, so `make release-check` names the dispatch,
+   `gh workflow run pr-test-rust.yml --ref release/<x.y>`);
 2. the versions are consistent (`make release-check` reads them; `make release-tag` refuses
    otherwise);
 3. the four model-provider verifiers (DeepSeek, GLM, Kimi, MiniMax) ran against the candidate

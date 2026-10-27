@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  # ── Both packages build; a version PyPI already has is skipped at upload (--skip-existing) ──
+  # ── The packages whose version at the dispatched ref is not on PyPI build and upload (--skip-existing covers a race) ──
   detect:
     name: Select packages
     runs-on: ubuntu-latest
@@ -24,8 +24,21 @@ jobs:
       - name: Select packages
         id: changes
         run: |
-          echo "proto=true" >> "$GITHUB_OUTPUT"
-          echo "servicer=true" >> "$GITHUB_OUTPUT"
+          # A package is selected when the version its pyproject.toml carries at this ref is not on PyPI yet, so a
+          # servicer-only release never runs the proto upload (and a proto token failure cannot hold it up).
+          selected() {
+            local name=$1 file=$2 version
+            version=$(grep -m1 '^version = ' "$file" | sed 's/version = "\(.*\)"/\1/; s/-rc\./rc/')
+            if curl -fsS "https://pypi.org/pypi/${name}/${version}/json" > /dev/null 2>&1; then
+              echo "${name} ${version} is on PyPI already: not selected" >&2
+              echo false
+            else
+              echo "${name} ${version} is not on PyPI: selected" >&2
+              echo true
+            fi
+          }
+          echo "proto=$(selected smg-grpc-proto crates/grpc_client/python/pyproject.toml)" >> "$GITHUB_OUTPUT"
+          echo "servicer=$(selected smg-grpc-servicer grpc_servicer/pyproject.toml)" >> "$GITHUB_OUTPUT"
 
   # ── Tier 1: Proto (no dependencies) ──
   build-proto:

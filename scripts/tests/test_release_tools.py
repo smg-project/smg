@@ -53,6 +53,12 @@ case "$1 $2" in
   "pr list") echo "#7  fix(router): y  pick/1.14-0000000" ;;
   "repo view") echo "example/repo" ;;
   "api --paginate") printf '%b\n' "${GH_STUB_CHECKS:-success a\nsuccess b}" ;;
+  "api repos/example/repo/actions/workflows/pr-test-rust.yml/runs?head_sha="*)
+    case "${GH_STUB_RUNS-}" in
+      none) ;;
+      "") echo "success https://example.invalid/runs/1" ;;
+      *) printf '%b\n' "$GH_STUB_RUNS" ;;
+    esac ;;
 esac
 """
 CARGO_STUB = r"""#!/usr/bin/env bash
@@ -354,6 +360,9 @@ def test_bump_without_push_prints_the_commands(repo: Sandbox) -> None:
     repo.cut()
     done = repo.tool("bump", "1.14.0", PUSH="0")
     assert "gh pr create --base release/1.14 --head chore/release-1.14.0" in done.stdout
+    assert (
+        "--title chore\\(release\\):\\ bump\\ versions\\ for\\ v1.14.0 --body-file " in done.stdout
+    ), "the printed title is shell-quoted (a bump-main title carries an apostrophe)"
     assert repo.origin_ref("refs/heads/chore/release-1.14.0") is None
     assert repo.gh_calls() == []
     assert (
@@ -594,6 +603,76 @@ def test_a_patch_bump_compares_against_the_final_not_its_candidate(repo: Sandbox
     assert "versions since v1.14.0" in bumped.stderr
 
 
+def test_a_cut_before_the_previous_releases_bump_main_merged_is_refused(repo: Sandbox) -> None:
+    """Against the previous final, a crate bumped for that release reads as bumped already: a cut from a main that
+    does not carry the release's versions yet would ship nothing for the crate, and nothing would say so."""
+    finished_release(repo)  # v1.14.0 on its branch; main still reads 1.13.0
+    repo.commit_main(
+        "fix(tool_parser): after the release (#125)",
+        "crates/tool_parser/src/lib.rs",
+        "pub fn x() {}\npub fn after() {}\n",
+    )
+    refused = repo.tool("cut", "1.15.0-rc.1", check=False)
+    assert refused.returncode == 1
+    assert (
+        "origin/main reads 1.13.0, not 1.14.0: merge the release-bump-main pull request for v1.14.0 first"
+        in refused.stderr
+    )
+    assert repo.git("branch", "--list", "release/1.15") == "", "nothing was cut"
+
+
+def land_on_release_squashed(repo: Sandbox, release: str = "1.14") -> None:
+    """The checked-out pick pull request merges as a squash: one commit on origin's branch whose message carries
+    the pull request body, the `(cherry picked from commit …)` lines among it, as the squash merge writes it."""
+    topic = repo.git("rev-parse", "--abbrev-ref", "HEAD")
+    body = repo.pr_body()
+    repo.git("switch", "--quiet", "--detach", f"origin/release/{release}")
+    repo.git("merge", "--quiet", "--squash", topic)
+    repo.git(
+        "commit",
+        "--quiet",
+        "-m",
+        f"chore(release): pick 2 commits from main into release/{release} (#9)",
+        "-m",
+        body,
+    )
+    repo.git("push", "--quiet", "origin", f"HEAD:refs/heads/release/{release}")
+    repo.git("switch", "--quiet", "main")
+
+
+def test_a_squash_landed_pick_is_read_as_picked_by_status_and_the_next_notes(repo: Sandbox) -> None:
+    repo.cut()
+    three = repo.commit_main(
+        "fix(router): three (#123)",
+        "model_gateway/src/main.rs",
+        'fn main() {\n    println!("three");\n}\n',
+    )
+    four = repo.commit_main(
+        "fix(router): four (#126)",
+        "model_gateway/src/four.rs",
+        "pub fn four() {}\n",
+    )
+    repo.tool("pick", "1.14", f"{three},{four}")
+    land_on_release_squashed(repo)
+    status = repo.tool("status", "1.14").stdout
+    assert "fix(router): three" not in status and "fix(router): four" not in status
+    assert "  (0 commit(s))" in status, "two picks in one squash commit: both read off its trailers"
+    repo.tool("bump", "1.14.0")
+    repo.land_on_release()
+    repo.tool("tag", "1.14.0", PUSH="1")
+    repo.tool("bump-main", "1.14.0")
+    repo.git("push", "--quiet", "origin", "HEAD:refs/heads/main")  # the pull request merges
+    repo.commit_main(
+        "fix(tool_parser): after the release (#125)",
+        "crates/tool_parser/src/lib.rs",
+        "pub fn after() {}\n",
+    )
+    repo.cut("1.15.0-rc.1")
+    notes = repo.tool("notes", "1.15.0-rc.1").stdout
+    assert "fix(router): three" not in notes and "fix(router): four" not in notes
+    assert "- fix(tool_parser): after the release (#125)\n" in notes
+
+
 def test_notes_of_the_next_release_skip_the_fixes_picked_into_the_previous_one(
     repo: Sandbox,
 ) -> None:
@@ -691,6 +770,7 @@ def test_check_reads_the_gate_items_and_leaves_the_verifier_lines_to_the_owner(
     out = done.stdout
     assert "[ok]   versions: the branch reads 1.14.0-rc.1" in out
     assert "[ok]   CI: 2 check(s) green" in out
+    assert "[ok]   PR Test (SMG): a successful run on" in out
     assert "[....] tag: v1.14.0-rc.1 not created yet" in out
     assert "[note] main: 1 commit(s) on origin/main are not on release/1.14" in out
     for family in ("DeepSeek", "GLM", "Kimi", "MiniMax"):
@@ -715,6 +795,24 @@ def test_check_fails_on_a_version_mismatch_or_red_ci(repo: Sandbox) -> None:
     assert "[FAIL] CI: 1 green, 1 red, 0 pending" in red.stdout
     pending = repo.tool("check", "1.14.0-rc.1", check=False, GH_STUB_CHECKS="in_progress build")
     assert pending.returncode == 1 and "1 pending" in pending.stdout
+
+
+def test_check_requires_a_run_of_the_test_matrix_on_the_head(repo: Sandbox) -> None:
+    """A documentation-only merge to the branch runs no matrix (the push trigger's paths-ignore) and the pull
+    request's run was for the merge ref: the gate wants a successful run for the head commit itself."""
+    repo.cut()
+    none = repo.tool("check", "1.14.0-rc.1", check=False, GH_STUB_RUNS="none")
+    assert none.returncode == 1
+    assert "[FAIL] PR Test (SMG): no run on" in none.stdout
+    assert "gh workflow run pr-test-rust.yml --ref release/1.14" in none.stdout
+    pending = repo.tool(
+        "check",
+        "1.14.0-rc.1",
+        check=False,
+        GH_STUB_RUNS="in_progress https://example.invalid/runs/2",
+    )
+    assert pending.returncode == 1
+    assert "[FAIL] PR Test (SMG): no successful run on" in pending.stdout
 
 
 def test_check_without_gh_names_the_branch_page(repo: Sandbox) -> None:

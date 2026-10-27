@@ -97,6 +97,11 @@ since_tag() { # <ref> <version>: the tag a bump or a check compares the versions
 manifest_version() { # the version a ref's gateway manifest carries (empty when it is not there)
   git show "$1:$GATEWAY_MANIFEST" 2>/dev/null | grep -m1 '^version = ' | sed 's/version = "\(.*\)"/\1/' || true
 }
+picked_into() { # <ref>: the commits named in the `(cherry picked from commit …)` trailers reachable from <ref>, space-bounded
+  # A pick lands on a release branch as its own commits (a fast-forward) or as one squash commit whose message carries
+  # the trailers from the pull request body; either way the picked originals are read off the branch's history.
+  printf ' %s ' "$(git log --format=%b "$1" | grep -o 'cherry picked from commit [0-9a-f]*' | sed 's/.* //' | tr '\n' ' ' || true)"
+}
 
 require_identity() {
   [ -n "${GIT_COMMITTER_EMAIL:-}" ] || git config --get user.email >/dev/null \
@@ -160,7 +165,7 @@ open_pr() { # <topic> <base> <title> <body file>
     say ""
     say "Not pushed (PUSH=0). To open the pull request:"
     say "  git push -u $REMOTE refs/heads/$topic:refs/heads/$topic"
-    say "  gh pr create --base $base --head $topic --title '$title' --body-file $body"
+    say "  gh pr create --base $base --head $topic --title $(printf '%q' "$title") --body-file $(printf '%q' "$body")"
     return 0
   fi
   command -v "$GH" >/dev/null 2>&1 || die "'$GH' is not installed: push $topic and open the pull request against $base by hand"
@@ -184,6 +189,12 @@ cmd_cut() {
   has_ref "refs/heads/$branch" && die "$branch exists locally: a new candidate on it is 'release.sh bump $version'"
   remote_has_branch "$branch" && die "$branch exists on $REMOTE: a new candidate on it is 'release.sh bump $version'"
   since=$(since_tag "$from_sha" "$version")
+  # The previous release's final is the right tag only once main carries that release's versions: a cut before the
+  # release-bump-main pull request merged (or from an older commit) would read a crate bumped for that release as
+  # bumped already, leave main's lower version, and ship nothing for it while every check passes.
+  if ! git merge-base --is-ancestor "$since" "$from_sha" && [ "$(manifest_version "$from_sha")" != "${since#v}" ]; then
+    die "$from reads $(manifest_version "$from_sha"), not ${since#v}: merge the release-bump-main pull request for $since first (release.sh bump-main ${since#v}), or cut from a commit after it"
+  fi
   note "cut: $branch from $(git rev-parse --short "$from_sha") ($from); the versions move from $since to $version"
   git switch --quiet --no-track -c "$branch" "$from_sha"
   bump_tree "$version" "$since"
@@ -312,12 +323,12 @@ cmd_status() {
   local base picked full short subject n=0
   fetch
   base=$(release_base "$release")
-  picked=$(git log --format=%b "$base" | grep -o 'cherry picked from commit [0-9a-f]*' | sed 's/.* //' || true)
+  picked=$(picked_into "$base")
   say "== release/$release is at $(git rev-parse --short "$base"): $(git log -1 --format=%s "$base")"
   say "== versions: $(manifest_version "$base") ($GATEWAY_MANIFEST)"
   say "== on $REMOTE/main and not on release/$release (same patch or picked with -x excluded):"
   while read -r full short subject; do
-    case " $picked " in *" $full "*) continue ;; esac
+    case "$picked" in *" $full "*) continue ;; esac
     n=$((n + 1))
     say "  $short $subject"
   done < <(git log --cherry-pick --right-only --no-merges --format='%H %h %s' "$base...$REMOTE/main")
@@ -364,7 +375,7 @@ cmd_notes() {
   local version=${1:-} since=${2:-}
   [ -n "$version" ] || die "usage: release.sh notes <version> [<since>]"
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
-  local release tagname ref subject type count
+  local release tagname ref subject type count picked full
   local feat=() fix=() perf=() docs=() maint=() other=()
   release=$(release_of "$version"); tagname="v$version"
   fetch
@@ -381,8 +392,13 @@ cmd_notes() {
   has_ref "$since" || die "unknown tag or commit: $since"
   # The symmetric range with --cherry-pick: from the second release on, $since is a final on the
   # previous release's branch, and the originals of the fixes picked into it are not news here.
-  count=$(git rev-list --count --cherry-pick --right-only --first-parent --no-merges "$since...$ref")
-  while IFS= read -r subject; do
+  # A pick lands as one squash commit whose patch matches none of the originals, so --cherry-pick alone would list
+  # them again: the commits named in the trailers reachable from $since are left out too (picked_into).
+  picked=$(picked_into "$since")
+  count=0
+  while read -r full subject; do
+    case "$picked" in *" $full "*) continue ;; esac
+    count=$((count + 1))
     case "$subject" in 'chore(release): bump versions'*) continue ;; esac
     type=${subject%%[(:!]*}
     case "$type" in
@@ -393,7 +409,7 @@ cmd_notes() {
       ci | chore | build | test | refactor | style) maint+=("$subject") ;;
       *) other+=("$subject") ;;
     esac
-  done < <(git log --cherry-pick --right-only --first-parent --no-merges --format=%s "$since...$ref")
+  done < <(git log --cherry-pick --right-only --first-parent --no-merges --format='%H %s' "$since...$ref")
   say "## SMG $tagname"
   say ""
   say "$count commits since $since on \`release/$release\` (the merged pull requests, by type):"
@@ -576,7 +592,7 @@ cmd_check() {
   local version=${1:-}
   [ -n "$version" ] || die "usage: release.sh check <version>"
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
-  local release branch base head tagname carried since scratch slug checks drift=0 family failed=0 full picked
+  local release branch base head tagname carried since scratch slug checks runs drift=0 family failed=0 full picked
   release=$(release_of "$version"); branch="release/$release"; tagname="v$version"
   fetch
   base=$(release_base "$release"); head=$(git rev-parse "$base")
@@ -621,6 +637,18 @@ cmd_check() {
         failed=1
       fi
     fi
+    # The test matrix on this very commit: a documentation-only merge runs none (the push trigger's paths-ignore)
+    # and the pull request's run was for the merge ref, not the branch head, so a run is required by head sha.
+    runs=$("$GH" api "repos/$slug/actions/workflows/pr-test-rust.yml/runs?head_sha=$head&per_page=20" --jq '.workflow_runs[] | "\(.conclusion // .status) \(.html_url)"' 2>/dev/null || true)
+    if [ -z "$runs" ]; then
+      say "[FAIL] PR Test (SMG): no run on $(git rev-parse --short "$head") (a documentation-only merge runs none): gh workflow run pr-test-rust.yml --ref $branch"
+      failed=1
+    elif grep -q '^success ' <<< "$runs"; then
+      say "[ok]   PR Test (SMG): a successful run on $(git rev-parse --short "$head") ($(grep -m1 '^success ' <<< "$runs" | cut -d' ' -f2))"
+    else
+      say "[FAIL] PR Test (SMG): no successful run on $(git rev-parse --short "$head") yet: $(tr '\n' ';' <<< "$runs")"
+      failed=1
+    fi
   else
     say "[....] CI: not readable here (gh is not installed or not logged in): read the checks of $(git rev-parse --short "$head") on the branch page"
   fi
@@ -635,7 +663,7 @@ cmd_check() {
     say "[....] tag: $tagname not created yet (release.sh tag $version, after the gate)"
   fi
   # 4. main's drift
-  picked=" $(git log --format=%b "$base" | grep -o 'cherry picked from commit [0-9a-f]*' | sed 's/.* //' | tr '\n' ' ' || true) "
+  picked=$(picked_into "$base")
   while read -r full; do
     case "$picked" in *" $full "*) ;; *) drift=$((drift + 1)) ;; esac
   done < <(git log --cherry-pick --right-only --no-merges --format=%H "$base...$REMOTE/main")
