@@ -10,6 +10,11 @@
 //! supplies M3's own parameters, and raises images below M3's short-side floor
 //! before delegating.
 //!
+//! Router and Rust-servicer images use `minimax_resize` to choose aligned dimensions
+//! from the source header and resize directly at decode. Their processor carries
+//! `RESIZED_KEY`, skipping short-side staging and the legacy image pixel budget.
+//! Standalone processors and video retain the defaults below.
+//!
 //! # MiniMax-M3 parameters
 //!
 //! - patch_size: 14
@@ -91,6 +96,7 @@ pub struct MiniMaxM3VisionProcessor {
     /// Whether the config set `max_pixels`, which then bounds video frames
     /// in place of a request's `max_long_side_pixel` tier.
     explicit_max_pixels: bool,
+    source_resized: bool,
 }
 
 impl Default for MiniMaxM3VisionProcessor {
@@ -157,6 +163,7 @@ impl MiniMaxM3VisionProcessor {
             .allow_video_dimensions_below_factor()
             .raise_rounded_sides_to_factor(),
             explicit_max_pixels: false,
+            source_resized: false,
         }
     }
 
@@ -231,8 +238,30 @@ impl MiniMaxM3VisionProcessor {
             .unwrap_or_else(|| self.inner.merge_size());
         let temporal_patch_size = Self::declared_temporal_patch_size(config)?
             .unwrap_or_else(|| self.inner.temporal_patch_size());
-        let max_pixels = config.max_pixels.unwrap_or_else(|| self.inner.max_pixels());
-        let min_pixels = config.min_pixels.unwrap_or_else(|| self.inner.min_pixels());
+        let source_resized = config
+            .get_extra::<bool>(crate::minimax_resize::RESIZED_KEY)
+            .unwrap_or(false);
+        if source_resized
+            && config
+                .get_patch_size(self.inner.patch_size())
+                .checked_mul(merge_size)
+                != Some(28)
+        {
+            return Err(TransformError::ShapeError(
+                "M3 source resizing requires patch_size * merge_size = 28".into(),
+            ));
+        }
+        // Source planning already aligned and checked the fixed image budget.
+        let max_pixels = if source_resized {
+            crate::minimax_resize::IMAGE_MAX_TOTAL_PIXELS as usize
+        } else {
+            config.max_pixels.unwrap_or_else(|| self.inner.max_pixels())
+        };
+        let min_pixels = if source_resized {
+            28 * 28
+        } else {
+            config.min_pixels.unwrap_or_else(|| self.inner.min_pixels())
+        };
         // Track an explicit `max_pixels` in both directions: flooring the video
         // budget at the default would leave video six times an image's budget
         // for an operator who lowered `max_pixels` to bound encoder memory.
@@ -249,6 +278,7 @@ impl MiniMaxM3VisionProcessor {
             video_max_pixels,
         );
         layered.inner = layered.inner.with_preprocessor_config(config);
+        layered.source_resized = source_resized;
         layered.explicit_max_pixels = self.explicit_max_pixels || config.max_pixels.is_some();
         Ok(layered)
     }
@@ -343,7 +373,7 @@ impl MiniMaxM3VisionProcessor {
     ) -> Result<Option<Vec<DynamicImage>>, TransformError> {
         let below_floor =
             |image: &DynamicImage| Self::raised_dimensions(image.width(), image.height()).is_some();
-        if !self.inner.resizes() || !images.iter().any(below_floor) {
+        if self.source_resized || !self.inner.resizes() || !images.iter().any(below_floor) {
             return Ok(None);
         }
         // Vet every image first so an off-contract input is rejected before any pixel work.
@@ -432,7 +462,7 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
 
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
         // Staged the way `preprocess` stages the image.
-        let staged = if self.inner.resizes() {
+        let staged = if self.inner.resizes() && !self.source_resized {
             self.staging_dimensions(width, height)?
         } else {
             None

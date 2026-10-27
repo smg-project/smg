@@ -1024,6 +1024,97 @@ mod tests {
         assert_eq!(output.batches.len(), 1);
     }
 
+    /// The Rust servicer runs the router's source policy, preserves the resulting
+    /// patch grid through preprocessing and emits exactly that many image tokens.
+    #[tokio::test]
+    async fn minimax_worker_resizes_once_from_source_geometry() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let dir = tempfile::Builder::new()
+            .prefix("minimax-m3-")
+            .tempdir()
+            .unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type":"minimax_m3_vl","image_token_index":32000}"#,
+        )
+        .unwrap();
+        let path = dir.path().to_str().unwrap();
+        let settings = WorkerMediaSettings {
+            encoder_dtype: "float32".into(),
+            ..pipeline_settings(path)
+        };
+        let tokenizer = Arc::new(MockTokenizer::new().with_tokens(&[
+            ("]<]image[>[", 32000),
+            ("]<]start of image[>[", 32001),
+            ("]<]end of image[>[", 32002),
+        ]));
+        let pipeline = WorkerMediaPipeline::new(settings, tokenizer).await.unwrap();
+        for (width, height, tokens, router_tokens) in [
+            (1000, 1000, 1296, 1296),
+            (2200, 100, 216, 72),
+            (1000, 50, 320, 320),
+            (224, 112, 32, 32),
+        ] {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(width, height)
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            let item = WorkerMediaItem {
+                modality: Modality::Image,
+                url: format!(
+                    "data:image/png;base64,{}",
+                    STANDARD.encode(bytes.into_inner())
+                ),
+            };
+            let output = pipeline
+                .process(vec![1, 32000, 2], std::slice::from_ref(&item), false)
+                .await
+                .unwrap();
+            assert_eq!(
+                output
+                    .prompt_token_ids
+                    .iter()
+                    .filter(|&&id| id == 32000)
+                    .count(),
+                tokens
+            );
+            assert_eq!(
+                output.batches[0].pixel_values.as_ref().unwrap().shape,
+                vec![(tokens * 4) as u32, 1176]
+            );
+            // The router also accepts a non-grid request cap, before handing
+            // the aligned dimensions to the same cached image processor.
+            let plan = MediaPlan::new(vec![MediaContentPart::ImageUrl {
+                url: item.url,
+                detail: None,
+                uuid: None,
+                max_long_side_pixel: Some(1000),
+            }]);
+            let routed = process_multimodal_plan(
+                plan,
+                &pipeline.model_id,
+                pipeline.tokenizer.as_ref(),
+                vec![1, 32000, 2],
+                &pipeline.components,
+                CONFIG_KEY,
+                &pipeline.model_dir,
+                pipeline.assembly.image_wire_dtype(),
+                TransparencyPolicy::CompositeOverWhite,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                routed
+                    .expanded_token_ids
+                    .iter()
+                    .filter(|&&id| id == 32000)
+                    .count(),
+                router_tokens
+            );
+        }
+    }
+
     /// The inline payload cap sizes a `data:` URL by the shared rule: the
     /// scheme's case does not matter, so an uppercase scheme cannot slip a
     /// payload past `--mm-max-item-bytes` that the router and the servicer
