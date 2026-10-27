@@ -35,8 +35,11 @@ Every commit, pick and tag carries the caller's git identity and sign-off.
 - A bump (`cut`, `bump`) is `make bump-version` for the gateway's files, then
   `scripts/check_release_versions.py --fix <previous tag>` for the crates and packages changed
   since that tag (their version follows the conventional commits since it) and the mirrors,
-  then `cargo update --workspace` for `Cargo.lock`. The previous tag is the newest release tag
-  reachable from the branch: the last final for a cut, the last candidate for the next one.
+  then `cargo update --workspace` for `Cargo.lock`. The previous tag is the branch's own newest
+  tag when it has one (the last candidate, for the next one), else the highest final below the
+  version (the previous release's, on its own branch: no release tag is reachable from `main`
+  under this process, and the checker diffs `tag..HEAD`, so none has to be), else the newest
+  tag reachable from the branch (a release made before this process).
 - `main` keeps the last final release's versions. After a final, `make release-bump-main` opens
   the pull request that moves them: the gateway and its mirrors to the release's version, every
   other crate or package to the release's version where that is higher than main's (crates.io

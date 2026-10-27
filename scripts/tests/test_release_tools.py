@@ -65,6 +65,22 @@ echo "- stub images for $1"
 """
 
 
+# The lines of the engine-image workflow the tooling reads: the release line the version checker
+# bumps and the release-base table the publishing plan turns into dispatches.
+ENGINE_WORKFLOW = """env:
+  SMG_RELEASE_TAG: v1.13.0
+jobs:
+  plan:
+    steps:
+      - run: |
+          engines='{
+            "vllm": {"release_bases": ["vllm/vllm-openai:v0.31.0", "vllm/vllm-openai:v0.27.1"]},
+            "sglang": {"release_bases": ["lmsysorg/sglang:v0.5.21"]},
+            "tokenspeed": {"release_bases": [""]}
+          }'
+"""
+
+
 def versioned(name: str, version: str) -> str:
     return f'[package]\nname = "{name}"\nversion = "{version}"\n'
 
@@ -190,9 +206,7 @@ class Sandbox:
             "deploy/helm/smg/Chart.yaml",
             'apiVersion: v2\nname: smg\nversion: 1.13.0\nappVersion: "1.13.0"\n',
         )
-        self.put(
-            ".github/workflows/release-engine-docker.yml", "env:\n  SMG_RELEASE_TAG: v1.13.0\n"
-        )
+        self.put(".github/workflows/release-engine-docker.yml", ENGINE_WORKFLOW)
         shutil.copy(ROOT / "Makefile", self.work / "Makefile")
         (self.work / "scripts" / "release").mkdir(parents=True)
         shutil.copy(ROOT / "scripts" / "check_release_versions.py", self.work / "scripts")
@@ -538,6 +552,60 @@ def finished_release(repo: Sandbox) -> None:
     repo.tool("tag", "1.14.0", PUSH="1")
 
 
+def next_minor_cut(repo: Sandbox) -> None:
+    """After v1.14.0: main follows the release, a crate changes again on main, release/1.15 is cut."""
+    finished_release(repo)
+    repo.tool("bump-main", "1.14.0")
+    repo.git("push", "--quiet", "origin", "HEAD:refs/heads/main")  # the pull request merges
+    repo.commit_main(
+        "fix(tool_parser): after the release (#125)",
+        "crates/tool_parser/src/lib.rs",
+        "pub fn x() {}\npub fn after() {}\n",
+    )
+    repo.cut("1.15.0-rc.1")
+
+
+def test_the_next_cut_compares_against_the_previous_final_on_its_own_branch(repo: Sandbox) -> None:
+    next_minor_cut(repo)
+    assert "v1.14.0" not in repo.git("tag", "--merged", "origin/main").split(), (
+        "the premise: a release tag is made on its branch and never reaches main"
+    )
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "release/1.15"
+    for path in VERSION_FILES:
+        assert repo.version_of(path) == "1.15.0-rc.1", path
+    # Against v1.14.0 (where tool-parser read 0.6.0): a feat and a fix since, so a minor bump.
+    # Against v1.13.0 (the newest tag reachable from main), 0.6.0 would read as already bumped
+    # and the crate would ship 1.15 at the version crates.io already has.
+    assert repo.version_of("crates/tool_parser/Cargo.toml") == "0.7.0"
+    assert 'tool-parser = { version = "0.7.0"' in repo.read("Cargo.toml")
+    repo.git("push", "--quiet", "origin", "HEAD:refs/heads/release/1.15")
+    tagged = repo.tool("tag", "1.15.0-rc.1", PUSH="1")
+    assert "checking the versions at" in tagged.stderr and "against v1.14.0" in tagged.stderr
+    checked = repo.tool("check", "1.15.0-rc.1")
+    assert "[ok]   versions: the branch reads 1.15.0-rc.1" in checked.stdout
+    assert "consistent with v1.15.0-rc.1" in checked.stdout, "the branch's own tag once it has one"
+    bumped = repo.tool("bump", "1.15.0-rc.2", PUSH="0")
+    assert "versions since v1.15.0-rc.1" in bumped.stderr
+
+
+def test_a_patch_bump_compares_against_the_final_not_its_candidate(repo: Sandbox) -> None:
+    finished_release(repo)  # the branch's own tags: v1.14.0-rc.1, v1.14.0
+    bumped = repo.tool("bump", "1.14.1", PUSH="0")
+    assert "versions since v1.14.0" in bumped.stderr
+
+
+def test_notes_of_the_next_release_skip_the_fixes_picked_into_the_previous_one(
+    repo: Sandbox,
+) -> None:
+    next_minor_cut(repo)
+    out = repo.tool("notes", "1.15.0-rc.1").stdout
+    assert "commits since v1.14.0 on `release/1.15`" in out
+    assert "fix(router): three (#123)" not in out, "picked into 1.14.0 with -x: not news in 1.15"
+    assert "- feat(tool_parser): x (#124)\n" in out
+    assert "- fix(tool_parser): after the release (#125)\n" in out
+    assert "fix(router): two" not in out, "shipped in 1.14.0"
+
+
 def test_notes_group_the_merged_subjects_and_name_the_release_command(repo: Sandbox) -> None:
     finished_release(repo)
     done = repo.tool("notes", "1.14.0")
@@ -579,6 +647,27 @@ def test_publish_plan_prints_the_dispatches_and_runs_nothing(repo: Sandbox) -> N
     assert "     smg 1.14.0-rc.1\n" in out and "     tool-parser 0.6.0\n" in out
     final = repo.tool("publish-plan", "1.14.0").stdout
     assert "smg==1.14.0," in final and "and latest" in final
+
+
+def test_publish_plan_prints_one_engine_dispatch_per_release_base(repo: Sandbox) -> None:
+    finished_release(repo)
+    out = repo.tool("publish-plan", "1.14.0").stdout
+    dispatches = [
+        line.strip()
+        for line in out.splitlines()
+        if line.strip().startswith("gh workflow run release-engine-docker.yml")
+    ]
+    assert dispatches == [
+        "gh workflow run release-engine-docker.yml --ref v1.14.0 -f engine=vllm"
+        "   # vllm/vllm-openai:v0.31.0",
+        "gh workflow run release-engine-docker.yml --ref v1.14.0 -f engine=vllm"
+        " -f base_image_ref=vllm/vllm-openai:v0.27.1   # vllm/vllm-openai:v0.27.1",
+        "gh workflow run release-engine-docker.yml --ref v1.14.0 -f engine=sglang"
+        "   # lmsysorg/sglang:v0.5.21",
+        "gh workflow run release-engine-docker.yml --ref v1.14.0 -f engine=tokenspeed"
+        "   # the latest nightly carrier",
+    ]
+    assert "every other base is a dispatch of its own" in out
 
 
 def test_publish_plan_refuses_a_version_the_branch_does_not_carry(repo: Sandbox) -> None:

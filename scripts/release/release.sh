@@ -79,6 +79,21 @@ previous_final_tag() { # the highest final tag below v<version>; empty when ther
   { git tag --list 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; printf 'v%s\n' "$1"; } \
     | sort -uV | grep -B1 -x "v$1" | head -1 | grep -v -x "v$1" || true
 }
+since_tag() { # <ref> <version>: the tag a bump or a check compares the versions against
+  # The branch's own newest tag when it has one (made on the release branch: the last candidate);
+  # else the highest final below <version>, which sits on the previous release's branch from the
+  # second release on (no release tag is reachable from main under this process; the checker
+  # diffs tag..HEAD, so the tag need not be an ancestor); else the newest tag reachable from
+  # <ref>, a release made before this process.
+  # A candidate sorts below its final: a version sort puts `~` before the end of the string.
+  local ref=$1 version=$2 own final
+  own=$(comm -23 <(git tag --list 'v[0-9]*' --merged "$ref" | sort) <(git tag --list 'v[0-9]*' --merged "$REMOTE/main" | sort) \
+    | sed 's/-rc\./~rc./' | sort -V | tail -n 1 | sed 's/~rc\./-rc./')
+  if [ -n "$own" ]; then printf '%s' "$own"; return 0; fi
+  final=$(previous_final_tag "$version")
+  if [ -n "$final" ]; then printf '%s' "$final"; return 0; fi
+  previous_tag "$ref"
+}
 manifest_version() { # the version a ref's gateway manifest carries (empty when it is not there)
   git show "$1:$GATEWAY_MANIFEST" 2>/dev/null | grep -m1 '^version = ' | sed 's/version = "\(.*\)"/\1/' || true
 }
@@ -168,7 +183,7 @@ cmd_cut() {
     || die "$from is not on $REMOTE/main: a release is cut from main's history"
   has_ref "refs/heads/$branch" && die "$branch exists locally: a new candidate on it is 'release.sh bump $version'"
   remote_has_branch "$branch" && die "$branch exists on $REMOTE: a new candidate on it is 'release.sh bump $version'"
-  since=$(previous_tag "$from_sha")
+  since=$(since_tag "$from_sha" "$version")
   note "cut: $branch from $(git rev-parse --short "$from_sha") ($from); the versions move from $since to $version"
   git switch --quiet --no-track -c "$branch" "$from_sha"
   bump_tree "$version" "$since"
@@ -190,7 +205,7 @@ cmd_bump() {
   require_identity; require_clean; fetch
   base=$(release_base "$release")
   [ "$(manifest_version "$base")" != "$version" ] || die "$branch already reads $version"
-  since=$(previous_tag "$base")
+  since=$(since_tag "$base" "$version")
   topic="chore/release-$version"
   has_ref "refs/heads/$topic" && die "the branch $topic exists: delete it or finish it"
   if is_final "$version"; then kind="the final"; else kind="the next candidate"; fi
@@ -331,7 +346,7 @@ cmd_tag() {
   remote_has_tag "$tagname" && die "the tag $tagname exists on $REMOTE"
   carried=$(manifest_version "$head")
   [ "$carried" = "$version" ] || die "$branch reads $carried at $(git rev-parse --short "$head"), not $version: merge the bump first (release.sh bump $version)"
-  since=$(previous_tag "$head")
+  since=$(since_tag "$head" "$version")
   note "tag: checking the versions at $(git rev-parse --short "$head") against $since"
   scratch=$(mktemp -d)
   git worktree add --quiet --detach "$scratch" "$head"
@@ -364,7 +379,9 @@ cmd_notes() {
     [ -n "$since" ] || die "no final release tag below $tagname: pass the tag to start from (release.sh notes $version <tag>)"
   fi
   has_ref "$since" || die "unknown tag or commit: $since"
-  count=$(git rev-list --count --first-parent --no-merges "$since..$ref")
+  # The symmetric range with --cherry-pick: from the second release on, $since is a final on the
+  # previous release's branch, and the originals of the fixes picked into it are not news here.
+  count=$(git rev-list --count --cherry-pick --right-only --first-parent --no-merges "$since...$ref")
   while IFS= read -r subject; do
     case "$subject" in 'chore(release): bump versions'*) continue ;; esac
     type=${subject%%[(:!]*}
@@ -376,7 +393,7 @@ cmd_notes() {
       ci | chore | build | test | refactor | style) maint+=("$subject") ;;
       *) other+=("$subject") ;;
     esac
-  done < <(git log --first-parent --no-merges --format=%s "$since..$ref")
+  done < <(git log --cherry-pick --right-only --first-parent --no-merges --format=%s "$since...$ref")
   say "## SMG $tagname"
   say ""
   say "$count commits since $since on \`release/$release\` (the merged pull requests, by type):"
@@ -468,11 +485,38 @@ for crate in crv.CRATES:
 PYEOF
 }
 
+engine_dispatches() { # <ref> <tag>: one dispatch per (engine, release base), the table read from the workflow at <ref>
+  "$PYTHON" - "$1" "$2" <<'PYEOF'
+import json
+import re
+import subprocess
+import sys
+
+ref, tag = sys.argv[1:3]
+shown = subprocess.run(
+    ["git", "show", f"{ref}:.github/workflows/release-engine-docker.yml"], capture_output=True, text=True
+)
+match = re.search(r"engines='(\{.*?\})'", shown.stdout, re.S) if shown.returncode == 0 else None
+if match is None:
+    print(f"(no release-base table is readable at {tag}: one dispatch per engine, its first base)")
+    for engine in ("vllm", "sglang", "tokenspeed", "trtllm"):
+        print(f"gh workflow run release-engine-docker.yml --ref {tag} -f engine={engine}")
+    sys.exit(0)
+for engine, entry in json.loads(match.group(1)).items():
+    for position, base in enumerate(entry.get("release_bases") or [""]):
+        with_base = f" -f base_image_ref={base}" if position and base else ""
+        print(
+            f"gh workflow run release-engine-docker.yml --ref {tag} -f engine={engine}{with_base}"
+            f"   # {base or 'the latest nightly carrier'}"
+        )
+PYEOF
+}
+
 cmd_publish_plan() {
   local version=${1:-}
   [ -n "$version" ] || die "usage: release.sh publish-plan <version>"
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
-  local release tagname ref latest proto servicer engine
+  local release tagname ref latest proto servicer
   release=$(release_of "$version"); tagname="v$version"
   fetch
   if has_ref "refs/tags/$tagname"; then
@@ -499,10 +543,9 @@ cmd_publish_plan() {
   say "4. Helm chart (oci://ghcr.io/smg-project/charts/smg, version $version)"
   say "   gh workflow run release-helm.yml --ref $tagname"
   say "5. Engine images (ghcr.io/smg-project/smg:$version-<engine>-<engine version>, built from SMG_RELEASE_TAG = $tagname at that ref;"
-  say "   one dispatch per engine; the engine versions are the release bases in .github/workflows/release-engine-docker.yml)"
-  for engine in vllm sglang tokenspeed trtllm; do
-    say "   gh workflow run release-engine-docker.yml --ref $tagname -f engine=$engine"
-  done
+  say "   one dispatch per engine and release base, the table of .github/workflows/release-engine-docker.yml at $tagname: a dispatch"
+  say "   without base_image_ref builds the engine's first base only, so every other base is a dispatch of its own)"
+  engine_dispatches "$ref" "$tagname" | sed 's/^/   /'
   say "6. gRPC Python packages (PyPI: smg-grpc-proto==${proto:-?}, smg-grpc-servicer==${servicer:-?}; versions already on PyPI are skipped)"
   say "   gh workflow run release-grpc.yml --ref $tagname"
   say "7. Go module tag (crates/grpc_client/go/v$version)"
@@ -533,7 +576,7 @@ cmd_check() {
   local version=${1:-}
   [ -n "$version" ] || die "usage: release.sh check <version>"
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
-  local release branch base head tagname carried since scratch slug checks drift=0 family failed=0 full
+  local release branch base head tagname carried since scratch slug checks drift=0 family failed=0 full picked
   release=$(release_of "$version"); branch="release/$release"; tagname="v$version"
   fetch
   base=$(release_base "$release"); head=$(git rev-parse "$base")
@@ -542,7 +585,7 @@ cmd_check() {
   # 1. the versions at the head
   carried=$(manifest_version "$head")
   if [ "$carried" = "$version" ]; then
-    since=$(previous_tag "$head")
+    since=$(since_tag "$head" "$version")
     scratch=$(mktemp -d)
     git worktree add --quiet --detach "$scratch" "$head"
     if (cd "$scratch" && "$PYTHON" scripts/check_release_versions.py --check "$since" >/dev/null 2>&1); then
@@ -592,8 +635,9 @@ cmd_check() {
     say "[....] tag: $tagname not created yet (release.sh tag $version, after the gate)"
   fi
   # 4. main's drift
+  picked=" $(git log --format=%b "$base" | grep -o 'cherry picked from commit [0-9a-f]*' | sed 's/.* //' | tr '\n' ' ' || true) "
   while read -r full; do
-    case " $(git log --format=%b "$base" | grep -o 'cherry picked from commit [0-9a-f]*' | sed 's/.* //' | tr '\n' ' ') " in *" $full "*) ;; *) drift=$((drift + 1)) ;; esac
+    case "$picked" in *" $full "*) ;; *) drift=$((drift + 1)) ;; esac
   done < <(git log --cherry-pick --right-only --no-merges --format=%H "$base...$REMOTE/main")
   say "[note] main: $drift commit(s) on $REMOTE/main are not on $branch (release.sh status $release lists them; release.sh pick $release <sha> brings one over)"
   # 5. the provider verifiers: the release owner's lines
