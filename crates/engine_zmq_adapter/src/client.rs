@@ -28,7 +28,7 @@ use engine_zmq_client::{
 };
 use futures::StreamExt;
 use llm_tokenizer::traits::Tokenizer;
-use openai_protocol::worker::{RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse};
+use openai_protocol::worker::{RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerType};
 use smg_grpc_client::{sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto as vllm};
 
 #[cfg(unix)]
@@ -635,25 +635,26 @@ impl ZmqEngineClient {
     }
 
     /// Check the disaggregation role every connected engine declared against
-    /// `registered`, the role its worker is registered for (`None` for one
-    /// that serves whole requests): a prefill engine registered as a decode
-    /// worker, or a whole-request engine as either, fails its connection with
-    /// both roles named instead of failing every request it takes. An encode
-    /// worker needs the wire's encode request, so an engine that does not
-    /// list it (one before the request, or a scheduler) fails the connection
-    /// of an `encode` registration whatever else it declares, as the servicer
-    /// refuses the same engine at its link. A prefill or encode worker's
-    /// requests name its engine's bootstrap rendezvous, which on this lane
-    /// only the handshake supplies (the worker's URL names the frontend's own
-    /// bind, not the engine's host), so an engine that declares no bootstrap
-    /// address fails the connection of either registration, whatever else it
-    /// declares, instead of sending every disaggregated request out with an
-    /// empty host. An engine that predates the declaration (it lists no
-    /// request types) is otherwise not checked.
-    pub fn check_declared_role(&self, registered: Option<&str>) -> Result<(), String> {
+    /// `registered`, the role its worker is registered for
+    /// ([`WorkerType::Regular`] for one that serves whole requests): a prefill
+    /// engine registered as a decode worker, or a whole-request engine as
+    /// either, fails its connection with both roles named instead of failing
+    /// every request it takes. An encode worker needs the wire's encode
+    /// request, so an engine that does not list it (one before the request,
+    /// or a scheduler) fails the connection of an encode registration whatever
+    /// else it declares, as the servicer refuses the same engine at its link.
+    /// A prefill or encode worker's requests name its engine's bootstrap
+    /// rendezvous, which on this lane only the handshake supplies (the
+    /// worker's URL names the frontend's own bind, not the engine's host), so
+    /// an engine that declares no bootstrap address fails the connection of
+    /// either registration, whatever else it declares, instead of sending
+    /// every disaggregated request out with an empty host. An engine that
+    /// predates the declaration (it lists no request types) is otherwise not
+    /// checked.
+    pub fn check_declared_role(&self, registered: WorkerType) -> Result<(), String> {
         for engine in self.engines() {
             let ready = &engine.ready_response;
-            if registered == Some("encode") && !ready.lists_request_kind(REQUEST_KIND_ENCODE) {
+            if registered == WorkerType::Encode && !ready.lists_request_kind(REQUEST_KIND_ENCODE) {
                 return Err(format!(
                     "engine {:?} lists no encode request on its wire (request_types {:?}) but \
                      its worker is registered as an encode worker: a newer engine, or the \
@@ -661,29 +662,28 @@ impl ZmqEngineClient {
                     engine.engine_id, ready.request_types,
                 ));
             }
-            if !ready.request_types.is_empty() {
-                let declared = ready.disaggregation_role();
-                if declared != registered {
-                    return Err(format!(
-                        "engine {:?} declared disaggregation role {} but its worker is \
-                         registered as {}",
-                        engine.engine_id,
-                        declared.unwrap_or("none (whole requests)"),
-                        registered.unwrap_or("a regular worker"),
-                    ));
-                }
+            if !ready.request_types.is_empty() && declared_worker_type(ready) != Some(registered) {
+                return Err(format!(
+                    "engine {:?} declared disaggregation role {} but its worker is registered \
+                     as {}",
+                    engine.engine_id,
+                    ready
+                        .disaggregation_role()
+                        .unwrap_or("none (whole requests)"),
+                    registered_words(registered),
+                ));
             }
-            if let Some(role @ ("prefill" | "encode")) = registered {
-                if ready.bootstrap_address().is_none() {
-                    return Err(format!(
-                        "engine {:?} declares no bootstrap address but its worker is registered \
-                         as {role}: a {role} worker's requests name its engine's rendezvous \
-                         (bootstrap_host and bootstrap_port in the handshake), which this lane \
-                         cannot take from the worker's own address; an engine that declares it \
-                         serves this worker",
-                        engine.engine_id,
-                    ));
-                }
+            if matches!(registered, WorkerType::Prefill | WorkerType::Encode)
+                && ready.bootstrap_address().is_none()
+            {
+                return Err(format!(
+                    "engine {:?} declares no bootstrap address but its worker is registered as \
+                     {registered}: a {registered} worker's requests name its engine's \
+                     rendezvous (bootstrap_host and bootstrap_port in the handshake), which \
+                     this lane cannot take from the worker's own address; an engine that \
+                     declares it serves this worker",
+                    engine.engine_id,
+                ));
             }
         }
         Ok(())
@@ -1834,6 +1834,31 @@ fn utility_status(error: engine_zmq_client::Error) -> tonic::Status {
     }
 }
 
+/// The disaggregation role an engine declared at its handshake, as the
+/// registry types a worker's role: [`WorkerType::Regular`] for an engine that
+/// serves whole requests (it declares no role), the role for the wire's three
+/// exact names, `None` for anything else (another spelling included), which
+/// no registration matches. The wire keeps the string the engine sent
+/// ([`EngineCoreReadyResponse::disaggregation_role`]); this is its one typed
+/// reading, and it is exact where [`WorkerType`]'s own parser is lenient.
+pub(crate) fn declared_worker_type(ready: &EngineCoreReadyResponse) -> Option<WorkerType> {
+    match ready.disaggregation_role() {
+        None => Some(WorkerType::Regular),
+        Some("prefill") => Some(WorkerType::Prefill),
+        Some("decode") => Some(WorkerType::Decode),
+        Some("encode") => Some(WorkerType::Encode),
+        Some(_) => None,
+    }
+}
+
+/// A registered role as the connection refusals name it.
+fn registered_words(role: WorkerType) -> String {
+    match role {
+        WorkerType::Regular => "a regular worker".to_string(),
+        role => role.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{path::Path, sync::Arc, time::Duration};
@@ -2455,6 +2480,44 @@ mod tests {
         client.expect("adapter connect")
     }
 
+    /// The handshake's role string, typed once: no role, `null` and an empty
+    /// string read as a whole-request engine; the wire's three names read as
+    /// their roles, exactly; anything else, another spelling or `regular`
+    /// included, matches no registration (as the string compare before it).
+    #[test]
+    fn the_declared_role_is_read_as_a_worker_type() {
+        let declaring = |role: Option<&str>| EngineCoreReadyResponse {
+            disaggregation_mode: role.map(str::to_string),
+            ..default_ready_response()
+        };
+        for whole in [None, Some("null"), Some("")] {
+            assert_eq!(
+                declared_worker_type(&declaring(whole)),
+                Some(WorkerType::Regular),
+                "{whole:?}"
+            );
+        }
+        assert_eq!(
+            declared_worker_type(&declaring(Some("prefill"))),
+            Some(WorkerType::Prefill)
+        );
+        assert_eq!(
+            declared_worker_type(&declaring(Some("decode"))),
+            Some(WorkerType::Decode)
+        );
+        assert_eq!(
+            declared_worker_type(&declaring(Some("encode"))),
+            Some(WorkerType::Encode)
+        );
+        for unknown in ["verifier", "Decode", "PREFILL", "regular"] {
+            assert_eq!(
+                declared_worker_type(&declaring(Some(unknown))),
+                None,
+                "{unknown}"
+            );
+        }
+    }
+
     /// A worker registered for a disaggregated role connects only to engines
     /// that declared that role: a prefill rank among a decode worker's, or a
     /// whole-request engine behind a prefill worker, fails the check with both
@@ -2483,14 +2546,16 @@ mod tests {
         )
         .await;
         prefill
-            .check_declared_role(Some("prefill"))
+            .check_declared_role(WorkerType::Prefill)
             .expect("prefill engines");
-        let error = prefill.check_declared_role(Some("decode")).unwrap_err();
+        let error = prefill.check_declared_role(WorkerType::Decode).unwrap_err();
         assert!(
             error.contains("declared disaggregation role prefill") && error.contains("as decode"),
             "{error}"
         );
-        let error = prefill.check_declared_role(None).unwrap_err();
+        let error = prefill
+            .check_declared_role(WorkerType::Regular)
+            .unwrap_err();
         assert!(error.contains("as a regular worker"), "{error}");
 
         let mixed = tokenspeed_ranks(
@@ -2498,7 +2563,7 @@ mod tests {
             vec![declaring(Some("decode")), declaring(Some("prefill"))],
         )
         .await;
-        let error = mixed.check_declared_role(Some("decode")).unwrap_err();
+        let error = mixed.check_declared_role(WorkerType::Decode).unwrap_err();
         assert!(
             error.contains("declared disaggregation role prefill"),
             "{error}"
@@ -2506,10 +2571,24 @@ mod tests {
 
         let whole = tokenspeed_ranks(&dir.path().join("w"), vec![declaring(None)]).await;
         whole
-            .check_declared_role(None)
+            .check_declared_role(WorkerType::Regular)
             .expect("a whole-request engine");
-        let error = whole.check_declared_role(Some("prefill")).unwrap_err();
+        let error = whole.check_declared_role(WorkerType::Prefill).unwrap_err();
         assert!(error.contains("none (whole requests)"), "{error}");
+
+        // A role this lane does not know matches no registration and is
+        // named as the engine sent it.
+        let unknown =
+            tokenspeed_ranks(&dir.path().join("k"), vec![declaring(Some("verifier"))]).await;
+        let error = unknown
+            .check_declared_role(WorkerType::Regular)
+            .unwrap_err();
+        assert!(
+            error.contains("declared disaggregation role verifier")
+                && error.contains("as a regular worker"),
+            "{error}"
+        );
+        assert!(unknown.check_declared_role(WorkerType::Prefill).is_err());
 
         // A prefill worker's requests name the engine's rendezvous: an engine
         // that declares the role without a bootstrap address, or declares
@@ -2517,16 +2596,18 @@ mod tests {
         // needs none, so an engine that declares nothing serves it.
         let unplaced =
             tokenspeed_ranks(&dir.path().join("u"), vec![declaring(Some("prefill"))]).await;
-        let error = unplaced.check_declared_role(Some("prefill")).unwrap_err();
+        let error = unplaced
+            .check_declared_role(WorkerType::Prefill)
+            .unwrap_err();
         assert!(
             error.contains("declares no bootstrap address") && error.contains("as prefill"),
             "{error}"
         );
         let silent = tokenspeed_ranks(&dir.path().join("s"), vec![default_ready_response()]).await;
-        let error = silent.check_declared_role(Some("prefill")).unwrap_err();
+        let error = silent.check_declared_role(WorkerType::Prefill).unwrap_err();
         assert!(error.contains("declares no bootstrap address"), "{error}");
         silent
-            .check_declared_role(Some("decode"))
+            .check_declared_role(WorkerType::Decode)
             .expect("an engine that declares nothing serves a decode worker");
 
         // An encode worker needs the wire's encode request: an engine that
@@ -2534,14 +2615,16 @@ mod tests {
         // before the request) or a scheduler's request types, as the servicer
         // refuses the same engine at its link; one that lists it connects
         // when it also declares its bootstrap address.
-        let error = silent.check_declared_role(Some("encode")).unwrap_err();
+        let error = silent.check_declared_role(WorkerType::Encode).unwrap_err();
         assert!(
             error.contains("lists no encode request") && error.contains("--servicer-impl python"),
             "{error}"
         );
         let scheduler =
             tokenspeed_ranks(&dir.path().join("e"), vec![declaring(Some("encode"))]).await;
-        let error = scheduler.check_declared_role(Some("encode")).unwrap_err();
+        let error = scheduler
+            .check_declared_role(WorkerType::Encode)
+            .unwrap_err();
         assert!(error.contains("lists no encode request"), "{error}");
         let encoder = |bootstrap_host: Option<&str>| EngineCoreReadyResponse {
             request_types: vec!["encode".into()],
@@ -2552,7 +2635,7 @@ mod tests {
         };
         let unplaced_encoder = tokenspeed_ranks(&dir.path().join("g"), vec![encoder(None)]).await;
         let error = unplaced_encoder
-            .check_declared_role(Some("encode"))
+            .check_declared_role(WorkerType::Encode)
             .unwrap_err();
         assert!(
             error.contains("declares no bootstrap address") && error.contains("as encode"),
@@ -2561,7 +2644,7 @@ mod tests {
         let placed_encoder =
             tokenspeed_ranks(&dir.path().join("f"), vec![encoder(Some("10.0.0.9"))]).await;
         placed_encoder
-            .check_declared_role(Some("encode"))
+            .check_declared_role(WorkerType::Encode)
             .expect("an encode worker that lists the encode request and declares its address");
     }
 

@@ -22,11 +22,13 @@ use engine_zmq_client::{
     ConnectedEngine,
 };
 use futures::Stream;
+use openai_protocol::worker::WorkerType;
 use smg_grpc_client::{common_proto as common, tokenspeed_proto, vllm_proto as vllm};
 use tracing::warn;
 
 use crate::{
     abort_status::engine_abort_status,
+    client::declared_worker_type,
     context_window::admit_prompt,
     fanout::fan_out_n,
     stream::{map_slim_output, poll_mapped, MappedGenerateStream, StreamState},
@@ -632,9 +634,9 @@ impl RankIndices {
     /// The ranks behind `engines`, each read at its handshake.
     pub(crate) fn of(engines: &[ConnectedEngine]) -> Self {
         let decode = !engines.is_empty()
-            && engines
-                .iter()
-                .all(|engine| engine.ready_response.disaggregation_role() == Some("decode"));
+            && engines.iter().all(|engine| {
+                declared_worker_type(&engine.ready_response) == Some(WorkerType::Decode)
+            });
         let mut declared: Vec<(u32, u32)> = engines
             .iter()
             .filter_map(|engine| {

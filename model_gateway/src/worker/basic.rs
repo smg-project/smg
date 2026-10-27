@@ -68,12 +68,6 @@ async fn connect_zmq_backend(
     startup: Duration,
     request_timeout: Option<Duration>,
 ) -> WorkerResult<Arc<BackendClient>> {
-    let registered_role = match worker_type {
-        WorkerType::Regular => None,
-        WorkerType::Prefill => Some("prefill"),
-        WorkerType::Decode => Some("decode"),
-        WorkerType::Encode => Some("encode"),
-    };
     zmq_client::connect_for_worker(
         &base_url,
         model_id,
@@ -85,7 +79,7 @@ async fn connect_zmq_backend(
     )
     .await
     .and_then(|client| {
-        client.check_declared_role(registered_role)?;
+        client.check_declared_role(worker_type)?;
         Ok(Arc::new(BackendClient::Zmq(client)))
     })
     .map_err(|reason| WorkerError::ConnectionFailed {
