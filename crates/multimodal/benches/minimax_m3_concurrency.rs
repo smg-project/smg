@@ -1,8 +1,9 @@
 //! Closed-loop CPU request benchmark, emitting one JSON record per measured arm.
 //! Run with SMG_M3_CONCURRENCY_BENCH=1 SMG_MM_THREADS=4 cargo bench
 //! -p llm-multimodal --bench minimax_m3_concurrency.
-//! Admission latency includes blocking-pool queueing, but excludes waiting for
-//! a concurrency slot. This is not HTTP latency or an open-loop overload test.
+//! Admission latency includes blocking-pool queueing, but excludes waiting for a concurrency slot.
+//! Set SMG_M3_BENCH_CASE to run only 1080p, 4k, mixed or rgba1080p.
+//! This is not HTTP latency or an open-loop overload test.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -29,17 +30,28 @@ struct Fixture {
 }
 
 /// Encode deterministic fixtures outside all timed regions.
-fn fixture(w: u32, h: u32, cap: u32, grid: [i64; 3]) -> Fixture {
+fn fixture(w: u32, h: u32, cap: u32, grid: [i64; 3], alpha: bool) -> Fixture {
     let image = DynamicImage::ImageRgb8(RgbImage::from_fn(w, h, |x, y| {
         image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
     }));
+    let (image, format, mime) = if alpha {
+        let mut rgba = image.into_rgba8();
+        for (x, y, pixel) in rgba.enumerate_pixels_mut() {
+            pixel[3] = ((x + y) % 256) as u8;
+        }
+        (
+            DynamicImage::ImageRgba8(rgba),
+            image::ImageFormat::Png,
+            "png",
+        )
+    } else {
+        (image, image::ImageFormat::Jpeg, "jpeg")
+    };
     let mut encoded = std::io::Cursor::new(Vec::new());
-    image
-        .write_to(&mut encoded, image::ImageFormat::Jpeg)
-        .unwrap();
+    image.write_to(&mut encoded, format).unwrap();
     Fixture {
         url: format!(
-            "data:image/jpeg;base64,{}",
+            "data:image/{mime};base64,{}",
             STANDARD.encode(encoded.get_ref())
         ),
         cap,
@@ -149,17 +161,29 @@ fn main() {
         Arc::new(MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap())
     });
     let fixtures = [
-        fixture(224, 224, 2016, [1, 16, 16]),
-        fixture(1000, 500, 1008, [1, 36, 72]),
-        fixture(1920, 1080, 1008, [1, 40, 72]),
-        fixture(3840, 2160, 2016, [1, 80, 144]),
+        fixture(224, 224, 2016, [1, 16, 16], false),
+        fixture(1000, 500, 1008, [1, 36, 72], false),
+        fixture(1920, 1080, 1008, [1, 40, 72], false),
+        fixture(3840, 2160, 2016, [1, 80, 144], false),
     ];
+    let rgba = [fixture(1920, 1080, 1008, [1, 40, 72], true)];
+    let selected = std::env::var("SMG_M3_BENCH_CASE").ok();
+    if let Some(name) = &selected {
+        assert!(
+            ["1080p", "4k", "mixed", "rgba1080p"].contains(&name.as_str()),
+            "unknown fixture set"
+        );
+    }
     for round in 0..3 {
         for (name, inputs) in [
             ("1080p", &fixtures[2..3]),
             ("4k", &fixtures[3..4]),
             ("mixed", &fixtures[..]),
+            ("rgba1080p", &rgba[..]),
         ] {
+            if selected.as_ref().is_some_and(|selected| selected != name) {
+                continue;
+            }
             for concurrency in [1, 2, 4, 8, 16] {
                 for index in [round % 2, 1 - round % 2] {
                     let direct = index == 1;
