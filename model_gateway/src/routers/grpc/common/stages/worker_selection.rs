@@ -1897,12 +1897,14 @@ impl WorkerSelectionStage {
             ..
         } = inputs;
         // All three pools derive from ONE membership snapshot (see
-        // select_pd_pair). The encode pool is strictly gRPC — encode
-        // dispatch is a gRPC encoder RPC the direct-ZMQ worker has no path
-        // for — and the prefill/decode pools hold the workers whose wire
-        // carries the KV-transfer rendezvous (see `RoutingPool::GrpcPrefill`);
-        // the wildcard model maps to the global snapshot. Availability
-        // stays a live per-request check.
+        // select_pd_pair). Each holds the workers whose wire carries its
+        // role's dispatch: the encode pool the gRPC encoder RPC's workers and
+        // TokenSpeed's direct-ZMQ encode servers, which take the encode request
+        // on their own lane (see `RoutingPool::GrpcEncode`; registration
+        // refuses the role to every other ZMQ runtime), the prefill/decode
+        // pools the workers whose wire carries the KV-transfer rendezvous (see
+        // `RoutingPool::GrpcPrefill`); the wildcard model maps to the global
+        // snapshot. Availability stays a live per-request check.
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let needs_encode = !encode_item_hashes.is_empty();
         let all_encode = epd_role_candidates(&snapshot, WorkerType::Encode, needs_encode)?;
