@@ -125,11 +125,11 @@ def register() -> None:
     from smg_grpc_servicer.sglang import mm_broadcast
 
     if mm_broadcast.enabled():
-        HookRegistry.register(
-            f"{_RECEIVER}._broadcast_reqs_across_ranks",
-            mm_broadcast.broadcast_with_shm,
-            HookType.AROUND,
-        )
+        target = f"{_RECEIVER}._broadcast_reqs_across_ranks"
+        if _resolves(target):
+            HookRegistry.register(target, mm_broadcast.broadcast_with_shm, HookType.AROUND)
+        else:
+            logger.info("SMG plugin: %s is unavailable; using inline media broadcast", target)
 
     logger.info("SMG ZMQ plugin: scheduler will dial %s", handshake_address())
 

@@ -303,6 +303,8 @@ pub(super) struct State {
     pub(super) media: Option<Arc<dyn SglangMediaProcessor>>,
     pub(super) media_identity_enabled: bool,
     pub(super) media_identity_key: Option<String>,
+    /// Resolved once at startup; missing or malformed roles cannot enable reuse.
+    pub(super) media_disaggregation_mode: Option<String>,
     pub(super) mm_hasher: Option<engine_zmq_adapter::SglangCpuMmHasher>,
 }
 
@@ -388,8 +390,17 @@ impl SglangServicerServer {
             .as_ref()
             .and_then(|processor| processor.identity_key())
             .map(|key| format!("v1:{}:{key}", config.model.sglang_version));
+        let media_disaggregation_mode =
+            serde_json::from_str::<serde_json::Value>(&config.model.server_args_json)
+                .ok()
+                .and_then(|args| {
+                    args.get("disaggregation_mode")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                });
         let state = Arc::new(State {
             media_identity_key,
+            media_disaggregation_mode,
             model: config.model,
             shared: Shared::new(kv_relay, metrics, config.servicer.tokenizer_dir.clone()),
             encode: config.encode_dispatcher,

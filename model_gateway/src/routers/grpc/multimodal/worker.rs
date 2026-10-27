@@ -551,7 +551,12 @@ impl WorkerMediaPipeline {
                         hash.update(&(bytes.len() as u64).to_le_bytes());
                         hash.update(&bytes);
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        tracing::info!(
+                            file = name,
+                            %error,
+                            "Tokenizer fingerprint unavailable; P/D media identity reuse disabled"
+                        );
                         complete = false;
                     }
                 }

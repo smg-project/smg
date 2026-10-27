@@ -62,7 +62,8 @@ def test_worker_launch_derives_dtype_and_admission(monkeypatch):
         "SMG_MM_THREADS",
         "SMG_MM_IMAGE_CONCURRENCY",
     ]:
-        monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv(key, "")
+        monkeypatch.delenv(key)
     monkeypatch.setattr(rust, "_model_config", lambda _: SimpleNamespace(dtype="torch.bfloat16"))
     args = SimpleNamespace(model_path="model", limit_mm_data_per_request={})
     options = rust.SglangLauncher().server_extras(args, "tokenizer")

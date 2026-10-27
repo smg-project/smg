@@ -53,8 +53,10 @@ def _install_fake_servicer(monkeypatch, server, init_servicer_tracing=None):
 
 @pytest.fixture(autouse=True)
 def restore_native_thread_defaults(monkeypatch):
+    """Restore launch defaults even when configure_threads creates absent variables."""
     for name in ["SMG_SERVICER_WORKER_THREADS", "SMG_MM_THREADS", "SMG_MM_IMAGE_CONCURRENCY"]:
-        monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
 
 
 @pytest.fixture
@@ -1397,9 +1399,10 @@ def test_native_media_processor_launch_options(monkeypatch):
         )
     with pytest.raises(ValueError, match="tokenizer directory"):
         rust.SglangLauncher().server_extras(_server_args(), None)
-    monkeypatch.setenv("SMG_SGLANG_MM_MAX_INFLIGHT", "0")
-    with pytest.raises(ValueError, match="must be positive"):
-        rust.SglangLauncher().server_extras(_server_args(), "/tok")
+    for invalid in ("0", "-1", "sixty-four"):
+        monkeypatch.setenv("SMG_SGLANG_MM_MAX_INFLIGHT", invalid)
+        with pytest.raises(ValueError, match="SMG_SGLANG_MM_MAX_INFLIGHT must be positive"):
+            rust.SglangLauncher().server_extras(_server_args(), "/tok")
     monkeypatch.setenv("SMG_SGLANG_MM_PROCESSOR", "python")
     with pytest.raises(ValueError, match="empty or smg"):
         rust.SglangLauncher().server_extras(_server_args(), "/tok")

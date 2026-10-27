@@ -568,9 +568,12 @@ class SglangLauncher(RustLauncher):
                 )
             if not tokenizer_dir:
                 raise ValueError("native media processing requires a tokenizer directory")
-            concurrency = int(os.environ.get("SMG_SGLANG_MM_MAX_INFLIGHT", "64"))
+            try:
+                concurrency = int(os.environ.get("SMG_SGLANG_MM_MAX_INFLIGHT", "64"))
+            except ValueError as error:
+                raise ValueError("SMG_SGLANG_MM_MAX_INFLIGHT must be positive integer") from error
             if concurrency <= 0:
-                raise ValueError("SMG_SGLANG_MM_MAX_INFLIGHT must be positive")
+                raise ValueError("SMG_SGLANG_MM_MAX_INFLIGHT must be positive integer")
             from smg_grpc_servicer.sglang.mm_defaults import configure_threads, encoder_dtype
 
             dtype = encoder_dtype(

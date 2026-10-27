@@ -12,6 +12,9 @@ including retries and prefill/decode processing. Mixed image/video requests,
 audio and per-item processing hints that cannot be represented by this wire
 contract are rejected. SGLang drops image alpha; vLLM's white compositing policy
 is unchanged. Video sampling preserves temporal grids, timestamps and offsets.
+Video is admitted through the advertised native media-reference path only;
+ordinary SGLang workers and router-side SGLang video tensors retain the existing
+unsupported-modality refusal.
 
 ## Prefill/decode reuse
 
@@ -27,7 +30,11 @@ Decode validates the contract, binding and tensor/range structure before using
 this metadata. DeepSeek uses separate patch ranges and hashes for each image.
 The router retains original media references and token anchors: an unsupported
 worker, mismatched/invalid identity or five-second identity wait timeout uses
-normal worker preprocessing. Legacy workers do not advertise reuse and receive
+normal worker preprocessing. On timeout, Decode starts its own processing after
+that wait: an input taking `T` seconds to preprocess can therefore take roughly
+`5 seconds + T` before Decode is ready, instead of overlapping both processors.
+This tradeoff can affect slow fetches and long videos; disable reuse with
+`SMG_SGLANG_PD_MEDIA_REUSE=0` to retain parallel preprocessing. Legacy workers do not advertise reuse and receive
 ordinary requests. Cancellation remains registered during preprocessing; a
 cancelled blocking decoder retains its admission slot until it actually exits.
 

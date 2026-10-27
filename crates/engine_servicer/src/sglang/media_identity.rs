@@ -12,15 +12,7 @@ pub(super) fn key(state: &State) -> Option<&str> {
 
 /// Read the resolved engine role; missing or malformed configuration cannot enable reuse.
 pub(super) fn mode(state: &State, expected: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(&state.model.server_args_json)
-        .ok()
-        .and_then(|v| {
-            v.get("disaggregation_mode")
-                .and_then(|s| s.as_str())
-                .map(str::to_owned)
-        })
-        .as_deref()
-        == Some(expected)
+    state.media_disaggregation_mode.as_deref() == Some(expected)
 }
 
 /// Consume an optional identity only after validation, retaining original inputs on failure.

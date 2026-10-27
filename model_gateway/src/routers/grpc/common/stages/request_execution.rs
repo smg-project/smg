@@ -1002,6 +1002,9 @@ impl<'a> PdSides<'a> {
     }
 }
 
+/// Bound the optional media optimization before Decode processes its original references.
+const SGLANG_MEDIA_IDENTITY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Execute a parallel PD dispatch: both sides are sent together and rendezvous
 /// on the bootstrap info the request carries; the first failure answers, and
 /// the pair that answered is handed to the response with the decode's abort
@@ -1067,19 +1070,21 @@ async fn execute_parallel_pd(
             if await_identity {
                 // This is a preprocessing control item, not a token or proof
                 // that KV transfer completed. Consume it before tracking TTFT.
-                let identity =
-                    match tokio::time::timeout(Duration::from_secs(5), stream.first_item_ahead())
-                        .await
+                let identity = match tokio::time::timeout(
+                    SGLANG_MEDIA_IDENTITY_TIMEOUT,
+                    stream.first_item_ahead(),
+                )
+                .await
+                {
+                    Ok(Some(Ok(ProtoGenerateResponse::Sglang(response))))
+                        if response.response.is_none() && response.media_identity.is_some() =>
                     {
-                        Ok(Some(Ok(ProtoGenerateResponse::Sglang(response))))
-                            if response.response.is_none() && response.media_identity.is_some() =>
-                        {
-                            let identity = response.media_identity.clone();
-                            let _ = stream.next().await;
-                            identity
-                        }
-                        _ => None,
-                    };
+                        let identity = response.media_identity.clone();
+                        let _ = stream.next().await;
+                        identity
+                    }
+                    _ => None,
+                };
                 let _ = identity_tx.send(identity);
             }
             Ok(stream)
@@ -1095,7 +1100,7 @@ async fn execute_parallel_pd(
             // Bound the optimization, not just inference. Stale capability
             // metadata or a legacy worker must not deadlock the PD rendezvous.
             if let Ok(Ok(Some(identity))) =
-                tokio::time::timeout(Duration::from_secs(5), identity_rx).await
+                tokio::time::timeout(SGLANG_MEDIA_IDENTITY_TIMEOUT, identity_rx).await
             {
                 if let ProtoGenerateRequest::Sglang(req) = &mut decode_request {
                     if smg_grpc_client::sglang_media_identity::validate(&identity, req, &key) {
