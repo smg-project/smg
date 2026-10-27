@@ -87,8 +87,9 @@ workflow, dispatched by the release owner against the release tag (nothing publi
 2. Merge PR 1; the proto publishes with the next release tag's dispatch of `release-grpc.yml`
    (the workflow refuses a dispatch from a branch, `main` included)
 3. Open PR 2 with servicer changes, bump servicer version
-4. Merge PR 2; the servicer publishes with a later release's dispatch, once the new proto is on
-   PyPI for its pin to resolve
+4. Merge PR 2; the servicer publishes with a later release's dispatch, after the proto's has put
+   the new proto on PyPI for consumers that need its fields (the servicer's `>=` pin accepts the
+   previous proto too)
 
 ## Version Pinning
 
