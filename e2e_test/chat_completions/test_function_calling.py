@@ -108,7 +108,7 @@ PYTHONIC_MESSAGES = [
 
 @pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed", "mock")
 @pytest.mark.gpu(1)
-@pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct")
+@pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct", mock="RedHatAI/Llama-3.2-1B-Instruct-FP8")
 @pytest.mark.gateway(
     reuse=True, extra_args=["--tool-call-parser", "llama", "--history-backend", "memory"]
 )
