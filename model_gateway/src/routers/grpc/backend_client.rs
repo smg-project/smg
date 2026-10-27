@@ -85,6 +85,18 @@ impl BackendClient {
         matches!(self, Self::Zmq(_))
     }
 
+    /// The bootstrap rendezvous the engine behind a direct-ZMQ connection
+    /// declared at its handshake (`host`, `port`): where a prefill or encode
+    /// engine's bootstrap server listens. `None` on a gRPC backend, whose
+    /// worker's registration carries the rendezvous, and on an engine that
+    /// declared none.
+    pub fn declared_bootstrap(&self) -> Option<(&str, u16)> {
+        match self {
+            Self::Grpc(_) => None,
+            Self::Zmq(client) => client.ready_response()?.bootstrap_address(),
+        }
+    }
+
     /// Finalize a built generate request for this backend's wire: resolve
     /// string `stop`s the engine cannot match (token-only wires and SGLang's
     /// `skip_tokenizer_init` workers) into `stop_token_ids`, folding in EOS

@@ -315,11 +315,13 @@ fn build_plan(
         let bootstrap_room = rand::rng().random_range(0..i64::MAX);
 
         let worker = &assignment.worker;
-        let declared = worker.declared_bootstrap();
+        let backend = worker.backend_client_if_initialized();
         let (bootstrap_host, bootstrap_port) = bootstrap_rendezvous(
             worker.bootstrap_host(),
             worker.bootstrap_port(),
-            declared.as_ref(),
+            backend
+                .as_deref()
+                .and_then(BackendClient::declared_bootstrap),
         );
         bootstrap_info.push(EncodeItemBootstrapInfo {
             item_index: global_index as u32,

@@ -892,14 +892,6 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         self.metadata().bootstrap_port()
     }
 
-    /// The bootstrap rendezvous the worker's engine declared at its handshake
-    /// (`host`, `port`): a TokenSpeed engine on the direct ZMQ lane says where
-    /// its bootstrap server listens. `None` for a worker whose engine declared
-    /// none or has not connected.
-    fn declared_bootstrap(&self) -> Option<(String, u16)> {
-        None
-    }
-
     /// Get the base URL without any DP rank suffix.
     fn base_url(&self) -> &str {
         self.metadata().base_url()
@@ -1574,15 +1566,6 @@ impl BasicWorker {
 
 #[async_trait]
 impl Worker for BasicWorker {
-    fn declared_bootstrap(&self) -> Option<(String, u16)> {
-        let cell = self.backend_client.load_full();
-        let BackendClient::Zmq(client) = cell.get()?.as_ref() else {
-            return None;
-        };
-        let (host, port) = client.ready_response()?.bootstrap_address()?;
-        Some((host.to_string(), port))
-    }
-
     /// [`BasicWorker`] keeps the trait's default `prepare_request`, so the
     /// HTTP proxy path may apply the DP-rank edit on raw slices.
     fn uses_builtin_prepare_request(&self) -> bool {
@@ -3532,6 +3515,66 @@ mod tests {
             &retyped.backend_client.load_full(),
             &old.backend_client.load_full()
         ));
+    }
+
+    /// What the engine declared at its handshake is read through the backend
+    /// peek, never through a method of its own: a direct-ZMQ worker whose
+    /// engine declared a bootstrap address answers it once the connect landed,
+    /// and nothing before (the peek never drives the connect).
+    #[tokio::test]
+    async fn the_declared_bootstrap_is_read_through_the_backend_peek() {
+        use engine_zmq_client::{
+            mock_engine::{connect_to_frontend, default_ready_response},
+            protocol::handshake::EngineCoreReadyResponse,
+            EngineId,
+        };
+
+        use crate::routers::grpc::zmq_client::{EosTokenIds, ZmqEngineClient};
+
+        let base = tempfile::tempdir().unwrap();
+        let ep = |name: &str| format!("ipc://{}", base.path().join(name).display());
+        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+        let worker = BasicWorkerBuilder::new(ep("ts0.ipc"))
+            .connection_mode(ConnectionMode::Zmq)
+            .worker_type(WorkerType::Prefill)
+            .health_config(no_health_check())
+            .build();
+        assert!(worker.backend_client_if_initialized().is_none());
+
+        let (client, engine) = tokio::join!(
+            ZmqEngineClient::connect(
+                &handshake,
+                &input,
+                &output,
+                1,
+                "m".to_string(),
+                EosTokenIds::default(),
+                RuntimeType::TokenSpeed,
+                Duration::from_secs(10)
+            ),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                EngineCoreReadyResponse {
+                    bootstrap_host: Some("10.0.0.7".to_string()),
+                    bootstrap_port: Some(8998),
+                    ..default_ready_response()
+                }
+            ),
+        );
+        let client = client.expect("adapter connect");
+        let _engine = engine.expect("mock engine");
+        worker
+            .backend_client
+            .load_full()
+            .set(Arc::new(BackendClient::Zmq(client)))
+            .ok()
+            .expect("cell empty");
+
+        let backend = worker
+            .backend_client_if_initialized()
+            .expect("the connect landed");
+        assert_eq!(backend.declared_bootstrap(), Some(("10.0.0.7", 8998)));
     }
 
     /// A ZMQ client whose engine dies must be evicted by the health probe (the

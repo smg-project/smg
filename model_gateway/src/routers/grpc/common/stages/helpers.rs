@@ -1011,14 +1011,14 @@ pub(crate) fn finish_generate_request(
 pub(crate) fn bootstrap_rendezvous<'a>(
     registered_host: &'a str,
     registered_port: Option<u16>,
-    declared: Option<&'a (String, u16)>,
+    declared: Option<(&'a str, u16)>,
 ) -> (&'a str, u16) {
     let host = match registered_host {
-        "" => declared.map_or("", |(host, _)| host.as_str()),
+        "" => declared.map_or("", |(host, _)| host),
         host => host,
     };
     let port = registered_port
-        .or_else(|| declared.map(|&(_, port)| port))
+        .or_else(|| declared.map(|(_, port)| port))
         .unwrap_or(DEFAULT_BOOTSTRAP_PORT);
     (host, port)
 }
@@ -1031,11 +1031,13 @@ fn inject_kv_bootstrap_room(
     dp_placement: DpPlacement,
 ) {
     let metadata = prefill_worker.metadata();
-    let declared = prefill_worker.declared_bootstrap();
+    let backend = prefill_worker.backend_client_if_initialized();
     let (hostname, bootstrap_port) = bootstrap_rendezvous(
         metadata.bootstrap_host(),
         metadata.bootstrap_port(),
-        declared.as_ref(),
+        backend
+            .as_deref()
+            .and_then(BackendClient::declared_bootstrap),
     );
     // 63-bit room: no dedup, keep the space wide so the birthday collision
     // rate stays negligible. See the proto field doc.
@@ -1076,21 +1078,21 @@ mod bootstrap_rendezvous_tests {
     /// declared fills the rest; the default port is the last resort.
     #[test]
     fn the_operators_rendezvous_wins_and_the_engines_fills_the_rest() {
-        let declared = ("10.0.0.7".to_string(), 31755);
+        let declared = Some(("10.0.0.7", 31755));
         assert_eq!(
-            bootstrap_rendezvous("", None, Some(&declared)),
+            bootstrap_rendezvous("", None, declared),
             ("10.0.0.7", 31755)
         );
         assert_eq!(
-            bootstrap_rendezvous("prefill-0", Some(9000), Some(&declared)),
+            bootstrap_rendezvous("prefill-0", Some(9000), declared),
             ("prefill-0", 9000)
         );
         assert_eq!(
-            bootstrap_rendezvous("prefill-0", None, Some(&declared)),
+            bootstrap_rendezvous("prefill-0", None, declared),
             ("prefill-0", 31755)
         );
         assert_eq!(
-            bootstrap_rendezvous("", Some(9000), Some(&declared)),
+            bootstrap_rendezvous("", Some(9000), declared),
             ("10.0.0.7", 9000)
         );
         assert_eq!(
