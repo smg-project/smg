@@ -198,8 +198,6 @@ pub(crate) unsafe fn start_chat_stream(
     Ok(SglangStreamHandle {
         stream: Arc::new(tokio::sync::Mutex::new(stream)),
         converter: Arc::new(tokio::sync::Mutex::new(converter)),
-        client: Arc::clone(client),
-        prompt_tokens,
         load,
     })
 }

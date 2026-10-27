@@ -9,11 +9,9 @@ use std::{sync::Arc, time::Duration};
 use axum::http::HeaderMap;
 use openai_protocol::interactions::InteractionsRequest;
 use serde_json::Value;
-use smg_mcp::McpOrchestrator;
 
 use super::state::RequestState;
 use crate::{
-    openai_bridge::FormatRegistry,
     tenant::TenantRequestMeta,
     worker::{ExternalWorker, WorkerSource},
 };
@@ -34,13 +32,6 @@ pub(crate) struct SharedComponents {
 
     /// Worker registry for model → worker resolution.
     pub workers: Arc<dyn WorkerSource>,
-
-    /// MCP orchestrator for creating tool sessions (used in Phase 2).
-    #[expect(dead_code, reason = "MCP tool integration is Phase 2")]
-    pub mcp_orchestrator: Arc<McpOrchestrator>,
-
-    #[expect(dead_code, reason = "MCP tool integration is Phase 2")]
-    pub mcp_format_registry: FormatRegistry,
 
     /// Per-request timeout from router config.
     pub request_timeout: Duration,

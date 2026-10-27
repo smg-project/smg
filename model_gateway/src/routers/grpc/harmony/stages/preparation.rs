@@ -152,7 +152,6 @@ impl HarmonyPreparationStage {
             } else {
                 None
             },
-            harmony_messages: build_output.harmony_messages,
             harmony_stop_ids: build_output.stop_token_ids,
         });
 
@@ -227,7 +226,6 @@ impl HarmonyPreparationStage {
             selection_text: build_output.selection_text,
             tool_constraints: constraint,
             modified_request: None,
-            harmony_messages: build_output.harmony_messages,
             harmony_stop_ids: build_output.stop_token_ids,
         });
 

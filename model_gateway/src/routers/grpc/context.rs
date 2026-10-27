@@ -689,8 +689,6 @@ pub(crate) enum PreparationOutput {
         tool_constraints: Option<(String, String)>,
         /// Request with response_format cleared (when converted to structural tag)
         modified_request: Option<Box<ChatCompletionRequest>>,
-        #[expect(dead_code, reason = "stored for future Harmony history tracking")]
-        harmony_messages: Vec<super::harmony::HarmonyMessage>,
         harmony_stop_ids: Vec<u32>,
     },
 }

@@ -29,19 +29,17 @@ impl std::fmt::Debug for GeminiRouter {
 
 impl GeminiRouter {
     /// Create a new `GeminiRouter` from the application context.
-    pub fn new(ctx: &ExternalContext) -> Result<Self, String> {
+    pub fn new(ctx: &ExternalContext) -> Self {
         let shared_components = Arc::new(SharedComponents {
             client: ctx.client.clone(),
             workers: ctx.workers.clone(),
-            mcp_orchestrator: ctx.mcp_orchestrator("Gemini")?,
-            mcp_format_registry: ctx.mcp_formats.clone(),
             request_timeout: ctx.request_timeout,
         });
 
-        Ok(Self {
+        Self {
             shared_components,
             retry_config: ctx.retry.clone(),
-        })
+        }
     }
 }
 

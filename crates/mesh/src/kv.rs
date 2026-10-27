@@ -6,12 +6,11 @@
 //!
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashSet, VecDeque},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
-    time::Instant,
 };
 
 use bytes::Bytes;
@@ -44,36 +43,6 @@ pub struct StreamConfig {
     pub max_buffer_bytes: usize,
     /// Routing mode: broadcast to all peers or targeted to one peer.
     pub routing: StreamRouting,
-}
-
-/// Mode selection for a namespace prefix. Internal enum used during configuration.
-#[derive(Debug)]
-#[expect(dead_code)] // Fields read during later steps (gossip integration)
-enum StoreMode {
-    Crdt {
-        merge_strategy: MergeStrategy,
-    },
-    Stream {
-        max_buffer_bytes: usize,
-        routing: StreamRouting,
-    },
-}
-
-/// CRDT mode entry metadata.
-#[derive(Debug, Clone)]
-#[expect(dead_code)] // Constructed in later steps (CRDT merge integration)
-pub(crate) struct ValueEntry {
-    /// The actual data (opaque bytes — mesh doesn't interpret).
-    pub value: Vec<u8>,
-    /// Lamport timestamp (logical clock).
-    pub version: u64,
-    /// Deterministic hash of server_name, computed once at MeshKV startup.
-    pub replica_id: u64,
-    /// Soft-deleted? Tombstones propagate via gossip and win by higher version.
-    pub tombstone: bool,
-    /// Monotonic timestamp for tombstone GC. Tombstones younger than
-    /// `tombstone_grace` (default 5 min) are not garbage collected.
-    pub created_at: Instant,
 }
 
 // ============================================================================
@@ -161,18 +130,6 @@ impl SubscriberRegistry {
                 }
             }
         }
-    }
-
-    /// Remove closed senders individually. If all senders for a prefix are
-    /// gone, remove the prefix entry entirely.
-    #[expect(dead_code)] // Called by gossip GC cycle in later steps
-    fn gc_closed(&self) {
-        for mut entry in self.subscribers.iter_mut() {
-            entry.value_mut().retain(|tx| !tx.is_closed());
-        }
-        // Atomically remove only if still empty, avoiding a race where
-        // a concurrent register() adds a sender between iter_mut and remove.
-        self.subscribers.retain(|_, senders| !senders.is_empty());
     }
 }
 
@@ -452,8 +409,8 @@ impl std::fmt::Debug for MeshKV {
 pub struct MeshKV {
     /// CRDT store shared across all CRDT namespaces.
     store: Arc<CrdtOrMap>,
-    /// Tracks configured prefixes to enforce fail-closed semantics.
-    configured_prefixes: RwLock<HashMap<String, StoreMode>>,
+    /// The configured prefixes, so a second configuration of one fails closed.
+    configured_prefixes: RwLock<HashSet<String>>,
     /// Stream namespaces, stored for round batch collection.
     stream_namespaces: RwLock<Vec<Arc<StreamNamespace>>>,
     /// Shared subscriber registry.
@@ -487,13 +444,7 @@ impl MeshKV {
         let store = Arc::new(CrdtOrMap::new());
         store.register_merge_strategy("config:".to_string(), MergeStrategy::LastWriterWins);
         let subscriber_registry = Arc::new(SubscriberRegistry::new());
-        let mut configured_prefixes = HashMap::new();
-        configured_prefixes.insert(
-            "config:".to_string(),
-            StoreMode::Crdt {
-                merge_strategy: MergeStrategy::LastWriterWins,
-            },
-        );
+        let configured_prefixes = HashSet::from(["config:".to_string()]);
         let configs = Arc::new(CrdtNamespace {
             prefix: "config:".to_string(),
             store: store.clone(),
@@ -572,10 +523,10 @@ impl MeshKV {
         {
             let mut prefixes = self.configured_prefixes.write();
             assert!(
-                !prefixes.contains_key(prefix),
+                !prefixes.contains(prefix),
                 "Prefix '{prefix}' is already configured. Each prefix must be configured exactly once."
             );
-            prefixes.insert(prefix.to_string(), StoreMode::Crdt { merge_strategy });
+            prefixes.insert(prefix.to_string());
         }
         self.store
             .register_merge_strategy(prefix.to_string(), merge_strategy);
@@ -601,16 +552,10 @@ impl MeshKV {
         {
             let mut prefixes = self.configured_prefixes.write();
             assert!(
-                !prefixes.contains_key(prefix),
+                !prefixes.contains(prefix),
                 "Prefix '{prefix}' is already configured. Each prefix must be configured exactly once."
             );
-            prefixes.insert(
-                prefix.to_string(),
-                StoreMode::Stream {
-                    max_buffer_bytes: config.max_buffer_bytes,
-                    routing: config.routing,
-                },
-            );
+            prefixes.insert(prefix.to_string());
         }
 
         let ns = Arc::new(StreamNamespace {
@@ -682,7 +627,7 @@ impl MeshKV {
 
     /// Check if a prefix has been configured.
     pub fn is_prefix_configured(&self, prefix: &str) -> bool {
-        self.configured_prefixes.read().contains_key(prefix)
+        self.configured_prefixes.read().contains(prefix)
     }
 }
 
