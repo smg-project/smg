@@ -265,6 +265,9 @@ jobs:
       - name: Run CI tooling unit tests
         run: pytest -q scripts/tests/test_ci_node_health.py scripts/tests/test_ci_prepared_backend_env.py scripts/tests/test_ci_e2e_dependencies.py scripts/tests/test_ci_tokenspeed_scheduler_pin.py scripts/tests/test_ci_tokenspeed_image_tag.py scripts/tests/test_ci_gpu_runner_image.py scripts/tests/test_bench_gate.py scripts/tests/test_ci_reap_job_processes.py scripts/tests/test_check_release_versions.py scripts/tests/test_ci_rust_tests.py scripts/tests/test_ci_apt_update.py
 
+      - name: Run GPU workflow argument tests
+        run: pytest -q scripts/tests/test_ci_gpu_pytest_argv.py
+
       # CPU-only unit tests for the e2e harness itself (connection-mode parsing,
       # ZMQ/EPD command builders, ZMQ-lane collection filter). --noconftest keeps
       # e2e_test/conftest.py — which needs the generated smg_client types and a
