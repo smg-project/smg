@@ -8,22 +8,21 @@ from infra.worker import Worker
 
 
 @pytest.mark.parametrize("mode", [ConnectionMode.HTTP, ConnectionMode.GRPC])
-@pytest.mark.parametrize("layout", ["hub_cache", "local_copy", "snapshot_symlink"])
+@pytest.mark.parametrize("layout", ["hf_id", "local_copy", "snapshot_symlink"])
 def test_vllm_advertises_the_resolved_request_model(monkeypatch, tmp_path, mode, layout):
     model_id = "org/model"
-    snapshot = tmp_path / "hub" / "models--org--model" / "snapshots" / "revision"
-    snapshot.mkdir(parents=True)
-    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
     local_root = tmp_path / "models"
     monkeypatch.setattr(model_specs, "ROUTER_LOCAL_MODEL_PATH", str(local_root))
     local_model = local_root / model_id
     if layout == "local_copy":
         local_model.mkdir(parents=True)
     elif layout == "snapshot_symlink":
+        snapshot = tmp_path / "hub" / "models--org--model" / "snapshots" / "revision"
+        snapshot.mkdir(parents=True)
         local_model.parent.mkdir(parents=True)
         local_model.symlink_to(snapshot, target_is_directory=True)
     resolved = model_specs._resolve_model_path(model_id)
-    assert resolved == (model_id if layout == "hub_cache" else str(local_model))
+    assert resolved == (model_id if layout == "hf_id" else str(local_model))
     monkeypatch.setitem(model_specs.MODEL_SPECS, model_id, {"model": resolved})
     # setup_backend uses this same resolved spec value in requests.
     request_model = model_specs.get_model_spec(model_id)["model"]
