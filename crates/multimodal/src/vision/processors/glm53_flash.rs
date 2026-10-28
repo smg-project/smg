@@ -606,7 +606,7 @@ impl VisionPreProcessor for Glm53FlashProcessor {
 
     fn preprocess(
         &self,
-        images: &[DynamicImage],
+        images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
@@ -619,7 +619,7 @@ impl VisionPreProcessor for Glm53FlashProcessor {
         let mut tokens = Vec::with_capacity(images.len());
         for image in images {
             let patches = encode(
-                std::slice::from_ref(image),
+                std::slice::from_ref(*image),
                 params.temporal,
                 params,
                 &self.pixels,
@@ -640,7 +640,11 @@ impl VisionPreProcessor for Glm53FlashProcessor {
         Ok(PreprocessedEncoderInputs::new(
             EncoderInput::bytes(tensor, norm),
             tokens,
-            images.iter().map(GenericImageView::dimensions).collect(),
+            images
+                .iter()
+                .copied()
+                .map(GenericImageView::dimensions)
+                .collect(),
         )
         .with_extra(
             "image_grid_thw",
@@ -810,7 +814,7 @@ mod tests {
         let output =
             Glm53FlashProcessor::from_config_for(&config(MAX_IMAGE_TOKENS), Modality::Image)
                 .unwrap()
-                .preprocess(&[image])
+                .preprocess(&[&image])
                 .unwrap();
         assert_eq!(grid(&output, "image_grid_thw"), vec![1, 16, 30]);
         let padding = (-PreProcessorConfig::CLIP_MEAN[0] / PreProcessorConfig::CLIP_STD[0]) as f32;
@@ -875,7 +879,7 @@ mod tests {
         let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(28, 28, Rgb([10, 20, 30])));
         let first = |config: &PreProcessorConfig| {
             Glm53FlashProcessor::from_config_for(config, Modality::Image)
-                .and_then(|processor| processor.preprocess(std::slice::from_ref(&image)))
+                .and_then(|processor| processor.preprocess(&[&image]))
                 .map(|output| output.encoder_input.as_f32()[[0, 0]])
         };
         let mut config = config(MAX_IMAGE_TOKENS);
@@ -907,7 +911,7 @@ mod tests {
         config.do_resize = Some(false);
         let processor = Glm53FlashProcessor::from_config_for(&config, Modality::Image).unwrap();
         assert!(processor.emits_pixel_bytes());
-        let output = processor.preprocess(std::slice::from_ref(&image)).unwrap();
+        let output = processor.preprocess(&[&image]).unwrap();
         let EncoderInput::U8 { patches, norm } = &output.encoder_input else {
             panic!("GLM patches should be pixel bytes");
         };
@@ -1029,7 +1033,7 @@ mod tests {
         let unaligned = DynamicImage::ImageRgb8(RgbImage::from_pixel(30, 30, Rgb([1, 2, 3])));
         let err = Glm53FlashProcessor::from_config_for(&no_resize, Modality::Image)
             .unwrap()
-            .preprocess(&[unaligned])
+            .preprocess(&[&unaligned])
             .unwrap_err();
         assert!(err.to_string().contains("not aligned"), "{err}");
     }
@@ -1043,7 +1047,7 @@ mod tests {
         let output =
             Glm53FlashProcessor::from_config_for(&config(MAX_IMAGE_TOKENS), Modality::Image)
                 .unwrap()
-                .preprocess(&images)
+                .preprocess(&images.iter().collect::<Vec<_>>())
                 .unwrap();
         let grids = grid(&output, "image_grid_thw");
         assert_eq!(grids.len(), 6, "one [t,h,w] row per image");

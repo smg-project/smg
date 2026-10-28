@@ -41,7 +41,7 @@ fn processor_does_not_repeat_resize_or_shrink_to_legacy_area_budget() {
     let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
     for (w, h) in [(1008, 56), (1008, 1008)] {
         let image = DynamicImage::new_rgb8(w, h);
-        let output = processor.preprocess(&[image]).unwrap();
+        let output = processor.preprocess(&[&image]).unwrap();
         assert_eq!(
             output.feature_token_counts,
             vec![(w as usize / 28) * (h as usize / 28)]
