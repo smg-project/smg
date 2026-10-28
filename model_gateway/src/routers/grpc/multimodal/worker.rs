@@ -449,6 +449,11 @@ impl WorkerMediaPipeline {
                 .video_preprocessor_config
                 .clone()
                 .unwrap_or_else(|| loaded.preprocessor_config.clone());
+            // MiniMaxVLProcessor defaults videos_kwargs.do_resize to false: the
+            // SGLang loader already aligned the float frames before this stage.
+            if !settings.processor_kwargs.contains_key("do_resize") {
+                video.do_resize = Some(false);
+            }
             video.extra.insert(
                 llm_multimodal::minimax_resize::SGLANG_HF_RESIZE_KEY.into(),
                 serde_json::json!(true),
@@ -1714,6 +1719,16 @@ mod tests {
             .await
             .unwrap();
         assert!(pipeline.sglang_identity_key().is_some());
+        let loaded = pipeline
+            .components
+            .config_registry
+            .get_or_load(CONFIG_KEY, dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded.video_preprocessor_config.as_ref().unwrap().do_resize,
+            Some(false)
+        );
         // Independent HF smart_resize results: 56², 504², 672², and 1008x56.
         for (width, height, tokens) in [
             (56, 56, 4),

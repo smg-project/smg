@@ -127,7 +127,10 @@ mod tests {
             "../../../tests/fixtures/golden/minimax_sglang_video.json"
         ))
         .unwrap();
-        let mut config = PreProcessorConfig::default();
+        let mut config = PreProcessorConfig {
+            do_resize: Some(false),
+            ..PreProcessorConfig::default()
+        };
         config.extra.insert(
             crate::minimax_resize::SGLANG_HF_RESIZE_KEY.into(),
             true.into(),
@@ -186,5 +189,26 @@ mod tests {
             .preprocess_video_rgb(&borrowed, &VideoClipOptions::sampled_at(1.0))
             .unwrap();
         assert_eq!(fast.encoder_input.flat_f32(), flat);
+    }
+    /// The combined HF processor disables a second resize after loader alignment.
+    #[test]
+    fn sglang_small_video_keeps_loader_grid() {
+        let mut config = PreProcessorConfig {
+            do_resize: Some(false),
+            ..PreProcessorConfig::default()
+        };
+        config.extra.insert(
+            crate::minimax_resize::SGLANG_HF_RESIZE_KEY.into(),
+            true.into(),
+        );
+        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
+        let output = processor
+            .preprocess_video(
+                &[image::DynamicImage::new_rgb8(14, 14)],
+                &VideoClipOptions::sampled_at(1.0),
+            )
+            .unwrap();
+        assert_eq!(output.encoder_input.shape(), [4, 1176]);
+        assert_eq!(output.feature_token_counts, [1]);
     }
 }
