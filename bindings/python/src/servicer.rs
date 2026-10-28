@@ -1795,12 +1795,12 @@ impl PySglangGrpcServer {
                         let tokenizer = llm_tokenizer::factory::create_tokenizer_async(dir).await?;
                         let mut settings = native.settings;
                         settings.tokenizer_dir = Some(dir.clone());
-                        WorkerMediaPipeline::new(settings, tokenizer).await
+                        WorkerMediaPipeline::new_sglang(settings, tokenizer).await
                     })
                     .map_err(|error| PyValueError::new_err(format!("{error:#}")))?;
-                if pipeline.spec_name() != "glm53_flash" {
+                if !matches!(pipeline.spec_name(), "glm53_flash" | "minimax_m3") {
                     return Err(PyValueError::new_err(format!(
-                        "SGLang smg media processing currently supports only GLM-5.3-Flash; got {}",
+                        "SGLang smg media processing currently supports GLM-5.3-Flash and MiniMax-M3; got {}",
                         pipeline.spec_name()
                     )));
                 }

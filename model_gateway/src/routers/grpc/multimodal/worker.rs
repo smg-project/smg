@@ -376,6 +376,23 @@ impl WorkerMediaPipeline {
         settings: WorkerMediaSettings,
         tokenizer: Arc<dyn TokenizerTrait>,
     ) -> anyhow::Result<Self> {
+        Self::new_for_runtime(settings, tokenizer, RuntimeType::Vllm).await
+    }
+
+    /// Load native SGLang media processing with its checkpoint-specific resize contract.
+    pub async fn new_sglang(
+        settings: WorkerMediaSettings,
+        tokenizer: Arc<dyn TokenizerTrait>,
+    ) -> anyhow::Result<Self> {
+        Self::new_for_runtime(settings, tokenizer, RuntimeType::Sglang).await
+    }
+
+    /// Resolve engine-specific preprocessing once, before any requests are admitted.
+    async fn new_for_runtime(
+        settings: WorkerMediaSettings,
+        tokenizer: Arc<dyn TokenizerTrait>,
+        runtime: RuntimeType,
+    ) -> anyhow::Result<Self> {
         // The servicer runs requests concurrently already, so each request's
         // preprocessing stays on its own thread unless an operator sized a pool.
         let parallelism = if std::env::var_os(POOL_THREADS_ENV).is_some() {
@@ -414,6 +431,38 @@ impl WorkerMediaPipeline {
             None => loaded,
         };
         let model_registry = Arc::new(ModelRegistry::default());
+        let native_minimax = runtime == RuntimeType::Sglang
+            && model_registry
+                .lookup(&ModelMetadata {
+                    model_id: &settings.model_id,
+                    tokenizer: &RegistryTokenizer(tokenizer.as_ref()),
+                    config: &loaded.config,
+                })
+                .is_some_and(|spec| spec.name() == "minimax_m3");
+        let loaded = if native_minimax {
+            let mut image = loaded.preprocessor_config.clone();
+            image.extra.insert(
+                llm_multimodal::minimax_resize::SGLANG_HF_RESIZE_KEY.into(),
+                serde_json::json!(true),
+            );
+            let mut video = loaded
+                .video_preprocessor_config
+                .clone()
+                .unwrap_or_else(|| loaded.preprocessor_config.clone());
+            video.extra.insert(
+                llm_multimodal::minimax_resize::SGLANG_HF_RESIZE_KEY.into(),
+                serde_json::json!(true),
+            );
+            let overridden = Arc::new(MultimodalModelConfig::new(
+                loaded.config.clone(),
+                image,
+                Some(video),
+            ));
+            config_registry.insert(CONFIG_KEY.to_string(), overridden.clone());
+            overridden
+        } else {
+            loaded
+        };
         let (spec_name, spec_limits, video_sampling, vision_processors) = {
             let adapter = RegistryTokenizer(tokenizer.as_ref());
             let metadata = ModelMetadata {
@@ -526,7 +575,9 @@ impl WorkerMediaPipeline {
             video_frame_budget: settings.video_frame_budget,
         };
         // Only processors with a pixel-less Decode metadata contract advertise reuse.
-        let sglang_identity_key = if spec_name == "glm53_flash" {
+        let sglang_identity_key = if spec_name == "glm53_flash"
+            || (spec_name == "minimax_m3" && runtime == RuntimeType::Sglang)
+        {
             let mut hash = blake3::Hasher::new();
             hash.update(b"sglang-media-identity-v1");
             let mut config = serde_json::json!({
@@ -1639,6 +1690,64 @@ mod tests {
                 if message.contains("192001 feature tokens (900 sampled frames)")
                     && message.contains("192000-token encoder budget")
         ));
+    }
+    /// SGLang follows the checkpoint's area limit and does not apply vLLM's source floor.
+    #[tokio::test]
+    async fn sglang_minimax_matches_hf_image_geometry_and_reuse_contract() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type":"minimax_m3_vl","image_token_index":32000}"#,
+        )
+        .unwrap();
+        for name in ["tokenizer.json", "tokenizer_config.json"] {
+            std::fs::write(dir.path().join(name), "{}").unwrap();
+        }
+        let tokenizer = Arc::new(MockTokenizer::new().with_tokens(&[
+            ("]<]image[>[", 32000),
+            ("]<]start of image[>[", 32001),
+            ("]<]end of image[>[", 32002),
+        ]));
+        let settings = pipeline_settings(dir.path().to_str().unwrap());
+        let pipeline = WorkerMediaPipeline::new_sglang(settings, tokenizer)
+            .await
+            .unwrap();
+        assert!(pipeline.sglang_identity_key().is_some());
+        // Independent HF smart_resize results: 56², 504², 672², and 1008x56.
+        for (width, height, tokens) in [
+            (56, 56, 4),
+            (512, 512, 324),
+            (1024, 1024, 576),
+            (1000, 50, 72),
+        ] {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(width, height)
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            let item = WorkerMediaItem {
+                modality: Modality::Image,
+                url: format!(
+                    "data:image/png;base64,{}",
+                    STANDARD.encode(bytes.into_inner())
+                ),
+            };
+            let (ids, mm) = pipeline
+                .process_sglang(vec![1, 32000, 2], &[item])
+                .await
+                .unwrap();
+            assert_eq!(ids.iter().filter(|&&id| id == 32000).count(), tokens);
+            assert_eq!(
+                mm.pixel_values.as_ref().unwrap().shape,
+                [(tokens * 4) as u32, 1176]
+            );
+            assert_eq!(mm.pixel_values.as_ref().unwrap().dtype, "bfloat16");
+            assert_eq!(mm.mm_placeholders.len(), 1);
+            assert_eq!(mm.mm_placeholders[0].offset, 2);
+            assert_eq!(mm.mm_placeholders[0].length, tokens as u32);
+            assert_eq!(ids[1], 32001);
+            assert_eq!(ids[ids.len() - 2], 32002);
+        }
     }
 }
 

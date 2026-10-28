@@ -86,7 +86,12 @@ impl VisionProcessors {
     fn build(spec: &dyn ModelProcessorSpec, model_config: &MultimodalModelConfig) -> Self {
         let build = |modality| {
             let mut config = preprocessor_config_for(model_config, modality).clone();
-            if spec.name() == "minimax_m3" && modality == Modality::Image {
+            if spec.name() == "minimax_m3"
+                && modality == Modality::Image
+                && !config
+                    .get_extra::<bool>(llm_multimodal::minimax_resize::SGLANG_HF_RESIZE_KEY)
+                    .unwrap_or(false)
+            {
                 if config.max_pixels.is_some_and(|pixels| {
                     pixels != llm_multimodal::minimax_resize::IMAGE_MAX_TOTAL_PIXELS as usize
                 }) || config.min_pixels.is_some_and(|pixels| pixels != 28 * 28)

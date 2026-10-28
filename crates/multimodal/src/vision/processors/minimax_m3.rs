@@ -13,7 +13,8 @@
 //! Router and Rust-servicer images use `minimax_resize` to choose aligned dimensions
 //! from the source header and resize directly at decode. Their processor carries
 //! `RESIZED_KEY`, skipping short-side staging and the legacy image pixel budget.
-//! Standalone processors and video retain the defaults below.
+//! SGLang native workers instead select the checkpoint HF area policy and preserve
+//! float video interpolation through patchification. Other processors retain the defaults below.
 //!
 //! # MiniMax-M3 parameters
 //!
@@ -38,6 +39,9 @@
 //! reuse the Qwen2-VL processor's defaults.
 
 use std::{borrow::Cow, ops::Deref};
+
+#[path = "minimax_sglang_video.rs"]
+mod sglang_video;
 
 use image::{imageops::FilterType, DynamicImage};
 
@@ -97,6 +101,8 @@ pub struct MiniMaxM3VisionProcessor {
     /// in place of a request's `max_long_side_pixel` tier.
     explicit_max_pixels: bool,
     source_resized: bool,
+    /// SGLang uses the checkpoint HF image processor without the legacy short-side stage.
+    hf_resize: bool,
 }
 
 impl Default for MiniMaxM3VisionProcessor {
@@ -164,6 +170,7 @@ impl MiniMaxM3VisionProcessor {
             .raise_rounded_sides_to_factor(),
             explicit_max_pixels: false,
             source_resized: false,
+            hf_resize: false,
         }
     }
 
@@ -278,6 +285,9 @@ impl MiniMaxM3VisionProcessor {
         );
         layered.inner = layered.inner.with_preprocessor_config(config);
         layered.source_resized = source_resized;
+        layered.hf_resize = config
+            .get_extra::<bool>(crate::minimax_resize::SGLANG_HF_RESIZE_KEY)
+            .unwrap_or(false);
         layered.explicit_max_pixels = self.explicit_max_pixels || config.max_pixels.is_some();
         Ok(layered)
     }
@@ -372,7 +382,11 @@ impl MiniMaxM3VisionProcessor {
     ) -> Result<Option<Vec<DynamicImage>>, TransformError> {
         let below_floor =
             |image: &DynamicImage| Self::raised_dimensions(image.width(), image.height()).is_some();
-        if self.source_resized || !self.inner.resizes() || !images.iter().any(below_floor) {
+        if self.source_resized
+            || self.hf_resize
+            || !self.inner.resizes()
+            || !images.iter().any(below_floor)
+        {
             return Ok(None);
         }
         // Vet every image first so an off-contract input is rejected before any pixel work.
@@ -448,6 +462,18 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
         frames: &[DynamicImage],
         clip: &VideoClipOptions,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        if self.hf_resize {
+            let owned: Vec<_> = frames.iter().map(DynamicImage::to_rgb8).collect();
+            let borrowed: Vec<_> = owned
+                .iter()
+                .map(|frame| RgbFrameRef {
+                    width: frame.width(),
+                    height: frame.height(),
+                    data: frame.as_raw(),
+                })
+                .collect();
+            return self.preprocess_sglang_video(&borrowed, clip);
+        }
         self.for_clip(clip).inner.preprocess_video(frames, clip)
     }
 
@@ -456,12 +482,15 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
         frames: &[RgbFrameRef<'_>],
         clip: &VideoClipOptions,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        if self.hf_resize {
+            return self.preprocess_sglang_video(frames, clip);
+        }
         self.for_clip(clip).inner.preprocess_video_rgb(frames, clip)
     }
 
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
         // Staged the way `preprocess` stages the image.
-        let staged = if self.inner.resizes() && !self.source_resized {
+        let staged = if self.inner.resizes() && !self.source_resized && !self.hf_resize {
             self.staging_dimensions(width, height)?
         } else {
             None

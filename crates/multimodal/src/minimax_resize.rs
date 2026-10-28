@@ -20,6 +20,8 @@ pub const IMAGE_MAX_TOTAL_PIXELS: u64 = 12_845_056;
 pub const IMAGE_DEFAULT_LONG_SIDE: u32 = 2016;
 /// Internal processor marker for images whose source geometry was already planned.
 pub const RESIZED_KEY: &str = "minimax_media_resized";
+/// Internal selector for SGLang checkpoint processors that use HF area-based resizing.
+pub const SGLANG_HF_RESIZE_KEY: &str = "minimax_sglang_hf_resize";
 
 #[cfg(test)]
 #[path = "minimax_resize_tests.rs"]

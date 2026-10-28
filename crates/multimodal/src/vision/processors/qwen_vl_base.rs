@@ -414,6 +414,11 @@ impl QwenVLProcessorBase {
         self.transforms.filter
     }
 
+    /// The resolved float normalization, also used after float video resizing.
+    pub(super) fn normalization(&self) -> PixelNorm {
+        self.transforms.norm
+    }
+
     /// Allow non-zero video dimensions below the patch-alignment factor.
     ///
     /// Some model families upscale these inputs to the minimum aligned size,

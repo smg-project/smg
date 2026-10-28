@@ -16,12 +16,17 @@ Video is admitted through the advertised native media-reference path only;
 ordinary SGLang workers and router-side SGLang video tensors retain the existing
 unsupported-modality refusal.
 
-The native SGLang `smg` media processor currently supports GLM-5.3-Flash only;
+The native SGLang `smg` media processor supports GLM-5.3-Flash and MiniMax-M3 (including M3.1);
 other model processors are rejected at startup.
+
+MiniMax uses the SGLang checkpoint HF image area limits and float video resizing,
+including upward frame-grid alignment before normalization. This differs from the
+vLLM source-size policy, which remains unchanged. Engine support for the checkpoint's
+quantization and Python processor API is required independently of SMG.
 
 ## Prefill/decode reuse
 
-GLM-5.3-Flash is the first supported processor and can advertise a versioned capability
+Both supported processors can advertise a versioned capability
 fingerprint covering model, tokenizer, processor, dtype and effective media
 limits. Both workers must advertise the same fingerprint. After preprocessing,
 Prefill returns a control response containing expanded tokens, feature hashes,
