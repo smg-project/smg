@@ -41,9 +41,11 @@ Every commit, pick and tag carries the caller's git identity and sign-off.
   under this process, and the checker diffs `tag..HEAD`, so none has to be), else the newest
   tag reachable from the branch (a release made before this process). Two live release lines
   share the crate versions, so the checker reads every release tag, not the comparison tag
-  alone: a changed crate whose version any release tag carries (the comparison tag's, or one
-  another line published, above or below it) is unbumped, and a proposed version a release tag
-  carries steps to the next free patch (crates.io and PyPI take a version once). A version
+  alone: a crate whose version a release tag carries with other code is unbumped (the
+  comparison tag's version with changes since it; a version another line published, above or
+  below it, that `release-bump-main` moved to `main` or that a cut found there), and a
+  proposed version a release tag carries steps to the next free patch (crates.io and PyPI take
+  a version once). A version a tag carries with this very code needs nothing. A version
   published without a release tag is not seen: the publish workflows skip a version the
   registry holds, and the release owner reads their output while two lines are live.
 - `main` keeps the last final release's versions. After a final, `make release-bump-main` opens

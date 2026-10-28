@@ -2,13 +2,13 @@
 """Pre-release version check for the workspace crates and the Python packages.
 
 For every component (a workspace crate or a Python package), since the given tag:
-whether its files changed, whether its version was bumped (a version that any release
-tag ``v<x.y.z>`` carries, the given tag's or another release line's, is not a bump: the
-registries hold it already), and, for a crate, whether the workspace root's dependency
-entry agrees. Then the files that must mirror the gateway's version. Issues are listed
-with the bump conventional commits ask for (``feat!:`` or ``BREAKING CHANGE``: major;
-``feat:``: minor; otherwise patch), stepped past the versions release tags carry, and,
-on request, applied.
+whether its files changed, whether its version was bumped, and, for a crate, whether
+the workspace root's dependency entry agrees. A version is bumped when no release tag
+``v<x.y.z>`` (the given tag, or one another release line made) carries it with other
+code: the registries take a version once. Then the files that must mirror the gateway's
+version. Issues are listed with the bump conventional commits ask for (``feat!:`` or
+``BREAKING CHANGE``: major; ``feat:``: minor; otherwise patch), stepped past the
+versions release tags carry, and, on request, applied.
 
 Usage:
     check_release_versions.py [tag] [--check | --fix]
@@ -348,18 +348,14 @@ class Repo:
 @dataclass
 class Verdict:
     component: Component
-    files_changed: int  # 0 = nothing to check
+    files_changed: int  # against the tag the verdict is judged by; 0 = nothing to check
     version: str = ""
     tag_version: str | None = None  # None = not at the tag: a new component
     tagged: dict[str, str] = field(default_factory=dict)  # version -> the release tag carrying it
-    carried_by: str | None = None  # a release tag other than the given one that carries the version
+    carried_by: str | None = None  # the release tag, not the given one, that carries the version
+    unbumped: bool = False  # the version is a release tag's, carried there with other code
     level: str | None = None  # the bump asked for when the version was not bumped
     workspace_version: str | None = None  # the root's entry when it disagrees
-
-    @property
-    def unbumped(self) -> bool:
-        """At the tag's version, or at one another release tag carries: published already."""
-        return self.version == self.tag_version or self.carried_by is not None
 
 
 def version_file_has_other_changes(repo: Repo, tag: str, file: str) -> bool:
@@ -424,9 +420,9 @@ def tagged_versions(repo: Repo, components: Sequence[Component]) -> dict[str, di
 def check(
     repo: Repo, tag: str, component: Component, root_toml: str, tagged: dict[str, str]
 ) -> Verdict:
-    verdict = Verdict(component, files_changed(repo, tag, component))
-    if verdict.files_changed == 0:
-        return verdict
+    verdict = Verdict(component, files_changed(repo, tag, component), tagged=tagged)
+    if not (repo.root / component.version_file).is_file():
+        return verdict  # not in this tree (removed, or a table entry a smaller tree lacks)
     kind = manifest_kind(component)
     verdict.version = read_version(kind, repo.read(component.version_file), component.version_file)
     for path in with_legacy(component.version_file):
@@ -434,9 +430,16 @@ def check(
         if text is not None:
             verdict.tag_version = read_version(kind, text, f"{path} at {tag}")
             break
-    verdict.tagged = tagged
-    if verdict.version != verdict.tag_version:
-        verdict.carried_by = verdict.tagged.get(verdict.version)
+    # The release tag whose copy of the component carries HEAD's version: the given tag, or one
+    # another line made (a patch of an older line synced to main, a cut before that patch). The
+    # version is bumped only when no tag carries it, or the carrier's code is this code already.
+    carrier = tag if verdict.version == verdict.tag_version else tagged.get(verdict.version)
+    if carrier is not None and carrier != tag:
+        verdict.carried_by = carrier
+        verdict.files_changed = files_changed(repo, carrier, component)
+    if verdict.files_changed == 0:
+        return verdict
+    verdict.unbumped = carrier is not None
     if verdict.unbumped:
         verdict.level = bump_level(
             repo.commits_since(tag, [f"{p}/" for p in with_legacy(component.path)])

@@ -403,11 +403,13 @@ def test_texts_at_reads_every_ref_and_path_in_one_call(mod, repo):
 
 def side_line(repo):
     """Another release line's tag, off v1.0.0: beta patched to 1.0.1 there, alpha at the 1.1.0
-    main gave it; v1.0.9 so that it is not the newest tag by date in every reading."""
+    main gave it (with v1.0.0's code), gamma at the 1.0.1 main gave it (the same code: main
+    moved gamma's version line alone)."""
     git(repo, "switch", "-q", "-c", "release/1.0", "v1.0.0")
     put(repo, "crates/beta/src/lib.rs", "// beta patched on the line\n")
     put(repo, "crates/beta/Cargo.toml", manifest("beta", "1.0.1"))
     put(repo, "crates/alpha/Cargo.toml", manifest("alpha", "1.1.0"))
+    put(repo, "crates/gamma/Cargo.toml", manifest("gamma", "1.0.1"))
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "chore(release): bump versions for v1.0.9")
     git(repo, "tag", "v1.0.9")
@@ -417,8 +419,9 @@ def side_line(repo):
 def test_a_version_any_release_tag_carries_is_not_a_bump(mod, repo):
     """Two release lines share the crate versions and a registry takes a version once. Against
     v1.0.0: beta, unbumped there, is proposed 1.0.2, past the 1.0.1 the other line's tag carries;
-    alpha, raised to 1.1.0 since v1.0.0 but at the version that tag carries, reads unbumped too
-    and its minor bump lands on 1.2.0. Against the other line's tag, beta's 1.0.0 sits below its
+    alpha, raised to 1.1.0 since v1.0.0 but at the version that tag carries with other code,
+    reads unbumped too and its minor bump lands on 1.2.0; gamma, at the version that tag carries
+    with this very code, needs nothing. Against the other line's tag, beta's 1.0.0 sits below its
     1.0.1, a difference the equality rule read as a bump: it is v1.0.0's version, so unbumped."""
     side_line(repo)
     code, out = run(mod, repo, tag="v1.0.0")
@@ -430,6 +433,7 @@ def test_a_version_any_release_tag_carries_is_not_a_bump(mod, repo):
         "  ! alpha (crates/alpha/) — 1 file(s) changed but version not bumped (v1.1.0, v1.0.9's) [minor]"
         in out
     )
+    assert "gamma" not in out, "the tag's copy of gamma is this code: nothing to publish"
     code, out = run(mod, repo, tag="v1.0.9")
     assert (
         "  ! beta (crates/beta/) — 1 file(s) changed but version not bumped (v1.0.0, v1.0.0's) [patch]"
