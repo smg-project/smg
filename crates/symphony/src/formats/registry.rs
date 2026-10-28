@@ -21,7 +21,11 @@
 //! renamed checkpoint (`Qwen3-8B-FP8`) is not matched and gives `None`, so the gateway keeps its
 //! older parsers for it until its group lists the name under `also`.
 
-use std::sync::{Arc, LazyLock, OnceLock};
+use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
+    sync::{Arc, LazyLock, OnceLock},
+};
 
 use super::{
     deepseek_v3, deepseek_v3_1, deepseek_v3_2, deepseek_v4, deepseek_v4_1, dots3, function_gemma,
@@ -290,15 +294,47 @@ const fn table_named(name: &str) -> Table {
 // writes it as this constant, so the compiled tables are the literals they were.
 include!(concat!(env!("OUT_DIR"), "/groups.rs"));
 
-/// Every group's checkpoints by repository name, each with its group's index, in the registry's
-/// order: worked out once, since a request looks its model up more than once.
-static REPOSITORIES: LazyLock<Vec<(&'static str, usize)>> = LazyLock::new(|| {
-    GROUPS
-        .iter()
-        .enumerate()
-        .flat_map(|(index, group)| group.repositories().map(move |own| (own, index)))
-        .collect()
+/// Every group's checkpoints by repository name, each with its group's index, keyed without
+/// regard to ASCII case ([`Caseless`]): worked out once, since a request looks its model up more
+/// than once, and read in constant time whatever the registry's size; a name two groups spell
+/// keeps the first in the registry's order, as the scan it replaces did.
+static REPOSITORIES: LazyLock<HashMap<Caseless<'static>, usize>> = LazyLock::new(|| {
+    let mut map = HashMap::new();
+    for (index, group) in GROUPS.iter().enumerate() {
+        for own in group.repositories() {
+            map.entry(Caseless(own)).or_insert(index);
+        }
+    }
+    map
 });
+
+/// A repository name as a map key, equal to another spelled in any ASCII case: hashed over its
+/// ASCII-lowercased bytes, compared with `eq_ignore_ascii_case`.
+#[derive(Clone, Copy, Debug)]
+struct Caseless<'a>(&'a str);
+
+impl PartialEq for Caseless<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq_ignore_ascii_case(other.0)
+    }
+}
+
+impl Eq for Caseless<'_> {}
+
+impl Hash for Caseless<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Folded into a stack buffer and written once per piece: a hasher's per-byte writes
+        // cost more than the fold; the terminator is `str`'s own.
+        let mut buffer = [0u8; 64];
+        for chunk in self.0.as_bytes().chunks(buffer.len()) {
+            let folded = &mut buffer[..chunk.len()];
+            folded.copy_from_slice(chunk);
+            folded.make_ascii_lowercase();
+            state.write(folded);
+        }
+        state.write_u8(0xff);
+    }
+}
 
 /// Every group's table ([`Group::format`]), built once and shared, by the group's index.
 static GROUP_FORMATS: [OnceLock<Arc<Format>>; GROUPS.len()] =
@@ -311,10 +347,10 @@ fn group_for(model: &str) -> Option<(usize, &'static Group)> {
     if repository.is_empty() {
         return None;
     }
-    REPOSITORIES
-        .iter()
-        .find(|(own, _)| own.eq_ignore_ascii_case(repository))
-        .map(|&(_, index)| (index, &GROUPS[index]))
+    let repositories: &HashMap<Caseless<'_>, usize> = &REPOSITORIES;
+    repositories
+        .get(&Caseless(repository))
+        .map(|&index| (index, &GROUPS[index]))
 }
 
 /// The table that reads `model`'s output, with the model's own turn opener where its template has
@@ -515,6 +551,54 @@ mod tests {
             assert_eq!(table_for(model), None, "{model}");
             assert!(for_model(model).is_none(), "{model}");
         }
+    }
+
+    /// The index answers as the scan it replaced did: every checkpoint name of every group, as
+    /// the registry spells it and in upper and lower case, finds the first group in the
+    /// registry's order that spells it; a name no group spells finds nothing.
+    #[test]
+    fn every_checkpoint_name_is_found_by_the_index_as_the_scan_found_it_in_any_case() {
+        fn scanned(repository: &str) -> Option<usize> {
+            GROUPS.iter().position(|group| {
+                group
+                    .repositories()
+                    .any(|own| own.eq_ignore_ascii_case(repository))
+            })
+        }
+        for group in GROUPS {
+            for own in group.repositories() {
+                let spellings = [
+                    own.to_string(),
+                    own.to_ascii_uppercase(),
+                    own.to_ascii_lowercase(),
+                ];
+                for spelling in &spellings {
+                    let found = group_for(spelling).map(|(index, _)| index);
+                    assert_eq!(found, scanned(own), "{spelling}");
+                    assert!(found.is_some(), "{spelling}");
+                }
+            }
+        }
+        assert_eq!(
+            group_for("no-such-checkpoint").map(|(index, _)| index),
+            None
+        );
+        assert_eq!(
+            group_for("NO-SUCH-CHECKPOINT").map(|(index, _)| index),
+            None
+        );
+    }
+
+    /// Two spellings of one name are one key: equal, and hashed the same.
+    #[test]
+    fn a_caseless_key_is_equal_and_hashes_equal_across_ascii_case() {
+        use std::hash::{BuildHasher, RandomState};
+
+        let state = RandomState::new();
+        let (upper, lower) = (Caseless("Qwen/QWEN3-8B"), Caseless("qwen/qwen3-8b"));
+        assert_eq!(upper, lower);
+        assert_eq!(state.hash_one(upper), state.hash_one(lower));
+        assert_ne!(Caseless("qwen3-8b"), Caseless("qwen3-8"));
     }
 
     #[test]
