@@ -632,7 +632,8 @@ class Worker:
         if not any(
             arg.split("=", 1)[0].replace("_", "-") == "--served-model-name" for arg in all_args
         ):
-            cmd.extend(["--served-model-name", model_path])
+            # Cached weights must still advertise the model ID used by requests.
+            cmd.extend(["--served-model-name", self.model_id])
         if extra:
             cmd.extend(extra)
         return cmd

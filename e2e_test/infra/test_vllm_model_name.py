@@ -10,10 +10,10 @@ from infra.worker import Worker
 @pytest.mark.parametrize("model", ["org/model", "/models/local/snapshot"])
 def test_vllm_advertises_the_requested_model(monkeypatch, mode, model):
     monkeypatch.setattr(worker_module, "get_model_spec", lambda _: {"model": model})
-    worker = Worker(model_id="unit-model", engine="vllm", port=50111, gpu_ids=[0], mode=mode)
+    worker = Worker(model_id="org/model", engine="vllm", port=50111, gpu_ids=[0], mode=mode)
     cmd = worker._build_cmd()
     assert cmd[cmd.index("--model") + 1] == model
-    assert cmd[cmd.index("--served-model-name") + 1] == model
+    assert cmd[cmd.index("--served-model-name") + 1] == worker.model_id
     assert cmd.count("--served-model-name") == 1
 
 
