@@ -127,22 +127,41 @@ pub(super) fn bandlimited_resample(
         TransformError::ShapeError(format!("failed to allocate resampled audio: {error}"))
     })?;
 
-    for block in 0..samples.len().div_ceil(orig_freq) {
+    // The convolution reads `width` samples before the signal and up to a
+    // kernel beyond its end, where it previously contributed nothing: a tap
+    // whose index fell outside the input was skipped. Materialising those
+    // zeros once turns the inner loop into a flat dot product over two slices,
+    // with no bounds test per tap. The result is unchanged bit for bit --
+    // `0.0f32.mul_add(coefficient, acc)` is `acc` exactly for the finite
+    // coefficients this kernel holds, and the accumulator starts at `+0.0`, so
+    // no signed-zero difference arises either.
+    let blocks = samples.len().div_ceil(orig_freq);
+    let padded_len = width
+        .checked_add(samples.len())
+        .and_then(|value| value.checked_add(kernel_len))
+        .and_then(|value| value.checked_add(blocks.checked_mul(orig_freq)?))
+        .ok_or_else(|| {
+            TransformError::ShapeError("padded resample input size overflow".to_string())
+        })?;
+    let mut padded: Vec<f32> = Vec::new();
+    padded.try_reserve_exact(padded_len).map_err(|error| {
+        TransformError::ShapeError(format!("failed to allocate padded resample input: {error}"))
+    })?;
+    padded.resize(width, 0.0);
+    padded.extend_from_slice(samples);
+    padded.resize(padded_len, 0.0);
+
+    'blocks: for block in 0..blocks {
         let input_start = block * orig_freq;
+        let window = &padded[input_start..input_start + kernel_len];
         for phase in 0..new_freq {
             if output.len() == target_len {
-                return Ok(output);
+                break 'blocks;
             }
             let kernel = &kernels[phase * kernel_len..(phase + 1) * kernel_len];
             let mut value = 0.0_f32;
-            for (kernel_index, &coefficient) in kernel.iter().enumerate() {
-                let padded_index = input_start + kernel_index;
-                if padded_index >= width {
-                    let sample_index = padded_index - width;
-                    if let Some(&sample) = samples.get(sample_index) {
-                        value = sample.mul_add(coefficient, value);
-                    }
-                }
+            for (&coefficient, &sample) in kernel.iter().zip(window) {
+                value = sample.mul_add(coefficient, value);
             }
             output.push(value);
         }
