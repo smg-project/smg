@@ -101,7 +101,7 @@ discovery on) watches the gateway Pods matching the selector and writes
 them into the membership table; a Pod's mesh port is read from its
 `sglang.ai/mesh-port` annotation (`router_mesh_port_annotation` in the
 configuration file) and falls back to this gateway's own `--mesh-port` when
-the annotation is missing or invalid (`model_gateway/src/mesh_discovery`).
+the annotation is missing or invalid (`model_gateway/src/mesh/discovery`).
 The Helm chart's `deploy/helm/smg/examples/with-mesh-ha.yaml` is a two-replica
 example.
 
@@ -157,10 +157,6 @@ their descriptions):
 | `router_mesh_peer_ack_total` | counter, `peer`, `status` (`success`, `failure`) | The accepting end, per ACK frame from `peer`. |
 | `router_mesh_peer_nack_total` | counter, `peer` | The accepting end, per NACK frame from `peer`. |
 | `router_mesh_sync_round_duration_seconds` | histogram, `peer` | The dialing end, the time of each sender round towards `peer`. |
-
-`router_mesh_store_cardinality`, `router_mesh_store_hash`,
-`router_rl_drift_ratio` and `router_lb_drift_ratio` are described in
-`metrics.rs` but nothing records them, so they do not appear in a scrape.
 
 ## Example: two gateways on one host
 

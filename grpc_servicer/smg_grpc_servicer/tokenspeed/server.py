@@ -106,7 +106,12 @@ def _grpc_server_options(max_message_bytes: int) -> list[tuple[str, int]]:
 
 
 class TokenSpeedEncodeDiscoveryServicer(TokenSpeedSchedulerServicer):
-    """Scheduler discovery surface for encode-only workers."""
+    """Scheduler discovery surface for encode-only workers.
+
+    Discovery (health, model and server info) answers as on the full
+    servicer; ``Generate`` and the scheduler's control RPCs are refused by
+    name, since the encode loop takes neither.
+    """
 
     async def Generate(self, request, context):
         await context.abort(
@@ -114,6 +119,27 @@ class TokenSpeedEncodeDiscoveryServicer(TokenSpeedSchedulerServicer):
             "Generate is unavailable on TokenSpeed encode workers",
         )
         yield tokenspeed_scheduler_pb2.GenerateResponse()
+
+    # The encode loop has no control-message dispatch (see GetLoads in the
+    # base servicer): a flush or profile call forwarded to the worker would be
+    # taken as an encode request. Answer by name before anything reaches it.
+    async def FlushCache(self, request, context):
+        await context.abort(
+            grpc.StatusCode.UNIMPLEMENTED,
+            "FlushCache is unavailable on TokenSpeed encode workers",
+        )
+
+    async def StartProfile(self, request, context):
+        await context.abort(
+            grpc.StatusCode.UNIMPLEMENTED,
+            "StartProfile is unavailable on TokenSpeed encode workers",
+        )
+
+    async def StopProfile(self, request, context):
+        await context.abort(
+            grpc.StatusCode.UNIMPLEMENTED,
+            "StopProfile is unavailable on TokenSpeed encode workers",
+        )
 
 
 async def serve_grpc(server_args: ServerArgs) -> None:

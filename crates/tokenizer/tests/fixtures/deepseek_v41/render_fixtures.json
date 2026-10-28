@@ -685,7 +685,7 @@
    "reasoning_effort": null,
    "drop_thinking": true,
    "continue_final_message": false,
-   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>Question?<｜Assistant｜><think>"
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\nFollow the policy.<｜User｜>Question?<｜Assistant｜><think>"
   },
   {
    "name": "two_user_turns",
@@ -1053,7 +1053,7 @@
   },
   {
    "name": "developer_then_user_chat",
-   "oracle": "vllm_python",
+   "oracle": "hf",
    "messages": [
     {
      "role": "developer",
@@ -1069,11 +1069,11 @@
    "reasoning_effort": null,
    "drop_thinking": true,
    "continue_final_message": false,
-   "text": "<｜begin▁of▁sentence｜><｜User｜>Follow the policy.<｜User｜>Question?<｜Assistant｜></think>"
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Follow the policy.<｜User｜>Question?<｜Assistant｜></think>"
   },
   {
    "name": "developer_with_tools",
-   "oracle": "vllm_python",
+   "oracle": "hf",
    "messages": [
     {
      "role": "developer",
@@ -1108,7 +1108,7 @@
    "reasoning_effort": null,
    "drop_thinking": true,
    "continue_final_message": false,
-   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"lookup\", \"description\": \"Look up\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>Follow the policy.<｜User｜>Question?<｜Assistant｜><think>"
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\nFollow the policy.\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"lookup\", \"description\": \"Look up\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>Question?<｜Assistant｜><think>"
   },
   {
    "name": "thinking_default_effort_current",

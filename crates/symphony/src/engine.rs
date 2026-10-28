@@ -81,6 +81,10 @@ pub struct Engine {
     /// The bytes of the call being assembled, and the ignored terminals that arrived among them
     /// while the assembler held bytes.
     region: Region,
+    /// The buffer a call's assembler fills for one piece before its events are counted and
+    /// placed ([`Self::push_call_events`]): kept between pieces with its room, as a stream's
+    /// caller keeps its event buffer, so a piece inside a call costs no list of its own.
+    scratch: Events<'static>,
 }
 
 /// The bytes of the call region being assembled: how many the assembler took, how many its events
@@ -181,8 +185,10 @@ pub(crate) fn is_strip_space(c: char) -> bool {
 pub(crate) trait CallAssembler: std::fmt::Debug + Send + Sync {
     /// Takes the next bytes of the region and pushes the events they complete; the number of bytes
     /// taken. A JSON syntax stops at its object's end and leaves the rest to the engine, which
-    /// reports it as text after the object; every other syntax takes every byte.
-    fn feed(&mut self, text: &str, declared: &Declared, out: &mut Events) -> usize;
+    /// reports it as text after the object; every other syntax takes every byte. The events may
+    /// borrow `text` for the life of `out` (`'d`): a JSON syntax's argument fragment that lies
+    /// within the bytes is a slice of them, as a text event is a slice of its delta.
+    fn feed<'d>(&mut self, text: &'d str, declared: &Declared, out: &mut Events<'d>) -> usize;
 
     /// The table's ignored terminal arrived inside the call. Its bytes are the engine's to place
     /// ([`Region`]): dropped where it stands when the assembler holds nothing, else placed where
@@ -252,7 +258,7 @@ struct ShapedCall {
 }
 
 impl CallAssembler for ShapedCall {
-    fn feed(&mut self, text: &str, declared: &Declared, out: &mut Events) -> usize {
+    fn feed<'d>(&mut self, text: &'d str, declared: &Declared, out: &mut Events<'d>) -> usize {
         self.call.feed(text, declared, out);
         text.len()
     }
@@ -409,7 +415,7 @@ impl Engine {
         }
         let at_turn_start = format.start().is_some();
         let mut engine = Self {
-            scanner: Scanner::new(format.terminal_texts()),
+            scanner: format.scanner(),
             format,
             declared,
             names: None,
@@ -425,6 +431,7 @@ impl Engine {
             stay: Stay::default(),
             pending: None,
             region: Region::default(),
+            scratch: Events::new(),
         };
         // A table whose output starts inside a call (a bare list of calls, with no marker before
         // it) opens the call here, since no terminal will.
@@ -707,10 +714,30 @@ impl Engine {
                     out.push_content(self.tokens.text(text));
                     return;
                 };
-                let mut assembled = Events::new();
-                let taken = call.feed(&text, &self.declared, &mut assembled);
+                // The assembler's events of this piece fill the engine's own buffer, then go out
+                // counted and placed. A piece the delta carries whole is fed as the delta's bytes,
+                // so a fragment within it borrows them; one the engine held or merged is its own,
+                // and the events that borrow it are taken owned.
+                let taken = match &text {
+                    Cow::Borrowed(piece) => {
+                        let mut assembled: Events<'d> = std::mem::take(&mut self.scratch);
+                        let taken = call.feed(piece, &self.declared, &mut assembled);
+                        self.push_call_events(assembled.consume(), out);
+                        self.scratch = assembled.recycle();
+                        taken
+                    }
+                    Cow::Owned(piece) => {
+                        let mut assembled: Events<'_> = std::mem::take(&mut self.scratch);
+                        let taken = call.feed(piece, &self.declared, &mut assembled);
+                        let owned = assembled
+                            .consume()
+                            .map(|event| -> Event<'d> { event.into_owned() });
+                        self.push_call_events(owned, out);
+                        self.scratch = assembled.recycle();
+                        taken
+                    }
+                };
                 self.region.fed += taken;
-                self.push_call_events(assembled.drain(), out);
                 if taken < text.len() {
                     let rest = part(&text, taken..text.len());
                     self.wrapping(rest, MalformedReason::TextAfterTheArguments, out);
@@ -1135,7 +1162,11 @@ impl Engine {
     /// a request that declares no tools is not asked. An event's bytes are counted as carried out
     /// of the region, with the ignored terminals that arrived among them placed where they
     /// arrived.
-    fn push_call_events<'d>(&mut self, events: Vec<Event<'d>>, out: &mut Events<'d>) {
+    fn push_call_events<'d>(
+        &mut self,
+        events: impl IntoIterator<Item = Event<'d>>,
+        out: &mut Events<'d>,
+    ) {
         for event in events {
             if let Event::ToolCallStart { id, name, .. } = &event {
                 self.calls += 1;
@@ -1388,24 +1419,8 @@ mod tests {
         formats::{glm, inkling, llama4, mistral, qwen3, xlam},
         input::TokenSpan,
         tagged::{Placement, Spelling},
-        testing::{arguments_of, bytes},
+        testing::{arguments_of, bytes, malformed, weather_declared},
     };
-
-    fn declared() -> Declared {
-        Declared::of(&[Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "get_weather".to_string(),
-                description: None,
-                parameters: value!({"type": "object", "properties": {
-                    "city": {"type": "string"},
-                    "days": {"type": "integer"},
-                }}),
-                strict: None,
-                extra: Default::default(),
-            },
-        }])
-    }
 
     /// GLM's last call, its closing marker not written: the stop token that would end it is
     /// hidden by the stop decoder.
@@ -1419,7 +1434,7 @@ mod tests {
     }
 
     fn run(format: Format, output: &str, finish: EngineFinish) -> Vec<Event<'static>> {
-        let mut engine = Engine::with_call_ids(Arc::new(format), declared(), ids());
+        let mut engine = Engine::with_call_ids(Arc::new(format), weather_declared(), ids());
         let mut out = Events::new();
         for input in [
             Input::Delta {
@@ -1436,7 +1451,7 @@ mod tests {
 
     /// The events of `output` after `prompt`, ended by a stop.
     fn run_after(format: Format, prompt: &str, output: &str) -> Vec<Event<'static>> {
-        let mut engine = Engine::with_call_ids(Arc::new(format), declared(), ids());
+        let mut engine = Engine::with_call_ids(Arc::new(format), weather_declared(), ids());
         let mut out = Events::new();
         for input in [
             Input::Prompt {
@@ -1556,7 +1571,12 @@ mod tests {
         for (table, format, prompt, written) in cases {
             let format = Arc::new(format);
             let declared_arguments = {
-                let events = read_with(&format, declared(), prompt, &[&written("get_weather")]);
+                let events = read_with(
+                    &format,
+                    weather_declared(),
+                    prompt,
+                    &[&written("get_weather")],
+                );
                 assert!(
                     !events
                         .iter()
@@ -1578,7 +1598,7 @@ mod tests {
                         .map(|cut| vec![&output[..cut], &output[cut..]]),
                 );
                 for pieces in plans {
-                    let events = read_with(&format, declared(), prompt, &pieces);
+                    let events = read_with(&format, weather_declared(), prompt, &pieces);
                     let place = || format!("{table} {name} in {} pieces: {events:?}", pieces.len());
                     assert_eq!(bytes(&events), output, "{}", place());
                     let unknown = unknown_tool_at(&events);
@@ -1710,17 +1730,6 @@ mod tests {
             }
         }
         calls
-    }
-
-    /// The malformed events as (text, reason), in order.
-    fn malformed(events: &[Event]) -> Vec<(String, MalformedReason)> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
-                _ => None,
-            })
-            .collect()
     }
 
     #[test]
@@ -2435,7 +2444,7 @@ mod tests {
             (["<resp", "onse>\nHi"], ["Hi", ""]),
             (["<resp", "ite"], ["", "<respite"]),
         ] {
-            let mut engine = Engine::new(ernie(), declared());
+            let mut engine = Engine::new(ernie(), weather_declared());
             let mut out = Events::new();
             for piece in pieces {
                 engine
@@ -2491,7 +2500,7 @@ mod tests {
     /// output's bytes.
     fn same_at_every_cut(format: &Format, prompt: &str, output: &str) -> [String; 4] {
         let replay = |cuts: &[usize]| {
-            let mut engine = Engine::new(format.clone(), declared());
+            let mut engine = Engine::new(format.clone(), weather_declared());
             let mut out = Events::new();
             engine
                 .feed(
@@ -2726,7 +2735,7 @@ mod tests {
         // The content of each feed's events, the end's included, empty ones left out: the
         // content deltas a client of the stream receives.
         let deltas = |pieces: &[&str]| -> Vec<String> {
-            let mut engine = Engine::new(qwen3(CallSyntax::Json), declared());
+            let mut engine = Engine::new(qwen3(CallSyntax::Json), weather_declared());
             let mut out = Events::new();
             let mut deltas = Vec::new();
             for piece in pieces {
@@ -2854,7 +2863,7 @@ mod tests {
                 span
             })
             .collect();
-        let mut engine = Engine::new(format(), declared());
+        let mut engine = Engine::new(format(), weather_declared());
         let mut out = Events::new();
         engine
             .feed(
@@ -2928,7 +2937,7 @@ mod tests {
         );
         assert_eq!(malformed, "");
         for cut in (1..held.len()).filter(|&cut| held.is_char_boundary(cut)) {
-            let mut engine = Engine::new(inkling(), declared());
+            let mut engine = Engine::new(inkling(), weather_declared());
             let mut out = Events::new();
             for input in [
                 Input::Prompt {
@@ -3004,7 +3013,7 @@ mod tests {
         };
         let read = |pieces: &[&str]| -> Vec<Event<'static>> {
             let spans: Vec<Vec<TokenSpan>> = pieces.iter().map(|piece| char_spans(piece)).collect();
-            let mut engine = Engine::new(format(), declared());
+            let mut engine = Engine::new(format(), weather_declared());
             let mut out = Events::new();
             for (piece, spans) in pieces.iter().zip(&spans) {
                 engine
@@ -3143,7 +3152,7 @@ mod tests {
         // The gateway makes one engine per request, so a conversation's turns never share a
         // nonce: four calls over two turns are four ids, each of the shape the older parsers mint.
         let turn = || {
-            let mut engine = Engine::new(qwen3(CallSyntax::Json), declared());
+            let mut engine = Engine::new(qwen3(CallSyntax::Json), weather_declared());
             let mut out = Events::new();
             engine
                 .feed(
@@ -3182,7 +3191,7 @@ mod tests {
     fn one_nonce_gives_an_output_the_same_ids_whole_or_cut_character_by_character() {
         let replay = |pieces: Vec<&str>| {
             let mut engine =
-                Engine::with_call_ids(Arc::new(qwen3(CallSyntax::Json)), declared(), ids());
+                Engine::with_call_ids(Arc::new(qwen3(CallSyntax::Json)), weather_declared(), ids());
             let mut out = Events::new();
             for piece in pieces {
                 engine

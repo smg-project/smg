@@ -457,16 +457,17 @@ def generate_golden_phi4_vision(image_path: str, output_dir: str) -> dict:
 
     Note: Phi4 uses 'input_image_embeds' key instead of 'pixel_values'
     """
-    from transformers import AutoProcessor
+    from transformers import AutoImageProcessor
 
-    processor = AutoProcessor.from_pretrained(
+    # Image fixtures do not need the tokenizer or its model configuration.
+    processor = AutoImageProcessor.from_pretrained(
         "microsoft/Phi-4-multimodal-instruct", trust_remote_code=True
     )
     image = Image.open(image_path).convert("RGB")
     original_size = image.size
 
     # Process image using the image processor directly
-    outputs = processor.image_processor(images=image, return_tensors="np")
+    outputs = processor(images=image, return_tensors="np")
 
     # Phi4 uses 'input_image_embeds' instead of 'pixel_values'
     pixel_values = outputs.get("input_image_embeds")
@@ -477,7 +478,7 @@ def generate_golden_phi4_vision(image_path: str, output_dir: str) -> dict:
     result = {
         "pixel_values": pixel_values,
         "original_size": original_size,
-        "processor_config": processor.image_processor.to_dict(),
+        "processor_config": processor.to_dict(),
     }
 
     if pixel_attention_mask is not None:
@@ -491,7 +492,7 @@ def generate_golden_phi4_vision(image_path: str, output_dir: str) -> dict:
 
     # Add debug info
     result["config_info"] = {
-        "dynamic_hd": getattr(processor.image_processor, "dynamic_hd", 36),
+        "dynamic_hd": getattr(processor, "dynamic_hd", 36),
         "base_resolution": 448,
     }
 

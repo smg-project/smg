@@ -1,8 +1,8 @@
 # cargo-audit configuration. `cargo audit` runs on every pull request that changes the dependency
 # graph (the cargo-audit job of pr-test-rust.yml) and daily on main (cargo-audit-nightly.yml), both
 # through scripts/ci_cargo_audit.sh. A vulnerability that is not listed here fails the job; an
-# unmaintained or yanked crate is printed as an allowed warning. Every entry needs a reason and a
-# review date, and goes when the fixed release is in the lockfile.
+# unmaintained, yanked or unsound crate is printed as an allowed warning. Every entry needs a reason
+# and a review date, and goes when the fixed release is in the lockfile.
 [advisories]
 ignore = [
     # RUSTSEC-2023-0071: rsa 0.9, a timing side channel on RSA private-key operations (Marvin),
@@ -28,9 +28,9 @@ ignore = [
     # when the backend changes. Review by 2027-01-15.
     "RUSTSEC-2026-0387",
 
-    # Unmaintained crates without a release that drops them. cargo-audit reports them as warnings
-    # (the job stays green); they are listed so that a new warning stands out in the job's output
-    # and each one carries its exit and a review date.
+    # Warning-level advisories: unmaintained crates without a release that drops them. cargo-audit
+    # reports them as warnings (the job stays green); they are listed so that a new warning stands
+    # out in the job's output and each one carries its exit and a review date.
 
     # RUSTSEC-2025-0012: backoff 0.4, the retry policy of the workflow engine (crates/workflow;
     # crates/mcp declares it as well). RUSTSEC-2024-0384: instant 0.1, pulled by backoff alone.

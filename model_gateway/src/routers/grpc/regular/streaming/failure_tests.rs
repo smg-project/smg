@@ -6,7 +6,6 @@
 //! the pair's bootstrap port before the client is told.
 use std::{net::TcpListener, time::Instant};
 
-use openai_protocol::worker::HealthCheckConfig;
 use smg_grpc_client::vllm_engine::proto;
 use tracing_test::traced_test;
 
@@ -21,7 +20,10 @@ use crate::{
         proto_wrapper::ENGINE_ERROR_MESSAGE,
         utils::{stream_failure::UpstreamStream, StreamFailure, StreamSource},
     },
-    worker::{BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType},
+    test_support::RefusedAddress,
+    worker::{
+        test_support::no_health_check, BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType,
+    },
 };
 
 const REQUEST_ID: &str = "chatcmpl-failure";
@@ -52,10 +54,7 @@ fn dispatch() -> context::DispatchMetadata {
 fn worker(url: &str) -> Arc<dyn Worker> {
     Arc::new(
         BasicWorkerBuilder::new(url)
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
+            .health_config(no_health_check())
             .build(),
     )
 }
@@ -84,20 +83,9 @@ fn loopback_prefill(bootstrap_port: u16) -> Arc<dyn Worker> {
         BasicWorkerBuilder::new(LOOPBACK_PREFILL_URL)
             .worker_type(WorkerType::Prefill)
             .bootstrap_port(Some(bootstrap_port))
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
+            .health_config(no_health_check())
             .build(),
     )
-}
-
-/// A loopback port nothing listens on.
-fn closed_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().expect("address").port();
-    drop(listener);
-    port
 }
 
 /// The decode side of a disaggregated chat answer, ended by the engine's own
@@ -288,7 +276,8 @@ fn a_decode_side_the_engine_fails_is_an_engine_error_of_the_decode_worker() {
 #[test]
 #[traced_test]
 fn a_decode_leg_failed_before_its_first_token_names_the_pairs_dead_bootstrap_port() {
-    let port = closed_port();
+    let refused = RefusedAddress::reserve();
+    let port = refused.port();
     let source = pd_source_with(loopback_prefill(port));
     let rt = runtime();
     let failure = decode_leg_failed_before_its_first_token(&rt);

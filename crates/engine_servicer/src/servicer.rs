@@ -138,11 +138,19 @@ impl Shared {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
-    /// The data-parallel rank count a zero-filled load report covers: the
-    /// handshake's, else the launcher's, else one.
+    /// The data-parallel rank count this servicer serves, the figure
+    /// `GetServerInfo` advertises and a zero-filled load report covers: the
+    /// connected engines (one per rank: a pin is placed on the engine of its
+    /// index and refused past them, the per-rank load names one entry each),
+    /// else the launcher's figure before the engines are up, else one. Not
+    /// the handshake's `data_parallel_size`: ranks launched independently
+    /// each report a size of one, so a four-rank engine read as one rank and
+    /// the gateway's `--dp-aware` expanded nothing.
     pub(crate) fn rank_count(&self, launcher: i32) -> usize {
-        self.ready()
-            .and_then(|ready| usize::try_from(ready.data_parallel_size).ok())
+        self.engine
+            .client
+            .get()
+            .map(ZmqEngineClient::engine_count)
             .filter(|&ranks| ranks > 0)
             .or_else(|| usize::try_from(launcher).ok())
             .unwrap_or(1)

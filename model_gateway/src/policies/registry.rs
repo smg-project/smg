@@ -1158,7 +1158,7 @@ impl std::fmt::Debug for PolicyRegistry {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::{HealthCheckConfig, SchedulerLoadSnapshot, WorkerLoadResponse};
+    use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
     use tokio::sync::watch;
     use tracing_test::traced_test;
 
@@ -1166,17 +1166,10 @@ mod tests {
     use crate::{
         policies::{BucketConfig, CacheAwareConfig, LeastLoadPolicy, SelectWorkerInfo},
         worker::{
-            load_state::LoadSnapshot, BasicWorkerBuilder, HashRing, Worker, WorkerLoadGuard,
-            WorkerType,
+            load_state::LoadSnapshot, test_support::no_health_check, BasicWorkerBuilder, HashRing,
+            Worker, WorkerLoadGuard, WorkerType,
         },
     };
-
-    fn no_health_check() -> HealthCheckConfig {
-        HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        }
-    }
 
     fn worker(url: &str, worker_type: WorkerType) -> Arc<dyn Worker> {
         Arc::new(
@@ -1365,25 +1358,7 @@ mod tests {
     }
 
     fn cache_aware_config() -> PolicyConfig {
-        PolicyConfig::CacheAware {
-            cache_threshold: 0.5,
-            balance_abs_threshold: 32,
-            balance_rel_threshold: 1.1,
-            eviction_interval_secs: 0,
-            max_tree_size: 4096,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-            balance_prefix_margin_tokens: 0,
-            balance_uncached_credit: false,
-        }
+        PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096)
     }
 
     fn headers_with_tokens(value: &str) -> HeaderMap {
@@ -1934,25 +1909,7 @@ mod tests {
     #[test]
     fn delegate_assignment_routes_via_underlying_policy_then_pins() {
         let reg = PolicyRegistry::with_override(
-            PolicyConfig::CacheAware {
-                cache_threshold: 0.5,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 0,
-                max_tree_size: 10000,
-                block_size: 16,
-                balance_token_usage_threshold: 1.0,
-                overload_token_usage_threshold: 1.0,
-                overlap_decay: 0.0,
-                selection_temperature: 0.0,
-                cache_index: Default::default(),
-                cache_ttl_secs: 180,
-                cache_boundaries: Vec::new(),
-                selection_policy: None,
-                selection_accounting_ttl_ms: 0,
-                balance_prefix_margin_tokens: 0,
-                balance_uncached_credit: false,
-            },
+            PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 10000),
             rid_override(ManualAssignmentMode::Delegate),
         );
         let policy = reg.get_default_policy();
@@ -2550,25 +2507,9 @@ mod tests {
 
         const ADDERS: usize = 4;
 
-        let registry = Arc::new(PolicyRegistry::new(PolicyConfig::CacheAware {
-            cache_threshold: 0.5,
-            balance_abs_threshold: 32,
-            balance_rel_threshold: 1.5,
-            eviction_interval_secs: 0,
-            max_tree_size: 128,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-            balance_prefix_margin_tokens: 0,
-            balance_uncached_credit: false,
-        }));
+        let registry = Arc::new(PolicyRegistry::new(PolicyConfig::cache_aware(
+            0.5, 32, 1.5, 0, 128,
+        )));
 
         for round in 0..64 {
             let monitor = Arc::new(KvEventMonitor::new());

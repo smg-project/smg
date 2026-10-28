@@ -72,6 +72,13 @@ pub struct EngineCoreEvent {
 /// Logprobs and the pooling tensor are resolved out of their wire form (aux
 /// frames, raw views) by [`decode_engine_core_outputs`], so this type only
 /// ever carries decoded [`Logprobs`] and a resolved [`PoolingOutput`].
+///
+/// The payloads most outputs do not carry (the pooled tensor, the transfer
+/// parameters, the opaque trace, routing and sampling values, the
+/// speculative-decoding counters) ride boxed: an output is moved several
+/// times between the wire and its request's stream, and the per-request
+/// output channel stores 32 of them per block, so the inline size is what
+/// every token batch pays.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct EngineCoreOutput {
     pub request_id: String,
@@ -81,27 +88,27 @@ pub struct EngineCoreOutput {
     /// Decoded prompt logprobs for the scored prompt positions.
     pub new_prompt_logprobs_tensors: Option<Logprobs>,
     /// The pooled tensor of a pooling request, set on its finishing output.
-    pub pooling_output: Option<PoolingOutput>,
+    pub pooling_output: Option<Box<PoolingOutput>>,
     pub finish_reason: Option<EngineCoreFinishReason>,
     pub stop_reason: Option<StopReason>,
     pub events: Option<Vec<EngineCoreEvent>>,
-    pub kv_transfer_params: Option<serde_json::Value>,
-    pub ec_transfer_params: Option<serde_json::Value>,
-    pub trace_headers: Option<OpaqueValue>,
+    pub kv_transfer_params: Option<Box<serde_json::Value>>,
+    pub ec_transfer_params: Option<Box<serde_json::Value>>,
+    pub trace_headers: Option<Box<OpaqueValue>>,
     /// Breakdown of the scheduled prefill computation, set on the first output
     /// of a newly scheduled prefill and elided for subsequent decode outputs.
     pub prefill_stats: Option<PrefillStats>,
-    pub routed_experts: Option<OpaqueValue>,
+    pub routed_experts: Option<Box<OpaqueValue>>,
     /// Number of NaNs seen in logits. Values above zero indicate corruption.
     pub num_nans_in_logits: u32,
     /// Multimodal hashes the engine's receiver cache missed, so the frontend
     /// resends those inputs.
     pub mm_cache_miss_hashes: Option<Vec<String>>,
     /// Updated sampling mask (untyped for now).
-    pub new_sampling_mask: Option<OpaqueValue>,
+    pub new_sampling_mask: Option<Box<OpaqueValue>>,
     /// Per-request speculative-decoding counters, on the final output only
     /// (vLLM `--per-request-spec-decode-metrics`).
-    pub spec_decode_metrics: Option<SpecDecodeMetrics>,
+    pub spec_decode_metrics: Option<Box<SpecDecodeMetrics>>,
 }
 
 /// vLLM's `RequestSpecDecodeMetrics` (a dataclass, so a msgpack map): the
@@ -125,7 +132,7 @@ pub struct SpecDecodeMetrics {
 /// `None` for this output; nothing downstream needs the counters.
 fn lenient_spec_decode_metrics<'de, D>(
     deserializer: D,
-) -> std::result::Result<Option<SpecDecodeMetrics>, D::Error>
+) -> std::result::Result<Option<Box<SpecDecodeMetrics>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -164,19 +171,19 @@ impl Serialize for EngineCoreOutput {
             new_token_ids: &self.new_token_ids,
             new_logprobs: new_logprobs.as_ref(),
             new_prompt_logprobs_tensors: new_prompt_logprobs_tensors.as_ref(),
-            pooling_output: self.pooling_output.as_ref().map(PoolingOutput::as_wire),
+            pooling_output: self.pooling_output.as_deref().map(PoolingOutput::as_wire),
             finish_reason: self.finish_reason,
             stop_reason: self.stop_reason.as_ref(),
             events: self.events.as_deref(),
-            kv_transfer_params: self.kv_transfer_params.as_ref(),
-            ec_transfer_params: self.ec_transfer_params.as_ref(),
-            trace_headers: self.trace_headers.as_ref(),
+            kv_transfer_params: self.kv_transfer_params.as_deref(),
+            ec_transfer_params: self.ec_transfer_params.as_deref(),
+            trace_headers: self.trace_headers.as_deref(),
             prefill_stats: self.prefill_stats.as_ref(),
-            routed_experts: self.routed_experts.as_ref(),
+            routed_experts: self.routed_experts.as_deref(),
             num_nans_in_logits: self.num_nans_in_logits,
             mm_cache_miss_hashes: self.mm_cache_miss_hashes.as_deref(),
-            new_sampling_mask: self.new_sampling_mask.as_ref(),
-            spec_decode_metrics: self.spec_decode_metrics.as_ref(),
+            new_sampling_mask: self.new_sampling_mask.as_deref(),
+            spec_decode_metrics: self.spec_decode_metrics.as_deref(),
         }
         .serialize(serializer)
     }
@@ -205,7 +212,7 @@ struct WireEngineCoreOutput {
     #[serde(default)]
     new_prompt_logprobs_tensors: Option<Box<WireLogprobs>>,
     #[serde(default)]
-    pooling_output: Option<WireTensor>,
+    pooling_output: Option<Box<WireTensor>>,
     #[serde(default)]
     finish_reason: Option<EngineCoreFinishReason>,
     #[serde(default)]
@@ -213,15 +220,15 @@ struct WireEngineCoreOutput {
     #[serde(default)]
     events: Option<Vec<EngineCoreEvent>>,
     #[serde(default)]
-    kv_transfer_params: Option<serde_json::Value>,
+    kv_transfer_params: Option<Box<serde_json::Value>>,
     #[serde(default)]
-    ec_transfer_params: Option<serde_json::Value>,
+    ec_transfer_params: Option<Box<serde_json::Value>>,
     #[serde(default)]
-    trace_headers: Option<OpaqueValue>,
+    trace_headers: Option<Box<OpaqueValue>>,
     #[serde(default)]
     prefill_stats: Option<PrefillStats>,
     #[serde(default)]
-    routed_experts: Option<OpaqueValue>,
+    routed_experts: Option<Box<OpaqueValue>>,
     #[serde(default)]
     num_nans_in_logits: u32,
     /// Multimodal hashes the engine's receiver cache missed, so the frontend
@@ -230,9 +237,9 @@ struct WireEngineCoreOutput {
     mm_cache_miss_hashes: Option<Vec<String>>,
     /// Updated sampling mask (untyped for now).
     #[serde(default)]
-    new_sampling_mask: Option<OpaqueValue>,
+    new_sampling_mask: Option<Box<OpaqueValue>>,
     #[serde(default, deserialize_with = "lenient_spec_decode_metrics")]
-    spec_decode_metrics: Option<SpecDecodeMetrics>,
+    spec_decode_metrics: Option<Box<SpecDecodeMetrics>>,
 }
 
 impl WireEngineCoreOutput {
@@ -251,7 +258,7 @@ impl WireEngineCoreOutput {
                 .transpose()?,
             pooling_output: self
                 .pooling_output
-                .map(|tensor| PoolingOutput::resolve(tensor, frames))
+                .map(|tensor| PoolingOutput::resolve(*tensor, frames).map(Box::new))
                 .transpose()?,
             finish_reason: self.finish_reason,
             stop_reason: self.stop_reason,
@@ -302,7 +309,7 @@ struct WireEngineCoreOutputs {
     #[serde(default, deserialize_with = "deserialize_tolerant_seq")]
     outputs: Vec<WireEngineCoreOutput>,
     #[serde(default)]
-    scheduler_stats: Option<Box<SchedulerStats>>,
+    scheduler_stats: Option<SchedulerStats>,
     #[serde(default)]
     timestamp: f64,
     /// A utility RPC reply, tolerant of fields a newer engine appends.
@@ -331,7 +338,7 @@ pub enum DpControlMessage {
 pub struct RequestBatchOutputs {
     pub engine_index: u32,
     pub outputs: Vec<EngineCoreOutput>,
-    pub scheduler_stats: Option<Box<SchedulerStats>>,
+    pub scheduler_stats: Option<SchedulerStats>,
     pub timestamp: f64,
     pub finished_requests: Option<BTreeSet<String>>,
 }
@@ -476,17 +483,24 @@ impl WireEngineCoreOutputs {
             wave_complete,
             start_wave,
         ) {
-            (true, None, None, None) => Ok(RequestBatchOutputs {
-                engine_index,
-                outputs: outputs
-                    .into_iter()
-                    .map(|output| output.resolve(frames))
-                    .collect::<Result<Vec<_>>>()?,
-                scheduler_stats,
-                timestamp,
-                finished_requests,
+            (true, None, None, None) => {
+                // Resolved into a vector sized to the batch: a fallible
+                // `collect` cannot trust the iterator's length and starts at
+                // the allocator's minimum capacity (four outputs, about
+                // 1 KiB) for every message, most of which carry one output.
+                let mut resolved = Vec::with_capacity(outputs.len());
+                for output in outputs {
+                    resolved.push(output.resolve(frames)?);
+                }
+                Ok(RequestBatchOutputs {
+                    engine_index,
+                    outputs: resolved,
+                    scheduler_stats,
+                    timestamp,
+                    finished_requests,
+                }
+                .into())
             }
-            .into()),
             (false, Some(TrailingTolerant(output)), None, None) => Ok(UtilityCallOutput {
                 engine_index,
                 timestamp,
@@ -543,7 +557,7 @@ impl<'a> From<&'a EngineCoreOutputs> for WireEngineCoreOutputsRef<'a> {
             EngineCoreOutputs::RequestBatch(batch) => Self {
                 engine_index: batch.engine_index,
                 outputs: &batch.outputs,
-                scheduler_stats: batch.scheduler_stats.as_deref(),
+                scheduler_stats: batch.scheduler_stats.as_ref(),
                 timestamp: batch.timestamp,
                 finished_requests: batch.finished_requests.as_ref(),
                 ..empty
@@ -670,9 +684,9 @@ mod tests {
     fn pooling_output_roundtrips_through_the_mock_send_path() {
         let outputs = batch(vec![EngineCoreOutput {
             request_id: "req-1".to_string(),
-            pooling_output: Some(PoolingOutput::new(
+            pooling_output: Some(Box::new(PoolingOutput::new(
                 WireTensor::from_f32(vec![2], vec![1.0, -2.0]).unwrap(),
-            )),
+            ))),
             finish_reason: Some(EngineCoreFinishReason::Stop),
             ..Default::default()
         }]);
@@ -709,13 +723,15 @@ mod tests {
         let outputs = batch(vec![EngineCoreOutput {
             request_id: "req-1".to_string(),
             new_token_ids: vec![1],
-            spec_decode_metrics: Some(metrics.clone()),
+            spec_decode_metrics: Some(Box::new(metrics.clone())),
             ..Default::default()
         }]);
         let decoded = decode_engine_core_outputs(&encoded_frame(&outputs)).unwrap();
         assert_eq!(
-            decoded.as_request_batch().unwrap().outputs[0].spec_decode_metrics,
-            Some(metrics)
+            decoded.as_request_batch().unwrap().outputs[0]
+                .spec_decode_metrics
+                .as_deref(),
+            Some(&metrics)
         );
 
         // Rewrite the encoded metrics map (the output array's last element).
@@ -1058,6 +1074,109 @@ mod tests {
         );
     }
 
+    /// The engine's scheduler stats map carries more than the load (cache hit
+    /// counts, eviction samples, speculative-decoding, connector, graph and
+    /// performance stats, and whatever a newer engine adds): the decoder reads
+    /// the load fields and skips the rest.
+    #[test]
+    fn scheduler_stats_decode_the_load_and_skip_the_rest() {
+        use rmpv::Value;
+
+        let map = |pairs: Vec<(&str, Value)>| {
+            Value::Map(
+                pairs
+                    .into_iter()
+                    .map(|(key, value)| (Value::from(key), value))
+                    .collect(),
+            )
+        };
+        let cache_stats = |hits: u64| {
+            map(vec![
+                ("reset", Value::from(false)),
+                ("requests", Value::from(10u64)),
+                ("queries", Value::from(20u64)),
+                ("hits", Value::from(hits)),
+                ("preempted_requests", Value::from(0u64)),
+                ("preempted_queries", Value::from(0u64)),
+                ("preempted_hits", Value::from(0u64)),
+            ])
+        };
+        let stats = map(vec![
+            ("num_running_reqs", Value::from(3u64)),
+            ("num_waiting_reqs", Value::from(5u64)),
+            ("num_skipped_waiting_reqs", Value::from(1u64)),
+            ("step_counter", Value::from(77u64)),
+            ("current_wave", Value::from(2u64)),
+            ("kv_cache_usage", Value::from(0.25f64)),
+            ("prefix_cache_stats", cache_stats(7)),
+            ("connector_prefix_cache_stats", cache_stats(1)),
+            (
+                "kv_cache_eviction_events",
+                Value::Array(vec![map(vec![
+                    ("lifetime_seconds", Value::from(1.5f64)),
+                    ("idle_seconds", Value::from(0.5f64)),
+                    (
+                        "reuse_gaps_seconds",
+                        Value::Array(vec![Value::from(0.1f64)]),
+                    ),
+                ])]),
+            ),
+            (
+                "spec_decoding_stats",
+                map(vec![
+                    ("num_spec_tokens", Value::from(2u64)),
+                    ("num_drafts", Value::from(4u64)),
+                    ("num_draft_tokens", Value::from(8u64)),
+                    ("num_accepted_tokens", Value::from(6u64)),
+                    (
+                        "num_accepted_tokens_per_pos",
+                        Value::Array(vec![Value::from(4u64), Value::from(2u64)]),
+                    ),
+                ]),
+            ),
+            (
+                "kv_connector_stats",
+                map(vec![("transfers", Value::from(3u64))]),
+            ),
+            (
+                "cudagraph_stats",
+                map(vec![
+                    ("num_unpadded_tokens", Value::from(1u64)),
+                    ("num_padded_tokens", Value::from(2u64)),
+                    ("num_paddings", Value::from(1u64)),
+                    ("runtime_mode", Value::from("FULL")),
+                ]),
+            ),
+            (
+                "perf_stats",
+                map(vec![
+                    ("num_flops_per_gpu", Value::from(1u64)),
+                    ("num_read_bytes_per_gpu", Value::from(2u64)),
+                    ("num_write_bytes_per_gpu", Value::from(3u64)),
+                    ("debug_stats", Value::Nil),
+                ]),
+            ),
+            ("a_field_of_a_newer_engine", Value::from(true)),
+        ]);
+        let mut envelope = wire_array(&batch(Vec::new()));
+        envelope[2] = stats;
+
+        let frame = Bytes::from(encode_value(&Value::Array(envelope)));
+        let decoded = decode_engine_core_outputs(&[frame])
+            .unwrap()
+            .into_request_batch()
+            .expect("request batch");
+        assert_eq!(
+            decoded.scheduler_stats,
+            Some(SchedulerStats {
+                num_running_reqs: 3,
+                num_waiting_reqs: 5,
+                num_skipped_waiting_reqs: 1,
+                kv_cache_usage: 0.25,
+            })
+        );
+    }
+
     #[test]
     fn decode_engine_core_outputs_from_single_frame() {
         let outputs = batch(vec![EngineCoreOutput {
@@ -1069,6 +1188,19 @@ mod tests {
         assert_eq!(
             decoded.as_request_batch().unwrap().outputs[0].new_token_ids,
             vec![1, 2, 3]
+        );
+    }
+
+    /// The per-request output channel stores outputs 32 to a block and every
+    /// token batch is moved several times on its way to its stream, so the
+    /// payloads most outputs do not carry stay boxed: an output's inline size
+    /// is what every token batch pays.
+    #[test]
+    fn an_output_keeps_its_rare_payloads_boxed() {
+        let inline = size_of::<EngineCoreOutput>();
+        assert!(
+            inline <= 288,
+            "EngineCoreOutput is {inline} bytes inline; a payload most outputs do not carry belongs in a box"
         );
     }
 }

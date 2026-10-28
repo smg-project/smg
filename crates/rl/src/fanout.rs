@@ -388,4 +388,31 @@ mod tests {
         }
         out
     }
+
+    /// A fan-out reaches the workers driven over their engine connection
+    /// like any other, each once, with the same body.
+    #[tokio::test]
+    async fn a_fanout_reaches_workers_over_their_engine_connection() {
+        use crate::testing::{zmq_worker, FakeCalls};
+
+        let (a, b) = (FakeCalls::succeeding(2), FakeCalls::succeeding(1));
+        let app = crate::router::<()>(state(
+            vec![zmq_worker("z1", a.clone()), zmq_worker("z2", b.clone())],
+            8,
+        ));
+        let req = Request::post("/engine/release_memory_occupation?selector=engine%3Dtokenspeed")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"tags":["kv_cache"]}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["succeeded"], 2);
+        for calls in [a, b] {
+            let seen = calls.seen();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].0, "release_memory_occupation");
+            assert_eq!(seen[0].1, Some(json!({"tags": ["kv_cache"]})));
+        }
+    }
 }

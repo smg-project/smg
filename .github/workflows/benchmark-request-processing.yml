@@ -15,7 +15,7 @@ on:
       - '!model_gateway/src/**/*_test.rs'
       - '!model_gateway/src/**/test_*.rs'
   pull_request:
-    branches: [ main ]
+    branches: [ main, release/** ]
     paths:
       - '.github/workflows/benchmark-request-processing.yml'
       - '.github/bench-gates/request-processing.toml'

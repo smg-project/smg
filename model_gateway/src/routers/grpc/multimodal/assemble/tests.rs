@@ -57,10 +57,23 @@ fn pending_tokenspeed_assembly_transfers_shm_ownership() {
     assert!(!path.exists());
 }
 
+/// A 1x1 inline image frame carrying `payload` under `hash`: the tests'
+/// image items differ in nothing else.
+fn inline_image(payload: &'static [u8], hash: &str) -> Arc<ImageFrame> {
+    Arc::new(ImageFrame::new(
+        image::DynamicImage::new_rgb8(1, 1),
+        bytes::Bytes::from_static(payload),
+        ImageDetail::Auto,
+        llm_multimodal::ImageSource::InlineBytes,
+        hash.to_string(),
+    ))
+}
+
 /// One image whose flat span is the whole encoder input: the tensor
 /// handed over by value moves into the item's payload, and the item is
-/// the same as the one written from a view of it.
-fn single_image_intermediate() -> PrecomputedMultimodalIntermediate {
+/// the same as the one written from a view of it. (Shared with the encode
+/// stage's tests, which plan this one image for an encode server.)
+pub(crate) fn single_image_intermediate() -> PrecomputedMultimodalIntermediate {
     let mut model_specific = HashMap::new();
     model_specific.insert(
         "patches_per_image".to_string(),
@@ -82,13 +95,7 @@ fn single_image_intermediate() -> PrecomputedMultimodalIntermediate {
     };
     PrecomputedMultimodalIntermediate {
         preprocessed,
-        media: MediaBatch::Images(vec![Arc::new(ImageFrame::new(
-            image::DynamicImage::new_rgb8(1, 1),
-            bytes::Bytes::from_static(b"a"),
-            ImageDetail::Auto,
-            llm_multimodal::ImageSource::InlineBytes,
-            "hash-a".to_string(),
-        ))]),
+        media: MediaBatch::Images(vec![inline_image(b"a", "hash-a")]),
         bindings: vec![PromptBinding {
             item_index: 0,
             prompt_ordinal: 0,
@@ -241,22 +248,7 @@ fn two_image_intermediate() -> PrecomputedMultimodalIntermediate {
         model_specific,
     };
 
-    let images = vec![
-        Arc::new(ImageFrame::new(
-            image::DynamicImage::new_rgb8(1, 1),
-            bytes::Bytes::from_static(b"a"),
-            ImageDetail::Auto,
-            llm_multimodal::ImageSource::InlineBytes,
-            "hash-a".to_string(),
-        )),
-        Arc::new(ImageFrame::new(
-            image::DynamicImage::new_rgb8(1, 1),
-            bytes::Bytes::from_static(b"b"),
-            ImageDetail::Auto,
-            llm_multimodal::ImageSource::InlineBytes,
-            "hash-b".to_string(),
-        )),
-    ];
+    let images = vec![inline_image(b"a", "hash-a"), inline_image(b"b", "hash-b")];
 
     PrecomputedMultimodalIntermediate {
         preprocessed,
@@ -362,13 +354,7 @@ fn one_image_intermediate(
             item_sizes: vec![(1, 1)],
             model_specific,
         },
-        media: MediaBatch::Images(vec![Arc::new(ImageFrame::new(
-            image::DynamicImage::new_rgb8(1, 1),
-            bytes::Bytes::from_static(b"a"),
-            ImageDetail::Auto,
-            llm_multimodal::ImageSource::InlineBytes,
-            "hash-a".to_string(),
-        ))]),
+        media: MediaBatch::Images(vec![inline_image(b"a", "hash-a")]),
         bindings: vec![PromptBinding {
             item_index: 0,
             prompt_ordinal: 0,
@@ -477,22 +463,7 @@ fn assemble_tokenspeed_v41_layouts_stay_inline_when_shm_disabled() {
         model_specific,
     };
 
-    let images = vec![
-        Arc::new(ImageFrame::new(
-            image::DynamicImage::new_rgb8(1, 1),
-            bytes::Bytes::from_static(b"a"),
-            ImageDetail::Auto,
-            llm_multimodal::ImageSource::InlineBytes,
-            "hash-a".to_string(),
-        )),
-        Arc::new(ImageFrame::new(
-            image::DynamicImage::new_rgb8(1, 1),
-            bytes::Bytes::from_static(b"b"),
-            ImageDetail::Auto,
-            llm_multimodal::ImageSource::InlineBytes,
-            "hash-b".to_string(),
-        )),
-    ];
+    let images = vec![inline_image(b"a", "hash-a"), inline_image(b"b", "hash-b")];
 
     let intermediate = PrecomputedMultimodalIntermediate {
         preprocessed,
@@ -1055,13 +1026,7 @@ fn tokenspeed_epd_items_and_hashes_follow_prompt_binding_order() {
     };
     let image_batch = PrecomputedMultimodalIntermediate {
         preprocessed: one_item_inputs(),
-        media: MediaBatch::Images(vec![Arc::new(ImageFrame::new(
-            image::DynamicImage::new_rgb8(1, 1),
-            bytes::Bytes::from_static(b"image"),
-            ImageDetail::Auto,
-            llm_multimodal::ImageSource::InlineBytes,
-            "image-hash".to_string(),
-        ))]),
+        media: MediaBatch::Images(vec![inline_image(b"image", "image-hash")]),
         // Deliberately earlier by offset but later by explicit ordinal.
         bindings: vec![PromptBinding {
             item_index: 0,
@@ -1127,7 +1092,7 @@ fn tokenspeed_epd_items_and_hashes_follow_prompt_binding_order() {
     let intermediate =
         MultimodalIntermediate::try_new(vec![image_batch, video_batch, audio_batch]).unwrap();
     let routing_hashes = encode_routing_hashes(&intermediate).unwrap();
-    let assembled = assemble_tokenspeed_for_encode(&intermediate, None).unwrap();
+    let assembled = assemble_tokenspeed_for_encode(&intermediate, None, false).unwrap();
 
     assert_eq!(assembled.items.len(), 3);
     assert_eq!(assembled.items[0].modality, TokenSpeedModality::Audio);
@@ -1144,6 +1109,48 @@ fn tokenspeed_epd_items_and_hashes_follow_prompt_binding_order() {
             .map(|item| item.content_hash.clone())
             .collect::<Vec<_>>()
     );
+}
+
+/// An encode server on the ZMQ lane takes its tensors inline: an inline
+/// encode assembly writes no /dev/shm segment even for an encode worker whose
+/// spec asks for shared memory, which the gRPC encoder's assembly honours.
+#[test]
+#[cfg(target_os = "linux")]
+fn an_inline_encode_assembly_writes_no_shared_memory() {
+    use openai_protocol::worker::{TransportMode, WorkerSpec};
+
+    use crate::{
+        routers::grpc::proto_wrapper::{mm_shm_dev_writable, TokenSpeedTensorStorage},
+        worker::{BasicWorkerBuilder, Worker},
+    };
+
+    if !mm_shm_dev_writable() {
+        return;
+    }
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::from_spec(WorkerSpec {
+            multimodal_tensor_transport: Some(TransportMode::Shm),
+            multimodal_shm_min_bytes: Some(0),
+            ..WorkerSpec::new("grpc://encode:9000")
+        })
+        .build(),
+    );
+    let workers = WorkerSelection::Single { worker };
+    let intermediate = MultimodalIntermediate::try_new(vec![single_image_intermediate()]).unwrap();
+
+    let inline = assemble_tokenspeed_for_encode(&intermediate, Some(&workers), true).unwrap();
+    assert!(!inline.shm_enabled);
+    assert!(matches!(
+        inline.items[0].encoder_input.storage,
+        TokenSpeedTensorStorage::Inline(_)
+    ));
+
+    let shared = assemble_tokenspeed_for_encode(&intermediate, Some(&workers), false).unwrap();
+    assert!(matches!(
+        shared.items[0].encoder_input.storage,
+        TokenSpeedTensorStorage::Shm(_)
+    ));
+    cleanup_tokenspeed_items_encoder_shm(&shared.items, None);
 }
 
 #[test]
@@ -1231,4 +1238,119 @@ fn vllm_layout_adapter_names_the_primary_tensor_by_the_spec_key() {
         Some("types_per_image")
     );
     assert!(!flat_keys.contains_key("pixel_values"));
+}
+
+/// The direct-ZMQ SGLang arm reaches the SGLang assembly (the function the
+/// gRPC arm calls) instead of the "not supported" refusal, and what it
+/// assembles crosses the wire: sent through the client to a mock scheduler,
+/// the request the scheduler decodes carries one image item whose feature
+/// bytes, grid tensor, offsets and image token are the assembled payload's.
+#[tokio::test]
+async fn the_zmq_sglang_arm_assembles_the_grpc_paths_payload_and_the_wire_carries_it() {
+    use std::time::Duration;
+
+    use engine_zmq_client::{
+        codec::decode_msgpack,
+        mock_engine::{connect_to_frontend, default_ready_response},
+        protocol::sglang::request::{SglangRequestType, TokenizedGenerateReqInput},
+        EngineId,
+    };
+    use smg_grpc_client::sglang_proto;
+
+    use crate::routers::grpc::zmq_client::{EosTokenIds, ZmqEngineClient};
+
+    let dir = tempfile::tempdir().unwrap();
+    let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+    let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+    let (client, engine) = tokio::join!(
+        ZmqEngineClient::connect(
+            &handshake,
+            &input,
+            &output,
+            1,
+            "m".to_string(),
+            EosTokenIds::default(),
+            RuntimeType::Sglang,
+            Duration::from_secs(10)
+        ),
+        connect_to_frontend(
+            &handshake,
+            EngineId::from_engine_index(0),
+            default_ready_response()
+        ),
+    );
+    let engine = engine.expect("mock scheduler");
+    let client = BackendClient::Zmq(client.expect("adapter connect"));
+
+    let intermediate = MultimodalIntermediate::try_new(vec![single_image_intermediate()]).unwrap();
+    let MultimodalData::Sglang(assembled) = assemble_multimodal_data(intermediate, &client, None)
+        .await
+        .expect("the SGLang arm")
+    else {
+        panic!("the SGLang runtime over ZMQ assembles SGLang data");
+    };
+    assert_eq!(assembled.mm_placeholders, vec![(10, 4)]);
+    assert_eq!(assembled.im_token_id, Some(151655));
+    assert!(!assembled.pixel_values.is_empty());
+    let pixel_values = assembled.pixel_values.clone();
+    let pixel_values_shape = assembled.pixel_values_shape.clone();
+    let grid = assembled.model_specific_tensors["patches_per_image"].clone();
+
+    // The prompt the placeholders describe: the four image tokens at 10..14.
+    let mut input_ids: Vec<u32> = (1..=16).collect();
+    for id in &mut input_ids[10..14] {
+        *id = 151655;
+    }
+    let request = sglang_proto::GenerateRequest {
+        request_id: "mm-over-zmq".into(),
+        tokenized: Some(sglang_proto::TokenizedInput {
+            input_ids: input_ids.clone(),
+            original_text: String::new(),
+        }),
+        mm_inputs: Some(assembled.into_proto()),
+        ..Default::default()
+    };
+    let BackendClient::Zmq(zmq) = &client else {
+        panic!("built as the ZMQ backend above");
+    };
+    let (mut scheduler_input, _scheduler_output) = engine.split();
+    let (sent, received) =
+        tokio::join!(zmq.generate_sglang(request), scheduler_input.recv_frames());
+    let _stream = sent.expect("the request is admitted and sent");
+    let frames = received.expect("the scheduler receives the request");
+    assert_eq!(
+        SglangRequestType::from_frame(frames[0].as_ref()),
+        Some(SglangRequestType::Add)
+    );
+    let decoded: TokenizedGenerateReqInput =
+        decode_msgpack(frames[1].as_ref()).expect("the scheduler's own struct");
+    assert_eq!(decoded.input_ids, input_ids);
+    let media = decoded.mm_inputs.expect("the processor output");
+    assert_eq!(media.im_token_id, Some(151655));
+    assert_eq!(media.mm_items.len(), 1);
+    let item = &media.mm_items[0];
+    assert_eq!(item.offsets, Some(vec![(10, 13)]));
+    let feature = item.feature.as_ref().expect("the pixel tensor");
+    assert_eq!(feature.dtype, "float32");
+    assert_eq!(
+        feature
+            .data
+            .as_raw_view()
+            .expect("a pixel tensor this small stays inline")
+            .as_ref(),
+        pixel_values.as_slice()
+    );
+    let widened = |shape: &[u32]| shape.iter().map(|&d| u64::from(d)).collect::<Vec<u64>>();
+    assert_eq!(feature.shape, widened(&pixel_values_shape));
+    let wire_grid = &item.model_specific_data["patches_per_image"];
+    assert_eq!(wire_grid.dtype, grid.dtype);
+    assert_eq!(wire_grid.shape, widened(&grid.shape));
+    assert_eq!(
+        wire_grid
+            .data
+            .as_raw_view()
+            .expect("the grid stays inline")
+            .as_ref(),
+        grid.data.as_slice()
+    );
 }

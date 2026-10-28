@@ -13,6 +13,8 @@ use thiserror::Error;
 pub enum RlError {
     #[error("invalid engine path: {0}")]
     InvalidEnginePath(String),
+    #[error("invalid request body: {0}")]
+    InvalidBody(String),
     #[error("a non-empty `selector` query parameter is required")]
     SelectorRequired,
     #[error("invalid selector at byte {offset}: {message}")]
@@ -49,6 +51,7 @@ impl RlError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::InvalidEnginePath(_) => "invalid_engine_path",
+            Self::InvalidBody(_) => "invalid_body",
             Self::SelectorRequired => "selector_required",
             Self::InvalidSelector { .. } => "invalid_selector",
             Self::NoWorkersMatch(_) => "no_workers_match",
@@ -62,6 +65,7 @@ impl RlError {
     pub fn status(&self) -> StatusCode {
         match self {
             Self::InvalidEnginePath(_)
+            | Self::InvalidBody(_)
             | Self::SelectorRequired
             | Self::InvalidSelector { .. }
             | Self::NoWorkersMatch(_) => StatusCode::BAD_REQUEST,

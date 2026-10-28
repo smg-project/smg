@@ -169,12 +169,15 @@ impl ProcessStage for HarmonyResponseProcessingStage {
                     error::internal_error("dispatch_metadata_not_set", "Dispatch metadata not set")
                 })?;
 
-                let iteration_result = self
+                let (iteration_result, counts) = self
                     .processor
                     .process_responses_iteration(execution_result, responses_request, dispatch)
                     .await?;
 
                 ctx.response.responses_iteration_result = Some(iteration_result);
+                // The engine's counts, for the settlement of the iteration's
+                // reservation, as the chat branch records them.
+                ctx.response.engine_counts = Some(counts);
                 Ok(None)
             }
         }

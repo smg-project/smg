@@ -47,7 +47,7 @@ impl Capture {
                     None
                 };
                 json!({
-                    "worker": worker.url(), "load": worker.load(), "healthy": worker.is_healthy(),
+                    "worker": worker.redacted_url(), "load": worker.load(), "healthy": worker.is_healthy(),
                     "overloaded": worker.is_overloaded(), "registry_revision": worker.revision(),
                     "backend_cache_epoch": epoch,
                     "backend_cache_epochs": epochs,
@@ -307,7 +307,7 @@ pub(crate) fn selection(
         }
         let value = json!({
             "policy": policy, "origin": origin,
-            "worker": selected.map(|idx| workers[idx].url()),
+            "worker": selected.map(|idx| workers[idx].redacted_url()),
             "prediction": std::mem::take(&mut capture.prediction),
             "candidates": std::mem::take(&mut capture.candidates),
             "candidates_complete": capture.candidates_complete,

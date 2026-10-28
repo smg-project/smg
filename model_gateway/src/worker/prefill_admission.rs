@@ -548,10 +548,15 @@ mod tests {
     };
 
     use openai_protocol::worker::WorkerStatus;
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::{
+        sync::{mpsc, oneshot},
+        task::JoinHandle,
+    };
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, CircuitBreakerConfig, WorkerType};
+    use crate::worker::{
+        test_support::select_worker, BasicWorkerBuilder, CircuitBreakerConfig, WorkerType,
+    };
 
     fn worker(url: &str) -> Arc<dyn Worker> {
         Arc::new(
@@ -559,6 +564,22 @@ mod tests {
                 .worker_type(WorkerType::Prefill)
                 .build(),
         )
+    }
+
+    /// A task that attempts `worker` through `admission` with the plain
+    /// select-this-worker attempt; the test joins it, and aborts it first where
+    /// it must never be admitted.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test joins (and where it must, aborts) the task before it ends"
+    )]
+    fn plain_attempt(
+        admission: &PrefillAdmission,
+        worker: &Arc<dyn Worker>,
+    ) -> JoinHandle<Result<AdmittedPrefill<()>, PrefillAdmissionRejection>> {
+        let admission = admission.clone();
+        let worker = Arc::clone(worker);
+        tokio::spawn(async move { admission.admit(None, select_worker(&worker)).await })
     }
 
     async fn wait_for_queued(admission: &PrefillAdmission, expected: usize) {
@@ -597,20 +618,9 @@ mod tests {
     async fn zero_size_queue_rejects_at_capacity() {
         let admission = PrefillAdmission::new(1, 0, Duration::from_secs(1));
         let worker = worker("http://prefill-no-queue");
-        let first = admission
-            .admit(None, {
-                let worker = Arc::clone(&worker);
-                move |capacity| capacity.select(Arc::clone(&worker), ())
-            })
-            .await
-            .unwrap();
+        let first = admission.admit(None, select_worker(&worker)).await.unwrap();
 
-        let result = admission
-            .admit(None, {
-                let worker = Arc::clone(&worker);
-                move |capacity| capacity.select(Arc::clone(&worker), ())
-            })
-            .await;
+        let result = admission.admit(None, select_worker(&worker)).await;
         assert!(matches!(result, Err(PrefillAdmissionRejection::QueueFull)));
         drop(first);
     }
@@ -619,29 +629,9 @@ mod tests {
     async fn full_queue_rejects_without_bypassing_waiter() {
         let admission = PrefillAdmission::new(1, 1, Duration::from_secs(1));
         let worker = worker("http://prefill-full-queue");
-        let first = admission
-            .admit(None, {
-                let worker = Arc::clone(&worker);
-                move |capacity| capacity.select(Arc::clone(&worker), ())
-            })
-            .await
-            .unwrap();
+        let first = admission.admit(None, select_worker(&worker)).await.unwrap();
 
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "test waiter task is aborted and joined before the test ends"
-        )]
-        let waiter = tokio::spawn({
-            let admission = admission.clone();
-            let worker = Arc::clone(&worker);
-            async move {
-                admission
-                    .admit(None, move |capacity| {
-                        capacity.select(Arc::clone(&worker), ())
-                    })
-                    .await
-            }
-        });
+        let waiter = plain_attempt(&admission, &worker);
         wait_for_queued(&admission, 1).await;
 
         let policy_called = Arc::new(AtomicBool::new(false));
@@ -673,29 +663,9 @@ mod tests {
     async fn queued_request_times_out_and_removes_its_ticket() {
         let admission = PrefillAdmission::new(1, 1, Duration::from_secs(5));
         let worker = worker("http://prefill-timeout");
-        let first = admission
-            .admit(None, {
-                let worker = Arc::clone(&worker);
-                move |capacity| capacity.select(Arc::clone(&worker), ())
-            })
-            .await
-            .unwrap();
+        let first = admission.admit(None, select_worker(&worker)).await.unwrap();
 
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "test waiter task is joined before the test ends"
-        )]
-        let waiter = tokio::spawn({
-            let admission = admission.clone();
-            let worker = Arc::clone(&worker);
-            async move {
-                admission
-                    .admit(None, move |capacity| {
-                        capacity.select(Arc::clone(&worker), ())
-                    })
-                    .await
-            }
-        });
+        let waiter = plain_attempt(&admission, &worker);
         wait_for_queued(&admission, 1).await;
 
         tokio::time::advance(Duration::from_secs(5)).await;
@@ -711,13 +681,7 @@ mod tests {
     async fn released_worker_load_is_visible_to_the_next_selection() {
         let admission = PrefillAdmission::new(1, 1, Duration::from_secs(1));
         let worker = worker("http://prefill-release-order");
-        let first = admission
-            .admit(None, {
-                let worker = Arc::clone(&worker);
-                move |capacity| capacity.select(Arc::clone(&worker), ())
-            })
-            .await
-            .unwrap();
+        let first = admission.admit(None, select_worker(&worker)).await.unwrap();
 
         #[expect(
             clippy::disallowed_methods,
@@ -749,13 +713,7 @@ mod tests {
     async fn queued_requests_are_admitted_in_strict_fifo_order() {
         let admission = PrefillAdmission::new(1, 2, Duration::from_secs(1));
         let worker = worker("http://prefill-fifo");
-        let initial = admission
-            .admit(None, {
-                let worker = Arc::clone(&worker);
-                move |capacity| capacity.select(Arc::clone(&worker), ())
-            })
-            .await
-            .unwrap();
+        let initial = admission.admit(None, select_worker(&worker)).await.unwrap();
         let (acquired_tx, mut acquired_rx) = mpsc::unbounded_channel();
         let (release_first_tx, release_first_rx) = oneshot::channel();
 
@@ -768,12 +726,7 @@ mod tests {
             let worker = Arc::clone(&worker);
             let acquired_tx = acquired_tx.clone();
             async move {
-                let admitted = admission
-                    .admit(None, move |capacity| {
-                        capacity.select(Arc::clone(&worker), ())
-                    })
-                    .await
-                    .unwrap();
+                let admitted = admission.admit(None, select_worker(&worker)).await.unwrap();
                 acquired_tx.send(1).unwrap();
                 let _ = release_first_rx.await;
                 drop(admitted);
@@ -789,12 +742,7 @@ mod tests {
             let admission = admission.clone();
             let worker = Arc::clone(&worker);
             async move {
-                let admitted = admission
-                    .admit(None, move |capacity| {
-                        capacity.select(Arc::clone(&worker), ())
-                    })
-                    .await
-                    .unwrap();
+                let admitted = admission.admit(None, select_worker(&worker)).await.unwrap();
                 acquired_tx.send(2).unwrap();
                 drop(admitted);
             }
@@ -887,13 +835,7 @@ mod tests {
     async fn queue_head_rechecks_circuit_breaker_recovery_without_event() {
         let admission = PrefillAdmission::new(1, 1, Duration::from_secs(5));
         let full = worker("http://prefill-full");
-        let occupied = admission
-            .admit(None, {
-                let full = Arc::clone(&full);
-                move |capacity| capacity.select(Arc::clone(&full), ())
-            })
-            .await
-            .unwrap();
+        let occupied = admission.admit(None, select_worker(&full)).await.unwrap();
         let recovering: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://prefill-recovering")
                 .worker_type(WorkerType::Prefill)
@@ -938,46 +880,12 @@ mod tests {
     async fn cancelled_waiters_are_removed_without_blocking_fifo() {
         let admission = PrefillAdmission::new(1, 2, Duration::from_secs(1));
         let worker = worker("http://prefill-cancel-head");
-        let initial = admission
-            .admit(None, {
-                let worker = Arc::clone(&worker);
-                move |capacity| capacity.select(Arc::clone(&worker), ())
-            })
-            .await
-            .unwrap();
+        let initial = admission.admit(None, select_worker(&worker)).await.unwrap();
 
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "test waiter task is aborted and joined before the test ends"
-        )]
-        let cancelled = tokio::spawn({
-            let admission = admission.clone();
-            let worker = Arc::clone(&worker);
-            async move {
-                admission
-                    .admit(None, move |capacity| {
-                        capacity.select(Arc::clone(&worker), ())
-                    })
-                    .await
-            }
-        });
+        let cancelled = plain_attempt(&admission, &worker);
         wait_for_queued(&admission, 1).await;
 
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "test waiter task is aborted and joined before the test ends"
-        )]
-        let middle = tokio::spawn({
-            let admission = admission.clone();
-            let worker = Arc::clone(&worker);
-            async move {
-                admission
-                    .admit(None, move |capacity| {
-                        capacity.select(Arc::clone(&worker), ())
-                    })
-                    .await
-            }
-        });
+        let middle = plain_attempt(&admission, &worker);
         wait_for_queued(&admission, 2).await;
         middle.abort();
         assert!(matches!(
@@ -1031,17 +939,11 @@ mod tests {
         let first_worker = worker("http://prefill-a");
         let second_worker = worker("http://prefill-b");
         let first = admission
-            .admit(None, {
-                let worker = Arc::clone(&first_worker);
-                move |capacity| capacity.select(Arc::clone(&worker), ())
-            })
+            .admit(None, select_worker(&first_worker))
             .await
             .unwrap();
         let second = admission
-            .admit(None, {
-                let worker = Arc::clone(&second_worker);
-                move |capacity| capacity.select(Arc::clone(&worker), ())
-            })
+            .admit(None, select_worker(&second_worker))
             .await
             .unwrap();
         let policy_calls = Arc::new(AtomicUsize::new(0));
@@ -1113,21 +1015,7 @@ mod tests {
         });
         wait_for_queued(&admission, 1).await;
 
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "test waiter task is joined before the test ends"
-        )]
-        let second = tokio::spawn({
-            let admission = admission.clone();
-            let worker = Arc::clone(&worker);
-            async move {
-                admission
-                    .admit(None, move |capacity| {
-                        capacity.select(Arc::clone(&worker), ())
-                    })
-                    .await
-            }
-        });
+        let second = plain_attempt(&admission, &worker);
         wait_for_queued(&admission, 2).await;
 
         unavailable.store(true, Ordering::Relaxed);
@@ -1144,29 +1032,9 @@ mod tests {
     async fn unavailable_is_not_queued() {
         let admission = PrefillAdmission::new(1, 2, Duration::from_secs(1));
         let worker = worker("http://prefill-unavailable");
-        let occupied = admission
-            .admit(None, {
-                let worker = Arc::clone(&worker);
-                move |capacity| capacity.select(Arc::clone(&worker), ())
-            })
-            .await
-            .unwrap();
+        let occupied = admission.admit(None, select_worker(&worker)).await.unwrap();
 
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "test waiter task is aborted and joined before the test ends"
-        )]
-        let queued = tokio::spawn({
-            let admission = admission.clone();
-            let worker = Arc::clone(&worker);
-            async move {
-                admission
-                    .admit(None, move |capacity| {
-                        capacity.select(Arc::clone(&worker), ())
-                    })
-                    .await
-            }
-        });
+        let queued = plain_attempt(&admission, &worker);
         wait_for_queued(&admission, 1).await;
 
         let result = admission
@@ -1207,7 +1075,7 @@ mod tests {
         worker.set_completion_sink(Some(spy.clone() as Arc<dyn RequestCompletionSink>));
         let admission = PrefillAdmission::new(1, 0, Duration::from_secs(1));
         let admitted = admission
-            .admit(None, |capacity| capacity.select(Arc::clone(&worker), ()))
+            .admit(None, select_worker(&worker))
             .await
             .expect("admitted");
         assert_eq!(worker.load(), 1);

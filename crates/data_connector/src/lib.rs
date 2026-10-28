@@ -28,6 +28,8 @@ mod postgres;
 mod postgres_migrations;
 mod redis;
 pub mod schema;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod versioning;
 
 // Re-export config types

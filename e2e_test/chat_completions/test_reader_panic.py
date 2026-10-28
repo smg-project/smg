@@ -56,7 +56,7 @@ def _panicked_outputs(gateway) -> int:
 
 @pytest.mark.engine("mock")
 @pytest.mark.gpu(1)
-@pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct")
+@pytest.mark.model("RedHatAI/Llama-3.2-1B-Instruct-FP8")
 @pytest.mark.gateway(
     extra_args=["--tool-call-parser", "llama"],
     # The trap armed; the panic hook without a backtrace, since symbolizing one

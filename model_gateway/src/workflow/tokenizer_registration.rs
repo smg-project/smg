@@ -69,9 +69,9 @@ pub struct TokenizerRemovalRequest {
 /// instead of the retry hint of a load still in flight.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenizerLoadFailure {
-    /// Nothing to load from: neither `tokenizer_path` nor `model_path` among
-    /// the worker's labels, and no `--tokenizer-path` or `--model-path` in
-    /// the router configuration.
+    /// Nothing to load from: no `tokenizer_path`, `model_path` or `model_id`
+    /// among the worker's labels, and no `--tokenizer-path` or
+    /// `--model-path` in the router configuration.
     NoSource,
     /// The registration workflow failed; its error, for the log.
     Failed(String),
@@ -86,7 +86,7 @@ impl TokenizerLoadFailure {
     pub fn reason(&self) -> &'static str {
         match self {
             Self::NoSource => {
-                "no tokenizer path in the worker's labels or the router configuration"
+                "no tokenizer source in the worker's labels (tokenizer_path, model_path, model_id) or the router configuration"
             }
             Self::Failed(_) => "the load failed; see the gateway log",
             Self::Removed => "the tokenizer was removed; register one again",
@@ -528,7 +528,7 @@ async fn fetch_tokenizer_from_worker(
         let runtime = worker.metadata().spec.runtime_type;
         info!(
             "Fetching tokenizer from worker: {} (runtime: {})",
-            worker.url(),
+            worker.redacted_url(),
             runtime
         );
 
@@ -590,13 +590,13 @@ async fn fetch_bundle(worker: &dyn Worker) -> Result<StreamBundle, String> {
         if is_unimplemented {
             debug!(
                 "Worker {} (runtime: {}) does not support GetTokenizer",
-                worker.url(),
+                worker.redacted_url(),
                 runtime
             );
         } else {
             warn!(
                 "Worker {} (runtime: {}) get_tokenizer failed: {}",
-                worker.url(),
+                worker.redacted_url(),
                 runtime,
                 e
             );
@@ -608,7 +608,7 @@ async fn fetch_bundle(worker: &dyn Worker) -> Result<StreamBundle, String> {
     })?;
     debug!(
         "Tokenizer bundle validation passed for worker {}",
-        worker.url()
+        worker.redacted_url()
     );
 
     Ok(bundle)
@@ -707,13 +707,10 @@ pub fn create_tokenizer_workflow_data(
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::{
-        model_card::ModelCard,
-        worker::{HealthCheckConfig, WorkerType},
-    };
+    use openai_protocol::{model_card::ModelCard, worker::WorkerType};
 
     use super::*;
-    use crate::worker::BasicWorkerBuilder;
+    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder};
 
     #[test]
     fn worker_tokenizer_bundle_preserves_configured_template() {
@@ -872,10 +869,7 @@ mod tests {
                     .worker_type(WorkerType::Regular)
                     .connection_mode(ConnectionMode::Grpc)
                     .model(ModelCard::new(model))
-                    .health_config(HealthCheckConfig {
-                        disable_health_check: true,
-                        ..Default::default()
-                    })
+                    .health_config(no_health_check())
                     .build(),
             ))
             .expect("register worker");

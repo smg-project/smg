@@ -8,6 +8,8 @@ mod tests {
     use openai_protocol::chat::{ChatMessage, MessageContent};
     use tempfile::TempDir;
 
+    use crate::common::MIN_TOKENIZER_JSON_WITH_SENTINELS;
+
     #[test]
     fn test_load_chat_template_from_file() {
         // Create temporary directory
@@ -25,32 +27,8 @@ mod tests {
 ";
         fs::write(&template_path, template_content).unwrap();
 
-        // Create a mock tokenizer config
-        let tokenizer_config = r#"{
-            "version": "1.0",
-            "truncation": null,
-            "padding": null,
-            "added_tokens": [],
-            "normalizer": null,
-            "pre_tokenizer": {
-                "type": "Whitespace"
-            },
-            "post_processor": null,
-            "decoder": null,
-            "model": {
-                "type": "BPE",
-                "vocab": {
-                    "hello": 0,
-                    "world": 1,
-                    "<s>": 2,
-                    "</s>": 3
-                },
-                "merges": []
-            }
-        }"#;
-
         let tokenizer_path = temp_dir.path().join("tokenizer.json");
-        fs::write(&tokenizer_path, tokenizer_config).unwrap();
+        fs::write(&tokenizer_path, MIN_TOKENIZER_JSON_WITH_SENTINELS).unwrap();
 
         // Load tokenizer with custom chat template
         let tokenizer = HuggingFaceTokenizer::from_file_with_chat_template(
@@ -107,29 +85,8 @@ mod tests {
         fs::write(&tokenizer_config_path, config_with_template).unwrap();
 
         // Create the actual tokenizer file
-        let tokenizer_json = r#"{
-            "version": "1.0",
-            "truncation": null,
-            "padding": null,
-            "added_tokens": [],
-            "normalizer": null,
-            "pre_tokenizer": {
-                "type": "Whitespace"
-            },
-            "post_processor": null,
-            "decoder": null,
-            "model": {
-                "type": "BPE",
-                "vocab": {
-                    "test": 0,
-                    "<s>": 1,
-                    "</s>": 2
-                },
-                "merges": []
-            }
-        }"#;
         let tokenizer_path = temp_dir.path().join("tokenizer.json");
-        fs::write(&tokenizer_path, tokenizer_json).unwrap();
+        fs::write(&tokenizer_path, MIN_TOKENIZER_JSON_WITH_SENTINELS).unwrap();
 
         // Create custom template that should override
         let custom_template_path = temp_dir.path().join("custom.jinja");
@@ -170,29 +127,8 @@ mod tests {
     fn test_set_chat_template_after_creation() {
         // Create temporary directory and tokenizer file
         let temp_dir = TempDir::new().unwrap();
-        let tokenizer_json = r#"{
-            "version": "1.0",
-            "truncation": null,
-            "padding": null,
-            "added_tokens": [],
-            "normalizer": null,
-            "pre_tokenizer": {
-                "type": "Whitespace"
-            },
-            "post_processor": null,
-            "decoder": null,
-            "model": {
-                "type": "BPE",
-                "vocab": {
-                    "test": 0,
-                    "<s>": 1,
-                    "</s>": 2
-                },
-                "merges": []
-            }
-        }"#;
         let tokenizer_path = temp_dir.path().join("tokenizer.json");
-        fs::write(&tokenizer_path, tokenizer_json).unwrap();
+        fs::write(&tokenizer_path, MIN_TOKENIZER_JSON_WITH_SENTINELS).unwrap();
 
         // Load tokenizer without custom template
         let mut tokenizer =

@@ -14,6 +14,7 @@ use smg::{
     endpoints::conversations,
     routers::RouterFactory,
     tenant::{RouteRequestMeta, TenantKey},
+    test_support::RefusedAddress,
 };
 
 use crate::common::{
@@ -3575,11 +3576,8 @@ async fn an_unstreamed_turn_the_allowance_cuts_renders_each_call_once() {
 #[tokio::test]
 async fn an_unreachable_upstream_ends_the_stream_with_the_typed_error_event() {
     let mut mcp = MockMCPServer::start().await.expect("start mcp");
-    let closed = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        format!("http://{}", listener.local_addr().expect("addr"))
-    };
-    let (router, _ctx, _dir) = external_router_with_mcp(&closed, &mcp, 1).await;
+    let closed = RefusedAddress::reserve();
+    let (router, _ctx, _dir) = external_router_with_mcp(&closed.http_url(), &mcp, 1).await;
 
     let body = stream_body(router.as_ref(), streaming_mcp_request(&mcp.url(), None)).await;
 

@@ -234,10 +234,10 @@ async fn output_silence_counts_from_the_dispatch_and_ends_with_the_requests() {
     // A stats-only step is output: the engine is alive, if quiet.
     let stats_only = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         engine_index: 0,
-        scheduler_stats: Some(Box::new(SchedulerStats {
+        scheduler_stats: Some(SchedulerStats {
             num_running_reqs: 1,
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     });
     engine
@@ -340,11 +340,11 @@ async fn scheduler_stats_surface_as_load_signal() {
             new_token_ids: vec![7],
             ..Default::default()
         }],
-        scheduler_stats: Some(Box::new(SchedulerStats {
+        scheduler_stats: Some(SchedulerStats {
             num_running_reqs: 3,
             num_waiting_reqs: 5,
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     });
     engine
@@ -376,11 +376,11 @@ async fn unpinned_requests_prefer_the_least_loaded_engine() {
             new_token_ids: vec![7],
             ..Default::default()
         }],
-        scheduler_stats: Some(Box::new(SchedulerStats {
+        scheduler_stats: Some(SchedulerStats {
             num_running_reqs: 3,
             num_waiting_reqs: 5,
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     });
     engines[0]
@@ -545,11 +545,11 @@ async fn an_emptied_rank_sheds_its_stale_queue_counts() {
             finish_reason: Some(EngineCoreFinishReason::Stop),
             ..Default::default()
         }],
-        scheduler_stats: Some(Box::new(SchedulerStats {
+        scheduler_stats: Some(SchedulerStats {
             num_running_reqs: 3,
             num_waiting_reqs: 5,
             ..Default::default()
-        })),
+        }),
         finished_requests: Some(std::collections::BTreeSet::from(["last".to_string()])),
         ..Default::default()
     });
@@ -2112,6 +2112,33 @@ async fn a_blocked_input_refuses_add_requests_past_the_frame_bound() {
     assert!(stream.next().await.unwrap().unwrap().finished());
 }
 
+/// A typed frame (an encode worker's request, the largest payload) is admitted
+/// against the same bound as an add frame: past it, refused at once.
+#[tokio::test]
+async fn a_blocked_input_refuses_typed_frames_past_the_byte_bound() {
+    let (client, engine, _ns) = connect().await;
+    client.set_send_timeout(SEND_WINDOW);
+    client.set_input_queue_limit(usize::MAX, 1 << 20);
+    saturate_input(&client).await;
+    // The writer has been stuck for its window: the input counts as blocked.
+    tokio::time::sleep(SEND_WINDOW).await;
+    let engine_id = client.engines()[0].engine_id.clone();
+    let started = std::time::Instant::now();
+    let error = client
+        .send_typed(
+            &engine_id,
+            Bytes::from_static(b"\x03"),
+            vec![0u8; 8],
+            vec![Bytes::from(vec![0u8; 2 << 20])],
+        )
+        .await
+        .expect_err("the waiting payload would pass the bound");
+    assert!(matches!(error, Error::EngineInputFull { .. }), "{error:?}");
+    assert!(started.elapsed() < SEND_WINDOW / 2, "refused at once");
+    assert!(client.is_alive());
+    drop(engine);
+}
+
 /// The bound in bytes: behind a blocked frame a small add-request within
 /// it still waits its window (and reaches the engine on resume), while
 /// one that would take the waiting payload past it is refused at once.
@@ -2602,8 +2629,11 @@ async fn an_abandoned_typed_tensor_submit_aborts_its_request_on_the_tagged_wire(
     let (client, mut engine, _ns) = connect_tagged().await;
     client.set_send_timeout(SEND_WINDOW);
     for _ in 0..3 {
-        let (payload, aux) =
-            TokenSpeedProtocol::encode_add(&large_tagged_request("queue-saturation")).unwrap();
+        let (payload, aux) = TokenSpeedProtocol::encode_add(
+            &large_tagged_request("queue-saturation"),
+            &Default::default(),
+        )
+        .unwrap();
         client
             .inner
             .queue_frame(
@@ -3106,4 +3136,37 @@ fn the_default_prefill_allowance_is_500_s_per_million_tokens() {
     );
     registry.prefill_tokens_per_sec = 0;
     assert_eq!(registry.prefill_allowance(1_000_000), Duration::ZERO);
+}
+
+/// The connection's layout is the one every rank declared; a rank that
+/// disagrees anywhere in the group, the middle included, fails the agreement
+/// and the connection falls back to the default layout; no engines read as
+/// the default.
+#[test]
+fn a_disagreeing_rank_in_the_middle_of_the_group_fails_the_agreement() {
+    use crate::protocol::sglang::{SglangLayout, SglangProtocol};
+
+    let engine = |index: u32, tensor_aux_frames: bool| ConnectedEngine {
+        engine_id: EngineId::from_engine_index(index),
+        ready_response: EngineCoreReadyResponse {
+            tensor_aux_frames,
+            ..default_ready_response()
+        },
+    };
+    let agreeing = [engine(0, true), engine(1, true), engine(2, true)];
+    assert_eq!(
+        connection_layout::<SglangProtocol>(&agreeing),
+        SglangLayout {
+            tensor_aux_frames: true
+        }
+    );
+    let middle_rank_behind = [engine(0, true), engine(1, false), engine(2, true)];
+    assert_eq!(
+        connection_layout::<SglangProtocol>(&middle_rank_behind),
+        SglangLayout::default()
+    );
+    assert_eq!(
+        connection_layout::<SglangProtocol>(&[]),
+        SglangLayout::default()
+    );
 }

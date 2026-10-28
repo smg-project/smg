@@ -31,7 +31,7 @@ use rustls::crypto::ring;
 use smg::{
     app_context::AppContext,
     config::RouterConfig,
-    mesh_discovery::{start_mesh_discovery_with_client, MeshDiscoveryConfig},
+    mesh::discovery::{start_mesh_discovery_with_client, MeshDiscoveryConfig},
     service_discovery::{
         start_service_discovery_with_client, ServiceDiscoveryConfig, DISCOVERY_ID_LABEL,
         DISCOVERY_PROVIDER_LABEL, POD_UID_LABEL,

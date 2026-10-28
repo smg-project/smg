@@ -19,7 +19,10 @@ use rustls::crypto::ring;
 use serde_json::json;
 use tokio::net::TcpListener;
 
-use crate::view::{RlWorkerInfo, RlWorkerView};
+use crate::{
+    calls::{CallFailure, RankReply, RlControlCalls},
+    view::{RlWorkerInfo, RlWorkerView},
+};
 
 pub struct FakeView(pub Vec<RlWorkerInfo>);
 
@@ -54,6 +57,7 @@ pub fn worker(id: &str, url: &str, runtime: RuntimeType) -> RlWorkerInfo {
         labels,
         control_url: Some(base_url),
         control_client: Ok(test_client()),
+        control_calls: None,
     }
 }
 
@@ -154,4 +158,66 @@ async fn handle(State(st): State<EngineState>, req: Request) -> Response {
     }
     st.in_flight.lock().expect("in_flight").0 -= 1;
     (st.status, Json(json!(st.body))).into_response()
+}
+
+/// A worker's engine connection that records the control calls it is given
+/// and answers each with a fixed outcome.
+#[derive(Debug)]
+pub struct FakeCalls {
+    answer: Result<Vec<RankReply>, CallFailure>,
+    seen: Mutex<Vec<(String, Option<serde_json::Value>, std::time::Duration)>>,
+}
+
+impl FakeCalls {
+    pub fn answering(answer: Result<Vec<RankReply>, CallFailure>) -> Arc<Self> {
+        Arc::new(Self {
+            answer,
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Every rank succeeded, saying nothing.
+    pub fn succeeding(ranks: usize) -> Arc<Self> {
+        Self::answering(Ok(vec![
+            RankReply {
+                success: true,
+                message: String::new(),
+            };
+            ranks
+        ]))
+    }
+
+    pub fn seen(&self) -> Vec<(String, Option<serde_json::Value>, std::time::Duration)> {
+        self.seen.lock().expect("seen").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl RlControlCalls for FakeCalls {
+    async fn call(
+        &self,
+        method: &str,
+        body: Option<serde_json::Value>,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<RankReply>, CallFailure> {
+        self.seen
+            .lock()
+            .expect("seen")
+            .push((method.to_string(), body, timeout));
+        self.answer.clone()
+    }
+}
+
+/// A TokenSpeed ZMQ worker with no control app, whose engine connection
+/// carries the RL routes as `calls`.
+pub fn zmq_worker(id: &str, calls: Arc<FakeCalls>) -> RlWorkerInfo {
+    let mut w = worker(
+        id,
+        &format!("ipc:///tmp/smg-zmq/{id}"),
+        RuntimeType::TokenSpeed,
+    );
+    w.connection_mode = ConnectionMode::Zmq;
+    w.control_url = None;
+    w.control_calls = Some(calls);
+    w
 }

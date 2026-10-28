@@ -381,9 +381,14 @@ impl SamplingBaseline {
 /// attempt stamp asks it for the worker each retry takes, as request building
 /// asked it for the first.
 pub(crate) trait TagForStart: fmt::Debug + Send + Sync {
-    /// The tag for an engine whose grammar starts at `start`, or `None` where
-    /// the table gives that engine no tag.
-    fn tag_for(&self, start: GrammarStart) -> Result<Option<String>, String>;
+    /// The tag for an engine whose grammar starts at `start`, in the
+    /// `vocabulary` of structural-tag nodes its compiler takes, or `None`
+    /// where the table gives that engine no tag.
+    fn tag_for(
+        &self,
+        start: GrammarStart,
+        vocabulary: utils::TagVocabulary,
+    ) -> Result<Option<String>, String>;
 
     /// The request's own JSON schema, where the tag is a JSON answer's: the
     /// constraint a worker the table gives no tag takes in its place, the
@@ -512,9 +517,11 @@ impl ToolConstraintStamp {
                 led || *first_token
             }
             Self::Table(tag) => {
-                let start = utils::WorkerDecoding::of(Some(workers)).start;
-                let shaped = tag.tag_for(start).map_err(failed)?;
-                let first_token = shaped.is_some() && start == GrammarStart::FirstToken;
+                let decoding = utils::WorkerDecoding::of(Some(workers));
+                let shaped = tag
+                    .tag_for(decoding.start, decoding.vocabulary)
+                    .map_err(failed)?;
+                let first_token = shaped.is_some() && decoding.start == GrammarStart::FirstToken;
                 match (shaped, tag.schema()) {
                     // A JSON answer's: the tag, or the request's own schema
                     // where the table gives this worker none, the one in the
@@ -588,7 +595,7 @@ pub(crate) fn sampling_defaults_for_request(
         Ok(defaults) => defaults,
         Err(e) => {
             warn!(
-                worker_url = %worker.url(),
+                worker_url = %worker.redacted_url(),
                 error = %e,
                 "Ignoring invalid default sampling params label"
             );
@@ -996,15 +1003,42 @@ pub(crate) fn finish_generate_request(
     Ok(())
 }
 
-/// Inject the KV bootstrap host/port/room into a generate request.
+/// A disaggregated worker's bootstrap rendezvous `(host, port)` (a prefill
+/// worker's KV, an encode worker's embeddings): the operator's
+/// (its URL's host, the port given with it) where set, else what its engine
+/// declared at the handshake (a direct-ZMQ worker's URL names the gateway's
+/// own bind, not the engine's host), else the default port.
+pub(crate) fn bootstrap_rendezvous<'a>(
+    registered_host: &'a str,
+    registered_port: Option<u16>,
+    declared: Option<(&'a str, u16)>,
+) -> (&'a str, u16) {
+    let host = match registered_host {
+        "" => declared.map_or("", |(host, _)| host),
+        host => host,
+    };
+    let port = registered_port
+        .or_else(|| declared.map(|(_, port)| port))
+        .unwrap_or(DEFAULT_BOOTSTRAP_PORT);
+    (host, port)
+}
+
+/// Inject the KV bootstrap host/port/room into a generate request, at the
+/// prefill worker's [`bootstrap_rendezvous`].
 fn inject_kv_bootstrap_room(
     request: &mut ProtoGenerateRequest,
     prefill_worker: &Arc<dyn Worker>,
     dp_placement: DpPlacement,
 ) {
     let metadata = prefill_worker.metadata();
-    let hostname = metadata.bootstrap_host();
-    let bootstrap_port = metadata.bootstrap_port().unwrap_or(DEFAULT_BOOTSTRAP_PORT);
+    let backend = prefill_worker.backend_client_if_initialized();
+    let (hostname, bootstrap_port) = bootstrap_rendezvous(
+        metadata.bootstrap_host(),
+        metadata.bootstrap_port(),
+        backend
+            .as_deref()
+            .and_then(BackendClient::declared_bootstrap),
+    );
     // 63-bit room: no dedup, keep the space wide so the birthday collision
     // rate stays negligible. See the proto field doc.
     //
@@ -1034,6 +1068,38 @@ fn inject_kv_bootstrap_room(
         "Injected PD rendezvous: host={}, port={}, room={}",
         hostname, bootstrap_port, room_id
     );
+}
+
+#[cfg(test)]
+mod bootstrap_rendezvous_tests {
+    use super::*;
+
+    /// What the operator registered wins, field by field; what the engine
+    /// declared fills the rest; the default port is the last resort.
+    #[test]
+    fn the_operators_rendezvous_wins_and_the_engines_fills_the_rest() {
+        let declared = Some(("10.0.0.7", 31755));
+        assert_eq!(
+            bootstrap_rendezvous("", None, declared),
+            ("10.0.0.7", 31755)
+        );
+        assert_eq!(
+            bootstrap_rendezvous("prefill-0", Some(9000), declared),
+            ("prefill-0", 9000)
+        );
+        assert_eq!(
+            bootstrap_rendezvous("prefill-0", None, declared),
+            ("prefill-0", 31755)
+        );
+        assert_eq!(
+            bootstrap_rendezvous("", Some(9000), declared),
+            ("10.0.0.7", 9000)
+        );
+        assert_eq!(
+            bootstrap_rendezvous("prefill-0", None, None),
+            ("prefill-0", DEFAULT_BOOTSTRAP_PORT)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1944,7 +2010,11 @@ mod tool_constraint_restamp_tests {
     struct TableTag;
 
     impl TagForStart for TableTag {
-        fn tag_for(&self, start: GrammarStart) -> Result<Option<String>, String> {
+        fn tag_for(
+            &self,
+            start: GrammarStart,
+            _vocabulary: utils::TagVocabulary,
+        ) -> Result<Option<String>, String> {
             Ok(match start {
                 GrammarStart::AfterReasoning => Some(BARE_TABLE_TAG.to_string()),
                 GrammarStart::FirstToken => Some(THOUGHT_TABLE_TAG.to_string()),
@@ -1965,7 +2035,11 @@ mod tool_constraint_restamp_tests {
     struct AnswerTag(Value);
 
     impl TagForStart for AnswerTag {
-        fn tag_for(&self, start: GrammarStart) -> Result<Option<String>, String> {
+        fn tag_for(
+            &self,
+            start: GrammarStart,
+            _vocabulary: utils::TagVocabulary,
+        ) -> Result<Option<String>, String> {
             Ok((start == GrammarStart::FirstToken).then(|| THOUGHT_ANSWER_TAG.to_string()))
         }
 

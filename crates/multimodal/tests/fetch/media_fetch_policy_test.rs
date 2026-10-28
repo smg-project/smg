@@ -7,7 +7,7 @@
 #![allow(clippy::expect_used, clippy::print_stderr)]
 
 use std::{
-    io::{Read, Write},
+    io::Write,
     net::TcpListener,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -28,21 +28,6 @@ use crate::common;
 const TINY_PNG_B64: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 
-fn read_head(stream: &mut std::net::TcpStream) {
-    let mut head = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        let read = stream.read(&mut buf).unwrap_or(0);
-        if read == 0 {
-            break;
-        }
-        head.extend_from_slice(&buf[..read]);
-        if head.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
-        }
-    }
-}
-
 /// An origin on `bind` answering every request with `respond(port, n)` for
 /// its `n`th request; the counter is the requests it answered.
 fn serve(
@@ -56,7 +41,7 @@ fn serve(
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
-            read_head(&mut stream);
+            common::read_head(&mut stream);
             let n = seen.fetch_add(1, Ordering::SeqCst);
             let _ = stream.write_all(&respond(port, n));
             let _ = stream.flush();

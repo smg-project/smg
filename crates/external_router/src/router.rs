@@ -292,8 +292,8 @@ pub mod known {
 
         use super::ExternalRouter;
         Box::pin(async move {
-            crate::gemini::GeminiRouter::new(&ctx)
-                .map(|router| Arc::new(router) as Arc<dyn ExternalRouter>)
+            let router = crate::gemini::GeminiRouter::new(&ctx);
+            Ok(Arc::new(router) as Arc<dyn ExternalRouter>)
         })
     }
 

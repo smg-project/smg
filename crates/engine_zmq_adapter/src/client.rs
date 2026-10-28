@@ -11,22 +11,25 @@ use std::{
 
 use engine_zmq_client::{
     check_engine_layouts,
-    codec::OpaqueValue,
+    codec::{tensor::encode_with_aux_frames, OpaqueValue},
     connect_handshake,
-    connector::{Client, EngineCoreClient, SglangClient, TokenSpeedClient},
+    connector::{Client, EngineCoreClient, SglangClient, TokenSpeedClient, TrtllmClient},
     protocol::{
-        handshake::EngineCoreReadyResponse,
+        handshake::{EngineCoreReadyResponse, REQUEST_KIND_ENCODE},
         sglang::{request::SglangRequest, SglangProtocol},
-        tokenspeed::{wire_carries_control_calls, TokenSpeedProtocol},
+        tokenspeed::{
+            request::TokenSpeedRequestType, wire_carries_control_calls, TokenSpeedProtocol,
+        },
+        trtllm::TrtllmProtocol,
         vllm::{request::EngineCoreRequest, sampling::EngineCoreSamplingParams, VllmProtocol},
         EngineLoad, EngineProtocol,
     },
-    ConnectedEngine, StartupBudget,
+    ConnectedEngine, EngineCount, StartupBudget,
 };
-use futures::{stream::SelectAll, StreamExt};
+use futures::StreamExt;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::worker::{RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse};
-use smg_grpc_client::{sglang_proto, tokenspeed_proto, vllm_proto as vllm};
+use smg_grpc_client::{sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto as vllm};
 
 #[cfg(unix)]
 use crate::sockets::unlink_stale_socket;
@@ -45,7 +48,12 @@ use crate::{
     },
     tokenspeed::{
         constraint_ref as tokenspeed_constraint_ref, fan_out_tokenspeed_requests,
-        translate_request_tokenspeed_for, GridTensors, RankIndices, TokenSpeedGenerateStream,
+        translate_encode_request, translate_request_tokenspeed_for, EncodeRendezvous, GridTensors,
+        LogprobColumns, RankIndices, TokenSpeedGenerateStream,
+    },
+    trtllm::{
+        constraint_ref as trtllm_constraint_ref, fan_out_trtllm_requests, translate_request_trtllm,
+        TrtllmGenerateStream,
     },
     vllm::{
         fan_out_requests, has_media, kv_transfer_params, now_secs, ranked_candidate_count,
@@ -68,7 +76,9 @@ const SUPPORTED_TASKS_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) fn default_structured_outputs_support(dialect: ZmqDialect) -> StructuredOutputsSupport {
     match dialect {
         ZmqDialect::Vllm => StructuredOutputsSupport::default(),
-        ZmqDialect::TokenSpeed | ZmqDialect::Sglang => StructuredOutputsBackendConfig::Other.into(),
+        ZmqDialect::TokenSpeed | ZmqDialect::Sglang | ZmqDialect::Trtllm => {
+            StructuredOutputsBackendConfig::Other.into()
+        }
     }
 }
 
@@ -97,6 +107,8 @@ pub enum ZmqDialect {
     TokenSpeed,
     /// SGLang's scheduler, behind the SMG plugin that performs the handshake.
     Sglang,
+    /// TensorRT-LLM's LLM API, behind the shim that performs the handshake.
+    Trtllm,
 }
 
 /// The connected client for a [`ZmqDialect`]. All share the transport and
@@ -107,6 +119,7 @@ pub(crate) enum ZmqBackend {
     Vllm(Arc<EngineCoreClient>),
     TokenSpeed(Arc<TokenSpeedClient>),
     Sglang(Arc<SglangClient>),
+    Trtllm(Arc<TrtllmClient>),
 }
 
 /// Per-connection constants of a [`ZmqEngineClient`], fixed at connect time.
@@ -150,11 +163,13 @@ pub(crate) struct ZmqConnectionMeta {
 }
 
 /// Bind the SMG-side ZMQ sockets and complete the handshake with the
-/// engine(s): the single connect path for a worker's `ipc://` URL, driven only
-/// by the worker's background handshake driver. `model_id` is
+/// engine(s): the single connect path for a worker's `ipc://` or `tcp://` URL
+/// (see `zmq_socket_addresses`), driven only by the worker's background
+/// handshake driver. `model_id` is
 /// the config-resolved served model (EngineCore reports none). `engine_count`
 /// is the number of DP engines that will dial this worker's sockets (1 for an
-/// ungrouped worker). `startup` is the longest any one stage of the handshake
+/// ungrouped worker), or [`EngineCount::Declared`] for as many as the engines
+/// declare. `startup` is the longest any one stage of the handshake
 /// (an engine's HELLO, its READY, its registration on the input socket) may
 /// stay silent: the gateway did not launch the engine and sees no sign of
 /// life from it beside the wire, so this bound alone must cover the engine's
@@ -169,10 +184,20 @@ pub async fn connect_for_worker(
     model_id: String,
     runtime: RuntimeType,
     handshake_override: Option<&str>,
-    engine_count: usize,
+    engine_count: impl Into<EngineCount>,
     startup: Duration,
     request_timeout: Option<Duration>,
 ) -> Result<ZmqEngineClient, String> {
+    // This dialect is served through its gRPC servicer: the gateway's direct
+    // lane has no request builder for it, so a worker registered on it is
+    // refused here, at registration, instead of handshaken, counted healthy
+    // and failed on every request.
+    if matches!(runtime, RuntimeType::Trtllm) {
+        return Err(format!(
+            "runtime {runtime} is served through its gRPC servicer, not the gateway's direct \
+             ZMQ lane"
+        ));
+    }
     // The engine can't stop at EOS on its own (it has no tokenizer or model
     // config); resolve the EOS ids from the local model dir so every request
     // carries them.
@@ -223,10 +248,11 @@ pub async fn connect_with_eos(
     model_id: String,
     runtime: RuntimeType,
     handshake: Handshake<'_>,
-    engine_count: usize,
+    engine_count: impl Into<EngineCount>,
     eos: EosTokenIds,
     startup: impl Into<StartupBudget>,
 ) -> Result<ZmqEngineClient, String> {
+    let engine_count = engine_count.into();
     let (handshake, input, output) = zmq_socket_addresses(base_url, handshake)?;
     ensure_ipc_socket_dir(base_url).await?;
     // ZMQ refuses to bind over an existing ipc socket file, so leftovers from
@@ -240,7 +266,7 @@ pub async fn connect_with_eos(
         unlink_stale_socket(&output).await?;
     }
     tracing::info!(
-        "Binding ZMQ client for worker {base_url} (handshake={handshake}, engines={engine_count})"
+        "Binding ZMQ client for worker {base_url} (handshake={handshake}, engines={engine_count:?})"
     );
     ZmqEngineClient::connect(
         &handshake,
@@ -261,6 +287,7 @@ pub enum ZmqModelInfo {
     Vllm(vllm::GetModelInfoResponse),
     TokenSpeed(Box<tokenspeed_proto::GetModelInfoResponse>),
     Sglang(Box<sglang_proto::GetModelInfoResponse>),
+    Trtllm(Box<trtllm_proto::GetModelInfoResponse>),
 }
 
 /// Server metadata as the connected engine's native proto response.
@@ -268,6 +295,7 @@ pub enum ZmqServerInfo {
     Vllm(Box<vllm::GetServerInfoResponse>),
     TokenSpeed(Box<tokenspeed_proto::GetServerInfoResponse>),
     Sglang(Box<sglang_proto::GetServerInfoResponse>),
+    Trtllm(Box<trtllm_proto::GetServerInfoResponse>),
 }
 
 /// Direct ZMQ connection to a same-host engine (vLLM EngineCore or TokenSpeed),
@@ -284,9 +312,10 @@ impl ZmqEngineClient {
     /// Bind the frontend sockets and complete the handshake with the engine(s),
     /// which must already be running and dialing `handshake_address`.
     ///
-    /// `input_address`/`output_address` are the `ipc://` data-plane endpoints the
-    /// engines connect to (chosen by SMG). `engine_count` is the number of DP
-    /// ranks to await. `runtime` selects the wire protocol spoken over the shared
+    /// `input_address`/`output_address` are the data-plane endpoints SMG binds
+    /// and the engines connect to (`ipc://` for a same-host engine, `tcp://`
+    /// for engines on other hosts). `engine_count` is the number of DP
+    /// ranks to await ([`EngineCount`]; a plain count is exact). `runtime` selects the wire protocol spoken over the shared
     /// transport (vLLM EngineCore vs TokenSpeed). `startup` bounds the
     /// handshake (see [`StartupBudget`]; a plain [`Duration`] is a per-message
     /// timeout).
@@ -298,7 +327,7 @@ impl ZmqEngineClient {
         handshake_address: &str,
         input_address: &str,
         output_address: &str,
-        engine_count: usize,
+        engine_count: impl Into<EngineCount>,
         model_id: String,
         eos: EosTokenIds,
         runtime: RuntimeType,
@@ -313,10 +342,11 @@ impl ZmqEngineClient {
             RuntimeType::Vllm | RuntimeType::Unspecified => ZmqDialect::Vllm,
             RuntimeType::TokenSpeed => ZmqDialect::TokenSpeed,
             RuntimeType::Sglang => ZmqDialect::Sglang,
+            RuntimeType::Trtllm => ZmqDialect::Trtllm,
             other => {
                 return Err(format!(
                     "ZMQ direct backend has no engine implementation for runtime \
-                     {other}; only vllm, tokenspeed and sglang are supported"
+                     {other}; only vllm, tokenspeed, sglang and trtllm are supported"
                 )
                 .into())
             }
@@ -339,6 +369,7 @@ impl ZmqEngineClient {
             ZmqDialect::Vllm => check_engine_layouts::<VllmProtocol>(&transport)?,
             ZmqDialect::TokenSpeed => check_engine_layouts::<TokenSpeedProtocol>(&transport)?,
             ZmqDialect::Sglang => check_engine_layouts::<SglangProtocol>(&transport)?,
+            ZmqDialect::Trtllm => check_engine_layouts::<TrtllmProtocol>(&transport)?,
         }
         let backend = match dialect {
             ZmqDialect::Vllm => ZmqBackend::Vllm(Arc::new(EngineCoreClient::new(transport))),
@@ -346,6 +377,7 @@ impl ZmqEngineClient {
                 ZmqBackend::TokenSpeed(Arc::new(TokenSpeedClient::new(transport)))
             }
             ZmqDialect::Sglang => ZmqBackend::Sglang(Arc::new(SglangClient::new(transport))),
+            ZmqDialect::Trtllm => ZmqBackend::Trtllm(Arc::new(TrtllmClient::new(transport))),
         };
         let client = Self {
             backend,
@@ -362,8 +394,13 @@ impl ZmqEngineClient {
         };
         // Every wire bounds a prompt by the window the engine reported
         // (`crate::context_window`); an engine that reported none leaves
-        // prompts unbounded before it, said once here.
-        if client.context_window().is_ok_and(|window| window == 0) {
+        // prompts unbounded before it, said once here. An encode server runs
+        // no language model, takes no prompt and reports no window.
+        let takes_prompts = client
+            .engines()
+            .iter()
+            .any(|engine| engine.ready_response.takes_generate());
+        if takes_prompts && client.context_window().is_ok_and(|window| window == 0) {
             tracing::warn!(
                 "the engine reported no context window at the handshake (max_model_len 0): \
                  prompt lengths are not bounded before the engine"
@@ -527,6 +564,7 @@ impl ZmqEngineClient {
             ZmqBackend::Vllm(_) => ZmqDialect::Vllm,
             ZmqBackend::TokenSpeed(_) => ZmqDialect::TokenSpeed,
             ZmqBackend::Sglang(_) => ZmqDialect::Sglang,
+            ZmqBackend::Trtllm(_) => ZmqDialect::Trtllm,
         }
     }
 
@@ -537,16 +575,18 @@ impl ZmqEngineClient {
             ZmqDialect::Vllm => RuntimeType::Vllm,
             ZmqDialect::TokenSpeed => RuntimeType::TokenSpeed,
             ZmqDialect::Sglang => RuntimeType::Sglang,
+            ZmqDialect::Trtllm => RuntimeType::Trtllm,
         }
     }
 
     /// The engines connected on the shared transport (same handshake for both
-    /// protocols).
-    fn engines(&self) -> &[ConnectedEngine] {
+    /// protocols), each with the facts its handshake declared.
+    pub fn engines(&self) -> &[ConnectedEngine] {
         match &self.backend {
             ZmqBackend::Vllm(client) => client.engines(),
             ZmqBackend::TokenSpeed(client) => client.engines(),
             ZmqBackend::Sglang(client) => client.engines(),
+            ZmqBackend::Trtllm(client) => client.engines(),
         }
     }
 
@@ -556,9 +596,11 @@ impl ZmqEngineClient {
     pub(crate) fn vllm_client(&self, operation: &str) -> Result<&EngineCoreClient, tonic::Status> {
         match &self.backend {
             ZmqBackend::Vllm(client) => Ok(client),
-            ZmqBackend::TokenSpeed(_) | ZmqBackend::Sglang(_) => Err(tonic::Status::unimplemented(
-                format!("{operation} is only available on a vLLM ZMQ backend"),
-            )),
+            ZmqBackend::TokenSpeed(_) | ZmqBackend::Sglang(_) | ZmqBackend::Trtllm(_) => {
+                Err(tonic::Status::unimplemented(format!(
+                    "{operation} is only available on a vLLM ZMQ backend"
+                )))
+            }
         }
     }
 
@@ -568,9 +610,11 @@ impl ZmqEngineClient {
     pub(crate) fn sglang_client(&self, operation: &str) -> Result<&SglangClient, tonic::Status> {
         match &self.backend {
             ZmqBackend::Sglang(client) => Ok(client),
-            ZmqBackend::Vllm(_) | ZmqBackend::TokenSpeed(_) => Err(tonic::Status::unimplemented(
-                format!("{operation} is only available on an SGLang ZMQ backend"),
-            )),
+            ZmqBackend::Vllm(_) | ZmqBackend::TokenSpeed(_) | ZmqBackend::Trtllm(_) => {
+                Err(tonic::Status::unimplemented(format!(
+                    "{operation} is only available on an SGLang ZMQ backend"
+                )))
+            }
         }
     }
 
@@ -579,6 +623,70 @@ impl ZmqEngineClient {
     /// sizes, KV capacity) a frontend re-exposes as metadata.
     pub fn ready_response(&self) -> Option<&EngineCoreReadyResponse> {
         self.engines().first().map(|engine| &engine.ready_response)
+    }
+
+    /// The data-parallel ranks this connection serves: one connected engine
+    /// per rank (a pinned request is placed on the engine of its index and
+    /// refused past this count, `get_loads` names an entry per engine). The
+    /// handshake's `data_parallel_size` is not this figure: ranks launched
+    /// independently each report a size of one.
+    pub fn engine_count(&self) -> usize {
+        self.engines().len()
+    }
+
+    /// Check the disaggregation role every connected engine declared against
+    /// `registered`, the role its worker is registered for (`None` for one
+    /// that serves whole requests): a prefill engine registered as a decode
+    /// worker, or a whole-request engine as either, fails its connection with
+    /// both roles named instead of failing every request it takes. An encode
+    /// worker needs the wire's encode request, so an engine that does not
+    /// list it (one before the request, or a scheduler) fails the connection
+    /// of an `encode` registration whatever else it declares, as the servicer
+    /// refuses the same engine at its link. A prefill or encode worker's
+    /// requests name its engine's bootstrap rendezvous, which on this lane
+    /// only the handshake supplies (the worker's URL names the frontend's own
+    /// bind, not the engine's host), so an engine that declares no bootstrap
+    /// address fails the connection of either registration, whatever else it
+    /// declares, instead of sending every disaggregated request out with an
+    /// empty host. An engine that predates the declaration (it lists no
+    /// request types) is otherwise not checked.
+    pub fn check_declared_role(&self, registered: Option<&str>) -> Result<(), String> {
+        for engine in self.engines() {
+            let ready = &engine.ready_response;
+            if registered == Some("encode") && !ready.lists_request_kind(REQUEST_KIND_ENCODE) {
+                return Err(format!(
+                    "engine {:?} lists no encode request on its wire (request_types {:?}) but \
+                     its worker is registered as an encode worker: a newer engine, or the \
+                     Python servicer (--servicer-impl python), serves this worker",
+                    engine.engine_id, ready.request_types,
+                ));
+            }
+            if !ready.request_types.is_empty() {
+                let declared = ready.disaggregation_role();
+                if declared != registered {
+                    return Err(format!(
+                        "engine {:?} declared disaggregation role {} but its worker is \
+                         registered as {}",
+                        engine.engine_id,
+                        declared.unwrap_or("none (whole requests)"),
+                        registered.unwrap_or("a regular worker"),
+                    ));
+                }
+            }
+            if let Some(role @ ("prefill" | "encode")) = registered {
+                if ready.bootstrap_address().is_none() {
+                    return Err(format!(
+                        "engine {:?} declares no bootstrap address but its worker is registered \
+                         as {role}: a {role} worker's requests name its engine's rendezvous \
+                         (bootstrap_host and bootstrap_port in the handshake), which this lane \
+                         cannot take from the worker's own address; an engine that declares it \
+                         serves this worker",
+                        engine.engine_id,
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The engine's context window as the ready handshake reported it (`0`
@@ -801,11 +909,8 @@ impl ZmqEngineClient {
         }
         // The deadline counts from the dispatch: before the submits.
         let deadline = self.request_deadline();
-        let mut streams = SelectAll::new();
-        for stream in self.generate_vllm_streams(req).await? {
-            streams.push(stream);
-        }
-        Ok(ZmqGenerateStream::vllm(streams).with_deadline(deadline))
+        let subs = self.generate_vllm_streams(req).await?;
+        Ok(ZmqGenerateStream::vllm(subs).with_deadline(deadline))
     }
 
     /// [`Self::generate_vllm`] for a TokenSpeed backend and request.
@@ -814,26 +919,27 @@ impl ZmqEngineClient {
         req: tokenspeed_proto::GenerateRequest,
     ) -> Result<ZmqGenerateStream, tonic::Status> {
         let deadline = self.request_deadline();
-        let mut streams = SelectAll::new();
-        for stream in self.generate_tokenspeed_streams(req).await? {
-            streams.push(stream);
-        }
-        Ok(ZmqGenerateStream::tokenspeed(streams).with_deadline(deadline))
+        let subs = self.generate_tokenspeed_streams(req).await?;
+        Ok(ZmqGenerateStream::tokenspeed(subs).with_deadline(deadline))
     }
 
     /// [`Self::generate_vllm_streams`] for a TokenSpeed backend: the `n > 1`
     /// fan-out submitted to the engine, each sub tagged with its proto
     /// `index`, left unmerged so a caller can end one choice without the
     /// others (the gRPC servicer matches string stops per choice).
-    /// Grid tensors keep the conservative reading here ([`GridTensors::Positions`]):
-    /// the router's direct-ZMQ path, which calls this, carries no model facts, so
-    /// an item with a vision grid is refused there as before; the Rust servicer,
-    /// which knows the model, calls [`Self::generate_tokenspeed_streams_for_model`].
+    /// A multimodal item's grid tensors are read with the model facts the
+    /// engine declared at its handshake ([`GridTensors::declared`]); an
+    /// engine that declares none keeps the conservative reading, which
+    /// refuses an item with a vision grid. The Rust servicer, which has the
+    /// launcher's facts, calls [`Self::generate_tokenspeed_streams_for_model`].
     pub async fn generate_tokenspeed_streams(
         &self,
         req: tokenspeed_proto::GenerateRequest,
     ) -> Result<Vec<TokenSpeedGenerateStream>, tonic::Status> {
-        self.generate_tokenspeed_streams_for_model(req, GridTensors::Positions)
+        let grid_tensors = self
+            .ready_response()
+            .map_or(GridTensors::Positions, GridTensors::declared);
+        self.generate_tokenspeed_streams_for_model(req, grid_tensors)
             .await
     }
 
@@ -851,6 +957,17 @@ impl ZmqEngineClient {
                 "vLLM ZMQ backend expects a vLLM generate request",
             ));
         };
+        // A disaggregated encode worker lists `encode` alone: it runs no
+        // language model, so the gRPC servicer's words for its Generate.
+        if !client
+            .engines()
+            .iter()
+            .any(|engine| engine.ready_response.takes_generate())
+        {
+            return Err(tonic::Status::failed_precondition(
+                "Generate is unavailable on TokenSpeed encode workers",
+            ));
+        }
         // A constraint the engine's grammar backend cannot enforce is refused
         // here, before anything reaches the engine, as on every wire.
         if let Some(sp) = req.sampling_params.as_ref() {
@@ -862,19 +979,77 @@ impl ZmqEngineClient {
         }
         let max_model_len = self.prompt_bound()?;
         // The ranks as the engine numbers them: a disaggregated request is
-        // placed by its room's residue, a pinned one by its pin.
+        // placed on a prefill engine by its room's residue, a pinned one
+        // elsewhere by its pin.
         let ranks = RankIndices::of(client.engines());
+        let logprobs = LogprobColumns::of(client.engines());
         // Sub-streams submitted before a mid-loop failure are dropped with the
         // error, which auto-aborts their engine-side requests.
         let mut streams = Vec::new();
         for (index, sub) in fan_out_tokenspeed_requests(req).into_iter().enumerate() {
-            let request =
-                translate_request_tokenspeed_for(sub, grid_tensors, max_model_len, &ranks)
-                    .map_err(tonic::Status::invalid_argument)?;
+            let request = translate_request_tokenspeed_for(
+                sub,
+                grid_tensors,
+                max_model_len,
+                &ranks,
+                logprobs,
+            )
+            .map_err(tonic::Status::invalid_argument)?;
             let stream = client.submit(request).await.map_err(zmq_status)?;
             streams.push(TokenSpeedGenerateStream::new(stream, index as u32));
         }
         Ok(streams)
+    }
+
+    /// Hand an `Encode` RPC to a TokenSpeed encode worker: the request
+    /// translated with the gRPC servicer's rules
+    /// ([`translate_encode_request`]), sent under the wire's encode request
+    /// type to an engine whose handshake lists `encode` (by the room's
+    /// residue when several do: the embedding's rendezvous is per room, any
+    /// encode worker serves it), with its large tensors as auxiliary frames.
+    /// Nothing answers it: the worker ships the embedding to the prefill
+    /// peer over the transfer engine, as the gRPC servicer's `Encode` acks
+    /// after its send. An engine that lists no encode request (one before
+    /// the wire carried it) is refused by name, nothing sent.
+    pub async fn encode_tokenspeed(
+        &self,
+        req: smg_grpc_client::tokenspeed_encoder_proto::EncodeRequest,
+        rendezvous: &EncodeRendezvous,
+    ) -> Result<(), tonic::Status> {
+        let ZmqBackend::TokenSpeed(client) = &self.backend else {
+            return Err(tonic::Status::internal(
+                "vLLM ZMQ backend expects a vLLM encode request",
+            ));
+        };
+        let encoders: Vec<&ConnectedEngine> = client
+            .engines()
+            .iter()
+            .filter(|engine| {
+                engine
+                    .ready_response
+                    .lists_request_kind(REQUEST_KIND_ENCODE)
+            })
+            .collect();
+        if encoders.is_empty() {
+            return Err(tonic::Status::failed_precondition(
+                "Encode is not served by this engine: its handshake lists no encode request on \
+                 the msgpack wire (an engine before the encode role rode it); a newer engine, \
+                 or the Python servicer (--servicer-impl python), serves this worker",
+            ));
+        }
+        let request =
+            translate_encode_request(req, rendezvous).map_err(tonic::Status::invalid_argument)?;
+        let (payload, aux_frames) = encode_with_aux_frames(&request).map_err(zmq_status)?;
+        let residue = request.bootstrap_room.rem_euclid(encoders.len() as i64) as usize;
+        client
+            .send_typed(
+                &encoders[residue].engine_id,
+                TokenSpeedRequestType::Encode.to_frame(),
+                payload,
+                aux_frames,
+            )
+            .await
+            .map_err(zmq_status)
     }
 
     /// [`Self::generate_vllm`] for an SGLang backend and request.
@@ -891,11 +1066,8 @@ impl ZmqEngineClient {
             ));
         }
         let deadline = self.request_deadline();
-        let mut streams = SelectAll::new();
-        for stream in self.generate_sglang_streams(req).await? {
-            streams.push(stream);
-        }
-        Ok(ZmqGenerateStream::sglang(streams).with_deadline(deadline))
+        let subs = self.generate_sglang_streams(req).await?;
+        Ok(ZmqGenerateStream::sglang(subs).with_deadline(deadline))
     }
 
     /// [`Self::generate_tokenspeed_streams`] for an SGLang backend: the
@@ -1084,6 +1256,59 @@ impl ZmqEngineClient {
         )))
     }
 
+    /// Submit a `TrtllmService` generate request to the engine's shim and
+    /// stream back vLLM-proto responses, the `n > 1` fan-out merged.
+    pub async fn generate_trtllm(
+        &self,
+        req: trtllm_proto::GenerateRequest,
+    ) -> Result<ZmqGenerateStream, tonic::Status> {
+        let deadline = self.request_deadline();
+        let subs = self.generate_trtllm_streams(req, None).await?;
+        Ok(ZmqGenerateStream::trtllm(subs).with_deadline(deadline))
+    }
+
+    /// [`Self::generate_sglang_streams_with_trace`] for a TensorRT-LLM
+    /// backend: the `n > 1` fan-out submitted to the shim, each sub tagged
+    /// with its proto `sequence_index`, left unmerged. `trace_headers` is the
+    /// caller's W3C trace context, carried on each sub's request for the
+    /// engine's own spans.
+    pub async fn generate_trtllm_streams(
+        &self,
+        req: trtllm_proto::GenerateRequest,
+        trace_headers: Option<BTreeMap<String, String>>,
+    ) -> Result<Vec<TrtllmGenerateStream>, tonic::Status> {
+        let ZmqBackend::Trtllm(client) = &self.backend else {
+            return Err(tonic::Status::internal(
+                "this ZMQ backend is not a TensorRT-LLM engine",
+            ));
+        };
+        // A constraint the engine's grammar backend cannot enforce is refused
+        // here, before anything reaches the engine, as on every wire.
+        refuse_unenforceable_constraint(
+            trtllm_constraint_ref(&req),
+            self.structured_outputs_support(),
+        )
+        .map_err(tonic::Status::invalid_argument)?;
+        let max_model_len = self.prompt_bound()?;
+        let mut streams = Vec::new();
+        for (index, sub) in fan_out_trtllm_requests(req).into_iter().enumerate() {
+            let mut request = translate_request_trtllm(sub, max_model_len)
+                .map_err(tonic::Status::invalid_argument)?;
+            request.trace_headers.clone_from(&trace_headers);
+            let stream = client.submit(request).await.map_err(zmq_status)?;
+            streams.push(TrtllmGenerateStream::new(stream, index as u32));
+        }
+        Ok(streams)
+    }
+
+    /// Whether the engine's wire carries control calls (the cache flush and
+    /// the profiler): an SGLang scheduler's always does, a TokenSpeed one's
+    /// when every rank declared the control reply, a vLLM engine's never.
+    pub fn carries_control_calls(&self) -> bool {
+        matches!(&self.backend, ZmqBackend::Sglang(_))
+            || self.tokenspeed_wire_carries_control_calls()
+    }
+
     /// Whether every connected TokenSpeed rank declared the control reply at
     /// its handshake (the control-wire revision), so the scheduler's control
     /// RPCs can be carried to it; false on a scheduler that declares none and
@@ -1123,9 +1348,9 @@ impl ZmqEngineClient {
                 }
                 control_on_every_rank(client, method, args, wait).await
             }
-            ZmqBackend::Vllm(_) => Err(tonic::Status::unimplemented(format!(
-                "{rpc} is only available on an SGLang or TokenSpeed ZMQ backend"
-            ))),
+            ZmqBackend::Vllm(_) | ZmqBackend::Trtllm(_) => Err(tonic::Status::unimplemented(
+                format!("{rpc} is only available on an SGLang or TokenSpeed ZMQ backend"),
+            )),
         }
     }
 
@@ -1178,6 +1403,35 @@ impl ZmqEngineClient {
         Ok(aggregate_control(&results, ok_message))
     }
 
+    /// One RL or weight operation on every connected rank: the TokenSpeed
+    /// scheduler's control call `method` (`pause_generation`,
+    /// `update_weights_from_distributed`, ...), its argument `body`, the JSON
+    /// body of the engine's HTTP route of the same name (none when `None`).
+    /// Each rank's `(success, message)`, in engine order; `wait` bounds each
+    /// rank's reply (DEADLINE_EXCEEDED). Only a TokenSpeed scheduler of the
+    /// control-wire revision serves these calls; any other engine answers
+    /// UNIMPLEMENTED naming the gap.
+    pub async fn rl_control_call(
+        &self,
+        method: &str,
+        body: Option<serde_json::Value>,
+        wait: Duration,
+    ) -> Result<Vec<(bool, String)>, tonic::Status> {
+        if !matches!(&self.backend, ZmqBackend::TokenSpeed(_)) {
+            return Err(tonic::Status::unimplemented(format!(
+                "{method} is served over the engine connection by a TokenSpeed scheduler only"
+            )));
+        }
+        if !self.tokenspeed_wire_carries_control_calls() {
+            return Err(tonic::Status::unimplemented(format!(
+                "{method} cannot ride this engine's connection: its handshake declares no \
+                 control reply, so the msgpack wire carries generate and abort only"
+            )));
+        }
+        let args = body.map(json_to_msgpack).into_iter().collect();
+        self.control_calls(method, method, args, wait).await
+    }
+
     /// Local liveness: false once the connection observed `ENGINE_CORE_DEAD` or
     /// a transport failure. No RPC (the raw ZMQ wire has no health RPC).
     pub fn is_alive(&self) -> bool {
@@ -1185,6 +1439,7 @@ impl ZmqEngineClient {
             ZmqBackend::Vllm(client) => client.is_alive(),
             ZmqBackend::TokenSpeed(client) => client.is_alive(),
             ZmqBackend::Sglang(client) => client.is_alive(),
+            ZmqBackend::Trtllm(client) => client.is_alive(),
         }
     }
 
@@ -1264,6 +1519,7 @@ impl ZmqEngineClient {
             ZmqBackend::Vllm(client) => client.engine_load(engine_index),
             ZmqBackend::TokenSpeed(client) => client.engine_load(engine_index),
             ZmqBackend::Sglang(client) => client.engine_load(engine_index),
+            ZmqBackend::Trtllm(client) => client.engine_load(engine_index),
         }
     }
 
@@ -1275,6 +1531,7 @@ impl ZmqEngineClient {
             ZmqBackend::Vllm(client) => client.output_silence(),
             ZmqBackend::TokenSpeed(client) => client.output_silence(),
             ZmqBackend::Sglang(client) => client.output_silence(),
+            ZmqBackend::Trtllm(client) => client.output_silence(),
         }
     }
 
@@ -1286,6 +1543,7 @@ impl ZmqEngineClient {
             ZmqBackend::Vllm(client) => client.reports_steps(),
             ZmqBackend::TokenSpeed(client) => client.reports_steps(),
             ZmqBackend::Sglang(client) => client.reports_steps(),
+            ZmqBackend::Trtllm(client) => client.reports_steps(),
         }
     }
 
@@ -1298,6 +1556,7 @@ impl ZmqEngineClient {
             ZmqBackend::Vllm(client) => client.note_reports_steps(),
             ZmqBackend::TokenSpeed(client) => client.note_reports_steps(),
             ZmqBackend::Sglang(client) => client.note_reports_steps(),
+            ZmqBackend::Trtllm(client) => client.note_reports_steps(),
         }
     }
 
@@ -1308,6 +1567,7 @@ impl ZmqEngineClient {
             ZmqBackend::Vllm(client) => client.prefill_pending_tokens(),
             ZmqBackend::TokenSpeed(client) => client.prefill_pending_tokens(),
             ZmqBackend::Sglang(client) => client.prefill_pending_tokens(),
+            ZmqBackend::Trtllm(client) => client.prefill_pending_tokens(),
         }
     }
 
@@ -1319,6 +1579,7 @@ impl ZmqEngineClient {
             ZmqBackend::Vllm(client) => client.set_silence_death_timeout(timeout),
             ZmqBackend::TokenSpeed(client) => client.set_silence_death_timeout(timeout),
             ZmqBackend::Sglang(client) => client.set_silence_death_timeout(timeout),
+            ZmqBackend::Trtllm(client) => client.set_silence_death_timeout(timeout),
         }
     }
 
@@ -1330,6 +1591,7 @@ impl ZmqEngineClient {
             ZmqBackend::Vllm(client) => client.set_prefill_tokens_per_sec(tokens_per_sec),
             ZmqBackend::TokenSpeed(client) => client.set_prefill_tokens_per_sec(tokens_per_sec),
             ZmqBackend::Sglang(client) => client.set_prefill_tokens_per_sec(tokens_per_sec),
+            ZmqBackend::Trtllm(client) => client.set_prefill_tokens_per_sec(tokens_per_sec),
         }
     }
 
@@ -1398,6 +1660,17 @@ impl ZmqEngineClient {
                     ..Default::default()
                 }))
             }
+            // The handshake's window bounds the sequence; the proto's input
+            // bound follows it here (the servicer's facts refine both).
+            ZmqBackend::Trtllm(_) => {
+                let max_seq_len = i32::try_from(max_context_length).unwrap_or(i32::MAX);
+                ZmqModelInfo::Trtllm(Box::new(trtllm_proto::GetModelInfoResponse {
+                    model_id: self.meta.model_id.clone(),
+                    max_input_len: max_seq_len,
+                    max_seq_len,
+                    ..Default::default()
+                }))
+            }
         }
     }
 
@@ -1442,6 +1715,36 @@ impl ZmqEngineClient {
                         .and_then(|n| i32::try_from(n).ok())
                         .unwrap_or(0),
                     ..Default::default()
+                }))
+            }
+            // The handshake carries the version (as `vllm_version`, prefixed
+            // by the shim) and the parallel sizes.
+            ZmqBackend::Trtllm(_) => {
+                let ready = self.ready_response();
+                ZmqServerInfo::Trtllm(Box::new(trtllm_proto::GetServerInfoResponse {
+                    version: ready
+                        .map(|r| {
+                            r.vllm_version
+                                .strip_prefix("trtllm-")
+                                .unwrap_or(&r.vllm_version)
+                                .to_string()
+                        })
+                        .unwrap_or_default(),
+                    backend: "tensorrt-llm".to_string(),
+                    tensor_parallel_size: ready.map_or(1, |r| {
+                        i32::try_from(r.tensor_parallel_size).unwrap_or(i32::MAX)
+                    }),
+                    pipeline_parallel_size: ready.map_or(1, |r| {
+                        i32::try_from(r.pipeline_parallel_size).unwrap_or(i32::MAX)
+                    }),
+                    context_parallel_size: ready.map_or(1, |r| {
+                        i32::try_from(r.decode_context_parallel_size).unwrap_or(i32::MAX)
+                    }),
+                    world_size: ready
+                        .map_or(1, |r| i32::try_from(r.world_size).unwrap_or(i32::MAX)),
+                    // The handshake does not say which structural-tag
+                    // vocabulary the engine's grammar compiler takes.
+                    structural_tag_vocabulary: String::new(),
                 }))
             }
         }
@@ -1489,6 +1792,34 @@ async fn control_on_every_rank<P: EngineProtocol>(
     Ok(replies.iter().map(control_outcome).collect())
 }
 
+/// A JSON value as the msgpack value the engine's control call reads: maps
+/// keep their string keys, an integer stays an integer.
+fn json_to_msgpack(value: serde_json::Value) -> OpaqueValue {
+    match value {
+        serde_json::Value::Null => OpaqueValue::Nil,
+        serde_json::Value::Bool(value) => OpaqueValue::Boolean(value),
+        serde_json::Value::Number(number) => {
+            if let Some(value) = number.as_i64() {
+                OpaqueValue::from(value)
+            } else if let Some(value) = number.as_u64() {
+                OpaqueValue::from(value)
+            } else {
+                OpaqueValue::F64(number.as_f64().unwrap_or(f64::NAN))
+            }
+        }
+        serde_json::Value::String(value) => OpaqueValue::from(value),
+        serde_json::Value::Array(items) => {
+            OpaqueValue::Array(items.into_iter().map(json_to_msgpack).collect())
+        }
+        serde_json::Value::Object(fields) => OpaqueValue::Map(
+            fields
+                .into_iter()
+                .map(|(key, value)| (OpaqueValue::from(key), json_to_msgpack(value)))
+                .collect(),
+        ),
+    }
+}
+
 /// A utility call's error as a status: the wait expiring is the caller's
 /// deadline, everything else is the engine failing.
 fn utility_status(error: engine_zmq_client::Error) -> tonic::Status {
@@ -1520,6 +1851,55 @@ mod tests {
 
     use super::*;
     use crate::{eos::EosTokenIds, test_support::connected_pair};
+
+    /// A route's JSON body becomes the control call's msgpack argument field
+    /// by field: integers stay integers (one above `i64` included), floats
+    /// floats, strings, booleans and nulls their own kind; arrays and nested
+    /// objects recurse.
+    #[test]
+    fn a_json_body_becomes_a_msgpack_argument_field_by_field() {
+        let value = json_to_msgpack(serde_json::json!({
+            "steps": 3,
+            "big": u64::MAX,
+            "neg": -2,
+            "ratio": 0.25,
+            "name": "w",
+            "flag": false,
+            "none": null,
+            "list": [1, 2.5, "x"],
+            "inner": {"k": [true]}
+        }));
+        let fields = value.as_map().expect("a map");
+        let field = |key: &str| {
+            fields
+                .iter()
+                .find(|(name, _)| name.as_str() == Some(key))
+                .map(|(_, value)| value)
+                .unwrap_or_else(|| panic!("{key}"))
+        };
+        assert_eq!(*field("steps"), OpaqueValue::from(3i64));
+        assert_eq!(*field("big"), OpaqueValue::from(u64::MAX));
+        assert_eq!(*field("neg"), OpaqueValue::from(-2i64));
+        assert_eq!(*field("ratio"), OpaqueValue::F64(0.25));
+        assert_eq!(*field("name"), OpaqueValue::from("w"));
+        assert_eq!(*field("flag"), OpaqueValue::Boolean(false));
+        assert_eq!(*field("none"), OpaqueValue::Nil);
+        assert_eq!(
+            *field("list"),
+            OpaqueValue::Array(vec![
+                OpaqueValue::from(1i64),
+                OpaqueValue::F64(2.5),
+                OpaqueValue::from("x"),
+            ])
+        );
+        let inner = field("inner").as_map().expect("a nested map");
+        assert_eq!(inner.len(), 1);
+        assert_eq!(inner[0].0.as_str(), Some("k"));
+        assert_eq!(
+            inner[0].1,
+            OpaqueValue::Array(vec![OpaqueValue::Boolean(true)])
+        );
+    }
 
     /// A request that reaches the connector once it is shutting down (its
     /// engine died and the servicer is on its way out) is answered the way a
@@ -1603,6 +1983,34 @@ mod tests {
         client.expect("adapter connect")
     }
 
+    /// The dialect only its servicer speaks is refused on the gateway's
+    /// connect path before any handshake: a worker registered on it would
+    /// otherwise connect, count healthy and fail every request. The
+    /// servicer's own connect path keeps taking it.
+    #[tokio::test]
+    async fn the_gateway_connect_path_refuses_the_servicer_only_dialect() {
+        let started = std::time::Instant::now();
+        let err = match connect_for_worker(
+            "ipc:///tmp/no-such-worker",
+            "m".to_string(),
+            RuntimeType::Trtllm,
+            None,
+            1,
+            Duration::from_secs(5),
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("the gateway's connect path accepted the servicer-only dialect"),
+            Err(err) => err,
+        };
+        assert!(err.contains("direct ZMQ lane"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "refused before the handshake"
+        );
+    }
+
     #[tokio::test]
     async fn tokenizer_eos_is_adopted_when_the_model_dir_is_not_local() {
         // MockTokenizer's EOS set is {999}. With no local model dir the
@@ -1679,6 +2087,50 @@ mod tests {
         let client = client.expect("the retry connects the engine");
         engine.expect("mock engine connected");
         assert_eq!(client.dialect(), ZmqDialect::Vllm);
+    }
+
+    /// A `tcp://` worker serves engines on other hosts: they dial its own
+    /// address, and the INIT hands them data-plane addresses on the same
+    /// host with the ports the gateway bound.
+    #[tokio::test]
+    async fn a_tcp_worker_connects_its_engines_through_its_own_address() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let base_url = format!("tcp://127.0.0.1:{port}");
+        let (client, engine) = tokio::join!(
+            connect_with_eos(
+                &base_url,
+                "m".to_string(),
+                RuntimeType::TokenSpeed,
+                Handshake::Derived,
+                1,
+                EosTokenIds::default(),
+                Duration::from_secs(10),
+            ),
+            connect_to_frontend(
+                &base_url,
+                EngineId::from_engine_index(0),
+                default_ready_response()
+            ),
+        );
+        let client = client.expect("the tcp worker connects");
+        let engine = engine.expect("mock engine connected");
+        assert_eq!(client.engine_count(), 1);
+        for address in engine
+            .init
+            .addresses
+            .inputs
+            .iter()
+            .chain(&engine.init.addresses.outputs)
+        {
+            let bound = address
+                .strip_prefix("tcp://127.0.0.1:")
+                .unwrap_or_else(|| panic!("a data-plane address on the worker's host: {address}"));
+            assert_ne!(bound.parse::<u16>().unwrap(), 0, "{address}");
+        }
     }
 
     /// The gateway's own connection (nothing configures the backend, as
@@ -1926,12 +2378,12 @@ mod tests {
             1,
             "m".to_string(),
             EosTokenIds::default(),
-            RuntimeType::Trtllm,
+            RuntimeType::Mlx,
             Duration::from_secs(600),
         )
         .await
         else {
-            panic!("TRT-LLM has no ZMQ engine adapter");
+            panic!("MLX has no ZMQ engine adapter");
         };
         assert!(
             error.to_string().contains("no engine implementation"),
@@ -1972,6 +2424,255 @@ mod tests {
             .map(|engine| engine.expect("mock engine"))
             .collect();
         (client.expect("adapter connect"), engines)
+    }
+
+    /// A TokenSpeed connection whose ranks declared `ready` at their
+    /// handshake, one rank per response.
+    async fn tokenspeed_ranks(dir: &Path, ready: Vec<EngineCoreReadyResponse>) -> ZmqEngineClient {
+        std::fs::create_dir_all(dir).unwrap();
+        let ep = |name: &str| format!("ipc://{}", dir.join(name).display());
+        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+        let count = ready.len();
+        let ranks = ready.into_iter().enumerate().map(|(rank, ready)| {
+            connect_to_frontend(&handshake, EngineId::from_engine_index(rank as u32), ready)
+        });
+        let (client, engines) = tokio::join!(
+            ZmqEngineClient::connect(
+                &handshake,
+                &input,
+                &output,
+                count,
+                "org/repo".to_string(),
+                EosTokenIds::default(),
+                RuntimeType::TokenSpeed,
+                Duration::from_secs(10)
+            ),
+            futures::future::join_all(ranks),
+        );
+        for engine in engines {
+            engine.expect("mock engine");
+        }
+        client.expect("adapter connect")
+    }
+
+    /// A worker registered for a disaggregated role connects only to engines
+    /// that declared that role: a prefill rank among a decode worker's, or a
+    /// whole-request engine behind a prefill worker, fails the check with both
+    /// roles named. An engine that declares no request types predates the
+    /// declaration and is taken as registered, except for an encode worker,
+    /// which needs the encode request listed and is refused by such an engine.
+    /// A prefill or encode worker also needs the engine's bootstrap address:
+    /// an engine that declares the role without it, or nothing at all, is
+    /// refused with the missing rendezvous named; a decode worker needs none.
+    #[tokio::test]
+    async fn a_worker_connects_only_to_engines_of_its_registered_role() {
+        let declaring = |role: Option<&str>| EngineCoreReadyResponse {
+            request_types: vec!["add".into(), "abort".into(), "control".into()],
+            disaggregation_mode: role.map(str::to_string),
+            ..default_ready_response()
+        };
+        let rendezvous = |role: Option<&str>| EngineCoreReadyResponse {
+            bootstrap_host: Some("10.0.0.7".to_string()),
+            bootstrap_port: Some(8998),
+            ..declaring(role)
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let prefill = tokenspeed_ranks(
+            &dir.path().join("p"),
+            vec![rendezvous(Some("prefill")), rendezvous(Some("prefill"))],
+        )
+        .await;
+        prefill
+            .check_declared_role(Some("prefill"))
+            .expect("prefill engines");
+        let error = prefill.check_declared_role(Some("decode")).unwrap_err();
+        assert!(
+            error.contains("declared disaggregation role prefill") && error.contains("as decode"),
+            "{error}"
+        );
+        let error = prefill.check_declared_role(None).unwrap_err();
+        assert!(error.contains("as a regular worker"), "{error}");
+
+        let mixed = tokenspeed_ranks(
+            &dir.path().join("m"),
+            vec![declaring(Some("decode")), declaring(Some("prefill"))],
+        )
+        .await;
+        let error = mixed.check_declared_role(Some("decode")).unwrap_err();
+        assert!(
+            error.contains("declared disaggregation role prefill"),
+            "{error}"
+        );
+
+        let whole = tokenspeed_ranks(&dir.path().join("w"), vec![declaring(None)]).await;
+        whole
+            .check_declared_role(None)
+            .expect("a whole-request engine");
+        let error = whole.check_declared_role(Some("prefill")).unwrap_err();
+        assert!(error.contains("none (whole requests)"), "{error}");
+
+        // A prefill worker's requests name the engine's rendezvous: an engine
+        // that declares the role without a bootstrap address, or declares
+        // nothing, is refused with the missing address named; a decode worker
+        // needs none, so an engine that declares nothing serves it.
+        let unplaced =
+            tokenspeed_ranks(&dir.path().join("u"), vec![declaring(Some("prefill"))]).await;
+        let error = unplaced.check_declared_role(Some("prefill")).unwrap_err();
+        assert!(
+            error.contains("declares no bootstrap address") && error.contains("as prefill"),
+            "{error}"
+        );
+        let silent = tokenspeed_ranks(&dir.path().join("s"), vec![default_ready_response()]).await;
+        let error = silent.check_declared_role(Some("prefill")).unwrap_err();
+        assert!(error.contains("declares no bootstrap address"), "{error}");
+        silent
+            .check_declared_role(Some("decode"))
+            .expect("an engine that declares nothing serves a decode worker");
+
+        // An encode worker needs the wire's encode request: an engine that
+        // lists none fails the connection whether it declares nothing (one
+        // before the request) or a scheduler's request types, as the servicer
+        // refuses the same engine at its link; one that lists it connects
+        // when it also declares its bootstrap address.
+        let error = silent.check_declared_role(Some("encode")).unwrap_err();
+        assert!(
+            error.contains("lists no encode request") && error.contains("--servicer-impl python"),
+            "{error}"
+        );
+        let scheduler =
+            tokenspeed_ranks(&dir.path().join("e"), vec![declaring(Some("encode"))]).await;
+        let error = scheduler.check_declared_role(Some("encode")).unwrap_err();
+        assert!(error.contains("lists no encode request"), "{error}");
+        let encoder = |bootstrap_host: Option<&str>| EngineCoreReadyResponse {
+            request_types: vec!["encode".into()],
+            disaggregation_mode: Some("encode".to_string()),
+            bootstrap_host: bootstrap_host.map(str::to_string),
+            bootstrap_port: Some(8998),
+            ..default_ready_response()
+        };
+        let unplaced_encoder = tokenspeed_ranks(&dir.path().join("g"), vec![encoder(None)]).await;
+        let error = unplaced_encoder
+            .check_declared_role(Some("encode"))
+            .unwrap_err();
+        assert!(
+            error.contains("declares no bootstrap address") && error.contains("as encode"),
+            "{error}"
+        );
+        let placed_encoder =
+            tokenspeed_ranks(&dir.path().join("f"), vec![encoder(Some("10.0.0.9"))]).await;
+        placed_encoder
+            .check_declared_role(Some("encode"))
+            .expect("an encode worker that lists the encode request and declares its address");
+    }
+
+    /// An RL operation rides the TokenSpeed control wire as a control call
+    /// named after its route, with the route's JSON body as its one argument
+    /// (a map, integers kept integers), answered on every rank under the call
+    /// id; a call without a body carries no argument.
+    #[tokio::test]
+    async fn an_rl_operation_rides_the_control_wire_with_its_routes_body() {
+        use engine_zmq_client::{
+            codec::{decode_msgpack, encode_msgpack},
+            protocol::{control::ControlReplySlim, tokenspeed::request::TokenSpeedRequestType},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+        let ready = EngineCoreReadyResponse {
+            positional_layouts: BTreeMap::from([(
+                "ControlReplySlim".to_string(),
+                ["call_id", "success", "message", "engine_index"]
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            )]),
+            ..default_ready_response()
+        };
+        let (client, engine) = tokio::join!(
+            ZmqEngineClient::connect(
+                &handshake,
+                &input,
+                &output,
+                1,
+                "org/repo".to_string(),
+                EosTokenIds::default(),
+                RuntimeType::TokenSpeed,
+                Duration::from_secs(10)
+            ),
+            connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready),
+        );
+        let client = client.expect("adapter connect");
+        let (mut engine_in, mut engine_out) = engine.expect("mock engine").split();
+        let wait = Duration::from_secs(10);
+        for (method, body, success) in [
+            (
+                "update_weights_from_mooncake",
+                Some(serde_json::json!({"version": 7, "flush_cache": false})),
+                true,
+            ),
+            ("continue_generation", None, false),
+        ] {
+            let (replies, ()) =
+                tokio::join!(client.rl_control_call(method, body.clone(), wait), async {
+                    let frames = engine_in.recv_frames().await.unwrap();
+                    assert_eq!(
+                        TokenSpeedRequestType::from_frame(frames[0].as_ref()),
+                        Some(TokenSpeedRequestType::Control)
+                    );
+                    let (call_id, called, args): (i64, String, Vec<OpaqueValue>) =
+                        decode_msgpack(frames[1].as_ref()).unwrap();
+                    assert_eq!(called, method);
+                    match &body {
+                        Some(_) => {
+                            let fields = args[0].as_map().expect("the body as a map");
+                            assert!(fields.iter().any(|(key, value)| {
+                                key.as_str() == Some("version") && *value == OpaqueValue::from(7i64)
+                            }));
+                            assert!(fields.iter().any(|(key, value)| {
+                                key.as_str() == Some("flush_cache")
+                                    && *value == OpaqueValue::Boolean(false)
+                            }));
+                        }
+                        None => assert!(args.is_empty()),
+                    }
+                    let reply = ControlReplySlim {
+                        call_id,
+                        success,
+                        message: (!success).then(|| "not paused".to_string()),
+                        engine_index: 0,
+                    };
+                    engine_out
+                        .send_frames(vec![bytes::Bytes::from(encode_msgpack(&reply).unwrap())])
+                        .await
+                        .unwrap();
+                });
+            let replies = replies.expect("one reply per rank");
+            assert_eq!(replies.len(), 1);
+            assert_eq!(replies[0].0, success);
+            if !success {
+                assert!(replies[0].1.contains("not paused"), "{replies:?}");
+            }
+        }
+    }
+
+    /// An RL operation on a TokenSpeed connection whose ranks declared no
+    /// control reply is refused by name before anything is sent: the wire
+    /// carries generate and abort only.
+    #[tokio::test]
+    async fn an_rl_operation_on_a_wire_without_control_calls_is_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = tokenspeed_ranks(&dir.path().join("n"), vec![default_ready_response()]).await;
+        let error = client
+            .rl_control_call("pause_generation", None, Duration::from_secs(1))
+            .await
+            .expect_err("refused");
+        assert_eq!(error.code(), Code::Unimplemented);
+        assert!(
+            error.message().contains("declares no control reply"),
+            "{}",
+            error.message()
+        );
     }
 
     #[tokio::test]

@@ -624,12 +624,9 @@ checksum = "1e4b40c7323adcfc0a41c4b88143ed58346ff65a288fc144329c5c45e05d70c6"
 
 [[package]]
 name = "bitcannon"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cfc3924e96bdcf270ede3ff8e0713b68edaf2daa3ed1661467ed58cc5630fba"
-dependencies = [
- "ahash",
-]
+checksum = "00208cafdc34c04a13092af3648cf21cc6d86fc08b831b18207d6f209ff9334a"
 
 [[package]]
 name = "bitflags"
@@ -1950,16 +1947,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "directories-next"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "339ee130d97a610ea5a5872d2bbb130fdf68884ff09d3028b81bec8a1ac23bbc"
-dependencies = [
- "cfg-if",
- "dirs-sys-next",
-]
-
-[[package]]
 name = "dirs"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1976,19 +1963,8 @@ checksum = "e01a3366d27ee9890022452ee61b2b63a67e6f13f58900b651ff5665f0bb1fab"
 dependencies = [
  "libc",
  "option-ext",
- "redox_users 0.5.2",
+ "redox_users",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "dirs-sys-next"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ebda144c4fe02d1f7ea1a7d9641b6fc6b580adcfa024ae48797ecdeb6825b4d"
-dependencies = [
- "libc",
- "redox_users 0.4.6",
- "winapi",
 ]
 
 [[package]]
@@ -4018,7 +3994,7 @@ dependencies = [
  "thread_local",
  "tiktoken-rs",
  "tokenizers 0.23.2",
- "tokenizers 1.0.0-rc.2",
+ "tokenizers 1.0.0-rc.3",
  "tokio",
  "toml",
  "tracing",
@@ -6500,17 +6476,6 @@ dependencies = [
 
 [[package]]
 name = "redox_users"
-version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba009ff324d1fc1b900bd1fdb31564febe58a8ccc8a6fdbb93b543d33b13ca43"
-dependencies = [
- "getrandom 0.2.17",
- "libredox",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "redox_users"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
@@ -7792,6 +7757,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tokio-util",
  "tracing",
+ "tracing-test",
  "url",
  "uuid",
  "webpki-roots",
@@ -7965,6 +7931,7 @@ dependencies = [
 name = "smg-rl"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
  "axum",
  "futures",
  "http",
@@ -8693,9 +8660,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tk-convert"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ae9aa847b762e874fe27be83b120f63fc76fd7f555d254540d16e044660dfeb"
+checksum = "4a67b6b8e8bcb4d10576eec88c962ed5092931ba2621596ddb35ff98929de767"
 dependencies = [
  "bitcannon",
  "serde_json",
@@ -8704,19 +8671,17 @@ dependencies = [
 
 [[package]]
 name = "tk-encode"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b28a17e23359d88085a838d0c893875f7d220262368eeafdfd662577b1ba9ee"
+checksum = "065ea1e7c9285a81d3190d0bd409f8311a2ebbcede8a355fe8fb33d766aaa9f7"
 dependencies = [
  "ahash",
  "bitcannon",
  "dary_heap",
  "fancy-regex 0.19.2",
- "itertools 0.15.0",
  "libc",
  "log",
  "memchr",
- "paste",
  "ptr_hash",
  "rand 0.10.2",
  "rayon",
@@ -8724,7 +8689,6 @@ dependencies = [
  "spm_precompiled",
  "thiserror 2.0.21",
  "unicode-normalization",
- "unicode-normalization-alignments",
  "unicode-segmentation",
  "unicode_categories",
  "wide",
@@ -8733,13 +8697,31 @@ dependencies = [
 
 [[package]]
 name = "tk-serialize"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b39d1d911331f6c6e6a626bb4a67b3ddc86bceab6a5ee50918b1009bbda668fe"
+checksum = "032f80db8335e6b44b3596d1a7cef42d0e561c64fef012f88b0888a477dc1131"
 dependencies = [
  "base64 0.22.1",
  "bitcannon",
  "hifijson",
+ "tk-encode",
+]
+
+[[package]]
+name = "tk-train"
+version = "0.1.0-rc.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce480ea19cf91c1790087311be925535b21b4ffc23fbf1c7d504d544b716278f"
+dependencies = [
+ "ahash",
+ "compact_str",
+ "dary_heap",
+ "esaxx-rs",
+ "itertools 0.14.0",
+ "log",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
  "tk-encode",
 ]
 
@@ -8779,13 +8761,14 @@ dependencies = [
 
 [[package]]
 name = "tokenizers"
-version = "1.0.0-rc.2"
+version = "1.0.0-rc.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe70fb41d7eb17980c9d53f8e9f3c507feb8cacfa99d0a78477aae2559e284e9"
+checksum = "df0e4d2415cd189e596f9575a08a8c97a5e56bbea0f08aff40148b20ddf4353a"
 dependencies = [
  "tk-convert",
  "tk-encode",
  "tk-serialize",
+ "tk-train",
 ]
 
 [[package]]
@@ -9864,7 +9847,6 @@ dependencies = [
  "wasm-encoder 0.258.3",
  "wasmparser 0.258.3",
  "wasmtime-environ",
- "wasmtime-internal-cache",
  "wasmtime-internal-component-macro",
  "wasmtime-internal-component-util",
  "wasmtime-internal-core",
@@ -9908,26 +9890,6 @@ dependencies = [
  "wasmprinter",
  "wasmtime-internal-component-util",
  "wasmtime-internal-core",
-]
-
-[[package]]
-name = "wasmtime-internal-cache"
-version = "49.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96e4469e885ac50f8dc06337245f9905b22c68d55416267f9afd07f7f76687be"
-dependencies = [
- "base64 0.22.1",
- "directories-next",
- "log",
- "postcard",
- "rustix",
- "serde",
- "serde_derive",
- "sha2 0.10.9",
- "toml",
- "wasmtime-environ",
- "windows-sys 0.61.2",
- "zstd 0.13.3",
 ]
 
 [[package]]
@@ -10850,7 +10812,7 @@ dependencies = [
  "typed-path",
  "zeroize",
  "zopfli",
- "zstd 0.14.3",
+ "zstd",
 ]
 
 [[package]]
@@ -10879,29 +10841,11 @@ dependencies = [
 
 [[package]]
 name = "zstd"
-version = "0.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
-dependencies = [
- "zstd-safe 7.2.4",
-]
-
-[[package]]
-name = "zstd"
 version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
 dependencies = [
- "zstd-safe 8.2.0",
-]
-
-[[package]]
-name = "zstd-safe"
-version = "7.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d"
-dependencies = [
- "zstd-sys",
+ "zstd-safe",
 ]
 
 [[package]]

@@ -538,30 +538,7 @@ fn test_epoch_max_wins_snapshot_only_propagation_preserves_tombstone_boundary() 
     // Source: pre-tombstone high-epoch insert, then tombstone, then
     // post-tombstone lower-epoch insert. After merge+compact, the
     // log holds a single shard insert with tombstone_version=65.
-    let source = CrdtOrMap::new();
-    source.register_merge_strategy("rl:".to_string(), MergeStrategy::EpochMaxWins);
-    let mut source_log = OperationLog::new();
-    source_log.append(Operation::insert(
-        key.to_string(),
-        encode(7, 99).to_vec(),
-        60,
-        ReplicaId::new(),
-    ));
-    source_log.append(Operation::remove(key.to_string(), 65, ReplicaId::new()));
-    source_log.append(Operation::insert(
-        key.to_string(),
-        encode(6, 1).to_vec(),
-        70,
-        ReplicaId::new(),
-    ));
-    source.merge(&source_log);
-
-    let snapshot_log = source.get_operation_log();
-    assert_eq!(
-        snapshot_log.operations().len(),
-        1,
-        "compaction must reduce to a single shard insert",
-    );
+    let (snapshot_log, _) = compacted_post_tombstone_snapshot(key);
 
     // Receiver applies the snapshot — gets the shard with
     // tombstone_version embedded but no Remove op in its log.
@@ -598,22 +575,15 @@ fn test_epoch_max_wins_snapshot_only_propagation_preserves_tombstone_boundary() 
     );
 }
 
-#[test]
-fn test_epoch_max_wins_compacted_snapshot_applies_when_op_id_already_seen() {
-    // Receiver sees the post-tombstone raw insert first (op-id (70, c)),
-    // then the source's compacted snapshot that reuses that same op-id but
-    // carries the embedded tombstone_version. Without strategy-aware merge
-    // the op-id collision drops the richer payload, and a delayed
-    // pre-tombstone insert can resurrect the deleted shard.
-    init_test_logging();
-    let key = "rl:global:node-a";
-
+/// A source's compacted history of `key` under epoch-max-wins: an insert at
+/// version 60, a tombstone at 65 and an insert at 70, merged and compacted
+/// into the one insert that reuses the post-tombstone op-id and embeds the
+/// tombstone version. Returns the compacted log and the replica of the
+/// post-tombstone insert, the op-id a receiver may already have seen.
+fn compacted_post_tombstone_snapshot(key: &str) -> (OperationLog, ReplicaId) {
     let pre_tombstone_replica = ReplicaId::new();
     let tombstone_replica = ReplicaId::new();
     let post_tombstone_replica = ReplicaId::new();
-
-    // Source applies the full history and compacts into one Insert that
-    // embeds tombstone_version=65 and reuses the post-tombstone op-id.
     let source = CrdtOrMap::new();
     source.register_merge_strategy("rl:".to_string(), MergeStrategy::EpochMaxWins);
     let mut source_log = OperationLog::new();
@@ -631,8 +601,28 @@ fn test_epoch_max_wins_compacted_snapshot_applies_when_op_id_already_seen() {
         post_tombstone_replica,
     ));
     source.merge(&source_log);
-    let compacted_log = source.get_operation_log();
-    assert_eq!(compacted_log.operations().len(), 1);
+    let compacted = source.get_operation_log();
+    assert_eq!(
+        compacted.operations().len(),
+        1,
+        "compaction must reduce to a single shard insert",
+    );
+    (compacted, post_tombstone_replica)
+}
+
+#[test]
+fn test_epoch_max_wins_compacted_snapshot_applies_when_op_id_already_seen() {
+    // Receiver sees the post-tombstone raw insert first (op-id (70, c)),
+    // then the source's compacted snapshot that reuses that same op-id but
+    // carries the embedded tombstone_version. Without strategy-aware merge
+    // the op-id collision drops the richer payload, and a delayed
+    // pre-tombstone insert can resurrect the deleted shard.
+    init_test_logging();
+    let key = "rl:global:node-a";
+
+    // Source applies the full history and compacts into one Insert that
+    // embeds tombstone_version=65 and reuses the post-tombstone op-id.
+    let (compacted_log, post_tombstone_replica) = compacted_post_tombstone_snapshot(key);
 
     // Receiver already has the raw post-tombstone insert (same op-id as the
     // compacted snapshot will use), but no tombstone information yet.
@@ -690,31 +680,9 @@ fn test_epoch_max_wins_same_op_id_folds_within_single_batch() {
     init_test_logging();
     let key = "rl:global:node-a";
 
-    let pre_tombstone_replica = ReplicaId::new();
-    let tombstone_replica = ReplicaId::new();
-    let post_tombstone_replica = ReplicaId::new();
-
     // Produce the compacted snapshot op: a single Insert at op-id
     // (70, post_tombstone_replica) embedding tombstone_version=65.
-    let source = CrdtOrMap::new();
-    source.register_merge_strategy("rl:".to_string(), MergeStrategy::EpochMaxWins);
-    let mut source_log = OperationLog::new();
-    source_log.append(Operation::insert(
-        key.to_string(),
-        encode(7, 99).to_vec(),
-        60,
-        pre_tombstone_replica,
-    ));
-    source_log.append(Operation::remove(key.to_string(), 65, tombstone_replica));
-    source_log.append(Operation::insert(
-        key.to_string(),
-        encode(6, 1).to_vec(),
-        70,
-        post_tombstone_replica,
-    ));
-    source.merge(&source_log);
-    let compacted = source.get_operation_log();
-    assert_eq!(compacted.operations().len(), 1);
+    let (compacted, post_tombstone_replica) = compacted_post_tombstone_snapshot(key);
     let snapshot_op = compacted.operations()[0].clone();
 
     // Receiver gets BOTH the raw post-tombstone insert and the compacted

@@ -110,7 +110,7 @@ on:
         default: false
         description: "Also run grpc_servicer/tests here, where the importorskip('vllm') / importorskip('sglang') cases meet a real engine; set on one lane per engine"
       servicer_impl:
-        description: "Which gRPC servicer the workers of the job's engine run (rust or python), handed to that engine's harness flag; empty keeps the engine default"
+        description: "Which gRPC servicer the workers of the job's engine run (rust or python), handed to that engine's harness flag; empty follows the servicer package's default"
         required: false
         type: string
         default: ""
@@ -129,9 +129,15 @@ on:
         required: false
         type: string
         default: ""
+      enabled:
+        description: "Whether this row runs: false skips the job before it takes a runner (a caller's matrix row the changed paths do not reach)"
+        required: false
+        type: boolean
+        default: true
 
 jobs:
   run:
+    if: ${{ inputs.enabled }}
     runs-on: ${{ inputs.runner }}
     container: ${{ inputs.container_image != '' && fromJSON(format('{{"image":{0},"options":{1}}}', toJSON(inputs.container_image), toJSON(inputs.container_options))) || vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     timeout-minutes: ${{ inputs.timeout }}
@@ -259,6 +265,7 @@ jobs:
           SHOW_ROUTER_LOGS: "1"
           E2E_LOG_DIR: e2e-logs
           E2E_MIN_SELECTED: ${{ inputs.min_selected }}
+          E2E_GPU_VENDOR: ${{ inputs.gpu_vendor }}
           BRAVE_MCP_HOST: ${{ inputs.setup_agentic_deps && 'brave-search-mcp' || '' }}
           # Every gRPC servicer runs a planned warm-up before it reports
           # SERVING (grpc_servicer/smg_grpc_servicer/warmup.py). At its default
@@ -318,8 +325,8 @@ jobs:
           if [ -n "$MM" ]; then
             SUFFIX="${SUFFIX}-mm-${MM}"
           fi
-          # A Rust-servicer leg runs the same suite as the engine's Python
-          # servicer leg; keep their log artifacts apart.
+          # A leg that names its servicer runs the same suite as the engine's
+          # default leg; keep their log artifacts apart.
           IMPL="${{ inputs.servicer_impl }}"
           if [ -n "$IMPL" ]; then
             SUFFIX="${SUFFIX}-${IMPL}-servicer"

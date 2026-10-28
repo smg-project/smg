@@ -213,21 +213,29 @@ mod tests {
         types::ImageSize,
     };
 
-    #[test]
-    fn llama4_single_tile_token_count() {
-        let tokenizer = TestTokenizer::new(&[
+    fn tokenizer() -> TestTokenizer {
+        TestTokenizer::new(&[
             ("<|image|>", 200090),
             ("<|image_start|>", 200088),
             ("<|image_end|>", 200089),
             ("<|patch|>", 200092),
             ("<|tile_x_separator|>", 200093),
             ("<|tile_y_separator|>", 200094),
-        ]);
-        let config = json!({
+        ])
+    }
+
+    fn config() -> serde_json::Value {
+        json!({
             "model_type": "llama4",
             "image_token_index": 200092,
             "vision_config": {"image_size": 336, "patch_size": 14}
-        });
+        })
+    }
+
+    #[test]
+    fn llama4_single_tile_token_count() {
+        let tokenizer = tokenizer();
+        let config = config();
         let metadata = ModelMetadata {
             model_id: "/models/meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
             tokenizer: &tokenizer,
@@ -251,19 +259,8 @@ mod tests {
 
     #[test]
     fn llama4_multi_tile_adds_global() {
-        let tokenizer = TestTokenizer::new(&[
-            ("<|image|>", 200090),
-            ("<|image_start|>", 200088),
-            ("<|image_end|>", 200089),
-            ("<|patch|>", 200092),
-            ("<|tile_x_separator|>", 200093),
-            ("<|tile_y_separator|>", 200094),
-        ]);
-        let config = json!({
-            "model_type": "llama4",
-            "image_token_index": 200092,
-            "vision_config": {"image_size": 336, "patch_size": 14}
-        });
+        let tokenizer = tokenizer();
+        let config = config();
         let metadata = ModelMetadata {
             model_id: "Llama-4-Scout-Vision",
             tokenizer: &tokenizer,
@@ -292,19 +289,8 @@ mod tests {
 
     #[test]
     fn llama4_matches_alias_via_model_type() {
-        let tokenizer = TestTokenizer::new(&[
-            ("<|image|>", 200090),
-            ("<|image_start|>", 200088),
-            ("<|image_end|>", 200089),
-            ("<|patch|>", 200092),
-            ("<|tile_x_separator|>", 200093),
-            ("<|tile_y_separator|>", 200094),
-        ]);
-        let config = json!({
-            "model_type": "llama4",
-            "image_token_index": 200092,
-            "vision_config": {"image_size": 336, "patch_size": 14}
-        });
+        let tokenizer = tokenizer();
+        let config = config();
         let metadata = ModelMetadata {
             model_id: "custom-model",
             tokenizer: &tokenizer,

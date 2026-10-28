@@ -21,6 +21,7 @@ use wfaas::WorkflowId;
 use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
+    worker::endpoint::Endpoint,
     workflow::{
         create_mcp_workflow_data, create_tokenizer_workflow_data,
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
@@ -96,6 +97,24 @@ impl Job {
             Job::RemoveWasmModule { .. } => "RemoveWasmModule",
             Job::AddTokenizer { .. } => "AddTokenizer",
             Job::RemoveTokenizer { .. } => "RemoveTokenizer",
+        }
+    }
+
+    /// `worker_url` as a log line writes it: the names that are not addresses
+    /// (the start-up marker, an MCP server, a WASM module, a tokenizer id) as
+    /// they are, since the address parser would respell or refuse them;
+    /// anything else is a worker's address, written with a userinfo in it
+    /// masked, so a worker job added later cannot write its address raw.
+    pub fn shown_worker(job_type: &str, worker_url: &str) -> String {
+        match job_type {
+            "InitializeWorkersFromConfig"
+            | "InitializeMcpServers"
+            | "RegisterMcpServer"
+            | "AddWasmModule"
+            | "RemoveWasmModule"
+            | "AddTokenizer"
+            | "RemoveTokenizer" => worker_url.to_string(),
+            _ => Endpoint::redacted_str(worker_url),
         }
     }
 
@@ -363,7 +382,10 @@ impl JobQueue {
         let (queue_depth, available_permits) = self.get_load_info();
         debug!(
             "Job submitted: type={}, worker={}, queue_depth={}, available_slots={}",
-            job_type, worker_url, queue_depth, available_permits
+            job_type,
+            Job::shown_worker(job_type, &worker_url),
+            queue_depth,
+            available_permits
         );
         Ok(())
     }
@@ -398,7 +420,11 @@ impl JobQueue {
             Some(JobStatus::processing(job_type, &worker_url)),
         );
 
-        debug!("Processing job: type={}, worker={}", job_type, worker_url);
+        debug!(
+            "Processing job: type={}, worker={}",
+            job_type,
+            Job::shown_worker(job_type, &worker_url)
+        );
 
         // Release concurrency slot immediately. The semaphore bounds how many
         // jobs can be dequeued concurrently (preventing thundering herd), but
@@ -436,7 +462,8 @@ impl JobQueue {
                 );
                 error!(
                     "AppContext dropped, cannot process job: type={}, worker={}",
-                    job_type, worker_url
+                    job_type,
+                    Job::shown_worker(job_type, &worker_url)
                 );
             }
         }
@@ -470,7 +497,8 @@ impl JobQueue {
 
                 debug!(
                     "Started worker registration workflow for {} (instance: {})",
-                    config.url, instance_id
+                    Endpoint::redacted_str(&config.url),
+                    instance_id
                 );
 
                 engines
@@ -498,7 +526,8 @@ impl JobQueue {
 
                 debug!(
                     "Started worker update workflow for {} (instance: {})",
-                    url, instance_id
+                    Endpoint::redacted_str(url),
+                    instance_id
                 );
 
                 let timeout_duration = Duration::from_secs(30);
@@ -535,7 +564,8 @@ impl JobQueue {
 
                 debug!(
                     "Started worker label refresh workflow for {} (instance: {})",
-                    url, instance_id
+                    Endpoint::redacted_str(url),
+                    instance_id
                 );
 
                 engines
@@ -566,7 +596,8 @@ impl JobQueue {
 
                 debug!(
                     "Started worker removal workflow for {} (instance: {})",
-                    url, instance_id
+                    Endpoint::redacted_str(url),
+                    instance_id
                 );
 
                 // Caller wait must cover the worst-case `DrainWorkersStep`
@@ -893,7 +924,9 @@ impl JobQueue {
                 Self::record_own_status(status_map, worker_url, job_type, None);
                 debug!(
                     "Completed job: type={}, worker={}, result={}",
-                    job_type, worker_url, message
+                    job_type,
+                    Job::shown_worker(job_type, worker_url),
+                    message
                 );
             }
             Err(error) => {
@@ -905,7 +938,9 @@ impl JobQueue {
                 );
                 warn!(
                     "Failed job: type={}, worker={}, error={}",
-                    job_type, worker_url, error
+                    job_type,
+                    Job::shown_worker(job_type, worker_url),
+                    error
                 );
             }
         }
@@ -950,7 +985,7 @@ impl JobQueue {
                 debug!(
                     "Job status of type={} for worker={} left to the {} job under the key",
                     job_type,
-                    url,
+                    Job::shown_worker(job_type, url),
                     entry.get().job_type
                 );
             }
@@ -1088,6 +1123,36 @@ fn build_external_worker_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A job line writes a worker's address masked and a non-address name as
+    /// it is; a job type the list does not name counts as a worker's, so a
+    /// type added later cannot write a credential into the six job lines.
+    #[test]
+    fn a_job_line_masks_every_address_and_keeps_the_names() {
+        let credentialed = "http://user:secret@127.0.0.1:8000";
+        for job_type in [
+            "AddWorker",
+            "UpdateWorker",
+            "RefreshWorkerLabels",
+            "RemoveWorker",
+            "ReplaceWorker",
+        ] {
+            let shown = Job::shown_worker(job_type, credentialed);
+            assert!(!shown.contains("secret"), "{job_type}: {shown}");
+            assert!(shown.contains("***@127.0.0.1:8000"), "{job_type}: {shown}");
+        }
+        for (job_type, name) in [
+            ("InitializeWorkersFromConfig", "startup"),
+            ("InitializeMcpServers", "startup"),
+            ("RegisterMcpServer", "search-tools"),
+            ("AddWasmModule", "my_module"),
+            ("RemoveWasmModule", "0f1e2d3c"),
+            ("AddTokenizer", "org/tokenizer"),
+            ("RemoveTokenizer", "org/tokenizer"),
+        ] {
+            assert_eq!(Job::shown_worker(job_type, name), name, "{job_type}");
+        }
+    }
 
     fn spec_for(url: &str, router_config: &RouterConfig) -> WorkerSpec {
         let mut spec = WorkerSpec::new(url);

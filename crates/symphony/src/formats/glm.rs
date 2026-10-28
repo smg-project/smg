@@ -45,7 +45,8 @@ mod tests {
         event::{DropReason, Event, FinishReason, MalformedReason, Text},
         input::EngineFinish,
         testing::{
-            arguments_of, bytes, content, drive, drive_to, reasoning, the_same_at_every_cut,
+            arguments_of, bytes, content, drive, drive_to, dropped, reasoning,
+            the_same_at_every_cut,
         },
         Declared,
     };
@@ -153,13 +154,6 @@ mod tests {
                 _ => None,
             })
             .collect()
-    }
-
-    fn dropped(text: &str) -> Event<'static> {
-        Event::Dropped {
-            text: Text::uncounted(text.to_owned()),
-            why: DropReason::Wrapper,
-        }
     }
 
     #[test]

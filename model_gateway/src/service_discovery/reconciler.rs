@@ -147,8 +147,11 @@ fn owned_workers(app_context: &AppContext, kind: DiscoveryKind) -> Vec<OwnedWork
             let endpoint = match Endpoint::parse_with_rank(worker.url()) {
                 Ok((endpoint, _)) => endpoint,
                 Err(e) => {
+                    // The address the parser refused reads as its marker, so the
+                    // id says which worker was skipped.
                     warn!(
-                        worker_url = %worker.url(),
+                        worker_id = %worker_id.as_str(),
+                        worker_url = %worker.redacted_url(),
                         error = %e,
                         "Skipping discovery-owned worker with an unparsable address"
                     );

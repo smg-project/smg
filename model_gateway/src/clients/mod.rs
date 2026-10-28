@@ -4,11 +4,32 @@
 //! `rustls-no-provider` feature) and panics at build time when there is
 //! none, so every client of this crate, of its bindings and of its tests
 //! comes from the functions here, which install the provider first (see
-//! [`crate::tls`]). The direct constructors are disallowed by the workspace's
+//! [`install_crypto_provider`]). The direct constructors are disallowed by the workspace's
 //! clippy configuration (`disallowed-methods` in `clippy.toml`) everywhere
 //! but here.
 
-use crate::tls::install_crypto_provider;
+use rustls::crypto::{ring, CryptoProvider};
+
+/// Installs `ring` as the process-level rustls crypto provider, unless one
+/// is installed already.
+///
+/// `ring` is the only backend compiled into this crate's binaries. The bare
+/// rustls builders (the HTTPS listener, the mesh listener) pick it up on
+/// their own, but the HTTP client is built with reqwest's
+/// `rustls-no-provider` feature and uses whatever provider the process
+/// installed, panicking when there is none. Installing is idempotent: a
+/// provider installed earlier, by an embedding process or a previous start in
+/// the same process, stays. [`crate::server::startup`] calls it first thing,
+/// and so do the client functions of this module, through which this
+/// crate, its bindings and its tests build every HTTP client; nothing else
+/// needs to.
+pub fn install_crypto_provider() {
+    if CryptoProvider::get_default().is_none() {
+        // An error here means another thread installed one in between,
+        // which is the outcome wanted.
+        let _ = ring::default_provider().install_default();
+    }
+}
 
 /// A client with reqwest's defaults, the process provider installed.
 ///

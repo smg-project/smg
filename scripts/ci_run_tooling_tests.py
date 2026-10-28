@@ -15,6 +15,7 @@ BASELINE = (
 COMPONENTS = (
     ("scripts/ci_check_e2e_dependencies.py", "scripts/tests/test_ci_e2e_dependencies.py"),
     ("scripts/ci_check_vllm_engine_units.py", "scripts/tests/test_ci_vllm_engine_units.py"),
+    ("scripts/release/release.sh", "scripts/tests/test_release_tools.py"),
 )
 # These scripts predate their regression suites. Earlier stack layers must not
 # claim to have run the later suites, or be required to contain later fixes.

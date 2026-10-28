@@ -7,9 +7,10 @@
 //! servicers aggregate their per-rank results. A wire without control calls
 //! answers UNIMPLEMENTED naming the gap (the adapter's word).
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use engine_zmq_adapter::SglangProfileStart;
+use engine_zmq_adapter::{
+    admin::{flush_reply_wait, PROFILE_WAIT},
+    SglangProfileStart,
+};
 use smg_grpc_client::common_proto as common;
 use tonic::{Code, Request, Status};
 use tracing::warn;
@@ -28,19 +29,13 @@ pub(crate) fn flush_timeout(timeout_s: f32) -> Result<f32, Status> {
     Ok(timeout_s)
 }
 
-/// The Python servicer's `PROFILE_COMM_TIMEOUT`.
-const PROFILE_WAIT: Duration = Duration::from_secs(600);
-
 pub(crate) async fn flush_cache(
     shared: &Shared,
     request: Request<common::FlushCacheRequest>,
 ) -> Result<common::FlushCacheResponse, Status> {
     let timeout_s = flush_timeout(request.get_ref().timeout_s)?;
     let engine = shared.engine()?;
-    // The scheduler itself waits up to `timeout_s` for an idle moment (a
-    // zero flushes at once or refuses); the reply wait is that plus slack,
-    // the Python servicer's `max(30, timeout_s + 10)`.
-    let wait = Duration::try_from_secs_f32(timeout_s.max(20.0) + 10.0).unwrap_or(Duration::MAX);
+    let wait = flush_reply_wait(timeout_s);
     match engine.flush_cache_control(timeout_s, wait).await {
         Ok((success, message)) => Ok(common::FlushCacheResponse { success, message }),
         // A wire without control calls: the adapter's own refusal, as is.
@@ -67,18 +62,13 @@ pub(crate) async fn start_profile(
     request: common::StartProfileRequest,
 ) -> Result<common::ProfileResponse, Status> {
     let engine = shared.engine()?;
-    let start = SglangProfileStart {
-        output_dir: request.output_dir,
-        start_step: request.start_step.map(i64::from),
-        num_steps: request.num_steps.map(i64::from),
-        activities: request.activities,
-        with_stack: request.with_stack,
-        record_shapes: request.record_shapes,
-        profile_by_stage: request.profile_by_stage,
-        profile_id: profile_id(),
-    };
     profile(
-        engine.profile_control(Some(start), PROFILE_WAIT).await,
+        engine
+            .profile_control(
+                Some(SglangProfileStart::from_request(request)),
+                PROFILE_WAIT,
+            )
+            .await,
         "Start profiling",
     )
 }
@@ -109,18 +99,6 @@ fn profile(
             )))
         }
     }
-}
-
-/// The profile id the Python servicer stamps on a start: the wall-clock
-/// start time in seconds.
-fn profile_id() -> String {
-    format!(
-        "{:.6}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|since| since.as_secs_f64())
-            .unwrap_or(0.0)
-    )
 }
 
 #[cfg(test)]

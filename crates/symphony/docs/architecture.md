@@ -143,10 +143,11 @@ Three tiers, two of them at run time:
 - **Dropped**: bytes the format consumed on purpose, each with a `DropReason`: a marker that moved
   the engine or a special token (`ControlToken`, `Wrapper`), the template's wrapping between regions
   (`Wrapper`), whitespace the format treats as structural (`Whitespace`), a call after the first
-  where the request takes one call only (`LaterCall`), and the bytes of a call block a syntax
-  whose block is never prose could not read (`MalformedCall`, behind a `Malformed` event of no
-  bytes that counts the failure). Dropped bytes are expected on every well-formed output, the
-  last kind excepted.
+  where the request takes one call only (`LaterCall`), a call the request forbade with
+  `tool_choice: none` and the model wrote anyway (`ForbiddenCall`, every call of the output), and
+  the bytes of a call block a syntax whose block is never prose could not read (`MalformedCall`,
+  behind a `Malformed` event of no bytes that counts the failure). Dropped bytes are expected on
+  every well-formed output, the last kind excepted.
 - **Malformed**: bytes of a region the parser gave up on, returned whole, each with a
   `MalformedReason` from a closed set: the stream ended inside a region (`UnterminatedRegion`),
   arguments that did not parse (`InvalidArguments`), a call to a function the request did not

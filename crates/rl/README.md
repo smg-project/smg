@@ -28,10 +28,25 @@ on the same machine. A wildcard host in an operator-supplied label is replaced
 by the worker's own host. The
 worker's `api_key` is sent as the bearer to the control endpoint. The label is
 trusted: whatever host `rl.control_url` names receives the worker's `api_key`
-as a bearer, so only engines and operators you trust may set it. A worker with
-no control endpoint is reported in `failed[]` as `no_control_endpoint` (HTTP
-422 on the per-worker route), so a fan-out over such a fleet answers 207 and
-`smg.rl.RL.fanout` raises `FanoutError` unless `allow_partial=True`.
+as a bearer, so only engines and operators you trust may set it.
+
+A TokenSpeed engine on the gateway's direct ZMQ lane needs no label: without
+one, its engine connection carries the engine's POST control routes as
+control calls named after them (`pause_generation`,
+`update_weights_from_distributed`, ...), the route's JSON body (an object, or
+none) as the call's argument, on every rank the worker drives. The answer
+keeps the route's shape: `{"success", "message"}` with 200 when every rank
+succeeded, 400 with the failing ranks' words otherwise. GET routes and routes
+below one path segment have no call. Discovery reports such a worker with
+`control_url: null` and `engine_control_calls: true`; a label, when set, wins.
+An engine whose handshake declares no control reply (its wire carries generate
+and abort only) is reported with `engine_control_calls: false` once connected,
+and a call on it answers `no_control_endpoint` (HTTP 422) naming the reason.
+
+A worker with no control endpoint is reported in `failed[]` as
+`no_control_endpoint` (HTTP 422 on the per-worker route), so a fan-out over
+such a fleet answers 207 and `smg.rl.RL.fanout` raises `FanoutError` unless
+`allow_partial=True`.
 
 Capabilities come from the `rl.*` labels when an engine (or operator) supplies
 them (`"source": "label"`), else from the built-in table (`"source": "static"`).

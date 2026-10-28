@@ -127,6 +127,10 @@ pub(crate) struct PipelineDeps {
     /// `--queue-timeout-secs`: a request still ahead of worker selection this
     /// long after the gateway accepted it is refused instead of dispatched.
     queue_timeout: Duration,
+    /// `--grpc-request-timeout-secs`: the deadline of each attempt's calls to
+    /// its workers and of the streams they open, counted from the dispatch;
+    /// `None` leaves them unbounded.
+    request_timeout: Option<Duration>,
 }
 
 impl PipelineDeps {
@@ -157,6 +161,7 @@ impl PipelineDeps {
             configured_reasoning_parser,
             rate_limit_manager,
             queue_timeout,
+            request_timeout: None,
         }
     }
 
@@ -179,7 +184,17 @@ impl PipelineDeps {
             configured_reasoning_parser: None,
             rate_limit_manager,
             queue_timeout,
+            request_timeout: None,
         }
+    }
+
+    /// Bound each attempt's calls to its workers, and the streams they open,
+    /// by `timeout` from the dispatch (`--grpc-request-timeout-secs`); zero
+    /// leaves them unbounded.
+    #[must_use]
+    pub(crate) fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = (!timeout.is_zero()).then_some(timeout);
+        self
     }
 
     /// Build the chat/messages response processor pair from the configured
@@ -249,6 +264,7 @@ impl PipelineDeps {
             configured_reasoning_parser: None,
             rate_limit_manager: None,
             queue_timeout: Duration::from_secs(60),
+            request_timeout: None,
         }
     }
 }
@@ -280,6 +296,8 @@ pub(crate) struct RequestPipeline {
     worker_registry: Arc<WorkerRegistry>,
     /// Shapes a forced tool call's constraint for each attempt's worker.
     tool_parser_factory: ToolParserFactory,
+    /// The deadline of each attempt's dispatch and streams, when set.
+    request_timeout: Option<Duration>,
 }
 
 /// Outcome of one full pipeline run.
@@ -465,7 +483,14 @@ impl RequestPipeline {
             mode,
             worker_registry: deps.worker_registry.clone(),
             tool_parser_factory: deps.tool_parser_factory.clone(),
+            request_timeout: deps.request_timeout,
         })
+    }
+
+    /// The deadline each attempt's dispatch and streams run under, when set.
+    #[cfg(test)]
+    pub(crate) fn request_timeout(&self) -> Option<Duration> {
+        self.request_timeout
     }
 
     /// Ingress phase: run the request-owning stages through request building.
@@ -603,7 +628,7 @@ impl RequestPipeline {
             dctx.workers.as_ref(),
         ));
 
-        execute_plan(dctx, attempt_plan, last_attempt).await?;
+        execute_plan(dctx, attempt_plan, last_attempt, self.request_timeout).await?;
         self.stages
             .response_processing
             .process(dctx, attempt_spec)
@@ -843,7 +868,7 @@ impl RequestPipeline {
                 WorkerSelection::Single { worker } => worker,
                 WorkerSelection::Disaggregated { decode, .. } => decode,
             };
-            insert_routed_worker_id(response.headers_mut(), worker.url());
+            insert_routed_worker_id(response.headers_mut(), worker.redacted_url());
         }
         response
     }
@@ -971,15 +996,12 @@ impl RequestPipeline {
     }
 
     /// Settle a non-streaming success's reservation with real usage, if this
-    /// logical request reserved one. No-op if the cell is unset (feature
-    /// disabled or endpoint opted out) or was never admitted (e.g. prep
-    /// failed before the reserve stage ran). Idempotent -- `settle_success`
-    /// is a no-op if the handle was already resolved.
+    /// logical request reserved one ([`RateLimitCell::settle`]; no-op when
+    /// the caller set no cell).
     async fn settle_reservation(cell: Option<&RateLimitCell>, usage: UsageSettlement) {
-        let Some(RateLimitOutcome::Admitted(handle)) = cell.and_then(RateLimitCell::peek) else {
-            return;
-        };
-        handle.settle_success(usage).await;
+        if let Some(cell) = cell {
+            cell.settle(usage).await;
+        }
     }
 
     /// The settlement of a non-streamed chat or messages answer: the engine's
@@ -1475,8 +1497,12 @@ impl RequestPipeline {
 
     /// Execute chat pipeline for responses endpoint
     ///
-    /// Used by ALL non-streaming /v1/responses requests.
-    /// Same stages as execute_chat(), with two differences:
+    /// Used by ALL non-streaming /v1/responses requests, once per iteration
+    /// of a tool loop. Same stages as execute_chat(), the tenant rate-limit
+    /// reservation included: every iteration is a generation of its own, so
+    /// each takes the reservation a chat request takes (reserved at ingress
+    /// under a charge id of its own, settled with the engine's counts, closed
+    /// unsettled when the iteration fails). Two differences:
     /// 1. Returns Result<ChatCompletionResponse, Response> for tool_loop composition
     /// 2. Disallows streaming (responses endpoint uses different SSE format)
     pub async fn execute_chat_for_responses(
@@ -1487,12 +1513,14 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
     ) -> Result<ChatCompletionResponse, Response> {
+        let rate_limit_cell = Arc::new(RateLimitCell::new());
         let run = {
             let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
-            ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.tenant_request_meta = tenant_request_meta.as_ref().map(iteration_charge);
+            ctx.input.rate_limit_cell = Some(rate_limit_cell.clone());
             self.run(ctx, None, None)
         };
-        match run.await {
+        let result = match run.await {
             Ok(RunOutcome::Early(_)) => {
                 // Streaming not supported for responses sync mode
                 error!(
@@ -1505,7 +1533,14 @@ impl RequestPipeline {
                 ))
             }
             Ok(RunOutcome::Final(mut dctx, _)) => match dctx.response.final_response.take() {
-                Some(FinalResponse::Chat(response)) => Ok(response),
+                Some(FinalResponse::Chat(response)) => {
+                    // The engine's counts the response stage recorded, as
+                    // `execute_chat` settles them.
+                    rate_limit_cell
+                        .settle(Self::recorded_settlement(&dctx.response))
+                        .await;
+                    Ok(response)
+                }
                 Some(_) => {
                     error!(
                         function = "execute_chat_for_responses",
@@ -1528,20 +1563,30 @@ impl RequestPipeline {
                 }
             },
             Err(response) => Err(response),
+        };
+        if result.is_err() {
+            // A failed iteration keeps its reserved debit, as a failed typed
+            // request does (`GrpcRouter::execute_reserved`).
+            rate_limit_cell.close_unsettled().await;
         }
+        result
     }
 
     /// Execute one Harmony Responses API iteration through the pipeline.
     ///
     /// Returns ToolCallsFound (continue serving) or Completed (final
     /// response); called by harmony::responses::serve_harmony_responses()
-    /// per iteration.
+    /// per iteration. Each iteration takes the tenant rate-limit reservation
+    /// a chat request takes: reserved at ingress under a charge id of its own,
+    /// settled with the engine's counts the response stage recorded, closed
+    /// unsettled when the iteration fails.
     pub async fn execute_harmony_responses(
         &self,
         request: &openai_protocol::responses::ResponsesRequest,
         harmony_ctx: &ResponsesContext,
         tenant_request_meta: Option<TenantRequestMeta>,
     ) -> Result<harmony::ResponsesIterationResult, Response> {
+        let rate_limit_cell = Arc::new(RateLimitCell::new());
         let run = {
             let mut ctx = RequestContext::for_responses(
                 Arc::new(request.clone()),
@@ -1549,48 +1594,65 @@ impl RequestPipeline {
                 request.model.clone(), // Model ID from request
                 harmony_ctx.components.clone(),
             );
-            ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.tenant_request_meta = tenant_request_meta.as_ref().map(iteration_charge);
+            ctx.input.rate_limit_cell = Some(rate_limit_cell.clone());
             self.run(ctx, None, None)
         };
-        let mut dctx = match run.await {
+        let result = match run.await {
             Ok(RunOutcome::Early(response)) => {
                 error!(
                     function = "execute_harmony_responses",
                     "Unexpected early response during Responses iteration"
                 );
-                return Err(response);
+                Err(response)
             }
-            Ok(RunOutcome::Final(dctx, _)) => dctx,
-            Err(response) => return Err(response),
+            Ok(RunOutcome::Final(mut dctx, _)) => {
+                match dctx.response.responses_iteration_result.take() {
+                    Some(iteration_result) => {
+                        rate_limit_cell
+                            .settle(Self::recorded_settlement(&dctx.response))
+                            .await;
+                        Ok(iteration_result)
+                    }
+                    None => {
+                        error!(
+                            function = "execute_harmony_responses",
+                            "No ResponsesIterationResult produced by pipeline"
+                        );
+                        Err(error::internal_error(
+                            "no_responses_iteration_result",
+                            "No ResponsesIterationResult produced by pipeline",
+                        ))
+                    }
+                }
+            }
+            Err(response) => Err(response),
         };
-
-        dctx.response
-            .responses_iteration_result
-            .take()
-            .ok_or_else(|| {
-                error!(
-                    function = "execute_harmony_responses",
-                    "No ResponsesIterationResult produced by pipeline"
-                );
-                error::internal_error(
-                    "no_responses_iteration_result",
-                    "No ResponsesIterationResult produced by pipeline",
-                )
-            })
+        if result.is_err() {
+            rate_limit_cell.close_unsettled().await;
+        }
+        result
     }
 
     /// Execute a Harmony Responses pipeline iteration with streaming support.
     ///
     /// Runs through dispatch and returns the raw ExecutionResult (with
-    /// stream) and LoadGuards for token-level streaming processing. The
-    /// caller keeps load_guards alive until stream processing completes.
+    /// stream) and LoadGuards for token-level streaming processing, with the
+    /// iteration's tenant rate-limit reservation (taken under a charge id of
+    /// its own). The caller keeps
+    /// load_guards alive until stream processing completes, then settles the
+    /// reservation with the counts the stream brought
+    /// ([`RateLimitCell::settle`]) or closes it when the stream broke
+    /// ([`RateLimitCell::close_unsettled`]); a cell dropped before either
+    /// (the client left) abandons the reservation, its debit kept.
     pub async fn execute_harmony_responses_streaming(
         &self,
         request: &openai_protocol::responses::ResponsesRequest,
         harmony_ctx: &ResponsesContext,
         tenant_request_meta: Option<TenantRequestMeta>,
         stream_start: Option<StreamStartupSender>,
-    ) -> Result<(ExecutionResult, Option<LoadGuards>), Response> {
+    ) -> Result<(ExecutionResult, Option<LoadGuards>, Arc<RateLimitCell>), Response> {
+        let rate_limit_cell = Arc::new(RateLimitCell::new());
         let run = {
             let mut ctx = RequestContext::for_responses(
                 Arc::new(request.clone()),
@@ -1598,35 +1660,40 @@ impl RequestPipeline {
                 request.model.clone(),
                 harmony_ctx.components.clone(),
             );
-            ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.tenant_request_meta = tenant_request_meta.as_ref().map(iteration_charge);
+            ctx.input.rate_limit_cell = Some(rate_limit_cell.clone());
             self.run_signalling(ctx, None, None, stream_start)
         };
-        let mut dctx = match run.await {
+        let result = match run.await {
             Ok(RunOutcome::Early(response)) => {
                 error!(
                     function = "execute_harmony_responses_streaming",
                     "Unexpected early response during streaming Responses"
                 );
-                return Err(response);
+                Err(response)
             }
-            Ok(RunOutcome::Final(dctx, _)) => dctx,
-            Err(response) => return Err(response),
+            Ok(RunOutcome::Final(mut dctx, _)) => match dctx.response.execution_result.take() {
+                Some(execution_result) => {
+                    let load_guards = dctx.load_guards.take();
+                    Ok((execution_result, load_guards, rate_limit_cell.clone()))
+                }
+                None => {
+                    error!(
+                        function = "execute_harmony_responses_streaming",
+                        "No ExecutionResult produced by pipeline"
+                    );
+                    Err(error::internal_error(
+                        "no_execution_result_produced",
+                        "No ExecutionResult produced by pipeline",
+                    ))
+                }
+            },
+            Err(response) => Err(response),
         };
-
-        let execution_result = dctx.response.execution_result.take().ok_or_else(|| {
-            error!(
-                function = "execute_harmony_responses_streaming",
-                "No ExecutionResult produced by pipeline"
-            );
-            error::internal_error(
-                "no_execution_result_produced",
-                "No ExecutionResult produced by pipeline",
-            )
-        })?;
-
-        let load_guards = dctx.load_guards.take();
-
-        Ok((execution_result, load_guards))
+        if result.is_err() {
+            rate_limit_cell.close_unsettled().await;
+        }
+        result
     }
 }
 
@@ -1985,19 +2052,24 @@ mod request_release_tests {
     };
 
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-    use futures::Stream;
+    use futures::{Stream, StreamExt};
     use llm_tokenizer::{
         traits::{Decoder, Tokenizer},
         HuggingFaceTokenizer, MockTokenizer, TokenizerRegistry,
     };
     use metrics_exporter_prometheus::PrometheusBuilder;
     use openai_protocol::{
-        completion::CompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
+        completion::CompletionRequest, model_card::ModelCard, responses::ResponsesRequest,
+        worker::HealthCheckConfig,
     };
     use portpicker::pick_unused_port;
+    use smg_data_connector::{
+        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage, ResponseId,
+    };
     use smg_grpc_client::{
         common_proto as common, constraint_failed_status, tokenspeed_proto as ts, vllm_proto,
     };
+    use smg_mcp::{McpConfig, McpOrchestrator};
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
     use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
@@ -2008,16 +2080,28 @@ mod request_release_tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        routers::grpc::{
-            client::ModelInfo,
-            multimodal::{
-                MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
-                SUPPORTS_VISION_LABEL,
+        routers::{
+            common::openai_bridge::FormatRegistry,
+            grpc::{
+                client::ModelInfo,
+                common::responses::{
+                    background::{queued_response, store_record},
+                    BackgroundResponses, BackgroundStream,
+                },
+                harmony::serve_harmony_responses_stream,
+                multimodal::{
+                    MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
+                    SUPPORTS_VISION_LABEL,
+                },
+                proto_wrapper::ENGINE_ERROR_MESSAGE,
+                regular::{
+                    responses::{route_responses, route_responses_background_stream},
+                    symphony::template::Templates,
+                },
+                utils::tonic_ext::TonicStatusExt,
             },
-            proto_wrapper::ENGINE_ERROR_MESSAGE,
-            regular::symphony::template::Templates,
-            utils::tonic_ext::TonicStatusExt,
         },
+        tenant::TenantKey,
         worker::{
             circuit_breaker::{CircuitBreakerConfig, CircuitState},
             BasicWorkerBuilder, ConnectionMode, RequestCompletionSink, RuntimeType, Worker,
@@ -2083,6 +2167,12 @@ mod request_release_tests {
         fail_mid_stream: bool,
         fail_constraint: bool,
         fail_engine_report: bool,
+        /// Send the first frame, then hold the stream open with nothing on
+        /// it: an engine whose generation wedged after its first token.
+        hold_after_first: bool,
+        /// Send the first frame, then hold the next until the flag is set:
+        /// a generation whose end the test times itself.
+        gate_after_first: Option<Arc<AtomicBool>>,
         answer_after: Option<Duration>,
         frame_gap: Option<Duration>,
         calls: Arc<AtomicUsize>,
@@ -2224,6 +2314,8 @@ mod request_release_tests {
             let released = Arc::clone(&self.released);
             let frame_gap = self.frame_gap;
             let fail_mid_stream = self.fail_mid_stream;
+            let hold_after_first = self.hold_after_first;
+            let gate_after_first = self.gate_after_first.clone();
             tokio::spawn(async move {
                 if let Some(probe) = probe {
                     Self::await_probe(&probe, &released).await;
@@ -2239,6 +2331,17 @@ mod request_release_tests {
                     };
                     if tx.send(frame).await.is_err() {
                         return;
+                    }
+                    if hold_after_first && index == 0 {
+                        // The stream stays open, with nothing more on it,
+                        // for longer than any wait a test sets.
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        return;
+                    }
+                    if let Some(gate) = gate_after_first.as_ref().filter(|_| index == 0) {
+                        while !gate.load(Ordering::SeqCst) {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
                     }
                 }
             });
@@ -2510,63 +2613,9 @@ mod request_release_tests {
             labels.iter().all(|(key, _)| key != SUPPORTS_VISION_LABEL),
             "{labels:?}"
         );
-        let seen_ids = Arc::new(Mutex::new(Vec::new()));
-        let port = spawn_stub(GatedScheduler {
-            seen_input_ids: Arc::clone(&seen_ids),
-            ..Default::default()
-        })
-        .await;
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        register_worker_with_labels(
-            &worker_registry,
-            port,
-            WorkerType::Regular,
-            &label_pairs(&labels),
-        );
-        let deps = PipelineDeps::pair(
-            worker_registry.clone(),
-            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
-            None,
-            None,
-            Duration::from_secs(60),
-        );
-        let pipeline =
-            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
-        let components = components_with_multimodal(worker_registry, true).await;
-        let request: Arc<ChatCompletionRequest> = Arc::new(
-            serde_json::from_value(serde_json::json!({
-                "model": MODEL,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "What colour is this pixel?"},
-                        {"type": "image_url", "image_url": {"url": ONE_PIXEL_PNG_DATA_URL}}
-                    ]
-                }],
-                "max_completion_tokens": 32,
-            }))
-            .expect("chat request"),
-        );
-        let response = tokio::time::timeout(
-            Duration::from_secs(10),
-            pipeline.execute_chat(
-                request,
-                None,
-                MODEL.to_string(),
-                components,
-                None,
-                None,
-                None,
-                None,
-            ),
-        )
-        .await
-        .expect("the mock path answers");
-        let status = response.status();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("drain body");
-        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+        let (pipeline, components, _) =
+            chat_pipeline_over(RuntimeType::TokenSpeed, &label_pairs(&labels)).await;
+        let (status, body) = chat_error_body(&pipeline, components, one_pixel_image_chat()).await;
         assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
         assert_ne!(body["error"]["code"], "multimodal_not_supported", "{body}");
         assert_eq!(
@@ -2612,63 +2661,9 @@ mod request_release_tests {
                 .any(|(key, value)| key == SUPPORTS_VISION_LABEL && value == "false"),
             "{labels:?}"
         );
-        let seen_ids = Arc::new(Mutex::new(Vec::new()));
-        let port = spawn_stub(GatedScheduler {
-            seen_input_ids: Arc::clone(&seen_ids),
-            ..Default::default()
-        })
-        .await;
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        register_worker_with_labels(
-            &worker_registry,
-            port,
-            WorkerType::Regular,
-            &label_pairs(&labels),
-        );
-        let deps = PipelineDeps::pair(
-            worker_registry.clone(),
-            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
-            None,
-            None,
-            Duration::from_secs(60),
-        );
-        let pipeline =
-            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
-        let components = components_with_multimodal(worker_registry, true).await;
-        let request: Arc<ChatCompletionRequest> = Arc::new(
-            serde_json::from_value(serde_json::json!({
-                "model": MODEL,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "What colour is this pixel?"},
-                        {"type": "image_url", "image_url": {"url": ONE_PIXEL_PNG_DATA_URL}}
-                    ]
-                }],
-                "max_completion_tokens": 32,
-            }))
-            .expect("chat request"),
-        );
-        let response = tokio::time::timeout(
-            Duration::from_secs(10),
-            pipeline.execute_chat(
-                request,
-                None,
-                MODEL.to_string(),
-                components,
-                None,
-                None,
-                None,
-                None,
-            ),
-        )
-        .await
-        .expect("the refusal must not wait on anything");
-        let status = response.status();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("drain body");
-        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+        let (pipeline, components, seen_ids) =
+            chat_pipeline_over(RuntimeType::TokenSpeed, &label_pairs(&labels)).await;
+        let (status, body) = chat_error_body(&pipeline, components, one_pixel_image_chat()).await;
         assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(body["error"]["code"], "multimodal_not_supported", "{body}");
         assert!(
@@ -2684,71 +2679,15 @@ mod request_release_tests {
     /// schedules it, which the client saw as a hang).
     #[tokio::test]
     async fn image_to_a_language_model_only_pool_is_refused_before_dispatch() {
-        let seen_ids = Arc::new(Mutex::new(Vec::new()));
-        let port = spawn_stub(GatedScheduler {
-            seen_input_ids: Arc::clone(&seen_ids),
-            ..Default::default()
-        })
-        .await;
-        let worker_registry = Arc::new(WorkerRegistry::new());
-        register_worker_with_labels(
-            &worker_registry,
-            port,
-            WorkerType::Regular,
-            LANGUAGE_MODEL_ONLY,
-        );
-        let deps = PipelineDeps::pair(
-            worker_registry.clone(),
-            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
-            None,
-            None,
-            Duration::from_secs(60),
-        );
-        let pipeline =
-            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
-        let components = components_with_multimodal(worker_registry, true).await;
-        let request: Arc<ChatCompletionRequest> = Arc::new(
-            serde_json::from_value(serde_json::json!({
-                "model": MODEL,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "What colour is this pixel?"},
-                        {"type": "image_url", "image_url": {"url": ONE_PIXEL_PNG_DATA_URL}}
-                    ]
-                }],
-                "max_completion_tokens": 32,
-            }))
-            .expect("chat request"),
-        );
-
+        let (pipeline, components, seen_ids) =
+            chat_pipeline_over(RuntimeType::TokenSpeed, LANGUAGE_MODEL_ONLY).await;
         let started = Instant::now();
-        let response = tokio::time::timeout(
-            Duration::from_secs(10),
-            pipeline.execute_chat(
-                request,
-                None,
-                MODEL.to_string(),
-                components,
-                None,
-                None,
-                None,
-                None,
-            ),
-        )
-        .await
-        .expect("the refusal must not wait on anything");
+        let (status, body) = chat_error_body(&pipeline, components, one_pixel_image_chat()).await;
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "{:?}",
             started.elapsed()
         );
-
-        let status = response.status();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("drain body");
-        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
         assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(body["error"]["code"], "multimodal_not_supported", "{body}");
         let message = body["error"]["message"].as_str().expect("message");
@@ -2766,10 +2705,27 @@ mod request_release_tests {
         );
     }
 
-    /// The chat pipeline over one stub worker typed as `runtime`, and the
-    /// ids the stub saw.
-    async fn chat_pipeline_of_runtime(
+    /// The chat request of one text part and the one-pixel image, as the
+    /// vision tests send it.
+    fn one_pixel_image_chat() -> serde_json::Value {
+        serde_json::json!({
+            "model": MODEL,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What colour is this pixel?"},
+                    {"type": "image_url", "image_url": {"url": ONE_PIXEL_PNG_DATA_URL}}
+                ]
+            }],
+            "max_completion_tokens": 32,
+        })
+    }
+
+    /// The chat pipeline over one stub worker typed as `runtime` that carries
+    /// `labels`, and the ids the stub saw.
+    async fn chat_pipeline_over(
         runtime: RuntimeType,
+        labels: &[(&str, &str)],
     ) -> (
         RequestPipeline,
         Arc<SharedComponents>,
@@ -2782,7 +2738,7 @@ mod request_release_tests {
         })
         .await;
         let worker_registry = Arc::new(WorkerRegistry::new());
-        register_worker_of_runtime(&worker_registry, port, WorkerType::Regular, runtime, &[]);
+        register_worker_of_runtime(&worker_registry, port, WorkerType::Regular, runtime, labels);
         let deps = PipelineDeps::pair(
             worker_registry.clone(),
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
@@ -2819,7 +2775,7 @@ mod request_release_tests {
             ),
         )
         .await
-        .expect("the refusal must not wait on anything");
+        .expect("the pipeline answers within its budget");
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -2845,7 +2801,7 @@ mod request_release_tests {
             serde_json::json!({"url": "data:video/mp4;base64,invalid"}),
         ] {
             let (pipeline, components, seen_ids) =
-                chat_pipeline_of_runtime(RuntimeType::Sglang).await;
+                chat_pipeline_over(RuntimeType::Sglang, &[]).await;
             let started = Instant::now();
             let (status, body) = chat_error_body(
                 &pipeline,
@@ -2889,23 +2845,8 @@ mod request_release_tests {
     /// tokenizer cannot satisfy, as for the worker without a vision verdict).
     #[tokio::test]
     async fn image_to_a_pool_whose_engine_takes_images_goes_on_into_media_processing() {
-        let (pipeline, components, _) = chat_pipeline_of_runtime(RuntimeType::Sglang).await;
-        let (status, body) = chat_error_body(
-            &pipeline,
-            components,
-            serde_json::json!({
-                "model": MODEL,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "What colour is this pixel?"},
-                        {"type": "image_url", "image_url": {"url": ONE_PIXEL_PNG_DATA_URL}}
-                    ]
-                }],
-                "max_completion_tokens": 32,
-            }),
-        )
-        .await;
+        let (pipeline, components, _) = chat_pipeline_over(RuntimeType::Sglang, &[]).await;
+        let (status, body) = chat_error_body(&pipeline, components, one_pixel_image_chat()).await;
         assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
         assert_ne!(body["error"]["code"], "multimodal_not_supported", "{body}");
         assert_eq!(
@@ -4235,6 +4176,597 @@ mod request_release_tests {
         drop(hold);
     }
 
+    /// Wait until the processor has read the first response of `worker`'s
+    /// one stream: the stream's output ticket is open from that response on
+    /// (see `Worker::output_silence`), and the processor waits on the engine
+    /// for the next one. The test tokenizer renders no text for the stub's
+    /// token, so the client's body carries no frame to wait for.
+    async fn first_response_read(worker: &Arc<dyn Worker>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while worker.output_silence().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the first response never reached the processor"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Wait for the stub to receive the abort of its one request: within
+    /// `deadline`, well inside the 30 s it holds a wedged stream open, so an
+    /// abort that only arrives with the engine's next frame is a failure.
+    async fn wait_for_abort(scheduler: &GatedScheduler, deadline: Instant) -> Duration {
+        let started = Instant::now();
+        let request_id = scheduler
+            .seen_request_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .first()
+            .cloned()
+            .expect("the stub saw the request");
+        while !scheduler
+            .aborted_request_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&request_id)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the stub never received the abort for {request_id} after the client left"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        started.elapsed()
+    }
+
+    /// gRPC regular path: the client leaves while the engine's generation
+    /// wedged after its first token (read by the processor, which then waits
+    /// on the engine). The abort reaches the engine the moment the body is
+    /// dropped, not when the engine next speaks, and the worker's load goes
+    /// with the body.
+    #[tokio::test]
+    async fn a_client_that_leaves_a_stalled_stream_aborts_it_on_the_engine_at_once() {
+        let scheduler = GatedScheduler {
+            hold_after_first: true,
+            ..Default::default()
+        };
+        let port = spawn_stub(scheduler.clone()).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker(&worker_registry, port, WorkerType::Regular);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(Arc::clone(&worker_registry)).await;
+
+        let response = start_stream(&pipeline, components).await;
+        first_response_read(&worker).await;
+        assert!(
+            scheduler
+                .aborted_request_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "nothing is aborted while the client reads"
+        );
+        assert_eq!(worker.load(), 1);
+
+        drop(response);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        wait_for_abort(&scheduler, deadline).await;
+        while worker.load() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the worker's load stayed at {} after the body was dropped",
+                worker.load()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// gRPC PD path: the same client leaves while the decode side wedged after
+    /// its first token. The decode engine receives the abort at once and
+    /// both sides end with their load released.
+    #[tokio::test]
+    async fn a_client_that_leaves_a_stalled_pd_stream_aborts_the_decode_side_at_once() {
+        let prefill_port = spawn_stub(GatedScheduler::default()).await;
+        let decode_scheduler = GatedScheduler {
+            hold_after_first: true,
+            ..Default::default()
+        };
+        let decode_port = spawn_stub(decode_scheduler.clone()).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let prefill = register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+        let decode = register_worker(&worker_registry, decode_port, WorkerType::Decode);
+        let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
+        let components = components(Arc::clone(&worker_registry)).await;
+
+        let response = start_stream(&pipeline, components).await;
+        first_response_read(&decode).await;
+        assert!(
+            decode_scheduler
+                .aborted_request_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "nothing is aborted while the client reads"
+        );
+
+        drop(response);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        wait_for_abort(&decode_scheduler, deadline).await;
+        while prefill.load() != 0 || decode.load() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the sides' load stayed at {} and {} after the body was dropped",
+                prefill.load(),
+                decode.load()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The Responses route over a chat pipeline of `worker_registry`: the
+    /// in-memory stores, no MCP servers, `background_slots` background
+    /// responses at once (0: the mode is off).
+    async fn responses_context(
+        worker_registry: &Arc<WorkerRegistry>,
+        background_slots: usize,
+    ) -> ResponsesContext {
+        responses_context_over(
+            Endpoint::Chat,
+            Mode::Regular,
+            worker_registry,
+            background_slots,
+        )
+        .await
+    }
+
+    /// [`responses_context`] over the `endpoint` pipeline of `worker_registry`
+    /// in `mode`: the chat pipeline, whose body the Responses relay reads, or
+    /// the Harmony pipeline, whose engine stream the Harmony reader reads.
+    async fn responses_context_over(
+        endpoint: Endpoint,
+        mode: Mode,
+        worker_registry: &Arc<WorkerRegistry>,
+        background_slots: usize,
+    ) -> ResponsesContext {
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
+            None,
+            Duration::from_secs(60),
+        );
+        let pipeline = RequestPipeline::build(endpoint, mode, &deps)
+            .unwrap_or_else(|| panic!("a {endpoint:?} pipeline in {mode:?} mode"));
+        ResponsesContext::new(
+            Arc::new(pipeline),
+            components(Arc::clone(worker_registry)).await,
+            Arc::new(MemoryResponseStorage::new()),
+            Arc::new(MemoryConversationStorage::new()),
+            Arc::new(MemoryConversationItemStorage::new()),
+            Arc::new(
+                McpOrchestrator::new(McpConfig::default())
+                    .await
+                    .expect("mcp orchestrator"),
+            ),
+            FormatRegistry::new(),
+            None,
+            Arc::new(BackgroundResponses::new(background_slots)),
+        )
+    }
+
+    /// A streamed Responses request for the stub's model, in the background
+    /// or not.
+    fn responses_request(background: bool) -> Arc<ResponsesRequest> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": MODEL,
+                "input": "hi",
+                "stream": true,
+                "background": background,
+            }))
+            .expect("responses request"),
+        )
+    }
+
+    /// The caller of these Responses requests: no tenant.
+    fn anonymous() -> TenantRequestMeta {
+        TenantRequestMeta::new(TenantKey::new("anonymous"))
+    }
+
+    /// The status of the response record stored under `id`; `Null` when
+    /// none is.
+    async fn stored_status(ctx: &ResponsesContext, id: &str) -> serde_json::Value {
+        ctx.response_storage
+            .get_response(&ResponseId::from(id))
+            .await
+            .expect("the store answers")
+            .map_or(serde_json::Value::Null, |stored| {
+                stored.raw_response["status"].clone()
+            })
+    }
+
+    /// Wait until `worker`'s load is back at 0, within `deadline`.
+    async fn wait_for_load_released(worker: &Arc<dyn Worker>, deadline: Instant) {
+        while worker.load() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the worker's load stayed at {} after the body was dropped",
+                worker.load()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Responses API over the gRPC regular path: the client leaves a
+    /// foreground stream while the engine's generation wedged after its
+    /// first token (read by the chat layer, whose body the Responses relay
+    /// waits on). The relay drops the chat body the moment the client is
+    /// gone and the abort reaches the engine through the chat layer at once,
+    /// not when the engine next speaks; the worker's load goes with it.
+    #[tokio::test]
+    async fn a_client_that_leaves_a_stalled_responses_stream_aborts_it_on_the_engine_at_once() {
+        let scheduler = GatedScheduler {
+            hold_after_first: true,
+            ..Default::default()
+        };
+        let port = spawn_stub(scheduler.clone()).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker(&worker_registry, port, WorkerType::Regular);
+        let ctx = responses_context(&worker_registry, 0).await;
+
+        let response = route_responses(
+            &ctx,
+            responses_request(false),
+            None,
+            anonymous(),
+            MODEL.to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        first_response_read(&worker).await;
+        assert!(
+            scheduler
+                .aborted_request_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "nothing is aborted while the client reads"
+        );
+        assert_eq!(worker.load(), 1);
+
+        drop(response);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        wait_for_abort(&scheduler, deadline).await;
+        wait_for_load_released(&worker, deadline).await;
+    }
+
+    /// Responses API, `background: true`: the generation outlives its
+    /// client on purpose. The client leaves the stream once the engine's
+    /// first token was read; nothing is aborted, the work runs to the
+    /// engine's end and the record under the response id completes.
+    #[tokio::test]
+    async fn a_client_that_leaves_a_background_responses_stream_leaves_its_generation_to_complete()
+    {
+        // The engine's first token after a second; its end only once the
+        // test releases it, after the client is gone.
+        let generation_end = Arc::new(AtomicBool::new(false));
+        let scheduler = GatedScheduler {
+            frame_gap: Some(Duration::from_secs(1)),
+            gate_after_first: Some(Arc::clone(&generation_end)),
+            ..Default::default()
+        };
+        let port = spawn_stub(scheduler.clone()).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker(&worker_registry, port, WorkerType::Regular);
+        let ctx = responses_context(&worker_registry, 1).await;
+        let request = responses_request(true);
+        let id = "resp_background_client_leaves";
+        let slot = ctx.background.admit(id).expect("a background slot");
+        store_record(
+            &ctx.response_storage,
+            &queued_response(id, &request),
+            &request,
+            None,
+            None,
+        )
+        .await
+        .expect("the queued record is stored");
+
+        let response = route_responses_background_stream(
+            &ctx,
+            request,
+            None,
+            anonymous(),
+            MODEL.to_string(),
+            BackgroundStream::new(slot),
+        )
+        .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        first_response_read(&worker).await;
+        assert_ne!(
+            stored_status(&ctx, id).await,
+            "completed",
+            "the client leaves before the generation ends"
+        );
+
+        drop(response);
+        generation_end.store(true, Ordering::SeqCst);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stored_status(&ctx, id).await != "completed" {
+            assert!(
+                Instant::now() < deadline,
+                "the background response did not complete after its client left: {}",
+                stored_status(&ctx, id).await
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            scheduler
+                .aborted_request_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "a background generation is not aborted when its client leaves"
+        );
+        wait_for_load_released(&worker, deadline).await;
+    }
+
+    /// The id a streamed Responses body announces in its first frame
+    /// (`response.created`).
+    fn announced_response_id(frame: &[u8]) -> String {
+        let frame = std::str::from_utf8(frame).expect("UTF-8 SSE");
+        let data = frame
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("a data line in the first frame");
+        let event: serde_json::Value = serde_json::from_str(data).expect("SSE JSON");
+        assert_eq!(event["type"], "response.created", "{event}");
+        event["response"]["id"]
+            .as_str()
+            .expect("the response id")
+            .to_string()
+    }
+
+    /// Harmony Responses over the gRPC regular path, where the Harmony reader
+    /// reads the engine stream itself: the client leaves a foreground stream
+    /// while the engine's generation wedged after its first token. The abort
+    /// reaches the engine the moment the body is dropped, not when the engine
+    /// next speaks; the worker's load goes with the body; and nothing of the
+    /// abandoned stream is stored, not a completed record of its partial
+    /// output.
+    #[tokio::test]
+    async fn a_client_that_leaves_a_stalled_harmony_responses_stream_aborts_it_on_the_engine_at_once(
+    ) {
+        let scheduler = GatedScheduler {
+            hold_after_first: true,
+            ..Default::default()
+        };
+        let port = spawn_stub(scheduler.clone()).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker(&worker_registry, port, WorkerType::Regular);
+        let ctx =
+            responses_context_over(Endpoint::Harmony, Mode::Regular, &worker_registry, 0).await;
+
+        let response = serve_harmony_responses_stream(
+            &ctx,
+            Arc::unwrap_or_clone(responses_request(false)),
+            anonymous(),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        // The first frame announces the response; the rest of the body is
+        // left unread, as a client that stopped reading leaves it.
+        let mut body = response.into_body().into_data_stream();
+        let first = body
+            .next()
+            .await
+            .expect("the first frame")
+            .expect("a readable frame");
+        let id = announced_response_id(&first);
+        first_response_read(&worker).await;
+        assert!(
+            scheduler
+                .aborted_request_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "nothing is aborted while the client reads"
+        );
+        assert_eq!(worker.load(), 1);
+
+        drop(body);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        wait_for_abort(&scheduler, deadline).await;
+        wait_for_load_released(&worker, deadline).await;
+        assert_eq!(
+            stored_status(&ctx, &id).await,
+            serde_json::Value::Null,
+            "nothing of an abandoned foreground stream is stored"
+        );
+    }
+
+    /// Harmony Responses over the gRPC PD path: the same client leaves while
+    /// the decode side wedged after its first token. The decode engine receives
+    /// the abort at once and both sides end with their load released.
+    #[tokio::test]
+    async fn a_client_that_leaves_a_stalled_harmony_responses_pd_stream_aborts_the_decode_side_at_once(
+    ) {
+        let prefill_port = spawn_stub(GatedScheduler::default()).await;
+        let decode_scheduler = GatedScheduler {
+            hold_after_first: true,
+            ..Default::default()
+        };
+        let decode_port = spawn_stub(decode_scheduler.clone()).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let prefill = register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+        let decode = register_worker(&worker_registry, decode_port, WorkerType::Decode);
+        let ctx =
+            responses_context_over(Endpoint::Harmony, Mode::PrefillDecode, &worker_registry, 0)
+                .await;
+
+        let response = serve_harmony_responses_stream(
+            &ctx,
+            Arc::unwrap_or_clone(responses_request(false)),
+            anonymous(),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        first_response_read(&decode).await;
+        assert!(
+            decode_scheduler
+                .aborted_request_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "nothing is aborted while the client reads"
+        );
+
+        drop(response);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        wait_for_abort(&decode_scheduler, deadline).await;
+        while prefill.load() != 0 || decode.load() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the sides' load stayed at {} and {} after the body was dropped",
+                prefill.load(),
+                decode.load()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Harmony Responses over the gRPC PD path, the client leaving while the
+    /// prefill side wedged after its first token: the prefill drain is cut by
+    /// the client's leaving, both sides drop unmarked (the prefill engine
+    /// receives the abort at once) and both sides' load returns with the body.
+    #[tokio::test]
+    async fn a_client_that_leaves_a_stalled_harmony_responses_pd_stream_during_the_prefill_aborts_both_sides_at_once(
+    ) {
+        let prefill_scheduler = GatedScheduler {
+            hold_after_first: true,
+            ..Default::default()
+        };
+        let prefill_port = spawn_stub(prefill_scheduler.clone()).await;
+        let decode_scheduler = GatedScheduler::default();
+        let decode_port = spawn_stub(decode_scheduler.clone()).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let prefill = register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+        let decode = register_worker(&worker_registry, decode_port, WorkerType::Decode);
+        let ctx =
+            responses_context_over(Endpoint::Harmony, Mode::PrefillDecode, &worker_registry, 0)
+                .await;
+
+        let response = serve_harmony_responses_stream(
+            &ctx,
+            Arc::unwrap_or_clone(responses_request(false)),
+            anonymous(),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        first_response_read(&prefill).await;
+        assert!(
+            prefill_scheduler
+                .aborted_request_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "nothing is aborted while the client reads"
+        );
+
+        drop(response);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        // Both sides drop unmarked: each engine receives the abort.
+        wait_for_abort(&prefill_scheduler, deadline).await;
+        wait_for_abort(&decode_scheduler, deadline).await;
+        while prefill.load() != 0 || decode.load() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the sides' load stayed at {} and {} after the body was dropped during the prefill",
+                prefill.load(),
+                decode.load()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Harmony Responses, `background: true`: the generation outlives its
+    /// client on purpose. The client leaves the stream once the engine's
+    /// first token was read; nothing is aborted, the work runs to the
+    /// engine's end and the record under the response id completes.
+    #[tokio::test]
+    async fn a_client_that_leaves_a_background_harmony_responses_stream_leaves_its_generation_to_complete(
+    ) {
+        // The engine's first token after a second, its end a second later:
+        // the client is gone in between.
+        let scheduler = GatedScheduler {
+            frame_gap: Some(Duration::from_secs(1)),
+            ..Default::default()
+        };
+        let port = spawn_stub(scheduler.clone()).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker(&worker_registry, port, WorkerType::Regular);
+        let ctx =
+            responses_context_over(Endpoint::Harmony, Mode::Regular, &worker_registry, 1).await;
+        let request = responses_request(true);
+        let id = "resp_background_harmony_client_leaves";
+        let slot = ctx.background.admit(id).expect("a background slot");
+        store_record(
+            &ctx.response_storage,
+            &queued_response(id, &request),
+            &request,
+            None,
+            None,
+        )
+        .await
+        .expect("the queued record is stored");
+
+        let response = serve_harmony_responses_stream(
+            &ctx,
+            Arc::unwrap_or_clone(request),
+            anonymous(),
+            Some(BackgroundStream::new(slot)),
+        )
+        .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        first_response_read(&worker).await;
+        assert_ne!(
+            stored_status(&ctx, id).await,
+            "completed",
+            "the client leaves before the generation ends"
+        );
+
+        drop(response);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stored_status(&ctx, id).await != "completed" {
+            assert!(
+                Instant::now() < deadline,
+                "the background response did not complete after its client left: {}",
+                stored_status(&ctx, id).await
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            scheduler
+                .aborted_request_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "a background generation is not aborted when its client leaves"
+        );
+        wait_for_load_released(&worker, deadline).await;
+    }
+
     /// gRPC PD path: the prefill side answers on its own and reports when its
     /// phase ends; the decode side is still owed its first token when the
     /// client leaves, and reports with the dropped body. Both sides end with
@@ -5061,6 +5593,270 @@ mod request_release_tests {
         assert!(line.contains("error_type=\"unavailable\""), "{line}");
         assert!(line.ends_with(" 1"), "{line}");
     }
+
+    /// The gateway's request timeout on a gRPC worker, in the shapes the
+    /// issue's reproduction had: a streamed completion whose engine takes
+    /// the request and says nothing ends at the deadline with the HTTP
+    /// path's `stream_error` event under the timeout's message and `[DONE]`,
+    /// the engine receives the abort for that request before the client
+    /// reads the event, and the worker's load goes with the body.
+    #[tokio::test]
+    async fn a_streamed_request_to_a_silent_worker_ends_at_the_request_timeout_and_is_aborted() {
+        let (pipeline, worker, scheduler, components) =
+            silent_worker_pipeline(SilentShape::Stream, REQUEST_TIMEOUT).await;
+        let started = Instant::now();
+        let response = pipeline
+            .execute_completion(
+                completion(true),
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let body = tokio::time::timeout(
+            CASE_CAP,
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the request timeout ends the body: without it the gateway waits on the silent worker as long as the client does")
+        .expect("drain body");
+        let elapsed = started.elapsed();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            elapsed >= REQUEST_TIMEOUT && elapsed < CASE_CAP,
+            "ended after {elapsed:?}: {body}"
+        );
+        assert!(body.contains("\"type\":\"stream_error\""), "{body}");
+        assert!(body.contains("request timed out after 300ms"), "{body}");
+        assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
+        assert_aborted_and_released(&scheduler, &worker).await;
+    }
+
+    /// The same request non-streamed is the HTTP path's 504 for its client
+    /// timeout, `call_upstream_timeout`, at the deadline; the engine request
+    /// is aborted and the slot released as for the streamed one.
+    #[tokio::test]
+    async fn a_non_streamed_request_to_a_silent_worker_is_the_504_at_the_request_timeout() {
+        let (pipeline, worker, scheduler, components) =
+            silent_worker_pipeline(SilentShape::Stream, REQUEST_TIMEOUT).await;
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            CASE_CAP,
+            pipeline.execute_completion(
+                completion(false),
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the request timeout answers: without it the gateway waits on the silent worker as long as the client does");
+        let elapsed = started.elapsed();
+        assert_timeout_response(response, elapsed).await;
+        assert_aborted_and_released(&scheduler, &worker).await;
+    }
+
+    /// A worker that never answers the call that opens the stream (the
+    /// request never admitted, the servicer wedged before its first frame)
+    /// is bounded by the same deadline: the call is dropped at the deadline,
+    /// which cancels it on the worker, and the client reads the 504.
+    #[tokio::test]
+    async fn a_call_the_worker_never_answers_is_the_504_at_the_request_timeout() {
+        let (pipeline, worker, _scheduler, components) =
+            silent_worker_pipeline(SilentShape::Call, REQUEST_TIMEOUT).await;
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            CASE_CAP,
+            pipeline.execute_completion(
+                completion(false),
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the request timeout answers: without it the gateway waits on the call as long as the client does");
+        let elapsed = started.elapsed();
+        assert_timeout_response(response, elapsed).await;
+        assert_eq!(worker.load(), 0, "the slot goes with the answer");
+    }
+
+    /// A worker that answers within the timeout is not touched by it: the
+    /// completion arrives whole, the engine sees no abort.
+    #[tokio::test]
+    async fn a_request_that_completes_before_the_request_timeout_is_unchanged() {
+        let scheduler = GatedScheduler::default();
+        let aborted = Arc::clone(&scheduler.aborted_request_ids);
+        let port = spawn_stub(scheduler).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker(&worker_registry, port, WorkerType::Regular);
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
+            None,
+            Duration::from_secs(60),
+        )
+        .with_request_timeout(Duration::from_secs(30));
+        let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
+            .expect("completion pipeline");
+        let components = components(Arc::clone(&worker_registry)).await;
+        for stream in [true, false] {
+            let response = pipeline
+                .execute_completion(
+                    completion(stream),
+                    None,
+                    MODEL.to_string(),
+                    Arc::clone(&components),
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            assert_eq!(response.status(), http::StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("drain body");
+            let body = String::from_utf8_lossy(&body);
+            assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
+            assert!(!body.contains("timed out"), "{body}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            aborted
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "a completed request sends no abort"
+        );
+        assert_eq!(worker.load(), 0);
+    }
+
+    /// The request timeout under test and the cap a gateway without it fails at.
+    const REQUEST_TIMEOUT: Duration = Duration::from_millis(300);
+    const CASE_CAP: Duration = Duration::from_secs(10);
+
+    /// Where the worker falls silent: after it answered the call with an
+    /// open stream (`Stream`), or before answering the call at all (`Call`).
+    #[derive(Clone, Copy)]
+    enum SilentShape {
+        Stream,
+        Call,
+    }
+
+    /// A completion pipeline with `request_timeout` over one stub worker that
+    /// takes the request and is silent for longer than any case runs.
+    async fn silent_worker_pipeline(
+        shape: SilentShape,
+        request_timeout: Duration,
+    ) -> (
+        RequestPipeline,
+        Arc<dyn Worker>,
+        GatedScheduler,
+        Arc<SharedComponents>,
+    ) {
+        let silence = Duration::from_secs(3600);
+        let scheduler = match shape {
+            SilentShape::Stream => GatedScheduler {
+                frame_gap: Some(silence),
+                ..Default::default()
+            },
+            SilentShape::Call => GatedScheduler {
+                answer_after: Some(silence),
+                ..Default::default()
+            },
+        };
+        let port = spawn_stub(scheduler.clone()).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker(&worker_registry, port, WorkerType::Regular);
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
+            None,
+            Duration::from_secs(60),
+        )
+        .with_request_timeout(request_timeout);
+        let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
+            .expect("completion pipeline");
+        let components = components(Arc::clone(&worker_registry)).await;
+        (pipeline, worker, scheduler, components)
+    }
+
+    fn completion(stream: bool) -> Arc<CompletionRequest> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": MODEL,
+                "prompt": "Hello world",
+                "max_tokens": 8,
+                "stream": stream,
+            }))
+            .expect("completion request"),
+        )
+    }
+
+    /// The HTTP path's 504 for its client timeout, at the deadline.
+    async fn assert_timeout_response(response: Response, elapsed: Duration) {
+        assert_eq!(response.status(), http::StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            elapsed >= REQUEST_TIMEOUT && elapsed < CASE_CAP,
+            "answered after {elapsed:?}"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("drain body");
+        let error: serde_json::Value = serde_json::from_slice(&body).expect("a JSON body");
+        assert_eq!(error["error"]["code"], "call_upstream_timeout", "{error}");
+        assert_eq!(error["error"]["type"], "server_error", "{error}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("request timed out after 300ms")),
+            "{error}"
+        );
+    }
+
+    /// The stub received the abort for the one request it saw, and the
+    /// worker's load is back to zero.
+    async fn assert_aborted_and_released(scheduler: &GatedScheduler, worker: &Arc<dyn Worker>) {
+        let request_id = scheduler
+            .seen_request_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .first()
+            .cloned()
+            .expect("the stub saw the request");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !scheduler
+            .aborted_request_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&request_id)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the stub never received the abort for {request_id}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        while worker.load() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the worker's load never returned to zero"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5468,6 +6264,7 @@ mod rate_limit_reserve_tests {
                 text: String::new(),
                 unbilled_prompt_tokens: 0,
                 continued_final_message: false,
+                generation_prompt: true,
             },
             chat_request: Arc::new(chat_request),
             format: TranscriptionResponseFormat::Json,

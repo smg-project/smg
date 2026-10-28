@@ -156,13 +156,21 @@ fn empty_peers() -> Arc<MockPeerList> {
     Arc::new(MockPeerList::default())
 }
 
-fn adapter_with_empty_handle(mesh: &MeshKV, node_name: &str) -> Arc<TreeSyncAdapter> {
+/// The adapter the tests drive: the three namespaces over `mesh`, `tree`
+/// behind it, `peers` in reach, named `node-a`.
+fn adapter_over(
+    mesh: &MeshKV,
+    tree: Arc<dyn TreeHandle>,
+    peers: Arc<dyn PeerList>,
+) -> Arc<TreeSyncAdapter> {
     let td = td_namespace(mesh);
     let req = req_namespace(mesh);
     let pages = page_namespace(mesh);
-    let tree: Arc<dyn TreeHandle> = empty_handle();
-    let peers: Arc<dyn PeerList> = empty_peers();
-    TreeSyncAdapter::new(td, req, pages, tree, peers, node_name.into())
+    TreeSyncAdapter::new(td, req, pages, tree, peers, "node-a".into())
+}
+
+fn adapter_with_empty_handle(mesh: &MeshKV) -> Arc<TreeSyncAdapter> {
+    adapter_over(mesh, empty_handle(), empty_peers())
 }
 
 #[tokio::test]
@@ -189,7 +197,7 @@ async fn tree_delta_bincode_round_trip() {
 #[tokio::test]
 async fn on_local_insert_buffers_per_model() {
     let mesh = MeshKV::new("node-a".into());
-    let adapter = adapter_with_empty_handle(&mesh, "node-a");
+    let adapter = adapter_with_empty_handle(&mesh);
 
     adapter.on_local_insert("model-1", delta(1, "http://w1"));
     adapter.on_local_insert("model-1", delta(2, "http://w1"));
@@ -202,7 +210,7 @@ async fn on_local_insert_buffers_per_model() {
 #[tokio::test]
 async fn drain_batches_per_model_and_clears_buffer() {
     let mesh = MeshKV::new("node-a".into());
-    let adapter = adapter_with_empty_handle(&mesh, "node-a");
+    let adapter = adapter_with_empty_handle(&mesh);
 
     adapter.on_local_insert("model-1", delta(1, "http://w1"));
     adapter.on_local_insert("model-1", delta(2, "http://w1"));
@@ -229,7 +237,7 @@ async fn drain_batches_per_model_and_clears_buffer() {
 async fn drain_skips_empty_model_buffers() {
     // Cleared model buckets must not emit empty batches.
     let mesh = MeshKV::new("node-a".into());
-    let adapter = adapter_with_empty_handle(&mesh, "node-a");
+    let adapter = adapter_with_empty_handle(&mesh);
 
     adapter
         .pending_deltas
@@ -244,7 +252,7 @@ async fn start_registers_drain_with_mesh_round_collector() {
     // End-to-end outbound: start → drain registration →
     // collect_round_batch pulls our entries.
     let mesh = MeshKV::new("node-a".into());
-    let adapter = adapter_with_empty_handle(&mesh, "node-a");
+    let adapter = adapter_with_empty_handle(&mesh);
     adapter.start();
 
     adapter.on_local_insert("model-1", delta(10, "http://w1"));
@@ -263,7 +271,7 @@ async fn drain_closure_uses_weak_reference() {
     // adapter; a strong Arc in the drain closure would cycle
     // through DrainRegistry and leak it.
     let mesh = MeshKV::new("node-a".into());
-    let adapter = adapter_with_empty_handle(&mesh, "node-a");
+    let adapter = adapter_with_empty_handle(&mesh);
     adapter.start();
 
     let weak = Arc::downgrade(&adapter);
@@ -291,14 +299,9 @@ async fn handle_incoming_batch_applies_known_and_skips_unknown() {
     // different `TreeKind` is a different (model, kind, hash)
     // tuple and stays unknown.
     let mesh = MeshKV::new("node-a".into());
-    let td = td_namespace(&mesh);
-    let req = req_namespace(&mesh);
-    let pages = page_namespace(&mesh);
     let tree = Arc::new(MockTreeHandle::default());
     tree.mark_known("model-1", TreeKind::String, 42);
-    let adapter_tree: Arc<dyn TreeHandle> = tree.clone();
-    let peers: Arc<dyn PeerList> = MockPeerList::with(&["node-b"]);
-    let adapter = TreeSyncAdapter::new(td, req, pages, adapter_tree, peers, "node-a".into());
+    let adapter = adapter_over(&mesh, tree.clone(), MockPeerList::with(&["node-b"]));
 
     let batch = vec![
         TreeDelta {
@@ -340,7 +343,7 @@ async fn handle_incoming_batch_applies_known_and_skips_unknown() {
 async fn handle_incoming_batch_ignores_malformed_payload() {
     // Corrupt batch → no propagation, no panic.
     let mesh = MeshKV::new("node-a".into());
-    let adapter = adapter_with_empty_handle(&mesh, "node-a");
+    let adapter = adapter_with_empty_handle(&mesh);
 
     adapter.handle_incoming_batch("model-1", &[Bytes::from_static(b"not-bincode")]);
 }
@@ -352,7 +355,7 @@ async fn handle_incoming_batch_ignores_malformed_payload() {
 #[traced_test]
 async fn an_undecodable_payload_is_dropped_with_one_warning_on_each_path() {
     let mesh = MeshKV::new("node-a".into());
-    let adapter = adapter_with_empty_handle(&mesh, "node-a");
+    let adapter = adapter_with_empty_handle(&mesh);
     let garbage = [Bytes::from_static(b"not-bincode")];
 
     adapter.handle_incoming_batch("model-1", &garbage);
@@ -433,7 +436,7 @@ async fn start_is_fused() {
     // Second start must panic at the mesh's
     // one-drain-per-prefix invariant.
     let mesh = MeshKV::new("node-a".into());
-    let adapter = adapter_with_empty_handle(&mesh, "node-a");
+    let adapter = adapter_with_empty_handle(&mesh);
     adapter.start();
     adapter.start();
 }
@@ -468,12 +471,7 @@ fn drain_repair_publishes(mesh: &MeshKV) -> Vec<(String, String, Bytes)> {
 #[tokio::test]
 async fn unknown_hash_publishes_repair_request_to_alive_peer() {
     let mesh = MeshKV::new("node-a".into());
-    let td = td_namespace(&mesh);
-    let req = req_namespace(&mesh);
-    let pages = page_namespace(&mesh);
-    let tree: Arc<dyn TreeHandle> = Arc::new(MockTreeHandle::default());
-    let peers: Arc<dyn PeerList> = MockPeerList::with(&["node-b"]);
-    let adapter = TreeSyncAdapter::new(td, req, pages, tree, peers, "node-a".into());
+    let adapter = adapter_over(&mesh, empty_handle(), MockPeerList::with(&["node-b"]));
 
     // Single unknown delta → one targeted publish to node-b.
     let batch = vec![delta(99, "http://w1")];
@@ -506,12 +504,7 @@ async fn coalesces_duplicate_repair_for_same_model_kind() {
     // batch must produce only one repair request — the
     // in-flight session covers both.
     let mesh = MeshKV::new("node-a".into());
-    let td = td_namespace(&mesh);
-    let req = req_namespace(&mesh);
-    let pages = page_namespace(&mesh);
-    let tree: Arc<dyn TreeHandle> = Arc::new(MockTreeHandle::default());
-    let peers: Arc<dyn PeerList> = MockPeerList::with(&["node-b"]);
-    let adapter = TreeSyncAdapter::new(td, req, pages, tree, peers, "node-a".into());
+    let adapter = adapter_over(&mesh, empty_handle(), MockPeerList::with(&["node-b"]));
 
     let batch = vec![delta(101, "http://w1"), delta(102, "http://w2")];
     let bytes = Bytes::from(bincode::serialize(&batch).unwrap());
@@ -526,12 +519,7 @@ async fn separate_kinds_get_separate_repair_sessions() {
     // String and Token unknown hashes for the same model are
     // distinct sessions — coalescing keys on (model, kind).
     let mesh = MeshKV::new("node-a".into());
-    let td = td_namespace(&mesh);
-    let req = req_namespace(&mesh);
-    let pages = page_namespace(&mesh);
-    let tree: Arc<dyn TreeHandle> = Arc::new(MockTreeHandle::default());
-    let peers: Arc<dyn PeerList> = MockPeerList::with(&["node-b"]);
-    let adapter = TreeSyncAdapter::new(td, req, pages, tree, peers, "node-a".into());
+    let adapter = adapter_over(&mesh, empty_handle(), MockPeerList::with(&["node-b"]));
 
     let batch = vec![
         TreeDelta {
@@ -559,7 +547,7 @@ async fn no_alive_peers_skips_repair_silently() {
     // Empty peer list → no publish, no panic, and no entry
     // recorded so a future delta retries once peers come up.
     let mesh = MeshKV::new("node-a".into());
-    let adapter = adapter_with_empty_handle(&mesh, "node-a");
+    let adapter = adapter_with_empty_handle(&mesh);
 
     let batch = vec![delta(99, "http://w1")];
     let bytes = Bytes::from(bincode::serialize(&batch).unwrap());
@@ -576,14 +564,9 @@ async fn no_alive_peers_skips_repair_silently() {
 #[tokio::test]
 async fn known_hashes_do_not_trigger_repair() {
     let mesh = MeshKV::new("node-a".into());
-    let td = td_namespace(&mesh);
-    let req = req_namespace(&mesh);
-    let pages = page_namespace(&mesh);
     let tree = Arc::new(MockTreeHandle::default());
     tree.mark_known("model-1", TreeKind::String, 42);
-    let adapter_tree: Arc<dyn TreeHandle> = tree.clone();
-    let peers: Arc<dyn PeerList> = MockPeerList::with(&["node-b"]);
-    let adapter = TreeSyncAdapter::new(td, req, pages, adapter_tree, peers, "node-a".into());
+    let adapter = adapter_over(&mesh, tree.clone(), MockPeerList::with(&["node-b"]));
 
     let batch = vec![delta(42, "http://w1")];
     let bytes = Bytes::from(bincode::serialize(&batch).unwrap());
@@ -919,9 +902,6 @@ async fn paging_cursor_encodes_cumulative_count() {
 #[tokio::test]
 async fn responder_publishes_pages_targeted_at_requester() {
     let mesh = MeshKV::new("node-a".into());
-    let td = td_namespace(&mesh);
-    let req = req_namespace(&mesh);
-    let pages = page_namespace(&mesh);
     let tree = Arc::new(MockTreeHandle::default());
     tree.set_repair_stream(
         "model-1",
@@ -931,9 +911,7 @@ async fn responder_publishes_pages_targeted_at_requester() {
             string_entry("hello world", &[("w1", 2), ("w2", 3)]),
         ],
     );
-    let adapter_tree: Arc<dyn TreeHandle> = tree.clone();
-    let peers: Arc<dyn PeerList> = MockPeerList::with(&["node-b"]);
-    let adapter = TreeSyncAdapter::new(td, req, pages, adapter_tree, peers, "node-a".into());
+    let adapter = adapter_over(&mesh, tree.clone(), MockPeerList::with(&["node-b"]));
 
     let session_id = Uuid::now_v7();
     let request = make_request(
@@ -975,12 +953,7 @@ async fn responder_emits_empty_ack_for_unknown_model() {
     // Same shape as "tree exists but is empty" — one is_last
     // page with no entries — gives the requester an ACK.
     let mesh = MeshKV::new("node-a".into());
-    let td = td_namespace(&mesh);
-    let req = req_namespace(&mesh);
-    let pages = page_namespace(&mesh);
-    let tree: Arc<dyn TreeHandle> = empty_handle();
-    let peers: Arc<dyn PeerList> = empty_peers();
-    let adapter = TreeSyncAdapter::new(td, req, pages, tree, peers, "node-a".into());
+    let adapter = adapter_with_empty_handle(&mesh);
 
     let request = make_request(
         Uuid::now_v7(),
@@ -1003,18 +976,13 @@ async fn responder_emits_empty_ack_for_unknown_model() {
 #[tokio::test]
 async fn responder_drops_request_with_mismatched_target() {
     let mesh = MeshKV::new("node-a".into());
-    let td = td_namespace(&mesh);
-    let req = req_namespace(&mesh);
-    let pages = page_namespace(&mesh);
     let tree = Arc::new(MockTreeHandle::default());
     tree.set_repair_stream(
         "model-1",
         TreeKind::String,
         vec![string_entry("p", &[("w1", 1)])],
     );
-    let adapter_tree: Arc<dyn TreeHandle> = tree.clone();
-    let peers: Arc<dyn PeerList> = empty_peers();
-    let adapter = TreeSyncAdapter::new(td, req, pages, adapter_tree, peers, "node-a".into());
+    let adapter = adapter_over(&mesh, tree.clone(), empty_peers());
 
     // Target is some other peer — drop, no spawn, no publish.
     let request = make_request(
@@ -1041,9 +1009,6 @@ async fn responder_drops_request_with_mismatched_target() {
 #[tokio::test]
 async fn responder_handles_two_distinct_sessions_independently() {
     let mesh = MeshKV::new("node-a".into());
-    let td = td_namespace(&mesh);
-    let req = req_namespace(&mesh);
-    let pages = page_namespace(&mesh);
     let tree = Arc::new(MockTreeHandle::default());
     tree.set_repair_stream(
         "model-1",
@@ -1055,9 +1020,7 @@ async fn responder_handles_two_distinct_sessions_independently() {
         TreeKind::Token,
         vec![token_entry(&[1, 2, 3], &[("w2", 2)])],
     );
-    let adapter_tree: Arc<dyn TreeHandle> = tree.clone();
-    let peers: Arc<dyn PeerList> = empty_peers();
-    let adapter = TreeSyncAdapter::new(td, req, pages, adapter_tree, peers, "node-a".into());
+    let adapter = adapter_over(&mesh, tree.clone(), empty_peers());
 
     let session_a = Uuid::now_v7();
     let session_b = Uuid::now_v7();
@@ -1104,14 +1067,9 @@ async fn responder_resumes_from_request_cursor() {
         })
         .collect();
     let mesh = MeshKV::new("node-a".into());
-    let td = td_namespace(&mesh);
-    let req = req_namespace(&mesh);
-    let pages = page_namespace(&mesh);
     let tree = Arc::new(MockTreeHandle::default());
     tree.set_repair_stream("model-1", TreeKind::String, canned.clone());
-    let adapter_tree: Arc<dyn TreeHandle> = tree.clone();
-    let peers: Arc<dyn PeerList> = empty_peers();
-    let adapter = TreeSyncAdapter::new(td, req, pages, adapter_tree, peers, "node-a".into());
+    let adapter = adapter_over(&mesh, tree.clone(), empty_peers());
 
     // Resume at offset 4 → response covers the last 2 entries.
     let cursor = bincode::serialize(&4u64).unwrap();
@@ -1201,13 +1159,8 @@ fn applied_pages(tree: &MockTreeHandle) -> Vec<TreeRepairPage> {
 #[tokio::test]
 async fn receiver_applies_page_and_records_session_progress() {
     let mesh = MeshKV::new("node-a".into());
-    let td = td_namespace(&mesh);
-    let req = req_namespace(&mesh);
-    let pages = page_namespace(&mesh);
     let tree = Arc::new(MockTreeHandle::default());
-    let adapter_tree: Arc<dyn TreeHandle> = tree.clone();
-    let peers: Arc<dyn PeerList> = empty_peers();
-    let adapter = TreeSyncAdapter::new(td, req, pages, adapter_tree, peers, "node-a".into());
+    let adapter = adapter_over(&mesh, tree.clone(), empty_peers());
 
     let session = Uuid::now_v7();
     seed_outstanding(&adapter, "model-1", TreeKind::String, session, "node-b");
@@ -1247,13 +1200,8 @@ async fn receiver_applies_page_and_records_session_progress() {
 #[tokio::test]
 async fn receiver_dedupes_same_page_index() {
     let mesh = MeshKV::new("node-a".into());
-    let td = td_namespace(&mesh);
-    let req = req_namespace(&mesh);
-    let pages = page_namespace(&mesh);
     let tree = Arc::new(MockTreeHandle::default());
-    let adapter_tree: Arc<dyn TreeHandle> = tree.clone();
-    let peers: Arc<dyn PeerList> = empty_peers();
-    let adapter = TreeSyncAdapter::new(td, req, pages, adapter_tree, peers, "node-a".into());
+    let adapter = adapter_over(&mesh, tree.clone(), empty_peers());
 
     let session = Uuid::now_v7();
     seed_outstanding(&adapter, "model-1", TreeKind::String, session, "node-b");
@@ -1280,13 +1228,8 @@ async fn receiver_dedupes_same_page_index() {
 #[tokio::test]
 async fn receiver_drops_page_for_unknown_session() {
     let mesh = MeshKV::new("node-a".into());
-    let td = td_namespace(&mesh);
-    let req = req_namespace(&mesh);
-    let pages = page_namespace(&mesh);
     let tree = Arc::new(MockTreeHandle::default());
-    let adapter_tree: Arc<dyn TreeHandle> = tree.clone();
-    let peers: Arc<dyn PeerList> = empty_peers();
-    let adapter = TreeSyncAdapter::new(td, req, pages, adapter_tree, peers, "node-a".into());
+    let adapter = adapter_over(&mesh, tree.clone(), empty_peers());
 
     // No outstanding session — page should be dropped.
     let page = make_page(
@@ -1309,13 +1252,8 @@ async fn receiver_drops_page_for_unknown_session() {
 #[tokio::test]
 async fn receiver_drops_page_with_mismatched_session_id() {
     let mesh = MeshKV::new("node-a".into());
-    let td = td_namespace(&mesh);
-    let req = req_namespace(&mesh);
-    let pages = page_namespace(&mesh);
     let tree = Arc::new(MockTreeHandle::default());
-    let adapter_tree: Arc<dyn TreeHandle> = tree.clone();
-    let peers: Arc<dyn PeerList> = empty_peers();
-    let adapter = TreeSyncAdapter::new(td, req, pages, adapter_tree, peers, "node-a".into());
+    let adapter = adapter_over(&mesh, tree.clone(), empty_peers());
 
     // Live session is `live_session`; incoming page carries
     // a different session_id (e.g., a delayed retry response).
@@ -1353,13 +1291,8 @@ async fn receiver_drops_page_with_mismatched_session_id() {
 #[tokio::test]
 async fn terminal_page_clears_outstanding_session() {
     let mesh = MeshKV::new("node-a".into());
-    let td = td_namespace(&mesh);
-    let req = req_namespace(&mesh);
-    let pages = page_namespace(&mesh);
     let tree = Arc::new(MockTreeHandle::default());
-    let adapter_tree: Arc<dyn TreeHandle> = tree.clone();
-    let peers: Arc<dyn PeerList> = empty_peers();
-    let adapter = TreeSyncAdapter::new(td, req, pages, adapter_tree, peers, "node-a".into());
+    let adapter = adapter_over(&mesh, tree.clone(), empty_peers());
 
     let session = Uuid::now_v7();
     seed_outstanding(&adapter, "model-1", TreeKind::String, session, "node-b");
@@ -1385,13 +1318,8 @@ async fn terminal_page_clears_outstanding_session() {
 #[tokio::test]
 async fn terminal_page_with_gap_keeps_session_open() {
     let mesh = MeshKV::new("node-a".into());
-    let td = td_namespace(&mesh);
-    let req = req_namespace(&mesh);
-    let pages = page_namespace(&mesh);
     let tree = Arc::new(MockTreeHandle::default());
-    let adapter_tree: Arc<dyn TreeHandle> = tree.clone();
-    let peers: Arc<dyn PeerList> = empty_peers();
-    let adapter = TreeSyncAdapter::new(td, req, pages, adapter_tree, peers, "node-a".into());
+    let adapter = adapter_over(&mesh, tree.clone(), empty_peers());
 
     let session = Uuid::now_v7();
     seed_outstanding(&adapter, "model-1", TreeKind::String, session, "node-b");
@@ -1432,13 +1360,8 @@ async fn terminal_page_with_gap_keeps_session_open() {
 #[tokio::test]
 async fn contiguous_cursor_handles_out_of_order_pages() {
     let mesh = MeshKV::new("node-a".into());
-    let td = td_namespace(&mesh);
-    let req = req_namespace(&mesh);
-    let pages = page_namespace(&mesh);
     let tree = Arc::new(MockTreeHandle::default());
-    let adapter_tree: Arc<dyn TreeHandle> = tree.clone();
-    let peers: Arc<dyn PeerList> = empty_peers();
-    let adapter = TreeSyncAdapter::new(td, req, pages, adapter_tree, peers, "node-a".into());
+    let adapter = adapter_over(&mesh, tree.clone(), empty_peers());
 
     let session = Uuid::now_v7();
     seed_outstanding(&adapter, "model-1", TreeKind::String, session, "node-b");
@@ -1483,13 +1406,12 @@ async fn contiguous_cursor_handles_out_of_order_pages() {
 #[tokio::test]
 async fn retry_scan_reissues_stale_session_with_contiguous_cursor() {
     let mesh = MeshKV::new("node-a".into());
-    let td = td_namespace(&mesh);
-    let req = req_namespace(&mesh);
-    let pages = page_namespace(&mesh);
     let tree = Arc::new(MockTreeHandle::default());
-    let adapter_tree: Arc<dyn TreeHandle> = tree.clone();
-    let peers: Arc<dyn PeerList> = MockPeerList::with(&["node-b", "node-c"]);
-    let adapter = TreeSyncAdapter::new(td, req, pages, adapter_tree, peers, "node-a".into());
+    let adapter = adapter_over(
+        &mesh,
+        tree.clone(),
+        MockPeerList::with(&["node-b", "node-c"]),
+    );
 
     // Seed an old session that has applied page 0; pretend
     // it started 10s ago (> 5s timeout).
@@ -1538,13 +1460,8 @@ async fn retry_scan_reissues_stale_session_with_contiguous_cursor() {
 #[tokio::test]
 async fn retry_scan_skips_session_with_recent_page_progress() {
     let mesh = MeshKV::new("node-a".into());
-    let td = td_namespace(&mesh);
-    let req = req_namespace(&mesh);
-    let pages = page_namespace(&mesh);
     let tree = Arc::new(MockTreeHandle::default());
-    let adapter_tree: Arc<dyn TreeHandle> = tree.clone();
-    let peers: Arc<dyn PeerList> = MockPeerList::with(&["node-b"]);
-    let adapter = TreeSyncAdapter::new(td, req, pages, adapter_tree, peers, "node-a".into());
+    let adapter = adapter_over(&mesh, tree.clone(), MockPeerList::with(&["node-b"]));
 
     let session = Uuid::now_v7();
     adapter.outstanding_repairs.insert(
@@ -1584,12 +1501,7 @@ async fn retry_scan_skips_session_with_recent_page_progress() {
 #[tokio::test]
 async fn retry_scan_gives_up_after_max_retries() {
     let mesh = MeshKV::new("node-a".into());
-    let td = td_namespace(&mesh);
-    let req = req_namespace(&mesh);
-    let pages = page_namespace(&mesh);
-    let tree: Arc<dyn TreeHandle> = empty_handle();
-    let peers: Arc<dyn PeerList> = MockPeerList::with(&["node-b"]);
-    let adapter = TreeSyncAdapter::new(td, req, pages, tree, peers, "node-a".into());
+    let adapter = adapter_over(&mesh, empty_handle(), MockPeerList::with(&["node-b"]));
 
     let mut progress = RepairProgress::new(
         Uuid::now_v7(),
@@ -1614,12 +1526,11 @@ async fn retry_scan_gives_up_after_max_retries() {
 #[tokio::test]
 async fn retry_scan_prefers_different_peer() {
     let mesh = MeshKV::new("node-a".into());
-    let td = td_namespace(&mesh);
-    let req = req_namespace(&mesh);
-    let pages = page_namespace(&mesh);
-    let tree: Arc<dyn TreeHandle> = empty_handle();
-    let peers: Arc<dyn PeerList> = MockPeerList::with(&["node-b", "node-c"]);
-    let adapter = TreeSyncAdapter::new(td, req, pages, tree, peers, "node-a".into());
+    let adapter = adapter_over(
+        &mesh,
+        empty_handle(),
+        MockPeerList::with(&["node-b", "node-c"]),
+    );
 
     let progress = RepairProgress::new(
         Uuid::now_v7(),
@@ -1644,13 +1555,8 @@ async fn variant_mismatch_is_skipped_not_panic() {
     // must drop the Token entry without panicking and not
     // count it toward the applied total.
     let mesh = MeshKV::new("node-a".into());
-    let td = td_namespace(&mesh);
-    let req = req_namespace(&mesh);
-    let pages = page_namespace(&mesh);
     let tree = Arc::new(MockTreeHandle::default());
-    let adapter_tree: Arc<dyn TreeHandle> = tree.clone();
-    let peers: Arc<dyn PeerList> = empty_peers();
-    let adapter = TreeSyncAdapter::new(td, req, pages, adapter_tree, peers, "node-a".into());
+    let adapter = adapter_over(&mesh, tree.clone(), empty_peers());
 
     let session = Uuid::now_v7();
     seed_outstanding(&adapter, "model-1", TreeKind::String, session, "node-b");

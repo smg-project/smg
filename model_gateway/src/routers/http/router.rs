@@ -682,7 +682,10 @@ impl Router {
         });
 
         // Note: Using borrowed reference avoids heap allocation
-        events::RequestSentEvent { url: worker.url() }.emit();
+        events::RequestSentEvent {
+            url: worker.redacted_url(),
+        }
+        .emit();
         let raw_body_len = header_utils::content_length(headers);
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -1066,7 +1069,10 @@ impl Router {
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
-        events::RequestSentEvent { url: worker.url() }.emit();
+        events::RequestSentEvent {
+            url: worker.redacted_url(),
+        }
+        .emit();
 
         let form = match build_transcription_form(body, audio, canonical_model.as_deref()) {
             Ok(f) => f,
@@ -1233,7 +1239,10 @@ impl Router {
         if is_stream {
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            header_utils::insert_routed_worker_id(&mut response_headers, source.worker().url());
+            header_utils::insert_routed_worker_id(
+                &mut response_headers,
+                source.worker().redacted_url(),
+            );
             if status.is_success() && !response_headers.contains_key(CONTENT_TYPE) {
                 response_headers
                     .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
@@ -1291,7 +1300,10 @@ impl Router {
                 }
                 Err(error_response) => error_response,
             };
-            header_utils::insert_routed_worker_id(response.headers_mut(), source.worker().url());
+            header_utils::insert_routed_worker_id(
+                response.headers_mut(),
+                source.worker().redacted_url(),
+            );
 
             // load_guard dropped here automatically after response body is read
             response
@@ -1677,7 +1689,7 @@ fn relay_transcription_stream(
     // responses as SSE; leave that judgment to whatever the worker
     // set.
     let mut response_headers = header_utils::preserve_response_headers(res.headers());
-    header_utils::insert_routed_worker_id(&mut response_headers, worker.url());
+    header_utils::insert_routed_worker_id(&mut response_headers, worker.redacted_url());
     let stream = res.bytes_stream();
     // Bounded channel applies backpressure: if the downstream client
     // is slow, the upstream relay awaits on `send` rather than piling
@@ -1701,6 +1713,11 @@ fn relay_transcription_stream(
         let mut stream = stream;
         let mut stream_failed = false;
         let mut client_disconnected = false;
+        // One wait for the client's leaving, kept across the chunks (a
+        // `closed()` per `select!` round registers and drops a waiter on
+        // every chunk; kept, it registers once).
+        let client_gone = tx.closed();
+        tokio::pin!(client_gone);
         loop {
             tokio::select! {
                 chunk = stream.next() => match chunk {
@@ -1730,7 +1747,7 @@ fn relay_transcription_stream(
                 // stalled upstream): break so the reqwest stream drops,
                 // closing the upstream connection and letting the
                 // engine abort generation.
-                () = tx.closed() => {
+                () = &mut client_gone => {
                     client_disconnected = true;
                     break;
                 }
@@ -1798,7 +1815,7 @@ async fn buffer_transcription_response(
         };
     // The routed worker's id on the error answers too, as the typed
     // routes' buffered arm sets it.
-    header_utils::insert_routed_worker_id(response.headers_mut(), worker.url());
+    header_utils::insert_routed_worker_id(response.headers_mut(), worker.redacted_url());
 
     // Non-streaming: classify metrics off the final response the client
     // will actually see. A body-read failure can rewrite a 2xx upstream
@@ -2019,7 +2036,10 @@ impl Router {
             worker.clone(),
             self.policy_registry.sticky_header_key(Some(req.headers())),
         );
-        events::RequestSentEvent { url: worker.url() }.emit();
+        events::RequestSentEvent {
+            url: worker.redacted_url(),
+        }
+        .emit();
 
         let (parts, body) = req.into_parts();
         let mut headers_with_trace = parts.headers;
@@ -2601,6 +2621,7 @@ mod tests {
             request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
         },
         service_discovery::testing::create_test_app_context,
+        test_support::RefusedAddress,
         worker::{circuit_breaker::CircuitState, BasicWorkerBuilder},
     };
 
@@ -2750,18 +2771,15 @@ mod tests {
     /// A failed call to a worker is logged log-safe as a whole: a worker
     /// registered with userinfo at a port nobody listens on fails the proxied
     /// GET, and the complete event (the message and every field) carries the
-    /// user and the mask, never the secret. The error's own text goes through
+    /// mask, never the user or the secret. The error's own text goes through
     /// `cause`, so the line names no address of its own either, whatever the
     /// HTTP client puts in its `Display`.
     #[tokio::test]
     async fn a_failed_call_to_a_worker_with_userinfo_is_logged_log_safe() {
         let texts = EventTexts::default();
         let _subscriber = test_subscriber(texts.clone());
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let refused = RefusedAddress::reserve();
+        let port = refused.port();
         let worker_registry = Arc::new(WorkerRegistry::new());
         worker_registry.register_or_replace(Arc::new(
             BasicWorkerBuilder::new(format!("http://alice:s3cret@127.0.0.1:{port}"))
@@ -2785,10 +2803,11 @@ mod tests {
             .find(|text| text.contains("Failed to proxy GET request"))
             .expect("the failure line");
         assert!(
-            line.contains(&format!("alice:***@127.0.0.1:{port}")),
+            line.contains(&format!("http://***@127.0.0.1:{port}")),
             "{line}"
         );
         assert!(!line.contains("s3cret"), "{line}");
+        assert!(!line.contains("alice"), "{line}");
         assert!(
             texts.iter().all(|text| !text.contains("s3cret")),
             "{texts:?}"
@@ -3546,25 +3565,7 @@ mod tests {
     }
 
     fn cache_aware_policy() -> PolicyConfig {
-        PolicyConfig::CacheAware {
-            cache_threshold: 0.5,
-            balance_abs_threshold: 32,
-            balance_rel_threshold: 1.1,
-            eviction_interval_secs: 0,
-            max_tree_size: 4096,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-            balance_prefix_margin_tokens: 0,
-            balance_uncached_credit: false,
-        }
+        PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096)
     }
 
     fn streaming_router(
@@ -4057,6 +4058,29 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string()
+    }
+
+    /// The routed-worker header names a worker registered with credentials
+    /// masked (the URL's userinfo whole), and the request-sent event line
+    /// the same; a worker registered without them keeps its header byte for
+    /// byte (the tests beside this one read it so).
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn the_routed_worker_header_and_the_event_mask_a_workers_credentials() {
+        let (url, _cap) = spawn_capture_stub("application/json", "{}").await;
+        let with_secret = url.replacen("http://", "http://user:secret@", 1);
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![plain_worker(&with_secret)],
+        );
+
+        let header = routed_worker_id(&router, streamed_request(&[b"{\"text\":\"hello\"}"])).await;
+
+        assert_eq!(header, url.replacen("http://", "http://***@", 1));
+        assert!(!header.contains("secret"), "{header}");
+        assert!(!logs_contain("secret"));
+        assert!(logs_contain(&url.replacen("http://", "http://***@", 1)));
     }
 
     #[tokio::test]
@@ -4805,9 +4829,8 @@ mod tests {
     /// outer error, and the converter leaves it out.
     #[tokio::test]
     async fn an_upstream_failures_answer_names_the_reason_and_not_the_worker() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let refused = RefusedAddress::reserve();
+        let addr = refused.addr();
         let err = crate::clients::http_client_builder()
             .build()
             .unwrap()
@@ -4832,10 +4855,9 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_connection_failure_keeps_its_own_code() {
-        // Bind, then drop: the port is free, so the connect is refused.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        // A reserved port nobody listens at: the connect is refused.
+        let refused = RefusedAddress::reserve();
+        let addr = refused.addr();
         let err = crate::clients::http_client()
             .get(format!("http://{addr}/generate"))
             .send()

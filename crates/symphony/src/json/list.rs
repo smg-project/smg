@@ -57,7 +57,7 @@
 //! a `;`, another object or prose after it (`docs/assemblers.md`).
 
 use crate::{
-    event::{release_between, DropReason, Event, Events, MalformedReason, Text},
+    event::{release_between, Event, Events, MalformedReason, Text},
     ids::CallIds,
     json,
 };
@@ -173,8 +173,9 @@ impl Assembler {
         }
     }
 
-    /// Append the next bytes and push the events they complete; every byte is taken.
-    pub fn feed(&mut self, bytes: &str, out: &mut Events) {
+    /// Append the next bytes and push the events they complete; every byte is taken. An
+    /// object's argument fragment that lies within `bytes` borrows them (`'d`, the delta's life).
+    pub fn feed<'d>(&mut self, bytes: &'d str, out: &mut Events<'d>) {
         let mut rest = bytes;
         while !rest.is_empty() {
             rest = self.take(rest, out);
@@ -225,7 +226,7 @@ impl Assembler {
     }
 
     /// Reads as much of `text` as the stage takes and returns the rest.
-    fn take<'a>(&mut self, text: &'a str, out: &mut Events) -> &'a str {
+    fn take<'d>(&mut self, text: &'d str, out: &mut Events<'d>) -> &'d str {
         match &mut self.stage {
             Stage::Deciding => {
                 let Some((at, first)) = text.char_indices().find(|(_, c)| !c.is_whitespace())
@@ -431,18 +432,17 @@ impl Assembler {
     }
 
     fn drop_carried(&mut self, out: &mut Events) {
-        if self.carried.is_empty() {
-            return;
-        }
-        out.push(Event::Dropped {
-            text: Text::uncounted(std::mem::take(&mut self.carried)),
-            why: DropReason::Wrapper,
-        });
+        crate::event::drop_carried(std::mem::take(&mut self.carried), out);
     }
 }
 
 impl crate::engine::CallAssembler for Assembler {
-    fn feed(&mut self, text: &str, _declared: &crate::Declared, out: &mut Events) -> usize {
+    fn feed<'d>(
+        &mut self,
+        text: &'d str,
+        _declared: &crate::Declared,
+        out: &mut Events<'d>,
+    ) -> usize {
         self.feed(text, out);
         text.len()
     }
@@ -460,7 +460,7 @@ impl crate::engine::CallAssembler for Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::bytes;
+    use crate::{event::DropReason, testing::bytes};
 
     fn ids() -> CallIds {
         CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
@@ -478,7 +478,7 @@ mod tests {
             assembler.feed(piece, &mut out);
         }
         assembler.finish(&mut out);
-        out.drain()
+        out.into_owned().drain()
     }
 
     fn calls(events: &[Event]) -> Vec<(u32, String, String)> {
@@ -665,7 +665,7 @@ mod tests {
             assembler.feed(piece, &mut out);
         }
         assembler.finish(&mut out);
-        out.drain()
+        out.into_owned().drain()
     }
 
     #[test]
@@ -805,7 +805,7 @@ mod tests {
             assembler.feed(piece, &mut out);
         }
         assembler.finish(&mut out);
-        out.drain()
+        out.into_owned().drain()
     }
 
     /// `output` through `run`, whole and one character at a time: the same bytes, calls,

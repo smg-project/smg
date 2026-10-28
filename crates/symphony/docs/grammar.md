@@ -184,3 +184,16 @@ structural token, one of the syntax's own tags (`CallSyntax::tag_texts`), or a t
 written as that token (`Grammar::Token`) wherever a tag writes it inside a tag or between tags, so
 the model cannot spell it in ordinary tokens there; a tag's begin and end and its triggers stay
 text, as the engines' `triggered_tags` takes them.
+
+A tag can be spelled in the older structural-tag vocabulary (`Grammar::in_older_vocabulary`) for an
+engine whose grammar compiler predates `optional`, `plus` and `star`, which xgrammar reads from
+0.1.33 on: they are spelled with the nodes every version reads and the same language: an optional
+content as the choice with the empty text, a repetition as a `tags_with_separator` of the repeated
+tags (or of a tag with an empty begin and end around the repeated item, which then carries the
+enclosing tag's end among its texts' excluded strings, since that end stopped them before), a
+separated list as one such list with its separator; a list that does not end its sequence takes the
+constant text after it as the end of a tag around it, as the older analyzer asks, and a text that is
+the last thing before its tag's end leaves out the excludes that end makes redundant (the older
+matcher cannot build the text otherwise). On the newer xgrammar the spelling compiles to the same
+token masks at every step; an engine whose grammar compiler predates the nodes no longer refuses the
+request at compile time. The gateway spells the tags it sends so where a worker's engine needs it.

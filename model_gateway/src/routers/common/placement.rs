@@ -867,8 +867,8 @@ fn relaxed_pair(
     }
     debug!(
         branch,
-        prefill = %prefill.url(),
-        decode = %decode.url(),
+        prefill = %prefill.redacted_url(),
+        decode = %decode.redacted_url(),
         model_id,
         "Veto fallback"
     );
@@ -1189,8 +1189,8 @@ pub(crate) fn select_pair(
             branch = BRANCH_ALL_OVERLOADED_FALLBACK,
             prefill_pool = prefill_over,
             decode_pool = lift_decode,
-            prefill = %selected_prefill.url(),
-            decode = %selected_decode.url(),
+            prefill = %selected_prefill.redacted_url(),
+            decode = %selected_decode.redacted_url(),
             model_id,
             "Veto fallback: a prefill pool over the overload thresholds placed by its policy, or a decode pool by load"
         );
@@ -1212,8 +1212,8 @@ pub(crate) fn select_pair(
     }
 
     debug!(
-        prefill = %selected_prefill.url(),
-        decode = %selected_decode.url(),
+        prefill = %selected_prefill.redacted_url(),
+        decode = %selected_decode.redacted_url(),
         "Selected PD pair"
     );
     Ok(Pair {
@@ -1987,25 +1987,7 @@ mod tests {
     }
 
     fn cache_aware_policy() -> PolicyConfig {
-        PolicyConfig::CacheAware {
-            cache_threshold: 0.5,
-            balance_abs_threshold: 32,
-            balance_rel_threshold: 1.1,
-            eviction_interval_secs: 0,
-            max_tree_size: 4096,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay: 0.0,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-            balance_prefix_margin_tokens: 0,
-            balance_uncached_credit: false,
-        }
+        PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096)
     }
 
     fn http_registry(urls: &[&str]) -> WorkerRegistry {

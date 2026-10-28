@@ -10,8 +10,8 @@ use llm_tokenizer::stop::StopSequenceDecoder;
 use openai_protocol::common::Tool;
 use parking_lot::RwLock;
 use symphony::{
-    adapt::chat, Declared, DropReason, Engine, EngineFinish, Event, Events, Format, Input,
-    Parser as _, Text, TokenSpan,
+    Declared, DropReason, Engine, EngineFinish, Event, Events, Format, Input, Parser as _, Text,
+    TokenSpan,
 };
 use tracing::debug;
 
@@ -34,6 +34,10 @@ pub(crate) struct Assignment {
     /// The table, shared with every reader of the response and every request it reads for.
     pub format: Arc<Format>,
     pub prompt: String,
+    /// The request forbade the calls the table reads (`tool_choice: none`,
+    /// [`Asks::forbids_calls`]): the reader drops every call, as the engine's own server reads
+    /// such a call and withholds it.
+    pub forbids_calls: bool,
 }
 
 impl Assignment {
@@ -44,18 +48,29 @@ impl Assignment {
 }
 
 /// The assignment of `format` to a response, with the part of `prompt` the engine replays.
-pub(super) fn assignment(format: Arc<Format>, model: &str, prompt: &str) -> Assignment {
+pub(super) fn assignment(
+    format: Arc<Format>,
+    model: &str,
+    prompt: &str,
+    forbids_calls: bool,
+) -> Assignment {
     debug!(model, table = format.name(), "Symphony reads the response");
     let prompt = format.replay(prompt).to_string();
-    Assignment { format, prompt }
+    Assignment {
+        format,
+        prompt,
+        forbids_calls,
+    }
 }
 
 /// The table as the request's asks make it: without its calls when the legacy path would run no
-/// tool parser (the request asks for none, or its response is not scanned for calls:
+/// tool parser (the response is not scanned for calls:
 /// [`scans_for_tool_calls`](crate::routers::grpc::spec::scans_for_tool_calls)), so a table that reads calls from the output's first byte (`json`,
 /// `xlam`) is content from it; without its thought when the request keeps the reasoning in the
 /// content, as the legacy path runs no reasoning parser then. A variant is a copy of the shared
-/// table; a request that asks for neither reads with the shared table itself.
+/// table; a request that asks for neither reads with the shared table itself. A `tool_choice` of
+/// `none` asks for no variant: the table keeps its calls and the reader drops them
+/// ([`Assignment::forbids_calls`]).
 pub(super) fn asked(format: Arc<Format>, no_calls: bool, no_reasoning: bool) -> Arc<Format> {
     if !no_calls && !no_reasoning {
         return format;
@@ -170,7 +185,12 @@ pub(crate) fn assign(
         return Ok(None);
     }
     let format = asked(format, asks.no_calls(), asks.no_reasoning());
-    Ok(Some(assignment(format, asks.model(), prompt)))
+    Ok(Some(assignment(
+        format,
+        asks.model(),
+        prompt,
+        asks.forbids_calls(),
+    )))
 }
 
 /// The engine's finish reason as Symphony takes it.
@@ -245,14 +265,15 @@ pub(crate) struct Reader {
     tally: Tally,
     /// The last token the decoder saw: text it releases later belongs to it.
     last_token: Option<u32>,
-    /// Where each token's text ends in the output read so far, in order; the text the decoder
-    /// releases after a token extends that token's end, as the older path's `token_ends` do.
-    ends: Vec<usize>,
     /// The bytes of the output read so far.
     read: usize,
     ended: bool,
     /// Drop the events of every call after the first.
     first_call_only: bool,
+    /// Drop the events of every call: the request forbade them (`tool_choice: none`), the table
+    /// read them whole, and the engine's own server delivers nothing of such a call
+    /// ([`Assignment::forbids_calls`]).
+    forbids_calls: bool,
     /// Whether the output showed the client anything yet: text, reasoning or a call.
     shown: bool,
     /// The whitespace the table dropped before the output showed anything: the template's
@@ -277,13 +298,6 @@ pub(crate) struct Reader {
     /// and the bytes between two refused blocks go out with the blocks
     /// ([`Self::hold_refused`]); the rest is the template's.
     framing: Vec<Framing>,
-    /// Where the held bytes sit in the output, as byte ranges, in order: the whitespace's and
-    /// the refused slice's. The event that releases them stands past the output's last byte, so
-    /// these say which tokens the released content was ([`Self::content_spans`]).
-    unshown_spans: Vec<(usize, usize)>,
-    refused_spans: Vec<(usize, usize)>,
-    /// The ranges of the bytes released at the end, once released.
-    released_spans: Vec<(usize, usize)>,
     /// The text the test trap springs on, when this process runs with one
     /// ([`isolation::test_trap`]): a step whose delta carries it panics the reader, so the
     /// request's isolation is driven end to end. `None` in every other process: one branch per
@@ -306,18 +320,15 @@ impl Reader {
             engine: Engine::shared(Arc::clone(&assignment.format), Declared::shared(tools)),
             tally: Tally::default(),
             last_token: None,
-            ends: Vec::new(),
             read: 0,
             ended: false,
             first_call_only: false,
+            forbids_calls: assignment.forbids_calls,
             shown: false,
             unshown: String::new(),
             called: false,
             refused: String::new(),
             framing: Vec::new(),
-            unshown_spans: Vec::new(),
-            refused_spans: Vec::new(),
-            released_spans: Vec::new(),
             trap: isolation::test_trap(),
         };
         // The prompt's events carry no text of the prompt (a thought it opens or closes), so they
@@ -373,7 +384,6 @@ impl Reader {
                 end: delta.text.len(),
                 continued: false,
             });
-            self.ends.push(self.read + delta.text.len());
             delta.tokens.push(token_id);
             self.last_token = Some(token_id);
             if stopped {
@@ -388,12 +398,6 @@ impl Reader {
         }
         self.feed(delta.input(), out)?;
         Ok(stopped)
-    }
-
-    /// Where each token's text ends in the output read so far, for the logprobs filter the older
-    /// path applies: a token belongs to the content when its text does.
-    pub(crate) fn token_ends(&self) -> &[usize] {
-        &self.ends
     }
 
     /// Reads `text` the decoder released after its last token, which held it back as a possible
@@ -418,9 +422,6 @@ impl Reader {
             }));
         delta.text = text;
         self.read += delta.text.len();
-        if let Some(last) = self.ends.last_mut() {
-            *last = self.read;
-        }
         self.feed(delta.input(), out)
     }
 
@@ -459,39 +460,15 @@ impl Reader {
         self.feed(Input::End { finish }, out)?;
         if self.tally.is_empty() && !self.unshown.is_empty() {
             let released = std::mem::take(&mut self.unshown);
-            self.released_spans = std::mem::take(&mut self.unshown_spans);
             self.tally.released(released.len());
             release_before_the_finish(released, out);
         } else if !self.refused.is_empty() {
             let released = std::mem::take(&mut self.refused);
-            self.released_spans = std::mem::take(&mut self.refused_spans);
             self.tally.released(released.len());
             release_before_the_finish(released, out);
         }
         self.tally.report(self.table, who);
         Ok(())
-    }
-
-    /// The byte ranges of the output that reached the client as content: the crate's content
-    /// spans of `events`, which count every event's bytes in order, and the ranges of the bytes
-    /// released at the end ([`Self::end`]), whose event stands past the output's last byte and
-    /// is left out. In order, not overlapping; what the logprobs filter of the whole response
-    /// reads next to [`Self::token_ends`].
-    pub(crate) fn content_spans(&self, events: &[Event<'_>]) -> Vec<(usize, usize)> {
-        let mut spans = chat::content_spans(events);
-        if !self.released_spans.is_empty() {
-            spans.retain(|&(start, _)| start < self.read);
-            spans.extend_from_slice(&self.released_spans);
-            spans.sort_unstable();
-        }
-        spans
-    }
-
-    /// The ranges of the output's bytes released as content at its end: none until the output
-    /// ended, or when it answered with something else.
-    #[cfg(test)]
-    pub(crate) fn released_spans(&self) -> &[(usize, usize)] {
-        &self.released_spans
     }
 
     /// Whether the output ended.
@@ -531,7 +508,11 @@ impl Reader {
         // Where the step's first event starts in the output: the held runs below are placed by it.
         let start = self.tally.at();
         for event in fresh.iter() {
-            self.tally.see(event, self.first_call_only);
+            if self.forbids_calls {
+                self.tally.see_forbidden(event);
+            } else {
+                self.tally.see(event, self.first_call_only);
+            }
         }
         // While the output makes no call, the bytes of the call blocks the table refuses are
         // kept for the end ([`Self::end`]), with the marker that led into the first and what the
@@ -546,7 +527,7 @@ impl Reader {
                     Event::Dropped {
                         text,
                         why: DropReason::MalformedCall,
-                    } => self.hold_refused(&text.text, at),
+                    } => self.hold_refused(&text.text),
                     Event::Dropped { text, why } => {
                         // A marker of the table leads into a block; the whitespace a call syntax
                         // drops as wrapping (the newline before a block's first tag) is not one.
@@ -579,16 +560,13 @@ impl Reader {
         // Until the output shows something, the whitespace it drops is kept for the end
         // ([`Self::end`]); the first text, reasoning or call makes it the template's for good.
         if !self.shown {
-            let mut at = start;
             for event in fresh.iter() {
-                let bytes = telemetry::bytes_of(event);
                 match event {
                     Event::Dropped {
                         text,
                         why: DropReason::Whitespace,
                     } => {
                         self.unshown.push_str(&text.text);
-                        hold_span(&mut self.unshown_spans, at, bytes);
                     }
                     Event::Content(_)
                     | Event::Reasoning(_)
@@ -598,7 +576,6 @@ impl Reader {
                     | Event::ToolCallEnd { .. } => {
                         self.shown = true;
                         self.unshown = String::new();
-                        self.unshown_spans = Vec::new();
                         break;
                     }
                     Event::Dropped { .. }
@@ -606,10 +583,11 @@ impl Reader {
                     | Event::ReasoningEnd
                     | Event::Finish { .. } => {}
                 }
-                at += bytes;
             }
         }
-        if self.first_call_only {
+        if self.forbids_calls {
+            symphony::event::forbidden_calls(fresh);
+        } else if self.first_call_only {
             symphony::event::first_call_only(fresh);
         }
         Ok(())
@@ -632,13 +610,13 @@ impl Reader {
         }
     }
 
-    /// `text`, bytes of a call block the table refused, at `at` in the output: held for the end
-    /// after the block's opener when it is the first block, which is the last marker the table
-    /// dropped before it (what it dropped before the marker is the template's), or after
-    /// everything the table dropped since the last refused byte when a block is held already
-    /// (the whitespace between two blocks, the next block's opener): the output's own slice, in
-    /// its order, from the first opener to the last refused byte.
-    fn hold_refused(&mut self, text: &str, at: usize) {
+    /// `text`, bytes of a call block the table refused: held for the end after the block's
+    /// opener when it is the first block, which is the last marker the table dropped before it
+    /// (what it dropped before the marker is the template's), or after everything the table
+    /// dropped since the last refused byte when a block is held already (the whitespace between
+    /// two blocks, the next block's opener): the output's own slice, in its order, from the
+    /// first opener to the last refused byte.
+    fn hold_refused(&mut self, text: &str) {
         let from = if self.refused.is_empty() {
             self.framing
                 .iter()
@@ -649,11 +627,9 @@ impl Reader {
         };
         for run in self.framing.drain(from..) {
             self.refused.push_str(&run.text);
-            hold_span(&mut self.refused_spans, run.at, run.text.len());
         }
         self.framing.clear();
         self.refused.push_str(text);
-        hold_span(&mut self.refused_spans, at, text.len());
     }
 
     /// The output went on past what was held, with text or a call: the held runs are debris
@@ -661,7 +637,6 @@ impl Reader {
     /// the answer; after a call nothing more is held (`called`).
     fn drop_held(&mut self) {
         self.refused.clear();
-        self.refused_spans.clear();
         self.framing.clear();
     }
 }
@@ -676,15 +651,6 @@ struct Framing {
     /// whitespace), as a block's opener is; the whitespace a call syntax drops as wrapping, as
     /// the newline before a block's first tag, is not one.
     marker: bool,
-}
-
-/// `bytes` more held at `at` in the output: they join the last range when they follow it, else
-/// they start one.
-fn hold_span(spans: &mut Vec<(usize, usize)>, at: usize, bytes: usize) {
-    match spans.last_mut() {
-        Some((_, end)) if *end == at => *end = at + bytes,
-        _ => spans.push((at, at + bytes)),
-    }
 }
 
 /// `released` goes into `out` as one content event right before the `Finish`, which stays the
@@ -753,6 +719,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(format),
             prompt: prompt.to_string(),
+            forbids_calls: false,
         };
         // A step's events borrow its delta, as a stream's do: each piece is a step of its own,
         // its events taken owned before the next.
@@ -1029,88 +996,6 @@ mod tests {
         assert!(reason.ends_with(" 1"), "{reason}");
     }
 
-    /// The released bytes have their places in the output, not the event's: the content spans
-    /// a logprobs filter reads are the released slice's range, from the block's opener, and the
-    /// released event past the output's end is left out; an output that answered in text before
-    /// the block has the text's range, then the slice's; one that made a call has no released
-    /// range and the crate's spans alone.
-    #[test]
-    fn the_released_bytes_are_placed_where_the_output_wrote_them() {
-        use symphony::formats::glm;
-        let assignment = Assignment {
-            format: Arc::new(glm()),
-            prompt: GLM_PROMPT.to_string(),
-        };
-        let mut events = Events::new();
-        let mut reader = Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
-        let output = "plan</think><tool_call>get_stock_info(company=\"Apple\")</tool_call>";
-        let events = read_tail(&mut reader, output);
-        let block = "plan</think>".len();
-        assert_eq!(reader.released_spans(), [(block, output.len())]);
-        assert_eq!(
-            reader.content_spans(&events),
-            [(block, output.len())],
-            "{events:?}"
-        );
-        // The second of two blocks cut by the stream's end: one range over both from the first
-        // opener, the marker between them included, as the table refused them.
-        let mut events = Events::new();
-        let mut reader = Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
-        let output = concat!(
-            "</think><tool_call>searchHotels(location=\"San Diego\")",
-            "<tool_call>searchHotels(location=\"San Diego\")"
-        );
-        let events = read_tail(&mut reader, output);
-        let block = "</think>".len();
-        assert_eq!(reader.content_spans(&events), [(block, output.len())]);
-        // An output that answered in text before the block: the text's range is the crate's,
-        // the released slice's follows it, from the opener.
-        let mut events = Events::new();
-        let mut reader = Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
-        let output = "</think>Let me look:<tool_call>Read(file_path=\"x\")</tool_call>";
-        let events = read_tail(&mut reader, output);
-        let text = "</think>".len();
-        let opener = "</think>Let me look:".len();
-        assert_eq!(reader.released_spans(), [(opener, output.len())]);
-        assert_eq!(
-            reader.content_spans(&events),
-            [(text, opener), (opener, output.len())],
-            "{events:?}"
-        );
-        // A block held, then text, then a block: the hold started over behind the text, so the
-        // released range is the second block's alone, from its opener; the first block is debris
-        // and no range of it is content.
-        let mut events = Events::new();
-        let mut reader = Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
-        let output = concat!(
-            "</think><tool_call>a(x=1)</tool_call>",
-            "Sorry.",
-            "<tool_call>b(y=2)</tool_call>"
-        );
-        let events = read_tail(&mut reader, output);
-        let text = "</think><tool_call>a(x=1)</tool_call>".len();
-        let opener = "</think><tool_call>a(x=1)</tool_call>Sorry.".len();
-        assert_eq!(reader.released_spans(), [(opener, output.len())]);
-        assert_eq!(
-            reader.content_spans(&events),
-            [(text, opener), (opener, output.len())],
-            "{events:?}"
-        );
-        // An output that made a call: nothing released, the crate's spans.
-        let mut events = Events::new();
-        let mut reader = Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
-        let output = concat!(
-            "</think>Let me look:<tool_call>Read(file_path=\"x\")</tool_call>",
-            "<tool_call>lookup<arg_key>q</arg_key><arg_value>1</arg_value></tool_call>"
-        );
-        let events = read_tail(&mut reader, output);
-        assert!(reader.released_spans().is_empty());
-        assert_eq!(
-            reader.content_spans(&events),
-            [("</think>".len(), "</think>Let me look:".len())]
-        );
-    }
-
     /// Two closed blocks after the thought, with the template's newline between them: what goes
     /// out is the output's own slice from the first opener to the last refused byte, the newline
     /// and the second opener in their places, as one content event over one range, however the
@@ -1149,16 +1034,6 @@ mod tests {
             assert!(choice.message.tool_calls.is_none());
             assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
         }
-        let assignment = Assignment {
-            format: Arc::new(glm()),
-            prompt: GLM_PROMPT.to_string(),
-        };
-        let mut events = Events::new();
-        let mut reader = Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
-        let events = read_tail(&mut reader, output);
-        let opener = "</think>".len();
-        assert_eq!(reader.released_spans(), [(opener, output.len())]);
-        assert_eq!(reader.content_spans(&events), [(opener, output.len())]);
         let events = read_pieces(glm(), GLM_PROMPT, &[output, "\n"], EngineFinish::Stop);
         assert_eq!(content_events(&events).0, vec![released], "{events:?}");
         let events = read_pieces(
@@ -1218,16 +1093,6 @@ mod tests {
             assert_eq!(contents, vec![released], "{pieces:?}: {events:?}");
             assert!(finish_last, "{events:?}");
         }
-        let assignment = Assignment {
-            format: Arc::new(glm()),
-            prompt: GLM_PROMPT.to_string(),
-        };
-        let mut events = Events::new();
-        let mut reader = Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
-        let events = read_tail(&mut reader, output);
-        let opener = "plan</think>".len();
-        assert_eq!(reader.released_spans(), [(opener, output.len())]);
-        assert_eq!(reader.content_spans(&events), [(opener, output.len())]);
     }
 
     /// The generation prompt's tail of a table whose template leaves the thought to the model:
@@ -1298,18 +1163,6 @@ mod tests {
                 "{scrape}"
             );
         }
-        let assignment = Assignment {
-            format: Arc::new(glm4()),
-            prompt: GLM4_PROMPT.to_string(),
-        };
-        let mut events = Events::new();
-        let mut reader = Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
-        let output =
-            "\n<think>plan</think>\n<tool_call>get_stock_info(company=\"Apple\")</tool_call>";
-        let events = read_tail(&mut reader, output);
-        let opener = "\n<think>plan</think>\n".len();
-        assert_eq!(reader.released_spans(), [(opener, output.len())]);
-        assert_eq!(reader.content_spans(&events), [(opener, output.len())]);
     }
 
     /// A call written as Python inside the block's markers after the answer's text (the recorded
@@ -1792,7 +1645,7 @@ mod tests {
         // The legacy path scans a response for calls when the request declares tools, an empty
         // list included, or when the model's provider reads calls without any; the table keeps
         // its calls exactly then, so a call the conversation established comes back as a call
-        // under either parser, and a `tool_choice` of `none` drops them under either.
+        // under either parser, and a `tool_choice` of `none` keeps them for the reader to drop.
         let table = |request: &ChatCompletionRequest| {
             reads(
                 ParserChoice::Symphony,
@@ -1824,10 +1677,20 @@ mod tests {
         let refused = request(json!({
             "model": "MiniMax-M3", "messages": retry_messages(), "tool_choice": "none"
         }));
+        let forbidden = assign(
+            ParserChoice::Symphony,
+            &ModelNames::default(),
+            &refused,
+            None,
+            PROMPT,
+        )
+        .expect("assigned");
         assert_eq!(
-            *assigned(&refused),
-            Arc::unwrap_or_clone(table(&refused)).without_calls()
+            forbidden.format,
+            table(&refused),
+            "none keeps the calls the provider reads; the reader drops them"
         );
+        assert!(forbidden.forbids_calls);
         let declared_none = request(json!({"tools": []}));
         assert!(scans_for_tool_calls(&declared_none));
         assert_eq!(
@@ -1931,6 +1794,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(symphony::formats::inkling().without_calls()),
             prompt: "<|message_model|>".to_string(),
+            forbids_calls: false,
         };
         let json = "{\"city\": \"Oslo\", \"country\": \"Norway\"}";
         let thought = "<|content_thinking|>plan<|end_message|><|message_model|><|content_text|>";
@@ -2001,6 +1865,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(glm4()),
             prompt: GLM4_PROMPT.to_string(),
+            forbids_calls: false,
         };
         let pieces = [
             "\n<think></think>\n<tool_call>answer_string\n<arg_key>answer</arg_key>\n<arg_value>",
@@ -2056,6 +1921,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: String::new(),
+            forbids_calls: false,
         };
         let mut events = Events::new();
         let mut reader = Reader::new(&assignment, Arc::default(), &mut events).expect("a reader");
@@ -2077,6 +1943,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: String::new(),
+            forbids_calls: false,
         };
         let tokenizer: Arc<dyn Tokenizer> = Arc::new(Refusing::default());
         let mut decoder = StopSequenceDecoder::new(
@@ -2200,6 +2067,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: "<|im_start|>assistant\n".to_string(),
+            forbids_calls: false,
         };
         let calls = |first_only: bool| {
             let mut events = Events::new();
@@ -2229,6 +2097,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: String::new(),
+            forbids_calls: false,
         };
         let first_run_at = |steps: &[&str]| -> (Option<usize>, usize) {
             let mut events = Events::new();
@@ -2275,6 +2144,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(symphony::formats::json().without_calls()),
             prompt: String::new(),
+            forbids_calls: false,
         };
         let mut events = Events::new();
         let mut reader = Reader::new(&assignment, Arc::default(), &mut events).expect("a reader");
@@ -2295,6 +2165,76 @@ mod tests {
             panic!("a finish");
         };
         assert_eq!(*tool_calls, 0);
+    }
+
+    /// `tool_choice: none` over declared tools: the table keeps its calls, the call the model
+    /// writes anyway is read whole, and the reader drops it, as the engine's own server reads
+    /// and withholds such a call; the thought and the text are what they are under `auto`, the
+    /// finish is the engine's `stop`, and the call is counted per table as forbidden.
+    #[test]
+    fn a_call_the_request_forbade_is_dropped_whole_and_counted() {
+        use symphony::{formats::qwen3, CallSyntax, FinishReason};
+        let assignment = Assignment {
+            format: Arc::new(qwen3(CallSyntax::Json)),
+            prompt: "<|im_start|>assistant\n".to_string(),
+            forbids_calls: true,
+        };
+        let mut events = Vec::new();
+        let scrape = rendered(|| {
+            let mut out = Events::new();
+            let mut reader = Reader::new(&assignment, tools().into(), &mut out).expect("a reader");
+            events = read_tail(&mut reader, QWEN3_OUTPUT);
+        });
+        assert!(
+            events.iter().all(|event| !matches!(
+                event,
+                Event::ToolCallStart { .. }
+                    | Event::ToolCallArguments { .. }
+                    | Event::ToolCallEnd { .. }
+            )),
+            "no call is delivered: {events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(e, Event::Reasoning(_))));
+        assert_eq!(content_of(&events).trim(), "Hello");
+        let dropped: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped {
+                    text,
+                    why: DropReason::ForbiddenCall,
+                } => Some(&*text.text),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            dropped.contains("lookup"),
+            "the call's bytes are dropped text, not content: {dropped:?}"
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(Event::Finish {
+                    reason: FinishReason::Stop,
+                    tool_calls: 0,
+                    ..
+                })
+            ),
+            "{events:?}"
+        );
+        let forbidden = line_with(&scrape, telemetry::CALLS_FORBIDDEN, &["table=\"qwen3\""])
+            .expect("the forbidden counter");
+        assert!(forbidden.ends_with(" 1"), "{forbidden}");
+        // The same output under `auto` is a call: the ask, not the table, decides.
+        let allowed = Assignment {
+            forbids_calls: false,
+            ..assignment
+        };
+        let mut out = Events::new();
+        let mut reader = Reader::new(&allowed, tools().into(), &mut out).expect("a reader");
+        let events = read_tail(&mut reader, QWEN3_OUTPUT);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::ToolCallStart { name, .. } if name == "lookup")));
     }
 
     #[test]
@@ -2479,6 +2419,7 @@ mod tests {
             let assignment = Assignment {
                 format: Arc::new(format),
                 prompt: prompt.to_string(),
+                forbids_calls: false,
             };
             let mut replayed = Events::new();
             let mut reader =

@@ -82,7 +82,7 @@ fn register_worker(
     match registration_mode {
         WorkerRegistrationMode::CreateOnly => registry
             .register(worker.clone())
-            .ok_or_else(|| step_failed(format!("Worker {} already exists", worker.url()))),
+            .ok_or_else(|| step_failed(format!("Worker {} already exists", worker.redacted_url()))),
         WorkerRegistrationMode::Upsert => Ok(registry.register_or_replace(worker)),
         WorkerRegistrationMode::ReplaceById {
             worker_id,
@@ -151,7 +151,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
             )?;
             debug!(
                 "Registered worker {} (model: {}) with ID {:?}",
-                worker.url(),
+                worker.redacted_url(),
                 worker.model_id(),
                 worker_id
             );

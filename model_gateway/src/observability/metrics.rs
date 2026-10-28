@@ -54,19 +54,23 @@ pub(crate) fn interner_size() -> usize {
 }
 
 /// Per-worker caches of the handles the gateway's per-request records go
-/// through: the HTTP layer's, the stream-timing set's and the per-worker
-/// request counters' and gauges'. The helpers, the installed flag and the router's
-/// request and duration caches are the external router crate's
+/// through: the HTTP layer's, the stream-timing set's, the per-worker
+/// request counters' and gauges', the breaker's outcomes', the selection's,
+/// the cache-aware decision's, the admission gauges' and the body path's.
+/// The helpers, the installed flag and the router's request and duration
+/// caches are the external router crate's
 /// (`smg_external_router::metrics::handles`), so every router records the
 /// same way.
 mod handles {
     use std::{
         cell::{OnceCell, RefCell},
         collections::HashMap,
+        hash::Hash,
         sync::{
             atomic::{AtomicU64, Ordering},
             Arc,
         },
+        thread::LocalKey,
     };
 
     use metrics::{Counter, Gauge, Histogram};
@@ -89,6 +93,14 @@ mod handles {
         pub(super) router_type: &'static str,
         pub(super) backend_type: &'static str,
         pub(super) endpoint: &'static str,
+    }
+
+    /// The static labels of `smg_worker_selection_total`.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    pub(super) struct SelectionLabels {
+        pub(super) worker_type: &'static str,
+        pub(super) connection_mode: &'static str,
+        pub(super) policy: &'static str,
     }
 
     /// The handles of one label set of the stream-timing set, each built
@@ -158,21 +170,56 @@ mod handles {
         }
     }
 
+    impl<V: Default> ByWorker<V> {
+        /// The kept handles under `worker_url`, created on first sight.
+        pub(super) fn for_worker(&mut self, worker_url: &str) -> &mut V {
+            nested(self.current(), worker_url)
+        }
+    }
+
     /// `smg_worker_requests_total`: by worker URL, then the model label as
     /// the interner gave it.
     pub(super) type WorkerRequests = ByWorker<HashMap<Arc<str>, Counter>>;
 
-    impl WorkerRequests {
-        /// The handles by model for `worker_url`.
-        pub(super) fn for_worker(&mut self, worker_url: &str) -> &mut HashMap<Arc<str>, Counter> {
-            nested(self.current(), worker_url)
-        }
-    }
+    /// `smg_worker_cb_outcomes_total`: by worker URL, then the outcome.
+    pub(super) type WorkerOutcomes = ByWorker<HashMap<&'static str, Counter>>;
 
     /// A per-worker gauge set on every request (the active-request count,
     /// the circuit breaker's consecutive outcomes): set through its kept
     /// handle, not through a key built and looked up per call.
     pub(super) type WorkerGauges = ByWorker<Gauge>;
+
+    /// Uses the one handle of a series with no dynamic label: this thread's
+    /// kept handle, built on first use, or a key built per call when handles
+    /// are not kept.
+    pub(super) fn with_single<H>(
+        kept: &'static LocalKey<RefCell<Option<H>>>,
+        build: impl FnOnce() -> H,
+        use_handle: impl FnOnce(&H),
+    ) {
+        if !keep_handles() {
+            use_handle(&build());
+            return;
+        }
+        kept.with_borrow_mut(|slot| use_handle(slot.get_or_insert_with(build)));
+    }
+
+    /// Uses the handle under a static label (or a tuple of them): this
+    /// thread's kept handle, built on the label's first sight, or a key
+    /// built per call when handles are not kept. A static label set is
+    /// finite, so the map needs no cap.
+    pub(super) fn with_static<K: Copy + Eq + Hash, H>(
+        kept: &'static LocalKey<RefCell<HashMap<K, H>>>,
+        label: K,
+        build: impl FnOnce() -> H,
+        use_handle: impl FnOnce(&H),
+    ) {
+        if !keep_handles() {
+            use_handle(&build());
+            return;
+        }
+        kept.with_borrow_mut(|map| use_handle(map.entry(label).or_insert_with(build)));
+    }
 
     thread_local! {
         /// `smg_http_requests_total`.
@@ -195,6 +242,24 @@ mod handles {
         pub(super) static WORKER_CB_FAILURES: RefCell<WorkerGauges> = RefCell::new(WorkerGauges::default());
         /// `smg_worker_cb_consecutive_successes`.
         pub(super) static WORKER_CB_SUCCESSES: RefCell<WorkerGauges> = RefCell::new(WorkerGauges::default());
+        /// `smg_worker_cb_outcomes_total`.
+        pub(super) static WORKER_CB_OUTCOMES: RefCell<WorkerOutcomes> = RefCell::new(WorkerOutcomes::default());
+        /// `smg_worker_selection_total` by its static labels, then the model.
+        pub(super) static WORKER_SELECTIONS: RefCell<ByLabels<SelectionLabels, Counter>> = RefCell::new(HashMap::new());
+        /// `smg_cache_aware_policy_branch_total` by branch.
+        pub(super) static CACHE_AWARE_BRANCHES: RefCell<HashMap<&'static str, Counter>> = RefCell::new(HashMap::new());
+        /// `smg_cache_aware_match_ratio`: one series.
+        pub(super) static CACHE_AWARE_MATCH_RATIO: RefCell<Option<Histogram>> = const { RefCell::new(None) };
+        /// `smg_routing_key_source_total` by source.
+        pub(super) static ROUTING_KEY_SOURCES: RefCell<HashMap<&'static str, Counter>> = RefCell::new(HashMap::new());
+        /// `smg_admission_queue_depth`: one series.
+        pub(super) static ADMISSION_QUEUE_DEPTH: RefCell<Option<Gauge>> = const { RefCell::new(None) };
+        /// `smg_admission_inflight`: one series.
+        pub(super) static ADMISSION_INFLIGHT: RefCell<Option<Gauge>> = const { RefCell::new(None) };
+        /// `smg_router_request_body_path_total` by path, then reason.
+        pub(super) static REQUEST_BODY_PATHS: RefCell<HashMap<(&'static str, &'static str), Counter>> = RefCell::new(HashMap::new());
+        /// `smg_router_request_buffers_released_early_bytes_total`: one series.
+        pub(super) static REQUEST_BUFFERS_RELEASED_EARLY: RefCell<Option<Counter>> = const { RefCell::new(None) };
     }
 
     #[cfg(test)]
@@ -210,6 +275,15 @@ mod handles {
         WORKER_REQUESTS_ACTIVE.with_borrow_mut(|kept| *kept = WorkerGauges::default());
         WORKER_CB_FAILURES.with_borrow_mut(|kept| *kept = WorkerGauges::default());
         WORKER_CB_SUCCESSES.with_borrow_mut(|kept| *kept = WorkerGauges::default());
+        WORKER_CB_OUTCOMES.with_borrow_mut(|kept| *kept = WorkerOutcomes::default());
+        WORKER_SELECTIONS.with_borrow_mut(HashMap::clear);
+        CACHE_AWARE_BRANCHES.with_borrow_mut(HashMap::clear);
+        CACHE_AWARE_MATCH_RATIO.set(None);
+        ROUTING_KEY_SOURCES.with_borrow_mut(HashMap::clear);
+        ADMISSION_QUEUE_DEPTH.set(None);
+        ADMISSION_INFLIGHT.set(None);
+        REQUEST_BODY_PATHS.with_borrow_mut(HashMap::clear);
+        REQUEST_BUFFERS_RELEASED_EARLY.set(None);
     }
 
     #[cfg(test)]
@@ -485,6 +559,10 @@ pub(crate) fn init_metrics() {
         "Tool calls after the first that a Symphony table read and the gateway dropped under parallel_tool_calls: false, by table"
     );
     describe_counter!(
+        symphony_telemetry::CALLS_FORBIDDEN,
+        "Tool calls a Symphony table read under tool_choice: none and the gateway dropped, by table"
+    );
+    describe_counter!(
         symphony_telemetry::FALLBACK,
         "Requests Symphony was configured for (the --parser flag or the request's X-SMG-Parser header) that the legacy parsers read instead of a table, by reason (no_table: the registry has no table for the model and nothing names one; reasoning_name_only: a reasoning parser name alone that no table answers to; legacy_tool_name: a legacy tool-call parser name no table answers to; passthrough; forced_call_without_tag: the table has no structural tag for the request's forced or required call, so the older registry's JSON schema constrains the output) and table (the table that had no tag; none where no table reads the model)"
     );
@@ -754,7 +832,8 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_kv_event_batches_total",
-        "KV event batches by worker and disposition (applied, stale, snapshot, load_only)"
+        "KV event batches by worker and disposition (applied, stale, snapshot, load_only, \
+         other_rank)"
     );
     describe_counter!(
         "smg_engine_load_polls_total",
@@ -1696,15 +1775,11 @@ impl Metrics {
 
     /// Set active HTTP connections count
     pub fn set_http_connections_active(count: usize) {
-        if !handles::keep_handles() {
-            gauge!("smg_http_connections_active").set(count as f64);
-            return;
-        }
-        handles::HTTP_CONNECTIONS_ACTIVE.with_borrow_mut(|gauge| {
-            gauge
-                .get_or_insert_with(|| gauge!("smg_http_connections_active"))
-                .set(count as f64);
-        });
+        handles::with_single(
+            &handles::HTTP_CONNECTIONS_ACTIVE,
+            || gauge!("smg_http_connections_active"),
+            |active| active.set(count as f64),
+        );
     }
 
     /// Record HTTP response.
@@ -1754,24 +1829,30 @@ impl Metrics {
 
     /// Record rate limit decision.
     pub fn record_http_rate_limit(result: &'static str) {
-        let build = || counter!("smg_http_rate_limit_total", "result" => result);
-        if !handles::keep_handles() {
-            build().increment(1);
-            return;
-        }
-        handles::HTTP_RATE_LIMITS.with_borrow_mut(|by_result| {
-            by_result.entry(result).or_insert_with(build).increment(1);
-        });
+        handles::with_static(
+            &handles::HTTP_RATE_LIMITS,
+            result,
+            || counter!("smg_http_rate_limit_total", "result" => result),
+            |count| count.increment(1),
+        );
     }
 
     /// Track a request entering the admission queue.
     pub fn record_admission_queue_entered() {
-        gauge!("smg_admission_queue_depth").increment(1.0);
+        handles::with_single(
+            &handles::ADMISSION_QUEUE_DEPTH,
+            || gauge!("smg_admission_queue_depth"),
+            |depth| depth.increment(1.0),
+        );
     }
 
     /// Track a request leaving the admission queue (admitted, rejected, or cancelled).
     pub fn record_admission_queue_exited() {
-        gauge!("smg_admission_queue_depth").decrement(1.0);
+        handles::with_single(
+            &handles::ADMISSION_QUEUE_DEPTH,
+            || gauge!("smg_admission_queue_depth"),
+            |depth| depth.decrement(1.0),
+        );
     }
 
     /// Record a request rejected at admission.
@@ -1785,12 +1866,20 @@ impl Metrics {
 
     /// Track acquisition of an admission token.
     pub fn record_admission_inflight_acquired() {
-        gauge!("smg_admission_inflight").increment(1.0);
+        handles::with_single(
+            &handles::ADMISSION_INFLIGHT,
+            || gauge!("smg_admission_inflight"),
+            |inflight| inflight.increment(1.0),
+        );
     }
 
     /// Track release of an admission token.
     pub fn record_admission_inflight_released() {
-        gauge!("smg_admission_inflight").decrement(1.0);
+        handles::with_single(
+            &handles::ADMISSION_INFLIGHT,
+            || gauge!("smg_admission_inflight"),
+            |inflight| inflight.decrement(1.0),
+        );
     }
 
     /// Record one multimodal tensor sent over `path` ("inline"|"shm"|"remote") for `runtime`.
@@ -1960,18 +2049,28 @@ impl Metrics {
 
     /// Record one per-request body-path decision with its dominant reason.
     pub fn record_request_body_path(path: &'static str, reason: &'static str) {
-        counter!(
-            "smg_router_request_body_path_total",
-            "path" => path,
-            "reason" => reason
-        )
-        .increment(1);
+        handles::with_static(
+            &handles::REQUEST_BODY_PATHS,
+            (path, reason),
+            || {
+                counter!(
+                    "smg_router_request_body_path_total",
+                    "path" => path,
+                    "reason" => reason
+                )
+            },
+            |count| count.increment(1),
+        );
     }
 
     /// Record request buffers freed at dispatch (retries disabled), sized by
     /// the serialized upstream body.
     pub fn record_request_buffers_released_early(bytes: usize) {
-        counter!("smg_router_request_buffers_released_early_bytes_total").increment(bytes as u64);
+        handles::with_single(
+            &handles::REQUEST_BUFFERS_RELEASED_EARLY,
+            || counter!("smg_router_request_buffers_released_early_bytes_total"),
+            |total| total.increment(bytes as u64),
+        );
     }
 
     /// Record upstream backend response.
@@ -2414,15 +2513,32 @@ impl Metrics {
         model_id: &str,
         policy: &'static str,
     ) {
-        let model = intern_model_label(model_id);
-        counter!(
-            "smg_worker_selection_total",
-            "worker_type" => worker_type,
-            "connection_mode" => connection_mode,
-            "model" => model,
-            "policy" => policy
-        )
-        .increment(1);
+        let build = |model: Arc<str>| {
+            counter!(
+                "smg_worker_selection_total",
+                "worker_type" => worker_type,
+                "connection_mode" => connection_mode,
+                "model" => model,
+                "policy" => policy
+            )
+        };
+        if !handles::keep_handles() {
+            build(intern_model_label(model_id)).increment(1);
+            return;
+        }
+        let labels = handles::SelectionLabels {
+            worker_type,
+            connection_mode,
+            policy,
+        };
+        handles::WORKER_SELECTIONS.with_borrow_mut(|by_labels| {
+            handles::with_model_handle(
+                by_labels.entry(labels).or_default(),
+                model_id,
+                build,
+                |count| count.increment(1),
+            );
+        });
     }
 
     /// Record worker error
@@ -2496,11 +2612,12 @@ impl Metrics {
 
     /// Record which source supplied the sticky routing key for a keyed request
     pub fn record_routing_key_source(source: &'static str) {
-        counter!(
-            "smg_routing_key_source_total",
-            "source" => source
-        )
-        .increment(1);
+        handles::with_static(
+            &handles::ROUTING_KEY_SOURCES,
+            source,
+            || counter!("smg_routing_key_source_total", "source" => source),
+            |count| count.increment(1),
+        );
     }
 
     /// Set cache-aware string-tree cached characters for a model
@@ -2529,11 +2646,12 @@ impl Metrics {
 
     /// Record cache-aware policy execution branch for tree-mode routing decisions
     pub fn record_worker_cache_aware_policy_branch(branch: &'static str) {
-        counter!(
-            "smg_cache_aware_policy_branch_total",
-            "branch" => branch
-        )
-        .increment(1);
+        handles::with_static(
+            &handles::CACHE_AWARE_BRANCHES,
+            branch,
+            || counter!("smg_cache_aware_policy_branch_total", "branch" => branch),
+            |count| count.increment(1),
+        );
     }
 
     /// Record a cache-aware affinity pick that the spill gate's swing-sized
@@ -2557,7 +2675,11 @@ impl Metrics {
     /// decision: the tree's best prefix match in tree mode, the chosen
     /// worker's overlap over the request's blocks in event mode.
     pub fn record_cache_aware_match_ratio(ratio: f64) {
-        histogram!("smg_cache_aware_match_ratio").record(ratio);
+        handles::with_single(
+            &handles::CACHE_AWARE_MATCH_RATIO,
+            || histogram!("smg_cache_aware_match_ratio"),
+            |ratios| ratios.record(ratio),
+        );
     }
 
     /// Record consistent hashing policy execution branch for routing decisions
@@ -3010,15 +3132,28 @@ impl Metrics {
         .absolute(0);
     }
 
-    /// Record circuit breaker outcome
+    /// Record circuit breaker outcome: through this thread's kept handle
+    /// for the worker and outcome (dropped when the worker set changes, as
+    /// every kept per-worker handle is), or through a key built per call
+    /// when handles are not kept.
     pub fn record_worker_cb_outcome(worker: &str, outcome: &'static str) {
-        let worker_interned = intern_string(worker);
-        counter!(
-            "smg_worker_cb_outcomes_total",
-            "worker" => worker_interned,
-            "outcome" => outcome
-        )
-        .increment(1);
+        let build = || {
+            counter!(
+                "smg_worker_cb_outcomes_total",
+                "worker" => intern_string(worker),
+                "outcome" => outcome
+            )
+        };
+        if !handles::keep_handles() {
+            build().increment(1);
+            return;
+        }
+        handles::WORKER_CB_OUTCOMES.with_borrow_mut(|kept| {
+            kept.for_worker(worker)
+                .entry(outcome)
+                .or_insert_with(build)
+                .increment(1);
+        });
     }
 
     /// Record an open circuit breaker put on trial (half-open) by the

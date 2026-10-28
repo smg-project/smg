@@ -159,6 +159,30 @@ fn unexpected_handshake(message: impl Into<String>) -> Error {
     }
 }
 
+/// How many engines a handshake awaits on its sockets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngineCount {
+    /// This many, as the caller was told.
+    Exactly(usize),
+    /// As many as the first engine to speak declares in its HELLO (or READY)
+    /// `engine_count`: an attention-DP group says its size, so a frontend
+    /// that was not told the count awaits the whole group. An engine that
+    /// declares none dials alone.
+    Declared,
+}
+
+impl From<usize> for EngineCount {
+    fn from(count: usize) -> Self {
+        Self::Exactly(count)
+    }
+}
+
+/// The count a handshake message settles: a declared `engine_count`, or one
+/// engine for an engine that declares none.
+fn declared_count(message: &ReadyMessage) -> usize {
+    message.engine_count.unwrap_or(1).max(1)
+}
+
 /// Connect to one or more engines through the startup handshake protocol,
 /// returning the shared data-plane transport plus the registered engines.
 ///
@@ -166,23 +190,31 @@ fn unexpected_handshake(message: impl Into<String>) -> Error {
 /// socket, drives HELLO -> INIT -> READY per engine, and finally waits for each
 /// engine to register (its `EngineCoreReadyResponse`) on the input socket.
 ///
-/// `startup` bounds the waits: a plain [`std::time::Duration`] is a
-/// per-message timeout; a [`StartupBudget`] lets signs of life from outside
-/// the wire extend the silence bound, under a ceiling.
+/// `engine_count` is how many engines to await ([`EngineCount`]; a plain
+/// count is [`EngineCount::Exactly`]). `startup` bounds the waits: a plain
+/// [`std::time::Duration`] is a per-message timeout; a [`StartupBudget`] lets
+/// signs of life from outside the wire extend the silence bound, under a
+/// ceiling.
 pub async fn connect_handshake(
     handshake_address: &str,
-    engine_count: usize,
+    engine_count: impl Into<EngineCount>,
     local_input_address: &str,
     local_output_address: &str,
     startup: impl Into<StartupBudget>,
 ) -> Result<ConnectedTransport> {
-    if engine_count == 0 {
-        return Err(unexpected_handshake("expected engine_count >= 1"));
-    }
+    // Settled up front when the caller says it, else by the first engine to
+    // speak.
+    let mut expected = match engine_count.into() {
+        EngineCount::Exactly(0) => {
+            return Err(unexpected_handshake("expected engine_count >= 1"));
+        }
+        EngineCount::Exactly(count) => Some(count),
+        EngineCount::Declared => None,
+    };
     let clock = StartupClock::new(startup);
 
     info!(
-        engine_count,
+        engine_count = ?expected,
         handshake_address, "waiting for engines to connect"
     );
 
@@ -215,11 +247,35 @@ pub async fn connect_handshake(
     //    second HELLO from an engine still between INIT and READY is a
     //    restarted engine process, greeted again. Either way the engine
     //    registers on the input socket once ready, as every engine does.
-    while engines.len() < engine_count || engines.values().any(|state| !state.is_ready_received()) {
-        let awaiting_hello = engines.len() < engine_count;
+    while expected.is_none_or(|count| engines.len() < count)
+        || engines.values().any(|state| !state.is_ready_received())
+    {
+        let awaiting_hello = expected.is_none_or(|count| engines.len() < count);
         let stage = if awaiting_hello { "HELLO" } else { "READY" };
         let message = clock.wait(stage, handshake_socket.recv()).await??;
         let (engine_id, handshake_message) = decode_handshake_message(message)?;
+        let declared = declared_count(&handshake_message);
+        let engine_count = match expected {
+            Some(count) => {
+                if handshake_message.engine_count.is_some() && declared != count {
+                    warn!(
+                        ?engine_id,
+                        declared,
+                        expected = count,
+                        "engine declares a group of a different size than this handshake awaits"
+                    );
+                }
+                count
+            }
+            None => {
+                info!(
+                    ?engine_id,
+                    engine_count = declared,
+                    "awaiting the engine group it declares"
+                );
+                *expected.insert(declared)
+            }
+        };
         match handshake_message.status.as_deref() {
             Some("HELLO") => match engines.get(&engine_id) {
                 None if awaiting_hello => {
@@ -525,7 +581,9 @@ mod tests {
     use super::*;
     use crate::{
         codec::encode_msgpack,
-        mock_engine::{connect_to_frontend, default_ready_response, hello, IpcNamespace},
+        mock_engine::{
+            connect_to_frontend, default_ready_response, hello, hello_in_group, IpcNamespace,
+        },
         protocol::vllm::{
             output::{
                 EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
@@ -735,6 +793,99 @@ mod tests {
                 EngineId::from_engine_index(1)
             ]
         );
+    }
+
+    /// A handshake not told its engine count awaits the group the first
+    /// engine's HELLO declares: both ranks of a declared group of two are
+    /// connected, whichever dials first.
+    #[tokio::test]
+    async fn a_handshake_given_no_count_awaits_the_group_the_engines_declare() {
+        let ns = IpcNamespace::new().unwrap();
+        let (handshake, input, output) = (
+            ns.handshake_endpoint(),
+            ns.input_endpoint(),
+            ns.output_endpoint(),
+        );
+        let rank = |index: u32| {
+            let handshake = handshake.clone();
+            async move {
+                hello_in_group(&handshake, EngineId::from_engine_index(index), Some(2))
+                    .await?
+                    .ready(default_ready_response())
+                    .await
+            }
+        };
+        let (transport, first, second) = tokio::join!(
+            connect_handshake(&handshake, EngineCount::Declared, &input, &output, TIMEOUT),
+            rank(1),
+            async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                rank(0).await
+            },
+        );
+        let transport = transport.expect("frontend handshake");
+        first.expect("first mock engine");
+        second.expect("second mock engine");
+        assert_eq!(transport.engines.len(), 2);
+    }
+
+    /// A rank that declares a different group size than the handshake
+    /// awaits (the size the first rank declared, or the caller's count) is
+    /// warned about, not refused: the size already settled stands and the
+    /// handshake completes with that many ranks.
+    #[tokio::test]
+    async fn a_rank_declaring_another_group_size_is_warned_about_and_the_handshake_proceeds() {
+        for count in [EngineCount::Declared, EngineCount::Exactly(2)] {
+            let ns = IpcNamespace::new().unwrap();
+            let (handshake, input, output) = (
+                ns.handshake_endpoint(),
+                ns.input_endpoint(),
+                ns.output_endpoint(),
+            );
+            // The first rank to speak settles the size at two; the second
+            // declares three, dialing only once the first holds its INIT (the
+            // frontend answers INIT per HELLO), so the order never depends on
+            // timing. Both READYs then run together.
+            let ranks = async {
+                let first =
+                    hello_in_group(&handshake, EngineId::from_engine_index(0), Some(2)).await?;
+                let second =
+                    hello_in_group(&handshake, EngineId::from_engine_index(1), Some(3)).await?;
+                tokio::try_join!(
+                    first.ready(default_ready_response()),
+                    second.ready(default_ready_response())
+                )
+            };
+            let (transport, engines) = tokio::join!(
+                connect_handshake(&handshake, count, &input, &output, TIMEOUT),
+                ranks,
+            );
+            let transport = transport.expect("frontend handshake");
+            engines.expect("both mock engines");
+            assert_eq!(transport.engines.len(), 2, "{count:?}");
+        }
+    }
+
+    /// An engine that declares no group dials alone: a handshake not told its
+    /// count connects it by itself, as a handshake told one does.
+    #[tokio::test]
+    async fn an_engine_that_declares_no_group_is_awaited_alone() {
+        let ns = IpcNamespace::new().unwrap();
+        let (handshake, input, output) = (
+            ns.handshake_endpoint(),
+            ns.input_endpoint(),
+            ns.output_endpoint(),
+        );
+        let (transport, engine) = tokio::join!(
+            connect_handshake(&handshake, EngineCount::Declared, &input, &output, TIMEOUT),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response()
+            ),
+        );
+        engine.expect("mock engine");
+        assert_eq!(transport.expect("frontend handshake").engines.len(), 1);
     }
 
     /// Once every expected engine has said HELLO, a further HELLO is refused

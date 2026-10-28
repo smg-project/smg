@@ -24,7 +24,7 @@ use openai_protocol::{
     worker::{WorkerInfo, WorkerStatus},
 };
 use serde::Serialize;
-use smg::worker::{worker::worker_to_info, BasicWorkerBuilder, Worker, WorkerType};
+use smg::worker::{basic::worker_to_info, BasicWorkerBuilder, Worker, WorkerType};
 
 /// ~16 generic labels approximating a realistic worker's label payload size.
 fn make_labels() -> HashMap<String, String> {

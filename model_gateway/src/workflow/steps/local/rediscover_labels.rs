@@ -57,16 +57,19 @@ impl StepExecutor<WorkerUpdateWorkflowData> for RediscoverLabelsStep {
         .await
         .map_err(|e| WorkflowError::StepFailed {
             step_id: StepId::new("rediscover_labels"),
-            message: format!("could not re-read the labels of {}: {e}", worker.url()),
+            message: format!(
+                "could not re-read the labels of {}: {e}",
+                worker.redacted_url()
+            ),
         })?;
         if fresh.is_empty() {
             // Nothing to follow; a complete read that says nothing is not a
             // reason to drop what registration found.
-            debug!(worker_url = %worker.url(), "The engine reports no labels; nothing to refresh");
+            debug!(worker_url = %worker.redacted_url(), "The engine reports no labels; nothing to refresh");
             return Ok(StepResult::Skip);
         }
         debug!(
-            worker_url = %worker.url(),
+            worker_url = %worker.redacted_url(),
             labels = fresh.len(),
             "Re-read the engine's labels for a refresh"
         );

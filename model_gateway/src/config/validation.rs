@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
 use super::*;
-use crate::{middleware::scheduler, policies::cost as selection_cost};
+use crate::{middleware::scheduler, policies::cost as selection_cost, worker::endpoint::Endpoint};
 
 /// Each listener needs its own port. `listeners` are `(field, flag, port)`
 /// in configuration order; the first two on one port are refused under the
@@ -208,14 +208,35 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     // matches schemes case-sensitively, so a mixed-case scheme would be
     // rewritten downstream and diverge from the reservation key — the
     // same orphan failure as a schemeless URL.
-    const ALLOWED_SCHEMES: &[&str] = &["http", "https", "grpc", "grpcs", "ipc"];
+    const ALLOWED_SCHEMES: &[&str] = &["http", "https", "grpc", "grpcs", "ipc", "tcp"];
     let scheme = url.split_once("://").map_or("", |(s, _)| s);
+    // A refusal names the address through the gateway's masking: it is
+    // written to stderr at start-up and answered to the API caller, and
+    // the URL may carry credentials. What the address parser accepts (a
+    // schemeless address, a known scheme in upper case) is written with
+    // its userinfo masked and its scheme lowercase; what it refuses (an
+    // unknown scheme, no host, a parse failure) reads `<unparsable
+    // address>`. The scheme is what this refusal is about and the masked
+    // address no longer shows it as written, so the reason names it when
+    // it is one (RFC 3986 scheme characters): the prefix before a `://`
+    // further into a URL could be a userinfo, and is left out.
     if !ALLOWED_SCHEMES.contains(&scheme) {
+        let rule =
+            "URL must start with a lowercase http://, https://, grpc://, grpcs://, ipc://, or \
+             tcp:// scheme";
+        let is_a_scheme = !scheme.is_empty()
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+        let reason = if is_a_scheme {
+            format!("scheme '{scheme}://' is not allowed; {rule}")
+        } else {
+            rule.to_string()
+        };
         return Err(ConfigError::invalid_value(
             "worker_url",
-            url,
-            "URL must start with a lowercase http://, https://, grpc://, grpcs://, or ipc:// \
-             scheme",
+            Endpoint::redacted_str(url),
+            reason,
         ));
     }
 
@@ -226,7 +247,7 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
         if path.is_empty() {
             return Err(ConfigError::invalid_value(
                 "worker_url",
-                url,
+                Endpoint::redacted_str(url),
                 "ipc:// worker URL must include a socket path",
             ));
         }
@@ -238,7 +259,7 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
             if parsed.host_str().is_none() {
                 return Err(ConfigError::invalid_value(
                     "worker_url",
-                    url,
+                    Endpoint::redacted_str(url),
                     "URL must have a valid host",
                 ));
             }
@@ -246,7 +267,7 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
         Err(e) => {
             return Err(ConfigError::invalid_value(
                 "worker_url",
-                url,
+                Endpoint::redacted_str(url),
                 format!("Invalid URL format: {e}"),
             ));
         }
@@ -324,6 +345,31 @@ pub fn runtime_worker_threads_oversubscription(threads: usize, cpus: usize) -> O
     })
 }
 
+/// The warning for `--dp-minimum-tokens-scheduler` set with `--dp-aware`,
+/// `None` for every other pair. The scheduler chooses a data-parallel rank
+/// for a request from the ranks' reported token loads where an engine is
+/// registered as one worker (the HTTP prefill-decode router's rank choice
+/// for an engine the gateway does not expand); under `--dp-aware` an engine
+/// registers as one worker per rank, the routing policy's pick among those
+/// workers is the rank choice, and the scheduler, asked about a worker that
+/// is one rank, can only answer that rank: it chooses nothing. Advice at
+/// start-up, not a refusal: the pair runs as `--dp-aware` alone does, and
+/// the flag's cache of per-rank token loads is kept up for nothing. Pure
+/// over the two settings so the rule is testable; start-up logs it with the
+/// configuration's other warnings.
+pub fn dp_minimum_tokens_scheduler_scope_warning(
+    dp_aware: bool,
+    dp_minimum_tokens_scheduler: bool,
+) -> Option<String> {
+    (dp_aware && dp_minimum_tokens_scheduler).then(|| {
+        "dp_minimum_tokens_scheduler chooses nothing under dp_aware: the engine's ranks are \
+         registered as workers and the routing policy's pick among them is the rank choice; \
+         the scheduler applies to the HTTP prefill-decode router for an engine registered as \
+         one worker"
+            .to_string()
+    })
+}
+
 /// The CPUs available to this process, as the runtime's own default reads
 /// them (the affinity mask and the cgroup quota included); 1 when the count
 /// cannot be read.
@@ -351,7 +397,6 @@ impl ConfigValidator {
         Self::validate_memory_history(config)?;
         Self::validate_model_aliases(config)?;
         Self::validate_rl(config)?;
-        Self::validate_kv_index(config)?;
         Self::validate_prefill_admission(config)?;
         Self::validate_priority_scheduler(config)?;
         if let Some(discovery) = &config.discovery {
@@ -1562,31 +1607,6 @@ impl ConfigValidator {
         Ok(ancestor)
     }
 
-    /// The deprecated `kv_index` field: the chain index is the only KV index,
-    /// so `chain` (in any case) is the one value accepted; `positional` names
-    /// the index that was removed and is refused with the reason, as is any
-    /// other value.
-    fn validate_kv_index(config: &RouterConfig) -> ConfigResult<()> {
-        let Some(value) = config.kv_index.as_deref() else {
-            return Ok(());
-        };
-        match value.trim().to_ascii_lowercase().as_str() {
-            "chain" => Ok(()),
-            "positional" => Err(ConfigError::invalid_value(
-                "kv_index",
-                value,
-                "the positional KV index was removed (kv-index 2.0.0): the chain index \
-                         is the only KV index, drop kv_index",
-            )),
-            _ => Err(ConfigError::invalid_value(
-                "kv_index",
-                value,
-                "the chain index is the only KV index, so kv_index takes chain only \
-                         (and is deprecated)",
-            )),
-        }
-    }
-
     fn validate_rl(config: &RouterConfig) -> ConfigResult<()> {
         config.rl.validate().map_err(|reason| {
             ConfigError::invalid_value(
@@ -2554,39 +2574,6 @@ mod tests {
         assert!(ConfigValidator::validate(&config).is_ok());
     }
 
-    /// The deprecated `kv_index` field, as a config file or a binding sets
-    /// it: `chain` in any case is accepted, the removed `positional` index
-    /// is refused with the removal in the reason, any other value is refused.
-    #[test]
-    fn kv_index_takes_chain_only() {
-        for value in ["chain", "Chain", " CHAIN "] {
-            let config = RouterConfig {
-                kv_index: Some(value.to_string()),
-                ..Default::default()
-            };
-            assert!(ConfigValidator::validate(&config).is_ok(), "{value:?}");
-        }
-
-        let config = RouterConfig {
-            kv_index: Some("positional".to_string()),
-            ..Default::default()
-        };
-        assert!(matches!(
-            ConfigValidator::validate(&config),
-            Err(ConfigError::InvalidValue { ref field, ref reason, .. })
-                if field == "kv_index" && reason.contains("positional KV index was removed")
-        ));
-
-        let config = RouterConfig {
-            kv_index: Some("run".to_string()),
-            ..Default::default()
-        };
-        assert!(matches!(
-            ConfigValidator::validate(&config),
-            Err(ConfigError::InvalidValue { ref field, .. }) if field == "kv_index"
-        ));
-    }
-
     /// A `RouterConfig` built directly, as a language binding or a library
     /// caller builds one: the validator refuses each malformed shape by its
     /// field, and accepts the well-formed values.
@@ -2885,6 +2872,35 @@ mod tests {
                 other => panic!("{bad} worker threads: expected a refusal, got {other:?}"),
             }
         }
+    }
+
+    /// The minimum-tokens scheduler set with rank expansion is a warning,
+    /// not a refusal: the pure rule names the pair and the scheduler's
+    /// scope, says nothing for the other three settings, and the validator
+    /// passes the pair.
+    #[test]
+    fn the_minimum_tokens_scheduler_under_dp_aware_warns_without_a_refusal() {
+        let warning = dp_minimum_tokens_scheduler_scope_warning(true, true).expect("a warning");
+        assert!(
+            warning.contains("chooses nothing under dp_aware")
+                && warning.contains("HTTP prefill-decode router"),
+            "{warning}"
+        );
+        for (dp_aware, scheduler) in [(false, false), (true, false), (false, true)] {
+            assert_eq!(
+                dp_minimum_tokens_scheduler_scope_warning(dp_aware, scheduler),
+                None,
+                "dp_aware {dp_aware}, scheduler {scheduler}"
+            );
+        }
+        // The pair validates: advice, not a refusal.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .round_robin_policy()
+            .dp_aware(true)
+            .dp_minimum_tokens_scheduler(true)
+            .build_unchecked();
+        assert!(ConfigValidator::validate(&config).is_ok());
     }
 
     /// A count above a small multiple of the CPUs available to the process
@@ -3268,6 +3284,8 @@ mod tests {
             "https://worker.example.com",
             "grpc://10.0.0.5:50051",
             "grpcs://worker.example.com:443",
+            "ipc:///tmp/smg-zmq/ts0.ipc",
+            "tcp://10.0.0.5:31000",
         ] {
             assert!(validate_worker_url(url).is_ok(), "expected {url} to pass");
         }
@@ -3299,6 +3317,55 @@ mod tests {
             validate_worker_url("10.0.0.5:8000"),
             Err(ConfigError::InvalidValue { ref field, .. }) if field == "worker_url"
         ));
+    }
+
+    /// A refusal never carries the URL raw: the secret of a URL's userinfo
+    /// reaches neither the start-up error nor the API caller's answer. The
+    /// masking writes an address the parser accepts with its userinfo masked
+    /// (a known scheme in upper case, rendered lowercase) or as written (a
+    /// schemeless address without credentials), and one it refuses (an
+    /// unknown scheme, an empty socket path, a parse failure) as
+    /// `<unparsable address>`. The scheme refusal names the scheme as
+    /// written, since the masked address no longer shows it; a prefix that
+    /// is not a scheme (it could be a userinfo) is left out of the reason.
+    #[test]
+    fn worker_url_refusals_never_carry_the_url_raw() {
+        let masked = validate_worker_url("HTTP://user:secret@10.0.0.5:8000")
+            .expect_err("refused")
+            .to_string();
+        assert!(masked.contains("http://***@10.0.0.5:8000"), "{masked}");
+        assert!(
+            masked.contains("scheme 'HTTP://' is not allowed"),
+            "{masked}"
+        );
+        assert!(!masked.contains("secret"), "{masked}");
+        let echoed = validate_worker_url("10.0.0.5:8000")
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            echoed.contains(": 10.0.0.5:8000 - URL must start"),
+            "{echoed}"
+        );
+        let refused = validate_worker_url("ws://user:secret@10.0.0.5:8000")
+            .expect_err("refused")
+            .to_string();
+        assert!(refused.contains("<unparsable address>"), "{refused}");
+        assert!(
+            refused.contains("scheme 'ws://' is not allowed"),
+            "{refused}"
+        );
+        assert!(!refused.contains("secret"), "{refused}");
+        let not_a_scheme = validate_worker_url("user:secret@host/x://y")
+            .expect_err("refused")
+            .to_string();
+        assert!(!not_a_scheme.contains("secret"), "{not_a_scheme}");
+        assert!(not_a_scheme.contains("- URL must start"), "{not_a_scheme}");
+        for url in ["ipc://", "http://user:secret@", "http://user:secret@[::1"] {
+            let error = validate_worker_url(url).expect_err("refused");
+            let text = error.to_string();
+            assert!(!text.contains("secret"), "{text}");
+            assert!(text.contains("<unparsable address>"), "{text}");
+        }
     }
 
     #[test]
@@ -3881,25 +3948,7 @@ mod tests {
                     "http://worker2:8000".to_string(),
                 ],
             },
-            PolicyConfig::CacheAware {
-                cache_threshold: 1.5, // Invalid: > 1.0
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 60,
-                max_tree_size: 1000,
-                block_size: 16,
-                balance_token_usage_threshold: 1.0,
-                overload_token_usage_threshold: 1.0,
-                overlap_decay: 0.0,
-                selection_temperature: 0.0,
-                cache_index: Default::default(),
-                cache_ttl_secs: 180,
-                cache_boundaries: Vec::new(),
-                selection_policy: None,
-                selection_accounting_ttl_ms: 0,
-                balance_prefix_margin_tokens: 0,
-                balance_uncached_credit: false,
-            },
+            PolicyConfig::cache_aware(1.5, 32, 1.1, 60, 1000), // Invalid: cache_threshold > 1.0
         );
 
         assert!(ConfigValidator::validate(&config).is_err());
@@ -4161,25 +4210,7 @@ mod tests {
             RoutingMode::Regular {
                 worker_urls: vec!["http://worker1:8000".to_string()],
             },
-            PolicyConfig::CacheAware {
-                cache_threshold: 0.5,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 60,
-                max_tree_size: 1000,
-                block_size: 16,
-                balance_token_usage_threshold: 1.0,
-                overload_token_usage_threshold: 1.0,
-                overlap_decay: 0.0,
-                selection_temperature: 0.0,
-                cache_index: Default::default(),
-                cache_ttl_secs: 180,
-                cache_boundaries: Vec::new(),
-                selection_policy: None,
-                selection_accounting_ttl_ms: 0,
-                balance_prefix_margin_tokens: 0,
-                balance_uncached_credit: false,
-            },
+            PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1000),
         );
 
         assert!(ConfigValidator::validate(&config).is_ok());
@@ -4286,25 +4317,7 @@ mod tests {
                 prefill_policy: None,
                 decode_policy: None,
             },
-            PolicyConfig::CacheAware {
-                cache_threshold: 0.5,
-                balance_abs_threshold: 32,
-                balance_rel_threshold: 1.1,
-                eviction_interval_secs: 60,
-                max_tree_size: 1000,
-                block_size: 16,
-                balance_token_usage_threshold: 1.0,
-                overload_token_usage_threshold: 1.0,
-                overlap_decay: 0.0,
-                selection_temperature: 0.0,
-                cache_index: Default::default(),
-                cache_ttl_secs: 180,
-                cache_boundaries: Vec::new(),
-                selection_policy: None,
-                selection_accounting_ttl_ms: 0,
-                balance_prefix_margin_tokens: 0,
-                balance_uncached_credit: false,
-            },
+            PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1000),
         );
 
         let result = ConfigValidator::validate(&config);
@@ -4342,25 +4355,7 @@ mod tests {
                     "http://decode1:8000".to_string(),
                     "http://decode2:8000".to_string(),
                 ],
-                prefill_policy: Some(PolicyConfig::CacheAware {
-                    cache_threshold: 0.5,
-                    balance_abs_threshold: 32,
-                    balance_rel_threshold: 1.1,
-                    eviction_interval_secs: 60,
-                    max_tree_size: 1000,
-                    block_size: 16,
-                    balance_token_usage_threshold: 1.0,
-                    overload_token_usage_threshold: 1.0,
-                    overlap_decay: 0.0,
-                    selection_temperature: 0.0,
-                    cache_index: Default::default(),
-                    cache_ttl_secs: 180,
-                    cache_boundaries: Vec::new(),
-                    selection_policy: None,
-                    selection_accounting_ttl_ms: 0,
-                    balance_prefix_margin_tokens: 0,
-                    balance_uncached_credit: false,
-                }),
+                prefill_policy: Some(PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1000)),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_metric: Default::default(),
                 }),
@@ -4480,25 +4475,7 @@ mod tests {
                 encode_urls: vec![("http://encode:8000".to_string(), None)],
                 prefill_urls: vec![("http://prefill:8000".to_string(), None)],
                 decode_urls: vec!["http://decode:8000".to_string()],
-                encode_policy: Some(PolicyConfig::CacheAware {
-                    cache_threshold: 0.5,
-                    balance_abs_threshold: 32,
-                    balance_rel_threshold: 1.1,
-                    eviction_interval_secs: 60,
-                    max_tree_size: 1000,
-                    block_size: 16,
-                    balance_token_usage_threshold: 1.0,
-                    overload_token_usage_threshold: 1.0,
-                    overlap_decay: 0.0,
-                    selection_temperature: 0.0,
-                    cache_index: Default::default(),
-                    cache_ttl_secs: 180,
-                    cache_boundaries: Vec::new(),
-                    selection_policy: None,
-                    selection_accounting_ttl_ms: 0,
-                    balance_prefix_margin_tokens: 0,
-                    balance_uncached_credit: false,
-                }),
+                encode_policy: Some(PolicyConfig::cache_aware(0.5, 32, 1.1, 60, 1000)),
                 prefill_policy: None,
                 decode_policy: None,
             },

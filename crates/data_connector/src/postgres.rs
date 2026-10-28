@@ -2138,6 +2138,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::test_support::RefusedAddress;
 
     #[test]
     fn an_insert_numbers_one_placeholder_per_column() {
@@ -2278,15 +2279,12 @@ mod tests {
     /// kind alone (`error connecting to server`) says nothing of why.
     #[tokio::test]
     async fn the_start_up_contact_keeps_the_cause_of_a_refused_connection() {
-        // A port nothing listens on: bound and released here, so the OS
-        // picked it and no service of the host is assumed absent.
-        let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("bind a local port")
-            .local_addr()
-            .expect("local address")
-            .port();
+        // A port nothing listens on: bound and never listening, held for the
+        // case, so the OS picked it, no service of the host is assumed absent,
+        // and no other test's bind can take it meanwhile.
+        let refused = RefusedAddress::reserve();
         let store = PostgresStore::new(PostgresConfig {
-            db_url: format!("postgres://u:p@127.0.0.1:{closed_port}/db"),
+            db_url: format!("postgres://u:p@127.0.0.1:{}/db", refused.port()),
             pool_max: 1,
             op_timeout_secs: 2,
             schema: None,

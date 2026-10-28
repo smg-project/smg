@@ -116,65 +116,16 @@ impl Default for PowerOfTwoPolicy {
 mod tests {
     use std::collections::HashMap;
 
-    use openai_protocol::worker::{HealthCheckConfig, SchedulerLoadSnapshot, WorkerLoadResponse};
-
     use super::*;
-    use crate::worker::{load_state::TestFeed, BasicWorkerBuilder, WorkerType};
-
-    fn no_health_check() -> HealthCheckConfig {
-        HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        }
-    }
-
-    /// One DP rank with the given queued tokens, KV utilization, and live
-    /// throughput (a request is running, so the rate gauge counts).
-    fn make_load(
-        num_waiting_uncached_tokens: i32,
-        token_usage: f64,
-        gen_throughput: f64,
-    ) -> WorkerLoadResponse {
-        WorkerLoadResponse {
-            timestamp: String::new(),
-            dp_rank_count: 1,
-            loads: vec![SchedulerLoadSnapshot {
-                dp_rank: 0,
-                num_running_reqs: 1,
-                num_waiting_uncached_tokens,
-                token_usage,
-                gen_throughput,
-                ..Default::default()
-            }],
-            ..Default::default()
-        }
-    }
-
-    /// One DP rank reporting a queue depth with no token count for it — the
-    /// shape produced by any backend scored from Prometheus gauges.
-    fn make_load_reqs_only(
-        num_waiting_reqs: i32,
-        token_usage: f64,
-        gen_throughput: f64,
-    ) -> WorkerLoadResponse {
-        let mut load = make_load(0, token_usage, gen_throughput);
-        load.loads[0].num_waiting_reqs = num_waiting_reqs;
-        load
-    }
-
-    fn mk(url: &str) -> Arc<dyn Worker> {
-        Arc::new(
-            BasicWorkerBuilder::new(url)
-                .worker_type(WorkerType::Regular)
-                .health_config(no_health_check())
-                .build(),
-        )
-    }
+    use crate::{
+        policies::test_support::{fed_pair, make_worker},
+        worker::load_state::{one_rank_load, one_rank_load_reqs_only, TestFeed},
+    };
 
     #[test]
     fn single_worker_always_selected() {
         let policy = PowerOfTwoPolicy::new();
-        let workers = vec![mk("http://w1:8000")];
+        let workers = vec![make_worker("http://w1:8000")];
         assert_eq!(
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
             Some(0)
@@ -194,12 +145,13 @@ mod tests {
         // steers picks to b; once the monitor drops a's entry and the policy
         // forgets a's tally, a is scored like its reporting peer instead of
         // by the stale queue, so both are picked.
-        let policy = PowerOfTwoPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let (policy, feed, workers) = fed_pair(PowerOfTwoPolicy::new());
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(100_000, 0.2, 100.0));
-        loads.insert("http://b:8000".to_string(), make_load(1000, 0.2, 100.0));
+        loads.insert(
+            "http://a:8000".to_string(),
+            one_rank_load(100_000, 0.2, 100.0),
+        );
+        loads.insert("http://b:8000".to_string(), one_rank_load(1000, 0.2, 100.0));
         feed.publish(&loads);
         assert_eq!(
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
@@ -226,12 +178,10 @@ mod tests {
     fn a_new_report_releases_the_in_flight_credit() {
         // pick1 -> a; its credit tips pick2 -> b; a fresh report releases
         // the credit so pick3 returns to a.
-        let policy = PowerOfTwoPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let (policy, feed, workers) = fed_pair(PowerOfTwoPolicy::new());
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(1000, 0.2, 100.0));
-        loads.insert("http://b:8000".to_string(), make_load(2000, 0.2, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(1000, 0.2, 100.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(2000, 0.2, 100.0));
         feed.publish(&loads);
 
         let info = SelectWorkerInfo::default();
@@ -246,12 +196,10 @@ mod tests {
     #[test]
     fn queue_length_steers_the_pair() {
         // Equal KV/throughput; the worker with the shorter token queue wins.
-        let policy = PowerOfTwoPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let (policy, feed, workers) = fed_pair(PowerOfTwoPolicy::new());
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(8000, 0.2, 100.0));
-        loads.insert("http://b:8000".to_string(), make_load(1000, 0.2, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(8000, 0.2, 100.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(1000, 0.2, 100.0));
         feed.publish(&loads);
         // a: 8000/100 = 80s ; b: 1000/100 = 10s -> pick b.
         assert_eq!(
@@ -264,17 +212,15 @@ mod tests {
     fn waiting_reqs_estimate_when_backend_reports_no_queued_tokens() {
         // A backend exposing queue depth but not queued tokens must not be
         // read as idle: its queue is estimated at waiting_reqs · mean prefill.
-        let policy = PowerOfTwoPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let (policy, feed, workers) = fed_pair(PowerOfTwoPolicy::new());
         let mut loads = HashMap::new();
         loads.insert(
             "http://a:8000".to_string(),
-            make_load_reqs_only(8, 0.2, 100.0),
+            one_rank_load_reqs_only(8, 0.2, 100.0),
         );
         loads.insert(
             "http://b:8000".to_string(),
-            make_load_reqs_only(0, 0.2, 100.0),
+            one_rank_load_reqs_only(0, 0.2, 100.0),
         );
         feed.publish(&loads);
         assert_eq!(
@@ -286,12 +232,10 @@ mod tests {
     #[test]
     fn kv_pressure_steers_when_queues_empty() {
         // No queued work anywhere: the KV barrier decides.
-        let policy = PowerOfTwoPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let (policy, feed, workers) = fed_pair(PowerOfTwoPolicy::new());
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(0, 0.8, 100.0));
-        loads.insert("http://b:8000".to_string(), make_load(0, 0.1, 100.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(0, 0.8, 100.0));
+        loads.insert("http://b:8000".to_string(), one_rank_load(0, 0.1, 100.0));
         feed.publish(&loads);
         assert_eq!(
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
@@ -306,14 +250,14 @@ mod tests {
         // comparable to a's KV barrier (0.15 · 0.9/0.1 = 1.35s) -> pick a.
         let policy = PowerOfTwoPolicy::new();
         let feed = TestFeed::attached_to(&policy);
-        let a = mk("http://a:8000");
-        let b = mk("http://b:8000");
+        let a = make_worker("http://a:8000");
+        let b = make_worker("http://b:8000");
         for _ in 0..5 {
             b.increment_load();
         }
         let workers = vec![a, b];
         let mut loads = HashMap::new();
-        loads.insert("http://a:8000".to_string(), make_load(0, 0.9, 0.0));
+        loads.insert("http://a:8000".to_string(), one_rank_load(0, 0.9, 0.0));
         feed.publish(&loads);
         assert_eq!(
             policy.select_worker(&workers, &SelectWorkerInfo::default()),
@@ -325,8 +269,8 @@ mod tests {
     fn dark_pair_joins_shortest_queue() {
         // Neither sampled worker reports loads: fall back to live in-flight.
         let policy = PowerOfTwoPolicy::new();
-        let a = mk("http://a:8000");
-        let b = mk("http://b:8000");
+        let a = make_worker("http://a:8000");
+        let b = make_worker("http://b:8000");
         for _ in 0..5 {
             a.increment_load();
         }
@@ -346,9 +290,9 @@ mod tests {
         // picks w3, the {w1,w2} pair picks w2, and w1 never wins.
         let policy = PowerOfTwoPolicy::new();
         let counts = {
-            let w1 = mk("http://w1:8000");
-            let w2 = mk("http://w2:8000");
-            let w3 = mk("http://w3:8000");
+            let w1 = make_worker("http://w1:8000");
+            let w2 = make_worker("http://w2:8000");
+            let w3 = make_worker("http://w3:8000");
             for _ in 0..10 {
                 w1.increment_load();
             }
@@ -376,12 +320,10 @@ mod tests {
     fn inflight_credit_water_fills_identical_workers() {
         // Two identically-loaded workers: the first pick's in-flight credit
         // tips the second pick to the other worker instead of herding.
-        let policy = PowerOfTwoPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
-        let workers = vec![mk("http://a:8000"), mk("http://b:8000")];
+        let (policy, feed, workers) = fed_pair(PowerOfTwoPolicy::new());
         let mut loads = HashMap::new();
         for url in ["http://a:8000", "http://b:8000"] {
-            loads.insert(url.to_string(), make_load(1000, 0.2, 100.0));
+            loads.insert(url.to_string(), one_rank_load(1000, 0.2, 100.0));
         }
         feed.publish(&loads);
 
@@ -403,7 +345,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, &requests)| {
-                let worker = mk(&format!("http://w{i}:8000"));
+                let worker = make_worker(&format!("http://w{i}:8000"));
                 (0..requests).for_each(|_| worker.increment_load());
                 worker
             })
@@ -414,8 +356,11 @@ mod tests {
     fn requests_metric_prefers_fewer_in_flight_over_a_lighter_report() {
         let workers = holding(&[5, 2]);
         let mut loads = HashMap::new();
-        loads.insert("http://w0:8000".to_string(), make_load(0, 0.1, 100.0));
-        loads.insert("http://w1:8000".to_string(), make_load(50_000, 0.1, 100.0));
+        loads.insert("http://w0:8000".to_string(), one_rank_load(0, 0.1, 100.0));
+        loads.insert(
+            "http://w1:8000".to_string(),
+            one_rank_load(50_000, 0.1, 100.0),
+        );
         let info = SelectWorkerInfo::default();
 
         let expected_wait = PowerOfTwoPolicy::new();
@@ -435,8 +380,11 @@ mod tests {
         let feed = TestFeed::attached_to(&policy);
         let workers = holding(&[4, 5, 1, 3]);
         let mut loads = HashMap::new();
-        loads.insert("http://w0:8000".to_string(), make_load(0, 0.1, 100.0));
-        loads.insert("http://w2:8000".to_string(), make_load(50_000, 0.1, 100.0));
+        loads.insert("http://w0:8000".to_string(), one_rank_load(0, 0.1, 100.0));
+        loads.insert(
+            "http://w2:8000".to_string(),
+            one_rank_load(50_000, 0.1, 100.0),
+        );
         feed.publish(&loads);
         for _ in 0..20 {
             assert_eq!(

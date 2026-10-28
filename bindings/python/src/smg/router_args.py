@@ -48,19 +48,6 @@ ENCODE_POLICY_CHOICES = ["random", "round_robin", "consistent_hashing"]
 DISCOVERY_PROVIDER_CHOICES = ["kubernetes", "file", "slurm", "consul"]
 
 
-def _parse_kv_index(value: str) -> str:
-    """The deprecated --kv-index value, as the Rust CLI reads it: any case, trimmed;
-    the removed positional index is refused with the reason (the choices refuse
-    the rest)."""
-    normalized = value.strip().lower()
-    if normalized == "positional":
-        raise argparse.ArgumentTypeError(
-            "the positional KV index was removed (kv-index 2.0.0): the chain index is the"
-            " only KV index, drop --kv-index"
-        )
-    return normalized
-
-
 def _parse_int_csv(value: str) -> list[int]:
     """Parse a comma-separated integer list (mirrors the CLI value_delimiter)."""
     return [int(item) for item in value.split(",") if item]
@@ -367,6 +354,10 @@ class RouterArgs:
     # spelling of discovery_provider="kubernetes"; set one or the other.
     discovery_provider: str | None = None
     dp_aware: bool = False
+    # Choose a data-parallel rank per request from the ranks' reported token
+    # loads: the HTTP prefill-decode router, for an engine registered as one
+    # worker. Under dp_aware the ranks are workers and the policy's pick among
+    # them is the rank choice, so this chooses nothing there (warned at start-up)
     dp_minimum_tokens_scheduler: bool = False
     # Seconds a Ready worker is kept in Draining before it leaves the registry,
     # on every removal (a discovery deletion, an unhealthy worker's removal, the
@@ -390,6 +381,9 @@ class RouterArgs:
     engine_metrics: bool = False
     epd_disaggregation: bool = False  # Enable Encode-Prefill-Decode disaggregated mode
     eviction_interval_secs: int = 60
+    # Seconds a request to a gRPC worker may take from its dispatch to its last
+    # message; 0 (the default) arms no deadline
+    grpc_request_timeout_secs: int = 0
     # HTTP edge: seconds to receive a complete request head
     header_read_timeout_secs: int = 30
     # Health checks (disable_health_check switches them off)
@@ -428,10 +422,6 @@ class RouterArgs:
     jwt_role_mapping: dict[str, str] = dataclasses.field(default_factory=dict)
     kv_connector_annotation: str = "smg.ai/kv-connector"
     kv_engine_id_annotation: str = "smg.ai/kv-engine-id"
-    # Deprecated: the chain index is the only KV index behind cache-aware
-    # routing, so "chain" is the one value and changes nothing; unset by
-    # default so that only a launch line that still passes it is warned
-    kv_index: str | None = None
     least_load_default_throughput: float = 2000.0
     least_load_kv_pressure_weight: float = 0.15
     least_load_max_waiting_requests: int = 0
@@ -575,7 +565,9 @@ class RouterArgs:
     # False none (resolved by the Rust core).
     remove_unhealthy_workers: bool | None = None
     request_id_headers: list[str] | None = None
-    # Request timeout in seconds
+    # Request timeout in seconds: the read of the body overall, and each
+    # request to an HTTP worker, or over a ZMQ worker's link, from its dispatch
+    # to its last message (a gRPC worker's bound is grpc_request_timeout_secs)
     request_timeout_secs: int = 1800
     # Retries (disable_retries switches them off)
     retry_backoff_multiplier: float = 1.5
@@ -609,6 +601,7 @@ class RouterArgs:
     service_discovery_port: int = 80
     # Grace period in seconds to wait for in-flight requests during shutdown
     shutdown_grace_period_secs: int = 180
+    shutdown_settle_secs: int | None = None
     # Slurm discovery (discovery_provider="slurm"): the account whose jobs are
     # discovered, the encode and prefill bootstrap port, the job names whose
     # nodes are each worker type, the partition, the port of every node's
@@ -1183,18 +1176,6 @@ class RouterArgs:
             ),
         )
         routing_group.add_argument(
-            f"--{prefix}kv-index",
-            type=_parse_kv_index,
-            choices=["chain"],
-            default=RouterArgs.kv_index,
-            help=(
-                "Deprecated: the chain index is the only KV index behind cache-aware"
-                " routing, so 'chain' is the one value and changes nothing; the flag"
-                " goes in a later release. 'positional' names the index that was"
-                " removed and is refused."
-            ),
-        )
-        routing_group.add_argument(
             f"--{prefix}worker-stall-secs",
             type=int,
             default=RouterArgs.worker_stall_secs,
@@ -1423,8 +1404,10 @@ class RouterArgs:
                 " regardless (bounded by max-payload-size); other eligible"
                 " requests buffer up to this many bytes when router retries"
                 " are enabled and otherwise stream to the worker verbatim,"
-                " forfeiting router-level retries. 0 never buffers for"
-                " retries"
+                " forfeiting router-level retries; a streamed request reaches"
+                " the worker as the client sent it: JSON validation defers to"
+                " the worker, and the provider profile's request normalization"
+                " is skipped. 0 never buffers for retries"
             ),
         )
         routing_group.add_argument(
@@ -1492,7 +1475,13 @@ class RouterArgs:
         routing_group.add_argument(
             f"--{prefix}dp-minimum-tokens-scheduler",
             action="store_true",
-            help="Enable minimum tokens scheduler for data parallel group",
+            help=(
+                "Choose a data-parallel rank per request from the ranks' reported token"
+                " loads: the HTTP prefill-decode router, for an engine registered as one"
+                " worker. Under --dp-aware the engine's ranks are workers and the policy's"
+                " pick among them is the rank choice, so this flag chooses nothing there"
+                " (warned at start-up)"
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}enable-igw",
@@ -2117,7 +2106,34 @@ class RouterArgs:
             f"--{prefix}request-timeout-secs",
             type=int,
             default=RouterArgs.request_timeout_secs,
-            help="Request timeout in seconds",
+            help=(
+                "Request timeout in seconds: the read of the body overall, and "
+                "each attempt at an HTTP worker from its dispatch to its last "
+                "message (504 call_upstream_timeout past it, the request's "
+                "answer; a worker's own pool timeout_secs takes this value's "
+                "place, on an HTTP worker and on a ZMQ worker's link, whose "
+                "streams carry the same bound). A request to a gRPC worker is "
+                "bounded by --grpc-request-timeout-secs instead"
+            ),
+        )
+        request_group.add_argument(
+            f"--{prefix}grpc-request-timeout-secs",
+            type=int,
+            default=RouterArgs.grpc_request_timeout_secs,
+            help=(
+                "Seconds a request to a gRPC worker may take from its dispatch "
+                "to its last message (504 call_upstream_timeout past it, the "
+                "request's answer; the call to the worker is dropped, which "
+                "cancels the request on the worker). 0 arms no deadline (the "
+                "default): the bound is opt-in"
+            ),
+        )
+        request_group.add_argument(
+            f"--{prefix}shutdown-settle-secs",
+            type=int,
+            default=RouterArgs.shutdown_settle_secs,
+            help="Keep accepting connections after readiness fails; defaults to 5 seconds "
+            "and is capped at half the shutdown grace period",
         )
         request_group.add_argument(
             f"--{prefix}shutdown-grace-period-secs",
@@ -2624,9 +2640,10 @@ class RouterArgs:
             type=int,
             default=RouterArgs.zmq_engine_count,
             help=(
-                "DP engines per startup ZMQ worker: each ipc:// worker becomes a "
-                "grouped worker whose handshake awaits this many engines on one "
-                "socket set (vLLM and TokenSpeed; default: 1)"
+                "DP engines per startup ZMQ worker: each ipc:// or tcp:// worker becomes "
+                "a grouped worker whose handshake awaits this many engines on one "
+                "socket set (vLLM and TokenSpeed; default: as many as the first "
+                "engine to dial declares, one for an engine that declares none)"
             ),
         )
         backend_group.add_argument(

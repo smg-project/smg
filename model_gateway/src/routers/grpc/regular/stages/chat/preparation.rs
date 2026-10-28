@@ -99,9 +99,9 @@ pub(crate) async fn prepare_chat_like(
 
         // Step 1: the request whose tools the template renders (every tool
         // for a named tool_choice; the constraint built below forces the call;
-        // under `none` the tools stay only for a renderer that declares them
-        // itself)
-        let body_ref = utils::request_as_rendered(request, tokenizer.renderer_capabilities());
+        // under `none` the tools stay declared, as the engine's own server
+        // renders them, and the reader delivers no call)
+        let body_ref = utils::request_as_rendered(request);
 
         // The media-part order and, for a request with media, the plan and
         // the placeholder tokens, resolved from the registries as the
@@ -176,6 +176,7 @@ pub(crate) async fn prepare_chat_like(
             &processed_messages.text,
             utils::chat_reasoning_starts_in_rendered_prefill(
                 request,
+                processed_messages.generation_prompt,
                 processed_messages.continued_final_message,
                 tokenizer.as_ref(),
             ),

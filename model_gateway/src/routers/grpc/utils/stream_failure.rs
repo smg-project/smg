@@ -49,7 +49,7 @@ use crate::{
         error::error_type_for_status,
         grpc::context::{DispatchMetadata, WorkerSelection},
     },
-    worker::{worker::WorkerTypeExt, ConnectionModeExt, Worker},
+    worker::{basic::WorkerTypeExt, endpoint::Endpoint, ConnectionModeExt, Worker},
 };
 
 /// The SSE error `type` of a stream the worker failed: the engine's
@@ -446,14 +446,14 @@ impl StreamSource {
         match rendezvous {
             Some(DeadRendezvous(port)) => warn!(
                 request_id = %self.request_id,
-                worker = worker_url,
+                worker = %Endpoint::redacted_str(worker_url),
                 worker_type,
                 completion_tokens,
                 grpc_code = ?status.code(),
                 http_status = class.http.as_u16(),
                 error_type = class.error_type,
                 reason = class.reason,
-                prefill = self.prefill.as_ref().map_or("none", |prefill| prefill.url()),
+                prefill = self.prefill.as_ref().map_or("none", |prefill| prefill.redacted_url()),
                 bootstrap_host = port.host.as_str(),
                 bootstrap_port = port.port,
                 bootstrap_port_source = port.source.label(),
@@ -464,7 +464,7 @@ impl StreamSource {
             ),
             None => warn!(
                 request_id = %self.request_id,
-                worker = worker_url,
+                worker = %Endpoint::redacted_str(worker_url),
                 worker_type,
                 completion_tokens,
                 grpc_code = ?status.code(),
@@ -537,13 +537,15 @@ mod tests {
     use std::net::TcpListener;
 
     use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-    use openai_protocol::worker::{HealthCheckConfig, WorkerType};
+    use openai_protocol::worker::WorkerType;
 
     use super::*;
     use crate::{
         routers::grpc::proto_wrapper::ENGINE_ERROR_MESSAGE,
+        test_support::RefusedAddress,
         worker::{
             circuit_breaker::{CircuitBreakerConfig, CircuitState},
+            test_support::no_health_check,
             BasicWorkerBuilder, ConnectionMode,
         },
     };
@@ -566,10 +568,7 @@ mod tests {
                     failure_threshold: 1,
                     ..Default::default()
                 })
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         )
     }
@@ -998,14 +997,6 @@ mod tests {
         );
     }
 
-    /// A loopback port nothing listens on.
-    fn closed_port() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("address").port();
-        drop(listener);
-        port
-    }
-
     /// A prefill side on the loopback host whose partners are handed `port`,
     /// its breaker opening on the first failure like [`worker`]'s.
     fn prefill_on(port: u16) -> Arc<dyn Worker> {
@@ -1014,10 +1005,7 @@ mod tests {
                 .worker_type(WorkerType::Prefill)
                 .connection_mode(ConnectionMode::Grpc)
                 .bootstrap_port(Some(port))
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         )
     }
@@ -1052,7 +1040,8 @@ mod tests {
     /// on the prefill side.
     #[tokio::test]
     async fn a_decode_leg_failed_before_its_first_token_is_explained_by_the_dead_bootstrap_port() {
-        let (source, decode) = pd_source_with(prefill_on(closed_port()));
+        let refused = RefusedAddress::reserve();
+        let (source, decode) = pd_source_with(prefill_on(refused.port()));
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let explained = {
@@ -1125,7 +1114,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let live = listener.local_addr().expect("address").port();
         let (live_source, _) = pd_source_with(prefill_on(live));
-        let (dead_source, _) = pd_source_with(prefill_on(closed_port()));
+        let refused = RefusedAddress::reserve();
+        let (dead_source, _) = pd_source_with(prefill_on(refused.port()));
         let single = WorkerSelection::Single { worker: worker() };
         let single_source =
             StreamSource::new(Some(&single), &dispatch(), metrics_labels::ENDPOINT_CHAT);

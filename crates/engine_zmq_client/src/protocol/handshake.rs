@@ -25,6 +25,11 @@ pub struct ReadyMessage {
     pub headless: Option<bool>,
     #[serde(default)]
     pub parallel_config_hash: Option<String>,
+    /// How many engines dial this frontend as one group, as the engine
+    /// declares it (a TokenSpeed attention-DP group says its size); `None`
+    /// from an engine that declares none.
+    #[serde(default)]
+    pub engine_count: Option<usize>,
 }
 
 /// KV-event publisher configuration reported by EngineCore.
@@ -116,6 +121,96 @@ pub struct EngineCoreReadyResponse {
     /// out or sends it as nil.
     #[serde(default, deserialize_with = "nil_as_empty_map")]
     pub positional_layouts: BTreeMap<String, Vec<String>>,
+    /// Whether the engine's request decoder resolves a tensor the request
+    /// addresses as an auxiliary frame of its message (the typed-tensor
+    /// wires' convention: the payload is frame 0 and a tensor's slot carries
+    /// the one-based index of its frame). Declared by the SGLang plugin,
+    /// which decodes with the engine's own hooks and resolves the frames
+    /// itself; an SGLang scheduler that declares nothing is sent every tensor
+    /// inline. The vLLM and TokenSpeed decoders resolve them on every
+    /// release and declare nothing.
+    #[serde(default)]
+    pub tensor_aux_frames: bool,
+    /// The request types this engine role takes, by name (`add`, `abort`,
+    /// `control`, `encode`), as the engine's own declaration lists them: a
+    /// scheduler lists the first three, a disaggregated encode worker lists
+    /// `encode` alone. Empty from an engine that predates the field, which
+    /// takes add and abort (and a control call when `positional_layouts`
+    /// names its reply).
+    #[serde(default)]
+    pub request_types: Vec<String>,
+    /// The engine's disaggregation role as it declares it (`prefill`,
+    /// `decode`, `encode`; `null` or absent for an engine that serves whole
+    /// requests). A worker registered for a role checks it here.
+    #[serde(default)]
+    pub disaggregation_mode: Option<String>,
+    /// Where a prefill or encode engine's bootstrap server listens: the
+    /// rendezvous a disaggregated request names so the next side can fetch
+    /// what this engine produced. `None` from an engine that declares none.
+    #[serde(default)]
+    pub bootstrap_host: Option<String>,
+    /// See `bootstrap_host`.
+    #[serde(default)]
+    pub bootstrap_port: Option<u16>,
+    /// The checkpoint's `model_type`, which (with `architectures`) picks the
+    /// rule that computes a multimodal item's MRoPE positions.
+    #[serde(default)]
+    pub model_type: Option<String>,
+    /// The checkpoint's `architectures`.
+    #[serde(default)]
+    pub architectures: Vec<String>,
+    /// Whether the language model's rotary positions are MRoPE, read off the
+    /// checkpoint's rope config; `None` when the engine does not say.
+    #[serde(default)]
+    pub mrope_positions: Option<bool>,
+    /// The vision tower's `spatial_merge_size`, an input of the MRoPE rule.
+    #[serde(default)]
+    pub spatial_merge_size: Option<u32>,
+    /// The checkpoint's image placeholder token id, an input of the MRoPE
+    /// rule.
+    #[serde(default)]
+    pub image_token_id: Option<u32>,
+    /// The checkpoint's video placeholder token id.
+    #[serde(default)]
+    pub video_token_id: Option<u32>,
+}
+
+/// The request type an engine lists for the generate path (`add`).
+pub const REQUEST_KIND_ADD: &str = "add";
+/// The request type a disaggregated encode worker lists (`encode`).
+pub const REQUEST_KIND_ENCODE: &str = "encode";
+
+impl EngineCoreReadyResponse {
+    /// Whether the engine listed `kind` among the request types it takes.
+    /// An engine that declared none takes add and abort: `takes_generate`
+    /// reads that silence as yes, this reads it as no.
+    pub fn lists_request_kind(&self, kind: &str) -> bool {
+        self.request_types.iter().any(|listed| listed == kind)
+    }
+
+    /// Whether the engine takes generate requests: every engine that declared
+    /// nothing, else one that lists `add`.
+    pub fn takes_generate(&self) -> bool {
+        self.request_types.is_empty() || self.lists_request_kind(REQUEST_KIND_ADD)
+    }
+
+    /// The disaggregation role the engine declared, `None` for an engine
+    /// that serves whole requests or declares nothing.
+    pub fn disaggregation_role(&self) -> Option<&str> {
+        self.disaggregation_mode
+            .as_deref()
+            .filter(|mode| !mode.is_empty() && *mode != "null")
+    }
+
+    /// The bootstrap rendezvous the engine declared, `(host, port)`.
+    pub fn bootstrap_address(&self) -> Option<(&str, u16)> {
+        Some((
+            self.bootstrap_host
+                .as_deref()
+                .filter(|host| !host.is_empty())?,
+            self.bootstrap_port?,
+        ))
+    }
 }
 
 /// A map an engine may send as nil (a Python `None` in a struct that omits
@@ -157,12 +252,14 @@ mod tests {
             local: Some(true),
             headless: Some(false),
             parallel_config_hash: None,
+            engine_count: Some(2),
         };
         let bytes = encode_msgpack(&msg).unwrap();
         let decoded: ReadyMessage = decode_msgpack(&bytes).unwrap();
         assert_eq!(decoded.status.as_deref(), Some("HELLO"));
         assert_eq!(decoded.local, Some(true));
         assert_eq!(decoded.headless, Some(false));
+        assert_eq!(decoded.engine_count, Some(2));
     }
 
     #[test]
@@ -194,6 +291,64 @@ mod tests {
         // Optional trailing field defaults when omitted.
         assert!(resp.kv_events_config.is_none());
         assert!(resp.positional_layouts.is_empty());
+        assert!(resp.request_types.is_empty());
+        assert!(resp.takes_generate());
+        assert!(!resp.lists_request_kind(REQUEST_KIND_ENCODE));
+        assert_eq!(resp.disaggregation_role(), None);
+        assert_eq!(resp.bootstrap_address(), None);
+    }
+
+    /// A TokenSpeed engine declares its role, its bootstrap rendezvous and
+    /// the checkpoint facts the MRoPE rule reads, by name; a regular one
+    /// spells its role `null`.
+    #[test]
+    fn ready_response_reads_the_engines_role_rendezvous_and_model_facts() {
+        let mut json = serde_json::json!({
+            "max_model_len": 8192u64,
+            "num_gpu_blocks": 0u64,
+            "prefix_granularity": 64u64,
+            "dp_stats_address": serde_json::Value::Null,
+            "dtype": "bfloat16",
+            "vllm_version": "tokenspeed-0.1.1",
+            "world_size": 1u64,
+            "data_parallel_size": 1u64,
+            "request_types": ["encode"],
+            "disaggregation_mode": "encode",
+            "bootstrap_host": "10.0.0.9",
+            "bootstrap_port": 8998u64,
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "mrope_positions": true,
+            "spatial_merge_size": 2u64,
+            "image_token_id": 248056u64,
+            "video_token_id": 248057u64,
+        });
+        let bytes = rmp_serde::to_vec_named(&json).unwrap();
+        let resp: EngineCoreReadyResponse = decode_msgpack(&bytes).unwrap();
+        assert!(resp.lists_request_kind(REQUEST_KIND_ENCODE));
+        assert!(!resp.takes_generate());
+        assert_eq!(resp.disaggregation_role(), Some("encode"));
+        assert_eq!(resp.bootstrap_address(), Some(("10.0.0.9", 8998)));
+        assert_eq!(resp.architectures, ["Qwen3_5ForConditionalGeneration"]);
+        assert_eq!(resp.mrope_positions, Some(true));
+        assert_eq!(
+            (
+                resp.spatial_merge_size,
+                resp.image_token_id,
+                resp.video_token_id
+            ),
+            (Some(2), Some(248056), Some(248057))
+        );
+
+        json["disaggregation_mode"] = "null".into();
+        json["bootstrap_host"] = serde_json::Value::Null;
+        json["request_types"] = serde_json::json!(["add", "abort", "control"]);
+        let bytes = rmp_serde::to_vec_named(&json).unwrap();
+        let resp: EngineCoreReadyResponse = decode_msgpack(&bytes).unwrap();
+        assert!(resp.takes_generate());
+        assert!(!resp.lists_request_kind(REQUEST_KIND_ENCODE));
+        assert_eq!(resp.disaggregation_role(), None);
+        assert_eq!(resp.bootstrap_address(), None);
     }
 
     #[test]

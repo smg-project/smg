@@ -454,6 +454,75 @@ legs on purpose; a production pair on one host wants a TTL of a few minutes,
 longer than any gap a busy pair leaves, shorter than the restart back-off a
 crashed leg would otherwise sit through.
 
+##### Prefill/decode over NIXL across hosts on TCP: the UCX segment size
+
+Legs on different hosts without an RDMA device move the KV over UCX's TCP
+transport, and the decode side's read of a remote block list is UCX's
+software-emulated GET: the data travels as active-message fragments of the
+TCP transport's send segment, 8 KiB by UCX's default, each one staged through
+host memory on both ends. For a hybrid checkpoint the per-request pull is
+large (the linear-attention state is moved whole; a 1,300-token prompt of a
+checkpoint with 34 linear-attention and 11 full-attention layers, TP 2 per
+leg, moves about 100 MB per rank), so the fragment count, not the link, sets
+the rate: the default moves about 2.2 Gbit/s per rank stream where a plain
+socket between the same pods moves 14 Gbit/s, pulls queue FIFO on the decode
+side, and one decode leg tops out near 2.7 requests/s with first tokens of
+30 s and more behind the queue. A 1 MiB segment on both legs removes most of
+the per-fragment cost and puts the stream at the single-socket rate, so the
+engine image ships it: `docker/ucx.conf`, copied to `/etc/ucx/ucx.conf` by
+the image build, holds
+
+```
+UCX_TCP_TX_SEG_SIZE=1m
+UCX_TCP_RX_SEG_SIZE=1m
+```
+
+(the receive segment, 64 KiB by default, must be at least the send segment;
+UCX refuses the pair otherwise). Measured on one prefill + one decode leg over TCP, text
+prompts of 1,000-1,500 tokens, 64-128 output tokens, open-loop arrivals,
+UCX 1.22 as bundled with NIXL 1.4:
+
+| offered | setting | completed req/s | first token p50 / p90 / p99 | per-rank pull, unqueued | pull wait p50 / p90 |
+|---|---|---|---|---|---|
+| 2 req/s | UCX's default (8 KiB) | 1.89 | 1.49 / 4.46 / 7.94 s | 0.36 s = 2.2 Gbit/s | 1.15 / 3.36 s |
+| 2 req/s | 1 MiB (the image's file) | 1.89 | 0.31 / 0.50 / 2.63 s | 0.073 s = 11 Gbit/s | 0.13 / 0.18 s |
+| 4 req/s | UCX's default (8 KiB) | 2.7 (the ceiling; 503 overload sheds) | 33.9 / 39.0 / 41.7 s | 0.37 s | 8.9 / 12.0 s |
+| 4 req/s | 1 MiB (the image's file) | 3.93 | 0.35 / 0.58 / 0.75 s | 0.074 s | 0.15 / 0.28 s |
+| ramp 1/2/4/8/12 req/s, 60 s each, image prompts, the router's default 3 s first-token bound | UCX's default (8 KiB) | 0.62 (181 first-token verdicts, 1,527 refusals from 4 req/s on) | - | 0.38 s | 1.13 / 3.82 s |
+| the same ramp | 1 MiB | 5.68 (steps served at 1.0 / 2.07 / 3.53 / 9.0 / 11.83; no verdict, no refusal) | 2.46 / 10.1 / 11.7 s over the whole ramp | 0.075 s | 0.76 / 2.10 s |
+
+Why a file and not an environment variable: UCX reads its settings in the
+process that creates the UCX context, that is the engine's tensor-parallel
+worker processes, and a deployment whose workers do not inherit the
+container's environment (the pair above was one: the workers saw a third of
+the container's variables, the `UCX_*` ones not among them) loses a pod-level
+`UCX_*` setting on the way. `/etc/ucx/ucx.conf` is the config directory
+compiled into the UCX that NIXL bundles, read by every process regardless of
+its environment or working directory. To override the shipped values, write
+the keys to a `ucx.conf` in a directory named by `UCX_CONFIG_DIR` or in the
+process's working directory (`/vllm-workspace` in the stock vLLM image), or
+set the variables in the workers' environment: UCX reads the files in that
+order and the environment last, each layer overriding the one before, so the
+image's file is the lowest layer and a working-directory file wins over
+`UCX_CONFIG_DIR`. `UCX_PROTO_INFO=y` in
+any of them prints UCX's protocol selection once per peer at the first
+transfer and is the quick check of what is in force. 256 KiB segments already
+give most of the gain and segments larger than 1 MiB buy nothing on one socket
+(the stream already sits at the socket's rate). The two keys configure the
+TCP transport only: a pair on one host over CUDA IPC, or over RDMA, does not
+use it and is not affected. Which engines read the file follows from their
+UCX: the pip NIXL wheels (1.0.0, 1.4.1) compile `/etc/ucx` in as the config
+directory, so vLLM's NIXL connector and SGLang's NIXL transfer backend read
+it; Mooncake (SGLang's default transport, TokenSpeed's only one) and MoRI-IO
+do not use UCX; TensorRT-LLM's release images build their own UCX under
+`/usr/local/ucx` with no system config directory, so that UCX looks in
+`/usr/local/ucx/etc/ucx` and never opens this file (a pair on that engine
+sets the keys through one of the layers above). The cost is host memory, not GPU memory: UCX
+stages TCP sends and receives through buffers of the segment size, pooled per
+process in chunks of eight (8 MiB of send and 16 MiB of receive buffers per
+chunk at 1 MiB segments, against 64 KiB and 1 MiB with the defaults), one
+send and one receive buffer in use per connected peer at a time.
+
 ##### Planned warm-up before SERVING (`SMG_VLLM_SERVICER_WARMUP`)
 
 The engine selects and compiles kernels lazily: the first scheduler step at a
@@ -631,6 +700,17 @@ holds a request's grammar back until the parser has seen the thought's end,
 the engine's own server would: the bare calls behind the parser's gate, so the
 call is forced right there; the thought and then the calls from the first
 token.
+
+The Rust servicer's launcher also advertises the vocabulary of structural-tag
+nodes the engine's grammar compiler takes (`GetServerInfo.structural_tag_vocabulary`,
+the `structural_tag_vocabulary` label): `older` when the xgrammar installed
+beside the engine predates the `optional`, `plus`, `star` and `token` nodes
+(0.1.33 is the first release with them) under `xgrammar` or `auto`, read off
+the distribution's metadata at start-up without importing it; absent for a
+current xgrammar or another backend. A router spells such a worker's structural
+tags without `optional`, `plus` and `star`, the same language, instead of a
+compile-time refusal per request; a `token` node stays as derived, so a table
+that writes single-token markers still meets the older compiler's refusal.
 
 #### CUDA-graph capture cap
 
@@ -837,9 +917,15 @@ servicer places a disaggregated request on the rank of its room's residue,
 the engine's own dispatch rule, and an aggregated one on its
 `data_parallel_rank` pin. The EPD prefill side is served the same way (each
 item's `encode_bootstrap_info` entry rides on the item); the EPD encode role
-(`--disaggregation-mode encode`) is refused at launch under `--servicer-impl
-rust` and stays with the Python implementation, whose encode servicer feeds
-the encode worker over the engine's in-process channel. `SubscribeKvEvents` relays
+(`--disaggregation-mode encode`) is served on an engine whose handshake lists
+the encode request: the servicer mounts the encoder service next to the
+scheduler's discovery surface, hands each `Encode` to the worker over the wire
+(the worker's own rendezvous address rides in every request, as the Python
+encoder servicer fills it) and refuses `Generate` and the scheduler's control RPCs there by name; an engine whose wire
+predates the encode request is refused before anything starts (its encode rank
+never dials the handshake, so the launch would otherwise wait in silence), one
+that lists no encode request fails the start by name, and the Python servicer
+serves the role on either. `SubscribeKvEvents` relays
 TokenSpeed's ZMQ KV-event publisher, which the servicer turns on by itself, on
 this path as on the Python one, when the launcher is given no
 `--kv-events-config`, at a port found free on the host rather than
@@ -912,6 +998,13 @@ kind under `none` (the scheduler itself would admit the request and abort it
 with a 400 that its slim wire reports as a bare `abort`, an empty answer to the
 caller), and a JSON-schema feature xgrammar drops under `xgrammar`; with no key
 it judges nothing ahead of the engine.
+
+The Rust servicer's launcher also writes the `structural_tag_vocabulary` key
+(`older`) when the xgrammar installed beside the engine predates the
+`optional`, `plus`, `star` and `token` structural-tag nodes (0.1.33 is the
+first release with them), under `xgrammar` or a backend not yet resolved; a
+router spells such a worker's structural tags without `optional`, `plus` and
+`star` (a `token` node stays as derived).
 
 Both TokenSpeed servicers also report the engine's constrained-decoding policy,
 when it declares one, as `GetServerInfo.constrained_decoding` (a field of its
@@ -1021,6 +1114,13 @@ an EBNF grammar or a structural tag under `outlines`, which compiles JSON
 schemas and regular expressions only, and a JSON-schema feature xgrammar drops
 under `xgrammar`; a backend it does not know (a plugin of the scheduler's) is
 left to the engine.
+
+The Rust servicer's launcher also writes the `structural_tag_vocabulary` key
+(`older`) when the xgrammar installed beside the engine predates the
+`optional`, `plus`, `star` and `token` structural-tag nodes (0.1.33 is the
+first release with them), under `xgrammar` or an unresolved backend; a router
+spells such a worker's structural tags without `optional`, `plus` and `star` (a
+`token` node stays as derived).
 
 #### KV-event recovery
 
@@ -1214,6 +1314,23 @@ python -m smg_grpc_servicer.sglang.headless \
 
 `smg serve --backend sglang --connection-mode zmq` runs exactly this for each
 worker, with the handshake port SMG derives from the worker's `ipc://` URL.
+The gateway binds its `ipc://` sockets in a directory it must own: it creates
+the directory itself (mode 0700) when it is missing, and refuses an existing
+one that is not a real directory owned by its own uid (`ipc socket dir ... is
+owned by uid 0 (expected 65532); refusing to bind unauthenticated ZMQ sockets
+in a directory owned by another user`). The check is on the socket path's
+parent, so a pod that shares an `emptyDir` (created by the kubelet, owned by
+root) between the gateway and a headless scheduler has two shapes that pass
+it: point the worker's `ipc://` URL into a subdirectory of the mount that does
+not exist yet (mount at `/run/smg`, register `ipc:///run/smg/zmq/worker0`),
+which the gateway creates itself at 0700 under its own uid and which lives as
+long as the pod (this needs the mount writable by the gateway's uid, as an
+`emptyDir` is when the kubelet creates it, mode 0777); or, when the mount
+point itself is the socket directory or the mount is not writable by that uid,
+an init container that creates the socket directory if needed and `chown`s it
+to the gateway's uid (65532 in the published router image) before either
+container starts. With both, the scheduler connects to the sockets in that
+directory, so it runs as the same uid.
 SMG's wait for the scheduler's HELLO, and for the READY and the registration
 that follow it, is bounded per stage by the router's
 `--zmq-startup-timeout-secs` (default 3600 s; `--router-zmq-startup-timeout-secs`
@@ -1281,6 +1398,68 @@ livenessProbe:
 ```
 
 
+### TensorRT-LLM
+
+The engine's own Python servicer lives in the TensorRT-LLM tree
+(`tensorrt_llm.grpc.smg`, what `trtllm-serve <model> --grpc --grpc-protocol smg`
+runs, in-process over the LLM API). This package adds the Rust request path
+for it, behind one switch.
+
+#### Rust request path (`SMG_TRTLLM_SERVICER_IMPL=rust`)
+
+With `SMG_TRTLLM_SERVICER_IMPL=rust`, the engine's gRPC entrypoint hands the
+process to this package's `serve_rust_from_engine` before an LLM or a Python
+gRPC server exists, and `python -m smg_grpc_servicer.trtllm --servicer-impl
+rust` reaches the same path: the `trtllm.TrtllmService` contract is served by
+`smg.servicer.TrtllmGrpcServer` (the `smg` wheel) on a Rust-owned thread, and
+the engine runs behind the wire shim beside its LLM API
+(`tensorrt_llm.grpc.smg.shim` in the engine's tree, or the same package
+installed beside it as `trtllm_smg_shim`; the launcher finds it by import),
+started from this process as a spawned child that dials the servicer's
+same-host msgpack ZMQ handshake. The shim declares the field order of the
+structs it decodes in its ready response and the Rust servicer checks the
+prefixes it encodes against it once, at connect time. Python keeps the
+lifecycle only; the Router cannot tell the two implementations apart.
+
+```bash
+# Python (default): the engine's own servicer
+trtllm-serve org/model --grpc --grpc-protocol smg --port 50051
+
+# Rust request path, same entrypoint
+SMG_TRTLLM_SERVICER_IMPL=rust trtllm-serve org/model --grpc --grpc-protocol smg --port 50051
+
+# This package's launcher; --llm-args carries the LLM API's keywords (JSON text, or @file)
+python -m smg_grpc_servicer.trtllm --model org/model --port 50051 --servicer-impl rust \
+    --llm-args '{"tensor_parallel_size": 2}'
+```
+
+Text generation with sampled, ranked and prompt logprobs, string and token
+stops matched by the engine (`matched_stop` from its `stop_reason`), images as
+raw bytes decoded by the engine's own loader, guided decoding (the five kinds,
+refused before the engine when its `guided_decoding_backend` cannot enforce
+them), LoRA by task id and the disaggregated parameters pass through as the
+Python servicer forwards them; `num_return_sequences > 1` fans out to one
+engine request per sample with derived seeds. What the wire does not carry is
+refused by name instead of dropped: beam search, the logits-returning flags,
+KV-cache retention, prompt-tuning and lookahead configs. `Embed` and
+`SubscribeKvEvents` answer UNIMPLEMENTED, as the Python servicer answers them;
+`GetTokenizer` serves the local tokenizer directory. The launcher's knobs are
+the shared ones under the `SMG_TRTLLM_SERVICER_*` names (handshake port, drain,
+start-up and silence bounds, prefill allowance); `--metrics-port` (and
+`--metrics-host`, `SMG_TRTLLM_SERVICER_METRICS_PORT/_HOST`) serves the Rust
+servicer's Prometheus metrics, the families every engine's Rust servicer
+exposes (see the vLLM section above), with `wire="trtllm"`.
+
+Its launcher also advertises the vocabulary of structural-tag nodes the
+engine's guided-decoding backend takes
+(`GetServerInfo.structural_tag_vocabulary`, the `structural_tag_vocabulary`
+label): `older` when the xgrammar installed beside the engine predates the
+`optional`, `plus`, `star` and `token` nodes (0.1.33 is the first release with
+them) under `guided_decoding_backend: xgrammar`, read off the distribution's
+metadata at start-up; absent otherwise. A router spells such a worker's
+structural tags without `optional`, `plus` and `star` (a `token` node stays as
+derived). The engine's own servicer does not report the field.
+
 ## Architecture
 
 ```
@@ -1288,12 +1467,13 @@ smg-grpc-servicer[vllm]    ──optional dep──>  vllm       (lazy import)
 smg-grpc-servicer[mlx]     ──optional dep──>  mlx-lm     (lazy import)
 smg-grpc-servicer          ──external runtime──>  tokenspeed (lazy import)
 smg-grpc-servicer[sglang]  ──optional dep──>  sglang     (lazy import)
+smg-grpc-servicer          ──external runtime──>  tensorrt_llm (the shim beside its LLM API, lazy)
 smg-grpc-servicer          ──depends on────>  smg-grpc-proto  (hard dependency)
 vllm                       ──optional──────>  smg-grpc-servicer (via vllm serve --grpc)
 sglang                     ──optional──────>  smg-grpc-servicer (via --grpc-mode)
 ```
 
-Backend dependencies are isolated via extras or runtime installs to avoid conflicts between vLLM, MLX, TokenSpeed, and SGLang.
+Backend dependencies are isolated via extras or runtime installs to avoid conflicts between vLLM, MLX, TokenSpeed, SGLang, and TensorRT-LLM.
 
 ## Development
 

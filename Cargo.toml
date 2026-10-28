@@ -76,7 +76,37 @@ tokio = { version = "1.54.1" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chrono"] }
 uuid = { version = "1.23", features = ["v7", "serde"] }
-wasmtime = { version = "49.0", features = ["component-model", "async"] }
+# The wasm runtime's default feature set as of wasmtime 49, named explicitly and without `cache`:
+# nothing configures wasmtime's compilation cache (no `Config::cache` call anywhere), and that
+# cache crate was the only path by which zstd 0.13 reached the lockfile. A wasmtime bump re-reads
+# the `default` list in its Cargo.toml and adds a new default here on purpose, not by inheritance.
+wasmtime = { version = "49.0", default-features = false, features = [
+    "anyhow",
+    "async",
+    "backtrace",
+    "gc",
+    "gc-copying",
+    "gc-drc",
+    "gc-null",
+    "wat",
+    "profiling",
+    "parallel-compilation",
+    "cranelift",
+    "pooling-allocator",
+    "demangle",
+    "addr2line",
+    "coredump",
+    "debug-builtins",
+    "runtime",
+    "component-model",
+    "component-model-async",
+    "threads",
+    "stack-switching",
+    "std",
+    "debug",
+    "compile-time-builtins",
+    "wit-parser",
+] }
 wasmtime-wasi = "49.0"
 tokio-util = { version = "0.7", features = ["rt"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }

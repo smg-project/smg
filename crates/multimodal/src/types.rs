@@ -198,6 +198,8 @@ pub struct ImageFrame {
     /// than from bytes it decodes: a later policy applies to those pixels,
     /// as there is nothing to decode again.
     from_pixels: bool,
+    /// Decode directly to the M3 source-policy dimensions in `size`.
+    minimax_resize: bool,
 }
 
 /// Decoded audio payload captured by the media connector.
@@ -466,6 +468,7 @@ impl ImageFrame {
             hash,
             transparency: TransparencyPolicy::KeepAlpha,
             from_pixels: true,
+            minimax_resize: false,
         }
     }
 
@@ -489,18 +492,30 @@ impl ImageFrame {
             hash,
             transparency: TransparencyPolicy::KeepAlpha,
             from_pixels: false,
+            minimax_resize: false,
         }
+    }
+
+    /// Mark an encoded frame for one direct resize to its planned dimensions.
+    pub(crate) fn with_minimax_resize(mut self) -> Self {
+        self.minimax_resize = true;
+        self
     }
 
     /// The decoded pixels, decoding on the first call. A body its header did
     /// not vouch for fails here, as the caller's input.
     pub fn image(&self) -> Result<&DynamicImage, MediaConnectorError> {
         self.decoded.get_or_try_init(|| {
-            decode_image_bytes(
+            let image = decode_image_bytes(
                 &self.raw_bytes,
                 self.max_long_side_pixel,
                 self.transparency(),
-            )
+            )?;
+            Ok(if self.minimax_resize {
+                crate::minimax_resize::resize_image(image, self.size.width, self.size.height)
+            } else {
+                image
+            })
         })
     }
 

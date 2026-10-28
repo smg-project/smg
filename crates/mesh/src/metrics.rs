@@ -5,8 +5,6 @@
 //! - Traffic metrics (batches, bytes)
 //! - Snapshot metrics
 //! - Peer health metrics
-//! - State integrity metrics
-//! - Rate-limit/LB drift metrics
 
 use std::time::Duration;
 
@@ -29,31 +27,10 @@ pub fn init_mesh_metrics() {
         "Total number of NACK messages"
     );
 
-    // State integrity metrics (drift gauges currently retained as scaffolding;
-    // recorder helpers below are `#[expect(dead_code)]`).
-    describe_gauge!(
-        "router_mesh_store_cardinality",
-        "Number of entries in each store"
-    );
-    describe_gauge!(
-        "router_mesh_store_hash",
-        "Hash of store state for integrity checking"
-    );
-
     // Sync round profiling
     describe_histogram!(
         "router_mesh_sync_round_duration_seconds",
         "Duration of a mesh sync round"
-    );
-
-    // Rate-limit and LB drift gauges
-    describe_gauge!(
-        "router_rl_drift_ratio",
-        "Rate-limit drift ratio (actual vs expected)"
-    );
-    describe_gauge!(
-        "router_lb_drift_ratio",
-        "Load balance drift ratio (actual vs expected)"
     );
 }
 
@@ -113,42 +90,6 @@ pub fn record_nack(peer: &str) {
         "peer" => peer.to_string()
     )
     .increment(1);
-}
-
-#[expect(dead_code)]
-/// Update store cardinality
-pub fn update_store_cardinality(store: &str, count: usize) {
-    gauge!("router_mesh_store_cardinality",
-        "store" => store.to_string()
-    )
-    .set(count as f64);
-}
-
-#[expect(dead_code)]
-/// Update store hash (for integrity checking)
-pub fn update_store_hash(store: &str, hash: u64) {
-    gauge!("router_mesh_store_hash",
-        "store" => store.to_string()
-    )
-    .set(hash as f64);
-}
-
-#[expect(dead_code)]
-/// Update rate-limit drift ratio
-pub fn update_rl_drift_ratio(key: &str, ratio: f64) {
-    gauge!("router_rl_drift_ratio",
-        "key" => key.to_string()
-    )
-    .set(ratio);
-}
-
-#[expect(dead_code)]
-/// Update load balance drift ratio
-pub fn update_lb_drift_ratio(model: &str, ratio: f64) {
-    gauge!("router_lb_drift_ratio",
-        "model" => model.to_string()
-    )
-    .set(ratio);
 }
 
 /// Record a mesh sync round's duration

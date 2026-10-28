@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
-use crate::engine::{Calibration, EngineParams, LoadsLike, TimingModel};
+use crate::engine::{Calibration, EngineParams, LoadsLike, OutputSeed, TimingModel};
 
 /// Configuration shared by every mocked HTTP and gRPC worker in the process.
 #[derive(Debug, Clone)]
@@ -226,6 +226,9 @@ impl Config {
                     cfg.gen_delay = Duration::from_millis(parse(value(&mut args, &flag)?, &flag)?);
                 }
                 "--output-tokens" => cfg.output_tokens = parse(value(&mut args, &flag)?, &flag)?,
+                "--output-prefix-ids" => {
+                    cfg.engine.output_prefix = parse_ids(value(&mut args, &flag)?, &flag)?;
+                }
                 "--capture" => cfg.replay.capture = Some(value(&mut args, &flag)?.into()),
                 "--script" => cfg.replay.script = Some(value(&mut args, &flag)?.into()),
                 "--engine" => {
@@ -265,6 +268,17 @@ impl Config {
                 "--request-overhead-ms" => {
                     cfg.engine.request_overhead_ms = parse(value(&mut args, &flag)?, &flag)?;
                     overhead_given = true;
+                }
+                "--output-seed" => {
+                    cfg.engine.output_seed = match value(&mut args, &flag)?.as_str() {
+                        "request-id" => OutputSeed::RequestId,
+                        "prompt" => OutputSeed::Prompt,
+                        other => {
+                            return Err(format!(
+                                "--output-seed must be request-id|prompt, got {other}"
+                            ))
+                        }
+                    };
                 }
                 "--prefill-first" => {
                     cfg.engine.prefill_first = parse(value(&mut args, &flag)?, &flag)?;
@@ -392,6 +406,17 @@ fn parse<T: std::str::FromStr>(raw: String, flag: &str) -> Result<T, String> {
         .map_err(|_| format!("invalid value for {flag}: {raw}"))
 }
 
+/// A comma-separated list of token ids.
+fn parse_ids(raw: String, flag: &str) -> Result<Vec<u32>, String> {
+    raw.split(',')
+        .map(|id| {
+            id.trim()
+                .parse()
+                .map_err(|_| format!("invalid value for {flag}: {raw}"))
+        })
+        .collect()
+}
+
 /// The flags, as `--help` prints them.
 pub fn usage() -> String {
     "mock-worker — multi-port mock HTTP/gRPC inference workers for SMG scale testing\n\n\
@@ -410,12 +435,17 @@ pub fn usage() -> String {
        --tokenizer <path>       tokenizer path for gRPC autoload (default = model)\n\
        --gen-ms <ms>            canned per-request latency (default 0)\n\
        --output-tokens <n>      output tokens per request when unspecified (default 8)\n\
+       --output-prefix-ids <a,b,..>  token ids every output starts with, before the synthetic ids\n\
+                                (a stream shaped for a gateway that parses the engine's tokens: the\n\
+                                canned gRPC/ZMQ workers and the realistic engine; default none)\n\
        --capture <path>         append each gRPC Generate request to <path> as a JSON line\n\
        --script <path>          scripted answers (JSONL keyed by the prompt's token ids), served on\n\
                                 every wire ahead of the engine; the admin API enqueues more\n\
      \n\
      Realistic engine simulator (vLLM pass loop over a block-level KV pool; opt-in):\n\
        --engine <canned|realistic>  engine mode (default canned)\n\
+       --output-seed <request-id|prompt>  synthetic output identity (default request-id);\n\
+                                prompt ignores transport IDs for repeatable cross-router output\n\
        --timing <polynomial|linear|fit:<path>>  pass duration model (default polynomial);\n\
                                 fit:<path> reads a hardware calibration JSON (polynomials, KV capacity,\n\
                                 block size, per-request overhead; flags given explicitly win)\n\
@@ -465,6 +495,26 @@ mod tests {
     }
 
     #[test]
+    fn output_seed_is_explicit_and_rejects_unknown_modes() {
+        let grpc = ["--grpc-base-port", "19000", "--grpc-count", "1"];
+        assert_eq!(
+            parse(&grpc).expect("defaults").engine.output_seed,
+            OutputSeed::RequestId
+        );
+        for (flag, expected) in [
+            ("prompt", OutputSeed::Prompt),
+            ("request-id", OutputSeed::RequestId),
+        ] {
+            let cfg =
+                parse(&[&grpc[..], &["--output-seed", flag]].concat()).expect("valid seed mode");
+            assert_eq!(cfg.engine.output_seed, expected);
+        }
+        assert!(parse(&[&grpc[..], &["--output-seed", "random"]].concat())
+            .expect_err("unknown seed mode")
+            .contains("--output-seed must be request-id|prompt"));
+    }
+
+    #[test]
     fn publishers_carry_their_worker_rank_and_port() {
         let cfg = Config {
             realistic: true,
@@ -503,6 +553,23 @@ mod tests {
             "a negative drain is refused"
         );
         assert!(parse(&[&grpc[..], &["--drain-timeout-secs", "soon"]].concat()).is_err());
+    }
+
+    #[test]
+    fn output_prefix_ids_are_a_comma_separated_list() {
+        let grpc = ["--grpc-base-port", "19000", "--grpc-count", "1"];
+        let cfg = parse(&grpc).expect("gRPC flags parse");
+        assert!(cfg.engine.output_prefix.is_empty(), "none by default");
+        let mut flags = grpc.to_vec();
+        flags.extend(["--output-prefix-ids", "200005, 17196,200008"]);
+        let cfg = parse(&flags).expect("a list of ids parses");
+        assert_eq!(cfg.engine.output_prefix, vec![200_005, 17_196, 200_008]);
+        let mut flags = grpc.to_vec();
+        flags.extend(["--output-prefix-ids", "200005,x"]);
+        assert!(
+            parse(&flags).is_err(),
+            "a value that is not an id is refused"
+        );
     }
 
     #[test]

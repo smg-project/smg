@@ -42,32 +42,12 @@ pub fn k2_horizon() -> Format {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::common::{Function, Tool};
-    use serde_json::json as value;
-
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, Text},
-        testing::{arguments_of, bytes, content, drive, reasoning},
-        Declared,
+        event::{Event, Text},
+        testing::{arguments_of, bytes, content, drive, dropped, reasoning, weather_declared},
     };
-
-    fn declared() -> Declared {
-        Declared::of(&[Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: "get_weather".to_string(),
-                description: None,
-                parameters: value!({"type": "object", "properties": {
-                    "city": {"type": "string"},
-                    "days": {"type": "integer"},
-                }}),
-                strict: None,
-                extra: Default::default(),
-            },
-        }])
-    }
 
     /// The generation prompt's tail: the turn opened, and its thought.
     const PROMPT: &str = "<|ifm|im_start|>assistant\n<ifm|think>\n";
@@ -82,14 +62,11 @@ mod tests {
     );
 
     fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
-        drive(&mut Engine::new(k2_horizon(), declared()), prompt, pieces)
-    }
-
-    fn dropped(text: &str) -> Event<'static> {
-        Event::Dropped {
-            text: Text::uncounted(text.to_owned()),
-            why: DropReason::Wrapper,
-        }
+        drive(
+            &mut Engine::new(k2_horizon(), weather_declared()),
+            prompt,
+            pieces,
+        )
     }
 
     #[test]

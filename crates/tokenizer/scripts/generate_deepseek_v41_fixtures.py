@@ -15,11 +15,17 @@ ones. Without the third argument those cases keep their recorded text.
 
 Oracle `vllm_python`: the serving engine's port of that encoder, imported from the clone at
 VLLM_REPO_DIR (never vendored) and named in the fixture with the clone's HEAD
-commit. It records the shapes the HF encoder cannot render, today a developer
-message it keeps (the serving engines render it as a user turn; the HF encoder has
-no developer branch). Without VLLM_REPO_DIR those cases keep their recorded
-text and a warning says so. Its cases take string content only: the engine flattens
-content parts in its tokenizer wrapper, not in the encoder.
+commit. It is for a shape the HF encoder cannot render; none today. Without
+VLLM_REPO_DIR such cases keep their recorded text and a warning says so. Its
+cases take string content only: the engine flattens content parts in its
+tokenizer wrapper, not in the encoder.
+
+Every case's messages first go through the engine's chat renderer step that
+precedes any tokenizer-mode encoder (`as_the_engine_hands_it`): a `developer`
+message becomes a `system` one and the system messages merge into one at the
+front when a system message is not the first. The request's tools attach after
+that, as the engine's wrapper and the gateway's shim do it; so the developer
+cases are the HF encoder's own renderings of their system form.
 
 Usage: generate_deepseek_v41_fixtures.py <checkpoint>/encoding/tests <checkpoint>/tokenizer.json [<checkpoint revision>]
 """
@@ -183,6 +189,40 @@ def oracle_messages(messages):
     return msgs
 
 
+def as_the_engine_hands_it(msgs):
+    """The engine's chat renderer before any tokenizer-mode encoder (its
+    `_convert_developer_to_system`, then `_consolidate_system_messages`): a
+    `developer` message becomes a `system` one without its `tools` field; when
+    a system message is then not the first, the non-empty system texts merge
+    into one system message at the front (a parts list contributes its text
+    parts joined by newlines) and the other messages keep their order."""
+    if not any(msg["role"] == "developer" for msg in msgs):
+        return msgs
+    rewritten = []
+    for msg in msgs:
+        if msg["role"] == "developer":
+            msg = {k: v for k, v in msg.items() if k != "tools"}
+            msg["role"] = "system"
+        rewritten.append(msg)
+    if not any(i > 0 and msg["role"] == "system" for i, msg in enumerate(rewritten)):
+        return rewritten
+    texts, others = [], []
+    for msg in rewritten:
+        if msg["role"] != "system":
+            others.append(msg)
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            content = "\n".join(
+                part if isinstance(part, str) else part.get("text", "")
+                for part in content
+                if isinstance(part, str) or "text" in part
+            )
+        if content:
+            texts.append(content)
+    return [{"role": "system", "content": "\n\n".join(texts)}, *others]
+
+
 def attach_tools(msgs, tools):
     """Rule D4, as `inject_tools_into_first_system_message` (huggingface.rs)
     and the engine's `apply_chat_template` do it: the request's tools land on the
@@ -233,7 +273,7 @@ def case(
 ):
     """One case; `current` records it with the checkpoint's own encoder at the
     current revision (oracle `hf` only) and names that revision on the case."""
-    msgs = oracle_messages(messages)
+    msgs = as_the_engine_hands_it(oracle_messages(messages))
     if tools:
         attach_tools(msgs, tools)
     if continue_final_message:
@@ -426,9 +466,8 @@ cases += [
         tools=[{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}],
         thinking_mode="thinking",
     ),
-    # A developer message before the last user turn is dropped by drop_thinking,
-    # which is the only developer shape the HF encoder can render; the kept
-    # shapes are recorded from the engine's port at the end of this list.
+    # A developer message is the system message by the time an encoder sees it
+    # (as_the_engine_hands_it); the HF encoder renders its system form.
     case("developer_then_user_thinking", DEVELOPER_THEN_USER, thinking_mode="thinking"),
     case(
         "two_user_turns",
@@ -550,17 +589,15 @@ cases += [
         ],
         thinking_mode="thinking",
     ),
-    # A kept developer message (chat mode; thinking with tools, where
-    # drop_thinking is off) renders as a <｜User｜> turn in the serving engines;
-    # the HF encoder raises on it, so the engine's port records these two. With
-    # tools, D4 puts them on a synthesised leading system message.
-    case("developer_then_user_chat", DEVELOPER_THEN_USER, oracle="vllm_python"),
+    # The same developer message in chat mode, and in thinking mode with tools
+    # (D4 puts them on the system message it has become, so drop_thinking is
+    # off): the HF encoder renders the system form of both.
+    case("developer_then_user_chat", DEVELOPER_THEN_USER),
     case(
         "developer_with_tools",
         DEVELOPER_THEN_USER,
         tools=LOOKUP_TOOL,
         thinking_mode="thinking",
-        oracle="vllm_python",
     ),
     # The same requests as thinking_default_effort, thinking_low and
     # continue_final_message under the current revision's effort table (the

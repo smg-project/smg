@@ -60,6 +60,11 @@ pub struct RlWorkerEntry {
     /// HTTP worker, the engine-advertised or operator-supplied
     /// `rl.control_url` otherwise; `null` when the worker has none.
     pub control_url: Option<String>,
+    /// Whether the worker's engine connection carries the RL routes as
+    /// control calls (a TokenSpeed engine on the direct ZMQ lane), which is
+    /// how a worker without a `control_url` is controlled.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub engine_control_calls: bool,
     pub tp_size: Option<u64>,
     pub dp_size: Option<u64>,
     pub pp_size: Option<u64>,
@@ -155,6 +160,7 @@ mod tests {
             worker_type: "regular".to_string(),
             connection_mode: "http".to_string(),
             control_url: Some("http://a:1".to_string()),
+            engine_control_calls: false,
             tp_size: Some(1),
             dp_size: None,
             pp_size: None,

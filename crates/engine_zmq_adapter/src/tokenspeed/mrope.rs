@@ -195,10 +195,10 @@ pub(crate) fn qwen35_positions(
                 // The frame count first, so a malformed row cannot ask for a
                 // frame list the size of its `t`: the frames must equal the
                 // spans before any list exists.
-                let frames = rows.iter().try_fold(0usize, |sum, &[t, ..]| {
+                let frames = rows.iter().enumerate().try_fold(0usize, |sum, (row, &[t, ..])| {
                     let t = usize::try_from(t).map_err(|_| {
                         format!(
-                            "multimodal item {index} video grid row has a negative frame count {t}"
+                            "multimodal item {index} video grid row {row} has a negative frame count {t}"
                         )
                     })?;
                     sum.checked_add(t).ok_or_else(|| {
@@ -516,8 +516,12 @@ pub(crate) mod tests {
         // A video row asking for more frames than there are spans is refused
         // before any frame list exists (a count, not an allocation).
         assert!(err(&[video(&[[1 << 40, 4, 4]], &[(1, 4)])]).contains("grid row(s) for 1"));
-        // A negative frame count is named, not read as an overflow.
-        assert!(err(&[video(&[[-1, 4, 4]], &[(1, 4)])]).contains("negative frame count -1"));
+        // A negative frame count is named with its row, not read as an overflow.
+        assert!(
+            err(&[video(&[[-1, 4, 4]], &[(1, 4)])]).contains("row 0 has a negative frame count -1")
+        );
+        assert!(err(&[video(&[[1, 4, 4], [-2, 4, 4]], &[(1, 4), (6, 9)])])
+            .contains("video grid row 1 has a negative frame count -2"));
         // A grid whose token count overflows is refused, not wrapped.
         assert!(
             err(&[image(&[[1, 22, 2 * 0x2E8B_A2E8_BA2E_8BA3]], &[(1, 4)])]).contains("overflows")

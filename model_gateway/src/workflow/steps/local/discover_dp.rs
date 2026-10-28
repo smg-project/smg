@@ -10,7 +10,7 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use super::discover_metadata::get_server_info;
 use crate::{
-    worker::{ConnectionMode, UNKNOWN_MODEL_ID},
+    worker::{endpoint::Endpoint, ConnectionMode, UNKNOWN_MODEL_ID},
     workflow::data::{WorkerKind, WorkerWorkflowData},
 };
 
@@ -29,8 +29,12 @@ pub async fn get_dp_info(
 ) -> Result<DpInfo, String> {
     let info = get_server_info(client, url, api_key).await?;
 
-    let dp_size = routing_dp_size(info.dp_size, info.attn_dp_size)
-        .map_err(|error| format!("Invalid DP metadata from {url}: {error}"))?;
+    let dp_size = routing_dp_size(info.dp_size, info.attn_dp_size).map_err(|error| {
+        format!(
+            "Invalid DP metadata from {}: {error}",
+            Endpoint::redacted_str(url)
+        )
+    })?;
 
     let model_id = info
         .model_id
@@ -129,12 +133,15 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
         if !app_context.router_config.dp_aware {
             debug!(
                 "Worker {} is not DP-aware, skipping DP discovery",
-                config.url
+                Endpoint::redacted_str(&config.url)
             );
             return Ok(StepResult::Success);
         }
 
-        debug!("Discovering DP info for {} (DP-aware)", config.url);
+        debug!(
+            "Discovering DP info for {} (DP-aware)",
+            Endpoint::redacted_str(&config.url)
+        );
 
         let dp_info = match context.data.connection_mode {
             // gRPC workers report dp_size through GetServerInfo, already
@@ -148,7 +155,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
                         warn!(
                             "No DP info for {} ({e}); registering as a single \
                          non-DP worker",
-                            config.url
+                            Endpoint::redacted_str(&config.url)
                         );
                         return Ok(StepResult::Success);
                     }
@@ -167,7 +174,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
                     warn!(
                         "DP discovery is not supported for {} HTTP workers ({}), skipping",
                         runtime.unwrap_or("unknown"),
-                        config.url
+                        Endpoint::redacted_str(&config.url)
                     );
                     return Ok(StepResult::Success);
                 }
@@ -183,7 +190,9 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
 
         debug!(
             "Discovered DP size {} for {} (model: {})",
-            dp_info.dp_size, config.url, dp_info.model_id
+            dp_info.dp_size,
+            Endpoint::redacted_str(&config.url),
+            dp_info.model_id
         );
 
         context.data.dp_info = Some(dp_info);

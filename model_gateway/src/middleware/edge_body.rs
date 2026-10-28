@@ -373,53 +373,15 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
     use tower::ServiceExt;
     use tracing::Level;
-    use tracing_subscriber::{layer::SubscriberExt, Layer, Registry};
 
     use super::*;
-    use crate::middleware::{
-        create_logging_layer, sse_keepalive_middleware, AccessLogFields, HttpMetricsLayer,
-        SseKeepAlive,
+    use crate::{
+        middleware::{
+            create_logging_layer, sse_keepalive_middleware, AccessLogFields, HttpMetricsLayer,
+            SseKeepAlive,
+        },
+        observability::logging::test_support::{test_subscriber, ResponseLines},
     };
-
-    /// Every event of the `smg::response` target, as (level, message).
-    #[derive(Clone, Default)]
-    struct ResponseLines(Arc<Mutex<Vec<(Level, String)>>>);
-
-    impl ResponseLines {
-        fn lines(&self) -> Vec<(Level, String)> {
-            self.0.lock().expect("lines").clone()
-        }
-    }
-
-    impl<S: tracing::Subscriber> Layer<S> for ResponseLines {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if event.metadata().target() != "smg::response" {
-                return;
-            }
-            struct Message(String);
-            impl tracing::field::Visit for Message {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    if field.name() == "message" {
-                        self.0 = format!("{value:?}");
-                    }
-                }
-            }
-            let mut message = Message(String::new());
-            event.record(&mut message);
-            self.0
-                .lock()
-                .expect("lines")
-                .push((*event.metadata().level(), message.0));
-        }
-    }
 
     /// A permit that records its release and refuses the first frame when
     /// told to.
@@ -495,7 +457,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn every_duty_ends_with_the_body() {
         let sink = ResponseLines::default();
-        let _guard = tracing::subscriber::set_default(Registry::default().with(sink.clone()));
+        let _subscriber = test_subscriber(sink.clone());
         let tracker = InFlightRequestTracker::new();
         let released = Arc::new(Mutex::new(false));
         let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
@@ -550,7 +512,7 @@ mod tests {
     #[tokio::test]
     async fn a_body_the_client_dropped_mid_stream_releases_every_duty_and_logs_the_close_once() {
         let sink = ResponseLines::default();
-        let _guard = tracing::subscriber::set_default(Registry::default().with(sink.clone()));
+        let _subscriber = test_subscriber(sink.clone());
         let tracker = InFlightRequestTracker::new();
         let released = Arc::new(Mutex::new(false));
         let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
@@ -625,7 +587,7 @@ mod tests {
     #[tokio::test]
     async fn duties_nobody_took_keep_the_access_log_quiet() {
         let sink = ResponseLines::default();
-        let _guard = tracing::subscriber::set_default(Registry::default().with(sink.clone()));
+        let _subscriber = test_subscriber(sink.clone());
         let (_tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(1);
         let slot = Arc::new(Mutex::new(Some(Body::from_stream(ReceiverStream::new(rx)))));
         let app = Router::new()

@@ -212,17 +212,10 @@ impl LoadBalancingPolicy for ConsistentHashingPolicy {
 mod tests {
     use std::collections::HashMap;
 
-    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use openai_protocol::worker::WorkerStatus;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, HashRing, WorkerType};
-
-    fn no_health_check() -> HealthCheckConfig {
-        HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        }
-    }
+    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder, HashRing, WorkerType};
 
     fn headers_with_routing_key(key: &str) -> http::HeaderMap {
         let mut headers = http::HeaderMap::new();
@@ -234,6 +227,25 @@ mod tests {
         let mut headers = http::HeaderMap::new();
         headers.insert("x-smg-target-worker", idx.to_string().parse().unwrap());
         headers
+    }
+
+    /// The selection info of a request carrying `headers` and nothing else.
+    fn with_headers(headers: &http::HeaderMap) -> SelectWorkerInfo<'_> {
+        SelectWorkerInfo {
+            headers: Some(headers),
+            ..Default::default()
+        }
+    }
+
+    /// The selection info of a request carrying `headers`, routed over `ring`.
+    fn with_headers_and_ring<'a>(
+        headers: &'a http::HeaderMap,
+        ring: &Arc<HashRing>,
+    ) -> SelectWorkerInfo<'a> {
+        SelectWorkerInfo {
+            hash_ring: Some(Arc::clone(ring)),
+            ..with_headers(headers)
+        }
     }
 
     fn create_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
@@ -259,10 +271,7 @@ mod tests {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let headers = headers_with_routing_key("user-veto");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
         let owner = policy.select_worker_impl(&workers, &info).0.unwrap();
 
         workers[owner].set_overloaded(true);
@@ -271,10 +280,7 @@ mod tests {
 
         // Explicit target-worker probe: an operator pin does not beat the veto.
         let target = headers_with_target_worker(owner);
-        let targeted_info = SelectWorkerInfo {
-            headers: Some(&target),
-            ..Default::default()
-        };
+        let targeted_info = with_headers(&target);
         assert_ne!(
             policy.select_worker_impl(&workers, &targeted_info).0,
             Some(owner)
@@ -303,10 +309,7 @@ mod tests {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let headers = headers_with_routing_key("user-123");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
 
         let (first_result, _) = policy.select_worker_impl(&workers, &info);
         let first_idx = first_result.unwrap();
@@ -327,10 +330,7 @@ mod tests {
         let mut distribution = HashMap::new();
         for i in 0..100 {
             let headers = headers_with_routing_key(&format!("user-{i}"));
-            let info = SelectWorkerInfo {
-                headers: Some(&headers),
-                ..Default::default()
-            };
+            let info = with_headers(&headers);
             let (result, _) = policy.select_worker_impl(&workers, &info);
             *distribution.entry(result.unwrap()).or_insert(0) += 1;
         }
@@ -344,10 +344,7 @@ mod tests {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let headers = headers_with_routing_key(&"k".repeat(129));
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert!(result.is_some());
@@ -360,10 +357,7 @@ mod tests {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
         let headers = headers_with_target_worker(1);
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(result, Some(1));
@@ -376,10 +370,7 @@ mod tests {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
         let headers = headers_with_target_worker(5); // Out of bounds
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(result, None);
@@ -393,10 +384,7 @@ mod tests {
         workers[1].set_status(WorkerStatus::NotReady);
 
         let headers = headers_with_target_worker(1);
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(result, None);
@@ -412,10 +400,7 @@ mod tests {
         headers.insert("x-smg-target-worker", "1".parse().unwrap());
         headers.insert("x-smg-routing-key", "some-key".parse().unwrap());
 
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(result, Some(1));
@@ -469,11 +454,7 @@ mod tests {
         );
         let mut distribution = HashMap::new();
         for _ in 0..64 {
-            let info = SelectWorkerInfo {
-                headers: Some(&headers),
-                hash_ring: Some(ring.clone()),
-                ..Default::default()
-            };
+            let info = with_headers_and_ring(&headers, &ring);
             let (result, branch) = policy.select_worker_impl(&workers, &info);
             assert_eq!(branch, Branch::RandomFallback);
             *distribution.entry(result.unwrap()).or_insert(0) += 1;
@@ -491,10 +472,7 @@ mod tests {
 
         let mut headers = http::HeaderMap::new();
         headers.insert("cookie", "session=abc123".parse().unwrap());
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
         let (first, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(branch, Branch::ImplicitKeyHit);
         for _ in 0..10 {
@@ -511,10 +489,7 @@ mod tests {
         workers[0].set_status(WorkerStatus::NotReady);
 
         let headers = headers_with_routing_key("test");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(result, None);
@@ -549,11 +524,7 @@ mod tests {
         for i in 0..100 {
             let key = format!("user-{i}");
             let headers = headers_with_routing_key(&key);
-            let info = SelectWorkerInfo {
-                headers: Some(&headers),
-                hash_ring: Some(ring.clone()),
-                ..Default::default()
-            };
+            let info = with_headers_and_ring(&headers, &ring);
             let (result, _) = policy.select_worker_impl(&workers, &info);
             key_to_worker_before.insert(key, result.unwrap());
         }
@@ -566,11 +537,7 @@ mod tests {
         for i in 0..100 {
             let key = format!("user-{i}");
             let headers = headers_with_routing_key(&key);
-            let info = SelectWorkerInfo {
-                headers: Some(&headers),
-                hash_ring: Some(ring.clone()),
-                ..Default::default()
-            };
+            let info = with_headers_and_ring(&headers, &ring);
             let (result, _) = policy.select_worker_impl(&workers, &info);
             let new_worker = result.unwrap();
             let old_worker = key_to_worker_before[&key];
@@ -606,11 +573,7 @@ mod tests {
         // Find which worker a key routes to when all are healthy
         let test_key = "session-abc-123";
         let headers = headers_with_routing_key(test_key);
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            hash_ring: Some(ring.clone()),
-            ..Default::default()
-        };
+        let info = with_headers_and_ring(&headers, &ring);
         let (result, _) = policy.select_worker_impl(&workers, &info);
         let original_idx = result.unwrap();
 
@@ -789,10 +752,7 @@ mod tests {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
         let headers = headers_with_routing_key("");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert!(result.is_some());

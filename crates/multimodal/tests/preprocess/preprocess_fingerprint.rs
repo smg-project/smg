@@ -8,7 +8,7 @@
     clippy::print_stdout,
     clippy::print_stderr
 )]
-use image::{DynamicImage, RgbImage};
+use image::DynamicImage;
 use llm_multimodal::{
     types::Modality,
     vision::{
@@ -16,15 +16,11 @@ use llm_multimodal::{
     },
 };
 
+use super::make_seeded_image;
+
+/// The binary's seeded pattern at seed 0: what the fingerprints below were taken on.
 fn make(w: u32, h: u32) -> DynamicImage {
-    let img = RgbImage::from_fn(w, h, |x, y| {
-        image::Rgb([
-            ((x * 7 + y * 3) % 256) as u8,
-            ((x * 5 + y * 11) % 256) as u8,
-            ((x + y * 2) % 256) as u8,
-        ])
-    });
-    DynamicImage::ImageRgb8(img)
+    make_seeded_image(w, h, 0)
 }
 
 fn config() -> PreProcessorConfig {
