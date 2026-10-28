@@ -500,7 +500,15 @@ impl AsyncMultiModalTracker {
             move |connector, source| async move {
                 let mut clip = connector.fetch_video_from(&source, cfg).await?;
                 if sglang {
-                    Arc::make_mut(&mut clip).max_long_side_pixel = max_long_side_pixel;
+                    let clip = Arc::make_mut(&mut clip);
+                    clip.max_long_side_pixel = max_long_side_pixel;
+                    // Decode hashed source bytes and sampling without a resize cap.
+                    // Domain-separate Pillow pixels and include the deferred cap.
+                    let mut hash = blake3::Hasher::new();
+                    hash.update(b"minimax-sglang-video-pillow-day0");
+                    hash.update(clip.hash.as_bytes());
+                    hash.update(&max_long_side_pixel.unwrap_or(0).to_le_bytes());
+                    clip.hash = hash.finalize().to_hex().to_string();
                 }
                 Ok(TrackedMedia::Video(clip))
             },
@@ -963,24 +971,46 @@ mod repeat_tests {
             .unwrap();
         assert!(status.success());
         let bytes = std::fs::read(path).unwrap();
+        let mut identities = std::collections::HashSet::new();
         for sglang in [false, true] {
-            let mut tracker = tracker().with_minimax_sglang_resize(sglang);
-            tracker
-                .push_part(MediaContentPart::VideoUrl {
-                    url: format!("data:video/mp4;base64,{}", STANDARD.encode(&bytes)),
-                    uuid: None,
-                    fps: Some(1.0),
-                    max_long_side_pixel: Some(168),
-                })
-                .unwrap();
-            let output = tracker.finalize().await.unwrap();
-            let TrackedMedia::Video(clip) = &output.data[&Modality::Video][0] else {
-                panic!("video expected");
-            };
-            assert_eq!(clip.max_long_side_pixel(), Some(168));
-            let frame = &clip.rgb_video().unwrap().frames[0];
-            let expected = if sglang { (320, 240) } else { (168, 126) };
-            assert_eq!((frame.width, frame.height), expected);
+            for cap in [None, Some(168), Some(224)] {
+                let mut tracker = tracker().with_minimax_sglang_resize(sglang);
+                tracker
+                    .push_part(MediaContentPart::VideoUrl {
+                        url: format!("data:video/mp4;base64,{}", STANDARD.encode(&bytes)),
+                        uuid: None,
+                        fps: Some(1.0),
+                        max_long_side_pixel: cap,
+                    })
+                    .unwrap();
+                let output = tracker.finalize().await.unwrap();
+                let TrackedMedia::Video(clip) = &output.data[&Modality::Video][0] else {
+                    panic!("video expected");
+                };
+                assert_eq!(clip.max_long_side_pixel(), cap);
+                assert!(
+                    identities.insert(clip.hash.clone()),
+                    "runtime and cap identify different pixels"
+                );
+                if !sglang {
+                    assert_eq!(
+                        clip.hash,
+                        crate::hasher::hash_video_with_sampling(
+                            &bytes,
+                            1.0,
+                            cap,
+                            FrameSampling::default()
+                        )
+                    );
+                }
+                let frame = &clip.rgb_video().unwrap().frames[0];
+                let expected = if sglang {
+                    (320, 240)
+                } else {
+                    cap.map_or((320, 240), |cap| (cap, cap * 3 / 4))
+                };
+                assert_eq!((frame.width, frame.height), expected);
+            }
         }
     }
 
