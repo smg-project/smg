@@ -704,7 +704,10 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::worker::{endpoint::Endpoint, registry::WorkerId, EndpointKey};
+    use crate::{
+        test_support::make_labeled_pod,
+        worker::{endpoint::Endpoint, registry::WorkerId, EndpointKey},
+    };
 
     /// The pod's Ready condition at `status` ("True", "False" or "Unknown"),
     /// every other field unset.
@@ -1638,28 +1641,6 @@ mod tests {
             selector,
             disaggregated_mode: false,
             ..Default::default()
-        }
-    }
-
-    fn make_labeled_pod(name: &str, ip: &str, labels: &[(&str, &str)]) -> Pod {
-        let mut label_map = BTreeMap::new();
-        for &(k, v) in labels {
-            label_map.insert(k.to_string(), v.to_string());
-        }
-        Pod {
-            metadata: ObjectMeta {
-                name: Some(name.to_string()),
-                uid: Some(format!("uid-{name}")),
-                labels: Some(label_map),
-                ..Default::default()
-            },
-            spec: Some(PodSpec::default()),
-            status: Some(PodStatus {
-                pod_ip: Some(ip.to_string()),
-                phase: Some("Running".to_string()),
-                conditions: Some(vec![ready_condition("True")]),
-                ..Default::default()
-            }),
         }
     }
 
