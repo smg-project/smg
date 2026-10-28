@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       engines:
-        description: "Space-separated engines to run (sglang vllm tokenspeed vllm-amd); empty = all"
+        description: "Space-separated engines (sglang vllm tokenspeed vllm-amd; opt-in vllm-amd-moriio-read); empty = default lanes"
         required: false
         default: ""
       filter:
@@ -30,11 +30,14 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
+      amd_read_rdma_options_json: ${{ steps.plan.outputs.amd_read_rdma_options_json }}
     steps:
       - id: plan
         env:
           ENGINES: ${{ inputs.engines }}
+          TEST_FILTER: ${{ inputs.filter }}
           AMD_ENABLED: ${{ vars.SMG_RUN_AMD_LEGS }}
+          AMD_RDMA_OPTIONS: ${{ vars.SMG_AMD_RDMA_CONTAINER_OPTIONS }}
         run: |
           wanted="${ENGINES:-sglang vllm tokenspeed}"
           # vllm-amd needs AMD's self-hosted runner; until it is online
@@ -42,12 +45,41 @@ jobs:
           if [ -z "$ENGINES" ] && [ "$AMD_ENABLED" = true ]; then
             wanted="$wanted vllm-amd"
           fi
+          for engine in $wanted; do
+            if [ "$engine" = vllm-amd-moriio-read ]; then
+              if [ -n "$TEST_FILTER" ]; then
+                echo "ERROR: READ/RDMA runs the complete topology suite; leave filter empty" >&2
+                exit 1
+              fi
+              python3 - <<'PY_OPTIONS'
+          import os
+          import re
+          import shlex
+
+          args = shlex.split(os.environ["AMD_RDMA_OPTIONS"])
+          devices = []
+          for i, arg in enumerate(args):
+              if arg == "--device" and i + 1 < len(args):
+                  devices.append(args[i + 1].split(":", 1)[0])
+              elif arg.startswith("--device="):
+                  devices.append(arg.split("=", 1)[1].split(":", 1)[0])
+          if "/dev/infiniband" not in devices and not (
+              "/dev/infiniband/rdma_cm" in devices
+              and any(re.fullmatch(r"/dev/infiniband/uverbs[0-9]+", p) for p in devices)
+          ):
+              raise SystemExit("READ/RDMA needs explicit InfiniBand device options")
+          PY_OPTIONS
+              # Capture the public device options once, not a later vars lookup.
+              options_json=$(jq -cn --arg options "$AMD_RDMA_OPTIONS" '$options')
+              echo "amd_read_rdma_options_json=$options_json" >> "$GITHUB_OUTPUT"
+            fi
+          done
           # One row per engine, plus each engine's other KV transport: vLLM over
           # Mooncake next to its NIXL default, SGLang over NIXL next to its
           # Mooncake default (TokenSpeed only has Mooncake). The NIXL row skips
           # the peer-restart tests: the SGLang prefill segfaults when its decode
           # comes back on the same address (#2503). vllm-amd is vLLM over NIXL
-          # and over MoRI-IO in WRITE mode; MoRI-IO's READ mode is left out
+          # and over MoRI-IO in WRITE mode; automatic READ mode is left out
           # while its decode faults on its first transfer over XGMI on AMD's
           # MI300X runners (vllm-project/vllm#61144).
           matrix=$(printf '%s\n' $wanted | jq -Rsc '
@@ -56,6 +88,8 @@ jobs:
                 elif . == "sglang" then [{engine: "sglang"},
                   {engine: "sglang", kv_backend: "nixl",
                    filter: "not sole_leg_outage and not survives_losing"}]
+                elif . == "vllm-amd-moriio-read" then [
+                  {engine: "vllm", kv_backend: "moriio", moriio_mode: "read", moriio_backend: "rdma", vendor: "amd"}]
                 elif . == "vllm-amd" then [
                   {engine: "vllm", kv_backend: "nixl", vendor: "amd"},
                   {engine: "vllm", kv_backend: "moriio", moriio_mode: "write", vendor: "amd"}]
@@ -173,12 +207,13 @@ jobs:
       # The AMD rows run in vLLM's ROCm image of the CI's vLLM pin
       # (scripts/ci_install_vllm.sh), which ships NIXL, UCX and MoRI. The
       # container gets the GPUs, the runner's model cache and its HF_TOKEN, but
-      # no RDMA devices, so MoRI-IO moves KV over XGMI.
+      # no RDMA devices by default, so those rows move KV over XGMI. An explicit
+      # READ/RDMA dispatch instead requires the dedicated, verified RDMA options.
       gpu_vendor: ${{ matrix.vendor || 'nvidia' }}
       container_image: ${{ matrix.vendor == 'amd' && 'vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f' || '' }}
-      container_options: ${{ matrix.vendor == 'amd' && (vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN') || '' }}
+      container_options: ${{ matrix.moriio_backend == 'rdma' && fromJSON(needs.plan.outputs.amd_read_rdma_options_json) || (matrix.vendor == 'amd' && (vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN') || '') }}
       vllm_moriio_mode: ${{ matrix.moriio_mode || '' }}
-      vllm_moriio_backend: ${{ matrix.kv_backend == 'moriio' && 'xgmi' || '' }}
+      vllm_moriio_backend: ${{ matrix.moriio_backend || (matrix.kv_backend == 'moriio' && 'xgmi' || '') }}
       # The whole sweep: ten topologies (eight gRPC, two HTTP), eight on
       # TokenSpeed (no HTTP frontend), each with worker restarts; TokenSpeed
       # also extracts its engine image and loads a slower model. Run
