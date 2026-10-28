@@ -34,8 +34,11 @@ def test_lower_bound_becomes_the_pin(mod):
     assert mod.scheduler_pin(NIGHTLY) == "tokenspeed-scheduler==0.1.26"
 
 
-def test_exact_requirement_is_kept(mod):
-    assert mod.scheduler_pin(["tokenspeed-scheduler==0.1.29"]) == "tokenspeed-scheduler==0.1.29"
+@pytest.mark.parametrize("runtime_version", [None, "0.1.1.post20261021", "0.1.1.post20261024"])
+def test_exact_requirement_is_kept(mod, runtime_version):
+    assert mod.scheduler_pin(["tokenspeed-scheduler==0.1.29"], runtime_version) == (
+        "tokenspeed-scheduler==0.1.29"
+    )
 
 
 def test_lower_bound_wins_over_an_upper_bound(mod):
@@ -97,12 +100,19 @@ def test_storage_nightly_uses_known_pair_without_changing_old_nightlies(mod):
     assert mod.scheduler_pin(requirements, "0.1.1.post20261024") == "tokenspeed-scheduler==0.1.41"
 
 
-def test_known_pair_cannot_override_declared_constraints(mod):
-    assert mod.scheduler_pin(["tokenspeed-scheduler==0.1.41"], "0.1.1.post20261023") == (
-        "tokenspeed-scheduler==0.1.41"
+@pytest.mark.parametrize(
+    "requirement",
+    ["tokenspeed-scheduler==0.1.41", "tokenspeed-scheduler>=0.1.41,<0.1.42"],
+)
+def test_known_pair_cannot_override_declared_constraints(mod, requirement):
+    with pytest.raises(ValueError, match="Known scheduler 0.1.42 conflicts with"):
+        mod.scheduler_pin([requirement], "0.1.1.post20261023")
+
+
+def test_known_pair_accepts_matching_exact_requirement(mod):
+    assert mod.scheduler_pin(["tokenspeed-scheduler==0.1.42"], "0.1.1.post20261023") == (
+        "tokenspeed-scheduler==0.1.42"
     )
-    with pytest.raises(ValueError, match="conflicts"):
-        mod.scheduler_pin(["tokenspeed-scheduler>=0.1.41,<0.1.42"], "0.1.1.post20261023")
 
 
 def test_storage_nightly_rejects_wrong_version_with_all_symbols_present(mod, monkeypatch):

@@ -39,7 +39,7 @@ def scheduler_pin(requirements, runtime_version=None) -> str | None:
         for operator in ("==", ">="):
             for clause in clauses:
                 if clause.startswith(operator) and not clause.startswith("==="):
-                    if operator == ">=" and runtime_version in KNOWN_SCHEDULERS:
+                    if runtime_version in KNOWN_SCHEDULERS:
                         version = KNOWN_SCHEDULERS[runtime_version]
                         if version not in Requirement(requirement).specifier:
                             raise ValueError(
