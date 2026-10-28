@@ -84,8 +84,8 @@ start() {
 stream_log() { tail -n +1 -F "$1" >&2 & echo $!; }
 
 wait_http() {  # wait_http <url> <timeout_s>
-  local url="$1" timeout="${2:-300}" waited=0
-  until curl -sf -m 3 "$url" >/dev/null 2>&1; do
+  local url="$1" timeout="${2:-300}" waited=0 http_code
+  until http_code=$(curl -sf -o /dev/null -w '%{http_code}' -m 3 "$url" 2>/dev/null) && [[ "$http_code" == 2[0-9][0-9] ]]; do
     sleep 5; waited=$((waited + 5))
     if [ "$waited" -ge "$timeout" ]; then echo "[launch_arm] TIMEOUT waiting for $url" >&2; return 1; fi
   done
@@ -161,7 +161,7 @@ case "$ARM" in
     [ -n "$SMG_REASONING_PARSER" ] && smg_cmd+=(--reasoning-parser "$SMG_REASONING_PARSER")
     start arm_b_gateway "$RUN_DIR/arm_b_gateway.log" "${smg_cmd[@]}"
     log_tail=$(stream_log "$RUN_DIR/arm_b_gateway.log")
-    wait_http "http://127.0.0.1:$ARM_B_GW_PORT/health" "${BFCL_STARTUP_TIMEOUT:-420}"
+    wait_http "http://127.0.0.1:$ARM_B_GW_PORT/readiness" "${BFCL_STARTUP_TIMEOUT:-420}"
     kill "$log_tail" 2>/dev/null || true
     echo "http://127.0.0.1:$ARM_B_GW_PORT"
     ;;
