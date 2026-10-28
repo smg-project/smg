@@ -336,9 +336,13 @@ fn custom_tool_output_text(output: &CustomToolCallOutputContent) -> String {
 /// `tool_choice: none` forbids calls; offering the schemas anyway makes the
 /// model re-issue calls on replayed histories, and with parsing disabled the
 /// raw call markup leaks into the message text, so the request's own tools are
-/// withheld then while the MCP tools stay offered. Under the loop the list is
-/// present even when both are empty, as the loop has always sent one; the
-/// plain conversion carries none when there are no tools.
+/// withheld then while the MCP tools stay offered. The chat and Messages paths
+/// render the tools under `none` as the engine's own server does for every
+/// API (`utils::request_as_rendered`), so the same request renders a different
+/// prompt here: a known divergence, kept until this API's rule is decided on
+/// its own. Under the loop the list is present even when both are empty, as
+/// the loop has always sent one; the plain conversion carries none when there
+/// are no tools.
 fn chat_tools(
     req: &ResponsesRequest,
     mcp_chat_tools: Option<&[Tool]>,
@@ -788,7 +792,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::routers::grpc::common::responses::utils::namespace_test_request;
+    use crate::routers::grpc::common::responses::utils::{
+        assert_responses_api_usage, namespace_test_request, responses_api_test_usage,
+    };
 
     #[test]
     fn chat_to_responses_serializes_responses_api_usage() {
@@ -808,11 +814,7 @@ mod tests {
                 matched_stop: None,
                 hidden_states: None,
             }])
-            .usage(
-                Usage::from_counts(12, 7)
-                    .with_cached_tokens(3)
-                    .with_reasoning_tokens(2),
-            )
+            .usage(responses_api_test_usage())
             .build();
 
         let response = chat_to_responses(
@@ -822,21 +824,7 @@ mod tests {
         )
         .expect("chat response should convert");
         let wire = serde_json::to_value(response).expect("response should serialize");
-        let usage = wire.get("usage").expect("usage should be present");
-
-        assert_eq!(usage.get("input_tokens"), Some(&serde_json::json!(12)));
-        assert_eq!(usage.get("output_tokens"), Some(&serde_json::json!(7)));
-        assert_eq!(usage.get("total_tokens"), Some(&serde_json::json!(19)));
-        assert_eq!(
-            usage.pointer("/input_tokens_details/cached_tokens"),
-            Some(&serde_json::json!(3))
-        );
-        assert_eq!(
-            usage.pointer("/output_tokens_details/reasoning_tokens"),
-            Some(&serde_json::json!(2))
-        );
-        assert!(usage.get("prompt_tokens").is_none());
-        assert!(usage.get("completion_tokens").is_none());
+        assert_responses_api_usage(&wire);
     }
 
     /// The public API returns these fields on every Response object (the

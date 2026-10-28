@@ -724,14 +724,15 @@ pub(crate) fn assemble_media_refs(plan: MediaPlan) -> Result<vllm::MediaRefs, Mm
 mod tests {
     use std::sync::Arc;
 
-    use openai_protocol::worker::HealthCheckConfig;
-
     use super::*;
     use crate::{
         routers::grpc::multimodal::{
             config::MultimodalConfigRegistry, settings::MultimodalSettings,
         },
-        worker::{BasicWorkerBuilder, ModelCard, WorkerType},
+        worker::{
+            test_support::{no_health_check, registry_with},
+            BasicWorkerBuilder, ModelCard, WorkerType,
+        },
     };
 
     const MODEL: &str = "qwen3-vl";
@@ -779,10 +780,7 @@ mod tests {
             .worker_type(WorkerType::Regular)
             .runtime_type(runtime)
             .connection_mode(connection)
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            });
+            .health_config(no_health_check());
         for (key, value) in labels {
             builder = builder.label(*key, *value);
         }
@@ -799,14 +797,6 @@ mod tests {
                 (MM_MEDIA_REF_SCHEMES_LABEL, "http,https,data"),
             ],
         )
-    }
-
-    fn registry_with(workers: Vec<Arc<dyn Worker>>) -> WorkerRegistry {
-        let registry = WorkerRegistry::new();
-        for worker in workers {
-            registry.register(worker).expect("register");
-        }
-        registry
     }
 
     type AcceptCase = (
@@ -988,10 +978,7 @@ mod tests {
                 .connection_mode(ConnectionMode::Grpc)
                 .label(MM_PROCESSOR_LABEL, "inprocess")
                 .label(MM_MEDIA_REF_SCHEMES_LABEL, "http,https,data")
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         );
         let epd = registry_with(vec![
@@ -1116,10 +1103,7 @@ mod tests {
                 .worker_type(WorkerType::Encode)
                 .runtime_type(RuntimeType::Vllm)
                 .connection_mode(ConnectionMode::Grpc)
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         );
         let epd = registry_with(vec![plain("grpc://127.0.0.1:9806"), encode]);
@@ -1185,10 +1169,7 @@ mod tests {
                 .worker_type(worker_type)
                 .runtime_type(RuntimeType::Vllm)
                 .connection_mode(ConnectionMode::Grpc)
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                });
+                .health_config(no_health_check());
             for (key, value) in labels {
                 builder = builder.label(*key, *value);
             }

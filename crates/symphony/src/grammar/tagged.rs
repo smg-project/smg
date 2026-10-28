@@ -197,24 +197,10 @@ fn any_argument(values: &Values<'_>) -> Grammar {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::common::Function;
     use serde_json::json as value;
 
     use super::*;
-    use crate::{format::CallSyntax, formats, tagged::Placement};
-
-    fn tool(name: &str, parameters: Value) -> Tool {
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: name.to_string(),
-                description: None,
-                parameters,
-                strict: None,
-                extra: Default::default(),
-            },
-        }
-    }
+    use crate::{format::CallSyntax, formats, tagged::Placement, testing::tool};
 
     fn weather_tools() -> Vec<Tool> {
         vec![

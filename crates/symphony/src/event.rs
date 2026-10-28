@@ -86,6 +86,19 @@ pub(crate) fn runs_at(text: &str) -> impl Iterator<Item = (std::ops::Range<usize
     })
 }
 
+/// Carried bytes that are the template's wrapping (the whitespace a syntax holds after a tag it
+/// read or between two pieces of text, a wrapper's spacing): one `Dropped { Wrapper }` event of
+/// them, so a reader that counts reasons counts them once; nothing when there are none.
+pub(crate) fn drop_carried(carried: String, out: &mut Events) {
+    if carried.is_empty() {
+        return;
+    }
+    out.push(Event::Dropped {
+        text: Text::uncounted(carried),
+        why: DropReason::Wrapper,
+    });
+}
+
 /// Text a syntax has no place for where its structure stands (a word between tags, between a
 /// list's objects or between a block's calls, a tag out of its place, text after a call's object),
 /// released as `Malformed` with `why`, which the chat surface shows as content. `carried` holds
@@ -106,11 +119,8 @@ pub(crate) fn release_between<'d>(
     why: MalformedReason,
     out: &mut Events<'d>,
 ) {
-    if !*released && !carried.is_empty() {
-        out.push(Event::Dropped {
-            text: Text::uncounted(std::mem::take(carried)),
-            why: DropReason::Wrapper,
-        });
+    if !*released {
+        drop_carried(std::mem::take(carried), out);
     }
     let text = if carried.is_empty() {
         text
@@ -140,6 +150,9 @@ pub enum DropReason {
     Whitespace,
     /// A call after the first, where the request takes one call only ([`first_call_only`]).
     LaterCall,
+    /// A call the request forbade (`tool_choice: none`), read whole so its bytes are no content
+    /// and delivered as none ([`forbidden_calls`]).
+    ForbiddenCall,
     /// Bytes of a call block the call syntax could not read as the call, for a syntax whose block
     /// is never prose (the keyed syntax: the block's markers and its four tags are the format's
     /// own tokens, and what stands between them where the syntax has no place for text is the
@@ -328,8 +341,11 @@ pub enum Event<'d> {
     ToolCallArguments {
         /// Which call the fragment belongs to.
         index: u32,
-        /// The fragment, as JSON text.
-        json: String,
+        /// The fragment, as JSON text: borrowed from the delta it came from where the fragment
+        /// is the model's own bytes and arrived in one delta, as a text event's text is; owned
+        /// where the syntax wrote it (a value given as text between tags, a raw control
+        /// character written as its escape) or where it reaches back into an earlier delta.
+        json: Cow<'d, str>,
         /// The output bytes this event accounts for, in the format's own syntax. Empty when the
         /// fragment came from bytes an earlier event already accounted for.
         source: Text<'d>,
@@ -393,7 +409,7 @@ impl Event<'_> {
                 source,
             } => Event::ToolCallArguments {
                 index,
-                json,
+                json: Cow::Owned(json.into_owned()),
                 source: source.into_owned(),
             },
             Event::ToolCallEnd { index, source } => Event::ToolCallEnd {
@@ -583,23 +599,44 @@ pub fn reasoning_text_tokens(events: &[Event]) -> u32 {
 
 /// One call only (`parallel_tool_calls: false`, `disable_parallel_tool_use`): the events of
 /// every call after the first become its dropped text, so every byte of the output still lands
-/// in one event and the content ranges after the call hold
-/// ([`content_spans`](crate::adapt::chat::content_spans)); the finish counts at most one. A
-/// table's grammar limits a forced call; this limits a free one.
+/// in one event; the finish counts at most one. A table's grammar limits a forced call; this
+/// limits a free one.
 pub fn first_call_only(events: &mut [Event]) {
+    drop_calls_from(events, 1, DropReason::LaterCall);
+}
+
+/// No call at all (`tool_choice: none` over tools the request declares): the events of every
+/// call become its dropped text, as [`first_call_only`] drops the later calls, so a call the
+/// model writes anyway is neither a call nor content, as the engine's own server reads and
+/// withholds it; the finish counts none, and a `tool_calls` finish is the engine's `stop` again.
+pub fn forbidden_calls(events: &mut [Event]) {
+    drop_calls_from(events, 0, DropReason::ForbiddenCall);
+}
+
+/// The events of every call from the index `kept` on become their dropped text under `why`, so
+/// every byte of the output still lands in one event; the finish counts at most `kept` calls,
+/// and one that counts none no longer says `tool_calls`.
+fn drop_calls_from(events: &mut [Event], kept: u32, why: DropReason) {
     for event in events {
         match event {
             Event::ToolCallStart { index, source, .. }
             | Event::ToolCallArguments { index, source, .. }
             | Event::ToolCallEnd { index, source, .. }
-                if *index > 0 =>
+                if *index >= kept =>
             {
                 *event = Event::Dropped {
                     text: std::mem::take(source),
-                    why: DropReason::LaterCall,
+                    why,
                 };
             }
-            Event::Finish { tool_calls, .. } => *tool_calls = (*tool_calls).min(1),
+            Event::Finish {
+                tool_calls, reason, ..
+            } => {
+                *tool_calls = (*tool_calls).min(kept);
+                if *tool_calls == 0 && *reason == FinishReason::ToolCalls {
+                    *reason = FinishReason::Stop;
+                }
+            }
             _ => {}
         }
     }
@@ -690,6 +727,90 @@ mod tests {
     }
 
     #[test]
+    fn forbidden_calls_drops_every_call_and_the_finish_counts_none() {
+        let call = |index: u32| {
+            [
+                Event::ToolCallStart {
+                    index,
+                    id: format!("call_{index}"),
+                    name: "f".to_string(),
+                    source: Text::uncounted("<"),
+                },
+                Event::ToolCallArguments {
+                    index,
+                    json: "{}".into(),
+                    source: Text::uncounted("{}"),
+                },
+                Event::ToolCallEnd {
+                    index,
+                    source: Text::uncounted(">"),
+                },
+            ]
+        };
+        let mut events = vec![Event::Content(Text::uncounted("x"))];
+        events.extend(call(0));
+        events.extend(call(1));
+        events.push(Event::Finish {
+            reason: FinishReason::ToolCalls,
+            tool_calls: 2,
+            reasoning_tokens: 3,
+        });
+
+        forbidden_calls(&mut events);
+
+        assert!(
+            events.iter().all(|event| !matches!(
+                event,
+                Event::ToolCallStart { .. }
+                    | Event::ToolCallArguments { .. }
+                    | Event::ToolCallEnd { .. }
+            )),
+            "no call is left: {events:?}"
+        );
+        assert!(matches!(events.first(), Some(Event::Content(_))));
+        let dropped: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped {
+                    text,
+                    why: DropReason::ForbiddenCall,
+                } => Some(&*text.text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dropped,
+            ["<", "{}", ">", "<", "{}", ">"],
+            "every call's bytes stay, in place, as dropped text"
+        );
+        assert_eq!(events.len(), 8);
+        assert_eq!(
+            events.last(),
+            Some(&Event::Finish {
+                reason: FinishReason::Stop,
+                tool_calls: 0,
+                reasoning_tokens: 3,
+            }),
+            "the finish counts no call and is the engine's stop again"
+        );
+        // A finish the engine gave for another reason keeps it.
+        let mut events = vec![Event::Finish {
+            reason: FinishReason::Length,
+            tool_calls: 1,
+            reasoning_tokens: 0,
+        }];
+        forbidden_calls(&mut events);
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish {
+                reason: FinishReason::Length,
+                tool_calls: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn first_call_only_keeps_the_first_call_and_caps_the_finish() {
         let call = |index: u32| {
             [
@@ -701,7 +822,7 @@ mod tests {
                 },
                 Event::ToolCallArguments {
                     index,
-                    json: "{}".to_string(),
+                    json: "{}".into(),
                     source: Text::uncounted("{}"),
                 },
                 Event::ToolCallEnd {

@@ -3,7 +3,10 @@
 //! (`FlushCache`, profiling) ride the wire's control call when the
 //! scheduler's handshake declared its control reply (the control-wire
 //! revision), and answer UNIMPLEMENTED naming the gap on a scheduler whose
-//! wire carries generate and abort only.
+//! wire carries generate and abort only. In the encode role this service is
+//! the discovery surface (health, model and server facts): `Generate` and
+//! the control RPCs are refused there by name, before the engine is asked,
+//! and the encoder service (`encode.rs`) takes the requests.
 
 use std::sync::Arc;
 
@@ -21,6 +24,21 @@ pub(super) struct TokenSpeedService {
     pub(super) state: Arc<State>,
 }
 
+impl TokenSpeedService {
+    /// The encode role's answer to a scheduler control RPC, before the
+    /// engine is asked: UNIMPLEMENTED naming the RPC. The role's worker
+    /// lists the encode request alone, so a control frame would have no
+    /// rank to dispatch it, whatever reply layout the handshake declared.
+    fn refuse_control_in_encode_role(&self, rpc: &str) -> Result<(), Status> {
+        if self.state.encode_role.is_some() {
+            return Err(Status::unimplemented(format!(
+                "{rpc} is unavailable on TokenSpeed encode workers"
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[tonic::async_trait]
 impl TokenSpeedScheduler for TokenSpeedService {
     type GenerateStream = BoxStream<ts::GenerateResponse>;
@@ -31,6 +49,13 @@ impl TokenSpeedScheduler for TokenSpeedService {
         &self,
         request: Request<ts::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
+        // The encode role runs the vision tower alone: the gRPC servicer's
+        // words for its Generate, before the engine is even asked.
+        if self.state.encode_role.is_some() {
+            return Err(Status::failed_precondition(
+                "Generate is unavailable on TokenSpeed encode workers",
+            ));
+        }
         generate::generate(&self.state, request.into_inner())
             .await
             .inspect_err(|status| self.state.shared.metrics.request_not_started(status))
@@ -86,6 +111,7 @@ impl TokenSpeedScheduler for TokenSpeedService {
         &self,
         request: Request<common::FlushCacheRequest>,
     ) -> Result<Response<common::FlushCacheResponse>, Status> {
+        self.refuse_control_in_encode_role("FlushCache")?;
         crate::admin::flush_cache(&self.state.shared, request)
             .await
             .map(Response::new)
@@ -95,6 +121,7 @@ impl TokenSpeedScheduler for TokenSpeedService {
         &self,
         request: Request<common::StartProfileRequest>,
     ) -> Result<Response<common::ProfileResponse>, Status> {
+        self.refuse_control_in_encode_role("StartProfile")?;
         crate::admin::start_profile(&self.state.shared, request.into_inner())
             .await
             .map(Response::new)
@@ -104,6 +131,7 @@ impl TokenSpeedScheduler for TokenSpeedService {
         &self,
         _request: Request<common::StopProfileRequest>,
     ) -> Result<Response<common::ProfileResponse>, Status> {
+        self.refuse_control_in_encode_role("StopProfile")?;
         crate::admin::stop_profile(&self.state.shared)
             .await
             .map(Response::new)

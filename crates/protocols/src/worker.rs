@@ -84,8 +84,9 @@ pub enum ConnectionMode {
     Http,
     /// gRPC connection.
     Grpc,
-    /// Direct ZMQ connection to a same-host engine core (bypasses the gRPC
-    /// Python servicer). Speaks the engine's native ZMQ IPC.
+    /// Direct ZMQ connection to an engine core (bypasses the gRPC Python
+    /// servicer). Speaks the engine's native ZMQ wire: over `ipc://` sockets
+    /// to a same-host engine, over `tcp://` to engines on other hosts.
     Zmq,
 }
 
@@ -95,7 +96,7 @@ impl ConnectionMode {
     /// scheme) or an unrecognized scheme, leaving the default to the caller
     /// (some probe both protocols; some default to HTTP).
     pub fn from_url(url: &str) -> Option<Self> {
-        if url.starts_with("ipc://") {
+        if url.starts_with("ipc://") || url.starts_with("tcp://") {
             Some(ConnectionMode::Zmq)
         } else if url.starts_with("grpc://") || url.starts_with("grpcs://") {
             Some(ConnectionMode::Grpc)
@@ -656,6 +657,39 @@ impl ConstrainedDecoding {
     pub fn of(spec: &WorkerSpec) -> Self {
         spec.constrained_decoding
             .unwrap_or_else(|| Self::from_label(spec.labels.get(Self::LABEL).map(String::as_str)))
+    }
+}
+
+/// The vocabulary of structural-tag nodes a worker's grammar compiler
+/// takes, from its `structural_tag_vocabulary` label: the current one unless
+/// the label says `older`, for a compiler that predates the `optional`,
+/// `plus` and `star` nodes and refuses a tag that carries one. The tables'
+/// tags go to such a worker spelled without them, the same language, which
+/// every compiler takes; a worker without the label gets the tag as the
+/// table built it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TagVocabulary {
+    /// Every node the tables use.
+    #[default]
+    Current,
+    /// Without the `optional`, `plus` and `star` nodes; a `token` node stays
+    /// as derived.
+    Older,
+}
+
+impl TagVocabulary {
+    /// The worker label that carries it.
+    pub const LABEL: &'static str = "structural_tag_vocabulary";
+    /// The label's value for [`Self::Older`].
+    pub const OLDER: &'static str = "older";
+
+    /// The vocabulary a worker's `structural_tag_vocabulary` label names;
+    /// anything else, the label's absence included, is [`Self::Current`].
+    pub fn from_label(value: Option<&str>) -> Self {
+        match value {
+            Some(Self::OLDER) => Self::Older,
+            _ => Self::Current,
+        }
     }
 }
 
@@ -1353,10 +1387,12 @@ pub struct FlushCacheResult {
     pub failed: Vec<(String, String)>,
     pub total_workers: usize,
     pub http_workers: usize,
+    /// gRPC workers, and direct-ZMQ engines whose wire carries the flush.
     #[serde(default)]
     pub grpc_workers: usize,
     /// Workers skipped because their transport has no cache-flush RPC
-    /// (direct-ZMQ engines). Keeps `total = http + grpc + zmq` exact.
+    /// (direct-ZMQ engines whose wire carries no control calls). Keeps
+    /// `total = http + grpc + zmq` exact.
     #[serde(default)]
     pub zmq_workers: usize,
     pub message: String,
@@ -1552,6 +1588,26 @@ pub struct WorkerLoadResponse {
 }
 
 impl WorkerLoadResponse {
+    /// Scope a backend response to one virtual DP worker. A missing rank is
+    /// unavailable; it must never inherit another rank or an aggregate. A
+    /// gateway fleet rollup cannot be projected because its rank IDs repeat
+    /// independently under each annotated worker.
+    pub fn for_dp_rank(mut self, rank: Option<usize>) -> Option<Self> {
+        if rank.is_some() && !self.ranks_are_dp_ranks() {
+            return None;
+        }
+        if let Some(rank) = rank {
+            let rank = i32::try_from(rank).ok()?;
+            self.loads.retain(|load| load.dp_rank == rank);
+            self.aggregate = None;
+            self.dp_rank_count = i32::try_from(self.loads.len()).ok()?;
+        }
+        if self.loads.is_empty() {
+            return None;
+        }
+        Some(self)
+    }
+
     /// Average token usage ratio across DP ranks. Returns 0.0 if empty.
     pub fn effective_token_usage(&self) -> f64 {
         if self.loads.is_empty() {
@@ -1711,6 +1767,10 @@ mod connection_mode_tests {
     fn from_url_classifies_known_schemes() {
         assert_eq!(
             ConnectionMode::from_url("ipc:///tmp/e"),
+            Some(ConnectionMode::Zmq)
+        );
+        assert_eq!(
+            ConnectionMode::from_url("tcp://10.0.0.5:31000"),
             Some(ConnectionMode::Zmq)
         );
         assert_eq!(

@@ -49,7 +49,8 @@ use crate::{
             },
             context,
             proto_wrapper::{
-                ProtoGenerateComplete, ProtoGenerateStreamChunk, ProtoResponseVariant, ProtoStream,
+                ProtoGenerateComplete, ProtoGenerateResponse, ProtoGenerateStreamChunk,
+                ProtoResponseVariant, ProtoStream,
             },
             utils,
         },
@@ -80,6 +81,42 @@ fn streams_arguments(response_format: Option<&ResponseFormat>) -> bool {
 /// Returns an SSE stream that parses Harmony tokens incrementally and
 /// emits ChatCompletionChunk events for streaming responses.
 pub(crate) struct HarmonyStreamingProcessor;
+
+/// The error a Responses iteration ends with when its client left (see
+/// [`next_response`]): its callers end the stream on their error path, the
+/// one they take today when the client's leaving is met at a send.
+const CLIENT_LEFT: &str = "Client disconnected";
+
+/// One read of the engine stream for the client of a Responses iteration
+/// (see [`next_response`]).
+enum EngineRead {
+    /// A response of the stream, or the error the read met.
+    Response(Result<ProtoGenerateResponse, tonic::Status>),
+    /// The stream ended.
+    End,
+    /// The client left before the stream yielded.
+    ClientLeft,
+}
+
+/// The next response of the engine `stream`, read for the client at the
+/// receiving end of `tx`'s channel. A Responses iteration reads the engine
+/// stream itself and sends its events best-effort: parked on a generation
+/// that stalled mid-stream, it would learn that its client left only when
+/// the engine next spoke, and a generation nobody reads would run to its end
+/// and be stored as completed. Here every read races the engine against the
+/// client's leaving, looked at first so a busy engine cannot outrun it; on
+/// [`EngineRead::ClientLeft`] the caller returns, the stream is dropped
+/// unmarked with it, and its abort-on-drop ends the generation on the
+/// engine. A background response's `tx` is the sender of its relay, which
+/// closes with the work and not with the client: its reads are the engine's
+/// own, and the work outlives the client as it is meant to.
+async fn next_response(stream: &mut ProtoStream, tx: &SseSender) -> EngineRead {
+    tokio::select! {
+        biased;
+        () = tx.closed() => EngineRead::ClientLeft,
+        item = stream.next() => item.map_or(EngineRead::End, EngineRead::Response),
+    }
+}
 
 impl HarmonyStreamingProcessor {
     /// Create a new Harmony streaming processor
@@ -116,6 +153,9 @@ impl HarmonyStreamingProcessor {
         let guards = body_guards(load_guards, reservation.as_ref());
         // Create SSE channel
         let (tx, rx) = sse_channel();
+        // Read for this client: the moment the response body is dropped, the
+        // request is aborted on the engine (see `ProtoStream::until_client_gone`).
+        let execution_result = execution_result.until_client_gone(&tx, &dispatch.request_id);
 
         // Spawn background task based on execution mode
         match execution_result {
@@ -139,10 +179,10 @@ impl HarmonyStreamingProcessor {
                 });
             }
             context::ExecutionResult::PrefillDecode {
-                // TODO(#1781 follow-up): thread pd_timing for honest PD TTFT
                 prefill,
                 decode,
                 prefill_guards,
+                pd_timing,
                 ..
             } => {
                 tokio::spawn(async move {
@@ -153,6 +193,7 @@ impl HarmonyStreamingProcessor {
                         chat_request,
                         &tx,
                         router_stop_strings,
+                        pd_timing,
                         prefill_guards,
                         reservation,
                     )
@@ -211,6 +252,7 @@ impl HarmonyStreamingProcessor {
             &mut prompt_tokens,
             &mut cached_tokens,
             &router_stop_strings,
+            None,
             reservation,
         )
         .await
@@ -228,6 +270,7 @@ impl HarmonyStreamingProcessor {
         original_request: Arc<ChatCompletionRequest>,
         tx: &SseSender,
         router_stop_strings: Vec<String>,
+        pd_timing: context::PdTiming,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
@@ -242,7 +285,8 @@ impl HarmonyStreamingProcessor {
         .await
         .map_err(utils::StreamFailure::prefill)?;
 
-        // Phase 2: Decode (shared helper)
+        // Phase 2: Decode (shared helper). Pass pd_timing so the first decode
+        // token yields honest PD TTFT.
         Self::process_chat_decode_stream(
             decode_stream,
             &dispatch,
@@ -251,12 +295,15 @@ impl HarmonyStreamingProcessor {
             &mut prompt_tokens,
             &mut cached_tokens,
             &router_stop_strings,
+            Some(pd_timing),
             reservation,
         )
         .await?;
 
-        // Mark prefill stream completed AFTER decode succeeds
-        // This ensures that if client disconnects during decode, BOTH streams send abort
+        // The prefill stream is marked completed after the decode's read ended
+        // well: a decode that failed leaves both streams to abort on drop; a
+        // client that left ends the read with `Ok` too, its decode stream
+        // aborting the request on drop, the prefill's own request complete.
         prefill_stream.mark_completed();
         Ok(())
     }
@@ -266,7 +313,8 @@ impl HarmonyStreamingProcessor {
     /// Shared between single-stream and prefill/decode stream modes. The `prompt_tokens`
     /// and `cached_tokens` maps may be pre-populated from a prefill phase
     /// (prefill/decode stream) or empty (single stream). Values from `Complete` messages
-    /// are inserted only if not already present.
+    /// are inserted only if not already present. `pd_timing` is `Some` only in PD mode and
+    /// yields honest PD TTFT (prefill start to first decode token).
     #[expect(clippy::too_many_arguments)]
     async fn process_chat_decode_stream(
         mut decode_stream: ProtoStream,
@@ -276,9 +324,10 @@ impl HarmonyStreamingProcessor {
         prompt_tokens: &mut HashMap<u32, u32>,
         cached_tokens: &mut HashMap<u32, u32>,
         router_stop_strings: &[String],
+        pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
-        let mut decode = ChatDecode::new();
+        let mut decode = ChatDecode::new(pd_timing);
         while let Some(result) = decode_stream.next().await {
             let response = result.map_err(|e| {
                 utils::StreamFailure::upstream(e, decode.completion_tokens.delivered())
@@ -320,6 +369,8 @@ impl HarmonyStreamingProcessor {
             }
         }
 
+        // The stream's verdict, before the engine side is released.
+        decode.client_left = decode_stream.client_left();
         decode.release_engine(decode_stream, &original_request.model);
 
         decode
@@ -486,23 +537,30 @@ impl HarmonyStreamingProcessor {
     /// - Other tools → `function_call.*` events
     ///
     /// When no MCP context is provided, all tool calls are treated as function calls.
+    ///
+    /// Answers the iteration's result with the engine's counts the terminal
+    /// frame brought, for the settlement of the iteration's reservation;
+    /// `None` when the stream ended before that frame (a clean EOF): the
+    /// usage the result carries is then the chunks' count at most, and the
+    /// caller keeps the reserved debit instead of settling with it.
     pub async fn process_responses_iteration_stream(
         execution_result: context::ExecutionResult,
         emitter: &mut ResponseStreamEventEmitter,
         tx: &SseSender,
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
-    ) -> Result<ResponsesIterationResult, String> {
+    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
         match execution_result {
             context::ExecutionResult::Single { stream } => {
                 debug!("Processing Responses API single stream mode");
-                Self::process_decode_stream(stream, emitter, tx, session, format_registry).await
+                Self::process_decode_stream(stream, emitter, tx, session, format_registry, None)
+                    .await
             }
             context::ExecutionResult::PrefillDecode {
-                // TODO(#1781 follow-up): thread pd_timing for honest PD TTFT
                 prefill,
                 decode,
                 prefill_guards,
+                pd_timing,
                 ..
             } => {
                 debug!("Processing Responses API prefill/decode stream mode");
@@ -513,6 +571,7 @@ impl HarmonyStreamingProcessor {
                     tx,
                     session,
                     format_registry,
+                    pd_timing,
                     prefill_guards,
                 )
                 .await
@@ -527,6 +586,7 @@ impl HarmonyStreamingProcessor {
         }
     }
 
+    #[expect(clippy::too_many_arguments)]
     async fn process_responses_prefill_decode_stream(
         mut prefill_stream: ProtoStream,
         decode_stream: ProtoStream,
@@ -534,36 +594,80 @@ impl HarmonyStreamingProcessor {
         tx: &SseSender,
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
+        pd_timing: context::PdTiming,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
-    ) -> Result<ResponsesIterationResult, String> {
-        // Phase 1: Drain prefill stream. The client's prompt-side usage is the
-        // prefill side's prefix-cache hit: the decode side counts the KV it was
-        // handed as cached, so its responses are restamped with the prefill
-        // side's number before the decode phase reads them.
+    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
+        // Phase 1: Drain prefill stream, for the client (see `next_response`):
+        // a client that leaves during the prefill ends both sides at once. The
+        // client's prompt-side usage is the prefill side's prefix-cache hit:
+        // the decode side counts the KV it was handed as cached, so its
+        // responses are restamped with the prefill side's number before the
+        // decode phase reads them.
+        let drained = tokio::select! {
+            biased;
+            () = tx.closed() => None,
+            drained = drain_prefill(&mut prefill_stream, prefill_guards, false, |_| {}) => {
+                Some(drained)
+            }
+        };
+        let Some(drained) = drained else {
+            // Both sides go with this return, unmarked: their abort-on-drop
+            // ends the request on the engines.
+            debug!(
+                response_id = %emitter.response_id,
+                "Client left during the prefill of the Responses stream; the request is aborted on the engines"
+            );
+            return Err(CLIENT_LEFT.to_string());
+        };
         let prefill_cached_tokens =
-            drain_prefill(&mut prefill_stream, prefill_guards, false, |_| {})
-                .await
-                .map_err(|e| format!("Prefill stream error: {}", e.message()))?;
+            drained.map_err(|e| format!("Prefill stream error: {}", e.message()))?;
         let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
-        // Phase 2: Process decode stream
-        let result =
-            Self::process_decode_stream(decode_stream, emitter, tx, session, format_registry).await;
+        // Phase 2: Process decode stream. Pass pd_timing so the first decode
+        // frame records honest PD TTFT.
+        let result = Self::process_decode_stream(
+            decode_stream,
+            emitter,
+            tx,
+            session,
+            format_registry,
+            Some(pd_timing),
+        )
+        .await;
 
         prefill_stream.mark_completed();
         result
     }
 
-    /// Process decode stream for tool call events.
+    /// Process decode stream for tool call events. `pd_timing` is `Some` only
+    /// in PD mode and yields honest PD TTFT (prefill start to first decode
+    /// frame).
     async fn process_decode_stream(
         mut decode_stream: ProtoStream,
         emitter: &mut ResponseStreamEventEmitter,
         tx: &SseSender,
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
-    ) -> Result<ResponsesIterationResult, String> {
-        let mut decode = ResponsesDecode::new()?;
-        while let Some(result) = decode_stream.next().await {
+        pd_timing: Option<context::PdTiming>,
+    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
+        let mut decode = ResponsesDecode::new(pd_timing)?;
+        // Each read races the engine against the client's leaving (see `next_response`).
+        loop {
+            let result = match next_response(&mut decode_stream, tx).await {
+                EngineRead::Response(result) => result,
+                EngineRead::End => break,
+                // The decode stream goes with this return, unmarked: its
+                // abort-on-drop ends the generation on the engine. The
+                // iteration ends as it does when the client's leaving is met
+                // at a send, and nothing of it is stored.
+                EngineRead::ClientLeft => {
+                    debug!(
+                        response_id = %emitter.response_id,
+                        "Client left during the Responses stream; the request is aborted on the engine"
+                    );
+                    return Err(CLIENT_LEFT.to_string());
+                }
+            };
             decode.frames += 1;
             let response = result.map_err(|e| format!("Decode stream error: {}", e.message()))?;
             match response.into_response() {
@@ -583,7 +687,8 @@ impl HarmonyStreamingProcessor {
         // Mark stream as completed successfully to prevent abort on drop
         decode_stream.mark_completed();
 
-        Ok(decode.result(emitter))
+        let counts = decode.settlement_counts();
+        Ok((decode.result(emitter), counts))
     }
 }
 
@@ -621,10 +726,15 @@ struct ResponsesDecode {
     engine_reasoning_tokens: u32,
     spec_accepted: u32,
     spec_drafted: u32,
+    /// The PD dispatch instants, in PD mode, until the first decode frame records the PD
+    /// first-token pair against them (the iteration records no streaming TTFT of its own).
+    pd_timing: Option<context::PdTiming>,
+    /// Whether the terminal frame came: the counters above are the engine's only then.
+    completed: bool,
 }
 
 impl ResponsesDecode {
-    fn new() -> Result<Self, String> {
+    fn new(pd_timing: Option<context::PdTiming>) -> Result<Self, String> {
         Ok(Self {
             parser: HarmonyParserAdapter::new()
                 .map_err(|e| format!("Failed to create parser: {e}"))?,
@@ -643,7 +753,17 @@ impl ResponsesDecode {
             engine_reasoning_tokens: 0,
             spec_accepted: 0,
             spec_drafted: 0,
+            pd_timing,
+            completed: false,
         })
+    }
+
+    /// The first decode frame: in PD mode the PD first-token pair, measured from the dispatch
+    /// instants, recorded once.
+    fn note_first_output(&mut self, model: &str) {
+        if let Some(timing) = self.pd_timing.take() {
+            timing.record_first_decode_token(metrics_labels::BACKEND_HARMONY, model);
+        }
     }
 
     /// One chunk: its tokens counted on a delta stream, parsed, and each channel's delta emitted
@@ -657,6 +777,7 @@ impl ResponsesDecode {
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
     ) -> Result<(), String> {
+        self.note_first_output(emitter.model());
         // Track token counts on delta streams; cumulative streams report them in Complete
         // instead.
         if chunk.chunk_semantics().is_delta() {
@@ -845,6 +966,7 @@ impl ResponsesDecode {
         tx: &SseSender,
         session: Option<&McpToolSession<'_>>,
     ) {
+        self.note_first_output(emitter.model());
         let finish_reason = complete.finish_reason().to_string();
         self.prompt_tokens = complete.prompt_tokens();
         // The prefill side's hit through a prefill/decode pair, the engine's own through a
@@ -858,6 +980,7 @@ impl ResponsesDecode {
         self.engine_reasoning_tokens = complete.reasoning_tokens();
         self.spec_accepted = complete.spec_accepted_tokens();
         self.spec_drafted = complete.spec_draft_tokens();
+        self.completed = true;
 
         // Finalize parser and get complete output
         // Responses API: no user-specified stop sequences
@@ -992,21 +1115,30 @@ impl ResponsesDecode {
         self.close_calls(emitter, tx, session).await;
     }
 
+    /// The engine's counts the stream brought (the terminal frame's counters).
+    fn counts(&self) -> TokenCounts {
+        TokenCounts {
+            prompt: self.prompt_tokens,
+            completion: self.completion_tokens,
+            cached: self.cached_tokens,
+            reasoning: self.engine_reasoning_tokens,
+            spec_accepted: self.spec_accepted,
+            spec_drafted: self.spec_drafted,
+        }
+    }
+
+    /// The counts the iteration's reservation settles with: the terminal frame's, so none when the
+    /// stream ended before it (a clean EOF). The caller then keeps the reserved debit, as the chat
+    /// streams do, instead of settling the prompt at zero.
+    fn settlement_counts(&self) -> Option<TokenCounts> {
+        self.completed.then(|| self.counts())
+    }
+
     /// The iteration's result: the calls found, with the analysis and the text so far, or the
     /// completed response; either with the iteration's usage, as the non-streamed iteration
     /// builds it.
     fn result(self, emitter: &ResponseStreamEventEmitter) -> ResponsesIterationResult {
-        let usage = iteration_usage(
-            TokenCounts {
-                prompt: self.prompt_tokens,
-                completion: self.completion_tokens,
-                cached: self.cached_tokens,
-                reasoning: self.engine_reasoning_tokens,
-                spec_accepted: self.spec_accepted,
-                spec_drafted: self.spec_drafted,
-            },
-            self.reasoning_token_count,
-        );
+        let usage = iteration_usage(self.counts(), self.reasoning_token_count);
         if let Some(tool_calls) = self.tool_calls.filter(|calls| !calls.is_empty()) {
             return ResponsesIterationResult::ToolCallsFound {
                 tool_calls,
@@ -1052,6 +1184,9 @@ struct ChatDecode {
     // Timing for metrics
     start_time: Instant,
     first_token_time: Option<Instant>,
+    /// The PD dispatch instants, in PD mode: the first token records the PD pair against
+    /// them and the metrics anchor at the prefill dispatch.
+    pd_timing: Option<context::PdTiming>,
     // Per-index state management (for n>1 support)
     parsers: HashMap<u32, HarmonyParserAdapter>,
     is_firsts: HashMap<u32, bool>,
@@ -1084,15 +1219,19 @@ struct ChatDecode {
     // Tokens the engine streamed for choices after their router-side stop, read before the
     // abort: the tail generated for nobody.
     tail_tokens: u64,
+    /// Whether the client left during the read: the stream's verdict, taken before
+    /// the finish so that no terminal router metric is recorded for a leaving client.
+    client_left: bool,
     // Reusable SSE encoder shared across every chunk emitted for this stream.
     encoder: SseEncoder,
 }
 
 impl ChatDecode {
-    fn new() -> Self {
+    fn new(pd_timing: Option<context::PdTiming>) -> Self {
         Self {
             start_time: Instant::now(),
             first_token_time: None,
+            pd_timing,
             parsers: HashMap::new(),
             is_firsts: HashMap::new(),
             matched_stops: HashMap::new(),
@@ -1108,6 +1247,7 @@ impl ChatDecode {
             tailed: HashSet::new(),
             engine_outlived: false,
             tail_tokens: 0,
+            client_left: false,
             encoder: SseEncoder::new(),
         }
     }
@@ -1163,6 +1303,17 @@ impl ChatDecode {
         drop(decode_stream);
     }
 
+    /// The stream's first engine output, for the TTFT; in PD mode the PD first-token pair is
+    /// recorded against the dispatch instants.
+    fn note_first_token(&mut self, model: &str) {
+        if self.first_token_time.is_none() {
+            self.first_token_time = Some(Instant::now());
+            if let Some(timing) = &self.pd_timing {
+                timing.record_first_decode_token(metrics_labels::BACKEND_HARMONY, model);
+            }
+        }
+    }
+
     /// One chunk of one choice: its parser made on the first, its tokens counted and parsed,
     /// the router's stop strings scanned, and the delta emitted (the choice's role chunk first);
     /// a router-side stop emits the choice's final chunk, closes the choice with the chunk's
@@ -1181,10 +1332,7 @@ impl ChatDecode {
     ) -> Result<(), utils::StreamFailure> {
         let index = chunk.index();
 
-        // Track first token time for TTFT metric
-        if self.first_token_time.is_none() {
-            self.first_token_time = Some(Instant::now());
-        }
+        self.note_first_token(&original_request.model);
 
         // A choice's engine chunk after its router-side stop is the tail the engine generated
         // for nobody (an engine that ends the choice on that step sends its Complete instead):
@@ -1226,9 +1374,18 @@ impl ChatDecode {
             .parse_chunk(chunk.token_ids())
             .map_err(|e| format!("Parse error: {e}"))?;
 
-        // Emit SSE event if there's a delta
-        let Some(mut delta) = delta_result else {
-            return Ok(());
+        // Emit SSE event if there's a delta; a step whose tokens made none (a
+        // channel header the parser consumed) still carries its logprobs, on
+        // a chunk with an empty delta, as the engine's own server sends it.
+        let bare_logprobs = utils::has_entries(chunk_logprobs.as_ref());
+        let mut delta = match delta_result {
+            Some(delta) => delta,
+            None if bare_logprobs => HarmonyChannelDelta {
+                analysis_delta: None,
+                commentary_delta: None,
+                final_delta: None,
+            },
+            None => return Ok(()),
         };
         let mut stop_matched: Option<String> = None;
         if !router_stop_strings.is_empty() {
@@ -1265,7 +1422,7 @@ impl ChatDecode {
             || delta.final_delta.is_some()
             || delta.commentary_delta.is_some();
         let is_first = self.is_firsts.get(&index).copied().unwrap_or(false);
-        if has_payload || is_first {
+        if has_payload || is_first || bare_logprobs {
             HarmonyStreamingProcessor::emit_chunk_delta(
                 &delta,
                 index,
@@ -1371,9 +1528,7 @@ impl ChatDecode {
         // chunk, as a choice with content opened on its first delta, and is the stream's first
         // output when nothing preceded it.
         if self.is_firsts.get(&index).copied().unwrap_or(true) {
-            if self.first_token_time.is_none() {
-                self.first_token_time = Some(Instant::now());
-            }
+            self.note_first_token(&original_request.model);
             HarmonyStreamingProcessor::emit_role_chunk(
                 index,
                 dispatch,
@@ -1487,6 +1642,14 @@ impl ChatDecode {
             }
         }
 
+        // The read ended with the client's leaving, not with the engine's end:
+        // no usage chunk on the sender it closed, and no terminal router metric
+        // for it, as the HTTP router has none for a disconnect (neither a
+        // completed request nor a failure).
+        if self.client_left {
+            return Ok(());
+        }
+
         // Emit final usage if requested
         if let Some(true) = original_request
             .stream_options
@@ -1504,16 +1667,23 @@ impl ChatDecode {
             .await?;
         }
 
-        // Record streaming metrics
+        // In PD mode this task only starts once the decode stream exists -- for sequential PD
+        // that is after prefill completes, with the first decode chunk already buffered -- so
+        // `start_time` would report a near-zero TTFT. Anchor at the prefill dispatch instant
+        // instead, as the chat stream does; generation duration must share the base or TPOT
+        // underflows.
+        let stream_base = self
+            .pd_timing
+            .as_ref()
+            .map(|timing| timing.prefill_start)
+            .unwrap_or(self.start_time);
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: metrics_labels::BACKEND_HARMONY,
             model_id: &original_request.model,
             endpoint: metrics_labels::ENDPOINT_CHAT,
-            ttft: self
-                .first_token_time
-                .map(|t| t.duration_since(self.start_time)),
-            generation_duration: self.start_time.elapsed(),
+            ttft: self.first_token_time.map(|t| t.duration_since(stream_base)),
+            generation_duration: stream_base.elapsed(),
             input_tokens: Some(counts.prompt as u64),
             cached_tokens: Some(u64::from(counts.cached)),
             output_tokens: counts.completion as u64,
@@ -1530,7 +1700,11 @@ impl Default for HarmonyStreamingProcessor {
 }
 
 #[cfg(test)]
+mod client_leave_tests;
+#[cfg(test)]
 mod local_stop_tests;
+#[cfg(test)]
+mod logprobs_tests;
 #[cfg(test)]
 mod lone_complete_tests;
 #[cfg(test)]

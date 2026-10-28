@@ -200,7 +200,9 @@ mod tests {
         values: Option<Vec<f32>>,
     ) -> EngineCoreOutputs {
         let pooling_output = values.map(|values| {
-            PoolingOutput::new(WireTensor::from_f32(vec![values.len()], values).unwrap())
+            Box::new(PoolingOutput::new(
+                WireTensor::from_f32(vec![values.len()], values).unwrap(),
+            ))
         });
         EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
             outputs: vec![EngineCoreOutput {

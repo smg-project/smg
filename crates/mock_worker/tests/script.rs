@@ -32,6 +32,7 @@ use tokio::net::TcpListener;
 use ts::generate_response::Response as GenResp;
 
 mod common;
+use common::generate;
 
 const MODEL: &str = "script-test";
 
@@ -98,20 +99,6 @@ fn grpc_request(id: &str, input_ids: &[u32], stream: bool, logprobs: bool) -> ts
         return_logprob: logprobs,
         ..Default::default()
     }
-}
-
-/// Send `req` and read every frame of the response.
-async fn generate(
-    client: &TokenSpeedSchedulerClient,
-    req: ts::GenerateRequest,
-) -> Vec<ts::GenerateResponse> {
-    let mut stream = client.generate(req).await.expect("generate");
-    let mut frames = Vec::new();
-    while let Some(frame) = stream.next().await {
-        frames.push(frame.expect("a response frame"));
-    }
-    stream.mark_completed();
-    frames
 }
 
 fn chunk(

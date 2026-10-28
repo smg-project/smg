@@ -778,7 +778,7 @@ impl Assembler {
         self.written += 1;
         out.push(Event::ToolCallArguments {
             index: self.index,
-            json: fragment,
+            json: fragment.into(),
             source: Text::uncounted(std::mem::take(&mut self.carried)),
         });
     }
@@ -839,7 +839,7 @@ impl Assembler {
     fn end_call<'d>(&mut self, source: Text<'d>, out: &mut Events<'d>) {
         out.push(Event::ToolCallArguments {
             index: self.index,
-            json: if self.written == 0 { "{}" } else { "}" }.to_string(),
+            json: if self.written == 0 { "{}" } else { "}" }.into(),
             source,
         });
         out.push(Event::ToolCallEnd {
@@ -868,13 +868,7 @@ impl Assembler {
     }
 
     fn drop_carried(&mut self, out: &mut Events) {
-        if self.carried.is_empty() {
-            return;
-        }
-        out.push(Event::Dropped {
-            text: Text::uncounted(std::mem::take(&mut self.carried)),
-            why: DropReason::Wrapper,
-        });
+        crate::event::drop_carried(std::mem::take(&mut self.carried), out);
     }
 
     /// The content held under the bare list, given back.
@@ -1008,11 +1002,10 @@ impl crate::engine::CallAssembler for Assembler {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::common::{Function, Tool};
     use serde_json::json as value;
 
     use super::*;
-    use crate::testing::bytes;
+    use crate::testing::{bytes, content, tool};
 
     fn ids() -> CallIds {
         CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
@@ -1346,16 +1339,6 @@ mod tests {
         calls
     }
 
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(&*text.text),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// The text of every `Malformed` event, one entry per event, whatever its reason: an event of
     /// no bytes counts here, where the joined text of [`malformed`] does not show it.
     fn words<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
@@ -1395,19 +1378,6 @@ mod tests {
         }
         assembler.finish(&mut out);
         out.drain()
-    }
-
-    fn tool(name: &str, parameters: serde_json::Value) -> Tool {
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: name.to_string(),
-                description: None,
-                parameters,
-                strict: None,
-                extra: Default::default(),
-            },
-        }
     }
 
     fn tools() -> Declared {

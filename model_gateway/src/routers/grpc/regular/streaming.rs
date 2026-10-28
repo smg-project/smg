@@ -236,6 +236,9 @@ impl StreamingProcessor {
 
         // Create SSE channel
         let (tx, rx) = sse_channel();
+        // Read for this client: the moment the response body is dropped, the
+        // request is aborted on the engine (see `ProtoStream::until_client_gone`).
+        let execution_result = execution_result.until_client_gone(&tx, &dispatch.request_id);
 
         // Spawn background task based on execution mode
         match execution_result {
@@ -404,17 +407,33 @@ impl StreamingProcessor {
             pd_timing,
         );
         stream.read_engine(&mut grpc_stream).await?;
+        // The stream's verdict, before the engine side is released.
+        let client_left = grpc_stream.client_left();
         stream.release_engine(grpc_stream, metrics_labels::ENDPOINT_CHAT);
-        let usage = stream.usage_snapshot();
-        stream.flush_parsers(usage.as_ref()).await?;
-        let final_usage = stream.final_usage();
-        stream
-            .send_finish_chunks(final_usage.as_ref(), usage.as_ref())
-            .await?;
-        stream.send_usage_chunk(final_usage).await?;
+        // Nothing reaches a client that left, so its read ends with `Ok`
+        // here; a sender closed between the read and the sends fails them.
+        // Either way the reservation is settled with the stream's actual
+        // usage first, and a failed terminal send records no completion
+        // metric (the caller records the failure).
+        let terminal = if client_left {
+            Ok(())
+        } else {
+            async {
+                let usage = stream.usage_snapshot();
+                stream.flush_parsers(usage.as_ref()).await?;
+                let final_usage = stream.final_usage();
+                stream
+                    .send_finish_chunks(final_usage.as_ref(), usage.as_ref())
+                    .await?;
+                stream.send_usage_chunk(final_usage).await
+            }
+            .await
+        };
 
-        stream.settle_and_record(reservation).await;
-        Ok(())
+        stream
+            .settle_and_record(reservation, client_left || terminal.is_err())
+            .await;
+        terminal
     }
 
     /// Process prefill/decode streaming chunks (prefill + decode) - PD mode
@@ -457,8 +476,10 @@ impl StreamingProcessor {
             )
             .await;
 
-        // Mark prefill stream as completed AFTER decode completes successfully
-        // This ensures that if client disconnects during decode, BOTH streams send abort
+        // The prefill stream is marked completed after the decode's read ended
+        // well: a decode that failed leaves both streams to abort on drop; a
+        // client that left ends the read with `Ok` too, its decode stream
+        // aborting the request on drop, the prefill's own request complete.
         if result.is_ok() {
             prefill_stream.mark_completed();
         }
@@ -488,6 +509,9 @@ impl StreamingProcessor {
         let guards = body_guards(load_guards, reservation.as_ref());
         // Create SSE channel
         let (tx, rx) = sse_channel();
+        // Read for this client: the moment the response body is dropped, the
+        // request is aborted on the engine (see `ProtoStream::until_client_gone`).
+        let execution_result = execution_result.until_client_gone(&tx, &dispatch.request_id);
 
         // Build context once, clone for spawned task
         let ctx = GenerateStreamContext {
@@ -724,6 +748,12 @@ impl StreamingProcessor {
                 handle.close_reserved_only().await;
             }
         }
+        // The read ended with the client's leaving, not with the engine's end:
+        // no terminal router metric for it, as the HTTP router has none for a
+        // disconnect (neither a completed request nor a failure).
+        if stream.client_left() {
+            return Ok(());
+        }
         Self::record_generate_metrics(start_time, first_token_time, total_completion, None, &ctx);
 
         Ok(())
@@ -783,8 +813,10 @@ impl StreamingProcessor {
         )
         .await;
 
-        // Mark prefill stream as completed AFTER decode completes successfully
-        // This ensures that if client disconnects during decode, BOTH streams send abort
+        // The prefill stream is marked completed after the decode's read ended
+        // well: a decode that failed leaves both streams to abort on drop; a
+        // client that left ends the read with `Ok` too, its decode stream
+        // aborting the request on drop, the prefill's own request complete.
         if result.is_ok() {
             prefill_stream.mark_completed();
         }
@@ -979,6 +1011,12 @@ impl StreamingProcessor {
             } else {
                 handle.close_reserved_only().await;
             }
+        }
+        // The read ended with the client's leaving, not with the engine's end:
+        // no terminal router metric for it, as the HTTP router has none for a
+        // disconnect (neither a completed request nor a failure).
+        if stream.client_left() {
+            return Ok(());
         }
         Self::record_generate_metrics(
             start_time,
@@ -1323,7 +1361,9 @@ impl StreamingProcessor {
     }
 
     /// Write the chunks Symphony's events make for the choice at `index`: the
-    /// delta each event has, the chunk's logprobs on its first text delta. The
+    /// delta each event has, the chunk's logprobs on its first delta (or on an
+    /// empty delta after them, when the events made none: a thought's opener
+    /// alone, a call's end), as the engine's own server sends them. The
     /// `Finish` event writes nothing here: the finish chunk is the loop's, with
     /// the matched stop. The opening chunk carried the role, so the deltas do
     /// not repeat it, as the older path's do not (and are built without it, one
@@ -1349,9 +1389,14 @@ impl StreamingProcessor {
             if choice.finish_reason.is_some() {
                 continue;
             }
-            if choice.delta.content.is_some() || choice.delta.reasoning_content.is_some() {
-                choice.logprobs = logprobs.take();
-            }
+            choice.logprobs = logprobs.take();
+            Self::push_chunk(tx, buffer, frame, &choice, usage, emit_usage_null)
+                .await
+                .map_err(|()| "Failed to send chunk".to_string())?;
+        }
+        if utils::has_entries(logprobs.as_ref()) {
+            let mut choice = assistant_choice(index, None, None, None);
+            choice.logprobs = logprobs;
             Self::push_chunk(tx, buffer, frame, &choice, usage, emit_usage_null)
                 .await
                 .map_err(|()| "Failed to send chunk".to_string())?;
@@ -1428,14 +1473,18 @@ impl StreamingProcessor {
     /// then the engine's `finish`; the events go through the machine ([`Self::send_symphony_blocks`],
     /// `thinking_text` as there) and the reasoning tokens they cost are added to `thinking_tokens`,
     /// under `who` for the telemetry of the output's end. The stream's `delta` and `spare` buffer
-    /// are read as a step's are, so events that wait in the buffer (the prompt's, when the
-    /// message ends before any chunk) go out in their order.
+    /// are read as a step's are, so events that wait in `spare` (the prompt's, when the message
+    /// ends before any chunk) go out in their order; the machine writes into `blocks` as a step's does.
     #[expect(clippy::too_many_arguments)]
     async fn end_symphony_message(
         tx: &SseSender,
         buffer: &mut Vec<u8>,
         (reader, machine): (&mut Reader, &mut adapt::messages::Stream),
-        (delta, spare): (&mut Delta, &mut Events<'static>),
+        (delta, spare, blocks): (
+            &mut Delta,
+            &mut Events<'static>,
+            &mut Vec<MessageStreamEvent>,
+        ),
         flushed: Option<String>,
         finish: EngineFinish,
         who: Who<'_>,
@@ -1448,8 +1497,14 @@ impl StreamingProcessor {
         }
         reader.end(finish, who, &mut events)?;
         *thinking_tokens += reasoning_text_tokens(events.as_slice());
-        let stop =
-            Self::send_symphony_blocks(tx, buffer, machine, events.as_slice(), thinking_text).await;
+        let stop = Self::send_symphony_blocks(
+            tx,
+            buffer,
+            (machine, blocks),
+            events.as_slice(),
+            thinking_text,
+        )
+        .await;
         *spare = events.recycle();
         stop
     }
@@ -1457,20 +1512,21 @@ impl StreamingProcessor {
     /// Feeds Symphony's `events` to the content-block `machine` and sends the stream events it
     /// gives, in order, the `thinking_delta`s only when `thinking_text` (a `thinking.display` of
     /// `omitted` keeps the thinking block, its start and its stop, and no text); the stop reason
-    /// when a `Finish` was among the events.
+    /// when a `Finish` was among the events. The machine writes into the stream's `blocks`
+    /// buffer, emptied here before the step: one buffer serves every step, as `buffer` does.
     async fn send_symphony_blocks(
         tx: &SseSender,
         buffer: &mut Vec<u8>,
-        machine: &mut adapt::messages::Stream,
+        (machine, blocks): (&mut adapt::messages::Stream, &mut Vec<MessageStreamEvent>),
         events: &[Event<'_>],
         thinking_text: bool,
     ) -> Result<Option<messages::StopReason>, utils::StreamFailure> {
         let mut stop = None;
-        let mut blocks = Vec::new();
+        blocks.clear();
         for event in events {
-            stop = machine.feed(event, &mut blocks).or(stop);
+            stop = machine.feed(event, blocks).or(stop);
         }
-        for block in &blocks {
+        for block in blocks.iter() {
             let thinking_delta = matches!(
                 block,
                 MessageStreamEvent::ContentBlockDelta {
@@ -1629,6 +1685,9 @@ impl StreamingProcessor {
         );
 
         let (tx, rx) = sse_channel();
+        // Read for this client: the moment the response body is dropped, the
+        // request is aborted on the engine (see `ProtoStream::until_client_gone`).
+        let execution_result = execution_result.until_client_gone(&tx, &dispatch.request_id);
 
         match execution_result {
             context::ExecutionResult::Single { stream } => {
@@ -1674,10 +1733,10 @@ impl StreamingProcessor {
                 });
             }
             context::ExecutionResult::PrefillDecode {
-                // TODO(#1781 follow-up): thread pd_timing for honest PD TTFT
                 prefill,
                 decode,
                 prefill_guards,
+                pd_timing,
                 ..
             } => {
                 let processor = self.clone();
@@ -1698,6 +1757,7 @@ impl StreamingProcessor {
                             stop_params,
                             messages_request,
                             &tx,
+                            pd_timing,
                             prefill_guards,
                             reservation,
                         ))
@@ -1756,12 +1816,40 @@ impl StreamingProcessor {
     #[expect(clippy::too_many_arguments)]
     pub async fn process_messages_streaming_chunks(
         &self,
+        grpc_stream: ProtoStream,
+        dispatch: context::DispatchMetadata,
+        tokenizer: Arc<dyn Tokenizer>,
+        stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
+        original_request: MessagesResponseSpec,
+        tx: &SseSender,
+        reservation: Option<Arc<SharedReservationHandle>>,
+    ) -> Result<(), utils::StreamFailure> {
+        self.process_messages_streaming_chunks_inner(
+            grpc_stream,
+            dispatch,
+            tokenizer,
+            stop_params,
+            original_request,
+            tx,
+            None,
+            reservation,
+        )
+        .await
+    }
+
+    /// Inner implementation shared by single-mode and PD prefill/decode
+    /// Messages streaming. `pd_timing` is `Some` only in PD mode and yields
+    /// honest PD TTFT (prefill start to first decode token).
+    #[expect(clippy::too_many_arguments)]
+    async fn process_messages_streaming_chunks_inner(
+        &self,
         mut grpc_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: MessagesResponseSpec,
         tx: &SseSender,
+        pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
         let mut stream = MessagesStream::open(
@@ -1771,23 +1859,39 @@ impl StreamingProcessor {
             stop_params,
             &original_request,
             tx,
+            pd_timing,
         )?;
         stream.send_message_start().await?;
         stream.read_engine(&mut grpc_stream).await?;
+        // The stream's verdict, before the engine side is released.
+        let client_left = grpc_stream.client_left();
         stream.release_engine(grpc_stream);
-        stream.flush_parsers().await?;
-        stream.close_open_blocks().await?;
-        stream.send_message_delta().await?;
-        stream.send_message_stop().await?;
+        // As for chat: nothing for a client that left, the settlement with
+        // the actual usage before a failed send is returned.
+        let terminal = if client_left {
+            Ok(())
+        } else {
+            async {
+                stream.flush_parsers().await?;
+                stream.close_open_blocks().await?;
+                stream.send_message_delta().await?;
+                stream.send_message_stop().await
+            }
+            .await
+        };
 
-        stream.settle_and_record(reservation).await;
-        Ok(())
+        stream
+            .settle_and_record(reservation, client_left || terminal.is_err())
+            .await;
+        terminal
     }
 
     /// Process prefill/decode streaming chunks for Messages API (PD mode).
     ///
     /// Consumes prefill stream then delegates to
-    /// [`Self::process_messages_streaming_chunks`] with the decode stream.
+    /// [`Self::process_messages_streaming_chunks_inner`] with the decode
+    /// stream and `pd_timing`, so the first decode token yields honest PD
+    /// TTFT.
     #[expect(clippy::too_many_arguments)]
     pub async fn process_prefill_decode_messages_streaming_chunks(
         &self,
@@ -1798,6 +1902,7 @@ impl StreamingProcessor {
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: MessagesResponseSpec,
         tx: &SseSender,
+        pd_timing: context::PdTiming,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
@@ -1810,13 +1915,14 @@ impl StreamingProcessor {
         let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
         let result = self
-            .process_messages_streaming_chunks(
+            .process_messages_streaming_chunks_inner(
                 decode_stream,
                 dispatch,
                 tokenizer,
                 stop_params,
                 original_request,
                 tx,
+                Some(pd_timing),
                 reservation,
             )
             .await;
@@ -1853,6 +1959,9 @@ impl StreamingProcessor {
         let source = source.with_backend(self.backend_type);
         let guards = body_guards(load_guards, reservation.as_ref());
         let (tx, rx) = sse_channel();
+        // Read for this client: the moment the response body is dropped, the
+        // request is aborted on the engine (see `ProtoStream::until_client_gone`).
+        let execution_result = execution_result.until_client_gone(&tx, &dispatch.request_id);
 
         let units = match Self::completion_stream_units(execution_result) {
             Ok(units) => units,
@@ -1870,6 +1979,17 @@ impl StreamingProcessor {
         )]
         tokio::spawn(async move {
             let start_time = Instant::now();
+            // In PD mode this task only starts once the decode streams exist --
+            // for sequential PD that is after prefill completes, with the first
+            // decode chunk already buffered -- so `start_time` would report a
+            // near-zero TTFT. Anchor at the earliest prefill dispatch instead,
+            // as the chat stream does; generation duration must share the base
+            // or TPOT underflows.
+            let stream_base = units
+                .iter()
+                .filter_map(CompletionStreamUnit::prefill_start)
+                .min()
+                .unwrap_or(start_time);
             let choices_per_prompt = completion_request.choices_per_prompt;
             let echo = completion_request.echo;
             let include_usage = completion_request.include_usage;
@@ -1926,6 +2046,7 @@ impl StreamingProcessor {
                                 prefill,
                                 decode,
                                 prefill_guards,
+                                pd_timing,
                             } => {
                                 processor
                                     .process_prefill_decode_completion_streaming_chunks(
@@ -1938,6 +2059,7 @@ impl StreamingProcessor {
                                         prompt_text,
                                         index_offset,
                                         tx,
+                                        pd_timing,
                                         prefill_guards,
                                     )
                                     .await
@@ -2020,13 +2142,20 @@ impl StreamingProcessor {
                         Self::format_completion_sse_into(&mut sse_buffer, &usage_chunk);
                         let _ = tx.send(Ok(Bytes::from(sse_buffer))).await;
                     }
+                    // The units' streams are read for this client (the sender
+                    // the watch reads): a sender closed by now says the client
+                    // left and ended the read, which is no completed
+                    // generation and gets no terminal router metric.
+                    if tx.is_closed() {
+                        return;
+                    }
                     Metrics::record_streaming_metrics(StreamingMetricsParams {
                         router_type: metrics_labels::ROUTER_GRPC,
                         backend_type: processor.backend_type,
                         model_id: &dispatch.model,
                         endpoint: metrics_labels::ENDPOINT_COMPLETIONS,
-                        ttft: first_token_time.map(|t| t.duration_since(start_time)),
-                        generation_duration: start_time.elapsed(),
+                        ttft: first_token_time.map(|t| t.duration_since(stream_base)),
+                        generation_duration: stream_base.elapsed(),
                         input_tokens: Some(total_prompt as u64),
                         cached_tokens: Some(u64::from(total_cached)),
                         output_tokens: total_completion as u64,
@@ -2049,15 +2178,16 @@ impl StreamingProcessor {
                 Ok(vec![CompletionStreamUnit::Single(stream)])
             }
             context::ExecutionResult::PrefillDecode {
-                // TODO(#1781 follow-up): thread pd_timing for honest PD TTFT
                 prefill,
                 decode,
                 prefill_guards,
+                pd_timing,
                 ..
             } => Ok(vec![CompletionStreamUnit::PrefillDecode {
                 prefill,
                 decode,
                 prefill_guards,
+                pd_timing,
             }]),
             context::ExecutionResult::Batch { results } => results
                 .into_iter()
@@ -2069,11 +2199,13 @@ impl StreamingProcessor {
                         prefill,
                         decode,
                         prefill_guards,
+                        pd_timing,
                         ..
                     } => Ok(CompletionStreamUnit::PrefillDecode {
                         prefill,
                         decode,
                         prefill_guards,
+                        pd_timing,
                     }),
                     _ => Err("Nested batch or embedding result in completion streaming"),
                 })
@@ -2095,6 +2227,35 @@ impl StreamingProcessor {
     #[expect(clippy::too_many_arguments)]
     async fn process_completion_streaming_chunks(
         &self,
+        grpc_stream: ProtoStream,
+        dispatch: context::DispatchMetadata,
+        tokenizer: Arc<dyn Tokenizer>,
+        stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
+        completion_request: &CompletionResponseSpec,
+        prompt_text: &str,
+        index_offset: u32,
+        tx: &SseSender,
+    ) -> Result<CompletionStreamOutcome, utils::StreamFailure> {
+        self.process_completion_streaming_chunks_inner(
+            grpc_stream,
+            dispatch,
+            tokenizer,
+            stop_params,
+            completion_request,
+            prompt_text,
+            index_offset,
+            tx,
+            None,
+        )
+        .await
+    }
+
+    /// Inner implementation shared by single-mode and PD prefill/decode
+    /// completion units. `pd_timing` is `Some` only in PD mode and yields
+    /// honest PD TTFT (prefill start to first decode token).
+    #[expect(clippy::too_many_arguments)]
+    async fn process_completion_streaming_chunks_inner(
+        &self,
         mut grpc_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
@@ -2103,6 +2264,7 @@ impl StreamingProcessor {
         prompt_text: &str,
         index_offset: u32,
         tx: &SseSender,
+        pd_timing: Option<context::PdTiming>,
     ) -> Result<CompletionStreamOutcome, utils::StreamFailure> {
         let mut stream = CompletionStream::open(
             &dispatch,
@@ -2112,16 +2274,25 @@ impl StreamingProcessor {
             prompt_text,
             index_offset,
             tx,
+            pd_timing,
+            self.backend_type,
         );
         stream.read_engine(&mut grpc_stream).await?;
-        stream.release_engine(grpc_stream, self.backend_type);
-        stream.finish_open_choices().await?;
+        // The stream's verdict, before the engine side is released: a client
+        // that left gets no finish of its open choices (the held tail would go
+        // to a closed sender), as on the chat and Messages paths.
+        let client_left = grpc_stream.client_left();
+        stream.release_engine(grpc_stream);
+        if !client_left {
+            stream.finish_open_choices().await?;
+        }
 
         Ok(stream.outcome())
     }
 
     /// PD prefill/decode variant: consume prefill stream, then delegate decode
-    /// stream to [`Self::process_completion_streaming_chunks`].
+    /// stream to [`Self::process_completion_streaming_chunks_inner`] with
+    /// `pd_timing`, so the first decode token yields honest PD TTFT.
     #[expect(clippy::too_many_arguments)]
     async fn process_prefill_decode_completion_streaming_chunks(
         &self,
@@ -2134,6 +2305,7 @@ impl StreamingProcessor {
         prompt_text: &str,
         index_offset: u32,
         tx: &SseSender,
+        pd_timing: context::PdTiming,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
     ) -> Result<CompletionStreamOutcome, utils::StreamFailure> {
         // The client's prompt-side usage is the prefill side's.
@@ -2144,7 +2316,7 @@ impl StreamingProcessor {
         let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
         let result = self
-            .process_completion_streaming_chunks(
+            .process_completion_streaming_chunks_inner(
                 decode_stream,
                 dispatch,
                 tokenizer,
@@ -2153,11 +2325,14 @@ impl StreamingProcessor {
                 prompt_text,
                 index_offset,
                 tx,
+                Some(pd_timing),
             )
             .await;
 
-        // Mark prefill stream as completed AFTER decode completes successfully
-        // This ensures that if client disconnects during decode, BOTH streams send abort
+        // The prefill stream is marked completed after the decode's read ended
+        // well: a decode that failed leaves both streams to abort on drop; a
+        // client that left ends the read with `Ok` too, its decode stream
+        // aborting the request on drop, the prefill's own request complete.
         if result.is_ok() {
             prefill_stream.mark_completed();
         }
@@ -2582,6 +2757,34 @@ impl<'a> ChatStream<'a> {
         Ok(())
     }
 
+    /// The logprobs of an engine chunk whose text made no delta (a marker a
+    /// parser consumed, text a tool parser holds, tokens that decoded to
+    /// nothing) go out on a chunk with an empty delta, as the engine's own
+    /// server sends a step whose text made none: every generated token's
+    /// entry reaches the client once, in order. Nothing without entries.
+    async fn push_bare_logprobs(
+        &mut self,
+        index: u32,
+        logprobs: Option<ChatLogProbs>,
+        usage: Option<&Usage>,
+    ) -> Result<(), String> {
+        if !utils::has_entries(logprobs.as_ref()) {
+            return Ok(());
+        }
+        let mut choice = assistant_choice(index, None, None, None);
+        choice.logprobs = logprobs;
+        StreamingProcessor::push_chunk(
+            self.tx,
+            &mut self.sse_buffer,
+            &self.chunk_frame,
+            &choice,
+            usage,
+            self.emit_usage_null,
+        )
+        .await
+        .map_err(|()| "Failed to send logprobs chunk".to_string())
+    }
+
     /// The logprobs of an engine chunk, in the public API's shape.
     fn logprobs_of(&self, chunk: &ProtoGenerateStreamChunk) -> Option<ChatLogProbs> {
         chunk.output_logprobs().map(|ref proto_logprobs| {
@@ -2618,6 +2821,13 @@ impl<'a> ChatStream<'a> {
                 // engine stream is polled once per message.
                 StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
                 let item = grpc_stream.next().await;
+                if item.is_none() && grpc_stream.client_left() {
+                    // The client's departure ends the read here: text the
+                    // decoder or a parser still holds can reach nobody, and
+                    // the EOF flush would fail on the closed sender before
+                    // the caller settles what was read.
+                    return Ok(());
+                }
                 match item.transpose() {
                     Ok(response) => response,
                     Err(e) => {
@@ -2802,6 +3012,15 @@ impl<'a> ChatStream<'a> {
 
         if chunk_text.is_empty() {
             *self.held_tokens.entry(index).or_default() += chunk.token_ids().len() as u32;
+            // The chunk's logprobs still reach the client, on a chunk with
+            // an empty delta, as the engine's own server sends a step whose
+            // text made no delta: every generated token's entry goes out once.
+            let logprobs = self.logprobs_of(&chunk);
+            if utils::has_entries(logprobs.as_ref()) {
+                let usage = self.usage_snapshot();
+                self.push_bare_logprobs(index, logprobs, usage.as_ref())
+                    .await?;
+            }
             return Ok(None);
         }
 
@@ -3252,7 +3471,7 @@ impl<'a> ChatStream<'a> {
                 && tool_choice_enabled
                 && (self.tool_parser_available || self.used_json_schema)
             {
-                let tool_choices = if self.is_specific_function {
+                let mut tool_choices = if self.is_specific_function {
                     // Handle specific function case - emit tool call deltas with arguments
                     StreamingProcessor::process_specific_function_stream(
                         &delta,
@@ -3280,6 +3499,12 @@ impl<'a> ChatStream<'a> {
                         .await
                 };
 
+                // The chunk's logprobs ride on the first of its tool-call
+                // deltas, as on a content delta; a chunk the parser holds
+                // whole goes out as an empty delta with them.
+                if let Some(first) = tool_choices.first_mut() {
+                    first.logprobs = choice_logprobs.take();
+                }
                 for choice in &tool_choices {
                     StreamingProcessor::push_chunk(
                         self.tx,
@@ -3292,6 +3517,8 @@ impl<'a> ChatStream<'a> {
                     .await
                     .map_err(|()| "Failed to send tool call chunk".to_string())?;
                 }
+                self.push_bare_logprobs(index, choice_logprobs, usage.as_ref())
+                    .await?;
 
                 // Always skip regular content when tool parsing is active
                 // Parser either emitted chunks or buffered content
@@ -3302,7 +3529,7 @@ impl<'a> ChatStream<'a> {
         // Regular content emission
         if !delta.is_empty() {
             let mut choice = assistant_choice(index, Some(delta), None, None);
-            choice.logprobs = choice_logprobs;
+            choice.logprobs = choice_logprobs.take();
             StreamingProcessor::push_chunk(
                 self.tx,
                 &mut self.sse_buffer,
@@ -3314,6 +3541,10 @@ impl<'a> ChatStream<'a> {
             .await
             .map_err(|()| "Failed to send content chunk".to_string())?;
         }
+        // A chunk whose text made no delta (a marker the reasoning parser
+        // consumed) still carries its logprobs, on a chunk with an empty delta.
+        self.push_bare_logprobs(index, choice_logprobs, usage.as_ref())
+            .await?;
         Ok(())
     }
 
@@ -3503,7 +3734,14 @@ impl<'a> ChatStream<'a> {
     /// The end: the reservation settled with what the stream used
     /// ([`Self::counts`], the engine's counts as they are), and the
     /// streaming metrics recorded.
-    async fn settle_and_record(self, reservation: Option<Arc<SharedReservationHandle>>) {
+    /// `client_left` says the read ended with the client's leaving, not with the engine's end:
+    /// the reservation is still settled, but no terminal router metric is recorded for it, as
+    /// the HTTP router has none for a disconnect (neither a completed request nor a failure).
+    async fn settle_and_record(
+        self,
+        reservation: Option<Arc<SharedReservationHandle>>,
+        client_left: bool,
+    ) {
         let model = &self.dispatch.model;
         let counts = self.counts();
         let (total_prompt, total_completion) = (counts.prompt, counts.completion);
@@ -3519,6 +3757,9 @@ impl<'a> ChatStream<'a> {
             } else {
                 handle.settle_success(counts.settlement()).await;
             }
+        }
+        if client_left {
+            return;
         }
         // In PD mode this task only starts once the decode stream exists --
         // for sequential PD that is after prefill completes, with the first
@@ -3699,6 +3940,7 @@ struct MessagesStream<'a> {
     /// Dispatch metadata, for consistent response fields.
     dispatch: &'a context::DispatchMetadata,
     tx: &'a SseSender,
+    pd_timing: Option<context::PdTiming>,
 
     // Metrics timing
     start_time: Instant,
@@ -3726,6 +3968,9 @@ struct MessagesStream<'a> {
     /// keeps them; the prompt's events wait in the buffer for the first step's.
     delta: Delta,
     spare: Events<'static>,
+    /// The machine's step buffer: the stream events a step's Symphony events
+    /// become, kept across steps like `sse_buffer` and `spare`.
+    machine_blocks: Vec<MessageStreamEvent>,
 
     // Token tracking
     completion_tokens: CompletionTokenTracker,
@@ -3796,6 +4041,7 @@ impl<'a> MessagesStream<'a> {
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         spec: &'a MessagesResponseSpec,
         tx: &'a SseSender,
+        pd_timing: Option<context::PdTiming>,
     ) -> Result<Self, utils::StreamFailure> {
         let start_time = Instant::now();
         let model = &dispatch.model;
@@ -3898,6 +4144,7 @@ impl<'a> MessagesStream<'a> {
             spec,
             dispatch,
             tx,
+            pd_timing,
             start_time,
             first_token_time: None,
             sse_buffer: Vec::with_capacity(512),
@@ -3908,6 +4155,7 @@ impl<'a> MessagesStream<'a> {
             stop_decoder,
             symphony,
             symphony_stop: None,
+            machine_blocks: Vec::new(),
             delta: Delta::default(),
             spare,
             completion_tokens: CompletionTokenTracker::new(),
@@ -4027,7 +4275,13 @@ impl<'a> MessagesStream<'a> {
             let response = if self.decoder_finished_at_eof || self.engine_outlived {
                 None
             } else {
-                grpc_stream.next().await.transpose().map_err(|e| {
+                let next = grpc_stream.next().await;
+                if next.is_none() && grpc_stream.client_left() {
+                    // As on the chat path: the departure ends the read before
+                    // held-back text is flushed to the closed sender.
+                    return Ok(());
+                }
+                next.transpose().map_err(|e| {
                     utils::StreamFailure::upstream(e, self.completion_tokens.delivered())
                 })?
             };
@@ -4062,6 +4316,9 @@ impl<'a> MessagesStream<'a> {
     ) -> Result<Option<MessagesPendingText>, utils::StreamFailure> {
         if self.first_token_time.is_none() {
             self.first_token_time = Some(Instant::now());
+            if let Some(timing) = &self.pd_timing {
+                timing.record_first_decode_token(self.processor.backend_type, &self.dispatch.model);
+            }
         }
 
         // Once the local stop decoder has fired, a further engine chunk is
@@ -4090,7 +4347,7 @@ impl<'a> MessagesStream<'a> {
             self.symphony_stop = StreamingProcessor::send_symphony_blocks(
                 self.tx,
                 &mut self.sse_buffer,
-                machine,
+                (machine, &mut self.machine_blocks),
                 events.as_slice(),
                 self.spec.thinking_text_returned,
             )
@@ -4170,7 +4427,7 @@ impl<'a> MessagesStream<'a> {
                 self.tx,
                 &mut self.sse_buffer,
                 (reader, machine),
-                (&mut self.delta, &mut self.spare),
+                (&mut self.delta, &mut self.spare, &mut self.machine_blocks),
                 flushed,
                 engine_finish(&self.finish_reason_str),
                 Who {
@@ -4226,7 +4483,7 @@ impl<'a> MessagesStream<'a> {
                 self.tx,
                 &mut self.sse_buffer,
                 (reader, machine),
-                (&mut self.delta, &mut self.spare),
+                (&mut self.delta, &mut self.spare, &mut self.machine_blocks),
                 flushed,
                 finish,
                 Who {
@@ -4598,7 +4855,14 @@ impl<'a> MessagesStream<'a> {
 
     /// The reservation settled with the usage the engine reported (or
     /// closed without one), and the stream's metrics recorded.
-    async fn settle_and_record(self, reservation: Option<Arc<SharedReservationHandle>>) {
+    /// `client_left` says the read ended with the client's leaving, not with the engine's end:
+    /// the reservation is still settled, but no terminal router metric is recorded for it, as
+    /// the HTTP router has none for a disconnect (neither a completed request nor a failure).
+    async fn settle_and_record(
+        self,
+        reservation: Option<Arc<SharedReservationHandle>>,
+        client_left: bool,
+    ) {
         if let Some(handle) = reservation {
             // The usage is settled by the engine's Complete, or by the
             // gateway's own stop with the counts of the chunk it matched in.
@@ -4616,16 +4880,27 @@ impl<'a> MessagesStream<'a> {
             }
         }
 
-        // Record metrics
+        if client_left {
+            return;
+        }
+        // In PD mode this task only starts once the decode stream exists --
+        // for sequential PD that is after prefill completes, with the first
+        // decode chunk already buffered -- so `start_time` would report a
+        // near-zero TTFT. Anchor at the prefill dispatch instant instead, as
+        // the chat stream does; generation duration must share the base or
+        // TPOT underflows.
+        let stream_base = self
+            .pd_timing
+            .as_ref()
+            .map(|timing| timing.prefill_start)
+            .unwrap_or(self.start_time);
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.processor.backend_type,
             model_id: &self.dispatch.model,
             endpoint: metrics_labels::ENDPOINT_MESSAGES,
-            ttft: self
-                .first_token_time
-                .map(|t| t.duration_since(self.start_time)),
-            generation_duration: self.start_time.elapsed(),
+            ttft: self.first_token_time.map(|t| t.duration_since(stream_base)),
+            generation_duration: stream_base.elapsed(),
             input_tokens: Some(u64::from(self.prompt_tokens)),
             cached_tokens: Some(u64::from(self.cached_tokens)),
             output_tokens: u64::from(self.completion_tokens.total()),
@@ -4641,6 +4916,8 @@ mod failure_tests;
 mod isolation_tests;
 #[cfg(test)]
 mod local_stop_tests;
+#[cfg(test)]
+mod pd_anchor_tests;
 #[cfg(test)]
 mod pd_usage_tests;
 #[cfg(test)]

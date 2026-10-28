@@ -841,7 +841,7 @@ impl Assembler {
         }
         out.push(Event::ToolCallArguments {
             index: self.index,
-            json,
+            json: json.into(),
             source,
         });
     }
@@ -881,7 +881,12 @@ fn push_bare(json: &mut String, literal: &str, null: &str) {
 }
 
 impl crate::engine::CallAssembler for Assembler {
-    fn feed(&mut self, text: &str, _declared: &crate::Declared, out: &mut Events) -> usize {
+    fn feed<'d>(
+        &mut self,
+        text: &'d str,
+        _declared: &crate::Declared,
+        out: &mut Events<'d>,
+    ) -> usize {
         self.feed(text, out);
         text.len()
     }
@@ -900,7 +905,7 @@ impl crate::engine::CallAssembler for Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::bytes;
+    use crate::testing::{arguments, bytes, malformed};
 
     const CLOSE: &str = "<tool_call|>";
 
@@ -916,26 +921,6 @@ mod tests {
             assembler.close(CLOSE, &mut out);
         }
         out.drain()
-    }
-
-    fn arguments(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn malformed(events: &[Event]) -> Vec<(String, MalformedReason)> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
-                _ => None,
-            })
-            .collect()
     }
 
     const CALL: &str = concat!(
@@ -1198,7 +1183,7 @@ mod tests {
         let fragments: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallArguments { json, .. } if !json.is_empty() => Some(json.as_str()),
+                Event::ToolCallArguments { json, .. } if !json.is_empty() => Some(json.as_ref()),
                 _ => None,
             })
             .collect();

@@ -11,7 +11,11 @@
 //!   dispatch.
 //!
 //! Also owns the backend wire details for EPD encode: item assembly,
-//! transport-specific tensor payloads, and the encode-worker RPC.
+//! transport-specific tensor payloads, and the request to the encode worker
+//! (the encoder RPC of a gRPC worker, the encode frame of a TokenSpeed encode
+//! server on the direct ZMQ lane).
+
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -24,7 +28,7 @@ use smg_grpc_client::{
 use tracing::error;
 use uuid::Uuid;
 
-use super::PipelineStage;
+use super::{helpers::bootstrap_rendezvous, PipelineStage};
 use crate::{
     routers::grpc::{
         backend_client::BackendClient,
@@ -39,8 +43,9 @@ use crate::{
             collect_tokenspeed_multimodal_inputs_shm_handles, stage_tokenspeed_tensor_rdma,
             EncodeItemBootstrapInfo, TokenSpeedMultimodalData, TokenSpeedMultimodalItem,
         },
+        zmq_client::EncodeRendezvous,
     },
-    worker::{RuntimeType, DEFAULT_BOOTSTRAP_PORT},
+    worker::{ConnectionMode, RuntimeType, Worker},
 };
 
 /// No-op unless the request is multimodal and worker selection produced encode
@@ -112,8 +117,22 @@ pub(crate) struct EncodeDispatchPlan {
 
 pub(crate) struct PreparedEncodeJob {
     item: PreparedEncodeItem,
-    endpoint: String,
+    target: EncodeTarget,
     bootstrap_room: i64,
+}
+
+/// The encode worker a job goes to, by the transport that reaches it.
+pub(crate) enum EncodeTarget {
+    /// A gRPC encode worker, by its URL.
+    Grpc(String),
+    /// A TokenSpeed encode server on the direct ZMQ lane: its worker, whose
+    /// connection carries the request, and the rendezvous the request names
+    /// (the server's own bootstrap address, which the prefill side pulls the
+    /// embedding from).
+    Zmq {
+        worker: Arc<dyn Worker>,
+        rendezvous: EncodeRendezvous,
+    },
 }
 
 impl EncodePlan {
@@ -146,7 +165,7 @@ impl EncodeDispatchPlan {
 
 impl PreparedEncodeJob {
     pub(crate) async fn dispatch(self) -> std::result::Result<(), String> {
-        self.item.dispatch(self.endpoint, self.bootstrap_room).await
+        self.item.dispatch(self.target, self.bootstrap_room).await
     }
 }
 
@@ -171,7 +190,7 @@ impl PreparedEncodeItem {
 
     pub(crate) async fn dispatch(
         mut self,
-        endpoint: String,
+        target: EncodeTarget,
         bootstrap_room: i64,
     ) -> std::result::Result<(), String> {
         match &mut self {
@@ -187,7 +206,8 @@ impl PreparedEncodeItem {
                 *cleanup_on_drop = false;
                 // Stage with bootstrap_room as the slot key (load-bearing), so
                 // into_proto(false) below does not re-stage with a random key.
-                if let Some(exporter) = mm_rdma_exporter() {
+                // The ZMQ lane carries the tensor inline, never a remote pull.
+                if let (EncodeTarget::Grpc(_), Some(exporter)) = (&target, mm_rdma_exporter()) {
                     item.encoder_input =
                         stage_tokenspeed_tensor_rdma(exporter, bootstrap_room, item.encoder_input);
                 }
@@ -209,7 +229,14 @@ impl PreparedEncodeItem {
                     .map(collect_tokenspeed_multimodal_inputs_shm_handles)
                     .unwrap_or_default();
                 let _shm_guard = TokenSpeedShmCleanupGuard(shm_handles);
-                send_tokenspeed_encode_rpc(endpoint, request).await
+                match target {
+                    EncodeTarget::Grpc(endpoint) => {
+                        send_tokenspeed_encode_rpc(endpoint, request).await
+                    }
+                    EncodeTarget::Zmq { worker, rendezvous } => {
+                        send_tokenspeed_encode_frame(worker.as_ref(), &rendezvous, request).await
+                    }
+                }
             }
         }
     }
@@ -242,7 +269,14 @@ fn build_plan(
     workers: Option<&WorkerSelection>,
 ) -> Result<EncodePlan> {
     let workers = workers.ok_or_else(|| anyhow!("Worker selection stage not completed"))?;
-    let items = prepare_items(intermediate, clients, Some(workers))?;
+    // The ZMQ lane carries an encode request's tensors inline, so a request
+    // with an encode server on it assembles without /dev/shm.
+    let inline = workers.encode_assignments().is_some_and(|assignments| {
+        assignments
+            .iter()
+            .any(|assignment| *assignment.worker.connection_mode() == ConnectionMode::Zmq)
+    });
+    let items = prepare_items(intermediate, clients, Some(workers), inline)?;
     if items.is_empty() {
         return Ok(EncodePlan {
             bootstrap_info: Vec::new(),
@@ -280,18 +314,36 @@ fn build_plan(
         // under load (silent embedding cross-wire). See the proto field doc.
         let bootstrap_room = rand::rng().random_range(0..i64::MAX);
 
+        let worker = &assignment.worker;
+        let backend = worker.backend_client_if_initialized();
+        let (bootstrap_host, bootstrap_port) = bootstrap_rendezvous(
+            worker.bootstrap_host(),
+            worker.bootstrap_port(),
+            backend
+                .as_deref()
+                .and_then(BackendClient::declared_bootstrap),
+        );
         bootstrap_info.push(EncodeItemBootstrapInfo {
             item_index: global_index as u32,
-            bootstrap_host: assignment.worker.bootstrap_host().to_string(),
-            bootstrap_port: assignment
-                .worker
-                .bootstrap_port()
-                .unwrap_or(DEFAULT_BOOTSTRAP_PORT) as i32,
+            bootstrap_host: bootstrap_host.to_string(),
+            bootstrap_port: i32::from(bootstrap_port),
             bootstrap_room,
         });
+        let target = match worker.connection_mode() {
+            ConnectionMode::Zmq => EncodeTarget::Zmq {
+                worker: Arc::clone(worker),
+                rendezvous: EncodeRendezvous {
+                    bootstrap_host: bootstrap_host.to_string(),
+                    bootstrap_port: i32::from(bootstrap_port),
+                },
+            },
+            ConnectionMode::Grpc | ConnectionMode::Http => {
+                EncodeTarget::Grpc(worker.url().to_string())
+            }
+        };
         jobs.push(PreparedEncodeJob {
             item,
-            endpoint: assignment.worker.url().to_string(),
+            target,
             bootstrap_room,
         });
     }
@@ -302,26 +354,28 @@ fn build_plan(
     })
 }
 
+/// The encode items of an EPD request, assembled for its encode workers
+/// (`inline`: without /dev/shm, for an encode server on the ZMQ lane). A
+/// TokenSpeed prefill worker takes the items' embeddings out of band over
+/// either transport.
 fn prepare_items(
     intermediate: &MultimodalIntermediate,
     clients: Option<&ClientSelection>,
     workers: Option<&WorkerSelection>,
+    inline: bool,
 ) -> Result<Vec<PreparedEncodeItem>> {
     let clients = clients.ok_or_else(|| anyhow!("Client acquisition stage not completed"))?;
     match clients {
         ClientSelection::Disaggregated {
             prefill: BackendClient::Grpc(GrpcClient::TokenSpeed(_)),
             ..
-        } => prepare_tokenspeed_items(intermediate, workers),
-        // TokenSpeed supports EPD encode, but only over gRPC — name the
-        // transport, not the engine, so the error points at the real limit.
+        } => prepare_tokenspeed_items(intermediate, workers, inline),
         ClientSelection::Disaggregated {
             prefill: prefill @ BackendClient::Zmq(_),
             ..
-        } if prefill.runtime_type() == RuntimeType::TokenSpeed => Err(anyhow!(
-            "EPD encode requires a gRPC TokenSpeed prefill worker; the direct-ZMQ backend has \
-             no encode dispatch"
-        )),
+        } if prefill.runtime_type() == RuntimeType::TokenSpeed => {
+            prepare_tokenspeed_items(intermediate, workers, inline)
+        }
         ClientSelection::Disaggregated { prefill, .. } => Err(anyhow!(
             "EPD encode is not implemented for {} backend",
             backend_name(prefill)
@@ -335,8 +389,9 @@ fn prepare_items(
 fn prepare_tokenspeed_items(
     intermediate: &MultimodalIntermediate,
     workers: Option<&WorkerSelection>,
+    inline: bool,
 ) -> Result<Vec<PreparedEncodeItem>> {
-    let tokenspeed_mm = assemble_tokenspeed_for_encode(intermediate, workers)?;
+    let tokenspeed_mm = assemble_tokenspeed_for_encode(intermediate, workers, inline)?;
     let shm_enabled = tokenspeed_mm.shm_enabled;
     let shm_min_bytes = tokenspeed_mm.shm_min_bytes;
     Ok(tokenspeed_mm
@@ -361,6 +416,30 @@ fn backend_name(client: &BackendClient) -> &'static str {
         // OpenAI-compatible HTTP backend), and Unspecified never reach here.
         RuntimeType::External | RuntimeType::Generic | RuntimeType::Unspecified => "unknown",
     }
+}
+
+/// Hand an encode request to a TokenSpeed encode server over its worker's
+/// ZMQ connection. Nothing answers it: the server ships the embedding to the
+/// prefill side over the transfer engine, as the gRPC encoder acks after its
+/// send.
+async fn send_tokenspeed_encode_frame(
+    worker: &dyn Worker,
+    rendezvous: &EncodeRendezvous,
+    request: tokenspeed_encoder::EncodeRequest,
+) -> std::result::Result<(), String> {
+    let url = worker.url();
+    let client = worker
+        .get_backend_client()
+        .await
+        .map_err(|e| format!("encode worker {url} is not connected: {e}"))?
+        .ok_or_else(|| format!("encode worker {url} has no ZMQ connection"))?;
+    let BackendClient::Zmq(client) = client.as_ref() else {
+        return Err(format!("encode worker {url} is not a direct-ZMQ worker"));
+    };
+    client
+        .encode_tokenspeed(request, rendezvous)
+        .await
+        .map_err(|status| format!("encode request to {url} failed: {}", status.message()))
 }
 
 async fn send_tokenspeed_encode_rpc(
@@ -397,6 +476,158 @@ mod tests {
         assert!(bootstrap_info.is_empty());
         assert_eq!(dispatch.len(), 0);
         assert!(dispatch.into_jobs().is_empty());
+    }
+
+    /// An EPD plan whose encode server is on the direct ZMQ lane assembles
+    /// its items inline (no /dev/shm), targets the server over its own
+    /// connection with the rendezvous its engine declared, and the dispatch
+    /// sends the encode frame on that connection with the rendezvous in it;
+    /// a prefill side on the same lane takes the TokenSpeed items.
+    #[tokio::test]
+    async fn a_zmq_encode_server_takes_its_items_inline_at_its_declared_rendezvous() {
+        use std::time::Duration;
+
+        use engine_zmq_client::{
+            mock_engine::{connect_to_frontend, default_ready_response},
+            protocol::{
+                handshake::EngineCoreReadyResponse, tokenspeed::request::TokenSpeedRequestType,
+            },
+            EngineId,
+        };
+
+        use crate::{
+            routers::grpc::{
+                context::EncodeWorkerAssignment,
+                multimodal::single_image_intermediate,
+                proto_wrapper::TokenSpeedTensorStorage,
+                zmq_client::{EosTokenIds, ZmqEngineClient},
+            },
+            worker::{BasicWorkerBuilder, WorkerType},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        // A rank that declared `ready`, behind a direct-ZMQ worker of `role`,
+        // the backend injected as the connect driver leaves it.
+        let connected = |name: &'static str, role: WorkerType, ready: EngineCoreReadyResponse| {
+            let dir = dir.path().join(name);
+            async move {
+                std::fs::create_dir_all(&dir).unwrap();
+                let ep = |socket: &str| format!("ipc://{}", dir.join(socket).display());
+                let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+                let (client, rank) = tokio::join!(
+                    ZmqEngineClient::connect(
+                        &handshake,
+                        &input,
+                        &output,
+                        1,
+                        "m".to_string(),
+                        EosTokenIds::default(),
+                        RuntimeType::TokenSpeed,
+                        Duration::from_secs(10)
+                    ),
+                    connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready),
+                );
+                let client = BackendClient::Zmq(client.expect("adapter connect"));
+                let worker = BasicWorkerBuilder::new(ep("worker.ipc"))
+                    .connection_mode(ConnectionMode::Zmq)
+                    .runtime_type(RuntimeType::TokenSpeed)
+                    .worker_type(role)
+                    .build();
+                worker
+                    .backend_client
+                    .load_full()
+                    .set(Arc::new(client.clone()))
+                    .ok()
+                    .expect("cell empty");
+                (
+                    Arc::new(worker) as Arc<dyn Worker>,
+                    client,
+                    rank.expect("mock engine"),
+                )
+            }
+        };
+        let encoder_ready = EngineCoreReadyResponse {
+            request_types: vec!["encode".to_string()],
+            disaggregation_mode: Some("encode".to_string()),
+            bootstrap_host: Some("10.0.0.9".to_string()),
+            bootstrap_port: Some(8998),
+            ..default_ready_response()
+        };
+        let (encoder, _, mut encoder_rank) =
+            connected("encode", WorkerType::Encode, encoder_ready).await;
+        let (prefill, prefill_client, _prefill_rank) =
+            connected("prefill", WorkerType::Prefill, default_ready_response()).await;
+        let (decode, decode_client, _decode_rank) =
+            connected("decode", WorkerType::Decode, default_ready_response()).await;
+        let workers = WorkerSelection::Disaggregated {
+            encode_assignments: Some(vec![EncodeWorkerAssignment {
+                item_index: 0,
+                worker: Arc::clone(&encoder),
+            }]),
+            prefill,
+            decode,
+            runtime_type: RuntimeType::TokenSpeed,
+        };
+        let clients = ClientSelection::Disaggregated {
+            prefill: prefill_client,
+            decode: decode_client,
+        };
+        let intermediate =
+            MultimodalIntermediate::try_new(vec![single_image_intermediate()]).unwrap();
+
+        let plan = build_plan(&intermediate, Some(&clients), Some(&workers)).expect("the plan");
+        let (bootstrap_info, dispatch) = plan.into_parts();
+        assert_eq!(bootstrap_info.len(), 1);
+        assert_eq!(
+            (
+                bootstrap_info[0].item_index,
+                bootstrap_info[0].bootstrap_host.as_str(),
+                bootstrap_info[0].bootstrap_port
+            ),
+            (0, "10.0.0.9", 8998)
+        );
+        let mut jobs = dispatch.into_jobs();
+        assert_eq!(jobs.len(), 1);
+        let job = jobs.pop().unwrap();
+        assert_eq!(job.bootstrap_room, bootstrap_info[0].bootstrap_room);
+        match &job.target {
+            EncodeTarget::Zmq { worker, rendezvous } => {
+                assert_eq!(worker.url(), encoder.url());
+                assert_eq!(
+                    (
+                        rendezvous.bootstrap_host.as_str(),
+                        rendezvous.bootstrap_port
+                    ),
+                    ("10.0.0.9", 8998)
+                );
+            }
+            EncodeTarget::Grpc(endpoint) => panic!("a gRPC target {endpoint}"),
+        }
+        let PreparedEncodeItem::TokenSpeed {
+            item: Some(item),
+            shm_enabled,
+            ..
+        } = &job.item
+        else {
+            panic!("an item")
+        };
+        assert!(!*shm_enabled, "inline on the ZMQ lane");
+        assert!(matches!(
+            item.encoder_input.storage,
+            TokenSpeedTensorStorage::Inline(_)
+        ));
+
+        let (sent, frames) = tokio::join!(job.dispatch(), encoder_rank.recv_request());
+        sent.expect("the frame left on the server's connection");
+        let frames = frames.unwrap();
+        assert_eq!(
+            TokenSpeedRequestType::from_frame(frames[0].as_ref()),
+            Some(TokenSpeedRequestType::Encode)
+        );
+        assert!(
+            frames[1].windows(8).any(|window| window == b"10.0.0.9"),
+            "the rendezvous rides the frame"
+        );
     }
 
     /// Real `/dev/shm` segments back the encode jobs, so these run only on
@@ -464,7 +695,7 @@ mod tests {
             let (item, path) = tokenspeed_item_backed_by_shm();
             let dispatch = EncodeDispatchPlan::new(vec![PreparedEncodeJob {
                 item,
-                endpoint: "http://encode-worker:9000".to_string(),
+                target: EncodeTarget::Grpc("http://encode-worker:9000".to_string()),
                 bootstrap_room: 42,
             }]);
             assert!(!dispatch.is_empty());
@@ -506,7 +737,9 @@ mod tests {
 
             // Bogus endpoint: the encode RPC fails, but the send-path guard still
             // reclaims the segment when dispatch() returns.
-            let _ = item.dispatch("http://127.0.0.1:1".to_string(), 7).await;
+            let _ = item
+                .dispatch(EncodeTarget::Grpc("http://127.0.0.1:1".to_string()), 7)
+                .await;
 
             assert!(
                 !path.exists(),

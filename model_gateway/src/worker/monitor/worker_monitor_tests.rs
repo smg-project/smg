@@ -10,22 +10,11 @@ use crate::{
     config::types::PolicyConfig,
     observability::metrics::test_support::render_with_recorder,
     policies::PolicyRegistry,
-    worker::{overload::OverloadThresholds, BasicWorkerBuilder, ConnectionMode, WorkerType},
+    worker::{
+        overload::OverloadThresholds, test_support::ready_worker, BasicWorkerBuilder,
+        ConnectionMode, WorkerType,
+    },
 };
-
-fn ready_worker(url: &str, model: &str) -> Arc<dyn Worker> {
-    let worker = BasicWorkerBuilder::new(url)
-        .worker_type(WorkerType::Regular)
-        .connection_mode(ConnectionMode::Http)
-        .model(ModelCard::new(model))
-        .health_config(HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        })
-        .build();
-    worker.set_status(WorkerStatus::Ready);
-    Arc::new(worker)
-}
 
 /// Build an isolated monitor and registry with round-robin routing for tests.
 fn build_monitor() -> (Arc<WorkerRegistry>, Arc<WorkerMonitor>) {
@@ -485,7 +474,7 @@ async fn a_pushed_record_with_the_engines_silence_vetoes_the_worker() {
     monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
     assert_eq!(
         worker.stall_reason(),
-        Some(super::super::worker::StallReason::Wedged)
+        Some(super::super::basic::StallReason::Wedged)
     );
     assert!(!worker.is_healthy_and_eligible());
     record.engine_silence_ms = None;
@@ -518,7 +507,7 @@ async fn a_pushed_record_with_a_long_pending_prefill_behind_the_engines_silence_
     monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
     assert_eq!(
         worker.stall_reason(),
-        Some(super::super::worker::StallReason::Wedged),
+        Some(super::super::basic::StallReason::Wedged),
         "silent past twice the prefill at the cold prior"
     );
     record.engine_silence_ms = None;
@@ -530,7 +519,7 @@ async fn a_pushed_record_with_a_long_pending_prefill_behind_the_engines_silence_
     monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
     assert_eq!(
         worker.stall_reason(),
-        Some(super::super::worker::StallReason::Wedged),
+        Some(super::super::basic::StallReason::Wedged),
         "a frozen engine with nothing to prefill"
     );
 }
@@ -611,7 +600,7 @@ async fn the_first_record_a_worker_pushes_is_judged_before_any_event_batch() {
     monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
     assert_eq!(
         worker.stall_reason(),
-        Some(super::super::worker::StallReason::Wedged)
+        Some(super::super::basic::StallReason::Wedged)
     );
     assert!(!worker.is_healthy_and_eligible());
 }

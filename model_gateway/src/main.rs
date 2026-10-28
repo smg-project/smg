@@ -36,7 +36,7 @@ use smg::{
         RoutingMode, SchemaConfig, SlurmDiscoveryConfig, TokenizerCacheConfig, TraceConfig,
         TurboJpegPolicy, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     },
-    mesh_discovery::MeshDiscoveryConfig,
+    mesh::discovery::MeshDiscoveryConfig,
     observability::metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
     policies::cost::DEFAULT_POLICY as DEFAULT_SELECTION_POLICY,
     server::{self, posture::SecretSources, ServerConfig},
@@ -57,10 +57,10 @@ use cli::{
     url_port::CommandLine,
     value::{
         parse_access_log_field, parse_control_plane_api_key, parse_job_queue_capacity,
-        parse_job_queue_concurrency, parse_kv_index, parse_mm_processing, parse_mm_turbojpeg,
-        parse_model_alias, parse_model_id_from, parse_positive_usize,
-        parse_power_of_two_load_metric, parse_role_mapping, parse_routing_key_header,
-        parse_tenant_api_key, parse_transport_mode, parse_unit_fraction,
+        parse_job_queue_concurrency, parse_mm_processing, parse_mm_turbojpeg, parse_model_alias,
+        parse_model_id_from, parse_positive_usize, parse_power_of_two_load_metric,
+        parse_role_mapping, parse_routing_key_header, parse_tenant_api_key, parse_transport_mode,
+        parse_unit_fraction,
     },
 };
 
@@ -300,8 +300,10 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 200, value_parser = parse_job_queue_concurrency, help_heading = "Worker Configuration")]
     job_queue_concurrency: usize,
 
-    /// DP engines per startup ZMQ worker: each ipc:// worker becomes a grouped
-    /// worker whose handshake awaits this many engines on one socket set.
+    /// DP engines per startup ZMQ worker: each ipc:// or tcp:// worker becomes a
+    /// grouped worker whose handshake awaits this many engines on one socket set
+    /// (default: as many as the first engine to dial declares, one for an
+    /// engine that declares none).
     #[arg(long, value_parser = parse_positive_usize, help_heading = "Worker Configuration")]
     zmq_engine_count: Option<usize>,
 
@@ -622,7 +624,11 @@ struct RoutingArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     enable_igw: bool,
 
-    /// Enable minimum tokens scheduler for data parallel group
+    /// Choose a data-parallel rank per request from the ranks' reported token
+    /// loads: the HTTP prefill-decode router, for an engine registered as one
+    /// worker. Under --dp-aware the engine's ranks are workers and the policy's
+    /// pick among them is the rank choice, so this flag chooses nothing there
+    /// (warned at start-up)
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_minimum_tokens_scheduler: bool,
 
@@ -658,26 +664,6 @@ struct RoutingArgs {
     /// workload where every request has a holder. 0 disables.
     #[arg(long, default_value_t = 8, help_heading = "Routing Policy")]
     worker_warmup_divert_every: u64,
-
-    /// Deprecated and ignored: the TTL prune of the positional indexer, which
-    /// the chain index replaced. The chain index holds what the engines report
-    /// and shrinks with their removals, so it has no prune; the flag is still
-    /// accepted so that existing launch lines keep working, and goes in a
-    /// later release.
-    #[arg(long, help_heading = "Routing Policy")]
-    kv_indexer_ttl_secs: Option<u64>,
-
-    /// Deprecated and ignored: the capacity ceiling of the positional
-    /// indexer's prune; see --kv-indexer-ttl-secs.
-    #[arg(long, help_heading = "Routing Policy")]
-    kv_indexer_max_entries: Option<usize>,
-
-    /// Deprecated: the chain index is the only KV index behind cache-aware
-    /// routing, so this takes `chain` only and does nothing; the flag goes in
-    /// a later release. `positional` names the index that was removed and is
-    /// refused.
-    #[arg(long, value_parser = parse_kv_index, help_heading = "Routing Policy")]
-    kv_index: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -769,7 +755,8 @@ struct WorkerArgs {
     /// prompts may still need in prefill, up to 120 seconds. The pile is the
     /// streaming gRPC generations in flight; HTTP workers, PD sides and
     /// non-streaming generations give no signal and never form one. The
-    /// same bound, read per request, is how long a prefill side of a
+    /// same bound, read per request with twice the prefill time its prompt
+    /// needs behind the worker's backlog, is how long a prefill side of a
     /// disaggregated dispatch may produce nothing, with its worker answering
     /// no other side either, before its request fails over to another
     /// prefill worker (or fails, when there is none); a side queued on a
@@ -1167,9 +1154,28 @@ struct ServingArgs {
     )]
     tenant_header_name: String,
 
-    /// Request timeout in seconds
+    /// Request timeout in seconds.
+    ///
+    /// Bounds the read of a request's body overall (a 408 past it), and each
+    /// attempt at an HTTP worker from its dispatch to its last message: an
+    /// attempt the worker has not finished within it ends with the gateway's
+    /// 504 (`call_upstream_timeout`; on a stream, the error event that ends
+    /// it). That 504 is the request's answer, not replayed. A worker's own
+    /// `timeout_secs` in its HTTP pool configuration takes this value's
+    /// place, on an HTTP worker and on a ZMQ worker's link, whose streams
+    /// carry the same bound. A request to a gRPC worker is bounded by
+    /// --grpc-request-timeout-secs instead.
     #[arg(long, default_value_t = 1800, help_heading = "Request Handling")]
     request_timeout_secs: u64,
+
+    /// Seconds a request to a gRPC worker may take, from its dispatch to its
+    /// last message: an attempt the worker has not finished within it ends
+    /// with the gateway's 504 (`call_upstream_timeout`; on a stream, the error
+    /// event that ends it) and the call to the worker is dropped, which
+    /// cancels the request on the worker; that 504 is the request's answer,
+    /// not replayed. 0 arms no deadline (the default): the bound is opt-in.
+    #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
+    grpc_request_timeout_secs: u64,
 
     /// Seconds of upstream silence after which an open SSE stream carries a
     /// keep-alive frame (an SSE comment on the OpenAI-shaped endpoints, the
@@ -1190,6 +1196,11 @@ struct ServingArgs {
     #[arg(long, default_value_t = 180, help_heading = "Request Handling")]
     shutdown_grace_period_secs: u64,
 
+    /// Keep accepting connections after readiness fails. Defaults to 5 seconds;
+    /// the window is capped at half the shutdown grace period.
+    #[arg(long, help_heading = "Request Handling")]
+    shutdown_settle_secs: Option<u64>,
+
     /// Maximum payload size in bytes
     #[arg(long, default_value_t = 536870912, help_heading = "Request Handling")]
     max_payload_size: usize,
@@ -1200,9 +1211,11 @@ struct ServingArgs {
     /// WASM request hooks, missing Content-Length, PD/batch backends) always
     /// buffers, bounded by max-payload-size; an eligible request buffers up
     /// to this many bytes when router retries are enabled, and otherwise
-    /// streams to the worker verbatim — forfeiting router-level retries,
-    /// with JSON validation deferring to the worker. 0 never buffers for
-    /// retries
+    /// streams to the worker verbatim — forfeiting router-level retries. A
+    /// streamed request reaches the worker as the client sent it: JSON
+    /// validation defers to the worker, and the provider profile's request
+    /// normalization (which the buffered path applies) is skipped. 0 never
+    /// buffers for retries
     #[arg(long, default_value_t = 1_048_576, help_heading = "Request Handling")]
     max_buffered_request_bytes: u64,
 
@@ -1377,7 +1390,9 @@ struct ServingArgs {
     health_failure_threshold: u32,
 
     /// Consecutive probe successes before a worker returns to rotation (at
-    /// least 1)
+    /// least 1): a pending worker's reads are an interval apart, a demoted
+    /// worker's a probe timeout apart (or an interval, if that is shorter)
+    /// once one passes
     #[arg(long, default_value_t = 2, help_heading = "Health Checks")]
     health_success_threshold: u32,
 
@@ -2906,6 +2921,7 @@ impl CliArgs {
             .idle_connection_timeout_secs(self.serving.idle_connection_timeout_secs)
             .max_connections(self.serving.max_connections)
             .request_timeout_secs(self.serving.request_timeout_secs)
+            .grpc_request_timeout_secs(self.serving.grpc_request_timeout_secs)
             .sse_keepalive_secs(self.serving.sse_keepalive_secs)
             .upstream_pool_idle_timeout_secs(self.serving.upstream_pool_idle_timeout_secs)
             .worker_startup_timeout_secs(self.workers.worker_startup_timeout_secs)
@@ -2933,9 +2949,6 @@ impl CliArgs {
             .worker_overload_waiting_requests(Some(self.routing.worker_overload_waiting_requests))
             .worker_overload_token_usage(Some(self.routing.worker_overload_token_usage))
             .worker_overload_shed(self.routing.worker_overload_shed)
-            .kv_indexer_ttl_secs(self.routing.kv_indexer_ttl_secs)
-            .kv_indexer_max_entries(self.routing.kv_indexer_max_entries)
-            .kv_index(self.routing.kv_index.clone())
             .engine_metrics(self.workers.engine_metrics)
             .multimodal_tensor_transport(self.workers.multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.workers.multimodal_shm_min_bytes)
@@ -3137,6 +3150,7 @@ impl CliArgs {
                 Some(self.serving.request_id_headers.clone())
             },
             shutdown_grace_period_secs: self.serving.shutdown_grace_period_secs,
+            shutdown_settle_secs: self.serving.shutdown_settle_secs,
             control_plane_auth,
             mesh_server_config,
             webrtc_bind_addr: self.integrations.webrtc_bind_addr,
@@ -4176,52 +4190,27 @@ mod tests {
         }
     }
 
-    /// The deprecated indexer prune flags are still accepted and flow into
-    /// `RouterConfig`, where nothing reads them but the startup warning.
+    /// The deprecated `--kv-index`, `--kv-indexer-ttl-secs` and
+    /// `--kv-indexer-max-entries` flags went with the positional indexer they
+    /// configured: a launch line that still carries one is refused at parse
+    /// time as an unknown argument, not accepted and ignored.
     #[test]
-    fn kv_indexer_prune_flags_flow_into_router_config() {
-        let cli = cli_args_from(&[
-            "--kv-indexer-ttl-secs",
-            "600",
-            "--kv-indexer-max-entries",
-            "500000",
-        ]);
-        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(router_config.kv_indexer_ttl_secs, Some(600));
-        assert_eq!(router_config.kv_indexer_max_entries, Some(500_000));
-
-        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(defaults.kv_indexer_ttl_secs, None);
-        assert_eq!(defaults.kv_indexer_max_entries, None);
-    }
-
-    /// `--kv-index` is deprecated: the chain index is the only KV index, so
-    /// `chain` is accepted (and flows into `RouterConfig` for the startup
-    /// warning), the removed `positional` index is refused with the reason,
-    /// and any other spelling is an invalid value.
-    #[test]
-    fn kv_index_flag_takes_chain_only() {
-        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(defaults.kv_index, None);
-
-        let cli = cli_args_from(&["--kv-index", "Chain"]);
-        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
-        assert_eq!(router_config.kv_index.as_deref(), Some("chain"));
-        router_config.validate().unwrap();
-
-        let err = Cli::try_parse_from(["smg", "--kv-index", "positional"])
-            .expect_err("the removed positional index is refused");
-        let text = err.to_string();
-        assert!(
-            text.contains("positional KV index was removed") && text.contains("--kv-index"),
-            "the refusal names the removal and the flag: {text}"
-        );
-        for value in ["run", "tree"] {
-            let err = Cli::try_parse_from(["smg", "--kv-index", value])
-                .expect_err("only chain is accepted");
+    fn removed_kv_index_flags_are_refused_at_parse_time() {
+        for argv in [
+            ["smg", "--kv-index", "chain"],
+            ["smg", "--kv-indexer-ttl-secs", "600"],
+            ["smg", "--kv-indexer-max-entries", "500000"],
+        ] {
+            let err = Cli::try_parse_from(argv).expect_err("a removed flag is refused");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{}: {err}",
+                argv[1]
+            );
             assert!(
-                err.to_string().contains("takes chain only"),
-                "{value}: {err}"
+                err.to_string().contains(argv[1]),
+                "the refusal names the flag: {err}"
             );
         }
     }

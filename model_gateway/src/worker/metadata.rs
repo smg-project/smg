@@ -7,8 +7,9 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use openai_protocol::{
     model_card::ModelCard,
     model_type::{Endpoint, ModelType},
-    worker::{HealthCheckConfig, ProviderType, WorkerSpec},
+    worker::{ConstrainedDecoding, HealthCheckConfig, ProviderType, TagVocabulary, WorkerSpec},
 };
+use tool_parser::GrammarStart;
 
 use super::{
     overload::OverloadThresholds, pd_pairing::PdPairing, WorkerError, WorkerResult,
@@ -28,6 +29,14 @@ pub struct WorkerMetadata {
     /// `GET /workers`) without a per-worker deep clone. Set once at construction
     /// and not mutated afterwards.
     pub spec: Arc<WorkerSpec>,
+    /// The URL as a request's success path shows it: the routed-worker
+    /// response header, the cache-trace header and the request-sent event.
+    /// The registered URL byte for byte when it has no userinfo, query or
+    /// fragment; otherwise `endpoint::Endpoint::redacted_str`'s form (see
+    /// `Endpoint::redacted_url`). Computed once at construction (the worker
+    /// builder, the Go binding's worker); nothing on a request path parses
+    /// the URL.
+    pub redacted_url: String,
     /// Resolved health check config (router defaults + per-worker overrides).
     /// This is the concrete config used at runtime; `spec.health` only stores
     /// the partial overrides from the API layer.
@@ -65,6 +74,42 @@ pub struct WorkerMetadata {
     /// value. Empty for a worker that was not discovered (a mesh import, a
     /// test fixture).
     pub discovered_labels: Arc<HashMap<String, String>>,
+    /// The worker's constrained-decoding labels (`constrained_decoding`,
+    /// `constrained_decoding_start`, `structural_tag_vocabulary`), parsed
+    /// once at construction: request building reads them for every worker
+    /// of the model on every request, so nothing on a request path looks a
+    /// label up.
+    pub decoding: DecodingLabels,
+}
+
+/// A worker's constrained-decoding labels as the routers read them, parsed
+/// once from its spec at construction ([`WorkerMetadata::decoding`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DecodingLabels {
+    /// Whether the engine constrains every turn or only the requested ones
+    /// (the spec's `constrained_decoding` field, else its label).
+    pub policy: ConstrainedDecoding,
+    /// Where the engine starts a grammar (the `constrained_decoding_start`
+    /// label; unknown without one).
+    pub start: GrammarStart,
+    /// The vocabulary of structural-tag nodes its grammar compiler takes
+    /// (the `structural_tag_vocabulary` label; the current one without one).
+    pub vocabulary: TagVocabulary,
+}
+
+impl DecodingLabels {
+    /// The labels of `spec`, read once.
+    pub fn of(spec: &WorkerSpec) -> Self {
+        Self {
+            policy: ConstrainedDecoding::of(spec),
+            start: GrammarStart::from_label(
+                spec.labels.get(GrammarStart::LABEL).map(String::as_str),
+            ),
+            vocabulary: TagVocabulary::from_label(
+                spec.labels.get(TagVocabulary::LABEL).map(String::as_str),
+            ),
+        }
+    }
 }
 
 impl WorkerMetadata {
@@ -119,10 +164,12 @@ impl WorkerMetadata {
     /// Number of ZMQ engines this worker's handshake awaits. A grouped ZMQ
     /// worker carries `dp_size = Some(N)` with no `dp_rank` — one worker, one
     /// socket set, N engines dialing in (the connector balances across them
-    /// and drives the wave protocol for lockstep groups). Rank-expanded DP
+    /// and drives the wave protocol for lockstep groups). `None` for a worker
+    /// given no count, which awaits as many engines as the first to dial
+    /// declares (one, from an engine that declares none). Rank-expanded DP
     /// workers never reach ZMQ connect (rejected at registration).
-    pub fn zmq_engine_count(&self) -> usize {
-        self.spec.dp_size.unwrap_or(1).max(1)
+    pub fn zmq_engine_count(&self) -> Option<usize> {
+        self.spec.dp_size.map(|count| count.max(1))
     }
 
     /// Transform a request for DP-aware routing.

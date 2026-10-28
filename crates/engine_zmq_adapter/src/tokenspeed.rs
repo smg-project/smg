@@ -6,14 +6,18 @@ use std::collections::BTreeMap;
 use engine_zmq_client::{
     codec::tensor::{checked_numel, WireTensor},
     connector::TokenSpeedStream,
-    protocol::tokenspeed::{
-        multimodal::{
-            mm_pad_value, EncodeHandshake, TokenSpeedWireMmInputs, TokenSpeedWireMmItem,
-            TokenSpeedWireModality,
+    protocol::{
+        handshake::EngineCoreReadyResponse,
+        sglang::output::SglangOutput,
+        tokenspeed::{
+            multimodal::{
+                mm_pad_value, EncodeHandshake, TokenSpeedWireMmInputs, TokenSpeedWireMmItem,
+                TokenSpeedWireModality,
+            },
+            output::{SlimOutputLayout, TokenSpeedOutput},
+            request::{TokenSpeedEncodeRequest, TokenizedGenerateReqInput},
+            sampling::SamplingParams as TokenSpeedSamplingParams,
         },
-        output::TokenSpeedOutput,
-        request::TokenizedGenerateReqInput,
-        sampling::SamplingParams as TokenSpeedSamplingParams,
     },
     ConnectedEngine,
 };
@@ -25,7 +29,7 @@ use crate::{
     abort_status::engine_abort_status,
     context_window::admit_prompt,
     fanout::fan_out_n,
-    stream::{poll_mapped, MappedGenerateStream, StreamState},
+    stream::{map_slim_output, poll_mapped, MappedGenerateStream, StreamState},
     structured_outputs::ConstraintRef,
 };
 
@@ -47,6 +51,9 @@ pub struct TokenSpeedGenerateStream {
     /// tokens: streaming frontends decode text/logprobs from chunks only, so
     /// the tick's delta goes out as a `Chunk` first.
     pending: Option<vllm::GenerateResponse>,
+    /// Whether the prompt logprobs went out on a chunk already (the proto
+    /// carries them on the first token-bearing chunk only).
+    input_logprobs_emitted: bool,
 }
 
 impl TokenSpeedGenerateStream {
@@ -56,6 +63,7 @@ impl TokenSpeedGenerateStream {
             state: StreamState::default(),
             index,
             pending: None,
+            input_logprobs_emitted: false,
         }
     }
 
@@ -201,39 +209,6 @@ impl MappedGenerateStream for TokenSpeedGenerateStream {
         &mut self,
         output: TokenSpeedOutput,
     ) -> Result<vllm::GenerateResponse, tonic::Status> {
-        let state = &mut self.state;
-        // TokenSpeed reports per-request token counts directly (cumulative for
-        // completions), rather than vLLM's per-output prefill-stats deltas.
-        if output.prompt_tokens > 0 {
-            state.prompt_tokens = output.prompt_tokens;
-        }
-        if output.cached_tokens > 0 {
-            state.cached_tokens = output.cached_tokens;
-        }
-        state.completion_tokens = output.completion_tokens;
-        state.output_ids.extend(output.output_ids.iter().copied());
-
-        // Sampled-token logprobs, if requested. The proto column is `float`, so
-        // downcast the wire's `f64` values. Chunks carry this tick's increment;
-        // the terminal `Complete` carries the cumulative set, so accumulate
-        // into `state` and drain it on finish.
-        let chunk_logprobs =
-            (!output.output_logprobs_val.is_empty()).then(|| vllm::OutputLogProbs {
-                token_logprobs: output
-                    .output_logprobs_val
-                    .iter()
-                    .map(|&lp| lp as f32)
-                    .collect(),
-                token_ids: output.output_logprobs_idx.clone(),
-                ..Default::default()
-            });
-        state
-            .output_logprobs_val
-            .extend(output.output_logprobs_val.iter().map(|&lp| lp as f32));
-        state
-            .output_logprobs_idx
-            .extend(output.output_logprobs_idx.iter().copied());
-
         // An engine-side failure must surface as an error, not a normal
         // completion with empty output — mirroring the vLLM stream's guard.
         // An `error` is a transfer or numerical failure. An `abort` is the
@@ -242,8 +217,8 @@ impl MappedGenerateStream for TokenSpeedGenerateStream {
         // ends as the engine's Python servicer ends the same finish: a status
         // the engine attached (an admission refusal's 400, a full queue's
         // 429) goes through the shared status table with the engine's words,
-        // both read off two columns an engine declares in its layout; an
-        // abort without a status is internal, with the words when they
+        // both read off the finish details an engine declares in its layout;
+        // an abort without a status is internal, with the words when they
         // travel and a fixed sentence when the engine declares no such
         // column. Before, every engine abort was an empty completion: a
         // success the client could not tell from a served request. The
@@ -262,14 +237,52 @@ impl MappedGenerateStream for TokenSpeedGenerateStream {
         // only, and the router-side stop machinery owns string matching.
         let finish = output
             .finish_reason
-            .map(|reason| (normalize_finish_reason(&reason).to_string(), None));
-        Ok(state.emit_tick(
+            .as_deref()
+            .map(|reason| (normalize_finish_reason(reason).to_string(), None));
+        // The columns TokenSpeed shares with the other slim wires (counts,
+        // sampled and ranked logprobs, prompt logprobs) are mapped once for
+        // all of them.
+        Ok(map_slim_output(
+            &mut self.state,
             self.index,
-            output.output_ids,
-            chunk_logprobs,
+            slim_record(output),
             finish,
             &mut self.pending,
+            &mut self.input_logprobs_emitted,
         ))
+    }
+}
+
+/// A TokenSpeed output as the slim record the wires share: the same per
+/// request columns, a prompt position without alternatives (the first)
+/// reading as an empty candidate list.
+fn slim_record(output: TokenSpeedOutput) -> SglangOutput {
+    SglangOutput {
+        request_id: output.request_id,
+        output_ids: output.output_ids,
+        finish_reason: output.finish_reason,
+        finish_message: output.finish_message,
+        finish_status: output.finish_status,
+        prompt_tokens: output.prompt_tokens,
+        completion_tokens: output.completion_tokens,
+        cached_tokens: output.cached_tokens,
+        output_logprobs_val: output.output_logprobs_val,
+        output_logprobs_idx: output.output_logprobs_idx,
+        output_top_logprobs_val: output.output_top_logprobs_val,
+        output_top_logprobs_idx: output.output_top_logprobs_idx,
+        input_logprobs_val: output.input_logprobs_val,
+        input_logprobs_idx: output.input_logprobs_idx,
+        input_top_logprobs_val: output
+            .input_top_logprobs_val
+            .into_iter()
+            .map(Option::unwrap_or_default)
+            .collect(),
+        input_top_logprobs_idx: output
+            .input_top_logprobs_idx
+            .into_iter()
+            .map(Option::unwrap_or_default)
+            .collect(),
+        ..SglangOutput::default()
     }
 }
 
@@ -334,6 +347,34 @@ pub enum GridTensors {
 }
 
 impl GridTensors {
+    /// From the facts a TokenSpeed engine declares at its handshake (the same
+    /// facts a launcher hands the Rust servicer): the layout facts travel
+    /// together, so an engine that declares only some of them declares none,
+    /// and an engine that declares nothing keeps the conservative reading
+    /// ([`Self::Positions`]).
+    pub fn declared(ready: &EngineCoreReadyResponse) -> Self {
+        let layout = match (
+            ready.spatial_merge_size,
+            ready.image_token_id,
+            ready.video_token_id,
+        ) {
+            (Some(spatial_merge_size), Some(image_token_id), Some(video_token_id)) => {
+                Some(MropeLayout {
+                    spatial_merge_size,
+                    image_token_id,
+                    video_token_id,
+                })
+            }
+            _ => None,
+        };
+        Self::for_model(
+            &ready.architectures,
+            ready.model_type.as_deref().unwrap_or_default(),
+            ready.mrope_positions,
+            layout,
+        )
+    }
+
     /// From the launcher's model facts: the checkpoint's `architectures` and
     /// `model_type` (the engine's own dispatch picks the Qwen3.5 rule by
     /// them, [`qwen35_lineage`]), its `mrope_positions` reading of the text
@@ -371,7 +412,11 @@ impl GridTensors {
 /// the window, is refused before it reaches the scheduler
 /// ([`admit_prompt`]). `ranks` is how the connected attention data-parallel
 /// ranks are reached ([`RankIndices`]), which places the request as the
-/// engine's own dispatcher would ([`rendezvous_rank`]).
+/// engine's own dispatcher would ([`rendezvous_rank`]). `logprobs` is which
+/// logprob columns the engines report beside the sampled tokens'
+/// ([`LogprobColumns`]): prompt logprobs and top-k candidates ride to an
+/// engine that reports them and are refused by one that does not, rather
+/// than answered short.
 ///
 /// The disaggregation fields ride as the Python servicer forwards them: the
 /// prefill/decode rendezvous (`kv_bootstrap_info`) onto the request's
@@ -384,6 +429,7 @@ pub(crate) fn translate_request_tokenspeed_for(
     grid_tensors: GridTensors,
     max_model_len: u64,
     ranks: &RankIndices,
+    logprobs: LogprobColumns,
 ) -> Result<TokenizedGenerateReqInput, String> {
     let mut input_ids = match req.tokenized {
         Some(tokenized) => tokenized.input_ids,
@@ -407,6 +453,7 @@ pub(crate) fn translate_request_tokenspeed_for(
         bootstrap_room,
         req.data_parallel_rank,
         ranks.len(),
+        ranks.is_decode(),
         &req.request_id,
     )? {
         Some(rank) => Some(ranks.index_of(rank).ok_or_else(|| {
@@ -480,17 +527,27 @@ pub(crate) fn translate_request_tokenspeed_for(
     // unset `max_new_tokens` stays unset: the scheduler caps it at the
     // remaining context itself.
     admit_prompt(input_ids.len(), max_model_len)?;
-    // Over the ZMQ wire TokenSpeed returns only the single sampled-token logprob
-    // per token: no top-k candidates (`top_logprobs_num > 1`) and no prompt
-    // logprobs (`token_ids_logprob`). Reject both rather than silently return
-    // fewer than asked. A bare `logprobs: true` (count 0/1) is the plain
-    // sampled-token logprob and is wired end-to-end via `return_logprob`.
-    if req.top_logprobs_num > 1 {
+    // Beside the sampled token's logprob, TokenSpeed reports top-k candidates
+    // (`top_logprobs_num > 1`) and prompt logprobs (`logprob_start_len >=
+    // 0`) where its handshake declares their columns; an engine that does not
+    // gets neither, and no engine reports selected-token logprobs
+    // (`token_ids_logprob`). What cannot be answered is refused rather than
+    // returned short. A bare `logprobs: true` (count 0/1) is the plain
+    // sampled-token logprob, wired end-to-end via `return_logprob`.
+    if req.top_logprobs_num > 1 && !logprobs.top {
         return Err("top_logprobs are not supported over the TokenSpeed ZMQ backend".to_string());
+    }
+    let logprob_start_len = req.logprob_start_len.unwrap_or(-1);
+    if logprob_start_len >= 0 && !logprobs.prompt {
+        return Err(
+            "prompt logprobs are not supported over the TokenSpeed ZMQ backend".to_string(),
+        );
     }
     if !req.token_ids_logprob.is_empty() {
         return Err(
-            "prompt logprobs are not supported over the TokenSpeed ZMQ backend".to_string(),
+            "selected-token logprobs (token_ids_logprob) are not supported over the TokenSpeed \
+             ZMQ backend"
+                .to_string(),
         );
     }
     Ok(TokenizedGenerateReqInput {
@@ -505,6 +562,12 @@ pub(crate) fn translate_request_tokenspeed_for(
                 params
             }),
         return_logprob: req.return_logprob,
+        logprob_start_len,
+        top_logprobs_num: if req.top_logprobs_num > 1 {
+            req.top_logprobs_num.unsigned_abs()
+        } else {
+            0
+        },
         stream: req.stream,
         input_ids_unpadded,
         multimodal_inputs,
@@ -519,6 +582,34 @@ pub(crate) fn translate_request_tokenspeed_for(
     })
 }
 
+/// Which logprob columns the connected engines report beside the sampled
+/// tokens', read off their declared output layouts: every engine must declare
+/// a column for the request to ask for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LogprobColumns {
+    /// Prompt logprobs.
+    pub(crate) prompt: bool,
+    /// Each new token's top-k candidates.
+    pub(crate) top: bool,
+}
+
+impl LogprobColumns {
+    /// The columns every one of `engines` declares.
+    pub(crate) fn of(engines: &[ConnectedEngine]) -> Self {
+        let layouts: Vec<SlimOutputLayout> = engines
+            .iter()
+            .map(|engine| SlimOutputLayout::declared(&engine.ready_response.positional_layouts))
+            .collect();
+        Self {
+            prompt: !layouts.is_empty()
+                && layouts
+                    .iter()
+                    .all(SlimOutputLayout::carries_prompt_logprobs),
+            top: !layouts.is_empty() && layouts.iter().all(SlimOutputLayout::carries_top_logprobs),
+        }
+    }
+}
+
 /// How the attention data-parallel ranks are reached over the direct wire:
 /// the engine index (the ZMQ identity the connector pins a request by) of
 /// each rank, in rank order, read off the ranks' own handshakes rather than
@@ -530,11 +621,20 @@ pub(crate) fn translate_request_tokenspeed_for(
 /// one) is reached by its indices in order, which the headless launch
 /// numbers 0..n in rank order.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RankIndices(Vec<u32>);
+pub(crate) struct RankIndices {
+    indices: Vec<u32>,
+    /// Whether every rank declared itself a decode engine, which takes a
+    /// disaggregated request on the rank it is pinned to ([`rendezvous_rank`]).
+    decode: bool,
+}
 
 impl RankIndices {
     /// The ranks behind `engines`, each read at its handshake.
     pub(crate) fn of(engines: &[ConnectedEngine]) -> Self {
+        let decode = !engines.is_empty()
+            && engines
+                .iter()
+                .all(|engine| engine.ready_response.disaggregation_role() == Some("decode"));
         let mut declared: Vec<(u32, u32)> = engines
             .iter()
             .filter_map(|engine| {
@@ -551,47 +651,71 @@ impl RankIndices {
                 .enumerate()
                 .all(|(rank, (declared_rank, _))| u32::try_from(rank) == Ok(*declared_rank));
         if permutation {
-            return Self(declared.into_iter().map(|(_, index)| index).collect());
+            return Self {
+                indices: declared.into_iter().map(|(_, index)| index).collect(),
+                decode,
+            };
         }
         let mut indices: Vec<u32> = engines
             .iter()
             .filter_map(|engine| engine.engine_id.engine_index())
             .collect();
         indices.sort_unstable();
-        Self(indices)
+        Self { indices, decode }
     }
 
-    /// The indices in rank order, as given.
+    /// The indices in rank order, as given, of an engine that is not a
+    /// decode engine.
     #[cfg(test)]
     pub(crate) fn new(indices_by_rank: Vec<u32>) -> Self {
-        Self(indices_by_rank)
+        Self {
+            indices: indices_by_rank,
+            decode: false,
+        }
+    }
+
+    /// The indices in rank order, as given, of a decode engine.
+    #[cfg(test)]
+    pub(crate) fn decode(indices_by_rank: Vec<u32>) -> Self {
+        Self {
+            indices: indices_by_rank,
+            decode: true,
+        }
     }
 
     /// How many ranks there are: the engine's `dp_size` for the residue.
     pub(crate) fn len(&self) -> usize {
-        self.0.len()
+        self.indices.len()
+    }
+
+    /// Whether the ranks are a decode engine's.
+    pub(crate) fn is_decode(&self) -> bool {
+        self.decode
     }
 
     /// The engine index that is rank `rank`, `None` past the last rank.
     pub(crate) fn index_of(&self, rank: u32) -> Option<u32> {
-        self.0.get(usize::try_from(rank).ok()?).copied()
+        self.indices.get(usize::try_from(rank).ok()?).copied()
     }
 }
 
 /// The attention data-parallel rank a request goes to, the engine's own
 /// dispatch rule over `ranks` connected ranks (its data-parallel controller
-/// and input processor, which the direct wire bypasses): a disaggregated
-/// request (one with a `bootstrap_room`) goes to `room % ranks` on the
-/// prefill side as on the decode side, since the decode side's receiver
-/// locates the KV on the prefill group of that residue; a pin that disagrees
-/// is logged and ignored, never refused. Outside disaggregation an in-range
-/// pin is honoured and an out-of-range one refused as the engine refuses it.
-/// A single rank takes everything, pin or not, and `None` leaves an unpinned
-/// request to the least-loaded selection.
+/// and input processor, which the direct wire bypasses). A disaggregated
+/// request (one with a `bootstrap_room`) goes to `room % ranks` on a prefill
+/// engine, since the decode side's receiver locates the KV on the prefill
+/// rank of that residue: a pin that disagrees is logged and ignored, never
+/// refused. A `decode` engine finds the prefill rank from the room on any of
+/// its ranks, so it takes a disaggregated request on its pin, and on the
+/// room's residue without one. An in-range pin is otherwise honoured and an
+/// out-of-range one refused as the engine refuses it. A single rank takes
+/// everything, pin or not, and `None` leaves an unpinned aggregated request
+/// to the least-loaded selection.
 pub(crate) fn rendezvous_rank(
     bootstrap_room: Option<i64>,
     pin: Option<i32>,
     ranks: usize,
+    decode: bool,
     request_id: &str,
 ) -> Result<Option<u32>, String> {
     let Ok(ranks) = u32::try_from(ranks) else {
@@ -600,7 +724,16 @@ pub(crate) fn rendezvous_rank(
     if ranks <= 1 {
         return Ok(None);
     }
+    let pinned = |pin: i32| match u32::try_from(pin) {
+        Ok(rank) if rank < ranks => Ok(Some(rank)),
+        _ => Err(format!(
+            "data_parallel_rank must be in [0, {ranks}), got {pin}"
+        )),
+    };
     if let Some(room) = bootstrap_room {
+        if let (true, Some(pin)) = (decode, pin) {
+            return pinned(pin);
+        }
         let rank = u32::try_from(room.rem_euclid(i64::from(ranks))).unwrap_or(0);
         if let Some(pin) = pin {
             if u32::try_from(pin).ok() != Some(rank) {
@@ -610,7 +743,7 @@ pub(crate) fn rendezvous_rank(
                     bootstrap_room = room,
                     dp_size = ranks,
                     "data_parallel_rank conflicts with the bootstrap_room residue; the room \
-                     stays authoritative on a disaggregated request, the pin is ignored"
+                     stays authoritative on a prefill engine, the pin is ignored"
                 );
             }
         }
@@ -618,12 +751,7 @@ pub(crate) fn rendezvous_rank(
     }
     match pin {
         None => Ok(None),
-        Some(pin) => match u32::try_from(pin) {
-            Ok(rank) if rank < ranks => Ok(Some(rank)),
-            _ => Err(format!(
-                "data_parallel_rank must be in [0, {ranks}), got {pin}"
-            )),
-        },
+        Some(pin) => pinned(pin),
     }
 }
 
@@ -660,40 +788,10 @@ pub(crate) fn translate_tokenspeed_multimodal(
         // VIDEO=3; engine: VIDEO=2, AUDIO=3) — translate, never pass through.
         // Unknown values are rejected, mirroring the gRPC servicer's
         // `_modality_from_proto`.
-        let modality = match item.modality() {
-            common::Modality::Image => TokenSpeedWireModality::Image,
-            common::Modality::Video => TokenSpeedWireModality::Video,
-            common::Modality::Audio => TokenSpeedWireModality::Audio,
-            common::Modality::Unspecified => {
-                return Err("multimodal item carried an unspecified modality".to_string());
-            }
-        };
-        if item.content_hash.is_empty() {
-            return Err(
-                "multimodal item carried no content hash; the engine pad value derives from it"
-                    .to_string(),
-            );
-        }
-        // u64 little-endian fold of the leading hash bytes — the same fold the
-        // gRPC servicer applies (`int.from_bytes(content_hash[:8], "little")`),
-        // so an item hashes identically on both transports.
-        let mut hash_bytes = [0u8; 8];
-        for (dst, src) in hash_bytes.iter_mut().zip(item.content_hash.iter()) {
-            *dst = *src;
-        }
-        let hash = u64::from_le_bytes(hash_bytes);
-        let pad_value = mm_pad_value(modality, hash);
-
-        if item.placeholders.is_empty() {
-            return Err("multimodal item carried no placeholders".to_string());
-        }
-        let mut offsets = Vec::with_capacity(item.placeholders.len());
-        for placeholder in &item.placeholders {
-            if placeholder.length == 0 {
-                return Err("multimodal placeholder length must be > 0".to_string());
-            }
-            let start = placeholder.offset as usize;
-            let end = start + placeholder.length as usize - 1;
+        let (modality, hash, pad_value) = mm_item_identity(&item)?;
+        let offsets = mm_item_offsets(&item.placeholders)?;
+        for &(start, end) in &offsets {
+            let (start, end) = (start as usize, end as usize);
             if end >= input_ids.len() {
                 return Err(format!(
                     "multimodal placeholder [{start}, {end}] exceeds the {} prompt tokens",
@@ -703,7 +801,6 @@ pub(crate) fn translate_tokenspeed_multimodal(
             for id in &mut input_ids[start..=end] {
                 *id = pad_value;
             }
-            offsets.push((start as u64, end as u64));
         }
         match modality {
             TokenSpeedWireModality::Image => {
@@ -804,6 +901,125 @@ pub(crate) fn translate_tokenspeed_multimodal(
             mrope_position_delta_scalar,
         },
     ))
+}
+
+/// A multimodal item's wire identity: its modality (the proto and engine
+/// enums disagree, so it is translated, never passed through; an unknown value
+/// is refused as the gRPC servicer's `_modality_from_proto` refuses it), its
+/// hash (the u64 little-endian fold of the leading content-hash bytes, the
+/// fold the gRPC servicer applies with `int.from_bytes(content_hash[:8],
+/// "little")`, so an item hashes identically on both transports) and the pad
+/// value the engine derives from the hash.
+fn mm_item_identity(
+    item: &tokenspeed_proto::MultimodalItem,
+) -> Result<(TokenSpeedWireModality, u64, u32), String> {
+    let modality = match item.modality() {
+        common::Modality::Image => TokenSpeedWireModality::Image,
+        common::Modality::Video => TokenSpeedWireModality::Video,
+        common::Modality::Audio => TokenSpeedWireModality::Audio,
+        common::Modality::Unspecified => {
+            return Err("multimodal item carried an unspecified modality".to_string());
+        }
+    };
+    if item.content_hash.is_empty() {
+        return Err(
+            "multimodal item carried no content hash; the engine pad value derives from it"
+                .to_string(),
+        );
+    }
+    let mut hash_bytes = [0u8; 8];
+    for (dst, src) in hash_bytes.iter_mut().zip(item.content_hash.iter()) {
+        *dst = *src;
+    }
+    let hash = u64::from_le_bytes(hash_bytes);
+    Ok((modality, hash, mm_pad_value(modality, hash)))
+}
+
+/// An item's placeholder spans as the engine's inclusive `offsets`; an item
+/// without placeholders, or a placeholder of length 0, is refused as the gRPC
+/// servicer refuses it. The spans are not checked against a prompt here: the
+/// generate path checks them against its ids, an encode request has none.
+fn mm_item_offsets(
+    placeholders: &[tokenspeed_proto::PlaceholderRange],
+) -> Result<Vec<(u64, u64)>, String> {
+    if placeholders.is_empty() {
+        return Err("multimodal item carried no placeholders".to_string());
+    }
+    placeholders
+        .iter()
+        .map(|placeholder| {
+            if placeholder.length == 0 {
+                return Err("multimodal placeholder length must be > 0".to_string());
+            }
+            let start = u64::from(placeholder.offset);
+            Ok((start, start + u64::from(placeholder.length) - 1))
+        })
+        .collect()
+}
+
+/// The encode worker's own rendezvous, which every encode request names: the
+/// worker hosts the transfer the prefill side pulls the embedding from, at
+/// its host and `--disaggregation-bootstrap-port` (the gRPC servicer fills
+/// them the same way, from the launch).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodeRendezvous {
+    pub bootstrap_host: String,
+    pub bootstrap_port: i32,
+}
+
+/// Translate an `Encode` RPC into the encode worker's wire request, with the
+/// gRPC servicer's rules: `mm_inputs` is required and carries exactly one
+/// item with exactly one room assignment (the engine's request names one
+/// room), the item's feature is required (the worker runs the tower on it;
+/// SHM and remote payloads are refused as on the generate path), its hash,
+/// pad value and offsets are the generate path's. An empty request id is
+/// refused rather than invented: the id names the request in the worker's
+/// log and nothing answers it.
+pub fn translate_encode_request(
+    req: smg_grpc_client::tokenspeed_encoder_proto::EncodeRequest,
+    rendezvous: &EncodeRendezvous,
+) -> Result<TokenSpeedEncodeRequest, String> {
+    if req.request_id.is_empty() {
+        return Err("request_id is required".to_string());
+    }
+    let Some(mm) = req.mm_inputs else {
+        return Err("EncodeRequest.mm_inputs is required".to_string());
+    };
+    if mm.items.len() != 1 || req.items.len() != 1 {
+        return Err(
+            "EncodeRequest must contain exactly one mm item and one room assignment".to_string(),
+        );
+    }
+    let bootstrap_room = req.items[0].bootstrap_room;
+    let mut items = Vec::with_capacity(1);
+    for item in mm.items {
+        let (modality, hash, pad_value) = mm_item_identity(&item)?;
+        let offsets = mm_item_offsets(&item.placeholders)?;
+        let Some(encoder_input) = item.encoder_input else {
+            return Err("encode MultimodalItem carried no encoder_input".to_string());
+        };
+        let feature = Some(wire_tensor_tokenspeed(encoder_input)?);
+        let mut model_specific_data = BTreeMap::new();
+        for (name, tensor) in item.model_specific_tensors {
+            model_specific_data.insert(name, wire_tensor_tokenspeed(tensor)?);
+        }
+        items.push(TokenSpeedWireMmItem {
+            modality,
+            hash,
+            pad_value,
+            offsets,
+            feature,
+            model_specific_data,
+            encode_handshake: None,
+        });
+    }
+    Ok(TokenSpeedEncodeRequest {
+        request_id: req.request_id,
+        bootstrap_host: rendezvous.bootstrap_host.clone(),
+        bootstrap_port: rendezvous.bootstrap_port,
+        bootstrap_room,
+        items,
+    })
 }
 
 /// Convert an inline proto tensor to the wire `(dtype, shape, data)` tuple,
@@ -971,7 +1187,7 @@ mod tests {
     use openai_protocol::worker::RuntimeType;
 
     use super::*;
-    use crate::test_support::connected_pair;
+    use crate::test_support::{connected_pair, two_logprob_chunks_then_the_complete};
 
     /// The translation under the mock scheduler's context window, one rank.
     fn translate_for(
@@ -983,6 +1199,7 @@ mod tests {
             grid_tensors,
             default_ready_response().max_model_len,
             &RankIndices::new(vec![0]),
+            LogprobColumns::default(),
         )
     }
 
@@ -1074,49 +1291,8 @@ mod tests {
         };
         let mut stream = client.generate_tokenspeed(req).await.expect("generate");
 
-        let first = stream.next().await.expect("chunk item").expect("chunk ok");
-        match first.response {
-            Some(vllm::generate_response::Response::Chunk(chunk)) => {
-                assert_eq!(chunk.token_ids, vec![10]);
-                assert_eq!(chunk.prompt_tokens, 3);
-                let logprobs = chunk.output_logprobs.expect("chunk logprobs");
-                assert_eq!(logprobs.token_logprobs, vec![-0.5]);
-                assert_eq!(logprobs.token_ids, vec![10]);
-            }
-            other => panic!("expected chunk, got {other:?}"),
-        }
-        // The finish tick carried a new token, so its delta is emitted as a
-        // chunk before the (cumulative) terminal complete.
-        let second = stream.next().await.expect("chunk item").expect("chunk ok");
-        match second.response {
-            Some(vllm::generate_response::Response::Chunk(chunk)) => {
-                assert_eq!(chunk.token_ids, vec![11]);
-                let logprobs = chunk.output_logprobs.expect("chunk logprobs");
-                assert_eq!(logprobs.token_logprobs, vec![-1.25]);
-                assert_eq!(logprobs.token_ids, vec![11]);
-            }
-            other => panic!("expected chunk, got {other:?}"),
-        }
-        let third = stream
-            .next()
-            .await
-            .expect("complete item")
-            .expect("complete ok");
-        match third.response {
-            Some(vllm::generate_response::Response::Complete(complete)) => {
-                assert_eq!(complete.output_ids, vec![10, 11]);
-                assert_eq!(complete.finish_reason, "length");
-                assert_eq!(complete.completion_tokens, 2);
-                // Chunks carry the tick's incremental logprobs; the terminal
-                // `Complete` carries the cumulative set, parallel to `output_ids`
-                // (the non-streaming renderer reads only the `Complete`).
-                let logprobs = complete.output_logprobs.expect("complete logprobs");
-                assert_eq!(logprobs.token_logprobs, vec![-0.5, -1.25]);
-                assert_eq!(logprobs.token_ids, vec![10, 11]);
-            }
-            other => panic!("expected complete, got {other:?}"),
-        }
-        assert!(stream.next().await.is_none());
+        let first = two_logprob_chunks_then_the_complete(&mut stream).await;
+        assert_eq!(first.prompt_tokens, 3);
 
         engine_task.await.unwrap();
     }
@@ -1205,7 +1381,13 @@ mod tests {
         req.top_logprobs_num = 5;
         assert!(translate_for(req, GridTensors::Positions).is_err());
 
-        // Prompt (input) logprobs cannot be produced.
+        // Prompt (input) logprobs are not reported by an engine that does not
+        // declare their columns.
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        req.logprob_start_len = Some(0);
+        assert!(translate_for(req, GridTensors::Positions).is_err());
+
+        // Selected-token logprobs are reported by no TokenSpeed engine.
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         req.token_ids_logprob = vec![1, 2];
         assert!(translate_for(req, GridTensors::Positions).is_err());
@@ -1216,6 +1398,173 @@ mod tests {
             req.top_logprobs_num = count;
             assert!(translate_for(req, GridTensors::Positions).is_ok());
         }
+    }
+
+    /// An engine that declares the prompt-logprob and top-k columns takes
+    /// requests for them, which ride on the wire's own fields; a count of
+    /// 0/1 stays the plain sampled-token logprob.
+    #[test]
+    fn an_engine_declaring_the_columns_takes_top_and_prompt_logprobs() {
+        let columns = LogprobColumns {
+            prompt: true,
+            top: true,
+        };
+        let translate = |req| {
+            translate_request_tokenspeed_for(
+                req,
+                GridTensors::Positions,
+                default_ready_response().max_model_len,
+                &RankIndices::new(vec![0]),
+                columns,
+            )
+        };
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        req.return_logprob = true;
+        req.top_logprobs_num = 5;
+        req.logprob_start_len = Some(0);
+        let wire = translate(req).expect("both columns declared");
+        assert_eq!((wire.top_logprobs_num, wire.logprob_start_len), (5, 0));
+
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        req.return_logprob = true;
+        req.top_logprobs_num = 1;
+        let wire = translate(req).expect("plain logprobs");
+        assert_eq!((wire.top_logprobs_num, wire.logprob_start_len), (0, -1));
+
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        req.token_ids_logprob = vec![1, 2];
+        assert!(translate(req).is_err());
+    }
+
+    /// A TokenSpeed engine's prompt logprobs and top-k candidates, read by
+    /// its declared column names, reach the stream: the prompt logprobs on
+    /// the first token chunk and the `Complete`, the candidates on each chunk
+    /// and accumulated on the `Complete`.
+    #[tokio::test]
+    async fn the_stream_carries_a_tokenspeed_engines_prompt_logprobs_and_candidates() {
+        use crate::test_support::connected_pair_declaring;
+
+        const COLUMNS: [&str; 22] = [
+            "rids",
+            "output_ids",
+            "finished_reasons",
+            "prompt_tokens",
+            "completion_tokens",
+            "cached_tokens",
+            "output_token_logprobs_val",
+            "output_token_logprobs_idx",
+            "engine_index",
+            "num_running",
+            "num_waiting",
+            "kv_active_pages",
+            "kv_total_pages",
+            "finish_reason_details",
+            "spec_verify_ct",
+            "accept_draft_tokens",
+            "input_token_logprobs_val",
+            "input_token_logprobs_idx",
+            "input_top_logprobs_val",
+            "input_top_logprobs_idx",
+            "output_top_logprobs_val",
+            "output_top_logprobs_idx",
+        ];
+        let mut ready = default_ready_response();
+        ready.positional_layouts.insert(
+            "BatchTokenIDOutSlim".to_string(),
+            COLUMNS.iter().map(|name| name.to_string()).collect(),
+        );
+        let (client, engine, _dir) = connected_pair_declaring(RuntimeType::TokenSpeed, ready).await;
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "engine task ends after responding"
+        )]
+        let engine_task = tokio::spawn(async move {
+            let (mut input, mut output) = engine.split();
+            let frames = input.recv_frames().await.unwrap();
+            let request: TokenizedGenerateReqInput =
+                engine_zmq_client::codec::decode_msgpack(frames[1].as_ref()).unwrap();
+            assert_eq!(
+                (request.logprob_start_len, request.top_logprobs_num),
+                (0, 2)
+            );
+            let prefill = serde_json::json!([
+                "BatchTokenIDOutSlim",
+                ["r1"],
+                [[10]],
+                [""],
+                [3],
+                [1],
+                [0],
+                [[-0.5]],
+                [[10]],
+                0,
+                1,
+                0,
+                4,
+                100,
+                [null],
+                [],
+                [],
+                [[null, -1.25, -2.5]],
+                [[1, 2, 3]],
+                [[null, [-1.25, -3.0], [-2.5, -2.75]]],
+                [[null, [2, 9], [3, 8]]],
+                [[[-0.5, -1.5]]],
+                [[[10, 4]]],
+            ]);
+            let done = serde_json::json!([
+                "BatchTokenIDOutSlim", ["r1"], [[11]], ["length"], [3], [2], [0],
+                [[-0.75]], [[11]], 0, 0, 0, 4, 100, [{"type": "length", "length": 2}], [], [],
+                [], [], [], [], [[[-0.75, -2.0]]], [[[11, 5]]],
+            ]);
+            for batch in [prefill, done] {
+                output
+                    .send_frames(vec![bytes::Bytes::from(
+                        engine_zmq_client::codec::encode_msgpack(&batch).unwrap(),
+                    )])
+                    .await
+                    .unwrap();
+            }
+            (input, output)
+        });
+
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams {
+            max_new_tokens: Some(2),
+            ..Default::default()
+        });
+        req.return_logprob = true;
+        req.top_logprobs_num = 2;
+        req.logprob_start_len = Some(0);
+        let mut stream = client.generate_tokenspeed(req).await.expect("generate");
+        let mut responses = Vec::new();
+        while let Some(item) = stream.next().await {
+            responses.push(item.expect("ok").response.expect("a response"));
+        }
+        let [vllm::generate_response::Response::Chunk(first), vllm::generate_response::Response::Chunk(second), vllm::generate_response::Response::Complete(complete)] =
+            responses.as_slice()
+        else {
+            panic!("two chunks then the complete, got {responses:?}");
+        };
+        let prompt = first
+            .input_logprobs
+            .as_ref()
+            .expect("prompt logprobs on the first chunk");
+        let values: Vec<_> = prompt.token_logprobs.iter().map(|lp| lp.value).collect();
+        assert_eq!(values, [None, Some(-1.25), Some(-2.5)]);
+        assert_eq!(prompt.token_ids, [1, 2, 3]);
+        assert_eq!(prompt.top_logprobs[1].token_ids, [2, 9]);
+        assert!(second.input_logprobs.is_none(), "once, on the first chunk");
+        let candidates = &first.output_logprobs.as_ref().unwrap().top_logprobs;
+        assert_eq!(candidates[0].token_ids, [10, 4]);
+        let all = complete
+            .output_logprobs
+            .as_ref()
+            .expect("cumulative logprobs");
+        assert_eq!(all.top_logprobs.len(), 2);
+        assert_eq!(all.top_logprobs[1].values, [-0.75, -2.0]);
+        assert!(complete.input_logprobs.is_some());
+        engine_task.await.unwrap();
     }
 
     fn kv_bootstrap(host: &str, port: i32, room: i64) -> tokenspeed_proto::KvBootstrapInfo {
@@ -1267,37 +1616,66 @@ mod tests {
     }
 
     /// Placement is the engine's own dispatch rule: a disaggregated request
-    /// goes to its room's residue on either side (a disagreeing pin is
-    /// ignored), an aggregated one to its pin when in range (out of range is
-    /// the engine's refusal), a single rank takes everything, and an
-    /// unpinned aggregated request is left to the least-loaded selection.
+    /// goes to its room's residue on a prefill engine (a disagreeing pin is
+    /// ignored) and to its pin on a decode engine, an aggregated one to its
+    /// pin when in range (out of range is the engine's refusal), a single
+    /// rank takes everything, and an unpinned aggregated request is left to
+    /// the least-loaded selection.
     #[test]
     fn tokenspeed_places_a_request_as_the_engines_dispatcher_would() {
-        assert_eq!(rendezvous_rank(Some(7), None, 2, "r").unwrap(), Some(1));
-        assert_eq!(rendezvous_rank(Some(8), None, 2, "r").unwrap(), Some(0));
         assert_eq!(
-            rendezvous_rank(Some(7), Some(0), 2, "r").unwrap(),
+            rendezvous_rank(Some(7), None, 2, false, "r").unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            rendezvous_rank(Some(8), None, 2, false, "r").unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            rendezvous_rank(Some(7), Some(0), 2, false, "r").unwrap(),
             Some(1),
             "the room stays authoritative over the pin"
         );
         assert_eq!(
-            rendezvous_rank(Some(-3), None, 4, "r").unwrap(),
+            rendezvous_rank(Some(-3), None, 4, false, "r").unwrap(),
             Some(1),
             "a negative room folds as Python's % does"
         );
-        assert_eq!(rendezvous_rank(Some(7), Some(1), 1, "r").unwrap(), None);
-        assert_eq!(rendezvous_rank(None, Some(1), 2, "r").unwrap(), Some(1));
-        assert_eq!(rendezvous_rank(None, None, 2, "r").unwrap(), None);
         assert_eq!(
-            rendezvous_rank(None, Some(5), 1, "r").unwrap(),
+            rendezvous_rank(Some(7), Some(1), 1, false, "r").unwrap(),
+            None
+        );
+        assert_eq!(
+            rendezvous_rank(None, Some(1), 2, false, "r").unwrap(),
+            Some(1)
+        );
+        assert_eq!(rendezvous_rank(None, None, 2, false, "r").unwrap(), None);
+        assert_eq!(
+            rendezvous_rank(None, Some(5), 1, false, "r").unwrap(),
             None,
             "without attention DP the pin is meaningless and dropped"
         );
         assert_eq!(
-            rendezvous_rank(None, Some(2), 2, "r").unwrap_err(),
+            rendezvous_rank(None, Some(2), 2, false, "r").unwrap_err(),
             "data_parallel_rank must be in [0, 2), got 2"
         );
-        assert!(rendezvous_rank(None, Some(-1), 2, "r").is_err());
+        assert!(rendezvous_rank(None, Some(-1), 2, false, "r").is_err());
+
+        // A decode engine takes a disaggregated request on its pin (any of
+        // its ranks finds the prefill rank from the room), on the room's
+        // residue without one, and refuses an out-of-range pin.
+        assert_eq!(
+            rendezvous_rank(Some(7), Some(0), 2, true, "r").unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            rendezvous_rank(Some(7), None, 2, true, "r").unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            rendezvous_rank(Some(7), Some(2), 2, true, "r").unwrap_err(),
+            "data_parallel_rank must be in [0, 2), got 2"
+        );
 
         // Through the translation, over two ranks whose engine indices are
         // the reverse of their ranks (rank 0 dialled in as index 1): the
@@ -1306,24 +1684,57 @@ mod tests {
         let reversed = RankIndices::new(vec![1, 0]);
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         req.data_parallel_rank = Some(1);
-        let wire = translate_request_tokenspeed_for(req, GridTensors::Positions, window, &reversed)
-            .expect("an in-range pin");
+        let wire = translate_request_tokenspeed_for(
+            req,
+            GridTensors::Positions,
+            window,
+            &reversed,
+            LogprobColumns::default(),
+        )
+        .expect("an in-range pin");
         assert_eq!(wire.data_parallel_rank, Some(0), "rank 1 is index 0");
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         req.data_parallel_rank = Some(1);
         req.kv_bootstrap_info = Some(kv_bootstrap("10.0.0.7", 8998, 4));
-        let wire = translate_request_tokenspeed_for(req, GridTensors::Positions, window, &reversed)
-            .expect("a disaggregated request");
+        let wire = translate_request_tokenspeed_for(
+            req,
+            GridTensors::Positions,
+            window,
+            &reversed,
+            LogprobColumns::default(),
+        )
+        .expect("a disaggregated request");
         assert_eq!(
             wire.data_parallel_rank,
             Some(1),
             "room 4 is rank 0 on two ranks, which is index 1"
         );
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        req.data_parallel_rank = Some(1);
+        req.kv_bootstrap_info = Some(kv_bootstrap("10.0.0.7", 8998, 4));
+        let wire = translate_request_tokenspeed_for(
+            req,
+            GridTensors::Positions,
+            window,
+            &RankIndices::decode(vec![1, 0]),
+            LogprobColumns::default(),
+        )
+        .expect("a pinned decode request");
+        assert_eq!(
+            wire.data_parallel_rank,
+            Some(0),
+            "a decode engine takes rank 1, which is index 0, whatever the room"
+        );
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         req.data_parallel_rank = Some(2);
-        let error =
-            translate_request_tokenspeed_for(req, GridTensors::Positions, window, &reversed)
-                .expect_err("an out-of-range pin");
+        let error = translate_request_tokenspeed_for(
+            req,
+            GridTensors::Positions,
+            window,
+            &reversed,
+            LogprobColumns::default(),
+        )
+        .expect_err("an out-of-range pin");
         assert!(
             error.contains("data_parallel_rank must be in [0, 2)"),
             "{error}"
@@ -1368,6 +1779,20 @@ mod tests {
             "declared ranks over arbitrary indices"
         );
         assert_eq!(RankIndices::of(&[]).len(), 0);
+        assert!(!swapped.is_decode());
+
+        // A group whose every rank declares the decode role is a decode
+        // engine's.
+        let decode = |index: u32| ConnectedEngine {
+            engine_id: EngineId::from_engine_index(index),
+            ready_response: EngineCoreReadyResponse {
+                data_parallel_rank: index,
+                disaggregation_mode: Some("decode".to_string()),
+                ..default_ready_response()
+            },
+        };
+        assert!(RankIndices::of(&[decode(0), decode(1)]).is_decode());
+        assert!(!RankIndices::of(&[decode(0), engine(1, 1)]).is_decode());
     }
 
     /// An EPD prefill request: each named item carries its encode rendezvous
@@ -1625,6 +2050,7 @@ mod tests {
                     GridTensors::Positions,
                     max_model_len,
                     &RankIndices::new(vec![0]),
+                    LogprobColumns::default(),
                 );
                 assert_eq!(
                     result.is_ok(),
@@ -1658,6 +2084,7 @@ mod tests {
             GridTensors::Positions,
             5,
             &RankIndices::new(vec![0]),
+            LogprobColumns::default(),
         )
         .expect_err("the prompt fills the window");
         assert!(error.contains("length 5"), "{error}");
@@ -1667,6 +2094,7 @@ mod tests {
             GridTensors::Positions,
             6,
             &RankIndices::new(vec![0]),
+            LogprobColumns::default(),
         )
         .expect("one position left for output");
         assert_eq!(wire.input_ids.len(), 5);
@@ -1884,6 +2312,36 @@ mod tests {
             .iter()
             .map(|c| i64::from_le_bytes(*c))
             .collect()
+    }
+
+    /// The facts a TokenSpeed engine declares at its handshake pick the same
+    /// rule a launcher's facts do: a Qwen3.5 checkpoint with its layout gets
+    /// the position table, one that declares only part of the layout gets
+    /// none, and an engine that declares nothing keeps the conservative
+    /// reading.
+    #[test]
+    fn the_facts_an_engine_declares_pick_the_position_rule() {
+        let mut ready = default_ready_response();
+        assert_eq!(GridTensors::declared(&ready), GridTensors::Positions);
+        ready.model_type = Some("qwen3_5".to_string());
+        ready.architectures = vec!["Qwen3_5ForConditionalGeneration".to_string()];
+        ready.mrope_positions = Some(true);
+        ready.spatial_merge_size = Some(QWEN35.spatial_merge_size);
+        ready.image_token_id = Some(QWEN35.image_token_id);
+        assert_eq!(
+            GridTensors::declared(&ready),
+            GridTensors::Qwen35PositionsUnavailable
+        );
+        ready.video_token_id = Some(QWEN35.video_token_id);
+        assert_eq!(
+            GridTensors::declared(&ready),
+            GridTensors::Qwen35Positions(QWEN35)
+        );
+        // A model whose rope config is plain lays out patches only.
+        let mut patches = default_ready_response();
+        patches.architectures = vec!["Llama4ForConditionalGeneration".to_string()];
+        patches.mrope_positions = Some(false);
+        assert_eq!(GridTensors::declared(&patches), GridTensors::PatchLayout);
     }
 
     /// A Qwen3.5-lineage checkpoint's grid feeds the position table this
@@ -2398,5 +2856,104 @@ mod tests {
             }
         }
         engine_task.await.unwrap();
+    }
+
+    fn encode_proto(room: i64) -> smg_grpc_client::tokenspeed_encoder_proto::EncodeRequest {
+        use smg_grpc_client::tokenspeed_encoder_proto::{EncodeItemAssignment, EncodeRequest};
+
+        let tensor = |dtype: &str, shape: Vec<u32>, bytes: Vec<u8>| tokenspeed_proto::TensorData {
+            dtype: dtype.to_string(),
+            shape,
+            payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(bytes.into())),
+        };
+        EncodeRequest {
+            request_id: "e1".to_string(),
+            mm_inputs: Some(tokenspeed_proto::MultimodalInputs {
+                items: vec![tokenspeed_proto::MultimodalItem {
+                    modality: common::Modality::Image as i32,
+                    content_hash: 0xDEAD_BEEFu64.to_le_bytes().to_vec(),
+                    encoder_input: Some(tensor("bfloat16", vec![3, 2], (0u8..12).collect())),
+                    model_specific_tensors: [(
+                        "vit_grid".to_string(),
+                        tensor(
+                            "uint32",
+                            vec![1, 3],
+                            vec![1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0],
+                        ),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    placeholders: vec![tokenspeed_proto::PlaceholderRange {
+                        offset: 1,
+                        length: 3,
+                    }],
+                    placeholder_token_id: Some(9),
+                }],
+            }),
+            items: vec![EncodeItemAssignment {
+                bootstrap_room: room,
+            }],
+        }
+    }
+
+    /// An `Encode` translates with the gRPC servicer's rules: the worker's
+    /// own rendezvous and the room, the item's identity as the generate path
+    /// derives it (the content-hash fold, the pad value, the placeholder
+    /// spans as offsets), its feature and model-specific tensors; no
+    /// `mm_inputs`, two items, no room, no feature, an empty request id are
+    /// refused in the servicer's words.
+    #[test]
+    fn an_encode_request_translates_with_the_grpc_servicers_rules() {
+        let rendezvous = EncodeRendezvous {
+            bootstrap_host: "10.0.0.9".to_string(),
+            bootstrap_port: 8998,
+        };
+        let wire = translate_encode_request(encode_proto(41), &rendezvous).expect("translates");
+        assert_eq!(wire.request_id, "e1");
+        assert_eq!(wire.bootstrap_host, "10.0.0.9");
+        assert_eq!(wire.bootstrap_port, 8998);
+        assert_eq!(wire.bootstrap_room, 41);
+        assert_eq!(wire.items.len(), 1);
+        let item = &wire.items[0];
+        assert_eq!(item.modality, TokenSpeedWireModality::Image);
+        assert_eq!(item.hash, 0xDEAD_BEEF);
+        assert_eq!(
+            item.pad_value,
+            mm_pad_value(TokenSpeedWireModality::Image, 0xDEAD_BEEF)
+        );
+        assert_eq!(item.offsets, vec![(1, 3)]);
+        assert!(item.feature.is_some());
+        assert!(item.model_specific_data.contains_key("vit_grid"));
+        assert_eq!(item.encode_handshake, None);
+
+        let mut no_inputs = encode_proto(1);
+        no_inputs.mm_inputs = None;
+        let mut two_items = encode_proto(2);
+        let twin = two_items.mm_inputs.as_ref().unwrap().items[0].clone();
+        two_items.mm_inputs.as_mut().unwrap().items.push(twin);
+        let mut no_room = encode_proto(3);
+        no_room.items.clear();
+        let mut no_feature = encode_proto(4);
+        no_feature.mm_inputs.as_mut().unwrap().items[0].encoder_input = None;
+        let mut no_id = encode_proto(5);
+        no_id.request_id.clear();
+        for (request, words) in [
+            (no_inputs, "EncodeRequest.mm_inputs is required"),
+            (
+                two_items,
+                "EncodeRequest must contain exactly one mm item and one room assignment",
+            ),
+            (
+                no_room,
+                "EncodeRequest must contain exactly one mm item and one room assignment",
+            ),
+            (no_feature, "encode MultimodalItem carried no encoder_input"),
+            (no_id, "request_id is required"),
+        ] {
+            assert_eq!(
+                translate_encode_request(request, &rendezvous).unwrap_err(),
+                words
+            );
+        }
     }
 }

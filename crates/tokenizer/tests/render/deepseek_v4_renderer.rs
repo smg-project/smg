@@ -27,19 +27,6 @@ use crate::common;
 
 const RENDER_FIXTURES: &str = include_str!("../fixtures/deepseek_v4/render_fixtures.json");
 
-/// A tokenizer.json that loads; the text check never calls into it.
-const MIN_TOKENIZER_JSON: &str = r#"{
-    "version": "1.0",
-    "truncation": null,
-    "padding": null,
-    "added_tokens": [],
-    "normalizer": null,
-    "pre_tokenizer": { "type": "Whitespace" },
-    "post_processor": null,
-    "decoder": null,
-    "model": { "type": "BPE", "vocab": { "hello": 0 }, "merges": [] }
-}"#;
-
 /// One request as the engine's own server received it, with its prompt.
 /// Unknown fields are rejected so a regenerated fixture carrying a new knob
 /// fails here instead of rendering with it ignored.
@@ -116,7 +103,11 @@ fn fixtures() -> Fixtures {
 #[test]
 fn deepseek_v4_render_text_matches_the_engines_prompts() {
     let temp = TempDir::new().expect("temp dir");
-    fs::write(temp.path().join("tokenizer.json"), MIN_TOKENIZER_JSON).expect("tokenizer.json");
+    fs::write(
+        temp.path().join("tokenizer.json"),
+        common::MIN_TOKENIZER_JSON,
+    )
+    .expect("tokenizer.json");
     fs::write(
         temp.path().join("config.json"),
         r#"{"architectures":["DeepseekV4ForCausalLM"],"model_type":"deepseek_v4"}"#,

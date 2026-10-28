@@ -1,50 +1,11 @@
 //! Shared types for Harmony pipeline
 
-use openai_harmony::chat::Content;
 use openai_protocol::common::ToolCall;
 use serde::{Deserialize, Serialize};
 
-/// Harmony message format
-///
-/// Represents messages in the Harmony encoding format with role and content.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct HarmonyMessage {
-    pub role: String,
-    pub content: String,
-}
-
-impl HarmonyMessage {
-    /// Convert from openai_harmony::chat::Message to our simplified HarmonyMessage
-    pub fn from_openai_harmony(msg: openai_harmony::chat::Message) -> Self {
-        // Extract role as string
-        let role = match msg.author.role {
-            openai_harmony::chat::Role::User => "user",
-            openai_harmony::chat::Role::Assistant => "assistant",
-            openai_harmony::chat::Role::System => "system",
-            openai_harmony::chat::Role::Developer => "developer",
-            openai_harmony::chat::Role::Tool => "tool",
-        }
-        .to_string();
-
-        // Extract text content from all Content::Text parts
-        let content = msg
-            .content
-            .iter()
-            .filter_map(|c| match c {
-                Content::Text(tc) => Some(tc.text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("");
-
-        Self { role, content }
-    }
-}
-
 /// Output from Harmony encoding process
 ///
-/// Contains the encoded input_ids, stop tokens, selection text for worker routing,
-/// and the Harmony message history.
+/// Contains the encoded input_ids, stop tokens and the selection text for worker routing.
 #[derive(Debug, Clone)]
 pub(crate) struct HarmonyBuildOutput {
     /// Encoded token IDs to send to the model
@@ -55,9 +16,6 @@ pub(crate) struct HarmonyBuildOutput {
 
     /// Selection text for worker routing (concise snippet from last user message)
     pub selection_text: String,
-
-    /// Harmony messages for this conversation (used for history tracking)
-    pub harmony_messages: Vec<HarmonyMessage>,
 }
 
 /// Parsed output from all three Harmony channels
@@ -79,12 +37,6 @@ pub(crate) struct HarmonyChannelOutput {
 
     /// Number of reasoning tokens (from analysis and commentary channels)
     pub reasoning_token_count: u32,
-
-    /// For each output token, the bytes of `final_text` it carries, or `None`
-    /// for a token outside it (a header, a stop token, the analysis or a tool
-    /// call). A token held for an incomplete UTF-8 character carries 0. Only
-    /// `parse_complete` fills it.
-    pub final_text_tokens: Vec<Option<usize>>,
 }
 
 /// Streaming delta for SSE responses

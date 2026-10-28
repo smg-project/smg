@@ -181,7 +181,7 @@ impl RelaySource {
         let error_type = error_type_from_status(cut.status);
         let reason = error_reason_from_status(cut.status);
         warn!(
-            worker = self.worker.url(),
+            worker = self.worker.redacted_url(),
             worker_type = self.worker_type,
             route = self.route,
             bytes_relayed,
@@ -275,11 +275,13 @@ pub(crate) fn note_sent(tail: &mut Vec<u8>, bytes: &[u8]) {
 #[cfg(test)]
 mod tests {
     use metrics_exporter_prometheus::PrometheusBuilder;
-    use openai_protocol::{messages::MessageStreamEvent, worker::HealthCheckConfig};
+    use openai_protocol::messages::MessageStreamEvent;
     use serde_json::Value;
 
     use super::*;
-    use crate::worker::{circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder};
+    use crate::worker::{
+        circuit_breaker::CircuitBreakerConfig, test_support::no_health_check, BasicWorkerBuilder,
+    };
 
     const CAUSE: &str = "error decoding response body: error reading a body from connection: \
                          connection reset";
@@ -292,10 +294,7 @@ mod tests {
                     failure_threshold: 1,
                     ..Default::default()
                 })
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         )
     }
@@ -329,9 +328,8 @@ mod tests {
     /// A call to a worker nobody listens at: the connect is refused, and the
     /// error carries the worker's URL as reqwest attaches it.
     async fn refused_call() -> (std::net::SocketAddr, reqwest::Error) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let refused = crate::test_support::RefusedAddress::reserve();
+        let addr = refused.addr();
         let error = crate::clients::http_client_builder()
             .build()
             .unwrap()

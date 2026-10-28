@@ -3,7 +3,7 @@ name: Tau2 Budget Tests
 on:
   pull_request:
     paths:
-      - scripts/tau2/budget.py
+      - scripts/tau2/budget*.py
       - scripts/tau2/costmap_shim/sitecustomize.py
       - scripts/tests/test_tau2_budget.py
       - scripts/tests/test_tau2_budget_startup.py
@@ -24,6 +24,6 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install pytest ruff==0.15.0
-      - run: ruff check scripts/tau2/budget*.py scripts/tau2/costmap_shim/sitecustomize.py scripts/tests/test_tau2_budget*.py
-      - run: ruff format --check scripts/tau2/budget*.py scripts/tau2/costmap_shim/sitecustomize.py scripts/tests/test_tau2_budget*.py
+      - run: ruff check scripts/tau2/budget*.py scripts/tau2/costmap_shim/sitecustomize.py scripts/tests/test_tau2_budget*.py scripts/tests/test_tau2_costmap_shim.py
+      - run: ruff format --check scripts/tau2/budget*.py scripts/tau2/costmap_shim/sitecustomize.py scripts/tests/test_tau2_budget*.py scripts/tests/test_tau2_costmap_shim.py
       - run: python -m pytest -q --confcutdir=scripts/tests scripts/tests/test_tau2_budget*.py scripts/tests/test_tau2_costmap_shim.py

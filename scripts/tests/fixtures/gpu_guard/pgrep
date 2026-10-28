@@ -1,0 +1,4 @@
+#!/bin/bash
+# A stand-in for pgrep: nothing matches, so the guard's `pgrep ... | xargs kill`
+# never reaches a process of the machine the tests run on.
+exit 1

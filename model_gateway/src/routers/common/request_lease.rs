@@ -236,13 +236,24 @@ pub(crate) mod test_probe {
     }
 
     /// Loopback POST /generate stub that answers `{}` only after every probe
-    /// clone outside the test is gone (or after a deadline, leaving
+    /// clone outside the test is gone (or after five seconds, leaving
     /// `released` false).
+    pub(crate) async fn spawn_release_gated_stub(probe: Weak<()>) -> (String, Arc<AtomicBool>) {
+        spawn_release_gated_stub_with_deadline(probe, Duration::from_secs(5)).await
+    }
+
+    /// [`spawn_release_gated_stub`] with the stub's own answer `deadline` away
+    /// instead of five seconds: far out, the stub answers only once the test
+    /// lets go of the probe, so a verdict can wait for that answer under a
+    /// hang guard instead of a clock.
     #[expect(
         clippy::disallowed_methods,
         reason = "test stub server lives for the duration of the test process"
     )]
-    pub(crate) async fn spawn_release_gated_stub(probe: Weak<()>) -> (String, Arc<AtomicBool>) {
+    pub(crate) async fn spawn_release_gated_stub_with_deadline(
+        probe: Weak<()>,
+        deadline: Duration,
+    ) -> (String, Arc<AtomicBool>) {
         let released = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&released);
         let app = axum::Router::new().route(
@@ -251,8 +262,8 @@ pub(crate) mod test_probe {
                 let probe = probe.clone();
                 let flag = Arc::clone(&flag);
                 async move {
-                    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-                    while probe.strong_count() > 1 && tokio::time::Instant::now() < deadline {
+                    let answer_by = tokio::time::Instant::now() + deadline;
+                    while probe.strong_count() > 1 && tokio::time::Instant::now() < answer_by {
                         tokio::time::sleep(Duration::from_millis(2)).await;
                     }
                     flag.store(probe.strong_count() <= 1, Ordering::SeqCst);

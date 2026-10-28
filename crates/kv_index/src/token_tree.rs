@@ -22,13 +22,12 @@ use std::{
 };
 
 use dashmap::{mapref::entry::Entry, DashMap};
-use once_cell::sync::Lazy;
 use parking_lot::RwLock as ParkingLotRwLock;
 use rustc_hash::FxBuildHasher;
 use tracing::debug;
 
 use super::{
-    common::{MatchResult, TenantId, MATCHED_TENANTS_CAP},
+    common::{intern_tenant, MatchResult, TenantId, MATCHED_TENANTS_CAP},
     RadixTree,
 };
 
@@ -171,25 +170,6 @@ impl MatchResult for PrefixMatchResult {
     fn input_count(&self) -> usize {
         self.input_token_count
     }
-}
-
-/// Global tenant string intern pool to avoid repeated allocations.
-/// Uses DashMap for concurrent access with minimal contention.
-static TENANT_INTERN_POOL: Lazy<DashMap<Arc<str>, (), FxBuildHasher>> =
-    Lazy::new(|| DashMap::with_hasher(FxBuildHasher));
-
-/// Intern tenant ID to avoid repeated allocations.
-/// Returns cached `Arc<str>` if tenant was seen before.
-fn intern_tenant(tenant: &str) -> TenantId {
-    // Fast path: check if already interned
-    if let Some(entry) = TENANT_INTERN_POOL.get(tenant) {
-        return Arc::clone(entry.key());
-    }
-
-    // Slow path: intern new tenant
-    let interned: Arc<str> = Arc::from(tenant);
-    TENANT_INTERN_POOL.insert(Arc::clone(&interned), ());
-    interned
 }
 
 /// Global timestamp counter for LRU ordering

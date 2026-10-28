@@ -28,16 +28,19 @@ runs:
       shell: bash
       run: |
         LOCAL=$(grep -E '^[[:space:]]*version[[:space:]]*=' ${{ inputs.path }}/Cargo.toml | head -1 | cut -d'"' -f2)
-        PUBLISHED=$(curl -s "https://crates.io/api/v1/crates/${{ inputs.crate }}" | jq -r '.crate.max_version // "0.0.0"')
+        INDEX=$(curl -s "https://crates.io/api/v1/crates/${{ inputs.crate }}")
+        PUBLISHED=$(jq -r '.crate.max_version // "0.0.0"' <<<"${INDEX}")
         echo "local=${LOCAL}" >> $GITHUB_OUTPUT
         echo "published=${PUBLISHED}" >> $GITHUB_OUTPUT
-        echo "${{ inputs.crate }}: local=${LOCAL}, published=${PUBLISHED}"
-        # Use sort -V for proper semver comparison (publish only if local is newer)
-        if [ "$(printf '%s\n' "$PUBLISHED" "$LOCAL" | sort -V | tail -n1)" = "$LOCAL" ] && [ "$LOCAL" != "$PUBLISHED" ]; then
-          echo "changed=true" >> $GITHUB_OUTPUT
-        else
+        echo "${{ inputs.crate }}: local=${LOCAL}, newest published=${PUBLISHED}"
+        # Publish when this exact version is not on crates.io yet. A final follows its candidates
+        # (1.14.0 after 1.14.0-rc.1) and a patch of an older line follows a newer release; neither
+        # is the newest by a version sort, both are new versions.
+        if jq -e --arg v "${LOCAL}" '[.versions[]?.num] | index($v) != null' <<<"${INDEX}" > /dev/null; then
           echo "changed=false" >> $GITHUB_OUTPUT
-          echo "Version unchanged or older, skipping publish"
+          echo "Version ${LOCAL} is on crates.io already, skipping publish"
+        else
+          echo "changed=true" >> $GITHUB_OUTPUT
         fi
 
     - name: Setup Rust

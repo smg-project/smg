@@ -4,22 +4,23 @@ use std::{borrow::Cow, sync::Arc};
 
 use async_trait::async_trait;
 use axum::response::Response;
-use tracing::error;
 
 use crate::routers::{
     error,
     grpc::{
-        client::GenerateRequestBuildOptions,
         common::stages::{
             helpers::{self, TagForStart},
             BuildStage,
         },
         context::{
-            stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan,
-            ExecutionPlanKind, PreparationOutput, RequestContext,
+            stage_output, AttemptStamp, BuildOutput, ExecutionPlan, ExecutionPlanKind,
+            PreparationOutput, RequestContext,
         },
         proto_wrapper::MultimodalData,
-        regular::{stages::reading, symphony},
+        regular::{
+            stages::{backed_plan, reading},
+            symphony,
+        },
         spec::ResponseSpec,
         utils,
     },
@@ -43,16 +44,10 @@ impl MessageRequestBuildingStage {
     }
 }
 
-/// Build the backend `GenerateRequest` from the Messages request: the
-/// request id stamped for the attempt, the forced call's grammar shaped for
-/// the worker (the bare calls behind a reasoning parser's gate, the thought
-/// and then the calls from the first token: the worker's
-/// `constrained_decoding_start` label, `utils::tool_constraints_for_worker`),
-/// the sampling defaults, the stops and the PD metadata; returns the plan
-/// and the attempt stamp, which carries the unshaped constraint, or what
-/// derives the table's tag for a start (the `auto` tag, a JSON answer's), so
-/// a retry gives the worker it selects the same shaping
-/// (`helpers::ToolConstraintStamp`).
+/// Build the backend `GenerateRequest` from the Messages request through the
+/// sequence the chat and Messages stages share ([`backed_plan::build`]), with
+/// the Messages request's client builder, its id prefix and the sampling mask
+/// of its request type; returns the plan and the attempt stamp.
 #[expect(clippy::too_many_arguments)]
 fn build_messages_backed_plan(
     ctx: &mut RequestContext,
@@ -67,91 +62,34 @@ fn build_messages_backed_plan(
     inject_pd_metadata: bool,
     plan_kind: ExecutionPlanKind,
 ) -> Result<(ExecutionPlan, AttemptStamp), Response> {
-    let clients = stage_output(
-        ctx.state.clients.as_ref(),
-        "MessageRequestBuildingStage::build",
-    )?;
-    let builder_client = clients.builder();
-
-    // Build message request
-    let disaggregated = matches!(clients, ClientSelection::Disaggregated { .. });
-    let (request_id, id_stamp) = helpers::resolve_request_id_stamp(
-        &ctx.input.request_type,
-        ctx.input.tenant_request_meta.as_ref(),
-        "msg_",
-        disaggregated,
-    );
-
-    let tool_parser = ctx
-        .components
-        .parser_resolver
-        .tool_parser(&messages_request.model);
-    let unshaped_tool_constraints = tool_constraints.clone();
-    let (tool_constraints, led_for_first_token) = utils::tool_constraints_for_worker(
-        &ctx.components.tool_parser_factory,
-        tool_parser.as_deref(),
-        tool_constraints,
-        ctx.state.workers.as_ref(),
-    )
-    .map_err(|e| {
-        error!(function = "MessageRequestBuildingStage::build", error = %e, "Failed to shape the tool constraint for the worker");
-        error::internal_error("invalid_tool_constraint", format!("Invalid tool constraint: {e}"))
-    })?;
-
-    // The ids are the prompt; the text rides along only when the request
-    // carries media (see `helpers::wire_prompt_text`).
-    let carries_media = multimodal_data.is_some() || ctx.state.multimodal_refs.is_some();
-    let mut proto_request = builder_client
-        .build_messages_request(
-            request_id,
-            messages_request,
-            helpers::wire_prompt_text(processed_text, carries_media),
-            token_ids,
-            GenerateRequestBuildOptions {
-                multimodal_inputs: multimodal_data,
-                tool_constraints,
-                require_reasoning,
-                first_token_grammar: first_token_tag || led_for_first_token,
-            },
-        )
-        .map_err(|e| {
-            error!(function = "MessageRequestBuildingStage::build", error = %e, "Failed to build generate request");
-            error::bad_request("invalid_request_parameters", format!("Invalid request parameters: {e}"))
-        })?;
-
     let sampling_mask = helpers::SamplingDefaultsMask::from_request_type(&ctx.input.request_type);
-    let sampling_baseline = helpers::apply_sampling_defaults(
-        &mut proto_request,
-        sampling_mask,
-        ctx.state.workers.as_ref(),
-    );
-
-    helpers::finish_generate_request(
+    backed_plan::build(
         ctx,
-        &mut proto_request,
-        inject_pd_metadata,
-        "MessageRequestBuildingStage::build",
-    )?;
-
-    let tool_constraint = match table_tag {
-        Some(table_tag) => helpers::ToolConstraintStamp::capture_table(table_tag, &proto_request),
-        None => helpers::ToolConstraintStamp::capture(
-            unshaped_tool_constraints,
-            tool_parser.as_deref(),
+        backed_plan::Inputs {
+            function: "MessageRequestBuildingStage::build",
+            id_prefix: "msg_",
+            model: &messages_request.model,
+            processed_text,
+            token_ids,
+            tool_constraints,
+            table_tag,
             first_token_tag,
-            &proto_request,
-        ),
-    };
-    Ok((
-        ExecutionPlan::generate(plan_kind, proto_request),
-        AttemptStamp {
-            id: id_stamp,
+            require_reasoning,
+            multimodal_data,
             sampling_mask,
-            sampling_baseline,
             inject_pd_metadata,
-            tool_constraint,
+            plan_kind,
         },
-    ))
+        |client, request_id, processed_text, token_ids, options| {
+            client.build_messages_request(
+                request_id,
+                messages_request,
+                processed_text,
+                token_ids,
+                options,
+            )
+        },
+    )
 }
 
 #[async_trait]
@@ -218,24 +156,18 @@ impl BuildStage for MessageRequestBuildingStage {
             &spec.chat_tools,
             &processed_messages.text,
             tool_constraints,
-            |ctx| {
+            |_| {
                 // The tag shares the spec's tools where `tool_choice` narrows
                 // nothing (the common case): no copy of the schemas on the
                 // first attempt; a narrowed list is the one the narrowing owns.
-                let tools: Arc<[_]> = ctx
-                    .tokenizer_arc()
-                    .map(|tokenizer| {
-                        match utils::template_tools(
-                            &spec.chat_tools,
-                            messages_request.tool_choice.as_ref(),
-                            tokenizer.renderer_capabilities(),
-                        ) {
-                            Cow::Owned(narrowed) => Arc::from(narrowed),
-                            Cow::Borrowed([]) => Arc::default(),
-                            Cow::Borrowed(_) => Arc::clone(&spec.chat_tools),
-                        }
-                    })
-                    .unwrap_or_default();
+                let tools: Arc<[_]> = match utils::template_tools(
+                    &spec.chat_tools,
+                    messages_request.tool_choice.as_ref(),
+                ) {
+                    Cow::Owned(narrowed) => Arc::from(narrowed),
+                    Cow::Borrowed([]) => Arc::default(),
+                    Cow::Borrowed(_) => Arc::clone(&spec.chat_tools),
+                };
                 reading::Auto {
                     request: symphony::AutoRequest::Messages {
                         request: Arc::clone(&messages_request),
@@ -280,5 +212,61 @@ impl BuildStage for MessageRequestBuildingStage {
             "MessageRequestBuildingStage(inject_pd_metadata={}, {:?})",
             self.inject_pd_metadata, self.plan_kind
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use openai_protocol::messages::CreateMessageRequest;
+    use serde_json::json;
+
+    use super::*;
+    use crate::routers::grpc::{
+        context::ClientSelection,
+        regular::stages::testing::{
+            assert_fixed_request_plan, components, mock_backend_client, FORCED_CALL_TAG,
+        },
+    };
+
+    const MODEL: &str = "test-model";
+
+    /// The builder's sequence on the fixed request of
+    /// [`assert_fixed_request_plan`], asked as a Messages request with no
+    /// worker selected and the prompt's thought decided closed: the plan and
+    /// the stamp read as pinned there, with the id under the Messages prefix.
+    #[tokio::test]
+    async fn a_fixed_messages_request_builds_the_pinned_plan_and_stamp() {
+        let (client, engine) = mock_backend_client(MODEL).await;
+        let messages: Arc<CreateMessageRequest> = Arc::new(
+            serde_json::from_value(json!({
+                "model": MODEL, "temperature": 0.5, "max_tokens": 7,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .expect("a Messages request"),
+        );
+        let mut ctx = RequestContext::for_messages(
+            Arc::clone(&messages),
+            None,
+            MODEL.to_string(),
+            components(),
+        );
+        ctx.state.clients = Some(ClientSelection::Single { client });
+        let (plan, stamp) = build_messages_backed_plan(
+            &mut ctx,
+            &messages,
+            "<prompt>".to_string(),
+            vec![1, 2, 3],
+            Some(("structural_tag".to_string(), FORCED_CALL_TAG.to_string())),
+            None,
+            false,
+            false,
+            None,
+            false,
+            ExecutionPlanKind::Single,
+        )
+        .map_err(|refusal| refusal.status())
+        .expect("built");
+        engine.abort();
+        assert_fixed_request_plan(&plan, &stamp, "msg_");
     }
 }

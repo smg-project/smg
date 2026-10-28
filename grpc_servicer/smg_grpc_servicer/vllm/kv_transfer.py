@@ -10,10 +10,11 @@ from smg_grpc_servicer.vllm.config_view import EngineConfigView
 logger = logging.getLogger(__name__)
 
 _MULTI_CONNECTOR = "MultiConnector"
+_MOONCAKE_CONNECTOR = "MooncakeConnector"
 # The connectors that hand a request's KV to the one partner the router names
 # (a rendezvous or side channel per pair): the router tags both sides of such
 # a pair, so the child that carries the handoff is the one it must see.
-_P2P_CONNECTORS = frozenset({"MooncakeConnector", "NixlConnector", "MoRIIOConnector"})
+_P2P_CONNECTORS = frozenset({_MOONCAKE_CONNECTOR, "NixlConnector", "MoRIIOConnector"})
 # The P2P connector whose handoff the gRPC router does not drive (its pipeline
 # refuses a disaggregated request on a worker that names it): beside exactly
 # one store child the store is the mover the router can serve, as it was when
@@ -55,6 +56,43 @@ def pairing_fields(vllm_config: object) -> dict:
 
 def _is_store_connector(connector: str) -> bool:
     return connector in _STORE_CONNECTORS or connector.startswith(_STORE_CONNECTOR_FAMILIES)
+
+
+def runs_mooncake(vllm_config: object) -> bool:
+    """Whether a Mooncake connector runs in this engine at all.
+
+    Read off the raw ``kv_transfer_config``, not the projection
+    :func:`resolve_pd_connector` reports: the top-level connector, or any
+    child a ``MultiConnector`` lists, at any depth (vLLM builds each child
+    from its own dict, so a wrapper may list a wrapper). A wrapper hands
+    every child the allocation a request gets and merges every child's
+    finished transfers, so a Mooncake child acts under whatever name the
+    projection reports (a second P2P child beside it, an empty child engine
+    id, a malformed sibling all leave the projection at the wrapper).
+    """
+    config = EngineConfigView(vllm_config).kv_transfer.config
+    if config is None:
+        return False
+    return _names_mooncake(
+        getattr(config, "kv_connector", None),
+        getattr(config, "kv_connector_extra_config", None),
+    )
+
+
+def _names_mooncake(connector: object, extra_config: object) -> bool:
+    """Whether ``connector`` is Mooncake or any connector under it is (the
+    ``connectors`` of a wrapper's extra config, each child a dict of the same
+    shape); a malformed child counts as no connector."""
+    if connector == _MOONCAKE_CONNECTOR:
+        return True
+    children = extra_config.get("connectors") if isinstance(extra_config, dict) else None
+    if not isinstance(children, list):
+        return False
+    return any(
+        isinstance(child, dict)
+        and _names_mooncake(child.get("kv_connector"), child.get("kv_connector_extra_config"))
+        for child in children
+    )
 
 
 def resolve_pd_connector(config: object) -> tuple[str, str]:

@@ -10,7 +10,7 @@
 //! that may be null held until its text says, any other value written whole at its close.
 
 use crate::{
-    event::{DropReason, Event, Events, MalformedReason, Text},
+    event::{Event, Events, MalformedReason, Text},
     tagged::{
         assembler::{push_escaped, push_quoted},
         value::NULL_WORDS,
@@ -64,7 +64,7 @@ impl Object {
     pub(super) fn push_fragment<'d>(&self, json: String, source: Text<'d>, out: &mut Events<'d>) {
         out.push(Event::ToolCallArguments {
             index: self.index,
-            json,
+            json: json.into(),
             source,
         });
     }
@@ -85,13 +85,7 @@ impl Object {
     /// read, dropped so the report holds only the text (after text released already an assembler
     /// keeps it with the report instead); nothing when none.
     pub(super) fn drop_carried(&mut self, out: &mut Events) {
-        if self.carried.is_empty() {
-            return;
-        }
-        out.push(Event::Dropped {
-            text: Text::uncounted(std::mem::take(&mut self.carried)),
-            why: DropReason::Wrapper,
-        });
+        crate::event::drop_carried(std::mem::take(&mut self.carried), out);
     }
 
     /// The next bytes of the value under `key`, whose text starts at `start` in the carried
@@ -179,7 +173,7 @@ mod tests {
             .iter()
             .map(|event| match event {
                 Event::ToolCallArguments { json, source, .. } => {
-                    (json.clone(), source.text.to_string())
+                    (json.to_string(), source.text.to_string())
                 }
                 Event::Dropped { text, .. } => ("dropped".to_string(), text.text.to_string()),
                 Event::Malformed { text, .. } => ("malformed".to_string(), text.text.to_string()),

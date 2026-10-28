@@ -81,12 +81,14 @@ mod tests {
     use std::{sync::Arc, time::Instant};
 
     use llm_multimodal::{PreprocessedEncoderInputs, TransformError, VisionPreProcessor};
-    use openai_protocol::worker::HealthCheckConfig;
 
     use super::*;
     use crate::{
         routers::grpc::mode::Mode,
-        worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, Worker, WorkerType},
+        worker::{
+            test_support::{no_health_check, registry_with},
+            BasicWorkerBuilder, ConnectionMode, ModelCard, Worker, WorkerType,
+        },
     };
 
     const MODEL: &str = "vision-model";
@@ -104,20 +106,9 @@ mod tests {
                 .worker_type(worker_type)
                 .runtime_type(runtime)
                 .connection_mode(ConnectionMode::Grpc)
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         )
-    }
-
-    fn registry_with(workers: Vec<Arc<dyn Worker>>) -> WorkerRegistry {
-        let registry = WorkerRegistry::new();
-        for worker in workers {
-            registry.register(worker).expect("register");
-        }
-        registry
     }
 
     /// One engine family per test: what each loader does with alpha.

@@ -55,14 +55,17 @@ use wfaas::LoggingSubscriber;
 pub mod connection_limit;
 pub mod connection_timeouts;
 pub mod posture;
+pub(crate) mod tls;
 
 use crate::{
     app_context::AppContext,
     config::{ParserChoice, RouterConfig},
     endpoints::{conversations, models, parse, responses as response_handlers, tokenize},
-    mesh::MeshAdapters,
-    mesh_discovery::{start_mesh_discovery, MeshDiscoveryConfig},
-    middleware::{self, AdmissionQueue, AuthConfig},
+    mesh::{
+        discovery::{start_mesh_discovery, MeshDiscoveryConfig},
+        MeshAdapters,
+    },
+    middleware::{self, inert::InertLayer, AdmissionQueue, AuthConfig},
     observability::{
         heap_profile, history_metrics,
         inflight_tracker::InFlightRequestTracker,
@@ -87,6 +90,7 @@ use crate::{
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
         admin_json::AdminJson,
+        endpoint::Endpoint,
         manager::{WorkerManager, WorkerManagerConfig},
         ConnectionMode,
     },
@@ -1014,6 +1018,8 @@ pub struct ServerConfig {
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
     pub shutdown_grace_period_secs: u64,
+    /// Listener propagation window; defaults to 5 seconds, capped at half the grace period.
+    pub shutdown_settle_secs: Option<u64>,
     /// Control plane authentication configuration
     pub control_plane_auth: Option<smg_auth::ControlPlaneAuthConfig>,
     pub mesh_server_config: Option<MeshServerConfig>,
@@ -1030,21 +1036,19 @@ pub struct ServerConfig {
     pub secret_sources: posture::SecretSources,
 }
 
-/// `Router::layer` and `Router::route_layer` for a layer a configuration may
-/// leave out.
+/// `Router::layer` for an application-wide layer a configuration may leave
+/// out.
 ///
 /// axum wraps every route in a fresh boxed service for whatever layer it is
 /// given, an identity layer included, and each wrapper costs a clone of the
-/// service and a boxed future per request; a layer with nothing to do is left
-/// uninstalled rather than installed empty.
+/// service and a boxed future per request; an application-wide layer with
+/// nothing to do is left uninstalled rather than installed empty (a route
+/// layer with nothing to do is an inert member of its routes' one stack:
+/// `middleware::inert`).
 trait LayerIfSome<L> {
     /// `Router::layer` with `layer` when there is one; the router unchanged
     /// otherwise.
     fn layer_if_some(self, layer: Option<L>) -> Self;
-
-    /// `Router::route_layer` with `layer` when there is one; the router
-    /// unchanged otherwise.
-    fn route_layer_if_some(self, layer: Option<L>) -> Self;
 }
 
 impl<S, L> LayerIfSome<L> for Router<S>
@@ -1061,48 +1065,6 @@ where
             Some(layer) => self.layer(layer),
             None => self,
         }
-    }
-
-    fn route_layer_if_some(self, layer: Option<L>) -> Self {
-        match layer {
-            Some(layer) => self.route_layer(layer),
-            None => self,
-        }
-    }
-}
-
-/// Apply the request-admission layer to a protected route group.
-///
-/// `AdmissionMode::Priority` installs the priority scheduler middleware
-/// (carrying its own `Arc<SchedulerState>`); `AdmissionMode::Legacy` installs
-/// the original concurrency limit (`ConcurrencyLimitLayer`) when a rate
-/// limiter is configured, and nothing otherwise (it would pass every request
-/// through). Either runs innermost of the protective layers (closest to the
-/// handler), after tenant resolution has populated `RouteRequestMeta`.
-///
-/// Invariant: a request parked at admission keeps its body unread — bodies
-/// are collected only at handler extraction, after a permit is granted.
-fn with_admission_layer(
-    router: Router<Arc<AppState>>,
-    admission_mode: &middleware::scheduler::AdmissionMode,
-    app_state: Arc<AppState>,
-) -> Router<Arc<AppState>> {
-    match admission_mode {
-        middleware::scheduler::AdmissionMode::Priority(scheduler_state) => {
-            router.route_layer(axum::middleware::from_fn_with_state(
-                scheduler_state.clone(),
-                middleware::scheduler::priority_admission_middleware,
-            ))
-        }
-        // Without a rate limiter the legacy layer passes every request through;
-        // it is not installed then (axum wraps every route in a boxed service
-        // for any layer it is given, this lean one included).
-        middleware::scheduler::AdmissionMode::Legacy
-            if app_state.context.rate_limiter.is_some() =>
-        {
-            router.route_layer(middleware::ConcurrencyLimitLayer::new(app_state))
-        }
-        middleware::scheduler::AdmissionMode::Legacy => router,
     }
 }
 
@@ -1178,10 +1140,10 @@ pub fn build_apps(
         middleware::TenantResolutionState::new(&app_state.context.router_config)?;
     // The serving auth layer, built once for every route group that takes
     // it: with no serving key configured it would pass every request through,
-    // so it is not installed then (a from_fn layer clones and boxes per request
-    // whatever it does, and axum wraps every route in a boxed service for an
-    // empty layer as well). The keys are fixed at start-up, so the decision at
-    // build time is the one the layer made per request.
+    // so it is an inert member of those groups' stacks then (a from_fn layer
+    // clones its state and boxes its future per request whatever it does; an
+    // inert member is one match). The keys are fixed at start-up, so the
+    // decision at build time is the one the layer made per request.
     let serving_auth_layer = serving_auth_config.is_enabled().then(|| {
         axum::middleware::from_fn_with_state(
             serving_auth_config.clone(),
@@ -1197,123 +1159,172 @@ pub fn build_apps(
         app_state.context.rate_limiter.clone(),
     );
 
-    let protected_routes = with_admission_layer(
-        Router::new()
-            .route("/v1/responses", post(v1_responses))
-            .route("/v1/responses/{response_id}", get(v1_responses_get))
-            .route(
-                "/v1/responses/{response_id}/cancel",
-                post(v1_responses_cancel),
+    // The admission members of the protected stacks, from the mode chosen
+    // above: the priority scheduler's middleware (carrying its own
+    // `Arc<SchedulerState>`), or the legacy concurrency limit when a rate
+    // limiter is configured (without one it would pass every request
+    // through), or neither. Either runs innermost of the protective layers
+    // (closest to the handler), after tenant resolution has populated
+    // `RouteRequestMeta`. Invariant: a request parked at admission keeps its
+    // body unread; bodies are collected only at handler extraction, after a
+    // permit is granted.
+    let (priority_admission, legacy_limit) = match &admission_mode {
+        middleware::scheduler::AdmissionMode::Priority(scheduler_state) => (
+            Some(axum::middleware::from_fn_with_state(
+                scheduler_state.clone(),
+                middleware::scheduler::priority_admission_middleware,
+            )),
+            None,
+        ),
+        middleware::scheduler::AdmissionMode::Legacy
+            if app_state.context.rate_limiter.is_some() =>
+        {
+            (
+                None,
+                Some(middleware::ConcurrencyLimitLayer::new(app_state.clone())),
             )
-            .route("/v1/responses/{response_id}", delete(v1_responses_delete))
-            .route(
-                "/v1/responses/{response_id}/input_items",
-                get(v1_responses_list_input_items),
-            )
-            .route("/v1/conversations", post(v1_conversations_create))
-            .route(
-                "/v1/conversations/{conversation_id}",
-                get(v1_conversations_get)
-                    .post(v1_conversations_update)
-                    .delete(v1_conversations_delete),
-            )
-            .route(
-                "/v1/conversations/{conversation_id}/items",
-                get(v1_conversations_list_items).post(v1_conversations_create_items),
-            )
-            .route(
-                "/v1/conversations/{conversation_id}/items/{item_id}",
-                get(v1_conversations_get_item).delete(v1_conversations_delete_item),
-            )
-            .route_layer(axum::middleware::from_fn_with_state(
-                app_state.clone(),
-                middleware::storage_context_middleware,
-            ))
-            .route("/generate", post(generate))
-            .route("/v1/chat/completions", post(v1_chat_completions))
-            .route("/v1/completions", post(v1_completions))
-            .route("/rerank", post(rerank))
-            .route("/v1/rerank", post(v1_rerank))
-            .route("/v1/embeddings", post(v1_embeddings))
-            .route("/v1/messages", post(v1_messages))
-            .route("/v1/messages/count_tokens", post(v1_messages_count_tokens))
-            .route("/v1/interactions", post(v1_interactions))
-            .route("/v1/classify", post(v1_classify))
-            .route("/v1/decisions", post(v1_decisions))
-            .route("/v1/systemone", post(v1_systemone))
-            // Bound the buffered body read: inside admission, so a stalled
-            // upload releases its permit, and inside the stream-vs-buffer
-            // decision, since the streamed relay has its own watchdog.
-            .route_layer(
-                middleware::RequestBodyTimeouts::from_config(&app_state.context.router_config)
-                    .layer(),
-            )
-            // Per-request buffer-vs-stream decision for typed-JSON bodies;
-            // declined requests pass to the handlers untouched.
-            .route_layer(
-                StreamBodyState::new(app_state.router.clone(), app_state.context.clone()).layer(),
-            )
-            // Every SSE stream of these routes carries a keep-alive through an
-            // upstream silence (a comment; the Messages API's ping event),
-            // written between frames, nothing while frames flow.
-            .route_layer(
-                middleware::SseKeepAlive::from_config(&app_state.context.router_config).layer(),
-            )
-            // Tokenize / Detokenize endpoints
-            .route("/v1/tokenize", post(v1_tokenize))
-            .route("/v1/detokenize", post(v1_detokenize))
-            // Realtime REST endpoints (same middleware as other protected routes)
-            .route("/v1/realtime/sessions", post(v1_realtime_session))
-            .route(
-                "/v1/realtime/client_secrets",
-                post(v1_realtime_client_secret),
-            )
-            .route(
-                "/v1/realtime/transcription_sessions",
-                post(v1_realtime_transcription_session),
-            ),
-        &admission_mode,
-        app_state.clone(),
-    )
-    .route_layer(tenant_resolution_state.clone().layer())
-    .route_layer_if_some(serving_auth_layer.clone())
-    // The wasm hooks run only with wasm enabled and a module manager; the
-    // layer is not installed otherwise.
-    .route_layer_if_some(
-        (app_state.context.router_config.enable_wasm && app_state.context.wasm_manager.is_some())
-            .then(|| {
-                axum::middleware::from_fn_with_state(app_state.clone(), middleware::wasm_middleware)
-            }),
-    )
-    // Outermost on these routes: a refusal by any layer inside (authentication,
-    // admission, the body timeout) leaves in the Messages envelope as well.
-    .route_layer(middleware::MessagesErrorEnvelopeLayer);
+        }
+        middleware::scheduler::AdmissionMode::Legacy => (None, None),
+    };
+    // The wasm hooks run only with wasm enabled and a module manager.
+    let wasm_layer = (app_state.context.router_config.enable_wasm
+        && app_state.context.wasm_manager.is_some())
+    .then(|| axum::middleware::from_fn_with_state(app_state.clone(), middleware::wasm_middleware));
 
-    // WebSocket and WebRTC routes: auth + concurrency but NO WASM middleware.
+    // The protection of the typed routes as ONE stack: axum boxes the routes
+    // once per `route_layer` call and a request clones the boxed stack at
+    // every level, so one call costs one level where six cost six (and their
+    // clones); a layer that is not configured is an inert member of the
+    // stack (`middleware::inert`), not a level of its own. Outermost first,
+    // as the builder reads: the Messages envelope (a refusal by any layer
+    // inside, authentication, admission, the body timeout, leaves in the
+    // envelope as well); the wasm hooks; the serving auth; the tenant
+    // resolution; the admission; then the keep-alive every SSE stream of
+    // these routes carries through an upstream silence (a comment; the
+    // Messages API's ping event), written between frames, nothing while
+    // frames flow; the per-request buffer-vs-stream decision for typed-JSON
+    // bodies (declined requests pass to the handlers untouched); innermost,
+    // the bound on the buffered body read (inside admission, so a stalled
+    // upload releases its permit, and inside the stream-vs-buffer decision,
+    // since the streamed relay has its own watchdog).
+    let typed_routes = Router::new()
+        .route("/v1/responses", post(v1_responses))
+        .route("/v1/responses/{response_id}", get(v1_responses_get))
+        .route(
+            "/v1/responses/{response_id}/cancel",
+            post(v1_responses_cancel),
+        )
+        .route("/v1/responses/{response_id}", delete(v1_responses_delete))
+        .route(
+            "/v1/responses/{response_id}/input_items",
+            get(v1_responses_list_input_items),
+        )
+        .route("/v1/conversations", post(v1_conversations_create))
+        .route(
+            "/v1/conversations/{conversation_id}",
+            get(v1_conversations_get)
+                .post(v1_conversations_update)
+                .delete(v1_conversations_delete),
+        )
+        .route(
+            "/v1/conversations/{conversation_id}/items",
+            get(v1_conversations_list_items).post(v1_conversations_create_items),
+        )
+        .route(
+            "/v1/conversations/{conversation_id}/items/{item_id}",
+            get(v1_conversations_get_item).delete(v1_conversations_delete_item),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            middleware::storage_context_middleware,
+        ))
+        .route("/generate", post(generate))
+        .route("/v1/chat/completions", post(v1_chat_completions))
+        .route("/v1/completions", post(v1_completions))
+        .route("/rerank", post(rerank))
+        .route("/v1/rerank", post(v1_rerank))
+        .route("/v1/embeddings", post(v1_embeddings))
+        .route("/v1/messages", post(v1_messages))
+        .route("/v1/messages/count_tokens", post(v1_messages_count_tokens))
+        .route("/v1/interactions", post(v1_interactions))
+        .route("/v1/classify", post(v1_classify))
+        .route("/v1/decisions", post(v1_decisions))
+        .route("/v1/systemone", post(v1_systemone))
+        .route_layer(
+            tower::ServiceBuilder::new()
+                .layer(middleware::MessagesErrorEnvelopeLayer)
+                .layer(InertLayer(wasm_layer.clone()))
+                .layer(InertLayer(serving_auth_layer.clone()))
+                .layer(tenant_resolution_state.clone().layer())
+                .layer(InertLayer(priority_admission.clone()))
+                .layer(InertLayer(legacy_limit.clone()))
+                .layer(
+                    middleware::SseKeepAlive::from_config(&app_state.context.router_config).layer(),
+                )
+                .layer(
+                    StreamBodyState::new(app_state.router.clone(), app_state.context.clone())
+                        .layer(),
+                )
+                .layer(
+                    middleware::RequestBodyTimeouts::from_config(&app_state.context.router_config)
+                        .layer(),
+                ),
+        );
+    // Tokenize / Detokenize and the Realtime REST endpoints: the same
+    // protection without the three stream-and-body layers of the typed
+    // routes (none of these routes answers an SSE stream; this change keeps
+    // the set of layers each route had and adds none).
+    let plain_protected_routes = Router::new()
+        .route("/v1/tokenize", post(v1_tokenize))
+        .route("/v1/detokenize", post(v1_detokenize))
+        .route("/v1/realtime/sessions", post(v1_realtime_session))
+        .route(
+            "/v1/realtime/client_secrets",
+            post(v1_realtime_client_secret),
+        )
+        .route(
+            "/v1/realtime/transcription_sessions",
+            post(v1_realtime_transcription_session),
+        )
+        .route_layer(
+            tower::ServiceBuilder::new()
+                .layer(middleware::MessagesErrorEnvelopeLayer)
+                .layer(InertLayer(wasm_layer))
+                .layer(InertLayer(serving_auth_layer.clone()))
+                .layer(tenant_resolution_state.clone().layer())
+                .layer(InertLayer(priority_admission.clone()))
+                .layer(InertLayer(legacy_limit.clone())),
+        );
+    let protected_routes = typed_routes.merge(plain_protected_routes);
+
+    // WebSocket and WebRTC routes: auth + admission but NO WASM middleware.
     // WASM OnResponse reconstructs the response from status/headers/body,
     // dropping the response extensions that carry the WebSocket upgrade future.
-    let realtime_routes = with_admission_layer(
-        Router::new()
-            .route("/v1/realtime", get(v1_realtime_ws))
-            .route("/v1/realtime/calls", post(v1_realtime_webrtc)),
-        &admission_mode,
-        app_state.clone(),
-    )
-    .route_layer(tenant_resolution_state.clone().layer())
-    .route_layer_if_some(serving_auth_layer.clone());
+    let realtime_routes = Router::new()
+        .route("/v1/realtime", get(v1_realtime_ws))
+        .route("/v1/realtime/calls", post(v1_realtime_webrtc))
+        .route_layer(
+            tower::ServiceBuilder::new()
+                .layer(InertLayer(serving_auth_layer.clone()))
+                .layer(tenant_resolution_state.clone().layer())
+                .layer(InertLayer(priority_admission.clone()))
+                .layer(InertLayer(legacy_limit.clone())),
+        );
 
-    // Multipart upload routes: auth + concurrency but NO WASM middleware.
+    // Multipart upload routes: auth + admission but NO WASM middleware.
     // The WASM OnRequest phase buffers the full body into a `Vec<u8>` subject
     // to the WASM manager's `max_body_size` (10MB default). Audio uploads
     // routinely exceed that, so WASM middleware would reject them with 400
     // before reaching the handler.
-    let multipart_upload_routes = with_admission_layer(
-        Router::new().route("/v1/audio/transcriptions", post(v1_audio_transcriptions)),
-        &admission_mode,
-        app_state.clone(),
-    )
-    .route_layer(tenant_resolution_state.layer())
-    .route_layer_if_some(serving_auth_layer.clone());
+    let multipart_upload_routes = Router::new()
+        .route("/v1/audio/transcriptions", post(v1_audio_transcriptions))
+        .route_layer(
+            tower::ServiceBuilder::new()
+                .layer(InertLayer(serving_auth_layer.clone()))
+                .layer(tenant_resolution_state.layer())
+                .layer(InertLayer(priority_admission))
+                .layer(InertLayer(legacy_limit)),
+        );
 
     let public_routes = Router::new()
         .route("/liveness", get(liveness))
@@ -1474,21 +1485,29 @@ where
 {
     app.fallback(sink_handler)
         .method_not_allowed_fallback(method_not_allowed_handler)
-        .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
-        // The payload limit on the request body: a declared over-limit
-        // length is refused here, in the gateway's envelope, before any
-        // layer inside runs; a chunked upload is capped on its way in.
-        .layer(middleware::RequestBodyLimitLayer::new(max_payload_size))
-        // The Messages envelope once more, outside the body-size limit: a
-        // declared over-limit length is refused by the limit layer before any
-        // route layer runs, and still leaves in the envelope.
-        .layer(middleware::MessagesErrorEnvelopeLayer)
-        .layer(tower::util::MapResponseLayer::new(
-            middleware::trace_context_on_response,
-        ))
-        .layer(middleware::create_logging_layer(access_log_fields))
-        .layer(middleware::HttpMetricsLayer::new(inflight_tracker))
-        .layer(middleware::RequestIdLayer::new(request_id_headers))
+        // The application-wide layers as ONE stack: axum boxes every route
+        // once per layer call and a request clones the boxed stack at every
+        // level, so one call costs one level where seven cost seven (and
+        // their clones). Outermost first: the request id; the HTTP metrics;
+        // the access log; the trace context on the response; the Messages
+        // envelope outside the body-size limit (a declared over-limit length
+        // is refused by the limit layer before any route layer runs, and
+        // still leaves in the envelope); the payload limit on the request
+        // body (a declared over-limit length is refused there, in the
+        // gateway's envelope, before any layer inside runs; a chunked upload
+        // is capped on its way in); innermost, the default body limit.
+        .layer(
+            tower::ServiceBuilder::new()
+                .layer(middleware::RequestIdLayer::new(request_id_headers))
+                .layer(middleware::HttpMetricsLayer::new(inflight_tracker))
+                .layer(middleware::create_logging_layer(access_log_fields))
+                .layer(tower::util::MapResponseLayer::new(
+                    middleware::trace_context_on_response,
+                ))
+                .layer(middleware::MessagesErrorEnvelopeLayer)
+                .layer(middleware::RequestBodyLimitLayer::new(max_payload_size))
+                .layer(axum::extract::DefaultBodyLimit::max(max_payload_size)),
+        )
         // CORS runs only with allowed origins configured; the layer is not
         // installed otherwise.
         .layer_if_some(create_cors_layer(cors_allowed_origins))
@@ -1848,8 +1867,179 @@ pub fn run(
     served
 }
 
+/// The listeners `bind_listeners` bound, for `serve_listeners`.
+struct BoundListeners {
+    /// The HTTP listener's address, as configured.
+    addr: std::net::SocketAddr,
+    /// The HTTP (data) listener.
+    data: std::net::TcpListener,
+    /// The admin listener (`--admin-port`); `None` without one.
+    admin: Option<std::net::TcpListener>,
+}
+
+/// The admin and HTTP listeners, bound in that order after the mesh
+/// listener, eagerly: a port another process holds fails the start here,
+/// before anything serves (the comments inside say why each binds where it
+/// does and how).
+async fn bind_listeners(
+    addr: std::net::SocketAddr,
+    admin_addr: Option<std::net::SocketAddr>,
+) -> Result<BoundListeners, Box<dyn std::error::Error>> {
+    // The admin listener binds now, before the HTTP listener, as the mesh
+    // listener did in `startup` before this call: a port another process
+    // holds fails the start here, before anything serves.
+    let admin_listener = match admin_addr {
+        Some(admin_addr) => Some(
+            tokio::net::TcpListener::bind(admin_addr)
+                .await
+                .and_then(tokio::net::TcpListener::into_std)
+                .map_err(|e| {
+                    format!("Failed to bind the admin listener on {admin_addr} (--admin-port): {e}")
+                })?,
+        ),
+        None => None,
+    };
+    // The HTTP listener binds now, eagerly, the last of the listeners: a port
+    // another process holds fails the start here, before `startup` lets the
+    // mesh server join the cluster. Bound through tokio, as axum-server
+    // binds (the same socket options and accept backlog; std's bind would
+    // queue 128 connections instead of 1024), and served from the socket in
+    // `serve_listeners`.
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .and_then(tokio::net::TcpListener::into_std)
+        .map_err(|e| format!("Failed to bind the HTTP listener on {addr}: {e}"))?;
+    info!("Starting server on {addr}");
+    Ok(BoundListeners {
+        addr,
+        data: listener,
+        admin: admin_listener,
+    })
+}
+
+/// What each listener serves, as the two futures `serve_together` runs: the
+/// admin listener the control plane, with the data listener's TLS material
+/// and connection timeouts but outside its connection limit; the data
+/// listener the data plane behind the limit. The connection bounds are read
+/// from the router configuration and logged here; both servings drain
+/// through their handles.
+fn serve_listeners(
+    listeners: BoundListeners,
+    apps: GatewayApps,
+    tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
+    router_config: &RouterConfig,
+    handle: axum_server::Handle<std::net::SocketAddr>,
+    admin_handle: axum_server::Handle<std::net::SocketAddr>,
+) -> Result<(Serving, Serving), Box<dyn std::error::Error>> {
+    let BoundListeners {
+        addr,
+        data: listener,
+        admin: admin_listener,
+    } = listeners;
+    let GatewayApps {
+        data: app,
+        admin: admin_app,
+    } = apps;
+    // Bounds on connections that carry no request (a head that never
+    // arrives or stalls, an idle keep-alive connection); a request in flight,
+    // an open streaming response included, is never cut here.
+    let connection_timeouts = ConnectionTimeouts::from_secs(
+        router_config.header_read_timeout_secs,
+        router_config.idle_connection_timeout_secs,
+    );
+    info!(
+        header_read_timeout_secs = router_config.header_read_timeout_secs,
+        idle_connection_timeout_secs = router_config.idle_connection_timeout_secs,
+        "HTTP connection timeouts (0 = disabled)"
+    );
+    // The bound on the connections open at once (see [`connection_limit`]):
+    // a connection beyond it is closed at accept, unanswered. 0 is no bound.
+    let max_connections = router_config.max_connections;
+    info!(
+        max_connections,
+        "HTTP connection limit on the data listener (0 = unlimited; the admin and probe listeners \
+         are outside it)"
+    );
+    // The admission limit the bound is compared with is the effective one
+    // (the one resolution of `max_concurrent_requests`, shared with the
+    // admission bucket).
+    let admission_limit = crate::app_context::effective_max_concurrent_requests(
+        router_config.max_concurrent_requests,
+    );
+    if let Some(admission_limit) =
+        admission_limit.filter(|limit| max_connections > 0 && max_connections < *limit)
+    {
+        warn!(
+            max_connections,
+            admission_limit,
+            "The connection limit is below the admission limit: clients on HTTP/1, one request \
+             per connection, are refused at the listener (a closed connection, no response) \
+             before admission can queue or answer them"
+        );
+    }
+
+    // The admin listener serves the control plane with the data listener's
+    // TLS material and connection timeouts, but outside its connection limit
+    // (`--max-connections`), so the control plane and the probes it serves
+    // stay reachable while the data plane is saturated; it drains with it
+    // (`startup`'s shutdown handler closes both handles together).
+    let admin_serving: Serving = match (admin_listener, admin_app) {
+        (Some(admin_listener), Some(admin_app)) => {
+            let admin_addr = admin_listener.local_addr()?;
+            info!(
+                "Admin listener serving the control plane on {admin_addr} (--admin-port): the \
+                 admin, worker-registry and RL routes answer there, and 404 on {addr}"
+            );
+            let admin_app = admin_app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+            match tls_config.clone() {
+                Some(tls_config) => Box::pin(
+                    axum_server::from_tcp_rustls(admin_listener, tls_config)?
+                        .map(|acceptor| tls_acceptor(acceptor, connection_timeouts))
+                        .handle(admin_handle)
+                        .serve(admin_app),
+                ),
+                None => Box::pin(
+                    axum_server::from_tcp(admin_listener)?
+                        .acceptor(http_acceptor(connection_timeouts))
+                        .handle(admin_handle)
+                        .serve(admin_app),
+                ),
+            }
+        }
+        _ => Box::pin(std::future::ready(Ok(()))),
+    };
+    let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let data_serving: Serving = if let Some(tls_config) = tls_config {
+        info!("TLS enabled");
+
+        Box::pin(
+            axum_server::from_tcp_rustls(listener, tls_config)?
+                .map(|acceptor| {
+                    ConnectionLimitAcceptor::new(
+                        tls_acceptor(acceptor, connection_timeouts),
+                        max_connections,
+                    )
+                })
+                .handle(handle)
+                .serve(app),
+        )
+    } else {
+        Box::pin(
+            axum_server::from_tcp(listener)?
+                .acceptor(ConnectionLimitAcceptor::new(
+                    http_acceptor(connection_timeouts),
+                    max_connections,
+                ))
+                .handle(handle)
+                .serve(app),
+        )
+    };
+    Ok((data_serving, admin_serving))
+}
+
+/// Start the gateway listeners and drain them within the configured shutdown budget.
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    crate::tls::install_crypto_provider();
+    crate::clients::install_crypto_provider();
 
     // Defense in depth: the CLI and Python bindings both validate via
     // `RouterConfigBuilder::build()` before reaching here, but `RouterConfig`
@@ -1947,22 +2137,30 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     }) {
         tracing::warn!("{warning}");
     }
+    // A rank scheduler under rank expansion chooses nothing: the operator's
+    // configuration runs, with the word that one of its flags does nothing.
+    if let Some(warning) = crate::config::dp_minimum_tokens_scheduler_scope_warning(
+        config.router_config.dp_aware,
+        config.router_config.dp_minimum_tokens_scheduler,
+    ) {
+        tracing::warn!("{warning}");
+    }
 
     // Who else can read the private key files: checked here, once the
     // subscriber exists, so the line reaches the log (the configuration is
     // validated before logging starts).
     if let Some(path) = &config.router_config.server_key_path {
-        crate::tls::warn_if_private_key_is_shared(std::path::Path::new(path), "--tls-key-path");
+        tls::warn_if_private_key_is_shared(std::path::Path::new(path), "--tls-key-path");
     }
     if let Some(path) = &config.router_config.client_key_path {
-        crate::tls::warn_if_private_key_is_shared(std::path::Path::new(path), "--client-key-path");
+        tls::warn_if_private_key_is_shared(std::path::Path::new(path), "--client-key-path");
     }
     if let Some(mtls) = config
         .mesh_server_config
         .as_ref()
         .and_then(|mesh| mesh.mtls_config.as_ref())
     {
-        crate::tls::warn_if_private_key_is_shared(&mtls.server_key_path, "--mesh-tls-key");
+        tls::warn_if_private_key_is_shared(&mtls.server_key_path, "--mesh-tls-key");
     }
 
     // Seed the process-wide multimodal tensor transport defaults from the
@@ -2175,6 +2373,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     info!(
         "Router ready | workers: {:?}",
         WorkerManager::get_worker_urls(&app_state.context.worker_registry)
+            .iter()
+            .map(|url| Endpoint::redacted_str(url))
+            .collect::<Vec<_>>()
     );
 
     let request_id_headers = config.request_id_headers.clone().unwrap_or_else(|| {
@@ -2233,10 +2434,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // And where a keyed start's secrets came from, sources alone.
     posture::log_secret_sources(&config.secret_sources);
 
-    let GatewayApps {
-        data: app,
-        admin: admin_app,
-    } = build_apps(
+    let apps = build_apps(
         app_state,
         serving_auth_config,
         admin_auth_config,
@@ -2253,31 +2451,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // The mesh listener binds and the mesh server prepares now, eagerly,
     // before the admin and HTTP listeners bind (see `prepare_mesh_server`).
     let mesh_server = prepare_mesh_server(mesh_server, config.mesh_server_config.as_ref()).await?;
-    // The admin listener binds now, before the HTTP listener, for the reason
-    // the mesh listener did: a port another process holds fails the start
-    // here, before anything serves.
-    let admin_listener = match admin_addr {
-        Some(admin_addr) => Some(
-            tokio::net::TcpListener::bind(admin_addr)
-                .await
-                .and_then(tokio::net::TcpListener::into_std)
-                .map_err(|e| {
-                    format!("Failed to bind the admin listener on {admin_addr} (--admin-port): {e}")
-                })?,
-        ),
-        None => None,
-    };
-    // The HTTP listener binds now, eagerly, the last of the listeners: a port
-    // another process holds fails the start here, before the mesh server
-    // below has joined the cluster. Bound through tokio, as axum-server
-    // binds (the same socket options and accept backlog; std's bind would
-    // queue 128 connections instead of 1024), and served from the socket at
-    // `serve` below.
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .and_then(tokio::net::TcpListener::into_std)
-        .map_err(|e| format!("Failed to bind the HTTP listener on {addr}: {e}"))?;
-    info!("Starting server on {addr}");
+    let listeners = bind_listeners(addr, admin_addr).await?;
 
     // The mesh server serves once every listener is bound: a member that
     // joined the cluster and vanished with a failed bind is the partial start
@@ -2306,7 +2480,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let admin_handle_clone = admin_handle.clone();
     let admin_stop = admin_handle.clone();
     let inflight_tracker = app_context.inflight_tracker.clone();
-    let budget = ShutdownBudget::from_grace_secs(config.shutdown_grace_period_secs);
+    let budget = ShutdownBudget::from_grace_secs(
+        config.shutdown_grace_period_secs,
+        config.shutdown_settle_secs,
+    );
     let drain_timeout = budget.drain;
     #[expect(
         clippy::disallowed_methods,
@@ -2350,100 +2527,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .await;
     });
 
-    // Bounds on connections that carry no request (a head that never
-    // arrives or stalls, an idle keep-alive connection); a request in flight,
-    // an open streaming response included, is never cut here.
-    let connection_timeouts = ConnectionTimeouts::from_secs(
-        config.router_config.header_read_timeout_secs,
-        config.router_config.idle_connection_timeout_secs,
-    );
-    info!(
-        header_read_timeout_secs = config.router_config.header_read_timeout_secs,
-        idle_connection_timeout_secs = config.router_config.idle_connection_timeout_secs,
-        "HTTP connection timeouts (0 = disabled)"
-    );
-    // The bound on the connections open at once (see [`connection_limit`]):
-    // a connection beyond it is closed at accept, unanswered. 0 is no bound.
-    let max_connections = config.router_config.max_connections;
-    info!(
-        max_connections,
-        "HTTP connection limit on the data listener (0 = unlimited; the admin and probe listeners \
-         are outside it)"
-    );
-    // The admission limit the bound is compared with is the effective one
-    // (the one resolution of `max_concurrent_requests`, shared with the
-    // admission bucket).
-    let admission_limit = crate::app_context::effective_max_concurrent_requests(
-        config.router_config.max_concurrent_requests,
-    );
-    if let Some(admission_limit) =
-        admission_limit.filter(|limit| max_connections > 0 && max_connections < *limit)
-    {
-        warn!(
-            max_connections,
-            admission_limit,
-            "The connection limit is below the admission limit: clients on HTTP/1, one request \
-             per connection, are refused at the listener (a closed connection, no response) \
-             before admission can queue or answer them"
-        );
-    }
-
-    // The admin listener serves the control plane with the data listener's
-    // TLS material and connection timeouts, but outside its connection limit
-    // (`--max-connections`), so the control plane and the probes it serves
-    // stay reachable while the data plane is saturated; it drains with it
-    // (the shutdown above closes both handles together).
-    let admin_serving: Serving = match (admin_listener, admin_app) {
-        (Some(admin_listener), Some(admin_app)) => {
-            let admin_addr = admin_listener.local_addr()?;
-            info!(
-                "Admin listener serving the control plane on {admin_addr} (--admin-port): the \
-                 admin, worker-registry and RL routes answer there, and 404 on {addr}"
-            );
-            let admin_app = admin_app.into_make_service_with_connect_info::<std::net::SocketAddr>();
-            match tls_config.clone() {
-                Some(tls_config) => Box::pin(
-                    axum_server::from_tcp_rustls(admin_listener, tls_config)?
-                        .map(|acceptor| tls_acceptor(acceptor, connection_timeouts))
-                        .handle(admin_handle)
-                        .serve(admin_app),
-                ),
-                None => Box::pin(
-                    axum_server::from_tcp(admin_listener)?
-                        .acceptor(http_acceptor(connection_timeouts))
-                        .handle(admin_handle)
-                        .serve(admin_app),
-                ),
-            }
-        }
-        _ => Box::pin(std::future::ready(Ok(()))),
-    };
-    let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
-    let data_serving: Serving = if let Some(tls_config) = tls_config {
-        info!("TLS enabled");
-
-        Box::pin(
-            axum_server::from_tcp_rustls(listener, tls_config)?
-                .map(|acceptor| {
-                    ConnectionLimitAcceptor::new(
-                        tls_acceptor(acceptor, connection_timeouts),
-                        max_connections,
-                    )
-                })
-                .handle(handle)
-                .serve(app),
-        )
-    } else {
-        Box::pin(
-            axum_server::from_tcp(listener)?
-                .acceptor(ConnectionLimitAcceptor::new(
-                    http_acceptor(connection_timeouts),
-                    max_connections,
-                ))
-                .handle(handle)
-                .serve(app),
-        )
-    };
+    let (data_serving, admin_serving) = serve_listeners(
+        listeners,
+        apps,
+        tls_config,
+        &config.router_config,
+        handle,
+        admin_handle,
+    )?;
     // Until both listeners have stopped; one that fails stops the other
     // (see `serve_together`), so the gateway is never half-served.
     let (server_result, admin_result) = serve_together(
@@ -2495,12 +2586,12 @@ struct ShutdownBudget {
 
 impl ShutdownBudget {
     /// The settle window is carved out of the grace budget (never more than
-    /// half, capped at 5 s, the per-worker `drain_settle_secs` default) so
+    /// half, with a configurable window defaulting to 5 seconds) so
     /// total shutdown stays within `shutdown_grace_period_secs` and never
     /// overruns terminationGracePeriod.
-    fn from_grace_secs(grace_secs: u64) -> Self {
+    fn from_grace_secs(grace_secs: u64, settle_secs: Option<u64>) -> Self {
         let grace = Duration::from_secs(grace_secs);
-        let settle = (grace / 2).min(Duration::from_secs(5));
+        let settle = (grace / 2).min(Duration::from_secs(settle_secs.unwrap_or(5)));
         Self {
             grace,
             settle,
@@ -2590,13 +2681,13 @@ mod graceful_shutdown_tests {
 
     use super::{graceful_shutdown, InFlightRequestTracker, ShutdownBudget};
 
-    /// The settle window is half the grace, capped at 5 s; the drain is the
+    /// The default settle window is half the grace, capped at 5 s; the drain is the
     /// rest; a zero grace has neither.
     #[test]
     fn the_budget_splits_the_grace() {
         let secs = |s| Duration::from_secs(s);
         assert_eq!(
-            ShutdownBudget::from_grace_secs(30),
+            ShutdownBudget::from_grace_secs(30, None),
             ShutdownBudget {
                 grace: secs(30),
                 settle: secs(5),
@@ -2604,7 +2695,7 @@ mod graceful_shutdown_tests {
             }
         );
         assert_eq!(
-            ShutdownBudget::from_grace_secs(6),
+            ShutdownBudget::from_grace_secs(6, None),
             ShutdownBudget {
                 grace: secs(6),
                 settle: secs(3),
@@ -2612,13 +2703,54 @@ mod graceful_shutdown_tests {
             }
         );
         assert_eq!(
-            ShutdownBudget::from_grace_secs(0),
+            ShutdownBudget::from_grace_secs(0, None),
             ShutdownBudget {
                 grace: secs(0),
                 settle: secs(0),
                 drain: secs(0)
             }
         );
+    }
+
+    /// Explicit windows preserve at least half the grace for draining, including zero and odd budgets.
+    #[test]
+    fn configured_settle_is_capped_at_half_the_grace() {
+        for (grace, configured, expected) in [
+            (180, None, 5),
+            (180, Some(30), 30),
+            (180, Some(120), 90),
+            (180, Some(0), 0),
+            (0, Some(30), 0),
+        ] {
+            let budget = ShutdownBudget::from_grace_secs(grace, configured);
+            assert_eq!(budget.settle, Duration::from_secs(expected));
+            assert_eq!(budget.settle + budget.drain, budget.grace);
+        }
+        assert_eq!(
+            ShutdownBudget::from_grace_secs(3, None).settle,
+            Duration::from_millis(1500)
+        );
+    }
+
+    /// Readiness fails immediately; listener gating uses the default or configured window.
+    #[tokio::test(start_paused = true)]
+    async fn listener_gating_respects_default_and_configured_windows() {
+        for (configured, expected) in [(None, 5), (Some(30), 30), (Some(120), 90)] {
+            let tracker = InFlightRequestTracker::new();
+            let start = tokio::time::Instant::now();
+            graceful_shutdown(
+                &tracker,
+                ShutdownBudget::from_grace_secs(180, configured),
+                async {},
+                || panic!("a completed mesh leave must not be stopped again"),
+                |remaining| {
+                    assert!(tracker.is_draining());
+                    assert_eq!(start.elapsed(), Duration::from_secs(expected));
+                    assert_eq!(remaining, Duration::from_secs(180 - expected));
+                },
+            )
+            .await;
+        }
     }
 
     /// The phases in order, on a paused clock: readiness drains at once;
@@ -2630,7 +2762,7 @@ mod graceful_shutdown_tests {
     async fn the_phases_run_in_order_within_the_grace() {
         let tracker = InFlightRequestTracker::new();
         let request = tracker.track();
-        let budget = ShutdownBudget::from_grace_secs(30);
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
         let start = tokio::time::Instant::now();
         let left = Arc::new(AtomicBool::new(false));
         let leave_mesh = {
@@ -2684,7 +2816,7 @@ mod graceful_shutdown_tests {
     async fn a_slow_leave_is_cut_short_and_a_stuck_request_holds_nothing_past_the_deadline() {
         let tracker = InFlightRequestTracker::new();
         let _stuck = tracker.track();
-        let budget = ShutdownBudget::from_grace_secs(10);
+        let budget = ShutdownBudget::from_grace_secs(10, None);
         let start = tokio::time::Instant::now();
         let mesh_stopped = Arc::new(AtomicBool::new(false));
         let gated = Arc::new(Mutex::new(None));
@@ -2736,7 +2868,7 @@ mod graceful_shutdown_tests {
         let gated = Arc::new(Mutex::new(None));
         graceful_shutdown(
             &tracker,
-            ShutdownBudget::from_grace_secs(0),
+            ShutdownBudget::from_grace_secs(0, None),
             std::future::pending::<()>(),
             {
                 let mesh_stopped = Arc::clone(&mesh_stopped);
@@ -3201,6 +3333,65 @@ mod tests {
         }
     }
 
+    /// A chat request body over the edge layers' 1024-byte limit of these
+    /// tests.
+    fn over_limit_chat_body() -> String {
+        format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
+            "x".repeat(2048)
+        )
+    }
+
+    /// Posts the over-limit body to `app` as 256-byte chunked frames with no
+    /// Content-Length, so only the body read can discover the overrun (four
+    /// frames fit, the fifth crosses), and checks the refusal: 413 with the
+    /// `request_body_too_large` envelope, and the reading stopped at the
+    /// limit (at most five frames pulled, fewer than the body has).
+    async fn chunked_over_limit_post_is_refused_at_the_limit(app: Router) {
+        use std::sync::atomic::AtomicUsize;
+
+        use axum::{
+            body::{to_bytes, Body},
+            http::header::CONTENT_TYPE,
+        };
+        use bytes::Bytes;
+        use futures::StreamExt;
+        use tower::ServiceExt;
+
+        let oversized = over_limit_chat_body();
+        let frames: Vec<Result<Bytes, Infallible>> = oversized
+            .as_bytes()
+            .chunks(256)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+            .collect();
+        let total_frames = frames.len();
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&pulled);
+        let body = Body::from_stream(futures::stream::iter(frames).inspect(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "request_body_too_large");
+        let pulled = pulled.load(Ordering::SeqCst);
+        assert!(
+            pulled <= 5 && pulled < total_frames,
+            "reading must stop at the limit: {pulled} of {total_frames} frames pulled"
+        );
+    }
+
     /// An over-limit body answers 413 whatever its framing: a declared
     /// Content-Length over the limit is refused by the limit layer before the
     /// body, and a chunked upload is refused the moment it crosses the limit,
@@ -3208,14 +3399,10 @@ mod tests {
     /// json_parse_error) and no further frame pulled from the client.
     #[tokio::test]
     async fn over_limit_bodies_answer_413_whatever_the_framing() {
-        use std::sync::atomic::AtomicUsize;
-
         use axum::{
             body::{to_bytes, Body},
             http::header::{CONTENT_LENGTH, CONTENT_TYPE},
         };
-        use bytes::Bytes;
-        use futures::StreamExt;
         use tower::ServiceExt;
 
         let app = attach_edge_layers(
@@ -3242,45 +3429,9 @@ mod tests {
             vec![],
             middleware::AccessLogFields::NONE,
         );
-        let oversized = format!(
-            r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
-            "x".repeat(2048)
-        );
-
-        // Chunked: 256-byte frames and no Content-Length, so only the body
-        // read can discover the overrun; four frames fit, the fifth crosses.
-        let frames: Vec<Result<Bytes, Infallible>> = oversized
-            .as_bytes()
-            .chunks(256)
-            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
-            .collect();
-        let total_frames = frames.len();
-        let pulled = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&pulled);
-        let body = Body::from_stream(futures::stream::iter(frames).inspect(move |_| {
-            counter.fetch_add(1, Ordering::SeqCst);
-        }));
-        let response = app
-            .clone()
-            .oneshot(
-                http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/chat/completions")
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(body)
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let json: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["code"], "request_body_too_large");
-        let pulled = pulled.load(Ordering::SeqCst);
-        assert!(
-            pulled <= 5 && pulled < total_frames,
-            "reading must stop at the limit: {pulled} of {total_frames} frames pulled"
-        );
+        // Chunked: only the body read can discover the overrun.
+        chunked_over_limit_post_is_refused_at_the_limit(app.clone()).await;
+        let oversized = over_limit_chat_body();
 
         // Declared length on a Messages route: refused by the limit layer
         // before the body, and still the Messages envelope.
@@ -3340,16 +3491,6 @@ mod tests {
     /// (not 400 json_parse_error) and no frame past the limit is pulled.
     #[tokio::test]
     async fn chunked_over_limit_body_is_413_behind_the_body_watchdog() {
-        use std::sync::atomic::AtomicUsize;
-
-        use axum::{
-            body::{to_bytes, Body},
-            http::header::CONTENT_TYPE,
-        };
-        use bytes::Bytes;
-        use futures::StreamExt;
-        use tower::ServiceExt;
-
         let app = attach_edge_layers(
             Router::new()
                 .route(
@@ -3369,41 +3510,7 @@ mod tests {
             vec![],
             middleware::AccessLogFields::NONE,
         );
-        let oversized = format!(
-            r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
-            "x".repeat(2048)
-        );
-        let frames: Vec<Result<Bytes, Infallible>> = oversized
-            .as_bytes()
-            .chunks(256)
-            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
-            .collect();
-        let total_frames = frames.len();
-        let pulled = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&pulled);
-        let body = Body::from_stream(futures::stream::iter(frames).inspect(move |_| {
-            counter.fetch_add(1, Ordering::SeqCst);
-        }));
-        let response = app
-            .oneshot(
-                http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/chat/completions")
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(body)
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let json: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"]["code"], "request_body_too_large");
-        let pulled = pulled.load(Ordering::SeqCst);
-        assert!(
-            pulled <= 5 && pulled < total_frames,
-            "reading must stop at the limit: {pulled} of {total_frames} frames pulled"
-        );
+        chunked_over_limit_post_is_refused_at_the_limit(app).await;
     }
 
     /// The CORS policy per `--cors-allowed-origins`, through the edge stack
@@ -3687,6 +3794,7 @@ mod tests {
         .expect("plain HTTP response test timed out");
     }
 
+    /// Build a loopback test server without discovery, mesh, or authentication.
     fn minimal_server_config(router_config: RouterConfig) -> ServerConfig {
         ServerConfig {
             host: "127.0.0.1".to_string(),
@@ -3704,6 +3812,7 @@ mod tests {
             request_timeout_secs: 60,
             request_id_headers: None,
             shutdown_grace_period_secs: 5,
+            shutdown_settle_secs: None,
             control_plane_auth: None,
             mesh_server_config: None,
             webrtc_bind_addr: None,

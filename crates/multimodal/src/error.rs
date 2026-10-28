@@ -35,6 +35,14 @@ pub enum TransformError {
 
 #[derive(Debug, Error)]
 pub enum MediaConnectorError {
+    #[error("{modality} has {pixels} pixels after resizing, exceeding max_total_pixels={limit}")]
+    PixelBudgetExceeded {
+        modality: &'static str,
+        pixels: u64,
+        limit: u64,
+    },
+    #[error("image max_long_side_pixel must be positive, got {value}")]
+    InvalidImageLongSideCap { value: u32 },
     #[error("max_long_side_pixel must be a positive multiple of {factor}, got {value}")]
     InvalidMaxLongSidePixel { value: u32, factor: u32 },
     #[error("fps must be between {min} and {max}, got {value}")]
@@ -220,10 +228,12 @@ impl MediaConnectorError {
     /// client can tell what to shrink from what to re-host.
     pub fn code(&self) -> MediaErrorCode {
         match self {
-            Self::PayloadTooLarge { .. }
+            Self::PixelBudgetExceeded { .. }
+            | Self::PayloadTooLarge { .. }
             | Self::DecodedTooLarge { .. }
             | Self::Image(image::ImageError::Limits(_)) => MediaErrorCode::TooLarge,
-            Self::InvalidMaxLongSidePixel { .. }
+            Self::InvalidImageLongSideCap { .. }
+            | Self::InvalidMaxLongSidePixel { .. }
             | Self::InvalidSampleFps { .. }
             | Self::InvalidVideoLongSideCap { .. }
             | Self::UnsupportedScheme(_)
@@ -260,7 +270,8 @@ impl MediaConnectorError {
             Self::Blocking(_) | Self::DecodeIo(_) | Self::DecoderUnavailable(_) => {
                 MediaFault::Internal
             }
-            Self::InvalidMaxLongSidePixel { .. }
+            Self::InvalidImageLongSideCap { .. }
+            | Self::InvalidMaxLongSidePixel { .. }
             | Self::InvalidSampleFps { .. }
             | Self::InvalidVideoLongSideCap { .. }
             | Self::UnsupportedScheme(_)
@@ -274,6 +285,7 @@ impl MediaConnectorError {
             | Self::Io(_)
             | Self::Base64Decode(_)
             | Self::DataUrl(_)
+            | Self::PixelBudgetExceeded { .. }
             | Self::PayloadTooLarge { .. }
             | Self::DecodedTooLarge { .. }
             | Self::Image(_)

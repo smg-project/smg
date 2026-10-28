@@ -333,6 +333,7 @@ mod tests {
     use super::*;
     use crate::{
         routers::grpc::proto_wrapper::{ProtoGenerateResponse, ENGINE_ERROR_MESSAGE},
+        test_support::RefusedAddress,
         worker::{BasicWorkerBuilder, ConnectionMode, WorkerType},
     };
 
@@ -420,6 +421,17 @@ mod tests {
         }
     }
 
+    /// A prefill side on the loopback host whose partners are handed `port`.
+    fn prefill_on(port: u16) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:30000")
+                .worker_type(WorkerType::Prefill)
+                .connection_mode(ConnectionMode::Grpc)
+                .bootstrap_port(Some(port))
+                .build(),
+        )
+    }
+
     #[tokio::test]
     async fn a_prefill_side_retired_at_its_rendezvous_is_counted_while_draining() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
@@ -505,19 +517,8 @@ mod tests {
     /// nothing is counted under the request phase, dead port or not.
     #[tokio::test]
     async fn a_decode_leg_failed_after_a_response_came_keeps_the_engines_report() {
-        let dead = {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-            let port = listener.local_addr().expect("address").port();
-            drop(listener);
-            port
-        };
-        let prefill: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("grpc://127.0.0.1:30000")
-                .worker_type(WorkerType::Prefill)
-                .connection_mode(ConnectionMode::Grpc)
-                .bootstrap_port(Some(dead))
-                .build(),
-        );
+        let refused = RefusedAddress::reserve();
+        let prefill = prefill_on(refused.port());
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let answer = {
@@ -556,19 +557,8 @@ mod tests {
     /// answer keeps nothing of it: the port is not probed, dead or not.
     #[tokio::test]
     async fn a_decode_side_failed_after_a_chunk_came_keeps_the_engines_report() {
-        let dead = {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-            let port = listener.local_addr().expect("address").port();
-            drop(listener);
-            port
-        };
-        let prefill: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("grpc://127.0.0.1:30000")
-                .worker_type(WorkerType::Prefill)
-                .connection_mode(ConnectionMode::Grpc)
-                .bootstrap_port(Some(dead))
-                .build(),
-        );
+        let refused = RefusedAddress::reserve();
+        let prefill = prefill_on(refused.port());
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let answer = {
@@ -607,24 +597,11 @@ mod tests {
     /// answer is the decode side's stream failure, as on the HTTP router.
     #[tokio::test]
     async fn a_decode_leg_the_engine_failed_without_a_reason_names_the_dead_rendezvous_port() {
-        let prefill_on = |port: u16| -> Arc<dyn Worker> {
-            Arc::new(
-                BasicWorkerBuilder::new("grpc://127.0.0.1:30000")
-                    .worker_type(WorkerType::Prefill)
-                    .connection_mode(ConnectionMode::Grpc)
-                    .bootstrap_port(Some(port))
-                    .build(),
-            )
-        };
         let report = || tonic::Status::internal(ENGINE_ERROR_MESSAGE);
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let live = listener.local_addr().expect("address").port();
-        let dead = {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-            let port = listener.local_addr().expect("address").port();
-            drop(listener);
-            port
-        };
+        let refused = RefusedAddress::reserve();
+        let dead = refused.port();
 
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();

@@ -1688,24 +1688,12 @@ mod tests {
 
     #[tokio::test]
     async fn internal_filter_keeps_builtin_passthrough_mcp_call_items() {
-        let orchestrator = test_support::internal_orchestrator(Some((
-            BuiltinToolType::WebSearchPreview,
-            "brave_web_search",
-        )))
+        let orchestrator = test_support::internal_orchestrator_serving(
+            Some((BuiltinToolType::WebSearchPreview, "brave_web_search")),
+            vec![test_tool("brave_web_search")],
+        )
         .await;
-
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                test_support::INTERNAL_SERVER,
-                test_tool("brave_web_search"),
-            ));
-
-        let session = McpToolSession::new(
-            &orchestrator,
-            vec![test_support::internal_binding()],
-            "test-request",
-        );
+        let session = test_support::internal_session(&orchestrator);
 
         let item = json!({
             "type": "mcp_call",
@@ -1718,30 +1706,15 @@ mod tests {
 
     #[tokio::test]
     async fn internal_filter_keeps_builtin_passthrough_mcp_call_items_with_mixed_tools() {
-        let orchestrator = test_support::internal_orchestrator(Some((
-            BuiltinToolType::WebSearchPreview,
-            "brave_web_search",
-        )))
-        .await;
-
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                test_support::INTERNAL_SERVER,
+        let orchestrator = test_support::internal_orchestrator_serving(
+            Some((BuiltinToolType::WebSearchPreview, "brave_web_search")),
+            vec![
                 test_tool("brave_web_search"),
-            ));
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                test_support::INTERNAL_SERVER,
                 test_tool("internal_non_builtin_tool"),
-            ));
-
-        let session = McpToolSession::new(
-            &orchestrator,
-            vec![test_support::internal_binding()],
-            "test-request",
-        );
+            ],
+        )
+        .await;
+        let session = test_support::internal_session(&orchestrator);
 
         let builtin_item = json!({
             "type": "mcp_call",

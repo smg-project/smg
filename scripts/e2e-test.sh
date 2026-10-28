@@ -80,7 +80,8 @@ check_dependencies() {
 cleanup_processes() {
     info "Cleaning up any stale processes..."
     if [[ -f "$SCRIPT_DIR/ci_killall_sglang.sh" ]]; then
-        bash "$SCRIPT_DIR/ci_killall_sglang.sh" "nuke_gpus" 2>/dev/null || true
+        # the verdict is discarded here: one reading, no wait for a draining card
+        CI_GPU_GUARD_WAIT_SECS=0 bash "$SCRIPT_DIR/ci_killall_sglang.sh" "nuke_gpus" 2>/dev/null || true
     fi
 }
 

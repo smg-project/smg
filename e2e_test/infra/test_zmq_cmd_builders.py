@@ -6,6 +6,18 @@ import pytest
 from infra.constants import ConnectionMode
 from infra.worker import Worker
 
+
+@pytest.fixture(autouse=True)
+def _no_servicer_package(monkeypatch):
+    """Keep every command-builder test hermetic: whatever servicer package the
+    host can import, a lane that sets nothing reads no package default here, so
+    building a vLLM gRPC worker never reaches the real hook check. The one test
+    about the switch pins its own default."""
+    from infra import constants
+
+    monkeypatch.setattr(constants, "_package_servicer_switch", lambda: None)
+
+
 _VLLM_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 _TS_MODEL = "Qwen/Qwen3.5-9B"
 
@@ -103,11 +115,19 @@ def test_rust_servicer_impl_is_a_worker_env_flag(monkeypatch):
     worker command and selects the Rust path through the servicer package's
     flag in the worker environment, so every test case runs unchanged."""
     import infra.worker as worker_module
+    from infra import constants
     from infra.constants import ENV_VLLM_SERVICER_IMPL
 
     hook_checks: list[bool] = []
     monkeypatch.setattr(
         worker_module, "_require_rust_servicer_hook", lambda: hook_checks.append(True)
+    )
+    # The servicer package's default (a launch that names nothing) is python
+    # here; a lane that sets nothing follows it and exports nothing.
+    monkeypatch.setattr(
+        constants,
+        "_package_servicer_switch",
+        lambda: lambda variable, environ=None, **_: ("python", "default"),
     )
 
     w = Worker(

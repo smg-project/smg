@@ -155,12 +155,14 @@ def media_warmup(
     load_tokenizer: Callable[[str], Any] | None = None,
     log: logging.Logger = logger,
 ) -> MediaWarmup | None:
-    """The media leg's request material, or ``None`` with the reason logged:
-    no tokenizer directory to render the prompt from, a tokenizer that does
-    not load, or a chat template that renders no image placeholder (the leg
-    would be a text request). The prompt is what the template renders around
-    one image item and :data:`WARMUP_IMAGE_QUESTION`, unexpanded, as a
-    client sends it to a language-side worker; the ids are its tokens."""
+    """The media leg's request material, or ``None`` with the reason logged.
+    Two expected omissions are INFO lines: no tokenizer directory to render
+    the prompt from, or a chat template that renders no image placeholder
+    (the leg would be a text request). A render that raises (a tokenizer that
+    does not load, a template that fails, a tokenization error) is a WARNING
+    with its traceback. The prompt is what the template renders around one
+    image item and :data:`WARMUP_IMAGE_QUESTION`, unexpanded, as a client
+    sends it to a language-side worker; the ids are its tokens."""
     if not tokenizer_dir:
         log.info("Planned warm-up: no image leg (no tokenizer directory to render the prompt from)")
         return None
@@ -182,8 +184,15 @@ def media_warmup(
         input_ids = tuple(
             int(t) for t in tokenizer(with_image, add_special_tokens=False)["input_ids"]
         )
-    except Exception as error:  # noqa: BLE001 -- the leg is an optimisation; the reason is logged
-        log.info("Planned warm-up: no image leg (the prompt could not be rendered: %s)", error)
+    except Exception as error:  # noqa: BLE001 -- the leg is an optimisation; the fault is logged
+        # Unlike the two expected omissions above, a render that raises is a
+        # fault worth a look (a tokenizer that does not load, a template that
+        # fails, a tokenization error): a WARNING with its traceback.
+        log.warning(
+            "Planned warm-up: no image leg (the prompt could not be rendered: %s)",
+            error,
+            exc_info=error,
+        )
         return None
     return MediaWarmup(
         prompt=with_image,

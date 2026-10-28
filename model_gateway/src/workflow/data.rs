@@ -178,16 +178,6 @@ impl WorkflowData for WorkerWorkflowData {
 }
 
 impl WorkerWorkflowData {
-    /// Validate that all transient fields are properly initialized.
-    pub fn validate_initialized(&self) -> Result<(), WorkflowError> {
-        if self.app_context.is_none() {
-            return Err(WorkflowError::ContextValueNotFound(
-                "app_context not initialized after deserialization".into(),
-            ));
-        }
-        Ok(())
-    }
-
     /// The worker-directed client for the resolved HTTP version, re-fetched
     /// from the cache when a deserialize dropped the transient handle.
     pub fn http_client(&self, step_id: &str) -> WorkflowResult<Arc<reqwest::Client>> {
@@ -250,21 +240,6 @@ impl WorkflowData for TokenizerWorkflowData {
     }
 }
 
-impl TokenizerWorkflowData {
-    /// Validate that all transient fields are properly initialized.
-    ///
-    /// Call this after deserializing workflow state to ensure runtime fields
-    /// have been repopulated.
-    pub fn validate_initialized(&self) -> Result<(), WorkflowError> {
-        if self.app_context.is_none() {
-            return Err(WorkflowError::ContextValueNotFound(
-                "app_context not initialized after deserialization".into(),
-            ));
-        }
-        Ok(())
-    }
-}
-
 /// Data for worker removal workflow
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRemovalWorkflowData {
@@ -285,18 +260,6 @@ pub struct WorkerRemovalWorkflowData {
 impl WorkflowData for WorkerRemovalWorkflowData {
     fn workflow_type() -> &'static str {
         "worker_removal"
-    }
-}
-
-impl WorkerRemovalWorkflowData {
-    /// Validate that all transient fields are properly initialized.
-    pub fn validate_initialized(&self) -> Result<(), WorkflowError> {
-        if self.app_context.is_none() {
-            return Err(WorkflowError::ContextValueNotFound(
-                "app_context not initialized after deserialization".into(),
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -337,18 +300,6 @@ impl WorkflowData for WorkerUpdateWorkflowData {
     }
 }
 
-impl WorkerUpdateWorkflowData {
-    /// Validate that all transient fields are properly initialized.
-    pub fn validate_initialized(&self) -> Result<(), WorkflowError> {
-        if self.app_context.is_none() {
-            return Err(WorkflowError::ContextValueNotFound(
-                "app_context not initialized after deserialization".into(),
-            ));
-        }
-        Ok(())
-    }
-}
-
 /// Data for MCP server registration workflow
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpWorkflowData {
@@ -365,18 +316,6 @@ pub struct McpWorkflowData {
 impl WorkflowData for McpWorkflowData {
     fn workflow_type() -> &'static str {
         "mcp_registration"
-    }
-}
-
-impl McpWorkflowData {
-    /// Validate that all transient fields are properly initialized.
-    pub fn validate_initialized(&self) -> Result<(), WorkflowError> {
-        if self.app_context.is_none() {
-            return Err(WorkflowError::ContextValueNotFound(
-                "app_context not initialized after deserialization".into(),
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -403,18 +342,6 @@ impl WorkflowData for WasmRegistrationWorkflowData {
     }
 }
 
-impl WasmRegistrationWorkflowData {
-    /// Validate that all transient fields are properly initialized.
-    pub fn validate_initialized(&self) -> Result<(), WorkflowError> {
-        if self.app_context.is_none() {
-            return Err(WorkflowError::ContextValueNotFound(
-                "app_context not initialized after deserialization".into(),
-            ));
-        }
-        Ok(())
-    }
-}
-
 /// Data for WASM module removal workflow
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WasmRemovalWorkflowData {
@@ -428,17 +355,5 @@ pub struct WasmRemovalWorkflowData {
 impl WorkflowData for WasmRemovalWorkflowData {
     fn workflow_type() -> &'static str {
         "wasm_module_removal"
-    }
-}
-
-impl WasmRemovalWorkflowData {
-    /// Validate that all transient fields are properly initialized.
-    pub fn validate_initialized(&self) -> Result<(), WorkflowError> {
-        if self.app_context.is_none() {
-            return Err(WorkflowError::ContextValueNotFound(
-                "app_context not initialized after deserialization".into(),
-            ));
-        }
-        Ok(())
     }
 }

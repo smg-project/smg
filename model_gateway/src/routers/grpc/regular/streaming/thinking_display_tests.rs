@@ -49,6 +49,7 @@ fn spec(display: Option<&str>, with_symphony: bool) -> MessagesResponseSpec {
         spec.symphony = Some(Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: "<|im_start|>assistant\n".to_string(),
+            forbids_calls: false,
         });
     }
     spec

@@ -21,3 +21,30 @@ pub(crate) use utils::{
 };
 
 pub(crate) use crate::routers::common::mcp_utils::collect_user_function_names;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    //! What the responses modules' tests share.
+
+    use openai_protocol::responses::{ResponseStatus, ResponsesRequest, ResponsesResponse};
+    use serde_json::json;
+
+    /// The terminal object of `request` with one output message.
+    pub(crate) fn completed_response(id: &str, request: &ResponsesRequest) -> ResponsesResponse {
+        let message = serde_json::from_value(json!({
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "hello", "annotations": []}]
+        }))
+        .unwrap();
+        ResponsesResponse::builder(id, &request.model)
+            .copy_from_request(request)
+            .created_at(chrono::Utc::now().timestamp())
+            .completed_at(chrono::Utc::now().timestamp())
+            .status(ResponseStatus::Completed)
+            .add_output(message)
+            .build()
+    }
+}

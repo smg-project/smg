@@ -19,6 +19,8 @@ pub(crate) mod router; // Used by routers/factory
 pub(crate) mod spec;
 #[cfg(test)]
 pub(crate) mod test_engine;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod utils; // Used by routers/http and bindings/golang
 pub mod zmq_client; // ZMQ backend adapter behind the vLLM client surface
 
@@ -64,6 +66,13 @@ pub struct ProcessedMessages {
     /// decisions follow, since a template that cannot continue the message
     /// appends its text after the generation prompt.
     pub continued_final_message: bool,
+    /// The prompt is rendered for generation, with the renderer's generation
+    /// header after the last turn (`ChatTemplateOutput::generation_prompt`):
+    /// false when the request asked for none and the renderer honoured it,
+    /// and when the final message was continued. What the reasoning
+    /// decisions follow, since a renderer with an encoder of its own writes
+    /// the header whatever the request asked, as the engines' own encoders do.
+    pub generation_prompt: bool,
 }
 
 #[cfg(test)]

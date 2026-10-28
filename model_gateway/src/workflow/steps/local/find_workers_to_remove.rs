@@ -7,7 +7,10 @@ use tracing::debug;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::find_workers_by_url;
-use crate::workflow::data::{WorkerList, WorkerRemovalWorkflowData};
+use crate::{
+    worker::endpoint::Endpoint,
+    workflow::data::{WorkerList, WorkerRemovalWorkflowData},
+};
 
 /// Request structure for worker removal.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -62,7 +65,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for FindWorkersToRemoveStep {
             });
             if workers_to_remove.is_empty() {
                 debug!(
-                    worker_url = %request.url,
+                    worker_url = %Endpoint::redacted_str(&request.url),
                     ?expected_revisions,
                     "Skipping stale worker removal job after same-URL replacement"
                 );
@@ -75,14 +78,14 @@ impl StepExecutor<WorkerRemovalWorkflowData> for FindWorkersToRemoveStep {
         } else if workers_to_remove.is_empty() {
             return Err(WorkflowError::StepFailed {
                 step_id: StepId::new("find_workers_to_remove"),
-                message: format!("Worker {} not found", request.url),
+                message: format!("Worker {} not found", Endpoint::redacted_str(&request.url)),
             });
         }
 
         debug!(
             "Found {} worker(s) to remove for {}",
             workers_to_remove.len(),
-            request.url
+            Endpoint::redacted_str(&request.url)
         );
 
         // Store workers and their model IDs for subsequent steps

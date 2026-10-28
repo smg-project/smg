@@ -16,7 +16,10 @@
 
 use crate::{
     event::{Event, Events, MalformedReason, Text},
-    json::{fragments::Fragments, outline::Scanner},
+    json::{
+        fragments::{Arrived, Fragments},
+        outline::Scanner,
+    },
 };
 
 /// The arguments object as it arrives.
@@ -45,7 +48,7 @@ impl Object {
 
     /// Append the next bytes of the object and push the fragments and the end they complete; how
     /// many of the bytes the object took.
-    pub(super) fn feed(&mut self, bytes: &str, out: &mut Events) -> usize {
+    pub(super) fn feed<'d>(&mut self, bytes: &'d str, out: &mut Events<'d>) -> usize {
         if self.done {
             return 0;
         }
@@ -61,7 +64,11 @@ impl Object {
             }
             None => bytes.len(),
         };
-        self.emit_new_bytes(close.is_none(), out);
+        let arrived = Arrived {
+            at: before,
+            text: &bytes[..taken],
+        };
+        self.emit_new_bytes(close.is_none(), Some(arrived), out);
         if close.is_some() {
             // The object closed. A value the judge refused said so at the break; one the outline
             // ended whole for the partial parser and cut short for a strict reader is said to be
@@ -90,7 +97,7 @@ impl Object {
         if self.done {
             return;
         }
-        self.fragments.send_held(&self.text, self.index, out);
+        self.fragments.send_held(&self.text, None, self.index, out);
         if !self.fragments.refused() && !self.fragments.whole() {
             out.push(Event::Malformed {
                 text: Text::default(),
@@ -108,13 +115,19 @@ impl Object {
     /// the model wrote it ([`Fragments::send`], [`Fragments::send_rest`]), and the bytes the judge
     /// may still go back to held while the object is `open`; they go with the object's close, or
     /// when no more bytes can come ([`Self::finish`]).
-    fn emit_new_bytes(&mut self, open: bool, out: &mut Events) {
+    fn emit_new_bytes<'d>(
+        &mut self,
+        open: bool,
+        arrived: Option<Arrived<'d>>,
+        out: &mut Events<'d>,
+    ) {
         if self
             .fragments
-            .send(&self.text, open, self.index, out)
+            .send(&self.text, arrived, open, self.index, out)
             .is_some()
         {
-            self.fragments.send_rest(&self.text, self.index, out);
+            self.fragments
+                .send_rest(&self.text, arrived, self.index, out);
         }
     }
 }
@@ -122,6 +135,7 @@ impl Object {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::arguments;
 
     /// The object fed in `pieces` and finished, as the region's end or the stream's finishes it:
     /// its events and how many bytes it took.
@@ -133,7 +147,7 @@ mod tests {
             taken += object.feed(piece, &mut out);
         }
         object.finish(&mut out);
-        (out.drain(), taken)
+        (out.into_owned().drain(), taken)
     }
 
     fn per_char(text: &str) -> Vec<&str> {
@@ -152,16 +166,6 @@ mod tests {
                 }
                 Event::Malformed { text, .. } => &*text.text,
                 other => panic!("an event the object never pushes: {other:?}"),
-            })
-            .collect()
-    }
-
-    fn arguments(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
-                _ => None,
             })
             .collect()
     }

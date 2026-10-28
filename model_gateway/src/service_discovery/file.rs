@@ -190,9 +190,20 @@ fn parse_manifest(bytes: &[u8], roles: Roles) -> Result<Vec<DiscoveredWorker>, S
             .into_worker(roles)
             .map_err(|reason| format!("workers[{index}]: {reason}"))?;
         if !ids.insert(worker.discovery_id.clone()) {
+            // The default id is the address with its userinfo masked, so two
+            // id-less entries at one address that differ only in their
+            // credentials (different keys) collide here on an id nobody
+            // wrote: say so. The same entry twice is a plain duplicate.
+            let defaulted = worker.discovery_id == worker.endpoint.redacted()
+                && !endpoints.contains_key(&worker.endpoint.key());
             return Err(format!(
-                "workers[{index}]: duplicate id '{}'",
-                worker.discovery_id
+                "workers[{index}]: duplicate id '{}'{}",
+                worker.discovery_id,
+                if defaulted {
+                    " (the default id, the address with its userinfo masked; set an explicit id)"
+                } else {
+                    ""
+                }
             ));
         }
         if let Some(other) = endpoints.insert(worker.endpoint.key(), worker.discovery_id.clone()) {
@@ -613,7 +624,8 @@ mod tests {
     }
 
     /// Without an id the endpoint names the instance, rendered with any
-    /// password masked: the id is written to a label.
+    /// userinfo masked: the id is written to a label. Two entries at one
+    /// address that differ only in their credentials need explicit ids.
     #[test]
     fn a_missing_id_defaults_to_the_redacted_endpoint() {
         let workers = parse(
@@ -621,7 +633,7 @@ mod tests {
             Roles::Regular,
         )
         .unwrap();
-        assert_eq!(workers[0].discovery_id, "http://admin:***@10.0.0.11:8000");
+        assert_eq!(workers[0].discovery_id, "http://***@10.0.0.11:8000");
     }
 
     #[test]
@@ -634,7 +646,7 @@ mod tests {
     /// the problem.
     #[test]
     fn malformed_manifests_are_rejected_with_the_reason() {
-        let cases: [(&str, String, Roles, &str); 16] = [
+        let cases: [(&str, String, Roles, &str); 18] = [
             ("bad JSON", "{".to_string(), Roles::Regular, "EOF"),
             (
                 "missing version",
@@ -727,6 +739,21 @@ mod tests {
                 "workers[1]: duplicate id 'a'",
             ),
             (
+                "the same id-less entry twice",
+                manifest(r#"{"url": "10.0.0.11:8000"}, {"url": "10.0.0.11:8000"}"#),
+                Roles::Regular,
+                "workers[1]: duplicate id '10.0.0.11:8000'",
+            ),
+            (
+                "two id-less entries at one address that differ only in their credentials",
+                manifest(
+                    r#"{"url": "http://alice:x@10.0.0.11:8000"}, {"url": "http://bob:y@10.0.0.11:8000"}"#,
+                ),
+                Roles::Regular,
+                "workers[1]: duplicate id 'http://***@10.0.0.11:8000' (the default id, the address \
+                 with its userinfo masked; set an explicit id)",
+            ),
+            (
                 "two spellings of one endpoint",
                 manifest(
                     r#"{"id": "a", "url": "10.0.0.11:8000"}, {"id": "b", "url": "http://10.0.0.11:8000"}"#,
@@ -742,6 +769,15 @@ mod tests {
                 "{case}: expected '{expected}' in '{reason}'"
             );
         }
+        // Exact: the plain duplicate carries no default-id hint (the table's
+        // `contains` would accept the hint's longer message as well).
+        assert_eq!(
+            parse_err(
+                &manifest(r#"{"url": "10.0.0.11:8000"}, {"url": "10.0.0.11:8000"}"#),
+                Roles::Regular,
+            ),
+            "workers[1]: duplicate id '10.0.0.11:8000'",
+        );
     }
 
     #[test]

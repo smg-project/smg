@@ -1,14 +1,6 @@
-## GitHub config URL for the runner scale set
-githubConfigUrl: "https://github.com/smg-project/smg"
-
-## Name of the Kubernetes secret containing GitHub credentials
-## The secret should contain either a PAT (github_token) or GitHub App credentials
-githubConfigSecret: github-arc-secret
-
-## The shared ARC controller runs in a separate namespace.
-controllerServiceAccount:
-  name: arc-gha-rs-controller
-  namespace: org-actions-runner
+## This runner scale set over runner-values-gpu-base.yaml (helm -f base -f this file):
+## the scale-set name, the runner bounds and the runner container. Helm merges values files
+## by replacing lists whole, so the accelerator limit travels with the entire containers list.
 
 ## Runner scaling configuration
 minRunners: 4
@@ -17,58 +9,8 @@ maxRunners: 20
 ## name of the runner scale set to create.  Defaults to the helm release name
 runnerScaleSetName: "1-gpu-h100"
 
-resourceMeta: {}
-keyVault: {}
-
-## Runner pod template
 template:
   spec:
-    terminationGracePeriodSeconds: 600
-
-    # Volcano binpack packs GPU runners onto fewer nodes
-    # (weights: volcano-scheduler-configmap.yaml).
-    schedulerName: volcano
-
-    # hostNetwork: RDMA KV transfer (NIXL/Mooncake) needs the host's RoCE GID
-    # tables; an overlay netns has empty GIDs and RDMA init fails.
-    hostNetwork: true
-    dnsPolicy: ClusterFirstWithHostNet
-
-    nodeSelector:
-      nvidia.com/gpu: "true"
-      node.kubernetes.io/instance-type: BM.GPU.H100.8
-
-    tolerations:
-      - key: "nvidia.com/gpu"
-        operator: "Equal"
-        value: "true"
-        effect: "NoSchedule"
-
-    # No affinity: placement left to binpack. e2e servers bind OS-assigned
-    # ports on 127.0.0.1, so co-located hostNetwork runners don't collide.
-
-    volumes:
-      - name: work
-        emptyDir: {}
-      - name: model-cache
-        hostPath:
-          path: /raid/models
-          type: Directory
-      - name: dshm
-        emptyDir:
-          medium: Memory
-          sizeLimit: 16Gi
-      - name: dind-sock
-        emptyDir: {}
-      - name: dind-externals
-        emptyDir: {}
-      - name: docker-storage
-        emptyDir: {}
-      - name: infiniband
-        hostPath:
-          path: /dev/infiniband
-          type: Directory
-
     containers:
       - name: runner
         image: fra.ocir.io/idqj093njucb/action-runner:2.337.0
@@ -118,63 +60,3 @@ template:
             mountPath: /var/lib/docker
           - name: infiniband
             mountPath: /dev/infiniband
-
-    initContainers:
-      - name: init-dind-externals
-        args:
-          - '-r'
-          - /home/runner/externals/.
-          - /home/runner/tmpDir/
-        command:
-          - cp
-        image: fra.ocir.io/idqj093njucb/action-runner:2.337.0
-        volumeMounts:
-          - mountPath: /home/runner/tmpDir
-            name: dind-externals
-      - name: dind
-        args:
-          - dockerd
-          - '--host=unix:///var/run/docker.sock'
-          - '--group=$(DOCKER_GROUP_GID)'
-        env:
-          - name: DOCKER_GROUP_GID
-            value: '123'
-          # Suppress dind's default TLS TCP listener (:2376). dockerd only needs
-          # the unix socket here; under hostNetwork a TCP listener would bind a
-          # node port unnecessarily.
-          - name: DOCKER_TLS_CERTDIR
-            value: ""
-        image: fra.ocir.io/idqj093njucb/docker:dind
-        restartPolicy: Always
-        securityContext:
-          privileged: true
-        resources:
-          # genai-bench (and any `docker run` workload) executes inside this dind
-          # cgroup, whose memory limit also caps the page cache for reading the
-          # multi-GB CUDA/torch image. At 4Gi a cold image read thrashes (constant
-          # reclaim + re-read), ballooning container startup to minutes and
-          # tripping the benchmark suite's 480s watchdog. Size for driver RSS +
-          # image page cache; the H100 nodes have ample RAM.
-          limits:
-            cpu: '8'
-            memory: 32Gi
-          requests:
-            cpu: '4'
-            memory: 8Gi
-        startupProbe:
-          exec:
-            command:
-              - docker
-              - info
-          failureThreshold: 24
-          initialDelaySeconds: 0
-          periodSeconds: 5
-        volumeMounts:
-          - mountPath: /home/runner/_work
-            name: work
-          - mountPath: /var/run
-            name: dind-sock
-          - mountPath: /home/runner/externals
-            name: dind-externals
-          - name: docker-storage
-            mountPath: /var/lib/docker

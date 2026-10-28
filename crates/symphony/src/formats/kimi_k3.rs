@@ -66,7 +66,7 @@ mod tests {
     use super::*;
     use crate::{
         ids::CallIds,
-        testing::{arguments_of, bytes, content, drive, drive_to, reasoning},
+        testing::{arguments_of, bytes, content, drive, drive_to, dropped, reasoning},
     };
 
     fn ids() -> CallIds {
@@ -108,13 +108,6 @@ mod tests {
                 _ => None,
             })
             .collect()
-    }
-
-    fn dropped(text: &str) -> Event<'static> {
-        Event::Dropped {
-            text: Text::uncounted(text.to_owned()),
-            why: DropReason::Wrapper,
-        }
     }
 
     #[test]
@@ -196,7 +189,7 @@ mod tests {
         let fragments: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
+                Event::ToolCallArguments { json, .. } => Some(json.as_ref()),
                 _ => None,
             })
             .collect();

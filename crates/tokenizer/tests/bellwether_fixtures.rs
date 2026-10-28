@@ -115,14 +115,6 @@ const HAND_WRITTEN_SET: &str = "common";
 /// content would be.
 const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 
-/// The reason of the render sets of a Llama-class checkpoint whose
-/// `tokenizer.json` keeps the legacy pipeline: the reference's ids were
-/// recorded from that file read as it is, the engines' tokenizer class
-/// rebuilds the pipeline, and the loader follows the class (see
-/// `huggingface::HuggingFaceTokenizer::llama_class_pipeline`). The gateway's
-/// render-parity harness lists the same sets under the same reason.
-const LEGACY_FILE_PIPELINE: &str = "the render ids of this Llama-class checkpoint were recorded from its raw tokenizer.json read by `tokenizers` (the file's legacy pipeline, the ids transformers 4.x gave by taking the file as is: a word marker after every special token, a marker token missed after a newline or a letter); transformers 5.17.0, the version the engines run, rebuilds the class's pipeline (no normalizer, a Metaspace pre-tokenizer) and the loader matches it since smg-project/smg#4248, so the reference's ids differ from the engine's at the special tokens and the markers while the text is equal; every render case of the model, until the sets are re-recorded with the class (smg-project/bellwether#210), when this entry heals and the run asks for its removal";
-
 /// Cases known to differ from the reference, each with the reason and where
 /// it is tracked: a fixture id, `<slug>/render/<name>` or `<slug>/parse/<name>`;
 /// a prefix ending in `*`, which stands for every case whose id begins with
@@ -143,18 +135,7 @@ const LEGACY_FILE_PIPELINE: &str = "the render ids of this Llama-class checkpoin
 /// under it; the entries of a benchmark set the tree omits (`bellwether unpack
 /// --sample-sets` writes every Nth) are left alone, an id of one of its cases
 /// among them.
-const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
-    ("nanbeige4-3b-thinking-2510/render/*", LEGACY_FILE_PIPELINE),
-    ("nanbeige4-3b-thinking-2511/render/*", LEGACY_FILE_PIPELINE),
-    ("nanbeige4.1-3b/render/*", LEGACY_FILE_PIPELINE),
-    ("nanollama/render/*", LEGACY_FILE_PIPELINE),
-    (
-        "spec-decoding-subfolder-fixture/render/*",
-        LEGACY_FILE_PIPELINE,
-    ),
-    ("tinyllama-1.1b-chat-v1.0/render/*", LEGACY_FILE_PIPELINE),
-    ("toolmind-web-3b/render/*", LEGACY_FILE_PIPELINE),
-];
+const KNOWN_DIFFERENCES: &[(&str, &str)] = &[];
 
 /// Models whose tokenizer is known not to load, with the reason and where it
 /// is tracked, so the run compares the others: an unlisted model that does
@@ -241,6 +222,12 @@ const KNOWN_UNLOADED: &[(&str, &str)] = &[
     ),
     (
         "llama-3.2-1b-instruct",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "llama-3.3-70b-instruct",
         "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
          files behind the gate are not fetched (bellwether recorded the group with its \
          own secret)",
@@ -1583,7 +1570,10 @@ fn download(
             bytes.len()
         ));
     }
-    let part = dir.join(format!("{file}.part"));
+    // Named for this process: two test binaries may fetch the same file into one
+    // shared directory at the same moment, and each renames its own whole file
+    // into place.
+    let part = dir.join(format!("{file}.{}.part", std::process::id()));
     fs::write(&part, &bytes).map_err(|e| format!("cannot write {}: {e}", part.display()))?;
     fs::rename(&part, &path)
         .map_err(|e| format!("cannot rename {} into place: {e}", part.display()))?;
@@ -2669,7 +2659,9 @@ fn a_download_whose_body_breaks_is_sent_again_and_lands_on_the_second_try() {
         "the wait before the second try was {elapsed:?}"
     );
     assert!(
-        !dir.path().join("tokenizer.json.part").exists(),
+        !dir.path()
+            .join(format!("tokenizer.json.{}.part", std::process::id()))
+            .exists(),
         "no part is left behind"
     );
     println!("a body broken once: 2 requests, the file landed after {elapsed:?}");
@@ -2772,7 +2764,10 @@ fn a_download_that_breaks_at_every_try_fails_after_the_bounded_retries() {
         "the waits of {waits:?} in all were honoured: {elapsed:?}"
     );
     assert!(!dir.path().join("tokenizer.json").exists());
-    assert!(!dir.path().join("tokenizer.json.part").exists());
+    assert!(!dir
+        .path()
+        .join(format!("tokenizer.json.{}.part", std::process::id()))
+        .exists());
     println!(
         "broken at every try: {} requests, failed after {elapsed:?}: {error}",
         served.load(Ordering::SeqCst)

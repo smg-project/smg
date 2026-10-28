@@ -112,7 +112,7 @@ impl LoadSnapshot {
         let entries = loads
             .into_iter()
             .map(|(url, load)| {
-                let dangling: Weak<super::worker::BasicWorker> = Weak::new();
+                let dangling: Weak<super::basic::BasicWorker> = Weak::new();
                 let entry = LoadEntry {
                     sampled_at: load.sampled_at.unwrap_or(published_at),
                     load: Arc::new(load),
@@ -148,6 +148,43 @@ impl TestFeed {
         self.0
             .send_replace(LoadSnapshot::from_loads_for_test(loads));
     }
+}
+
+/// One DP rank with the given queued uncached tokens, KV utilization and
+/// live throughput; one request is running, so a rate gauge counts.
+#[cfg(test)]
+pub(crate) fn one_rank_load(
+    num_waiting_uncached_tokens: i32,
+    token_usage: f64,
+    gen_throughput: f64,
+) -> WorkerLoadResponse {
+    WorkerLoadResponse {
+        timestamp: String::new(),
+        dp_rank_count: 1,
+        loads: vec![openai_protocol::worker::SchedulerLoadSnapshot {
+            dp_rank: 0,
+            num_running_reqs: 1,
+            num_waiting_uncached_tokens,
+            token_usage,
+            gen_throughput,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// One DP rank reporting a queue depth with no token count for it: the shape
+/// of a backend scored from Prometheus gauges, which have no waiting-token
+/// equivalent.
+#[cfg(test)]
+pub(crate) fn one_rank_load_reqs_only(
+    num_waiting_reqs: i32,
+    token_usage: f64,
+    gen_throughput: f64,
+) -> WorkerLoadResponse {
+    let mut load = one_rank_load(0, token_usage, gen_throughput);
+    load.loads[0].num_waiting_reqs = num_waiting_reqs;
+    load
 }
 
 /// Publication side of the shared load view. Owned by `WorkerMonitor`.
@@ -319,27 +356,10 @@ impl LoadState {
 mod tests {
     use std::sync::Barrier;
 
-    use openai_protocol::{
-        model_card::ModelCard,
-        worker::{HealthCheckConfig, SchedulerLoadSnapshot, WorkerType},
-    };
+    use openai_protocol::worker::SchedulerLoadSnapshot;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, ConnectionMode};
-
-    fn ready_worker(url: &str, model: &str) -> Arc<dyn Worker> {
-        let worker = BasicWorkerBuilder::new(url)
-            .worker_type(WorkerType::Regular)
-            .connection_mode(ConnectionMode::Http)
-            .model(ModelCard::new(model))
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
-            .build();
-        worker.set_status(WorkerStatus::Ready);
-        Arc::new(worker)
-    }
+    use crate::worker::test_support::ready_worker;
 
     /// A load report distinguishable by its waiting-token count.
     fn load(waiting: i32) -> Arc<WorkerLoadResponse> {

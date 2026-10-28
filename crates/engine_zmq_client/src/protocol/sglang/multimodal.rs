@@ -13,8 +13,19 @@
 //! values, the padded prompt and the M-RoPE positions are the scheduler's
 //! (`MultimodalInputs.from_processor_output`, the model's pad pattern,
 //! `_maybe_compute_mrope_positions`), as they are behind the Python servicer,
-//! which hands the scheduler the same object. The tensors ride inline: the
-//! plugin's decoder resolves no auxiliary frames on this wire.
+//! which hands the scheduler the same object.
+//!
+//! A tensor's bytes ride inline in the extension, or, on a scheduler whose
+//! plugin declared it resolves them, as an auxiliary frame of the message
+//! when the tensor is [`crate::codec::tensor::TENSOR_AUX_MIN_BYTES`] or more
+//! (`SglangProtocol::encode_add`, through the typed-tensor wires' routine):
+//! the slot then carries an extension of this wire's own
+//! ([`EXT_TENSOR_FRAME`]) whose payload names the tensor's shape and dtype
+//! and the frame's one-based index (the payload is frame 0), and the plugin's
+//! extension hook builds the tensor over the frame without a copy. An
+//! extension, not a plain value, because the scheduler's decoder calls its
+//! extension hook for every extension whatever the slot's declared type,
+//! while a plain value in an untyped slot reaches no hook at all.
 
 use std::collections::BTreeMap;
 
@@ -27,7 +38,10 @@ use serde::{
 };
 
 use crate::{
-    codec::{encode_msgpack, tensor::serialize_ext},
+    codec::{
+        decode_value, encode_msgpack,
+        tensor::{serialize_ext, TensorFields, WireArrayData},
+    },
     protocol::positional::{drain_trailing, next_field},
 };
 
@@ -60,6 +74,13 @@ pub const DATA_ITEM_WIRE_FIELDS: [&str; 9] = [
 /// SGLang's msgpack extension type of a torch tensor
 /// (`msgpack_utils._MSGPACK_EXT_TORCH_TENSOR`).
 const EXT_TORCH_TENSOR: i8 = 2;
+/// This wire's own extension type of a tensor whose bytes ride as an
+/// auxiliary frame: the payload is the msgpack list `[shape, dtype, index]`,
+/// the index one-based behind the payload. Well above the engine's own
+/// series (1 through 5 at the recorded release), which the plugin's hook
+/// hands to the engine's; the plugin declares at the handshake that it
+/// resolves this one (`tensor_aux_frames`).
+pub const EXT_TENSOR_FRAME: i8 = 100;
 /// `MultimodalInputFormat.NORMAL`: the processor's raw features, not
 /// precomputed embeddings.
 const FORMAT_NORMAL: u8 = 1;
@@ -115,16 +136,21 @@ impl Serialize for SglangWireModality {
 /// A tensor as SGLang's own encoder writes one: msgpack extension 2 whose
 /// payload is the length of the metadata (a big-endian u32), the metadata
 /// (`[shape, dtype, device]` as msgpack), then the raw little-endian bytes.
-/// The decoder in the scheduler rebuilds the tensor from exactly that.
+/// The decoder in the scheduler rebuilds the tensor from exactly that. A
+/// tensor whose bytes left the payload as an auxiliary frame
+/// ([`WireArrayData::AuxIndex`]) is this wire's own extension instead
+/// ([`EXT_TENSOR_FRAME`]), its payload the list `[shape, dtype, index]`: the
+/// frame's one-based index in the data's place.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SglangWireTensor {
     /// The torch dtype name (`float32`, `bfloat16`, `float16`, `uint8`,
     /// `int64` or `uint32`).
     pub dtype: String,
     pub shape: Vec<u64>,
-    /// The raw little-endian bytes: the shape's element count at the dtype's
-    /// width.
-    pub data: Bytes,
+    /// The raw little-endian bytes, the shape's element count at the dtype's
+    /// width, inline or as the index of the auxiliary frame that carries
+    /// them.
+    pub data: WireArrayData,
 }
 
 impl SglangWireTensor {
@@ -153,20 +179,24 @@ impl SglangWireTensor {
                 data.len()
             ));
         }
-        Ok(Self { dtype, shape, data })
+        Ok(Self {
+            dtype,
+            shape,
+            data: WireArrayData::RawView(data),
+        })
     }
 
     /// The extension's payload: the metadata's length, the metadata, the
     /// bytes.
-    fn ext_payload(&self) -> Result<Vec<u8>, String> {
+    fn ext_payload(&self, data: &[u8]) -> Result<Vec<u8>, String> {
         let metadata = encode_msgpack(&(&self.shape, &self.dtype, DEVICE_CPU))
             .map_err(|error| error.to_string())?;
         let length = u32::try_from(metadata.len())
             .map_err(|_| "tensor metadata longer than the wire's length field".to_string())?;
-        let mut payload = Vec::with_capacity(4 + metadata.len() + self.data.len());
+        let mut payload = Vec::with_capacity(4 + metadata.len() + data.len());
         payload.extend_from_slice(&length.to_be_bytes());
         payload.extend_from_slice(&metadata);
-        payload.extend_from_slice(&self.data);
+        payload.extend_from_slice(data);
         Ok(payload)
     }
 
@@ -187,8 +217,17 @@ impl SglangWireTensor {
 
 impl Serialize for SglangWireTensor {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let payload = self.ext_payload().map_err(S::Error::custom)?;
-        serialize_ext(EXT_TORCH_TENSOR, &payload, serializer)
+        match &self.data {
+            WireArrayData::RawView(data) => {
+                let payload = self.ext_payload(data).map_err(S::Error::custom)?;
+                serialize_ext(EXT_TORCH_TENSOR, &payload, serializer)
+            }
+            WireArrayData::AuxIndex(index) => {
+                let payload = encode_msgpack(&(&self.shape, &self.dtype, *index as u64))
+                    .map_err(S::Error::custom)?;
+                serialize_ext(EXT_TENSOR_FRAME, &payload, serializer)
+            }
+        }
     }
 }
 
@@ -198,13 +237,67 @@ impl<'de> Deserialize<'de> for SglangWireTensor {
             Value::Ext(EXT_TORCH_TENSOR, payload) => {
                 Self::from_ext_payload(&payload).map_err(D::Error::custom)
             }
+            Value::Ext(EXT_TENSOR_FRAME, payload) => {
+                Self::from_frame_reference(&payload).map_err(D::Error::custom)
+            }
             Value::Ext(code, _) => Err(D::Error::custom(format!(
-                "expected a torch tensor extension (type {EXT_TORCH_TENSOR}), got type {code}"
+                "expected a torch tensor extension (type {EXT_TORCH_TENSOR}) or a tensor frame \
+                 reference (type {EXT_TENSOR_FRAME}), got type {code}"
             ))),
             other => Err(D::Error::custom(format!(
                 "expected a torch tensor extension, got {other:?}"
             ))),
         }
+    }
+}
+
+impl SglangWireTensor {
+    /// A tensor from its frame reference, the extension's payload
+    /// `[shape, dtype, index]`.
+    fn from_frame_reference(payload: &[u8]) -> Result<Self, String> {
+        let Value::Array(list) = decode_value(payload).map_err(|error| error.to_string())? else {
+            return Err("a tensor's frame reference is the list [shape, dtype, index]".to_string());
+        };
+        let [shape, dtype, index] = list.as_slice() else {
+            return Err(format!(
+                "a tensor's frame reference is [shape, dtype, index], got {} elements",
+                list.len()
+            ));
+        };
+        let shape: Vec<u64> = shape
+            .as_array()
+            .ok_or_else(|| format!("tensor shape must be an array, got {shape:?}"))?
+            .iter()
+            .map(|dim| {
+                dim.as_u64().ok_or_else(|| {
+                    format!("tensor dimension must be a non-negative integer, got {dim:?}")
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let dtype = dtype
+            .as_str()
+            .ok_or_else(|| format!("tensor dtype must be a string, got {dtype:?}"))?;
+        if dtype_element_size(dtype).is_none() {
+            return Err(format!("unsupported tensor dtype {dtype:?}"));
+        }
+        let index = index.as_u64().filter(|index| *index > 0).ok_or_else(|| {
+            format!("tensor frame index must be a positive integer, got {index:?}")
+        })?;
+        Ok(Self {
+            dtype: dtype.to_string(),
+            shape,
+            data: WireArrayData::AuxIndex(index as usize),
+        })
+    }
+}
+
+impl TensorFields for SglangWireTensor {
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        visit(&self.data);
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        visit(&mut self.data);
     }
 }
 
@@ -225,6 +318,20 @@ pub struct SglangWireMmItem {
     /// The model-specific tensors beside it (`image_grid_thw` and the like),
     /// in key order.
     pub model_specific_data: BTreeMap<String, SglangWireTensor>,
+}
+
+/// The item's tensors in wire order: the feature, then the model-specific
+/// tensors in key order.
+impl TensorFields for SglangWireMmItem {
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        self.feature.for_each_tensor(visit);
+        self.model_specific_data.for_each_tensor(visit);
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        self.feature.for_each_tensor_mut(visit);
+        self.model_specific_data.for_each_tensor_mut(visit);
+    }
 }
 
 impl Serialize for SglangWireMmItem {
@@ -293,6 +400,16 @@ impl<'de> Deserialize<'de> for SglangWireMmItem {
 pub struct SglangWireMmInputs {
     pub mm_items: Vec<SglangWireMmItem>,
     pub im_token_id: Option<u32>,
+}
+
+impl TensorFields for SglangWireMmInputs {
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        self.mm_items.for_each_tensor(visit);
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        self.mm_items.for_each_tensor_mut(visit);
+    }
 }
 
 impl Serialize for SglangWireMmInputs {
@@ -380,7 +497,11 @@ pub(crate) mod recorded {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::{decode_msgpack, decode_value, unhex};
+    use crate::codec::{
+        decode_msgpack, decode_value,
+        tensor::{encode_with_aux_frames, TENSOR_AUX_MIN_BYTES},
+        unhex,
+    };
 
     /// `msgspec.msgpack.Encoder(enc_hook=sglang.srt.utils.msgpack_utils.enc_hook)`
     /// of `torch.arange(8, dtype=torch.float32).reshape(2, 4) * 0.5`.
@@ -517,6 +638,112 @@ mod tests {
         let back: Option<SglangWireMmInputs> =
             decode_msgpack(&encode_msgpack(&None::<()>).unwrap()).unwrap();
         assert_eq!(back, None);
+    }
+
+    /// A tensor whose bytes ride as an auxiliary frame is this wire's own
+    /// extension (type 100) whose payload is the list `[shape, dtype,
+    /// index]`, the frame's one-based index in the data's place; it decodes
+    /// back to the reference, and a malformed reference is refused by name.
+    #[test]
+    fn a_framed_tensor_is_the_frame_reference_extension() {
+        let framed = SglangWireTensor {
+            dtype: "float32".to_string(),
+            shape: vec![2, 4],
+            data: WireArrayData::AuxIndex(1),
+        };
+        // ext 8, 13 bytes, type 100: `[[2, 4], "float32", 1]`
+        const FRAMED: &str = "c70d6493920204a7666c6f6174333201";
+        assert_eq!(encode_msgpack(&framed).unwrap(), unhex(FRAMED));
+        let back: SglangWireTensor = decode_msgpack(&unhex(FRAMED)).unwrap();
+        assert_eq!(back, framed);
+        for (hex, needle) in [
+            (
+                "c70c6492920204a7666c6f61743332",
+                "[shape, dtype, index], got 2 elements",
+            ),
+            (
+                "c70d6493920204a7666c6f6174333200",
+                "frame index must be a positive integer",
+            ),
+            (
+                "c70d6493920204a7666c6f617436340a",
+                "unsupported tensor dtype \"float64\"",
+            ),
+            (
+                "c70e6493a3626164a7666c6f6174333201",
+                "shape must be an array",
+            ),
+            ("c7016401", "the list [shape, dtype, index]"),
+            ("c7020700ff", "got type 7"),
+        ] {
+            let error = decode_msgpack::<SglangWireTensor>(&unhex(hex))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(needle), "{hex}: {error}");
+        }
+    }
+
+    /// The tensors are visited in wire order: per item the feature, then the
+    /// model-specific tensors in key order; the items in order. The typed-
+    /// tensor routine numbers the frames by this order.
+    #[test]
+    fn tensors_are_visited_in_wire_order() {
+        let tensor = |n: usize| {
+            SglangWireTensor::new("uint8", vec![n as u64], Bytes::from(vec![n as u8; n])).unwrap()
+        };
+        let inputs = SglangWireMmInputs {
+            mm_items: vec![
+                SglangWireMmItem {
+                    modality: SglangWireModality::Image,
+                    offsets: None,
+                    feature: Some(tensor(1)),
+                    model_specific_data: BTreeMap::from([
+                        ("image_grid_thw".to_string(), tensor(3)),
+                        ("a_first_key".to_string(), tensor(2)),
+                    ]),
+                },
+                SglangWireMmItem {
+                    modality: SglangWireModality::Image,
+                    offsets: None,
+                    feature: None,
+                    model_specific_data: BTreeMap::from([("grid".to_string(), tensor(4))]),
+                },
+            ],
+            im_token_id: None,
+        };
+        let mut seen = Vec::new();
+        inputs.for_each_tensor(&mut |data| {
+            seen.push(data.as_raw_view().unwrap().len());
+        });
+        assert_eq!(seen, vec![1, 2, 3, 4]);
+        let mut inputs = inputs;
+        let mut index = 0;
+        inputs.for_each_tensor_mut(&mut |data| {
+            index += 1;
+            *data = WireArrayData::AuxIndex(index);
+        });
+        assert_eq!(
+            inputs.mm_items[1].model_specific_data["grid"].data,
+            WireArrayData::AuxIndex(4)
+        );
+        // A tensor over the frame bar leaves the payload; the small ones
+        // stay inline (the shared rule, applied to this wire's shape).
+        let large = SglangWireTensor::new(
+            "uint8",
+            vec![TENSOR_AUX_MIN_BYTES as u64],
+            Bytes::from(vec![7u8; TENSOR_AUX_MIN_BYTES]),
+        )
+        .unwrap();
+        let mixed = vec![large.clone(), tensor(16)];
+        let (payload, frames) = encode_with_aux_frames(&mixed).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            frames[0].as_ptr(),
+            large.data.as_raw_view().unwrap().as_ptr()
+        );
+        let decoded: Vec<SglangWireTensor> = decode_msgpack(&payload).unwrap();
+        assert_eq!(decoded[0].data, WireArrayData::AuxIndex(1));
+        assert_eq!(decoded[1], tensor(16));
     }
 
     /// The wire lists against the recorded release's declarations: the

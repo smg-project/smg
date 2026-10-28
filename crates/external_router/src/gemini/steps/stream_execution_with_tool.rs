@@ -37,7 +37,8 @@ use crate::gemini::{context::RequestContext, state::StepResult};
 /// - `ctx.processing.payload` — the JSON body (cloned into the spawned task).
 /// - `ctx.processing.upstream_url` — the worker endpoint.
 /// - `ctx.input.headers` — forwarded headers.
-/// - `ctx.components.mcp_orchestrator` — for tool execution.
+/// - the MCP orchestrator, which comes back to `SharedComponents` when this
+///   step is implemented (nothing reads it there today).
 ///
 /// ## Returns (planned)
 /// `Ok(StepResult::Response(sse_response))` — the SSE response for the client.
@@ -49,7 +50,8 @@ pub(crate) async fn stream_request_execution_with_tool(
     //
     // 1. Create SSE channel: let (tx, rx) = mpsc::unbounded_channel().
     // 2. Clone/move required data from ctx into the spawned task:
-    //    - payload, upstream_url, headers, mcp_orchestrator.
+    //    - payload, upstream_url, headers, the MCP orchestrator (added back to
+    //      SharedComponents with this step).
     // 3. Spawn a background task that runs:
     //    - Local state: is_first_iteration = true, sequence_number = 0, next_output_index = 0.
     //    - loop {

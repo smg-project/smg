@@ -545,8 +545,14 @@ pub(crate) fn render_messages(
     params: &EncodeParams,
 ) -> Result<String, DsEncodingError> {
     let messages = marks::without_marks(messages);
+    // The engine's renderer rewrites a `developer` message as a `system` one
+    // (and merges the system messages when one is not first) before any
+    // tokenizer mode's own encoder sees the conversation, so the vendor
+    // encoding's developer branch is never reached there; the same rule here.
+    let developer = crate::chat_template::developer_messages_as_system(&messages);
+    let messages = developer.as_deref().unwrap_or(&messages);
     // Preprocess: merge tool messages and sort tool results.
-    let merged = merge_tool_messages(&messages);
+    let merged = merge_tool_messages(messages);
     let mut full_messages = sort_tool_results_by_call_order(merged);
     let mut prompt = if params.add_default_bos_token {
         BOS.to_string()
@@ -859,5 +865,32 @@ mod tests {
         let msgs = [json!({ "role": "moderator", "content": "hi" })];
         let err = encode_messages(&msgs, ThinkingMode::Chat, &EncodeParams::default()).unwrap_err();
         assert!(matches!(err, DsEncodingError::UnknownRole(ref r) if r == "moderator"));
+    }
+
+    /// The engine's renderer hands every tokenizer mode a `developer` message
+    /// as a `system` one, so it renders as the system message does in both
+    /// modes, never with the user token the vendor branch wrote.
+    #[test]
+    fn developer_message_is_the_system_message_as_the_engine_hands_it() {
+        let msgs = [
+            json!({ "role": "developer", "content": "Answer in one word." }),
+            user("Colour of the sky?"),
+        ];
+        let as_system = [
+            json!({ "role": "system", "content": "Answer in one word." }),
+            user("Colour of the sky?"),
+        ];
+        for mode in [ThinkingMode::Chat, ThinkingMode::Thinking] {
+            let out = encode_messages(&msgs, mode, &EncodeParams::default()).unwrap();
+            assert_eq!(
+                out,
+                encode_messages(&as_system, mode, &EncodeParams::default()).unwrap()
+            );
+            assert!(
+                out.contains("Answer in one word.")
+                    && !out.contains(&format!("{USER_SP_TOKEN}Answer in one word.")),
+                "{out}"
+            );
+        }
     }
 }

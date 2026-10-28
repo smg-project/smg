@@ -44,6 +44,17 @@ MODEL_SPECS: dict[str, dict] = {
         "tp": 1,
         "features": ["chat", "streaming", "tool_choice"],
     },
+    # The same checkpoint's tokenizer and chat template from an ungated
+    # repository: what the classes on the mock engine read, so the CPU lane
+    # fetches the files without a hub token (the mock needs no weights, only
+    # the tokenizer files). Not a model any engine lane runs: no features, and
+    # no tier downloads it.
+    "RedHatAI/Llama-3.2-1B-Instruct-FP8": {
+        "model": _resolve_model_path("RedHatAI/Llama-3.2-1B-Instruct-FP8"),
+        "tp": 1,
+        "features": [],
+        "skip_tier_download": True,
+    },
     # Function calling specialist
     "Qwen/Qwen2.5-7B-Instruct": {
         "model": _resolve_model_path("Qwen/Qwen2.5-7B-Instruct"),

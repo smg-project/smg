@@ -11,12 +11,14 @@ use openai_protocol::{
 use tokio::sync::mpsc;
 
 use super::{
+    basic::{BasicWorker, ConnectionMode, RuntimeType, WorkerMetadata, WorkerRuntime, WorkerType},
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
+    endpoint::Endpoint,
     event::WorkerConnected,
     http_client::LazyHttpClient,
+    metadata::DecodingLabels,
     overload::OverloadThresholds,
     resilience::ResolvedResilience,
-    worker::{BasicWorker, ConnectionMode, RuntimeType, WorkerMetadata, WorkerRuntime, WorkerType},
 };
 use crate::{
     config::types::DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS, observability::metrics::Metrics,
@@ -345,6 +347,8 @@ impl BasicWorkerBuilder {
         let metadata = WorkerMetadata {
             overload: OverloadThresholds::resolve(&self.spec.overload, self.overload_defaults),
             pd_pairing: PdPairing::derive(&self.spec),
+            redacted_url: Endpoint::redacted_url(&self.spec.url),
+            decoding: DecodingLabels::of(&self.spec),
             spec: Arc::new(self.spec),
             health_config,
             health_endpoint: self.health_endpoint,
@@ -442,11 +446,17 @@ fn parse_bootstrap_host(url: &str) -> String {
         host
     } else if !clean_url.contains("://") {
         try_parse(&format!("http://{clean_url}")).unwrap_or_else(|| {
-            tracing::warn!("Failed to parse URL '{}', defaulting to localhost", url);
+            tracing::warn!(
+                "Failed to parse URL '{}', defaulting to localhost",
+                Endpoint::redacted_str(url)
+            );
             "localhost".to_string()
         })
     } else {
-        tracing::warn!("Failed to parse URL '{}', defaulting to localhost", url);
+        tracing::warn!(
+            "Failed to parse URL '{}', defaulting to localhost",
+            Endpoint::redacted_str(url)
+        );
         "localhost".to_string()
     }
 }
@@ -456,7 +466,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::worker::worker::Worker;
+    use crate::worker::basic::Worker;
 
     /// `new(url)` is `from_spec` of the default spec for `url`: the two constructors give the same
     /// worker, every default written once.
@@ -481,6 +491,20 @@ mod tests {
         assert_eq!(from_url.is_healthy(), from_spec.is_healthy());
     }
 
+    /// The rendered URL is computed once at build: a URL without userinfo is
+    /// the URL byte for byte (its spelling kept), one with userinfo masks it
+    /// whole and keeps the DP rank.
+    #[test]
+    fn the_rendered_url_masks_a_userinfo_and_keeps_a_plain_url_byte_for_byte() {
+        let plain = BasicWorkerBuilder::new("http://Worker:8080/").build();
+        assert_eq!(plain.redacted_url(), plain.url());
+        let with_secret = BasicWorkerBuilder::new("http://user:secret@worker:8080")
+            .dp_config(2, 4)
+            .build();
+        assert_eq!(with_secret.url(), "http://user:secret@worker:8080@2");
+        assert_eq!(with_secret.redacted_url(), "http://***@worker:8080@2");
+    }
+
     #[test]
     fn zmq_engine_group_sets_size_without_rank_or_url_rewrite() {
         // A grouped ZMQ worker is one worker awaiting N engines: dp_size set,
@@ -492,15 +516,17 @@ mod tests {
         assert_eq!(worker.metadata().spec.url, "ipc:///tmp/w.ipc");
         assert_eq!(worker.metadata().spec.dp_size, Some(4));
         assert_eq!(worker.metadata().spec.dp_rank, None);
-        assert_eq!(worker.metadata().zmq_engine_count(), 4);
+        assert_eq!(worker.metadata().zmq_engine_count(), Some(4));
     }
 
     #[test]
-    fn ungrouped_worker_awaits_one_engine() {
+    fn ungrouped_worker_awaits_the_engines_it_is_dialed_by() {
+        // No count: the handshake awaits the group the first engine declares
+        // (one engine for an engine that declares none).
         let worker = BasicWorkerBuilder::new("ipc:///tmp/w.ipc")
             .connection_mode(ConnectionMode::Zmq)
             .build();
-        assert_eq!(worker.metadata().zmq_engine_count(), 1);
+        assert_eq!(worker.metadata().zmq_engine_count(), None);
     }
 
     #[test]

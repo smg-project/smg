@@ -203,6 +203,7 @@ pub struct AsyncMultiModalTracker {
     /// [`TransparencyPolicy`]); `KeepAlpha` unless the request's processing
     /// stage set the destination engine's.
     image_transparency: TransparencyPolicy,
+    minimax_image_resize: bool,
 }
 
 impl AsyncMultiModalTracker {
@@ -216,6 +217,7 @@ impl AsyncMultiModalTracker {
             default_video_sample_fps: None,
             video_frame_sampling: FrameSampling::default(),
             image_transparency: TransparencyPolicy::KeepAlpha,
+            minimax_image_resize: false,
         }
     }
 
@@ -223,6 +225,13 @@ impl AsyncMultiModalTracker {
     /// engine's own transparency rule); it becomes part of each frame's hash.
     pub fn with_image_transparency(mut self, policy: TransparencyPolicy) -> Self {
         self.image_transparency = policy;
+        self
+    }
+
+    /// Plan M3 image geometry from source headers and resize once at lazy decode.
+    /// Video fetching and other model families retain their existing policy.
+    pub fn with_minimax_image_resize(mut self, enabled: bool) -> Self {
+        self.minimax_image_resize = enabled;
         self
     }
 
@@ -389,18 +398,30 @@ impl AsyncMultiModalTracker {
         uuid: Option<String>,
         max_long_side_pixel: Option<u32>,
     ) {
+        let minimax_cap = self.minimax_image_resize.then_some(
+            max_long_side_pixel.unwrap_or(crate::minimax_resize::IMAGE_DEFAULT_LONG_SIDE),
+        );
         let config = ImageFetchConfig {
             detail,
-            max_long_side_pixel,
+            max_long_side_pixel: if minimax_cap.is_some() {
+                None
+            } else {
+                max_long_side_pixel
+            },
             transparency: self.image_transparency,
         };
         self.enqueue(
             Modality::Image,
             uuid,
-            format!("{config:?}"),
+            format!("{config:?}/{minimax_cap:?}"),
             source,
             move |connector, source| async move {
                 let frame = connector.fetch_image_from(&source, config).await?;
+                let frame = if let Some(cap) = minimax_cap {
+                    crate::minimax_resize::image(frame, cap)?
+                } else {
+                    frame
+                };
                 Ok(TrackedMedia::Image(frame))
             },
         );

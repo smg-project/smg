@@ -969,7 +969,7 @@ mod tests {
     use super::*;
     use crate::{
         middleware::{RouteRequestMeta, TenantKey},
-        routers::factory::router_ids,
+        routers::{factory::router_ids, tests::error_shape},
         worker::{
             BasicWorkerBuilder, CircuitBreakerConfig, RuntimeType, WorkerRegistry, WorkerType,
         },
@@ -1128,22 +1128,6 @@ mod tests {
 
     fn test_tenant_meta() -> TenantRequestMeta {
         RouteRequestMeta::new(TenantKey::from("test-tenant"))
-    }
-
-    /// The status of an answer and the code and message of its JSON error object.
-    async fn error_shape(answer: Response) -> (StatusCode, String, String) {
-        let status = answer.status();
-        let body = axum::body::to_bytes(answer.into_body(), usize::MAX)
-            .await
-            .expect("drain body");
-        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
-        let field = |name: &str| {
-            body["error"][name]
-                .as_str()
-                .unwrap_or_else(|| panic!("error.{name} in {body}"))
-                .to_owned()
-        };
-        (status, field("code"), field("message"))
     }
 
     fn body<T: serde::de::DeserializeOwned>(json: serde_json::Value) -> T {
@@ -1363,36 +1347,49 @@ mod tests {
             .status()
     }
 
+    /// A gateway over a mixed fleet: `http_regular` as the HTTP regular router,
+    /// stubs as the PD and gRPC routers (the gRPC one the default), and five
+    /// workers serving `m` with the alias `alias` (an HTTP regular one unless
+    /// `has_http_regular` is false, HTTP prefill and decode ones, a gRPC and a
+    /// ZMQ regular one).
+    fn mixed_fleet_gateway(
+        http_regular: Arc<dyn RouterTrait>,
+        has_http_regular: bool,
+    ) -> Arc<Gateway> {
+        let gateway = test_gateway(true);
+        gateway.register_router(router_ids::HTTP_REGULAR, http_regular);
+        gateway.register_router(router_ids::HTTP_PD, Arc::new(PdStubRouter));
+        gateway.register_router(router_ids::GRPC_REGULAR, Arc::new(PdStubRouter));
+        gateway.set_default_router(router_ids::GRPC_REGULAR);
+        let workers = [
+            (ConnectionMode::Http, WorkerType::Regular),
+            (ConnectionMode::Http, WorkerType::Prefill),
+            (ConnectionMode::Http, WorkerType::Decode),
+            (ConnectionMode::Grpc, WorkerType::Regular),
+            (ConnectionMode::Zmq, WorkerType::Regular),
+        ];
+        for (index, (mode, role)) in workers.into_iter().enumerate() {
+            if index == 0 && !has_http_regular {
+                continue;
+            }
+            gateway
+                .worker_registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(format!("http://worker-{index}:8080"))
+                        .connection_mode(mode)
+                        .worker_type(role)
+                        .model(ModelCard::new("m").with_alias("alias"))
+                        .build(),
+                ))
+                .unwrap();
+        }
+        gateway
+    }
+
     #[tokio::test]
     async fn decisions_use_only_regular_http_workers_in_mixed_fleets() {
         for has_http_regular in [true, false] {
-            let gateway = test_gateway(true);
-            gateway.register_router(router_ids::HTTP_REGULAR, Arc::new(DecisionsStubRouter));
-            gateway.register_router(router_ids::HTTP_PD, Arc::new(PdStubRouter));
-            gateway.register_router(router_ids::GRPC_REGULAR, Arc::new(PdStubRouter));
-            gateway.set_default_router(router_ids::GRPC_REGULAR);
-            let workers = [
-                (ConnectionMode::Http, WorkerType::Regular),
-                (ConnectionMode::Http, WorkerType::Prefill),
-                (ConnectionMode::Http, WorkerType::Decode),
-                (ConnectionMode::Grpc, WorkerType::Regular),
-                (ConnectionMode::Zmq, WorkerType::Regular),
-            ];
-            for (index, (mode, role)) in workers.into_iter().enumerate() {
-                if index == 0 && !has_http_regular {
-                    continue;
-                }
-                gateway
-                    .worker_registry
-                    .register(Arc::new(
-                        BasicWorkerBuilder::new(format!("http://worker-{index}:8080"))
-                            .connection_mode(mode)
-                            .worker_type(role)
-                            .model(ModelCard::new("m").with_alias("alias"))
-                            .build(),
-                    ))
-                    .unwrap();
-            }
+            let gateway = mixed_fleet_gateway(Arc::new(DecisionsStubRouter), has_http_regular);
             let expected = if has_http_regular {
                 StatusCode::OK
             } else {
@@ -1483,33 +1480,7 @@ mod tests {
     #[tokio::test]
     async fn systemone_uses_only_regular_http_workers_in_mixed_fleets() {
         for has_http_regular in [true, false] {
-            let gateway = test_gateway(true);
-            gateway.register_router(router_ids::HTTP_REGULAR, Arc::new(SystemOneStubRouter));
-            gateway.register_router(router_ids::HTTP_PD, Arc::new(PdStubRouter));
-            gateway.register_router(router_ids::GRPC_REGULAR, Arc::new(PdStubRouter));
-            gateway.set_default_router(router_ids::GRPC_REGULAR);
-            let workers = [
-                (ConnectionMode::Http, WorkerType::Regular),
-                (ConnectionMode::Http, WorkerType::Prefill),
-                (ConnectionMode::Http, WorkerType::Decode),
-                (ConnectionMode::Grpc, WorkerType::Regular),
-                (ConnectionMode::Zmq, WorkerType::Regular),
-            ];
-            for (index, (mode, role)) in workers.into_iter().enumerate() {
-                if index == 0 && !has_http_regular {
-                    continue;
-                }
-                gateway
-                    .worker_registry
-                    .register(Arc::new(
-                        BasicWorkerBuilder::new(format!("http://worker-{index}:8080"))
-                            .connection_mode(mode)
-                            .worker_type(role)
-                            .model(ModelCard::new("m").with_alias("alias"))
-                            .build(),
-                    ))
-                    .unwrap();
-            }
+            let gateway = mixed_fleet_gateway(Arc::new(SystemOneStubRouter), has_http_regular);
             let expected = if has_http_regular {
                 StatusCode::OK
             } else {
@@ -2049,8 +2020,9 @@ mod tests {
 
     #[test]
     fn a_worker_on_a_transport_the_family_cannot_use_does_not_count() {
-        // A gRPC prefill worker and a ZMQ decode worker: the gRPC PD family
-        // selects from gRPC-only pools, so the fleet is not PD-ready and the
+        // A gRPC prefill worker and a ZMQ decode worker of a runtime whose
+        // ZMQ wire carries no rendezvous: the gRPC PD family's pools leave it
+        // out, so the fleet is not PD-ready and the
         // request must not be steered to a family that cannot select a pair.
         let registry = Arc::new(WorkerRegistry::new());
         for (url, worker_type, connection) in [

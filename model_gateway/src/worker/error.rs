@@ -2,30 +2,47 @@
 //!
 //! This module defines error types used throughout the router for worker operations.
 
-/// Worker-related errors
+use super::endpoint::Endpoint;
+
+/// Worker-related errors. An arm that names a worker writes its address
+/// masked ([`Endpoint::redacted_url`]): the message follows a masked field
+/// into log lines, step failures and response bodies, and must not repeat
+/// the address raw. The `url` field keeps the registered address for the
+/// code that matches on it.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
-    #[error("Health check failed for worker {url}: {reason}")]
+    #[error("Health check failed for worker {}: {reason}", shown(.url))]
     HealthCheckFailed { url: String, reason: String },
 
-    #[error("Worker not found: {url}")]
+    #[error("Worker not found: {}", shown(.url))]
     WorkerNotFound { url: String },
 
     #[error("Invalid worker configuration: {message}")]
     InvalidConfiguration { message: String },
 
-    #[error("Network error for worker {url}: {error}")]
+    #[error("Network error for worker {}: {error}", shown(.url))]
     NetworkError { url: String, error: String },
 
-    #[error("Connection failed for worker {url}: {reason}")]
+    #[error("Connection failed for worker {}: {reason}", shown(.url))]
     ConnectionFailed { url: String, reason: String },
 
-    #[error("{operation} failed for worker {url}: {reason}")]
+    #[error("{operation} failed for worker {}: {reason}", shown(.url))]
     OperationFailed {
         url: String,
         operation: String,
         reason: String,
     },
+}
+
+/// The address as an error message writes it: masked when it carries
+/// userinfo, cut at a query; an error without one (a network error whose
+/// request had no URL) writes nothing where the address goes.
+fn shown(url: &str) -> String {
+    if url.is_empty() {
+        String::new()
+    } else {
+        Endpoint::redacted_url(url)
+    }
 }
 
 /// Result type for worker operations
@@ -186,6 +203,51 @@ mod tests {
             }
             _ => panic!("Expected NetworkError variant"),
         }
+    }
+
+    #[test]
+    fn a_credentialed_address_is_masked_in_every_arm_that_names_one() {
+        let url = "http://user:secret@worker:3000".to_string();
+        let errors = [
+            WorkerError::HealthCheckFailed {
+                url: url.clone(),
+                reason: "health probe returned non-success".to_string(),
+            },
+            WorkerError::WorkerNotFound { url: url.clone() },
+            WorkerError::NetworkError {
+                url: url.clone(),
+                error: "timeout".to_string(),
+            },
+            WorkerError::ConnectionFailed {
+                url: url.clone(),
+                reason: "refused".to_string(),
+            },
+            WorkerError::OperationFailed {
+                url: url.clone(),
+                operation: "Flush cache".to_string(),
+                reason: "500".to_string(),
+            },
+        ];
+        for error in &errors {
+            let line = error.to_string();
+            assert!(
+                !line.contains("secret") && line.contains("http://***@worker:3000"),
+                "{line}"
+            );
+        }
+        // The field keeps the registered address for the code that matches on it.
+        assert!(
+            matches!(&errors[1], WorkerError::WorkerNotFound { url } if url.contains("secret"))
+        );
+        // A query may carry a token: cut, as a log line cuts it.
+        let error = WorkerError::ConnectionFailed {
+            url: "http://worker:3000/v1?token=secret".to_string(),
+            reason: "refused".to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "Connection failed for worker http://worker:3000/v1: refused"
+        );
     }
 
     #[test]

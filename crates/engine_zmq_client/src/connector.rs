@@ -33,15 +33,16 @@ use tokio::{
     task::JoinHandle,
     time::Instant,
 };
-use tracing::{trace, warn};
+use tracing::{info, trace, warn};
 use zeromq::{RouterSendHalf, SocketRecv};
 
 use crate::{
     codec::OpaqueValue,
     error::{Error, Result},
     protocol::{
-        sglang::SglangProtocol, tokenspeed::TokenSpeedProtocol, vllm::VllmProtocol, EngineBatch,
-        EngineLoad, EngineOutput, EngineProtocol, UtilityReply, WaveEvent,
+        sglang::SglangProtocol, tokenspeed::TokenSpeedProtocol, trtllm::TrtllmProtocol,
+        vllm::VllmProtocol, EngineBatch, EngineLoad, EngineOutput, EngineProtocol, UtilityReply,
+        WaveEvent,
     },
     transport::{run_output_loop, send_message, ConnectedEngine, ConnectedTransport, EngineId},
 };
@@ -58,6 +59,10 @@ pub type TokenSpeedStream = RequestStream<TokenSpeedProtocol>;
 pub type SglangClient = Client<SglangProtocol>;
 /// The per-request output stream for the SGLang connector.
 pub type SglangStream = RequestStream<SglangProtocol>;
+/// The TensorRT-LLM connector.
+pub type TrtllmClient = Client<TrtllmProtocol>;
+/// The per-request output stream for the TensorRT-LLM connector.
+pub type TrtllmStream = RequestStream<TrtllmProtocol>;
 
 /// Per-request output channels are unbounded on purpose. The dispatcher fans
 /// one engine tick out to every request in it while holding the registry lock,
@@ -559,6 +564,9 @@ struct ClientInner<P: EngineProtocol> {
     /// frame, for one log line when it does.
     refused: AtomicUsize,
     engines: Vec<ConnectedEngine>,
+    /// What `P` read off the engines' handshakes ([`connection_layout`]):
+    /// handed to every request it frames and every output it decodes.
+    layout: P::Layout,
     registry: Mutex<RequestRegistry<P::Output>>,
     routing: Mutex<RoutingState>,
     /// Rotates the selection scan start so all-zero ties (cold start, fresh
@@ -1062,24 +1070,38 @@ impl<P: EngineProtocol> ClientInner<P> {
     }
 }
 
-/// The output layout of a connection: what its engines declared for the
-/// optional output columns `P` knows. The ranks of one connection run one
-/// engine build and declare one layout; a group that disagrees reads none of
-/// the optional columns (the default layout) rather than a column at the
-/// wrong position on some rank, and says so once.
+/// The layout of a connection: what its engines declared for the optional
+/// output columns `P` knows and for its request decoder. The ranks of one
+/// connection run one engine build and declare one layout; a group that
+/// disagrees is read at the default layout (none of the optional columns,
+/// every tensor inline) rather than a column at the wrong position on some
+/// rank, and says so once. Every rank's declaration is logged with its id at
+/// the handshake: on a running connection that is the one place that tells
+/// which form the wire takes, and which rank fell behind when they disagree.
 fn connection_layout<P: EngineProtocol>(engines: &[ConnectedEngine]) -> P::Layout {
-    let mut layouts = engines
+    // Every rank is read, and logged, before the decision: the ranks behind a
+    // disagreeing one are the ones that tell which rank fell behind.
+    let layouts: Vec<P::Layout> = engines
         .iter()
-        .map(|engine| P::read_layout(&engine.ready_response));
-    let Some(first) = layouts.next() else {
+        .map(|engine| {
+            let layout = P::read_layout(&engine.ready_response);
+            info!(
+                engine_id = ?engine.engine_id,
+                ?layout,
+                "engine's wire layout declared at the handshake"
+            );
+            layout
+        })
+        .collect();
+    let Some(first) = layouts.first() else {
         return P::Layout::default();
     };
-    if layouts.all(|layout| layout == first) {
-        first
+    if layouts.iter().all(|layout| layout == first) {
+        first.clone()
     } else {
         warn!(
-            "the engines of this connection declare different output layouts; the optional \
-             output columns are not read"
+            "the engines of this connection declare different layouts; the optional output \
+             columns are not read and every tensor is sent inline"
         );
         P::Layout::default()
     }
@@ -1115,6 +1137,7 @@ impl<P: EngineProtocol> Client<P> {
         let lockstep = engines
             .iter()
             .any(|engine| engine.ready_response.data_parallel_size > 1);
+        let layout = connection_layout::<P>(&engines);
 
         let (abort_tx, abort_rx) = mpsc::unbounded_channel();
         let (input_tx, input_rx) = mpsc::unbounded_channel();
@@ -1132,6 +1155,7 @@ impl<P: EngineProtocol> Client<P> {
             writing_since: Mutex::new(None),
             refused: AtomicUsize::new(0),
             engines,
+            layout,
             registry: Mutex::new(RequestRegistry::default()),
             routing: Mutex::new(RoutingState::default()),
             scan_start: AtomicUsize::new(0),
@@ -1193,7 +1217,7 @@ impl<P: EngineProtocol> Client<P> {
         let output_task = tokio::spawn(run_output_loop::<P>(
             output_socket,
             out_tx,
-            connection_layout::<P>(&inner.engines),
+            inner.layout.clone(),
         ));
         #[expect(
             clippy::disallowed_methods,
@@ -1390,7 +1414,7 @@ impl<P: EngineProtocol> Client<P> {
             request_id,
             armed: true,
         };
-        let (payload, mut aux_frames) = match P::encode_add(&request) {
+        let (payload, mut aux_frames) = match P::encode_add(&request, &self.inner.layout) {
             Ok(encoded) => encoded,
             Err(error) => {
                 guard.take_back(false);
@@ -1454,6 +1478,30 @@ impl<P: EngineProtocol> Client<P> {
     pub async fn notify(&self, engine_id: &EngineId, payload: Vec<u8>) -> Result<()> {
         self.inner
             .send_to_engine(engine_id, P::add_frame(), payload, Vec::new())
+            .await
+    }
+
+    /// [`notify`](Self::notify) under a request-type frame of the caller's
+    /// choosing, with `aux_frames` behind the payload: a message of the
+    /// engine's vocabulary outside the add/abort pair that the engine consumes
+    /// itself (an encode worker's encode request, the largest payload this
+    /// wire carries). Nothing answers it, no stream is opened, no registration
+    /// or in-flight slot is taken; the frame is admitted against the input
+    /// queue bound and counted while it waits, as an add frame is (see
+    /// `ClientInner::admit_add`): once the engine has stopped reading for
+    /// a whole send window, a frame that would take the waiting payload past
+    /// the bound is refused at once rather than parked and delivered later.
+    pub async fn send_typed(
+        &self,
+        engine_id: &EngineId,
+        request_type: Bytes,
+        payload: Vec<u8>,
+        aux_frames: Vec<Bytes>,
+    ) -> Result<()> {
+        let bytes = payload.len() + aux_frames.iter().map(Bytes::len).sum::<usize>();
+        self.inner.admit_add(bytes)?;
+        self.inner
+            .send_frame(engine_id, request_type, payload, aux_frames, Some(bytes))
             .await
     }
 }

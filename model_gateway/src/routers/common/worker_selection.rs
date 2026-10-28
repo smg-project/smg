@@ -17,7 +17,10 @@ use crate::{
         },
         error,
     },
-    worker::{overload::STAGE_SELECTION, ProviderType, RuntimeType, Worker, WorkerRegistry},
+    worker::{
+        endpoint::Endpoint, overload::STAGE_SELECTION, ProviderType, RuntimeType, Worker,
+        WorkerRegistry,
+    },
 };
 
 /// Holds references to shared infrastructure needed for worker selection.
@@ -279,7 +282,7 @@ async fn refresh_worker_models(
                         tracing::info!(
                             "Model refresh: found {} models from {}",
                             model_cards.len(),
-                            url
+                            Endpoint::redacted_str(&url)
                         );
                         worker.set_models(model_cards);
                         return true;
@@ -296,7 +299,7 @@ async fn refresh_worker_models(
             tracing::debug!(
                 "Model refresh returned non-success status {} from {}",
                 response.status(),
-                url
+                Endpoint::redacted_str(&url)
             );
             false
         }
@@ -309,18 +312,11 @@ async fn refresh_worker_models(
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::{HealthCheckConfig, WorkerSpec};
+    use openai_protocol::worker::WorkerSpec;
     use smg_external_router::known;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, WorkerType};
-
-    fn no_health_check() -> HealthCheckConfig {
-        HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        }
-    }
+    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder, WorkerType};
 
     // Wildcard model support (no `.models()`), so `supports_model` is always true;
     // this isolates the realtime-capability gate.

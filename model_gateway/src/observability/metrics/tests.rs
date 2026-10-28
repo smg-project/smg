@@ -1451,3 +1451,166 @@ fn time_per_router_record_contended() {
     time("keys built per record", false);
     time("handles kept per worker", true);
 }
+
+/// The chat path's remaining per-request records (the selection, the
+/// cache-aware decision, the routing-key source, the admission gauges,
+/// the body path, the early release) render the same through kept
+/// handles as through a key built per record: the same series with the
+/// same values.
+#[test]
+fn the_per_request_records_render_the_same_through_kept_handles() {
+    let records = || {
+        for _ in 0..2 {
+            Metrics::record_worker_selection(
+                metrics_labels::WORKER_REGULAR,
+                metrics_labels::CONNECTION_GRPC,
+                "m1",
+                "cache_aware",
+            );
+        }
+        Metrics::record_worker_selection(
+            metrics_labels::WORKER_PREFILL,
+            metrics_labels::CONNECTION_GRPC,
+            "m2",
+            "random",
+        );
+        Metrics::record_worker_cache_aware_policy_branch("tree_match");
+        Metrics::record_worker_cache_aware_policy_branch("tree_match");
+        Metrics::record_worker_cache_aware_policy_branch("spill");
+        Metrics::record_cache_aware_match_ratio(0.25);
+        Metrics::record_cache_aware_match_ratio(0.75);
+        Metrics::record_routing_key_source("header");
+        Metrics::record_admission_queue_entered();
+        Metrics::record_admission_inflight_acquired();
+        Metrics::record_admission_inflight_acquired();
+        Metrics::record_admission_inflight_released();
+        Metrics::record_admission_queue_exited();
+        Metrics::record_admission_queue_entered();
+        Metrics::record_request_body_path("buffered", "no_available_worker");
+        Metrics::record_request_body_path("streamed", "single_worker");
+        Metrics::record_request_body_path("buffered", "no_available_worker");
+        Metrics::record_request_buffers_released_early(300);
+        Metrics::record_request_buffers_released_early(200);
+    };
+    let built = render_with_recorder(|| {
+        handles::force_on_this_thread(Some(false));
+        records();
+        handles::reset();
+    });
+    let kept = render_with_recorder(|| {
+        handles::force_on_this_thread(Some(true));
+        records();
+        handles::reset();
+    });
+    assert_eq!(sorted_series(&kept), sorted_series(&built));
+    for expected in [
+        "smg_worker_selection_total{worker_type=\"regular\",connection_mode=\"grpc\",model=\"m1\",policy=\"cache_aware\"} 2",
+        "smg_worker_selection_total{worker_type=\"prefill\",connection_mode=\"grpc\",model=\"m2\",policy=\"random\"} 1",
+        "smg_cache_aware_policy_branch_total{branch=\"tree_match\"} 2",
+        "smg_cache_aware_policy_branch_total{branch=\"spill\"} 1",
+        "smg_cache_aware_match_ratio_count 2",
+        "smg_routing_key_source_total{source=\"header\"} 1",
+        "smg_admission_queue_depth 1",
+        "smg_admission_inflight 1",
+        "smg_router_request_body_path_total{path=\"buffered\",reason=\"no_available_worker\"} 2",
+        "smg_router_request_body_path_total{path=\"streamed\",reason=\"single_worker\"} 1",
+        "smg_router_request_buffers_released_early_bytes_total 500",
+    ] {
+        assert!(
+            kept.lines().any(|line| line == expected),
+            "missing {expected} in:\n{kept}"
+        );
+    }
+}
+
+/// The breaker's outcome counter is a per-worker series: through kept
+/// handles it counts on the recorder's own series, a retirement drops the
+/// kept handle (an outcome racing the removal feeds nothing), and a
+/// re-registration starts the counter over instead of feeding the handle
+/// built while the address was retired.
+#[test]
+fn kept_worker_outcome_counters_follow_the_workers_registrations() {
+    let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
+        parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )));
+    let recorder = WorkerSeriesRecorder::new(
+        PrometheusBuilder::new().build_recorder(),
+        Arc::clone(&workers),
+    );
+    workers.activate("http://w1");
+    // The rendered value of one worker's outcome series.
+    let value = |worker: &str, outcome: &str| -> Option<String> {
+        let mut rendered = String::new();
+        workers.render_into(&mut rendered);
+        rendered
+            .lines()
+            .find(|line| {
+                line.starts_with("smg_worker_cb_outcomes_total{")
+                    && line.contains(&format!("worker=\"{worker}\""))
+                    && line.contains(&format!("outcome=\"{outcome}\""))
+            })
+            .map(|line| line.rsplit(' ').next().unwrap_or_default().to_owned())
+    };
+    handles::force_on_this_thread(Some(true));
+    metrics::with_local_recorder(&recorder, || {
+        Metrics::record_worker_cb_outcome("http://w1", "success");
+        Metrics::record_worker_cb_outcome("http://w1", "success");
+        Metrics::record_worker_cb_outcome("http://w1", "failure");
+        assert_eq!(value("http://w1", "success").as_deref(), Some("2"));
+        assert_eq!(value("http://w1", "failure").as_deref(), Some("1"));
+
+        workers.retire("http://w1");
+        handles::worker_set_changed();
+        Metrics::record_worker_cb_outcome("http://w1", "success");
+        assert_eq!(value("http://w1", "success"), None);
+
+        workers.activate("http://w1");
+        handles::worker_set_changed();
+        Metrics::record_worker_cb_outcome("http://w1", "success");
+        assert_eq!(value("http://w1", "success").as_deref(), Some("1"));
+    });
+    handles::reset();
+}
+
+/// The cost of the chat path's per-request records with and without the
+/// kept handles, for the Numbers table; run with `--ignored --nocapture`.
+#[test]
+#[ignore = "a timing, not a check"]
+#[expect(clippy::print_stdout, reason = "the timing is the output")]
+fn time_per_request_records() {
+    use std::time::Instant;
+    const ROUNDS: u32 = 200_000;
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let time = |label: &str| {
+        metrics::with_local_recorder(&recorder, || {
+            let start = Instant::now();
+            for _ in 0..ROUNDS {
+                Metrics::record_admission_inflight_acquired();
+                Metrics::record_worker_selection(
+                    metrics_labels::WORKER_REGULAR,
+                    metrics_labels::CONNECTION_GRPC,
+                    "m1",
+                    "cache_aware",
+                );
+                Metrics::record_worker_cache_aware_policy_branch("tree_match");
+                Metrics::record_cache_aware_match_ratio(0.5);
+                Metrics::record_request_body_path("buffered", "single_worker");
+                Metrics::record_request_buffers_released_early(300);
+                Metrics::record_worker_cb_outcome("http://w1", "success");
+                Metrics::record_admission_inflight_released();
+            }
+            let per_request = start.elapsed().as_nanos() as f64 / f64::from(ROUNDS);
+            println!("ns per request for the eight per-request records, {label}: {per_request:.0}");
+        });
+    };
+    handles::force_on_this_thread(Some(false));
+    time("keys built per record");
+    handles::force_on_this_thread(Some(true));
+    time("handles kept per thread");
+    handles::reset();
+}

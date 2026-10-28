@@ -135,15 +135,10 @@ mod tests {
     use openai_protocol::worker::{RuntimeType, WorkerType};
 
     use super::*;
-    use crate::{routers::grpc::proto_wrapper::ENGINE_ERROR_MESSAGE, worker::BasicWorkerBuilder};
-
-    /// A loopback port nothing listens on.
-    fn closed_port() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("address").port();
-        drop(listener);
-        port
-    }
+    use crate::{
+        routers::grpc::proto_wrapper::ENGINE_ERROR_MESSAGE, test_support::RefusedAddress,
+        worker::BasicWorkerBuilder,
+    };
 
     /// A prefill side on the loopback host whose partners are handed `port`.
     fn prefill_on(port: u16) -> Arc<dyn Worker> {
@@ -169,7 +164,8 @@ mod tests {
     /// phase on the prefill side, worded for the client without the address.
     #[tokio::test]
     async fn the_engines_own_report_behind_a_dead_bootstrap_port_is_a_rendezvous_failure() {
-        let port = closed_port();
+        let refused = RefusedAddress::reserve();
+        let port = refused.port();
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let dead = {
@@ -218,6 +214,7 @@ mod tests {
                 .kv_connector("NixlConnector")
                 .build(),
         );
+        let dead = RefusedAddress::reserve();
         let report = tonic::Status::internal(ENGINE_ERROR_MESSAGE);
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
@@ -226,7 +223,7 @@ mod tests {
             [
                 dead_rendezvous_of(Some(&prefill_on(live)), &report).await,
                 dead_rendezvous_of(
-                    Some(&prefill_on(closed_port())),
+                    Some(&prefill_on(dead.port())),
                     &tonic::Status::internal(
                         "Decode handshake failed for request rank=0 req.rid='r2' \
                          req.bootstrap_room=42",
@@ -234,7 +231,7 @@ mod tests {
                 )
                 .await,
                 dead_rendezvous_of(
-                    Some(&prefill_on(closed_port())),
+                    Some(&prefill_on(dead.port())),
                     &tonic::Status::unavailable("connection reset"),
                 )
                 .await,

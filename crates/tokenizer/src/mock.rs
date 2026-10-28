@@ -373,6 +373,7 @@ impl TokenizerTrait for MockTokenizer {
         assistant_prefix: Option<&str>,
     ) -> Result<ChatTemplateOutput> {
         let continued_final_message = params.continue_final_message;
+        let generation_prompt_unless_continued = params.generation_prompt_unless_continued();
         let mut text = self.apply_chat_template(messages, params)?;
         if let Some(prefix) = assistant_prefix {
             text.push_str(prefix);
@@ -395,6 +396,7 @@ impl TokenizerTrait for MockTokenizer {
             encoding,
             unbilled_prompt_tokens: self.unbilled_prompt_tokens,
             continued_final_message,
+            generation_prompt: generation_prompt_unless_continued && !continued_final_message,
         })
     }
 

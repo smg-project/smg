@@ -1,4 +1,4 @@
-use llm_tokenizer::chat_template::ChatTemplateContentFormat;
+use llm_tokenizer::{chat_template::ChatTemplateContentFormat, traits::RendererCapabilities};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
     common::{AudioUrl, ContentPart, ImageUrl, InputAudio, VideoUrl},
@@ -897,9 +897,8 @@ fn a_named_tool_choice_renders_every_tool() {
     };
 
     let named = request(json!({"type": "function", "function": {"name": "get_weather"}}));
-    let plain = RendererCapabilities::default();
     assert_eq!(
-        names(&request_as_rendered(&named, plain)),
+        names(&request_as_rendered(&named)),
         ["get_weather", "get_time"]
     );
     assert_eq!(
@@ -915,11 +914,11 @@ fn a_named_tool_choice_renders_every_tool() {
         "type": "allowed_tools", "mode": "auto",
         "tools": [{"type": "function", "name": "get_time"}]
     }));
-    assert_eq!(names(&request_as_rendered(&allowed, plain)), ["get_time"]);
+    assert_eq!(names(&request_as_rendered(&allowed)), ["get_time"]);
 
     let auto = request(json!("auto"));
     assert_eq!(
-        names(&request_as_rendered(&auto, plain)),
+        names(&request_as_rendered(&auto)),
         ["get_weather", "get_time"]
     );
 }
@@ -936,36 +935,31 @@ fn tool_choice_none_request() -> ChatCompletionRequest {
         .expect("chat request")
 }
 
-/// `tool_choice: none` renders no tool: the model is not offered a call
-/// it may not make, and the request's other fields render as sent.
+/// `tool_choice: none` renders the tools as `auto` renders them: the request
+/// renders as sent (borrowed, nothing narrowed), so the prompt is the one the
+/// engine's own server renders for it and the one the session's other turns
+/// rendered; the choice itself reaches the template as a kwarg.
 #[test]
-fn tool_choice_none_renders_no_tool() {
+fn tool_choice_none_renders_the_tools_as_auto_does() {
     let request = tool_choice_none_request();
-    let rendered = request_as_rendered(&request, RendererCapabilities::default());
-    assert!(rendered.tools.is_none());
-    assert_eq!(rendered.messages.len(), request.messages.len());
-    // The request itself keeps its tools for the rest of the pipeline.
-    assert!(request.tools.is_some());
-}
-
-/// A renderer that declares the tools under `tool_choice: none` itself
-/// (and forbids the call in the prompt, as its reference does) gets them:
-/// the request renders as sent.
-#[test]
-fn a_renderer_that_declares_tools_under_tool_choice_none_keeps_them() {
-    let request = tool_choice_none_request();
-    let rendered = request_as_rendered(
-        &request,
-        RendererCapabilities {
-            declares_tools_under_tool_choice_none: true,
-            ..RendererCapabilities::default()
-        },
-    );
+    let rendered = request_as_rendered(&request);
     assert!(matches!(rendered, std::borrow::Cow::Borrowed(_)));
     assert_eq!(
         rendered.tools.as_deref().map(<[_]>::len),
         Some(1),
-        "the tool declaration stays for the renderer to write"
+        "the tool declaration stays for the template to write"
+    );
+    let mut auto = request.clone();
+    auto.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
+    let under_auto = request_as_rendered(&auto);
+    assert_eq!(
+        serde_json::to_value(&under_auto.tools).expect("tools"),
+        serde_json::to_value(&rendered.tools).expect("tools"),
+        "the same tools render under none and under auto"
+    );
+    assert_eq!(
+        build_chat_template_kwargs(&request)[TOOL_CHOICE_KEY],
+        json!("none")
     );
 }
 
@@ -1064,9 +1058,9 @@ fn thinking_disabled_projects_params_thinking_false() {
     );
 }
 
-/// Under the MiniMax profile no effort value switches thinking off and an
-/// explicit effort outranks `thinking.disabled`; the request renders the
-/// template's default (thinking on, the model's own depth).
+/// Under the MiniMax profile no effort value switches thinking off: the
+/// request renders the template's default (thinking on, the model's own
+/// depth). An explicit `thinking.disabled` wins over the effort there too.
 #[test]
 fn minimax_effort_keeps_thinking_on() {
     let minimax = |thinking: Option<Value>, reasoning_effort: Option<&str>| {
@@ -1083,8 +1077,8 @@ fn minimax_effort_keeps_thinking_on() {
         );
         assert_eq!(
             resolve_template_thinking(&minimax(Some(json!({"type": "disabled"})), Some(effort))),
-            None,
-            "{effort} outranks thinking.disabled"
+            Some(false),
+            "{effort}: thinking.disabled wins"
         );
     }
     assert_eq!(
@@ -1340,7 +1334,6 @@ const NATIVE_CONTINUATION: RendererCapabilities = RendererCapabilities {
     enable_thinking_alias: false,
     native_assistant_continuation: true,
     raw_tool_call_arguments: false,
-    declares_tools_under_tool_choice_none: false,
     leading_system_only: false,
 };
 const RAW_ARGUMENTS: RendererCapabilities = RendererCapabilities {
@@ -1348,7 +1341,6 @@ const RAW_ARGUMENTS: RendererCapabilities = RendererCapabilities {
     enable_thinking_alias: false,
     native_assistant_continuation: false,
     raw_tool_call_arguments: true,
-    declares_tools_under_tool_choice_none: false,
     leading_system_only: false,
 };
 
@@ -1372,6 +1364,136 @@ fn native_continuation_keeps_the_trailing_assistant_message_instead_of_prefixing
     assert_eq!(native["messages"][1]["content"], "Sure");
     assert_eq!(native["add_generation_prompt"], json!(false));
     assert_eq!(native["assistant_prefix"], json!(""));
+}
+
+/// `add_generation_prompt: false` renders the conversation without a
+/// generation header; absent, the header is rendered as before. A continued
+/// final message keeps its own rule: no header natively, the emulation's
+/// header and prefix otherwise, whatever the field says.
+#[test]
+fn add_generation_prompt_false_renders_the_conversation_without_a_header() {
+    let request = |fields: Value| -> ChatCompletionRequest {
+        let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "Hello"}]});
+        body.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        serde_json::from_value(body).unwrap()
+    };
+    let closed = render_with(
+        Default::default(),
+        &request(json!({"add_generation_prompt": false})),
+    );
+    assert_eq!(closed["add_generation_prompt"], json!(false));
+    assert_eq!(closed["messages"].as_array().unwrap().len(), 1);
+    let open = render_with(Default::default(), &request(json!({})));
+    assert_eq!(open["add_generation_prompt"], json!(true));
+
+    let pair = request(json!({
+        "continue_final_message": true,
+        "add_generation_prompt": false,
+        "messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Sure"}
+        ]
+    }));
+    let emulated = render_with(Default::default(), &pair);
+    assert_eq!(emulated["add_generation_prompt"], json!(true));
+    assert_eq!(emulated["assistant_prefix"], json!("Sure"));
+    let native = render_with(NATIVE_CONTINUATION, &pair);
+    assert_eq!(native["add_generation_prompt"], json!(false));
+    assert_eq!(native["messages"].as_array().unwrap().len(), 2);
+}
+
+/// Through a Jinja template: without the header the prompt ends at the last
+/// turn's end marker; with it (the field absent) the assistant header follows.
+/// The rendered prompt reports which, for the reasoning decisions. A
+/// `chat_template_kwargs` entry of that name does not override the request's
+/// field (the render context keeps the field's value), so the header stays
+/// and is reported as such.
+#[test]
+fn jinja_template_renders_no_header_when_add_generation_prompt_is_false() {
+    let mut tokenizer =
+        llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase).unwrap();
+    tokenizer
+        .set_chat_template(HEADER_TEMPLATE.to_string())
+        .unwrap();
+    let render = |add_generation_prompt: Value| {
+        let mut body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "Hello."}],
+            "add_generation_prompt": add_generation_prompt
+        });
+        if let Some(kwargs) = add_generation_prompt.get("chat_template_kwargs") {
+            body["chat_template_kwargs"] = kwargs.clone();
+            body["add_generation_prompt"] = Value::Null;
+        }
+        let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        process_chat_messages_with_placeholders(
+            &request,
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap()
+        .0
+    };
+    let closed = render(json!(false));
+    assert_eq!(closed.text, "<|turn|>user<|body|>Hello.<|end|>");
+    assert!(!closed.generation_prompt);
+    let open = render(Value::Null);
+    assert_eq!(
+        open.text,
+        "<|turn|>user<|body|>Hello.<|end|><|turn|>assistant"
+    );
+    assert!(open.generation_prompt);
+    let by_kwargs = render(json!({"chat_template_kwargs": {"add_generation_prompt": false}}));
+    assert_eq!(
+        by_kwargs.text,
+        "<|turn|>user<|body|>Hello.<|end|><|turn|>assistant"
+    );
+    assert!(by_kwargs.generation_prompt);
+}
+
+/// The rendered prompt reports whether it carries the generation header, as
+/// the reasoning decisions read it: the header the request asked for, none
+/// under `add_generation_prompt: false`, none for a natively continued
+/// message, and the emulation's header (the message's text after it)
+/// otherwise.
+#[test]
+fn the_rendered_prompt_reports_its_generation_header() {
+    let processed = |capabilities: RendererCapabilities, body: Value| -> ProcessedMessages {
+        let tokenizer = llm_tokenizer::MockTokenizer::new()
+            .with_renderer_capabilities(capabilities)
+            .with_json_chat_template();
+        let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        process_chat_messages_with_placeholders(
+            &request,
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap()
+        .0
+    };
+    let hello = json!({"model": "m", "messages": [{"role": "user", "content": "Hello"}]});
+    assert!(processed(Default::default(), hello.clone()).generation_prompt);
+    let mut closed = hello;
+    closed["add_generation_prompt"] = json!(false);
+    assert!(!processed(Default::default(), closed).generation_prompt);
+    let pair = json!({
+        "model": "m",
+        "continue_final_message": true,
+        "messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Sure"}
+        ]
+    });
+    let native = processed(NATIVE_CONTINUATION, pair.clone());
+    assert!(native.continued_final_message);
+    assert!(!native.generation_prompt);
+    let emulated = processed(Default::default(), pair);
+    assert!(!emulated.continued_final_message);
+    assert!(emulated.generation_prompt);
 }
 
 /// A text-rendered prompt reaches the tokenizer with each rendered marker
@@ -1865,7 +1987,7 @@ async fn a_served_model_whose_tokenizer_load_failed_is_a_503_without_retry_after
         "Workflow failed at step load_tokenizer: File not found: /models/secret".to_string(),
     );
     for (failure, autoload, reason) in [
-        (&TokenizerLoadFailure::NoSource, true, "no tokenizer path"),
+        (&TokenizerLoadFailure::NoSource, true, "no tokenizer source"),
         (
             &TokenizerLoadFailure::Removed,
             true,

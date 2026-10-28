@@ -6,9 +6,11 @@
 //! given comes from one decision, `ProbeSlot::of`: what the schedule does
 //! with a worker of a given status under the manager's configuration (a
 //! removed worker's slot and the lag recovery's rebuild are the only writes
-//! beside it). A worker's deadline is re-armed when its probe launches
-//! (never when it completes), and `in_flight` keeps a slow probe from being
-//! joined by a second one.
+//! beside it). A worker's deadline is re-armed when its probe launches, and
+//! on its completion only to bring the next read of a demoted worker whose
+//! probe just passed to a probe's timeout from now (its return is
+//! consecutive reads, not consecutive intervals); `in_flight` keeps a slow
+//! probe from being joined by a second one.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -38,12 +40,13 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     service_discovery::DISCOVERY_PROVIDER_LABEL,
     worker::{
+        basic::WorkerTypeExt,
+        endpoint::Endpoint,
         event::{WorkerConnected, WorkerEvent},
         liveness,
         load_state::LoadSnapshot,
         metrics_aggregator::{self, MetricPack},
         registry::WorkerId,
-        worker::WorkerTypeExt,
         ConnectionMode, RuntimeType, Worker, WorkerOrigin, WorkerRegistry, WorkerResult,
         WorkerType,
     },
@@ -386,8 +389,11 @@ impl ProbeSlot {
 }
 
 /// Writes `worker_id`'s slot. A probed worker is due at once (`immediate`: a
-/// registration or replacement is probed without waiting an interval) or
-/// after its interval; any other slot leaves the schedule.
+/// registration or replacement is probed without waiting an interval, and so
+/// is a demoted worker a contact brings forward) or after its interval; any
+/// other slot leaves the schedule. (A demoted worker's passing probe short of
+/// its success threshold brings the next read to a probe timeout away, or
+/// leaves an earlier deadline standing; that write is the health loop's own.)
 fn schedule_at(
     next_check: &mut HashMap<WorkerId, tokio::time::Instant>,
     worker_id: WorkerId,
@@ -471,8 +477,9 @@ async fn run_health_loop(
             Some(completion) = probes.next(), if !probes.is_empty() => {
                 let worker_id = completion.worker_id.clone();
                 let worker = Arc::clone(&completion.worker);
+                let probe_ok = completion.probe_result.is_ok();
                 in_flight.remove(&worker_id);
-                if let ProbeApplyResult::Applied(Some((_, new))) = apply_probe_completion(
+                match apply_probe_completion(
                     &registry,
                     completion,
                     removal_queue.as_ref().map(|queue| (queue, config.remove_unhealthy)),
@@ -480,15 +487,72 @@ async fn run_health_loop(
                 )
                 .await
                 {
-                    // The one slot a probe's outcome changes: a worker that
-                    // just failed under removal leaves the schedule (its
-                    // removal is in flight). Every other transition keeps the
-                    // deadline armed at the probe's launch.
-                    if ProbeSlot::of_worker(&registry, &worker_id, worker.as_ref(), new, &config)
-                        == ProbeSlot::Removal
-                    {
-                        next_check.remove(&worker_id);
+                    ProbeApplyResult::Applied(Some((_, new))) => {
+                        // A worker that just failed under removal leaves the
+                        // schedule (its removal is in flight). Every other
+                        // transition keeps the deadline armed at the probe's
+                        // launch.
+                        if ProbeSlot::of_worker(
+                            &registry,
+                            &worker_id,
+                            worker.as_ref(),
+                            new,
+                            &config,
+                        ) == ProbeSlot::Removal
+                        {
+                            next_check.remove(&worker_id);
+                        }
                     }
+                    // A demoted worker's probe passed short of its success
+                    // threshold: its next read is due at most a probe's
+                    // timeout from now, and never after a deadline the
+                    // schedule already holds (the interval's, or a contact's
+                    // immediate one), so the threshold is consecutive reads a
+                    // round trip apart, not consecutive intervals. Whatever took
+                    // the worker out (its transport within seconds where
+                    // something contacts it; the probes alone where nothing
+                    // does, an HTTP worker or a gRPC worker under a policy
+                    // that opens no stream), its return was read by the
+                    // schedule alone: each further read waited a whole
+                    // interval, and a worker the gateway kept through a
+                    // restart stayed out of routing for one to two intervals
+                    // after its engine answered while a worker re-registered
+                    // for the same engine served on one read. The gap keeps a
+                    // run of passes a run of reads (a flapping engine has to
+                    // answer across it); a failed read, a stale outcome and a
+                    // worker already Ready keep the deadline armed at the
+                    // launch.
+                    ProbeApplyResult::Applied(None)
+                        if probe_ok
+                            && matches!(
+                                worker.status(),
+                                WorkerStatus::NotReady | WorkerStatus::Failed
+                            ) =>
+                    {
+                        let slot = ProbeSlot::of_worker(
+                            &registry,
+                            &worker_id,
+                            worker.as_ref(),
+                            worker.status(),
+                            &config,
+                        );
+                        if matches!(slot, ProbeSlot::Probe(_)) {
+                            // Brought forward, never pushed back: a deadline
+                            // the schedule already holds earlier (the
+                            // interval's, armed at the launch, or the immediate
+                            // one a connect signal wrote while the probe was in
+                            // flight) stands.
+                            let gap = Duration::from_secs(
+                                worker.metadata().health_config.timeout_secs.max(1),
+                            );
+                            let due = tokio::time::Instant::now() + gap;
+                            next_check
+                                .entry(worker_id)
+                                .and_modify(|deadline| *deadline = (*deadline).min(due))
+                                .or_insert(due);
+                        }
+                    }
+                    ProbeApplyResult::Applied(None) | ProbeApplyResult::Stale => {}
                 }
             }
             () = tokio::time::sleep_until(sleep_until) => {}
@@ -690,7 +754,7 @@ async fn apply_probe_completion(
         Ok(()) => true,
         Err(err) => {
             warn!(
-                worker_url = %worker.url(),
+                worker_url = %worker.redacted_url(),
                 error = %err,
                 "Health probe failed"
             );
@@ -721,7 +785,7 @@ async fn apply_probe_completion(
         })
     else {
         debug!(
-            worker_url = %worker.url(),
+            worker_url = %worker.redacted_url(),
             expected_revision,
             "Discarding stale probe outcome after worker replacement"
         );
@@ -733,7 +797,7 @@ async fn apply_probe_completion(
         // outage is read from (a refusal names the pool's healthy count, not
         // why it moved); the probe failures behind it are WARN lines already.
         info!(
-            worker_url = %worker.url(),
+            worker_url = %worker.redacted_url(),
             ?old,
             ?new,
             "Worker status transition"
@@ -820,11 +884,11 @@ fn apply_connect_signal(
 ) -> Option<(WorkerId, Arc<dyn Worker>)> {
     let WorkerConnected { url, revision } = connected;
     let Some(worker_id) = registry.get_id_by_url(&url) else {
-        debug!(worker_url = %url, "Connect signal for an unknown worker; ignoring");
+        debug!(worker_url = %Endpoint::redacted_str(&url), "Connect signal for an unknown worker; ignoring");
         return None;
     };
     let Some(worker) = registry.get(&worker_id) else {
-        debug!(worker_url = %url, "Connect signal for a removed worker; ignoring");
+        debug!(worker_url = %Endpoint::redacted_str(&url), "Connect signal for a removed worker; ignoring");
         return None;
     };
     let slot = ProbeSlot::of_worker(
@@ -837,15 +901,15 @@ fn apply_connect_signal(
     // A Failed worker under removal is on its way out: the contact that
     // signalled it was a last poll, not a return.
     if slot == ProbeSlot::Removal {
-        debug!(worker_url = %url, "Connect signal for a worker being removed; ignoring");
+        debug!(worker_url = %Endpoint::redacted_str(&url), "Connect signal for a worker being removed; ignoring");
         return None;
     }
     if matches!(slot, ProbeSlot::Probe(_)) && *worker.connection_mode() != ConnectionMode::Zmq {
         if worker.revision() != revision {
-            debug!(worker_url = %url, "Connect signal for a replaced worker; ignoring");
+            debug!(worker_url = %Endpoint::redacted_str(&url), "Connect signal for a replaced worker; ignoring");
             return None;
         }
-        debug!(worker_url = %url, "Contact from a demoted worker: its health probe runs now");
+        debug!(worker_url = %Endpoint::redacted_str(&url), "Contact from a demoted worker: its health probe runs now");
         schedule_at(
             next_check,
             worker_id,
@@ -857,7 +921,7 @@ fn apply_connect_signal(
     }
     match registry.transition_status_if_revision(&worker_id, revision, WorkerStatus::Ready) {
         Some((old, new)) => {
-            debug!(worker_url = %url, ?old, ?new, "Promoted worker on connect signal");
+            debug!(worker_url = %Endpoint::redacted_str(&url), ?old, ?new, "Promoted worker on connect signal");
             // A promoted worker serves traffic, so it is on the schedule from
             // here whatever its slot was (a Failed worker's may have gone):
             // otherwise a later engine death would leave it Ready with a dead
@@ -876,7 +940,7 @@ fn apply_connect_signal(
         None => {
             // No transition: already Ready (idempotent), or a stale revision
             // after a same-URL replacement. Polling covers either case.
-            debug!(worker_url = %url, "Connect signal applied no transition");
+            debug!(worker_url = %Endpoint::redacted_str(&url), "Connect signal applied no transition");
             None
         }
     }
@@ -931,7 +995,7 @@ async fn refresh_kv_engine_id_after_recovery(worker: &Arc<dyn Worker>, timeout: 
             let previous = worker.kv_engine_id();
             if worker.refresh_kv_engine_id(Some(discovered.clone())) {
                 info!(
-                    worker_url = %worker.url(),
+                    worker_url = %worker.redacted_url(),
                     ?previous,
                     discovered,
                     "Recovered PD worker reports a new KV engine id"
@@ -945,24 +1009,24 @@ async fn refresh_kv_engine_id_after_recovery(worker: &Arc<dyn Worker>, timeout: 
         Ok(Ok(None)) => {
             match worker.kv_engine_id() {
                 Some(previous) => warn!(
-                    worker_url = %worker.url(),
+                    worker_url = %worker.redacted_url(),
                     previous,
                     "Recovered PD worker reports no KV engine id; keeping the previous one"
                 ),
                 None => debug!(
-                    worker_url = %worker.url(),
+                    worker_url = %worker.redacted_url(),
                     "PD worker reports no KV engine id; handoffs carry none"
                 ),
             }
             worker.set_kv_engine_id_confirmed(true);
         }
         Ok(Err(error)) => warn!(
-            worker_url = %worker.url(),
+            worker_url = %worker.redacted_url(),
             %error,
             "Could not re-read the KV engine id of a recovered PD worker; keeping the previous one and retrying on the next probe"
         ),
         Err(_) => warn!(
-            worker_url = %worker.url(),
+            worker_url = %worker.redacted_url(),
             timeout_secs = timeout.as_secs(),
             "Re-reading the KV engine id of a recovered PD worker timed out; keeping the previous one and retrying on the next probe"
         ),
@@ -1004,15 +1068,15 @@ async fn submit_label_refresh(worker: &Arc<dyn Worker>, job_queue: &Arc<JobQueue
         .await
     {
         Ok(true) => debug!(
-            worker_url = %url,
+            worker_url = %Endpoint::redacted_str(&url),
             "Submitted a label refresh for a worker that came into service"
         ),
         Ok(false) => debug!(
-            worker_url = %url,
+            worker_url = %Endpoint::redacted_str(&url),
             "A job for the worker is in flight; its label refresh waits for the next transition into service"
         ),
         Err(error) => warn!(
-            worker_url = %url,
+            worker_url = %Endpoint::redacted_str(&url),
             %error,
             "Could not submit a label refresh for a worker that came into service"
         ),
@@ -1158,7 +1222,7 @@ async fn submit_removal_job(
     let url = worker_url.to_string();
     warn!(
         worker_id = %worker_id.as_str(),
-        worker_url = %url,
+        worker_url = %Endpoint::redacted_str(&url),
         expected_revision,
         "Removing failed worker from registry"
     );
@@ -1174,7 +1238,7 @@ async fn submit_removal_job(
         .await
     {
         error!(
-            worker_url = %url,
+            worker_url = %Endpoint::redacted_str(&url),
             error = %e,
             "Failed to submit worker removal job"
         );
@@ -1248,12 +1312,23 @@ impl WorkerManager {
             .iter()
             .filter(|w| matches!(w.connection_mode(), ConnectionMode::Http))
             .count();
-        // ZMQ engines have no cache-flush RPC; fan out only to workers that can
-        // succeed instead of reporting every ZMQ worker as failed.
-        let (workers, zmq_workers): (Vec<_>, Vec<_>) = all_workers
-            .into_iter()
-            .partition(|w| !matches!(w.connection_mode(), ConnectionMode::Zmq));
-        let zmq_skipped = zmq_workers.len();
+        // A ZMQ engine flushes when its wire carries control calls (an SGLang
+        // scheduler, a TokenSpeed one that declares them); fan out only to
+        // workers that can succeed instead of reporting the others as failed.
+        let mut workers = Vec::with_capacity(all_workers.len());
+        for worker in all_workers {
+            if matches!(worker.connection_mode(), ConnectionMode::Zmq)
+                && !matches!(
+                    worker.get_backend_client().await,
+                    Ok(Some(client)) if client.carries_admin_calls()
+                )
+            {
+                continue;
+            }
+            workers.push(worker);
+        }
+        let zmq_skipped = total_workers - workers.len();
+        // The ZMQ engines that flush ride the gRPC pipeline's admin path.
         let grpc_workers = total_workers - http_workers - zmq_skipped;
 
         if workers.is_empty() {
@@ -1369,7 +1444,9 @@ impl WorkerManager {
                 failed: vec![],
                 total_workers,
                 message: match worker_url {
-                    Some(url) => format!("No worker matching url '{url}'"),
+                    Some(url) => {
+                        format!("No worker matching url '{}'", Endpoint::redacted_str(url))
+                    }
                     None => "No workers available for profiling".to_string(),
                 },
             };
@@ -1866,6 +1943,22 @@ mod tests {
         success_threshold: u32,
         check_interval_secs: u64,
     ) -> Arc<dyn Worker> {
+        probed_worker_with_timeout(
+            url,
+            connection_mode,
+            success_threshold,
+            check_interval_secs,
+            1,
+        )
+    }
+
+    fn probed_worker_with_timeout(
+        url: &str,
+        connection_mode: ConnectionMode,
+        success_threshold: u32,
+        check_interval_secs: u64,
+        timeout_secs: u64,
+    ) -> Arc<dyn Worker> {
         Arc::new(
             BasicWorkerBuilder::new(url)
                 .worker_type(WorkerType::Regular)
@@ -1873,7 +1966,7 @@ mod tests {
                 .health_config(HealthCheckConfig {
                     success_threshold,
                     failure_threshold: 1,
-                    timeout_secs: 1,
+                    timeout_secs,
                     check_interval_secs,
                     disable_health_check: false,
                     drain_settle_secs: 0,
@@ -2407,6 +2500,107 @@ mod tests {
         assert!(
             tokio::time::Instant::now() >= contact + Duration::from_secs(2),
             "the promoting probe was the scheduled one, an interval after the launch"
+        );
+
+        manager.shutdown().await;
+    }
+
+    /// A demoted worker whose health answers again returns on consecutive
+    /// reads, not consecutive intervals. Through the running loop, a
+    /// threshold of two reads, three seconds between probes and a one-second
+    /// probe timeout: the stub is held until the registration's probe has
+    /// read it, so the next probe is an interval away; it passes, and the
+    /// read that promotes the worker follows a probe's timeout later (three
+    /// reads, one interval and a second) instead of an interval later (three
+    /// reads, two intervals).
+    #[tokio::test]
+    async fn a_demoted_worker_returns_on_consecutive_reads_not_consecutive_intervals() {
+        let serving = Arc::new(AtomicBool::new(false));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = start_health_stub(serving.clone(), hits.clone()).await;
+        let registry = Arc::new(WorkerRegistry::new());
+        let mut manager = manager_over(&registry);
+
+        // Registered under the running manager: probed at once, and held.
+        let worker = probed_worker_with(&url, ConnectionMode::Http, 2, 3);
+        worker.set_status(WorkerStatus::NotReady);
+        registry.register(worker.clone()).unwrap();
+        let registered = tokio::time::Instant::now();
+        wait_until(
+            registered + Duration::from_secs(5),
+            "the registration's probe did not read the health in time",
+            || hits.load(Ordering::SeqCst) > 0,
+        )
+        .await;
+        assert_eq!(worker.status(), WorkerStatus::NotReady);
+
+        // The engine is back; the next probe is a whole interval away.
+        serving.store(true, Ordering::SeqCst);
+        let back = tokio::time::Instant::now();
+        wait_until(
+            back + Duration::from_millis(5500),
+            "the worker did not return within one interval and a probe timeout",
+            || worker.status() == WorkerStatus::Ready,
+        )
+        .await;
+        let returned = tokio::time::Instant::now();
+        assert!(
+            returned >= back + Duration::from_millis(3500),
+            "the first passing read was the scheduled one, an interval after the launch, and the \
+             promoting read a probe timeout after it"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            3,
+            "the held read, the scheduled pass and the pass brought forward"
+        );
+
+        manager.shutdown().await;
+    }
+
+    /// The read a pass brings forward never lands after the one the schedule
+    /// already holds. With two seconds between probes and a five-second probe
+    /// timeout, a demoted worker's promoting read follows the interval, not
+    /// the timeout: three reads over two intervals (the held read, the
+    /// scheduled pass, the pass an interval later), not two intervals and a
+    /// timeout.
+    #[tokio::test]
+    async fn a_brought_forward_read_never_lands_after_the_scheduled_one() {
+        let serving = Arc::new(AtomicBool::new(false));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = start_health_stub(serving.clone(), hits.clone()).await;
+        let registry = Arc::new(WorkerRegistry::new());
+        let mut manager = manager_over(&registry);
+
+        let worker = probed_worker_with_timeout(&url, ConnectionMode::Http, 2, 2, 5);
+        worker.set_status(WorkerStatus::NotReady);
+        registry.register(worker.clone()).unwrap();
+        let registered = tokio::time::Instant::now();
+        wait_until(
+            registered + Duration::from_secs(5),
+            "the registration's probe did not read the health in time",
+            || hits.load(Ordering::SeqCst) > 0,
+        )
+        .await;
+        assert_eq!(worker.status(), WorkerStatus::NotReady);
+
+        serving.store(true, Ordering::SeqCst);
+        let back = tokio::time::Instant::now();
+        wait_until(
+            back + Duration::from_millis(5500),
+            "the worker did not return within two intervals: the brought-forward read landed \
+             after the scheduled one",
+            || worker.status() == WorkerStatus::Ready,
+        )
+        .await;
+        assert!(
+            tokio::time::Instant::now() >= back + Duration::from_millis(3500),
+            "the scheduled pass an interval after the launch, the promoting read an interval later"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            3,
+            "the held read, the scheduled pass and the pass an interval later"
         );
 
         manager.shutdown().await;

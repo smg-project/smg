@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -52,7 +53,14 @@ def install(litellm, *, original):
         env["SMG_TAU2_BUDGET_GUARD"] = mode
     env.update(PYTHONPATH=os.pathsep.join((str(shim), str(tmp_path))), PYTHONNOUSERSITE="1")
     return subprocess.run(
-        [sys.executable, "-B", "-c", 'import litellm; litellm.completion(); print("main ran")'],
+        [
+            sys.executable,
+            "-B",
+            "-c",
+            "import json, sys; from pathlib import Path; import litellm; "
+            'Path("startup_sys_path").write_text(json.dumps(sys.path)); '
+            'litellm.completion(); print("main ran")',
+        ],
         cwd=tmp_path,
         env=env,
         text=True,
@@ -96,4 +104,5 @@ def test_startup_loads_the_sibling_hook_instead_of_pythonpath_decoy(tmp_path):
     result = startup(tmp_path, "1", None, None)
     assert result.returncode != 0 and "sibling budget guard refused" in result.stderr
     assert Path((tmp_path / "hook_origin").read_text()) == tmp_path / "tau2/budget_hook.py"
+    assert str(tmp_path / "tau2") not in json.loads((tmp_path / "startup_sys_path").read_text())
     assert not (tmp_path / "sent").exists()

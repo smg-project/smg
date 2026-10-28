@@ -35,7 +35,8 @@ redis = { version = "1.2.4", features = ["tokio-comp", "json", "connection-manag
 tokio-postgres = { version = "0.7.18", features = ["runtime", "with-chrono-0_4", "with-serde_json-1", "array-impls"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# `net`: the refused-address fixture of the start-up tests binds a loopback socket.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
 
 [lints]
 workspace = true

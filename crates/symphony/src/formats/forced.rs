@@ -29,7 +29,7 @@ mod tests {
         event::{Event, Events, FinishReason, MalformedReason},
         input::{EngineFinish, Input},
         parser::Parser,
-        testing::calls,
+        testing::{calls, finish},
         Declared,
     };
 
@@ -66,18 +66,6 @@ mod tests {
             )
             .expect("end");
         out.into_owned().drain()
-    }
-
-    fn finish(events: &[Event]) -> (FinishReason, u32) {
-        events
-            .iter()
-            .find_map(|event| match event {
-                Event::Finish {
-                    reason, tool_calls, ..
-                } => Some((reason.clone(), *tool_calls)),
-                _ => None,
-            })
-            .expect("a finish")
     }
 
     #[test]

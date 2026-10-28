@@ -5,15 +5,9 @@ use openai_protocol::model_card::ModelCard;
 use super::*;
 use crate::worker::{
     circuit_breaker::{CircuitBreakerConfig, CircuitState},
+    test_support::no_health_check,
     BasicWorkerBuilder, WorkerLoadGuard,
 };
-
-fn no_health_check() -> openai_protocol::worker::HealthCheckConfig {
-    openai_protocol::worker::HealthCheckConfig {
-        disable_health_check: true,
-        ..Default::default()
-    }
-}
 
 /// A worker whose breaker opens on one failed request and would stay
 /// open for an hour on its own.
@@ -1104,25 +1098,95 @@ fn global_snapshot_never_publishes_a_torn_generation() {
 #[test]
 fn routing_pools_filter_regular_workers_by_transport() {
     let registry = WorkerRegistry::new();
+    let (sglang, tokenspeed) = (RuntimeType::Sglang, RuntimeType::TokenSpeed);
     let workers = [
-        ("http://regular", WorkerType::Regular, ConnectionMode::Http),
-        ("grpc://regular", WorkerType::Regular, ConnectionMode::Grpc),
-        ("zmq://regular", WorkerType::Regular, ConnectionMode::Zmq),
-        ("http://prefill", WorkerType::Prefill, ConnectionMode::Http),
-        ("grpc://prefill", WorkerType::Prefill, ConnectionMode::Grpc),
-        ("zmq://prefill", WorkerType::Prefill, ConnectionMode::Zmq),
-        ("http://decode", WorkerType::Decode, ConnectionMode::Http),
-        ("grpc://decode", WorkerType::Decode, ConnectionMode::Grpc),
-        ("grpc://encode", WorkerType::Encode, ConnectionMode::Grpc),
-        ("http://encode", WorkerType::Encode, ConnectionMode::Http),
+        (
+            "http://regular",
+            WorkerType::Regular,
+            ConnectionMode::Http,
+            sglang,
+        ),
+        (
+            "grpc://regular",
+            WorkerType::Regular,
+            ConnectionMode::Grpc,
+            sglang,
+        ),
+        (
+            "zmq://regular",
+            WorkerType::Regular,
+            ConnectionMode::Zmq,
+            sglang,
+        ),
+        (
+            "http://prefill",
+            WorkerType::Prefill,
+            ConnectionMode::Http,
+            sglang,
+        ),
+        (
+            "grpc://prefill",
+            WorkerType::Prefill,
+            ConnectionMode::Grpc,
+            sglang,
+        ),
+        (
+            "zmq://prefill",
+            WorkerType::Prefill,
+            ConnectionMode::Zmq,
+            sglang,
+        ),
+        (
+            "zmq://ts-prefill",
+            WorkerType::Prefill,
+            ConnectionMode::Zmq,
+            tokenspeed,
+        ),
+        (
+            "http://decode",
+            WorkerType::Decode,
+            ConnectionMode::Http,
+            sglang,
+        ),
+        (
+            "grpc://decode",
+            WorkerType::Decode,
+            ConnectionMode::Grpc,
+            sglang,
+        ),
+        (
+            "zmq://ts-decode",
+            WorkerType::Decode,
+            ConnectionMode::Zmq,
+            tokenspeed,
+        ),
+        (
+            "grpc://encode",
+            WorkerType::Encode,
+            ConnectionMode::Grpc,
+            sglang,
+        ),
+        (
+            "http://encode",
+            WorkerType::Encode,
+            ConnectionMode::Http,
+            sglang,
+        ),
+        (
+            "zmq://ts-encode",
+            WorkerType::Encode,
+            ConnectionMode::Zmq,
+            tokenspeed,
+        ),
     ];
-    for (url, worker_type, connection_mode) in workers {
+    for (url, worker_type, connection_mode, runtime_type) in workers {
         registry
             .register(Arc::new(
                 BasicWorkerBuilder::new(url)
                     .model(ModelCard::new("model"))
                     .worker_type(worker_type)
                     .connection_mode(connection_mode)
+                    .runtime_type(runtime_type)
                     .health_config(no_health_check())
                     .build(),
             ))
@@ -1145,19 +1209,21 @@ fn routing_pools_filter_regular_workers_by_transport() {
         urls(RoutingPool::GrpcPipelineRegular),
         HashSet::from(["grpc://regular".to_string(), "zmq://regular".to_string()])
     );
-    // PD/EPD pools are strictly gRPC: a ZMQ prefill worker that slipped
-    // past registration must not appear.
+    // The disaggregated pools hold gRPC workers and TokenSpeed's direct-ZMQ
+    // engines, whose wire carries the rendezvous and the encode request:
+    // another runtime's ZMQ prefill worker that slipped past registration
+    // must not appear.
     assert_eq!(
         urls(RoutingPool::GrpcPrefill),
-        HashSet::from(["grpc://prefill".to_string()])
+        HashSet::from(["grpc://prefill".to_string(), "zmq://ts-prefill".to_string()])
     );
     assert_eq!(
         urls(RoutingPool::GrpcDecode),
-        HashSet::from(["grpc://decode".to_string()])
+        HashSet::from(["grpc://decode".to_string(), "zmq://ts-decode".to_string()])
     );
     assert_eq!(
         urls(RoutingPool::GrpcEncode),
-        HashSet::from(["grpc://encode".to_string()])
+        HashSet::from(["grpc://encode".to_string(), "zmq://ts-encode".to_string()])
     );
     // The HTTP PD pools are HTTP-only: the router proxies plain HTTP to
     // the selected URL, so gRPC and ZMQ workers must never be selectable.
@@ -1200,10 +1266,7 @@ fn test_transition_status_emits_event_and_changes_status() {
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new("http://w1:8080")
             .worker_type(WorkerType::Regular)
-            .health_config(openai_protocol::worker::HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
+            .health_config(no_health_check())
             .build(),
     );
     let worker_id = registry.register(worker.clone()).unwrap();
@@ -1237,10 +1300,7 @@ fn test_transition_status_no_op_when_status_unchanged() {
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new("http://w1:8080")
             .worker_type(WorkerType::Regular)
-            .health_config(openai_protocol::worker::HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
+            .health_config(no_health_check())
             .build(),
     );
     let worker_id = registry.register(worker).unwrap();
@@ -1270,10 +1330,7 @@ fn test_get_id_by_url_returns_id_for_registered_worker() {
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new("http://w-by-url:8080")
             .worker_type(WorkerType::Regular)
-            .health_config(openai_protocol::worker::HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
+            .health_config(no_health_check())
             .build(),
     );
     let worker_id = registry.register(worker).unwrap();
@@ -1412,10 +1469,7 @@ fn test_transition_to_draining_emits_status_changed_event() {
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new("http://w-drain:8080")
             .worker_type(WorkerType::Regular)
-            .health_config(openai_protocol::worker::HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
+            .health_config(no_health_check())
             .build(),
     );
     let worker_id = registry.register(worker.clone()).unwrap();
@@ -1967,10 +2021,9 @@ fn test_registered_model_id_evicts_a_colliding_alias() {
     assert!(registry.get_by_model("GLM-5.2").is_empty());
 }
 
-#[test]
-fn test_replace_same_url_refreshes_all_model_indexes() {
-    let registry = WorkerRegistry::new();
-
+/// Two workers at one URL, as a replacement sees them: the first serving one
+/// model, the second two others.
+fn replacement_pair() -> (Arc<dyn Worker>, Arc<dyn Worker>) {
     let first: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new("https://api.openai.com")
             .worker_type(WorkerType::Regular)
@@ -1985,6 +2038,14 @@ fn test_replace_same_url_refreshes_all_model_indexes() {
             .circuit_breaker_config(CircuitBreakerConfig::default())
             .build(),
     );
+    (first, second)
+}
+
+#[test]
+fn test_replace_same_url_refreshes_all_model_indexes() {
+    let registry = WorkerRegistry::new();
+
+    let (first, second) = replacement_pair();
 
     // First registration creates the worker
     let first_id = registry.register(first).unwrap();
@@ -2011,20 +2072,7 @@ fn test_replace_same_url_refreshes_all_model_indexes() {
 fn test_register_or_replace_upsert() {
     let registry = WorkerRegistry::new();
 
-    let first: Arc<dyn Worker> = Arc::new(
-        BasicWorkerBuilder::new("https://api.openai.com")
-            .worker_type(WorkerType::Regular)
-            .models(vec![ModelCard::new("gpt-4o")])
-            .circuit_breaker_config(CircuitBreakerConfig::default())
-            .build(),
-    );
-    let second: Arc<dyn Worker> = Arc::new(
-        BasicWorkerBuilder::new("https://api.openai.com")
-            .worker_type(WorkerType::Regular)
-            .models(vec![ModelCard::new("o3"), ModelCard::new("o4-mini")])
-            .circuit_breaker_config(CircuitBreakerConfig::default())
-            .build(),
-    );
+    let (first, second) = replacement_pair();
 
     let first_id = registry.register_or_replace(first);
     let second_id = registry.register_or_replace(second);

@@ -2,36 +2,33 @@ use std::{
     fs,
     sync::{
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
-        Arc, OnceLock,
+        Arc,
     },
     time::{Duration, Instant},
 };
 
 use http::header::RETRY_AFTER;
-use llm_tokenizer::{factory, registry::TokenizerRegistry};
+use llm_tokenizer::factory;
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use portpicker::pick_unused_port;
-use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use serde_json::json;
-use smg_data_connector::{
-    MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
-};
 use smg_grpc_client::{common_proto as common, tokenspeed_proto as ts};
-use smg_mcp::{McpConfig, McpOrchestrator};
 use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
-use tool_parser::ParserFactory as ToolParserFactory;
 use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer};
 use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
 
 use super::*;
 use crate::{
-    config::{ParserChoice, PolicyConfig, RouterConfig, RoutingMode},
-    policies::PolicyRegistry,
+    config::{ParserChoice, RoutingMode},
     rate_limit::{
         RateLimitBackend, ReserveOutcome, ReserveRequest, SharedReservationHandle, UsageSettlement,
     },
+    routers::grpc::{
+        common::stages::RateLimitOutcome,
+        testing::{grpc_config, grpc_ctx, grpc_ctx_from, grpc_ctx_with_parsers, mcp_orchestrator},
+    },
     tenant::TenantKey,
-    worker::{BasicWorker, BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerRegistry},
+    worker::{BasicWorker, BasicWorkerBuilder, ConnectionMode, RuntimeType},
     workflow::{
         create_worker_workflow_data, steps::local::SubmitTokenizerJobStep, JobQueue,
         JobQueueConfig, TokenizerLoadFailure, WorkerKind, WorkerRegistrationMode, WorkerSpec,
@@ -127,65 +124,49 @@ async fn a_mode_without_the_endpoint_refuses_it_with_the_json_error_object() {
     }
 }
 
-/// Minimal `AppContext` for constructing a disaggregated gRPC router. PD
-/// serves /v1/responses, so the MCP orchestrator must be initialized.
-async fn grpc_ctx(mode: RoutingMode) -> Arc<AppContext> {
-    grpc_ctx_with_parsers(mode, ParserChoice::default(), None).await
+/// The bound on a request to a gRPC worker is opt-in: a router built from a
+/// configuration that leaves `grpc_request_timeout_secs` at its default arms
+/// no deadline on any of its pipelines, whatever the HTTP bound
+/// `request_timeout_secs` says; one that sets it arms that bound on every
+/// pipeline.
+#[tokio::test]
+async fn the_attempt_deadline_is_armed_only_by_grpc_request_timeout_secs() {
+    let mcp_orchestrator = mcp_orchestrator().await;
+    let config = grpc_config(regular_routing_mode()).build_unchecked();
+    let ctx = grpc_ctx_from(&config, Arc::clone(&mcp_orchestrator));
+    assert_eq!(ctx.router_config.request_timeout_secs, 60);
+    assert_eq!(ctx.router_config.grpc_request_timeout_secs, 0);
+    let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+    for pipeline in pipelines_of(&router) {
+        assert_eq!(pipeline.request_timeout(), None);
+    }
+
+    let config = grpc_config(regular_routing_mode())
+        .grpc_request_timeout_secs(30)
+        .build_unchecked();
+    let ctx = grpc_ctx_from(&config, mcp_orchestrator);
+    let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+    for pipeline in pipelines_of(&router) {
+        assert_eq!(pipeline.request_timeout(), Some(Duration::from_secs(30)));
+    }
 }
 
-/// [`grpc_ctx`] with the gateway's `--parser` choice and its
-/// `--tool-call-parser` name, which under Symphony pins the table that
-/// answers to it for every model the registry does not know.
-async fn grpc_ctx_with_parsers(
-    mode: RoutingMode,
-    parser: ParserChoice,
-    tool_parser: Option<&str>,
-) -> Arc<AppContext> {
-    let mut builder = RouterConfig::builder()
-        .mode(mode)
-        .parser(parser)
-        .grpc_connection()
-        .policy(PolicyConfig::Random)
-        .host("127.0.0.1")
-        .port(3001)
-        .max_payload_size(1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(10)
-        .worker_startup_check_interval_secs(1)
-        .max_concurrent_requests(64)
-        .queue_timeout_secs(60);
-    if let Some(name) = tool_parser {
-        builder = builder.tool_call_parser(name);
-    }
-    let config = builder.build_unchecked();
-
-    let mcp_orchestrator = Arc::new(OnceLock::new());
-    mcp_orchestrator
-        .set(Arc::new(
-            McpOrchestrator::new(McpConfig::default())
-                .await
-                .expect("mcp orchestrator"),
-        ))
-        .ok();
-
-    Arc::new(
-        AppContext::builder()
-            .router_config(config.clone())
-            .client(crate::clients::http_client())
-            .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
-            .reasoning_parser_factory(Some(ReasoningParserFactory::new()))
-            .tool_parser_factory(Some(ToolParserFactory::new()))
-            .worker_registry(Arc::new(WorkerRegistry::new()))
-            .policy_registry(Arc::new(PolicyRegistry::new(config.policy.clone())))
-            .response_storage(Arc::new(MemoryResponseStorage::new()))
-            .conversation_storage(Arc::new(MemoryConversationStorage::new()))
-            .conversation_item_storage(Arc::new(MemoryConversationItemStorage::new()))
-            .worker_job_queue(Arc::new(OnceLock::new()))
-            .workflow_engines(Arc::new(OnceLock::new()))
-            .mcp_orchestrator(mcp_orchestrator)
-            .build()
-            .expect("app context"),
-    )
+/// Every pipeline `router` built: the three of every mode and the optional
+/// ones its mode serves.
+fn pipelines_of(router: &GrpcRouter) -> Vec<&RequestPipeline> {
+    [
+        Some(&router.pipeline),
+        Some(&router.messages_pipeline),
+        Some(&router.completion_pipeline),
+        router.harmony_pipeline.as_ref(),
+        router.embedding_pipeline.as_ref(),
+        router.classify_pipeline.as_ref(),
+        router.decisions_pipeline.as_ref(),
+        router.transcription_pipeline.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 fn responses_request(model: &str) -> ResponsesRequest {
@@ -205,27 +186,7 @@ fn count_request(model: &str) -> CountMessageTokensRequest {
 /// model_not_found for a model nobody serves. No worker takes part.
 #[tokio::test]
 async fn count_tokens_is_answered_from_the_tokenizer() {
-    let ctx = grpc_ctx(regular_routing_mode()).await;
-    let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
-        llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![11, 12, 13]),
-    );
-    ctx.tokenizer_registry
-        .load("m", "m", "mock", || async move { Ok(tokenizer) })
-        .await
-        .expect("register the tokenizer");
-    let worker = BasicWorkerBuilder::new("grpc://worker:30000")
-        .worker_type(WorkerType::Regular)
-        .connection_mode(ConnectionMode::Grpc)
-        .model(ModelCard::new("m"))
-        .health_config(HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        })
-        .build();
-    ctx.worker_registry
-        .register(Arc::new(worker))
-        .expect("register worker");
-    let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+    let (_ctx, router) = regular_router_over_m(None).await;
     let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
     let response = router
@@ -266,28 +227,7 @@ async fn count_tokens_refuses_media_no_worker_of_the_model_takes() {
         ),
         (RuntimeType::Sglang, "invalid_multimodal_request", None),
     ] {
-        let ctx = grpc_ctx(regular_routing_mode()).await;
-        let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
-            llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![11, 12, 13]),
-        );
-        ctx.tokenizer_registry
-            .load("m", "m", "mock", || async move { Ok(tokenizer) })
-            .await
-            .expect("register the tokenizer");
-        let worker = BasicWorkerBuilder::new("grpc://worker:30000")
-            .worker_type(WorkerType::Regular)
-            .connection_mode(ConnectionMode::Grpc)
-            .runtime_type(runtime)
-            .model(ModelCard::new("m"))
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
-            .build();
-        ctx.worker_registry
-            .register(Arc::new(worker))
-            .expect("register worker");
-        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let (_ctx, router) = regular_router_over_m(Some(runtime)).await;
         let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
         let request: CountMessageTokensRequest = serde_json::from_value(json!({
             "model": "m",
@@ -352,17 +292,8 @@ async fn count_tokens_refuses_a_model_no_worker_serves_whatever_the_tokenizer_re
 #[tokio::test]
 async fn count_tokens_answers_not_ready_while_a_served_models_tokenizer_loads() {
     let ctx = grpc_ctx(regular_routing_mode()).await;
-    let worker = BasicWorkerBuilder::new("grpc://worker:30000")
-        .worker_type(WorkerType::Regular)
-        .connection_mode(ConnectionMode::Grpc)
-        .model(ModelCard::new("m"))
-        .health_config(HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        })
-        .build();
     ctx.worker_registry
-        .register(Arc::new(worker))
+        .register(grpc_worker_for_m())
         .expect("register worker");
     let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
     let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
@@ -386,17 +317,43 @@ async fn count_tokens_answers_not_ready_while_a_served_models_tokenizer_loads() 
 
 /// A local gRPC worker of model `m`, as the pipeline tests register it.
 fn grpc_worker_for_m() -> Arc<BasicWorker> {
-    Arc::new(
-        BasicWorkerBuilder::new("grpc://worker:30000")
-            .worker_type(WorkerType::Regular)
-            .connection_mode(ConnectionMode::Grpc)
-            .model(ModelCard::new("m"))
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
-            .build(),
-    )
+    grpc_worker_for_m_on(None)
+}
+
+/// The same worker, naming its engine when a test's claim depends on it.
+fn grpc_worker_for_m_on(runtime: Option<RuntimeType>) -> Arc<BasicWorker> {
+    let mut builder = BasicWorkerBuilder::new("grpc://worker:30000")
+        .worker_type(WorkerType::Regular)
+        .connection_mode(ConnectionMode::Grpc)
+        .model(ModelCard::new("m"))
+        .health_config(HealthCheckConfig {
+            disable_health_check: true,
+            ..Default::default()
+        });
+    if let Some(runtime) = runtime {
+        builder = builder.runtime_type(runtime);
+    }
+    Arc::new(builder.build())
+}
+
+/// A regular gRPC router over one local worker of model `m`, whose
+/// tokenizer is the mock that answers three ids: the context the count and
+/// Messages tests share. `runtime` names the worker's engine when a test's
+/// claim depends on it.
+async fn regular_router_over_m(runtime: Option<RuntimeType>) -> (Arc<AppContext>, GrpcRouter) {
+    let ctx = grpc_ctx(regular_routing_mode()).await;
+    let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
+        llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![11, 12, 13]),
+    );
+    ctx.tokenizer_registry
+        .load("m", "m", "mock", || async move { Ok(tokenizer) })
+        .await
+        .expect("register the tokenizer");
+    ctx.worker_registry
+        .register(grpc_worker_for_m_on(runtime))
+        .expect("register worker");
+    let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+    (ctx, router)
 }
 
 /// The tokenizer-registration step's input for a local gRPC worker with
@@ -654,27 +611,7 @@ fn sse_event(frame: &str, name: &str) -> serde_json::Value {
 /// context window the model's workers advertise is the pipeline's 400.
 #[tokio::test]
 async fn max_tokens_zero_is_answered_with_an_empty_message() {
-    let ctx = grpc_ctx(regular_routing_mode()).await;
-    let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
-        llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![11, 12, 13]),
-    );
-    ctx.tokenizer_registry
-        .load("m", "m", "mock", || async move { Ok(tokenizer) })
-        .await
-        .expect("register the tokenizer");
-    let worker = BasicWorkerBuilder::new("grpc://worker:30000")
-        .worker_type(WorkerType::Regular)
-        .connection_mode(ConnectionMode::Grpc)
-        .model(ModelCard::new("m"))
-        .health_config(HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        })
-        .build();
-    ctx.worker_registry
-        .register(Arc::new(worker))
-        .expect("register worker");
-    let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+    let (ctx, router) = regular_router_over_m(None).await;
     let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
     let body = json!({
         "model": "m", "max_tokens": 0,
@@ -836,17 +773,8 @@ async fn counts_render_the_output_config_effort() {
         .load("m", "m", "mock", || async move { Ok(registered) })
         .await
         .expect("register the tokenizer");
-    let worker = BasicWorkerBuilder::new("grpc://worker:30000")
-        .worker_type(WorkerType::Regular)
-        .connection_mode(ConnectionMode::Grpc)
-        .model(ModelCard::new("m"))
-        .health_config(HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        })
-        .build();
     ctx.worker_registry
-        .register(Arc::new(worker))
+        .register(grpc_worker_for_m())
         .expect("register worker");
     let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
     let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
@@ -1612,27 +1540,7 @@ fn max_tokens_zero_records_the_requests_media_and_count_tokens_does_not() {
     ]}]);
     ::metrics::with_local_recorder(&recorder, || {
         runtime.block_on(async {
-            let ctx = grpc_ctx(regular_routing_mode()).await;
-            let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
-                llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![11, 12, 13]),
-            );
-            ctx.tokenizer_registry
-                .load("m", "m", "mock", || async move { Ok(tokenizer) })
-                .await
-                .expect("register the tokenizer");
-            let worker = BasicWorkerBuilder::new("grpc://worker:30000")
-                .worker_type(WorkerType::Regular)
-                .connection_mode(ConnectionMode::Grpc)
-                .model(ModelCard::new("m"))
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
-                .build();
-            ctx.worker_registry
-                .register(Arc::new(worker))
-                .expect("register worker");
-            let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+            let (_ctx, router) = regular_router_over_m(None).await;
             let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
             let count: CountMessageTokensRequest =

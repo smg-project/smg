@@ -270,9 +270,16 @@ impl TokenizerRegistry {
 
     /// Get a tokenizer (for backward compatibility, tries name first then ID)
     pub fn get(&self, name_or_id: &str) -> Option<Arc<dyn Tokenizer>> {
-        self.get_by_name(name_or_id)
-            .or_else(|| self.get_by_id(name_or_id))
-            .map(|e| e.tokenizer)
+        let by_name = self.name_to_id.get(name_or_id).and_then(|id| {
+            self.tokenizers
+                .get(id.as_str())
+                .map(|e| Arc::clone(&e.tokenizer))
+        });
+        by_name.or_else(|| {
+            self.tokenizers
+                .get(name_or_id)
+                .map(|e| Arc::clone(&e.tokenizer))
+        })
     }
 
     /// Check if a tokenizer is registered by name

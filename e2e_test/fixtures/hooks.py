@@ -20,8 +20,7 @@ from infra import (
     cleanup_pool,
     get_connection_mode_override,
     get_runtime,
-    get_sglang_servicer_impl,
-    get_tokenspeed_servicer_impl,
+    get_servicer_impl,
     get_zmq_engine_count,
 )
 from infra.worker_pool import get_pool
@@ -248,15 +247,16 @@ def _filter_zmq_items(items: list[pytest.Item]) -> tuple[list[pytest.Item], list
     return kept, deselected
 
 
-_SGLANG_ZMQ_SKIPPED_MODULES = ("test_multimodal.py", "test_error_shapes.py")
+_SGLANG_ZMQ_SKIPPED_MODULES = ("test_error_shapes.py",)
 
 
 def _filter_sglang_zmq_items(
     items: list[pytest.Item],
 ) -> tuple[list[pytest.Item], list[pytest.Item]]:
     """Split items into (kept, deselected) for the SGLang ZMQ lane: the
-    multimodal module stays on the gRPC lane until the wire carries media, and
-    the error-shape module tests SGLang's HTTP server's own validation."""
+    error-shape module tests SGLang's HTTP server's own validation, which this
+    wire has no counterpart of. The multimodal module runs: the wire carries
+    the preprocessed media to the scheduler as the Rust servicer's does."""
     kept: list[pytest.Item] = []
     deselected: list[pytest.Item] = []
     for item in items:
@@ -317,7 +317,8 @@ def _filter_tokenspeed_rust_items(
     items: list[pytest.Item],
 ) -> tuple[list[pytest.Item], list[pytest.Item]]:
     """Split items into (kept, deselected) for a TokenSpeed lane whose gRPC
-    workers run the Rust servicer.
+    workers run the Rust servicer (by the lane's setting or by the servicer
+    package's default: ``infra.constants.get_servicer_impl``).
 
     The Rust servicer reaches the scheduler over the msgpack wire, which
     carries generate and abort only: no control messages, so the admin
@@ -353,7 +354,8 @@ def _filter_sglang_rust_items(
     items: list[pytest.Item],
 ) -> tuple[list[pytest.Item], list[pytest.Item]]:
     """Split items into (kept, deselected) for an SGLang lane whose gRPC
-    workers run the Rust servicer.
+    workers run the Rust servicer (by the lane's setting or by the servicer
+    package's default: ``infra.constants.get_servicer_impl``).
 
     The Rust servicer reaches the scheduler over the msgpack wire, which
     runs no encode dispatch. The EPD topologies stay with the Python servicer,
@@ -540,14 +542,16 @@ def pytest_collection_modifyitems(
             config.hook.pytest_deselected(items=deselected)
         items[:] = selected
 
-    if get_runtime() == "tokenspeed" and get_tokenspeed_servicer_impl() == "rust":
+    # The Rust-path filters key on the implementation the lane's workers run,
+    # whether the lane named it or the servicer package's default selects it.
+    if get_runtime() == "tokenspeed" and get_servicer_impl("tokenspeed") == "rust":
         kept, deselected = _filter_tokenspeed_rust_items(items)
         stats["by_tokenspeed_rust"] = len(deselected)
         if deselected:
             config.hook.pytest_deselected(items=deselected)
             items[:] = kept
 
-    if get_runtime() == "sglang" and get_sglang_servicer_impl() == "rust":
+    if get_runtime() == "sglang" and get_servicer_impl("sglang") == "rust":
         kept, deselected = _filter_sglang_rust_items(items)
         stats["by_sglang_rust"] = len(deselected)
         if deselected:
@@ -561,10 +565,10 @@ def pytest_collection_modifyitems(
             config.hook.pytest_deselected(items=deselected)
             items[:] = kept
 
-        # Multimodal is not wired over the SGLang ZMQ wire yet (the adapter
-        # refuses mm inputs), and the error-shape cases exercise SGLang's own
-        # HTTP server, which this wire has no counterpart of; the gRPC and HTTP
-        # lanes keep covering those modules.
+        # The error-shape cases exercise SGLang's own HTTP server, which this
+        # wire has no counterpart of; the gRPC and HTTP lanes keep covering
+        # that module. The multimodal module runs here: the adapter carries
+        # the preprocessed media to the scheduler over this wire.
         if get_runtime() == "sglang":
             kept, deselected = _filter_sglang_zmq_items(items)
             stats["by_sglang_zmq"] = len(deselected)
