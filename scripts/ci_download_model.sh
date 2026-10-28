@@ -56,6 +56,18 @@ download_model() {
 
     echo "Acquiring lock for ${model_id}..."
     (
+        # Prefer a writable FD (also required by NFS exclusive-lock emulation).
+        # Append never truncates an existing shared lock. On local filesystems,
+        # a readable existing lock can still carry the same exclusive flock.
+        if { exec 200>>"$lock_file"; } 2>/dev/null; then
+            :
+        elif [[ -f "$lock_file" && ! -L "$lock_file" && -r "$lock_file" ]] &&
+             { exec 200<"$lock_file"; } 2>/dev/null; then
+            echo "Using existing read-only lock for ${model_id}."
+        else
+            echo "ERROR: Cannot open shared lock for ${model_id}" >&2
+            exit 1
+        fi
         # Serialize downloads across pods sharing the same volume
         flock -w 1800 200 || { echo "ERROR: Timed out waiting for lock on ${model_id}"; exit 1; }
 
@@ -88,7 +100,7 @@ download_model() {
         done
         echo "ERROR: Failed to download ${model_id} after ${MAX_RETRIES} attempts."
         exit 1
-    ) 200>"$lock_file"
+    )
 }
 
 # Parse arguments
