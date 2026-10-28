@@ -682,6 +682,7 @@ fn native_media_options(
     Ok(NativeMediaOptions {
         settings: WorkerMediaSettings {
             model_dir: required("model_dir")?,
+            tokenizer_dir: None,
             model_id: required("model_id")?,
             served_model_name: Some(served_model_name.to_string()),
             pixel_format: if raw_pixels {
@@ -1792,7 +1793,9 @@ impl PySglangGrpcServer {
                 let pipeline = runtime
                     .block_on(async {
                         let tokenizer = llm_tokenizer::factory::create_tokenizer_async(dir).await?;
-                        WorkerMediaPipeline::new(native.settings, tokenizer).await
+                        let mut settings = native.settings;
+                        settings.tokenizer_dir = Some(dir.clone());
+                        WorkerMediaPipeline::new(settings, tokenizer).await
                     })
                     .map_err(|error| PyValueError::new_err(format!("{error:#}")))?;
                 if pipeline.spec_name() != "glm53_flash" {

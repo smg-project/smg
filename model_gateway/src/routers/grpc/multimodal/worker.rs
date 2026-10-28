@@ -64,6 +64,8 @@ pub struct WorkerMediaSettings {
     /// Directory (or Hub id) holding the model's `config.json` and
     /// preprocessor configs.
     pub model_dir: String,
+    /// Resolved tokenizer directory; defaults to the model directory.
+    pub tokenizer_dir: Option<String>,
     /// The id the model specs match on: the served model path or Hub id.
     pub model_id: String,
     /// The name the model is served under, for messages an operator reads;
@@ -519,6 +521,7 @@ impl WorkerMediaPipeline {
                 .map(|(&modality, limit)| (modality, limit.limit))
                 .collect(),
             processing: MmProcessingMode::Worker,
+            drain_fetches_on_error: true,
             inflight: None,
             video_frame_budget: settings.video_frame_budget,
         };
@@ -544,9 +547,13 @@ impl WorkerMediaPipeline {
             });
             config.sort_all_objects();
             hash.update(config.to_string().as_bytes());
+            let tokenizer_dir = settings
+                .tokenizer_dir
+                .as_deref()
+                .unwrap_or(&settings.model_dir);
             let mut complete = true;
             for name in ["tokenizer.json", "tokenizer_config.json"] {
-                match tokio::fs::read(std::path::Path::new(&settings.model_dir).join(name)).await {
+                match tokio::fs::read(std::path::Path::new(tokenizer_dir).join(name)).await {
                     Ok(bytes) => {
                         hash.update(&(bytes.len() as u64).to_le_bytes());
                         hash.update(&bytes);
@@ -910,6 +917,7 @@ mod tests {
     pub(super) fn pipeline_settings(model_dir: &str) -> WorkerMediaSettings {
         WorkerMediaSettings {
             model_dir: model_dir.to_string(),
+            tokenizer_dir: None,
             model_id: model_dir.to_string(),
             served_model_name: None,
             pixel_format: PixelFormat::Normalized,
@@ -1164,6 +1172,7 @@ mod tests {
         let path = dir.path().to_str().unwrap().to_string();
         let settings = WorkerMediaSettings {
             model_dir: path.clone(),
+            tokenizer_dir: None,
             model_id: path,
             served_model_name: None,
             pixel_format: PixelFormat::Normalized,
@@ -1349,6 +1358,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
+                assert!(pipeline.components.drain_fetches_on_error);
                 assert_eq!(
                     pipeline.sglang_identity_key().is_some(),
                     model_type == "glm53_flash" && complete,
@@ -1356,6 +1366,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Reuse follows the tokenizer actually loaded, including a separate local directory.
+    #[tokio::test]
+    async fn sglang_fingerprint_uses_resolved_tokenizer_directory() {
+        let model = tempfile::tempdir().unwrap();
+        let tokenizer = tempfile::tempdir().unwrap();
+        std::fs::write(
+            model.path().join("config.json"),
+            r#"{"model_type":"glm53_flash"}"#,
+        )
+        .unwrap();
+        let mut settings = pipeline_settings(model.path().to_str().unwrap());
+        settings.tokenizer_dir = Some(tokenizer.path().to_str().unwrap().to_owned());
+        for name in ["tokenizer.json", "tokenizer_config.json"] {
+            std::fs::write(tokenizer.path().join(name), "{}").unwrap();
+        }
+        let first = WorkerMediaPipeline::new(settings.clone(), Arc::new(MockTokenizer::new()))
+            .await
+            .unwrap();
+        assert!(first.sglang_identity_key().is_some());
+        std::fs::write(
+            tokenizer.path().join("tokenizer_config.json"),
+            r#"{"changed":true}"#,
+        )
+        .unwrap();
+        let changed = WorkerMediaPipeline::new(settings.clone(), Arc::new(MockTokenizer::new()))
+            .await
+            .unwrap();
+        assert_ne!(first.sglang_identity_key(), changed.sglang_identity_key());
+        std::fs::remove_file(tokenizer.path().join("tokenizer.json")).unwrap();
+        let missing = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::new()))
+            .await
+            .unwrap();
+        assert!(missing.sglang_identity_key().is_none());
     }
 
     /// The Rust servicer runs the router's source policy, preserves the resulting

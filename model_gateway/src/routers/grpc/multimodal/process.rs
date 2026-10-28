@@ -15,7 +15,6 @@ use llm_multimodal::{
     TransparencyPolicy, VideoClip, VideoClipOptions, VisionPreProcessor,
 };
 use llm_tokenizer::TokenizerTrait;
-use openai_protocol::worker::MmProcessingMode;
 use rayon::prelude::*;
 use tracing::{debug, info, warn};
 
@@ -290,7 +289,7 @@ pub(crate) async fn process_multimodal_plan(
 async fn fetch_media(plan: MediaPlan, ctx: &PlanContext<'_>) -> Result<Fetched> {
     let video_config = ctx.model_config.video_preprocessor_config.as_ref();
     let mut tracker = AsyncMultiModalTracker::new(ctx.components.media_connector.clone())
-        .with_drain_on_error(ctx.components.processing == MmProcessingMode::Worker)
+        .with_drain_on_error(ctx.components.drain_fetches_on_error)
         .with_fetch_observer(
             Metrics::interned_model_label(ctx.model_id),
             Metrics::record_mm_fetch,

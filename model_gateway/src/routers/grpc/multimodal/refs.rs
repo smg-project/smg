@@ -771,6 +771,7 @@ mod tests {
         )
         .expect("components");
         components.processing = mode;
+        assert!(!components.drain_fetches_on_error);
         components
     }
 
