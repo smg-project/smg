@@ -78,6 +78,15 @@ def contender(lock: Path) -> int:
     return subprocess.run(["flock", "-n", str(lock), "true"], timeout=5, check=False).returncode
 
 
+def require_append_denied(lock: Path) -> None:
+    try:
+        with lock.open("a"):
+            pass
+    except PermissionError:
+        return
+    pytest.skip("this process can bypass the read-only mode bits")
+
+
 @pytest.mark.parametrize(
     "location", ["models--test-org--test-model", ".locks/models--test-org--test-model"]
 )
@@ -122,7 +131,6 @@ def test_failed_download_still_tries_three_times_with_original_delay(tmp_path):
     assert "flock -w 1800 200" in SCRIPT.read_text()
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses read-only mode bits")
 def test_readonly_lock_waits_for_writable_holder_before_download(tmp_path):
     lock = tmp_path / "cache/.locks/test-org_test-model.lock"
     lock.parent.mkdir(parents=True)
@@ -135,8 +143,7 @@ def test_readonly_lock_waits_for_writable_holder_before_download(tmp_path):
         assert owner.stdout.readline().strip() == "locked"
         lock.chmod(0o444)
         original = lock.stat()
-        with pytest.raises(PermissionError), lock.open("a"):
-            pass
+        require_append_denied(lock)
         downloader = subprocess.Popen(**download_options(tmp_path, [0]))
         assert downloader.stdout is not None
         # Read the real fallback message before checking that flock still blocks.
@@ -180,7 +187,6 @@ def test_readonly_lock_waits_for_writable_holder_before_download(tmp_path):
     assert contender(lock) == 0
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses read-only mode bits")
 @pytest.mark.parametrize("kind", ["symlink", "missing"])
 def test_readonly_fallback_rejects_invalid_existing_lock(tmp_path, kind):
     lock = tmp_path / "cache/.locks/test-org_test-model.lock"
@@ -194,8 +200,7 @@ def test_readonly_fallback_rejects_invalid_existing_lock(tmp_path, kind):
     lock.parent.chmod(0o555)
     try:
         # Both cases must reach the fallback after an actual failed append-open.
-        with pytest.raises(PermissionError), lock.open("a"):
-            pass
+        require_append_denied(lock)
         result = download(tmp_path, [0])
         assert result.returncode != 0
         assert "Cannot open shared lock" in result.stderr
