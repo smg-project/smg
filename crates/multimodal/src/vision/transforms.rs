@@ -1175,17 +1175,6 @@ pub fn resize_bicubic_torch_aa_f32(
     out_w: u32,
     out_h: u32,
 ) -> Result<Vec<f32>> {
-    resize_bicubic_torch_aa_values(data, width, height, out_w, out_h)
-}
-
-/// Resize float RGB values without clamping or quantizing intermediate video pixels.
-pub(crate) fn resize_bicubic_torch_aa_values<T: Copy + Into<f32>>(
-    data: &[T],
-    width: u32,
-    height: u32,
-    out_w: u32,
-    out_h: u32,
-) -> Result<Vec<f32>> {
     let (in_w, in_h, out_w, out_h) = (
         width as usize,
         height as usize,
@@ -1216,7 +1205,7 @@ pub(crate) fn resize_bicubic_torch_aa_values<T: Copy + Into<f32>>(
             for (k, &weight) in weights[..count].iter().enumerate() {
                 let pixel = &src[(start + k) * 3..][..3];
                 for c in 0..3 {
-                    acc[c] += weight * pixel[c].into();
+                    acc[c] += weight * f32::from(pixel[c]);
                 }
             }
             dst[ox * 3..][..3].copy_from_slice(&acc);

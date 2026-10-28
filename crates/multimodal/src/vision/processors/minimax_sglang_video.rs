@@ -1,5 +1,4 @@
-//! SGLang first aligns decoded float frames upwards, then runs the HF video processor.
-//! Keep both resizes in float: rounding intermediate pixels to u8 changes the encoder input.
+//! SGLang day-0 aligns video frames to the nearest grid with Pillow bicubic resizing.
 use ndarray::{Array2, Array3};
 
 use super::MiniMaxM3VisionProcessor;
@@ -8,7 +7,7 @@ use crate::{
     types::RgbFrameRef,
     vision::{
         processor::VideoClipOptions,
-        transforms::{resize_bicubic_torch_aa_values, round_half_to_even, TransformError},
+        transforms::{resize_bicubic_pil_rgb, TransformError},
     },
 };
 
@@ -43,14 +42,16 @@ impl MiniMaxM3VisionProcessor {
                 "MiniMax video pixel budget is below one patch group".into(),
             ));
         }
-        let ratio = (cap as f64 / f64::from(width.max(height))).min(1.0);
-        let aligned = |side: u32| {
-            (round_half_to_even(f64::from(side) * ratio) as usize)
-                .div_ceil(factor)
-                .max(1)
-                * factor
-        };
-        let (stage_w, stage_h) = (aligned(width), aligned(height));
+        let cap = clip.max_long_side_pixel.unwrap_or(cap as u32);
+        let (stage_w, stage_h) = crate::minimax_resize::sglang_dimensions(width, height, cap)
+            .map_err(|error| TransformError::ShapeError(error.to_string()))?;
+        let total_pixels = u64::from(stage_w) * u64::from(stage_h) * frames.len() as u64;
+        if total_pixels > 301_056_000 {
+            return Err(TransformError::ShapeError(format!(
+                "MiniMax video has {total_pixels} pixels, exceeding 301056000"
+            )));
+        }
+        let (stage_w, stage_h) = (stage_w as usize, stage_h as usize);
         let (out_h, out_w) = if self.inner.resizes() {
             self.inner
                 .smart_resize_video(frames.len(), stage_h, stage_w)?
@@ -60,16 +61,11 @@ impl MiniMaxM3VisionProcessor {
         let norm = self.inner.normalization();
         let mut tensors = Vec::with_capacity(frames.len() + self.inner.temporal_patch_size());
         for frame in frames {
-            let mut pixels = resize_bicubic_torch_aa_values(
-                frame.data,
-                width,
-                height,
-                stage_w as u32,
-                stage_h as u32,
-            )?;
+            let mut pixels =
+                resize_bicubic_pil_rgb(frame.data, width, height, stage_w as u32, stage_h as u32)?;
             if self.inner.resizes() && (stage_w != out_w || stage_h != out_h) {
-                pixels = resize_bicubic_torch_aa_values(
-                    &pixels,
+                pixels = resize_bicubic_pil_rgb(
+                    pixels.as_raw(),
                     stage_w as u32,
                     stage_h as u32,
                     out_w as u32,
@@ -77,7 +73,8 @@ impl MiniMaxM3VisionProcessor {
                 )?;
             }
             tensors.push(Array3::from_shape_fn((3, out_h, out_w), |(c, y, x)| {
-                (pixels[(y * out_w + x) * 3 + c] * norm.scale - norm.offset[c]) / norm.divisor[c]
+                (f32::from(pixels.as_raw()[(y * out_w + x) * 3 + c]) * norm.scale - norm.offset[c])
+                    / norm.divisor[c]
             }));
         }
         let temporal = self.inner.temporal_patch_size();
@@ -120,7 +117,7 @@ mod tests {
     use super::*;
     use crate::vision::{PreProcessorConfig, VisionPreProcessor};
 
-    /// Compare frame alignment, patch order and non-rounded pixels with SGLang/HF output.
+    /// Compare frame alignment, patch order and Pillow pixels with SGLang/HF output.
     #[test]
     fn sglang_video_matches_independent_torch_reference() {
         let golden: serde_json::Value = serde_json::from_str(include_str!(
@@ -131,10 +128,9 @@ mod tests {
             do_resize: Some(false),
             ..PreProcessorConfig::default()
         };
-        config.extra.insert(
-            crate::minimax_resize::SGLANG_HF_RESIZE_KEY.into(),
-            true.into(),
-        );
+        config
+            .extra
+            .insert(crate::minimax_resize::SGLANG_RESIZE_KEY.into(), true.into());
         let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
         let frames: Vec<_> = golden["sampled_indices"]
             .as_array()
@@ -152,14 +148,14 @@ mod tests {
         let output = processor
             .preprocess_video(&frames, &VideoClipOptions::sampled_at(1.0))
             .unwrap();
-        assert_eq!(output.encoder_input.shape(), [864, 1176]);
-        assert_eq!(output.feature_token_counts, [216]);
+        assert_eq!(output.encoder_input.shape(), [792, 1176]);
+        assert_eq!(output.feature_token_counts, [198]);
         let ModelSpecificValue::IntTensor { data, shape } =
             &output.model_specific["video_grid_thw"]
         else {
             panic!("integer video grid required")
         };
-        assert_eq!(data, &[2, 18, 24]);
+        assert_eq!(data, &[2, 18, 22]);
         assert_eq!(shape, &[1, 3]);
         let flat = output.encoder_input.flat_f32();
         for (i, v) in golden["indices"]
@@ -197,10 +193,9 @@ mod tests {
             do_resize: Some(false),
             ..PreProcessorConfig::default()
         };
-        config.extra.insert(
-            crate::minimax_resize::SGLANG_HF_RESIZE_KEY.into(),
-            true.into(),
-        );
+        config
+            .extra
+            .insert(crate::minimax_resize::SGLANG_RESIZE_KEY.into(), true.into());
         let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
         let output = processor
             .preprocess_video(
@@ -208,7 +203,7 @@ mod tests {
                 &VideoClipOptions::sampled_at(1.0),
             )
             .unwrap();
-        assert_eq!(output.encoder_input.shape(), [4, 1176]);
-        assert_eq!(output.feature_token_counts, [1]);
+        assert_eq!(output.encoder_input.shape(), [64, 1176]);
+        assert_eq!(output.feature_token_counts, [16]);
     }
 }

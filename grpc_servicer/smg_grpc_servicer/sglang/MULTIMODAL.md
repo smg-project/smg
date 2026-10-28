@@ -19,8 +19,8 @@ unsupported-modality refusal.
 The native SGLang `smg` media processor supports GLM-5.3-Flash and MiniMax-M3 (including M3.1);
 other model processors are rejected at startup.
 
-MiniMax uses the SGLang checkpoint HF image area limits and float video resizing,
-including upward frame-grid alignment before normalization. This differs from the
+MiniMax uses the SGLang day-0 source image geometry, Pillow image and video resizing,
+including nearest-grid frame alignment before normalization. This differs from the
 vLLM source-size policy, which remains unchanged. Engine support for the checkpoint's
 quantization and Python processor API is required independently of SMG.
 

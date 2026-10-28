@@ -204,6 +204,7 @@ pub struct AsyncMultiModalTracker {
     /// stage set the destination engine's.
     image_transparency: TransparencyPolicy,
     minimax_image_resize: bool,
+    minimax_sglang_resize: bool,
     drain_on_error: bool,
 }
 
@@ -219,6 +220,7 @@ impl AsyncMultiModalTracker {
             video_frame_sampling: FrameSampling::default(),
             image_transparency: TransparencyPolicy::KeepAlpha,
             minimax_image_resize: false,
+            minimax_sglang_resize: false,
             drain_on_error: false,
         }
     }
@@ -241,6 +243,12 @@ impl AsyncMultiModalTracker {
     /// Video fetching and other model families retain their existing policy.
     pub fn with_minimax_image_resize(mut self, enabled: bool) -> Self {
         self.minimax_image_resize = enabled;
+        self
+    }
+
+    /// Select SGLang's MiniMax image geometry and Pillow resize kernel.
+    pub fn with_minimax_sglang_resize(mut self, enabled: bool) -> Self {
+        self.minimax_sglang_resize = enabled;
         self
     }
 
@@ -423,7 +431,8 @@ impl AsyncMultiModalTracker {
         uuid: Option<String>,
         max_long_side_pixel: Option<u32>,
     ) {
-        let minimax_cap = self.minimax_image_resize.then_some(
+        let sglang = self.minimax_sglang_resize;
+        let minimax_cap = (self.minimax_image_resize || sglang).then_some(
             max_long_side_pixel.unwrap_or(crate::minimax_resize::IMAGE_DEFAULT_LONG_SIDE),
         );
         let config = ImageFetchConfig {
@@ -438,12 +447,16 @@ impl AsyncMultiModalTracker {
         self.enqueue(
             Modality::Image,
             uuid,
-            format!("{config:?}/{minimax_cap:?}"),
+            format!("{config:?}/{minimax_cap:?}/{sglang}"),
             source,
             move |connector, source| async move {
                 let frame = connector.fetch_image_from(&source, config).await?;
                 let frame = if let Some(cap) = minimax_cap {
-                    crate::minimax_resize::image(frame, cap)?
+                    if sglang {
+                        crate::minimax_resize::image_for_runtime(frame, cap, true)?
+                    } else {
+                        crate::minimax_resize::image(frame, cap)?
+                    }
                 } else {
                     frame
                 };

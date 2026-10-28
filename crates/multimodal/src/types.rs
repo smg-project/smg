@@ -14,7 +14,7 @@ use crate::{
     audio::DecodedAudio,
     error::MediaConnectorError,
     media::{apply_transparency, decode_image_bytes},
-    vision::execution,
+    vision::{execution, transforms::resize_bicubic_pil},
 };
 
 /// Supported multimodal modalities.
@@ -200,6 +200,7 @@ pub struct ImageFrame {
     from_pixels: bool,
     /// Decode directly to the M3 source-policy dimensions in `size`.
     minimax_resize: bool,
+    minimax_sglang_resize: bool,
 }
 
 /// Decoded audio payload captured by the media connector.
@@ -469,6 +470,7 @@ impl ImageFrame {
             transparency: TransparencyPolicy::KeepAlpha,
             from_pixels: true,
             minimax_resize: false,
+            minimax_sglang_resize: false,
         }
     }
 
@@ -493,12 +495,19 @@ impl ImageFrame {
             transparency: TransparencyPolicy::KeepAlpha,
             from_pixels: false,
             minimax_resize: false,
+            minimax_sglang_resize: false,
         }
     }
 
     /// Mark an encoded frame for one direct resize to its planned dimensions.
     pub(crate) fn with_minimax_resize(mut self) -> Self {
         self.minimax_resize = true;
+        self
+    }
+
+    /// Select Pillow's byte-exact image resize for SGLang's source geometry.
+    pub(crate) fn with_minimax_sglang_resize(mut self, enabled: bool) -> Self {
+        self.minimax_sglang_resize = enabled;
         self
     }
 
@@ -511,7 +520,9 @@ impl ImageFrame {
                 self.max_long_side_pixel,
                 self.transparency(),
             )?;
-            Ok(if self.minimax_resize {
+            Ok(if self.minimax_sglang_resize {
+                resize_bicubic_pil(&image, self.size.width, self.size.height)
+            } else if self.minimax_resize {
                 crate::minimax_resize::resize_image(image, self.size.width, self.size.height)
             } else {
                 image

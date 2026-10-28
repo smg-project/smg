@@ -8,7 +8,7 @@ use image::{
 
 use crate::{
     types::{ImageFrame, ImageSize},
-    vision::transforms::resize_bicubic_torch_aa,
+    vision::transforms::{resize_bicubic_torch_aa, round_half_to_even},
     MediaConnectorError,
 };
 
@@ -20,8 +20,8 @@ pub const IMAGE_MAX_TOTAL_PIXELS: u64 = 12_845_056;
 pub const IMAGE_DEFAULT_LONG_SIDE: u32 = 2016;
 /// Internal processor marker for images whose source geometry was already planned.
 pub const RESIZED_KEY: &str = "minimax_media_resized";
-/// Internal selector for SGLang checkpoint processors that use HF area-based resizing.
-pub const SGLANG_HF_RESIZE_KEY: &str = "minimax_sglang_hf_resize";
+/// Internal selector for the SGLang MiniMax M3.1 day-0 resize contract.
+pub const SGLANG_RESIZE_KEY: &str = "minimax_sglang_resize";
 
 #[cfg(test)]
 #[path = "minimax_resize_tests.rs"]
@@ -73,6 +73,36 @@ pub(crate) fn dimensions(
     Ok((w as u32, h as u32))
 }
 
+/// Match SGLang day-0 nearest-grid alignment with a bounded short-side floor.
+pub(crate) fn sglang_dimensions(
+    width: u32,
+    height: u32,
+    cap: u32,
+) -> Result<(u32, u32), MediaConnectorError> {
+    if !(112..=3584).contains(&cap) || !cap.is_multiple_of(28) {
+        return Err(MediaConnectorError::InvalidImageLongSideCap { value: cap });
+    }
+    if width == 0
+        || height == 0
+        || f64::from(width.max(height)) / f64::from(width.min(height)) > 200.0
+    {
+        return Err(MediaConnectorError::Image(ImageError::Parameter(
+            ParameterError::from_kind(ParameterErrorKind::DimensionMismatch),
+        )));
+    }
+    let long = f64::from(width.max(height));
+    let short = f64::from(width.min(height));
+    let ratio = if long > f64::from(cap) {
+        f64::from(cap) / long
+    } else if short < 112.0 {
+        (112.0 / short).min(f64::from(cap) / long)
+    } else {
+        1.0
+    };
+    let align = |side| (round_half_to_even(f64::from(side) * ratio / 28.0) as u32).max(1) * 28;
+    Ok((align(width), align(height)))
+}
+
 /// Reject oversized output before allocating pixels.
 fn budget(pixels: u64, limit: u64, modality: &'static str) -> Result<(), MediaConnectorError> {
     if pixels > limit {
@@ -109,9 +139,12 @@ pub(crate) fn resize_image(image: DynamicImage, width: u32, height: u32) -> Dyna
 }
 
 /// Include effective geometry in the pixel-cache identity.
-fn resized_hash(hash: &str, width: u32, height: u32) -> String {
+fn resized_hash(hash: &str, width: u32, height: u32, sglang: bool) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"minimax-m3-source-resize-v1");
+    if sglang {
+        hasher.update(b"sglang-pillow-day0");
+    }
     hasher.update(hash.as_bytes());
     hasher.update(&width.to_le_bytes());
     hasher.update(&height.to_le_bytes());
@@ -123,19 +156,33 @@ pub(crate) fn image(
     frame: Arc<ImageFrame>,
     cap: u32,
 ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
+    image_for_runtime(frame, cap, false)
+}
+
+/// Plan the engine's source geometry while retaining lazy image decoding.
+pub(crate) fn image_for_runtime(
+    frame: Arc<ImageFrame>,
+    cap: u32,
+    sglang: bool,
+) -> Result<Arc<ImageFrame>, MediaConnectorError> {
     let size = frame.size();
-    let (w, h) = dimensions(size.width, size.height, cap)?;
+    let (w, h) = if sglang {
+        sglang_dimensions(size.width, size.height, cap)?
+    } else {
+        dimensions(size.width, size.height, cap)?
+    };
     budget(u64::from(w) * u64::from(h), IMAGE_MAX_TOTAL_PIXELS, "image")?;
     Ok(Arc::new(
         ImageFrame::encoded(
             frame.raw_bytes.clone(),
             frame.detail,
             frame.source.clone(),
-            resized_hash(&frame.hash, w, h),
+            resized_hash(&frame.hash, w, h, sglang),
             ImageSize::new(w, h),
             None,
         )
         .with_transparency(frame.transparency())
-        .with_minimax_resize(),
+        .with_minimax_resize()
+        .with_minimax_sglang_resize(sglang),
     ))
 }

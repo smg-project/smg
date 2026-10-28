@@ -89,7 +89,7 @@ impl VisionProcessors {
             if spec.name() == "minimax_m3"
                 && modality == Modality::Image
                 && !config
-                    .get_extra::<bool>(llm_multimodal::minimax_resize::SGLANG_HF_RESIZE_KEY)
+                    .get_extra::<bool>(llm_multimodal::minimax_resize::SGLANG_RESIZE_KEY)
                     .unwrap_or(false)
             {
                 if config.max_pixels.is_some_and(|pixels| {

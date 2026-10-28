@@ -101,8 +101,8 @@ pub struct MiniMaxM3VisionProcessor {
     /// in place of a request's `max_long_side_pixel` tier.
     explicit_max_pixels: bool,
     source_resized: bool,
-    /// SGLang uses the checkpoint HF image processor without the legacy short-side stage.
-    hf_resize: bool,
+    /// SGLang uses its day-0 image source policy and float video resize.
+    sglang_resize: bool,
 }
 
 impl Default for MiniMaxM3VisionProcessor {
@@ -170,7 +170,7 @@ impl MiniMaxM3VisionProcessor {
             .raise_rounded_sides_to_factor(),
             explicit_max_pixels: false,
             source_resized: false,
-            hf_resize: false,
+            sglang_resize: false,
         }
     }
 
@@ -285,8 +285,8 @@ impl MiniMaxM3VisionProcessor {
         );
         layered.inner = layered.inner.with_preprocessor_config(config);
         layered.source_resized = source_resized;
-        layered.hf_resize = config
-            .get_extra::<bool>(crate::minimax_resize::SGLANG_HF_RESIZE_KEY)
+        layered.sglang_resize = config
+            .get_extra::<bool>(crate::minimax_resize::SGLANG_RESIZE_KEY)
             .unwrap_or(false);
         layered.explicit_max_pixels = self.explicit_max_pixels || config.max_pixels.is_some();
         Ok(layered)
@@ -383,7 +383,7 @@ impl MiniMaxM3VisionProcessor {
         let below_floor =
             |image: &DynamicImage| Self::raised_dimensions(image.width(), image.height()).is_some();
         if self.source_resized
-            || self.hf_resize
+            || self.sglang_resize
             || !self.inner.resizes()
             || !images.iter().any(below_floor)
         {
@@ -462,7 +462,7 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
         frames: &[DynamicImage],
         clip: &VideoClipOptions,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if self.hf_resize {
+        if self.sglang_resize {
             let owned: Vec<_> = frames.iter().map(DynamicImage::to_rgb8).collect();
             let borrowed: Vec<_> = owned
                 .iter()
@@ -482,7 +482,7 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
         frames: &[RgbFrameRef<'_>],
         clip: &VideoClipOptions,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if self.hf_resize {
+        if self.sglang_resize {
             return self.preprocess_sglang_video(frames, clip);
         }
         self.for_clip(clip).inner.preprocess_video_rgb(frames, clip)
@@ -490,7 +490,7 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
 
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
         // Staged the way `preprocess` stages the image.
-        let staged = if self.inner.resizes() && !self.source_resized && !self.hf_resize {
+        let staged = if self.inner.resizes() && !self.source_resized && !self.sglang_resize {
             self.staging_dimensions(width, height)?
         } else {
             None

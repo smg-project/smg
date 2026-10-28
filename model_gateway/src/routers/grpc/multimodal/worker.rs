@@ -442,20 +442,30 @@ impl WorkerMediaPipeline {
         let loaded = if native_minimax {
             let mut image = loaded.preprocessor_config.clone();
             image.extra.insert(
-                llm_multimodal::minimax_resize::SGLANG_HF_RESIZE_KEY.into(),
+                llm_multimodal::minimax_resize::SGLANG_RESIZE_KEY.into(),
+                serde_json::json!(true),
+            );
+            image.extra.insert(
+                llm_multimodal::minimax_resize::RESIZED_KEY.into(),
                 serde_json::json!(true),
             );
             let mut video = loaded
                 .video_preprocessor_config
                 .clone()
                 .unwrap_or_else(|| loaded.preprocessor_config.clone());
+            // The day-0 builtin processor reads its frame cap from checkpoint size.
+            let size = loaded.preprocessor_config.size.as_ref();
+            let side = size
+                .and_then(|size| size.get("height").zip(size.get("width")))
+                .map_or(672, |(height, width)| (*height).max(*width));
+            video.max_pixels = Some((side as usize).saturating_mul(side as usize));
             // MiniMaxVLProcessor defaults videos_kwargs.do_resize to false: the
             // SGLang loader already aligned the float frames before this stage.
             if !settings.processor_kwargs.contains_key("do_resize") {
                 video.do_resize = Some(false);
             }
             video.extra.insert(
-                llm_multimodal::minimax_resize::SGLANG_HF_RESIZE_KEY.into(),
+                llm_multimodal::minimax_resize::SGLANG_RESIZE_KEY.into(),
                 serde_json::json!(true),
             );
             let overridden = Arc::new(MultimodalModelConfig::new(
@@ -1696,9 +1706,9 @@ mod tests {
                     && message.contains("192000-token encoder budget")
         ));
     }
-    /// SGLang follows the checkpoint's area limit and does not apply vLLM's source floor.
+    /// SGLang follows its day-0 source geometry and advertises pixel-less Decode reuse.
     #[tokio::test]
-    async fn sglang_minimax_matches_hf_image_geometry_and_reuse_contract() {
+    async fn sglang_minimax_matches_day0_image_geometry_and_reuse_contract() {
         use base64::{engine::general_purpose::STANDARD, Engine};
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1729,12 +1739,12 @@ mod tests {
             loaded.video_preprocessor_config.as_ref().unwrap().do_resize,
             Some(false)
         );
-        // Independent HF smart_resize results: 56², 504², 672², and 1008x56.
+        // Independent day-0 source resize: 112², 504², 1036², and 2016x112.
         for (width, height, tokens) in [
-            (56, 56, 4),
+            (56, 56, 16),
             (512, 512, 324),
-            (1024, 1024, 576),
-            (1000, 50, 72),
+            (1024, 1024, 1369),
+            (1000, 50, 288),
         ] {
             let mut bytes = std::io::Cursor::new(Vec::new());
             image::DynamicImage::new_rgb8(width, height)
