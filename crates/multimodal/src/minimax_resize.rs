@@ -80,7 +80,7 @@ pub(crate) fn sglang_dimensions(
     cap: u32,
 ) -> Result<(u32, u32), MediaConnectorError> {
     if !(112..=3584).contains(&cap) || !cap.is_multiple_of(28) {
-        return Err(MediaConnectorError::InvalidImageLongSideCap { value: cap });
+        return Err(MediaConnectorError::InvalidSglangLongSideCap { value: cap });
     }
     if width == 0
         || height == 0

@@ -86,7 +86,7 @@ pub struct VideoClipOptions {
     /// the double the request or the checkpoint named it.
     pub sample_fps: f64,
     /// The long-side cap the caller asked for, when it named one; the frames
-    /// were already scaled to it.
+    /// are already scaled except on native SGLang MiniMax, which applies Pillow here.
     pub max_long_side_pixel: Option<u32>,
 }
 

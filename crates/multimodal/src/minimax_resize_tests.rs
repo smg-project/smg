@@ -306,3 +306,25 @@ fn sglang_day0_geometry_and_cache_identity() {
     assert_eq!(vllm.size(), sglang.size());
     assert_ne!(vllm.hash, sglang.hash);
 }
+
+/// Preserve vLLM's source geometry, exact cache key and Torch-AA pixels.
+#[test]
+fn vllm_source_contract_is_unchanged_by_sglang_opt_in() {
+    let frame = encoded(1000, 50);
+    let resized = image(frame.clone(), 1000).unwrap();
+    assert_eq!(resized.size(), ImageSize::new(2240, 112));
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"minimax-m3-source-resize-v1");
+    hash.update(frame.hash.as_bytes());
+    hash.update(&2240u32.to_le_bytes());
+    hash.update(&112u32.to_le_bytes());
+    assert_eq!(resized.hash, hash.finalize().to_hex().to_string());
+    assert_eq!(
+        resized.image().unwrap().to_rgb8(),
+        resize_image(frame.image().unwrap().clone(), 2240, 112).to_rgb8()
+    );
+    let error = sglang_dimensions(512, 512, 1000).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("multiple of 28 within 112..=3584"));
+}

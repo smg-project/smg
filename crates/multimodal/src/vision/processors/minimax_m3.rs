@@ -13,8 +13,8 @@
 //! Router and Rust-servicer images use `minimax_resize` to choose aligned dimensions
 //! from the source header and resize directly at decode. Their processor carries
 //! `RESIZED_KEY`, skipping short-side staging and the legacy image pixel budget.
-//! SGLang native workers instead select the checkpoint HF area policy and preserve
-//! float video interpolation through patchification. Other processors retain the defaults below.
+//! SGLang native workers explicitly select day-0 nearest-grid geometry and Pillow
+//! byte resizing. Other processors retain the defaults below.
 //!
 //! # MiniMax-M3 parameters
 //!
@@ -101,7 +101,7 @@ pub struct MiniMaxM3VisionProcessor {
     /// in place of a request's `max_long_side_pixel` tier.
     explicit_max_pixels: bool,
     source_resized: bool,
-    /// SGLang uses its day-0 image source policy and float video resize.
+    /// Opt in to SGLang's day-0 geometry and Pillow byte resize for images and videos.
     sglang_resize: bool,
 }
 

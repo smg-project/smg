@@ -447,7 +447,11 @@ impl AsyncMultiModalTracker {
         self.enqueue(
             Modality::Image,
             uuid,
-            format!("{config:?}/{minimax_cap:?}/{sglang}"),
+            if sglang {
+                format!("{config:?}/{minimax_cap:?}/sglang")
+            } else {
+                format!("{config:?}/{minimax_cap:?}")
+            },
             source,
             move |connector, source| async move {
                 let frame = connector.fetch_image_from(&source, config).await?;
@@ -472,19 +476,32 @@ impl AsyncMultiModalTracker {
         fps: Option<f64>,
         max_long_side_pixel: Option<u32>,
     ) -> MultiModalResult<()> {
-        let cfg = video_fetch_config(
+        let mut cfg = video_fetch_config(
             fps,
             max_long_side_pixel,
             self.default_video_sample_fps,
             self.video_frame_sampling,
         )?;
+        let sglang = self.minimax_sglang_resize;
+        let key = if sglang {
+            format!("{cfg:?}/sglang")
+        } else {
+            format!("{cfg:?}")
+        };
+        if sglang {
+            // Native MiniMax applies Pillow once, after source-resolution decode.
+            cfg.max_long_side_pixel = None;
+        }
         self.enqueue(
             Modality::Video,
             uuid,
-            format!("{cfg:?}"),
+            key,
             source,
             move |connector, source| async move {
-                let clip = connector.fetch_video_from(&source, cfg).await?;
+                let mut clip = connector.fetch_video_from(&source, cfg).await?;
+                if sglang {
+                    Arc::make_mut(&mut clip).max_long_side_pixel = max_long_side_pixel;
+                }
                 Ok(TrackedMedia::Video(clip))
             },
         );
@@ -914,6 +931,57 @@ mod repeat_tests {
             .find(|(_, report)| report.outcome == FetchOutcome::ClientFault)
             .expect("the failed fetch");
         assert_eq!(failed.1.bytes, 0, "{:?}", failed.1);
+    }
+
+    /// Only native SGLang defers the cap to its Pillow processor; vLLM still
+    /// receives decoder-scaled frames. Explicit caps survive both paths.
+    #[tokio::test]
+    #[ignore = "requires ffmpeg and ffprobe; run explicitly for MiniMax validation"]
+    async fn minimax_video_cap_is_deferred_only_for_sglang() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.mp4");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=8",
+                "-t",
+                "1",
+                "-filter_threads",
+                "1",
+                "-threads",
+                "1",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let bytes = std::fs::read(path).unwrap();
+        for sglang in [false, true] {
+            let mut tracker = tracker().with_minimax_sglang_resize(sglang);
+            tracker
+                .push_part(MediaContentPart::VideoUrl {
+                    url: format!("data:video/mp4;base64,{}", STANDARD.encode(&bytes)),
+                    uuid: None,
+                    fps: Some(1.0),
+                    max_long_side_pixel: Some(168),
+                })
+                .unwrap();
+            let output = tracker.finalize().await.unwrap();
+            let TrackedMedia::Video(clip) = &output.data[&Modality::Video][0] else {
+                panic!("video expected");
+            };
+            assert_eq!(clip.max_long_side_pixel(), Some(168));
+            let frame = &clip.rgb_video().unwrap().frames[0];
+            let expected = if sglang { (320, 240) } else { (168, 126) };
+            assert_eq!((frame.width, frame.height), expected);
+        }
     }
 
     fn image_part(max_long_side_pixel: Option<u32>) -> MediaContentPart {

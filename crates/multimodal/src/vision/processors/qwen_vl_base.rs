@@ -414,9 +414,14 @@ impl QwenVLProcessorBase {
         self.transforms.filter
     }
 
-    /// The resolved float normalization, also used after float video resizing.
-    pub(super) fn normalization(&self) -> PixelNorm {
-        self.transforms.norm
+    /// Preserve an already aligned native-loader video grid and its pixel bytes.
+    /// Only the caller's clone is changed; ordinary Qwen/vLLM planning is unchanged.
+    pub(super) fn with_aligned_video_frames(mut self, pixels: usize) -> Self {
+        self.config.video_min_pixels = pixels;
+        self.config.video_max_pixels = pixels;
+        self.config.video_resize_mode = QwenVideoResizeMode::PerFrame;
+        self.transforms.do_resize = false;
+        self
     }
 
     /// Allow non-zero video dimensions below the patch-alignment factor.

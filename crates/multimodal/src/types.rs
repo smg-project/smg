@@ -236,7 +236,7 @@ pub struct VideoClip {
     /// Blake3 hex-digest of raw_bytes, computed at decode time.
     pub hash: String,
     /// The long-side cap the caller asked for (MiniMax `max_long_side_pixel`);
-    /// the frames were already scaled to it when set.
+    /// decoding applies it except for native SGLang MiniMax, which defers to Pillow.
     pub max_long_side_pixel: Option<u32>,
 }
 

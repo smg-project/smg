@@ -460,7 +460,7 @@ impl WorkerMediaPipeline {
                 .map_or(672, |(height, width)| (*height).max(*width));
             video.max_pixels = Some((side as usize).saturating_mul(side as usize));
             // MiniMaxVLProcessor defaults videos_kwargs.do_resize to false: the
-            // SGLang loader already aligned the float frames before this stage.
+            // SGLang loader already aligned the byte frames before this stage.
             if !settings.processor_kwargs.contains_key("do_resize") {
                 video.do_resize = Some(false);
             }
@@ -1725,6 +1725,23 @@ mod tests {
             ("]<]end of image[>[", 32002),
         ]));
         let settings = pipeline_settings(dir.path().to_str().unwrap());
+        // The same checkpoint must keep the pre-existing vLLM defaults. Native
+        // source-policy overrides belong only to the explicit SGLang constructor.
+        let vllm = WorkerMediaPipeline::new(settings.clone(), tokenizer.clone())
+            .await
+            .unwrap();
+        assert!(vllm.sglang_identity_key().is_none());
+        let vllm_config = vllm
+            .components
+            .config_registry
+            .get_or_load(CONFIG_KEY, dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(!vllm_config
+            .preprocessor_config
+            .get_extra::<bool>(llm_multimodal::minimax_resize::SGLANG_RESIZE_KEY)
+            .unwrap_or(false));
+        assert!(vllm_config.video_preprocessor_config.is_none());
         let pipeline = WorkerMediaPipeline::new_sglang(settings, tokenizer)
             .await
             .unwrap();
