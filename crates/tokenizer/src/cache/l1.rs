@@ -1,6 +1,6 @@
 //! L1 Cache: Special-token boundary prefix cache
 //!
-//! Caches tokenization results at ALL special token boundaries.
+//! Caches tokenization results at selected special token boundaries.
 //! Special tokens (like `<|im_start|>`, `<|im_end|>`) are atomic in BPE tokenizers (special: true, normalized: false),
 //! making them the ONLY safe split points that guarantee correctness. A tokenizer extracts its added tokens in two
 //! passes: the `normalized: false` ones from the raw text, then the `normalized: true` ones from the pieces that pass
@@ -8,10 +8,10 @@
 //! tokens it matches so that no boundary falls inside them are raw-pass added tokens; a token of the second pass can
 //! neither displace a raw-pass token nor be a boundary of a raw-text matcher.
 //!
-//! **Design**: Cache at every special token boundary (not at fixed granularity intervals)
-//! - Simple: No granularity parameter, no search windows
-//! - Efficient: Fewer cache entries (10 instead of 64 for typical 8KB prompt)
-//! - Natural: Aligns with actual chat template structure
+//! **Design**: Select checkpoints from special token boundaries.
+//! - Cold fills: Geometrically spaced token lengths plus the deepest boundary.
+//! - Hits: Learn the next boundary after a match and the deepest boundary.
+//! - Admission: Nonblocking and subject to the retained-memory budget.
 //!
 //! Example:
 //!
@@ -20,7 +20,7 @@
 //! Request 1: "<|im_start|>system\nYou are helpful.<|im_end|><|im_start|>user\nWhat is 2+2?<|im_end|>"
 //! Request 2: "<|im_start|>system\nYou are helpful.<|im_end|><|im_start|>user\nHello!<|im_end|>"
 //!
-//! Cache points: After each "<|im_end|>" (atomic tokens, guaranteed safe)
+//! Candidate split points: After atomic special tokens such as "<|im_end|>".
 //! Result: tokenize(prefix) + tokenize(suffix) == tokenize(prefix + suffix)
 
 use std::{
@@ -566,10 +566,10 @@ impl L1Cache {
         PrefixLookup::Miss(seeds)
     }
 
-    /// Insert prefix entries at all special token boundaries (incremental hashing
-    /// and tokenization, O(N)). The miss path of [`super::CachedTokenizer`] instead
-    /// uses `Self::populate_with_seeds`, which reuses this per-segment work to also
-    /// return the full encoding.
+    /// Insert geometrically spaced prefixes plus the deepest special-token
+    /// boundary, subject to admission. The miss path of [`super::CachedTokenizer`]
+    /// uses `Self::populate_with_seeds`, which reuses the incremental hashing
+    /// and per-segment encoding to also return the full encoding.
     pub fn insert_at_boundaries<E: Encoder + ?Sized>(
         &self,
         input: &str,
@@ -589,9 +589,9 @@ impl L1Cache {
         Ok(())
     }
 
-    /// Miss-path encode: tokenize `input` exactly once, caching the cumulative prefix
-    /// at every special token boundary, and return the assembled encoding, equal
-    /// to an uncached `encode(input, add_special_tokens)`: the segments are
+    /// Miss-path encode: tokenize `input` once, admitting geometrically spaced
+    /// prefixes plus the deepest special-token boundary, and return the assembled
+    /// encoding, equal to an uncached `encode(input, add_special_tokens)`: the segments are
     /// encoded in context and the frame the flag adds goes around the whole.
     /// A request with the flag is served by the plain encode, uncached, when
     /// the frame cannot be read off the tokenizer (`SpecialTokenFrame::probe`).

@@ -452,7 +452,8 @@ fn main() {
 
             // L1 alone: the same text again (a hit at the deepest boundary), the
             // next turn of a seen conversation (10 % and 1 % new text), and
-            // distinct conversations (a miss that seeds every boundary).
+            // distinct conversations (a miss that seeds geometric checkpoints
+            // plus the deepest boundary).
             if wanted("l1") {
                 let t = cached(&inner, false, true);
                 assert_eq!(ids(&t, &text0), reference);

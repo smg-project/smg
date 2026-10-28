@@ -225,8 +225,8 @@ impl Encoder for CachedTokenizer {
         // L1 path (prefix match at special token boundaries): a hit splices the
         // shared cached prefix with the suffix encoded after the boundary's
         // special token, as it is in the whole text; a miss tokenizes the input
-        // once, seeding every boundary entry along the way. Where the splice
-        // cannot be shown exact for this input (the boundary's token does not
+        // once, seeding geometrically spaced prefixes plus the deepest boundary.
+        // Where the splice cannot be shown exact (the boundary's token does not
         // come back as itself in front of the suffix), the plain encode serves
         // the request, counted as a fallback in the L1 stats; a prefix cached
         // before that point stays, its own segments having come back exact.
