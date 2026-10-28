@@ -56,6 +56,25 @@ impl SglangCpuMmHasher {
         Ok(())
     }
 
+    /// Reuse hashes across identical fan-out copies of one request's media.
+    /// The caller must keep this cache local to that request and preserve item order.
+    pub(crate) async fn precompute_shared(
+        &self,
+        mm: &mut SglangWireMmInputs,
+        request_id: &str,
+        shared_hashes: &mut Option<Vec<Option<u64>>>,
+    ) -> Result<(), Status> {
+        if let Some(hashes) = shared_hashes {
+            for (item, hash) in mm.mm_items.iter_mut().zip(hashes) {
+                item.hash = item.hash.or(*hash);
+            }
+        } else {
+            self.precompute(mm, request_id).await?;
+            *shared_hashes = Some(mm.mm_items.iter().map(|item| item.hash).collect());
+        }
+        Ok(())
+    }
+
     /// Fill missing large-feature hashes without copying storage or overriding existing hashes.
     pub(crate) async fn precompute(
         &self,
@@ -203,5 +222,36 @@ mod transport_tests {
         assert_eq!(actual.dtype, "bfloat16");
         assert_eq!(actual.data.as_raw_view().unwrap().as_ptr(), bytes.as_ptr());
         assert_eq!(actual.data.as_raw_view().unwrap(), &bytes);
+
+        // A later choice must not acquire a hashing slot or replace its existing hash.
+        let mut shared_hashes = None;
+        hasher
+            .precompute_shared(&mut mm, "first-choice", &mut shared_hashes)
+            .await
+            .unwrap();
+        let mut choice = mm.clone();
+        choice.mm_items[0].hash = None;
+        choice.mm_items[1].hash = Some(42);
+        let _occupied = hasher.slots.acquire().await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            hasher.precompute_shared(&mut choice, "next-choice", &mut shared_hashes),
+        )
+        .await
+        .expect("cached choices must bypass the hash pool")
+        .unwrap();
+        assert_eq!(choice.mm_items[0].hash, mm.mm_items[0].hash);
+        assert_eq!(choice.mm_items[1].hash, Some(42));
+        assert_eq!(
+            choice.mm_items[0]
+                .feature
+                .as_ref()
+                .unwrap()
+                .data
+                .as_raw_view()
+                .unwrap()
+                .as_ptr(),
+            bytes.as_ptr()
+        );
     }
 }

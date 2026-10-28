@@ -1157,6 +1157,8 @@ impl ZmqEngineClient {
             RankPlacement::Pin
         };
         let mut streams = Vec::new();
+        // Fan-out clones share identical media; cache only within this request.
+        let mut shared_hashes = None;
         for (index, sub) in fan_out_sglang_requests(req).into_iter().enumerate() {
             let image_refs = sub
                 .mm_inputs
@@ -1169,7 +1171,9 @@ impl ZmqEngineClient {
                 .map_err(tonic::Status::invalid_argument)?;
             request.trace_headers.clone_from(&trace_headers);
             if let (Some(hasher), Some(mm)) = (hasher, request.mm_inputs.as_mut()) {
-                hasher.precompute(mm, &request.rid).await?;
+                hasher
+                    .precompute_shared(mm, &request.rid, &mut shared_hashes)
+                    .await?;
             }
             let dispatched = match (image_refs, dispatcher) {
                 (None, _) => None,

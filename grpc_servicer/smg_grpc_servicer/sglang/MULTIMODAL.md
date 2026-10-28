@@ -68,8 +68,10 @@ thread settings are preserved.
 CPU hashing preserves SGLang's SHA256 feature identity. A nonzero/unknown
 `SGLANG_MM_BUFFER_SIZE_MB` or enabled/unknown `SGLANG_MM_SKIP_COMPUTE_HASH`
 retains engine hashing and disables identity reuse. Shared-memory broadcasts
-require single-node TP, CPU features of at least 32 KiB and the engine's SHM
-finalization support. Other configurations retain inline transport. Allocation
+require single-node TP with `tp_size > 1` and the engine's SHM finalization
+support. The 32 KiB threshold applies per CPU feature tensor: eligible tensors
+use shared memory while smaller or non-CPU tensors in the same broadcast retain
+inline transport. Other configurations retain inline transport. Allocation
 failure warns and retains inline transport; the engine owns collective
 materialization and handle cleanup.
 
