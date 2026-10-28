@@ -204,6 +204,7 @@ pub struct AsyncMultiModalTracker {
     /// stage set the destination engine's.
     image_transparency: TransparencyPolicy,
     minimax_image_resize: bool,
+    drain_on_error: bool,
 }
 
 impl AsyncMultiModalTracker {
@@ -218,7 +219,15 @@ impl AsyncMultiModalTracker {
             video_frame_sampling: FrameSampling::default(),
             image_transparency: TransparencyPolicy::KeepAlpha,
             minimax_image_resize: false,
+            drain_on_error: false,
         }
+    }
+
+    /// Keep worker admission until sibling fetches finish, including blocking decode.
+    /// Disabled by default to preserve the router's fail-fast error response.
+    pub fn with_drain_on_error(mut self, enabled: bool) -> Self {
+        self.drain_on_error = enabled;
+        self
     }
 
     /// Decode the request's image frames under `policy` (the destination
@@ -319,7 +328,7 @@ impl AsyncMultiModalTracker {
         Ok(())
     }
 
-    /// Await every fetch, including siblings of a failed fetch, before releasing caller admission.
+    /// Collect fetched media, optionally draining siblings before returning an error.
     pub async fn finalize(mut self) -> MultiModalResult<TrackerOutput> {
         let mut data = MultiModalData::new();
         let mut first_error = None;
@@ -340,6 +349,9 @@ impl AsyncMultiModalTracker {
                 match media {
                     Ok(media) => items.push(media),
                     Err(error) => {
+                        if !self.drain_on_error {
+                            return Err(error);
+                        }
                         first_error.get_or_insert(error);
                     }
                 }
@@ -765,47 +777,64 @@ mod repeat_tests {
         AsyncMultiModalTracker::new(Arc::new(connector))
     }
 
-    /// A failed fetch must not detach a sibling and release the request's admission early.
+    /// Workers drain failed siblings; default router processing still returns errors promptly.
     #[tokio::test]
     #[expect(
         clippy::disallowed_methods,
-        reason = "fetch handles are owned and drained by the tracker under test"
+        reason = "the test waits for both fetch tasks via finalize and a completion channel"
     )]
-    async fn failed_fetch_drains_sibling_before_returning() {
+    async fn failed_fetch_obeys_drain_policy() {
         use tokio::sync::oneshot;
-        for panic in [false, true] {
-            let mut tracker = tracker();
-            let (release, wait) = oneshot::channel();
-            tracker.pending.insert(
-                Modality::Video,
-                vec![
-                    Slot::Fetch(tokio::spawn(async move {
-                        assert!(!panic, "fetch panic");
-                        Err(MultiModalError::Validation("first fetch failed".into()))
-                    })),
-                    Slot::Fetch(tokio::spawn(async move {
-                        wait.await.unwrap();
-                        Err(MultiModalError::Validation("sibling finished".into()))
-                    })),
-                ],
-            );
-            let finalize = tracker.finalize();
-            tokio::pin!(finalize);
-            assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(20), &mut finalize)
+        for drain in [false, true] {
+            for panic in [false, true] {
+                let mut tracker = tracker().with_drain_on_error(drain);
+                let (release, wait) = oneshot::channel();
+                let (finished, done) = oneshot::channel();
+                tracker.pending.insert(
+                    Modality::Video,
+                    vec![
+                        Slot::Fetch(tokio::spawn(async move {
+                            assert!(!panic, "fetch panic");
+                            Err(MultiModalError::Validation("first fetch failed".into()))
+                        })),
+                        Slot::Fetch(tokio::spawn(async move {
+                            wait.await.unwrap();
+                            finished.send(()).unwrap();
+                            Err(MultiModalError::Validation("sibling finished".into()))
+                        })),
+                    ],
+                );
+                let finalize = tracker.finalize();
+                tokio::pin!(finalize);
+                let error = if drain {
+                    assert!(tokio::time::timeout(
+                        std::time::Duration::from_millis(20),
+                        &mut finalize
+                    )
                     .await
-                    .is_err()
-            );
-            release.send(()).unwrap();
-            let error = finalize.await.unwrap_err().to_string();
-            assert!(
-                error.contains(if panic {
-                    "fetch panic"
+                    .is_err());
+                    release.send(()).unwrap();
+                    finalize.await.unwrap_err()
                 } else {
-                    "first fetch failed"
-                }),
-                "{error}"
-            );
+                    let error =
+                        tokio::time::timeout(std::time::Duration::from_secs(1), &mut finalize)
+                            .await
+                            .unwrap()
+                            .unwrap_err();
+                    release.send(()).unwrap();
+                    error
+                };
+                done.await.unwrap();
+                let error = error.to_string();
+                assert!(
+                    error.contains(if panic {
+                        "fetch panic"
+                    } else {
+                        "first fetch failed"
+                    }),
+                    "{error}"
+                );
+            }
         }
     }
 

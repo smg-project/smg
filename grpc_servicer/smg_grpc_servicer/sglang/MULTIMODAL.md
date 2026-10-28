@@ -40,6 +40,9 @@ This tradeoff can affect slow fetches and long videos; disable reuse with
 `SMG_SGLANG_PD_MEDIA_REUSE=0` to retain parallel preprocessing. Legacy workers do not advertise reuse and receive
 ordinary requests. Cancellation remains registered during preprocessing; a
 cancelled blocking decoder retains its admission slot until it actually exits.
+Worker-side fetch failures drain sibling tasks before releasing admission; this
+may delay an error response until slow siblings finish. Router-side preprocessing
+retains its existing fail-fast behavior.
 
 ## Configuration
 
