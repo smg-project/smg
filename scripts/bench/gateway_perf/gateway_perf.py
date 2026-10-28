@@ -271,6 +271,13 @@ class Bed:
 
     def up(self) -> dict:
         self.run_dir.mkdir(parents=True, exist_ok=True)
+        # The script refuses to start over a running bed (its pid file is there); that
+        # bed is not this call's to stop, so the refusal is read here, before anything
+        # starts and before the failure path below could take it down.
+        if (self.run_dir / "bed" / "gateway.pid").exists():
+            raise RuntimeError(
+                f"a bed is up already under {self.run_dir} (take it down first: bed down)"
+            )
         log = self.run_dir / "bed-up.log"
         with log.open("w") as handle:
             proc = subprocess.run(
@@ -280,9 +287,9 @@ class Bed:
             tail = "".join(log.read_text().splitlines(keepends=True)[-15:])
             # The script can fail after the mock fleet or the gateway started (the
             # gateway's health, the workers' registration, the probe): take down what
-            # came up, by the bed's own pid files, before the error goes out, so a
-            # caller that has not reached its own `finally` leaves no process and no
-            # port behind.
+            # this call started, by the bed's own pid files, before the error goes out,
+            # so a caller that has not reached its own `finally` leaves no process and
+            # no port behind.
             self.down()
             raise RuntimeError(f"bed up failed (rc {proc.returncode}); {log}:\n{tail}")
         self.info = json.loads((self.run_dir / "bed" / "bed.json").read_text())
@@ -697,12 +704,16 @@ def cell(settings: Settings, side: str, spec: PathSpec | None, label: str) -> di
 
 
 def per_request(c: dict, idle: dict | None) -> dict[str, float]:
-    """The per-request numbers of one loaded cell: the whole-process counters over the
-    window, minus the idle cell's per-second rate times the window, divided by the
-    requests sent. The fixed start-up share of the counters is the same on both sides
-    of an A/B, so it cancels in the comparison; the idle rate (metrics, timers, load
-    polling) is what the subtraction removes. Instructions and allocation counts are
-    load-independent; cycles and CPU time are not."""
+    """The per-request numbers of one loaded cell, divided by the requests sent. The
+    counters read over the window (perf's, CPU time) lose the idle cell's per-second
+    rate times the window. The allocator's counters are the process's exit totals, so
+    the idle cell's totals are subtracted whole: that removes the start-up share and
+    the idle allocations over the idle cell's life; what stays beside the requests'
+    own allocations is the idle rate times the difference of the two cells' lives
+    (seconds of a rate of a few allocations per second, spread over the requests), the
+    same on both sides of an A/B, so the comparison is unbiased and the absolute
+    values carry it. Instructions and allocation counts are load-independent; cycles
+    and CPU time are not."""
     n = c.get("sent") or 0
     if not n:
         return {}
@@ -839,7 +850,7 @@ def numbers_table(results: dict, setup: str) -> str:
             continue
         bm, hm = statistics.median(b), statistics.median(h)
         if relative:
-            change = f"{(hm / bm - 1) * 100:+.1f} %" if bm else "-"
+            change = f"{(hm - bm) / abs(bm) * 100:+.1f} %" if bm else "-"
         else:
             change = (
                 f"{hm - bm:+,.1f}"

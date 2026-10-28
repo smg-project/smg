@@ -314,3 +314,11 @@ def test_a_failed_bed_up_takes_the_partial_bed_down(gp, tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="bed up failed"):
         bed.up()
     assert calls == ["up", "down"]
+    # A bed that is up already (its pid file under the run directory) is not this call's
+    # to stop: the refusal comes before the script runs, and nothing is taken down.
+    calls.clear()
+    (tmp_path / "bed" / "bed").mkdir(parents=True)
+    (tmp_path / "bed" / "bed" / "gateway.pid").write_text("1\n")
+    with pytest.raises(RuntimeError, match="up already"):
+        bed.up()
+    assert calls == []

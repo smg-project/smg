@@ -18,7 +18,8 @@ make perf-alloc perf-cpu       # the head is built from the working tree; both r
 make perf-report PERF_OUT=target/gateway-perf/<stamp>/perf-cpu   # the Numbers table again, for the PR body
 ```
 
-`perf-alloc` is the deterministic part (allocation calls and KiB per request, RSS) and takes
+`perf-alloc` is the deterministic part (allocation calls and KiB per request; RSS is reported
+beside them and moves with the allocator, see below) and takes
 about a minute per path and side at the defaults; `perf-cpu` adds instructions and cycles
 when `perf stat` can count them here (otherwise CPU time per request, which carries the
 machine's load). The table each run prints is the `## Numbers` table of the pull-request
@@ -86,7 +87,10 @@ template, pass `TOKENIZER=<tokenizer directory or hub id>`.
   agree to a fraction of a percent whatever else the machine runs; a difference beyond the
   base's spread is the change.
 - **Load-dependent columns**: cycles, CPU time per request, kernel instructions, latencies.
-  They carry the machine's load (the idle cell's rate is subtracted, the rest is not) and are
+  They carry the machine's load (the idle cell's rate over the window is subtracted from the
+  counters read over the window; the allocator's exit totals lose the idle cell's totals
+  whole, which removes the start-up share and leaves the idle rate times the difference of
+  the two cells' lives, the same on both sides) and are
   reported with the 1-minute load average beside them in `cells.json`; compare them between
   cells run minutes apart at a similar load, and read a CPU-time delta under the spread as
   noise. In `cpu` mode the attached `perf stat` adds its own per-context-switch cost to the
