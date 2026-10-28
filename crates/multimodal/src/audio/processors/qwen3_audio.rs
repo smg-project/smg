@@ -338,6 +338,32 @@ fn qwen3_audio_output_length(input_length: usize, n_window: usize) -> usize {
         + qwen_audio_cnn_output_length(remainder)
 }
 
+/// The half-open bin range `[first, last)` each mel filter is non-zero over.
+///
+/// The filters are triangular and adjacent, so a bin carries weight in at most
+/// two of them: over the default 128 mels x 201 bins the bank is 394/25,728
+/// non-zero, 1.5%. Each row's weight is contiguous, which
+/// `mel_filter_rows_are_contiguous` pins, so one range per row describes it.
+fn mel_spans(mel_filters: &[f32], n_mels: usize, fft_bins: usize) -> Vec<(usize, usize)> {
+    (0..n_mels)
+        .map(|mel| {
+            let row = &mel_filters[mel * fft_bins..(mel + 1) * fft_bins];
+            let first = row.iter().position(|weight| *weight != 0.0);
+            match first {
+                Some(first) => {
+                    let last = row
+                        .iter()
+                        .rposition(|weight| *weight != 0.0)
+                        .map_or(first, |index| index + 1);
+                    (first, last)
+                }
+                // An all-zero row contributes nothing however it is summed.
+                None => (0, 0),
+            }
+        })
+        .collect()
+}
+
 fn whisper_log_mel(
     samples: &[f32],
     frame_count: usize,
@@ -349,7 +375,9 @@ fn whisper_log_mel(
     let fft_bins = params.n_fft / 2 + 1;
     let window = hann_window(params.n_fft);
     let mel_filters = mel_basis(params.sample_rate, params.n_fft, params.n_mels);
+    let spans = mel_spans(&mel_filters, params.n_mels, fft_bins);
     let mut buffer = vec![Complex32::new(0.0, 0.0); params.n_fft];
+    let mut power = vec![0.0_f32; fft_bins];
     let mut output = vec![0.0_f32; params.n_mels * frame_count];
 
     for frame in 0..frame_count {
@@ -365,15 +393,28 @@ fn whisper_log_mel(
         }
         fft.process(&mut buffer);
 
+        // The power spectrum, once per bin. The expression is unchanged from
+        // the per-(mel, bin) form it replaces -- `mul_add`, not
+        // `re * re + im * im`, which rounds differently and would move the
+        // output. `parakeet.rs` hoists the same way but uses the unfused form;
+        // do not copy it here.
+        for (value, bin) in power.iter_mut().zip(&buffer[..fft_bins]) {
+            *value = bin.re.mul_add(bin.re, bin.im * bin.im);
+        }
+
+        // A mel filter is triangular, so each FFT bin falls in at most two of
+        // them and the bank is ~1.5% non-zero. Skipping a zero weight is exact
+        // only while `power` is finite -- `0.0f32.mul_add(inf, acc)` is NaN --
+        // so the sparse path runs on the frames where that holds and the dense
+        // one, whose values are what this function has always produced, on any
+        // other. See `the_sparse_projection_is_taken_only_where_it_is_exact`.
+        let sparse = power.iter().all(|value| value.is_finite());
         for mel in 0..params.n_mels {
             let filter = &mel_filters[mel * fft_bins..(mel + 1) * fft_bins];
+            let (first, last) = if sparse { spans[mel] } else { (0, fft_bins) };
             let mut value = 0.0_f32;
-            for bin in 0..fft_bins {
-                let fft_value = buffer[bin];
-                let power = fft_value
-                    .re
-                    .mul_add(fft_value.re, fft_value.im * fft_value.im);
-                value = filter[bin].mul_add(power, value);
+            for bin in first..last {
+                value = filter[bin].mul_add(power[bin], value);
             }
             output[mel * frame_count + frame] = value.max(1e-10).log10();
         }
@@ -640,5 +681,226 @@ mod tests {
             vec![3.0, 2.0, 1.0, 2.0, 3.0, 2.0, 1.0]
         );
         assert_eq!(reflect_pad(&[2.0], 2), vec![2.0; 5]);
+    }
+
+    /// The projection this function performed before the sparse path existed:
+    /// every bin of every mel, with the power term recomputed inline. The
+    /// optimized path must agree with it bit for bit on every input.
+    fn dense_reference(samples: &[f32], frame_count: usize, params: &Qwen3AudioParams) -> Vec<f32> {
+        let padded = reflect_pad(samples, params.n_fft / 2);
+        let fft_bins = params.n_fft / 2 + 1;
+        let window = hann_window(params.n_fft);
+        let mel_filters = mel_basis(params.sample_rate, params.n_fft, params.n_mels);
+        let fft = FftPlanner::<f32>::new().plan_fft_forward(params.n_fft);
+        let mut buffer = vec![Complex32::new(0.0, 0.0); params.n_fft];
+        let mut output = vec![0.0_f32; params.n_mels * frame_count];
+        for frame in 0..frame_count {
+            let start = frame * params.hop_length;
+            for index in 0..params.n_fft {
+                buffer[index] = Complex32::new(padded[start + index] * window[index], 0.0);
+            }
+            fft.process(&mut buffer);
+            for mel in 0..params.n_mels {
+                let filter = &mel_filters[mel * fft_bins..(mel + 1) * fft_bins];
+                let mut value = 0.0_f32;
+                for bin in 0..fft_bins {
+                    let fft_value = buffer[bin];
+                    let power = fft_value
+                        .re
+                        .mul_add(fft_value.re, fft_value.im * fft_value.im);
+                    value = filter[bin].mul_add(power, value);
+                }
+                output[mel * frame_count + frame] = value.max(1e-10).log10();
+            }
+        }
+        let peak = output.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let floor = peak - 8.0;
+        for value in &mut output {
+            *value = (value.max(floor) + 4.0) / 4.0;
+        }
+        output
+    }
+
+    fn log_mel_of(samples: &[f32], params: &Qwen3AudioParams) -> Vec<f32> {
+        let frames = samples.len() / params.hop_length;
+        let fft = FftPlanner::<f32>::new().plan_fft_forward(params.n_fft);
+        whisper_log_mel(samples, frames, params, fft.as_ref())
+            .expect("log-mel")
+            .into_raw_vec_and_offset()
+            .0
+    }
+
+    /// One `mel_spans` range per row describes that row only while its weight
+    /// is contiguous. It is, because the filters are triangular and adjacent --
+    /// but the sparse projection silently drops weight if that ever stops being
+    /// true, so assert it rather than trust it.
+    #[test]
+    fn mel_filter_rows_are_contiguous() {
+        let params = Qwen3AudioParams::default();
+        let fft_bins = params.n_fft / 2 + 1;
+        let filters = mel_basis(params.sample_rate, params.n_fft, params.n_mels);
+        let spans = mel_spans(&filters, params.n_mels, fft_bins);
+        let mut non_zero = 0;
+        for (mel, &(first, last)) in spans.iter().enumerate() {
+            let row = &filters[mel * fft_bins..(mel + 1) * fft_bins];
+            assert!(
+                row[..first].iter().chain(&row[last..]).all(|w| *w == 0.0),
+                "mel row {mel} carries weight outside [{first}, {last}); the sparse \
+                 projection would drop it"
+            );
+            non_zero += row.iter().filter(|w| **w != 0.0).count();
+        }
+        // 394 of 25,728 at the default geometry: the reason the sparse path pays.
+        assert!(
+            non_zero * 50 < params.n_mels * fft_bins,
+            "the filterbank is {non_zero}/{} non-zero, denser than the sparse path assumes",
+            params.n_mels * fft_bins
+        );
+    }
+
+    /// Hoisting the power term out of the mel loop must not change a bit. It
+    /// does not, because the expression is identical -- which is exactly what
+    /// would break if someone replaced it with `re * re + im * im`.
+    #[test]
+    fn the_hoisted_power_term_is_bit_identical_to_the_inline_one() {
+        let params = Qwen3AudioParams::default();
+        for (name, samples) in sample_corpus() {
+            let frames = samples.len() / params.hop_length;
+            assert_eq!(
+                log_mel_of(&samples, &params),
+                dense_reference(&samples, frames, &params),
+                "{name}: the optimized projection differs from the dense reference"
+            );
+        }
+    }
+
+    /// `mul_add` and the unfused product round differently on real spectra, so
+    /// the comment warning against copying `parakeet.rs`'s formulation is load
+    /// bearing. If this ever stops differing the warning can go.
+    #[test]
+    fn the_fused_and_unfused_power_terms_really_do_differ() {
+        let params = Qwen3AudioParams::default();
+        let samples = sample_corpus()
+            .into_iter()
+            .find(|(name, _)| *name == "noise")
+            .expect("corpus")
+            .1;
+        let window = hann_window(params.n_fft);
+        let fft = FftPlanner::<f32>::new().plan_fft_forward(params.n_fft);
+        let mut buffer = vec![Complex32::new(0.0, 0.0); params.n_fft];
+        let (mut differing, mut total) = (0_usize, 0_usize);
+        for frame in 0..40 {
+            let start = frame * params.hop_length;
+            for index in 0..params.n_fft {
+                buffer[index] = Complex32::new(samples[start + index] * window[index], 0.0);
+            }
+            fft.process(&mut buffer);
+            for bin in &buffer[..params.n_fft / 2 + 1] {
+                let fused = bin.re.mul_add(bin.re, bin.im * bin.im);
+                let unfused = bin.re * bin.re + bin.im * bin.im;
+                total += 1;
+                differing += usize::from(fused.to_bits() != unfused.to_bits());
+            }
+        }
+        assert!(
+            differing > 0,
+            "the two power formulations agreed on all {total} bins"
+        );
+    }
+
+    /// The guard, both ways round. A clip whose spectrum overflows to infinity
+    /// takes the dense path -- skipping a zero weight there would be
+    /// `0.0f32.mul_add(inf, acc)`, which is NaN, and would corrupt every value
+    /// in the frame. An ordinary clip takes the sparse path. Both must equal
+    /// the dense reference.
+    #[test]
+    fn the_sparse_projection_is_taken_only_where_it_is_exact() {
+        let params = Qwen3AudioParams::default();
+
+        // f32 squares overflow above ~1.8e19; the windowed FFT of 1e30-scale
+        // samples is far past it.
+        let overflowing: Vec<f32> = (0..4_000)
+            .map(|i| if i % 2 == 0 { 1e30 } else { -1e30 })
+            .collect();
+        assert!(
+            !frame_powers_are_finite(&overflowing, &params),
+            "the overflow fixture no longer overflows; the guard is untested"
+        );
+        let frames = overflowing.len() / params.hop_length;
+        assert_eq!(
+            log_mel_of(&overflowing, &params),
+            dense_reference(&overflowing, frames, &params),
+            "the dense fallback did not engage on a non-finite spectrum"
+        );
+
+        let ordinary = sample_corpus()
+            .into_iter()
+            .find(|(name, _)| *name == "noise")
+            .expect("corpus")
+            .1;
+        assert!(
+            frame_powers_are_finite(&ordinary, &params),
+            "an ordinary clip should take the sparse path"
+        );
+    }
+
+    /// Whether every frame's power spectrum is finite, i.e. whether
+    /// `whisper_log_mel` would take its sparse path throughout.
+    fn frame_powers_are_finite(samples: &[f32], params: &Qwen3AudioParams) -> bool {
+        let padded = reflect_pad(samples, params.n_fft / 2);
+        let window = hann_window(params.n_fft);
+        let fft = FftPlanner::<f32>::new().plan_fft_forward(params.n_fft);
+        let mut buffer = vec![Complex32::new(0.0, 0.0); params.n_fft];
+        (0..samples.len() / params.hop_length).all(|frame| {
+            let start = frame * params.hop_length;
+            for index in 0..params.n_fft {
+                buffer[index] = Complex32::new(padded[start + index] * window[index], 0.0);
+            }
+            fft.process(&mut buffer);
+            buffer[..params.n_fft / 2 + 1]
+                .iter()
+                .all(|bin| bin.re.mul_add(bin.re, bin.im * bin.im).is_finite())
+        })
+    }
+
+    /// Deterministic waveforms covering the paths a numerical change disturbs.
+    fn sample_corpus() -> Vec<(&'static str, Vec<f32>)> {
+        const N: usize = 8_000;
+        let mut state = 0x243f_6a88_u32;
+        let mut noise = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        vec![
+            (
+                "tone",
+                (0..N).map(|i| (i as f32 * 0.001).sin() * 0.5).collect(),
+            ),
+            ("noise", (0..N).map(|_| noise()).collect()),
+            ("silence", vec![0.0; N]),
+            ("impulse", {
+                let mut v = vec![0.0_f32; N];
+                v[7] = 1.0;
+                v
+            }),
+            (
+                "loud",
+                (0..N)
+                    .map(|i| {
+                        if (i / 37) % 2 == 0 {
+                            30_000.0
+                        } else {
+                            -30_000.0
+                        }
+                    })
+                    .collect(),
+            ),
+            (
+                "quiet",
+                (0..N).map(|i| (i as f32 * 0.01).sin() * 1e-30).collect(),
+            ),
+        ]
     }
 }
