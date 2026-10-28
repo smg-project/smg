@@ -377,3 +377,75 @@ def test_the_newest_tag_is_the_default(mod, repo):
         "Summary: 0 crate(s) with changes, 6 unchanged; 0 Python package(s) with changes, 2 unchanged"
         in out
     )
+
+
+# --- the versions release tags carry ----------------------------------------------
+
+
+def test_version_keys_order_candidates_below_their_finals(mod):
+    versions = ("1.9.0", "1.10.0-rc.1", "1.10.0-rc.2", "1.10.0", "1.10.1")
+    keys = [mod.version_key(v) for v in versions]
+    assert keys == sorted(keys)
+    assert mod.version_key("1.2") is None and mod.version_key("v1.2.3") is None
+
+
+def test_texts_at_reads_every_ref_and_path_in_one_call(mod, repo):
+    wanted = [
+        ("v1.0.0", "crates/alpha/Cargo.toml"),
+        ("v1.0.0", "crates/delta/Cargo.toml"),  # not at the tag
+        ("HEAD", "crates/delta/Cargo.toml"),
+    ]
+    texts = mod.Repo(repo).texts_at(wanted)
+    assert set(texts) == {wanted[0], wanted[2]}
+    assert mod.read_version("cargo", texts[wanted[0]], "") == "1.0.0"
+    assert mod.read_version("cargo", texts[wanted[2]], "") == "0.2.0"
+
+
+def side_line(repo):
+    """Another release line's tag, off v1.0.0: beta patched to 1.0.1 there, alpha at the 1.1.0
+    main gave it; v1.0.9 so that it is not the newest tag by date in every reading."""
+    git(repo, "switch", "-q", "-c", "release/1.0", "v1.0.0")
+    put(repo, "crates/beta/src/lib.rs", "// beta patched on the line\n")
+    put(repo, "crates/beta/Cargo.toml", manifest("beta", "1.0.1"))
+    put(repo, "crates/alpha/Cargo.toml", manifest("alpha", "1.1.0"))
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "chore(release): bump versions for v1.0.9")
+    git(repo, "tag", "v1.0.9")
+    git(repo, "switch", "-q", "main")
+
+
+def test_a_version_any_release_tag_carries_is_not_a_bump(mod, repo):
+    """Two release lines share the crate versions and a registry takes a version once. Against
+    v1.0.0: beta, unbumped there, is proposed 1.0.2, past the 1.0.1 the other line's tag carries;
+    alpha, raised to 1.1.0 since v1.0.0 but at the version that tag carries, reads unbumped too
+    and its minor bump lands on 1.2.0. Against the other line's tag, beta's 1.0.0 sits below its
+    1.0.1, a difference the equality rule read as a bump: it is v1.0.0's version, so unbumped."""
+    side_line(repo)
+    code, out = run(mod, repo, tag="v1.0.0")
+    assert code == 1
+    assert (
+        "  ! beta (crates/beta/) — 1 file(s) changed but version not bumped (v1.0.0) [patch]" in out
+    )
+    assert (
+        "  ! alpha (crates/alpha/) — 1 file(s) changed but version not bumped (v1.1.0, v1.0.9's) [minor]"
+        in out
+    )
+    code, out = run(mod, repo, tag="v1.0.9")
+    assert (
+        "  ! beta (crates/beta/) — 1 file(s) changed but version not bumped (v1.0.0, v1.0.0's) [patch]"
+        in out
+    )
+    code, out = run(mod, repo, tag="v1.0.0", mode="prompt", answer="n")
+    assert "  patch beta v1.0.0 → v1.0.2 (crates/beta/Cargo.toml; v1.0.1 is v1.0.9's)" in out
+    assert "       sync workspace Cargo.toml beta → v1.0.2" in out
+    assert "  minor alpha v1.1.0 → v1.2.0 (crates/alpha/Cargo.toml)" in out
+    code, out = run(mod, repo, tag="v1.0.0", mode="fix")
+    assert code == 0, out
+    assert mod.read_version("cargo", (repo / "crates/beta/Cargo.toml").read_text(), "") == "1.0.2"
+    assert mod.read_version("cargo", (repo / "crates/alpha/Cargo.toml").read_text(), "") == "1.2.0"
+    root = (repo / "Cargo.toml").read_text()
+    assert mod.workspace_dep_version(root, "beta") == "1.0.2"
+    assert mod.workspace_dep_version(root, "alpha") == "1.2.0"
+    code, out = run(mod, repo, tag="v1.0.0")
+    assert code == 0, out
+    assert "All versions consistent." in out
