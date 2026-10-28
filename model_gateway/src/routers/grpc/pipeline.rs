@@ -2801,7 +2801,7 @@ mod request_release_tests {
             serde_json::json!({"url": "data:video/mp4;base64,invalid"}),
         ] {
             let (pipeline, components, seen_ids) =
-                chat_pipeline_over(RuntimeType::Sglang, &[]).await;
+                chat_pipeline_over(RuntimeType::Trtllm, &[]).await;
             let started = Instant::now();
             let (status, body) = chat_error_body(
                 &pipeline,
@@ -2827,7 +2827,7 @@ mod request_release_tests {
             assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
             assert_eq!(body["error"]["code"], "multimodal_not_supported", "{body}");
             assert_eq!(
-                body["error"]["message"], "backend sglang does not support video inputs",
+                body["error"]["message"], "backend trtllm does not support video inputs",
                 "{body}"
             );
             assert!(

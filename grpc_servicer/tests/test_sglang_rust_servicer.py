@@ -52,6 +52,14 @@ def _install_fake_servicer(monkeypatch, server, init_servicer_tracing=None):
     )
 
 
+@pytest.fixture(autouse=True)
+def restore_native_thread_defaults(monkeypatch):
+    """Restore launch defaults even when configure_threads creates absent variables."""
+    for name in ["SMG_SERVICER_WORKER_THREADS", "SMG_MM_THREADS", "SMG_MM_IMAGE_CONCURRENCY"]:
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+
+
 @pytest.fixture
 def no_parsed_flag(monkeypatch):
     """No ``--servicer-impl`` parsed in this process, whatever ran before."""
@@ -1392,3 +1400,49 @@ def test_server_facts_carry_the_structural_tag_vocabulary_of_an_older_xgrammar(m
         rust.server_facts(_server_args(grammar_backend="xgrammar"))["server_args_json"]
     )
     assert "structural_tag_vocabulary" not in current
+
+
+def test_native_media_processor_launch_options(monkeypatch):
+    """Forward native processor settings and enforce positive admission limits."""
+    monkeypatch.setenv("SMG_SGLANG_MM_PROCESSOR", "smg")
+    monkeypatch.setenv("SMG_SGLANG_MM_MAX_INFLIGHT", "8")
+    monkeypatch.setattr(rust, "_model_config", lambda _: SimpleNamespace(dtype="bfloat16"))
+    monkeypatch.setattr("smg_grpc_servicer.sglang.mm_defaults.configure_threads", lambda: None)
+    options = rust.SglangLauncher().server_extras(
+        _server_args(limit_mm_data_per_request={"image": 2, "video": 1}), "/tok"
+    )
+    assert options["smg_media_processor"]["model_dir"] == str(_server_args().model_path)
+    assert options["smg_media_processor"]["max_inflight"] == 8
+    assert options["smg_media_processor"]["engine_item_limits"] == {"image": 2, "video": 1}
+    assert "encode_dispatcher" not in options
+    with pytest.raises(ValueError, match="encode disaggregation"):
+        rust.SglangLauncher().server_extras(
+            _server_args(language_only=True, encoder_transfer_backend="zmq_to_scheduler"),
+            "/tok",
+        )
+    with pytest.raises(ValueError, match="tokenizer directory"):
+        rust.SglangLauncher().server_extras(_server_args(), None)
+    for invalid in ("0", "-1", "sixty-four"):
+        monkeypatch.setenv("SMG_SGLANG_MM_MAX_INFLIGHT", invalid)
+        with pytest.raises(ValueError, match="SMG_SGLANG_MM_MAX_INFLIGHT must be positive"):
+            rust.SglangLauncher().server_extras(_server_args(), "/tok")
+    monkeypatch.setenv("SMG_SGLANG_MM_PROCESSOR", "python")
+    with pytest.raises(ValueError, match="empty or smg"):
+        rust.SglangLauncher().server_extras(_server_args(), "/tok")
+
+
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16", "float16"])
+def test_native_media_dtype(monkeypatch, dtype):
+    """Pass each supported vision dtype to the native worker."""
+    monkeypatch.setenv("SMG_SGLANG_MM_PROCESSOR", "smg")
+    monkeypatch.setenv("SMG_SGLANG_MM_DTYPE", dtype)
+    options = rust.SglangLauncher().server_extras(_server_args(), "/tok")
+    assert options["smg_media_processor"]["encoder_dtype"] == dtype
+
+
+def test_native_media_dtype_rejects_unknown(monkeypatch):
+    """Reject unsupported pixel dtypes before server startup."""
+    monkeypatch.setenv("SMG_SGLANG_MM_PROCESSOR", "smg")
+    monkeypatch.setenv("SMG_SGLANG_MM_DTYPE", "fp8")
+    with pytest.raises(ValueError, match="SMG_SGLANG_MM_DTYPE"):
+        rust.SglangLauncher().server_extras(_server_args(), "/tok")

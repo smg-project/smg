@@ -249,6 +249,15 @@ impl ProtoGenerateRequest {
     pub fn clone_without_mm_pixels(&mut self) -> Self {
         match self {
             Self::Sglang(req) => {
+                // A reference request still has unexpanded anchors. Decode
+                // must run the same processor to obtain the same prompt
+                // length and positions before receiving Prefill's KV.
+                if req.mm_inputs.as_ref().is_some_and(|mm| {
+                    mm.pixel_values.is_none()
+                        && (!mm.image_urls.is_empty() || !mm.video_urls.is_empty())
+                }) {
+                    return Self::Sglang(req.clone());
+                }
                 let mm = req.mm_inputs.take();
                 let clone = Self::Sglang(req.clone());
                 req.mm_inputs = mm;
@@ -435,15 +444,36 @@ impl ProtoGenerateRequest {
         }
     }
 
-    /// Attach media references for worker-side multimodal processing (vLLM only).
-    pub fn set_vllm_media_refs(&mut self, refs: vllm::MediaRefs) -> Result<(), String> {
+    /// Attach media references for worker-side multimodal processing.
+    pub fn set_media_refs(&mut self, refs: vllm::MediaRefs) -> Result<(), String> {
         match self {
             Self::Vllm(req) => {
                 req.media_refs = Some(refs);
                 Ok(())
             }
-            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
-                Err("media refs require a vLLM gRPC worker".to_string())
+            Self::Sglang(req) => {
+                let mut mm = sglang::MultimodalInputs::default();
+                for item in refs.items {
+                    match smg_grpc_client::common_proto::Modality::try_from(item.modality) {
+                        Ok(smg_grpc_client::common_proto::Modality::Image) => {
+                            mm.image_urls.push(item.url);
+                        }
+                        Ok(smg_grpc_client::common_proto::Modality::Video) => {
+                            mm.video_urls.push(item.url);
+                        }
+                        _ => return Err("SGLang media references require images or videos".into()),
+                    }
+                }
+                if !mm.image_urls.is_empty() && !mm.video_urls.is_empty() {
+                    return Err(
+                        "SGLang media references require a single modality per request".into(),
+                    );
+                }
+                req.mm_inputs = Some(mm);
+                Ok(())
+            }
+            Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
+                Err("media refs require a supported gRPC worker".to_string())
             }
         }
     }

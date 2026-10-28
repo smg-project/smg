@@ -319,24 +319,37 @@ impl AsyncMultiModalTracker {
         Ok(())
     }
 
+    /// Await every fetch, including siblings of a failed fetch, before releasing caller admission.
     pub async fn finalize(mut self) -> MultiModalResult<TrackerOutput> {
         let mut data = MultiModalData::new();
+        let mut first_error = None;
         for (modality, slots) in self.pending.drain() {
             let mut items: Vec<TrackedMedia> = Vec::with_capacity(slots.len());
             for slot in slots {
                 let media = match slot {
-                    Slot::Fetch(task) => task.await??,
+                    Slot::Fetch(task) => task
+                        .await
+                        .map_err(MultiModalError::from)
+                        .and_then(|media| media),
                     Slot::SameAs(first) => items.get(first).cloned().ok_or_else(|| {
                         MultiModalError::Validation(format!(
                             "{modality} slot refers to a slot that was never fetched"
                         ))
-                    })?,
+                    }),
                 };
-                items.push(media);
+                match media {
+                    Ok(media) => items.push(media),
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
             }
             data.insert(modality, items);
         }
 
+        if let Some(error) = first_error {
+            return Err(error);
+        }
         Ok(TrackerOutput {
             data,
             uuids: self.uuids,
@@ -750,6 +763,50 @@ mod repeat_tests {
         )
         .expect("default connector");
         AsyncMultiModalTracker::new(Arc::new(connector))
+    }
+
+    /// A failed fetch must not detach a sibling and release the request's admission early.
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "fetch handles are owned and drained by the tracker under test"
+    )]
+    async fn failed_fetch_drains_sibling_before_returning() {
+        use tokio::sync::oneshot;
+        for panic in [false, true] {
+            let mut tracker = tracker();
+            let (release, wait) = oneshot::channel();
+            tracker.pending.insert(
+                Modality::Video,
+                vec![
+                    Slot::Fetch(tokio::spawn(async move {
+                        assert!(!panic, "fetch panic");
+                        Err(MultiModalError::Validation("first fetch failed".into()))
+                    })),
+                    Slot::Fetch(tokio::spawn(async move {
+                        wait.await.unwrap();
+                        Err(MultiModalError::Validation("sibling finished".into()))
+                    })),
+                ],
+            );
+            let finalize = tracker.finalize();
+            tokio::pin!(finalize);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), &mut finalize)
+                    .await
+                    .is_err()
+            );
+            release.send(()).unwrap();
+            let error = finalize.await.unwrap_err().to_string();
+            assert!(
+                error.contains(if panic {
+                    "fetch panic"
+                } else {
+                    "first fetch failed"
+                }),
+                "{error}"
+            );
+        }
     }
 
     /// The plan side classifies a URL part as the fetch will: the scheme as

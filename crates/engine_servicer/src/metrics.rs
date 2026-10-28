@@ -653,6 +653,17 @@ impl ServicerMetrics {
         }
     }
 
+    /// SGLang PD media preprocessing/reuse attempts, on this servicer's
+    /// recorder (never the gateway's process-global recorder).
+    pub(crate) fn media_identity(&self, outcome: &'static str) {
+        if let Some(recorded) = &self.recorded {
+            recorded
+                .registrar
+                .counter("smg_servicer_media_identity_total", &[("outcome", outcome)])
+                .increment(1);
+        }
+    }
+
     /// A request ended before its stream existed: the status `Generate`
     /// answered with. A refusal of the servicer's own (a duplicate id, a
     /// drain, an invalid request, media that could not be processed) counts

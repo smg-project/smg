@@ -29,6 +29,29 @@ def test_register_is_inert_without_the_launcher_env():
     zmq_plugin.register()
 
 
+@pytest.mark.parametrize("available", [False, True])
+def test_optional_media_broadcast_hook_requires_engine_support(monkeypatch, available):
+    """Older engines keep inline broadcast without registering a missing method."""
+    import sys
+
+    from smg_grpc_servicer.sglang import mm_broadcast
+
+    registered = []
+    registry = SimpleNamespace(register=lambda *args: registered.append(args))
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.plugins.hook_registry",
+        SimpleNamespace(HookRegistry=registry, HookType=SimpleNamespace(AROUND=1, AFTER=2)),
+    )
+    monkeypatch.setattr(zmq_plugin, "attributes_grammar_aborts", lambda: False)
+    monkeypatch.setattr(zmq_plugin, "active", lambda: True)
+    monkeypatch.setattr(zmq_plugin, "_resolves", lambda target: available)
+    monkeypatch.setattr(mm_broadcast, "enabled", lambda: True)
+    zmq_plugin.register()
+    media_hooks = [entry for entry in registered if entry[1] is mm_broadcast.broadcast_with_shm]
+    assert len(media_hooks) == int(available)
+
+
 def test_grammar_attribution_registers_under_either_env(monkeypatch):
     # The handshake implies it (the ZMQ wire carries the name); the Python
     # servicer asks for it alone, for the finish dicts it reads.

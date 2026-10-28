@@ -14,7 +14,7 @@ use std::{
 };
 
 use engine_zmq_adapter::{to_sglang_response, SglangGenerateStream};
-use futures::{stream::SelectAll, Stream};
+use futures::{stream::SelectAll, Stream, StreamExt};
 use smg_grpc_client::{sglang_proto as sg, vllm_proto as vllm};
 use tonic::Status;
 
@@ -32,7 +32,7 @@ use crate::{
 /// each choice's request so the engine's spans join the Router's trace.
 pub(super) async fn generate(
     state: &Arc<State>,
-    req: sg::GenerateRequest,
+    mut req: sg::GenerateRequest,
     trace_headers: Option<BTreeMap<String, String>>,
 ) -> Result<BoxStream<sg::GenerateResponse>, Status> {
     // The request's arrival, the instant its latencies are measured from.
@@ -47,7 +47,69 @@ pub(super) async fn generate(
     let request_id: Arc<str> = Arc::from(req.request_id.as_str());
     // Register before the submit: an `Abort` landing in the gap must find the
     // entry, and a duplicate id is refused up front.
-    let (registration, cancel) = state.shared.registry.register(&request_id)?;
+    let (registration, mut cancel) = state.shared.registry.register(&request_id)?;
+    let original = req.return_media_identity.then(|| req.clone());
+    let reused = super::media_identity::apply(state, &mut req);
+    // Hash fields are only accepted on an internally validated pixel-less hint
+    // or on the freshly processed Prefill result below.
+    if let Some(mm) = &mut req.mm_inputs {
+        if !reused {
+            mm.feature_hash = None;
+        }
+    }
+    if req.mm_inputs.as_ref().is_some_and(|mm| {
+        mm.pixel_values.is_none() && (!mm.image_urls.is_empty() || !mm.video_urls.is_empty())
+    }) {
+        if let Some(processor) = &state.media {
+            state.shared.metrics.media_identity("processed");
+            req = tokio::select! {
+                biased;
+                _ = &mut cancel => return Err(Status::cancelled("media request aborted")),
+                result = processor.process(req) => result?,
+            };
+        }
+    }
+    let mut early_identity = None;
+    if let Some(original) = original {
+        let mut identity = sg::MediaIdentity::default();
+        if super::media_identity::mode(state, "prefill") {
+            if let (Some(key), Some(hasher), Some(mm)) = (
+                super::media_identity::key(state),
+                state.mm_hasher.as_ref(),
+                req.mm_inputs.as_mut(),
+            ) {
+                if smg_grpc_client::sglang_media_identity::reusable_request(&original) {
+                    tokio::select! {
+                        biased;
+                        _ = &mut cancel => return Err(Status::cancelled("media identity request aborted")),
+                        result = hasher.precompute_proto(mm, &req.request_id) => result?,
+                    };
+                    identity = sg::MediaIdentity {
+                        version: smg_grpc_client::sglang_media_identity::VERSION,
+                        processor_key: key.to_string(),
+                        request_digest: smg_grpc_client::sglang_media_identity::request_digest(
+                            &original,
+                        ),
+                        input_ids: req
+                            .tokenized
+                            .as_ref()
+                            .map_or_else(Vec::new, |t| t.input_ids.clone()),
+                        mm_inputs: Some(smg_grpc_client::sglang_media_identity::pixel_less(mm)),
+                    };
+                    if smg_grpc_client::sglang_media_identity::validate(&identity, &original, key) {
+                        state.shared.metrics.media_identity("prepared");
+                    } else {
+                        identity = sg::MediaIdentity::default();
+                    }
+                }
+            }
+        }
+        early_identity = Some(sg::GenerateResponse {
+            request_id: req.request_id.clone(),
+            media_identity: Some(identity),
+            response: None,
+        });
+    }
     let streaming = req.stream;
     let prompt_tokens = req.tokenized.as_ref().map_or(0, |tokenized| {
         u32::try_from(tokenized.input_ids.len()).unwrap_or(u32::MAX)
@@ -60,7 +122,12 @@ pub(super) async fn generate(
     // encoders before the submit (the dispatcher the lifecycle owner
     // supplied); every other worker refuses such a request there.
     let subs = client
-        .generate_sglang_streams_dispatching(req, trace_headers, state.encode.as_ref())
+        .generate_sglang_streams_dispatching_with_mm_hasher(
+            req,
+            trace_headers,
+            state.encode.as_ref(),
+            state.mm_hasher.as_ref(),
+        )
         .await?;
     let metrics = state.shared.metrics.request(
         arrival,
@@ -78,12 +145,10 @@ pub(super) async fn generate(
             metrics: metrics.choice(),
         });
     }
-    Ok(Box::pin(RequestStream::new(
-        choices,
-        cancel,
-        registration,
-        metrics,
-    )))
+    let stream = RequestStream::new(choices, cancel, registration, metrics);
+    Ok(Box::pin(
+        futures::stream::iter(early_identity.map(Ok)).chain(stream),
+    ))
 }
 
 /// `return_hidden_states` on a scheduler launched below `full`

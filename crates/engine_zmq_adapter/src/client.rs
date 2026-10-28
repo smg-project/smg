@@ -1111,6 +1111,26 @@ impl ZmqEngineClient {
         trace_headers: Option<BTreeMap<String, String>>,
         dispatcher: Option<&Arc<dyn SglangEncodeDispatcher>>,
     ) -> Result<Vec<SglangGenerateStream>, tonic::Status> {
+        self.generate_sglang_streams_dispatching_with_mm_hasher(
+            req,
+            trace_headers,
+            dispatcher,
+            None,
+        )
+        .await
+    }
+
+    /// As above, with bounded off-runtime CPU feature hashing. The caller must
+    /// opt in only for an engine using the SHA256 CPU identity algorithm, not
+    /// its GPU hash buffer or skip-hash path. This is a local option, never an
+    /// identity supplied by an untrusted RPC caller.
+    pub async fn generate_sglang_streams_dispatching_with_mm_hasher(
+        &self,
+        req: sglang_proto::GenerateRequest,
+        trace_headers: Option<BTreeMap<String, String>>,
+        dispatcher: Option<&Arc<dyn SglangEncodeDispatcher>>,
+        hasher: Option<&crate::SglangCpuMmHasher>,
+    ) -> Result<Vec<SglangGenerateStream>, tonic::Status> {
         let ZmqBackend::Sglang(client) = &self.backend else {
             return Err(tonic::Status::internal(
                 "this ZMQ backend is not an SGLang scheduler",
@@ -1148,6 +1168,9 @@ impl ZmqEngineClient {
             let mut request = translate_request_sglang(sub, max_model_len, ranks, placement)
                 .map_err(tonic::Status::invalid_argument)?;
             request.trace_headers.clone_from(&trace_headers);
+            if let (Some(hasher), Some(mm)) = (hasher, request.mm_inputs.as_mut()) {
+                hasher.precompute(mm, &request.rid).await?;
+            }
             let dispatched = match (image_refs, dispatcher) {
                 (None, _) => None,
                 (Some(_), None) => {
