@@ -2,25 +2,27 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from infra.web_search import (
     NO_RESULTS_ANSWER,
     is_no_results_answer,
     skip_if_web_search_found_nothing,
 )
-from openai.types.responses.response_output_item import McpCall, McpListTools
+from openai.types.responses.response_output_item import McpListTools
 
 
-def _mcp_call(error: dict | None = None) -> McpCall:
-    return McpCall.model_validate(
-        {
+def _mcp_call(error: dict | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        **{
             "id": "mcp_1",
             "type": "mcp_call",
             "name": "web_search",
             "arguments": '{"query": "Python programming language", "count": 1}',
             "server_label": "search",
             "status": "completed" if error is None else "failed",
-            "error": error,
+            "error": SimpleNamespace(**error) if error is not None else None,
             "output": None if error else "1. Python (programming language) - Wikipedia",
         }
     )
