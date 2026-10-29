@@ -2,19 +2,17 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 from infra.web_search import (
     NO_RESULTS_ANSWER,
     is_no_results_answer,
     skip_if_web_search_found_nothing,
 )
-from openai.types.responses.response_output_item import McpListTools
+from openai.types.responses.response_output_item import McpCall, McpListTools
 
 
-def _mcp_call(error: dict | None = None) -> SimpleNamespace:
-    return SimpleNamespace(
+def _mcp_call(error: dict | None = None) -> McpCall:
+    return McpCall.construct(
         **{
             "id": "mcp_1",
             "type": "mcp_call",
@@ -22,7 +20,7 @@ def _mcp_call(error: dict | None = None) -> SimpleNamespace:
             "arguments": '{"query": "Python programming language", "count": 1}',
             "server_label": "search",
             "status": "completed" if error is None else "failed",
-            "error": SimpleNamespace(**error) if error is not None else None,
+            "error": error,
             "output": None if error else "1. Python (programming language) - Wikipedia",
         }
     )
