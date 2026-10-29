@@ -871,6 +871,10 @@ class Worker:
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.gpu_ids))
+        # A nonempty HIP mask takes precedence over CUDA on ROCm. Select this
+        # worker within the parent's ROCR-visible order, leaving ROCR unchanged.
+        if env.get("HIP_VISIBLE_DEVICES"):
+            env["HIP_VISIBLE_DEVICES"] = env["CUDA_VISIBLE_DEVICES"]
         if self.engine == "vllm":
             # vLLM 0.31.0 runs tensor-parallel all-reduces through FlashInfer,
             # whose auto backend picks the MNNVL kernel wherever NVLink
