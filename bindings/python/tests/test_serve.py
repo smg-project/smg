@@ -1652,6 +1652,7 @@ class TestServeOrchestrator:
         assert len(orch.workers) == 1
         assert orch.workers[0][1] == 50051
 
+    @patch.dict("os.environ", {"CUDA_VISIBLE_DEVICES": "0,1,2,3"})
     def test_launch_workers_passes_gpu_env(self):
         """_launch_workers passes CUDA_VISIBLE_DEVICES via gpu_env for each dp_rank."""
         args = _make_args(data_parallel_size=2, tensor_parallel_size=2, connection_mode="grpc")
