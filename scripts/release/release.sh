@@ -74,10 +74,17 @@ fetch() { git fetch --quiet --tags "$REMOTE" || die "cannot fetch $REMOTE"; }
 has_ref() { git rev-parse --verify --quiet "$1^{commit}" >/dev/null 2>&1; }
 remote_has_branch() { git ls-remote --exit-code --heads "$REMOTE" "$1" >/dev/null 2>&1; }
 remote_has_tag() { git ls-remote --exit-code --tags "$REMOTE" "refs/tags/$1" >/dev/null 2>&1; }
-release_base() { # the remote-tracking release branch, fetched
+release_base() { # the remote-tracking release branch, fetched: what a bump, a pick or a tag builds on
   local branch="release/$1"
   has_ref "$REMOTE/$branch" || die "no $branch on $REMOTE: cut it first (release.sh cut <version> [<from>])"
   printf '%s/%s' "$REMOTE" "$branch"
+}
+release_ref() { # the release branch a read-only command reads: the remote's, else a local cut not pushed yet (a rehearsal), said so
+  local branch="release/$1"
+  if has_ref "$REMOTE/$branch"; then printf '%s/%s' "$REMOTE" "$branch"; return 0; fi
+  has_ref "refs/heads/$branch" || die "no $branch on $REMOTE or here: cut it first (release.sh cut <version> [<from>])"
+  note "$branch is not on $REMOTE yet: reading the local branch (the push: git push $REMOTE refs/heads/$branch:refs/heads/$branch)"
+  printf 'refs/heads/%s' "$branch"
 }
 previous_tag() { # the newest release tag reachable from $1
   git describe --tags --abbrev=0 --match 'v[0-9]*' "$1" 2>/dev/null \
@@ -356,7 +363,7 @@ cmd_status() {
   release_ok "$release"
   local base picked full short subject n=0
   fetch
-  base=$(release_base "$release")
+  base=$(release_ref "$release")
   picked=$(picked_into "$base")
   say "== release/$release is at $(git rev-parse --short "$base"): $(git log -1 --format=%s "$base")"
   say "== versions: $(manifest_version "$base") ($GATEWAY_MANIFEST)"
@@ -417,7 +424,7 @@ cmd_notes() {
   if has_ref "refs/tags/$tagname"; then
     ref=$tagname
   else
-    ref=$(release_base "$release")
+    ref=$(release_ref "$release")
     note "notes: $tagname is not tagged yet; reading release/$release's head"
   fi
   if [ -z "$since" ]; then
@@ -605,7 +612,7 @@ cmd_publish_plan() {
   if has_ref "refs/tags/$tagname"; then
     ref=$tagname
   else
-    ref=$(release_base "$release")
+    ref=$(release_ref "$release")
     note "publish-plan: $tagname is not tagged yet; the plan reads release/$release's head and names the tag as the ref to dispatch on"
   fi
   [ "$(manifest_version "$ref")" = "$version" ] || die "$ref reads $(manifest_version "$ref"), not $version"
@@ -662,7 +669,7 @@ cmd_check() {
   local release branch base head tagname carried since scratch slug checks runs drift=0 family failed=0 full picked
   release=$(release_of "$version"); branch="release/$release"; tagname="v$version"
   fetch
-  base=$(release_base "$release"); head=$(git rev-parse "$base")
+  base=$(release_ref "$release"); head=$(git rev-parse "$base")
   say "Release gate for v$version ($branch at $(git rev-parse --short "$head"): $(git log -1 --format=%s "$head"))"
   say ""
   # 1. the versions at the head
