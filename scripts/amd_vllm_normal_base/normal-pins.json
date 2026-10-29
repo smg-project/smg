@@ -1,0 +1,120 @@
+{
+  "source_head": "9134d03216a53077668f373e2d9ed2546da57635",
+  "source_base": "9134d03216a53077668f373e2d9ed2546da57635",
+  "producer_head": "9134d03216a53077668f373e2d9ed2546da57635",
+  "vllm_wheel": "vllm-0.32.1rc1.dev505+g00b6c4c56.rocm100.smggrpc1811-cp312-cp312-linux_x86_64.whl",
+  "pycairo_wheel": "pycairo-1.29.2-cp312-cp312-linux_x86_64.whl",
+  "smg_wheel": "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl",
+  "flat_inputs": {
+    "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl": {
+      "bytes": 53420249,
+      "sha256": "dd25ba68327afcd7e38356e490946e5a5073b24f1a02cfb6995b4b3287e4f295"
+    },
+    "_generated.py": {
+      "bytes": 188787,
+      "sha256": "c6e9cffe1d9007401bdf24993d698797a98012793ab342c834c8f7e5922ad87f"
+    },
+    "native_identity_adapter.py": {
+      "bytes": 6884,
+      "sha256": "57c6e2dce180c839ba9389cbb3bec262d3d0b11c473a354c49a5ab31ca58b97c"
+    },
+    "wire_probe.py": {
+      "bytes": 7097,
+      "sha256": "39e05ebc979b4825e886110bde274a5a3d3bdee81880187a8a33a0507dc8fa72"
+    },
+    "vllm-0.32.1rc1.dev505+g00b6c4c56.rocm100.smggrpc1811-cp312-cp312-linux_x86_64.whl": {
+      "bytes": 317317515,
+      "sha256": "cdfb7f9eaac435a072fc2eeab3cf4ed8d8d624d405f5e689e1ec918589b63d77"
+    },
+    "pycairo-1.29.2-cp312-cp312-linux_x86_64.whl": {
+      "bytes": 132355,
+      "sha256": "e006d5e39469035fe615799dced8b7f3c267a43f256b07a551e6cf92a9f03bac"
+    },
+    "postflight.py": {
+      "bytes": 9041,
+      "sha256": "0c58ee21e589f12b49766b2588a5a08972f717ddb80a7226840f15f67c933727"
+    },
+    "postflight-inputs.json": {
+      "bytes": 52198,
+      "sha256": "0b9d9079a5b4c8870c56e5ca223ac6e410879d50779d0e1e06c02694834a1a07"
+    },
+    "identity-pins.json": {
+      "bytes": 4166,
+      "sha256": "97cc3ae4ed9cf950cfe986b24047f65fd454dfa08534bc051321ae3061810a12"
+    }
+  },
+  "artifact_acceptances": {
+    "vllm": {
+      "bytes": 5140,
+      "sha256": "acf4df384cc21c42b141dc9043907b140a74ad623f7a3df0020f386436af4cea"
+    },
+    "pycairo": {
+      "bytes": 5438,
+      "sha256": "03c029594e69c431a8be5cbbca12bed8feb12155bcb858cbfc9d95834f961b03"
+    },
+    "smg": {
+      "bytes": 3833,
+      "sha256": "5b993af542ee264fc70d0eedaf260db54069074095032084d8c38e4551451bf4"
+    }
+  },
+  "Cairo_runtime_package_version": "1.16.0-5ubuntu2.1",
+  "runtime_constraints_text": "# Proposed protective runtime constraints; not a solved/downloaded wheelhouse.\n# This targets the future fully accepted repack wheel, never the current64missing HOLD.\ntorch==2.13.0+rocm10.0.0\ntorchvision==0.28.0+rocm10.0.0\ntorchaudio==2.11.0+rocm10.0.0\ntriton==3.8.0+git669b31ac\namd-aiter==0.1.26\namdsmi==27.0.0+6b0e43f3\nflash-attn==2.8.3\nrocm==10.0.0\ngrpcio==1.81.1\ngrpcio-reflection==1.81.1\ngrpcio-health-checking==1.81.1\ngrpcio-tools==1.81.1\nprotobuf==6.33.6\nsetuptools==79.0.1\nsetuptools-scm==10.3.4\nsetuptools-rust==1.13.0\npackaging==26.3\nwheel==0.48.0\nsmg-grpc-proto==0.4.28\nsmg-grpc-servicer==0.14.1\npycairo==1.29.2\n",
+  "runtime_versions": {
+    "vllm": "0.32.1rc1.dev505+g00b6c4c56.rocm100.smggrpc1811",
+    "pycairo": "1.29.2",
+    "grpcio": "1.81.1",
+    "grpcio-reflection": "1.81.1",
+    "grpcio-health-checking": "1.81.1",
+    "grpcio-tools": "1.81.1",
+    "protobuf": "6.33.6",
+    "smg-grpc-proto": "0.4.28",
+    "smg-grpc-servicer": "0.14.1"
+  },
+  "protected_base_distributions": [
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "triton",
+    "amd-aiter",
+    "amdsmi",
+    "flash-attn",
+    "rocm"
+  ],
+  "runtime_admitted": false,
+  "runtime_accepted": false,
+  "CPU_grant": null,
+  "reserved_seconds": 0,
+  "SOURCE_DATA_ONLY": true,
+  "normal_BASE_root_acceptance_sha256": "b4bae63c180d6e6444b5a7fb4465286d827123a51be7282eee9d5e1f3e94a76b",
+  "normal_BASE_actual_peer_sha256": "d53e3134f033755107bca533f5e783ff2b33061bc1f12d79e187d15720d3e6c5",
+  "input_directory": "/opt/smg-vllm-normal-input",
+  "purpose": "Future normal install/gencode/fullpip/native/CPU-fixture RPC on true vLLM00b6 with current9134 SMG; no accepted runtime or model result",
+  "current_product_data_provenance": {
+    "wheel": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/goal-progress-normal-provenance-controls-Root-20261028/main9134-upstream-wheel-data-Root/smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl",
+      "bytes": 53420249,
+      "sha256": "dd25ba68327afcd7e38356e490946e5a5073b24f1a02cfb6995b4b3287e4f295"
+    },
+    "types": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/goal-progress-normal-provenance-controls-Root-20261028/main9134-current-client-types-data-Root/_generated.py",
+      "bytes": 188787,
+      "sha256": "c6e9cffe1d9007401bdf24993d698797a98012793ab342c834c8f7e5922ad87f"
+    },
+    "source": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/goal-progress-normal-provenance-controls-Root-20261028/main9134-retained-native-normal-CPU600-source-D-20261029/input/source.tar.gz",
+      "bytes": 12178702,
+      "sha256": "c806bf9baf62840a77fb2218bfc80b5a3484bd4144b9abdebe79cbd5ae93a133"
+    },
+    "Root_data_verification": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/goal-progress-normal-provenance-controls-Root-20261028/main9134-upstream-wheel-data-Root/data-verification.json",
+      "bytes": 3833,
+      "sha256": "5b993af542ee264fc70d0eedaf260db54069074095032084d8c38e4551451bf4"
+    },
+    "Root_types_data_verification": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/goal-progress-normal-provenance-controls-Root-20261028/main9134-current-client-types-data-Root/data-verification.json",
+      "bytes": 879,
+      "sha256": "29d2b2ea72ce41537128cf7bbe6e71303e5046d0b15a112c2af7ed54be008db6"
+    },
+    "current_product_installation_accepted": false
+  }
+}

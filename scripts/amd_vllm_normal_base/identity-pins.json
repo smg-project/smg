@@ -1,0 +1,94 @@
+{
+  "PREVIEW_ONLY": true,
+  "source_base": "9134d03216a53077668f373e2d9ed2546da57635",
+  "producer": {
+    "head": "9134d03216a53077668f373e2d9ed2546da57635",
+    "run_id": 40795986051,
+    "job_id": 123192466952,
+    "run_attempt": 1,
+    "build_source_evidence": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/goal-progress-normal-provenance-controls-Root-20261028/main9134-current-artifact-route-A-20261029/artifact-summary.json",
+      "bytes": 11633,
+      "sha256": "83b2889d887869fd7214f6ebef139ff17503a16fbe10620115b4f986d67705ec"
+    },
+    "artifact_integrity_data": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/goal-progress-normal-provenance-controls-Root-20261028/main9134-upstream-wheel-data-Root/data-verification.json",
+      "bytes": 3833,
+      "sha256": "5b993af542ee264fc70d0eedaf260db54069074095032084d8c38e4551451bf4"
+    },
+    "scope": "Current main build/source and retained data verification only; no vLLM installation/native/RPC/model acceptance"
+  },
+  "installation_source": {
+    "head": "9134d03216a53077668f373e2d9ed2546da57635",
+    "tar_sha256": "c806bf9baf62840a77fb2218bfc80b5a3484bd4144b9abdebe79cbd5ae93a133",
+    "tar_bytes": 12178702,
+    "source_archive": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/goal-progress-normal-provenance-controls-Root-20261028/main9134-retained-native-normal-CPU600-source-D-20261029/input/source.tar.gz",
+      "bytes": 12178702,
+      "sha256": "c806bf9baf62840a77fb2218bfc80b5a3484bd4144b9abdebe79cbd5ae93a133"
+    },
+    "meaning": "Actual retained main9134 source; a future checkout with only the explicit normal-helper overlay and same-run generated client types. Old f103/f949/69215 are ancestors only."
+  },
+  "archives": [
+    {
+      "name": "python-client-types",
+      "artifact_id": 12865295201,
+      "bytes": 34948,
+      "sha256": "425ad67ca0b09905cda43ce1087c9612ddb161033fe91b2155ae9a6f49be3bc6",
+      "expires_at": "2026-10-30T01:02:00Z",
+      "workflow_run": {
+        "id": 40795986051,
+        "repository_id": 1101714630,
+        "head_repository_id": 1101714630,
+        "head_branch": "main",
+        "head_sha": "9134d03216a53077668f373e2d9ed2546da57635"
+      }
+    },
+    {
+      "name": "smg-wheel",
+      "artifact_id": 12864911107,
+      "bytes": 53281911,
+      "sha256": "be379e40be5e978a0c94d07988b85e636d6a9d5f8394187d49c1b490f76bc5d7",
+      "expires_at": "2026-10-30T01:01:29Z",
+      "workflow_run": {
+        "id": 40795986051,
+        "repository_id": 1101714630,
+        "head_repository_id": 1101714630,
+        "head_branch": "main",
+        "head_sha": "9134d03216a53077668f373e2d9ed2546da57635"
+      }
+    }
+  ],
+  "payloads": [
+    {
+      "role": "smg_wheel",
+      "archive_name": "smg-wheel",
+      "member": "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl",
+      "bytes": 53420249,
+      "sha256": "dd25ba68327afcd7e38356e490946e5a5073b24f1a02cfb6995b4b3287e4f295"
+    },
+    {
+      "role": "client_types",
+      "archive_name": "python-client-types",
+      "member": "_generated.py",
+      "bytes": 188787,
+      "sha256": "c6e9cffe1d9007401bdf24993d698797a98012793ab342c834c8f7e5922ad87f"
+    }
+  ],
+  "installed_native": {
+    "sha256": "adc7ace4dffc0b020d22106e291dbea998c4673554e37bdff41946ae2132fbe9",
+    "bytes": 145042944,
+    "wheel_member": "smg/smg_rs.abi3.so",
+    "prefix": "/usr"
+  },
+  "normal_postflight_inputs_sha256": "0b9d9079a5b4c8870c56e5ca223ac6e410879d50779d0e1e06c02694834a1a07",
+  "RPC_source_manifest_sha256": null,
+  "normal_install_result": null,
+  "native_identity_result": null,
+  "NEW_CPU_seconds_reserved": 0,
+  "resource_granted": false,
+  "executed": false,
+  "GPU_accepted": false,
+  "actual_baked_version_metadata": null,
+  "scope": "Current9134 normally installed SMG native in real exact-vLLM00b6 AMD environment; future observation only, no transferred qualification"
+}

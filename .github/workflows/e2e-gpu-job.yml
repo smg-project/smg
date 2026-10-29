@@ -114,6 +114,11 @@ on:
         required: false
         type: string
         default: ""
+      amd_vllm_normal_base:
+        description: "Use separately admitted current9134 CDF/e006 normal BASE setup; default off"
+        required: false
+        type: boolean
+        default: false
       gpu_vendor:
         description: "GPU vendor of the runner: nvidia, or amd for a lane that runs in an engine's ROCm image"
         required: false
@@ -164,6 +169,38 @@ jobs:
       TOKENSPEED_PREBUILT_IMAGE: ${{ inputs.tokenspeed_prebuilt_image }}
       ROUTER_LOCAL_MODEL_PATH: /models
     steps:
+      - name: Check actual shared-node UTC window before normal BASE setup
+        if: inputs.amd_vllm_normal_base
+        shell: bash
+        env:
+          UTC_GUARD_ENGINE: ${{ inputs.engine }}
+          UTC_GUARD_VENDOR: ${{ inputs.gpu_vendor }}
+          UTC_GUARD_JOB_MINUTES: ${{ inputs.timeout }}
+        run: |
+          /usr/bin/python3 -I -B - <<'PYTHON'
+          import datetime as dt
+          import json
+          import os
+          if (os.environ["UTC_GUARD_ENGINE"], os.environ["UTC_GUARD_VENDOR"],
+                  os.environ["UTC_GUARD_JOB_MINUTES"]) != ("vllm", "amd", "60"):
+              raise SystemExit("UTC guard requires the unchanged private AMD vLLM whole60 contract")
+          now = dt.datetime.now(dt.timezone.utc)
+          reserved_start = now.replace(hour=5, minute=0, second=0, microsecond=0)
+          reserved_end = reserved_start.replace(hour=6, minute=30)
+          in_reserved_window = reserved_start <= now < reserved_end
+          if now >= reserved_end:
+              reserved_start += dt.timedelta(days=1)
+          cleanup_buffer_seconds = 300
+          allowed = (not in_reserved_window and
+                     now + dt.timedelta(seconds=3600 + cleanup_buffer_seconds) < reserved_start)
+          print(json.dumps({"actual_UTC": now.isoformat(), "reserved_start_UTC": reserved_start.isoformat(),
+                            "whole_job_seconds": 3600, "cleanup_buffer_seconds": cleanup_buffer_seconds,
+                            "allowed_before_setup": allowed,
+                            "scope": "actual first step; job-container pull/create already happened"}), flush=True)
+          if not allowed:
+              raise SystemExit("shared-node reserved UTC window or insufficient whole60 cleanup margin")
+          PYTHON
+
       - name: Checkout code
         uses: actions/checkout@v7
 
@@ -198,7 +235,7 @@ jobs:
         uses: ./.github/actions/setup-vllm
 
       - name: Setup vLLM backend (in vLLM's ROCm image)
-        if: inputs.engine == 'vllm' && inputs.gpu_vendor == 'amd'
+        if: inputs.engine == 'vllm' && inputs.gpu_vendor == 'amd' && !inputs.amd_vllm_normal_base
         run: bash scripts/ci_setup_vllm_rocm_image.sh
 
       - name: Setup TRT-LLM backend
@@ -212,7 +249,7 @@ jobs:
       - name: Download build artifacts
         uses: ./.github/actions/download-build-artifacts
         with:
-          wasm-fixtures: 'true'
+          wasm-fixtures: ${{ !inputs.amd_vllm_normal_base }}
           client-types: 'true'
 
       # Agentic service dependencies (Oracle DB, Brave MCP)
@@ -222,20 +259,64 @@ jobs:
 
       # Install
       - name: Install wheel and test dependencies
+        id: install-dependencies
         run: |
-          pip uninstall -y smg || true
-          pip install wheel/*.whl
-          bash scripts/ci_install_e2e_deps.sh ${{ inputs.extra_deps }}
+          if [ "${{ inputs.amd_vllm_normal_base }}" = "true" ]; then
+            test "${{ inputs.engine }}" = vllm
+            test "${{ inputs.gpu_vendor }}" = amd
+            mkdir -p normal-base-proof
+            /usr/bin/python3 -I -B scripts/amd_vllm_normal_base/setup_normal_base.py \
+              --source "$GITHUB_WORKSPACE" --output "$GITHUB_WORKSPACE/normal-base-proof" \
+              --admission "$GITHUB_WORKSPACE/.github/amd-shared-product/inputs.json"
+          else
+            pip uninstall -y smg || true
+            pip install wheel/*.whl
+            bash scripts/ci_install_e2e_deps.sh ${{ inputs.extra_deps }}
+          fi
+
+      - name: Prepare AMD dependency evidence
+        id: amd-dependencies
+        if: always() && inputs.gpu_vendor == 'amd' && steps.install-dependencies.conclusion == 'success'
+        shell: bash
+        run: |
+          DIRECTORY="$(mktemp -d "$RUNNER_TEMP/amd-dependencies.XXXXXXXXXX")"
+          echo "directory=$DIRECTORY" >> "$GITHUB_OUTPUT"
+          echo "python=$(command -v python3)" >> "$GITHUB_OUTPUT"
+          echo "artifact=amd-dependencies-${{ inputs.engine }}-gpu${{ inputs.gpu_tier }}-${DIRECTORY##*.}" >> "$GITHUB_OUTPUT"
 
       # The servicer's engine-gated unit tests (importorskip("vllm"),
       # importorskip("sglang") for the SGLang ZMQ wire pins) only meet a real
       # engine here; the CPU unit-test job skips them. One lane per engine opts in.
       - name: Run engine-gated servicer unit tests
         if: inputs.servicer_unit_tests
+        env:
+          AMD_DEPENDENCY_DIRECTORY: ${{ steps.amd-dependencies.outputs.directory }}
         run: |
           python3 -c "import ${{ inputs.engine }}, msgspec, zmq"  # the gates these tests importorskip on
           pip install pytest-asyncio  # runs the @pytest.mark.asyncio cases; pytest>=8.4 fails them without a plugin
-          pytest -q grpc_servicer/tests -p no:cacheprovider -rs
+          set --
+          if [ "${{ inputs.gpu_vendor }}" = amd ]; then
+            test -n "$AMD_DEPENDENCY_DIRECTORY"
+            set -- "--junitxml=$AMD_DEPENDENCY_DIRECTORY/servicer-engine.xml"
+          fi
+          pytest -q grpc_servicer/tests -p no:cacheprovider -rs "$@"
+
+      - name: Require installed-vLLM unit coverage on AMD
+        if: always() && inputs.gpu_vendor == 'amd' && inputs.engine == 'vllm' && inputs.servicer_unit_tests && steps.install-dependencies.conclusion == 'success'
+        env:
+          AMD_DEPENDENCY_DIRECTORY: ${{ steps.amd-dependencies.outputs.directory }}
+        run: |
+          test -n "$AMD_DEPENDENCY_DIRECTORY"
+          python3 scripts/ci_check_vllm_engine_units.py "$AMD_DEPENDENCY_DIRECTORY/servicer-engine.xml"
+
+      - name: Check installed AMD dependencies
+        if: always() && inputs.gpu_vendor == 'amd' && steps.install-dependencies.conclusion == 'success'
+        shell: bash
+        env:
+          AMD_DEPENDENCY_DIRECTORY: ${{ steps.amd-dependencies.outputs.directory }}
+        run: |
+          test -n "$AMD_DEPENDENCY_DIRECTORY"
+          python3 scripts/ci_check_e2e_dependencies.py "$AMD_DEPENDENCY_DIRECTORY" installed
 
       - name: Setup Oracle
         if: inputs.setup_agentic_deps
@@ -265,6 +346,7 @@ jobs:
           SHOW_ROUTER_LOGS: "1"
           E2E_LOG_DIR: e2e-logs
           E2E_MIN_SELECTED: ${{ inputs.min_selected }}
+          AMD_DEPENDENCY_DIRECTORY: ${{ steps.amd-dependencies.outputs.directory }}
           E2E_GPU_VENDOR: ${{ inputs.gpu_vendor }}
           BRAVE_MCP_HOST: ${{ inputs.setup_agentic_deps && 'brave-search-mcp' || '' }}
           # Every gRPC servicer runs a planned warm-up before it reports
@@ -350,6 +432,21 @@ jobs:
       # cancelled or timed-out test step keeps its GPU memory and its
       # listening ports, and the next job on this runner would start against
       # them. The script prints what it ended and never fails the job itself.
+      - name: Preserve normal BASE provenance
+        if: always() && inputs.amd_vllm_normal_base
+        uses: actions/upload-artifact@v7
+        with:
+          name: vllm-current9134-normal-base-proof
+          path: normal-base-proof/
+          if-no-files-found: error
+          retention-days: 7
+
+      # Whatever the job started and did not stop ends here, found by the
+      # marker in its environment: an engine or gateway that outlived a
+      # cancelled or timed-out test step keeps its GPU memory and its
+      # listening ports, and the next job on this runner would start against
+      # them. The script prints what it ended and never fails the job itself.
+
       - name: Stop every process this job started
         if: always() && env.E2E_JOB_MARKER != ''
         run: python3 scripts/ci_reap_job_processes.py "$E2E_JOB_MARKER"
@@ -367,3 +464,37 @@ jobs:
         run: |
           bash scripts/ci_agentic_svc_deps.sh cleanup-oracle-flyway-user oracle-db
           bash scripts/ci_agentic_svc_deps.sh cleanup-oracle-user oracle-db
+
+      - name: Check final AMD dependencies
+        if: always() && inputs.gpu_vendor == 'amd'
+        shell: bash
+        env:
+          INSTALL_RESULT: ${{ steps.install-dependencies.conclusion }}
+          DEPENDENCY_DIRECTORY: ${{ steps.amd-dependencies.outputs.directory }}
+          DEPENDENCY_PYTHON: ${{ steps.amd-dependencies.outputs.python }}
+        run: |
+          if [[ "$INSTALL_RESULT" != success ]]; then
+            echo "Skipping dependency audit: test dependency installation did not complete."
+            exit 0
+          fi
+          test -n "$DEPENDENCY_DIRECTORY"
+          test -n "$DEPENDENCY_PYTHON"
+          "$DEPENDENCY_PYTHON" scripts/ci_check_e2e_dependencies.py "$DEPENDENCY_DIRECTORY" final
+
+      - name: Upload AMD dependency evidence
+        if: always() && inputs.gpu_vendor == 'amd' && steps.amd-dependencies.outputs.directory != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.amd-dependencies.outputs.artifact }}
+          path: ${{ steps.amd-dependencies.outputs.directory }}/
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload AMD worker logs
+        if: always() && inputs.gpu_vendor == 'amd' && steps.amd-dependencies.outputs.artifact != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.amd-dependencies.outputs.artifact }}-worker-logs
+          path: e2e-logs/
+          retention-days: 7
+          if-no-files-found: ignore
