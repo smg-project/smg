@@ -9,21 +9,26 @@ gateway's version. Issues are listed with the bump conventional commits ask for
 on request, applied.
 
 Usage:
-    check_release_versions.py [tag] [--check | --fix]
+    check_release_versions.py [tag] [--check | --fix | --plan]
 
-    tag       the release to compare against (default: the newest tag)
+    tag       the release to compare against (default: the newest tag; for --plan the
+              highest final release tag, what a cut compares against)
     --check   report only, never prompt (for CI and dry runs)
     --fix     apply the proposed fixes without prompting
+    --plan    the bump the next cut writes against the tag, quietly: the proposed versions
+              only, nothing changed, exit 0 (on main every crate changed since the last
+              release reads as unbumped by design; the cut bumps them)
 
 Environment:
     VERSION_OVERRIDE  X.Y.Z: the gateway's new version instead of the detected bump
 
-Exit code 0 = all versions consistent (or fixed), 1 = issues found and not fixed.
+Exit code 0 = all versions consistent (or fixed, or --plan), 1 = issues found and not fixed.
 """
 
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import re
 import subprocess
@@ -116,6 +121,7 @@ class Fatal(Exception):
 # --- version lines: read and rewrite ------------------------------------------
 
 SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
+FINAL_TAG = re.compile(r"^v\d+\.\d+\.\d+$")
 TOML_VERSION = re.compile(r'^version\s*=\s*"([^"]*)"', re.M)
 TOML_WORKSPACE_VERSION = re.compile(
     r"^version\.workspace\s*=\s*true|^version\s*=\s*\{\s*workspace\s*=\s*true", re.M
@@ -274,6 +280,13 @@ class Repo:
     def newest_tag(self) -> str | None:
         tags = self.git("tag", "--sort=-creatordate").split()
         return tags[0] if tags else None
+
+    def highest_final_tag(self) -> str | None:
+        """The highest vX.Y.Z tag; a candidate (-rc.N) is not a final."""
+        finals = [t for t in self.git("tag", "--list", "v[0-9]*").split() if FINAL_TAG.match(t)]
+        return (
+            max(finals, key=lambda t: tuple(int(n) for n in t[1:].split("."))) if finals else None
+        )
 
     def show(self, ref: str, path: str) -> str | None:
         """A file's text at a ref; None when it is not there."""
@@ -493,9 +506,9 @@ def examine(
     return plan
 
 
-def propose(plan: Plan, out: Out) -> None:
+def propose(plan: Plan, out: Out, title: str = "Proposed fixes:") -> None:
     out.line()
-    out.line(out.paint("bold", "Proposed fixes:"))
+    out.line(out.paint("bold", title))
     sync = out.paint("blue", "sync")
     for v in plan.verdicts:
         c = v.component
@@ -518,6 +531,37 @@ def propose(plan: Plan, out: Out) -> None:
             )
     for mirror, carried in plan.mirrors:
         out.line(f"  {sync} {mirror.label} v{carried} → v{plan.gateway_target} ({mirror.file})")
+
+
+def show_plan(plan: Plan, tag: str, out: Out) -> None:
+    """The bump the next cut writes against ``tag``: the proposal alone, nothing judged."""
+    bumped_already = [
+        f"{v.component.name} v{v.version}" + (" (new)" if v.tag_version is None else "")
+        for v in plan.verdicts
+        if v.files_changed and not v.unbumped
+    ]
+    if plan.issues == 0:
+        out.line(
+            out.paint("bold", f"Nothing to bump against {tag}:")
+            + " every crate and package changed since it is bumped already"
+            + (f" ({', '.join(bumped_already)})" if bumped_already else "")
+            + "; the mirrors agree."
+        )
+        return
+    propose(
+        plan,
+        out,
+        f"The bump the next cut writes against {tag} (nothing is changed here; `make release-cut` writes it):",
+    )
+    out.line()
+    out.line(
+        out.paint("bold", f"{plan.issues} version line(s) move.")
+        + (
+            f" Bumped already since {tag}, left as they are: {', '.join(bumped_already)}."
+            if bumped_already
+            else ""
+        )
+    )
 
 
 def apply(plan: Plan, repo: Repo, out: Out) -> int:
@@ -584,16 +628,23 @@ def run(
     packages: Sequence[Component] = PACKAGES,
     mirrors: Sequence[Mirror] = MIRRORS,
 ) -> int:
-    """The check against ``tag`` in ``root``; mode is "check", "fix" or "prompt"."""
+    """The check against ``tag`` in ``root``; mode is "check", "fix", "prompt" or "plan"."""
     repo = Repo(root)
     if override and not SEMVER.match(override):
         raise Fatal(f"ERROR: VERSION_OVERRIDE must be in X.Y.Z format, got: '{override}'")
     if tag is None:
-        tag = repo.newest_tag()
+        # a plan compares against what a cut compares against: the last final release
+        tag = repo.highest_final_tag() if mode == "plan" else repo.newest_tag()
         if tag is None:
             raise Fatal("No tags found in repository. Pass a tag explicitly.")
     if not repo.has_ref(tag):
         raise Fatal(f"Tag '{tag}' does not exist.")
+    if mode == "plan":
+        # the verdicts are walked in silence: on main before a cut every changed crate reads as unbumped by design
+        show_plan(
+            examine(repo, tag, override, Out(io.StringIO()), crates, packages, mirrors), tag, out
+        )
+        return 0
 
     out.line(
         out.paint("bold", "Checking workspace versions against tag: ") + out.paint("blue", tag)
@@ -639,8 +690,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     group.add_argument(
         "--fix", action="store_true", help="apply the proposed fixes without prompting"
     )
+    group.add_argument(
+        "--plan",
+        action="store_true",
+        help="the bump the next cut writes against the tag, quietly; nothing is changed",
+    )
     args = parser.parse_args(argv)
-    mode = "check" if args.check else "fix" if args.fix else "prompt"
+    mode = "check" if args.check else "fix" if args.fix else "plan" if args.plan else "prompt"
     out = Out(sys.stdout)
     try:
         return run(
