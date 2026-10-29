@@ -171,6 +171,14 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          closed",
     ),
     (
+        "deepseek-v3.2-exp/render/text-developer-role",
+        "the gateway renders this checkpoint through its port of the checkpoint's own \
+         encoder, as the serving engine does for this architecture, which renders a \
+         developer message as a user turn under a heading; the reference is the run of the \
+         Jinja template the checkpoint ships, handed the developer message as a system one; \
+         the entry goes when the group is re-recorded under the engine's rule",
+    ),
+    (
         "deepseek-v3.2-exp/render/text-system-after-user",
         "the gateway renders this checkpoint through its port of the checkpoint's own \
          encoder, as the engines do, where the reference is the run of the Jinja \
