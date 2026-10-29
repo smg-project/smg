@@ -140,7 +140,7 @@ def main():
     assert all(admission[k] is True for k in ("ready", "run_budget_admitted", "artifacts_pinned", "normal_validation_authorized"))
     assert admission["runtime_cohort_accepted"] is False and admission["consumer_gpu_ready"] is False  # outcomes are not first-validation preconditions
     binding = admission["normal_base"]
-    assert binding["input_ready"] is True and binding["root_acceptance_sha256"] == "b4bae63c180d6e6444b5a7fb4465286d827123a51be7282eee9d5e1f3e94a76b"
+    assert binding["input_ready"] is False and admission["normal_validation_authorized"] is True and binding["root_acceptance_sha256"] == "b4bae63c180d6e6444b5a7fb4465286d827123a51be7282eee9d5e1f3e94a76b"
     assert sha(code / "normal-pins.json") == binding["pins_sha256"]
     assert sha(Path(__file__)) == binding["adapter_sha256"]
     pins = json.loads((code / "normal-pins.json").read_text())
@@ -215,6 +215,11 @@ def main():
                           "RECORD_sha256": sha(Path(d._path) / "RECORD")}
         return rows
     try:
+        mount_flags = os.statvfs(args.input).f_flag
+        report["normal_input_mount"] = {"path": str(args.input), "f_flag": mount_flags,
+            "ST_RDONLY": os.ST_RDONLY, "readonly": bool(mount_flags & os.ST_RDONLY)}
+        save()
+        assert mount_flags & os.ST_RDONLY, "actual normal input mount must be read-only"
         for name, row in pins["flat_inputs"].items():
             checked(input_path(name), row)
         before = protected(); write(args.output / "protected-base-before.json", before)
