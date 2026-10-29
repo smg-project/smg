@@ -137,8 +137,8 @@ def main():
     code = Path(__file__).resolve().parent
     admission = json.loads(args.admission.read_text())
     assert admission["admitted_lane"] == "vllm-chat-full-original"
-    assert all(admission[k] is True for k in ("ready", "run_budget_admitted", "artifacts_pinned", "runtime_cohort_accepted"))
-    assert admission["consumer_gpu_ready"] is False  # outcome is not a precondition or preclaim
+    assert all(admission[k] is True for k in ("ready", "run_budget_admitted", "artifacts_pinned", "normal_validation_authorized"))
+    assert admission["runtime_cohort_accepted"] is False and admission["consumer_gpu_ready"] is False  # outcomes are not first-validation preconditions
     binding = admission["normal_base"]
     assert binding["input_ready"] is True and binding["root_acceptance_sha256"] == "b4bae63c180d6e6444b5a7fb4465286d827123a51be7282eee9d5e1f3e94a76b"
     assert sha(code / "normal-pins.json") == binding["pins_sha256"]
