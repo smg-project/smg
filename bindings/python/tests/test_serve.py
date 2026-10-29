@@ -539,7 +539,7 @@ class TestWorkerLauncherGpuEnv:
     def test_gpu_env_none_copies_os_environ(self):
         launcher = SglangWorkerLauncher()
         args = argparse.Namespace(tensor_parallel_size=1)
-        with patch.dict("os.environ", {"TEST_VAR": "123"}, clear=False):
+        with patch.dict("os.environ", {"TEST_VAR": "123", "CUDA_VISIBLE_DEVICES": ""}, clear=False):
             env = launcher.gpu_env(args, dp_rank=0)
         assert env["TEST_VAR"] == "123"
         assert env["CUDA_VISIBLE_DEVICES"] == "0"
