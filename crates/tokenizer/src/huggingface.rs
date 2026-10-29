@@ -2173,10 +2173,13 @@ fn detect_dsv41_effort_table(dir: &Path) -> deepseek_v41::EffortTable {
 /// Derive the V3.2 thinking mode. The native encoder bypasses
 /// `ChatTemplateState::apply`, so this is where the resolved thinking preference
 /// is consumed. An explicit `template_kwargs["thinking"]` wins, then the
-/// engine's `enable_thinking` alias, which its tokenizer wrapper reads as the
-/// same switch; otherwise fall back to `params.thinking` (resolved from
-/// `reasoning_effort` / Anthropic `ThinkingConfig`) — same precedence as the
-/// Jinja path and as the gateway's parser arming. Default off, matching the
+/// engine's `enable_thinking` alias; otherwise fall back to `params.thinking`
+/// (resolved from `reasoning_effort` / Anthropic `ThinkingConfig`) — same
+/// precedence as the Jinja path and as the gateway's parser arming. The
+/// engine's tokenizer wrapper ORs the two keys; `thinking` wins here when both
+/// are present, as it does in the parser arming and in the V4 shim, so the
+/// prompt and the parser agree (a contradictory pair renders chat mode here
+/// where the engine would think). Default off, matching the
 /// `ThinkingKeyName::Thinking` / `DefaultOff` contract reported here.
 fn derive_thinking_mode(params: &ChatTemplateParams) -> deepseek_v32::ThinkingMode {
     if explicit_thinking(params).unwrap_or(false) {
@@ -3373,11 +3376,14 @@ mod tests {
 
     /// The engine's tokenizer wrapper switches V3.2 thinking on from the
     /// `thinking` kwarg or its `enable_thinking` alias; the shim reads the
-    /// alias the same way, `thinking` first when both are present (the order
-    /// the gateway arms the reasoning parser in), and the alias, like the
-    /// key, outranks the projected `params.thinking`. (That the profile
-    /// declares the alias is checked through the detected renderer in the
-    /// render tests.)
+    /// alias too, and the alias, like the key, outranks the projected
+    /// `params.thinking`. Deliberate divergence from the engine's wrapper,
+    /// which ORs the two keys: `thinking` wins here when both are present,
+    /// the order the gateway arms the reasoning parser in (as in the V4
+    /// shim), so a contradictory pair renders chat mode here where the
+    /// engine would think, and the prompt and the parser agree. (That the
+    /// profile declares the alias is checked through the detected renderer
+    /// in the render tests.)
     #[test]
     fn derive_thinking_mode_reads_the_enable_thinking_alias() {
         let alias = |value: bool| {
