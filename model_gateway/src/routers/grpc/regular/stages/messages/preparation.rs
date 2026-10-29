@@ -247,18 +247,13 @@ mod tests {
 
         use llm_tokenizer::{traits::Tokenizer, HuggingFaceTokenizer, TokenizerRegistry};
         use openai_protocol::messages::CreateMessageRequest;
-        use reasoning_parser::ParserFactory as ReasoningParserFactory;
         use serde_json::{json, Value};
-        use tool_parser::ParserFactory as ToolParserFactory;
 
         use crate::{
             routers::grpc::{
                 common::stages::PipelineStage,
-                context::{PreparationOutput, RequestContext, SharedComponents},
-                regular::{
-                    stages::messages::MessagePreparationStage, symphony::template::Templates,
-                },
-                utils::ParserResolver,
+                context::{PreparationOutput, RequestContext},
+                regular::stages::{messages::MessagePreparationStage, testing::components_over},
             },
             worker::WorkerRegistry,
         };
@@ -295,18 +290,11 @@ mod tests {
             .load(MODEL, MODEL, "test", || async move { Ok(tokenizer) })
             .await
             .unwrap();
-        let components = Arc::new(SharedComponents {
-            templates: Arc::new(Templates::new(tokenizer_registry.clone())),
+        let components = components_over(
             tokenizer_registry,
-            worker_registry: Arc::new(WorkerRegistry::new()),
-            tool_parser_factory: ToolParserFactory::default(),
-            reasoning_parser_factory: ReasoningParserFactory::default(),
-            parser_resolver: ParserResolver::disabled(),
-            multimodal: None,
-            tokenizer_autoload: true,
-            tokenizer_load_failures: Arc::default(),
-            parser: crate::config::ParserChoice::Legacy,
-        });
+            Arc::new(WorkerRegistry::new()),
+            crate::config::ParserChoice::Legacy,
+        );
         for (output_config, rendered) in [
             (json!({"effort": "high"}), Ok("effort=high")),
             (json!({"effort": 2}), Ok("effort=2")),
