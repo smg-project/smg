@@ -146,3 +146,56 @@ def test_explicit_extra_env_still_overrides_gpu_masks(monkeypatch):
     env = worker._build_env()
 
     assert all(env[key] == value for key, value in worker.extra_env.items())
+
+
+@pytest.mark.parametrize(
+    ("rocr_devices", "inherited_hip", "gpu_ids", "selected_mask"),
+    [
+        ("0,1,2,3", "2,3", [0], "2"),
+        ("0,1,2,3", "2,3", [1], "3"),
+        ("0,1,2,3", "2,3", [0, 1], "2,3"),
+        ("0,1,2,3", "2,3", [1, 0], "3,2"),
+        ("3,1,0,2", "2,3", [0], "2"),
+        ("3,1,0,2", "2,3", [1], "3"),
+        ("3,1,0,2", "2,3", [0, 1], "2,3"),
+        ("3,1,0,2", "2,3", [1, 0], "3,2"),
+        ("0,1", "1,0", [0], "1"),
+        ("0,1", "1,0", [1], "0"),
+        ("0,1", "1,0", [0, 1], "1,0"),
+        ("0,1", "1,0", [1, 0], "0,1"),
+        ("3,1", "1,0", [0], "1"),
+        ("3,1", "1,0", [1], "0"),
+        ("3,1", "1,0", [0, 1], "1,0"),
+        ("3,1", "1,0", [1, 0], "0,1"),
+    ],
+)
+def test_worker_selects_entries_from_the_parent_hip_mask(
+    monkeypatch, rocr_devices, inherited_hip, gpu_ids, selected_mask
+):
+    from infra import process_utils
+
+    monkeypatch.setenv("ROCR_VISIBLE_DEVICES", rocr_devices)
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", inherited_hip)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "6,7")
+    # Exercise the same logical-to-physical mapping used by the launcher's
+    # memory accounting, with distinct CPU fixtures instead of amd-smi.
+    listed = [{"gpu": i, "node_id": i} for i in range(4)]
+    metrics = [{"gpu": i, "mem_usage": {"used_vram": {"value": (i + 1) * 100}}} for i in range(4)]
+    monkeypatch.setattr(
+        process_utils, "_amd_smi", lambda *args: listed if args == ("list",) else metrics
+    )
+    parent_used = process_utils._amd_smi_used_mib(gpu_ids)
+    worker = _worker("sglang", ConnectionMode.HTTP)
+    worker.gpu_ids = gpu_ids
+
+    env = worker._build_env()
+
+    assert env["HIP_VISIBLE_DEVICES"] == env["CUDA_VISIBLE_DEVICES"] == selected_mask
+    assert env["ROCR_VISIBLE_DEVICES"] == rocr_devices
+    assert worker_module.os.environ["HIP_VISIBLE_DEVICES"] == inherited_hip
+    assert worker_module.os.environ["CUDA_VISIBLE_DEVICES"] == "6,7"
+    with monkeypatch.context() as child:
+        for variable in ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+            child.setenv(variable, env[variable])
+        child_used = process_utils._amd_smi_used_mib(list(range(len(gpu_ids))))
+    assert list(child_used.values()) == [parent_used[gpu] for gpu in gpu_ids]
