@@ -638,6 +638,10 @@ cmd_publish_plan() {
   say "Watch a dispatch: gh run list --workflow <file> --branch $tagname"
 }
 
+api_message() { # <gh api output>: the "message" of the error body gh leaves on stdout when the API refused (empty otherwise)
+  sed -n 's/.*"message": *"\([^"]*\)".*/\1/p' <<< "$1" | head -n 1
+}
+
 VERIFIER_FAMILIES="DeepSeek GLM Kimi MiniMax"
 
 gate_section() { # <version> <ref>: the release gate as a pull request body section
@@ -684,17 +688,27 @@ cmd_check() {
   fi
   # 2. CI on the head
   if command -v "$GH" >/dev/null 2>&1 && slug=$("$GH" repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null) && [ -n "$slug" ]; then
-    checks=$("$GH" api --paginate "repos/$slug/commits/$head/check-runs?per_page=100" --jq '.check_runs[] | "\(.conclusion // .status) \(.name)"' 2>/dev/null || true)
-    if [ -z "$checks" ]; then
+    local ok=0 bad=0 pending=0 line read_rc=0 error
+    # On an API error gh leaves the error body on stdout ({"message": ...}) and exits non-zero: the read is reported
+    # as the failure it is, never counted as a check run (a head the remote does not have yet answers 422).
+    checks=$("$GH" api --paginate "repos/$slug/commits/$head/check-runs?per_page=100" --jq '.check_runs[] | "\(.conclusion // .status) \(.name)"' 2>/dev/null) || read_rc=$?
+    if [ "$read_rc" -ne 0 ]; then
+      error=$(api_message "$checks")
+      if [[ $error == "No commit found for SHA"* ]]; then
+        say "[....] CI: $(git rev-parse --short "$head") is not on $slug yet: push $branch first; its checks and its PR Test (SMG) run are read here then"
+      else
+        say "[FAIL] CI: the check-runs read failed (${error:-gh exited $read_rc}); the checks and the PR Test (SMG) run of $(git rev-parse --short "$head") are at https://github.com/$slug/commits/$head"
+      fi
+      failed=1
+    elif [ -z "$checks" ]; then
       say "[....] CI: no check run on $(git rev-parse --short "$head") yet (https://github.com/$slug/commits/$head)"
       failed=1
     else
-      local ok=0 bad=0 pending=0 line
       while IFS= read -r line; do
         case "$line" in
           success\ *|skipped\ *|neutral\ *) ok=$((ok + 1)) ;;
-          failure\ *|cancelled\ *|timed_out\ *|action_required\ *|stale\ *) bad=$((bad + 1)); say "       red: ${line#* }" ;;
-          *) pending=$((pending + 1)) ;;
+          failure\ *|cancelled\ *|timed_out\ *|action_required\ *|stale\ *|startup_failure\ *) bad=$((bad + 1)); say "       red: ${line#* }" ;;
+          *) pending=$((pending + 1)); say "       pending: ${line#* } (${line%% *})" ;;
         esac
       done <<< "$checks"
       if [ "$bad" -eq 0 ] && [ "$pending" -eq 0 ]; then
@@ -706,15 +720,22 @@ cmd_check() {
     fi
     # The test matrix on this very commit: a documentation-only merge runs none (the push trigger's paths-ignore)
     # and the pull request's run was for the merge ref, not the branch head, so a run is required by head sha.
-    runs=$("$GH" api "repos/$slug/actions/workflows/pr-test-rust.yml/runs?head_sha=$head&per_page=20" --jq '.workflow_runs[] | "\(.conclusion // .status) \(.html_url)"' 2>/dev/null || true)
-    if [ -z "$runs" ]; then
-      say "[FAIL] PR Test (SMG): no run on $(git rev-parse --short "$head") (a documentation-only merge runs none): gh workflow run pr-test-rust.yml --ref $branch"
-      failed=1
-    elif grep -q '^success ' <<< "$runs"; then
-      say "[ok]   PR Test (SMG): a successful run on $(git rev-parse --short "$head") ($(grep -m1 '^success ' <<< "$runs" | cut -d' ' -f2))"
-    else
-      say "[FAIL] PR Test (SMG): no successful run on $(git rev-parse --short "$head") yet: $(tr '\n' ';' <<< "$runs")"
-      failed=1
+    # A head the remote lacks has none, and a read that failed above fails here the same way: one line says so.
+    if [ "$read_rc" -eq 0 ]; then
+      runs=$("$GH" api "repos/$slug/actions/workflows/pr-test-rust.yml/runs?head_sha=$head&per_page=20" --jq '.workflow_runs[] | "\(.conclusion // .status) \(.html_url)"' 2>/dev/null) || read_rc=$?
+      if [ "$read_rc" -ne 0 ]; then
+        error=$(api_message "$runs")
+        say "[FAIL] PR Test (SMG): the workflow-runs read failed (${error:-gh exited $read_rc}); the runs of $(git rev-parse --short "$head") are at https://github.com/$slug/actions/workflows/pr-test-rust.yml"
+        failed=1
+      elif [ -z "$runs" ]; then
+        say "[FAIL] PR Test (SMG): no run on $(git rev-parse --short "$head") (a documentation-only merge runs none): gh workflow run pr-test-rust.yml --ref $branch"
+        failed=1
+      elif grep -q '^success ' <<< "$runs"; then
+        say "[ok]   PR Test (SMG): a successful run on $(git rev-parse --short "$head") ($(grep -m1 '^success ' <<< "$runs" | cut -d' ' -f2))"
+      else
+        say "[FAIL] PR Test (SMG): no successful run on $(git rev-parse --short "$head") yet: $(tr '\n' ';' <<< "$runs")"
+        failed=1
+      fi
     fi
   else
     say "[....] CI: not readable here (gh is not installed or not logged in): read the checks of $(git rev-parse --short "$head") on the branch page"

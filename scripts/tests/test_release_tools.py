@@ -45,6 +45,11 @@ MAKE_TARGETS = {
 
 GH_STUB = r"""#!/usr/bin/env bash
 printf 'gh %s\n' "$*" >> "$GH_STUB_LOG"
+api_error() { # <message> <status>: an API error as gh reports it: the body on stdout, the status on stderr, exit 1
+  printf '{"message":"%s","documentation_url":"https://docs.github.com/rest","status":"%s"}\n' "$1" "$2"
+  echo "gh: $1 (HTTP $2)" >&2
+  exit 1
+}
 case "$1 $2" in
   "pr create")
     for ((i = 1; i <= $#; i++)); do
@@ -53,8 +58,11 @@ case "$1 $2" in
     echo "https://example.invalid/pull/1" ;;
   "pr list") echo "#7  fix(router): y  pick/1.14-0000000" ;;
   "repo view") echo "example/repo" ;;
-  "api --paginate") printf '%b\n' "${GH_STUB_CHECKS:-success a\nsuccess b}" ;;
+  "api --paginate")
+    [ -z "${GH_STUB_API_ERROR-}" ] || api_error "$GH_STUB_API_ERROR" "${GH_STUB_API_STATUS:-422}"
+    printf '%b\n' "${GH_STUB_CHECKS:-success a\nsuccess b}" ;;
   "api repos/example/repo/actions/workflows/pr-test-rust.yml/runs?head_sha="*)
+    [ -z "${GH_STUB_RUNS_ERROR-}" ] || api_error "$GH_STUB_RUNS_ERROR" 401
     case "${GH_STUB_RUNS-}" in
       none) ;;
       "") echo "success https://example.invalid/runs/1" ;;
@@ -899,6 +907,61 @@ def test_check_requires_a_run_of_the_test_matrix_on_the_head(repo: Sandbox) -> N
     )
     assert pending.returncode == 1
     assert "[FAIL] PR Test (SMG): no successful run on" in pending.stdout
+
+
+def test_check_reads_an_api_error_as_an_error_not_as_a_pending_check(repo: Sandbox) -> None:
+    """gh leaves the API's error body on stdout: a head the remote lacks (422), a rate limit or a bad token
+    is reported as the failed read it is, with the API's message, never counted as one pending check."""
+    repo.cut()
+    head = repo.git("rev-parse", "--short", "origin/release/1.14")
+    unpushed = repo.tool(
+        "check", "1.14.0-rc.1", check=False, GH_STUB_API_ERROR=f"No commit found for SHA: {head}"
+    )
+    assert unpushed.returncode == 1
+    assert (
+        f"[....] CI: {head} is not on example/repo yet: push release/1.14 first;"
+        " its checks and its PR Test (SMG) run are read here then" in unpushed.stdout
+    )
+    assert "pending" not in unpushed.stdout and "[FAIL] PR Test (SMG)" not in unpushed.stdout
+    assert unpushed.stdout.count("gh api") == 0 and '"message"' not in unpushed.stdout
+    limited = repo.tool(
+        "check",
+        "1.14.0-rc.1",
+        check=False,
+        GH_STUB_API_ERROR="API rate limit exceeded for 203.0.113.9.",
+        GH_STUB_API_STATUS="403",
+    )
+    assert limited.returncode == 1
+    assert (
+        "[FAIL] CI: the check-runs read failed (API rate limit exceeded for 203.0.113.9.);"
+        " the checks and the PR Test (SMG) run of " in limited.stdout
+    )
+    assert "https://github.com/example/repo/commits/" in limited.stdout
+    assert "pending" not in limited.stdout
+    runs = repo.tool("check", "1.14.0-rc.1", check=False, GH_STUB_RUNS_ERROR="Bad credentials")
+    assert runs.returncode == 1
+    assert "[ok]   CI: 2 check(s) green" in runs.stdout
+    assert (
+        "[FAIL] PR Test (SMG): the workflow-runs read failed (Bad credentials); the runs of "
+        in runs.stdout
+    )
+
+
+def test_check_names_every_pending_check_and_reads_a_startup_failure_as_red(repo: Sandbox) -> None:
+    repo.cut()
+    done = repo.tool(
+        "check",
+        "1.14.0-rc.1",
+        check=False,
+        GH_STUB_CHECKS="in_progress build\\nqueued e2e (mock)\\nstartup_failure finish\\nsuccess lint",
+    )
+    assert done.returncode == 1
+    assert "       pending: build (in_progress)" in done.stdout
+    assert "       pending: e2e (mock) (queued)" in done.stdout
+    assert "       red: finish" in done.stdout
+    assert "[FAIL] CI: 1 green, 1 red, 2 pending on" in done.stdout
+    green = repo.tool("check", "1.14.0-rc.1")
+    assert "pending:" not in green.stdout and "red:" not in green.stdout
 
 
 def test_check_without_gh_names_the_branch_page(repo: Sandbox) -> None:
