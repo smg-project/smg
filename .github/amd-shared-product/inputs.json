@@ -1,0 +1,308 @@
+{
+  "ready": false,
+  "run_budget_admitted": false,
+  "artifacts_pinned": false,
+  "consumer_gpu_ready": false,
+  "runtime_cohort_accepted": false,
+  "admitted_lane": "vllm-chat-full-original",
+  "target_product_commit": "41a14289e8df18dcb44287213e07a415190487dc",
+  "artifacts": [
+    {
+      "name": "python-client-types",
+      "id": 12865295201,
+      "expires_at": "2026-10-30T01:02:00Z",
+      "bytes": 34948,
+      "sha256": "425ad67ca0b09905cda43ce1087c9612ddb161033fe91b2155ae9a6f49be3bc6",
+      "files": {
+        "_generated.py": {
+          "bytes": 188787,
+          "sha256": "c6e9cffe1d9007401bdf24993d698797a98012793ab342c834c8f7e5922ad87f"
+        }
+      }
+    },
+    {
+      "name": "smg-wheel",
+      "id": 12864911107,
+      "expires_at": "2026-10-30T01:01:29Z",
+      "bytes": 53281911,
+      "sha256": "be379e40be5e978a0c94d07988b85e636d6a9d5f8394187d49c1b490f76bc5d7",
+      "files": {
+        "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl": {
+          "bytes": 53420249,
+          "sha256": "dd25ba68327afcd7e38356e490946e5a5073b24f1a02cfb6995b4b3287e4f295"
+        }
+      }
+    }
+  ],
+  "gateway_native": {
+    "name": "smg/smg_rs.abi3.so",
+    "bytes": 145042944,
+    "sha256": "adc7ace4dffc0b020d22106e291dbea998c4673554e37bdff41946ae2132fbe9"
+  },
+  "producer_sha": "9134d03216a53077668f373e2d9ed2546da57635",
+  "run_id": 40795986051,
+  "run_attempt": 1,
+  "build_job_id": 123192466952,
+  "producer_branch": "main",
+  "producer_policy": "exact_9134_main_push_build_leg_all_17_steps_success_v1",
+  "source_base": "9134d03216a53077668f373e2d9ed2546da57635",
+  "source_trees": {
+    ".cargo": "9c8e2b9f1332e819c76bb06433b1945c7a3cd1b1",
+    "Cargo.toml": "4d158bb00cf4f5f4c2e263916c3685a6e6d81e79",
+    "Cargo.lock": "de68c71ba95c6a782e02807289994b01ae64fdcc",
+    "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+    "Makefile": "2b393aa7863d0615eb2b40d9480a8c657bddc949",
+    "bindings": "43c8e0ae1b2d4d00def0c2b54e1f328e26990276",
+    "clients": "599d7ce2727e5d6287825271f464a3b7b5e64ee9",
+    "crates": "be316956d4d3878e47e1046c29c6997860848059",
+    "model_gateway": "0065bea64ce983a7faa30077eb2cc1c847c7e26c",
+    "grpc_servicer": "03755134b50f8ac2bd00f2910921c691febb781e",
+    "e2e_test": "cdd5b7449fc0b0c8be4c6f3decad1f8def211672",
+    "scripts": "b9db30eb35b03877519330009dd85363bdba78c7",
+    ".github/actions": "5638e71525155d524069fc5f398817e1ebb1cd09",
+    ".github/workflows/e2e-gpu-job.yml": "ef6ae46417aea5d5c5a6cafcaa7fa8fd844d05d1",
+    "README.md": "83b7df25632da03f0184bd5b4628b9c9a3ace803",
+    "LICENSE": "9088c2872db9763b9e6533c6960e9adb0c9cb65f",
+    "rustfmt.toml": "19e1ab31f8958c31292f0f568976a036af7e683b",
+    "clippy.toml": "cfb9e85a5074e6b02e603df8da9653ee18dbcca3",
+    "examples/wasm": "fc10fea21779371f9de247209af2028cf8173236"
+  },
+  "compiled_source_trees": {
+    ".cargo": "9c8e2b9f1332e819c76bb06433b1945c7a3cd1b1",
+    "Cargo.toml": "4d158bb00cf4f5f4c2e263916c3685a6e6d81e79",
+    "Cargo.lock": "de68c71ba95c6a782e02807289994b01ae64fdcc",
+    "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+    "Makefile": "2b393aa7863d0615eb2b40d9480a8c657bddc949",
+    "bindings": "43c8e0ae1b2d4d00def0c2b54e1f328e26990276",
+    "clients": "599d7ce2727e5d6287825271f464a3b7b5e64ee9",
+    "model_gateway": "0065bea64ce983a7faa30077eb2cc1c847c7e26c",
+    "examples/wasm": "fc10fea21779371f9de247209af2028cf8173236",
+    "crates/auth": "642cfcb069e7a56f0637909b6bf67365f4c48d07",
+    "crates/data_connector": "995e26908827be38a008706246496cfd57b4381e",
+    "crates/engine_servicer": "4d52c285426a9336f7cca308d517f2b44f759634",
+    "crates/engine_zmq_adapter": "46faa9bd8dbadee73d59cd787a881d8ab14874a5",
+    "crates/engine_zmq_client": "a746945b7da7a6cc09d3874b48b99912351cf3d3",
+    "crates/external_router": "f430536880c0c17ee5fab13eda86afb89abcdff7",
+    "crates/kv_index": "211244066c6957034c078c529cc0e67f58b82f9b",
+    "crates/mcp": "44f06460326061759fdc29ae1a87507d666ebd55",
+    "crates/mesh": "44c7796b90755ddfac8e3b488fb7823e1d859c48",
+    "crates/mm_rdma": "5e42c1198e2f08f74061c398258971e7ecaa33aa",
+    "crates/mock_worker": "820d17746ab0bbc72f817eb6b4158dc89c5765ae",
+    "crates/multimodal": "75c155446c6c70f597af8cb3ae8ef086bdda3130",
+    "crates/protocols": "6c8f251c6fe1160fa02cbea9f61309ca25928566",
+    "crates/radix_tree": "063bfb16dbbf4423b632fbc00aa79b01a3b06996",
+    "crates/reasoning_parser": "fad4e67c1082415ccf5975209cf6dbb4b4753651",
+    "crates/response_template": "51ea20dd99da5a89644f0960c64d8a383c144b02",
+    "crates/rl": "8ac9b04920420db5ece0d7f2234f2b5eb15e5626",
+    "crates/symphony": "4e120a1164b28bcf214ba49cba0af218f9eb4112",
+    "crates/tokenizer": "fad01041d171c6d511d067f06c04a17b5f8d063c",
+    "crates/tool_parser": "4f2b4246f15b1497fdf74f4c5683e0a57ff37db0",
+    "crates/wasm": "00dfd67a1b95f4c28410cde6117112457aa695dc",
+    "crates/workflow": "3f326a4463d196a70dfb312402475bbde88ed6a7",
+    "crates/grpc_client/Cargo.toml": "16ed107c1d32f668216ca23bc92f6862457ac14f",
+    "crates/grpc_client/build.rs": "946832e4554939503959adf7d0ee725beb6b65c8",
+    "crates/grpc_client/go": "89b5a2463e45e0f64d577e9ab74ec318653b9352",
+    "crates/grpc_client/proto": "9711ab3cae8d7e0062a7263d2af638d0514772eb",
+    "crates/grpc_client/src": "882d79a6ed938fb33ace8d8e62c1d6f2be97e5cd",
+    "crates/grpc_client/tests": "e15c3383afe2c9aa7c184de7c387fa876935f1a1"
+  },
+  "producer_source_trees": {
+    ".cargo": "9c8e2b9f1332e819c76bb06433b1945c7a3cd1b1",
+    "Cargo.toml": "4d158bb00cf4f5f4c2e263916c3685a6e6d81e79",
+    "Cargo.lock": "de68c71ba95c6a782e02807289994b01ae64fdcc",
+    "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+    "Makefile": "2b393aa7863d0615eb2b40d9480a8c657bddc949",
+    "bindings": "43c8e0ae1b2d4d00def0c2b54e1f328e26990276",
+    "clients": "599d7ce2727e5d6287825271f464a3b7b5e64ee9",
+    "crates": "be316956d4d3878e47e1046c29c6997860848059",
+    "model_gateway": "0065bea64ce983a7faa30077eb2cc1c847c7e26c",
+    "grpc_servicer": "03755134b50f8ac2bd00f2910921c691febb781e",
+    "e2e_test": "9120db68ac6bc13dc078af2d2af999491e71ed0a",
+    "scripts": "7e5b856e13ec2e8fd5d6611710c1fddd34d0d56a",
+    ".github/actions": "5638e71525155d524069fc5f398817e1ebb1cd09",
+    ".github/workflows": "6ef0001ffc8ac99972844101d87af15193209663"
+  },
+  "prior_GPU_results_transferred": false,
+  "new_native_required": false,
+  "recipe": {
+    "engine": "vllm",
+    "gpu_tier": "1",
+    "test_dirs": "e2e_test/chat_completions",
+    "test_filter": "",
+    "timeout": 60,
+    "test_timeout": 45,
+    "min_selected": 202,
+    "servicer_unit_tests": true,
+    "parser": "",
+    "connection_mode": "",
+    "servicer_impl": "",
+    "mm_processing": "",
+    "reruns": 2,
+    "reruns_delay": 5,
+    "same_original_tests_models_protocols_and_oracles": true,
+    "floor_is_only_integrity_guard": true,
+    "original16_inventory_unchanged": true,
+    "fullQA_nonMLX_registry_retained": 17
+  },
+  "budget": {
+    "admitted": false,
+    "reserved_runner_seconds": 0,
+    "proposed_new_max_seconds": 3600,
+    "global_owned_max": 2,
+    "one_lane_per_run": true,
+    "old_retired_seconds_reused": 0
+  },
+  "dispatch_contract": {
+    "registered_workflow": ".github/workflows/pr-test-rust.yml",
+    "manual_only": true,
+    "execute_default": false,
+    "root_admission_required": true,
+    "one_GPU_job": "private-vllm-chat / vllm-chat / run (actual API identity must be bound after dispatch)",
+    "other_GPU_matrix_jobs": 0,
+    "private_ref": null,
+    "actual_dispatch_head": null,
+    "actual_run_id": null,
+    "controller_source": null,
+    "run_binding": null,
+    "watch_PID_or_session": null,
+    "reusable_leaf": ".github/workflows/amd-vllm-chat-fixed-f103-private.yml",
+    "private_input": "private_vllm_chat",
+    "execute_input": "private_vllm_chat",
+    "normal_input_mount": "--mount type=bind,source=/var/cache/smg-amd-qa/normal-cdfb7f9eaac4-e006d5e39469,target=/opt/smg-vllm-normal-input,readonly",
+    "registered_dispatch_input_semantics": {
+      "registered_inputs": [
+        "private_vllm_chat",
+        "normal_input_mount"
+      ],
+      "execution_trigger": "private_vllm_chat",
+      "private_default": false,
+      "workflow_call_internal_execute": "private leaf execute is supplied from private_vllm_chat by registered caller; execute is not a workflow_dispatch input",
+      "future_POSTs": 0,
+      "scope": "Correct data contract to actual717 registered YAML; no workflow/event/permissions/ordinary/NV behavior change."
+    },
+    "shared_node_reserved_window": {
+      "UTC_start": "05:00",
+      "UTC_end": "06:30",
+      "actual_first_step_guard": true,
+      "precontainer_guard": false,
+      "cleanup_buffer_seconds": 300,
+      "whole_control_window_seconds": 5340,
+      "root_dispatch_requires_whole_window_plus_buffer_before_reserved_start": true,
+      "future_actual_reserved_start_utc": null,
+      "scope": "Firststepchecks actual clock before Checkout/setup only. Root solewatch absolute cutoff+queue900/overall5340 and conservative one-shot scheduling are independently required; recurringCI precontainer safety remains unimplemented."
+    }
+  },
+  "pending_note": "Default-off first full normal validation. Root must form a genuine new product including the reviewed normal authorization-only helper delta, then an actual disabled/admitted consumer with correct target product SHA and unchanged source.py map verification. Native compiled37 and actual9134 producer17/two archives remain exact. Source authorization is separate from runtime/GPU acceptance; all five old flags remain false. No current normal pass or old runtime result is transferred.",
+  "binding_preparation_evidence": {
+    "current_artifact_data": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/goal-progress-normal-provenance-controls-Root-20261028/main9134-upstream-wheel-data-Root/data-verification.json",
+      "bytes": 3833,
+      "sha256": "5b993af542ee264fc70d0eedaf260db54069074095032084d8c38e4551451bf4"
+    },
+    "current_types_data": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/goal-progress-normal-provenance-controls-Root-20261028/main9134-current-client-types-data-Root/data-verification.json",
+      "bytes": 879,
+      "sha256": "29d2b2ea72ce41537128cf7bbe6e71303e5046d0b15a112c2af7ed54be008db6"
+    },
+    "normal_source_peer": {
+      "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/goal-progress-normal-provenance-controls-Root-20261028/current9134-vllm00b6-normal-consumer-source-A-20261029/peer-source-independent.json",
+      "bytes": 9625,
+      "sha256": "d61ebfd1395481c34af94fe734ad308aae85130eca1de0b8c2d6cd9058ae2b54"
+    },
+    "prior_GPU_results_transferred": false,
+    "normal_install_verified": false,
+    "current_consumer_source_review": null
+  },
+  "normal_base": {
+    "input_ready": false,
+    "input_directory": "/opt/smg-vllm-normal-input",
+    "adapter_sha256": "8a382bdb94d422d4ffaa9c39422b61ac4d6e2d3d60996d8e7925b5b5469de134",
+    "pins_sha256": "8470eb19ba56d95d0e5ede6a4a0063dce2b0c672893c14db189c96907c5b032c",
+    "root_acceptance_sha256": "b4bae63c180d6e6444b5a7fb4465286d827123a51be7282eee9d5e1f3e94a76b",
+    "actual_peer_sha256": "d53e3134f033755107bca533f5e783ff2b33061bc1f12d79e187d15720d3e6c5",
+    "scope": "Retained exact00b6/Cairo base data is historical background only; new9134 normally installed native/pip/RPC/full chat+units require actual execution",
+    "node_image_cache_verified": false,
+    "artifact_CI_visibility_verified": false,
+    "input_readiness_evidence": {
+      "asof_utc": "2026-10-26T23:30:13.599082+00:00",
+      "image_manifest": "sha256:c49bfef372b73213eb490a81c6b04d949d368ff4726999406696756fa4ca77c6",
+      "image_config": "sha256:9fe6eda0d94f5948d0350495ace5006910489dc884997f740427794f5425ffee",
+      "Docker29_identity_note": "Containerd-backed .Id/.Image is manifestc49; config9fe6 association is separate accepted CAS evidence, not an Id==config assertion or full layer-blob rehash.",
+      "host_source": "/var/cache/smg-amd-qa/normal-cdfb7f9eaac4-e006d5e39469",
+      "container_target": "/opt/smg-vllm-normal-input",
+      "readonly": true,
+      "expected_files": {
+        "vllm-0.32.1rc1.dev505+g00b6c4c56.rocm100.smggrpc1811-cp312-cp312-linux_x86_64.whl": {
+          "bytes": 317317515,
+          "sha256": "cdfb7f9eaac435a072fc2eeab3cf4ed8d8d624d405f5e689e1ec918589b63d77"
+        },
+        "pycairo-1.29.2-cp312-cp312-linux_x86_64.whl": {
+          "bytes": 132355,
+          "sha256": "e006d5e39469035fe615799dced8b7f3c267a43f256b07a551e6cf92a9f03bac"
+        }
+      },
+      "node_evidence": {
+        "amd-mi300x-1": {
+          "whole": {
+            "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/vllm-node1-readonly-mount-NEWCPU60-root-453cff4521d141f38f247e52d34d68b2/whole-window-result.json",
+            "bytes": 1585,
+            "sha256": "c7d7a4999e2034b874fbc930cdfac8b7924dc8e1c45ceba5c1c5a95eadcf0898"
+          },
+          "root_result": {
+            "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/vllm-node1-readonly-mount-NEWCPU60-root-453cff4521d141f38f247e52d34d68b2/root-result.json",
+            "bytes": 33551,
+            "sha256": "f42226132ed80fb5b36642e2ae671ee8762947a93d4974e8f235f05d1624d917"
+          },
+          "independent_actual_peer": {
+            "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/vllm-node1-readonly-mount-NEWCPU60-root-453cff4521d141f38f247e52d34d68b2/peer-actual-node1-mount-B.json",
+            "bytes": 17169,
+            "sha256": "0684662e5012178b0a150ca6fa68bbd7dc6a9ae30e51bb4197cb86de5e0c7f89"
+          },
+          "scope": "Actual exactimage UID995:985 readonly mount and two complete file hashes only; no model/GPU/fullchat/units/native/runtime acceptance.",
+          "static_scope_label_note": "Node1 leaf retained historical NODE2 label; actual node1 is proven by outer SSH target/pins/source as independently reviewed."
+        },
+        "amd-mi300x-2": {
+          "whole": {
+            "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/vllm-node2-readonly-mount-NEWCPU60-root-157bc929716e4f8f8f0c6985dc640e59/whole-window-result.json",
+            "bytes": 1582,
+            "sha256": "3bb4761d140541491f3ce3538818ed14911330413b903956a3d91316173be348"
+          },
+          "root_result": {
+            "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/vllm-node2-readonly-mount-NEWCPU60-root-157bc929716e4f8f8f0c6985dc640e59/root-result.json",
+            "bytes": 33553,
+            "sha256": "21f2785bc99dd97133c0dc567604708a863025a8c3e478e9cf7fbaea46f00f0d"
+          },
+          "independent_actual_peer": {
+            "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/vllm-node2-readonly-mount-NEWCPU60-root-157bc929716e4f8f8f0c6985dc640e59/peer-actual-mount-D.json",
+            "bytes": 17213,
+            "sha256": "3d8207bfcf3c6ff37e238a7dc46fdee8b457e7acf92cab2035058b8c03ca56b3"
+          },
+          "scope": "Actual exactimage UID995:985 readonly mount and two complete file hashes only; no model/GPU/fullchat/units/native/runtime acceptance.",
+          "static_scope_label_note": null
+        }
+      },
+      "node1_image_cache_C_peer": {
+        "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/vllm-node1-c49-image-cache-NEWCPU900-root-4bf158ecd3ab4943844ebffa1a0882ab/peer-actual-image-cache-C.json",
+        "bytes": 12903,
+        "sha256": "d74f7353d884dfeeafe860c15cd6c2d4f5ddf93cd81488d3c6f97b3ffec36e78"
+      },
+      "node2_manifest_config_CAS": {
+        "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/vllm-CI-manifest-config-CAS-read-root-f31fabf4b5984cbeb6f12b81cc8f9109/summary.json",
+        "bytes": 16778,
+        "sha256": "86bd69f5f17f46876bce3bf7ba4ec28e16110ec5a2932d03973183ee63f9d109"
+      },
+      "BASE_acceptance": {
+        "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/vllm00b6-CDF-e006-finalBASE-activated-data-NEWCPU900-root-ee8969a411e54019a5aa1831fd70410b/root-finalBASE-normal-native-RPC-acceptance.json",
+        "bytes": 3779,
+        "sha256": "b4bae63c180d6e6444b5a7fb4465286d827123a51be7282eee9d5e1f3e94a76b"
+      },
+      "BASE_actual_C_peer": {
+        "path": "/home/chun.fang@amd.com/chun/scripts/smg_router/codex_work/ci-parity-20261022/execution-live/amd-owned-qa-20261022/progress-20261024T2054Z/vllm00b6-CDF-e006-finalBASE-activated-data-NEWCPU900-root-ee8969a411e54019a5aa1831fd70410b/peer-actual-finalBASE-native-RPC-and-resource-C.json",
+        "bytes": 65697,
+        "sha256": "d53e3134f033755107bca533f5e783ff2b33061bc1f12d79e187d15720d3e6c5"
+      },
+      "scope": "Completed input visibility/read-only metadata and previously accepted normalBASE/native69215/CPUfixtureRPC/PNG only. Not fresh queue/placement/capacity, currentGPUidentity, fullunits/chat, original16/17model/fullQA or current-main acceptance."
+    }
+  },
+  "normal_validation_authorized": false
+}

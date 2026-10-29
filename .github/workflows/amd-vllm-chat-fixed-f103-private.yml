@@ -1,0 +1,107 @@
+name: Current9134 exact00b6 original full vLLM chat and units private validation
+on:
+  workflow_call:
+    inputs:
+      execute:
+        type: boolean
+        default: false
+      normal_input_mount:
+        type: string
+        default: ''
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: amd-vllm-original-chat-fixed-f103
+  cancel-in-progress: false
+jobs:
+  artifact-relay:
+    if: inputs.execute
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      NORMAL_INPUT_MOUNT: ${{ inputs.normal_input_mount }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Require one separately admitted original full vLLM chat and units row
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          from pathlib import Path
+          data = json.loads(Path(".github/amd-shared-product/inputs.json").read_text())
+          assert data["admitted_lane"] == "vllm-chat-full-original"
+          assert data["normal_validation_authorized"] is True and data["runtime_cohort_accepted"] is False
+          assert all(data[key] is True for key in ("ready", "run_budget_admitted", "artifacts_pinned"))
+          assert data["consumer_gpu_ready"] is False
+          recipe = data["recipe"]
+          assert recipe["test_dirs"] == "e2e_test/chat_completions" and recipe["test_filter"] == ""
+          assert recipe["engine"] == "vllm" and recipe["gpu_tier"] == "1"
+          assert recipe["timeout"] == 60 and recipe["test_timeout"] == 45 and recipe["min_selected"] == 202
+          assert recipe["servicer_unit_tests"] is True and recipe["reruns"] == 2 and recipe["reruns_delay"] == 5
+          assert data["normal_base"]["input_ready"] is False
+          import os, shlex
+          parts = shlex.split(os.environ["NORMAL_INPUT_MOUNT"])
+          assert len(parts) == 2 and parts[0] == "--mount"
+          fields = parts[1].split(",")
+          values = dict(s.split("=", 1) for s in fields if "=" in s)
+          assert len(fields) == 4 and set(values) == {"type", "source", "target"} and "readonly" in fields
+          assert values["type"] == "bind" and values["source"].startswith("/") and values["source"] != "/"
+          assert values["target"] == "/opt/smg-vllm-normal-input"
+          PYTHON
+      - name: Verify external producer and relay payloads
+        id: relay
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          DIRECTORY="$RUNNER_TEMP/shared-relay-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "directory=$DIRECTORY" >> "$GITHUB_OUTPUT"
+          python3 .github/amd-shared-product/relay.py --out "$DIRECTORY"
+      - name: Relay wheel without changing its bytes
+        uses: actions/upload-artifact@v7
+        with:
+          name: smg-wheel
+          path: ${{ steps.relay.outputs.directory }}/smg-wheel/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+      - name: Relay Python types without changing their bytes
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-client-types
+          path: ${{ steps.relay.outputs.directory }}/python-client-types/
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+      - name: Preserve external producer identity and verification
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: external-producer-relay-evidence
+          path: ${{ steps.relay.outputs.directory }}/evidence/
+          if-no-files-found: ignore
+          retention-days: 7
+  vllm-chat:
+    needs: artifact-relay
+    if: inputs.execute && needs.artifact-relay.result == 'success'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: vllm
+      gpu_tier: '1'
+      runner: 4-gpu-mi300x
+      timeout: 60
+      test_timeout: 45
+      test_dirs: e2e_test/chat_completions
+      test_filter: ''
+      min_selected: 202
+      servicer_unit_tests: true
+      gpu_vendor: amd
+      amd_vllm_normal_base: true
+      container_image: vllm/vllm-openai-rocm@sha256:c49bfef372b73213eb490a81c6b04d949d368ff4726999406696756fa4ca77c6
+      container_options: >-
+        ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+        ${{ inputs.normal_input_mount }}
+    secrets: inherit
