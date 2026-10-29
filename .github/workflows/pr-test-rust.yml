@@ -10,6 +10,19 @@ on:
     branches: [ main, release/** ]
     types: [opened, synchronize, reopened]
   workflow_dispatch:
+    inputs:
+      private_amd_sglang:
+        description: Root-admitted retained fixed4420 full231 QA only
+        type: boolean
+        default: false
+      sglang_profile:
+        type: choice
+        options: [SG0, Symphony]
+        default: SG0
+      sglang_transport_nonce:
+        description: Fresh separately granted Root staging nonce
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -19,8 +32,8 @@ permissions:
 # merges otherwise stack full GPU matrices on one runner pool and time each
 # other out. Re-run an intermediate commit via workflow_dispatch if needed.
 concurrency:
-  group: gateway-tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}
-  cancel-in-progress: true
+  group: gateway-tests-${{ inputs.private_amd_sglang && format('private-amd-sglang-{0}-{1}', github.ref_name, inputs.sglang_profile) || github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}
+  cancel-in-progress: ${{ !inputs.private_amd_sglang }}
 
 env:
   RUSTC_WRAPPER: sccache
@@ -29,6 +42,7 @@ env:
 
 jobs:
   pre-commit:
+    if: ${{ !inputs.private_amd_sglang }}
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
       contents: read
@@ -61,6 +75,7 @@ jobs:
         run: pre-commit run --all-files --show-diff-on-failure
 
   python-lint:
+    if: ${{ !inputs.private_amd_sglang }}
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
       contents: read
@@ -88,6 +103,7 @@ jobs:
         run: mypy bindings/python/ --config-file mypy.ini
 
   grpc-proto-build-check:
+    if: ${{ !inputs.private_amd_sglang }}
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
       contents: read
@@ -135,6 +151,7 @@ jobs:
     # runner pool (which also tolerates the nvidia.com/gpu taint, so it can use
     # the abundant stranded CPU on GPU nodes) instead of competing for scarce
     # GPU runners.
+    if: ${{ !inputs.private_amd_sglang }}
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
       contents: read
@@ -227,6 +244,7 @@ jobs:
           python3 -m smg.launch_router --help > /dev/null && echo "Entry point: OK"
 
   python-unit-tests:
+    if: ${{ !inputs.private_amd_sglang }}
     needs: build-wheel
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -296,12 +314,14 @@ jobs:
     name: rust-lint (${{ matrix.leg }})
     needs: [detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.detect-changes.result == 'success'
       && (
         github.event_name != 'pull_request'
         || needs.detect-changes.outputs.rust-ci == 'true'
+      )
       )
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     timeout-minutes: 45
@@ -381,10 +401,12 @@ jobs:
     name: rust-tests (${{ matrix.shard }})
     needs: [detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.detect-changes.result == 'success'
       && needs.detect-changes.outputs.rust-shards != '[]'
+      )
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     timeout-minutes: 75
     permissions:
@@ -481,12 +503,14 @@ jobs:
   cargo-audit:
     needs: [detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.detect-changes.result == 'success'
       && (
         github.event_name != 'pull_request'
         || needs.detect-changes.outputs.dependencies == 'true'
+      )
       )
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     timeout-minutes: 10
@@ -535,12 +559,14 @@ jobs:
   rust-aarch64:
     needs: [detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.detect-changes.result == 'success'
       && (
         github.event_name != 'pull_request'
         || needs.detect-changes.outputs.rust-ci == 'true'
+      )
       )
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
@@ -578,7 +604,9 @@ jobs:
   benchmarks:
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       needs.detect-changes.outputs.docs-only != 'true'
+      )
     runs-on: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     continue-on-error: true
@@ -641,6 +669,7 @@ jobs:
           retention-days: 7
 
   detect-changes:
+    if: ${{ !inputs.private_amd_sglang }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -1210,11 +1239,13 @@ jobs:
     name: e2e-1gpu-chat (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-chat-one-engine != 'true'
+      )
     # Now also runs the previously-2-GPU chat tests (gpt-oss-20b,
     # Qwen2.5-14B) since they're tp=1.
     strategy:
@@ -1270,6 +1301,7 @@ jobs:
     name: e2e-1gpu-chat-amd (vllm)
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && vars.SMG_RUN_AMD_LEGS == 'true'
@@ -1277,6 +1309,7 @@ jobs:
       && (github.event_name != 'pull_request'
           || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
       && needs.detect-changes.outputs.skip-chat-completions != 'true'
+      )
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: vllm
@@ -1309,11 +1342,13 @@ jobs:
     name: e2e-1gpu-chat-symphony (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-chat-symphony != 'true'
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -1349,11 +1384,13 @@ jobs:
     name: e2e-1gpu-chat-rust-servicer (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-chat-one-engine != 'true'
+      )
     # Now also runs the previously-2-GPU chat tests (gpt-oss-20b,
     # Qwen2.5-14B) since they're tp=1.
     strategy:
@@ -1404,11 +1441,13 @@ jobs:
   e2e-1gpu-chat-mm-worker:
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-chat-completions != 'true'
+      )
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: vllm
@@ -1425,11 +1464,13 @@ jobs:
     name: e2e-1gpu-chat-zmq (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-chat-completions != 'true'
+      )
     # Same single-worker chat suite as e2e-1gpu-chat, driven over the ZMQ
     # direct-backend wire. The collection hook deselects the gRPC-only
     # families (PD, EPD, multi-worker) for a ZMQ lane, so this covers the
@@ -1473,11 +1514,13 @@ jobs:
     name: e2e-2gpu-chat-zmq-dp (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-chat-completions != 'true'
+      )
     # The 1-GPU ZMQ suite with grouped workers: each ZMQ worker launches two
     # DP engines on one socket set (tp=1 models, one GPU per engine), so the
     # gateway's handshake, the connector's least-loaded selection, and
@@ -1519,11 +1562,13 @@ jobs:
     name: e2e-1gpu-completions (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-completions != 'true'
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -1548,11 +1593,13 @@ jobs:
     name: e2e-1gpu-embeddings (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-embeddings != 'true'
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -1577,11 +1624,13 @@ jobs:
   e2e-1gpu-realtime:
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-realtime != 'true'
+      )
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: vllm
@@ -1599,11 +1648,13 @@ jobs:
     name: e2e-1gpu-gateway (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-chat-one-engine != 'true'
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -1635,11 +1686,13 @@ jobs:
   e2e-1gpu-responses:
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-agentic != 'true'
+      )
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: sglang
@@ -1656,11 +1709,13 @@ jobs:
     name: e2e-2gpu-pd (${{ matrix.engine }}${{ matrix.kv_backend && format('-{0}', matrix.kv_backend) || '' }})
     needs: [e2e-1gpu-gateway, detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.e2e-1gpu-gateway.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-chat-completions != 'true'
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -1713,11 +1768,13 @@ jobs:
   e2e-2gpu-pd-mm-worker:
     needs: [e2e-1gpu-chat-mm-worker, detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.e2e-1gpu-chat-mm-worker.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-chat-completions != 'true'
+      )
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: vllm
@@ -1739,11 +1796,13 @@ jobs:
     name: e2e-4gpu-chat (${{ matrix.engine }})
     needs: [e2e-1gpu-chat, detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.e2e-1gpu-chat.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-chat-completions != 'true'
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -1771,11 +1830,13 @@ jobs:
     name: e2e-4gpu-gateway
     needs: [e2e-1gpu-gateway, detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.e2e-1gpu-gateway.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-chat-completions != 'true'
+      )
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: sglang
@@ -1790,11 +1851,13 @@ jobs:
     name: e2e-4gpu-epd (tokenspeed)
     needs: [e2e-1gpu-chat, detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.e2e-1gpu-chat.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-chat-completions != 'true'
+      )
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: tokenspeed
@@ -1816,11 +1879,13 @@ jobs:
     name: e2e-4gpu-pd (${{ matrix.engine }}${{ matrix.kv_backend && format('-{0}', matrix.kv_backend) || '' }})
     needs: [e2e-1gpu-gateway, detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.e2e-1gpu-gateway.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-chat-completions != 'true'
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -1894,11 +1959,13 @@ jobs:
     name: e2e-cpu-mock
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.docs-only != 'true'
+      )
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     # A cold build of the mock worker and its dependencies takes minutes; the
     # warm one (main's entry under the job's own cache key) a fraction.
@@ -2020,11 +2087,13 @@ jobs:
     name: ${{ matrix.name }}
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-vendor != 'true'
+      )
     permissions:
       contents: read
     strategy:
@@ -2124,6 +2193,7 @@ jobs:
           bash scripts/ci_agentic_svc_deps.sh cleanup-oracle-user oracle-db
 
   go-unit-tests:
+    if: ${{ !inputs.private_amd_sglang }}
     name: go-unit-tests
     needs: build-wheel
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
@@ -2165,11 +2235,13 @@ jobs:
     name: go-bindings-e2e
     needs: [build-wheel, detect-changes]
     if: >-
+      !inputs.private_amd_sglang && (
       always()
       && !cancelled()
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-go-bindings != 'true'
+      )
     runs-on: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     # 19 min on a quiet host (SGLang setup ~6.5 min, Go ~4 min, tests ~6.5
@@ -2229,7 +2301,7 @@ jobs:
   go-bindings-benchmark:
     name: go-bindings-benchmark
     needs: build-wheel
-    if: false  # Disabled
+    if: ${{ !inputs.private_amd_sglang && (false) }}  # Disabled
     runs-on: ${{ vars.SMG_RUNNER_GPU || 'k8s-runner-gpu' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     timeout-minutes: 32
@@ -2283,7 +2355,7 @@ jobs:
 
   finish:
     needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-symphony, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
-    if: always()
+    if: ${{ !inputs.private_amd_sglang && (always()) }}
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
       contents: read
@@ -2384,7 +2456,7 @@ jobs:
   summarize-benchmarks:
     needs: [benchmarks]
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
-    if: always() && contains(fromJSON('["success", "failure"]'), needs.benchmarks.result)
+    if: ${{ !inputs.private_amd_sglang && (always() && contains(fromJSON('["success", "failure"]'), needs.benchmarks.result)) }}
     permissions:
       contents: read
     steps:
@@ -2403,3 +2475,74 @@ jobs:
 
     - name: Create benchmark summary
       run: python3 e2e_test/benchmarks/summarize.py .
+
+  private-amd-sglang-relay:
+    if: github.event_name == 'workflow_dispatch' && inputs.private_amd_sglang
+    runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
+    timeout-minutes: 10
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    env:
+      SMG_PRIVATE_SGLANG_EXECUTE: ${{ inputs.private_amd_sglang }}
+      NONCE: ${{ inputs.sglang_transport_nonce }}
+      PROFILE: ${{ inputs.sglang_profile }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Copy and verify separately admitted retained bytes
+        run: >-
+          python3 .github/amd-shared-product/sglang-full231/relay.py --execute
+          --nonce "$NONCE" --profile "$PROFILE"
+          --out "$RUNNER_TEMP/smg-byte-relay-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: retained-full231-${{ inputs.sglang_profile }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/smg-byte-relay-${{ github.run_id }}-${{ github.run_attempt }}/
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 1
+      - name: Remove only matching owned nonce prestage
+        if: always()
+        run: >-
+          python3 .github/amd-shared-product/sglang-full231/relay.py --execute --cleanup
+          --nonce "$NONCE" --profile "$PROFILE"
+          --out "$RUNNER_TEMP/smg-byte-relay-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Preserve relay receipt and cleanup outcome
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: retained-full231-relay-evidence-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/smg-byte-relay-${{ github.run_id }}-${{ github.run_attempt }}/relay-receipt.json
+            ${{ runner.temp }}/smg-byte-relay-${{ github.run_id }}-${{ github.run_attempt }}/relay-cleanup.json
+          if-no-files-found: error
+          retention-days: 7
+
+  private-amd-sglang-run:
+    needs: private-amd-sglang-relay
+    if: >-
+      github.event_name == 'workflow_dispatch' && inputs.private_amd_sglang &&
+      needs.private-amd-sglang-relay.result == 'success'
+    uses: ./.github/workflows/private-sglang-full231.yml
+    with:
+      execute: ${{ inputs.private_amd_sglang }}
+      profile: ${{ inputs.sglang_profile }}
+      artifact-id: ${{ needs.private-amd-sglang-relay.outputs.artifact-id }}
+    permissions:
+      contents: read
+      actions: read
+
+  private-amd-sglang-finish:
+    needs: [private-amd-sglang-relay, private-amd-sglang-run]
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.private_amd_sglang
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    timeout-minutes: 3
+    steps:
+      - name: Require every private dependency success
+        env:
+          RELAY: ${{ needs.private-amd-sglang-relay.result }}
+          COMPLETE: ${{ needs.private-amd-sglang-run.result }}
+        run: test "$RELAY" = success && test "$COMPLETE" = success

@@ -1,0 +1,87 @@
+name: Retained fixed4420 complete SGLang full231
+on:
+  workflow_call:
+    inputs:
+      execute:
+        type: boolean
+        default: false
+      profile:
+        type: string
+        required: true
+      artifact-id:
+        type: string
+        required: true
+permissions:
+  contents: read
+  actions: read
+jobs:
+  run:
+    if: inputs.execute
+    runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
+    timeout-minutes: 36
+    container:
+      image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
+      options: >-
+        --user=0:0 --device=/dev/kfd --device=/dev/dri --group-add=992
+        --ipc=private --shm-size=32g --cpus=8 --memory=96g --pids-limit=1024
+        --ulimit memlock=-1:-1 --cap-drop=ALL --cap-add=CHOWN --cap-add=SETGID
+        --cap-add=SETUID --cap-add=SETPCAP --security-opt=no-new-privileges
+        --volume=/models:/models
+        --tmpfs=/tmp/aiter_configs:rw,nosuid,nodev,mode=0700,uid=995,gid=985
+        --tmpfs=/run/smg-hf:rw,noexec,nosuid,nodev,size=64k,mode=0711,uid=0,gid=0
+    env:
+      SMG_PRIVATE_SGLANG_EXECUTE: ${{ inputs.execute }}
+      PROFILE: ${{ inputs.profile }}
+      PYTHONDONTWRITEBYTECODE: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Download the new same-run retained-byte artifact
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ inputs.artifact-id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/sglang-full231-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Complete original normal11 and full231 profile
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ACTUAL_JOB_CONTAINER_ID: ${{ job.container.id }}
+        run: >-
+          /opt/venv/bin/python -I -B
+          .github/amd-shared-product/sglang-full231/route_entry.py --execute
+          --profile "$PROFILE"
+          --transport "$RUNNER_TEMP/sglang-full231-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Preserve complete cases, JUnit, phase streams and source facts
+        if: always()
+        timeout-minutes: 1
+        uses: actions/upload-artifact@v7
+        with:
+          name: full231-${{ inputs.profile }}-evidence-${{ github.run_id }}
+          path: |
+            /evidence.tar
+            /evidence-tar-pin.json
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+      - name: Restore only this checkout owner and remove only this transport
+        if: always()
+        timeout-minutes: 1
+        env:
+          ACTUAL_JOB_CONTAINER_ID: ${{ job.container.id }}
+        run: >-
+          /opt/venv/bin/python -I -S -B
+          .github/amd-shared-product/sglang-full231/cleanup.py --execute
+      - name: Preserve own cleanup receipt
+        if: always()
+        timeout-minutes: 1
+        uses: actions/upload-artifact@v7
+        with:
+          name: full231-${{ inputs.profile }}-cleanup-${{ github.run_id }}
+          path: ${{ runner.temp }}/sglang-full231-cleanup-${{ github.run_id }}.json
+          if-no-files-found: error
+          retention-days: 7

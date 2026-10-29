@@ -1,0 +1,87 @@
+{
+  "scope": "private fixed4420 original full231 QA; no current176 native claim",
+  "image": "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d",
+  "staging_files": {
+    "runtime.tar": {
+      "bytes": 174080,
+      "sha256": "24b0c63fb853f11c1e65cdbb1eaf6a43b9783827e9b5286601f8b8d9b8ae5e44"
+    },
+    "SG0.tar": {
+      "bytes": 73615360,
+      "sha256": "85d2d15cd8a055324595a03971a9393f1f3a69a68061dfb09f56ac1200244a95"
+    },
+    "SG0-map.json": {
+      "bytes": 4074,
+      "sha256": "65f0bdaaaffc1ee653274731a6bdfc8b0d923659ee1d9a45d0ca51e2190a2649"
+    },
+    "Symphony.tar": {
+      "bytes": 73615360,
+      "sha256": "0b573a7e048fc9a29290b4ec4dbea6a65d22b97d575369465437d69049db0769"
+    },
+    "Symphony-map.json": {
+      "bytes": 4073,
+      "sha256": "432aaa6694d0d00330c0c36e22ea52fa9f4ed02023e2e0987742d0e7080dbe63"
+    },
+    "Root-start-authority.json": null,
+    "component-proof.json": {
+      "bytes": 431118,
+      "sha256": "6cc2c62ce1c8df051c762b9b9b74f77830c9ec6caa5153426c4d5fef33b36e73"
+    },
+    "root-chown-component-proof.json": null
+  },
+  "runtime_files": {
+    "profile_SG0.py": {
+      "bytes": 67991,
+      "sha256": "3262ed2abe0702501cd032cb2ad6f8adf87726fb2b57afc2063c7cf5f69691d9"
+    },
+    "profile_Symphony.py": {
+      "bytes": 67959,
+      "sha256": "23ce3a46a2ef9207e140ef6d5a8ea20ae666ad7f3796f4167917cc23c003535a"
+    },
+    "root_to_uid995.py": {
+      "bytes": 7032,
+      "sha256": "f8acaec92bfaaa8e74184acf601202a3c98420122b2f1f861a751c12ec344dcf"
+    },
+    "root_chown_entry.py": {
+      "bytes": 6039,
+      "sha256": "fd859efb79580175130137b51dc6a93ce632ba36edcab8631f62b1d4da493915"
+    },
+    "profiles.json": {
+      "bytes": 11474,
+      "sha256": "7b5482521289e993b528d3dcec4fc0c5cdeb4c764c72ff1e4ca509ee295b0bf7"
+    },
+    "phase-source-lineage.json": {
+      "bytes": 2258,
+      "sha256": "b9df61d59fb849c6f24aa43e61909e0f0742c03ebd6e1e1288aa61d71b992771"
+    }
+  },
+  "converter_source_manifest_sha256": "6ac0ef353ea88df8e9c299517fb44a0a6ab9c04ee15eb048f9670e9f58c2b24b",
+  "converter_source_peer_sha256": "a4f6cb2acd6359fd809fed3e75bf51525f5603163e0a3078a1ea77b1c17c9936",
+  "dynamic_files_explanation": {
+    "Root-start-authority.json": "new actual Root grant, profile/source/eligible hosts+runnernames/queue/cutoff/watch authority; never a future fabricated value",
+    "component-proof.json": "actual finite credential CPU component result, full hash provided by new Root authority",
+    "root-chown-component-proof.json": "actual future finite new root CHOWN-only branch result; must be Root verified and full SHA supplied in new start authority; no result fabricated here"
+  },
+  "external_start_authority": "Root must own separate finite relay and GPU budget, queue TTL, before-hook actions/pull start oversight and exact postjob CID/lease cleanup. Source is not grant.",
+  "root_chown_source_manifest_sha256": "59f8d9eafcf1c642e9c5bb086cfdd23f09ba376c70a760bcceed1754525d0106",
+  "root_chown_source_peer": {
+    "bytes": 4590,
+    "sha256": "4e5ccb3043f3fe32e8dbb1be8d8e280358f25ef34bfc64e508ef101c4dcb1215"
+  },
+  "converter_actual_component_peer": {
+    "bytes": 33136,
+    "sha256": "5eff724fbeec4bfd3b5b4620fd937ab8671b3b99e984810bfa8885362126cb88"
+  },
+  "denied_initial_env": [
+    "PREBUILD_THREAD_NUM",
+    "AITER_AOT_IMPORT",
+    "AITER_REBUILD",
+    "GPU_ARCHS",
+    "E2E_STARTUP_TIMEOUT",
+    "SMG_QWEN_MROPE_TRACE",
+    "SMG_QWEN_MM_TRACE",
+    "SMG_QWEN_MM_MODEL",
+    "HF_TOKEN",
+    "HUGGING_FACE_HUB_TOKEN"
+  ]
+}
