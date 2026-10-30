@@ -2027,6 +2027,117 @@ fn test_apply_known_remote_insert_from_request_hot_path() {
 }
 
 #[test]
+fn hash_index_counts_what_it_stores() {
+    let index = PerModelHashIndex::default();
+    index.insert_string(1, "abcd".to_string());
+    // An overwrite replaces the old value's size instead of adding to it.
+    index.insert_string(1, "ab".to_string());
+    index.insert_string(2, "xyz".to_string());
+    assert_eq!(index.string_bytes.load(Ordering::Relaxed), 5);
+    index.insert_tokens(7, vec![1, 2, 3]);
+    index.insert_tokens(7, vec![1, 2, 3, 4]);
+    assert_eq!(index.token_count.load(Ordering::Relaxed), 4);
+
+    index.evict("model1", 5);
+    assert_eq!(index.string_tree.len(), 2);
+    // Two entries fit a budget of 4, five bytes do not; four tokens still fit.
+    index.evict("model1", 4);
+    assert!(index.string_tree.is_empty());
+    assert_eq!(index.string_bytes.load(Ordering::Relaxed), 0);
+    assert_eq!(index.token_tree.len(), 1);
+    index.evict("model1", 3);
+    assert!(index.token_tree.is_empty());
+    assert_eq!(index.token_count.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn hash_index_is_bounded_by_stored_text_in_multi_turn_chat() {
+    // Each turn resends the conversation so far and the populate site
+    // stores the part already in the tree, the whole previous request.
+    // A few entries then hold more text than the budget, which an
+    // entry-count bound never notices (#4751).
+    let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+        eviction_interval_secs: 0,
+        ..Default::default()
+    });
+    policy.set_populate_hash_index(true);
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    policy.init_workers(&workers);
+    let model = normalize_model_key(workers[0].model_id());
+
+    let mut conversation = String::new();
+    let mut previous_requests = 0;
+    for turn in 0..5 {
+        previous_requests += conversation.len();
+        conversation.push_str(&format!("turn {turn}: {} ", "x".repeat(1_000)));
+        route_text(&policy, &workers, &conversation).unwrap();
+    }
+    let held = {
+        let index = policy.hash_index.get(model).unwrap();
+        assert_eq!(index.string_tree.len(), 5);
+        index.string_bytes.load(Ordering::Relaxed)
+    };
+    assert_eq!(held, previous_requests);
+
+    policy.evict_cache(held);
+    assert_eq!(policy.hash_index.get(model).unwrap().string_tree.len(), 5);
+    policy.evict_cache(held - 1);
+    let index = policy.hash_index.get(model).unwrap();
+    assert!(
+        index.string_tree.is_empty(),
+        "five entries holding more text than the budget must be cleared"
+    );
+    assert_eq!(index.string_bytes.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn repair_pages_count_toward_the_hash_index_bound() {
+    fn page(tree_kind: TreeKind, entries: Vec<RepairEntry>) -> TreeRepairPage {
+        TreeRepairPage {
+            session_id: uuid::Uuid::now_v7(),
+            model_id: "model1".to_string(),
+            tree_kind,
+            page_index: 0,
+            entries,
+            next_cursor: None,
+            is_last: true,
+        }
+    }
+    let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+        eviction_interval_secs: 0,
+        ..Default::default()
+    });
+    let tenants = vec![(Arc::from("http://w1"), 1)];
+    let strings = ["a".repeat(600), "b".repeat(900)]
+        .into_iter()
+        .map(|path| RepairEntry::String {
+            path,
+            tenants: tenants.clone(),
+        })
+        .collect();
+    assert_eq!(
+        policy.apply_repair_page(&page(TreeKind::String, strings)),
+        2
+    );
+    let tokens = vec![RepairEntry::Token {
+        tokens: (0..700).collect(),
+        tenants,
+    }];
+    assert_eq!(policy.apply_repair_page(&page(TreeKind::Token, tokens)), 1);
+    {
+        let index = policy.hash_index.get("model1").unwrap();
+        assert_eq!(index.string_bytes.load(Ordering::Relaxed), 1_500);
+        assert_eq!(index.token_count.load(Ordering::Relaxed), 700);
+    }
+
+    // Three entries are far below the budget; their contents are not.
+    policy.evict_cache(699);
+    let index = policy.hash_index.get("model1").unwrap();
+    assert!(index.string_tree.is_empty());
+    assert!(index.token_tree.is_empty());
+}
+
+#[test]
 fn test_cache_aware_without_mesh() {
     let config = CacheAwareConfig {
         eviction_interval_secs: 0,

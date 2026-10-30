@@ -1327,7 +1327,8 @@ class RouterArgs:
             help="Maximum total size of each model's approximation tree for "
             "cache-aware routing (chars for HTTP, tokens for gRPC), shared "
             "across all workers; eviction keeps every tree at or under this "
-            "bound",
+            "bound. With mesh enabled, eviction also clears a model's prefix "
+            "hash index once the prefixes it stores exceed this bound",
         )
         routing_group.add_argument(
             f"--{prefix}block-size",

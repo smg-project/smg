@@ -81,7 +81,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -236,13 +236,14 @@ pub struct CacheAwarePolicy {
     /// Spec §7.1 mandates model scoping: the same hash can refer
     /// to different prefixes in different models, so a global
     /// index mis-routes multi-model deployments. Bounded by
-    /// eviction at `max_tree_size` total entries.
+    /// eviction at `max_tree_size` entries or stored text, per
+    /// model and tree kind (see [`PerModelHashIndex::evict`]).
     ///
     /// Per-entry value semantics differ by populate site:
     /// - `select_worker_*` (request hot paths) store the prior
-    ///   shared prefix from a pre-insert match. Bytes/entry is
-    ///   bounded by tree depth, not input size — a 32K-token
-    ///   request costs O(matched-prefix), not O(input).
+    ///   shared prefix from a pre-insert match. In multi-turn chat
+    ///   that prefix is the whole previous request, so one entry
+    ///   can cost as much as the input.
     /// - `apply_repair_page` (cold-start replay) stores the full
     ///   inserted path because the canonical path is required to
     ///   attach remote tenants at the correct node. This path
@@ -315,6 +316,70 @@ struct PerModelHashIndex {
     string_tree: DashMap<u64, String>,
     /// token-path hash → tokens (reconstructs the token-tree node).
     token_tree: DashMap<u64, Vec<u32>>,
+    /// Bytes of text held in `string_tree`. A char is at least one
+    /// byte, so bounding this by `max_tree_size` keeps the index
+    /// within the tree's char budget.
+    string_bytes: AtomicUsize,
+    /// Tokens held in `token_tree`.
+    token_count: AtomicUsize,
+}
+
+impl PerModelHashIndex {
+    fn insert_string(&self, node_hash: u64, prefix: String) {
+        let added = prefix.len();
+        let replaced = self
+            .string_tree
+            .insert(node_hash, prefix)
+            .map_or(0, |old| old.len());
+        Self::account(&self.string_bytes, added, replaced);
+    }
+
+    fn insert_tokens(&self, node_hash: u64, tokens: Vec<u32>) {
+        let added = tokens.len();
+        let replaced = self
+            .token_tree
+            .insert(node_hash, tokens)
+            .map_or(0, |old| old.len());
+        Self::account(&self.token_count, added, replaced);
+    }
+
+    /// Apply one insert's net change to a size counter. Writers and
+    /// eviction both hold the model's shard lock in `hash_index`, so
+    /// a clear never races an overwrite; saturating keeps the
+    /// counter from wrapping should that change.
+    fn account(counter: &AtomicUsize, added: usize, replaced: usize) {
+        if added >= replaced {
+            counter.fetch_add(added - replaced, Ordering::Relaxed);
+        } else {
+            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                Some(held.saturating_sub(replaced - added))
+            });
+        }
+    }
+
+    /// Clear each tree kind whose entry count or stored size exceeds
+    /// `max_size`. The entry count alone never fires in multi-turn
+    /// chat, where a few thousand entries can hold hundreds of
+    /// megabytes of prefixes.
+    fn evict(&self, model_id: &str, max_size: usize) {
+        if self.string_tree.len() > max_size || self.string_bytes.load(Ordering::Relaxed) > max_size
+        {
+            self.string_tree.clear();
+            self.string_bytes.store(0, Ordering::Relaxed);
+            debug!(
+                model_id,
+                "String hash index cleared (exceeded max_size: {})", max_size
+            );
+        }
+        if self.token_tree.len() > max_size || self.token_count.load(Ordering::Relaxed) > max_size {
+            self.token_tree.clear();
+            self.token_count.store(0, Ordering::Relaxed);
+            debug!(
+                model_id,
+                "Token hash index cleared (exceeded max_size: {})", max_size
+            );
+        }
+    }
 }
 
 /// Total cached characters across tenants and the tenant count for one
@@ -429,22 +494,7 @@ impl CacheAwarePolicy {
                     let mut hash_total: usize = 0;
                     for entry in hash_index_clone.iter() {
                         let per_model = entry.value();
-                        if per_model.string_tree.len() > max_tree_size {
-                            per_model.string_tree.clear();
-                            debug!(
-                                model_id = entry.key(),
-                                "String hash index cleared (exceeded max_tree_size: {})",
-                                max_tree_size
-                            );
-                        }
-                        if per_model.token_tree.len() > max_tree_size {
-                            per_model.token_tree.clear();
-                            debug!(
-                                model_id = entry.key(),
-                                "Token hash index cleared (exceeded max_tree_size: {})",
-                                max_tree_size
-                            );
-                        }
+                        per_model.evict(entry.key(), max_tree_size);
                         hash_total += per_model.string_tree.len() + per_model.token_tree.len();
                     }
 
@@ -654,7 +704,7 @@ impl CacheAwarePolicy {
         let entry = self.hash_index.entry(model_id.to_string()).or_default();
         match tree_kind {
             TreeKind::String => {
-                entry.string_tree.insert(node_hash, matched.to_string());
+                entry.insert_string(node_hash, matched.to_string());
                 // Ensure the string_tree map has a matching tree so
                 // apply_known_remote_insert doesn't hit the
                 // populate-site invariant warning.
@@ -663,9 +713,7 @@ impl CacheAwarePolicy {
                     .or_insert_with(|| Arc::new(Tree::new()));
             }
             TreeKind::Token => {
-                entry
-                    .token_tree
-                    .insert(node_hash, matched.bytes().map(u32::from).collect());
+                entry.insert_tokens(node_hash, matched.bytes().map(u32::from).collect());
                 self.token_trees
                     .entry(model_id.to_string())
                     .or_insert_with(|| Arc::new(self.new_token_tree()));
@@ -963,21 +1011,7 @@ impl CacheAwarePolicy {
         // per-tree bound; clearing one model's overflow must not wipe
         // other models' still-valid metadata.
         for entry in self.hash_index.iter() {
-            let per_model = entry.value();
-            if per_model.string_tree.len() > max_size {
-                per_model.string_tree.clear();
-                debug!(
-                    model_id = entry.key(),
-                    "String hash index cleared (exceeded max_size: {})", max_size
-                );
-            }
-            if per_model.token_tree.len() > max_size {
-                per_model.token_tree.clear();
-                debug!(
-                    model_id = entry.key(),
-                    "Token hash index cleared (exceeded max_size: {})", max_size
-                );
-            }
+            entry.value().evict(entry.key(), max_size);
         }
     }
 
@@ -1021,8 +1055,7 @@ impl CacheAwarePolicy {
                     self.hash_index
                         .entry(model_id.to_string())
                         .or_default()
-                        .token_tree
-                        .insert(kv_index::hash_token_path(tokens), matched_prefix);
+                        .insert_tokens(kv_index::hash_token_path(tokens), matched_prefix);
                 } else {
                     tree.insert_tokens(tokens, worker_url);
                 }
@@ -1051,8 +1084,7 @@ impl CacheAwarePolicy {
                     self.hash_index
                         .entry(model_id.to_string())
                         .or_default()
-                        .string_tree
-                        .insert(path_hash, matched_prefix);
+                        .insert_string(path_hash, matched_prefix);
                 } else {
                     tree.insert_text(text, worker_url);
                 }
@@ -1228,8 +1260,7 @@ impl TreeHandle for CacheAwarePolicy {
                             self.hash_index
                                 .entry(model_id.to_string())
                                 .or_default()
-                                .string_tree
-                                .insert(kv_index::hash_node_path(path), path.clone());
+                                .insert_string(kv_index::hash_node_path(path), path.clone());
                             applied += 1;
                         }
                         RepairEntry::Token { .. } => {
@@ -1258,8 +1289,7 @@ impl TreeHandle for CacheAwarePolicy {
                             self.hash_index
                                 .entry(model_id.to_string())
                                 .or_default()
-                                .token_tree
-                                .insert(kv_index::hash_token_path(tokens), tokens.clone());
+                                .insert_tokens(kv_index::hash_token_path(tokens), tokens.clone());
                             applied += 1;
                         }
                         RepairEntry::String { .. } => {
@@ -3447,8 +3477,7 @@ impl CacheAwarePolicy {
             self.hash_index
                 .entry(model_id.to_string())
                 .or_default()
-                .token_tree
-                .insert(node_hash, matched_prefix);
+                .insert_tokens(node_hash, matched_prefix);
             self.sync_local_insert(
                 model_id,
                 TreeDelta {
@@ -3528,8 +3557,7 @@ impl CacheAwarePolicy {
             self.hash_index
                 .entry(model_id.to_string())
                 .or_default()
-                .string_tree
-                .insert(path_hash, matched_prefix);
+                .insert_string(path_hash, matched_prefix);
             self.sync_local_insert(
                 model_id,
                 TreeDelta {

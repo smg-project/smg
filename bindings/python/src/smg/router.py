@@ -348,6 +348,8 @@ class Router:
         max_tree_size: Maximum total size of each model's approximation tree for
             cache-aware routing (chars for HTTP, tokens for gRPC), shared across
             all workers; eviction keeps every tree at or under this bound.
+            With mesh enabled, eviction also clears a model's prefix hash
+            index once the prefixes it stores exceed this bound.
             Default: 2^26
         dp_aware: Enable data parallelism aware schedule. Default: False
         dp_minimum_tokens_scheduler: Choose a data-parallel rank per request from the
