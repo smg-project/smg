@@ -12,7 +12,7 @@
 //! refresh-on-miss that the provider and realtime paths use; this is the
 //! policy-registry path over the self-hosted routing pools.
 
-use std::{fmt, sync::Arc, time::Duration};
+use std::{borrow::Cow, fmt, sync::Arc, time::Duration};
 
 use axum::{
     http::{header::RETRY_AFTER, HeaderMap, HeaderValue},
@@ -236,6 +236,36 @@ pub(crate) fn select_single(
     select_from(registry, policies, model_id, candidates.as_slice(), inputs)
 }
 
+/// Whether selection over a single routing pool can reach a worker without
+/// invoking the policy's stateful selection path.
+pub(crate) fn has_selectable_single(
+    registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
+    model_id: &str,
+    pool: RoutingPool,
+    wire: Option<WireConstraint>,
+    inputs: PlacementInputs<'_>,
+) -> bool {
+    let pool_candidates = candidates(registry, model_id, pool, wire);
+    let policy = policies.get_policy_or_default(model_id);
+    if policy.name() == "consistent_hashing"
+        && header_utils::extract_target_worker(inputs.headers).is_some()
+    {
+        return false;
+    }
+    let accepted = filter_candidates(pool_candidates.as_slice(), inputs.candidate_filter);
+    let available = available_candidates(policy.as_ref(), accepted.as_ref());
+    let retry_candidates = skip_tried_candidates(
+        policy.as_ref(),
+        available.as_ref(),
+        inputs.headers,
+        inputs.tried,
+    );
+
+    retry_candidates.iter().any(|worker| worker.is_available())
+        || overload::has_fallback_if_all_vetoed(accepted.as_ref(), registry.overload_shed_enabled())
+}
+
 /// [`select_single`] over an explicit candidate slice: the entry for a caller
 /// with a candidate rule the pools cannot express, such as dropping DP-aware
 /// workers from a path that cannot pin a rank.
@@ -247,67 +277,16 @@ pub(crate) fn select_from(
     inputs: PlacementInputs<'_>,
 ) -> Option<Arc<dyn Worker>> {
     let policy = policies.get_policy_or_default(model_id);
-
-    // The per-request predicate applies to every entry point, so a caller
-    // that sets it can never dispatch to a worker it rejects.
-    let accepted;
-    let candidates: &[Arc<dyn Worker>] = match inputs.candidate_filter {
-        Some(accepts) => {
-            accepted = candidates
-                .iter()
-                .filter(|w| accepts(w.as_ref()))
-                .cloned()
-                .collect::<Vec<_>>();
-            &accepted
-        }
-        None => candidates,
-    };
-
-    // Most policies already apply the complete availability predicate. Give
-    // them the shared snapshot directly instead of cloning every available
-    // worker into a second per-request Vec. Hash policies use a weaker health
-    // predicate and keep the pre-filter.
-    let filtered;
-    let available: &[Arc<dyn Worker>] = if policy_filters_unavailable_workers(policy.as_ref()) {
-        candidates
-    } else {
-        filtered = candidates
-            .iter()
-            .filter(|worker| worker.is_available())
-            .cloned()
-            .collect::<Vec<_>>();
-        &filtered
-    };
-    // The engines this request already tried step aside for its retry while
-    // another available candidate remains; otherwise the pool is used whole.
-    // An explicit target under consistent hashing indexes this slice and
-    // stays strict (as `admission_prefilters` keeps it), so it is never
-    // narrowed: the retry goes back to the targeted worker.
-    let strict_target = policy.name() == "consistent_hashing"
-        && header_utils::extract_target_worker(inputs.headers).is_some();
-    let untried;
-    let available: &[Arc<dyn Worker>] = if inputs.tried.is_empty() || strict_target {
-        available
-    } else {
-        untried = available
-            .iter()
-            .filter(|worker| {
-                worker.is_available()
-                    && !inputs
-                        .tried
-                        .iter()
-                        .any(|engine| engine == worker.base_url())
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if untried.is_empty() {
-            available
-        } else {
-            &untried
-        }
-    };
+    let candidates = filter_candidates(candidates, inputs.candidate_filter);
+    let available = available_candidates(policy.as_ref(), candidates.as_ref());
+    let available = skip_tried_candidates(
+        policy.as_ref(),
+        available.as_ref(),
+        inputs.headers,
+        inputs.tried,
+    );
     if available.is_empty() {
-        return overload_fallback(registry, policy.name(), model_id, candidates);
+        return overload_fallback(registry, policy.name(), model_id, candidates.as_ref());
     }
 
     // Cached hash ring for consistent hashing (O(log n) lookup).
@@ -318,7 +297,7 @@ pub(crate) fn select_from(
     let Some(idx) = policies.select_worker_for_model(
         &policy,
         model_id,
-        available,
+        available.as_ref(),
         &SelectWorkerInfo {
             request_text: inputs.text,
             tokens: inputs.tokens,
@@ -333,7 +312,7 @@ pub(crate) fn select_from(
     ) else {
         // A policy that filters availability itself misses on an
         // all-overloaded pool the same way the pre-filter empties.
-        return overload_fallback(registry, policy.name(), model_id, candidates);
+        return overload_fallback(registry, policy.name(), model_id, candidates.as_ref());
     };
     let selected = available[idx].clone();
 
@@ -345,6 +324,69 @@ pub(crate) fn select_from(
     );
 
     Some(selected)
+}
+
+fn filter_candidates<'a>(
+    candidates: &'a [Arc<dyn Worker>],
+    candidate_filter: Option<CandidateFilter<'_>>,
+) -> Cow<'a, [Arc<dyn Worker>]> {
+    match candidate_filter {
+        Some(accepts) => Cow::Owned(
+            candidates
+                .iter()
+                .filter(|worker| accepts(worker.as_ref()))
+                .cloned()
+                .collect(),
+        ),
+        None => Cow::Borrowed(candidates),
+    }
+}
+
+fn available_candidates<'a>(
+    policy: &dyn LoadBalancingPolicy,
+    candidates: &'a [Arc<dyn Worker>],
+) -> Cow<'a, [Arc<dyn Worker>]> {
+    // Keep the shared snapshot for policies that apply this same availability
+    // predicate themselves; other policies receive the caller-filtered pool.
+    if policy_filters_unavailable_workers(policy) {
+        Cow::Borrowed(candidates)
+    } else {
+        Cow::Owned(
+            candidates
+                .iter()
+                .filter(|worker| worker.is_available())
+                .cloned()
+                .collect(),
+        )
+    }
+}
+
+fn skip_tried_candidates<'a>(
+    policy: &dyn LoadBalancingPolicy,
+    available: &'a [Arc<dyn Worker>],
+    headers: Option<&HeaderMap>,
+    tried: &[String],
+) -> Cow<'a, [Arc<dyn Worker>]> {
+    // An explicit target under consistent hashing remains strict. Otherwise,
+    // tried engines step aside while another available candidate remains.
+    let strict_target = policy.name() == "consistent_hashing"
+        && header_utils::extract_target_worker(headers).is_some();
+    if tried.is_empty() || strict_target {
+        return Cow::Borrowed(available);
+    }
+
+    let untried = available
+        .iter()
+        .filter(|worker| {
+            worker.is_available() && !tried.iter().any(|engine| engine == worker.base_url())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if untried.is_empty() {
+        Cow::Borrowed(available)
+    } else {
+        Cow::Owned(untried)
+    }
 }
 
 /// The steering default for a pool whose every worker is vetoed, by the
@@ -2160,6 +2202,28 @@ mod tests {
                 "target {index}: the retry stays on the targeted worker"
             );
         }
+    }
+
+    #[test]
+    fn explicit_target_preflight_rejects_a_narrowed_consistent_hash_pool() {
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-target-worker", "0".parse().unwrap());
+        let only_other_worker = |worker: &dyn Worker| worker.url() == "http://h:2";
+
+        assert!(!has_selectable_single(
+            &registry,
+            &policies,
+            MODEL,
+            RoutingPool::HttpRegular,
+            None,
+            PlacementInputs {
+                headers: Some(&headers),
+                candidate_filter: Some(&only_other_worker),
+                ..Default::default()
+            },
+        ));
     }
 
     /// Round robin never re-selects a tried worker while another is left,

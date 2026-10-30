@@ -115,6 +115,68 @@ const WEBRTC_REQUEST_BODY_LIMIT: usize = 10 * 1024 * 1024;
 const STREAMED_BODY_STALLED: &str = "request_body_stalled";
 const STREAMED_BODY_TOO_LARGE: &str = "request_body_too_large";
 const STREAMED_BODY_ABORTED: &str = "request_body_aborted";
+const CONTEXT_REJECTION_BODY_LIMIT: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+struct ContextLengthRejected {
+    window: Option<u32>,
+}
+
+#[derive(Default)]
+struct ContextRetryState {
+    used: bool,
+    minimum_window: Option<u32>,
+}
+
+fn is_context_length_rejection(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let error = value.get("error");
+    let code = error
+        .and_then(|error| error.get("code"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("code").and_then(serde_json::Value::as_str));
+    if code == Some("context_length_exceeded") {
+        return true;
+    }
+
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| error.and_then(serde_json::Value::as_str))
+        .or_else(|| value.get("message").and_then(serde_json::Value::as_str))
+        .or_else(|| value.get("detail").and_then(serde_json::Value::as_str));
+    let Some(message) = message else {
+        return false;
+    };
+    let message = message.trim().to_ascii_lowercase();
+    let vllm_context_error = message.starts_with("this model's maximum context length is ")
+        && message.contains(" tokens. however, ")
+        && ((message.contains("your request has ") && message.contains(" input tokens."))
+            || (message.contains("you requested ")
+                && ((message.contains(" tokens in the messages,")
+                    && message.contains("which exceeds the model's maximum context length"))
+                    || (message.contains(" in the messages, ")
+                        && message.contains(" in the completion)")))));
+    let sglang_context_error = message.starts_with("the input (")
+        && message.contains(" tokens) is longer than the model's context length (")
+        && message.ends_with(").");
+
+    vllm_context_error || sglang_context_error
+}
+
+fn is_json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| {
+            let media_type = media_type.trim();
+            media_type.eq_ignore_ascii_case("application/json")
+                || media_type.to_ascii_lowercase().ends_with("+json")
+        })
+}
 
 /// How a worker response body is relayed to the client. Re-chunking exists
 /// on this regular HTTP relay only; the PD and gRPC relays do not apply it.
@@ -221,6 +283,18 @@ impl Router {
             .find(|worker| worker.is_healthy())
             .cloned()
             .ok_or_else(|| "No workers are available".to_string())
+    }
+
+    fn has_context_capacity_variance(&self, model_id: &str) -> bool {
+        let workers = self
+            .worker_registry
+            .get_routing_pool(model_id, RoutingPool::HttpRegular);
+        let mut windows = workers
+            .iter()
+            .filter_map(|worker| worker.context_length(model_id));
+        windows
+            .next()
+            .is_some_and(|first| windows.any(|window| window != first))
     }
 
     async fn proxy_get_request(&self, req: Request<Body>, endpoint: &str) -> Response {
@@ -455,9 +529,16 @@ impl Router {
         let retry_config = per_model_retry_config
             .as_ref()
             .unwrap_or(&self.retry_config);
+        let configured_attempts = retry_config.max_retries.max(1);
+        let has_context_capacity_variance = self.has_context_capacity_variance(model_id);
+        let mut executor_retry_config = retry_config.clone();
+        if configured_attempts == 1 && has_context_capacity_variance {
+            executor_retry_config.max_retries = 2;
+        }
 
         // The lease owns the parsed request and its routing derivatives for
-        // the dispatch phase; its release point encodes the retry policy.
+        // the dispatch phase; heterogeneous context windows can require one
+        // capacity retry even when ordinary retries are disabled.
         let lease = RequestLease::new(
             typed_req,
             RoutingDerivatives {
@@ -466,8 +547,13 @@ impl Router {
                 rid_key,
                 cache_namespace,
             },
-            ReleasePoint::from_retry_config(retry_config),
+            if has_context_capacity_variance {
+                ReleasePoint::AtRetryClose
+            } else {
+                ReleasePoint::from_retry_config(retry_config)
+            },
         );
+        let context_retry = parking_lot::Mutex::new(ContextRetryState::default());
         // The engines a failed attempt of this request dispatched to; a retry
         // re-selects away from them while another available worker is left.
         let tried = parking_lot::Mutex::new(Vec::new());
@@ -490,6 +576,7 @@ impl Router {
                     is_stream,
                     &ledger,
                     &tried,
+                    &context_retry,
                 )
                 .await;
             Metrics::record_router_upstream_response(
@@ -497,15 +584,14 @@ impl Router {
                 res.status().as_u16(),
                 extract_error_code_from_response(&res),
             );
-            // Mirror the retry executor's exhaustion accounting for a
-            // retryable response that gets no retry.
+            // Match the retry executor's exhaustion accounting for this single attempt.
             if is_retryable_response(&res) {
                 Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
             }
             res
         } else {
             RetryExecutor::execute_response_with_retry(
-                retry_config,
+                &executor_retry_config,
                 // operation per attempt; the lease keeps the request alive
                 // for replay until the retry window closes (first
                 // non-retryable response).
@@ -520,6 +606,7 @@ impl Router {
                             is_stream,
                             &ledger,
                             &tried,
+                            &context_retry,
                         )
                         .await;
 
@@ -533,7 +620,58 @@ impl Router {
                     res
                 },
                 // should_retry predicate
-                |res, _attempt| is_retryable_response(res),
+                |res, attempt| {
+                    if is_retryable_response(res) {
+                        return configured_attempts > 1;
+                    }
+
+                    let Some(rejection) = res.extensions().get::<ContextLengthRejected>() else {
+                        return false;
+                    };
+                    if attempt + 1 >= executor_retry_config.max_retries {
+                        return false;
+                    }
+
+                    let mut state = context_retry.lock();
+                    if state.used {
+                        return false;
+                    }
+                    let Some(minimum_window) = rejection.window else {
+                        return false;
+                    };
+                    let has_larger_worker = lease.with_view(|view| {
+                        let tried = tried.lock();
+                        let has_larger_context = |worker: &dyn Worker| {
+                            ledger.admits(worker)
+                                && worker
+                                    .context_length(model_id)
+                                    .is_some_and(|window| window > minimum_window)
+                        };
+                        placement::has_selectable_single(
+                            &self.worker_registry,
+                            &self.policy_registry,
+                            model_id,
+                            RoutingPool::HttpRegular,
+                            None,
+                            PlacementInputs {
+                                text: view.text,
+                                tokens: view.tokens,
+                                headers,
+                                rid_key: view.rid_key,
+                                cache_namespace: view.cache_namespace,
+                                candidate_filter: Some(&has_larger_context),
+                                tried: &tried,
+                            },
+                        )
+                    });
+                    if !has_larger_worker {
+                        return false;
+                    }
+
+                    state.used = true;
+                    state.minimum_window = Some(minimum_window);
+                    true
+                },
                 // on_backoff hook
                 |delay, attempt| {
                     // Layer 3 worker metrics
@@ -590,12 +728,20 @@ impl Router {
         is_stream: bool,
         ledger: &AttemptLedger,
         tried: &parking_lot::Mutex<Vec<String>>,
+        context_retry: &parking_lot::Mutex<ContextRetryState>,
     ) -> Response {
-        // A retry never goes back to a worker whose answer was definitive.
-        let admits = |worker: &dyn Worker| ledger.admits(worker);
+        let minimum_window = context_retry.lock().minimum_window;
+        let admits = |worker: &dyn Worker| {
+            ledger.admits(worker)
+                && minimum_window.is_none_or(|minimum| {
+                    worker
+                        .context_length(model_id)
+                        .is_some_and(|window| window > minimum)
+                })
+        };
         let worker = match lease.with_view(|view| {
-            // A retry re-selects away from the engines this request already
-            // tried, while another available worker is left to take it.
+            // Re-select after backoff so current health and availability are
+            // honored along with the context bound from the rejection.
             let tried = tried.lock();
             self.select_worker_for_model(
                 model_id,
@@ -755,6 +901,10 @@ impl Router {
 
         // Judge the converted result so malformed successes become backend
         // failures and follow the same outcome accounting and retry policy.
+        let upstream_context_rejection = response
+            .extensions()
+            .get::<ContextLengthRejected>()
+            .is_some();
         let mut response = if let Some(adapter) = decision_adapter {
             adapter
                 .convert_response(response, self.max_payload_size)
@@ -762,6 +912,11 @@ impl Router {
         } else {
             response
         };
+        if upstream_context_rejection {
+            response.extensions_mut().insert(ContextLengthRejected {
+                window: worker.context_length(model_id),
+            });
+        }
 
         events::RequestReceivedEvent {}.emit();
 
@@ -1169,6 +1324,32 @@ impl Router {
         Ok(body.freeze())
     }
 
+    async fn read_context_rejection_body(
+        mut body: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + Unpin + 'static,
+        limit: usize,
+    ) -> Result<Bytes, stream::BoxStream<'static, Result<Bytes, reqwest::Error>>> {
+        let mut buffered = BytesMut::new();
+        while let Some(chunk) = body.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    let stream =
+                        stream::iter([Ok::<Bytes, reqwest::Error>(buffered.freeze()), Err(error)])
+                            .chain(body);
+                    return Err(stream.boxed());
+                }
+            };
+            if buffered.len().saturating_add(chunk.len()) > limit {
+                let stream =
+                    stream::iter([Ok::<Bytes, reqwest::Error>(buffered.freeze()), Ok(chunk)])
+                        .chain(body);
+                return Err(stream.boxed());
+            }
+            buffered.extend_from_slice(&chunk);
+        }
+        Ok(buffered.freeze())
+    }
+
     // Send an already-serialized request body. The stale-connection resend
     // guard inside `send_with_stale_conn_retry` shares the body allocation by
     // refcount, so the bytes live exactly until the response head arrives.
@@ -1235,6 +1416,67 @@ impl Router {
         let StreamRelayMode { is_stream, rechunk } = mode;
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+        if status == StatusCode::BAD_REQUEST && is_json_content_type(res.headers()) {
+            let mut response_headers = header_utils::preserve_response_headers(res.headers());
+            let body = match Self::read_context_rejection_body(
+                res.bytes_stream(),
+                CONTEXT_REJECTION_BODY_LIMIT.min(self.max_payload_size),
+            )
+            .await
+            {
+                Ok(body) => body,
+                Err(body) if is_stream => {
+                    header_utils::insert_routed_worker_id(
+                        &mut response_headers,
+                        source.worker().url(),
+                    );
+                    let mut response = relay_streaming_body(
+                        body,
+                        Relay {
+                            status,
+                            upstream_sse: false,
+                            source,
+                            guard: load_guard,
+                            headers: response_headers,
+                            mode: ChunkMode::Plain,
+                        },
+                    );
+                    mark_upstream_answer(&mut response);
+                    return response;
+                }
+                Err(body) => {
+                    let mut response =
+                        match Self::read_worker_body_capped(body, self.max_payload_size).await {
+                            Ok(body) => {
+                                let mut response = Response::new(Body::from(body));
+                                *response.status_mut() = status;
+                                *response.headers_mut() = response_headers;
+                                mark_upstream_answer(&mut response);
+                                response
+                            }
+                            Err(response) => response,
+                        };
+                    header_utils::insert_routed_worker_id(
+                        response.headers_mut(),
+                        source.worker().url(),
+                    );
+                    return response;
+                }
+            };
+            let rejected_for_context_length = is_context_length_rejection(&body);
+            let mut response = Response::new(Body::from(body));
+            *response.status_mut() = status;
+            *response.headers_mut() = response_headers;
+            header_utils::insert_routed_worker_id(response.headers_mut(), source.worker().url());
+            mark_upstream_answer(&mut response);
+            if rejected_for_context_length {
+                response
+                    .extensions_mut()
+                    .insert(ContextLengthRejected { window: None });
+            }
+            return response;
+        }
 
         if is_stream {
             // Preserve headers for streaming response
@@ -1964,7 +2206,8 @@ impl Router {
             retries_enabled: self.retry_config.max_retries > 1
                 || self
                     .worker_registry
-                    .any_model_retry_override_enables_retries(),
+                    .any_model_retry_override_enables_retries()
+                || self.has_context_capacity_variance(crate::worker::UNKNOWN_MODEL_ID),
             max_buffered_request_bytes: self.max_buffered_request_bytes,
         })
     }
@@ -3049,18 +3292,35 @@ mod tests {
         reason = "test stub server lives for the duration of the test process"
     )]
     async fn fixed_status_upstream(status: StatusCode) -> (String, Arc<AtomicUsize>) {
+        fixed_status_upstream_with_body(
+            status,
+            r#"{"error":{"message":"upstream failed","type":"InternalServerError"}}"#,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn fixed_status_upstream_with_body(
+        status: StatusCode,
+        response_body: impl Into<Arc<str>> + Send + 'static,
+    ) -> (String, Arc<AtomicUsize>) {
         let hits = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&hits);
+        let response_body = response_body.into();
         let app = axum::Router::new().route(
             "/generate",
             axum::routing::post(move || {
                 let seen = Arc::clone(&seen);
+                let response_body = Arc::clone(&response_body);
                 async move {
                     seen.fetch_add(1, AtomicOrdering::SeqCst);
                     (
                         status,
                         [(CONTENT_TYPE, "application/json")],
-                        r#"{"error":{"message":"upstream failed","type":"InternalServerError"}}"#,
+                        response_body.to_string(),
                     )
                 }
             }),
@@ -3629,6 +3889,29 @@ mod tests {
             .build()
     }
 
+    fn context_worker(url: &str, window: u32) -> crate::worker::BasicWorker {
+        BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .model(
+                openai_protocol::model_card::ModelCard::new("context-model")
+                    .with_context_length(window),
+            )
+            .build()
+    }
+
+    fn unknown_context_worker(url: &str) -> crate::worker::BasicWorker {
+        BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .model(openai_protocol::model_card::ModelCard::new("context-model"))
+            .build()
+    }
+
+    fn context_router(workers: Vec<crate::worker::BasicWorker>) -> Router {
+        streaming_router(PolicyConfig::RoundRobin, 1024 * 1024, workers)
+    }
+
     type CapturedUpstreamRequest = Arc<tokio::sync::Mutex<Option<(HeaderMap, Bytes)>>>;
 
     /// Loopback engine stub: captures the forwarded `/generate` request and
@@ -3659,6 +3942,265 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         (format!("http://{addr}"), captured)
+    }
+
+    async fn context_request(router: &Router, text: &str) -> Response {
+        router
+            .route_typed_request(
+                None,
+                DropProbeRequest {
+                    text: text.to_string(),
+                    _probe: Arc::new(()),
+                },
+                "/generate",
+                "context-model",
+            )
+            .await
+    }
+
+    #[test]
+    fn context_length_rejection_recognizes_vllm_sglang_and_gateway_codes() {
+        for body in [
+            br#"{"error":{"message":"This model's maximum context length is 16 tokens. However, your request has 17 input tokens. Please reduce the length of the input."}}"#.as_slice(),
+            br#"{"error":{"message":"This model's maximum context length is 16 tokens. However, you requested 17 tokens (17 in the messages, 0 in the completion). Please reduce the length of the input messages."}}"#.as_slice(),
+            br#"{"error":{"message":"This model's maximum context length is 16 tokens. However, you requested 17 tokens in the messages, which exceeds the model's maximum context length. Please reduce the length of the messages."}}"#.as_slice(),
+            br#"{"error":"The input (17 tokens) is longer than the model's context length (16)."}"#.as_slice(),
+            br#"{"error":{"code":"context_length_exceeded"}}"#.as_slice(),
+        ] {
+            assert!(is_context_length_rejection(body), "{body:?}");
+        }
+        for body in [
+            br#"{"error":{"code":"invalid_request_error","message":"Invalid temperature."}}"#.as_slice(),
+            br#"{"error":{"message":"This request has a context length issue unrelated to the model window."}}"#.as_slice(),
+            br#"{"error":{"message":"Your request exceeds an unrelated context length limit."}}"#.as_slice(),
+        ] {
+            assert!(!is_context_length_rejection(body), "{body:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn context_length_rejection_retries_on_a_larger_worker_even_when_retries_are_disabled() {
+        const BODY: &str = r#"{"error":{"message":"This model's maximum context length is 16 tokens. However, your request has 17 input tokens."}}"#;
+        let (small_url, small_hits) =
+            fixed_status_upstream_with_body(StatusCode::BAD_REQUEST, BODY).await;
+        let (large_url, large_hits) =
+            fixed_status_upstream_with_body(StatusCode::OK, r#"{"ok":true}"#).await;
+        let mut router = context_router(vec![
+            context_worker(&small_url, 16),
+            context_worker(&large_url, 32),
+        ]);
+        router.retry_config.max_retries = 1;
+
+        let response = context_request(&router, "a prompt beyond the first worker's window").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(small_hits.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(large_hits.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn context_retry_preflight_does_not_advance_round_robin_rotation() {
+        const BODY: &str = r#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#;
+        let (small_url, small_hits) =
+            fixed_status_upstream_with_body(StatusCode::BAD_REQUEST, BODY).await;
+        let (first_larger_url, first_larger_hits) =
+            fixed_status_upstream_with_body(StatusCode::OK, r#"{"ok":true}"#).await;
+        let (second_larger_url, second_larger_hits) =
+            fixed_status_upstream_with_body(StatusCode::OK, r#"{"ok":true}"#).await;
+        let router = context_router(vec![
+            context_worker(&small_url, 16),
+            context_worker(&first_larger_url, 32),
+            context_worker(&second_larger_url, 64),
+        ]);
+
+        let response = context_request(&router, "beyond the first worker's window").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(small_hits.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(first_larger_hits.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(second_larger_hits.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn context_retry_requires_a_known_error_and_strictly_larger_worker() {
+        for (body, alternate_window, rejecting_window_known) in [
+            (
+                r#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#,
+                16,
+                true,
+            ),
+            (
+                r#"{"error":{"code":"invalid_request_error","message":"Invalid temperature."}}"#,
+                32,
+                true,
+            ),
+            (
+                r#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#,
+                32,
+                false,
+            ),
+        ] {
+            let (small_url, small_hits) =
+                fixed_status_upstream_with_body(StatusCode::BAD_REQUEST, body).await;
+            let (other_url, other_hits) =
+                fixed_status_upstream_with_body(StatusCode::OK, r#"{"ok":true}"#).await;
+            let rejecting_worker = if rejecting_window_known {
+                context_worker(&small_url, 16)
+            } else {
+                unknown_context_worker(&small_url)
+            };
+            let router = context_router(vec![
+                rejecting_worker,
+                context_worker(&other_url, alternate_window),
+            ]);
+
+            let response = context_request(&router, "test request").await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+            assert_eq!(small_hits.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(other_hits.load(AtomicOrdering::SeqCst), 0);
+            assert_eq!(response_body.as_ref(), body.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn context_length_rejection_uses_at_most_one_context_retry() {
+        const BODY: &str = r#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#;
+        let (small_url, small_hits) =
+            fixed_status_upstream_with_body(StatusCode::BAD_REQUEST, BODY).await;
+        let (larger_url, larger_hits) =
+            fixed_status_upstream_with_body(StatusCode::BAD_REQUEST, BODY).await;
+        let (largest_url, largest_hits) =
+            fixed_status_upstream_with_body(StatusCode::BAD_REQUEST, BODY).await;
+        let router = context_router(vec![
+            context_worker(&small_url, 16),
+            context_worker(&larger_url, 32),
+            context_worker(&largest_url, 64),
+        ]);
+
+        let response = context_request(&router, "beyond the first worker's window").await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(small_hits.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            larger_hits.load(AtomicOrdering::SeqCst) + largest_hits.load(AtomicOrdering::SeqCst),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn context_retry_reselects_after_backoff_when_larger_worker_becomes_unavailable() {
+        const BODY: &str = r#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#;
+        let (small_url, small_hits) =
+            fixed_status_upstream_with_body(StatusCode::BAD_REQUEST, BODY).await;
+        let (larger_url, larger_hits) =
+            fixed_status_upstream_with_body(StatusCode::OK, r#"{"ok":true}"#).await;
+        let larger_worker = context_worker(&larger_url, 32);
+        let mut router =
+            context_router(vec![context_worker(&small_url, 16), larger_worker.clone()]);
+        router.retry_config = RetryConfig {
+            max_retries: 1,
+            initial_backoff_ms: 2_000,
+            max_backoff_ms: 2_000,
+            backoff_multiplier: 1.0,
+            jitter_factor: 0.0,
+        };
+        let router = Arc::new(router);
+        let request_router = Arc::clone(&router);
+        let request = tokio::spawn(async move {
+            context_request(&request_router, "beyond the first worker's window").await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while small_hits.load(AtomicOrdering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the small worker should receive the initial request");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        larger_worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(small_hits.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(larger_hits.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn oversized_json_400_preserves_streamed_and_within_limit_buffered_responses() {
+        let body = format!(
+            r#"{{"error":{{"code":"context_length_exceeded","message":"too long"}}}}{}"#,
+            " ".repeat(CONTEXT_REJECTION_BODY_LIMIT)
+        );
+        let (buffered_url, buffered_hits) =
+            fixed_status_upstream_with_body(StatusCode::BAD_REQUEST, body.clone()).await;
+        let (buffered_larger_url, buffered_larger_hits) =
+            fixed_status_upstream_with_body(StatusCode::BAD_REQUEST, body.clone()).await;
+        let buffered_router = streaming_router(
+            PolicyConfig::RoundRobin,
+            body.len() + 1,
+            vec![
+                context_worker(&buffered_url, 16),
+                context_worker(&buffered_larger_url, 32),
+            ],
+        );
+        let response = context_request(&buffered_router, "oversized buffered upstream error").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(response_body.as_ref(), body.as_bytes());
+        assert_eq!(buffered_hits.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(buffered_larger_hits.load(AtomicOrdering::SeqCst), 0);
+
+        let (streamed_url, streamed_hits) =
+            fixed_status_upstream_with_body(StatusCode::BAD_REQUEST, body.clone()).await;
+        let (streamed_larger_url, streamed_larger_hits) =
+            fixed_status_upstream_with_body(StatusCode::BAD_REQUEST, body.clone()).await;
+        let streamed_router = streaming_router(
+            PolicyConfig::RoundRobin,
+            32,
+            vec![
+                context_worker(&streamed_url, 16),
+                context_worker(&streamed_larger_url, 32),
+            ],
+        );
+        let response = streamed_router
+            .route_typed_request(None, streaming_chat_request(), "/generate", "context-model")
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(response_body.as_ref(), body.as_bytes());
+        assert_eq!(streamed_hits.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(streamed_larger_hits.load(AtomicOrdering::SeqCst), 0);
+
+        let (capped_url, capped_hits) =
+            fixed_status_upstream_with_body(StatusCode::BAD_REQUEST, body.clone()).await;
+        let (capped_larger_url, capped_larger_hits) =
+            fixed_status_upstream_with_body(StatusCode::BAD_REQUEST, body.clone()).await;
+        let mut capped_router = streaming_router(
+            PolicyConfig::RoundRobin,
+            body.len() - 1,
+            vec![
+                context_worker(&capped_url, 16),
+                context_worker(&capped_larger_url, 32),
+            ],
+        );
+        capped_router.retry_config.max_retries = 1;
+        let hits_before = capped_hits.load(AtomicOrdering::SeqCst);
+        let larger_hits_before = capped_larger_hits.load(AtomicOrdering::SeqCst);
+        let response = context_request(&capped_router, "over-limit buffered upstream error").await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            capped_hits.load(AtomicOrdering::SeqCst),
+            hits_before + 1,
+            "a capped context probe must not issue an extra context retry"
+        );
+        assert_eq!(
+            capped_larger_hits.load(AtomicOrdering::SeqCst),
+            larger_hits_before,
+            "a capped context probe must not issue an extra context retry"
+        );
     }
 
     fn streamed_request(chunks: &[&'static [u8]]) -> Request<Body> {
@@ -3810,6 +4352,32 @@ mod tests {
         assert_eq!(
             router.request_body_path(&headers_with_content_length(Some("64")), false),
             BodyPath::Buffer(REASON_RETRYABLE)
+        );
+    }
+
+    #[test]
+    fn context_capacity_variance_buffers_replayable_bodies_only_within_limit() {
+        let mut router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![
+                context_worker("http://worker1:8080", 16),
+                context_worker("http://worker2:8080", 32),
+            ],
+        );
+        router.retry_config = RetryConfig {
+            max_retries: 1,
+            ..Default::default()
+        };
+        router.max_buffered_request_bytes = 1024;
+
+        assert_eq!(
+            router.request_body_path(&headers_with_content_length(Some("64")), false),
+            BodyPath::Buffer(REASON_RETRYABLE)
+        );
+        assert_eq!(
+            router.request_body_path(&headers_with_content_length(Some("1025")), false),
+            BodyPath::Stream(REASON_RETRY_FORFEITED)
         );
     }
 

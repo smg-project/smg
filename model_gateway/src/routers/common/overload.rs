@@ -126,7 +126,7 @@ pub fn fallback_if_all_vetoed(
     stage: &'static str,
     shedding: bool,
 ) -> Option<Arc<dyn Worker>> {
-    if !all_vetoed(candidates) {
+    if !has_fallback_if_all_vetoed(candidates, shedding) {
         return None;
     }
     let mut rng = rand::rng();
@@ -166,6 +166,24 @@ pub fn fallback_if_all_vetoed(
         "Veto fallback"
     );
     Some(Arc::clone(worker))
+}
+
+/// Whether [`fallback_if_all_vetoed`] could return a worker, without choosing
+/// one or recording fallback metrics.
+pub(crate) fn has_fallback_if_all_vetoed(candidates: &[Arc<dyn Worker>], shedding: bool) -> bool {
+    if !all_vetoed(candidates) {
+        return false;
+    }
+
+    let ready =
+        |worker: &Arc<dyn Worker>| worker.is_healthy() && worker.circuit_breaker_can_execute();
+    (!shedding
+        && candidates
+            .iter()
+            .any(|worker| ready(worker) && worker.stall_reason().is_none()))
+        || candidates
+            .iter()
+            .any(|worker| ready(worker) && !(shedding && worker.is_overloaded()))
 }
 
 /// Dispatch-time re-check under `--worker-overload-shed` (`shedding`): one atomic
@@ -308,6 +326,8 @@ mod tests {
         );
 
         b.set_overloaded(true);
+        assert!(has_fallback_if_all_vetoed(&pool, false));
+        assert!(!has_fallback_if_all_vetoed(&pool, true));
         assert!(
             shed_if_all_overloaded(&pool, "m", false).is_none(),
             "without shedding an all-overloaded pool is steered, not refused"
