@@ -1534,6 +1534,7 @@ jobs:
       always()
       && !cancelled()
       && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_VLLM_LOCAL_LEGS == 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
@@ -1559,6 +1560,7 @@ jobs:
       always()
       && !cancelled()
       && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_VLLM_LOCAL_LEGS == 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
           || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
