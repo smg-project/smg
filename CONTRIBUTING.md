@@ -157,11 +157,19 @@ edits, so upstream syncs stay conflict-free.
 | `SMG_RUNNER_DOCKER` | `cpu-e5` | docker / engine image build and push |
 | `SMG_RUNNER_GPU` | `k8s-runner-gpu` | GPU jobs with no fixed GPU count |
 | `SMG_RUNNER_GPU_1` | `1-gpu-h100` | 1-GPU e2e jobs |
-| `SMG_RUNNER_AMD_GPU_1` | `1-gpu-mi300x` | AMD row of the 1-GPU chat e2e job (off unless `SMG_RUN_AMD_LEGS` is `true`) |
+| `SMG_RUNNER_AMD_GPU_1` | `1-gpu-mi300x` | AMD 1-GPU e2e jobs (off unless `SMG_RUN_AMD_LEGS` is `true`) |
 | `SMG_RUNNER_GPU_2` | `2-gpu-h100` | 2-GPU e2e jobs |
 | `SMG_RUNNER_GPU_4` | `4-gpu-h100` | 4-GPU e2e and benchmark jobs |
 | `SMG_RUNNER_AMD_GPU_4` | `4-gpu-mi300x` | AMD nightly benchmark (off unless `SMG_RUN_AMD_LEGS` is `true`) |
 | `SMG_RUNNER_AMD_GPU_8` | `8-gpu-mi300x` | AMD legs of the BFCL A/B and AMD rows of the nightly PD sweep (off unless `SMG_RUN_AMD_LEGS` is `true`) |
+
+The `e2e-1gpu-completions-amd` and `e2e-1gpu-embeddings-amd` jobs in
+`pr-test-rust.yml` require both `SMG_RUN_AMD_VLLM_LOCAL_LEGS` and
+`SMG_RUN_AMD_LEGS` to be `true`. The extra `SMG_RUN_AMD_VLLM_LOCAL_LEGS`
+flag opts in to these local-runner tests without changing the existing AMD
+chat and nightly gates. On pull requests, `SMG_RUN_AMD_ON_PRS` must also be
+`true`. Unset values skip those jobs; normal workflow triggers, wheel builds
+and change filters still apply.
 
 GitHub-hosted labels (`ubuntu-latest`, `macos-latest`) are left as-is — every
 fork already has those.
