@@ -1,6 +1,6 @@
 #!/bin/bash
-# Install the pinned TokenSpeed nightly for CI, with the scheduler package
-# the nightly was built against (its metadata's lower bound).
+# Install the pinned TokenSpeed nightly for CI, with the scheduler
+# package selected for that nightly by the compatibility helper.
 # CUDA tooling supports runtime JIT; SMG gRPC packages come from this checkout.
 # TOKENSPEED_BUILD_ONLY=1 prepares the carrier image without per-PR SMG glue.
 
@@ -149,15 +149,16 @@ PY
     # The nightly requires the scheduler package with a lower bound only, so
     # the install above resolves the newest scheduler release, which can be
     # newer than the nightly and refuse its configuration at start. Pin the
-    # scheduler to the nightly's lower bound: the release it was built against.
+    # scheduler to its known compatible pair, or its older lower-bound policy.
     scheduler="$(python3 "${SCRIPT_DIR}/ci_tokenspeed_scheduler_pin.py")"
     if [ -n "$scheduler" ]; then
-        echo "Pinning ${scheduler} (the nightly's lower bound)"
+        echo "Pinning ${scheduler} for the installed nightly"
         $RETRY 3 10 python3 -m pip install "$scheduler" \
             --extra-index-url https://lightseek.org/whl/nightly
     fi
     python3 -c "from importlib import metadata; \
         print('Installed tokenspeed-scheduler==' + metadata.version('tokenspeed-scheduler'))"
+    python3 "${SCRIPT_DIR}/ci_tokenspeed_scheduler_pin.py" --check
     $RETRY 3 10 python3 "${SCRIPT_DIR}/ci_install_flashinfer.py"
 }
 

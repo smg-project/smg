@@ -1,23 +1,26 @@
-"""Print the scheduler pin the installed TokenSpeed runtime nightly implies.
+"""Select the CI scheduler for the installed TokenSpeed runtime.
 
-The runtime nightly requires ``tokenspeed-scheduler`` with a lower bound
-only, so a plain install resolves the newest scheduler release, which can be
-newer than the nightly: a scheduler released after the nightly rejected a
-scheduler field the nightly never sets, and every engine worker died at
-start. The lower bound is the release the nightly was built against; pin to
-it. Prints ``tokenspeed-scheduler==<version>`` for ``pip install``; prints
+Retain the lower-bound pin for older nightlies. The 20261023 runtime imports
+StorageConfig, which first appears in scheduler 0.1.42 although that runtime
+declares >=0.1.41. Use its explicit compatible pair and check real imports
+after installation. Prints ``tokenspeed-scheduler==<version>`` for ``pip install``; prints
 nothing (a note on stderr) when the runtime declares no lower bound or exact
 version, so the caller keeps pip's choice.
 """
 
 from __future__ import annotations
 
+import argparse
+import importlib
 import re
 import sys
 from importlib import metadata
 
+from packaging.requirements import Requirement
+
 RUNTIME = "tokenspeed"
 SCHEDULER = "tokenspeed-scheduler"
+KNOWN_SCHEDULERS = {"0.1.1.post20261023": "0.1.42"}
 
 _REQUIREMENT = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*(.*)$")
 
@@ -26,8 +29,8 @@ def _canonical(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def scheduler_pin(requirements) -> str | None:
-    """The exact scheduler requirement the runtime's metadata implies, or None."""
+def scheduler_pin(requirements, runtime_version=None) -> str | None:
+    """Select a known compatible pair, otherwise preserve the metadata pin."""
     for requirement in requirements or ():
         match = _REQUIREMENT.match(requirement.split(";", 1)[0].strip())
         if not match or _canonical(match.group(1)) != SCHEDULER:
@@ -36,18 +39,48 @@ def scheduler_pin(requirements) -> str | None:
         for operator in ("==", ">="):
             for clause in clauses:
                 if clause.startswith(operator) and not clause.startswith("==="):
+                    if runtime_version in KNOWN_SCHEDULERS:
+                        version = KNOWN_SCHEDULERS[runtime_version]
+                        if version not in Requirement(requirement).specifier:
+                            raise ValueError(
+                                f"Known scheduler {version} conflicts with {requirement}"
+                            )
+                        return f"{SCHEDULER}=={version}"
                     return f"{SCHEDULER}=={clause[len(operator) :].strip()}"
         return None
     return None
 
 
-def main() -> int:
+def check_scheduler(runtime_version):
+    expected = KNOWN_SCHEDULERS.get(runtime_version)
+    if expected and metadata.version(SCHEDULER) != expected:
+        raise RuntimeError(
+            f"TokenSpeed {runtime_version} requires the CI scheduler pair {expected}"
+        )
+    module = importlib.import_module("tokenspeed_scheduler")
+    required = (
+        ("Scheduler", "StorageConfig", "StoragePressure", "StorageKind")
+        if expected
+        else ("Scheduler",)
+    )
+    for symbol in required:
+        if getattr(module, symbol, None) is None:
+            raise ImportError(
+                f"tokenspeed_scheduler lacks {symbol} for TokenSpeed {runtime_version}"
+            )
+
+
+def main(check=False) -> int:
     try:
+        runtime_version = metadata.version(RUNTIME)
         requirements = metadata.requires(RUNTIME)
     except metadata.PackageNotFoundError:
         print(f"{RUNTIME} is not installed; nothing to pin", file=sys.stderr)
         return 1
-    pin = scheduler_pin(requirements)
+    if check:
+        check_scheduler(runtime_version)
+        return 0
+    pin = scheduler_pin(requirements, runtime_version)
     if pin is None:
         print(
             f"{RUNTIME} declares no lower bound on {SCHEDULER}; keeping pip's choice",
@@ -59,4 +92,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true")
+    sys.exit(main(check=parser.parse_args().check))
