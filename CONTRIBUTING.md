@@ -163,11 +163,12 @@ edits, so upstream syncs stay conflict-free.
 | `SMG_RUNNER_AMD_GPU_4` | `4-gpu-mi300x` | AMD nightly benchmark (off unless `SMG_RUN_AMD_LEGS` is `true`) |
 | `SMG_RUNNER_AMD_GPU_8` | `8-gpu-mi300x` | AMD legs of the BFCL A/B and AMD rows of the nightly PD sweep (off unless `SMG_RUN_AMD_LEGS` is `true`) |
 
-Additional AMD vLLM jobs guarded by `SMG_RUN_AMD_VLLM_LOCAL_LEGS` require
-both that variable and `SMG_RUN_AMD_LEGS` to be `true`. On pull requests,
-`SMG_RUN_AMD_ON_PRS` must also be `true`. Unset values skip those jobs;
-normal workflow triggers, wheel builds and change filters still apply.
-This additional opt-in leaves the existing AMD chat and nightly gates unchanged.
+The `e2e-1gpu-gateway-amd` job in `pr-test-rust.yml` requires both
+`SMG_RUN_AMD_VLLM_LOCAL_LEGS` and `SMG_RUN_AMD_LEGS` to be `true`.
+The extra `SMG_RUN_AMD_VLLM_LOCAL_LEGS` flag opts in to this local-runner
+test without changing the existing AMD chat and nightly gates. On pull
+requests, `SMG_RUN_AMD_ON_PRS` must also be `true`. Unset values skip this
+job; normal workflow triggers, wheel builds and change filters still apply.
 
 GitHub-hosted labels (`ubuntu-latest`, `macos-latest`) are left as-is — every
 fork already has those.
