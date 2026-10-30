@@ -358,7 +358,12 @@ def test_the_plan_lists_the_bump_quietly_and_changes_nothing(mod, repo):
     before = {path: (repo / path).read_text() for path in files}
     code, out = run(mod, repo, mode="plan", tag="v1.0.0")
     assert code == 0
-    assert "The bump the next cut writes against v1.0.0 (nothing is changed here" in out
+    assert (
+        "The bump the next cut writes against v1.0.0: the crates and packages by their conventional"
+        " commits since it, the gateway and its mirrors by the checker's own step (the cut writes the"
+        " VERSION it is given there: pass it as VERSION_OVERRIDE for those lines). Nothing is changed here"
+        in out
+    )
     assert "  patch beta v1.0.0 → v1.0.1 (crates/beta/Cargo.toml)" in out
     assert "       sync workspace Cargo.toml beta → v1.0.1" in out
     assert "  sync workspace Cargo.toml delta v0.1.0 → v0.2.0" in out
@@ -366,10 +371,21 @@ def test_the_plan_lists_the_bump_quietly_and_changes_nothing(mod, repo):
     assert "  minor pkg v0.1.0 → v0.2.0 (pkg/pyproject.toml)" in out
     assert "  sync chart v1.0.0 → v2.0.0 (chart/Chart.yaml)" in out
     assert out.rstrip().endswith(
-        "8 version line(s) move. Bumped already since v1.0.0, left as they are: alpha v1.1.0, delta v0.2.0 (new)."
+        "8 component(s) and mirror(s) move (a crate's workspace pin follows it)."
+        " Bumped already since v1.0.0, left as they are: alpha v1.1.0, delta v0.2.0 (new)."
     )
     for quiet in ("not bumped", "issue(s) found", "Checking workspace", "Summary:", "✓", "!"):
         assert quiet not in out, quiet
+    assert {path: (repo / path).read_text() for path in files} == before
+    # the cut's own version for the gateway and its mirrors: a candidate is allowed here, and only here
+    code, out = run(mod, repo, mode="plan", tag="v1.0.0", override="1.1.0-rc.1")
+    assert code == 0
+    assert "the gateway and its mirrors to 1.1.0-rc.1. Nothing is changed here" in out
+    assert "  major smg v1.0.0 → v1.1.0-rc.1 (model_gateway/Cargo.toml)" in out
+    assert "  sync chart v1.0.0 → v1.1.0-rc.1 (chart/Chart.yaml)" in out
+    assert "  patch beta v1.0.0 → v1.0.1 (crates/beta/Cargo.toml)" in out
+    with pytest.raises(mod.Fatal, match="X.Y.Z"):
+        run(mod, repo, override="1.1.0-rc.1")
     assert {path: (repo / path).read_text() for path in files} == before
     # once the tree is consistent there is nothing to plan, still exit 0
     assert run(mod, repo, mode="fix")[0] == 0

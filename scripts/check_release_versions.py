@@ -17,7 +17,9 @@ Usage:
     --fix     apply the proposed fixes without prompting
     --plan    the bump the next cut writes against the tag, quietly: the proposed versions
               only, nothing changed, exit 0 (on main every crate changed since the last
-              release reads as unbumped by design; the cut bumps them)
+              release reads as unbumped by design; the cut bumps them); VERSION_OVERRIDE
+              may be the cut's candidate version here (X.Y.Z-rc.N), what the cut writes
+              to the gateway and its mirrors
 
 Environment:
     VERSION_OVERRIDE  X.Y.Z: the gateway's new version instead of the detected bump
@@ -121,6 +123,7 @@ class Fatal(Exception):
 # --- version lines: read and rewrite ------------------------------------------
 
 SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
+CUT_VERSION = re.compile(r"^\d+\.\d+\.\d+(-rc\.\d+)?$")  # what a cut writes: a final or a candidate
 FINAL_TAG = re.compile(r"^v\d+\.\d+\.\d+$")
 TOML_VERSION = re.compile(r'^version\s*=\s*"([^"]*)"', re.M)
 TOML_WORKSPACE_VERSION = re.compile(
@@ -534,7 +537,12 @@ def propose(plan: Plan, out: Out, title: str = "Proposed fixes:") -> None:
 
 
 def show_plan(plan: Plan, tag: str, out: Out) -> None:
-    """The bump the next cut writes against ``tag``: the proposal alone, nothing judged."""
+    """The bump the next cut writes against ``tag``: the proposal alone, nothing judged.
+
+    The crates and packages move by their conventional commits since the tag, as the cut's ``--fix`` moves them.
+    The gateway and its mirrors take the version the cut is given (``make bump-version VERSION=…`` runs first): with
+    ``VERSION_OVERRIDE`` the plan shows that version, without it the checker's own step for the gateway.
+    """
     bumped_already = [
         f"{v.component.name} v{v.version}" + (" (new)" if v.tag_version is None else "")
         for v in plan.verdicts
@@ -548,14 +556,24 @@ def show_plan(plan: Plan, tag: str, out: Out) -> None:
             + "; the mirrors agree."
         )
         return
+    gateway = (
+        f"the gateway and its mirrors to {plan.override}"
+        if plan.override
+        else "the gateway and its mirrors by the checker's own step (the cut writes the VERSION it is given there:"
+        " pass it as VERSION_OVERRIDE for those lines)"
+    )
     propose(
         plan,
         out,
-        f"The bump the next cut writes against {tag} (nothing is changed here; `make release-cut` writes it):",
+        f"The bump the next cut writes against {tag}: the crates and packages by their conventional commits since it,"
+        f" {gateway}. Nothing is changed here; `make release-cut` writes it:",
     )
     out.line()
     out.line(
-        out.paint("bold", f"{plan.issues} version line(s) move.")
+        out.paint(
+            "bold",
+            f"{plan.issues} component(s) and mirror(s) move (a crate's workspace pin follows it).",
+        )
         + (
             f" Bumped already since {tag}, left as they are: {', '.join(bumped_already)}."
             if bumped_already
@@ -630,7 +648,7 @@ def run(
 ) -> int:
     """The check against ``tag`` in ``root``; mode is "check", "fix", "prompt" or "plan"."""
     repo = Repo(root)
-    if override and not SEMVER.match(override):
+    if override and not (CUT_VERSION if mode == "plan" else SEMVER).match(override):
         raise Fatal(f"ERROR: VERSION_OVERRIDE must be in X.Y.Z format, got: '{override}'")
     if tag is None:
         # a plan compares against what a cut compares against: the last final release
