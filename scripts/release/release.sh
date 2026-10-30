@@ -695,7 +695,9 @@ cmd_check() {
     if [ "$read_rc" -ne 0 ]; then
       error=$(api_message "$checks")
       if [[ $error == "No commit found for SHA"* ]]; then
-        say "[....] CI: $(git rev-parse --short "$head") is not on $slug yet: push $branch first; its checks and its PR Test (SMG) run are read here then"
+        # Two causes, both outside this read: the head is not pushed (a cut rehearsed locally, a stale or hand-made
+        # remote-tracking ref), or gh reads another repository than $REMOTE (a fork as the remote, GH_REPO, gh repo set-default).
+        say "[....] CI: $(git rev-parse --short "$head") is not on $slug, the repository gh reads ($REMOTE is $(git remote get-url "$REMOTE")): either the head is not pushed yet, or gh is pointed at another repository than $REMOTE (GH_REPO, gh repo set-default, a fork as the remote); its checks and its PR Test (SMG) run are read here once they agree"
       else
         say "[FAIL] CI: the check-runs read failed (${error:-gh exited $read_rc}); the checks and the PR Test (SMG) run of $(git rev-parse --short "$head") are at https://github.com/$slug/commits/$head"
       fi

@@ -914,16 +914,23 @@ def test_check_reads_an_api_error_as_an_error_not_as_a_pending_check(repo: Sandb
     is reported as the failed read it is, with the API's message, never counted as one pending check."""
     repo.cut()
     head = repo.git("rev-parse", "--short", "origin/release/1.14")
+    calls_before = len(repo.gh_calls())
     unpushed = repo.tool(
         "check", "1.14.0-rc.1", check=False, GH_STUB_API_ERROR=f"No commit found for SHA: {head}"
     )
     assert unpushed.returncode == 1
     assert (
-        f"[....] CI: {head} is not on example/repo yet: push release/1.14 first;"
-        " its checks and its PR Test (SMG) run are read here then" in unpushed.stdout
+        f"[....] CI: {head} is not on example/repo, the repository gh reads (origin is {repo.origin}):"
+        " either the head is not pushed yet, or gh is pointed at another repository than origin"
+        " (GH_REPO, gh repo set-default, a fork as the remote)" in unpushed.stdout
     )
     assert "pending" not in unpushed.stdout and "[FAIL] PR Test (SMG)" not in unpushed.stdout
-    assert unpushed.stdout.count("gh api") == 0 and '"message"' not in unpushed.stdout
+    assert '"message"' not in unpushed.stdout
+    calls = repo.gh_calls()[calls_before:]
+    assert any("check-runs" in call for call in calls)
+    assert not any("actions/workflows" in call for call in calls), (
+        "no matrix-run read after a failed check-runs read"
+    )
     limited = repo.tool(
         "check",
         "1.14.0-rc.1",
