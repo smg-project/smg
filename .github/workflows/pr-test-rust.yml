@@ -1530,6 +1530,7 @@ jobs:
       min_selected: ${{ matrix.min_selected }}
     secrets: inherit
 
+  # Opt-in via SMG_RUN_AMD_VLLM_LOCAL_LEGS; the AMD and PR gates below still apply.
   e2e-1gpu-completions-amd:
     name: e2e-1gpu-completions-amd (vllm)
     needs: [build-wheel, detect-changes]
@@ -1556,6 +1557,7 @@ jobs:
       container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
     secrets: inherit
 
+  # Opt-in via SMG_RUN_AMD_VLLM_LOCAL_LEGS; the AMD and PR gates below still apply.
   e2e-1gpu-embeddings-amd:
     name: e2e-1gpu-embeddings-amd (vllm)
     needs: [build-wheel, detect-changes]
