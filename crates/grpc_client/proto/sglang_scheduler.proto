@@ -171,6 +171,16 @@ message GenerateRequest {
   bool return_media_identity = 19;
   // Decode-only hint. Original tokenized input and references remain for fallback.
   MediaIdentity media_identity = 20;
+
+  // Router-selected external encoders for one prefill attempt. Not a decode hint.
+  EncodeHandoff encode_handoff = 21;
+}
+
+message EncodeHandoff {
+  string request_id = 1;
+  // Ordered snapshot: keep each URL aligned with its item count.
+  repeated string encoder_urls = 2;
+  repeated uint32 num_items_assigned = 3;
 }
 
 message TokenizedInput {
