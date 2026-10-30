@@ -87,16 +87,19 @@ previous_final_tag() { # the highest final tag below v<version>; empty when ther
   { git tag --list 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; printf 'v%s\n' "$1"; } \
     | sort -uV | grep -B1 -x "v$1" | head -1 | grep -v -x "v$1" || true
 }
+own_tags() { # <ref>: the release tags made on the branch (reachable from <ref>, not from main), oldest version first
+  # A candidate sorts below its final: a version sort puts `~` before the end of the string.
+  comm -23 <(git tag --list 'v[0-9]*' --merged "$1" | sort) <(git tag --list 'v[0-9]*' --merged "$REMOTE/main" | sort) \
+    | sed 's/-rc\./~rc./' | sort -V | sed 's/~rc\./-rc./'
+}
 since_tag() { # <ref> <version>: the tag a bump or a check compares the versions against
   # The branch's own newest tag when it has one (made on the release branch: the last candidate);
   # else the highest final below <version>, which sits on the previous release's branch from the
   # second release on (no release tag is reachable from main under this process; the checker
   # diffs tag..HEAD, so the tag need not be an ancestor); else the newest tag reachable from
   # <ref>, a release made before this process.
-  # A candidate sorts below its final: a version sort puts `~` before the end of the string.
   local ref=$1 version=$2 own final
-  own=$(comm -23 <(git tag --list 'v[0-9]*' --merged "$ref" | sort) <(git tag --list 'v[0-9]*' --merged "$REMOTE/main" | sort) \
-    | sed 's/-rc\./~rc./' | sort -V | tail -n 1 | sed 's/~rc\./-rc./')
+  own=$(own_tags "$ref" | tail -n 1)
   if [ -n "$own" ]; then printf '%s' "$own"; return 0; fi
   final=$(previous_final_tag "$version")
   if [ -n "$final" ]; then printf '%s' "$final"; return 0; fi
@@ -369,8 +372,9 @@ cmd_status() {
   say "  ($n commit(s))"
   say "== on release/$release and not on main (the branch's own commits):"
   git log --cherry-pick --left-only --no-merges --format='  %h %s' "$base...$REMOTE/main"
-  say "== tags on release/$release:"
-  git tag --list 'v[0-9]*' --merged "$base" | sort -V | sed 's/^/  /'
+  # The branch's own tags (its candidates, its final, its patches), not every release tag in main's history below it.
+  say "== tags made on release/$release (the versions are compared against $(since_tag "$base" "$(manifest_version "$base")")):"
+  own_tags "$base" | sed 's/^/  /' | grep . || say "  (none yet)"
   say "== open pull requests against release/$release:"
   if command -v "$GH" >/dev/null 2>&1; then
     "$GH" pr list --base "release/$release" --state open --limit 100 2>/dev/null | sed 's/^/  /' || say "  (gh could not list them)"
