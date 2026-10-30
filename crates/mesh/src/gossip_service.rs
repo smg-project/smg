@@ -30,7 +30,7 @@
 //! identity) is to read the first inbound frame's `peer_id`. That
 //! learning step is what `learned_peer` exists for.
 
-use std::{net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
+use std::{collections::btree_map::Entry, net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use futures::Stream;
@@ -49,7 +49,6 @@ use super::{
     crdt_kv::CrdtWatermark,
     metrics::{peer_connection_opened, record_ack, record_nack, record_peer_reconnect},
     mtls::MTLSManager,
-    partition::PartitionDetector,
     service::{
         gossip::{
             self,
@@ -110,7 +109,6 @@ pub struct GossipService {
     listen_addr: SocketAddr,
     advertise_addr: SocketAddr,
     self_name: String,
-    partition_detector: Option<Arc<PartitionDetector>>,
     mtls_manager: Option<Arc<MTLSManager>>,
     /// Shared reference to the current stream RoundBatch, drained once
     /// per round by the GossipController. Server-side handlers read
@@ -136,7 +134,6 @@ impl GossipService {
             listen_addr,
             advertise_addr,
             self_name: self_name.to_string(),
-            partition_detector: None,
             mtls_manager: None,
             current_stream_batch: None,
             mesh_kv: None,
@@ -162,11 +159,6 @@ impl GossipService {
     /// (inbound) SyncStream handlers.
     pub fn with_mesh_kv(mut self, mesh_kv: Arc<crate::kv::MeshKV>) -> Self {
         self.mesh_kv = Some(mesh_kv);
-        self
-    }
-
-    pub fn with_partition_detector(mut self, partition_detector: Arc<PartitionDetector>) -> Self {
-        self.partition_detector = Some(partition_detector);
         self
     }
 
@@ -232,18 +224,52 @@ impl GossipService {
         let mut state = self.state.write();
         let mut updated = false;
         for node in incoming_nodes {
-            state
-                .entry(node.name.clone())
-                .and_modify(|entry| {
-                    if node.version > entry.version {
-                        *entry = node.clone();
+            let is_failure_for_self = node.name == self.self_name
+                && (node.status == NodeStatus::Down as i32
+                    || node.status == NodeStatus::Suspected as i32);
+            match state.entry(node.name.clone()) {
+                Entry::Occupied(mut entry) => {
+                    let current = entry.get_mut();
+                    if is_failure_for_self {
+                        // A node's local process state is authoritative for itself.
+                        if current.status != NodeStatus::Leaving as i32
+                            && current.status != NodeStatus::Alive as i32
+                        {
+                            current.status = NodeStatus::Alive as i32;
+                            updated = true;
+                        }
+                        if node.version >= current.version {
+                            let version = node.version.saturating_add(1);
+                            if version != current.version {
+                                current.version = version;
+                                updated = true;
+                            }
+                        }
+                    } else if node.version > current.version
+                        || (node.version == current.version
+                            && node.status == NodeStatus::Alive as i32
+                            && (current.status == NodeStatus::Down as i32
+                                || current.status == NodeStatus::Suspected as i32))
+                    {
+                        *current = node;
                         updated = true;
                     }
-                })
-                .or_insert_with(|| {
+                }
+                Entry::Vacant(entry) => {
                     updated = true;
-                    node
-                });
+                    if is_failure_for_self {
+                        entry.insert(NodeState {
+                            name: self.self_name.clone(),
+                            address: self.advertise_addr.to_string(),
+                            status: NodeStatus::Alive as i32,
+                            version: node.version.saturating_add(1),
+                            metadata: Default::default(),
+                        });
+                    } else {
+                        entry.insert(node);
+                    }
+                }
+            }
         }
         if updated {
             log::info!("Cluster state updated. Current nodes: {}", state.len());
@@ -454,14 +480,16 @@ mod tests {
     //! the mesh nodes on a current-thread runtime so every task of theirs
     //! records into it.
 
-    use std::{future::Future, net::SocketAddr, time::Duration};
+    use std::{collections::BTreeMap, future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
     use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+    use parking_lot::RwLock;
     use tokio::sync::mpsc;
     use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 
+    use super::GossipService;
     use crate::{
-        service::gossip::{gossip_client::GossipClient, StreamMessage},
+        service::gossip::{gossip_client::GossipClient, NodeState, NodeStatus, StreamMessage},
         tests::test_utils::{bind_node, wait_for},
         transport::sync_stream::build_heartbeat,
         MeshServerBuilder, MeshServerHandler,
@@ -506,6 +534,175 @@ mod tests {
             .lines()
             .filter(|line| line.starts_with(PEER_GAUGE))
             .collect()
+    }
+
+    #[test]
+    fn merge_state_refutes_down_for_self_but_merges_other_members() {
+        let local_addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+        let state = Arc::new(RwLock::new(BTreeMap::from([
+            (
+                "node-a".to_string(),
+                NodeState {
+                    name: "node-a".to_string(),
+                    address: local_addr.to_string(),
+                    status: NodeStatus::Alive as i32,
+                    version: 2,
+                    metadata: Default::default(),
+                },
+            ),
+            (
+                "node-b".to_string(),
+                NodeState {
+                    name: "node-b".to_string(),
+                    address: "127.0.0.1:8002".to_string(),
+                    status: NodeStatus::Alive as i32,
+                    version: 1,
+                    metadata: Default::default(),
+                },
+            ),
+        ])));
+        let service = GossipService::new(state.clone(), local_addr, local_addr, "node-a");
+
+        assert!(service.merge_state(vec![
+            NodeState {
+                name: "node-a".to_string(),
+                address: local_addr.to_string(),
+                status: NodeStatus::Down as i32,
+                version: 5,
+                metadata: Default::default(),
+            },
+            NodeState {
+                name: "node-b".to_string(),
+                address: "127.0.0.1:8002".to_string(),
+                status: NodeStatus::Down as i32,
+                version: 3,
+                metadata: Default::default(),
+            },
+        ]));
+
+        let merged = state.read();
+        let local = merged.get("node-a").unwrap();
+        assert_eq!(local.status, NodeStatus::Alive as i32);
+        assert_eq!(local.version, 6);
+        let peer = merged.get("node-b").unwrap();
+        assert_eq!(peer.status, NodeStatus::Down as i32);
+        assert_eq!(peer.version, 3);
+    }
+
+    #[test]
+    fn merge_state_refutes_max_version_down_for_self_without_overflow() {
+        let local_addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+        let state = Arc::new(RwLock::new(BTreeMap::from([(
+            "node-a".to_string(),
+            NodeState {
+                name: "node-a".to_string(),
+                address: local_addr.to_string(),
+                status: NodeStatus::Down as i32,
+                version: 4,
+                metadata: Default::default(),
+            },
+        )])));
+        let service = GossipService::new(state.clone(), local_addr, local_addr, "node-a");
+
+        assert!(service.merge_state(vec![NodeState {
+            name: "node-a".to_string(),
+            address: local_addr.to_string(),
+            status: NodeStatus::Down as i32,
+            version: u64::MAX,
+            metadata: Default::default(),
+        }]));
+
+        let local = state.read();
+        let node = local.get("node-a").unwrap();
+        assert_eq!(node.status, NodeStatus::Alive as i32);
+        assert_eq!(node.version, u64::MAX);
+    }
+
+    #[test]
+    fn merge_state_refutes_suspected_for_self_and_advances_version() {
+        let local_addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+        let state = Arc::new(RwLock::new(BTreeMap::from([(
+            "node-a".to_string(),
+            NodeState {
+                name: "node-a".to_string(),
+                address: local_addr.to_string(),
+                status: NodeStatus::Alive as i32,
+                version: 2,
+                metadata: Default::default(),
+            },
+        )])));
+        let service = GossipService::new(state.clone(), local_addr, local_addr, "node-a");
+
+        assert!(service.merge_state(vec![NodeState {
+            name: "node-a".to_string(),
+            address: local_addr.to_string(),
+            status: NodeStatus::Suspected as i32,
+            version: 5,
+            metadata: Default::default(),
+        }]));
+
+        let local = state.read();
+        let node = local.get("node-a").unwrap();
+        assert_eq!(node.status, NodeStatus::Alive as i32);
+        assert_eq!(node.version, 6);
+    }
+
+    #[test]
+    fn merge_state_accepts_alive_over_down_at_equal_max_version() {
+        let local_addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+        let state = Arc::new(RwLock::new(BTreeMap::from([(
+            "node-b".to_string(),
+            NodeState {
+                name: "node-b".to_string(),
+                address: "127.0.0.1:8002".to_string(),
+                status: NodeStatus::Down as i32,
+                version: u64::MAX,
+                metadata: Default::default(),
+            },
+        )])));
+        let service = GossipService::new(state.clone(), local_addr, local_addr, "node-a");
+
+        assert!(service.merge_state(vec![NodeState {
+            name: "node-b".to_string(),
+            address: "127.0.0.1:8002".to_string(),
+            status: NodeStatus::Alive as i32,
+            version: u64::MAX,
+            metadata: Default::default(),
+        }]));
+
+        let peer = state.read();
+        let node = peer.get("node-b").unwrap();
+        assert_eq!(node.status, NodeStatus::Alive as i32);
+        assert_eq!(node.version, u64::MAX);
+    }
+
+    #[test]
+    fn merge_state_accepts_alive_over_suspected_at_equal_version() {
+        let local_addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+        let state = Arc::new(RwLock::new(BTreeMap::from([(
+            "node-b".to_string(),
+            NodeState {
+                name: "node-b".to_string(),
+                address: "127.0.0.1:8002".to_string(),
+                status: NodeStatus::Suspected as i32,
+                version: 5,
+                metadata: Default::default(),
+            },
+        )])));
+        let service = GossipService::new(state.clone(), local_addr, local_addr, "node-a");
+
+        assert!(service.merge_state(vec![NodeState {
+            name: "node-b".to_string(),
+            address: "127.0.0.1:8002".to_string(),
+            status: NodeStatus::Alive as i32,
+            version: 5,
+            metadata: Default::default(),
+        }]));
+
+        let peer = state.read();
+        let node = peer.get("node-b").unwrap();
+        assert_eq!(node.status, NodeStatus::Alive as i32);
+        assert_eq!(node.version, 5);
     }
 
     /// A mesh node on an ephemeral loopback port, joining `init_peer` when

@@ -263,14 +263,18 @@ impl MeshServer {
     }
 
     fn build_controller(&self) -> GossipController {
-        GossipController::new(
+        let mut controller = GossipController::new(
             self.state.clone(),
             self.advertise_addr,
             &self.self_name,
             self.init_peer,
             self.mtls_manager.clone(),
         )
-        .with_mesh_kv(self.mesh_kv.clone())
+        .with_mesh_kv(self.mesh_kv.clone());
+        if let Some(partition_detector) = &self.partition_detector {
+            controller = controller.with_partition_detector(partition_detector.clone());
+        }
+        controller
     }
 
     pub async fn start(self) -> Result<()> {
@@ -310,22 +314,11 @@ impl MeshServer {
         self,
         listener: Option<tokio::net::TcpListener>,
     ) -> Result<PreparedMeshServer> {
-        #[expect(
-            clippy::expect_used,
-            reason = "partition_detector is always set to Some by MeshServerBuilder::build() before start() is called"
-        )]
-        let partition_detector = self
-            .partition_detector
-            .clone()
-            .expect("partition detector missing");
-
         // Build controller first so we can share its current_stream_batch
         // with server-side sync_stream handlers.
         let controller = self.build_controller();
 
         let mut service = self.build_gossip_service();
-
-        service = service.with_partition_detector(partition_detector);
 
         // Share the controller's current_stream_batch so server-side
         // sync_stream handlers see the same drained stream entries as
