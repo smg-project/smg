@@ -293,8 +293,10 @@ class Repo:
         return result.stdout if result.returncode == 0 else None
 
     def release_tags(self) -> list[str]:
-        """Every release tag (``v<x.y.z>``, candidates included), whichever line made it."""
-        return self.git("tag", "--list", "v[0-9]*").split()
+        """Every release tag (``v<x.y.z>`` or ``v<x.y.z>-rc.<n>``), whichever line made it; a tag
+        of another shape (``v1.14.0-qa``) published nothing and is not one."""
+        tags = self.git("tag", "--list", "v[0-9]*").split()
+        return [tag for tag in tags if version_key(tag[1:]) is not None]
 
     def texts_at(self, wanted: Sequence[tuple[str, str]]) -> dict[tuple[str, str], str]:
         """The text of each (ref, path) that exists, read in one ``cat-file --batch`` call."""
@@ -422,7 +424,9 @@ def check(
 ) -> Verdict:
     verdict = Verdict(component, files_changed(repo, tag, component), tagged=tagged)
     if not (repo.root / component.version_file).is_file():
-        return verdict  # not in this tree (removed, or a table entry a smaller tree lacks)
+        if verdict.files_changed:  # its files went since the tag: the table still names it
+            raise Fatal(f"{component.version_file} is gone: drop {component.name} from the table.")
+        return verdict  # a table entry this tree never had
     kind = manifest_kind(component)
     verdict.version = read_version(kind, repo.read(component.version_file), component.version_file)
     for path in with_legacy(component.version_file):

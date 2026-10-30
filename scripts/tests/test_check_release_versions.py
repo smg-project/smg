@@ -403,16 +403,24 @@ def test_texts_at_reads_every_ref_and_path_in_one_call(mod, repo):
 
 def side_line(repo):
     """Another release line's tag, off v1.0.0: beta patched to 1.0.1 there, alpha at the 1.1.0
-    main gave it (with v1.0.0's code), gamma at the 1.0.1 main gave it (the same code: main
-    moved gamma's version line alone)."""
+    main gave it (with v1.0.0's code), gamma at the 1.0.1 main gave it with the very code main
+    carries (the same fix picked), and a tag of another shape that published nothing."""
+    put(repo, "crates/gamma/src/lib.rs", "// gamma fixed\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "fix(gamma): real")
     git(repo, "switch", "-q", "-c", "release/1.0", "v1.0.0")
     put(repo, "crates/beta/src/lib.rs", "// beta patched on the line\n")
     put(repo, "crates/beta/Cargo.toml", manifest("beta", "1.0.1"))
     put(repo, "crates/alpha/Cargo.toml", manifest("alpha", "1.1.0"))
+    put(repo, "crates/gamma/src/lib.rs", "// gamma fixed\n")
     put(repo, "crates/gamma/Cargo.toml", manifest("gamma", "1.0.1"))
     git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "chore(release): bump versions for v1.0.9")
     git(repo, "tag", "v1.0.9")
+    put(repo, "crates/alpha/Cargo.toml", manifest("alpha", "1.2.0"))  # never published
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "chore: a trial tag")
+    git(repo, "tag", "v1.0.9-qa")
     git(repo, "switch", "-q", "main")
 
 
@@ -420,10 +428,12 @@ def test_a_version_any_release_tag_carries_is_not_a_bump(mod, repo):
     """Two release lines share the crate versions and a registry takes a version once. Against
     v1.0.0: beta, unbumped there, is proposed 1.0.2, past the 1.0.1 the other line's tag carries;
     alpha, raised to 1.1.0 since v1.0.0 but at the version that tag carries with other code,
-    reads unbumped too and its minor bump lands on 1.2.0; gamma, at the version that tag carries
-    with this very code, needs nothing. Against the other line's tag, beta's 1.0.0 sits below its
+    reads unbumped too and its minor bump lands on 1.2.0 (the 1.2.0 of a tag of another shape
+    counts for nothing); gamma, changed since v1.0.0 but at the version that tag carries with
+    this very code, needs nothing. Against the other line's tag, beta's 1.0.0 sits below its
     1.0.1, a difference the equality rule read as a bump: it is v1.0.0's version, so unbumped."""
     side_line(repo)
+    assert mod.Repo(repo).release_tags() == ["v1.0.0", "v1.0.9"]
     code, out = run(mod, repo, tag="v1.0.0")
     assert code == 1
     assert (
@@ -433,7 +443,7 @@ def test_a_version_any_release_tag_carries_is_not_a_bump(mod, repo):
         "  ! alpha (crates/alpha/) — 1 file(s) changed but version not bumped (v1.1.0, v1.0.9's) [minor]"
         in out
     )
-    assert "gamma" not in out, "the tag's copy of gamma is this code: nothing to publish"
+    assert "gamma" not in out, "the tag's copy of gamma is this very code: nothing to publish"
     code, out = run(mod, repo, tag="v1.0.9")
     assert (
         "  ! beta (crates/beta/) — 1 file(s) changed but version not bumped (v1.0.0, v1.0.0's) [patch]"
@@ -453,3 +463,12 @@ def test_a_version_any_release_tag_carries_is_not_a_bump(mod, repo):
     code, out = run(mod, repo, tag="v1.0.0")
     assert code == 0, out
     assert "All versions consistent." in out
+
+
+def test_a_component_whose_files_went_is_named_loudly(mod, repo):
+    """A crate deleted since the tag but still in the table: its files read as changed and its
+    version file is gone; the check says which entry to drop rather than printing a green line."""
+    git(repo, "rm", "-q", "-r", "crates/beta")
+    git(repo, "commit", "-q", "-m", "refactor: beta goes")
+    with pytest.raises(mod.Fatal, match="crates/beta/Cargo.toml is gone: drop beta from the table"):
+        run(mod, repo, tag="v1.0.0")
