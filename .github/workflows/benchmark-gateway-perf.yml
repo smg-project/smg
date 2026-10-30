@@ -1,0 +1,185 @@
+name: Benchmark - Gateway perf (advisory)
+
+# The gateway's cost per request, base against head, on the CPU mock bed of
+# scripts/bench/gateway_perf: allocation calls and KiB per request (exact, from
+# jemalloc's exit statistics), RSS, CPU time per request, and instructions per
+# request when the runner exposes hardware counters (a hosted runner does not).
+# ADVISORY: the job reports the table in its step summary, as a pull-request
+# comment when the token may write one, and as an artifact; it never fails on a
+# verdict. The thresholds in .github/bench-gates/gateway-perf.toml come from
+# measured spreads; results.json of every run carries the per-repeat values, so
+# the runner's own spread can be read and the gate made blocking once known.
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'model_gateway/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/bench/gateway_perf/**'
+      - 'scripts/bench/grpc_stress/bed.sh'
+      - 'scripts/bench_gate.py'
+      - '.github/bench-gates/gateway-perf.toml'
+      - '.github/workflows/benchmark-gateway-perf.yml'
+      - '!model_gateway/**/tests/**'
+      - '!model_gateway/**/*_test.rs'
+      - '!model_gateway/**/test_*.rs'
+      - '!model_gateway/benches/**'
+      - '!crates/**/tests/**'
+      - '!crates/**/*_test.rs'
+      - '!crates/**/test_*.rs'
+      - '!crates/**/benches/**'
+  workflow_dispatch:
+
+concurrency:
+  group: benchmark-gateway-perf-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  gateway-perf:
+    name: Gateway perf (advisory)
+    if: github.repository == 'smg-project/smg' || vars.SMG_RUN_BENCHMARKS == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 100
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          cache-key: grpc-stress
+
+      # The pull request's side: the gateway ALONE first (building it together with
+      # another package changes its binary through feature unification; the base is built
+      # by the same line), then the mock engine and the client, which serve both sides.
+      # Each binary is copied the moment its build ends: the checkout of the base below
+      # replaces target/release/smg.
+      - name: Build the pull request's gateway, the mock engine and the client
+        timeout-minutes: 60
+        env:
+          # The nightly stress bed's release build (nightly-grpc-stress.yml) is the cache the
+          # setup step restores (its cache key); the key hashes the CARGO*/CFLAGS*/RUST*
+          # environment of THAT step, so these live on the build steps alone, as the nightly
+          # has them: a release profile with frame pointers and line tables, the same on both
+          # sides of the comparison, and sccache in front of rustc.
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTFLAGS: -C force-frame-pointers=yes
+          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+          CFLAGS: -fno-omit-frame-pointer
+        run: |
+          source "$HOME/.cargo/env"
+          mkdir -p "$RUNNER_TEMP/gateway-perf/pr" "$RUNNER_TEMP/gateway-perf/base"
+          cargo build --release -p smg --bin smg
+          cp target/release/smg "$RUNNER_TEMP/gateway-perf/pr/smg"
+          cargo build --release -p mock-worker --bin mock-worker --bin stress_load
+          cp target/release/mock-worker target/release/stress_load "$RUNNER_TEMP/gateway-perf/"
+
+      # The base: on a pull_request event the checkout is the merge ref, whose first parent is
+      # the base branch's tip; on a dispatch it is the branch's tip itself, so the base is
+      # origin/main, fetched. The comparison is named in the step summary and the comment.
+      - name: Build the base branch's gateway
+        id: base
+        timeout-minutes: 60
+        env:
+          # The nightly stress bed's release build (nightly-grpc-stress.yml) is the cache the
+          # setup step restores (its cache key); the key hashes the CARGO*/CFLAGS*/RUST*
+          # environment of THAT step, so these live on the build steps alone, as the nightly
+          # has them: a release profile with frame pointers and line tables, the same on both
+          # sides of the comparison, and sccache in front of rustc.
+          RUSTC_WRAPPER: sccache
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTFLAGS: -C force-frame-pointers=yes
+          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+          CFLAGS: -fno-omit-frame-pointer
+        run: |
+          source "$HOME/.cargo/env"
+          head=$(git rev-parse HEAD)
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base=$(git rev-parse HEAD^1); desc="the merge commit's first parent (the base branch's tip)"
+          else
+            git fetch --quiet --depth=1 origin main; base=$(git rev-parse FETCH_HEAD); desc="origin/main at the time of the run"
+          fi
+          echo "sha=$base" >> "$GITHUB_OUTPUT"
+          echo "desc=$desc" >> "$GITHUB_OUTPUT"
+          echo "base: $base ($desc); head: $head"
+          git -c advice.detachedHead=false checkout --quiet "$base"
+          cargo build --release -p smg --bin smg
+          cp target/release/smg "$RUNNER_TEMP/gateway-perf/base/smg"
+          git checkout --quiet "$head"
+
+      # Three paths, 4,000 requests per cell at half the bed's rates (a hosted runner has
+      # four cores for the gateway, four engines and the client together), three
+      # interleaved repeats per side. The driver writes the tables to the step summary.
+      # The verdict's exit code is recorded, never the job's: advisory.
+      - name: Measure base against head on the mock bed
+        id: measure
+        timeout-minutes: 30
+        run: |
+          set +e
+          python3 scripts/bench/gateway_perf/gateway_perf.py cpu \
+            --base "$RUNNER_TEMP/gateway-perf/base/smg" --head "$RUNNER_TEMP/gateway-perf/pr/smg" \
+            --mock "$RUNNER_TEMP/gateway-perf/mock-worker" --load "$RUNNER_TEMP/gateway-perf/stress_load" \
+            --out gateway-perf --paths chat,stream,tools --requests 4000 --repeats 3 --rate-scale 0.5 \
+            --idle-seconds 15 --gw-threads 2 --gates .github/bench-gates/gateway-perf.toml 2>&1 | tee gateway-perf.log
+          rc=${PIPESTATUS[0]}
+          echo "gate_rc=$rc" >> "$GITHUB_OUTPUT"
+          echo "advisory: the gate's exit code was $rc (0 = no gated regression, 1 = a gated id regressed, 2 = the run failed)"
+          {
+            echo "Base = ${{ steps.base.outputs.sha }} (${{ steps.base.outputs.desc }}), head = ${{ github.sha }}; gate exit code $rc."
+          } >> "$GITHUB_STEP_SUMMARY"
+          # A failed run, not a verdict: the driver's own 2 (a bed that never came up, a cell that did
+          # not measure), an uncaught exception's 1 with no gate.md written, a signal's 137/143.
+          if [ "$rc" -ne 0 ] && { [ "$rc" -ne 1 ] || [ ! -s gateway-perf/gate.md ]; }; then
+            echo "::error::the gateway perf run failed or a cell did not measure (exit $rc): read gateway-perf.log in the job's artifact"
+            exit 2
+          fi
+
+      - name: Comment the tables on the pull request
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && hashFiles('gateway-perf/numbers.md') != ''
+        continue-on-error: true
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- benchmark-gateway-perf -->';
+            const numbers = fs.readFileSync('gateway-perf/numbers.md', 'utf8');
+            const gate = fs.existsSync('gateway-perf/gate.md') ? fs.readFileSync('gateway-perf/gate.md', 'utf8') : '';
+            const rc = '${{ steps.measure.outputs.gate_rc }}';
+            const body = `${marker}\n## Gateway perf (advisory, CPU mock bed)\n\nBase = ${{ steps.base.outputs.sha }} (${{ steps.base.outputs.desc }}), head = this pull request; medians of 3 interleaved repeats per side; the gate's exit code was ${rc} (advisory, never fails the job). [Run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})\n\n${numbers}\n\n<details><summary>verdicts</summary>\n\n${gate}\n</details>\n`;
+            const comments = await github.paginate(github.rest.issues.listComments, { ...context.repo, issue_number: context.issue.number, per_page: 100 });
+            const mine = comments.find(c => c.user && c.user.type === 'Bot' && c.body && c.body.startsWith(marker));
+            if (mine) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: mine.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+            }
+
+      - name: Upload the run
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gateway-perf-${{ github.sha }}
+          path: |
+            gateway-perf.log
+            gateway-perf/results.json
+            gateway-perf/numbers.md
+            gateway-perf/gate.md
+            gateway-perf/cells.json
+            gateway-perf/cells/*/*/*/cell.json
+            gateway-perf/cells/*/*/*/summary.json
+            gateway-perf/cells/*/*/*/perf.csv
+            gateway-perf/cells/*/*/*/bed/bed/*.log
+          retention-days: 30
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats || true
