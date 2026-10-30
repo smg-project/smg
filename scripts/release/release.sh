@@ -82,6 +82,9 @@ release_base() { # the remote-tracking release branch, fetched: what a bump, a p
 release_ref() { # the release branch a read-only command reads: the remote's, else a local cut not pushed yet (a rehearsal), said so
   local branch="release/$1"
   if has_ref "$REMOTE/$branch"; then printf '%s/%s' "$REMOTE" "$branch"; return 0; fi
+  # No remote-tracking ref is not the same as no branch on the remote (a single-branch clone, a narrowed fetch refspec):
+  # the remote is asked, once, before a local branch is read as a rehearsal; a stale local cut must never pass for the remote's.
+  remote_has_branch "$branch" && die "$branch is on $REMOTE but not fetched here: git fetch $REMOTE refs/heads/$branch:refs/remotes/$REMOTE/$branch"
   has_ref "refs/heads/$branch" || die "no $branch on $REMOTE or here: cut it first (release.sh cut <version> [<from>])"
   note "$branch is not on $REMOTE yet: reading the local branch (the push: git push $REMOTE refs/heads/$branch:refs/heads/$branch)"
   printf 'refs/heads/%s' "$branch"

@@ -943,6 +943,33 @@ def test_the_read_only_commands_read_a_local_cut_before_its_push(repo: Sandbox) 
     assert "reading the local branch" not in repo.tool("check", "1.14.0-rc.1").stderr
 
 
+def test_a_branch_the_remote_has_but_this_clone_never_fetched_is_not_read_as_a_rehearsal(
+    repo: Sandbox,
+) -> None:
+    """A single-branch clone or a narrowed fetch refspec never creates origin/release/<x.y>, while the local
+    branch the cut left behind goes stale as pull requests move the remote: the remote is asked before a local
+    branch is read."""
+    repo.cut()  # pushed: the remote has release/1.14
+    repo.git("update-ref", "-d", "refs/remotes/origin/release/1.14")
+    repo.git("config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main")
+    for command in (("check", "1.14.0-rc.1"), ("status", "1.14"), ("publish-plan", "1.14.0-rc.1")):
+        refused = repo.tool(*command, check=False)
+        assert refused.returncode == 1, command
+        assert (
+            "release/1.14 is on origin but not fetched here:"
+            " git fetch origin refs/heads/release/1.14:refs/remotes/origin/release/1.14"
+            in refused.stderr
+        ), command
+        assert "reading the local branch" not in refused.stderr, command
+    repo.git(
+        "fetch", "--quiet", "origin", "refs/heads/release/1.14:refs/remotes/origin/release/1.14"
+    )
+    done = repo.tool("status", "1.14")
+    assert (
+        "reading the local branch" not in done.stderr and "== versions: 1.14.0-rc.1" in done.stdout
+    )
+
+
 # --- bump-main ---------------------------------------------------------------------------------
 
 

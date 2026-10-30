@@ -24,8 +24,8 @@ branch they created):
 branch local (`bump`, `pick`, `bump-main` otherwise push it and open the pull request with `gh`).
 Every commit, pick and tag carries the caller's git identity and sign-off. Before the cut is
 pushed, the read-only commands (`check`, `status`, `publish-plan`, `notes`) read the local
-`release/<x.y>` and say so, which rehearses a release end to end on a clone; `bump`, `pick` and
-`tag` need the branch on `origin`.
+`release/<x.y>` and say so, which rehearses a release end to end on a clone; `bump`, `pick`,
+`pick-pr`, `tag` and `bump-main` (before the tag) need the branch on `origin`.
 
 ## Versions
 
