@@ -154,6 +154,7 @@ def repo(tmp_path, mod):
     put(root, "quiet/quiet.py", "y = 1\n")
     put(root, "bindings/Cargo.toml", manifest("smg-binding", "1.0.0"))
     put(root, "bindings/pyproject.toml", '[project]\nname = "smg"\nversion = "1.0.0"\n')
+    put(root, "bindings/smg/version.py", '__version__ = "1.0.0"\n')
     put(
         root, "chart/Chart.yaml", 'apiVersion: v2\nname: smg\nversion: 1.0.0\nappVersion: "1.0.0"\n'
     )
@@ -222,6 +223,7 @@ def tables(mod):
     mirrors = (
         mod.Mirror("binding", "bindings/Cargo.toml", "cargo"),
         mod.Mirror("pyproject", "bindings/pyproject.toml", "pyproject"),
+        mod.Mirror("version.py", "bindings/smg/version.py", "python"),
         mod.Mirror("chart", "chart/Chart.yaml", "helm"),
         mod.Mirror("workflow", "wf.yml", "workflow"),
     )
@@ -292,6 +294,7 @@ def test_the_verdicts(mod, repo):
     assert "quiet" not in out
     for label, file in (
         ("binding", "bindings/Cargo.toml"),
+        ("version.py", "bindings/smg/version.py"),
         ("chart", "chart/Chart.yaml"),
         ("workflow", "wf.yml"),
     ):
@@ -300,8 +303,19 @@ def test_the_verdicts(mod, repo):
         "Summary: 4 crate(s) with changes, 2 unchanged; 1 Python package(s) with changes, 1 unchanged"
         in out
     )
-    assert "8 issue(s) found." in out
+    assert "9 issue(s) found." in out
     assert "Proposed fixes" not in out, "--check never proposes"
+
+
+def test_the_installed_packages_version_file_is_a_checked_mirror(mod):
+    """smg.__version__ is read from bindings/python/src/smg/version.py; the bump writes it and this check reads it."""
+    mirror = next(m for m in mod.MIRRORS if m.file == "bindings/python/src/smg/version.py")
+    assert mirror.kind == "python"
+    assert mod.read_version(mirror.kind, '__version__ = "1.2.3"\n', mirror.file) == "1.2.3"
+    assert (
+        mod.write_version(mirror.kind, '__version__ = "1.2.3"\n', "1.2.3", "1.3.0")
+        == '__version__ = "1.3.0"\n'
+    )
 
 
 def test_the_prompt_declined_changes_nothing(mod, repo):
@@ -340,6 +354,7 @@ def test_the_fixes_make_the_tree_consistent(mod, repo):
     assert mod.workspace_dep_version(root, "alpha") == "1.1.0"
     assert mod.read_version("cargo", (repo / "model_gateway/Cargo.toml").read_text(), "") == "2.0.0"
     assert mod.read_version("pyproject", (repo / "pkg/pyproject.toml").read_text(), "") == "0.2.0"
+    assert (repo / "bindings/smg/version.py").read_text() == '__version__ = "2.0.0"\n'
     assert (
         repo / "chart/Chart.yaml"
     ).read_text() == 'apiVersion: v2\nname: smg\nversion: 2.0.0\nappVersion: "2.0.0"\n'
