@@ -70,11 +70,13 @@ use crate::{
             utils::{isolation::isolated, message_utils},
         },
     },
-    worker::{GuardedStream, PrefillLoadGuard},
+    worker::{liveness, GuardedStream, PrefillLoadGuard},
 };
 
 mod completion;
 mod frames;
+mod pending_prefill;
+use pending_prefill::PendingPrefill;
 
 use self::{
     completion::{CompletionStream, CompletionStreamOutcome, CompletionStreamUnit},
@@ -374,6 +376,7 @@ impl StreamingProcessor {
             tx,
             None,
             reservation,
+            None,
         )
         .await
     }
@@ -396,6 +399,7 @@ impl StreamingProcessor {
         tx: &SseSender,
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
+        mut prefill: Option<PendingPrefill<'_>>,
     ) -> Result<(), utils::StreamFailure> {
         let mut stream = ChatStream::open(
             self,
@@ -406,10 +410,21 @@ impl StreamingProcessor {
             tx,
             pd_timing,
         );
-        stream.read_engine(&mut grpc_stream).await?;
+        stream
+            .read_engine_with_prefill(&mut grpc_stream, prefill.as_mut())
+            .await?;
         // The stream's verdict, before the engine side is released.
         let client_left = grpc_stream.client_left();
+        // A local stop releases Decode before waiting for Prefill accounting.
         stream.release_engine(grpc_stream, metrics_labels::ENDPOINT_CHAT);
+        if let Some(prefill) = &mut prefill {
+            let cached = prefill.finish(stream.completion_tokens.delivered()).await?;
+            for (index, value) in &mut stream.cached_tokens {
+                if let Some(hit) = cached.for_index(*index) {
+                    *value = hit;
+                }
+            }
+        }
         // Nothing reaches a client that left, so its read ends with `Ok`
         // here; a sender closed between the read and the sends fails them.
         // Either way the reservation is settled with the stream's actual
@@ -451,20 +466,21 @@ impl StreamingProcessor {
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
-        // Phase 1.5: Drain prefill stream. Streaming chat does not emit prompt
-        // logprobs, but the Prefill reservation must end with this phase, and
-        // the client's prompt-side usage is the prefill side's.
-        let prefill_cached_tokens =
-            drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
-                .await
-                .map_err(utils::StreamFailure::prefill)?;
-        let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
-
-        // Phase 2-5: Process decode stream (same as single mode). Pass pd_timing
-        // so the first decode token yields honest PD TTFT.
-        // Note: decode_stream will be marked completed inside process_streaming_chunks
-        let result = self
-            .process_streaming_chunks_inner(
+        // Only ordinary single-choice SGLang chat can forward chunks before
+        // prompt-side usage is known. Continuous/provider usage keeps its
+        // existing exact per-chunk metadata contract.
+        let early = pd_timing.runtime == "sglang" && original_request.allows_early_pd_output();
+        let result = if early {
+            let finish_bound = prefill_stream
+                .worker()
+                .and_then(|worker| liveness::prefill_side_bound(worker, 0));
+            let drain = Box::pin(drain_prefill(
+                &mut prefill_stream,
+                prefill_guards,
+                true,
+                |_| {},
+            ));
+            self.process_streaming_chunks_inner(
                 decode_stream,
                 dispatch,
                 tokenizer,
@@ -473,8 +489,26 @@ impl StreamingProcessor {
                 tx,
                 Some(pd_timing),
                 reservation,
+                Some(PendingPrefill::new(drain, finish_bound)),
             )
-            .await;
+            .await
+        } else {
+            let cached = drain_prefill(&mut prefill_stream, prefill_guards, true, |_| {})
+                .await
+                .map_err(utils::StreamFailure::prefill)?;
+            self.process_streaming_chunks_inner(
+                decode_stream.decode_side(cached),
+                dispatch,
+                tokenizer,
+                stop_params,
+                original_request,
+                tx,
+                Some(pd_timing),
+                reservation,
+                None,
+            )
+            .await
+        };
 
         // The prefill stream is marked completed after the decode's read ended
         // well: a decode that failed leaves both streams to abort on drop; a
@@ -2802,9 +2836,10 @@ impl<'a> ChatStream<'a> {
     /// below, so nothing reaches the client without being parsed. After the
     /// engine's end the loop keeps turning until every choice's decoder and
     /// parsers have flushed.
-    async fn read_engine(
+    async fn read_engine_with_prefill(
         &mut self,
         grpc_stream: &mut ProtoStream,
+        mut prefill: Option<&mut PendingPrefill<'_>>,
     ) -> Result<(), utils::StreamFailure> {
         loop {
             // An engine that outlived the client's stream (every choice
@@ -2820,7 +2855,14 @@ impl<'a> ChatStream<'a> {
                 // client as its own frame as soon as it is processed; the
                 // engine stream is polled once per message.
                 StreamingProcessor::flush_chunks(self.tx, &mut self.sse_buffer).await?;
-                let item = grpc_stream.next().await;
+                let item = match &mut prefill {
+                    Some(prefill) => {
+                        prefill
+                            .next(grpc_stream, self.completion_tokens.delivered())
+                            .await?
+                    }
+                    None => grpc_stream.next().await,
+                };
                 if item.is_none() && grpc_stream.client_left() {
                     // The client's departure ends the read here: text the
                     // decoder or a parser still holds can reach nobody, and

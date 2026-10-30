@@ -628,7 +628,16 @@ impl RequestPipeline {
             dctx.workers.as_ref(),
         ));
 
-        execute_plan(dctx, attempt_plan, last_attempt, self.request_timeout).await?;
+        let early_pd_output = dctx.streaming
+            && matches!(&attempt_spec, ResponseSpec::Chat(chat) if chat.allows_early_pd_output());
+        execute_plan(
+            dctx,
+            attempt_plan,
+            last_attempt,
+            self.request_timeout,
+            early_pd_output,
+        )
+        .await?;
         self.stages
             .response_processing
             .process(dctx, attempt_spec)
