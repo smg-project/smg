@@ -1407,6 +1407,7 @@ jobs:
       min_selected: 5 # the 6 Qwen3-VL cases on 1 GPU (Llama-4 Scout is a 4-GPU class)
     secrets: inherit
 
+  # Opt-in via SMG_RUN_AMD_VLLM_LOCAL_LEGS; the AMD and PR gates below still apply.
   e2e-1gpu-chat-mm-worker-amd:
     name: e2e-1gpu-chat-mm-worker-amd (vllm)
     needs: [build-wheel, detect-changes]
