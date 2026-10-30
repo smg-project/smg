@@ -632,6 +632,7 @@ class Worker:
         if not any(
             arg.split("=", 1)[0].replace("_", "-") == "--served-model-name" for arg in all_args
         ):
+            # Fixtures send the resolved spec path as the request model.
             cmd.extend(["--served-model-name", model_path])
         if extra:
             cmd.extend(extra)
