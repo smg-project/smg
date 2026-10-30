@@ -1610,6 +1610,7 @@ jobs:
       min_selected: ${{ matrix.min_selected }}
     secrets: inherit
 
+  # Opt-in via SMG_RUN_AMD_VLLM_LOCAL_LEGS; the AMD and PR gates below still apply.
   e2e-1gpu-gateway-amd:
     name: e2e-1gpu-gateway-amd (vllm)
     needs: [build-wheel, detect-changes]
