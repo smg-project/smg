@@ -103,6 +103,15 @@ where
     {
         return Err(Status::invalid_argument("invalid SGLang encode attempt"));
     }
+    if prefill
+        .sampling_params
+        .as_ref()
+        .is_some_and(|params| params.n > 1)
+    {
+        return Err(Status::invalid_argument(
+            "SGLang encoder handoff does not support multiple samples",
+        ));
+    }
     let images = prefill
         .mm_inputs
         .as_ref()

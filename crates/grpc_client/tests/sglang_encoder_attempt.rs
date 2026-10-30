@@ -65,19 +65,27 @@ async fn encoder_waits_for_registration_and_concurrent_attempts_keep_final_ids()
         .unwrap();
         assert_eq!(forwarded.request_id, id);
     }
-    let seen = second.state.requests.lock().unwrap();
-    assert_eq!(seen.len(), 2);
-    assert_eq!(seen[0].mm_items, ["a", "b"]);
-    assert_eq!((seen[0].part_idx, seen[0].num_parts), (0, 2));
-    assert!(seen[0].embedding_port.is_empty());
-    assert_ne!(seen[0].req_id, seen[1].req_id);
+    let heads = second.state.requests.lock().unwrap();
+    let tails = first.state.requests.lock().unwrap();
+    assert_eq!(heads.len(), 2);
+    assert_eq!(tails.len(), 2);
+    for (index, id) in ["attempt-one", "attempt-two"].iter().enumerate() {
+        assert_eq!(heads[index].req_id, *id);
+        assert_eq!(heads[index].mm_items, ["a", "b"]);
+        assert_eq!((heads[index].part_idx, heads[index].num_parts), (0, 2));
+        assert!(heads[index].embedding_port.is_empty());
+        assert_eq!(tails[index].req_id, *id);
+        assert_eq!(tails[index].mm_items, ["c"]);
+        assert_eq!((tails[index].part_idx, tails[index].num_parts), (1, 2));
+        assert!(tails[index].embedding_port.is_empty());
+    }
 }
 
 #[tokio::test]
 async fn stale_ids_counts_endpoint_order_and_non_images_reject_before_dispatch() {
     let peer = Peer::new().await.unwrap();
     let calls = AtomicUsize::new(0);
-    for mutation in 0..9 {
+    for mutation in 0..10 {
         let mut generate = prefill("final", vec![peer.url.clone()], vec![1]);
         let encoders = vec![peer.client.clone()];
         match mutation {
@@ -112,13 +120,19 @@ async fn stale_ids_counts_endpoint_order_and_non_images_reject_before_dispatch()
                 .unwrap()
                 .audio_data
                 .push(vec![1]),
-            _ => {
+            8 => {
                 generate
                     .mm_inputs
                     .as_mut()
                     .unwrap()
                     .model_specific_tensors
                     .insert("image_grid_thw".into(), sg::TensorData::default());
+            }
+            _ => {
+                generate.sampling_params = Some(sg::SamplingParams {
+                    n: 2,
+                    ..Default::default()
+                });
             }
         }
         let result = encode_with_prefill(encoders, generate, Duration::from_secs(1), |_| async {
