@@ -12,8 +12,8 @@ from openai.types.responses.response_output_item import McpCall, McpListTools
 
 
 def _mcp_call(error: dict | None = None) -> McpCall:
-    return McpCall.model_validate(
-        {
+    return McpCall.construct(
+        **{
             "id": "mcp_1",
             "type": "mcp_call",
             "name": "web_search",
