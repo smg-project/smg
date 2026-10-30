@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use futures::{channel::mpsc::channel as monitor_channel, SinkExt, StreamExt};
-use zeromq::{util::PeerIdentity, SocketEvent};
+use zeromq::{util::PeerIdentity, Endpoint, SocketEvent};
 
 use super::*;
 use crate::{
@@ -1751,10 +1751,11 @@ async fn round_trip(client: &EngineCoreClient, engine: &mut MockEngine, request_
 /// did not admit: the data socket of a previous engine generation, which
 /// dialed this frontend's new bind by itself and closed when that
 /// generation was replaced, under the identity the next generation
-/// registers with. Replayed on the monitor stream: queued before the client
-/// is built, it leaves the link up and serving; after, a disconnect of
-/// another identity leaves it up too, and one of the link's own engine ends
-/// it.
+/// registers with. Replayed on the monitor stream in the socket's order (the
+/// previous connection's accept and end, then the admitted connection's
+/// accept): queued before the client is built, it leaves the link up and
+/// serving; after, a disconnect of another identity leaves it up too, and
+/// one of the link's own engine ends it.
 #[tokio::test]
 async fn a_disconnect_queued_before_the_link_was_admitted_does_not_end_it() {
     let ns = IpcNamespace::new().unwrap();
@@ -1774,13 +1775,19 @@ async fn a_disconnect_queued_before_the_link_was_admitted_does_not_end_it() {
     let mut transport = transport.unwrap();
     let mut engine = engine.unwrap();
 
-    // The monitor stream, replayed: a disconnect of the engine's identity
-    // is already queued when the client is built.
+    // The monitor stream, replayed in the order the socket reports a
+    // previous generation's connection and the admitted one: its accept, its
+    // end, then the accept of the connection that carried the registration,
+    // all queued when the client is built.
     let own = PeerIdentity::try_from(EngineId::from_engine_index(0)).unwrap();
     let (mut events, replay) = monitor_channel(8);
-    events
-        .try_send(SocketEvent::Disconnected(own.clone()))
-        .unwrap();
+    for event in [
+        SocketEvent::Accepted(Endpoint::Ipc(None), own.clone()),
+        SocketEvent::Disconnected(own.clone()),
+        SocketEvent::Accepted(Endpoint::Ipc(None), own.clone()),
+    ] {
+        events.try_send(event).unwrap();
+    }
     transport.input_events = replay;
     let client = EngineCoreClient::new(transport);
 
@@ -1862,6 +1869,64 @@ async fn a_previous_generations_disconnect_does_not_end_the_next_link() {
     let mut next = next.unwrap();
     round_trip(&client, &mut next, "generation-two").await;
     assert!(client.is_alive());
+}
+
+/// A link of several engines admits them together, and an engine that
+/// registered first can go away while the handshake still waits for the
+/// others: its disconnect is queued on the monitor before the client is
+/// built, after its own accept, and no second event for it ever comes (the
+/// socket has forgotten the peer). Replayed: the first engine's accept, its
+/// disconnect, then the second engine's accept; the link ends at its
+/// admission (`is_alive()` false, submits refused), as the monitor arm ends
+/// it on a loss after.
+#[tokio::test]
+async fn an_engine_lost_while_the_handshake_waited_for_the_others_ends_the_link() {
+    let ns = IpcNamespace::new().unwrap();
+    let (handshake, input, output) = (
+        ns.handshake_endpoint(),
+        ns.input_endpoint(),
+        ns.output_endpoint(),
+    );
+    let (transport, first, second) = tokio::join!(
+        connect_handshake(&handshake, 2, &input, &output, TIMEOUT),
+        connect_to_frontend(
+            &handshake,
+            EngineId::from_engine_index(0),
+            default_ready_response()
+        ),
+        connect_to_frontend(
+            &handshake,
+            EngineId::from_engine_index(1),
+            default_ready_response()
+        ),
+    );
+    let mut transport = transport.unwrap();
+    let (_first, _second) = (first.unwrap(), second.unwrap());
+
+    let lost = PeerIdentity::try_from(EngineId::from_engine_index(0)).unwrap();
+    let other = PeerIdentity::try_from(EngineId::from_engine_index(1)).unwrap();
+    let (mut events, replay) = monitor_channel(8);
+    for event in [
+        SocketEvent::Accepted(Endpoint::Ipc(None), lost.clone()),
+        SocketEvent::Disconnected(lost),
+        SocketEvent::Accepted(Endpoint::Ipc(None), other),
+    ] {
+        events.try_send(event).unwrap();
+    }
+    transport.input_events = replay;
+    let client = EngineCoreClient::new(transport);
+
+    tokio::time::timeout(TIMEOUT, async {
+        while client.is_alive() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the link ends at its admission on a registered engine's loss");
+    assert!(matches!(
+        client.submit(request_for("after-the-end", 0)).await,
+        Err(Error::ClientClosed { .. })
+    ));
 }
 
 /// Local admission completes before receipt; output silence still detects stalls.
