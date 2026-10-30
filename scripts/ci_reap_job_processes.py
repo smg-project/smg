@@ -146,7 +146,7 @@ def reap(
     SIGTERM to each, up to ``grace`` seconds for them to exit, SIGKILL to the
     rest. Returns the processes found (ended; in a dry run, only listed)."""
     me = os.getpid() if self_pid is None else self_pid
-    found = marked_processes(marker, proc_root=proc_root, exclude=ancestors(proc_root, me))
+    found = marked_processes(marker, proc_root=proc_root, exclude=ancestors(proc_root, me) | {1})
     if not found:
         log(f"no process carries {MARKER_ENV}={marker}")
         return found
