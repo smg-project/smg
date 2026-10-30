@@ -232,8 +232,8 @@ check-versions: ## Check workspace crate versions against latest tag (usage: mak
 # Release process (scripts/release/README.md): release branches cut from main, moved by pull requests
 RELEASE_TOOL := scripts/release/release.sh
 
-release-plan: ## Before a cut: the bump the next cut writes against TAG (default: the highest final release tag), quietly; nothing is changed (usage: make release-plan [TAG=v1.13.0])
-	@python3 scripts/check_release_versions.py --plan $(TAG)
+release-plan: ## Before a cut: the bump the next cut writes against TAG (default: the highest final release tag), quietly; nothing is changed (usage: make release-plan [TAG=v1.13.0] [VERSION=1.14.0-rc.1])
+	@VERSION_OVERRIDE="$(VERSION)" python3 scripts/check_release_versions.py --plan $(TAG)
 
 release-cut: ## Cut release/<x.y> from FROM (default origin/main) and bump it to VERSION (usage: make release-cut VERSION=1.14.0-rc.1 [FROM=<sha>] [PUSH=1])
 	@PUSH="$(PUSH)" $(RELEASE_TOOL) cut "$(VERSION)" $(FROM)
