@@ -228,6 +228,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         logger.info(f"Receive generation request: {request.request_id}")
 
         try:
+            if getattr(request, "encode_handoff", None) is not None and request.HasField(
+                "encode_handoff"
+            ):
+                await context.abort(
+                    grpc.StatusCode.UNIMPLEMENTED,
+                    "router-selected SGLang encode handoff is not connected on this servicer",
+                )
             # Convert gRPC request to internal format
             tokenized_req = self._convert_generate_request(request)
             self._handle_epd_disaggregation_encode_request(request, tokenized_req)

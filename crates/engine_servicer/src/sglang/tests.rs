@@ -3732,3 +3732,24 @@ fn media_optimization_defaults_require_a_supported_identity() {
     assert_eq!(mm_hash_threads(None, true, "64", "0").unwrap(), 0);
     assert_eq!(mm_hash_threads(None, true, "0", "1").unwrap(), 0);
 }
+
+/// A typed router envelope must not trigger ordinary media processing or the
+/// existing frontend auto-dispatch before the router receiver is connected.
+#[tokio::test]
+async fn router_encode_handoff_is_refused_before_scheduler_submission() {
+    let mut h = harness(model_info()).await;
+    let mut request = generate_request("external-handoff", false, Vec::new());
+    request.encode_handoff = Some(sg::EncodeHandoff::default());
+    let error = h.client.generate(request).await.unwrap_err();
+    assert_eq!(error.code(), Code::Unimplemented);
+    assert_eq!(
+        error.message(),
+        "router-selected SGLang encode handoff is not connected on this servicer"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), h.engine_in.recv_frames())
+            .await
+            .is_err()
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
