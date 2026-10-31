@@ -838,22 +838,28 @@ pub(crate) fn maybe_inject_pd_metadata(
         ..
     } = workers
     {
-        let rendezvous = PdProtocol::for_runtime(*runtime_type).map(|p| p.rendezvous);
-        if rendezvous == Some(PdRendezvous::SglangBootstrap) {
-            inject_sglang_bootstrap_metadata(request, prefill);
+        let Some(protocol) = PdProtocol::for_runtime(*runtime_type) else {
+            return;
+        };
+        if protocol.rendezvous == PdRendezvous::SglangBootstrap {
+            inject_sglang_bootstrap_metadata(request, prefill, protocol.dp_placement);
         }
     }
 }
 
-/// Inject bootstrap metadata into a SGLang gRPC request.
+/// Inject bootstrap metadata into a SGLang gRPC request. The room is minted
+/// in the proto's `int32` space, congruent to the selected prefill rank under
+/// `DpPlacement::RoomResidue` ([`mint_bootstrap_room`]).
 fn inject_sglang_bootstrap_metadata(
     request: &mut ProtoGenerateRequest,
     prefill_worker: &Arc<dyn Worker>,
+    dp_placement: DpPlacement,
 ) {
     let metadata = prefill_worker.metadata();
     let hostname = metadata.bootstrap_host();
     let bootstrap_port = metadata.bootstrap_port().unwrap_or(DEFAULT_BOOTSTRAP_PORT);
-    let room_id = rand::rng().random_range(0..i32::MAX);
+    // Minted below `i32::MAX`, so the cast cannot truncate.
+    let room_id = mint_bootstrap_room(prefill_worker, dp_placement, i64::from(i32::MAX)) as i32;
 
     let disagg_params = DisaggregatedParams {
         bootstrap_host: hostname.to_string(),
@@ -1041,26 +1047,7 @@ fn inject_kv_bootstrap_room(
     );
     // 63-bit room: no dedup, keep the space wide so the birthday collision
     // rate stays negligible. See the proto field doc.
-    //
-    // Under `DpPlacement::RoomResidue`, mint the room congruent to the
-    // dp-aware prefill worker's rank: the engine dispatches by
-    // `room % dp_size`, so the residue is the placement carrier. The low
-    // bits therefore carry structure — do not shard on them elsewhere. Under
-    // round_robin the decode side follows the same residue and deliberately
-    // inherits the prefill placement (decode prefix reuse shrinks the KV
-    // transfer).
-    let room_id = match (
-        dp_placement,
-        prefill_worker.dp_rank(),
-        prefill_worker.dp_size(),
-    ) {
-        (DpPlacement::RoomResidue, Some(rank), Some(dp)) if dp > 1 && rank < dp => {
-            let dp = dp as i64;
-            let base = rand::rng().random_range(0..i64::MAX - dp);
-            base - (base % dp) + rank as i64
-        }
-        _ => rand::rng().random_range(0..i64::MAX),
-    };
+    let room_id = mint_bootstrap_room(prefill_worker, dp_placement, i64::MAX);
 
     request.set_kv_bootstrap_info(hostname.to_string(), bootstrap_port as i32, room_id);
 
@@ -1068,6 +1055,117 @@ fn inject_kv_bootstrap_room(
         "Injected PD rendezvous: host={}, port={}, room={}",
         hostname, bootstrap_port, room_id
     );
+}
+
+/// Mint a bootstrap room below `space`, with no dedup (the space is kept
+/// wide so the birthday collision rate stays negligible).
+///
+/// Under `DpPlacement::RoomResidue`, the room is congruent to the dp-aware
+/// prefill worker's rank: the engine's prefill side places the request by
+/// `room % dp_size` and its decode side locates the KV source there, so the
+/// residue is the placement carrier. The low bits therefore carry structure:
+/// do not shard on them elsewhere. A decode side whose own dispatch follows
+/// the same residue deliberately inherits the prefill placement (decode
+/// prefix reuse shrinks the KV transfer); one whose placement is free keeps
+/// its own pin (each engine's row in [`PdProtocol::for_runtime`] says which).
+/// A prefill worker without a dp-aware rank, or under `PinField`, takes a
+/// free room.
+fn mint_bootstrap_room(
+    prefill_worker: &Arc<dyn Worker>,
+    dp_placement: DpPlacement,
+    space: i64,
+) -> i64 {
+    match (
+        dp_placement,
+        prefill_worker.dp_rank(),
+        prefill_worker.dp_size(),
+    ) {
+        (DpPlacement::RoomResidue, Some(rank), Some(dp)) if dp > 1 && rank < dp => {
+            let dp = dp as i64;
+            let base = rand::rng().random_range(0..space - dp);
+            base - (base % dp) + rank as i64
+        }
+        _ => rand::rng().random_range(0..space),
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_room_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::worker::{BasicWorkerBuilder, RuntimeType, Worker, WorkerType};
+
+    fn prefill(dp: Option<(usize, usize)>) -> Arc<dyn Worker> {
+        let builder =
+            BasicWorkerBuilder::new("grpc://prefill:30000").worker_type(WorkerType::Prefill);
+        let builder = match dp {
+            Some((rank, size)) => builder.dp_config(rank, size),
+            None => builder,
+        };
+        Arc::new(builder.build())
+    }
+
+    fn sglang_room(prefill: &Arc<dyn Worker>) -> i32 {
+        use smg_grpc_client::sglang_proto;
+
+        let mut request = ProtoGenerateRequest::Sglang(Box::new(sglang_proto::GenerateRequest {
+            request_id: "room".to_string(),
+            ..Default::default()
+        }));
+        let selection = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: Arc::clone(prefill),
+            decode: Arc::clone(prefill),
+            runtime_type: RuntimeType::Sglang,
+        };
+        maybe_inject_pd_metadata(&mut request, &selection);
+        match request {
+            ProtoGenerateRequest::Sglang(request) => {
+                request
+                    .disaggregated_params
+                    .expect("injected")
+                    .bootstrap_room
+            }
+            _ => panic!("built as an SGLang request"),
+        }
+    }
+
+    /// Under `RoomResidue` the room is congruent to the prefill rank, in the
+    /// space asked for; a worker without a dp-aware rank takes a free room.
+    #[test]
+    fn a_room_residue_room_is_congruent_to_the_prefill_rank() {
+        let rank1_of_2 = prefill(Some((1, 2)));
+        let rank3_of_4 = prefill(Some((3, 4)));
+        let plain = prefill(None);
+        for _ in 0..64 {
+            let room = mint_bootstrap_room(&rank1_of_2, DpPlacement::RoomResidue, i64::MAX);
+            assert!((0..i64::MAX).contains(&room) && room % 2 == 1, "{room}");
+            let room = mint_bootstrap_room(&rank3_of_4, DpPlacement::RoomResidue, 1_000);
+            assert!((0..1_000).contains(&room) && room % 4 == 3, "{room}");
+            let room = mint_bootstrap_room(&plain, DpPlacement::RoomResidue, 1_000);
+            assert!((0..1_000).contains(&room), "{room}");
+            let room = mint_bootstrap_room(&rank1_of_2, DpPlacement::PinField, 1_000);
+            assert!((0..1_000).contains(&room), "{room}");
+        }
+    }
+
+    /// The SGLang rendezvous rides the proto's `int32` room: congruent to the
+    /// dp-aware prefill rank (the engine's prefill side places the request by
+    /// the room's residue), non-negative, free without a dp-aware rank.
+    #[test]
+    fn the_sglang_room_is_congruent_to_the_dp_aware_prefill_rank() {
+        let rank1_of_2 = prefill(Some((1, 2)));
+        let rank0_of_2 = prefill(Some((0, 2)));
+        let plain = prefill(None);
+        for _ in 0..64 {
+            let room = sglang_room(&rank1_of_2);
+            assert!(room >= 0 && room % 2 == 1, "{room}");
+            let room = sglang_room(&rank0_of_2);
+            assert!(room >= 0 && room % 2 == 0, "{room}");
+            assert!(sglang_room(&plain) >= 0);
+        }
+    }
 }
 
 #[cfg(test)]
