@@ -6,6 +6,7 @@ mod grpc_chat_logprobs_test;
 mod grpc_context_length_test;
 mod grpc_context_routing_test;
 mod grpc_message_declared_tools_test;
+mod grpc_served_model_without_workers_test;
 mod grpc_worker_registration_gate_test;
 mod grpc_worker_restart_test;
 mod kimi_k3_tool_choice_none;

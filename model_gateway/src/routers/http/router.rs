@@ -620,7 +620,9 @@ impl Router {
                     RoutingPool::HttpRegular,
                     None,
                 ) {
-                    PlacementFailure::NoCandidates => error::model_not_found(model_id),
+                    PlacementFailure::NoCandidates => {
+                        placement::model_refusal(&self.worker_registry, model_id)
+                    }
                     PlacementFailure::AllOverloaded(shed) => shed,
                     PlacementFailure::Unavailable
                     | PlacementFailure::PolicyDeclined(_)
@@ -984,7 +986,7 @@ impl Router {
             let resp = self.report_refusal(
                 "Router::route_multipart_transcription",
                 model_id,
-                error::model_not_found(model_id),
+                placement::model_refusal(&self.worker_registry, model_id),
             );
             outcome.pre_send_error(&resp);
             return resp;

@@ -1052,8 +1052,9 @@ impl WorkerRegistry {
     /// Return the set of model IDs that currently have at least one
     /// worker serving them.
     ///
-    /// Skips model entries whose worker slice has become empty (those are
-    /// eventually evicted by the removal path).
+    /// Skips model entries whose worker slice is empty (a served model keeps
+    /// its entry after its last worker leaves, see
+    /// [`Self::has_served_model`]).
     pub fn get_models(&self) -> Vec<String> {
         self.model_index
             .iter()
@@ -1091,6 +1092,20 @@ impl WorkerRegistry {
         self.model_index
             .get(canonical_id)
             .is_some_and(|workers| !workers.is_empty())
+    }
+
+    /// Whether the gateway has served this name: a worker was registered for
+    /// it, as a canonical model ID or an alias, whether or not one serves it
+    /// now ([`Self::contains_model`] says that). A model's entry outlives its
+    /// workers (`remove_worker_from_model_index`), so a model whose only
+    /// engine is away is served and empty, and a request for it is refused as
+    /// a pool with no worker (`placement::model_refusal`), not as a name
+    /// nobody serves. The `unknown` wildcard is served once any worker is.
+    pub fn has_served_model(&self, model_id: &str) -> bool {
+        if model_id == UNKNOWN_MODEL_ID {
+            return !self.model_index.is_empty();
+        }
+        self.model_routing_snapshot(model_id).is_some()
     }
 
     /// The value of the `model` label on the request metric families for a
@@ -1523,6 +1538,9 @@ impl WorkerRegistry {
             for alias in model.aliases {
                 self.add_model_alias(&alias, &model.id);
             }
+        }
+        for model_id in Self::worker_model_ids(&new_worker) {
+            self.release_undeclared_aliases(&model_id);
         }
 
         self.warn_on_sampling_defaults_divergence_for_worker(&new_worker);
@@ -2090,6 +2108,9 @@ impl WorkerRegistry {
                 self.add_model_alias(&alias, &model.id);
             }
         }
+        for model_id in Self::worker_model_ids(&worker) {
+            self.release_undeclared_aliases(&model_id);
+        }
         self.warn_on_sampling_defaults_divergence_for_worker(&worker);
 
         // Update type index (clone needed for DashMap key ownership)
@@ -2132,8 +2153,13 @@ impl WorkerRegistry {
         let _update = self.hash_ring_update.lock();
 
         // Clone the copy-on-write slice out so the ring build never runs
-        // under the index shard guard.
-        let workers = self.model_index.get(model_id).map(|entry| entry.clone());
+        // under the index shard guard. A served model's entry outlives its
+        // workers; with none, it has no ring, as a removed one has none.
+        let workers = self
+            .model_index
+            .get(model_id)
+            .map(|entry| entry.clone())
+            .filter(|workers| !workers.is_empty());
 
         #[cfg(test)]
         {
@@ -2170,9 +2196,12 @@ impl WorkerRegistry {
     /// so the ring spans every model's workers, deduplicated by URL.
     /// Called only by `rebuild_hash_ring` while holding `hash_ring_update`.
     fn rebuild_wildcard_hash_ring(&self) {
+        // The models with workers: a served model's entry outlives its
+        // workers and routes nothing.
         let model_ids: Vec<String> = self
             .model_index
             .iter()
+            .filter(|entry| !entry.value().is_empty())
             .map(|entry| entry.key().clone())
             .collect();
 
@@ -2316,9 +2345,13 @@ impl WorkerRegistry {
     }
 
     /// Drop `worker_url` from the copy-on-write model index slice for `model_id`
-    /// and rebuild the hash ring. Evicts the whole model entry when empty.
+    /// and rebuild the hash ring. The entry stays when it empties: a model the
+    /// gateway has served is known while nothing serves it (its only engine
+    /// restarting under discovery, a roll), so a request for it is refused as
+    /// a pool with no worker, the transient 503, and not as a name nobody
+    /// serves ([`Self::has_served_model`]). `contains_model`, `get_models`
+    /// and the routing pools read an empty entry as no worker, as before.
     fn remove_worker_from_model_index(&self, model_id: &str, worker_url: &str) {
-        let mut should_remove_entry = false;
         // As in add_worker_to_model_index: the replaced snapshot drops after
         // the shard guard, not under it.
         let mut previous = None;
@@ -2329,30 +2362,14 @@ impl WorkerRegistry {
                 .filter(|w| w.url() != worker_url)
                 .cloned()
                 .collect();
-
-            if new_workers.is_empty() {
-                previous = Some(std::mem::replace(
-                    &mut *entry,
-                    Arc::new(ModelWorkerSnapshot::new(Arc::from(
-                        Vec::<Arc<dyn Worker>>::new().into_boxed_slice(),
-                    ))),
-                ));
-                should_remove_entry = true;
-            } else {
-                previous = Some(std::mem::replace(
-                    &mut *entry,
-                    Arc::new(ModelWorkerSnapshot::new(Arc::from(
-                        new_workers.into_boxed_slice(),
-                    ))),
-                ));
-            }
+            previous = Some(std::mem::replace(
+                &mut *entry,
+                Arc::new(ModelWorkerSnapshot::new(Arc::from(
+                    new_workers.into_boxed_slice(),
+                ))),
+            ));
         }
         drop(previous);
-
-        if should_remove_entry {
-            self.model_index
-                .remove_if(model_id, |_, workers| workers.is_empty());
-        }
 
         self.rebuild_hash_ring(model_id);
     }
@@ -2381,7 +2398,7 @@ impl WorkerRegistry {
         // leave the alias inserted here in place. Holding the entry makes
         // that cleanup wait until the insert is visible.
         let entry = self.model_alias_index.entry(alias.to_string());
-        if self.model_index.contains_key(alias) {
+        if self.model_has_workers(alias) {
             tracing::warn!(
                 alias,
                 canonical_id,
@@ -2395,14 +2412,35 @@ impl WorkerRegistry {
             }
             return;
         }
+        // The name of a model the gateway served and nothing serves any more
+        // (its entry stayed, empty) becomes the alias: the model's lookup
+        // would otherwise shadow it.
+        self.model_index
+            .remove_if(alias, |_, workers| workers.is_empty());
 
         match entry {
-            Entry::Occupied(entry) if entry.get().as_ref() != canonical_id => tracing::warn!(
-                alias,
-                existing_canonical_id = entry.get().as_ref(),
-                ignored_canonical_id = canonical_id,
-                "Model alias already maps to a different canonical model"
-            ),
+            Entry::Occupied(mut entry) if entry.get().as_ref() != canonical_id => {
+                // An alias a served model holds is not taken from it; one left
+                // by a model nothing serves any more (it stayed with the
+                // model, `remove_model_alias_if_unused`) is the declaring
+                // model's.
+                if self.model_has_workers(entry.get().as_ref()) {
+                    tracing::warn!(
+                        alias,
+                        existing_canonical_id = entry.get().as_ref(),
+                        ignored_canonical_id = canonical_id,
+                        "Model alias already maps to a different canonical model"
+                    );
+                } else {
+                    tracing::debug!(
+                        alias,
+                        previous_canonical_id = entry.get().as_ref(),
+                        canonical_id,
+                        "Handing the alias of a model without workers to the model that declares it"
+                    );
+                    entry.insert(Arc::from(canonical_id));
+                }
+            }
             Entry::Occupied(_) => {}
             Entry::Vacant(entry) => {
                 entry.insert(Arc::from(canonical_id));
@@ -2459,9 +2497,38 @@ impl WorkerRegistry {
                 );
                 entry.insert(Arc::from(next_canonical_id.as_str()));
             }
+            // The alias of a model the gateway has served stays with the
+            // model while nothing serves it, as the model's own entry does
+            // (`remove_worker_from_model_index`): a request by the alias is
+            // refused as one by the model is. A model that declares the alias
+            // later takes it over (`add_model_alias`). A model that still has
+            // workers, none of which declares the alias, loses it as before.
+            None if self.model_index.contains_key(canonical_id)
+                && !self.model_has_workers(canonical_id) => {}
             None => {
                 entry.remove();
             }
+        }
+    }
+
+    /// Re-judge every alias that maps to `canonical_id` against the model's
+    /// workers as they are now. A served model with no workers keeps its
+    /// aliases (`remove_model_alias_if_unused`); when a worker registers
+    /// into the model again, the aliases its workers declare stay and the
+    /// rest go to a model that declares them or away, as a removal would
+    /// have judged them, so an alias a roll dropped does not outlive its
+    /// last declaration and block another model's claim to the name. The
+    /// alias index is read first and released before each alias is judged
+    /// (the lock order on `model_alias_index`).
+    fn release_undeclared_aliases(&self, canonical_id: &str) {
+        let held: Vec<String> = self
+            .model_alias_index
+            .iter()
+            .filter(|entry| entry.value().as_ref() == canonical_id)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for alias in held {
+            self.remove_model_alias_if_unused(&alias, canonical_id);
         }
     }
 
