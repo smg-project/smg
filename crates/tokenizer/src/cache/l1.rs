@@ -1,6 +1,6 @@
 //! L1 Cache: Special-token boundary prefix cache
 //!
-//! Caches tokenization results at ALL special token boundaries.
+//! Caches tokenization results at selected special token boundaries.
 //! Special tokens (like `<|im_start|>`, `<|im_end|>`) are atomic in BPE tokenizers (special: true, normalized: false),
 //! making them the ONLY safe split points that guarantee correctness. A tokenizer extracts its added tokens in two
 //! passes: the `normalized: false` ones from the raw text, then the `normalized: true` ones from the pieces that pass
@@ -8,10 +8,10 @@
 //! tokens it matches so that no boundary falls inside them are raw-pass added tokens; a token of the second pass can
 //! neither displace a raw-pass token nor be a boundary of a raw-text matcher.
 //!
-//! **Design**: Cache at every special token boundary (not at fixed granularity intervals)
-//! - Simple: No granularity parameter, no search windows
-//! - Efficient: Fewer cache entries (10 instead of 64 for typical 8KB prompt)
-//! - Natural: Aligns with actual chat template structure
+//! **Design**: Select checkpoints from special token boundaries.
+//! - Cold fills: Geometrically spaced token lengths plus the deepest boundary.
+//! - Hits: Learn the next boundary after a match and the deepest boundary.
+//! - Admission: Nonblocking and subject to the retained-memory budget.
 //!
 //! Example:
 //!
@@ -20,7 +20,7 @@
 //! Request 1: "<|im_start|>system\nYou are helpful.<|im_end|><|im_start|>user\nWhat is 2+2?<|im_end|>"
 //! Request 2: "<|im_start|>system\nYou are helpful.<|im_end|><|im_start|>user\nHello!<|im_end|>"
 //!
-//! Cache points: After each "<|im_end|>" (atomic tokens, guaranteed safe)
+//! Candidate split points: After atomic special tokens such as "<|im_end|>".
 //! Result: tokenize(prefix) + tokenize(suffix) == tokenize(prefix + suffix)
 
 use std::{
@@ -566,10 +566,10 @@ impl L1Cache {
         PrefixLookup::Miss(seeds)
     }
 
-    /// Insert prefix entries at all special token boundaries (incremental hashing
-    /// and tokenization, O(N)). The miss path of [`super::CachedTokenizer`] instead
-    /// uses `Self::populate_with_seeds`, which reuses this per-segment work to also
-    /// return the full encoding.
+    /// Insert geometrically spaced prefixes plus the deepest special-token
+    /// boundary, subject to admission. The miss path of [`super::CachedTokenizer`]
+    /// uses `Self::populate_with_seeds`, which reuses the incremental hashing
+    /// and per-segment encoding to also return the full encoding.
     pub fn insert_at_boundaries<E: Encoder + ?Sized>(
         &self,
         input: &str,
@@ -589,9 +589,9 @@ impl L1Cache {
         Ok(())
     }
 
-    /// Miss-path encode: tokenize `input` exactly once, caching the cumulative prefix
-    /// at every special token boundary, and return the assembled encoding, equal
-    /// to an uncached `encode(input, add_special_tokens)`: the segments are
+    /// Miss-path encode: tokenize `input` once, admitting geometrically spaced
+    /// prefixes plus the deepest special-token boundary, and return the assembled
+    /// encoding, equal to an uncached `encode(input, add_special_tokens)`: the segments are
     /// encoded in context and the frame the flag adds goes around the whole.
     /// A request with the flag is served by the plain encode, uncached, when
     /// the frame cannot be read off the tokenizer (`SpecialTokenFrame::probe`).
@@ -643,8 +643,8 @@ impl L1Cache {
             return tokenizer.encode(input, add_special_tokens);
         };
 
-        // Tokenize + cache every boundary prefix; `running` covers input[0..last
-        // boundary], behind the frame's leading ids.
+        // Tokenize every segment and cache selected prefixes; `running` covers
+        // input[0..last boundary], behind the frame's leading ids.
         let mut running =
             self.populate_boundaries(input, seeds, tokenizer, special_tokens, frame)?;
 
@@ -662,8 +662,9 @@ impl L1Cache {
     /// Shared core of the insert and fused-miss paths: walk the precomputed
     /// `seeds`, encoding each segment once without the flag (the first as the
     /// start of the input, each later one after the special token that ends
-    /// the boundary before it), cache the cumulative prefix at each boundary,
-    /// and return the running token vector (covering `input[0..last boundary]`)
+    /// the boundary before it), cache geometrically spaced cumulative prefixes
+    /// plus the deepest boundary, and return the running token vector
+    /// (covering `input[0..last boundary]`)
     /// behind `frame`'s leading ids when there is a frame; the entries never
     /// hold the frame. Nothing is stored before every segment came back exact.
     fn populate_boundaries<E: Encoder + ?Sized>(
@@ -702,10 +703,21 @@ impl L1Cache {
             last = Some(seed);
         }
 
-        // Keep only offsets until every segment is known to splice exactly.
-        // Copy each admitted prefix directly from the completed running buffer.
-        for (seed, end) in seeds.iter().zip(prefix_lengths) {
-            self.insert_prefix(seed.digest, seed.end, &running_tokens[head..end]);
+        // Wait for exact segment splicing before admitting any prefix. Copying
+        // every cumulative prefix is quadratic for many-turn conversations.
+        // Doubling the token length bounds geometric copies by twice the final
+        // prefix length; always retaining the deepest adds at most one more.
+        // Advance the selection even when admission fails (budget/contention).
+        let mut previous = None;
+        for (at, (seed, end)) in seeds.iter().zip(prefix_lengths).enumerate() {
+            let length = end - head;
+            if previous
+                .is_none_or(|before: usize| length > before && length >= before.saturating_mul(2))
+                || at + 1 == seeds.len()
+            {
+                previous = Some(length);
+                self.insert_prefix(seed.digest, seed.end, &running_tokens[head..end]);
+            }
         }
 
         Ok(running_tokens)
@@ -1729,6 +1741,160 @@ mod tests {
                     .is_none(),
                 "opposite flag must not collide with populated entries"
             );
+        }
+    }
+
+    /// Cold admission copies a linear token payload without relying on eviction.
+    #[test]
+    fn cold_admission_bounds_copies_and_keeps_deepest() {
+        let tokenizer = bos_tokenizer();
+        for turns in [1, 8, 4096] {
+            for suffix in ["", "tail"] {
+                let input = format!("{}{suffix}", "<|im_start|>abcdefgh<|im_end|>".repeat(turns));
+                for flag in [false, true] {
+                    let cache = L1Cache::new(128 * 1024 * 1024);
+                    let got = cache
+                        .populate_and_encode(&input, &tokenizer, &SPECIALS, flag)
+                        .unwrap();
+                    assert_eq!(
+                        got.token_ids(),
+                        tokenizer.encode(&input, flag).unwrap().token_ids()
+                    );
+                    let seeds = L1Cache::boundary_seeds(
+                        &input,
+                        &SpecialTokenBoundaries::new(&SPECIALS),
+                        flag,
+                    );
+                    let deepest = seeds.last().unwrap().end;
+                    let expected = tokenizer.encode(&input[..deepest], false).unwrap();
+                    let copied: usize = cache
+                        .shards
+                        .iter()
+                        .map(|s| s.iter().map(|e| e.tokens.len()).sum::<usize>())
+                        .sum();
+                    assert!(
+                        copied <= 3 * expected.token_ids().len(),
+                        "copied {copied} tokens"
+                    );
+                    assert!(cache.len() <= usize::BITS as usize + 1);
+                    let (tokens, offset) =
+                        cache.longest_prefix_match(&input, &SPECIALS, flag).unwrap();
+                    assert_eq!(offset, deepest);
+                    assert_eq!(tokens.as_ref(), expected.token_ids());
+                    let next = format!("{input}<|im_start|>next<|im_end|>tail");
+                    assert_eq!(
+                        cache
+                            .longest_prefix_match(&next, &SPECIALS, flag)
+                            .unwrap()
+                            .1,
+                        deepest
+                    );
+                }
+            }
+        }
+    }
+
+    /// Geometric short checkpoints remain reusable by independently branched histories.
+    #[test]
+    fn cold_admission_keeps_geometric_shared_prefixes() {
+        let tokenizer = bos_tokenizer();
+        let turn = "<|im_start|>abcdefgh<|im_end|>";
+        let input = format!("{}tail", turn.repeat(4096));
+        let cache = L1Cache::new(128 * 1024 * 1024);
+        cache
+            .populate_and_encode(&input, &tokenizer, &SPECIALS, false)
+            .unwrap();
+        for turns in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048] {
+            let prefix = turn.repeat(turns);
+            let sibling = format!("{prefix}different");
+            let (tokens, offset) = cache
+                .longest_prefix_match(&sibling, &SPECIALS, false)
+                .unwrap();
+            assert_eq!(offset, prefix.len());
+            assert_eq!(
+                tokens.as_ref(),
+                tokenizer.encode(&prefix, false).unwrap().token_ids()
+            );
+        }
+    }
+
+    /// Tight budgets reject large checkpoints without replacing a useful small one.
+    #[test]
+    fn cold_admission_tight_budget_keeps_shared_prefix() {
+        let tokenizer = bos_tokenizer();
+        let input = format!("{}tail", "<|im_start|>abcdefgh<|im_end|>".repeat(4096));
+        for budget in [0, 1, 32, 4096, 8 * 1024 * 1024] {
+            let cache = L1Cache::new(budget);
+            for flag in [false, true] {
+                let got = cache
+                    .populate_and_encode(&input, &tokenizer, &SPECIALS, flag)
+                    .unwrap();
+                assert_eq!(
+                    got.token_ids(),
+                    tokenizer.encode(&input, flag).unwrap().token_ids()
+                );
+                assert!(cache.stats().memory_bytes <= budget);
+            }
+            let retained: usize = cache
+                .shards
+                .iter()
+                .map(|s| s.iter().map(|e| e.size_bytes).sum::<usize>())
+                .sum();
+            assert_eq!(cache.stats().memory_bytes, retained);
+            if budget == 32 {
+                assert_eq!(cache.len(), 2);
+                assert!(cache
+                    .longest_prefix_match("<|im_start|>different", &SPECIALS, false)
+                    .is_some());
+            }
+            cache.clear();
+            assert_eq!(cache.stats().memory_bytes, 0);
+        }
+    }
+
+    /// Cold fills racing with clear/churn keep charge bounded and reconcile at rest.
+    #[test]
+    fn cold_admission_concurrent_clear_reconciles() {
+        use std::sync::{Arc, Barrier};
+        for budget in [0, 1, 4096, 8 * 1024 * 1024] {
+            let cache = Arc::new(L1Cache::new(budget));
+            let gate = Barrier::new(17);
+            std::thread::scope(|scope| {
+                for worker in 0..16 {
+                    let (cache, gate) = (&cache, &gate);
+                    scope.spawn(move || {
+                        let tokenizer = bos_tokenizer();
+                        gate.wait();
+                        for round in 0..16 {
+                            let input =
+                                format!("{worker}/{round}{}tail", "abcdefgh<|im_end|>".repeat(128));
+                            let got = cache
+                                .populate_and_encode(&input, &tokenizer, &SPECIALS, false)
+                                .unwrap();
+                            assert_eq!(
+                                got.token_ids(),
+                                tokenizer.encode(&input, false).unwrap().token_ids()
+                            );
+                            assert!(cache.stats().memory_bytes <= budget);
+                        }
+                    });
+                }
+                gate.wait();
+                for _ in 0..128 {
+                    cache.clear();
+                    std::thread::yield_now();
+                }
+            });
+            let retained: usize = cache
+                .shards
+                .iter()
+                .map(|s| s.iter().map(|e| e.size_bytes).sum::<usize>())
+                .sum();
+            assert_eq!(cache.stats().memory_bytes, retained);
+            assert!(retained <= budget);
+            cache.clear();
+            assert!(cache.is_empty());
+            assert_eq!(cache.stats().memory_bytes, 0);
         }
     }
 }
