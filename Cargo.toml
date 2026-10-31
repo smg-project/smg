@@ -80,7 +80,7 @@ uuid = { version = "1.23", features = ["v7", "serde"] }
 # nothing configures wasmtime's compilation cache (no `Config::cache` call anywhere), and that
 # cache crate was the only path by which zstd 0.13 reached the lockfile. A wasmtime bump re-reads
 # the `default` list in its Cargo.toml and adds a new default here on purpose, not by inheritance.
-wasmtime = { version = "49.0", default-features = false, features = [
+wasmtime = { version = "50.0", default-features = false, features = [
     "anyhow",
     "async",
     "backtrace",
