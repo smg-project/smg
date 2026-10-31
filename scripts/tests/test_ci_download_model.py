@@ -206,7 +206,7 @@ def test_readable_download_lock_serializes_without_write_access():
                     },
                     preexec_fn=enter_fixture_process_group,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
                     bufsize=0,
                 )
                 deadline = time.monotonic() + 3
@@ -224,8 +224,8 @@ def test_readable_download_lock_serializes_without_write_access():
                 assert proc.poll() is None
                 assert not marker.exists(), "downloader entered while another opener held the lock"
                 fcntl.flock(owner, fcntl.LOCK_UN)
-                stdout, stderr = proc.communicate(timeout=10)
-                assert proc.returncode == 0, (b"".join(output) + stdout + stderr).decode()
+                stdout, _ = proc.communicate(timeout=10)
+                assert proc.returncode == 0, (b"".join(output) + stdout).decode()
                 observation = json.loads(marker.read_text())
                 assert observation == {
                     "uid": target_uid,
