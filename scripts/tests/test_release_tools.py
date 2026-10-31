@@ -908,6 +908,68 @@ def test_check_without_gh_names_the_branch_page(repo: Sandbox) -> None:
     assert "[....] CI: not readable here" in out
 
 
+# --- a rehearsal: the cut before its push ------------------------------------------------------------
+
+
+def test_the_read_only_commands_read_a_local_cut_before_its_push(repo: Sandbox) -> None:
+    """A cut without PUSH=1 is local. check, status, publish-plan and notes read the local branch and say so,
+    which rehearses a release on a clone; bump, pick and tag still need the branch on the remote."""
+    repo.tool("cut", "1.14.0-rc.1")
+    assert repo.origin_ref("refs/heads/release/1.14") is None
+    repo.git("switch", "--quiet", "main")
+    said = (
+        "release: release/1.14 is not on origin yet: reading the local branch"
+        " (the push: git push origin refs/heads/release/1.14:refs/heads/release/1.14)"
+    )
+    check = repo.tool("check", "1.14.0-rc.1")
+    assert said in check.stderr and "[ok]   versions: the branch reads 1.14.0-rc.1" in check.stdout
+    status = repo.tool("status", "1.14")
+    assert said in status.stderr and "== versions: 1.14.0-rc.1" in status.stdout
+    plan = repo.tool("publish-plan", "1.14.0-rc.1")
+    assert (
+        said in plan.stderr and "gh workflow run release-pypi.yml --ref v1.14.0-rc.1" in plan.stdout
+    )
+    notes = repo.tool("notes", "1.14.0-rc.1")
+    assert said in notes.stderr and "## SMG v1.14.0-rc.1" in notes.stdout
+    assert repo.origin_ref("refs/heads/release/1.14") is None, "a read pushes nothing"
+    on_main = repo.git("rev-parse", "origin/main")
+    for command in (("bump", "1.14.0-rc.2"), ("pick", "1.14", on_main), ("tag", "1.14.0-rc.1")):
+        refused = repo.tool(*command, check=False)
+        assert refused.returncode == 1, command
+        assert "no release/1.14 on origin: cut it first" in refused.stderr, command
+    assert "no release/1.15 on origin or here" in repo.tool("status", "1.15", check=False).stderr
+    # Once pushed, the remote's branch is read and nothing is said.
+    repo.git("push", "--quiet", "origin", "refs/heads/release/1.14:refs/heads/release/1.14")
+    assert "reading the local branch" not in repo.tool("check", "1.14.0-rc.1").stderr
+
+
+def test_a_branch_the_remote_has_but_this_clone_never_fetched_is_not_read_as_a_rehearsal(
+    repo: Sandbox,
+) -> None:
+    """A single-branch clone or a narrowed fetch refspec never creates origin/release/<x.y>, while the local
+    branch the cut left behind goes stale as pull requests move the remote: the remote is asked before a local
+    branch is read."""
+    repo.cut()  # pushed: the remote has release/1.14
+    repo.git("update-ref", "-d", "refs/remotes/origin/release/1.14")
+    repo.git("config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main")
+    for command in (("check", "1.14.0-rc.1"), ("status", "1.14"), ("publish-plan", "1.14.0-rc.1")):
+        refused = repo.tool(*command, check=False)
+        assert refused.returncode == 1, command
+        assert (
+            "release/1.14 is on origin but not fetched here:"
+            " git fetch origin refs/heads/release/1.14:refs/remotes/origin/release/1.14"
+            in refused.stderr
+        ), command
+        assert "reading the local branch" not in refused.stderr, command
+    repo.git(
+        "fetch", "--quiet", "origin", "refs/heads/release/1.14:refs/remotes/origin/release/1.14"
+    )
+    done = repo.tool("status", "1.14")
+    assert (
+        "reading the local branch" not in done.stderr and "== versions: 1.14.0-rc.1" in done.stdout
+    )
+
+
 # --- bump-main ---------------------------------------------------------------------------------
 
 
