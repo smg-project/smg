@@ -141,17 +141,25 @@ impl Mock {
 }
 
 /// The ports stop accepting connections soon after the signal.
-fn assert_refuses_connections(port: u16) {
+async fn assert_refuses_connections(port: u16) {
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        if TcpStream::connect_timeout(&addr(port), Duration::from_millis(200)).is_err() {
+        let accepts = matches!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                tokio::net::TcpStream::connect(addr(port)),
+            )
+            .await,
+            Ok(Ok(_))
+        );
+        if !accepts {
             return;
         }
         assert!(
             Instant::now() < deadline,
             "port {port} still accepted connections 3 s after the signal"
         );
-        thread::sleep(Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -277,8 +285,8 @@ async fn sigterm_lets_the_streams_in_flight_finish_then_exits_zero() {
 
     let sent = mock.signal("TERM");
     // No new connection from the signal on, on either worker.
-    assert_refuses_connections(mock.grpc_port);
-    assert_refuses_connections(mock.http_port);
+    assert_refuses_connections(mock.grpc_port).await;
+    assert_refuses_connections(mock.http_port).await;
 
     // The streams already running are served to their end.
     let delivered = drain_generate(
@@ -435,7 +443,7 @@ async fn a_second_signal_during_the_drain_exits_at_once() {
     grpc.next().await.expect("a first frame").expect("ok");
 
     let first = mock.signal("TERM");
-    thread::sleep(Duration::from_millis(300));
+    tokio::time::sleep(Duration::from_millis(300)).await;
     mock.signal("TERM");
     let (status, exited, log) = mock.exit(Duration::from_secs(10)).await;
     assert_eq!(status.code(), Some(0), "exit code; log:\n{log}");
@@ -537,7 +545,7 @@ async fn sigterm_puts_the_last_batch_of_a_drained_zmq_request_on_the_socket() {
     let sent = mock.signal("TERM");
     // The stop is in effect once a port refuses connections: the drain's
     // count is logged before anything else of this test reaches the rank.
-    assert_refuses_connections(mock.grpc_port);
+    assert_refuses_connections(mock.grpc_port).await;
     // The frontend gives the long request up during the drain: its Abort
     // reaches the rank, whose forwarder for it is cancelled, and the queued
     // request takes its place in the engine.
