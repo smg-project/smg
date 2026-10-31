@@ -121,7 +121,7 @@ impl Mock {
     /// Wait up to `limit` for the exit; a process still alive by then is
     /// killed and the test fails. Returns the exit status, when it happened
     /// and the process's log.
-    fn exit(mut self, limit: Duration) -> (ExitStatus, Instant, String) {
+    async fn exit(mut self, limit: Duration) -> (ExitStatus, Instant, String) {
         let deadline = Instant::now() + limit;
         loop {
             if let Some(status) = self.child.try_wait().expect("try_wait") {
@@ -135,7 +135,7 @@ impl Mock {
                 let log = self.stdout.join().expect("stdout reader");
                 panic!("the mock worker did not exit within {limit:?}; log:\n{log}");
             }
-            thread::sleep(Duration::from_millis(5));
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 }
@@ -200,11 +200,11 @@ async fn drain_generate(
     delivered
 }
 
-#[test]
-fn sigterm_with_nothing_in_flight_exits_zero_at_once() {
+#[tokio::test]
+async fn sigterm_with_nothing_in_flight_exits_zero_at_once() {
     let mock = Mock::start(&[]);
     let sent = mock.signal("TERM");
-    let (status, exited, log) = mock.exit(Duration::from_secs(10));
+    let (status, exited, log) = mock.exit(Duration::from_secs(10)).await;
     assert_eq!(status.code(), Some(0), "exit code; log:\n{log}");
     assert!(
         exited - sent < Duration::from_secs(2),
@@ -218,11 +218,11 @@ fn sigterm_with_nothing_in_flight_exits_zero_at_once() {
     assert!(log.contains("drained; exiting"), "log:\n{log}");
 }
 
-#[test]
-fn sigint_is_handled_the_same_way() {
+#[tokio::test]
+async fn sigint_is_handled_the_same_way() {
     let mock = Mock::start(&[]);
     let sent = mock.signal("INT");
-    let (status, exited, log) = mock.exit(Duration::from_secs(10));
+    let (status, exited, log) = mock.exit(Duration::from_secs(10)).await;
     assert_eq!(status.code(), Some(0), "exit code; log:\n{log}");
     assert!(
         exited - sent < Duration::from_secs(2),
@@ -309,7 +309,7 @@ async fn sigterm_lets_the_streams_in_flight_finish_then_exits_zero() {
         "the HTTP stream ended with its finish frame and [DONE]:\n{body}"
     );
 
-    let (status, exited, log) = mock.exit(Duration::from_secs(10));
+    let (status, exited, log) = mock.exit(Duration::from_secs(10)).await;
     assert_eq!(status.code(), Some(0), "exit code; log:\n{log}");
     assert!(
         exited - sent < Duration::from_secs(4),
@@ -346,7 +346,7 @@ async fn the_drain_deadline_bounds_the_exit() {
     grpc.next().await.expect("a first frame").expect("ok");
 
     let sent = mock.signal("TERM");
-    let (status, exited, log) = mock.exit(Duration::from_secs(10));
+    let (status, exited, log) = mock.exit(Duration::from_secs(10)).await;
     assert_eq!(status.code(), Some(0), "exit code; log:\n{log}");
     let took = exited - sent;
     assert!(
@@ -405,7 +405,7 @@ async fn sigterm_ends_a_kv_event_subscription_held_open() {
     })
     .await;
     assert!(ended.is_ok(), "the subscription ends at the stop");
-    let (status, exited, log) = mock.exit(Duration::from_secs(10));
+    let (status, exited, log) = mock.exit(Duration::from_secs(10)).await;
     assert_eq!(status.code(), Some(0), "exit code; log:\n{log}");
     eprintln!(
         "kv subscription held open: exit {:?} after SIGTERM",
@@ -437,7 +437,7 @@ async fn a_second_signal_during_the_drain_exits_at_once() {
     let first = mock.signal("TERM");
     thread::sleep(Duration::from_millis(300));
     mock.signal("TERM");
-    let (status, exited, log) = mock.exit(Duration::from_secs(10));
+    let (status, exited, log) = mock.exit(Duration::from_secs(10)).await;
     assert_eq!(status.code(), Some(0), "exit code; log:\n{log}");
     assert!(
         exited - first < Duration::from_secs(2),
@@ -564,7 +564,7 @@ async fn sigterm_puts_the_last_batch_of_a_drained_zmq_request_on_the_socket() {
     );
     assert_eq!(tokens, 40, "every token of the drained request arrived");
 
-    let (status, exited, log) = mock.exit(Duration::from_secs(10));
+    let (status, exited, log) = mock.exit(Duration::from_secs(10)).await;
     assert_eq!(status.code(), Some(0), "exit code; log:\n{log}");
     assert!(
         exited - sent < Duration::from_secs(4),
