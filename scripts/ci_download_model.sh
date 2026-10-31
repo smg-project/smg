@@ -56,6 +56,18 @@ download_model() {
 
     echo "Acquiring lock for ${model_id}..."
     (
+        # Prefer a writable FD (also required by NFS exclusive-lock emulation).
+        # Append never truncates an existing shared lock. On local filesystems,
+        # a readable existing lock can still carry the same exclusive flock.
+        if { exec 200>>"$lock_file"; } 2>/dev/null; then
+            :
+        elif [[ -f "$lock_file" && ! -L "$lock_file" && -r "$lock_file" ]] &&
+             { exec 200<"$lock_file"; } 2>/dev/null; then
+            echo "Using existing read-only lock for ${model_id}."
+        else
+            echo "ERROR: Cannot open shared lock for ${model_id}" >&2
+            exit 1
+        fi
         # Serialize downloads across pods sharing the same volume
         flock -w 1800 200 || { echo "ERROR: Timed out waiting for lock on ${model_id}"; exit 1; }
 
@@ -81,18 +93,14 @@ download_model() {
             fi
             echo "Download attempt ${attempt}/${MAX_RETRIES} failed for ${model_id}."
             if [ $attempt -lt $MAX_RETRIES ]; then
-                # Clean up stale HF hub lock files older than 30 min (both legacy and new locations)
-                # Only delete old locks to avoid removing locks held by active processes
-                find "${model_dir}" -name "*.lock" -type f -mmin +30 -delete 2>/dev/null || true
-                local hf_lock_dir="${HF_HOME}/hub/.locks/models--${model_id//\//--}"
-                find "${hf_lock_dir}" -name "*.lock" -type f -mmin +30 -delete 2>/dev/null || true
+                # Lock age does not prove that another downloader released it.
                 echo "Retrying in ${RETRY_DELAY}s..."
                 sleep "$RETRY_DELAY"
             fi
         done
         echo "ERROR: Failed to download ${model_id} after ${MAX_RETRIES} attempts."
         exit 1
-    ) 200>"$lock_file"
+    )
 }
 
 # Parse arguments
