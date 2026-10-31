@@ -58,6 +58,7 @@ use crate::{
         otel_trace::inject_trace_context_http,
     },
     policies::{CacheNamespace, PolicyRegistry},
+    rate_limit::RateLimitManager,
     routers::{
         common::{
             attach_sized_body,
@@ -70,13 +71,14 @@ use crate::{
             decisions::{SglangDecisionAdapter, UPSTREAM_ROUTE},
             header_utils, overload,
             placement::{self, CandidateFilter, PlacementFailure, PlacementInputs, RefusalSite},
+            rate_limit_cell::RateLimitCell,
             realtime::{
                 rest::forward_realtime_rest, webrtc, webrtc::handle_realtime_webrtc,
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
             },
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{
-                is_request_timeout, is_retryable_response, is_retryable_status,
+                is_request_timeout, is_retryable_response, is_retryable_status, mark_non_retryable,
                 request_timeout_response, RetryExecutor,
             },
             sse_rechunk::{NoopObserver, SseRechunker},
@@ -96,6 +98,7 @@ use crate::{
             request_stream::{CappedBodyStream, StreamProgress},
             stream_failure::{cause, head_success_recorded, RelaySource},
             stream_relay::{relay_streaming_body, ChunkMode, Relay},
+            tenant_rate_limit,
         },
         BodyPolicy, RouterTrait,
     },
@@ -141,6 +144,10 @@ pub struct Router {
     realtime_registry: Arc<RealtimeRegistry>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
+    /// The tenant rate limiter, `None` when it is off. The typed routes that
+    /// take a tenant reservation reserve through it in
+    /// [`Router::route_typed_request`].
+    rate_limit_manager: Option<Arc<RateLimitManager>>,
 }
 
 trait RealtimeRestRequest: serde::Serialize + Clone {
@@ -208,6 +215,7 @@ impl Router {
             realtime_registry: ctx.realtime_registry.clone(),
             webrtc_bind_addr: ctx.webrtc_bind_addr,
             webrtc_stun_server: ctx.webrtc_stun_server.clone(),
+            rate_limit_manager: ctx.rate_limit_manager.clone(),
         })
     }
 
@@ -405,9 +413,16 @@ impl Router {
         )
     }
 
+    /// Route a typed request to a worker serving `model_id`, retried as the
+    /// model's retry config allows. With `tenant_meta` (the routes that take a
+    /// tenant reservation) and the tenant rate limiter on, the request
+    /// reserves its estimate once, before any dispatch, and the one answer the
+    /// dispatch paths converge on resolves the reservation once
+    /// (`tenant_rate_limit::resolve`).
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
+        tenant_meta: Option<&TenantRequestMeta>,
         typed_req: T,
         route: &'static str,
         model_id: &str,
@@ -456,6 +471,25 @@ impl Router {
             .as_ref()
             .unwrap_or(&self.retry_config);
 
+        // Reserve once per logical request, before any dispatch: every attempt
+        // below dispatches under this one reservation. A denial is the
+        // request's answer, never retried.
+        let (reservation, denial) = match (&self.rate_limit_manager, tenant_meta) {
+            (Some(manager), Some(tenant_meta)) => {
+                let cell = RateLimitCell::new();
+                let estimate =
+                    tenant_rate_limit::estimated_input_tokens(&typed_req, text.as_deref());
+                match cell.reserve(manager, tenant_meta, model_id, estimate).await {
+                    Ok(()) => (Some(cell), None),
+                    Err(mut denied) => {
+                        mark_non_retryable(&mut denied);
+                        (None, Some(denied))
+                    }
+                }
+            }
+            _ => (None, None),
+        };
+
         // The lease owns the parsed request and its routing derivatives for
         // the dispatch phase; its release point encodes the retry policy.
         let lease = RequestLease::new(
@@ -477,7 +511,9 @@ impl Router {
         // definitive takes no further attempt.
         let ledger = AttemptLedger::default();
 
-        let response = if lease.release_point() == ReleasePoint::AfterDispatch {
+        let response = if let Some(denied) = denial {
+            denied
+        } else if lease.release_point() == ReleasePoint::AfterDispatch {
             // Retries disabled: one dispatch; the lease frees the parsed
             // request the moment the upstream bytes are serialized.
             let res = self
@@ -549,6 +585,17 @@ impl Router {
                 },
             )
             .await
+        };
+
+        // The one answer both dispatch paths converge on resolves the
+        // reservation, once: settled, handed to the streamed body, or closed
+        // at the estimate.
+        let response = match &reservation {
+            Some(cell) => {
+                tenant_rate_limit::resolve(cell, route, is_stream, response, self.max_payload_size)
+                    .await
+            }
+            None => response,
         };
 
         if response.status().is_success() {
@@ -1966,6 +2013,7 @@ impl Router {
                     .worker_registry
                     .any_model_retry_override_enables_retries(),
             max_buffered_request_bytes: self.max_buffered_request_bytes,
+            tenant_rate_limited: self.rate_limit_manager.is_some(),
         })
     }
 
@@ -2291,23 +2339,24 @@ impl RouterTrait for Router {
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: GenerateRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/generate", model_id)
+        self.route_typed_request(headers, Some(tenant_meta), body, "/generate", model_id)
             .await
     }
 
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
         self.route_typed_request(
             headers,
+            Some(tenant_meta),
             super::chat_for_upstream(body),
             "/v1/chat/completions",
             model_id,
@@ -2318,14 +2367,14 @@ impl RouterTrait for Router {
     async fn route_messages(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
         if let Some(refused) = super::refuse_max_tokens_zero(&body) {
             return refused;
         }
-        self.route_typed_request(headers, body, "/v1/messages", model_id)
+        self.route_typed_request(headers, Some(tenant_meta), body, "/v1/messages", model_id)
             .await
     }
 
@@ -2336,29 +2385,35 @@ impl RouterTrait for Router {
         body: CountMessageTokensRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/messages/count_tokens", model_id)
+        self.route_typed_request(headers, None, body, "/v1/messages/count_tokens", model_id)
             .await
     }
 
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: CompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/completions", model_id)
-            .await
+        self.route_typed_request(
+            headers,
+            Some(tenant_meta),
+            body,
+            "/v1/completions",
+            model_id,
+        )
+        .await
     }
 
     async fn route_responses(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/responses", model_id)
+        self.route_typed_request(headers, Some(tenant_meta), body, "/v1/responses", model_id)
             .await
     }
 
@@ -2375,22 +2430,22 @@ impl RouterTrait for Router {
     async fn route_embeddings(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: EmbeddingRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/embeddings", model_id)
+        self.route_typed_request(headers, Some(tenant_meta), body, "/v1/embeddings", model_id)
             .await
     }
 
     async fn route_classify(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: ClassifyRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/classify", model_id)
+        self.route_typed_request(headers, Some(tenant_meta), body, "/v1/classify", model_id)
             .await
     }
 
@@ -2401,7 +2456,7 @@ impl RouterTrait for Router {
         body: DecisionsRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/decisions", model_id)
+        self.route_typed_request(headers, None, body, "/v1/decisions", model_id)
             .await
     }
 
@@ -2423,7 +2478,7 @@ impl RouterTrait for Router {
         {
             return error::model_not_found(model_id);
         }
-        self.route_typed_request(headers, body, "/v1/systemone", model_id)
+        self.route_typed_request(headers, None, body, "/v1/systemone", model_id)
             .await
     }
 
@@ -2455,7 +2510,7 @@ impl RouterTrait for Router {
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
         let response_spec = RerankResponseSpec::from(&body);
         let response = self
-            .route_typed_request(headers, body, "/v1/rerank", model_id)
+            .route_typed_request(headers, None, body, "/v1/rerank", model_id)
             .await;
         if response.status().is_success() {
             Self::build_rerank_response(
@@ -2730,6 +2785,7 @@ mod tests {
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
+            rate_limit_manager: None,
         }
     }
 
@@ -3016,6 +3072,7 @@ mod tests {
         let response = router
             .route_typed_request(
                 None,
+                None,
                 DropProbeRequest {
                     text: "unavailable".to_string(),
                     _probe: Arc::new(()),
@@ -3123,12 +3180,14 @@ mod tests {
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
+            rate_limit_manager: None,
         }
     }
 
     async fn generate(router: &Router, text: &str) -> Response {
         router
             .route_typed_request(
+                None,
                 None,
                 DropProbeRequest {
                     text: text.to_string(),
@@ -3619,6 +3678,7 @@ mod tests {
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
+            rate_limit_manager: None,
         }
     }
 
@@ -3831,7 +3891,13 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "text": "hello" })).unwrap();
         assert_eq!(req.model, crate::worker::UNKNOWN_MODEL_ID);
         let response = router
-            .route_typed_request(None, req, "/generate", crate::worker::UNKNOWN_MODEL_ID)
+            .route_typed_request(
+                None,
+                None,
+                req,
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
             .await;
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -4200,7 +4266,13 @@ mod tests {
             _probe: Arc::clone(&probe),
         };
         let response = router
-            .route_typed_request(None, req, "/generate", crate::worker::UNKNOWN_MODEL_ID)
+            .route_typed_request(
+                None,
+                None,
+                req,
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -4303,6 +4375,7 @@ mod tests {
         let typed = router
             .route_typed_request(
                 Some(&headers),
+                None,
                 DropProbeRequest {
                     text: "hello".to_string(),
                     _probe: Arc::new(()),
@@ -4478,7 +4551,13 @@ mod tests {
             _probe: Arc::new(()),
         };
         let response = router
-            .route_typed_request(None, req, "/generate", crate::worker::UNKNOWN_MODEL_ID)
+            .route_typed_request(
+                None,
+                None,
+                req,
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -4694,6 +4773,7 @@ mod tests {
             let response = router
                 .route_typed_request(
                     Some(&headers),
+                    None,
                     DropProbeRequest {
                         text: "pinned".to_string(),
                         _probe: Arc::new(()),
@@ -5035,6 +5115,7 @@ mod tests {
         let response = router
             .route_typed_request(
                 None,
+                None,
                 streaming_chat_request(),
                 "/v1/chat/completions",
                 crate::worker::UNKNOWN_MODEL_ID,
@@ -5162,6 +5243,7 @@ mod tests {
             let response = router
                 .route_typed_request(
                     None,
+                    None,
                     streaming_chat_request(),
                     "/v1/chat/completions",
                     crate::worker::UNKNOWN_MODEL_ID,
@@ -5239,6 +5321,7 @@ mod tests {
         let response = router
             .route_typed_request(
                 None,
+                None,
                 streaming_chat_request(),
                 "/v1/chat/completions",
                 crate::worker::UNKNOWN_MODEL_ID,
@@ -5290,6 +5373,7 @@ mod tests {
         let response = router
             .route_typed_request(
                 None,
+                None,
                 streaming_chat_request(),
                 "/v1/chat/completions",
                 crate::worker::UNKNOWN_MODEL_ID,
@@ -5334,6 +5418,7 @@ mod tests {
 
         let response = router
             .route_typed_request(
+                None,
                 None,
                 request,
                 "/v1/messages",
@@ -5382,6 +5467,7 @@ mod tests {
         let response = router
             .route_typed_request(
                 None,
+                None,
                 streaming_chat_request(),
                 "/v1/chat/completions",
                 crate::worker::UNKNOWN_MODEL_ID,
@@ -5415,6 +5501,7 @@ mod tests {
 
         let response = router
             .route_typed_request(
+                None,
                 None,
                 streaming_chat_request(),
                 "/v1/chat/completions",
@@ -5490,6 +5577,7 @@ mod tests {
                 let response = router
                     .route_typed_request(
                         None,
+                        None,
                         DropProbeRequest {
                             text: "refused".to_string(),
                             _probe: Arc::new(()),
@@ -5535,6 +5623,7 @@ mod tests {
         let handle = recorder.handle();
         let response = metrics::with_local_recorder(&recorder, || {
             runtime.block_on(router.route_typed_request(
+                None,
                 None,
                 DropProbeRequest {
                     text: "refused".to_string(),
