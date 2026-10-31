@@ -266,8 +266,8 @@ jobs:
       - name: Run E2E tests
         timeout-minutes: ${{ inputs.test_timeout }}
         env:
-          OPENAI_API_KEY: ${{ inputs.provider_api_keys && secrets.OPENAI_API_KEY || '' }}
-          XAI_API_KEY: ${{ inputs.provider_api_keys && secrets.XAI_API_KEY || '' }}
+          SMG_PROVIDER_OPENAI_API_KEY: ${{ inputs.provider_api_keys && secrets.OPENAI_API_KEY || '' }}
+          SMG_PROVIDER_XAI_API_KEY: ${{ inputs.provider_api_keys && secrets.XAI_API_KEY || '' }}
           SHOW_WORKER_LOGS: "0"
           SHOW_ROUTER_LOGS: "1"
           E2E_LOG_DIR: e2e-logs
@@ -291,6 +291,11 @@ jobs:
           SMG_SGLANG_SERVICER_WARMUP: fast
           SMG_TOKENSPEED_SERVICER_WARMUP: fast
         run: |
+          if [ "${{ inputs.provider_api_keys }}" = true ]; then
+            export OPENAI_API_KEY="$SMG_PROVIDER_OPENAI_API_KEY"
+            export XAI_API_KEY="$SMG_PROVIDER_XAI_API_KEY"
+          fi
+          unset SMG_PROVIDER_OPENAI_API_KEY SMG_PROVIDER_XAI_API_KEY
           if [ "${{ inputs.gpu_vendor }}" = amd ]; then
             bash scripts/ci_killall_sglang.sh rocm  # the default mode reads nvidia-smi
           else
