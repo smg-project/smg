@@ -104,6 +104,8 @@ MIRRORS = (
     Mirror("smg-python", "bindings/python/Cargo.toml", "cargo"),
     Mirror("smg-golang", "bindings/golang/Cargo.toml", "cargo"),
     Mirror("smg pyproject", "bindings/python/pyproject.toml", "pyproject"),
+    # smg.__version__ as the installed package reports it; `make bump-version` writes it, this check reads it
+    Mirror("smg version.py", "bindings/python/src/smg/version.py", "python"),
     Mirror("helm chart", "deploy/helm/smg/Chart.yaml", "helm"),
     Mirror("engine-docker", ".github/workflows/release-engine-docker.yml", "workflow"),
 )
