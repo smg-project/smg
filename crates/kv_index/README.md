@@ -180,8 +180,8 @@ The servicer relays the engine's publisher into `SubscribeKvEvents` through one 
   it first: that grace arms no veto and lifts none), re-admits a worker on its first contact with a closed
   circuit breaker, and never touches the health status. A veto steers, it never refuses: when every
   candidate is vetoed, the request goes to the least-loaded ready worker among them (a cache-aware
-  prefill pool of a prefill/decode pair is not steered by the overload thresholds unless
-  `--worker-overload-shed` is set).
+  prefill pool of a prefill/decode pair, or a regular request that `consistent_hashing` places by
+  its routing key, is not steered by the overload thresholds unless `--worker-overload-shed` is set).
 - **Warm-up slice.** A worker that just became routable, or whose index is thin against the
   fleet's (`--worker-warmup-thin-ratio`), receives a share of cache-miss traffic until its index has
   grown, so an empty index does not starve it while every prompt has a holder elsewhere.
@@ -194,7 +194,8 @@ The servicer relays the engine's publisher into `SubscribeKvEvents` through one 
   `--worker-overload-waiting-requests` or `--worker-overload-token-usage` is left out of selection
   while another is under them, and a fleet uniformly over them is routed to its least-loaded worker
   (a cache-aware prefill pool of a prefill/decode pair is balanced by its spill gate instead,
-  unless `--worker-overload-shed` is set);
+  and a regular request that `consistent_hashing` places by its routing key stays on its ring
+  owner, unless `--worker-overload-shed` is set);
   shedding stays opt-in (`--worker-overload-shed`).
 
 ## Flags and settings
