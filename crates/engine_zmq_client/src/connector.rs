@@ -1167,6 +1167,28 @@ impl<P: EngineProtocol> Client<P> {
             steps_reported: AtomicBool::new(false),
         });
 
+        // The input monitor was opened when the frontend bound the input
+        // socket, before the handshake, and holds every peer event since. Of
+        // this link it holds at most its engines' accepts: the handshake
+        // admitted the link when it read their registrations, which their
+        // connections carried. Whatever else is queued is of a connection
+        // the handshake did not admit: the data socket of a previous engine
+        // generation, which dialed this frontend's new bind by itself and
+        // closed when that generation was replaced, under the identity the
+        // next generation registers with. Read from the start, that
+        // disconnect would pass for the fresh engine's transport loss and
+        // end a client whose engine, having handshaken once, never dials
+        // again. So the queue is read off here, and the monitor arm below
+        // starts at the admission.
+        while let Ok(event) = input_events.try_recv() {
+            if let zeromq::SocketEvent::Disconnected(peer) = event {
+                info!(
+                    ?peer,
+                    "an input peer disconnected before this link was admitted; not this link's"
+                );
+            }
+        }
+
         // Input writer: the one owner of the input socket's send half.
         let writer_inner = inner.clone();
         #[expect(
@@ -1196,12 +1218,26 @@ impl<P: EngineProtocol> Client<P> {
 
                 () = async {
                     while let Some(event) = input_events.next().await {
-                        if let zeromq::SocketEvent::Disconnected(peer) = event {
-                            warn!(?peer, "engine input transport disconnected after queue admission");
-                            writer_inner.registry.lock().fail_all(Arc::new(Error::EngineCoreDead));
-                            writer_inner.routing.lock().inflight.clear();
-                            return;
+                        let zeromq::SocketEvent::Disconnected(peer) = event else {
+                            continue;
+                        };
+                        // The monitor reports every peer of the shared input
+                        // socket; only this link's engines are its loss.
+                        if !writer_inner
+                            .engines
+                            .iter()
+                            .any(|engine| engine.engine_id[..] == peer[..])
+                        {
+                            info!(
+                                ?peer,
+                                "an input peer that is not an engine of this link disconnected; ignored"
+                            );
+                            continue;
                         }
+                        warn!(?peer, "engine input transport disconnected after queue admission");
+                        writer_inner.registry.lock().fail_all(Arc::new(Error::EngineCoreDead));
+                        writer_inner.routing.lock().inflight.clear();
+                        return;
                     }
                     // Monitor closure alone does not prove engine death.
                     std::future::pending::<()>().await;
