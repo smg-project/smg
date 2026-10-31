@@ -369,6 +369,23 @@ pub(crate) async fn resolve_media(
             media: None,
         });
     }
+    let plan = plan();
+    if record_media {
+        record(&plan);
+    }
+    // No images or video to a pool whose every worker is language model only (the engine admits
+    // such a request and never schedules it), and no modality to a pool whose engines take none of
+    // it (the capability matrix): both are refused here, for the chat and the Messages paths alike,
+    // on the declared parts, before any byte of media is fetched, decoded or sent.
+    multimodal::ensure_model_accepts_media(&components.worker_registry, model_id, &plan)?;
+    if plan.is_empty() {
+        // A request without media renders the same under either order (its text parts in
+        // their own order): the registries are not asked for a model with nothing to place.
+        return Ok(ResolvedMedia {
+            media_order: MediaPartOrder::MediaFirst,
+            media: None,
+        });
+    }
     // The tokenizer's registry entry (its id and source) is read for the
     // media paths alone, which need the multimodal components; a gateway
     // without them looks nothing up.
@@ -394,21 +411,6 @@ pub(crate) async fn resolve_media(
         _ => MediaPartOrder::MediaFirst,
     };
 
-    let plan = plan();
-    if record_media {
-        record(&plan);
-    }
-    // No images or video to a pool whose every worker is language model only (the engine admits
-    // such a request and never schedules it), and no modality to a pool whose engines take none of
-    // it (the capability matrix): both are refused here, for the chat and the Messages paths alike,
-    // on the declared parts, before any byte of media is fetched, decoded or sent.
-    multimodal::ensure_model_accepts_media(&components.worker_registry, model_id, &plan)?;
-    if plan.is_empty() {
-        return Ok(ResolvedMedia {
-            media_order,
-            media: None,
-        });
-    }
     let Some(mm_components) = components.multimodal.as_ref() else {
         error!(
             function = stage,

@@ -838,6 +838,47 @@ fn an_absent_assistant_content_is_the_engines_empty_content_in_the_templates_for
 }
 
 #[test]
+fn a_content_array_without_media_renders_the_same_under_either_order() {
+    // The order places media relative to text; with no media part there is
+    // nothing to place, so the resolver asks no registry for it (an empty
+    // plan returns before the lookups) and both orders must keep rendering
+    // alike: the text parts in their own order, joined as the engine joins
+    // them, under the string format; the parts as given under the other.
+    let messages = vec![ChatMessage::User {
+        ext: Default::default(),
+        content: MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "first".to_string(),
+            },
+            ContentPart::Text {
+                text: "second".to_string(),
+            },
+        ]),
+        name: None,
+    }];
+    for format in [
+        ChatTemplateContentFormat::String,
+        ChatTemplateContentFormat::OpenAI,
+    ] {
+        let media_first =
+            process_content_format_with_order(&messages, format, None, MediaPartOrder::MediaFirst)
+                .unwrap();
+        let authored =
+            process_content_format_with_order(&messages, format, None, MediaPartOrder::Authored)
+                .unwrap();
+        assert_eq!(media_first, authored, "{format:?}");
+    }
+    let rendered = process_content_format_with_order(
+        &messages,
+        ChatTemplateContentFormat::String,
+        None,
+        MediaPartOrder::MediaFirst,
+    )
+    .unwrap();
+    assert_eq!(rendered[0]["content"], "first\nsecond");
+}
+
+#[test]
 fn test_tml_preserves_authored_multipart_order_string() {
     let messages = vec![ChatMessage::User {
         ext: Default::default(),
