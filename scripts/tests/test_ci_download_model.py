@@ -136,6 +136,14 @@ def test_readable_download_lock_serializes_without_write_access():
         lock.write_bytes(b"existing shared lock\n")
         lock.chmod(0o444)
         original = lock.stat()
+        if os.geteuid() != 0:
+            try:
+                write_fd = os.open(lock, os.O_WRONLY | os.O_APPEND)
+            except PermissionError:
+                pass
+            else:
+                os.close(write_fd)
+                pytest.skip("process can write a 0444 lock; read-only fallback is unreachable")
         target_uid = 995 if os.geteuid() == 0 else os.geteuid()
         marker = root / "download-observation.json"
         tools = root / "tools"
@@ -158,7 +166,14 @@ def test_readable_download_lock_serializes_without_write_access():
             "    raise AssertionError('independent opener acquired held lock')\n"
             "finally:\n"
             "    os.close(other)\n"
-            "observation = {'uid': os.geteuid(), 'writable': os.access(lock, os.W_OK),\n"
+            "try:\n"
+            "    write_fd = os.open(lock, os.O_WRONLY | os.O_APPEND)\n"
+            "except PermissionError:\n"
+            "    writable = False\n"
+            "else:\n"
+            "    os.close(write_fd)\n"
+            "    writable = True\n"
+            "observation = {'uid': os.geteuid(), 'writable': writable,\n"
             "               'dev': held.st_dev, 'ino': held.st_ino,\n"
             "               'independent_opener_blocked': True}\n"
             "marker = Path(os.environ['TEST_MARKER'])\n"
@@ -198,10 +213,13 @@ def test_readable_download_lock_serializes_without_write_access():
                 output = []
                 while not any(b"Using existing read-only lock" in line for line in output):
                     remaining = deadline - time.monotonic()
-                    assert remaining > 0
-                    assert select.select([proc.stdout], [], [], remaining)[0]
+                    diagnostic = (
+                        f"Waiting for read-only fallback; collected output: {b''.join(output)!r}"
+                    )
+                    assert remaining > 0, diagnostic
+                    assert select.select([proc.stdout], [], [], remaining)[0], diagnostic
                     line = proc.stdout.readline()
-                    assert line
+                    assert line, diagnostic
                     output.append(line)
                 assert proc.poll() is None
                 assert not marker.exists(), "downloader entered while another opener held the lock"
