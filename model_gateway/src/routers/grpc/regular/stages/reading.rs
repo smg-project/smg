@@ -24,7 +24,7 @@ use crate::{
             common::stages::helpers::TagForStart,
             context::RequestContext,
             regular::symphony::{self, Asks, Assignment, AutoRequest, PreparedConstraint},
-            utils,
+            utils::{self, Names},
         },
     },
 };
@@ -43,6 +43,10 @@ pub(crate) struct Prepared {
     /// The decoder keeps the special tokens the reader of the response needs:
     /// a table's markers, or a legacy reasoning parser's.
     pub keeps_special_tokens: bool,
+    /// The parser names the model's cards set, resolved here once for the request: the stage
+    /// stores them (`ProcessingState::parser_names`) and request building reads them in
+    /// place of a second resolution.
+    pub names: Names,
 }
 
 /// The constraint preparation finds for what the request asks, and whether
@@ -161,7 +165,7 @@ pub(crate) fn prepare(
                     &ctx.components.reasoning_parser_factory,
                     ctx.components
                         .parser_resolver
-                        .reasoning_parser(model)
+                        .reasoning_parser_for(Some(&names.labels), model)
                         .as_deref(),
                     model,
                 )
@@ -171,6 +175,7 @@ pub(crate) fn prepare(
         constraint,
         json_schema,
         keeps_special_tokens,
+        names: names.labels,
     })
 }
 
@@ -200,7 +205,9 @@ pub(crate) fn reasoning_decision(
     };
     match symphony::reasoning_open(
         ctx.state.parser.unwrap_or(ParserChoice::Legacy),
-        &ctx.components.parser_resolver.names(model),
+        &ctx.components
+            .parser_resolver
+            .names_for(ctx.state.parser_names.as_ref(), model),
         model,
         &ctx.components.templates,
         processed_text,
@@ -211,7 +218,7 @@ pub(crate) fn reasoning_decision(
                 &ctx.components.reasoning_parser_factory,
                 ctx.components
                     .parser_resolver
-                    .reasoning_parser(model)
+                    .reasoning_parser_for(ctx.state.parser_names.as_ref(), model)
                     .as_deref(),
                 model,
                 processed_text,
@@ -284,7 +291,10 @@ pub(crate) fn decide(
     auto: impl FnOnce(&RequestContext) -> Auto,
 ) -> Result<Decided, Response> {
     let model = asks.model();
-    let names = ctx.components.parser_resolver.names(model);
+    let names = ctx
+        .components
+        .parser_resolver
+        .names_for(ctx.state.parser_names.as_ref(), model);
     let parser = ctx.state.parser.unwrap_or(ParserChoice::Legacy);
     let decoding = utils::WorkerDecoding::of(ctx.state.workers.as_ref());
     let decided = symphony::worker_constraint(
@@ -423,5 +433,30 @@ mod tests {
             Some("qwen3")
         );
         assert!(for_chat.constraint.is_none());
+    }
+
+    /// Request building reads the parser names preparation resolved for the request
+    /// (`ProcessingState::parser_names`), not the registry again: the names stored name the
+    /// Kimi K2 table, so that table reads the response, though no label of the model's workers
+    /// and no flag names it (the registry's own table for the model is Qwen3's).
+    #[test]
+    fn the_decision_reads_the_names_preparation_resolved() {
+        let chat: Arc<ChatCompletionRequest> = Arc::new(
+            serde_json::from_value(
+                json!({"model": MODEL, "messages": [{"role": "user", "content": "hi"}]}),
+            )
+            .expect("chat request"),
+        );
+        let mut ctx = RequestContext::for_chat(Arc::clone(&chat), None, MODEL.into(), components());
+        ctx.state.parser_names = Some(Names {
+            tool: Some("kimi_k2".to_string()),
+            reasoning: None,
+        });
+        let outcome = decided(&mut ctx, Asks::Chat(&chat));
+        assert_eq!(outcome.parser, Some(ParserChoice::Symphony));
+        assert_eq!(
+            outcome.assigned.as_ref().map(|(table, _)| table.as_str()),
+            Some("kimi_k2")
+        );
     }
 }

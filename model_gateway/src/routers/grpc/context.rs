@@ -42,7 +42,7 @@ use super::{
     },
     regular::stages::decisions::scoring::{DecisionPrompt, DecisionScoring},
     spec::ResponseSpec,
-    utils::{ParserResolver, WorkerDecoding},
+    utils::{Names, ParserResolver, WorkerDecoding},
 };
 use crate::{
     config::ParserChoice,
@@ -234,6 +234,13 @@ pub(crate) struct ProcessingState {
     /// otherwise, which the response reports as `x-smg-parser`. `None` on the other endpoints,
     /// which keep the legacy parsers.
     pub parser: Option<ParserChoice>,
+
+    /// The parser names the request's model's cards set (its workers' labels), resolved once
+    /// in preparation (`reading::prepare`: one walk over the model's workers) and read by
+    /// request building in its place (`reading::reasoning_decision`, `reading::decide`,
+    /// `backed_plan::build`): one request, one resolution. `None` on the endpoints whose
+    /// preparation resolves no names; a read then resolves them itself.
+    pub parser_names: Option<Names>,
 
     /// Owned here rather than inside `PreparationOutput` so EPD's `EncodeStage`
     /// can borrow it for the with-pixels encode serialization before request
