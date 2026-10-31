@@ -18,6 +18,7 @@ use crate::{
     worker::{
         expected_wait::ExpectedWait,
         load_state::{LoadReceiver, LoadSnapshot},
+        monitor::PUSHED_LOAD_VERSION,
         Worker, WorkerType,
     },
 };
@@ -138,6 +139,11 @@ impl SincePollDispatch {
 /// back to `p̄ · count`, which is weaker on size-skewed traffic. This policy is
 /// therefore intended for gRPC workers.
 ///
+/// A decode or regular rank worker of a data-parallel engine (`--dp-aware`
+/// registers one worker per rank at one address) is priced by the engine's
+/// whole report, not by its own rank's entry of it; a prefill rank keeps its
+/// own entry: see `Self::priced_load`.
+///
 /// # Tuning knobs
 ///
 /// All are fields of `PolicyConfig::LeastLoad` with the defaults below:
@@ -187,12 +193,19 @@ pub struct LeastLoadPolicy {
     tie_rng: Option<Mutex<StdRng>>,
 }
 
+/// The whole report of each data-parallel engine a decision prices its rank
+/// workers by (see [`LeastLoadPolicy::priced_load`]), keyed by the engine's
+/// address ([`Worker::base_url`]).
+type EngineReports<'a> = HashMap<&'a str, WorkerLoadResponse>;
+
 /// Everything one expected-wait score reads besides the worker itself.
 #[derive(Clone, Copy)]
 struct ScoreInputs<'a> {
     /// The load feed's current snapshot; `None` until the registry wires the
     /// feed.
     snapshot: Option<&'a LoadSnapshot>,
+    /// The data-parallel engines' whole reports for this decision.
+    engines: &'a EngineReports<'a>,
     inflight: &'a HashMap<String, SincePollDispatch>,
     nominal_throughput: f64,
     fleet_has_loads: bool,
@@ -349,20 +362,27 @@ impl LeastLoadPolicy {
     fn score(&self, worker: &Arc<dyn Worker>, inputs: &ScoreInputs<'_>) -> f64 {
         let ScoreInputs {
             snapshot,
+            engines,
             inflight,
             nominal_throughput,
             fleet_has_loads,
             peer_baseline,
         } = *inputs;
         let url = worker.url();
-        match Self::fresh_load(snapshot, url) {
+        match Self::priced_load(snapshot, engines, worker) {
             Some(load) => {
                 let dispatch = inflight.get(url);
                 let inflight_tokens = dispatch.map_or(0, |dispatch| dispatch.tokens);
                 let since_poll = dispatch.map_or(0, |dispatch| dispatch.requests);
+                // The in-transit floor is per-rank work, like the since-poll
+                // credit: the router's in-flight on this worker is held against
+                // this worker's own entry, never against the engine's whole
+                // report, whose count over every rank would hide one rank's
+                // backlog behind its siblings'.
+                let own = Self::fresh_load(snapshot, url).unwrap_or(load);
                 let queued_tokens = self.queued_tokens(load)
                     + self.running_estimated_tokens(load)
-                    + Self::unaccounted_requests(worker, load, since_poll) as f64
+                    + Self::unaccounted_requests(worker, own, since_poll) as f64
                         * f64::from(self.mean_prefill_tokens);
                 ExpectedWait::new(
                     queued_tokens,
@@ -394,6 +414,79 @@ impl LeastLoadPolicy {
         url: &str,
     ) -> Option<&'a WorkerLoadResponse> {
         snapshot.and_then(|snapshot| snapshot.get(url))
+    }
+
+    /// The report a worker is priced by: its own, except for a rank worker
+    /// of a data-parallel engine (`--dp-aware` registers one worker per rank
+    /// at one address), which is priced by the engine's whole report (see
+    /// [`Self::engine_reports`]). An engine's ranks then tie on the engine's
+    /// work and rate, and the since-poll credit, kept per rank, spreads the
+    /// dispatches among them. Priced by its own rank's entry of the answer,
+    /// a sample up to a poll interval old, the policy herded onto the rank
+    /// that looked lightest at the last poll until the next one (on a
+    /// four-rank engine under a closed loop the ranks' in-flight max/min
+    /// went 1.02 -> 1.39 at an equal rate). A rank whose own entry is a
+    /// record pushed on its stream, current at the stream's cadence, is a
+    /// fresher per-rank signal and keeps its own price; a rank without an
+    /// entry is scored like any worker without a report. A prefill rank keeps
+    /// its own entry too: its drain rate is the configured per-rank input
+    /// capacity, which has no engine-wide reading to price the whole report
+    /// at (priced by it, an N-rank prefill engine would read N times a lone
+    /// prefill worker with the same queues).
+    fn priced_load<'a>(
+        snapshot: Option<&'a LoadSnapshot>,
+        engines: &'a EngineReports<'a>,
+        worker: &Arc<dyn Worker>,
+    ) -> Option<&'a WorkerLoadResponse> {
+        let own = Self::fresh_load(snapshot, worker.url())?;
+        if worker.dp_rank().is_none()
+            || worker.worker_type() == &WorkerType::Prefill
+            || own.version == PUSHED_LOAD_VERSION
+        {
+            return Some(own);
+        }
+        Some(engines.get(worker.base_url()).unwrap_or(own))
+    }
+
+    /// The whole report of every data-parallel engine with a candidate rank
+    /// worker priced by it ([`Self::priced_load`]): the entries of all its
+    /// rank workers in the snapshot, pushed or polled, as the engine's one
+    /// answer held them before the monitor scoped it to each rank. Built per
+    /// decision; a fleet without such a candidate builds nothing.
+    fn engine_reports<'a>(
+        workers: &'a [Arc<dyn Worker>],
+        candidates: &[usize],
+        snapshot: Option<&LoadSnapshot>,
+    ) -> EngineReports<'a> {
+        let mut engines: EngineReports<'a> = HashMap::new();
+        for &i in candidates {
+            let worker = &workers[i];
+            if worker.dp_rank().is_some()
+                && worker.worker_type() != &WorkerType::Prefill
+                && Self::fresh_load(snapshot, worker.url())
+                    .is_some_and(|own| own.version != PUSHED_LOAD_VERSION)
+            {
+                engines.entry(worker.base_url()).or_default();
+            }
+        }
+        if engines.is_empty() {
+            return engines;
+        }
+        for worker in workers {
+            if worker.dp_rank().is_none() {
+                continue;
+            }
+            let Some(engine) = engines.get_mut(worker.base_url()) else {
+                continue;
+            };
+            if let Some(own) = Self::fresh_load(snapshot, worker.url()) {
+                engine.loads.extend(own.loads.iter().cloned());
+            }
+        }
+        for engine in engines.values_mut() {
+            engine.dp_rank_count = i32::try_from(engine.loads.len()).unwrap_or(i32::MAX);
+        }
+        engines
     }
 
     /// Generation throughput is a usable drain rate only for decode and regular
@@ -441,11 +534,12 @@ impl LeastLoadPolicy {
         candidates: &[usize],
         snapshot: Option<&'a LoadSnapshot>,
         inflight: &'a HashMap<String, SincePollDispatch>,
+        engines: &'a EngineReports<'a>,
     ) -> ScoreInputs<'a> {
         let (tp_sum, tp_count) = candidates
             .iter()
             .filter_map(|&i| {
-                Self::fresh_load(snapshot, workers[i].url())
+                Self::priced_load(snapshot, engines, &workers[i])
                     .and_then(|load| Self::live_drain_rate(&workers[i], load))
             })
             .fold((0.0, 0u32), |(s, n), t| (s + t, n + 1));
@@ -460,6 +554,7 @@ impl LeastLoadPolicy {
             .count();
         let mut inputs = ScoreInputs {
             snapshot,
+            engines,
             inflight,
             nominal_throughput,
             fleet_has_loads: reporting > 0,
@@ -634,7 +729,8 @@ impl LeastLoadPolicy {
         };
         let (&first, rest) = candidates.split_first()?;
 
-        let inputs = self.score_inputs(workers, candidates, snapshot, &inflight);
+        let engines = Self::engine_reports(workers, candidates, snapshot);
+        let inputs = self.score_inputs(workers, candidates, snapshot, &inflight, &engines);
 
         // Argmin with reservoir tie-breaking: workers within
         // `TIE_EPSILON_SECS` of the minimum (the common idle/homogeneous case
@@ -643,7 +739,7 @@ impl LeastLoadPolicy {
         let observe_score = |idx: usize, score: f64| {
             if cache_trace::enabled() {
                 let url = workers[idx].url();
-                let load = Self::fresh_load(snapshot, url);
+                let load = Self::priced_load(snapshot, &engines, &workers[idx]);
                 cache_trace::score(serde_json::json!({
                     "source": "expected_wait", "worker": url, "score": score,
                     "score_unit": if inputs.fleet_has_loads { "seconds" } else { "requests" },
@@ -656,7 +752,11 @@ impl LeastLoadPolicy {
                     "since_poll_tokens": inflight.get(url).map_or(0, |dispatch| dispatch.tokens),
                     "unaccounted_requests": load.map(|load| {
                         let since_poll = inflight.get(url).map_or(0, |dispatch| dispatch.requests);
-                        Self::unaccounted_requests(&workers[idx], load, since_poll)
+                        Self::unaccounted_requests(
+                            &workers[idx],
+                            Self::fresh_load(snapshot, url).unwrap_or(load),
+                            since_poll,
+                        )
                     }),
                     "fresh_load": load.is_some(),
                 }));
@@ -789,13 +889,15 @@ mod tests {
             .collect();
         workers[1].increment_load();
         let inflight = HashMap::new();
+        let engines = HashMap::new();
         for generated in [0.0, 0.5, 10_000.0] {
             feed.publish(&HashMap::from([(
                 workers[0].url().to_string(),
                 one_rank_load(10_000, 0.0, generated),
             )]));
             let snapshot = policy.snapshot().unwrap();
-            let inputs = policy.score_inputs(&workers, &[0, 1], Some(&snapshot), &inflight);
+            let inputs =
+                policy.score_inputs(&workers, &[0, 1], Some(&snapshot), &inflight, &engines);
             assert_eq!(inputs.nominal_throughput, 4_000.0);
             // 10,000 queued plus the fixture's one running request at p̄.
             let prefill = (10_000.0 + 1024.0) / 4_000.0;
@@ -813,6 +915,7 @@ mod tests {
         let policy = LeastLoadPolicy::new();
         let feed = TestFeed::attached_to(&policy);
         let inflight = HashMap::new();
+        let engines = HashMap::new();
         for role in [WorkerType::Decode, WorkerType::Regular] {
             let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
                 BasicWorkerBuilder::new("http://worker:1")
@@ -832,7 +935,8 @@ mod tests {
                 );
                 feed.publish(&HashMap::from([(workers[0].url().to_string(), load)]));
                 let snapshot = policy.snapshot().unwrap();
-                let inputs = policy.score_inputs(&workers, &[0], Some(&snapshot), &inflight);
+                let inputs =
+                    policy.score_inputs(&workers, &[0], Some(&snapshot), &inflight, &engines);
                 assert_eq!(inputs.nominal_throughput, expected);
                 // 10,000 queued plus the fixture's one running request at p̄.
                 assert_eq!(
@@ -1023,6 +1127,225 @@ mod tests {
         );
     }
 
+    /// The rank workers of a data-parallel engine of `size` ranks at `base`
+    /// in `role`: `{base}@{rank}` each, as `--dp-aware` registers them.
+    fn rank_workers(base: &str, size: usize, role: WorkerType) -> Vec<Arc<dyn Worker>> {
+        (0..size)
+            .map(|rank| {
+                Arc::new(
+                    BasicWorkerBuilder::new(base)
+                        .worker_type(role)
+                        .health_config(no_health_check())
+                        .dp_config(rank, size)
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    /// Each rank worker's entry of its engine's answer, `version` telling a
+    /// poll's from a pushed record's: `queued` tokens waiting and one request
+    /// running at 100 tok/s on every rank.
+    fn rank_reports(
+        workers: &[Arc<dyn Worker>],
+        queued: &[i32],
+        version: &str,
+    ) -> HashMap<String, WorkerLoadResponse> {
+        workers
+            .iter()
+            .zip(queued)
+            .map(|(worker, &queued)| {
+                let mut load = one_rank_load(queued, 0.0, 100.0);
+                load.loads[0].dp_rank = i32::try_from(worker.dp_rank().unwrap()).unwrap();
+                load.version = version.to_string();
+                (worker.url().to_string(), load)
+            })
+            .collect()
+    }
+
+    /// Skewed queues for a four-rank engine, and the engine's expected wait:
+    /// 24,100 tokens waiting plus four running requests at p̄, draining at
+    /// its four ranks' 400 tok/s.
+    const SKEWED_QUEUES: [i32; 4] = [100, 4_000, 8_000, 12_000];
+    const ENGINE_WAIT: f64 = (24_100.0 + 4.0 * 1024.0) / 400.0;
+
+    #[test]
+    fn the_rank_workers_of_a_data_parallel_engine_are_priced_by_its_whole_report() {
+        // Polled reports, rank 0 by far the lightest. Priced by its own
+        // entry, a sample up to a poll interval old, rank 0 would take
+        // every pick until the next poll; priced by the engine's report the
+        // four tie exactly on the engine's figure and the since-poll credit,
+        // kept per rank, water-fills the picks: 100 each of 400.
+        let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0, 0).with_tie_break_seed(7);
+        let feed = TestFeed::attached_to(&policy);
+        let workers = rank_workers("http://engine:8000", 4, WorkerType::Regular);
+        feed.publish(&rank_reports(&workers, &SKEWED_QUEUES, ""));
+        let snapshot = policy.snapshot().unwrap();
+        let inflight = HashMap::new();
+        let candidates = [0, 1, 2, 3];
+        let engines = LeastLoadPolicy::engine_reports(&workers, &candidates, Some(&snapshot));
+        assert_eq!(engines["http://engine:8000"].loads.len(), 4);
+        let inputs =
+            policy.score_inputs(&workers, &candidates, Some(&snapshot), &inflight, &engines);
+        assert_eq!(inputs.nominal_throughput, 400.0);
+        for worker in &workers {
+            let score = policy.score(worker, &inputs);
+            assert!(
+                (score - ENGINE_WAIT).abs() < 1e-9,
+                "{}: {score}",
+                worker.url()
+            );
+        }
+        let mut hits = [0usize; 4];
+        for _ in 0..400 {
+            hits[policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .unwrap()] += 1;
+        }
+        assert_eq!(hits, [100; 4]);
+    }
+
+    #[test]
+    fn a_rank_workers_pushed_report_is_its_own_price() {
+        // The same engine, every rank's entry a record pushed on its own
+        // stream: a fresher per-rank signal than the engine's answer, priced
+        // as the rank's own, so the lightest rank wins outright; and a
+        // decision that prices nobody by an engine report builds none.
+        let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0, 0);
+        let feed = TestFeed::attached_to(&policy);
+        let workers = rank_workers("http://engine:8000", 4, WorkerType::Regular);
+        feed.publish(&rank_reports(&workers, &SKEWED_QUEUES, PUSHED_LOAD_VERSION));
+        let snapshot = policy.snapshot().unwrap();
+        let inflight = HashMap::new();
+        let candidates = [0, 1, 2, 3];
+        let engines = LeastLoadPolicy::engine_reports(&workers, &candidates, Some(&snapshot));
+        assert!(engines.is_empty());
+        let inputs =
+            policy.score_inputs(&workers, &candidates, Some(&snapshot), &inflight, &engines);
+        for (worker, queued) in workers.iter().zip(SKEWED_QUEUES) {
+            let score = policy.score(worker, &inputs);
+            let own = (f64::from(queued) + 1024.0) / 100.0;
+            assert!((score - own).abs() < 1e-9, "{}: {score}", worker.url());
+        }
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn a_polled_rank_is_priced_by_the_engine_beside_a_pushed_sibling() {
+        // Rank 0's stream pushes its record while ranks 1-3 are polled: rank
+        // 0 is priced by its own fresh entry, the three by the engine's
+        // report, which carries rank 0's entry too.
+        let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0, 0);
+        let feed = TestFeed::attached_to(&policy);
+        let workers = rank_workers("http://engine:8000", 4, WorkerType::Regular);
+        let mut loads = rank_reports(&workers, &SKEWED_QUEUES, "");
+        loads.get_mut(workers[0].url()).unwrap().version = PUSHED_LOAD_VERSION.to_string();
+        feed.publish(&loads);
+        let snapshot = policy.snapshot().unwrap();
+        let inflight = HashMap::new();
+        let candidates = [0, 1, 2, 3];
+        let engines = LeastLoadPolicy::engine_reports(&workers, &candidates, Some(&snapshot));
+        assert_eq!(engines["http://engine:8000"].loads.len(), 4);
+        let inputs =
+            policy.score_inputs(&workers, &candidates, Some(&snapshot), &inflight, &engines);
+        let scores: Vec<f64> = workers
+            .iter()
+            .map(|worker| policy.score(worker, &inputs))
+            .collect();
+        assert!(
+            (scores[0] - (100.0 + 1024.0) / 100.0).abs() < 1e-9,
+            "{scores:?}"
+        );
+        for score in &scores[1..] {
+            assert!((score - ENGINE_WAIT).abs() < 1e-9, "{scores:?}");
+        }
+    }
+
+    #[test]
+    fn a_fleet_without_rank_workers_builds_no_engine_report() {
+        let (policy, feed, workers) = fed_pair(LeastLoadPolicy::new());
+        feed.publish(&HashMap::from([
+            (workers[0].url().to_string(), one_rank_load(0, 0.1, 100.0)),
+            (workers[1].url().to_string(), one_rank_load(0, 0.1, 100.0)),
+        ]));
+        let snapshot = policy.snapshot().unwrap();
+        assert!(LeastLoadPolicy::engine_reports(&workers, &[0, 1], Some(&snapshot)).is_empty());
+    }
+
+    #[test]
+    fn a_polled_ranks_in_transit_floor_is_held_against_its_own_entry() {
+        // Four polled ranks, two running requests each and nothing waiting;
+        // the router holds five requests on rank 0 with no since-poll credit.
+        // Rank 0's own entry accounts for two of them, so three are in
+        // transit and rank 0 scores three mean prefills above its idle
+        // siblings. Held against the engine's whole report (eight running)
+        // the floor would read 5 - 8 = 0 and rank 0 would tie with them.
+        let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0, 0);
+        let feed = TestFeed::attached_to(&policy);
+        let workers = rank_workers("http://engine:8000", 4, WorkerType::Regular);
+        let mut loads = rank_reports(&workers, &[0, 0, 0, 0], "");
+        for load in loads.values_mut() {
+            load.loads[0].num_running_reqs = 2;
+        }
+        feed.publish(&loads);
+        for _ in 0..5 {
+            workers[0].increment_load();
+        }
+        let snapshot = policy.snapshot().unwrap();
+        let inflight = HashMap::new();
+        let candidates = [0, 1, 2, 3];
+        let engines = LeastLoadPolicy::engine_reports(&workers, &candidates, Some(&snapshot));
+        let inputs =
+            policy.score_inputs(&workers, &candidates, Some(&snapshot), &inflight, &engines);
+        let scores: Vec<f64> = workers
+            .iter()
+            .map(|worker| policy.score(worker, &inputs))
+            .collect();
+        // The engine's eight running requests at p̄ over its 400 tok/s; rank 0
+        // adds its three in-transit requests at p̄ over the same rate.
+        let engine_wait = 8.0 * 1024.0 / 400.0;
+        let floored = engine_wait + 3.0 * 1024.0 / 400.0;
+        assert!((scores[0] - floored).abs() < 1e-9, "{scores:?}");
+        for score in &scores[1..] {
+            assert!((score - engine_wait).abs() < 1e-9, "{scores:?}");
+        }
+        assert_ne!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn prefill_rank_workers_keep_their_own_entry() {
+        // The skewed polled reports on a prefill engine: a prefill rank drains
+        // at its configured input capacity, a per-rank figure with no
+        // engine-wide reading, so the ranks are priced by their own entries
+        // (the lightest wins) and no engine report is built for them.
+        let policy = LeastLoadPolicy::with_params(0.0, 1024, 2000.0, 0);
+        let feed = TestFeed::attached_to(&policy);
+        let workers = rank_workers("http://prefill:8000", 4, WorkerType::Prefill);
+        feed.publish(&rank_reports(&workers, &SKEWED_QUEUES, ""));
+        let snapshot = policy.snapshot().unwrap();
+        let inflight = HashMap::new();
+        let candidates = [0, 1, 2, 3];
+        let engines = LeastLoadPolicy::engine_reports(&workers, &candidates, Some(&snapshot));
+        assert!(engines.is_empty());
+        let inputs =
+            policy.score_inputs(&workers, &candidates, Some(&snapshot), &inflight, &engines);
+        for (worker, queued) in workers.iter().zip(SKEWED_QUEUES) {
+            let score = policy.score(worker, &inputs);
+            let own = (f64::from(queued) + 1024.0) / 2000.0;
+            assert!((score - own).abs() < 1e-9, "{}: {score}", worker.url());
+        }
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(0)
+        );
+    }
+
     #[test]
     fn cold_start_picks_lowest_in_flight() {
         // No load reports yet -> join-shortest-queue on live in-flight count.
@@ -1193,6 +1516,7 @@ mod tests {
         let snapshot = LoadSnapshot::from_loads_for_test(loads.into_iter().collect());
         let inputs = ScoreInputs {
             snapshot: Some(&snapshot),
+            engines: &HashMap::new(),
             inflight: &HashMap::new(),
             nominal_throughput: 2000.0,
             fleet_has_loads: true,

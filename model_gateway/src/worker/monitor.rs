@@ -449,6 +449,13 @@ fn keep_telemetry(
 /// A pushed record is sampled this much before its receipt on top of its own
 /// `age_ms`: the servicer-to-gateway one-way latency.
 const PUSHED_ONE_WAY_MARGIN: Duration = Duration::from_millis(20);
+
+/// The `version` of a report built from a worker's pushed load records
+/// ([`WorkerMonitor::apply_pushed_load`]): what tells a reader of the shared
+/// snapshot a stream's report, current at the stream's cadence, from a
+/// poll's, up to a tick old. An engine's own answer never carries it.
+pub(crate) const PUSHED_LOAD_VERSION: &str = "pushed";
+
 /// Pushed reports are published into the shared snapshot in one rebuild per
 /// window: the rebuild is O(fleet) pointer work, the records arrive per
 /// scheduler step from every engine. Routing reads the snapshot, so a record
@@ -596,7 +603,7 @@ impl WorkerMonitor {
             ranks.insert(dp_rank, fresh);
             Arc::new(WorkerLoadResponse {
                 timestamp: chrono::Utc::now().to_rfc3339(),
-                version: "pushed".to_string(),
+                version: PUSHED_LOAD_VERSION.to_string(),
                 dp_rank_count: i32::try_from(ranks.len()).unwrap_or(i32::MAX),
                 loads: ranks.values().cloned().collect(),
                 aggregate: None,
