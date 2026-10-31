@@ -8,4 +8,5 @@ mod rl_control_plane_test;
 mod rl_tokenspeed_control_endpoint_test;
 mod scheduler_test;
 mod systemone_http_test;
+mod tenant_rate_limiting_http_test;
 mod wasm_test;
