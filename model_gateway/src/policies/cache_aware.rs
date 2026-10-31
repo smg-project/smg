@@ -1596,6 +1596,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         if let Some(accounting) = &self.accounting {
             accounting.release(worker_url);
         }
+        self.load_scorer.on_request_complete(worker_url);
         self.selection.on_request_complete(worker_url);
     }
 
@@ -1658,6 +1659,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             .accounting
             .as_ref()
             .map_or(0, |accounting| accounting.reconcile(worker_url, in_flight));
+        self.load_scorer.reconcile_in_flight(worker_url, in_flight);
         self.selection.reconcile_in_flight(worker_url, in_flight);
         if released > 0 {
             Metrics::record_policy_inflight_reconciled(self.name(), released);

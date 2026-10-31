@@ -3867,8 +3867,10 @@ fn hash_mode_short_request_stays_dark_fleet_expected_wait() {
     }
 
     let tokens: Vec<u32> = (0..8).collect();
+    // Each request ends before the next arrives.
     for _ in 0..5 {
         assert_eq!(route_tokens(&policy, &workers, &tokens), 1);
+        policy.on_request_complete(workers[1].url());
     }
     assert!(policy.placement_index.is_empty());
 }
@@ -3885,11 +3887,28 @@ fn hash_mode_untokenized_text_stays_dark_fleet_expected_wait() {
         request_text: Some("system prompt plus a user question"),
         ..Default::default()
     };
+    // Each request ends before the next arrives.
     for _ in 0..5 {
         assert_eq!(policy.select_worker(&workers, &info), Some(1));
+        policy.on_request_complete(workers[1].url());
     }
     assert!(policy.placement_index.is_empty());
     assert!(policy.string_trees.is_empty());
+}
+
+#[test]
+fn the_load_poll_releases_a_pick_the_router_never_dispatched() {
+    // w1 holds one request; each pick on w2 is dropped before its guard is
+    // taken, and the poll that follows sets w2 back to the router's zero.
+    let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    workers[0].increment_load();
+
+    let tokens: Vec<u32> = (0..8).collect();
+    for _ in 0..50 {
+        assert_eq!(route_tokens(&policy, &workers, &tokens), 1);
+        policy.reconcile_in_flight(workers[1].url(), workers[1].load());
+    }
 }
 
 #[test]

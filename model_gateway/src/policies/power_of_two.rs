@@ -134,6 +134,14 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         self.scorer.remove_worker(url);
     }
 
+    fn on_request_complete(&self, worker_url: &str) {
+        self.scorer.on_request_complete(worker_url);
+    }
+
+    fn reconcile_in_flight(&self, worker_url: &str, in_flight: usize) {
+        self.scorer.reconcile_in_flight(worker_url, in_flight);
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -318,9 +326,28 @@ mod tests {
     }
 
     #[test]
+    fn the_load_poll_releases_a_pick_the_router_never_dispatched() {
+        // b holds one request; each pick on a is dropped before its guard is
+        // taken, and the poll that follows sets a back to the router's zero.
+        let policy = PowerOfTwoPolicy::new();
+        let a = make_worker("http://a:8000");
+        let b = make_worker("http://b:8000");
+        b.increment_load();
+        let workers = vec![a, b];
+        for _ in 0..50 {
+            assert_eq!(
+                policy.select_worker(&workers, &SelectWorkerInfo::default()),
+                Some(0)
+            );
+            policy.reconcile_in_flight(workers[0].url(), workers[0].load());
+        }
+    }
+
+    #[test]
     fn cold_start_distribution_prefers_lower_in_flight() {
-        // Three dark workers with in-flight 10/5/0: every pair containing w3
-        // picks w3, the {w1,w2} pair picks w2, and w1 never wins.
+        // Three dark workers with in-flight 10/5/0, each request ending before
+        // the next: every pair containing w3 picks w3, the {w1,w2} pair picks
+        // w2, and w1 never wins.
         let policy = PowerOfTwoPolicy::new();
         let counts = {
             let w1 = make_worker("http://w1:8000");
@@ -339,6 +366,7 @@ mod tests {
                     .select_worker(&workers, &SelectWorkerInfo::default())
                     .unwrap();
                 counts[idx] += 1;
+                policy.on_request_complete(workers[idx].url());
             }
             counts
         };
