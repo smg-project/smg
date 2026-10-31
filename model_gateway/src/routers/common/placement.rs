@@ -28,8 +28,8 @@ use crate::{
         metrics::{metrics_labels, Metrics},
     },
     policies::{
-        policy_filters_unavailable_workers, CacheNamespace, LoadBalancingPolicy, PolicyRegistry,
-        SelectWorkerInfo, WorkerRole,
+        policy_filters_unavailable_workers, traffic_split, CacheNamespace, LoadBalancingPolicy,
+        PolicyRegistry, SelectWorkerInfo, WorkerRole,
     },
     routers::{
         common::{header_utils, overload, retry::mark_non_retryable},
@@ -280,9 +280,12 @@ pub(crate) fn select_from(
     };
     // The engines this request already tried step aside for its retry while
     // another available candidate remains; otherwise the pool is used whole.
-    // An explicit target under consistent hashing indexes this slice and
-    // stays strict (as `admission_prefilters` keeps it), so it is never
-    // narrowed: the retry goes back to the targeted worker.
+    // Under the traffic split, untried candidates that are all in drained
+    // groups count as none left: the retry goes back to the tried workers
+    // rather than to the drained build or to a miss. An explicit target
+    // under consistent hashing indexes this slice and stays strict (as
+    // `admission_prefilters` keeps it), so it is never narrowed: the retry
+    // goes back to the targeted worker.
     let strict_target = policy.name() == "consistent_hashing"
         && header_utils::extract_target_worker(inputs.headers).is_some();
     let untried;
@@ -300,40 +303,52 @@ pub(crate) fn select_from(
             })
             .cloned()
             .collect::<Vec<_>>();
-        if untried.is_empty() {
+        if untried.is_empty()
+            || (policies.traffic_split_enabled()
+                && traffic_split::drained(&untried, |worker| worker.is_available()))
+        {
             available
         } else {
             &untried
         }
     };
-    if available.is_empty() {
-        return overload_fallback(registry, policy.name(), model_id, candidates);
-    }
-
     // Cached hash ring for consistent hashing (O(log n) lookup).
     let hash_ring = registry.get_hash_ring(model_id);
+    let info = SelectWorkerInfo {
+        request_text: inputs.text,
+        tokens: inputs.tokens,
+        headers: inputs.headers,
+        routing_key: policies.resolve_routing_key(inputs.headers),
+        rid_key: inputs.rid_key,
+        cache_namespace: inputs.cache_namespace,
+        hash_ring,
+        role: WorkerRole::Single,
+        overload_lifted: false,
+    };
+    if available.is_empty() {
+        return overload_fallback(
+            registry,
+            policies,
+            policy.name(),
+            model_id,
+            candidates,
+            &info,
+        );
+    }
 
     // The registry applies the routing-key sticky override when enabled and
     // otherwise delegates to the configured policy.
-    let Some(idx) = policies.select_worker_for_model(
-        &policy,
-        model_id,
-        available,
-        &SelectWorkerInfo {
-            request_text: inputs.text,
-            tokens: inputs.tokens,
-            headers: inputs.headers,
-            routing_key: policies.resolve_routing_key(inputs.headers),
-            rid_key: inputs.rid_key,
-            cache_namespace: inputs.cache_namespace,
-            hash_ring,
-            role: WorkerRole::Single,
-            overload_lifted: false,
-        },
-    ) else {
+    let Some(idx) = policies.select_worker_for_model(&policy, model_id, available, &info) else {
         // A policy that filters availability itself misses on an
         // all-overloaded pool the same way the pre-filter empties.
-        return overload_fallback(registry, policy.name(), model_id, candidates);
+        return overload_fallback(
+            registry,
+            policies,
+            policy.name(),
+            model_id,
+            candidates,
+            &info,
+        );
     };
     let selected = available[idx].clone();
 
@@ -352,19 +367,78 @@ pub(crate) fn select_from(
 /// worker, recorded as a selection under `policy`. Under
 /// `--worker-overload-shed` an overloaded worker is never taken (the caller
 /// sheds an all-overloaded pool); `None` when the pool is not all-vetoed or
-/// has nothing routable.
+/// has nothing routable. Under `--traffic-split` the pool is narrowed to one
+/// group first, by the request's key where it has one and at random
+/// otherwise, so a canary takes its weight's share of a spike and not the
+/// least-loaded worker's; the pool is judged whole first, as without the
+/// split, so the split chooses where, not whether: the arms admit what the fallback itself can take
+/// (a ready worker, healthy with its circuit closed; under
+/// `--worker-overload-shed` not an overloaded one), so a stalled member joins
+/// its group's arm, counts in the group's weight and is the arm's answer when
+/// every worker is stalled or the shed leaves it alone, while a group the
+/// shed empties drops out of the draw as a down group does; a pool whose
+/// groups all weigh 0 among those is declined rather than served from the
+/// drained build; a pool of one group keeps the least-loaded pick. The
+/// split's selection is counted once the arm has answered.
 fn overload_fallback(
     registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
     policy: &'static str,
     model_id: &str,
     candidates: &[Arc<dyn Worker>],
+    info: &SelectWorkerInfo,
 ) -> Option<Arc<dyn Worker>> {
-    let selected = overload::fallback_if_all_vetoed(
-        candidates,
-        model_id,
-        STAGE_SELECTION,
-        registry.overload_shed_enabled(),
-    )?;
+    let shedding = registry.overload_shed_enabled();
+    let whole =
+        || overload::fallback_if_all_vetoed(candidates, model_id, STAGE_SELECTION, shedding);
+    let selected = if policies.traffic_split_enabled() {
+        // The pool is judged whole first, as it is without the split: a pool
+        // with a worker that is down but not vetoed keeps its unavailable
+        // answer whichever arm the draw would take. The split then only
+        // chooses where, over arms that are all vetoed by construction.
+        if !overload::all_vetoed(candidates) {
+            return None;
+        }
+        // The arms admit what the fallback can take: a ready worker (healthy,
+        // circuit closed), and under the shed not an overloaded one, so a group
+        // the shed empties drops out of the draw as a down group does.
+        let takes = |worker: &dyn Worker| {
+            worker.is_healthy()
+                && worker.circuit_breaker_can_execute()
+                && !(shedding && worker.is_overloaded())
+        };
+        if traffic_split::drained(candidates, takes) {
+            return None;
+        }
+        match traffic_split::Split::plan(candidates, takes) {
+            Some(split) => {
+                let arm = match policies.effective_sticky_key(info) {
+                    Some((key, _)) => split.arm_for_key(key),
+                    None => split.arm_at_random(&mut rand::rng()),
+                };
+                // The arm's group whole: the pool is all vetoed (checked above),
+                // so the group is too, and the fallback's readiness and shed
+                // filters pick inside it as they would over the pool; the other
+                // groups stay out, a drained one among them.
+                let members: Vec<Arc<dyn Worker>> = candidates
+                    .iter()
+                    .filter(|worker| traffic_split::group_of(worker.as_ref()) == arm.name)
+                    .cloned()
+                    .collect();
+                let selected = overload::fallback_if_all_vetoed(
+                    &members,
+                    model_id,
+                    STAGE_SELECTION,
+                    shedding,
+                )?;
+                Metrics::record_traffic_split_selection(model_id, arm.name);
+                selected
+            }
+            None => whole()?,
+        }
+    } else {
+        whole()?
+    };
     Metrics::record_worker_selection(
         metrics_labels::WORKER_REGULAR,
         selected.connection_mode().as_metric_label(),
@@ -777,6 +851,64 @@ impl fmt::Display for PoolState {
     }
 }
 
+/// Every group of a pool weighs 0 among the workers the steering default
+/// admits: the pool is drained and the default declines (the caller reports
+/// the miss) rather than serve from the drained build.
+struct Drained;
+
+/// Under `--traffic-split`, one side of the pair the steering default
+/// places: the group it is confined to and the group it reports for the
+/// other side to follow, as one side of a request reports under the
+/// policies ([`PolicyRegistry::select_worker_for_model_split`]).
+struct SideArm<'a> {
+    /// The arm the side is confined to; `None` for a pool of one group among
+    /// the workers the default admits (nothing to confine).
+    confined: Option<&'a str>,
+    /// The group the side reports: its arm, or the one named group of an
+    /// unsplit pool; `None` for the default group.
+    reported: Option<&'a str>,
+}
+
+/// The side drawn over `pool` as the policies draw one: `follow`, the group
+/// the earlier side reported, while the pool has it in the draw (an admitted
+/// member of positive weight), else the arm of the request's key where it
+/// has one and of a random draw otherwise; a pool of one group among the
+/// workers `takes` admits is not split and confines nothing, a named one
+/// still reported; `Err(Drained)` when every group weighs 0 among those.
+fn side_arm<'a>(
+    key: Option<&str>,
+    pool: &'a [Arc<dyn Worker>],
+    takes: &dyn Fn(&dyn Worker) -> bool,
+    follow: Option<&str>,
+) -> Result<SideArm<'a>, Drained> {
+    if traffic_split::drained(pool, takes) {
+        return Err(Drained);
+    }
+    match traffic_split::Split::plan(pool, takes) {
+        Some(split) => {
+            let arm = match follow.and_then(|name| split.arm_named(name)) {
+                Some(arm) => arm,
+                None => match key {
+                    Some(key) => split.arm_for_key(key),
+                    None => split.arm_at_random(&mut rand::rng()),
+                },
+            };
+            Ok(SideArm {
+                confined: Some(arm.name),
+                reported: Some(arm.name),
+            })
+        }
+        None => Ok(SideArm {
+            confined: None,
+            reported: pool
+                .iter()
+                .find(|worker| takes(worker.as_ref()))
+                .map(|worker| traffic_split::group_of(worker.as_ref()))
+                .filter(|group| *group != traffic_split::DEFAULT_GROUP),
+        }),
+    }
+}
+
 /// The steering default for a disaggregated placement whose failed pool is
 /// vetoed on every worker the request may use (`failed_pool`, see
 /// [`admitted_pool`]), by the overload thresholds or by the liveness
@@ -789,27 +921,86 @@ impl fmt::Display for PoolState {
 /// `None` when the failed pool is not all-vetoed (an unhealthy pool keeps its
 /// unavailable answer), when it is all-overloaded under shedding (the caller
 /// sheds), or when nothing pairs; a prefill admission gate still has the last
-/// word.
+/// word. Under `--traffic-split` each side is confined to an arm of its own
+/// pool, drawn as the policies draw a side ([`side_arm`]: the prefill leads,
+/// the decode follows its group while the decode pool has it in the draw),
+/// and a pool whose groups all weigh 0 is declined, so a drained build
+/// serves no fallback either.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the steering default threads every routing input the pair placement does"
+)]
 fn relaxed_pair(
     registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
     model_id: &str,
     pairs: &PdPairIndex,
     wire: Option<WireConstraint>,
     prefill_capacity: Option<&PrefillSelectionContext<'_>>,
     inputs: &PlacementInputs<'_>,
+    failed_role: WorkerRole,
     failed_pool: &[Arc<dyn Worker>],
 ) -> Option<Result<Pair, Box<PairFailure>>> {
     let shedding = registry.overload_shed_enabled();
     if !overload::all_vetoed(failed_pool) || (shedding && overload::all_overloaded(failed_pool)) {
         return None;
     }
-    let eligible = |w: &Arc<dyn Worker>| {
+    // Under `--traffic-split` the default narrows each side to one group
+    // first, as the single-worker default does (`overload_fallback`), so a
+    // canary takes its weight's share of an all-vetoed pool and not the
+    // least-loaded pair's. The arms admit what this default can take, and
+    // each side is confined to an arm of its own pool, as under the
+    // policies: the prefill side leads, and the decode side follows its
+    // group while the decode pool has it in the draw, else draws its own
+    // arm; so a pair never spans two groups both pools carry, a canary one
+    // pool alone carries keeps its share, an unlabelled pool pairs with any
+    // arm, and a prefill pool of one named group steers the decode to it. A
+    // pool whose groups all weigh 0 among those is declined (the caller
+    // reports the miss) rather than served from the drained build; one group
+    // keeps the least-loaded pair over the whole pool. The decode arm is
+    // drawn over the decode pool once, so a prefill whose partners lack it
+    // is passed over by the search below.
+    let (prefill_group, decode_group) = if policies.traffic_split_enabled() {
+        let takes = |w: &dyn Worker| {
+            w.is_healthy()
+                && w.circuit_breaker_can_execute()
+                && WireConstraint::admits(wire, w)
+                && inputs.candidate_filter.is_none_or(|accepts| accepts(w))
+                && !(shedding && w.is_overloaded())
+        };
+        let key = policies
+            .effective_sticky_key(&SelectWorkerInfo {
+                request_text: inputs.text,
+                tokens: inputs.tokens,
+                headers: inputs.headers,
+                routing_key: policies.resolve_routing_key(inputs.headers),
+                rid_key: inputs.rid_key,
+                cache_namespace: inputs.cache_namespace,
+                hash_ring: None,
+                role: failed_role,
+                overload_lifted: false,
+            })
+            .map(|(key, _)| key);
+        let prefill = side_arm(key, &pairs.prefill, &takes, None).ok()?;
+        let decode = side_arm(key, &pairs.decode_pool, &takes, prefill.reported).ok()?;
+        (prefill.confined, decode.confined)
+    } else {
+        (None, None)
+    };
+    let admitted = |w: &Arc<dyn Worker>| {
         w.is_healthy()
             && w.circuit_breaker_can_execute()
             && WireConstraint::admits(wire, w.as_ref())
             && inputs
                 .candidate_filter
                 .is_none_or(|accepts| accepts(w.as_ref()))
+    };
+    let eligible_prefill = |w: &Arc<dyn Worker>| {
+        admitted(w)
+            && prefill_group.is_none_or(|group| traffic_split::group_of(w.as_ref()) == group)
+    };
+    let eligible_decode = |w: &Arc<dyn Worker>| {
+        admitted(w) && decode_group.is_none_or(|group| traffic_split::group_of(w.as_ref()) == group)
     };
     // Equal loads draw uniformly (partner and pair alike), so an equally
     // loaded pool does not send every fallback to its first pair.
@@ -818,11 +1009,13 @@ fn relaxed_pair(
         let mut best: Option<(Arc<dyn Worker>, Arc<dyn Worker>)> = None;
         let mut tied = 0u32;
         for (i, prefill) in pairs.prefill.iter().enumerate() {
-            if !routable(prefill) {
+            if !(eligible_prefill(prefill) && routable(prefill)) {
                 continue;
             }
             let Some(decode) = overload::least_loaded_uniform(
-                pairs.partners[i].iter().filter(|d| routable(d)),
+                pairs.partners[i]
+                    .iter()
+                    .filter(|d| eligible_decode(d) && routable(d)),
                 &mut rng,
             ) else {
                 continue;
@@ -845,12 +1038,12 @@ fn relaxed_pair(
         best
     };
     let overloaded_first = (!shedding)
-        .then(|| search(&|w| eligible(w) && w.stall_reason().is_none()))
+        .then(|| search(&|w| w.stall_reason().is_none()))
         .flatten();
     let ((prefill, decode), branch) = match overloaded_first {
         Some(pair) => (pair, BRANCH_ALL_OVERLOADED_FALLBACK),
         None => (
-            search(&|w| eligible(w) && !(shedding && w.is_overloaded()))?,
+            search(&|w| !(shedding && w.is_overloaded()))?,
             BRANCH_ALL_STALLED_FALLBACK,
         ),
     };
@@ -864,6 +1057,10 @@ fn relaxed_pair(
         Metrics::record_worker_overload_fallback(STAGE_SELECTION);
     } else {
         Metrics::record_worker_liveness_fallback(STAGE_SELECTION);
+    }
+    // Every confined side counts as a split selection, as under the policies.
+    for group in [prefill_group, decode_group].into_iter().flatten() {
+        Metrics::record_traffic_split_selection(model_id, group);
     }
     debug!(
         branch,
@@ -1007,11 +1204,13 @@ pub(crate) fn select_pair(
         let admitted = admitted_pool(&pairs.prefill, wire, &inputs);
         if let Some(pair) = relaxed_pair(
             registry,
+            policies,
             model_id,
             pairs,
             wire,
             prefill_capacity,
             &inputs,
+            WorkerRole::Prefill,
             &admitted,
         ) {
             return pair;
@@ -1070,11 +1269,13 @@ pub(crate) fn select_pair(
         let admitted = admitted_pool(failed_pool, wire, &inputs);
         if let Some(pair) = relaxed_pair(
             registry,
+            policies,
             model_id,
             pairs,
             wire,
             prefill_capacity,
             &inputs,
+            role,
             &admitted,
         ) {
             return pair;
@@ -1125,8 +1326,8 @@ pub(crate) fn select_pair(
             verdict: PlacementFailure::PolicyDeclined(policy),
         })
     };
-    let Some(prefill_idx) =
-        policies.select_worker_for_model(&prefill_policy, model_id, &prefill, &info)
+    let Some((prefill_idx, prefill_group)) =
+        policies.select_worker_for_model_split(&prefill_policy, model_id, &prefill, &info, None)
     else {
         // A policy that declines a lifted pool all over the thresholds: the
         // least-loaded default steers it, as it steers any other such pool.
@@ -1134,11 +1335,13 @@ pub(crate) fn select_pair(
             let admitted = admitted_pool(&pairs.prefill, wire, &inputs);
             if let Some(pair) = relaxed_pair(
                 registry,
+                policies,
                 model_id,
                 pairs,
                 wire,
                 prefill_capacity,
                 &inputs,
+                WorkerRole::Prefill,
                 &admitted,
             ) {
                 return pair;
@@ -1170,16 +1373,52 @@ pub(crate) fn select_pair(
     // A decode pool all over the thresholds pairs by load, as the default
     // paired it: the least-loaded of the pick's partners, counted as a veto
     // fallback and not as a selection of the decode policy. Any other keeps
-    // the veto for its policy.
+    // the veto for its policy. Either way the decode side is confined under
+    // `--traffic-split` as one side of a request is: it follows the group
+    // the prefill side reported (the one it was split into, or the named
+    // group an unsplit prefill was picked from) while its partners have that
+    // group in the draw, else draws its own arm, so a pair never spans two
+    // groups both pools carry and a canary one pool alone carries keeps its
+    // share; partners whose groups all weigh 0 are declined, so a drained
+    // canary takes no fallback pair (by load: `side_arm`; under the policy:
+    // `PolicyRegistry::select_worker_for_model_split`).
     let selected_decode = if lift_decode {
-        overload::least_loaded_uniform(decode.iter(), &mut rand::rng())
-            .cloned()
-            .ok_or_else(|| fail(WorkerRole::Decode, PlacementFailure::Unavailable))?
+        let arm = if policies.traffic_split_enabled() {
+            info.role = WorkerRole::Decode;
+            let key = policies.effective_sticky_key(&info).map(|(key, _)| key);
+            match side_arm(key, &decode, &|_: &dyn Worker| true, prefill_group) {
+                Ok(side) => {
+                    if let Some(group) = side.confined {
+                        Metrics::record_traffic_split_selection(model_id, group);
+                    }
+                    side.confined
+                }
+                Err(Drained) => {
+                    return Err(declined(WorkerRole::Decode, decode_policy.name()));
+                }
+            }
+        } else {
+            None
+        };
+        overload::least_loaded_uniform(
+            decode
+                .iter()
+                .filter(|d| arm.is_none_or(|group| traffic_split::group_of(d.as_ref()) == group)),
+            &mut rand::rng(),
+        )
+        .cloned()
+        .ok_or_else(|| fail(WorkerRole::Decode, PlacementFailure::Unavailable))?
     } else {
         info.role = WorkerRole::Decode;
         info.overload_lifted = false;
-        match policies.select_worker_for_model(&decode_policy, model_id, &decode, &info) {
-            Some(decode_idx) => decode[decode_idx].clone(),
+        match policies.select_worker_for_model_split(
+            &decode_policy,
+            model_id,
+            &decode,
+            &info,
+            prefill_group,
+        ) {
+            Some((decode_idx, _)) => decode[decode_idx].clone(),
             None => return Err(declined(WorkerRole::Decode, decode_policy.name())),
         }
     };
@@ -2014,6 +2253,212 @@ mod tests {
         .expect("a worker is selectable")
     }
 
+    /// Under the traffic split, a retry whose untried candidates are all in
+    /// a drained group goes back to the tried workers, as it does with
+    /// nothing untried left: never to the drained build, and not to a miss
+    /// while a healthy tried worker stands.
+    #[test]
+    fn a_retry_with_only_a_drained_group_untried_goes_back_to_the_tried_workers() {
+        let registry = WorkerRegistry::new();
+        for (url, group, weight) in [
+            ("http://s:1", "stable", "90"),
+            ("http://c:1", "canary", "0"),
+        ] {
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new(MODEL))
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Http)
+                        .runtime_type(RuntimeType::Sglang)
+                        .label("traffic_group", group)
+                        .label("traffic_weight", weight)
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .build(),
+                ))
+                .expect("worker registers");
+        }
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin).with_traffic_split(true);
+        let first = pick(&registry, &policies, PlacementInputs::default());
+        assert_eq!(
+            first.base_url(),
+            "http://s:1",
+            "the drained canary takes nothing"
+        );
+        let tried = vec![first.base_url().to_string()];
+        let retried = pick(
+            &registry,
+            &policies,
+            PlacementInputs {
+                tried: &tried,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            retried.base_url(),
+            "http://s:1",
+            "the retry goes back to the tried stable worker, not to the drained canary"
+        );
+    }
+
+    /// Every worker of a split pool over the overload thresholds: the steering
+    /// default narrows the pool to one group first, so the canary takes its
+    /// weight's share of the spike and not the least-loaded worker's, a canary
+    /// at weight 0 takes nothing, and a pool whose groups all weigh 0 is
+    /// declined rather than served from the drained build.
+    #[test]
+    fn an_all_overloaded_pool_under_the_split_keeps_the_groups_weights() {
+        let grouped = |stable_weight: &str, canary_weight: &str| {
+            let registry = WorkerRegistry::new();
+            for (url, group, weight) in [
+                ("http://s:1", "stable", stable_weight),
+                ("http://s:2", "stable", stable_weight),
+                ("http://c:1", "canary", canary_weight),
+            ] {
+                registry
+                    .register(Arc::new(
+                        BasicWorkerBuilder::new(url)
+                            .model(ModelCard::new(MODEL))
+                            .worker_type(WorkerType::Regular)
+                            .connection_mode(ConnectionMode::Http)
+                            .runtime_type(RuntimeType::Sglang)
+                            .label("traffic_group", group)
+                            .label("traffic_weight", weight)
+                            .health_config(HealthCheckConfig {
+                                disable_health_check: true,
+                                ..Default::default()
+                            })
+                            .build(),
+                    ))
+                    .expect("worker registers");
+            }
+            for worker in registry.get_all() {
+                registry.set_worker_overloaded(&worker, true);
+            }
+            registry
+        };
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin).with_traffic_split(true);
+        let registry = grouped("90", "10");
+        let canary = (0..100)
+            .filter(|_| {
+                pick(&registry, &policies, PlacementInputs::default()).base_url() == "http://c:1"
+            })
+            .count();
+        assert!(canary <= 25, "the canary took {canary} of 100 at weight 10");
+        let registry = grouped("90", "0");
+        for _ in 0..50 {
+            assert_ne!(
+                pick(&registry, &policies, PlacementInputs::default()).base_url(),
+                "http://c:1",
+                "a drained canary took a request from the steering default"
+            );
+        }
+        let registry = grouped("0", "0");
+        assert!(
+            select_single(
+                &registry,
+                &policies,
+                MODEL,
+                RoutingPool::HttpRegular,
+                None,
+                PlacementInputs::default(),
+            )
+            .is_none(),
+            "a pool whose groups all weigh 0 is declined, not served"
+        );
+        // A stalled member still joins its group's arm. Under the shed, where
+        // an overloaded worker is never taken, the shed empties the canary
+        // group here, so the pool is one group and the least-loaded pick is
+        // the wedged stable worker, not a miss.
+        let registry = grouped("90", "10");
+        registry.set_overload_shed(true);
+        let wedged = registry.get_by_url("http://s:2").expect("registered");
+        registry.set_worker_overloaded(&wedged, false);
+        wedged.set_stall(Some(StallReason::Wedged));
+        for _ in 0..20 {
+            assert_eq!(
+                pick(&registry, &policies, PlacementInputs::default()).base_url(),
+                "http://s:2",
+                "the shed left the pool without its stalled worker"
+            );
+        }
+        // With a wedged worker in each group the shed leaves two groups, and
+        // the arm's answer is its wedged worker, the canary's at its weight.
+        let registry = grouped("90", "10");
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("http://c:2")
+                    .model(ModelCard::new(MODEL))
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(ConnectionMode::Http)
+                    .runtime_type(RuntimeType::Sglang)
+                    .label("traffic_group", "canary")
+                    .label("traffic_weight", "10")
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            ))
+            .expect("worker registers");
+        registry.set_overload_shed(true);
+        for url in ["http://s:2", "http://c:2"] {
+            let worker = registry.get_by_url(url).expect("registered");
+            registry.set_worker_overloaded(&worker, false);
+            worker.set_stall(Some(StallReason::Wedged));
+        }
+        let mut canary = 0;
+        for _ in 0..100 {
+            let picked = pick(&registry, &policies, PlacementInputs::default());
+            assert!(
+                picked.base_url() == "http://s:2" || picked.base_url() == "http://c:2",
+                "the arm answered with an overloaded worker under the shed: {}",
+                picked.base_url()
+            );
+            if picked.base_url() == "http://c:2" {
+                canary += 1;
+            }
+        }
+        assert!(
+            canary <= 25,
+            "the canary took {canary} of 100 at weight 10 under the shed"
+        );
+        // A group with a worker that is down but not vetoed keeps the pool's
+        // unavailable answer, as the single-group and the split-off paths do.
+        let registry = grouped("90", "10");
+        let down = registry.get_by_url("http://s:2").expect("registered");
+        registry.set_worker_overloaded(&down, false);
+        down.set_status(WorkerStatus::NotReady);
+        assert!(
+            select_single(
+                &registry,
+                &policies,
+                MODEL,
+                RoutingPool::HttpRegular,
+                None,
+                PlacementInputs::default(),
+            )
+            .is_none(),
+            "a not-ready worker in the stable group was hidden from the all-vetoed check"
+        );
+        let registry = grouped("90", "0");
+        for url in ["http://s:1", "http://s:2"] {
+            let worker = registry.get_by_url(url).expect("registered");
+            registry.set_worker_overloaded(&worker, false);
+            worker.set_stall(Some(StallReason::Wedged));
+        }
+        for _ in 0..20 {
+            assert_ne!(
+                pick(&registry, &policies, PlacementInputs::default()).base_url(),
+                "http://c:1",
+                "a drained canary served a pool whose stable fleet is only suspected"
+            );
+        }
+    }
+
     /// A routing key pins consistent hashing to one worker; once that worker
     /// was tried, the retry falls through to the next node on the ring, and
     /// a pool with nothing untried left is used whole.
@@ -2603,6 +3048,350 @@ mod tests {
             place_prompt(&registry, &policies, &next_turn).prefill.url(),
             home.url()
         );
+    }
+
+    /// Two traffic groups on both pools under `--traffic-split`, every worker
+    /// over the overload thresholds: the veto is lifted on both pools, and the
+    /// split still holds. The pair never spans two groups (the decode follows
+    /// the prefill's), and a canary at weight 0 takes nothing, lifted or not.
+    #[test]
+    fn a_pool_placed_with_the_veto_lifted_is_still_split_and_its_pair_shares_a_group() {
+        let grouped = |canary_weight: &str| {
+            let registry = WorkerRegistry::new();
+            for (url, worker_type, group, weight) in [
+                ("grpc://ps:1", WorkerType::Prefill, "stable", "90"),
+                ("grpc://ps:2", WorkerType::Prefill, "stable", "90"),
+                ("grpc://pc:1", WorkerType::Prefill, "canary", canary_weight),
+                ("grpc://ds:1", WorkerType::Decode, "stable", "90"),
+                ("grpc://ds:2", WorkerType::Decode, "stable", "90"),
+                ("grpc://dc:1", WorkerType::Decode, "canary", canary_weight),
+            ] {
+                registry
+                    .register(Arc::new(
+                        BasicWorkerBuilder::new(url)
+                            .model(ModelCard::new(MODEL))
+                            .worker_type(worker_type)
+                            .connection_mode(ConnectionMode::Grpc)
+                            .runtime_type(RuntimeType::Vllm)
+                            .label("traffic_group", group)
+                            .label("traffic_weight", weight)
+                            .health_config(HealthCheckConfig {
+                                disable_health_check: true,
+                                ..Default::default()
+                            })
+                            .build(),
+                    ))
+                    .expect("worker registers");
+            }
+            for worker in registry.get_all() {
+                registry.set_worker_overloaded(&worker, true);
+            }
+            registry
+        };
+        let policies = cohort_policies().with_traffic_split(true);
+        let registry = grouped("10");
+        let pairs = pairs_of(&registry, &policies);
+        let mut canary = 0;
+        for _ in 0..100 {
+            let pair = select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                &pairs,
+                None,
+                true,
+                None,
+                PlacementInputs::default(),
+            )
+            .expect("a pair");
+            let prefill = traffic_split::group_of(pair.prefill.as_ref());
+            assert_eq!(
+                prefill,
+                traffic_split::group_of(pair.decode.as_ref()),
+                "a lifted pair spans two groups"
+            );
+            if prefill == "canary" {
+                canary += 1;
+            }
+        }
+        assert!(canary <= 25, "the canary took {canary} of 100 at weight 10");
+        // The canary drained: nothing lands on it, lifted or not.
+        let registry = grouped("0");
+        let pairs = pairs_of(&registry, &policies);
+        for _ in 0..50 {
+            let pair = select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                &pairs,
+                None,
+                true,
+                None,
+                PlacementInputs::default(),
+            )
+            .expect("a pair");
+            assert_eq!(traffic_split::group_of(pair.prefill.as_ref()), "stable");
+            assert_eq!(traffic_split::group_of(pair.decode.as_ref()), "stable");
+        }
+    }
+
+    /// A worker of a labelled PD fleet: its URL, its role and its traffic
+    /// group and weight (`None` leaves it in the default group, unlabelled).
+    type LabelledWorker<'a> = (&'a str, WorkerType, Option<(&'a str, &'a str)>);
+
+    /// A vLLM gRPC PD fleet whose workers carry the given traffic group and
+    /// weight (`None` leaves a worker in the default group, unlabelled).
+    fn labelled_pd_registry(workers: &[LabelledWorker<'_>]) -> WorkerRegistry {
+        let registry = WorkerRegistry::new();
+        for (url, worker_type, group) in workers {
+            let mut builder = BasicWorkerBuilder::new(*url)
+                .model(ModelCard::new(MODEL))
+                .worker_type(*worker_type)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::Vllm)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                });
+            if let Some((group, weight)) = group {
+                builder = builder
+                    .label("traffic_group", *group)
+                    .label("traffic_weight", *weight);
+            }
+            registry
+                .register(Arc::new(builder.build()))
+                .expect("worker registers");
+        }
+        registry
+    }
+
+    /// The groups on one pool only under `--traffic-split`, every worker
+    /// over the thresholds: the side that carries them is confined to its
+    /// arm and the other side pairs with it unconfined, so a canary on the
+    /// prefill pool alone, or on the decode pool alone, keeps its share of
+    /// the steered pairs where the fallback would otherwise decline them.
+    #[test]
+    fn a_lifted_pair_follows_the_groups_of_the_pool_that_carries_them() {
+        let policies = cohort_policies().with_traffic_split(true);
+        // A canary on the prefill pool alone, the decode pool unlabelled.
+        let registry = labelled_pd_registry(&[
+            ("grpc://ps:1", WorkerType::Prefill, Some(("stable", "90"))),
+            ("grpc://pc:1", WorkerType::Prefill, Some(("canary", "10"))),
+            ("grpc://d:1", WorkerType::Decode, None),
+        ]);
+        for worker in registry.get_all() {
+            registry.set_worker_overloaded(&worker, true);
+        }
+        let pairs = pairs_of(&registry, &policies);
+        let mut canary = 0;
+        for _ in 0..100 {
+            let pair = select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                &pairs,
+                None,
+                true,
+                None,
+                PlacementInputs::default(),
+            )
+            .expect("a pair beside an unlabelled decode pool");
+            assert_eq!(pair.decode.url(), "grpc://d:1");
+            if traffic_split::group_of(pair.prefill.as_ref()) == "canary" {
+                canary += 1;
+            }
+        }
+        assert!(
+            (1..=25).contains(&canary),
+            "the prefill canary took {canary} of 100 at weight 10"
+        );
+        // Two named groups on the decode pool alone, the prefill pool
+        // unlabelled: the decode side draws its own arm.
+        let registry = labelled_pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, None),
+            ("grpc://ds:1", WorkerType::Decode, Some(("stable", "90"))),
+            ("grpc://dc:1", WorkerType::Decode, Some(("canary", "10"))),
+        ]);
+        for worker in registry.get_all() {
+            registry.set_worker_overloaded(&worker, true);
+        }
+        let pairs = pairs_of(&registry, &policies);
+        let mut canary = 0;
+        for _ in 0..100 {
+            let pair = select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                &pairs,
+                None,
+                true,
+                None,
+                PlacementInputs::default(),
+            )
+            .expect("a pair beside an unlabelled prefill pool");
+            assert_eq!(pair.prefill.url(), "grpc://p:1");
+            if traffic_split::group_of(pair.decode.as_ref()) == "canary" {
+                canary += 1;
+            }
+        }
+        assert!(
+            (1..=25).contains(&canary),
+            "the decode canary took {canary} of 100 at weight 10"
+        );
+    }
+
+    /// A prefill pool of one named group over the thresholds beside a decode
+    /// pool under them that carries a drained canary: the decode side
+    /// follows the prefill pool's group, as under the policies, so the
+    /// drained canary takes no steered pair for being the least loaded.
+    #[test]
+    fn a_lifted_prefill_pool_of_one_named_group_steers_its_decode_clear_of_a_drained_canary() {
+        let policies = cohort_policies().with_traffic_split(true);
+        let registry = labelled_pd_registry(&[
+            ("grpc://ps:1", WorkerType::Prefill, Some(("stable", "90"))),
+            ("grpc://ps:2", WorkerType::Prefill, Some(("stable", "90"))),
+            ("grpc://ds:1", WorkerType::Decode, Some(("stable", "90"))),
+            ("grpc://dc:1", WorkerType::Decode, Some(("canary", "0"))),
+        ]);
+        for worker in registry.get_all() {
+            if *worker.worker_type() == WorkerType::Prefill {
+                registry.set_worker_overloaded(&worker, true);
+            }
+        }
+        let pairs = pairs_of(&registry, &policies);
+        for _ in 0..50 {
+            let pair = select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                &pairs,
+                None,
+                true,
+                None,
+                PlacementInputs::default(),
+            )
+            .expect("a pair");
+            assert_eq!(traffic_split::group_of(pair.prefill.as_ref()), "stable");
+            assert_eq!(
+                pair.decode.url(),
+                "grpc://ds:1",
+                "the drained decode canary took a steered pair"
+            );
+        }
+    }
+
+    /// The prefills under the thresholds and every decode over them, the
+    /// groups on one pool only under `--traffic-split`: the decode pool is
+    /// paired by load, and that pick is confined as the policies confine a
+    /// side, so a prefill-only canary pairs with the unlabelled decode, a
+    /// decode-only canary keeps its share, and a drained decode canary takes
+    /// nothing.
+    #[test]
+    fn a_lifted_decode_pool_follows_the_groups_of_the_pool_that_carries_them() {
+        let policies = cohort_policies().with_traffic_split(true);
+        let lift_decodes = |registry: &WorkerRegistry| {
+            for worker in registry.get_all() {
+                if *worker.worker_type() == WorkerType::Decode {
+                    registry.set_worker_overloaded(&worker, true);
+                }
+            }
+        };
+        let steered = |registry: &WorkerRegistry, draws: usize| -> Vec<Pair> {
+            let pairs = pairs_of(registry, &policies);
+            (0..draws)
+                .map(|_| {
+                    select_pair(
+                        registry,
+                        &policies,
+                        MODEL,
+                        &pairs,
+                        None,
+                        true,
+                        None,
+                        PlacementInputs::default(),
+                    )
+                    .expect("a pair")
+                })
+                .collect()
+        };
+        // A canary on the prefill pool alone, the decode pool unlabelled.
+        let registry = labelled_pd_registry(&[
+            ("grpc://ps:1", WorkerType::Prefill, Some(("stable", "90"))),
+            ("grpc://pc:1", WorkerType::Prefill, Some(("canary", "10"))),
+            ("grpc://d:1", WorkerType::Decode, None),
+        ]);
+        lift_decodes(&registry);
+        let pairs = steered(&registry, 100);
+        assert!(pairs.iter().all(|pair| pair.decode.url() == "grpc://d:1"));
+        let canary = pairs
+            .iter()
+            .filter(|pair| traffic_split::group_of(pair.prefill.as_ref()) == "canary")
+            .count();
+        assert!(
+            (1..=25).contains(&canary),
+            "the prefill canary took {canary} of 100 at weight 10"
+        );
+        // Two named groups on the decode pool alone, the prefill pool
+        // unlabelled: the decode side draws its own arm.
+        let registry = labelled_pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, None),
+            ("grpc://ds:1", WorkerType::Decode, Some(("stable", "90"))),
+            ("grpc://dc:1", WorkerType::Decode, Some(("canary", "10"))),
+        ]);
+        lift_decodes(&registry);
+        let canary = steered(&registry, 100)
+            .iter()
+            .filter(|pair| traffic_split::group_of(pair.decode.as_ref()) == "canary")
+            .count();
+        assert!(
+            (1..=25).contains(&canary),
+            "the decode canary took {canary} of 100 at weight 10"
+        );
+        // The decode canary drained: the least-loaded pick never lands on it.
+        let registry = labelled_pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, None),
+            ("grpc://ds:1", WorkerType::Decode, Some(("stable", "90"))),
+            ("grpc://dc:1", WorkerType::Decode, Some(("canary", "0"))),
+        ]);
+        lift_decodes(&registry);
+        assert!(
+            steered(&registry, 50)
+                .iter()
+                .all(|pair| pair.decode.url() == "grpc://ds:1"),
+            "the drained decode canary took a fallback pair"
+        );
+        // Partners whose groups all weigh 0: declined, not served from the
+        // drained build.
+        let registry = labelled_pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, None),
+            ("grpc://dc:1", WorkerType::Decode, Some(("canary", "0"))),
+        ]);
+        lift_decodes(&registry);
+        let pairs = pairs_of(&registry, &policies);
+        match select_pair(
+            &registry,
+            &policies,
+            MODEL,
+            &pairs,
+            None,
+            true,
+            None,
+            PlacementInputs::default(),
+        ) {
+            Ok(pair) => panic!(
+                "a drained decode pool served {} / {}",
+                pair.prefill.url(),
+                pair.decode.url()
+            ),
+            Err(failure) => {
+                assert_eq!(failure.role, WorkerRole::Decode);
+                assert!(
+                    matches!(failure.verdict, PlacementFailure::PolicyDeclined(_)),
+                    "{:?}",
+                    failure.verdict
+                );
+            }
+        }
     }
 
     /// One prefill worker over the thresholds beside one under them, as the

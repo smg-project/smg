@@ -27,6 +27,7 @@ mod registry;
 mod round_robin;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod traffic_split;
 pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;

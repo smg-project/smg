@@ -642,6 +642,9 @@ class RouterArgs:
     tokenizer_cache_l1_max_memory: int = 50 * 1024 * 1024  # 50MB
     tokenizer_path: str | None = None
     tool_call_parser: str | None = None
+    # Weighted traffic split across worker groups (traffic_group / traffic_weight
+    # labels), run before the policy
+    traffic_split: bool = False
     # Tenant resolution: trust an upstream tenant header (tenant_header_name names it)
     trust_tenant_header: bool = False
     upstream_http2: bool = False
@@ -1460,6 +1463,21 @@ class RouterArgs:
                 "Sticky sessions: route every request of a conversation to the"
                 " same worker, on any policy (valid routing-key headers take"
                 " priority, falling back to the request-id lineage)"
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}traffic-split",
+            action="store_true",
+            help=(
+                "Weighted traffic split across worker groups: a worker's"
+                " traffic_group label names its group (default for workers"
+                " without one) and its traffic_weight label the group's weight"
+                " (the default group weighs 100 without one; a named group"
+                " weighs what its workers carry). A request with two or more groups among"
+                " its candidates picks one by weight, by its routing key when"
+                " it has one, then the policy selects inside it. Weights are"
+                " labels: a ramp is a PATCH /workers/{id}, a weight of 0"
+                " drains a group. Off by default."
             ),
         )
         routing_group.add_argument(
