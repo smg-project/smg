@@ -201,3 +201,68 @@ async fn test_v1_messages_takes_a_missing_anthropic_version_and_refuses_a_malfor
 
     ctx.shutdown().await;
 }
+
+/// A `top_p` of 0.0 or a `top_k` of 0 is refused with a 400 in the Messages
+/// error envelope that names the bound, before anything is routed: the
+/// engines' wires cannot tell either zero from a field the client left out.
+/// A request inside the bounds (`top_p: 1.0, top_k: 1`) is served.
+#[tokio::test]
+async fn test_v1_messages_refuses_a_nucleus_of_nothing_and_a_top_k_of_zero_before_routing() {
+    let ctx = AppTestContext::new(vec![MockWorkerConfig {
+        port: 18305,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    }])
+    .await;
+
+    let app = ctx.create_app();
+
+    for (sampling, expected, message) in [
+        (
+            json!({"top_p": 0.0}),
+            StatusCode::BAD_REQUEST,
+            "top_p: range: (0, 1]",
+        ),
+        (
+            json!({"top_k": 0}),
+            StatusCode::BAD_REQUEST,
+            "top_k: range: 1..2147483647",
+        ),
+        (json!({"top_p": 1.0, "top_k": 1}), StatusCode::OK, ""),
+    ] {
+        let mut payload = json!({
+            "model": "mock-model",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "Hello!"}]
+        });
+        for (field, value) in sampling.as_object().unwrap() {
+            payload[field] = value.clone();
+        }
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(CONTENT_TYPE, "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), expected, "{sampling}");
+        if expected == StatusCode::BAD_REQUEST {
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body_json["type"], "error", "{sampling}");
+            assert_eq!(
+                body_json["error"]["type"], "invalid_request_error",
+                "{sampling}"
+            );
+            let text = body_json["error"]["message"].as_str().unwrap_or_default();
+            assert!(text.contains(message), "{sampling}: {text}");
+        }
+    }
+
+    ctx.shutdown().await;
+}
