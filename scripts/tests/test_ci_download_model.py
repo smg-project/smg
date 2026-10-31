@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import select
+import signal
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -110,3 +114,137 @@ def test_failed_download_still_tries_three_times_with_original_delay(tmp_path):
     calls = [json.loads(line) for line in (tmp_path / "downloads").read_text().splitlines()]
     assert calls == [["download", MODEL, "--quiet"]] * 3
     assert "flock -w 1800 200" in SCRIPT.read_text()
+
+
+def test_readable_download_lock_serializes_without_write_access():
+    # A root-capable fixture additionally exercises a genuinely different UID.
+    # Unprivileged CI exercises the same denied-write/read-only-FD path.
+    with tempfile.TemporaryDirectory(prefix="smg-download-lock-") as directory:
+        root = Path(directory)
+        root.chmod(0o777)
+        script = root / "ci_download_model.sh"
+        script.write_bytes(SCRIPT.read_bytes())
+        script.chmod(0o755)
+        lock = root / "cache/.locks/test-org_test-model.lock"
+        lock.parent.mkdir(parents=True)
+        (root / "cache").chmod(0o755)
+        lock.parent.chmod(0o755)
+        for directory_name in ("cache/hub", "xet"):
+            directory_path = root / directory_name
+            directory_path.mkdir()
+            directory_path.chmod(0o755)
+        lock.write_bytes(b"existing shared lock\n")
+        lock.chmod(0o444)
+        original = lock.stat()
+        target_uid = 995 if os.geteuid() == 0 else os.geteuid()
+        marker = root / "download-observation.json"
+        tools = root / "tools"
+        tools.mkdir()
+        tools.chmod(0o755)
+        (tools / "hf").write_text(
+            f"#!{sys.executable}\n"
+            "import fcntl, json, os\n"
+            "from pathlib import Path\n"
+            "lock = Path(os.environ['TEST_LOCK'])\n"
+            "held, named = os.fstat(200), lock.stat()\n"
+            "assert (held.st_dev, held.st_ino) == (named.st_dev, named.st_ino)\n"
+            "assert fcntl.fcntl(200, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY\n"
+            "other = os.open(lock, os.O_RDONLY)\n"
+            "try:\n"
+            "    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "except BlockingIOError:\n"
+            "    pass\n"
+            "else:\n"
+            "    raise AssertionError('independent opener acquired held lock')\n"
+            "finally:\n"
+            "    os.close(other)\n"
+            "observation = {'uid': os.geteuid(), 'writable': os.access(lock, os.W_OK),\n"
+            "               'dev': held.st_dev, 'ino': held.st_ino,\n"
+            "               'independent_opener_blocked': True}\n"
+            "marker = Path(os.environ['TEST_MARKER'])\n"
+            "marker.write_text(json.dumps(observation))\n"
+            "marker.chmod(0o644)\n"
+        )
+        (tools / "hf").chmod(0o755)
+
+        def enter_fixture_process_group():
+            # Keep the caller's SID so its session-wide cleanup sees this group.
+            os.setpgid(0, 0)
+            if os.geteuid() == 0:
+                os.setgroups([])
+                os.setgid(995)
+                os.setuid(target_uid)
+
+        proc = None
+        with lock.open("rb") as owner:
+            fcntl.flock(owner, fcntl.LOCK_EX)
+            try:
+                proc = subprocess.Popen(
+                    ["timeout", "--kill-after=1s", "8s", "bash", str(script), MODEL],
+                    env={
+                        **os.environ,
+                        "PATH": f"{tools}:{os.environ['PATH']}",
+                        "HF_HOME": str(root / "cache"),
+                        "HF_XET_CACHE": str(root / "xet"),
+                        "TEST_LOCK": str(lock),
+                        "TEST_MARKER": str(marker),
+                    },
+                    preexec_fn=enter_fixture_process_group,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    bufsize=0,
+                )
+                deadline = time.monotonic() + 3
+                output = []
+                while not any(b"Using existing read-only lock" in line for line in output):
+                    remaining = deadline - time.monotonic()
+                    assert remaining > 0
+                    assert select.select([proc.stdout], [], [], remaining)[0]
+                    line = proc.stdout.readline()
+                    assert line
+                    output.append(line)
+                assert proc.poll() is None
+                assert not marker.exists(), "downloader entered while another opener held the lock"
+                fcntl.flock(owner, fcntl.LOCK_UN)
+                stdout, stderr = proc.communicate(timeout=10)
+                assert proc.returncode == 0, (b"".join(output) + stdout + stderr).decode()
+                observation = json.loads(marker.read_text())
+                assert observation == {
+                    "uid": target_uid,
+                    "writable": False,
+                    "dev": original.st_dev,
+                    "ino": original.st_ino,
+                    "independent_opener_blocked": True,
+                }
+                if os.geteuid() == 0:
+                    assert original.st_uid != target_uid
+                current = lock.stat()
+                assert (
+                    current.st_dev,
+                    current.st_ino,
+                    current.st_uid,
+                    current.st_gid,
+                    current.st_mode,
+                ) == (
+                    original.st_dev,
+                    original.st_ino,
+                    original.st_uid,
+                    original.st_gid,
+                    original.st_mode,
+                )
+                assert lock.read_bytes() == b"existing shared lock\n"
+                fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                print(
+                    json.dumps(
+                        {
+                            **observation,
+                            "cross_uid": original.st_uid != target_uid,
+                            "parent_holder_blocked": True,
+                            "postclose_reacquired": True,
+                        }
+                    )
+                )
+            finally:
+                if proc is not None and proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.wait(timeout=2)
