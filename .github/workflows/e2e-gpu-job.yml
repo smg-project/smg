@@ -54,6 +54,11 @@ on:
         type: boolean
         default: false
         description: "Set up Oracle DB and Brave MCP for agentic tests"
+      provider_api_keys:
+        required: false
+        type: boolean
+        default: false
+        description: "Export provider API keys for mixed local/external worker tests"
       vllm_kv_backend:
         required: false
         type: string
@@ -261,8 +266,8 @@ jobs:
       - name: Run E2E tests
         timeout-minutes: ${{ inputs.test_timeout }}
         env:
-          OPENAI_API_KEY: ${{ inputs.engine == 'sglang' && inputs.gpu_tier == '4' && inputs.test_dirs == 'e2e_test/router' && inputs.test_filter == '-k TestIGWMixedWorkerClassification' && secrets.OPENAI_API_KEY || '' }}
-          XAI_API_KEY: ${{ inputs.engine == 'sglang' && inputs.gpu_tier == '4' && inputs.test_dirs == 'e2e_test/router' && inputs.test_filter == '-k TestIGWMixedWorkerClassification' && secrets.XAI_API_KEY || '' }}
+          OPENAI_API_KEY: ${{ inputs.provider_api_keys && secrets.OPENAI_API_KEY || '' }}
+          XAI_API_KEY: ${{ inputs.provider_api_keys && secrets.XAI_API_KEY || '' }}
           SHOW_WORKER_LOGS: "0"
           SHOW_ROUTER_LOGS: "1"
           E2E_LOG_DIR: e2e-logs
