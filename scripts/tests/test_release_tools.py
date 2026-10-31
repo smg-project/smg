@@ -993,6 +993,74 @@ def test_bump_main_after_a_patch_of_an_older_line_keeps_mains_higher_version(rep
         assert repo.version_of(path) == "1.16.0-rc.1", path
 
 
+def test_a_patch_of_the_older_line_steps_past_the_version_the_newer_line_published(
+    repo: Sandbox,
+) -> None:
+    """Two live lines share tool-parser's versions. 1.15's candidate ships the crate at 0.6.1 (two
+    fixes on main since v1.14.0); one fix picked into release/1.14 afterwards is bumped against
+    that line's own tag, where the crate reads 0.6.0. The plain patch, 0.6.1, is on crates.io
+    from the candidate: the bump steps past it to 0.6.2 and says so. Then release-bump-main for
+    the patch moves main's tool-parser to 0.6.2, a version published with the other line's
+    code; the next cut, which finds no change since v1.15.0, bumps it past that too (0.6.3),
+    so the 1.16 line never ships main's code under the 1.14 line's number."""
+    repo.cut()  # 1.14.0-rc.1: tool-parser 0.6.0 for the feat on main since v1.13.0
+    repo.tool("tag", "1.14.0-rc.1", PUSH="1")
+    repo.tool("bump", "1.14.0")
+    repo.land_on_release()
+    repo.tool("tag", "1.14.0", PUSH="1")
+    repo.tool("bump-main", "1.14.0")
+    repo.git("push", "--quiet", "origin", "HEAD:refs/heads/main")
+    fix = repo.commit_main(
+        "fix(tool_parser): one (#130)",
+        "crates/tool_parser/src/lib.rs",
+        "pub fn parse() {}\npub fn more() {}\npub fn one() {}\n",
+    )
+    repo.commit_main(
+        "fix(tool_parser): three (#131)",
+        "crates/tool_parser/src/lib.rs",
+        "pub fn parse() {}\npub fn more() {}\npub fn one() {}\npub fn three() {}\n",
+    )
+    repo.cut("1.15.0-rc.1")
+    assert repo.version_of("crates/tool_parser/Cargo.toml") == "0.6.1", "the fixes since v1.14.0"
+    repo.tool("tag", "1.15.0-rc.1", PUSH="1")
+    repo.tool("pick", "1.14", fix)
+    repo.land_on_release("1.14")
+    bumped = repo.tool("bump", "1.14.1")
+    assert repo.version_of("crates/tool_parser/Cargo.toml") == "0.6.2"
+    assert 'tool-parser = { version = "0.6.2"' in repo.read("Cargo.toml")
+    assert (
+        "tool-parser v0.6.0 → v0.6.2 (crates/tool_parser/Cargo.toml; v0.6.1 is v1.15.0-rc.1's)"
+        in (bumped.stdout)
+    )
+    for path in VERSION_FILES:
+        assert repo.version_of(path) == "1.14.1", path
+    repo.land_on_release("1.14")
+    tagged = repo.tool("tag", "1.14.1", PUSH="1")
+    assert "against v1.14.0" in tagged.stderr, "the line's own newest tag"
+    assert repo.version_of("crates/tool_parser/Cargo.toml", "v1.14.1") == "0.6.2"
+    # main follows the patch: tool-parser 0.6.2 there, with main's code (the 1.15 line's)
+    repo.tool("bump-main", "1.14.1")
+    repo.git("push", "--quiet", "origin", "HEAD:refs/heads/main")
+    assert repo.version_of("crates/tool_parser/Cargo.toml", "origin/main") == "0.6.2"
+    repo.tool("bump", "1.15.0")
+    repo.land_on_release("1.15")
+    repo.tool("tag", "1.15.0", PUSH="1")
+    assert repo.version_of("crates/tool_parser/Cargo.toml", "v1.15.0") == "0.6.1"
+    repo.tool("bump-main", "1.15.0")
+    repo.git("push", "--quiet", "origin", "HEAD:refs/heads/main")
+    assert repo.version_of("crates/tool_parser/Cargo.toml", "origin/main") == "0.6.2", (
+        "the sync never lowers a version main already carries"
+    )
+    # the next cut: nothing of tool-parser changed since v1.15.0, but 0.6.2 is v1.14.1's, other code
+    cut = repo.tool("cut", "1.16.0-rc.1", PUSH="1")
+    assert (
+        "tool-parser (crates/tool_parser/) — 1 file(s) changed but version not bumped (v0.6.2, v1.14.1's) [patch]"
+        in (cut.stdout)
+    )
+    assert repo.version_of("crates/tool_parser/Cargo.toml") == "0.6.3"
+    assert 'tool-parser = { version = "0.6.3"' in repo.read("Cargo.toml")
+
+
 def grpc_detect(
     tmp_path: Path, pypi: str, packages: str = "auto", ref_type: str = "tag"
 ) -> tuple[subprocess.CompletedProcess[str], Path]:

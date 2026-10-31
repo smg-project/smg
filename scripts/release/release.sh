@@ -219,8 +219,9 @@ cmd_cut() {
   remote_has_branch "$branch" && die "$branch exists on $REMOTE: a new candidate on it is 'release.sh bump $version'"
   since=$(since_tag "$from_sha" "$version")
   # The previous release's final is the right tag only once main carries that release's versions: a cut before the
-  # release-bump-main pull request merged (or from an older commit) would read a crate bumped for that release as
-  # bumped already, leave main's lower version, and ship nothing for it while every check passes.
+  # release-bump-main pull request merged (or from an older commit) would start from versions below the release
+  # that is out (the checker steps a changed crate past the exact versions release tags carry, not above them;
+  # the gateway's files would still read below it).
   if ! git merge-base --is-ancestor "$since" "$from_sha" && version_above "${since#v}" "$(manifest_version "$from_sha")"; then
     die "$from reads $(manifest_version "$from_sha"), below ${since#v}: merge the release-bump-main pull request for $since first (release.sh bump-main ${since#v}), or cut from a commit after it"
   fi

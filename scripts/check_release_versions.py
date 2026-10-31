@@ -3,10 +3,12 @@
 
 For every component (a workspace crate or a Python package), since the given tag:
 whether its files changed, whether its version was bumped, and, for a crate, whether
-the workspace root's dependency entry agrees. Then the files that must mirror the
-gateway's version. Issues are listed with the bump conventional commits ask for
-(``feat!:`` or ``BREAKING CHANGE``: major; ``feat:``: minor; otherwise patch) and,
-on request, applied.
+the workspace root's dependency entry agrees. A version is bumped when no release tag
+``v<x.y.z>`` (the given tag, or one another release line made) carries it with other
+code: the registries take a version once. Then the files that must mirror the gateway's
+version. Issues are listed with the bump conventional commits ask for (``feat!:`` or
+``BREAKING CHANGE``: major; ``feat:``: minor; otherwise patch), stepped past the
+versions release tags carry, and, on request, applied.
 
 Usage:
     check_release_versions.py [tag] [--check | --fix]
@@ -29,7 +31,7 @@ import re
 import subprocess
 import sys
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # --- what is checked ----------------------------------------------------------
@@ -116,6 +118,7 @@ class Fatal(Exception):
 # --- version lines: read and rewrite ------------------------------------------
 
 SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
+RELEASE_VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+))?$")
 TOML_VERSION = re.compile(r'^version\s*=\s*"([^"]*)"', re.M)
 TOML_WORKSPACE_VERSION = re.compile(
     r"^version\.workspace\s*=\s*true|^version\s*=\s*\{\s*workspace\s*=\s*true", re.M
@@ -124,6 +127,15 @@ DUNDER_VERSION = re.compile(r'__version__\s*=\s*"([^"]*)"')
 HELM_VERSION = re.compile(r'^version:\s*"?([^"\s]*)"?\s*$', re.M)
 HELM_APP_VERSION = re.compile(r"^appVersion:.*$", re.M)
 WORKFLOW_VERSION = re.compile(r"SMG_RELEASE_TAG:\s*v([0-9]\S*)")
+
+
+def version_key(version: str) -> tuple[int, int, int, int, int] | None:
+    """A sort key for ``X.Y.Z`` and ``X.Y.Z-rc.N`` (a candidate below its final); None otherwise."""
+    match = RELEASE_VERSION.match(version)
+    if not match:
+        return None
+    major, minor, patch, candidate = match.groups()
+    return (int(major), int(minor), int(patch), 0 if candidate else 1, int(candidate or 0))
 
 
 def version_kind(file: str) -> str:
@@ -280,6 +292,36 @@ class Repo:
         result = self._run("show", f"{ref}:{path}")
         return result.stdout if result.returncode == 0 else None
 
+    def release_tags(self) -> list[str]:
+        """Every release tag (``v<x.y.z>`` or ``v<x.y.z>-rc.<n>``), whichever line made it; a tag
+        of another shape (``v1.14.0-qa``) published nothing and is not one."""
+        tags = self.git("tag", "--list", "v[0-9]*").split()
+        return [tag for tag in tags if version_key(tag[1:]) is not None]
+
+    def texts_at(self, wanted: Sequence[tuple[str, str]]) -> dict[tuple[str, str], str]:
+        """The text of each (ref, path) that exists, read in one ``cat-file --batch`` call."""
+        out = subprocess.run(
+            ["git", "cat-file", "--batch"],
+            cwd=self.root,
+            env=self.env,
+            check=True,
+            input="".join(f"{ref}:{path}\n" for ref, path in wanted).encode(),
+            capture_output=True,
+        ).stdout
+        texts: dict[tuple[str, str], str] = {}
+        position = 0
+        # one answer per request, in order: "<sha> blob <size>\n<text>\n", or "<request> missing"
+        for ref_path in wanted:
+            end = out.index(b"\n", position)
+            header = out[position:end].decode("utf-8")
+            position = end + 1
+            if header.endswith((" missing", " ambiguous")):
+                continue
+            size = int(header.rsplit(" ", 1)[1])
+            texts[ref_path] = out[position : position + size].decode("utf-8")
+            position += size + 1
+        return texts
+
     def changed_since(self, tag: str, paths: Sequence[str]) -> list[str]:
         """``git diff --name-status`` lines since the tag, renames detected."""
         return self.git("diff", "--name-status", "-M", f"{tag}..HEAD", "--", *paths).splitlines()
@@ -308,15 +350,14 @@ class Repo:
 @dataclass
 class Verdict:
     component: Component
-    files_changed: int  # 0 = nothing to check
+    files_changed: int  # against the tag the verdict is judged by; 0 = nothing to check
     version: str = ""
     tag_version: str | None = None  # None = not at the tag: a new component
+    tagged: dict[str, str] = field(default_factory=dict)  # version -> the release tag carrying it
+    carried_by: str | None = None  # the release tag, not the given one, that carries the version
+    unbumped: bool = False  # the version is a release tag's, carried there with other code
     level: str | None = None  # the bump asked for when the version was not bumped
     workspace_version: str | None = None  # the root's entry when it disagrees
-
-    @property
-    def unbumped(self) -> bool:
-        return self.tag_version is not None and self.tag_version == self.version
 
 
 def version_file_has_other_changes(repo: Repo, tag: str, file: str) -> bool:
@@ -348,17 +389,61 @@ def files_changed(repo: Repo, tag: str, component: Component) -> int:
     return count
 
 
-def check(repo: Repo, tag: str, component: Component, root_toml: str) -> Verdict:
-    verdict = Verdict(component, files_changed(repo, tag, component))
-    if verdict.files_changed == 0:
-        return verdict
-    kind = version_kind(component.version_file) if component.kind == "package" else "cargo"
+def manifest_kind(component: Component) -> str:
+    return version_kind(component.version_file) if component.kind == "package" else "cargo"
+
+
+def tagged_versions(repo: Repo, components: Sequence[Component]) -> dict[str, dict[str, str]]:
+    """Per component name, {version: release tag} over every release tag that carries it (the
+    newest tag for a version several carry), read in one git call; a tag whose copy has no
+    readable version is skipped."""
+    tags = sorted(repo.release_tags(), key=lambda tag: version_key(tag[1:]) or (-1, 0, 0, 0, 0))
+    wanted = [
+        (tag, path) for c in components for tag in tags for path in with_legacy(c.version_file)
+    ]
+    texts = repo.texts_at(wanted)
+    table: dict[str, dict[str, str]] = {}
+    for component in components:
+        found: dict[str, str] = {}
+        for tag in tags:
+            for path in with_legacy(component.version_file):
+                text = texts.get((tag, path))
+                if text is None:
+                    continue
+                try:
+                    found[tag] = read_version(manifest_kind(component), text, f"{path} at {tag}")
+                except Fatal:
+                    pass
+                break
+        table[component.name] = {found[tag]: tag for tag in tags if tag in found}
+    return table
+
+
+def check(
+    repo: Repo, tag: str, component: Component, root_toml: str, tagged: dict[str, str]
+) -> Verdict:
+    verdict = Verdict(component, files_changed(repo, tag, component), tagged=tagged)
+    if not (repo.root / component.version_file).is_file():
+        if verdict.files_changed:  # its files went since the tag: the table still names it
+            raise Fatal(f"{component.version_file} is gone: drop {component.name} from the table.")
+        return verdict  # a table entry this tree never had
+    kind = manifest_kind(component)
     verdict.version = read_version(kind, repo.read(component.version_file), component.version_file)
     for path in with_legacy(component.version_file):
         text = repo.show(tag, path)
         if text is not None:
             verdict.tag_version = read_version(kind, text, f"{path} at {tag}")
             break
+    # The release tag whose copy of the component carries HEAD's version: the given tag, or one
+    # another line made (a patch of an older line synced to main, a cut before that patch). The
+    # version is bumped only when no tag carries it, or the carrier's code is this code already.
+    carrier = tag if verdict.version == verdict.tag_version else tagged.get(verdict.version)
+    if carrier is not None and carrier != tag:
+        verdict.carried_by = carrier
+        verdict.files_changed = files_changed(repo, carrier, component)
+    if verdict.files_changed == 0:
+        return verdict
+    verdict.unbumped = carrier is not None
     if verdict.unbumped:
         verdict.level = bump_level(
             repo.commits_since(tag, [f"{p}/" for p in with_legacy(component.path)])
@@ -416,22 +501,32 @@ class Plan:
             + len(self.mirrors)
         )
 
-    def new_version(self, verdict: Verdict) -> str:
+    def proposal(self, verdict: Verdict) -> tuple[str, list[str]]:
+        """The version to write, and the versions stepped past because a release tag carries them."""
         if self.override and verdict.component.name == GATEWAY:
-            return self.override
-        return bumped(verdict.version, verdict.level or "patch")
+            return self.override, []
+        new, stepped = bumped(verdict.version, verdict.level or "patch"), []
+        while new in verdict.tagged:
+            stepped.append(f"v{new} is {verdict.tagged[new]}'s")
+            new = bumped(new, "patch")
+        return new, stepped
+
+    def new_version(self, verdict: Verdict) -> str:
+        return self.proposal(verdict)[0]
 
 
 def report(verdict: Verdict, out: Out) -> None:
     c, name = verdict.component, out.paint("bold", verdict.component.name)
     where, n = f"({c.path}/)", f"{verdict.files_changed} file(s) changed"
     ok, warn, bad = out.paint("green", "✓"), out.paint("yellow", "!"), out.paint("red", "✗")
-    if verdict.tag_version is None:
-        out.line(f"  {ok} {name} {where} — new {c.kind} (v{verdict.version}), {n}")
-    elif verdict.unbumped:
+    if verdict.unbumped:
+        carried = f", {verdict.carried_by}'s" if verdict.carried_by else ""
         out.line(
-            f"  {warn} {name} {where} — {n} but version not bumped (v{verdict.version}) [{out.level(verdict.level)}]"
+            f"  {warn} {name} {where} — {n} but version not bumped (v{verdict.version}{carried})"
+            f" [{out.level(verdict.level)}]"
         )
+    elif verdict.tag_version is None:
+        out.line(f"  {ok} {name} {where} — new {c.kind} (v{verdict.version}), {n}")
     else:
         out.line(f"  {ok} {name} {where} — v{verdict.tag_version} → v{verdict.version} ({n})")
     if verdict.workspace_version is not None:
@@ -451,9 +546,10 @@ def examine(
 ) -> Plan:
     """Walk the components and the mirrors, printing each verdict as the shell did."""
     root_toml = repo.read("Cargo.toml")
+    tagged = tagged_versions(repo, (*crates, *packages))
     verdicts = []
     for component in (*crates, *packages):
-        verdict = check(repo, tag, component, root_toml)
+        verdict = check(repo, tag, component, root_toml, tagged.get(component.name, {}))
         verdicts.append(verdict)
         if verdict.files_changed:
             report(verdict, out)
@@ -500,11 +596,13 @@ def propose(plan: Plan, out: Out) -> None:
     for v in plan.verdicts:
         c = v.component
         if v.unbumped and c.kind == "crate":
+            new, stepped = plan.proposal(v)
+            note = f"; {', '.join(stepped)}" if stepped else ""
             out.line(
-                f"  {out.level(v.level)} {c.name} v{v.version} → v{plan.new_version(v)} ({c.version_file})"
+                f"  {out.level(v.level)} {c.name} v{v.version} → v{new} ({c.version_file}{note})"
             )
             if c.dep_key:
-                out.line(f"       sync workspace Cargo.toml {c.dep_key} → v{plan.new_version(v)}")
+                out.line(f"       sync workspace Cargo.toml {c.dep_key} → v{new}")
     for v in plan.verdicts:
         if v.workspace_version is not None:
             out.line(
@@ -513,8 +611,10 @@ def propose(plan: Plan, out: Out) -> None:
     for v in plan.verdicts:
         c = v.component
         if v.unbumped and c.kind == "package":
+            new, stepped = plan.proposal(v)
+            note = f"; {', '.join(stepped)}" if stepped else ""
             out.line(
-                f"  {out.level(v.level)} {c.name} v{v.version} → v{plan.new_version(v)} ({c.version_file})"
+                f"  {out.level(v.level)} {c.name} v{v.version} → v{new} ({c.version_file}{note})"
             )
     for mirror, carried in plan.mirrors:
         out.line(f"  {sync} {mirror.label} v{carried} → v{plan.gateway_target} ({mirror.file})")
