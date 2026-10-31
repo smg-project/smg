@@ -2172,10 +2172,15 @@ fn detect_dsv41_effort_table(dir: &Path) -> deepseek_v41::EffortTable {
 // ---------------------------------------------------------------------------
 /// Derive the V3.2 thinking mode. The native encoder bypasses
 /// `ChatTemplateState::apply`, so this is where the resolved thinking preference
-/// is consumed. An explicit `template_kwargs["thinking"]` wins; otherwise fall
-/// back to `params.thinking` (resolved from `reasoning_effort` / Anthropic
-/// `ThinkingConfig`) — same precedence as the Jinja path. Default off, matching
-/// the `ThinkingKeyName::Thinking` / `DefaultOff` contract reported here.
+/// is consumed. An explicit `template_kwargs["thinking"]` wins, then the
+/// engine's `enable_thinking` alias; otherwise fall back to `params.thinking`
+/// (resolved from `reasoning_effort` / Anthropic `ThinkingConfig`) — same
+/// precedence as the Jinja path and as the gateway's parser arming. The
+/// engine's tokenizer wrapper ORs the two keys; `thinking` wins here when both
+/// are present, as it does in the parser arming and in the V4 shim, so the
+/// prompt and the parser agree (a contradictory pair renders chat mode here
+/// where the engine would think). Default off, matching the
+/// `ThinkingKeyName::Thinking` / `DefaultOff` contract reported here.
 fn derive_thinking_mode(params: &ChatTemplateParams) -> deepseek_v32::ThinkingMode {
     if explicit_thinking(params).unwrap_or(false) {
         deepseek_v32::ThinkingMode::Thinking
@@ -2184,14 +2189,11 @@ fn derive_thinking_mode(params: &ChatTemplateParams) -> deepseek_v32::ThinkingMo
     }
 }
 
-/// Explicit thinking preference: `template_kwargs["thinking"]` wins, else
+/// Explicit thinking preference: the `thinking` kwarg, else its
+/// `enable_thinking` alias ([`explicit_thinking_kwarg`]), else
 /// `params.thinking`.
 fn explicit_thinking(params: &ChatTemplateParams) -> Option<bool> {
-    params
-        .template_kwargs
-        .and_then(|k| k.get("thinking"))
-        .and_then(serde_json::Value::as_bool)
-        .or(params.thinking)
+    explicit_thinking_kwarg(params).or(params.thinking)
 }
 
 /// Per DeepSeek's encoding README, preserve all reasoning when a system
@@ -2263,10 +2265,11 @@ fn apply_deepseek_v32(
     deepseek_v32::render_messages(msgs, thinking_mode, &encode_params)
         .map_err(|e| Error::msg(format!("DeepSeek V3.2 encode failed: {e}")))
 }
-/// V4's explicit thinking toggle: `template_kwargs["thinking"]`, else the engine's
-/// `enable_thinking` alias (the gateway reads the two keys in the same order
-/// when it arms the reasoning parser, see `renderer_capabilities`).
-fn explicit_thinking_v4(params: &ChatTemplateParams) -> Option<bool> {
+/// The V3.2 and V4 shims' explicit thinking toggle: `template_kwargs["thinking"]`,
+/// else the engine's `enable_thinking` alias (the gateway reads the two keys
+/// in the same order when it arms the reasoning parser, see
+/// `renderer_capabilities`).
+fn explicit_thinking_kwarg(params: &ChatTemplateParams) -> Option<bool> {
     let kwargs = params.template_kwargs?;
     kwargs
         .get("thinking")
@@ -2323,7 +2326,7 @@ fn apply_deepseek_v4(
         Some("low" | "minimal" | "medium") => (Some(true), Some(deepseek_v4::ReasoningEffort::Low)),
         Some(_) => (Some(true), Some(deepseek_v4::ReasoningEffort::High)),
     };
-    let thinking_on = explicit_thinking_v4(params)
+    let thinking_on = explicit_thinking_kwarg(params)
         .or(effort_mode)
         .or(params.thinking)
         .unwrap_or(true);
@@ -3365,6 +3368,54 @@ mod tests {
             derive_thinking_mode(&ChatTemplateParams {
                 thinking: Some(true),
                 template_kwargs: Some(&off),
+                ..Default::default()
+            }),
+            ThinkingMode::Chat
+        ));
+    }
+
+    /// The engine's tokenizer wrapper switches V3.2 thinking on from the
+    /// `thinking` kwarg or its `enable_thinking` alias; the shim reads the
+    /// alias too, and the alias, like the key, outranks the projected
+    /// `params.thinking`. Deliberate divergence from the engine's wrapper,
+    /// which ORs the two keys: `thinking` wins here when both are present,
+    /// the order the gateway arms the reasoning parser in (as in the V4
+    /// shim), so a contradictory pair renders chat mode here where the
+    /// engine would think, and the prompt and the parser agree. (That the
+    /// profile declares the alias is checked through the detected renderer
+    /// in the render tests.)
+    #[test]
+    fn derive_thinking_mode_reads_the_enable_thinking_alias() {
+        let alias = |value: bool| {
+            HashMap::from([(
+                "enable_thinking".to_string(),
+                serde_json::Value::Bool(value),
+            )])
+        };
+        let on = alias(true);
+        assert!(matches!(
+            derive_thinking_mode(&ChatTemplateParams {
+                template_kwargs: Some(&on),
+                ..Default::default()
+            }),
+            ThinkingMode::Thinking
+        ));
+        let off = alias(false);
+        assert!(matches!(
+            derive_thinking_mode(&ChatTemplateParams {
+                thinking: Some(true),
+                template_kwargs: Some(&off),
+                ..Default::default()
+            }),
+            ThinkingMode::Chat
+        ));
+        let both = HashMap::from([
+            ("thinking".to_string(), serde_json::Value::Bool(false)),
+            ("enable_thinking".to_string(), serde_json::Value::Bool(true)),
+        ]);
+        assert!(matches!(
+            derive_thinking_mode(&ChatTemplateParams {
+                template_kwargs: Some(&both),
                 ..Default::default()
             }),
             ThinkingMode::Chat

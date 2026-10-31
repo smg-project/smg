@@ -304,9 +304,10 @@ pub(crate) fn extract_thinking_from_kwargs(
         Some(ThinkingKeyName::EnableThinking) => {
             kwargs?.get("enable_thinking").and_then(Value::as_bool)
         }
-        // Renderers that honour vLLM's `enable_thinking` alias (DeepSeek-V4.1)
-        // read it too; `thinking` wins when both are present (the renderer
-        // rejects a disagreeing pair before anything is dispatched).
+        // Renderers that honour vLLM's `enable_thinking` alias (DeepSeek-V3.2,
+        // V4 and V4.1) read it too; `thinking` wins when both are present, the
+        // order their shims render in (V3.2 and V4 resolve a disagreeing pair
+        // silently that way; V4.1 rejects it before anything is dispatched).
         Some(ThinkingKeyName::Thinking) => {
             let kwargs = kwargs?;
             kwargs.get("thinking").and_then(Value::as_bool).or_else(|| {

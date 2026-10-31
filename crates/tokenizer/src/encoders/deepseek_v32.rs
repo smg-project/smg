@@ -17,7 +17,10 @@ use super::{
     },
     marks, RendererProfile,
 };
-use crate::chat_template::{ThinkingKeyName, ThinkingToggle};
+use crate::{
+    chat_template::{ThinkingKeyName, ThinkingToggle},
+    traits::RendererCapabilities,
+};
 
 /// Mode for thinking/reasoning rendering.
 ///
@@ -103,7 +106,13 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
     native_effort_off_values: &[],
     // `<｜Assistant｜><think>` ends the prompt when thinking is on.
     think_in_prefill: true,
-    capabilities: RendererProfile::NO_CAPABILITIES,
+    // The engine's tokenizer wrapper switches thinking on from `thinking` or
+    // its `enable_thinking` alias; the shim reads both, so the gateway arms
+    // the reasoning parser from the alias as the prompt is rendered from it.
+    capabilities: RendererCapabilities {
+        enable_thinking_alias: true,
+        ..RendererProfile::NO_CAPABILITIES
+    },
     thinking_mode: None,
 };
 
