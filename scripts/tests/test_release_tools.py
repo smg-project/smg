@@ -1142,6 +1142,25 @@ def test_make_dry_run_of_every_target(target: str, command: str) -> None:
     assert f"scripts/release/release.sh {command} " in done.stdout
 
 
+def test_make_release_plan_runs_the_checker_quietly() -> None:
+    if shutil.which("make") is None:
+        pytest.skip("make is not installed")
+    done = subprocess.run(
+        ["make", "-n", "release-plan", "TAG=v1.13.0", "VERSION=1.14.0-rc.1"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert done.returncode == 0, done.stderr
+    assert (
+        'VERSION_OVERRIDE="1.14.0-rc.1" python3 scripts/check_release_versions.py --plan v1.13.0'
+        in done.stdout
+    )
+    assert "release.sh" not in done.stdout, "the plan reads; nothing of the release tool runs"
+    help_text = subprocess.run(["make", "help"], cwd=ROOT, capture_output=True, text=True).stdout
+    assert "release-plan" in help_text
+
+
 def test_make_help_lists_every_target() -> None:
     if shutil.which("make") is None:
         pytest.skip("make is not installed")
