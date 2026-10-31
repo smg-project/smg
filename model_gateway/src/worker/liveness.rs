@@ -97,7 +97,14 @@
 //!   rate), caps how long a disaggregated prefill side may stay silent
 //!   ([`prefill_side_bound`]): a side is not part of any pile, so its
 //!   request is what fails, over to another prefill worker when one is
-//!   available. A side past its bound is
+//!   available. A sequential decode side that pulls its prompt KV from the
+//!   prefill side waits on a transfer, not a prefill, so this threshold
+//!   never judges it: its first token is bounded by the KV-transfer timeout
+//!   its decode worker declares ([`declared_kv_transfer_timeout`], the
+//!   `kv_transfer_timeout_secs` worker label), else by the request's own
+//!   timeout alone; a decode side that recomputes its prompt is bounded as
+//!   a prefill side is, on its decode worker, with the prefill time counted
+//!   once ([`decode_side_bound`]). A side past its bound is
 //!   given up on only while its worker has answered nothing within the
 //!   bound ([`prefill_side_reprieve`]): a worker that keeps answering other
 //!   sides is backed up (on the parallel dispatch shape a side's first
@@ -135,7 +142,8 @@
 //! its own state machine, and the veto is simply gone once the worker talks.
 
 use std::{
-    sync::{Arc, OnceLock},
+    collections::HashSet,
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -253,20 +261,23 @@ fn side_bound_with(
     })
 }
 
-/// How long a sequential disaggregated decode side of `prompt_tokens`
-/// dispatched now may produce nothing before its request gives up on it:
-/// the prefill side's bound for the same prompt on `prefills`, the worker
-/// whose prefill of the prompt stands before the side's first token
-/// ([`prefill_side_bound`]): the prefill worker when the side was handed its
-/// KV (the handoff moves what that prefill produced), the decode worker when
-/// it recomputes the prompt itself (no handoff: a fan-out, or a prefill that
-/// returned no transfer parameters), with that prefill's time once, not
-/// twice: the side's first token waits on a prefill that has answered, or
-/// on the decode worker's own at the cold rate, not on one still to come
-/// behind a busy worker's backlog. The configured threshold for a short
-/// prompt, the time the worker's measured prefill rate says a long prompt
-/// takes, and nothing more than the cap. The side was admitted to a room on
-/// its decode worker before its dispatch. `None` when the rule is off (a
+/// How long a sequential disaggregated decode side of `prompt_tokens` that
+/// recomputes its prompt on `prefills`, its decode worker (no handoff: a
+/// fan-out, or a prefill that returned no transfer parameters), may produce
+/// nothing before its request gives up on it, and the silence a stalled
+/// decode partner is judged by on the parallel shape (`prefills` the prefill
+/// worker there, whose prefill of the prompt stands before the decode
+/// side's first token): the prefill side's bound for the same prompt on
+/// that worker ([`prefill_side_bound`]) with the prompt's prefill time once,
+/// not twice, since the wait before the first token is one prefill: the
+/// decode worker's own at the cold rate, or on the parallel shape a prefill
+/// that has answered, not one still to come behind a busy worker's backlog.
+/// The configured threshold for a short prompt, the time the worker's
+/// measured prefill rate says a long prompt takes, and nothing more than the
+/// cap. A sequential side that pulls its prompt KV from the prefill side
+/// waits on a transfer instead, and is bounded by
+/// [`declared_kv_transfer_timeout`] alone. The side was admitted to a room
+/// on its decode worker before its dispatch. `None` when the rule is off (a
 /// zero threshold).
 pub(crate) fn decode_side_bound(
     prefills: &Arc<dyn Worker>,
@@ -283,6 +294,78 @@ fn decode_side_bound_with(
     wedge: Duration,
 ) -> Option<Duration> {
     side_bound_with(prefills, prompt_tokens, wedge, 1)
+}
+
+/// The worker label a prefill/decode worker declares its KV-transfer
+/// timeout with, in whole seconds: how long a decode side may wait for the
+/// prompt KV the prefill side holds for it before the request gives up on
+/// that decode worker. Set at registration like any label, or reported by a
+/// servicer that knows its connector's own transfer timeout.
+pub(crate) const KV_TRANSFER_TIMEOUT_LABEL: &str = "kv_transfer_timeout_secs";
+
+/// The KV-transfer timeout `worker` declares ([`KV_TRANSFER_TIMEOUT_LABEL`]):
+/// the bound on a sequential decode side's first token while its prompt KV
+/// is pulled from the prefill side, counted from the decode dispatch (the
+/// transfer and the decode engine's first step). `None` when the worker
+/// declares none, or declares something that is not a positive whole number
+/// of seconds: the side is then bounded by the request's own timeout alone,
+/// as the regular timeout bounds any call to a worker. The wedge threshold
+/// never judges that wait: a transfer that is slow but working is load on
+/// the decode leg, not silence, and the operator who knows the transport
+/// says how long it may take.
+pub(crate) fn declared_kv_transfer_timeout(worker: &Arc<dyn Worker>) -> Option<Duration> {
+    let metadata = worker.metadata();
+    let Some(value) = metadata.spec.labels.get(KV_TRANSFER_TIMEOUT_LABEL) else {
+        if label_noted_once(worker, LabelNote::Undeclared) {
+            info!(
+                worker = worker.url(),
+                label = KV_TRANSFER_TIMEOUT_LABEL,
+                "the decode worker declares no KV-transfer timeout: its pulled decode sides are \
+                 bounded by the request timeout alone; set the label to the connector's own \
+                 transfer timeout to bound them earlier"
+            );
+        }
+        return None;
+    };
+    match value.trim().parse::<u64>() {
+        Ok(secs) if secs > 0 => Some(Duration::from_secs(secs)),
+        _ => {
+            if label_noted_once(worker, LabelNote::Malformed) {
+                warn!(
+                    worker = worker.url(),
+                    label = KV_TRANSFER_TIMEOUT_LABEL,
+                    value = %value,
+                    "not a positive whole number of seconds: the label is ignored and the worker's \
+                     pulled decode sides are bounded by the request timeout alone"
+                );
+            }
+            None
+        }
+    }
+}
+
+/// What was said once about a worker's KV-transfer timeout label
+/// ([`label_noted_once`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum LabelNote {
+    /// The worker declares no label: said at its first pulled decode side.
+    Undeclared,
+    /// The label's value is not a positive whole number of seconds.
+    Malformed,
+}
+
+/// Whether `note` about `worker`'s label is new: the label is read per
+/// request, the operator is told once per worker (by URL) and per note, not
+/// once per request. The set holds one entry per worker it ever noted: it
+/// is as large as the distinct workers the gateway served pulled decode
+/// sides on, and never read on a request that gives no note.
+fn label_noted_once(worker: &Arc<dyn Worker>, note: LabelNote) -> bool {
+    static NOTED: OnceLock<Mutex<HashSet<(String, LabelNote)>>> = OnceLock::new();
+    let noted = NOTED.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut noted = noted
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    noted.insert((worker.url().to_string(), note))
 }
 
 /// Where a prefill side past its own bound stands (see

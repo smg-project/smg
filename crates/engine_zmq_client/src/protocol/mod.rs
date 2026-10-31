@@ -146,6 +146,20 @@ pub trait EngineProtocol: Send + Sync + 'static {
     /// every forced interval; one streamed every so many tokens) is quiet
     /// while healthy, and is left out of that count.
     fn reported_every_step(request: &Self::Request) -> bool;
+    /// Whether the request waits for a KV transfer before the engine can
+    /// schedule it: the decode side of a prefill/decode pair, whose prompt
+    /// KV the prefill side holds for it until the transfer completes. The
+    /// connector books no prefill for its prompt (the decode engine does not
+    /// prefill it), and on a wire that does not report its steps counts no
+    /// silence over it and starts no busy period on it until its first
+    /// output, from which it counts as [`Self::reported_every_step`] says
+    /// (a wire that reports every step keeps the clock with its stats-only
+    /// steps while the side waits, so the side counts from its dispatch
+    /// there, and a frozen engine is still seen over it). `false` on every
+    /// other request, and on a wire with no such side.
+    fn transfer_pending(_request: &Self::Request) -> bool {
+        false
+    }
     /// SMG-pinned DP rank, if any (else the sole engine is used).
     fn data_parallel_rank(request: &Self::Request) -> Option<u32>;
     /// Reject fields this client cannot represent on the wire.

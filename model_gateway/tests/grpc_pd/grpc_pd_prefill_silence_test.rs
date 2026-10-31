@@ -48,14 +48,19 @@
 //! and expect the side given up on a bound after the handoff: a handoff
 //! stands in for an answer for one bound, as an answer does.
 //!
-//! The decode side of the sequential shape has a bound of its own, counted
-//! from its dispatch once the prefill side has answered: a handoff that
-//! waits on a prefill engine that stalled right after answering, or a
-//! decode engine that never schedules the side, holds the request past the
-//! prefill side's bound otherwise. Two cases hold the decode call's headers
-//! or return an empty stream after a prefill that answered at once, and
-//! expect 504 `decode_worker_silent` within the bound, one `timeout` on the
-//! decode worker and nothing on the prefill.
+//! The decode side of the sequential shape waits on a KV transfer once the
+//! prefill side has answered, and the wedge threshold never judges that
+//! wait: its bound is the KV-transfer timeout its decode worker declares
+//! (the `kv_transfer_timeout_secs` label), else the request's own timeout. Two
+//! cases hold the decode call's headers or return an empty stream after a
+//! prefill that answered at once, on a decode worker that declares a
+//! three-second transfer timeout, and expect 504 `decode_worker_silent`
+//! within that bound, one `timeout` on the decode worker and nothing on the
+//! prefill; a third, on a decode worker that declares none, answers past the
+//! wedge threshold and expects the request answered in full with nothing
+//! charged (a handoff that waits on a prefill engine that stalled right after
+//! answering, or a decode engine that never schedules the side, is the
+//! request timeout's to end there).
 
 use std::{
     future::Future,
@@ -138,6 +143,10 @@ enum Behaviour {
     EmptyStream,
     /// Tokens and a completion after the delay, the stream returned at once.
     Answer(Duration),
+    /// [`Behaviour::Answer`] whose completion carries KV-transfer params, as
+    /// a prefill side's does when its decode side pulls the prompt KV from
+    /// it: the handoff that makes the decode side a pulled one.
+    AnswerWithHandoff(Duration),
     /// The call returns its stream when its turn comes at the engine's
     /// gate (one call every `TURN`), the tokens at once after that.
     Queued,
@@ -203,7 +212,10 @@ fn chunk(id: u32) -> proto::GenerateResponse {
     }
 }
 
-fn complete() -> proto::GenerateResponse {
+/// The completion of a stream; with `handoff` it is a prefill side's whose
+/// decode side pulls the prompt KV from it: the connector's transfer params
+/// ride the completion.
+fn complete_with_handoff(handoff: bool) -> proto::GenerateResponse {
     proto::GenerateResponse {
         response: Some(GenResp::Complete(proto::GenerateComplete {
             output_ids: (1..=OUTPUT_TOKENS).collect(),
@@ -211,6 +223,9 @@ fn complete() -> proto::GenerateResponse {
             prompt_tokens: 1,
             completion_tokens: OUTPUT_TOKENS,
             index: 0,
+            kv_transfer_params_json: handoff.then(|| {
+                r#"{"do_remote_prefill":true,"remote_block_ids":[1],"remote_engine_id":"prefill","remote_host":"127.0.0.1","remote_port":1}"#.to_string()
+            }),
             ..Default::default()
         })),
     }
@@ -218,11 +233,16 @@ fn complete() -> proto::GenerateResponse {
 
 /// Feed one generate stream: the tokens after `delay`, then the completion.
 /// With `delay` at [`FOREVER`] the sender is held and nothing is written.
+fn produce_after(tx: GenerateTx, delay: Duration) {
+    produce_after_with_handoff(tx, delay, false);
+}
+
+/// [`produce_after`] whose completion hands off when `handoff` is set.
 #[expect(
     clippy::disallowed_methods,
     reason = "test mock; the producer task ends with its stream"
 )]
-fn produce_after(tx: GenerateTx, delay: Duration) {
+fn produce_after_with_handoff(tx: GenerateTx, delay: Duration, handoff: bool) {
     tokio::spawn(async move {
         tokio::time::sleep(delay).await;
         for id in 1..=OUTPUT_TOKENS {
@@ -230,7 +250,7 @@ fn produce_after(tx: GenerateTx, delay: Duration) {
                 return;
             }
         }
-        let _ = tx.send(Ok(complete())).await;
+        let _ = tx.send(Ok(complete_with_handoff(handoff))).await;
     });
 }
 
@@ -264,6 +284,7 @@ impl proto::vllm_engine_server::VllmEngine for Engine {
             }
             Behaviour::EmptyStream => produce_after(tx, FOREVER),
             Behaviour::Answer(delay) => produce_after(tx, delay),
+            Behaviour::AnswerWithHandoff(delay) => produce_after_with_handoff(tx, delay, true),
             Behaviour::Queued => {
                 self.gate.turn().await;
                 produce_after(tx, Duration::ZERO);
@@ -797,6 +818,33 @@ async fn build_pd_router(
         .0
 }
 
+/// [`build_pd_router`] with the decode workers declaring a KV-transfer
+/// timeout of `secs` (the `kv_transfer_timeout_secs` worker label): the bound
+/// on a pulled decode side's first token, counted from its dispatch.
+async fn build_pd_router_with_decode_transfer_timeout(
+    endpoints: &[(u16, WorkerType)],
+    runtime: RuntimeType,
+    secs: u64,
+) -> Box<dyn RouterTrait> {
+    let config = grpc_router_config()
+        .prefill_decode_mode(vec![], vec![])
+        .round_robin_policy()
+        .build_unchecked();
+    let workers: Vec<Arc<dyn Worker>> = endpoints
+        .iter()
+        .map(|&(port, worker_type)| {
+            let builder = grpc_worker(port, worker_type, runtime, ModelCard::new(MODEL));
+            let builder = if worker_type == WorkerType::Decode {
+                builder.label("kv_transfer_timeout_secs", secs.to_string())
+            } else {
+                builder
+            };
+            Arc::new(builder.build()) as Arc<dyn Worker>
+        })
+        .collect();
+    build_grpc_router(config, MODEL, workers).await
+}
+
 /// [`build_pd_router`] with every worker's circuit breaker configured as
 /// `breaker`; the registered workers come back with the router.
 async fn build_pd_router_with(
@@ -1008,6 +1056,10 @@ fn assert_decode_given_up_on(status: http::StatusCode, body: &str, elapsed: Dura
     assert_eq!(status, http::StatusCode::GATEWAY_TIMEOUT, "{body}");
     assert!(body.contains("decode_worker_silent"), "{body}");
     assert!(
+        body.contains("declared KV-transfer timeout"),
+        "the verdict names the declared bound: {body}"
+    );
+    assert!(
         elapsed >= BOUND && elapsed < BOUND + SLACK,
         "given up on at the bound ({BOUND:?}), not before and not much after: {elapsed:?}"
     );
@@ -1016,23 +1068,25 @@ fn assert_decode_given_up_on(status: http::StatusCode, body: &str, elapsed: Dura
 /// Sequential dispatch, the prefill answers at once and the decode call
 /// never returns its stream (a servicer that flushes headers with the first
 /// message, in front of a handoff that waits on a prefill engine that
-/// stalled right after answering): given up on at the decode side's bound,
-/// counted as the decode worker's timeout, nothing charged to the prefill.
+/// stalled right after answering), on a decode worker that declares a
+/// three-second KV-transfer timeout: given up on at that bound, counted as
+/// the decode worker's timeout, nothing charged to the prefill.
 #[test]
 fn a_sequential_decode_that_returns_no_stream_after_the_prefill_answered_is_given_up_on_within_the_bound(
 ) {
-    let prefill = Engine::new(Behaviour::Answer(Duration::ZERO));
+    let prefill = Engine::new(Behaviour::AnswerWithHandoff(Duration::ZERO));
     let decode = Engine::new(Behaviour::HoldHeaders);
     let (prefill_calls, decode_calls) = (prefill.clone(), decode.clone());
     let rendered = render_after(|| async move {
         let prefill_port = start_mock_engine(prefill).await;
         let decode_port = start_mock_engine(decode).await;
-        let router = build_pd_router(
+        let router = build_pd_router_with_decode_transfer_timeout(
             &[
                 (prefill_port, WorkerType::Prefill),
                 (decode_port, WorkerType::Decode),
             ],
             RuntimeType::Vllm,
+            3,
         )
         .await;
         let (status, body, elapsed) = one_streaming_chat(router.as_ref()).await;
@@ -1058,23 +1112,24 @@ fn a_sequential_decode_that_returns_no_stream_after_the_prefill_answered_is_give
 }
 
 /// Sequential dispatch, the prefill answers at once and the decode returns
-/// its stream at once and never writes to it: the same verdict, from the
-/// first-response phase.
+/// its stream at once and never writes to it, the same declared timeout: the
+/// same verdict, from the first-response phase.
 #[test]
 fn a_sequential_decode_whose_stream_stays_empty_after_the_prefill_answered_is_given_up_on_within_the_bound(
 ) {
-    let prefill = Engine::new(Behaviour::Answer(Duration::ZERO));
+    let prefill = Engine::new(Behaviour::AnswerWithHandoff(Duration::ZERO));
     let decode = Engine::new(Behaviour::EmptyStream);
     let (prefill_calls, decode_calls) = (prefill.clone(), decode.clone());
     let rendered = render_after(|| async move {
         let prefill_port = start_mock_engine(prefill).await;
         let decode_port = start_mock_engine(decode).await;
-        let router = build_pd_router(
+        let router = build_pd_router_with_decode_transfer_timeout(
             &[
                 (prefill_port, WorkerType::Prefill),
                 (decode_port, WorkerType::Decode),
             ],
             RuntimeType::Vllm,
+            3,
         )
         .await;
         let (status, body, elapsed) = one_streaming_chat(router.as_ref()).await;
@@ -1092,6 +1147,46 @@ fn a_sequential_decode_whose_stream_stays_empty_after_the_prefill_answered_is_gi
         0.0,
         "the prefill, which answered, is not charged:\n{rendered}"
     );
+}
+
+/// Sequential dispatch on a decode worker that declares no KV-transfer
+/// timeout: the wedge threshold does not judge the decode side (its wait is
+/// a transfer, load on the decode leg, not silence), so a decode that answers
+/// a second past the threshold still answers the request in full, and
+/// nothing is charged to either worker; the request's own timeout is what
+/// would end a handoff that never completes.
+#[test]
+fn a_sequential_decode_whose_worker_declares_no_transfer_timeout_is_not_judged_by_the_wedge_threshold(
+) {
+    let prefill = Engine::new(Behaviour::AnswerWithHandoff(Duration::ZERO));
+    let decode = Engine::new(Behaviour::Answer(BOUND + Duration::from_secs(1)));
+    let (prefill_calls, decode_calls) = (prefill.clone(), decode.clone());
+    let rendered = render_after(|| async move {
+        let prefill_port = start_mock_engine(prefill).await;
+        let decode_port = start_mock_engine(decode).await;
+        let router = build_pd_router(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (decode_port, WorkerType::Decode),
+            ],
+            RuntimeType::Vllm,
+        )
+        .await;
+        let (status, body, elapsed) = one_streaming_chat(router.as_ref()).await;
+        assert_eq!(status, http::StatusCode::OK, "{body}");
+        assert!(
+            elapsed >= BOUND + Duration::from_secs(1) && elapsed < CASE_CAP,
+            "answered when the decode answered, past the wedge threshold: {elapsed:?}"
+        );
+    });
+    assert_eq!(prefill_calls.calls(), 1, "the prefill answered once");
+    assert_eq!(decode_calls.calls(), 1, "not replayed");
+    assert_eq!(
+        worker_errors(&rendered, "decode", "timeout"),
+        0.0,
+        "no verdict on a side waiting for its transfer:\n{rendered}"
+    );
+    assert_eq!(worker_errors(&rendered, "prefill", "timeout"), 0.0);
 }
 
 /// Sequential dispatch, a non-streaming request: the decode side's first item

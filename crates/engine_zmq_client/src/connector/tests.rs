@@ -3080,8 +3080,8 @@ async fn an_add_the_engine_never_received_queues_no_allowance_on_the_wire() {
 fn an_add_the_engine_never_received_queues_no_allowance() {
     let mut registry = RequestRegistry::<<VllmProtocol as EngineProtocol>::Output>::default();
     let before = Instant::now();
-    let _first = registry.register("req-1".to_string(), 1_000_000, true);
-    let _second = registry.register("req-2".to_string(), 1_000_000, true);
+    let _first = registry.register("req-1".to_string(), 1_000_000, true, false, false);
+    let _second = registry.register("req-2".to_string(), 1_000_000, true, false, false);
     assert_eq!(registry.prefill_pending_tokens(), 0, "nothing handed yet");
     assert_eq!(
         registry.work_end.saturating_duration_since(before),
@@ -3125,8 +3125,8 @@ fn the_default_prefill_allowance_is_500_s_per_million_tokens() {
     );
     assert_eq!(registry.prefill_allowance(0), Duration::ZERO);
     let before = Instant::now();
-    let _first = registry.register("req-1".to_string(), 1_000_000, true);
-    let _second = registry.register("req-2".to_string(), 1_000_000, true);
+    let _first = registry.register("req-1".to_string(), 1_000_000, true, false, false);
+    let _second = registry.register("req-2".to_string(), 1_000_000, true, false, false);
     registry.handed("req-1");
     registry.handed("req-2");
     let in_hand = registry.work_end.saturating_duration_since(before);
@@ -3169,4 +3169,212 @@ fn a_disagreeing_rank_in_the_middle_of_the_group_fails_the_agreement() {
         connection_layout::<SglangProtocol>(&[]),
         SglangLayout::default()
     );
+}
+
+/// A decode side waiting for its KV transfer (`do_remote_prefill` in its
+/// KV-transfer params) is not in flight on the engine until its first
+/// output: the registry counts no silence over it, starts no busy period on
+/// it and books no prefill for its prompt; its first output admits it, and
+/// its retirement then ends the busy period as any request's does.
+#[test]
+fn a_transfer_pending_side_is_not_in_flight_until_its_first_output() {
+    let mut registry = RequestRegistry::<<VllmProtocol as EngineProtocol>::Output>::default();
+    let _pending = registry.register("decode-1".to_string(), 3_000, true, true, true);
+    assert_eq!(
+        registry.reported_every_step(),
+        0,
+        "no silence counted over it"
+    );
+    assert!(registry.in_flight_since.is_none(), "no busy period on it");
+    registry.handed("decode-1");
+    assert_eq!(
+        registry.prefill_pending_tokens(),
+        0,
+        "its prompt is the prefill side's work, not this engine's"
+    );
+    // A plain request beside it starts the busy period and counts.
+    let _plain = registry.register("plain-1".to_string(), 10, true, false, false);
+    assert_eq!(registry.reported_every_step(), 1);
+    assert!(registry.in_flight_since.is_some());
+    registry.handed("plain-1");
+    assert_eq!(registry.prefill_pending_tokens(), 10);
+    // The plain request ends: the busy period ends with it, the pending side
+    // notwithstanding.
+    registry.retire("plain-1");
+    assert_eq!(registry.reported_every_step(), 0);
+    assert!(
+        registry.in_flight_since.is_none(),
+        "a transfer-pending side left behind keeps no busy period"
+    );
+    // The side's first output admits it: from here it is in flight.
+    let entry = registry.requests.get_mut("decode-1").expect("registered");
+    entry.started = true;
+    entry.transfer_pending = false;
+    entry.counted = entry.every_step;
+    registry.admitted(true, Instant::now());
+    assert_eq!(
+        registry.reported_every_step(),
+        1,
+        "counted from its first output"
+    );
+    assert!(
+        registry.in_flight_since.is_some(),
+        "the busy period starts on it"
+    );
+    assert_eq!(
+        registry.prefill_pending_tokens(),
+        0,
+        "still no prefill of its own"
+    );
+    registry.retire("decode-1");
+    assert_eq!(registry.reported_every_step(), 0);
+    assert!(
+        registry.in_flight_since.is_none(),
+        "the last active one ended the busy period"
+    );
+    // A pulled side registered active (a wire that reports every step keeps
+    // the clock while it waits): counted and busy from its dispatch, its
+    // prompt still never booked as prefill here.
+    let _active = registry.register("decode-2".to_string(), 3_000, true, false, true);
+    assert_eq!(
+        registry.reported_every_step(),
+        1,
+        "counted from its dispatch"
+    );
+    assert!(registry.in_flight_since.is_some(), "the busy period is on");
+    registry.handed("decode-2");
+    assert_eq!(
+        registry.prefill_pending_tokens(),
+        0,
+        "a pulled prompt is never this engine's prefill"
+    );
+    registry.retire("decode-2");
+    assert_eq!(registry.reported_every_step(), 0);
+    assert!(registry.in_flight_since.is_none());
+}
+
+/// The same through the client: a vLLM decode side's silence clock starts at
+/// its first output, not at its dispatch, and its prompt never counts as
+/// pending prefill; a plain request is counted from its dispatch as before.
+#[tokio::test]
+async fn a_vllm_decode_side_waiting_for_its_transfer_counts_no_silence() {
+    use crate::protocol::vllm::sampling::EngineCoreSamplingParams;
+    let (client, mut engine, _ns) = connect().await;
+    let decode_side = EngineCoreRequest {
+        request_id: "decode-1".to_string(),
+        prompt_token_ids: Some(vec![1, 2, 3, 4]),
+        sampling_params: Some(EngineCoreSamplingParams {
+            extra_args: Some(HashMap::from([(
+                "kv_transfer_params".to_string(),
+                serde_json::json!({"do_remote_prefill": true, "remote_block_ids": [7]}),
+            )])),
+            ..EngineCoreSamplingParams::default()
+        }),
+        ..EngineCoreRequest::default()
+    };
+    let mut side = client.submit(decode_side).await.unwrap();
+    engine.recv_request().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert_eq!(
+        client.output_silence(),
+        None,
+        "a side waiting for its KV transfer is not in flight on the engine"
+    );
+    assert_eq!(
+        client.prefill_pending_tokens(),
+        0,
+        "its prompt is pulled as KV, not prefilled here"
+    );
+    // Its first token: the transfer is done, the side is in flight.
+    engine
+        .send_output(batch(
+            0,
+            EngineCoreOutput {
+                request_id: "decode-1".to_string(),
+                new_token_ids: vec![11],
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap();
+    let first = side.next().await.expect("the first token").unwrap();
+    assert_eq!(first.request_id, "decode-1");
+    let after_first = client
+        .output_silence()
+        .expect("in flight from its first output");
+    assert!(after_first < Duration::from_millis(500), "{after_first:?}");
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let grown = client.output_silence().expect("still in flight");
+    assert!(
+        grown >= Duration::from_millis(70),
+        "counts from here on: {grown:?}"
+    );
+    // Its end ends the busy period.
+    engine
+        .send_output(batch(
+            0,
+            EngineCoreOutput {
+                request_id: "decode-1".to_string(),
+                new_token_ids: vec![12],
+                finish_reason: Some(EngineCoreFinishReason::Stop),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap();
+    while side.next().await.is_some() {}
+    assert_eq!(client.output_silence(), None, "nothing in flight");
+}
+
+/// On a wire that reports every step the same side counts from its dispatch:
+/// the stats-only steps keep the clock while a healthy side waits, so a
+/// frozen engine whose only work is pulled sides is still seen (its silence
+/// grows, the busy period is on); its prompt is still no prefill of this
+/// engine's.
+#[tokio::test]
+async fn a_vllm_decode_side_waiting_for_its_transfer_counts_silence_on_a_step_reporting_wire() {
+    use crate::protocol::vllm::sampling::EngineCoreSamplingParams;
+    let (client, mut engine, _ns) = connect().await;
+    client.note_reports_steps();
+    let decode_side = EngineCoreRequest {
+        request_id: "decode-1".to_string(),
+        prompt_token_ids: Some(vec![1, 2, 3, 4]),
+        sampling_params: Some(EngineCoreSamplingParams {
+            extra_args: Some(HashMap::from([(
+                "kv_transfer_params".to_string(),
+                serde_json::json!({"do_remote_prefill": true, "remote_block_ids": [7]}),
+            )])),
+            ..EngineCoreSamplingParams::default()
+        }),
+        ..EngineCoreRequest::default()
+    };
+    let mut side = client.submit(decode_side).await.unwrap();
+    engine.recv_request().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let silence = client
+        .output_silence()
+        .expect("in flight from its dispatch on a step-reporting wire");
+    assert!(
+        silence >= Duration::from_millis(70),
+        "counts from its dispatch: {silence:?}"
+    );
+    assert_eq!(
+        client.prefill_pending_tokens(),
+        0,
+        "its prompt is pulled as KV, not prefilled here"
+    );
+    engine
+        .send_output(batch(
+            0,
+            EngineCoreOutput {
+                request_id: "decode-1".to_string(),
+                new_token_ids: vec![11],
+                finish_reason: Some(EngineCoreFinishReason::Stop),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap();
+    while side.next().await.is_some() {}
+    assert_eq!(client.output_silence(), None, "nothing in flight");
 }
