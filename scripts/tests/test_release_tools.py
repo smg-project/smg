@@ -222,6 +222,9 @@ class Sandbox:
             versioned("openapi-gen", "0.2.0") + "publish = false\n",
         )
         self.put("clients/openapi-gen/src/main.rs", "fn main() {}\n")
+        # cargo's other spelling of never published, under [package] like the first (the sandbox's, not the crate's)
+        self.put("clients/rust/Cargo.toml", versioned("smg-client", "0.1.0") + "publish = []\n")
+        self.put("clients/rust/src/lib.rs", "pub fn client() {}\n")
         self.put("bindings/golang/Cargo.toml", versioned("smg-golang", "1.13.0"))
         self.put("bindings/python/Cargo.toml", versioned("smg-python", "1.13.0"))
         self.put("bindings/python/pyproject.toml", '[project]\nname = "smg"\nversion = "1.13.0"\n')
@@ -819,7 +822,10 @@ def test_publish_plan_prints_the_dispatches_and_runs_nothing(repo: Sandbox) -> N
     assert "openapi-gen" not in out, (
         "a crate with publish = false is never published: not in the plan"
     )
-    assert "publish = false is never published and not listed" in out
+    assert "smg-client" not in out, (
+        "a crate with publish = [] is never published either: not in the plan"
+    )
+    assert "publish = false or publish = [] is never published and not listed" in out
     final = repo.tool("publish-plan", "1.14.0").stdout
     assert "smg==1.14.0," in final and "and latest" in final
 
