@@ -448,6 +448,9 @@ def test_a_version_any_release_tag_carries_is_not_a_bump(mod, repo):
     assert "gamma (crates/gamma/) — v1.0.1 is v1.0.9's, with this code" in out
     assert "    ✗ workspace Cargo.toml has gamma v1.0.0, expected v1.0.1" in out
     assert "not bumped (v1.0.1" not in out, "the tag's copy of gamma is this very code: no bump"
+    assert "Summary: 5 crate(s) with changes, 1 unchanged" in out, (
+        "gamma's pin counts it as changed"
+    )
     code, out = run(mod, repo, tag="v1.0.9")
     assert (
         "  ! beta (crates/beta/) — 1 file(s) changed but version not bumped (v1.0.0, v1.0.0's) [patch]"

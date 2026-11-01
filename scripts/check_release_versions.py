@@ -350,7 +350,8 @@ class Repo:
 @dataclass
 class Verdict:
     component: Component
-    files_changed: int  # against the tag the verdict is judged by; 0 = nothing to check
+    # against the tag the verdict is judged by; 0 = no files to publish (the carrier path may still check the pin)
+    files_changed: int
     version: str = ""
     tag_version: str | None = None  # None = not at the tag: a new component
     tagged: dict[str, str] = field(default_factory=dict)  # version -> the release tag carrying it
@@ -588,8 +589,12 @@ def examine(
             )
 
     def count(kind: str, changed: bool) -> int:
+        # a verdict with a pin to sync is "with changes" too: the Summary matches the list above
         return sum(
-            1 for v in verdicts if v.component.kind == kind and bool(v.files_changed) == changed
+            1
+            for v in verdicts
+            if v.component.kind == kind
+            and bool(v.files_changed or v.workspace_version is not None) == changed
         )
 
     out.line()
