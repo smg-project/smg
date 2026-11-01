@@ -33,6 +33,7 @@ from smg_grpc_servicer.rust_lifecycle import (
     EXIT_GRACE_SECS,
     ServicerConfigError,
     announce_kv_events_default,
+    announce_servicer_impl,
     check_metrics_port_needs_rust,
     configuration_exit,
     guarded_exit,
@@ -135,7 +136,7 @@ async def serve_grpc(
     # ServerArgs flag stay the same, and the Router cannot tell them apart.
     try:
         impl, origin = servicer_impl_source(server_args)
-        logger.info("Servicer implementation: %s (source=%s)", impl, origin)
+        announce_servicer_impl(impl, origin, SERVICER_IMPL_ENV, logger)
         if impl == "rust":
             if on_request_manager_ready is not None:
                 logger.warning(

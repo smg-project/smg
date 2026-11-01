@@ -13,7 +13,9 @@ Rust-owned thread, and the scheduler ranks are started from this same process
 (SGLang's own spawner, the way this package's :mod:`headless` launcher starts
 them), each with this package's SGLang plugin dialing the servicer's same-host
 msgpack ZMQ handshake. Python keeps the lifecycle only. The Router cannot tell
-the two implementations apart.
+the two implementations apart. This path is the default; the Python servicer
+is selected with ``--servicer-impl python`` / ``SMG_SGLANG_SERVICER_IMPL=python``
+and is deprecated (the launcher logs its deprecation when it is chosen).
 
 Prefill/decode disaggregation is served as on the Python servicer: a request's
 bootstrap fields (host, port, room) ride the scheduler's own request struct
@@ -116,7 +118,8 @@ def resolve_servicer_impl(args: Any = None, environ: Mapping[str, str] | None = 
     """Which implementation serves this process: the launcher's
     ``--servicer-impl`` when it carried one (``args.servicer_impl``, or the
     value this package's SGLang plugin parsed in this process), else
-    ``$SMG_SGLANG_SERVICER_IMPL``, else python."""
+    ``$SMG_SGLANG_SERVICER_IMPL``, else rust
+    (:data:`~smg_grpc_servicer.rust_lifecycle.DEFAULT_IMPL`)."""
     return servicer_impl_source(args, environ)[0]
 
 

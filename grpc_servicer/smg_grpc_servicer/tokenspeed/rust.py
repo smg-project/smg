@@ -1,18 +1,20 @@
-"""The Rust request path of the TokenSpeed gRPC servicer, behind one flag.
+"""The Rust request path of the TokenSpeed gRPC servicer, the launcher's default.
 
-``python -m smg_grpc_servicer.tokenspeed`` (what ``ts serve`` spawns) serves
+``python -m smg_grpc_servicer.tokenspeed`` (what ``ts serve`` spawns) served
 ``tokenspeed.grpc.scheduler.TokenSpeedScheduler`` from Python over TokenSpeed's
-in-process ``AsyncLLM``. With ``--servicer-impl rust`` (this package's flag on
-that launcher, see :func:`add_servicer_impl_argument`;
-``SMG_TOKENSPEED_SERVICER_IMPL=rust`` is the fallback the flag overrides) the
-same entrypoint hands the process to :func:`serve_rust` before an ``AsyncLLM``
-or a Python gRPC server exists: the contract is served by the Rust
+in-process ``AsyncLLM``. Unless ``--servicer-impl python`` (this package's flag
+on that launcher, see :func:`add_servicer_impl_argument`;
+``SMG_TOKENSPEED_SERVICER_IMPL`` is the fallback the flag overrides) selects
+that path, the same entrypoint hands the process to :func:`serve_rust` before
+an ``AsyncLLM`` or a Python gRPC server exists: the contract is served by the Rust
 :class:`smg.servicer.TokenSpeedGrpcServer` on a Rust-owned thread, and the
 scheduler rank processes are started from this same process (the way
 TokenSpeed's own ``launch_scheduler_headless``, what ``ts serve --headless``
 runs, starts them), dialing the servicer's same-host msgpack ZMQ handshake.
 Python keeps the lifecycle only. The Router cannot tell the two
-implementations apart.
+implementations apart. This path is the default; the Python servicer is
+selected with ``--servicer-impl python`` / ``SMG_TOKENSPEED_SERVICER_IMPL=python``
+and is deprecated (the launcher logs its deprecation when it is chosen).
 
 What the msgpack wire does not carry, the Rust path reports rather than
 emulates: ``FlushCache`` and profiling ride the wire's control call on a
@@ -130,9 +132,9 @@ def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
     return _add_servicer_impl_argument(
         parser,
         help=(
-            "Which implementation serves the gRPC contract: the Python servicer (default) "
-            "or the Rust one (smg.servicer.TokenSpeedGrpcServer, with the scheduler(s) "
-            f"headless). Unset falls back to ${SERVICER_IMPL_ENV}."
+            "Which implementation serves the gRPC contract: the Rust servicer (default; "
+            "smg.servicer.TokenSpeedGrpcServer, with the scheduler(s) headless) or the "
+            f"deprecated Python one. Unset falls back to ${SERVICER_IMPL_ENV}, then rust."
         ),
     )
 
@@ -152,7 +154,7 @@ def add_metrics_arguments(parser: argparse.ArgumentParser) -> bool:
 def resolve_servicer_impl(args: Any = None, environ: Mapping[str, str] | None = None) -> str:
     """Which implementation serves this process: ``args.servicer_impl`` when
     the launcher carried the flag, else ``$SMG_TOKENSPEED_SERVICER_IMPL``, else
-    python."""
+    rust."""
     return servicer_impl_source(args, environ)[0]
 
 
@@ -689,19 +691,19 @@ def refuse_encode_role_without_wire(server_args: Any) -> None:
         if getattr(error, "name", None) == "tokenspeed":
             return  # no engine installed (the launcher's unit tests)
         raise ServicerConfigError(
-            f"{SERVICER_IMPL_ENV}=rust cannot read the EPD encode capability off this engine "
-            f"build ({error}): its wire module does not import; run this worker on the Python "
-            f"servicer (unset {SERVICER_IMPL_ENV} or pass --servicer-impl python)"
+            f"The Rust servicer cannot read the EPD encode capability off this engine "
+            f"build ({error}): its wire module does not import; run this worker on the "
+            f"deprecated Python servicer (--servicer-impl python / {SERVICER_IMPL_ENV}=python)"
         ) from None
     registers_encode_role = getattr(zmq_wire, "encode_ready_response", None) is not None
     if not registers_encode_role and getattr(zmq_wire, "REQ_TYPE_ENCODE", None) is None:
         raise ServicerConfigError(
-            f"{SERVICER_IMPL_ENV}=rust does not serve the EPD encode role on this engine build "
+            "The Rust servicer does not serve the EPD encode role on this engine build "
             "(disaggregation_mode='encode'): its direct msgpack wire carries no encode request, "
             "so the encode rank would never dial the servicer's handshake and the worker would "
             "wait in silence, serving nothing; run an engine whose wire carries the encode "
-            f"request, or this worker on the Python servicer (unset {SERVICER_IMPL_ENV} or pass "
-            "--servicer-impl python)"
+            "request, or this worker on the deprecated Python servicer (--servicer-impl python / "
+            f"{SERVICER_IMPL_ENV}=python)"
         )
 
 

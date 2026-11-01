@@ -120,7 +120,10 @@ def test_package_exposes_the_flag_and_the_rust_entry_points():
 
 
 def test_resolve_servicer_impl_prefers_the_launcher_flag_then_the_env():
-    assert rust.resolve_servicer_impl(environ={}) == "python"
+    assert rust.resolve_servicer_impl(environ={}) == "rust"
+    assert (
+        rust.resolve_servicer_impl(environ={"SMG_TOKENSPEED_SERVICER_IMPL": "python"}) == "python"
+    )
     assert rust.resolve_servicer_impl(environ={"SMG_TOKENSPEED_SERVICER_IMPL": " Rust "}) == "rust"
     args = argparse.Namespace(servicer_impl="rust")
     assert rust.resolve_servicer_impl(args, environ={}) == "rust"
@@ -146,7 +149,7 @@ def test_resolve_servicer_impl_prefers_the_launcher_flag_then_the_env():
 
 
 def test_servicer_impl_source_names_the_origin_and_writes_a_flag_back():
-    assert rust.servicer_impl_source(environ={}) == ("python", "default")
+    assert rust.servicer_impl_source(environ={}) == ("rust", "default")
     assert rust.servicer_impl_source(environ={"SMG_TOKENSPEED_SERVICER_IMPL": "rust"}) == (
         "rust",
         "env",
@@ -159,7 +162,7 @@ def test_servicer_impl_source_names_the_origin_and_writes_a_flag_back():
     assert environ == {"SMG_TOKENSPEED_SERVICER_IMPL": "python"}
     # Without a flag in hand nothing is written.
     environ = {}
-    assert rust.servicer_impl_source(SimpleNamespace(), environ=environ) == ("python", "default")
+    assert rust.servicer_impl_source(SimpleNamespace(), environ=environ) == ("rust", "default")
     assert environ == {}
 
 
@@ -233,7 +236,7 @@ def test_the_launcher_takes_the_flag_ahead_of_tokenspeeds_args(launcher, monkeyp
     assert os.environ[rust.SERVICER_IMPL_ENV] == "rust"
 
 
-def test_the_launcher_falls_back_to_the_environment_then_python(launcher, monkeypatch, caplog):
+def test_the_launcher_falls_back_to_the_environment_then_rust(launcher, monkeypatch, caplog):
     module, calls = launcher
     monkeypatch.setenv(rust.SERVICER_IMPL_ENV, "rust")
     with caplog.at_level("INFO", logger=module.logger.name):
@@ -242,20 +245,26 @@ def test_the_launcher_falls_back_to_the_environment_then_python(launcher, monkey
     assert raised.value.code == 3 and calls["served"][0] == "rust"
     assert calls["argv"] == ["--model", "org/m"]
     assert "Servicer implementation: rust (source=env)" in caplog.text
-    # `--servicer-impl python` overrides the exported `rust`, environment included.
+    assert "deprecated" not in caplog.text
+    # `--servicer-impl python` overrides the exported `rust`, environment
+    # included, and is announced as deprecated.
     caplog.clear()
     with caplog.at_level("INFO", logger=module.logger.name):
         module.main(["--servicer-impl=python", "--model", "org/m"])
     assert calls["served"][0] == "python" and calls["argv"] == ["--model", "org/m"]
     assert "Servicer implementation: python (source=flag)" in caplog.text
+    assert "The Python gRPC servicer is deprecated" in caplog.text
     assert os.environ[rust.SERVICER_IMPL_ENV] == "python"
-    # Neither: the Python servicer, and the environment is left alone.
+    # Neither: the Rust servicer (the default), no deprecation line, and the
+    # environment is left alone.
     monkeypatch.delenv(rust.SERVICER_IMPL_ENV)
     caplog.clear()
     with caplog.at_level("INFO", logger=module.logger.name):
-        module.main(["--model", "org/m"])
-    assert calls["served"][0] == "python"
-    assert "Servicer implementation: python (source=default)" in caplog.text
+        with pytest.raises(SystemExit) as raised:
+            module.main(["--model", "org/m"])
+    assert raised.value.code == 3 and calls["served"][0] == "rust"
+    assert "Servicer implementation: rust (source=default)" in caplog.text
+    assert "deprecated" not in caplog.text
     assert rust.SERVICER_IMPL_ENV not in os.environ
 
 

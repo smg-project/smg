@@ -129,8 +129,9 @@ def servicer_impl_source(
 ) -> tuple[str, str]:
     """:func:`resolve_servicer_impl`'s answer with where it came from
     (``flag``, ``env`` or ``default``: the shared
-    :func:`~smg_grpc_servicer.rust_lifecycle.servicer_switch`)."""
-    return servicer_switch(SERVICER_IMPL_ENV, args, environ)
+    :func:`~smg_grpc_servicer.rust_lifecycle.servicer_switch`, with the
+    engine's own Python servicer as this launcher's default)."""
+    return servicer_switch(SERVICER_IMPL_ENV, args, environ, default="python")
 
 
 # ---------------------------------------------------------------------------
