@@ -60,7 +60,7 @@ class Mirror:
 
     label: str
     file: str
-    kind: str  # "cargo" | "pyproject" | "helm" | "workflow"
+    kind: str  # "cargo" | "pyproject" | "python" | "helm" | "workflow"
 
 
 GATEWAY = "smg"

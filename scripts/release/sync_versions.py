@@ -27,8 +27,6 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-# bumped by make bump-version; the checker does not list it among its mirrors
-VERSION_PY = "bindings/python/src/smg/version.py"
 VERSION_PARTS = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+))?$")
 
 
@@ -107,9 +105,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         set_version(gateway.version_file, "cargo", gateway_version)
-        for mirror in crv.MIRRORS:
+        for mirror in crv.MIRRORS:  # the installed package's version.py among them
             set_version(mirror.file, mirror.kind, gateway_version)
-        set_version(VERSION_PY, "python", gateway_version)
 
     for component in (*crv.CRATES, *crv.PACKAGES):
         if component.name == crv.GATEWAY:
