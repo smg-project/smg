@@ -566,11 +566,14 @@ pep440() { # 1.14.0-rc.1 -> 1.14.0rc1, the spelling PyPI shows
 ref_version() { # <ref> <file>: the version line a file carries at a ref (empty when the file is not there)
   git show "$1:$2" 2>/dev/null | grep -m1 '^version = ' | sed 's/version = "\(.*\)"/\1/' || true
 }
-crate_versions() { # <ref>: "name version" of every workspace crate the version checker lists, at a ref
+crate_versions() { # <ref>: "name version" of every publishable workspace crate the version checker lists, at a ref
+  # A manifest whose [package] says `publish = false` or `publish = []` names a crate cargo never publishes (and
+  # release-crates.yml has no tier for): left out. The key is read from the parsed manifest, not matched as a line.
   "$PYTHON" - "$1" <<'PYEOF'
 import importlib.util
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location("check_release_versions", Path("scripts/check_release_versions.py"))
@@ -580,8 +583,11 @@ spec.loader.exec_module(crv)
 ref = sys.argv[1]
 for crate in crv.CRATES:
     shown = subprocess.run(["git", "show", f"{ref}:{crate.version_file}"], capture_output=True, text=True)
-    if shown.returncode == 0:
-        print(crate.name, crv.read_version("cargo", shown.stdout, crate.version_file))
+    if shown.returncode != 0:
+        continue
+    if tomllib.loads(shown.stdout).get("package", {}).get("publish", True) in (False, []):
+        continue
+    print(crate.name, crv.read_version("cargo", shown.stdout, crate.version_file))
 PYEOF
 }
 
@@ -636,7 +642,7 @@ cmd_publish_plan() {
   say "   gh workflow run release-pypi.yml --ref $tagname"
   say "2. Rust crates (crates.io: every workspace crate whose version at $tagname is not published yet; smg $version)"
   say "   gh workflow run release-crates.yml --ref $tagname"
-  say "   crate versions at $tagname:"
+  say "   crate versions at $tagname (a crate whose manifest says publish = false or publish = [] is never published and not listed):"
   crate_versions "$ref" | sed 's/^/     /'
   say "3. Gateway image (Docker Hub lightseekorg/smg:$version and ghcr.io/smg-project/smg:$version $latest)"
   say "   gh workflow run release-docker.yml --ref $tagname"
