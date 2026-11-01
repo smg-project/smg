@@ -296,6 +296,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         0
     }
 
+    /// Rooms the places waiting in this worker's admission queue need
+    /// ([`Worker::pd_enqueue`]), so a selection can tell a free room from one
+    /// a waiter is already in line for. The default never queues, so zero.
+    fn pd_waiting_rooms(&self) -> usize {
+        0
+    }
+
     /// Take a place at the back of this worker's admission queue for a
     /// dispatch that needs `rooms`. The gate lets it claim only while no older
     /// place needs as few rooms ([`Worker::pd_may_claim`]), which is what
@@ -1604,6 +1611,10 @@ impl Worker for BasicWorker {
 
     fn pd_admitted(&self) -> usize {
         self.runtime.load().pd_admitted()
+    }
+
+    fn pd_waiting_rooms(&self) -> usize {
+        self.runtime.load().pd_waiting_rooms()
     }
 
     fn pd_enqueue(&self, rooms: usize) -> u64 {

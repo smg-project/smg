@@ -151,6 +151,11 @@ pub struct WorkerRuntime {
     /// the over-window burst the gate exists to prevent. Lives here so a
     /// same-URL replacement inherits the rooms the engine still holds.
     pd_admitted: AtomicUsize,
+    /// Rooms the places in `pd_queue` are waiting for, kept beside the
+    /// claimed rooms so a selection can read what the window has left for a
+    /// newcomer with two atomic loads and no queue lock. Updated only under
+    /// the queue's lock, with the place that takes or gives it back.
+    pd_waiting_rooms: AtomicUsize,
     /// The dispatches waiting at the PD admission gate for this worker's
     /// rooms, oldest first, so a room that frees goes to the one that has
     /// waited longest for it (see [`Self::pd_enqueue`]), each with the
@@ -624,6 +629,7 @@ impl WorkerRuntime {
             total_pending_probes: AtomicUsize::new(0),
             load_counter: AtomicUsize::new(0),
             pd_admitted: AtomicUsize::new(0),
+            pd_waiting_rooms: AtomicUsize::new(0),
             pd_queue: Mutex::new(PdQueue::default()),
             processed_counter: AtomicUsize::new(0),
             worker_routing_key_load: WorkerRoutingKeyLoad::new(url),
@@ -1047,6 +1053,11 @@ impl WorkerRuntime {
         self.pd_admitted.load(Ordering::Relaxed)
     }
 
+    /// Rooms the places waiting in the admission queue need, in all.
+    pub fn pd_waiting_rooms(&self) -> usize {
+        self.pd_waiting_rooms.load(Ordering::Relaxed)
+    }
+
     /// Claim `count` rooms, but only while the claimed total stays within
     /// `window`. All-or-nothing: a refusal claims nothing.
     pub fn try_admit_pd(&self, count: usize, window: usize) -> bool {
@@ -1089,6 +1100,7 @@ impl WorkerRuntime {
             rooms,
             wake: Arc::new(Notify::new()),
         });
+        self.pd_waiting_rooms.fetch_add(rooms, Ordering::Relaxed);
         place
     }
 
@@ -1115,7 +1127,12 @@ impl WorkerRuntime {
                 return;
             };
             let could_claim = queue.may_claim(place);
-            queue.waiting.remove(at);
+            let rooms = queue.waiting.remove(at).map_or(0, |gone| gone.rooms);
+            let _ = self.pd_waiting_rooms.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |waiting| Some(waiting.saturating_sub(rooms)),
+            );
             if could_claim {
                 queue.claimable_wakes()
             } else {
