@@ -9,7 +9,7 @@
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock, PoisonError,
     },
 };
@@ -20,12 +20,23 @@ use serde_json::Value;
 pub struct WorkerOverrides {
     serving: AtomicBool,
     info: Mutex<BTreeMap<String, Value>>,
+    loads_polls: AtomicUsize,
 }
 
 impl WorkerOverrides {
     /// Whether the health check answers `healthy` (the default).
     pub fn serving(&self) -> bool {
         self.serving.load(Ordering::Relaxed)
+    }
+
+    /// How many `GetLoads` the worker has answered: what a gateway's load
+    /// polls cost the engine.
+    pub fn loads_polls(&self) -> usize {
+        self.loads_polls.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn note_loads_poll(&self) {
+        self.loads_polls.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn set_serving(&self, serving: bool) {
@@ -73,6 +84,7 @@ pub fn for_port(port: u16) -> Arc<WorkerOverrides> {
         Arc::new(WorkerOverrides {
             serving: AtomicBool::new(true),
             info: Mutex::new(BTreeMap::new()),
+            loads_polls: AtomicUsize::new(0),
         })
     }))
 }

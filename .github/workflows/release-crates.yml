@@ -3,13 +3,9 @@ name: Publish Crates
 permissions:
   contents: read
 
+# Published only on a maintainer's dispatch against a release tag or branch
+# (scripts/release/README.md): no push publishes.
 on:
-  push:
-    branches: [main]
-    paths:
-      - '**/Cargo.toml'
-      - '.github/workflows/release-crates.yml'
-      - '.github/actions/publish-crate/**'
   workflow_dispatch:
 
 env:

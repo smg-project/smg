@@ -1013,52 +1013,15 @@ mod client_closed_tests {
     use tokio_stream::wrappers::ReceiverStream;
     use tower::ServiceExt;
     use tracing::Level;
-    use tracing_subscriber::{layer::SubscriberExt, Layer, Registry};
 
     use super::*;
     use crate::{
-        middleware::HttpMetricsLayer, observability::inflight_tracker::InFlightRequestTracker,
+        middleware::HttpMetricsLayer,
+        observability::{
+            inflight_tracker::InFlightRequestTracker,
+            logging::test_support::{test_subscriber, ResponseLines},
+        },
     };
-
-    /// Every event of the `smg::response` target, as (level, message).
-    #[derive(Clone, Default)]
-    struct ResponseLines(Arc<Mutex<Vec<(Level, String)>>>);
-
-    impl ResponseLines {
-        fn lines(&self) -> Vec<(Level, String)> {
-            self.0.lock().expect("lines").clone()
-        }
-    }
-
-    impl<S: tracing::Subscriber> Layer<S> for ResponseLines {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if event.metadata().target() != "smg::response" {
-                return;
-            }
-            struct Message(String);
-            impl tracing::field::Visit for Message {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    if field.name() == "message" {
-                        self.0 = format!("{value:?}");
-                    }
-                }
-            }
-            let mut message = Message(String::new());
-            event.record(&mut message);
-            self.0
-                .lock()
-                .expect("lines")
-                .push((*event.metadata().level(), message.0));
-        }
-    }
 
     fn line(level: Level, message: &str) -> (Level, String) {
         (level, message.to_owned())
@@ -1128,7 +1091,7 @@ mod client_closed_tests {
         // bytes are out and drops the body: sent in full, not a client that
         // left.
         let sink = ResponseLines::default();
-        let _guard = tracing::subscriber::set_default(Registry::default().with(sink.clone()));
+        let _subscriber = test_subscriber(sink.clone());
         let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
         let response = relay_app(Body::from_stream(ReceiverStream::new(rx)))
             .oneshot(request("/relay"))
@@ -1153,7 +1116,7 @@ mod client_closed_tests {
         // The other side of the declared-length rule: the client left with
         // the body short of its declared bytes.
         let sink = ResponseLines::default();
-        let _guard = tracing::subscriber::set_default(Registry::default().with(sink.clone()));
+        let _subscriber = test_subscriber(sink.clone());
         let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
         let response = relay_app(Body::from_stream(ReceiverStream::new(rx)))
             .oneshot(request("/relay"))
@@ -1182,7 +1145,7 @@ mod client_closed_tests {
     #[tokio::test]
     async fn a_request_the_client_dropped_before_the_response_logs_one_info_line() {
         let sink = ResponseLines::default();
-        let _guard = tracing::subscriber::set_default(Registry::default().with(sink.clone()));
+        let _subscriber = test_subscriber(sink.clone());
         let mut pending = Box::pin(app(Body::empty()).oneshot(request("/slow")));
         assert!(matches!(futures::poll!(pending.as_mut()), Poll::Pending));
         drop(pending);
@@ -1198,7 +1161,7 @@ mod client_closed_tests {
     #[tokio::test]
     async fn a_stream_the_client_dropped_logs_one_info_line_after_the_access_log() {
         let sink = ResponseLines::default();
-        let _guard = tracing::subscriber::set_default(Registry::default().with(sink.clone()));
+        let _subscriber = test_subscriber(sink.clone());
         let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
         let response = app(Body::from_stream(ReceiverStream::new(rx)))
             .oneshot(request("/stream"))
@@ -1227,7 +1190,7 @@ mod client_closed_tests {
     #[tokio::test]
     async fn a_stream_that_ends_logs_no_client_close() {
         let sink = ResponseLines::default();
-        let _guard = tracing::subscriber::set_default(Registry::default().with(sink.clone()));
+        let _subscriber = test_subscriber(sink.clone());
         let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
         let response = app(Body::from_stream(ReceiverStream::new(rx)))
             .oneshot(request("/stream"))

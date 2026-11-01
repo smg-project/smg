@@ -14,57 +14,17 @@
     reason = "an opt-in parity run reports per vocabulary"
 )]
 
-use std::{
-    io::{BufRead, BufReader},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use llm_tokenizer::{
     create_tokenizer,
     traits::{Encoder as _, Tokenizer},
     CacheConfig, CachedTokenizer,
 };
-use serde_json::Value;
 
 const DIRS_ENV: &str = "SMG_L0_PARITY_DIRS";
 const ROOT_ENV: &str = "SMG_L0_PARITY_ROOT";
 const CASES_ENV: &str = "SMG_L0_PARITY_CASES";
-
-fn prompts(root: &str, name: &str, limit: usize) -> Vec<String> {
-    let dir = std::path::Path::new(root).join(name).join("render");
-    let mut files: Vec<_> = std::fs::read_dir(&dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-                .collect()
-        })
-        .unwrap_or_default();
-    files.sort();
-    let per_file = (limit / files.len().max(1)).max(1);
-    let mut out = Vec::new();
-    for file in files {
-        let Ok(f) = std::fs::File::open(&file) else {
-            continue;
-        };
-        for line in BufReader::new(f)
-            .lines()
-            .map_while(Result::ok)
-            .take(per_file)
-        {
-            let Ok(v) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            if let Some(text) = v["reference"]["text"].as_str() {
-                if !text.is_empty() {
-                    out.push(text.to_owned());
-                }
-            }
-        }
-    }
-    out
-}
 
 /// The prompt with its last character replaced: the same length (for a
 /// one-byte character) and the same text up to the end.
@@ -111,7 +71,7 @@ fn the_l0_exact_match_cache_matches_the_plain_encode_on_render_prompts() {
                 continue;
             }
         };
-        let texts = prompts(&root, name, limit);
+        let texts = super::prompts(&root, name, limit);
         if texts.is_empty() {
             println!("L0-PARITY {name}: no prompts");
             continue;

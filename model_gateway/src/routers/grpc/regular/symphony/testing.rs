@@ -20,7 +20,7 @@ pub(super) use super::{
 pub(super) use crate::{
     routers::grpc::{
         spec::scans_for_tool_calls,
-        utils::{ModelNames, Names},
+        utils::{ModelNames, Names, TagVocabulary},
     },
     worker::BasicWorkerBuilder,
 };
@@ -114,9 +114,12 @@ pub(super) fn constraint(
         reasoning_open,
         false,
         symphony::GrammarStart::Unknown,
+        TagVocabulary::Current,
         &templates(),
     )
-    .and_then(|prepared| prepared.for_start(symphony::GrammarStart::Unknown))
+    .and_then(|prepared| {
+        prepared.for_start(symphony::GrammarStart::Unknown, TagVocabulary::Current)
+    })
     .expect("no hf")
 }
 
@@ -268,6 +271,7 @@ pub(super) fn read_with(format: Format) -> Vec<Event<'static>> {
     let assignment = Assignment {
         format: Arc::new(format),
         prompt: "<|im_start|>assistant\n".to_string(),
+        forbids_calls: false,
     };
     let mut events = Events::new();
     let mut reader = Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
@@ -350,6 +354,7 @@ pub(super) fn turn(mut extra: Value, continued: Option<&str>) -> Result<Option<V
         Asks::Chat(&request),
         &request.effective_tool_list(),
         &prompt,
+        TagVocabulary::Current,
     )?;
     Ok(constraint.map(|constraint| tag_of(Ok(Some(constraint)))["format"].clone()))
 }

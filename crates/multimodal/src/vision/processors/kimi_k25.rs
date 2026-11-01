@@ -102,14 +102,13 @@ impl VisionPreProcessor for KimiK25Processor {
 
 #[cfg(test)]
 mod tests {
-    use image::{Rgb, RgbImage};
+    use image::Rgb;
 
     use super::*;
-    use crate::vision::{preprocessor_config::PatchSize, processor::ModelSpecificValue};
-
-    fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
-        DynamicImage::from(RgbImage::from_pixel(width, height, color))
-    }
+    use crate::{
+        test_support::create_test_image,
+        vision::{preprocessor_config::PatchSize, processor::ModelSpecificValue},
+    };
 
     #[test]
     fn test_defaults() {

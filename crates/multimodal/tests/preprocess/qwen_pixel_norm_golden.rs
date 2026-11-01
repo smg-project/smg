@@ -17,6 +17,8 @@ use llm_multimodal::{
 };
 use serde_json::Value;
 
+use super::fnv1a;
+
 const GOLDEN: &str = "tests/fixtures/golden/qwen_pixel_norm.json";
 
 /// Channel 0 is the row, channel 1 the column, channel 2 their sum, each
@@ -25,15 +27,6 @@ fn gradient(width: u32, height: u32) -> DynamicImage {
     DynamicImage::ImageRgb8(RgbImage::from_fn(width, height, |x, y| {
         Rgb([(y % 256) as u8, (x % 256) as u8, ((x + y) % 256) as u8])
     }))
-}
-
-fn fnv1a(bytes: &[u8]) -> String {
-    let mut value: u64 = 0xcbf2_9ce4_8422_2325;
-    for &byte in bytes {
-        value ^= u64::from(byte);
-        value = value.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{value:016x}")
 }
 
 fn processor_for(name: &str, config: &PreProcessorConfig) -> Box<dyn VisionPreProcessor> {
@@ -119,17 +112,17 @@ fn qwen_pixel_values_match_the_reference_processors() {
         // engine receives in either width.
         let bytes = output.encoder_input.write_as(EncoderDtype::Uint8);
         assert_eq!(
-            fnv1a(&bytes),
+            fnv1a(bytes.iter().copied()),
             entry["fnv1a_patch_u8"].as_str().expect("u8 fingerprint"),
             "{name}: patch bytes"
         );
         assert_eq!(
-            fnv1a(&output.encoder_input.write_as(EncoderDtype::Float32)),
+            fnv1a(output.encoder_input.write_as(EncoderDtype::Float32)),
             entry["fnv1a_f32"].as_str().expect("f32 fingerprint"),
             "{name}: normalized f32 tensor"
         );
         assert_eq!(
-            fnv1a(&output.encoder_input.write_as(EncoderDtype::BFloat16)),
+            fnv1a(output.encoder_input.write_as(EncoderDtype::BFloat16)),
             entry["fnv1a_bf16"].as_str().expect("bf16 fingerprint"),
             "{name}: normalized bfloat16 tensor"
         );

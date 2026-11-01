@@ -72,13 +72,12 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
     // written. The engine's own server rewrites `enable_thinking` into the
     // encoder's `thinking` before rendering, so the renderer and the parser
     // read the alias. `build_chat_segments` declares every tool it is given
-    // and renders `tool_choice=none` as an internal system message that
-    // forbids the call (the served entry point forwards both as sent), so the
-    // gateway keeps the tools of such a request.
+    // and renders the `tool_choice` kwarg of `none` as an internal system
+    // message that forbids the call, as the served entry point does with the
+    // tools and the choice it is given.
     capabilities: RendererCapabilities {
         raw_tool_call_arguments: true,
         enable_thinking_alias: true,
-        declares_tools_under_tool_choice_none: true,
         ..RendererProfile::NO_CAPABILITIES
     },
     // The encoder resolves the mode by its own rule; the parser is armed
@@ -198,6 +197,12 @@ fn render_xtml(
     params: &ChatTemplateParams,
     default_effort: Option<&str>,
 ) -> Result<RenderedXtml> {
+    // The engine's renderer rewrites a `developer` message as a `system` one
+    // (and merges the system messages when one is not first) before the
+    // vendor encoding sees the conversation, whose loop has no branch for the
+    // role and would skip it; the same rule here.
+    let developer = crate::chat_template::developer_messages_as_system(messages);
+    let messages = developer.as_deref().unwrap_or(messages);
     // Re-sort tool results by tool_call_id, then normalize each message
     // (deep-sort tool schemas, coerce tool-call arguments) — both side-effect
     // free, mirroring the Python entry point.
@@ -1944,5 +1949,25 @@ mod tests {
             ),
             "schema must be deep-sorted and compacted: {rendered}"
         );
+    }
+
+    /// The engine's renderer hands the encoder a `developer` message as a
+    /// `system` one; the XTML loop has no branch for the role and dropped it.
+    #[test]
+    fn developer_message_is_the_system_message_as_the_engine_hands_it() {
+        let developer = vec![
+            json!({"role": "developer", "content": "Answer in one word."}),
+            json!({"role": "user", "content": "Colour of the sky?"}),
+        ];
+        let system = vec![
+            json!({"role": "system", "content": "Answer in one word."}),
+            json!({"role": "user", "content": "Colour of the sky?"}),
+        ];
+        let rendered = apply_kimi_k3_xtml(&developer, &params(None, None)).unwrap();
+        assert_eq!(
+            rendered,
+            apply_kimi_k3_xtml(&system, &params(None, None)).unwrap()
+        );
+        assert!(rendered.contains("Answer in one word."), "{rendered}");
     }
 }

@@ -212,17 +212,10 @@ impl LoadBalancingPolicy for ConsistentHashingPolicy {
 mod tests {
     use std::collections::HashMap;
 
-    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use openai_protocol::worker::WorkerStatus;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, HashRing, WorkerType};
-
-    fn no_health_check() -> HealthCheckConfig {
-        HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        }
-    }
+    use crate::{policies::test_support::make_workers, worker::HashRing};
 
     fn headers_with_routing_key(key: &str) -> http::HeaderMap {
         let mut headers = http::HeaderMap::new();
@@ -236,17 +229,23 @@ mod tests {
         headers
     }
 
-    fn create_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
-        urls.iter()
-            .map(|url| {
-                Arc::new(
-                    BasicWorkerBuilder::new(*url)
-                        .worker_type(WorkerType::Regular)
-                        .health_config(no_health_check())
-                        .build(),
-                ) as Arc<dyn Worker>
-            })
-            .collect()
+    /// The selection info of a request carrying `headers` and nothing else.
+    fn with_headers(headers: &http::HeaderMap) -> SelectWorkerInfo<'_> {
+        SelectWorkerInfo {
+            headers: Some(headers),
+            ..Default::default()
+        }
+    }
+
+    /// The selection info of a request carrying `headers`, routed over `ring`.
+    fn with_headers_and_ring<'a>(
+        headers: &'a http::HeaderMap,
+        ring: &Arc<HashRing>,
+    ) -> SelectWorkerInfo<'a> {
+        SelectWorkerInfo {
+            hash_ring: Some(Arc::clone(ring)),
+            ..with_headers(headers)
+        }
     }
 
     /// Every consistent-hashing entry point gathers on
@@ -256,13 +255,10 @@ mod tests {
     #[test]
     fn overloaded_worker_is_skipped_by_every_selection_path() {
         let policy = ConsistentHashingPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let headers = headers_with_routing_key("user-veto");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
         let owner = policy.select_worker_impl(&workers, &info).0.unwrap();
 
         workers[owner].set_overloaded(true);
@@ -271,10 +267,7 @@ mod tests {
 
         // Explicit target-worker probe: an operator pin does not beat the veto.
         let target = headers_with_target_worker(owner);
-        let targeted_info = SelectWorkerInfo {
-            headers: Some(&target),
-            ..Default::default()
-        };
+        let targeted_info = with_headers(&target);
         assert_ne!(
             policy.select_worker_impl(&workers, &targeted_info).0,
             Some(owner)
@@ -300,13 +293,10 @@ mod tests {
     #[test]
     fn test_consistent_routing() {
         let policy = ConsistentHashingPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let headers = headers_with_routing_key("user-123");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
 
         let (first_result, _) = policy.select_worker_impl(&workers, &info);
         let first_idx = first_result.unwrap();
@@ -322,15 +312,12 @@ mod tests {
     #[test]
     fn test_different_keys_distribute() {
         let policy = ConsistentHashingPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let mut distribution = HashMap::new();
         for i in 0..100 {
             let headers = headers_with_routing_key(&format!("user-{i}"));
-            let info = SelectWorkerInfo {
-                headers: Some(&headers),
-                ..Default::default()
-            };
+            let info = with_headers(&headers);
             let (result, _) = policy.select_worker_impl(&workers, &info);
             *distribution.entry(result.unwrap()).or_insert(0) += 1;
         }
@@ -341,13 +328,10 @@ mod tests {
     #[test]
     fn test_over_cap_routing_key_is_ignored() {
         let policy = ConsistentHashingPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let headers = headers_with_routing_key(&"k".repeat(129));
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert!(result.is_some());
@@ -357,13 +341,10 @@ mod tests {
     #[test]
     fn test_target_worker_hit() {
         let policy = ConsistentHashingPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
 
         let headers = headers_with_target_worker(1);
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(result, Some(1));
@@ -373,13 +354,10 @@ mod tests {
     #[test]
     fn test_target_worker_miss_out_of_bounds() {
         let policy = ConsistentHashingPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
 
         let headers = headers_with_target_worker(5); // Out of bounds
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(result, None);
@@ -389,14 +367,11 @@ mod tests {
     #[test]
     fn test_target_worker_miss_unhealthy() {
         let policy = ConsistentHashingPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         workers[1].set_status(WorkerStatus::NotReady);
 
         let headers = headers_with_target_worker(1);
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(result, None);
@@ -406,16 +381,13 @@ mod tests {
     #[test]
     fn test_target_worker_priority_over_routing_key() {
         let policy = ConsistentHashingPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
 
         let mut headers = http::HeaderMap::new();
         headers.insert("x-smg-target-worker", "1".parse().unwrap());
         headers.insert("x-smg-routing-key", "some-key".parse().unwrap());
 
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(result, Some(1));
@@ -425,7 +397,7 @@ mod tests {
     #[test]
     fn test_fallback_random_distribution() {
         let policy = ConsistentHashingPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         // Without routing headers, should distribute randomly across workers
         let mut distribution = HashMap::new();
@@ -450,7 +422,7 @@ mod tests {
         // key. The credential is not a session signal: the requests must
         // spread as anonymous ones do instead of landing on one worker.
         let policy = ConsistentHashingPolicy::new();
-        let workers = create_workers(&[
+        let workers = make_workers(&[
             "http://w0:8000",
             "http://w1:8000",
             "http://w2:8000",
@@ -469,11 +441,7 @@ mod tests {
         );
         let mut distribution = HashMap::new();
         for _ in 0..64 {
-            let info = SelectWorkerInfo {
-                headers: Some(&headers),
-                hash_ring: Some(ring.clone()),
-                ..Default::default()
-            };
+            let info = with_headers_and_ring(&headers, &ring);
             let (result, branch) = policy.select_worker_impl(&workers, &info);
             assert_eq!(branch, Branch::RandomFallback);
             *distribution.entry(result.unwrap()).or_insert(0) += 1;
@@ -487,14 +455,11 @@ mod tests {
     #[test]
     fn a_cookie_is_an_implicit_session_key() {
         let policy = ConsistentHashingPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let mut headers = http::HeaderMap::new();
         headers.insert("cookie", "session=abc123".parse().unwrap());
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
         let (first, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(branch, Branch::ImplicitKeyHit);
         for _ in 0..10 {
@@ -507,14 +472,11 @@ mod tests {
     #[test]
     fn test_no_healthy_workers() {
         let policy = ConsistentHashingPolicy::new();
-        let workers = create_workers(&["http://w1:8000"]);
+        let workers = make_workers(&["http://w1:8000"]);
         workers[0].set_status(WorkerStatus::NotReady);
 
         let headers = headers_with_routing_key("test");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert_eq!(result, None);
@@ -536,7 +498,7 @@ mod tests {
     fn test_consistent_hash_minimal_redistribution() {
         // Test that consistent hashing moves fewer keys than random redistribution
         let policy = ConsistentHashingPolicy::new();
-        let workers = create_workers(&[
+        let workers = make_workers(&[
             "http://w0:8000",
             "http://w1:8000",
             "http://w2:8000",
@@ -549,11 +511,7 @@ mod tests {
         for i in 0..100 {
             let key = format!("user-{i}");
             let headers = headers_with_routing_key(&key);
-            let info = SelectWorkerInfo {
-                headers: Some(&headers),
-                hash_ring: Some(ring.clone()),
-                ..Default::default()
-            };
+            let info = with_headers_and_ring(&headers, &ring);
             let (result, _) = policy.select_worker_impl(&workers, &info);
             key_to_worker_before.insert(key, result.unwrap());
         }
@@ -566,11 +524,7 @@ mod tests {
         for i in 0..100 {
             let key = format!("user-{i}");
             let headers = headers_with_routing_key(&key);
-            let info = SelectWorkerInfo {
-                headers: Some(&headers),
-                hash_ring: Some(ring.clone()),
-                ..Default::default()
-            };
+            let info = with_headers_and_ring(&headers, &ring);
             let (result, _) = policy.select_worker_impl(&workers, &info);
             let new_worker = result.unwrap();
             let old_worker = key_to_worker_before[&key];
@@ -600,17 +554,13 @@ mod tests {
         // Test that when a worker fails, keys move to another worker,
         // and when it recovers, keys return to the original worker
         let policy = ConsistentHashingPolicy::new();
-        let workers = create_workers(&["http://w0:8000", "http://w1:8000", "http://w2:8000"]);
+        let workers = make_workers(&["http://w0:8000", "http://w1:8000", "http://w2:8000"]);
         let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
 
         // Find which worker a key routes to when all are healthy
         let test_key = "session-abc-123";
         let headers = headers_with_routing_key(test_key);
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            hash_ring: Some(ring.clone()),
-            ..Default::default()
-        };
+        let info = with_headers_and_ring(&headers, &ring);
         let (result, _) = policy.select_worker_impl(&workers, &info);
         let original_idx = result.unwrap();
 
@@ -650,7 +600,7 @@ mod tests {
     #[test]
     fn test_routing_key_hint_field_routes_consistently() {
         let policy = ConsistentHashingPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let info = SelectWorkerInfo {
             routing_key: Some("user-123"),
@@ -671,7 +621,7 @@ mod tests {
     #[test]
     fn test_routing_key_hint_field_distributes() {
         let policy = ConsistentHashingPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let mut distribution = HashMap::new();
         for i in 0..100 {
@@ -690,7 +640,7 @@ mod tests {
     #[test]
     fn test_routing_key_hint_wins_over_raw_header() {
         let policy = ConsistentHashingPolicy::new();
-        let workers = create_workers(&[
+        let workers = make_workers(&[
             "http://w1:8000",
             "http://w2:8000",
             "http://w3:8000",
@@ -729,7 +679,7 @@ mod tests {
     #[test]
     fn test_routing_key_hint_outranks_rid_key() {
         let policy = ConsistentHashingPolicy::new();
-        let workers = create_workers(&[
+        let workers = make_workers(&[
             "http://w1:8000",
             "http://w2:8000",
             "http://w3:8000",
@@ -786,13 +736,10 @@ mod tests {
     #[test]
     fn test_empty_routing_key_uses_fallback() {
         let policy = ConsistentHashingPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
 
         let headers = headers_with_routing_key("");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
+        let info = with_headers(&headers);
 
         let (result, branch) = policy.select_worker_impl(&workers, &info);
         assert!(result.is_some());
