@@ -5,6 +5,7 @@ use axum::response::Response;
 use openai_protocol::{
     common::{ToolChoice, ToolChoiceValue},
     messages::CreateMessageRequest,
+    profile::ProviderProfile,
 };
 use tracing::error;
 
@@ -147,6 +148,10 @@ impl MessagePreparationStage {
         // decoder keeps the special tokens the reader needs, is decided as for
         // a chat request (`reading::prepare`), over the tools the template
         // renders.
+        // The model's provider profile, derived once for the request and
+        // read by the later stages from the state.
+        let provider = ProviderProfile::for_model(&request.model);
+        ctx.state.provider = Some(provider);
         let reading::Prepared {
             constraint: tool_call_constraint,
             json_schema: json_schema_constraint,
@@ -160,8 +165,9 @@ impl MessagePreparationStage {
             },
             &filtered_tools,
             &processed_messages.text,
-            utils::messages_reasoning_starts_in_prefill(
+            utils::messages_reasoning_starts_in_prefill_for(
                 request,
+                provider,
                 processed_messages.continued_final_message,
                 tokenizer.as_ref(),
             ),

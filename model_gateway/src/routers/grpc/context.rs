@@ -17,6 +17,7 @@ use openai_protocol::{
     embedding::{EmbeddingRequest, EmbeddingResponse},
     generate::{GenerateRequest, GenerateResponse},
     messages::{CreateMessageRequest, Message},
+    profile::ProviderProfile,
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
@@ -243,6 +244,12 @@ pub(crate) struct ProcessingState {
     /// themselves; they are the next read. `None` on the endpoints whose preparation resolves
     /// no names; a read then resolves them itself.
     pub parser_names: Option<Names>,
+
+    /// The provider profile of the request's model (`ProviderProfile::for_model`), derived once
+    /// by the chat and Messages preparations and read by the later stages in place of a
+    /// derivation of their own (the output budget, the constraint's tool-call reading, the
+    /// response spec). `None` on the other endpoints; a read then derives it itself.
+    pub provider: Option<ProviderProfile>,
 
     /// Owned here rather than inside `PreparationOutput` so EPD's `EncodeStage`
     /// can borrow it for the with-pixels encode serialization before request

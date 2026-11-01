@@ -19,7 +19,7 @@ pub(super) use super::{
 };
 pub(super) use crate::{
     routers::grpc::{
-        spec::scans_for_tool_calls,
+        spec::scans_for_tool_calls_for,
         utils::{ModelNames, Names, TagVocabulary},
     },
     worker::BasicWorkerBuilder,
