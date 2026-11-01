@@ -150,9 +150,13 @@ cmd_cleanup_postgres_db() {
 cmd_setup_oracle_client() {
     set -e
     bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_mirror.sh"
-    sudo apt-get update
-    sudo apt-get install -y unzip wget
-    sudo apt-get install -y libaio1t64 || sudo apt-get install -y libaio1
+    local sudo_cmd=()
+    if [ "$EUID" -ne 0 ]; then
+        sudo_cmd=(sudo)
+    fi
+    "${sudo_cmd[@]}" apt-get update
+    "${sudo_cmd[@]}" apt-get install -y unzip wget
+    "${sudo_cmd[@]}" apt-get install -y libaio1t64 || "${sudo_cmd[@]}" apt-get install -y libaio1
 
     LIBAIO_PATH=$(find /usr/lib -name "libaio.so*" -type f 2>/dev/null | head -1)
     INSTANT_CLIENT_DIR="$HOME/instant-client"

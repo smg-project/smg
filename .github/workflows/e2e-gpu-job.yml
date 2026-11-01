@@ -359,6 +359,7 @@ jobs:
           if [ "$CI_AMD_RESPONSES" = true ]; then
             python3 - <<'PY_RESPONSES_JUNIT'
           from pathlib import Path
+          import os
           import xml.etree.ElementTree as ET
           path = Path("e2e-logs/responses-amd.xml")
           if not path.is_file() or path.is_symlink():
@@ -366,8 +367,11 @@ jobs:
           root = ET.parse(path).getroot()
           cases = root.findall(".//testcase")
           identities = {(case.get("classname"), case.get("name")) for case in cases}
-          if len(identities) < 128:
-              raise SystemExit(f"AMD Responses: only {len(identities)} unique tests; need >=128")
+          minimum = int(os.environ["E2E_MIN_SELECTED"])
+          if minimum < 128:
+              raise SystemExit("AMD Responses: min_selected must preserve the original >=128 minimum")
+          if len(identities) < minimum:
+              raise SystemExit(f"AMD Responses: only {len(identities)} unique tests; need >={minimum}")
           bad = [case for case in cases
                  if any(case.find(tag) is not None for tag in ("skipped", "failure", "error"))]
           if bad:
