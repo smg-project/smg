@@ -519,6 +519,15 @@ class Plan:
     mirrors: list[tuple[Mirror, str]]  # the mirrors that disagree, with the version they carry
     gateway_target: str
     override: str | None
+    gateway_version: str = ""  # what the gateway's manifest reads now
+    cut_version: str | None = (
+        None  # a plan only: what the cut writes to the gateway and its mirrors, whatever the verdict
+    )
+
+    @property
+    def gateway_set(self) -> bool:
+        """Whether a plan moves the gateway to the cut's version (the cut always writes it; a line when it differs)."""
+        return self.cut_version is not None and self.gateway_version != self.cut_version
 
     @property
     def issues(self) -> int:
@@ -574,8 +583,13 @@ def examine(
     crates: Sequence[Component] = CRATES,
     packages: Sequence[Component] = PACKAGES,
     mirrors: Sequence[Mirror] = MIRRORS,
+    cut_version: str | None = None,
 ) -> Plan:
-    """Walk the components and the mirrors, printing each verdict as the shell did."""
+    """Walk the components and the mirrors, printing each verdict as the shell did.
+
+    With ``cut_version`` (a plan) the gateway and its mirrors are measured against that version, as the cut
+    writes it unconditionally (``make bump-version`` first), not against the checker's own step.
+    """
     root_toml = repo.read("Cargo.toml")
     tagged = tagged_versions(repo, (*crates, *packages))
     verdicts = []
@@ -590,8 +604,10 @@ def examine(
     target = read_version(
         "cargo", repo.read(gateway_component.version_file), gateway_component.version_file
     )
-    plan = Plan(verdicts, [], target, override)
-    if gateway is not None and gateway.unbumped:
+    plan = Plan(verdicts, [], target, override, gateway_version=target, cut_version=cut_version)
+    if cut_version is not None:
+        plan.gateway_target = cut_version
+    elif gateway is not None and gateway.unbumped:
         plan.gateway_target = plan.new_version(gateway)
     for mirror in mirrors:
         carried = read_version(mirror.kind, repo.read(mirror.file), mirror.file)
@@ -630,7 +646,7 @@ def propose(plan: Plan, out: Out, title: str = "Proposed fixes:") -> None:
     sync = out.paint("blue", "sync")
     for v in plan.verdicts:
         c = v.component
-        if v.unbumped and c.kind == "crate":
+        if v.unbumped and c.kind == "crate" and not (c.name == GATEWAY and plan.cut_version):
             new, stepped = plan.proposal(v)
             note = f"; {', '.join(stepped)}" if stepped else ""
             out.line(
@@ -651,6 +667,14 @@ def propose(plan: Plan, out: Out, title: str = "Proposed fixes:") -> None:
             out.line(
                 f"  {out.level(v.level)} {c.name} v{v.version} → v{new} ({c.version_file}{note})"
             )
+    if plan.gateway_set:
+        # the cut writes its version to the gateway whatever the conventional commits say: no level, a set
+        manifest = next(
+            v.component.version_file for v in plan.verdicts if v.component.name == GATEWAY
+        )
+        out.line(
+            f"  {out.paint('blue', 'set')} {GATEWAY} v{plan.gateway_version} → v{plan.cut_version} ({manifest})"
+        )
     for mirror, carried in plan.mirrors:
         out.line(f"  {sync} {mirror.label} v{carried} → v{plan.gateway_target} ({mirror.file})")
 
@@ -662,12 +686,21 @@ def show_plan(plan: Plan, tag: str, out: Out) -> None:
     The gateway and its mirrors take the version the cut is given (``make bump-version VERSION=…`` runs first): with
     ``VERSION_OVERRIDE`` the plan shows that version, without it the checker's own step for the gateway.
     """
+    gateway_unbumped = any(v.component.name == GATEWAY and v.unbumped for v in plan.verdicts)
     bumped_already = [
         f"{v.component.name} v{v.version}" + (" (new)" if v.tag_version is None else "")
         for v in plan.verdicts
-        if v.files_changed and not v.unbumped
+        if v.files_changed
+        and not v.unbumped
+        and not (v.component.name == GATEWAY and plan.cut_version)
     ]
-    if plan.issues == 0:
+    # what the proposal lists: the issues, the gateway counted once as a set when the cut's version is known
+    moving = (
+        plan.issues
+        - (1 if gateway_unbumped and plan.cut_version else 0)
+        + (1 if plan.gateway_set else 0)
+    )
+    if moving == 0:
         out.line(
             out.paint("bold", f"Nothing to bump against {tag}:")
             + " every crate and package changed since it is bumped already"
@@ -676,8 +709,8 @@ def show_plan(plan: Plan, tag: str, out: Out) -> None:
         )
         return
     gateway = (
-        f"the gateway and its mirrors to {plan.override}"
-        if plan.override
+        f"the gateway and its mirrors to {plan.cut_version}"
+        if plan.cut_version
         else "the gateway and its mirrors by the checker's own step (the cut writes the VERSION it is given there:"
         " pass it as VERSION_OVERRIDE for those lines)"
     )
@@ -691,7 +724,7 @@ def show_plan(plan: Plan, tag: str, out: Out) -> None:
     out.line(
         out.paint(
             "bold",
-            f"{plan.issues} component(s) and mirror(s) move (a crate's workspace pin follows it).",
+            f"{moving} component(s) and mirror(s) move (a crate's workspace pin follows it).",
         )
         + (
             f" Bumped already since {tag}, left as they are: {', '.join(bumped_already)}."
@@ -768,7 +801,8 @@ def run(
     """The check against ``tag`` in ``root``; mode is "check", "fix", "prompt" or "plan"."""
     repo = Repo(root)
     if override and not (CUT_VERSION if mode == "plan" else SEMVER).match(override):
-        raise Fatal(f"ERROR: VERSION_OVERRIDE must be in X.Y.Z format, got: '{override}'")
+        expected = "X.Y.Z or X.Y.Z-rc.N" if mode == "plan" else "X.Y.Z"
+        raise Fatal(f"ERROR: VERSION_OVERRIDE must be in {expected} format, got: '{override}'")
     if tag is None:
         # a plan compares against what a cut compares against: the last final release
         tag = repo.highest_final_tag() if mode == "plan" else repo.newest_tag()
@@ -778,8 +812,11 @@ def run(
         raise Fatal(f"Tag '{tag}' does not exist.")
     if mode == "plan":
         # the verdicts are walked in silence: on main before a cut every changed crate reads as unbumped by design
+        silent = Out(io.StringIO())
         show_plan(
-            examine(repo, tag, override, Out(io.StringIO()), crates, packages, mirrors), tag, out
+            examine(repo, tag, None, silent, crates, packages, mirrors, cut_version=override),
+            tag,
+            out,
         )
         return 0
 

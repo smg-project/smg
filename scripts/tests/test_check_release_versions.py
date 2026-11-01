@@ -392,15 +392,20 @@ def test_the_plan_lists_the_bump_quietly_and_changes_nothing(mod, repo):
     for quiet in ("not bumped", "issue(s) found", "Checking workspace", "Summary:", "✓", "!"):
         assert quiet not in out, quiet
     assert {path: (repo / path).read_text() for path in files} == before
-    # the cut's own version for the gateway and its mirrors: a candidate is allowed here, and only here
+    # the cut's own version for the gateway and its mirrors: a candidate is allowed here, and only here; the gateway
+    # is set to it whatever its conventional commits say (the fixture's are breaking: the checker alone says major)
     code, out = run(mod, repo, mode="plan", tag="v1.0.0", override="1.1.0-rc.1")
     assert code == 0
     assert "the gateway and its mirrors to 1.1.0-rc.1. Nothing is changed here" in out
-    assert "  major smg v1.0.0 → v1.1.0-rc.1 (model_gateway/Cargo.toml)" in out
+    assert "  set smg v1.0.0 → v1.1.0-rc.1 (model_gateway/Cargo.toml)" in out
+    assert "major smg" not in out
     assert "  sync chart v1.0.0 → v1.1.0-rc.1 (chart/Chart.yaml)" in out
     assert "  patch beta v1.0.0 → v1.0.1 (crates/beta/Cargo.toml)" in out
-    with pytest.raises(mod.Fatal, match="X.Y.Z"):
+    assert "8 component(s) and mirror(s) move" in out
+    with pytest.raises(mod.Fatal, match="X.Y.Z format"):
         run(mod, repo, override="1.1.0-rc.1")
+    with pytest.raises(mod.Fatal, match="X.Y.Z or X.Y.Z-rc.N format"):
+        run(mod, repo, mode="plan", override="1.1.0-rc1")
     assert {path: (repo / path).read_text() for path in files} == before
     # once the tree is consistent there is nothing to plan, still exit 0
     assert run(mod, repo, mode="fix")[0] == 0
@@ -410,6 +415,14 @@ def test_the_plan_lists_the_bump_quietly_and_changes_nothing(mod, repo):
         "Nothing to bump against v1.0.0: every crate and package changed since it is bumped already ("
     )
     assert "alpha v1.1.0" in out and "beta v1.0.1" in out and "smg v2.0.0" in out
+    # a gateway bumped already (2.0.0 against v1.0.0) is still set to the cut's version, with its mirrors: the cut
+    # writes that version unconditionally, so the plan never lists the gateway as left alone when it is given one
+    code, out = run(mod, repo, mode="plan", tag="v1.0.0", override="2.1.0-rc.1")
+    assert code == 0
+    assert "  set smg v2.0.0 → v2.1.0-rc.1 (model_gateway/Cargo.toml)" in out
+    assert "  sync chart v2.0.0 → v2.1.0-rc.1 (chart/Chart.yaml)" in out
+    assert "smg v2.0.0" not in out.split("Bumped already")[-1]
+    assert "5 component(s) and mirror(s) move" in out
 
 
 def test_the_plan_compares_against_the_highest_final_tag_by_default(mod, repo):
