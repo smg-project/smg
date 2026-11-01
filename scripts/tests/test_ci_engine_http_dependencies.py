@@ -109,9 +109,14 @@ def run_installer(
         "GITHUB_ENV": str(tmp_path / "github.env"),
     }
     for name in (
-        "SMG_CI_GRPC_COMPANION_VERSION", "IMAGE_REFLECTION_VERSION",
-        "IMAGE_SGLANG_VERSION", "IMAGE_TORCH_VERSION", "IMAGE_TORCH_HIP",
-        "IMAGE_TORCH_C_API", "FAIL_PIP_STAGE", "FAIL_NATIVE_CHECK",
+        "SMG_CI_GRPC_COMPANION_VERSION",
+        "IMAGE_REFLECTION_VERSION",
+        "IMAGE_SGLANG_VERSION",
+        "IMAGE_TORCH_VERSION",
+        "IMAGE_TORCH_HIP",
+        "IMAGE_TORCH_C_API",
+        "FAIL_PIP_STAGE",
+        "FAIL_NATIVE_CHECK",
     ):
         env.pop(name, None)
     env.update(extra_env or {})
@@ -174,8 +179,14 @@ def test_sglang_image_companion_survives_separate_actions_steps(tmp_path, image_
     assert result.returncode == 0, result.stderr
     assert calls == [
         [
-            "-m", "pip", "install", "--no-cache-dir", "--no-build-isolation",
-            "--no-binary=torch-c-dlpack-ext", "apache-tvm-ffi==0.1.12", "tilelang==0.1.15",
+            "-m",
+            "pip",
+            "install",
+            "--no-cache-dir",
+            "--no-build-isolation",
+            "--no-binary=torch-c-dlpack-ext",
+            "apache-tvm-ffi==0.1.12",
+            "tilelang==0.1.15",
             EXTENSION_SOURCE,
         ],
         ["-m", "pip", "install", "-e", "crates/grpc_client/python/", "-e", "grpc_servicer/"],
@@ -228,9 +239,7 @@ def test_unsupported_rocm_cohort_stops_before_pip(tmp_path, bad_image):
     assert calls == [] and not (tmp_path / "github.env").exists()
 
 
-@pytest.mark.parametrize(
-    "stage,exitcode", [("cohort", 42), ("native", 44), ("check", 43)]
-)
+@pytest.mark.parametrize("stage,exitcode", [("cohort", 42), ("native", 44), ("check", 43)])
 def test_rocm_repair_failure_does_not_publish_handoff(tmp_path, stage, exitcode):
     result, calls = run_installer(
         tmp_path,
@@ -250,7 +259,13 @@ def test_rocm_repair_failure_does_not_publish_handoff(tmp_path, stage, exitcode)
     else:
         assert len(calls) == (2 if stage == "native" else 3)
         assert calls[1] == [
-            "-m", "pip", "install", "-e", "crates/grpc_client/python/", "-e", "grpc_servicer/"
+            "-m",
+            "pip",
+            "install",
+            "-e",
+            "crates/grpc_client/python/",
+            "-e",
+            "grpc_servicer/",
         ]
 
 
@@ -270,10 +285,7 @@ def test_rocm_repair_preserves_all_constraint_inputs(tmp_path):
         extra_env={"IMAGE_REFLECTION_VERSION": "1.84.0", **expected},
     )
     assert result.returncode == 0, result.stderr
-    observed = [
-        json.loads(line)
-        for line in (tmp_path / "pip-env.jsonl").read_text().splitlines()
-    ]
+    observed = [json.loads(line) for line in (tmp_path / "pip-env.jsonl").read_text().splitlines()]
     assert observed == [expected] * len(calls)
     assert all(path.read_text() == contents for path in paths.values())
 
