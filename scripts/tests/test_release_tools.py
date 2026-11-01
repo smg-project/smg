@@ -1113,19 +1113,48 @@ def grpc_selection(tmp_path: Path, pypi: str, packages: str = "auto") -> dict[st
     return dict(line.split("=", 1) for line in output.read_text().splitlines())
 
 
+def go_guard(
+    ref_type: str, ref_name: str, version: str = "1.14.0"
+) -> subprocess.CompletedProcess[str]:
+    """The first step of release-go.yml, run as the workflow runs it: dispatched with the version input, on a ref
+    of the given type and name."""
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "release-go.yml").read_text())
+    step = workflow["jobs"]["release"]["steps"][0]
+    assert step["env"] == {"VERSION": "${{ inputs.version }}"}, (
+        "the input reaches the step through env"
+    )
+    return subprocess.run(
+        ["bash", "-eo", "pipefail", "-c", step["run"]],
+        env={
+            "PATH": os.pathsep.join(["/usr/bin", "/bin"]),
+            "GITHUB_REF_TYPE": ref_type,
+            "GITHUB_REF_NAME": ref_name,
+            "VERSION": version,
+        },
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_the_go_module_tag_is_made_on_a_dispatch_against_a_tag_only() -> None:
     """release-go.yml publishes a Go module tag: no push or pull request runs it (the job used to be skipped by its
-    `if`, after a run that did nothing), and its first step refuses a dispatch whose ref is not a tag, as release-grpc
-    does; the tag names the code at the release tag."""
+    `if`, after a run that did nothing), and its first step refuses a dispatch whose ref is not the tag of the version
+    it publishes: a branch moves between a dispatch and a retry, and another release's tag would give the module tag
+    that release's code (the proxies keep what they fetched first)."""
     workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "release-go.yml").read_text())
     assert list(workflow[True]) == ["workflow_dispatch"], "the yaml key `on` reads as True"
     job = workflow["jobs"]["release"]
     assert "if" not in job, "nothing to skip once the dispatch is the only trigger"
-    guard = job["steps"][0]
-    assert "tag" in guard["name"] and 'GITHUB_REF_TYPE:-}" != tag' in guard["run"]
-    assert "exit 1" in guard["run"]
+    assert "tag" in job["steps"][0]["name"]
     header = (ROOT / ".github" / "workflows" / "release-go.yml").read_text().splitlines()[2]
     assert header.startswith("# Published only on a maintainer's dispatch against a release tag")
+    assert go_guard("tag", "v1.14.0").returncode == 0
+    branch = go_guard("branch", "release/1.14")
+    assert branch.returncode == 1
+    assert "release tag" in branch.stderr and "release/1.14 is a branch" in branch.stderr
+    other = go_guard("tag", "v1.14.0", version="1.15.0")
+    assert other.returncode == 1
+    assert "against v1.15.0" in other.stderr and "v1.14.0 is another tag" in other.stderr
 
 
 def test_the_grpc_release_refuses_a_dispatch_against_a_branch(tmp_path: Path) -> None:

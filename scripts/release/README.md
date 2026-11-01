@@ -62,14 +62,16 @@ Every commit, pick and tag carries the caller's git identity and sign-off.
 
 Nothing, on its own. The `release-pypi`, `release-helm`, `release-crates`, `release-grpc`,
 `release-go` (the Go module tag `crates/grpc_client/go/v<version>`) and `release-engine-docker`
-workflows run on `workflow_dispatch` only, and refuse a dispatch whose ref is not a tag where
-the artifact names the code at the tag; `release-docker` builds the image on a push to `main`
-or `release/**` that touches the Dockerfile and pushes it on a dispatch only. The release owner dispatches each against the tag once the gate is green;
-`make release-publish-plan VERSION=<x.y.z>` prints the exact commands and the artifact names
-(the gateway image's `latest` moves only for a final; a crate publishes when its exact version
-is not on crates.io yet; a PyPI version that is complete, wheel and sdist, is skipped, and
-`-f packages=proto|servicer|both` on `release-grpc` names a package outright for a retry). The nightly prerelease and the
-CI images are unchanged by this process.
+workflows run on `workflow_dispatch` only; `release-grpc` and `release-go` also refuse a dispatch
+whose ref is not a tag (`release-go`: not the version's tag), since a branch can move between a
+dispatch and its retry; `release-docker` builds the image on a push to `main` or `release/**`
+that touches the Dockerfile and pushes it on a dispatch only. The release owner dispatches each
+against the tag once the gate is green; `make release-publish-plan VERSION=<x.y.z>` prints the
+exact commands and the artifact names (the gateway image's `latest` moves only for a final; a
+crate publishes when its exact version is not on crates.io yet; a PyPI version that is complete,
+wheel and sdist, is skipped, and `-f packages=proto|servicer|both` on `release-grpc` names a
+package outright for a retry). The nightly prerelease and the CI images are unchanged by this
+process.
 
 ## The gate
 
