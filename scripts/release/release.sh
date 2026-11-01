@@ -247,10 +247,13 @@ cmd_cut() {
   bump_tree "$version" "$since"
   commit_all "chore(release): bump versions for v$version" \
     "The release branch $branch, cut from $from_sha ($from). Versions since $since."
+  # Back to where the cut started: the next commands run from a checkout that has scripts/release/ (a line cut from a
+  # commit before a tooling change on main has none), and the push below names the branch, not HEAD.
+  git switch --quiet - 2>/dev/null || git switch --quiet --detach '@{-1}'
   say ""
-  say "$branch is at $(git rev-parse --short HEAD): $(git log -1 --format=%s)"
-  git show --stat --oneline HEAD | sed -n '2,$p' | sed 's/^/  /'
-  say "(You are on $branch now; the release commands run from a checkout that has scripts/release/, main for instance.)"
+  say "$branch is at $(git rev-parse --short "$branch"): $(git log -1 --format=%s "$branch")"
+  git show --stat --oneline "$branch" | sed -n '2,$p' | sed 's/^/  /'
+  say "(You are back on $(git rev-parse --abbrev-ref HEAD); the release commands run from a checkout that has scripts/release/, main for instance.)"
   push_release_ref "refs/heads/$branch:refs/heads/$branch" "runs the test matrix on $branch (nothing is published); then 'release.sh tag $version'"
 }
 
