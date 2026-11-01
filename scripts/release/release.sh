@@ -8,7 +8,8 @@
 #                                          commit on a topic branch and its pull request against the release branch
 #   release.sh pick <x.y> <sha>[,<sha>..]  cherry-pick commits of main (-x -s) onto a topic branch off
 #                                          release/<x.y> and open the pull request; a conflict stops with the steps
-#   release.sh pick-pr <x.y>               after a resolved conflict: push the pick branch and open its pull request
+#   release.sh pick-pr <x.y> [<branch>]    after a resolved conflict: push the pick branch (the current one, or the
+#                                          named one, checked out first) and open its pull request
 #   release.sh status <x.y>                what is on main and not on release/<x.y>, the branch's own commits,
 #                                          its tags, the open pull requests against it
 #   release.sh tag <version>               check the versions at release/<x.y>'s head and tag it v<version>
@@ -294,7 +295,7 @@ cmd_pick() {
     if [ "$n" -le 3 ]; then topic="$topic-$(git rev-parse --short "$full")"; fi
   done
   [ "$n" -le 3 ] || topic="$topic-and-$((n - 3))-more"
-  has_ref "refs/heads/$topic" && die "the branch $topic exists: delete it or finish it (release.sh pick-pr $release)"
+  has_ref "refs/heads/$topic" && die "the branch $topic exists: delete it or finish it (make release-pick-pr RELEASE=$release PICK=$topic)"
   note "pick: ${#ordered[@]} commit(s) onto $topic (from $base)"
   git switch --quiet --no-track -c "$topic" "$base"
   if ! git cherry-pick -x --signoff "${ordered[@]}"; then
@@ -307,19 +308,30 @@ cmd_pick() {
     say "    1. edit the files above, then: git add <file>..."
     say "    2. git cherry-pick --continue   (keeps the '(cherry picked from commit ...)' line and your sign-off;"
     say "                                    git cherry-pick --abort gives the pick up)"
-    say "    3. make release-pick-pr RELEASE=$release   (pushes $topic and opens the pull request against release/$release)"
+    say "    3. make release-pick-pr RELEASE=$release PICK=$topic   (pushes $topic and opens the pull request against release/$release;"
+    say "                                    run it from main, as the other release commands)"
     exit 1
   fi
   pick_pr "$release" "$topic"
 }
 
 cmd_pick_pr() {
-  local release=${1:-}
-  [ -n "$release" ] || die "usage: release.sh pick-pr <x.y>"
+  local release=${1:-} named=${2:-}
+  [ -n "$release" ] || die "usage: release.sh pick-pr <x.y> [<pick branch>]"
   release_ok "$release"
   local topic
   topic=$(git rev-parse --abbrev-ref HEAD)
-  case "$topic" in pick/"$release"-*) ;; *) die "not on a pick/$release-* branch (on $topic)" ;; esac
+  # The pick branch may lack the release targets (a line cut before a tooling change on main): the command runs from
+  # main with the branch named, and checks it out itself, after every refusal: a wrong name or a dirty tree never
+  # moves the clone.
+  if [ -n "$named" ] && [ "$named" != "$topic" ]; then
+    case "$named" in pick/"$release"-*) ;; *) die "$named is not a pick/$release-* branch (the pick branches are pick/$release-<sha>...)" ;; esac
+    has_ref "refs/heads/$named" || die "no branch $named here (the pick branches are pick/$release-<sha>...)"
+    require_clean "commit or discard them before switching to $named"
+    git switch --quiet "$named"
+    topic=$named
+  fi
+  case "$topic" in pick/"$release"-*) ;; *) die "not on a pick/$release-* branch (on $topic): name it, release.sh pick-pr $release <pick branch>" ;; esac
   has_ref CHERRY_PICK_HEAD && die "a cherry-pick is still in progress: git cherry-pick --continue (or --abort) first"
   [ ! -d "$(git rev-parse --git-path sequencer)" ] || die "a cherry-pick sequence is still in progress: git cherry-pick --continue (or --abort) first"
   # A stray change (a lock file a build rewrote after the conflict resolution) would ride into the squash unnamed.

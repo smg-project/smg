@@ -12,7 +12,7 @@ branch they created):
 |---|---|---|---|
 | cut | `make release-cut VERSION=1.14.0-rc.1 [FROM=<sha>] [PUSH=1]` | creates `release/1.14` from `FROM` (default `origin/main`), commits the version bump to `1.14.0-rc.1` on it, prints the push command | a maintainer with push rights to `release/**` |
 | gate | `make release-check VERSION=1.14.0-rc.1` | the release gate: what the repository can read (the versions at the branch head, its CI, the tag, main's drift) and the lines the release owner fills (the four model-provider verifiers) | the release owner |
-| pick | `make release-pick RELEASE=1.14 SHA=<sha>[,<sha>]` | `git cherry-pick -x -s` of commits of `main` onto a topic branch off `release/1.14`, pushed, with its pull request against the release branch; a conflict stops with the resolution steps, `make release-pick-pr RELEASE=1.14` finishes it | anyone with push rights; the pull request merges like any other |
+| pick | `make release-pick RELEASE=1.14 SHA=<sha>[,<sha>]` | `git cherry-pick -x -s` of commits of `main` onto a topic branch off `release/1.14`, pushed, with its pull request against the release branch; a conflict stops with the resolution steps, `make release-pick-pr RELEASE=1.14 PICK=pick/1.14-<sha>` finishes it from `main` (the pick branch may lack these targets) | anyone with push rights; the pull request merges like any other |
 | status | `make release-status RELEASE=1.14` | what is on `main` and not on the branch (same patch or picked with `-x` excluded), the branch's own commits, its tags, the open pull requests against it | anyone |
 | candidate or final | `make release-bump VERSION=1.14.0-rc.2` (or `VERSION=1.14.0`) | the version bump on a topic branch off `release/1.14` and its pull request against the release branch; the body carries the release gate | the release owner |
 | tag | `make release-tag VERSION=1.14.0-rc.1 [PUSH=1]` | checks the versions at the branch head against the previous tag, creates the annotated tag `v1.14.0-rc.1` with a `Signed-off-by` line, prints the push command | a maintainer with tag rights (the tag ruleset) |
@@ -128,8 +128,10 @@ A candidate or a final is tagged when, on the branch head:
   types). Files of different names never conflict, so several pick pull requests can be open
   against one branch. The directory is the release branch's; `bump-main` moves version files only.
 - A pick conflicts: the tool leaves you on the pick branch and prints the three steps
-  (`git add`, `git cherry-pick --continue`, `make release-pick-pr RELEASE=<x.y>`);
-  `git cherry-pick --abort` gives it up.
+  (`git add`, `git cherry-pick --continue`, then from `main`
+  `make release-pick-pr RELEASE=<x.y> PICK=<pick branch>`, which checks the branch out itself: a
+  line cut before a change to these targets does not carry them); `git cherry-pick --abort`
+  gives it up.
 - A candidate is bad: the next candidate is a bump pull request after the fixes are picked;
   tags are never moved.
 - A dispatched workflow fails: dispatch it again against the same tag; every publish step skips
