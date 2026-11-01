@@ -155,13 +155,17 @@ _NIXL_HELD_MEMORY = (
 )
 
 
+# The gateway refreshes the load reports it serves on /loads once per
+# load-monitor interval; the idle checks below wait for a report taken after
+# the clients left before they judge, so the sweep pins the interval it reads.
+_LOAD_MONITOR_INTERVAL_S = 2
 _GATEWAY_ARGS = [
     "--prefill-policy",
     "round_robin",
     "--decode-policy",
     "round_robin",
     "--load-monitor-interval",
-    "2",
+    str(_LOAD_MONITOR_INTERVAL_S),
     *_HEALTH_ARGS,
 ]
 _TOPOLOGIES = (
@@ -495,16 +499,37 @@ def _require_load_reports(backend: str) -> None:
         pytest.skip("load reports need gRPC workers")
 
 
+# How long a tick's report can take to reach /loads: the gateway gives a
+# group's poll LOAD_POLL_DEADLINE (worker/monitor.rs, 3 s) before it publishes
+# the tick, and an engine that answers between scheduler steps can use it. A
+# poll that misses the deadline is not published late: the tick prunes the
+# worker from /loads, which the check reads as not idle.
+_LOAD_POLL_DEADLINE_S = 3.0
+
+
 def _assert_fleet_idle_within(gateway: Gateway, timeout: float) -> None:
+    """Every worker reads idle on a load report taken after the clients left, within ``timeout``.
+
+    ``/loads`` serves the gateway's latest load report, which is up to one
+    load-monitor interval old: read the moment the clients left, it can be the
+    report taken before their requests arrived, and say idle about engines
+    that still hold the abandoned work. The first read therefore waits one
+    interval and the gateway's poll deadline, so the report it judges was
+    taken after the clients left; the deadline still counts from that moment.
+    The MoRI-IO lane reads the engines' own metrics, which are live, so it
+    does not wait.
+    """
     started = time.monotonic()
     deadline = started + timeout
+    if not _moriio_lane():
+        time.sleep(_LOAD_MONITOR_INTERVAL_S + _LOAD_POLL_DEADLINE_S)
     idle, loads = _fleet_idle(gateway)
     while not idle and time.monotonic() < deadline:
         time.sleep(1.0)
         idle, loads = _fleet_idle(gateway)
     # A floor on how long the engines kept working after the clients left:
-    # the clock starts once the callers joined their threads, and /loads is
-    # a 2 s-interval report, so only differences well above that mean much.
+    # the clock starts once the callers joined their threads and the first
+    # read waits for a fresh report, so only differences well above that mean much.
     if idle:
         logger.info("fleet idle within %.1fs of the clients leaving", time.monotonic() - started)
     assert idle, f"engines still hold work after {timeout:.0f}s: {loads}"
