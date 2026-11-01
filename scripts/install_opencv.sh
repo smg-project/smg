@@ -52,7 +52,7 @@ install_apt() {
   export DEBIAN_FRONTEND=noninteractive
   # Keep this list in sync with .github/workflows/pr-test-rust.yml.
   run $sudo apt-get update
-  run $sudo apt-get install -y --no-install-recommends \
+  run bash "$(dirname "${BASH_SOURCE[0]}")/ci_retry.sh" 3 10 $sudo apt-get install -y --no-install-recommends \
     clang \
     libclang-dev \
     cmake \

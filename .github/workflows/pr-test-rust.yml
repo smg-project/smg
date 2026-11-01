@@ -443,7 +443,7 @@ jobs:
           sudo=""; command -v sudo >/dev/null 2>&1 && sudo=sudo
           export DEBIAN_FRONTEND=noninteractive
           $sudo apt-get update
-          $sudo apt-get install -y --no-install-recommends ffmpeg
+          bash scripts/ci_retry.sh 3 10 $sudo apt-get install -y --no-install-recommends ffmpeg
 
       - name: Build the Rust tests
         timeout-minutes: 40
@@ -2145,7 +2145,7 @@ jobs:
         run: |
           bash scripts/ci_apt_mirror.sh
           sudo apt-get update
-          sudo apt-get install -y build-essential
+          bash scripts/ci_retry.sh 3 10 sudo apt-get install -y build-essential
 
       - name: Download build artifacts
         uses: ./.github/actions/download-build-artifacts
