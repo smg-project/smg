@@ -241,8 +241,8 @@ release-bump: ## Bump an existing release branch to VERSION through a pull reque
 release-pick: ## Cherry-pick SHA (comma-separated) from main onto release/RELEASE through a pull request (usage: make release-pick RELEASE=1.14 SHA=<sha>[,<sha>] [PUSH=0])
 	@PUSH="$(PUSH)" $(RELEASE_TOOL) pick "$(RELEASE)" "$(SHA)"
 
-release-pick-pr: ## After a resolved pick conflict: push the pick branch and open its pull request (usage: make release-pick-pr RELEASE=1.14)
-	@PUSH="$(PUSH)" $(RELEASE_TOOL) pick-pr "$(RELEASE)"
+release-pick-pr: ## After a resolved pick conflict: push the pick branch (the current one, or PICK=<branch> checked out first) and open its pull request (usage: make release-pick-pr RELEASE=1.14 [PICK=pick/1.14-<sha>])
+	@PUSH="$(PUSH)" $(RELEASE_TOOL) pick-pr "$(RELEASE)" $(PICK)
 
 release-status: ## What is on main and not on release/RELEASE, its own commits, tags and open pull requests (usage: make release-status RELEASE=1.14)
 	@$(RELEASE_TOOL) status "$(RELEASE)"

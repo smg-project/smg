@@ -489,16 +489,19 @@ def test_pick_conflict_stops_with_the_steps_and_pick_pr_finishes(repo: Sandbox) 
     assert f"the pick of {four[:7]} (fix(router): four (#125)) conflicts on:" in done.stdout
     assert "    model_gateway/src/main.rs" in done.stdout
     assert "git cherry-pick --continue" in done.stdout
-    assert "make release-pick-pr RELEASE=1.14" in done.stdout
-    assert repo.gh_calls() == [], "no pull request for an unresolved pick"
     topic = f"pick/1.14-{four[:7]}"
+    assert f"make release-pick-pr RELEASE=1.14 PICK={topic}" in done.stdout
+    assert repo.gh_calls() == [], "no pull request for an unresolved pick"
     assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == topic
     assert "still in progress" in repo.tool("pick-pr", "1.14", check=False).stderr
     repo.put("model_gateway/src/main.rs", 'fn main() {\n    println!("four");\n}\n')
     repo.git("add", "model_gateway/src/main.rs")
     repo.git("cherry-pick", "--continue")
     assert f"(cherry picked from commit {four})" in repo.git("log", "-1", "--format=%B")
-    repo.tool("pick-pr", "1.14")
+    # finished from main, the branch named: the pick branch may lack the release targets
+    repo.git("switch", "--quiet", "main")
+    repo.tool("pick-pr", "1.14", topic)
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == topic
     assert repo.origin_ref(f"refs/heads/{topic}") == repo.git("rev-parse", "HEAD")
     assert repo.gh_calls()[-1].startswith(
         f"gh pr create --base release/1.14 --head {topic} --title fix(router): four"
@@ -507,7 +510,27 @@ def test_pick_conflict_stops_with_the_steps_and_pick_pr_finishes(repo: Sandbox) 
 
 def test_pick_pr_refuses_other_branches(repo: Sandbox) -> None:
     repo.cut()
-    assert "not on a pick/1.14-* branch" in repo.tool("pick-pr", "1.14", check=False).stderr
+    refused = repo.tool("pick-pr", "1.14", check=False)
+    assert (
+        "not on a pick/1.14-* branch (on release/1.14): name it, release.sh pick-pr 1.14 <pick branch>"
+        in refused.stderr
+    )
+    assert (
+        "no branch pick/1.14-0000000 here"
+        in repo.tool("pick-pr", "1.14", "pick/1.14-0000000", check=False).stderr
+    )
+    assert (
+        "not on a pick/1.14-* branch (on main)"
+        in repo.tool("pick-pr", "1.14", "main", check=False).stderr
+    )  # named and checked out, then refused by its name
+    repo.put("Cargo.toml", repo.read("Cargo.toml") + "# edited\n")
+    dirty = repo.tool("pick-pr", "1.14", "release/1.14", check=False)
+    assert (
+        "uncommitted changes: commit or discard them before switching to release/1.14"
+        in dirty.stderr
+    )
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "main", "a dirty tree is not switched"
+    repo.git("checkout", "--", "Cargo.toml")
 
 
 # --- status ------------------------------------------------------------------------------
