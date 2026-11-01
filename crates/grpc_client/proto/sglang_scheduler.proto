@@ -166,6 +166,11 @@ message GenerateRequest {
   // Ask SGLang scheduler to count reasoning tokens.
   // Keep false unless the request explicitly enables reasoning/thinking.
   bool require_reasoning = 18;
+
+  // Opt-in early media identity, emitted before waiting for the PD KV handoff.
+  bool return_media_identity = 19;
+  // Decode-only hint. Original tokenized input and references remain for fallback.
+  MediaIdentity media_identity = 20;
 }
 
 message TokenizedInput {
@@ -205,6 +210,8 @@ message MultimodalInputs {
 
   // Placeholder offsets: where each image's tokens are in input_ids
   repeated PlaceholderRange mm_placeholders = 11;
+  // Engine-compatible CPU feature hash; padding is still derived by the engine.
+  optional uint64 feature_hash = 12;
 }
 
 message PlaceholderRange {
@@ -216,11 +223,23 @@ message PlaceholderRange {
 // Generate Response
 // =====================
 
+// Pixel-less preprocessing result; version/config and request bound at both ends.
+message MediaIdentity {
+  uint32 version = 1;
+  string processor_key = 2;
+  bytes request_digest = 3;
+  repeated uint32 input_ids = 4;
+  MultimodalInputs mm_inputs = 5;
+}
+
 message GenerateResponse {
   string request_id = 1;
 
   // Response type
   reserved 4;  // was GenerateError — removed, errors use gRPC status
+  // Control-only first item (response unset), never a generated token.
+  // An empty identity explicitly declines reuse.
+  MediaIdentity media_identity = 5;
 
   oneof response {
     GenerateStreamChunk chunk = 2;

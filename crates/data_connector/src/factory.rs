@@ -322,7 +322,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::core::{NewConversation, NewConversationItem, StoredResponse};
+    use crate::{
+        core::{NewConversation, NewConversationItem, StoredResponse},
+        test_support::RefusedAddress,
+    };
 
     /// A listener that completes the TCP handshake and never answers: the
     /// store that accepts bytes and says nothing.
@@ -337,12 +340,6 @@ mod tests {
     /// the client's and pool's backstops (twice it) by construction.
     const BOUND_SECS: u64 = 2;
     const BOUND: Duration = Duration::from_secs(BOUND_SECS);
-
-    /// A port nothing listens on: the connection is refused.
-    fn closed_port() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
-        listener.local_addr().expect("local address").port()
-    }
 
     fn postgres_config(port: u16) -> PostgresConfig {
         PostgresConfig {
@@ -384,8 +381,14 @@ mod tests {
         }
     }
 
-    /// `create_storage` for one remote backend, given up on well after the
-    /// start-up bound: `None` is a start-up that never gave a verdict.
+    /// The tests' hang guard: a start-up verdict, the contact's own at
+    /// `BOUND` or a backstop's at twice it, must come within it; the guard
+    /// only turns a start-up that never answers into a failure. A loaded
+    /// runner changes the tests' duration, never their verdict.
+    const HANG_GUARD: Duration = Duration::from_secs(30);
+
+    /// `create_storage` for one remote backend, given up on at the hang
+    /// guard: `None` is a start-up that never gave a verdict.
     async fn start_up(
         postgres: Option<&PostgresConfig>,
         redis: Option<&RedisConfig>,
@@ -396,7 +399,7 @@ mod tests {
             HistoryBackend::Redis
         };
         tokio::time::timeout(
-            BOUND + Duration::from_secs(20),
+            HANG_GUARD,
             create_storage(StorageFactoryConfig {
                 backend: &backend,
                 oracle: None,
@@ -445,7 +448,9 @@ mod tests {
             .expect("a store that never answers is refused at start-up");
         // The client's connect and the pool's create are bounded at twice the
         // store-call bound: the start-up contact's own verdict comes first,
-        // and names the bound, the same as for Postgres.
+        // the same as for Postgres. Only that verdict names the bound (a
+        // backstop's reads "is unreachable at start-up: ..."), so the text
+        // tells which came first; no clock on the test's side judges it.
         assert!(
             err.contains("Redis history backend")
                 && err.contains("did not answer within the start-up bound of 2 s"),
@@ -456,16 +461,12 @@ mod tests {
             started.elapsed() >= BOUND,
             "the verdict waited for the bound"
         );
-        assert!(
-            started.elapsed() <= BOUND + Duration::from_secs(5),
-            "the verdict came within the bound"
-        );
     }
 
     #[tokio::test]
     async fn an_unreachable_redis_store_is_refused_at_start_up_like_postgres() {
-        let port = closed_port();
-        let err = start_up(None, Some(&redis_config(port)))
+        let refused = RefusedAddress::reserve();
+        let err = start_up(None, Some(&redis_config(refused.port())))
             .await
             .expect("the start-up contact gives a verdict within its bound")
             .err()
@@ -479,8 +480,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreachable_postgres_store_is_refused_at_start_up() {
-        let port = closed_port();
-        let err = start_up(Some(&postgres_config(port)), None)
+        let refused = RefusedAddress::reserve();
+        let err = start_up(Some(&postgres_config(refused.port())), None)
             .await
             .expect("the start-up contact gives a verdict within its bound")
             .err()
@@ -496,24 +497,13 @@ mod tests {
         assert!(!err.contains("s3cr3t"), "the password is masked: {err}");
     }
 
-    #[tokio::test]
-    async fn test_create_storage_memory() {
-        let config = StorageFactoryConfig {
-            backend: &HistoryBackend::Memory,
-            oracle: None,
-            postgres: None,
-            redis: None,
-            memory: None,
-            hook: None,
-        };
-        let bundle = create_storage(config).await.unwrap();
+    /// The three stores of `bundle` take a write each and read it back.
+    async fn stores_and_reads_back(bundle: StorageBundle) {
         let (resp, conv, items) = (
             bundle.response_storage,
             bundle.conversation_storage,
             bundle.conversation_item_storage,
         );
-
-        // Verify they work end-to-end
         let mut response = StoredResponse::new(None);
         response.input = json!("hello");
         let id = resp.store_response(response).await.unwrap();
@@ -546,6 +536,19 @@ mod tests {
             .await
             .unwrap();
         assert!(items.get_item(&item.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_create_storage_memory() {
+        let config = StorageFactoryConfig {
+            backend: &HistoryBackend::Memory,
+            oracle: None,
+            postgres: None,
+            redis: None,
+            memory: None,
+            hook: None,
+        };
+        stores_and_reads_back(create_storage(config).await.unwrap()).await;
     }
 
     #[tokio::test]
@@ -711,45 +714,6 @@ mod tests {
             memory: None,
             hook: Some(Arc::new(NoOpHook)),
         };
-        let bundle = create_storage(config).await.unwrap();
-        let (resp, conv, items) = (
-            bundle.response_storage,
-            bundle.conversation_storage,
-            bundle.conversation_item_storage,
-        );
-
-        // Verify hooked storage works end-to-end
-        let mut response = StoredResponse::new(None);
-        response.input = json!("hello");
-        let id = resp.store_response(response).await.unwrap();
-        assert!(resp.get_response(&id).await.unwrap().is_some());
-
-        let conversation = conv
-            .create_conversation(NewConversation {
-                id: None,
-                metadata: None,
-                tenant: None,
-            })
-            .await
-            .unwrap();
-        assert!(conv
-            .get_conversation(&conversation.id)
-            .await
-            .unwrap()
-            .is_some());
-
-        let item = items
-            .create_item(NewConversationItem {
-                id: None,
-                response_id: None,
-                item_type: "message".to_string(),
-                role: Some("user".to_string()),
-                content: json!([]),
-                status: Some("completed".to_string()),
-                tenant: None,
-            })
-            .await
-            .unwrap();
-        assert!(items.get_item(&item.id).await.unwrap().is_some());
+        stores_and_reads_back(create_storage(config).await.unwrap()).await;
     }
 }

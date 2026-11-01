@@ -290,6 +290,31 @@ class Gateway:
                 worker_urls=worker_urls,
                 workers=workers,
             )
+            # A worker whose servicer cannot advertise which structural-tag
+            # vocabulary its grammar compiler takes is labelled by its
+            # operator: the TensorRT-LLM lane runs the engine's own gRPC
+            # servicer (`tensorrt_llm.commands.serve`), which reports no such
+            # fact, over the xgrammar its pinned wheel carries
+            # (scripts/ci_install_trtllm.sh: 0.1.32, before the `optional`,
+            # `plus`, `star` and `token` nodes), and the gateway spells that
+            # worker's structural tags in the older vocabulary.
+            # The router is up by now (`_launch`): a label that does not land
+            # within its wait takes the router down with it before the error
+            # goes out, so a caller that does not shut down on failure leaves
+            # no process and no port behind. The launch is marked failed
+            # first, so a temporary log is kept and the error names its tail
+            # (`_open_log_file`'s contract), as `_launch` does when the router
+            # exits.
+            try:
+                self.label_workers(
+                    [w for w in workers or () if getattr(w, "engine", None) == "trtllm"],
+                    {"structural_tag_vocabulary": "older"},
+                )
+            except Exception as e:
+                detail = self._output_tail()
+                self._started = False
+                self.shutdown()
+                raise RuntimeError(f"{e}; {detail}") from e
 
     def _ensure_ports_free(self) -> None:
         """Re-check the auto-allocated ports right before the launch.
@@ -589,6 +614,45 @@ class Gateway:
             if strict:
                 raise
             return []
+
+    def label_workers(self, workers: list, labels: dict[str, str], timeout: float = 10.0) -> None:
+        """Merge ``labels`` into the labels of ``workers`` the gateway already
+        registered (``PATCH /workers/{id}``): what an operator sets on a worker
+        whose servicer does not advertise the fact itself. The gateway keeps an
+        operator's label across its own refreshes of the labels it discovered.
+        The gateway queues the update (202), so this returns once ``GET
+        /workers`` shows the labels on every one of ``workers``, and raises
+        when they are not there after ``timeout`` seconds.
+        """
+        if not workers:
+            return
+        ids_by_url = {w.url.rstrip("/"): w.id for w in self.list_workers(strict=True)}
+        pending: set[str] = set()
+        for worker in workers:
+            worker_id = ids_by_url.get(worker.base_url.rstrip("/"))
+            if not worker_id:
+                raise RuntimeError(f"{worker.base_url} is not registered; it cannot be labelled")
+            resp = httpx.patch(
+                f"{self.base_url}/workers/{worker_id}", json={"labels": labels}, timeout=10.0
+            )
+            if resp.status_code not in (200, 202):
+                raise RuntimeError(
+                    f"PATCH /workers/{worker_id} returned {resp.status_code}: {resp.text}"
+                )
+            pending.add(worker_id)
+        deadline = time.monotonic() + timeout
+        while pending:
+            resp = httpx.get(f"{self.base_url}/workers", timeout=5.0)
+            if resp.status_code == 200:
+                for w in resp.json().get("workers", []):
+                    if w.get("id") in pending and all(
+                        (w.get("labels") or {}).get(key) == value for key, value in labels.items()
+                    ):
+                        pending.discard(w["id"])
+            if pending and time.monotonic() > deadline:
+                raise RuntimeError(f"labels {labels} are not on {sorted(pending)} after {timeout}s")
+            if pending:
+                time.sleep(0.1)
 
     def add_worker(
         self,

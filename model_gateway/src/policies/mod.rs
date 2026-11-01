@@ -25,6 +25,8 @@ mod prefix_hash;
 mod random;
 mod registry;
 mod round_robin;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;
@@ -422,17 +424,12 @@ impl SelectWorkerInfo<'_> {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use openai_protocol::worker::WorkerStatus;
 
     use super::*;
-    use crate::worker::{runtime::StallReason, BasicWorkerBuilder, WorkerType};
-
-    fn no_health_check() -> HealthCheckConfig {
-        HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        }
-    }
+    use crate::worker::{
+        runtime::StallReason, test_support::no_health_check, BasicWorkerBuilder, WorkerType,
+    };
 
     #[test]
     fn test_get_healthy_worker_indices() {

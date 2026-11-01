@@ -161,7 +161,7 @@ pub fn fallback_if_all_vetoed(
     debug!(
         branch,
         stage,
-        worker = worker.url(),
+        worker = worker.redacted_url(),
         model_id,
         "Veto fallback"
     );
@@ -182,7 +182,7 @@ pub fn shed_if_worker_overloaded(
     if !shedding || !worker.is_overloaded() {
         return None;
     }
-    let url = worker.url();
+    let url = worker.redacted_url();
     Some(shed(
         BRANCH_OVERLOADED_AT_DISPATCH,
         STAGE_DISPATCH,
@@ -457,7 +457,7 @@ mod tests {
     /// to an overloaded one.
     #[test]
     fn all_stalled_falls_back_to_the_least_loaded_ready_worker() {
-        use crate::worker::worker::StallReason;
+        use crate::worker::basic::StallReason;
 
         let a = worker("http://127.0.0.1:9841", "m");
         let b = worker("http://127.0.0.1:9842", "m");
