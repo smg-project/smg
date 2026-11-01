@@ -675,6 +675,26 @@ async fn a_generate_batch_settles_each_prompt_once_and_every_completion() {
     }
 }
 
+/// A Messages answer's `input_tokens` leave out the cached prefix: it
+/// settles them with the tokens read from the cache and written to it.
+#[tokio::test]
+async fn a_cached_messages_prompt_settles_whole() {
+    let worker = mock_worker().await;
+    worker.answer(json!({"usage": {
+        "input_tokens": 50,
+        "cache_read_input_tokens": 900,
+        "cache_creation_input_tokens": 50,
+        "output_tokens": 7,
+    }}));
+    let backend = Arc::new(RecordingBackend::default());
+    let (router, _dir) = router(Limiter::Recording(backend.clone()), &worker, true).await;
+
+    let response = Endpoint::Messages.call(&router, false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(backend.settlements(), vec![usage(1000, 7)]);
+    assert_eq!((backend.closes(), backend.abandons()), (0, 0));
+}
+
 /// A success whose body reports no usage this router can read whole closes
 /// its reservation at the estimate: no settlement, one close, nothing left
 /// open for the cell's drop to abandon. The client still gets the body.

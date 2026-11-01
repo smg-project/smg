@@ -321,29 +321,33 @@ fn hold_in_body(response: Response, attachment: ReservationAttachment) -> Respon
 }
 
 /// The usage a worker's buffered JSON answer to `route` reports: SGLang's
-/// `meta_info` on `/generate` ([`generate_usage`]), and on every other route
-/// a `usage` object in the OpenAI shape (`prompt_tokens` and
-/// `completion_tokens`: chat, completions) or the Anthropic one
-/// (`input_tokens` and `output_tokens`: messages, Responses). Embeddings and
-/// classify report `prompt_tokens` alone: they generate nothing, and a
-/// `completion_tokens` they do report must read whole. `None` for a body
-/// that is not JSON or reports none of these whole. The engine's cached and
-/// reasoning split is not read; it takes no part in the true-up.
+/// `meta_info` on `/generate` ([`generate_usage`]), Anthropic's `usage` on
+/// `/v1/messages` ([`messages_input_tokens`]), and on every other route a
+/// `usage` object in the OpenAI shape (`prompt_tokens` and
+/// `completion_tokens`: chat, completions) or the Responses one
+/// (`input_tokens` and `output_tokens`). Embeddings and classify report
+/// `prompt_tokens` alone: they generate nothing, and a `completion_tokens`
+/// they do report must read whole. `None` for a body that is not JSON or
+/// reports none of these whole. Which of the input the engine served from
+/// its cache, and which of the output it counted as reasoning, is not
+/// recorded.
 fn usage_from_body(route: &str, samples_per_prompt: u32, body: &[u8]) -> Option<UsageSettlement> {
     let value: Value = serde_json::from_slice(body).ok()?;
     if route == "/generate" {
         return generate_usage(&value, samples_per_prompt);
     }
     let usage = value.get("usage")?;
-    let (input, output) = if matches!(route, "/v1/embeddings" | "/v1/classify") {
-        let completion = match usage.get("completion_tokens") {
-            None | Some(Value::Null) => 0,
-            Some(count) => as_u32(count)?,
-        };
-        (as_u32(usage.get("prompt_tokens")?)?, completion)
-    } else {
-        token_pair(usage, "prompt_tokens", "completion_tokens")
-            .or_else(|| token_pair(usage, "input_tokens", "output_tokens"))?
+    let (input, output) = match route {
+        "/v1/embeddings" | "/v1/classify" => (
+            as_u32(usage.get("prompt_tokens")?)?,
+            count_or_zero(usage, "completion_tokens")?,
+        ),
+        "/v1/messages" => (
+            messages_input_tokens(usage)?,
+            as_u32(usage.get("output_tokens")?)?,
+        ),
+        _ => token_pair(usage, "prompt_tokens", "completion_tokens")
+            .or_else(|| token_pair(usage, "input_tokens", "output_tokens"))?,
     };
     Some(UsageSettlement {
         actual_input_tokens: input,
@@ -384,10 +388,31 @@ fn generate_usage(value: &Value, samples_per_prompt: u32) -> Option<UsageSettlem
     })
 }
 
+/// The whole prompt of an Anthropic Messages `usage`: its `input_tokens`
+/// count only the input after the last cache breakpoint, and the prompt is
+/// those, the `cache_read_input_tokens` read from the cache and the
+/// `cache_creation_input_tokens` written to it. SGLang's Messages adapter
+/// reports its cached prefix the same way, out of `input_tokens`. Unlike
+/// Responses, whose `input_tokens` include their cached tokens.
+fn messages_input_tokens(usage: &Value) -> Option<u32> {
+    as_u32(usage.get("input_tokens")?)?
+        .checked_add(count_or_zero(usage, "cache_read_input_tokens")?)?
+        .checked_add(count_or_zero(usage, "cache_creation_input_tokens")?)
+}
+
 /// The two counts `object` reports under `input` and `output`, when both
 /// are there as `u32`s.
 fn token_pair(object: &Value, input: &str, output: &str) -> Option<(u32, u32)> {
     Some((as_u32(object.get(input)?)?, as_u32(object.get(output)?)?))
+}
+
+/// The count `object` reports under `key`, zero when it reports none (absent
+/// or null); `None` for one that is not a `u32`.
+fn count_or_zero(object: &Value, key: &str) -> Option<u32> {
+    match object.get(key) {
+        None | Some(Value::Null) => Some(0),
+        Some(count) => as_u32(count),
+    }
 }
 
 fn as_u32(count: &Value) -> Option<u32> {
@@ -447,6 +472,35 @@ mod tests {
 
     /// The usage embeddings and classify report generates nothing: their
     /// `prompt_tokens` alone settles, where a generating route's would not.
+    /// Anthropic's `input_tokens` leave out the cached prefix, read or
+    /// written, which the prompt adds back; Responses' include theirs.
+    #[test]
+    fn a_messages_prompt_counts_its_cache_reads_and_writes() {
+        let cached = json!({"usage": {
+            "input_tokens": 50,
+            "cache_read_input_tokens": 900,
+            "cache_creation_input_tokens": 50,
+            "output_tokens": 7,
+        }});
+        assert_eq!(parse("/v1/messages", cached), Some(usage(1000, 7)));
+
+        let read_only = json!({"usage": {
+            "input_tokens": 50,
+            "cache_read_input_tokens": 900,
+            "cache_creation_input_tokens": null,
+            "output_tokens": 7,
+        }});
+        assert_eq!(parse("/v1/messages", read_only), Some(usage(950, 7)));
+
+        let responses = json!({"usage": {
+            "input_tokens": 1000,
+            "input_tokens_details": {"cached_tokens": 900},
+            "output_tokens": 7,
+            "total_tokens": 1007,
+        }});
+        assert_eq!(parse("/v1/responses", responses), Some(usage(1000, 7)));
+    }
+
     #[test]
     fn embeddings_and_classify_settle_their_prompt_tokens_alone() {
         for usage_object in [
@@ -519,6 +573,14 @@ mod tests {
             (
                 "/v1/messages",
                 json!({"usage": {"input_tokens": "5", "output_tokens": 2}}),
+            ),
+            (
+                "/v1/messages",
+                json!({"usage": {"input_tokens": 5, "cache_read_input_tokens": "9", "output_tokens": 2}}),
+            ),
+            (
+                "/v1/messages",
+                json!({"usage": {"input_tokens": u32::MAX, "cache_creation_input_tokens": 1, "output_tokens": 2}}),
             ),
             (
                 "/v1/completions",
