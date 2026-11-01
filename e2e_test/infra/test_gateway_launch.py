@@ -23,6 +23,24 @@ from infra.gateway import Gateway
 from infra.process_utils import ProcessExitedError, wait_for_health, wait_for_workers_ready
 from infra.worker import Worker
 
+
+def test_gateway_can_use_an_isolated_release_launcher():
+    argv = ["/work/smg-release-venv/bin/python", "-I", "-m", "smg.cli", "launch"]
+    gateway = Gateway(launch_command=argv)
+    command = gateway._build_base_cmd()
+    assert command[:5] == argv
+    assert command[5:7] == ["--host", gateway.host]
+    assert Gateway()._build_base_cmd()[:3] == ["python3", "-m", "smg.launch_router"]
+    argv.append("unrelated")
+    assert "unrelated" not in gateway._build_base_cmd()
+
+
+@pytest.mark.parametrize("argv", [[], [""], [1], "python3", {"python3": True}])
+def test_gateway_rejects_invalid_launcher_vectors(argv):
+    with pytest.raises(ValueError, match="argv list"):
+        Gateway(launch_command=argv)
+
+
 FAKE_ROUTER = textwrap.dedent(
     '''
     """A stand-in router: binds its ports, serves /workers and /readiness."""
