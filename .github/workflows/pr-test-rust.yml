@@ -935,10 +935,10 @@ jobs:
           )
           # The areas, one per skip-<area> output, each the gate of a group of lanes:
           #   chat-one-engine   the chat and router suites on one engine, SGLang: the
-          #                     sglang rows of the chat, Rust-servicer and gateway lanes
+          #                     sglang rows of the chat, Python-servicer and gateway lanes
           #                     (chat-completions implies it)
           #   chat-completions  the chat and router suites on every engine: the chat,
-          #                     Rust-servicer, worker-side multimodal, ZMQ, gateway, PD,
+          #                     Python-servicer, worker-side multimodal, ZMQ, gateway, PD,
           #                     EPD and 4-GPU lanes
           #   completions, embeddings, realtime, go-bindings   that suite's lane
           #   agentic           the Responses suite on an engine
@@ -1258,7 +1258,7 @@ jobs:
 
   # The chat suite per engine. The sglang row is the representative engine's:
   # a change the tier table places in the core (chat-one-engine) runs it, the
-  # sglang row of the Rust-servicer lane and the sglang row of the gateway
+  # sglang row of the Python-servicer lane and the sglang row of the gateway
   # lane, and nothing else of the chat family; the other rows run when every
   # engine's family (chat-completions) is reached, as the family's other lanes
   # do. A row that is not enabled skips inside the reusable job, before it
@@ -1361,15 +1361,20 @@ jobs:
       container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
     secrets: inherit
 
-  # The chat cases against the Rust gRPC servicer (SMG_SGLANG_SERVICER_IMPL=rust,
-  # SMG_VLLM_SERVICER_IMPL=rust): the same workers, the Rust request path. A
-  # row for SGLang and one for vLLM (the TokenSpeed Rust servicer has no
-  # PR-time row yet, so this lane says nothing about it): every other lane of
-  # those engines runs the Python servicer, so a launcher or binding change
-  # that breaks the Rust servicer's start fails here and nowhere else. The
-  # sglang row is the representative engine's (the chat lane says how).
-  e2e-1gpu-chat-rust-servicer:
-    name: e2e-1gpu-chat-rust-servicer (${{ matrix.engine }})
+  # The chat cases against the deprecated Python gRPC servicer
+  # (SMG_SGLANG_SERVICER_IMPL=python, SMG_VLLM_SERVICER_IMPL=python), named
+  # explicitly: the same workers and chat suite as the engine's e2e-1gpu-chat
+  # row, plus the admin-op and decisions cases that servicer serves through
+  # its own handlers. The servicer package's default is the Rust servicer, so
+  # every other vLLM and SGLang lane runs it, and this row is the one per
+  # engine that keeps the Python servicer's start, request path and control
+  # handlers covered until its removal: a launcher or binding change that
+  # breaks that start fails here and nowhere else. No tokenspeed row: the
+  # pinned engine has no Python frontend, and e2e-1gpu-chat's tokenspeed row
+  # runs the Rust servicer itself. The sglang row is the representative
+  # engine's (the chat lane says how).
+  e2e-1gpu-chat-python-servicer:
+    name: e2e-1gpu-chat-python-servicer (${{ matrix.engine }})
     needs: [build-wheel, detect-changes]
     if: >-
       always()
@@ -1377,29 +1382,30 @@ jobs:
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
       && needs.detect-changes.outputs.skip-chat-one-engine != 'true'
-    # Now also runs the previously-2-GPU chat tests (gpt-oss-20b,
-    # Qwen2.5-14B) since they're tp=1.
     strategy:
       fail-fast: false
       matrix:
         include:
+          # The chat suite of e2e-1gpu-chat's sglang row (the Python servicer
+          # serves every case, so the harness deselects nothing here) plus the
+          # admin-op and decisions cases: the Python servicer serves those
+          # through its own handlers, which the router lanes no longer reach
+          # once they run the default (Rust) servicer. The budgets are four
+          # minutes over the chat row's for those extra cases.
           - engine: sglang
             timeout: 40
             test_timeout: 32
-            # Chat lane plus the admin ops the Rust servicer serves through
-            # the wire's control calls.
             test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py e2e_test/router/test_decisions.py
-            min_selected: 204 # floor ≈ 95% of the chat lane's measured effective (215 of 223 ran on the Rust servicer; audit 2026-10-04)
-          # The vLLM chat suite on the Rust servicer: the suite, floor and
-          # budgets of e2e-1gpu-chat's vllm row (the harness deselects nothing
-          # for this servicer), so the two rows differ by the servicer only.
+            min_selected: 204 # the sglang chat row's floor; the extra cases only raise the count
+          # The vLLM chat suite on the Python servicer (the suite and floor of
+          # e2e-1gpu-chat's vllm row) plus the flush-cache case the Python
+          # servicer serves through its own handler, two minutes over the chat
+          # row's budgets; the decisions cases are SGLang's alone.
           - engine: vllm
-            timeout: 32
-            test_timeout: 24
-            min_selected: 202 # the vllm chat row's floor: the same selection
-          # No tokenspeed row: e2e-1gpu-chat's tokenspeed row runs the Rust
-          # servicer itself (the pinned engine has no Python frontend), so a
-          # second row here would repeat it.
+            timeout: 34
+            test_timeout: 26
+            test_dirs: e2e_test/chat_completions e2e_test/router/test_admin_ops.py
+            min_selected: 202 # the vllm chat row's floor; the extra case only raises the count
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: ${{ matrix.engine }}
@@ -1407,10 +1413,9 @@ jobs:
       runner: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
       timeout: ${{ matrix.timeout }}
       test_timeout: ${{ matrix.test_timeout }}
-      test_dirs: ${{ matrix.test_dirs || 'e2e_test/chat_completions' }}
+      test_dirs: ${{ matrix.test_dirs }}
       min_selected: ${{ matrix.min_selected }}
-      tokenspeed_prebuilt_image: ${{ matrix.engine == 'tokenspeed' && needs.detect-changes.outputs.tokenspeed-image || '' }}
-      servicer_impl: rust
+      servicer_impl: python
       enabled: ${{ matrix.engine == 'sglang' || needs.detect-changes.outputs.skip-chat-completions != 'true' }}
     secrets: inherit
 
@@ -2338,7 +2343,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -2411,7 +2416,7 @@ jobs:
                 "${{ needs.rust-aarch64.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-amd.result }}" =~ $bad || \
-                "${{ needs.e2e-1gpu-chat-rust-servicer.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-chat-python-servicer.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-mm-worker.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-zmq.result }}" =~ $bad || \
                 "${{ needs.e2e-2gpu-chat-zmq-dp.result }}" =~ $bad || \
