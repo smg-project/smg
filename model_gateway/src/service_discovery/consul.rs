@@ -936,7 +936,10 @@ mod tests {
     use std::{collections::VecDeque, sync::Mutex};
 
     use super::*;
-    use crate::service_discovery::testing::{create_test_app_context, live_app_context};
+    use crate::{
+        service_discovery::testing::{create_test_app_context, live_app_context},
+        test_support::RefusedAddress,
+    };
 
     const PASSING_2_0_4: &str = include_str!("testdata/consul/health-passing-2.0.4.json");
     const PASSING_1_22_7: &str = include_str!("testdata/consul/health-passing-1.22.7.json");
@@ -1787,12 +1790,9 @@ mod tests {
         );
 
         // Nothing listening at all.
-        let closed = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap()
-        };
+        let closed = RefusedAddress::reserve();
         let config = ConsulProviderConfig::with_env(
-            &discovery("smg-worker", Some(&format!("http://{closed}"))),
+            &discovery("smg-worker", Some(&closed.http_url())),
             &pd(),
             |_| None,
         )

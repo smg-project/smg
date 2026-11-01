@@ -1095,6 +1095,7 @@ class TestStartupFlow:
             request_id_headers=["x-request-id", "x-trace-id"],
             storage_context_headers={"x-tenant-id": "tenant_id"},
             request_timeout_secs=1200,
+            grpc_request_timeout_secs=30,
             max_concurrent_requests=512,
             queue_size=200,
             queue_timeout_secs=120,
@@ -1140,6 +1141,7 @@ class TestStartupFlow:
                         request_id_headers=router_args.request_id_headers,
                         storage_context_headers=router_args.storage_context_headers,
                         request_timeout_secs=router_args.request_timeout_secs,
+                        grpc_request_timeout_secs=router_args.grpc_request_timeout_secs,
                         max_concurrent_requests=router_args.max_concurrent_requests,
                         queue_size=router_args.queue_size,
                         queue_timeout_secs=router_args.queue_timeout_secs,
@@ -1189,6 +1191,7 @@ class TestStartupFlow:
             assert captured_args["request_id_headers"] == ["x-request-id", "x-trace-id"]
             assert captured_args["storage_context_headers"] == {"x-tenant-id": "tenant_id"}
             assert captured_args["request_timeout_secs"] == 1200
+            assert captured_args["grpc_request_timeout_secs"] == 30
             assert captured_args["max_concurrent_requests"] == 512
             assert captured_args["queue_size"] == 200
             assert captured_args["queue_timeout_secs"] == 120

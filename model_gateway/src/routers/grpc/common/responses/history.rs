@@ -901,21 +901,26 @@ pub(crate) mod tests {
             .link_item(&conv_id, &row.id, chrono::Utc::now())
             .await
             .expect("the row is linked");
+        let items = replayed_items(&stores, "go on").await;
+        assert_eq!(shape(&items), ["function_call:call_B", "message:user"]);
+        assert_eq!(input_item_id(&items[0]), Some(row.id.0.as_str()));
+    }
+
+    /// The items a request that continues `conv_1` with the message `text`
+    /// replays: the loaded history's input, an item list.
+    async fn replayed_items(stores: &Stores, text: &str) -> Vec<ResponseInputOutputItem> {
         let request = ResponsesRequest {
-            input: ResponseInput::Text("go on".to_string()),
+            input: ResponseInput::Text(text.to_string()),
             conversation: Some(ConversationRef::Id("conv_1".to_string())),
             ..Default::default()
         };
-
         let loaded = load_history(stores.history(), &request, None)
             .await
             .expect("the conversation loads");
-
-        let ResponseInput::Items(items) = &loaded.input else {
+        let ResponseInput::Items(items) = loaded.input else {
             panic!("the loaded input is an item list");
         };
-        assert_eq!(shape(items), ["function_call:call_B", "message:user"]);
-        assert_eq!(input_item_id(&items[0]), Some(row.id.0.as_str()));
+        items
     }
 
     /// Links `rows` to `conv_1` in order, each stamped later than the one
@@ -1012,21 +1017,9 @@ pub(crate) mod tests {
     async fn a_conversation_longer_than_the_limit_replays_its_newest_items() {
         let stores = Stores::with_conversation().await;
         link_rows(&stores, (1..=120).map(message_row).collect()).await;
-        let request = ResponsesRequest {
-            input: ResponseInput::Text("item 121".to_string()),
-            conversation: Some(ConversationRef::Id("conv_1".to_string())),
-            ..Default::default()
-        };
-
-        let loaded = load_history(stores.history(), &request, None)
-            .await
-            .expect("the conversation loads");
-
-        let ResponseInput::Items(items) = &loaded.input else {
-            panic!("the loaded input is an item list");
-        };
+        let items = replayed_items(&stores, "item 121").await;
         let expected: Vec<String> = (21..=121).map(|n| format!("item {n}")).collect();
-        assert_eq!(texts(items), expected);
+        assert_eq!(texts(&items), expected);
     }
 
     /// A conversation one item longer than the limit, whose first items are
@@ -1045,20 +1038,8 @@ pub(crate) mod tests {
         ];
         rows.extend((5..=101).map(message_row));
         link_rows(&stores, rows).await;
-        let request = ResponsesRequest {
-            input: ResponseInput::Text("item 102".to_string()),
-            conversation: Some(ConversationRef::Id("conv_1".to_string())),
-            ..Default::default()
-        };
-
-        let loaded = load_history(stores.history(), &request, None)
-            .await
-            .expect("the conversation loads");
-
-        let ResponseInput::Items(items) = &loaded.input else {
-            panic!("the loaded input is an item list");
-        };
-        let kinds = shape(items);
+        let items = replayed_items(&stores, "item 102").await;
+        let kinds = shape(&items);
         assert_eq!(kinds[0], "message:user", "{kinds:?}");
         assert!(
             !kinds.iter().any(|kind| kind.starts_with("function_call")),
@@ -1068,7 +1049,7 @@ pub(crate) mod tests {
         // messages replay, then the request
         assert_eq!(items.len(), 101 - 4 + 1);
         let expected: Vec<String> = (5..=102).map(|n| format!("item {n}")).collect();
-        assert_eq!(texts(items), expected);
+        assert_eq!(texts(&items), expected);
     }
 
     /// A conversation of exactly the limit is not cut: every item replays,
@@ -1080,20 +1061,8 @@ pub(crate) mod tests {
         let mut rows = vec![output_row("call_A")];
         rows.extend((2..=100).map(message_row));
         link_rows(&stores, rows).await;
-        let request = ResponsesRequest {
-            input: ResponseInput::Text("item 101".to_string()),
-            conversation: Some(ConversationRef::Id("conv_1".to_string())),
-            ..Default::default()
-        };
-
-        let loaded = load_history(stores.history(), &request, None)
-            .await
-            .expect("the conversation loads");
-
-        let ResponseInput::Items(items) = &loaded.input else {
-            panic!("the loaded input is an item list");
-        };
-        let kinds = shape(items);
+        let items = replayed_items(&stores, "item 101").await;
+        let kinds = shape(&items);
         assert_eq!(kinds[0], "function_call_output:call_A", "{kinds:?}");
         assert_eq!(items.len(), 100 + 1);
         assert_eq!(kinds.last().map(String::as_str), Some("message:user"));
@@ -1323,21 +1292,9 @@ pub(crate) mod tests {
     async fn a_cut_that_lands_on_a_turn_boundary_replays_the_newest_items_whole() {
         let stores = Stores::with_conversation().await;
         link_rows(&stores, (1..=150).map(message_row).collect()).await;
-        let request = ResponsesRequest {
-            input: ResponseInput::Text("item 151".to_string()),
-            conversation: Some(ConversationRef::Id("conv_1".to_string())),
-            ..Default::default()
-        };
-
-        let loaded = load_history(stores.history(), &request, None)
-            .await
-            .expect("the conversation loads");
-
-        let ResponseInput::Items(items) = &loaded.input else {
-            panic!("the loaded input is an item list");
-        };
+        let items = replayed_items(&stores, "item 151").await;
         let expected: Vec<String> = (51..=151).map(|n| format!("item {n}")).collect();
-        assert_eq!(texts(items), expected);
+        assert_eq!(texts(&items), expected);
     }
 
     /// The rows of a conversation of agent turns, each the user's message,
@@ -1364,20 +1321,8 @@ pub(crate) mod tests {
     async fn a_cut_window_that_begins_inside_a_turn_starts_at_the_next_turn_boundary() {
         let stores = Stores::with_conversation().await;
         link_rows(&stores, agent_turn_rows()).await;
-        let request = ResponsesRequest {
-            input: ResponseInput::Text("item 151".to_string()),
-            conversation: Some(ConversationRef::Id("conv_1".to_string())),
-            ..Default::default()
-        };
-
-        let loaded = load_history(stores.history(), &request, None)
-            .await
-            .expect("the conversation loads");
-
-        let ResponseInput::Items(items) = &loaded.input else {
-            panic!("the loaded input is an item list");
-        };
-        let kinds = shape(items);
+        let items = replayed_items(&stores, "item 151").await;
+        let kinds = shape(&items);
         assert_eq!(
             &kinds[..4],
             [
@@ -1399,7 +1344,7 @@ pub(crate) mod tests {
             .map(|n| format!("item {n}"))
             .collect();
         expected.extend(["item 149".to_string(), "item 151".to_string()]);
-        assert_eq!(texts(items), expected);
+        assert_eq!(texts(&items), expected);
     }
 
     /// One turn longer than the window, the model's reasoning, call and
@@ -1416,20 +1361,8 @@ pub(crate) mod tests {
             rows.push(output_row(&format!("call_{step}")));
         }
         link_rows(&stores, rows).await;
-        let request = ResponsesRequest {
-            input: ResponseInput::Text("go on".to_string()),
-            conversation: Some(ConversationRef::Id("conv_1".to_string())),
-            ..Default::default()
-        };
-
-        let loaded = load_history(stores.history(), &request, None)
-            .await
-            .expect("the conversation loads");
-
-        let ResponseInput::Items(items) = &loaded.input else {
-            panic!("the loaded input is an item list");
-        };
-        let kinds = shape(items);
+        let items = replayed_items(&stores, "go on").await;
+        let kinds = shape(&items);
         // row 52 of 151 is the output of step 17: the window begins at step 18
         assert_eq!(
             &kinds[..3],

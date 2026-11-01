@@ -412,13 +412,7 @@ impl Assembler {
     /// tag the syntax read, before text that is released ([`Self::release`]), which cannot wait
     /// for a later event's source.
     fn drop_carried(&mut self, out: &mut Events) {
-        let text = std::mem::take(&mut self.carried);
-        if !text.is_empty() {
-            out.push(Event::Dropped {
-                text: Text::uncounted(text),
-                why: DropReason::Wrapper,
-            });
-        }
+        crate::event::drop_carried(std::mem::take(&mut self.carried), out);
     }
 
     fn take(&mut self, piece: Piece<'_>, declared: &Declared, out: &mut Events) {
@@ -766,7 +760,7 @@ impl Assembler {
     fn push_fragment<'d>(&self, json: String, source: Text<'d>, out: &mut Events<'d>) {
         out.push(Event::ToolCallArguments {
             index: self.index,
-            json,
+            json: json.into(),
             source,
         });
     }
@@ -802,7 +796,7 @@ pub(crate) fn push_escaped(out: &mut String, text: &str) {
 }
 
 impl crate::engine::CallAssembler for Assembler {
-    fn feed(&mut self, text: &str, declared: &Declared, out: &mut Events) -> usize {
+    fn feed<'d>(&mut self, text: &'d str, declared: &Declared, out: &mut Events<'d>) -> usize {
         self.feed(text, declared, out)
     }
 
@@ -832,7 +826,10 @@ mod tests {
     use serde_json::{json as value, Value};
 
     use super::*;
-    use crate::testing::bytes;
+    use crate::{
+        tagged::{dropped, nothing_empty, refused, shown},
+        testing::{arguments, bytes, malformed},
+    };
 
     fn ids() -> CallIds {
         CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
@@ -895,46 +892,11 @@ mod tests {
         run(pieces, Placement::OwnLine, Assembler::close).0
     }
 
-    /// The arguments as the client sees them: every fragment, concatenated.
-    fn arguments(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
     fn name_of<'a>(events: &'a [Event<'_>]) -> Option<&'a str> {
         events.iter().find_map(|event| match event {
             Event::ToolCallStart { name, .. } => Some(name.as_str()),
             _ => None,
         })
-    }
-
-    fn malformed(events: &[Event]) -> Vec<(String, MalformedReason)> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// The bytes dropped as the template's wrapper: the whitespace around the syntax's tags.
-    fn dropped(events: &[Event]) -> Vec<String> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Dropped {
-                    text,
-                    why: DropReason::Wrapper,
-                } => Some(text.text.to_string()),
-                _ => None,
-            })
-            .collect()
     }
 
     fn ends(events: &[Event]) -> usize {
@@ -947,7 +909,7 @@ mod tests {
     fn fragment(json: &str, source: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index: 0,
-            json: json.to_string(),
+            json: json.to_string().into(),
             source: Text::uncounted(source.to_owned()),
         }
     }
@@ -957,44 +919,6 @@ mod tests {
             index: 0,
             source: Text::uncounted(source.to_owned()),
         }
-    }
-
-    /// No fragment is empty and no `Malformed` or `Dropped` text is empty, but for the one event
-    /// of no bytes that counts a refused run and stands right before its `Dropped {
-    /// MalformedCall }`: any other empty report would claim a byte where none was.
-    fn nothing_empty(events: &[Event]) {
-        for (at, event) in events.iter().enumerate() {
-            match event {
-                Event::ToolCallArguments { json, .. } => assert!(!json.is_empty(), "{event:?}"),
-                Event::Malformed { text, .. } if text.text.is_empty() => assert!(
-                    matches!(
-                        events.get(at + 1),
-                        Some(Event::Dropped { text, why: DropReason::MalformedCall })
-                            if !text.text.is_empty()
-                    ),
-                    "{event:?}: an empty report with no refused bytes after it"
-                ),
-                Event::Malformed { text, .. } | Event::Dropped { text, .. } => {
-                    assert!(!text.text.is_empty(), "{event:?}");
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// The bytes refused: the text of the `Dropped { MalformedCall }` events, which no adapter
-    /// shows.
-    fn refused(events: &[Event]) -> Vec<String> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Dropped {
-                    text,
-                    why: DropReason::MalformedCall,
-                } => Some(text.text.to_string()),
-                _ => None,
-            })
-            .collect()
     }
 
     #[test]
@@ -1252,7 +1176,7 @@ mod tests {
         };
         let fragment_of = |index: u32, json: &str, source: &str| Event::ToolCallArguments {
             index,
-            json: json.to_string(),
+            json: json.to_string().into(),
             source: Text::uncounted(source.to_owned()),
         };
         let end_of = |index: u32| Event::ToolCallEnd {
@@ -1450,18 +1374,6 @@ mod tests {
         assert_eq!(arguments(&events), "{}");
         assert_eq!(ends(&events), 1);
         assert_eq!(bytes(&events), block);
-    }
-
-    /// The content a chat client reads: every content and malformed text, in order, as the chat
-    /// adapter folds it.
-    fn shown(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) | Event::Malformed { text, .. } => Some(&*text.text),
-                _ => None,
-            })
-            .collect()
     }
 
     #[test]

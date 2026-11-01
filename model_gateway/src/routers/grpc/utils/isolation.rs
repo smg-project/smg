@@ -177,8 +177,8 @@ fn sanitized(message: &str) -> String {
 }
 
 /// The text the test trap springs on, when this process runs with one
-/// ([`TEST_TRAP_VAR`]; a test of this crate arms it with
-/// [`arm_test_trap`]): a reader whose step carries it panics, so the
+/// ([`TEST_TRAP_VAR`]; a test of this crate arms it with `arm_test_trap`,
+/// a `cfg(test)` item): a reader whose step carries it panics, so the
 /// request's isolation is exercised end to end. `None` otherwise.
 pub(crate) fn test_trap() -> Option<&'static str> {
     static TRAP: OnceLock<Option<Box<str>>> = OnceLock::new();

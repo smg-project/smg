@@ -215,7 +215,7 @@ def scheduler_load_fields(
     num_running: int,
     num_waiting: int,
     kv_usage: float,
-    estimate: LoadEstimate,
+    estimate: LoadEstimate | None,
     *,
     dp_rank: int = 0,
     max_total_num_tokens: int = 0,
@@ -224,7 +224,7 @@ def scheduler_load_fields(
     """The ``SchedulerLoad`` fields for one rank: vLLM's own counts plus the
     tracker's estimate for that rank, with ``num_used_tokens`` and
     ``utilization`` derived from the KV usage as the SGLang servicer derives
-    them."""
+    them. A missing estimate leaves its fields unset."""
     kv_usage = max(0.0, float(kv_usage or 0.0))
     fields = {
         "dp_rank": int(dp_rank),
@@ -233,10 +233,13 @@ def scheduler_load_fields(
         "num_total_reqs": int(num_running) + int(num_waiting),
         "token_usage": kv_usage,
         "utilization": kv_usage,
-        "num_waiting_uncached_tokens": int(estimate.queued_token_work),
-        "gen_throughput": float(estimate.gen_throughput),
-        "cache_hit_rate": float(estimate.cache_hit_rate),
     }
+    if estimate is not None:
+        fields.update(
+            num_waiting_uncached_tokens=int(estimate.queued_token_work),
+            gen_throughput=float(estimate.gen_throughput),
+            cache_hit_rate=float(estimate.cache_hit_rate),
+        )
     if max_total_num_tokens > 0:
         fields["max_total_num_tokens"] = int(max_total_num_tokens)
         fields["num_used_tokens"] = int(round(kv_usage * max_total_num_tokens))
@@ -249,7 +252,7 @@ def load_record(
     num_running: int,
     num_waiting: int,
     kv_usage: float,
-    estimate: LoadEstimate,
+    estimate: LoadEstimate | None,
     *,
     dp_rank: int = 0,
     max_total_num_tokens: int = 0,
@@ -259,7 +262,7 @@ def load_record(
     figures :func:`scheduler_load_fields` reports on ``GetLoads``: the two
     agree field for field. The queued token-work is this servicer's own
     estimate for the rank, so every rank's record carries it, as on the
-    poll."""
+    poll. A missing estimate leaves queued token-work unset."""
     load = vllm_engine_pb2.SchedulerLoad(
         **scheduler_load_fields(
             num_running,
@@ -271,4 +274,4 @@ def load_record(
             max_running_requests=max_running_requests,
         )
     )
-    return engine_load_from(load, queued_token_work=True)
+    return engine_load_from(load, queued_token_work=estimate is not None)
