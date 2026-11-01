@@ -608,50 +608,76 @@ for component in (*crv.CRATES, *crv.PACKAGES):
     print(component.kind, component.name, version, component.version_file, component.path)
 PYEOF
 }
-crate_versions() { # <ref>: "name version" of every workspace crate the version checker lists, at a ref
-  publishable "$1" | awk '$1 == "crate" { print $2, $3 }'
+component_list() { # <ref> <file>: publishable's lines into <file>, or a failure naming the error (a manifest the checker refuses, an import
+  # failure): read outside a pipe or a process substitution, where the exit status would be lost and a short list pass for the whole
+  local err
+  err=$(mktemp)
+  if ! publishable "$1" > "$2" 2> "$err"; then
+    say "the crate and package list at $(git rev-parse --short "$1") could not be read ($(tail -n 1 "$err"))" >&2
+    return 1
+  fi
 }
 
 # --- the registries ---------------------------------------------------------------------
 # crates.io and PyPI take a version once: a component whose version at the branch head is published already is skipped
-# by its publish dispatch, and when its code changed after that version landed (the push-triggered publishes of the
-# older process left such versions behind) the release ships none of those changes while every repository-side check
-# reads green. The reads run in parallel, 20 s each; REGISTRY=0 skips them.
+# by its publish dispatch, and when its code changed after that version was published the release ships none of those
+# changes while every repository-side check reads green. A version is published from the first tag of this process
+# that carries it (the dispatch runs against the tag); a version no such tag carries was published at its bump, the
+# way of the older push-triggered publishes. The reads run one at a time: crates.io through the sparse index cargo
+# itself reads (one static file per crate, no API call: the API asks its clients for one request a second), PyPI's
+# JSON API at most once a second; 20 s each. REGISTRY=0 skips them.
 
-registry_versions() { # <crate|package> <name>: the versions the registry holds, one per line; "unread" when it did not answer; nothing for a name it has not
+USER_AGENT='smg-release-tooling (https://github.com/smg-project/smg)'
+index_path() { # <crate name>: the crate's file in the sparse index, as cargo spells it (1/x, 2/xy, 3/x/xyz, xy/zw/xyzw...)
+  local name
+  name=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case ${#name} in
+    1) printf '1/%s' "$name" ;;
+    2) printf '2/%s' "$name" ;;
+    3) printf '3/%s/%s' "${name:0:1}" "$name" ;;
+    *) printf '%s/%s/%s' "${name:0:2}" "${name:2:2}" "$name" ;;
+  esac
+}
+registry_versions() { # <crate|package> <name>: the versions the registry holds, one per line (yanked ones too: a name takes a version once); "unread" when it did not answer; nothing for a name it has not
   local url out code body
-  case $1 in crate) url="https://crates.io/api/v1/crates/$2" ;; *) url="https://pypi.org/pypi/$2/json" ;; esac
-  out=$("$CURL" -sS -L -m 20 -A 'smg-release-tooling' -w '\n%{http_code}' "$url" 2>/dev/null) || { say unread; return 0; }
+  case $1 in crate) url="https://index.crates.io/$(index_path "$2")" ;; *) url="https://pypi.org/pypi/$2/json" ;; esac
+  out=$("$CURL" -sS -L -m 20 -A "$USER_AGENT" -w '\n%{http_code}' "$url" 2>/dev/null) || { say unread; return 0; }
   code=${out##*$'\n'}; body=${out%$'\n'*}
   case $code in
     200) "$PYTHON" -c 'import json, sys
-data = json.load(sys.stdin)
-print("\n".join(v["num"] for v in data["versions"]) if sys.argv[1] == "crate" else "\n".join(data["releases"]))' "$1" <<< "$body" 2>/dev/null || say unread ;;
+if sys.argv[1] == "crate":
+    print("\n".join(json.loads(line)["vers"] for line in sys.stdin if line.strip()))
+else:
+    print("\n".join(json.load(sys.stdin)["releases"]))' "$1" <<< "$body" 2>/dev/null || say unread ;;
     404) ;;
     *) say unread ;;
   esac
 }
-registry_report() { # <ref>: "name version held|free|unread <commits after the version line last moved>" per publishable component
-  local ref=$1 dir kind name version manifest path moved after
-  dir=$(mktemp -d)
+published_from() { # <ref> <bump commit>: the first release tag of this process (none is on $REMOTE/main) reachable from <ref> that carries the bump, where its publish dispatch ran; empty when no tag does
+  comm -23 <(git tag --list 'v[0-9]*' --merged "$1" --contains "$2" | sort) <(git tag --list 'v[0-9]*' --merged "$REMOTE/main" | sort) \
+    | sed 's/-rc\./~rc./' | sort -V | head -n 1 | sed 's/~rc\./-rc./'
+}
+after_text() { # <count> <bump|tag>: the commits a published version misses, and from where they are counted
+  if [ "$2" = bump ]; then printf '%s commit(s) after its bump' "$1"; else printf '%s commit(s) after %s, the tag it was published from' "$1" "$2"; fi
+}
+registry_report() { # <ref> <list>: "name version held|free|unread <commits after> <bump|tag>" per line of <list> (publishable's output), one registry read at a time
+  local ref=$1 list=$2 kind name version manifest path moved from after state line pypi=0
   while read -r kind name version manifest path; do
     moved=$(git log -1 --format=%H -G'^version = ' "$ref" -- "$manifest")
-    after=$(git rev-list --count "${moved:-$ref}..$ref" -- "$path")
+    from=$(published_from "$ref" "${moved:-$ref}")
+    after=$(git rev-list --count "${from:-${moved:-$ref}}..$ref" -- "$path")
+    state=free
     if [ "${REGISTRY:-1}" = 0 ]; then
-      printf '%s %s unread %s\n' "$name" "$version" "$after" > "$dir/$name"
-      continue
-    fi
-    (
-      local state=free line
+      state=unread
+    else
+      if [ "$kind" = package ]; then [ "$pypi" -eq 0 ] || sleep 1; pypi=$((pypi + 1)); fi
       while IFS= read -r line; do
         [ "$line" = unread ] && state=unread
         [ "$line" = "$version" ] && state=held
       done < <(registry_versions "$kind" "$name")
-      printf '%s %s %s %s\n' "$name" "$version" "$state" "$after"
-    ) > "$dir/$name" &
-  done < <(publishable "$ref")
-  wait
-  cat "$dir"/* 2>/dev/null | sort
+    fi
+    printf '%s %s %s %s %s\n' "$name" "$version" "$state" "$after" "${from:-bump}"
+  done < "$list" | sort
 }
 
 engine_dispatches() { # <ref> <tag>: one dispatch per (engine, release base), the table read from the workflow at <ref>
@@ -682,14 +708,14 @@ PYEOF
 }
 
 registry_mark() { # <report file> <name> <registry>: the mark a plan line carries when the registry holds that version already
-  awk -v n="$2" -v r="$3" '$1 == n && $3 == "held" { printf " (on %s already: the dispatch skips it%s)", r, ($4 > 0 ? "; " $4 " commit(s) after its bump" : "") }' "$1"
+  awk -v n="$2" -v r="$3" '$1 == n && $3 == "held" { printf " (on %s already: the dispatch skips it%s)", r, ($4 > 0 ? "; " $4 " commit(s) after " ($5 == "bump" ? "its bump" : $5 ", the tag it was published from") : "") }' "$1"
 }
 
 cmd_publish_plan() {
   local version=${1:-}
   [ -n "$version" ] || die "usage: release.sh publish-plan <version>"
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
-  local release tagname ref latest proto servicer marks crate_name crate_version
+  local release tagname ref latest proto servicer list marks crate_name crate_version
   release=$(release_of "$version"); tagname="v$version"
   fetch
   if has_ref "refs/tags/$tagname"; then
@@ -710,11 +736,12 @@ cmd_publish_plan() {
   say "2. Rust crates (crates.io: every workspace crate whose version at $tagname is not published yet; smg $version)"
   say "   gh workflow run release-crates.yml --ref $tagname"
   say "   crate versions at $tagname (a crate whose manifest says publish = false or publish = [] is never published and not listed; a version crates.io holds already is skipped by the dispatch and marked):"
-  marks=$(mktemp)
-  registry_report "$ref" > "$marks"
+  list=$(mktemp); marks=$(mktemp)
+  component_list "$ref" "$list" || die "publish-plan: the crates and packages at $ref are unknown; nothing listed"
+  registry_report "$ref" "$list" > "$marks"
   while read -r crate_name crate_version; do
     say "     $crate_name $crate_version$(registry_mark "$marks" "$crate_name" crates.io)"
-  done < <(crate_versions "$ref")
+  done < <(awk '$1 == "crate" { print $2, $3 }' "$list")
   [ "${REGISTRY:-1}" != 0 ] || say "     (the registries were not read: REGISTRY=0)"
   say "3. Gateway image (Docker Hub lightseekorg/smg:$version and ghcr.io/smg-project/smg:$version $latest)"
   say "   gh workflow run release-docker.yml --ref $tagname"
@@ -759,7 +786,7 @@ cmd_check() {
   [ -n "$version" ] || die "usage: release.sh check <version>"
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
   local release branch base head tagname carried since scratch slug checks runs drift=0 family failed=0 full picked
-  local name state after held="" quiet="" unread=0 read=0
+  local name state after from list listed held="" quiet="" unread=0 read=0
   release=$(release_of "$version"); branch="release/$release"; tagname="v$version"
   fetch
   base=$(release_ref "$release"); head=$(git rev-parse "$base")
@@ -783,27 +810,38 @@ cmd_check() {
     failed=1
   fi
   # 1b. the registries: a component at a version crates.io or PyPI hold already is skipped by its publish dispatch;
-  # with changes after that version landed, the release ships none of them. REGISTRY=0 skips the reads.
-  while read -r name carried state after; do
-    read=$((read + 1))
-    case $state in
-      held) if [ "$after" -gt 0 ]; then held="$held, $name $carried ($after commit(s) after its bump)"; else quiet="$quiet, $name $carried"; fi ;;
-      unread) unread=$((unread + 1)) ;;
-    esac
-  done < <(registry_report "$head")
-  if [ "${REGISTRY:-1}" = 0 ]; then
-    say "[....] registry: crates.io and PyPI not read (REGISTRY=0): a version they hold already is skipped by its publish dispatch"
-    failed=1
-  elif [ -n "$held" ]; then
-    say "[FAIL] registry: at a version crates.io or PyPI hold already, with changes after it (the publish dispatch skips them and ships none of those changes; a bump pull request against $branch moves them): ${held#, }"
-    failed=1
-  elif [ "$unread" -gt 0 ]; then
-    say "[....] registry: $unread of $read read(s) of crates.io / PyPI did not answer; read again before the tag"
+  # with changes after that version was published, the release ships none of them. REGISTRY=0 skips the reads.
+  # The component list is read first, with its exit status: a list the checker could not produce is a failure of
+  # this item, never a shorter list that passes.
+  list=$(mktemp)
+  if ! listed=$(component_list "$head" "$list" 2>&1); then
+    say "[FAIL] registry: $listed; nothing was compared with crates.io or PyPI"
     failed=1
   else
-    say "[ok]   registry: no crate or package sits at a version crates.io or PyPI hold already with changes after it ($read read)"
+    while read -r name carried state after from; do
+      read=$((read + 1))
+      case $state in
+        held) if [ "$after" -gt 0 ]; then held="$held, $name $carried ($(after_text "$after" "$from"))"; else quiet="$quiet, $name $carried"; fi ;;
+        unread) unread=$((unread + 1)) ;;
+      esac
+    done < <(registry_report "$head" "$list")
+    if [ "$read" -ne "$(grep -c . "$list")" ]; then
+      say "[FAIL] registry: $read of $(grep -c . "$list") crates and packages compared with crates.io / PyPI (the report is short)"
+      failed=1
+    elif [ "${REGISTRY:-1}" = 0 ]; then
+      say "[....] registry: crates.io and PyPI not read (REGISTRY=0): a version they hold already is skipped by its publish dispatch"
+      failed=1
+    elif [ -n "$held" ]; then
+      say "[FAIL] registry: at a version crates.io or PyPI hold already, with changes after it (the publish dispatch skips them and ships none of those changes; a bump pull request against $branch moves them): ${held#, }"
+      failed=1
+    elif [ "$unread" -gt 0 ]; then
+      say "[....] registry: $unread of $read read(s) of crates.io / PyPI did not answer; read again before the tag"
+      failed=1
+    else
+      say "[ok]   registry: no crate or package sits at a version crates.io or PyPI hold already with changes after it ($read of $read read)"
+    fi
+    [ -z "$quiet" ] || say "[note] registry: at a published version with nothing changed after it (the dispatch skips them, nothing is lost): ${quiet#, }"
   fi
-  [ -z "$quiet" ] || say "[note] registry: at a published version with nothing changed after it (the dispatch skips them, nothing is lost): ${quiet#, }"
   # 2. CI on the head
   if command -v "$GH" >/dev/null 2>&1 && slug=$("$GH" repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null) && [ -n "$slug" ]; then
     local ok=0 bad=0 pending=0 line read_rc=0 error
