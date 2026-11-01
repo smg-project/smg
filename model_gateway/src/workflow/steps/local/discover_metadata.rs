@@ -12,8 +12,8 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 use crate::{
     routers::grpc::client::{flat_labels, GrpcClient},
     worker::{
-        sampling_defaults::SamplingDefaults, ConnectionMode, DEFAULT_SAMPLING_PARAMS_LABEL,
-        UNKNOWN_MODEL_ID,
+        endpoint::Endpoint, sampling_defaults::SamplingDefaults, ConnectionMode,
+        DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
     },
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
@@ -139,6 +139,9 @@ async fn get_json_with_fallback_classified<T: serde::de::DeserializeOwned>(
     api_key: Option<&str>,
 ) -> Result<T, MetadataError> {
     let url = format!("{base_url}/{endpoint}");
+    // The addresses as every failure below names them: a userinfo in them
+    // masked (the texts end in the step's failure message and its lines).
+    let shown = Endpoint::redacted_str(&url);
     let mut req = client.get(&url).timeout(METADATA_TIMEOUT);
     if let Some(key) = api_key {
         req = req.bearer_auth(key);
@@ -147,12 +150,13 @@ async fn get_json_with_fallback_classified<T: serde::de::DeserializeOwned>(
     let response = req
         .send()
         .await
-        .map_err(|e| MetadataError::Failed(format!("Failed to connect to {url}: {e}")))?;
+        .map_err(|e| MetadataError::Failed(format!("Failed to connect to {shown}: {e}")))?;
 
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         // Fallback to deprecated /get_<endpoint> prefix
         warn!("'/{endpoint}' returned 404, falling back to deprecated '/get_{endpoint}'");
         let old_url = format!("{base_url}/get_{endpoint}");
+        let shown_old = Endpoint::redacted_str(&old_url);
         let mut req = client.get(&old_url).timeout(METADATA_TIMEOUT);
         if let Some(key) = api_key {
             req = req.bearer_auth(key);
@@ -160,35 +164,33 @@ async fn get_json_with_fallback_classified<T: serde::de::DeserializeOwned>(
         let resp = req
             .send()
             .await
-            .map_err(|e| MetadataError::Failed(format!("Failed to connect to {old_url}: {e}")))?;
+            .map_err(|e| MetadataError::Failed(format!("Failed to connect to {shown_old}: {e}")))?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(MetadataError::NotOffered);
         }
         if !resp.status().is_success() {
             return Err(MetadataError::Failed(format!(
-                "status {} from {}",
-                resp.status(),
-                old_url
+                "status {} from {shown_old}",
+                resp.status()
             )));
         }
         return resp
             .json::<T>()
             .await
-            .map_err(|e| MetadataError::Failed(format!("Failed to parse {old_url}: {e}")));
+            .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown_old}: {e}")));
     }
 
     if !response.status().is_success() {
         return Err(MetadataError::Failed(format!(
-            "status {} from {}",
-            response.status(),
-            url
+            "status {} from {shown}",
+            response.status()
         )));
     }
 
     response
         .json::<T>()
         .await
-        .map_err(|e| MetadataError::Failed(format!("Failed to parse {url}: {e}")))
+        .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {e}")))
 }
 
 async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
@@ -196,6 +198,7 @@ async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
     url: &str,
     api_key: Option<&str>,
 ) -> Result<T, MetadataError> {
+    let shown = Endpoint::redacted_str(url);
     let mut req = client.get(url).timeout(METADATA_TIMEOUT);
     if let Some(key) = api_key {
         req = req.bearer_auth(key);
@@ -203,20 +206,19 @@ async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
     let resp = req
         .send()
         .await
-        .map_err(|e| MetadataError::Failed(format!("Failed to connect to {url}: {e}")))?;
+        .map_err(|e| MetadataError::Failed(format!("Failed to connect to {shown}: {e}")))?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(MetadataError::NotOffered);
     }
     if !resp.status().is_success() {
         return Err(MetadataError::Failed(format!(
-            "status {} from {}",
-            resp.status(),
-            url
+            "status {} from {shown}",
+            resp.status()
         )));
     }
     resp.json::<T>()
         .await
-        .map_err(|e| MetadataError::Failed(format!("Failed to parse {url}: {e}")))
+        .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {e}")))
 }
 
 pub async fn get_server_info(
@@ -1021,6 +1023,49 @@ mod tests {
         assert_eq!(
             labels.get("max_model_len").map(String::as_str),
             Some("4096")
+        );
+    }
+
+    /// A credentialed worker that answers 401 (a wrong password): the error
+    /// text names the address masked, never the secret. The status error is
+    /// the likeliest failure of such a worker, and it ends in the DP
+    /// discovery's warning and the step's failure message.
+    #[tokio::test]
+    async fn a_status_error_names_the_address_masked() {
+        use axum::{http::StatusCode, Router};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only server answering 401; handle is aborted at test end"
+        )]
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(|| async { (StatusCode::UNAUTHORIZED, "no") }),
+            )
+            .await
+            .unwrap();
+        });
+
+        let err = get_server_info(
+            &crate::clients::http_client(),
+            &format!("http://user:secret@127.0.0.1:{port}"),
+            None,
+        )
+        .await
+        .expect_err("401 is a failure");
+        server.abort();
+
+        assert!(!err.contains("secret"), "{err}");
+        assert!(!err.contains("user:"), "{err}");
+        assert!(
+            err.contains(&format!(
+                "401 Unauthorized from http://***@127.0.0.1:{port}/server_info"
+            )),
+            "{err}"
         );
     }
 }

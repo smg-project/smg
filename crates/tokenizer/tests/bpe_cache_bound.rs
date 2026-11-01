@@ -4,51 +4,15 @@
 //! (a few MB per thread) and never settled. The wrapper bounds them, so a
 //! thread that encodes many distinct words keeps a few hundred KB.
 
-#![expect(
-    unsafe_code,
-    reason = "a counting global allocator is the only way to see what a thread's cache kept"
-)]
 #![expect(clippy::expect_used, reason = "a test that stops on a broken setup")]
 
-use std::{
-    alloc::{GlobalAlloc, Layout, System},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Mutex, PoisonError,
-    },
-};
+mod common;
 
+use std::sync::{atomic::Ordering, Mutex, PoisonError};
+
+use common::counting_alloc::{Counting, LIVE};
 use llm_tokenizer::{traits::Encoder, HuggingFaceTokenizer};
 use tokenizers::Tokenizer;
-
-/// Bytes currently allocated through the global allocator.
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-
-struct Counting;
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        LIVE.fetch_add(layout.size(), Ordering::Relaxed);
-        // SAFETY: the same layout contract as the caller's, forwarded to the system allocator.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-        // SAFETY: `ptr` came from `alloc` with this layout.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if new_size >= layout.size() {
-            LIVE.fetch_add(new_size - layout.size(), Ordering::Relaxed);
-        } else {
-            LIVE.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
-        }
-        // SAFETY: `ptr` came from `alloc` with this layout; the caller upholds `new_size`.
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
 
 #[global_allocator]
 static GLOBAL: Counting = Counting;

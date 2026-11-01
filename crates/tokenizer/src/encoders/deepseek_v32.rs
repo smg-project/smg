@@ -567,7 +567,14 @@ pub(crate) fn render_messages(
     thinking_mode: ThinkingMode,
     params: &EncodeParams,
 ) -> Result<String, DsEncodingError> {
-    let mut full_messages: Vec<Value> = marks::without_marks(messages).into_owned();
+    let messages = marks::without_marks(messages);
+    // The engine's renderer rewrites a `developer` message as a `system` one
+    // (and merges the system messages when one is not first) before any
+    // tokenizer mode's own encoder sees the conversation, so the vendor
+    // encoding's developer branch is never reached there; the same rule here.
+    let mut full_messages: Vec<Value> =
+        crate::chat_template::developer_messages_as_system(&messages)
+            .unwrap_or_else(|| messages.into_owned());
 
     let mut prompt = if params.add_default_bos_token {
         BOS.to_string()
@@ -755,10 +762,11 @@ mod tests {
 
     #[test]
     fn drop_thinking_does_not_overrun_when_filtering_shrinks_messages() {
-        // `drop_thinking_messages` removes developer-role messages before the
-        // last user turn, so `full_messages.len() < messages.len()`. The
+        // `drop_thinking_messages` can leave `full_messages` shorter than
+        // `messages` (the roles it drops before the last user turn), so the
         // outer loop must iterate the filtered length, not the original, or
-        // it walks off the end and returns IndexOutOfRange.
+        // it walks off the end and returns IndexOutOfRange. A developer
+        // message is a system message by the time it gets there and stays.
         let msgs = [
             json!({ "role": "developer", "content": "earlier developer note" }),
             json!({ "role": "user", "content": "now" }),
@@ -766,8 +774,35 @@ mod tests {
         let out = encode_messages(&msgs, ThinkingMode::Thinking, &EncodeParams::default())
             .expect("filtered message length must not blow up the loop");
         assert!(
-            out.contains("now"),
-            "user message missing from prompt: {out}"
+            out.contains("now") && out.contains("earlier developer note"),
+            "messages missing from prompt: {out}"
         );
+    }
+
+    /// The engine's renderer hands every tokenizer mode a `developer` message
+    /// as a `system` one: the recorded reference of the developer-role case
+    /// (the content as the system message, no user token before it), the same
+    /// as a system message in both modes.
+    #[test]
+    fn developer_message_is_the_system_message_as_the_engine_hands_it() {
+        let msgs = [
+            json!({ "role": "developer", "content": "Answer in one word." }),
+            json!({ "role": "user", "content": "Colour of the sky?" }),
+        ];
+        let out = encode_messages(&msgs, ThinkingMode::Chat, &EncodeParams::default()).unwrap();
+        assert_eq!(
+            out,
+            "<｜begin▁of▁sentence｜>Answer in one word.<｜User｜>Colour of the sky?<｜Assistant｜></think>"
+        );
+        let as_system = [
+            json!({ "role": "system", "content": "Answer in one word." }),
+            json!({ "role": "user", "content": "Colour of the sky?" }),
+        ];
+        for mode in [ThinkingMode::Chat, ThinkingMode::Thinking] {
+            assert_eq!(
+                encode_messages(&msgs, mode, &EncodeParams::default()).unwrap(),
+                encode_messages(&as_system, mode, &EncodeParams::default()).unwrap()
+            );
+        }
     }
 }

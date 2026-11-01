@@ -17,7 +17,9 @@ This package provides pre-compiled Python gRPC stubs for:
 pip install smg-grpc-proto
 ```
 
-Requires `grpcio>=1.78.0` and `protobuf>=6.31.1`.
+Requires `grpcio>=1.78.0` and `protobuf>=6.33.5`. Stubs are generated with pinned
+`grpcio-tools==1.78.0`; the protobuf minimum remains at 6.33.5. Installed-package
+tests verify that both runtime floors cover every shipped generated module.
 
 ## Usage
 

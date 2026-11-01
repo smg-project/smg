@@ -2,6 +2,7 @@
 //! engine-native RL routes, and label-selected fan-out. Compiled into the
 //! gateway but inert unless `--enable-rl`.
 
+pub mod calls;
 pub mod capability;
 pub mod config;
 mod control;
@@ -20,6 +21,7 @@ pub mod view;
 use std::sync::Arc;
 
 use axum::{routing::get, Router};
+pub use calls::{CallFailure, RankReply, RlControlCalls};
 pub use config::RlConfig;
 pub use control::resolve_control_url;
 pub use error::RlError;

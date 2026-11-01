@@ -1,15 +1,16 @@
 //! Test support the crate's modules share: readers of an event list, and a
 //! driver that feeds a parser one turn.
 
-use openai_protocol::common::Tool;
+use openai_protocol::common::{Function, Tool};
 use serde_json::{json as value, Value};
 
 use crate::{
-    event::{Event, Events, FinishReason},
+    event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
     format::Format,
     grammar::{GrammarStart, Options},
     input::{EngineFinish, Input},
     parser::Parser,
+    Declared,
 };
 
 /// The output bytes the events account for, in order: content, reasoning,
@@ -55,7 +56,29 @@ pub(crate) fn arguments_of(events: &[Event], call: u32) -> String {
     events
         .iter()
         .filter_map(|event| match event {
-            Event::ToolCallArguments { index, json, .. } if *index == call => Some(json.as_str()),
+            Event::ToolCallArguments { index, json, .. } if *index == call => Some(json.as_ref()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The argument fragments of every call, joined in order.
+pub(crate) fn arguments(events: &[Event]) -> String {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::ToolCallArguments { json, .. } => Some(json.as_ref()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The malformed reports, each text with its reason, in order.
+pub(crate) fn malformed(events: &[Event]) -> Vec<(String, MalformedReason)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
             _ => None,
         })
         .collect()
@@ -86,6 +109,20 @@ pub(crate) fn calls(events: &[Event]) -> Vec<(String, String)> {
         }
     }
     calls
+}
+
+/// The engine's finish: its reason as the engine gave it (the adapters refine it to
+/// `tool_calls`), and the calls counted.
+pub(crate) fn finish(events: &[Event]) -> (FinishReason, u32) {
+    events
+        .iter()
+        .find_map(|event| match event {
+            Event::Finish {
+                reason, tool_calls, ..
+            } => Some((reason.clone(), *tool_calls)),
+            _ => None,
+        })
+        .expect("a finish")
 }
 
 /// One turn through `parser`: the prompt, the output in `pieces`, a stop; the
@@ -355,4 +392,59 @@ pub(crate) fn a_forced_tag_after_a_prompt_that_wrote_the_templates_text(
             );
         }
     }
+}
+
+/// A function tool named `name` with `parameters` as its schema.
+pub(crate) fn tool(name: &str, parameters: Value) -> Tool {
+    Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: name.to_string(),
+            description: None,
+            parameters,
+            strict: None,
+            extra: Default::default(),
+        },
+    }
+}
+
+/// The grammar tests' pair of tools: `get_weather` with a city, days and
+/// units, and `ping` without parameters.
+pub(crate) fn weather_tools() -> Vec<Tool> {
+    vec![
+        tool(
+            "get_weather",
+            value!({
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "days": {"type": "integer", "minimum": 1},
+                    "units": {"type": "string", "enum": ["c", "f"]},
+                },
+                "required": ["city", "days"],
+            }),
+        ),
+        tool("ping", value!({"type": "object"})),
+    ]
+}
+
+/// Wrapper text the engine dropped: uncounted, dropped as a wrapper, the
+/// event the formats' tests expect around a call.
+pub(crate) fn dropped(text: &str) -> Event<'static> {
+    Event::Dropped {
+        text: Text::uncounted(text.to_owned()),
+        why: DropReason::Wrapper,
+    }
+}
+
+/// One declared tool, `get_weather` with a city and days: the fixture the
+/// engine's tests and several formats' parse against.
+pub(crate) fn weather_declared() -> Declared {
+    Declared::of(&[tool(
+        "get_weather",
+        value!({"type": "object", "properties": {
+            "city": {"type": "string"},
+            "days": {"type": "integer"},
+        }}),
+    )])
 }

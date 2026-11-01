@@ -11,7 +11,7 @@ use tracing::{debug, error};
 use crate::routers::{
     error,
     grpc::{
-        backend_client::BackendClient,
+        backend_client::{BackendClient, DIRECT_LANE_NOT_FOR_TRTLLM},
         client::GrpcClient,
         common::stages::{helpers, BuildStage},
         context::{
@@ -310,6 +310,9 @@ fn build_harmony_proto(
             ZmqDialect::Sglang => {
                 build_sglang(body, request_id, text, token_ids, tool_constraints)?
             }
+            // A TensorRT-LLM engine is reached through its gRPC servicer; the
+            // gateway's direct ZMQ lane builds no request for it.
+            ZmqDialect::Trtllm => return Err(DIRECT_LANE_NOT_FOR_TRTLLM.to_string()),
         },
     })
 }

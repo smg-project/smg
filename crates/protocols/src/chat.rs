@@ -346,6 +346,14 @@ pub struct ChatCompletionRequest {
     )]
     pub continue_final_message: bool,
 
+    /// Whether the prompt ends with the assistant's generation header, the
+    /// template's `add_generation_prompt`: absent is `true`, what the engines
+    /// apply without the field; `false` leaves the conversation closed for
+    /// the model to continue on its own. Serialized only when set. Set to
+    /// `true` beside `continue_final_message` it is refused, as the engine
+    /// that has the field refuses the pair.
+    pub add_generation_prompt: Option<bool>,
+
     /// Skip special tokens during detokenization. Serialized only when
     /// `false`, like `separate_reasoning`: `true` is what the engine applies
     /// without the field.
@@ -453,26 +461,17 @@ impl ChatCompletionRequest {
         self.thinking.as_ref().and_then(ThinkingParam::toggle)
     }
 
-    /// [`Self::thinking_toggle`] as the request's provider profile reads it:
-    /// a profile whose contract lets an explicit effort outrank
-    /// `thinking.type: disabled` ([`ProviderProfile::effort_outranks_thinking_disabled`])
-    /// drops that toggle from a request that carries an effort.
-    pub fn effective_thinking_toggle(&self) -> Option<bool> {
-        let toggle = self.thinking_toggle();
-        if toggle == Some(false)
-            && self.effective_reasoning_effort().is_some()
-            && ProviderProfile::for_model(&self.model).effort_outranks_thinking_disabled()
-        {
-            return None;
-        }
-        toggle
-    }
-
-    /// The thinking preference the prompt is rendered with: the effective
-    /// typed toggle, else the provider profile's reading of the effective
-    /// `reasoning_effort` ([`ProviderProfile::thinking_from_reasoning_effort`]).
+    /// The thinking preference the prompt is rendered with: the typed
+    /// `thinking.type` toggle, else the provider profile's reading of the
+    /// effective `reasoning_effort`
+    /// ([`ProviderProfile::thinking_from_reasoning_effort`]). An explicit
+    /// toggle wins over the profile's reading of any effort, as it does in
+    /// the engine's own server, which keeps a `chat_template_kwargs` toggle
+    /// over the one it would derive from `reasoning_effort`; a renderer with
+    /// a native template effort still ranks that effort above the toggle
+    /// when it reads the prompt (the gateway's parser precedence).
     pub fn template_thinking(&self) -> Option<bool> {
-        self.effective_thinking_toggle().or_else(|| {
+        self.thinking_toggle().or_else(|| {
             ProviderProfile::for_model(&self.model)
                 .thinking_from_reasoning_effort(self.effective_reasoning_effort())
         })
@@ -483,6 +482,12 @@ impl ChatCompletionRequest {
     pub fn continues_final_assistant(&self) -> bool {
         self.continue_final_message
             && matches!(self.messages.last(), Some(ChatMessage::Assistant { .. }))
+    }
+
+    /// Whether the prompt ends with the assistant's generation header: the
+    /// request's `add_generation_prompt`, `true` when absent.
+    pub fn adds_generation_prompt(&self) -> bool {
+        self.add_generation_prompt.unwrap_or(true)
     }
 
     /// Whether `parallel_tool_calls: false` asks for one tool call at most.
@@ -693,7 +698,17 @@ fn validate_chat_cross_parameters(
         ));
     }
 
-    // 10. Provider-profile contract rules, selected from the model id. Both
+    // 10. A continued final message and the generation header exclude each
+    //     other: the pair set together is refused, as the engine that has
+    //     the field refuses it; `continue_final_message` alone continues.
+    if req.continue_final_message && req.add_generation_prompt == Some(true) {
+        return Err(invalid(
+            "add_generation_prompt_conflicts_with_continue_final_message",
+            "Cannot set both `continue_final_message` and `add_generation_prompt` to True.",
+        ));
+    }
+
+    // 11. Provider-profile contract rules, selected from the model id. Both
     //     token limits at once are judged there: the request keeps whichever
     //     the client wrote and `output_token_cap` reads `max_completion_tokens`
     //     first, the precedence the serving engines apply themselves; only
@@ -1329,6 +1344,62 @@ mod tests {
         serde_json::from_value(value).expect("request must deserialize")
     }
 
+    /// `add_generation_prompt`: absent is none and reads as `true`, so a
+    /// request without the field serializes without it; `false` round-trips
+    /// as sent; null is absent.
+    #[test]
+    fn add_generation_prompt_is_read_only_when_sent_and_defaults_to_true() {
+        let absent = request_with_output_fields(&[]);
+        assert_eq!(absent.add_generation_prompt, None);
+        assert!(absent.adds_generation_prompt());
+        let value = serde_json::to_value(&absent).expect("serialize");
+        assert!(value.get("add_generation_prompt").is_none());
+
+        let off = request_with_output_fields(&[("add_generation_prompt", json!(false))]);
+        assert_eq!(off.add_generation_prompt, Some(false));
+        assert!(!off.adds_generation_prompt());
+        let value = serde_json::to_value(&off).expect("serialize");
+        assert_eq!(value["add_generation_prompt"], false);
+        let back: ChatCompletionRequest = serde_json::from_value(value).expect("roundtrip");
+        assert_eq!(back.add_generation_prompt, Some(false));
+
+        let nulled = request_with_output_fields(&[("add_generation_prompt", Value::Null)]);
+        assert_eq!(nulled.add_generation_prompt, None);
+    }
+
+    /// The generation header and a continued final message exclude each
+    /// other: both set is refused with the engine's wording;
+    /// `continue_final_message` alone, or beside `add_generation_prompt:
+    /// false`, passes, as does `false` alone.
+    #[test]
+    fn add_generation_prompt_true_is_refused_beside_continue_final_message() {
+        use validator::Validate;
+        let both = request_with_output_fields(&[
+            ("continue_final_message", json!(true)),
+            ("add_generation_prompt", json!(true)),
+        ]);
+        let error = both
+            .validate()
+            .expect_err("the pair is refused")
+            .to_string();
+        assert!(
+            error.contains(
+                "Cannot set both `continue_final_message` and `add_generation_prompt` to True."
+            ),
+            "{error}"
+        );
+        for passing in [
+            vec![("continue_final_message", json!(true))],
+            vec![
+                ("continue_final_message", json!(true)),
+                ("add_generation_prompt", json!(false)),
+            ],
+            vec![("add_generation_prompt", json!(false))],
+        ] {
+            assert!(request_with_output_fields(&passing).validate().is_ok());
+        }
+    }
+
     #[test]
     fn default_sglang_flags_are_omitted_and_absent_reads_defaults() {
         let request = request_with_output_fields(&[]);
@@ -1386,9 +1457,10 @@ mod tests {
     }
 
     /// The MiniMax contract reads `reasoning_effort` by its own rule: `none`
-    /// (the default depth) and `minimal` (`low`) keep thinking on, and an
-    /// explicit effort outranks `thinking.type: disabled`; every other
-    /// profile keeps the OpenAI reading and honours the toggle.
+    /// (the default depth) and `minimal` (`low`) keep thinking on; every
+    /// other profile keeps the OpenAI reading. An explicit `thinking.type:
+    /// disabled` wins over any effort under every profile, as an explicit
+    /// toggle wins over the effort in the engine's own server.
     #[test]
     fn minimax_profile_keeps_thinking_on_for_every_effort() {
         let request = |model: &str, fields: Value| -> ChatCompletionRequest {
@@ -1411,8 +1483,8 @@ mod tests {
                     json!({"reasoning_effort": effort, "thinking": {"type": "disabled"}})
                 )
                 .template_thinking(),
-                None,
-                "MiniMax {effort} outranks thinking.disabled"
+                Some(false),
+                "MiniMax {effort}: thinking.disabled wins"
             );
         }
         assert_eq!(
