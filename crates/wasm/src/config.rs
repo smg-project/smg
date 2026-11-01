@@ -143,11 +143,7 @@ mod tests {
     fn test_validation_max_memory_pages_zero() {
         let config = WasmRuntimeConfig {
             max_memory_pages: 0,
-            max_execution_time_ms: 1000,
-            max_stack_size: 1024 * 1024,
-            thread_pool_size: 2,
-            module_cache_size: 10,
-            max_body_size: 10 * 1024 * 1024,
+            ..Default::default()
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -158,11 +154,7 @@ mod tests {
     fn test_validation_max_memory_pages_too_large() {
         let config = WasmRuntimeConfig {
             max_memory_pages: 65537, // Exceeds 4GB limit
-            max_execution_time_ms: 1000,
-            max_stack_size: 1024 * 1024,
-            thread_pool_size: 2,
-            module_cache_size: 10,
-            max_body_size: 10 * 1024 * 1024,
+            ..Default::default()
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -174,12 +166,8 @@ mod tests {
     #[test]
     fn test_validation_max_execution_time_zero() {
         let config = WasmRuntimeConfig {
-            max_memory_pages: 1024,
             max_execution_time_ms: 0,
-            max_stack_size: 1024 * 1024,
-            thread_pool_size: 2,
-            module_cache_size: 10,
-            max_body_size: 10 * 1024 * 1024,
+            ..Default::default()
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -191,12 +179,8 @@ mod tests {
     #[test]
     fn test_validation_max_execution_time_too_large() {
         let config = WasmRuntimeConfig {
-            max_memory_pages: 1024,
             max_execution_time_ms: 300001, // Exceeds 5 minutes
-            max_stack_size: 1024 * 1024,
-            thread_pool_size: 2,
-            module_cache_size: 10,
-            max_body_size: 10 * 1024 * 1024,
+            ..Default::default()
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -208,12 +192,8 @@ mod tests {
     #[test]
     fn test_validation_max_stack_size_too_small() {
         let config = WasmRuntimeConfig {
-            max_memory_pages: 1024,
-            max_execution_time_ms: 1000,
             max_stack_size: 32 * 1024, // Less than 64KB
-            thread_pool_size: 2,
-            module_cache_size: 10,
-            max_body_size: 10 * 1024 * 1024,
+            ..Default::default()
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -225,12 +205,8 @@ mod tests {
     #[test]
     fn test_validation_max_stack_size_too_large() {
         let config = WasmRuntimeConfig {
-            max_memory_pages: 1024,
-            max_execution_time_ms: 1000,
             max_stack_size: 17 * 1024 * 1024, // Exceeds 16MB
-            thread_pool_size: 2,
-            module_cache_size: 10,
-            max_body_size: 10 * 1024 * 1024,
+            ..Default::default()
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -242,12 +218,8 @@ mod tests {
     #[test]
     fn test_validation_thread_pool_size_zero() {
         let config = WasmRuntimeConfig {
-            max_memory_pages: 1024,
-            max_execution_time_ms: 1000,
-            max_stack_size: 1024 * 1024,
             thread_pool_size: 0,
-            module_cache_size: 10,
-            max_body_size: 10 * 1024 * 1024,
+            ..Default::default()
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -257,12 +229,8 @@ mod tests {
     #[test]
     fn test_validation_thread_pool_size_too_large() {
         let config = WasmRuntimeConfig {
-            max_memory_pages: 1024,
-            max_execution_time_ms: 1000,
-            max_stack_size: 1024 * 1024,
             thread_pool_size: 129, // Exceeds 128
-            module_cache_size: 10,
-            max_body_size: 10 * 1024 * 1024,
+            ..Default::default()
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -274,12 +242,8 @@ mod tests {
     #[test]
     fn test_validation_module_cache_size_zero() {
         let config = WasmRuntimeConfig {
-            max_memory_pages: 1024,
-            max_execution_time_ms: 1000,
-            max_stack_size: 1024 * 1024,
-            thread_pool_size: 2,
             module_cache_size: 0,
-            max_body_size: 10 * 1024 * 1024,
+            ..Default::default()
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -291,12 +255,8 @@ mod tests {
     #[test]
     fn test_validation_module_cache_size_too_large() {
         let config = WasmRuntimeConfig {
-            max_memory_pages: 1024,
-            max_execution_time_ms: 1000,
-            max_stack_size: 1024 * 1024,
-            thread_pool_size: 2,
             module_cache_size: 1001, // Exceeds 1000
-            max_body_size: 10 * 1024 * 1024,
+            ..Default::default()
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -309,11 +269,7 @@ mod tests {
     fn test_get_total_memory_bytes() {
         let config = WasmRuntimeConfig {
             max_memory_pages: 1024,
-            max_execution_time_ms: 1000,
-            max_stack_size: 1024 * 1024,
-            thread_pool_size: 2,
-            module_cache_size: 10,
-            max_body_size: 10 * 1024 * 1024,
+            ..Default::default()
         };
         // 1024 pages * 64KB = 64MB
         assert_eq!(config.get_total_memory_bytes(), 64 * 1024 * 1024);
@@ -322,12 +278,8 @@ mod tests {
     #[test]
     fn test_validation_max_body_size_zero() {
         let config = WasmRuntimeConfig {
-            max_memory_pages: 1024,
-            max_execution_time_ms: 1000,
-            max_stack_size: 1024 * 1024,
-            thread_pool_size: 2,
-            module_cache_size: 10,
             max_body_size: 0,
+            ..Default::default()
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -337,12 +289,8 @@ mod tests {
     #[test]
     fn test_validation_max_body_size_too_large() {
         let config = WasmRuntimeConfig {
-            max_memory_pages: 1024,
-            max_execution_time_ms: 1000,
-            max_stack_size: 1024 * 1024,
-            thread_pool_size: 2,
-            module_cache_size: 10,
             max_body_size: 101 * 1024 * 1024, // Exceeds 100MB
+            ..Default::default()
         };
         let result = config.validate();
         assert!(result.is_err());

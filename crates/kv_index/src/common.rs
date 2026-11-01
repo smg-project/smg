@@ -2,11 +2,34 @@
 
 use std::sync::Arc;
 
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
+use rustc_hash::FxBuildHasher;
+
 /// Interned tenant identifier for efficient comparison and storage.
 ///
 /// Using `Arc<str>` allows O(1) cloning and pointer-based equality checks
 /// for frequently accessed tenant identifiers.
 pub type TenantId = Arc<str>;
+
+/// The tenant string intern pool both trees share: one `Arc<str>` per tenant
+/// name, whichever tree saw it first.
+static TENANT_INTERN_POOL: Lazy<DashMap<Arc<str>, (), FxBuildHasher>> =
+    Lazy::new(|| DashMap::with_hasher(FxBuildHasher));
+
+/// The interned `TenantId` for `tenant`: the pooled `Arc<str>` when the name
+/// was seen before, otherwise the one the pool holds after this call entered
+/// it (one `Arc` per name even when two callers race on it).
+#[inline]
+pub(super) fn intern_tenant(tenant: &str) -> TenantId {
+    if let Some(entry) = TENANT_INTERN_POOL.get(tenant) {
+        return Arc::clone(entry.key());
+    }
+    // A miss goes through the entry: when two callers race on a new name,
+    // both get the key the pool holds and the loser's allocation is dropped.
+    let entry = TENANT_INTERN_POOL.entry(Arc::from(tenant)).or_insert(());
+    Arc::clone(entry.key())
+}
 
 /// Trait for prefix match results.
 ///

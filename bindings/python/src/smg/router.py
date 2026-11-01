@@ -350,7 +350,11 @@ class Router:
             all workers; eviction keeps every tree at or under this bound.
             Default: 2^26
         dp_aware: Enable data parallelism aware schedule. Default: False
-        dp_minimum_tokens_scheduler: Enable minimum tokens scheduler for data parallel group. Default: False
+        dp_minimum_tokens_scheduler: Choose a data-parallel rank per request from the
+            ranks' reported token loads: the HTTP prefill-decode router, for an engine
+            registered as one worker. Under dp_aware the engine's ranks are workers and
+            the policy's pick among them is the rank choice, so this chooses nothing
+            there (warned at start-up). Default: False
         upstream_http2: Speak HTTP/2 to workers via prior knowledge (h2c on
             cleartext), multiplexing every request to a worker over one
             connection. Negotiated per worker at registration: a worker that
@@ -427,7 +431,18 @@ class Router:
             'smg.ai/kv-connector'
         kv_engine_id_annotation: Kubernetes annotation containing KV engine IDs,
             aligned with worker_ports_annotation. Default: 'smg.ai/kv-engine-id'
-        request_timeout_secs: Request timeout in seconds. Default: 600
+        request_timeout_secs: Request timeout in seconds: the read of the body
+            overall, and each attempt at an HTTP worker from its dispatch to
+            its last message (504 call_upstream_timeout past it, the request's
+            answer; a worker's own pool timeout_secs takes this value's place,
+            on an HTTP worker and on a ZMQ worker's link, whose streams carry
+            the same bound). A request to a gRPC worker is bounded by
+            grpc_request_timeout_secs instead. Default: 1800
+        grpc_request_timeout_secs: Seconds a request to a gRPC worker may take
+            from its dispatch to its last message (504 call_upstream_timeout
+            past it, the request's answer; the call to the worker is dropped,
+            which cancels the request on the worker). 0 arms no deadline (the
+            default): the bound is opt-in. Default: 0
         max_concurrent_requests: Maximum standing concurrent requests. -1 derives
             the bound from the host (1024 per available core, at least 4096); 0
             disables it. Default: -1

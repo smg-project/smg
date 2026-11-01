@@ -157,7 +157,7 @@ struct Rendered {
 /// by the stage's rule for this renderer, then the template, then the
 /// renderer's own encode.
 fn render(tok: &dyn Tokenizer, request: &ChatCompletionRequest) -> Rendered {
-    let request = request_as_rendered(request, tok.renderer_capabilities());
+    let request = request_as_rendered(request);
     let (processed, encoding) =
         process_chat_messages_with_encoding(&request, tok, None).expect("render");
     billed(tok, processed, encoding)
@@ -168,11 +168,7 @@ fn render(tok: &dyn Tokenizer, request: &ChatCompletionRequest) -> Rendered {
 /// renderer's own encode.
 fn render_messages(tok: &dyn Tokenizer, request: &CreateMessageRequest) -> Rendered {
     let chat_tools = request.chat_tools();
-    let tools = template_tools(
-        &chat_tools,
-        request.tool_choice.as_ref(),
-        tok.renderer_capabilities(),
-    );
+    let tools = template_tools(&chat_tools, request.tool_choice.as_ref());
     let tools_for_template = if tools.is_empty() {
         None
     } else {

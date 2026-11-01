@@ -609,12 +609,26 @@ pub fn create_test_context_with_tokenizer_registry(
         // the public direct setter added for this purpose).
         let tenant_rate_limit_manager = smg::rate_limit::RateLimitManager::from_config(&config)
             .expect("tenant rate limit config should be valid");
+        create_test_context_with_rate_limiter(config, tokenizer_registry, tenant_rate_limit_manager)
+            .await
+    })
+}
+
+/// [`create_test_context_with_tokenizer_registry`] with a tenant rate limiter
+/// of the caller's (a manager over a backend of the test's, or none) in place
+/// of the one `config` would build.
+pub fn create_test_context_with_rate_limiter(
+    config: RouterConfig,
+    tokenizer_registry: Arc<TokenizerRegistry>,
+    rate_limit_manager: Option<Arc<smg::rate_limit::RateLimitManager>>,
+) -> Pin<Box<dyn Future<Output = Arc<AppContext>> + Send>> {
+    Box::pin(async move {
         build_test_app_context(
             config,
             tokenizer_registry,
             Some(ReasoningParserFactory::new()),
             Some(ToolParserFactory::new()),
-            tenant_rate_limit_manager,
+            rate_limit_manager,
             empty_mcp_config(),
             None,
         )

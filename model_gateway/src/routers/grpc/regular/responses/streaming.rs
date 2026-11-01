@@ -12,7 +12,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use axum::{body::Body, response::Response};
+use axum::{
+    body::{Body, BodyDataStream},
+    response::Response,
+};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use openai_protocol::{
@@ -55,16 +58,19 @@ use crate::{
         },
         error,
         grpc::{
-            common::responses::{
-                await_stream_startup, build_sse_response, persist_response_if_needed,
-                signal_stream_startup, stored_foreground, stream_startup_channel,
-                streaming::{
-                    attach_mcp_server_label, ResponseStreamEventEmitter, StreamStartupSender,
+            common::{
+                responses::{
+                    await_stream_startup, build_sse_response, persist_response_if_needed,
+                    signal_stream_startup, stored_foreground, stream_startup_channel,
+                    streaming::{
+                        attach_mcp_server_label, ResponseStreamEventEmitter, StreamStartupSender,
+                    },
+                    utils::{
+                        function_call_status, generation_failure_error, resolve_function_identity,
+                    },
+                    BackgroundStream, ResponsesContext,
                 },
-                utils::{
-                    function_call_status, generation_failure_error, resolve_function_identity,
-                },
-                BackgroundStream, ResponsesContext,
+                stages::{iteration_charge, RateLimitCell},
             },
             utils,
         },
@@ -94,7 +100,11 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     let response_id = params.response_id;
     let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
 
-    // Get chat streaming response
+    // Get chat streaming response, under the request's tenant rate-limit
+    // reservation, taken under a charge id of the iteration's own: the chat
+    // stream settles it with the engine's counts as it ends (the handoff to
+    // the body), a refused or failed start closes it with its debit kept.
+    let reservation = Arc::new(RateLimitCell::new());
     let chat_response = ctx
         .pipeline
         .execute_chat(
@@ -102,11 +112,8 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
             params.headers,
             params.model_id,
             ctx.components.clone(),
-            Some(params.tenant_request_meta),
-            // Responses endpoint hasn't opted into tenant rate limiting yet
-            // (out of scope for this phase; see RequestPipeline::build's
-            // stage-insertion comment).
-            None,
+            Some(iteration_charge(&params.tenant_request_meta)),
+            Some(reservation.clone()),
             // Tool-loop iterations are not retried.
             None,
             // No startup barrier: the status is checked below before the
@@ -116,6 +123,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
         .await;
 
     if !chat_response.status().is_success() {
+        reservation.close_unsettled().await;
         return chat_response;
     }
 
@@ -244,6 +252,37 @@ fn stream_read_error(error: &impl fmt::Display) -> Value {
     json!({"code": "stream_error", "message": format!("Stream read error: {error}")})
 }
 
+/// One read of the chat body for the client at the receiving end of the
+/// Responses stream's channel (see [`next_frame`]).
+enum BodyRead {
+    /// A frame of the body, or the error the read met.
+    Frame(Result<Bytes, axum::Error>),
+    /// The body ended.
+    End,
+    /// The client left before the body yielded.
+    ClientLeft,
+}
+
+/// The next frame of the chat body `stream`, read for the client at the
+/// receiving end of `tx`'s channel. The relay that turns the chat stream
+/// into the Responses stream holds the chat layer's receiver through that
+/// body: parked on a body that stalled mid-stream, it would learn that its
+/// client left only when the body next yields, and the engine request behind
+/// the body would run on as long. Here every read races the body against the
+/// client's leaving, looked at first so a busy body cannot outrun it; on
+/// [`BodyRead::ClientLeft`] the caller returns, the body is dropped with it,
+/// and the chat layer ends the engine request the way it does for its own
+/// clients. A background response's `tx` is the sender of its relay, which
+/// closes with the work and not with the client: its reads are the body's
+/// own, and the work outlives the client as it is meant to.
+async fn next_frame(stream: &mut BodyDataStream, tx: &SseSender) -> BodyRead {
+    tokio::select! {
+        biased;
+        () = tx.closed() => BodyRead::ClientLeft,
+        frame = stream.next() => frame.map_or(BodyRead::End, BodyRead::Frame),
+    }
+}
+
 /// Process chat SSE stream and transform to responses format
 #[expect(
     clippy::too_many_arguments,
@@ -298,13 +337,18 @@ async fn process_and_transform_sse_stream(
 
     let mut terminal_error = None;
     // Process the stream frame by frame; a frame holds one or more SSE events.
-    'frames: while let Some(chunk_result) = stream.next().await {
-        let chunk = match chunk_result {
-            Ok(chunk) => chunk,
-            Err(error) => {
+    'frames: loop {
+        let chunk = match next_frame(&mut stream, &tx).await {
+            BodyRead::Frame(Ok(chunk)) => chunk,
+            BodyRead::Frame(Err(error)) => {
                 terminal_error = Some(stream_read_error(&error));
                 break;
             }
+            BodyRead::End => break,
+            // The chat body goes with this return, which ends the generation
+            // on the engine; the stream ends as it does when the client's
+            // leaving is met at the next frame, and nothing of it is stored.
+            BodyRead::ClientLeft => return Err("Client disconnected".to_string()),
         };
 
         let frame = String::from_utf8_lossy(&chunk);
@@ -912,8 +956,12 @@ async fn execute_tool_loop_streaming_internal(
         state.iteration += 1;
         Metrics::record_mcp_tool_iteration(&current_request.model);
 
-        // Execute chat streaming
+        // Execute chat streaming, under the iteration's own tenant rate-limit
+        // reservation (every iteration is a generation, under a charge id of
+        // its own): the chat stream settles it with the engine's counts as
+        // it ends, a refused or failed start closes it with its debit kept.
         let startup_pending = startup.is_some();
+        let reservation = Arc::new(RateLimitCell::new());
         let response = ctx
             .pipeline
             .execute_chat(
@@ -921,9 +969,8 @@ async fn execute_tool_loop_streaming_internal(
                 params.headers.clone(),
                 params.model_id.clone(),
                 ctx.components.clone(),
-                Some(params.tenant_request_meta.clone()),
-                // Responses endpoint hasn't opted into tenant rate limiting yet.
-                None,
+                Some(iteration_charge(&params.tenant_request_meta)),
+                Some(reservation.clone()),
                 // Tool-loop iterations are not retried.
                 None,
                 startup.take(),
@@ -931,6 +978,7 @@ async fn execute_tool_loop_streaming_internal(
             .await;
 
         if !response.status().is_success() {
+            reservation.close_unsettled().await;
             if startup_pending {
                 return Ok(());
             }
@@ -1085,8 +1133,17 @@ async fn convert_and_accumulate_stream(
     let mut pending: HashMap<u32, Vec<ToolCallDelta>> = HashMap::new();
 
     // A frame holds one or more SSE events; every one of them counts.
-    'frames: while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result.map_err(|error| stream_read_error(&error))?;
+    'frames: loop {
+        let chunk = match next_frame(&mut stream, tx).await {
+            BodyRead::Frame(frame) => frame.map_err(|error| stream_read_error(&error))?,
+            BodyRead::End => break,
+            // The chat body goes with this return, which ends the generation
+            // on the engine; the loop ends with the error it meets when the
+            // client's leaving is found at the next frame.
+            BodyRead::ClientLeft => {
+                return Err(json!({"code": "stream_error", "message": "Client disconnected"}))
+            }
+        };
         let frame = String::from_utf8_lossy(&chunk);
         for event in chat_sse_events(&frame) {
             let mut chat_chunk = match event {
@@ -1261,37 +1318,51 @@ impl ChatResponseAccumulator {
 #[cfg(test)]
 mod tests {
     use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
 
     use super::*;
-    use crate::routers::grpc::common::responses::utils::namespace_test_request;
+    use crate::routers::grpc::common::responses::utils::{
+        assert_responses_api_usage, namespace_test_request, responses_api_test_usage,
+    };
 
     #[test]
     fn streaming_accumulator_serializes_responses_api_usage() {
         let request = ResponsesRequest::default();
         let mut accumulator = StreamingResponseAccumulator::new(&request);
-        accumulator.usage = Some(
-            Usage::from_counts(12, 7)
-                .with_cached_tokens(3)
-                .with_reasoning_tokens(2),
-        );
+        accumulator.usage = Some(responses_api_test_usage());
 
         let wire = serde_json::to_value(accumulator.finalize())
             .expect("streaming response should serialize");
-        let usage = wire.get("usage").expect("usage should be present");
+        assert_responses_api_usage(&wire);
+    }
 
-        assert_eq!(usage.get("input_tokens"), Some(&serde_json::json!(12)));
-        assert_eq!(usage.get("output_tokens"), Some(&serde_json::json!(7)));
-        assert_eq!(usage.get("total_tokens"), Some(&serde_json::json!(19)));
-        assert_eq!(
-            usage.pointer("/input_tokens_details/cached_tokens"),
-            Some(&serde_json::json!(3))
-        );
-        assert_eq!(
-            usage.pointer("/output_tokens_details/reasoning_tokens"),
-            Some(&serde_json::json!(2))
-        );
-        assert!(usage.get("prompt_tokens").is_none());
-        assert!(usage.get("completion_tokens").is_none());
+    /// Runs chat SSE frames through the Responses transform as an unstored
+    /// request over empty memory storages (no tenant, no request context) and
+    /// hands back the client's receiver once the transform has returned.
+    async fn transformed_chat_stream(
+        frames: Vec<String>,
+    ) -> mpsc::Receiver<Result<Bytes, std::io::Error>> {
+        let body = Body::from_stream(futures_util::stream::iter(
+            frames.into_iter().map(Ok::<_, std::convert::Infallible>),
+        ));
+        let (tx, rx) = mpsc::channel(64);
+        process_and_transform_sse_stream(
+            body,
+            ResponsesRequest {
+                store: Some(false),
+                ..Default::default()
+            },
+            None,
+            Arc::new(smg_data_connector::MemoryResponseStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
+            None,
+            tx,
+        )
+        .await
+        .unwrap();
+        rx
     }
 
     #[tokio::test]
@@ -1308,26 +1379,7 @@ mod tests {
                 format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap()),
                 "data: [DONE]\n\n".into(),
             ];
-            let body = Body::from_stream(futures_util::stream::iter(
-                frames.into_iter().map(Ok::<_, std::convert::Infallible>),
-            ));
-            let (tx, mut rx) = mpsc::channel(64);
-            process_and_transform_sse_stream(
-                body,
-                ResponsesRequest {
-                    store: Some(false),
-                    ..Default::default()
-                },
-                None,
-                Arc::new(smg_data_connector::MemoryResponseStorage::new()),
-                Arc::new(smg_data_connector::MemoryConversationStorage::new()),
-                Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
-                None,
-                None,
-                tx,
-            )
-            .await
-            .unwrap();
+            let mut rx = transformed_chat_stream(frames).await;
             let mut terminal = None;
             while let Some(Ok(bytes)) = rx.recv().await {
                 let text = std::str::from_utf8(&bytes).unwrap();
@@ -1489,26 +1541,7 @@ mod tests {
         let frames = vec![format!("data: {reasoning}\n\n"),
             "data: {\"error\":{\"message\":\"engine unavailable\",\"type\":\"internal_error\"}}\n\n".into(),
             "data: [DONE]\n\n".into()];
-        let body = Body::from_stream(futures_util::stream::iter(
-            frames.into_iter().map(Ok::<_, std::convert::Infallible>),
-        ));
-        let (tx, mut rx) = mpsc::channel(64);
-        process_and_transform_sse_stream(
-            body,
-            ResponsesRequest {
-                store: Some(false),
-                ..Default::default()
-            },
-            None,
-            Arc::new(smg_data_connector::MemoryResponseStorage::new()),
-            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
-            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
-            None,
-            None,
-            tx,
-        )
-        .await
-        .unwrap();
+        let mut rx = transformed_chat_stream(frames).await;
         let mut events: Vec<Value> = Vec::new();
         while let Some(Ok(bytes)) = rx.recv().await {
             let text = std::str::from_utf8(&bytes).unwrap();
@@ -1658,7 +1691,8 @@ mod tests {
             let body = Body::from(frame);
             let mut emitter =
                 ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
-            let (tx, _) = mpsc::channel(64);
+            // The client stays (its receiver lives), so the body is read.
+            let (tx, _rx) = mpsc::channel(64);
             let error = convert_and_accumulate_stream(body, &mut emitter, &tx, |_| false)
                 .await
                 .unwrap_err();
@@ -1754,7 +1788,8 @@ mod tests {
         )]));
         let mut emitter =
             ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
-        let (tx, _) = mpsc::channel(64);
+        // The client stays (its receiver lives), so the body is read.
+        let (tx, _rx) = mpsc::channel(64);
         let error = convert_and_accumulate_stream(body, &mut emitter, &tx, |_| false)
             .await
             .unwrap_err();
@@ -1763,6 +1798,36 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("connection reset"));
+    }
+
+    /// The reader parked on a chat body that stalled (nothing more on it)
+    /// ends the moment its client leaves, with the error it ends with when
+    /// it meets the dead client at the next frame, and the chat body goes
+    /// with it: its sender sees the drop, as the chat layer does.
+    #[tokio::test]
+    async fn a_client_that_leaves_while_the_chat_body_is_stalled_ends_the_read_at_once() {
+        let (body_tx, body_rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+        let body = Body::from_stream(ReceiverStream::new(body_rx));
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        let (tx, rx) = mpsc::channel(64);
+        let read = convert_and_accumulate_stream(body, &mut emitter, &tx, |_| false);
+        let leave = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            drop(rx);
+        };
+        let (outcome, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(read, leave)
+        })
+        .await
+        .expect("the body never yields; the client's leaving ends the read");
+        let error = outcome.unwrap_err();
+        assert_eq!(error["code"], "stream_error");
+        assert_eq!(error["message"], "Client disconnected");
+        assert!(
+            body_tx.is_closed(),
+            "the chat body is dropped with the read"
+        );
     }
 
     /// One reader for the chat stream's events: chunks, the error event as
@@ -1836,26 +1901,7 @@ mod tests {
             ]
             .concat(),
         ];
-        let body = Body::from_stream(futures_util::stream::iter(
-            frames.into_iter().map(Ok::<_, std::convert::Infallible>),
-        ));
-        let (tx, mut rx) = mpsc::channel(64);
-        process_and_transform_sse_stream(
-            body,
-            ResponsesRequest {
-                store: Some(false),
-                ..Default::default()
-            },
-            None,
-            Arc::new(smg_data_connector::MemoryResponseStorage::new()),
-            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
-            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
-            None,
-            None,
-            tx,
-        )
-        .await
-        .unwrap();
+        let mut rx = transformed_chat_stream(frames).await;
         let mut events: Vec<Value> = Vec::new();
         while let Some(Ok(bytes)) = rx.recv().await {
             let text = std::str::from_utf8(&bytes).unwrap();

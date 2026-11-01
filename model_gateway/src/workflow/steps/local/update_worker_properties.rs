@@ -16,8 +16,8 @@ use super::create_worker::{
 use crate::{
     service_discovery::DISCOVERY_PROVIDER_LABEL,
     worker::{
-        overload::OverloadThresholds, service::MAX_WORKER_LABELS, worker::merge_labels,
-        BasicWorker, BasicWorkerBuilder, RuntimeType, Worker,
+        basic::merge_labels, overload::OverloadThresholds, service::MAX_WORKER_LABELS, BasicWorker,
+        BasicWorkerBuilder, RuntimeType, Worker,
     },
     workflow::data::WorkerUpdateWorkflowData,
 };
@@ -703,7 +703,6 @@ mod tests {
     use super::*;
     use crate::{
         app_context::AppContext,
-        middleware::AuthConfig,
         routers::{
             common::kv_transfer::{connector_mode_for_worker, KvConnectorMode},
             grpc::{
@@ -729,14 +728,8 @@ mod tests {
         tool_parser_factory: Option<tool_parser::ParserFactory>,
     ) -> Arc<AppContext> {
         use crate::{
-            config::RouterConfig,
-            middleware::TokenBucket,
-            observability::inflight_tracker::InFlightRequestTracker,
-            routers::{
-                common::{openai_bridge, realtime::RealtimeRegistry},
-                grpc::multimodal::MultimodalConfigRegistry,
-            },
-            worker::{WorkerRegistry, WorkerService},
+            app_context::testing::app_context_for_tests, config::RouterConfig,
+            worker::WorkerRegistry,
         };
 
         let router_config = RouterConfig::builder()
@@ -746,49 +739,7 @@ mod tests {
         for w in workers {
             registry.register(Arc::clone(w)).unwrap();
         }
-        let job_queue = Arc::new(std::sync::OnceLock::new());
-
-        Arc::new(AppContext {
-            gateway_auth: AuthConfig::new(None),
-            client: crate::clients::http_client(),
-            router_config: router_config.clone(),
-            rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
-            rate_limit_manager: None,
-            worker_registry: Arc::clone(&registry),
-            prefill_admission: None,
-            policy_registry: Arc::new(crate::policies::PolicyRegistry::new(
-                router_config.policy.clone(),
-            )),
-            reasoning_parser_factory: None,
-            tool_parser_factory,
-            gateway: None,
-            response_storage: Arc::new(smg_data_connector::MemoryResponseStorage::new()),
-            conversation_storage: Arc::new(smg_data_connector::MemoryConversationStorage::new()),
-            conversation_item_storage: Arc::new(
-                smg_data_connector::MemoryConversationItemStorage::new(),
-            ),
-            worker_monitor: None,
-            configured_reasoning_parser: None,
-            configured_tool_parser: None,
-            worker_job_queue: Arc::clone(&job_queue),
-            workflow_engines: Arc::new(std::sync::OnceLock::new()),
-            mcp_orchestrator: Arc::new(std::sync::OnceLock::new()),
-            mcp_format_registry: openai_bridge::FormatRegistry::new(),
-            tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
-            multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
-            tokenizer_load_failures: Arc::default(),
-            wasm_manager: None,
-            worker_client_cache: Arc::new(crate::worker::WorkerHttpClientCache::new(
-                &router_config,
-            )),
-            worker_service: Arc::new(WorkerService::new(registry, job_queue, router_config)),
-            inflight_tracker: InFlightRequestTracker::new(),
-            kv_event_monitor: None,
-            rl: None,
-            realtime_registry: Arc::new(RealtimeRegistry::new()),
-            webrtc_bind_addr: None,
-            webrtc_stun_server: None,
-        })
+        app_context_for_tests(router_config, registry, tool_parser_factory)
     }
 
     /// Each worker's id and revision, as the find step captures them.
@@ -1913,7 +1864,7 @@ mod tests {
             new.metadata().spec.zmq_handshake_address.as_deref(),
             Some(handshake.as_str())
         );
-        assert_eq!(new.metadata().zmq_engine_count(), 2);
+        assert_eq!(new.metadata().zmq_engine_count(), Some(2));
         // The overload block survives a metadata-only update, and so does the
         // effective threshold resolved from it.
         assert_eq!(new.metadata().spec.overload.waiting_requests, Some(8));
