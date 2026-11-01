@@ -32,6 +32,7 @@ use std::collections::BTreeMap;
 use common::{
     env_u64,
     model::{Model, StoreResult},
+    subject::Subject,
     workload::{self, Config as WlConfig},
     Op, Rng,
 };
@@ -72,43 +73,9 @@ fn random_config(rng: &mut Rng, wide: bool) -> WlConfig {
     }
 }
 
-enum Core {
-    Flat(FlatTree),
-    Chain(RadixTree),
-}
-
-struct Subject {
-    core: Core,
-    ids: Vec<HolderId>,
-    scratch: Vec<radix_tree::Overlap>,
-    qscratch: OverlapScratch,
-}
-
 impl Subject {
-    fn new_flat(holders: usize) -> Self {
-        let mut tree = FlatTree::new(Config::default());
-        let ids = (0..holders)
-            .map(|h| tree.create_holder(&format!("holder-{h}")))
-            .collect();
-        Self {
-            core: Core::Flat(tree),
-            ids,
-            scratch: Vec::new(),
-            qscratch: OverlapScratch::default(),
-        }
-    }
-    fn new_chain(holders: usize) -> Self {
-        let mut tree = RadixTree::new(Config::default());
-        let ids = (0..holders)
-            .map(|h| tree.create_holder(&format!("holder-{h}")))
-            .collect();
-        Self {
-            core: Core::Chain(tree),
-            ids,
-            scratch: Vec::new(),
-            qscratch: OverlapScratch::default(),
-        }
-    }
+    /// `None` when the store was rejected, else the applied and
+    /// duplicate counts the core reported.
     fn apply(&mut self, op: &Op) -> Option<(u32, u32)> {
         match op {
             Op::Store {
@@ -119,21 +86,13 @@ impl Subject {
                 // covered() is the shared-lock duplicate fast path's
                 // load-bearing predicate: gate it as an exact no-op
                 // oracle on EVERY store of every seed.
-                let predicted = match &self.core {
-                    Core::Flat(t) => Some(t.covered(self.ids[*holder], *parent, blocks)),
-                    Core::Chain(t) => Some(t.covered(self.ids[*holder], *parent, blocks)),
-                };
-                let r = match &mut self.core {
-                    Core::Flat(t) => t.store(self.ids[*holder], *parent, blocks),
-                    Core::Chain(t) => t.store(self.ids[*holder], *parent, blocks),
-                };
-                if let Some(predicted) = predicted {
-                    let no_op = matches!(&r, Ok(o) if o.applied == 0);
-                    assert_eq!(
-                        predicted, no_op,
-                        "covered() disagreed with store outcome {r:?}"
-                    );
-                }
+                let predicted = self.covered(*holder, *parent, blocks);
+                let r = self.store(*holder, *parent, blocks);
+                let no_op = matches!(&r, Ok(o) if o.applied == 0);
+                assert_eq!(
+                    predicted, no_op,
+                    "covered() disagreed with store outcome {r:?}"
+                );
                 match r {
                     Ok(o) => Some((o.applied, o.duplicates)),
                     Err(StoreError::ParentNotFound) => None,
@@ -141,75 +100,13 @@ impl Subject {
                 }
             }
             Op::Remove { holder, keys } => {
-                match &mut self.core {
-                    Core::Flat(t) => t.remove(self.ids[*holder], keys),
-                    Core::Chain(t) => t.remove(self.ids[*holder], keys),
-                };
+                self.remove(*holder, keys);
                 Some((0, 0))
             }
             Op::Clear { holder } => {
-                match &mut self.core {
-                    Core::Flat(t) => t.clear(self.ids[*holder]),
-                    Core::Chain(t) => t.clear(self.ids[*holder]),
-                }
+                self.clear(*holder);
                 Some((0, 0))
             }
-        }
-    }
-    fn overlap(&mut self, query: &[u64]) -> BTreeMap<usize, u32> {
-        let scratch = &mut self.scratch;
-        match &mut self.core {
-            Core::Flat(t) => t.overlap(query, &mut self.qscratch, scratch),
-            Core::Chain(t) => t.overlap(query, &mut self.qscratch, scratch),
-        }
-        let mut out = BTreeMap::new();
-        for o in scratch.iter() {
-            // Same uniqueness gate as differential.rs: a holder emitted
-            // twice in the raw Vec would otherwise be silently
-            // overwritten here, hiding a duplicate-emission regression
-            // exactly where the widest seed space runs.
-            assert!(
-                out.insert(o.holder.parts().0 as usize, o.depth).is_none(),
-                "overlap emitted holder {} twice in the raw Vec",
-                o.holder.parts().0
-            );
-        }
-        out
-    }
-    fn holder_blocks(&self, h: usize) -> u64 {
-        match &self.core {
-            Core::Flat(t) => t.holder_blocks(self.ids[h]),
-            Core::Chain(t) => t.holder_blocks(self.ids[h]),
-        }
-    }
-    fn enumerate(&self, h: usize) -> Vec<(u32, u64, u64)> {
-        match &self.core {
-            Core::Flat(t) => t.enumerate(self.ids[h]).collect(),
-            Core::Chain(t) => t.enumerate(self.ids[h]).collect(),
-        }
-    }
-    fn distinct_entries(&self) -> u64 {
-        match &self.core {
-            Core::Flat(t) => t.stats().distinct_entries,
-            Core::Chain(t) => t.stats().distinct_entries,
-        }
-    }
-    fn dup_prefix(&self, h: usize, parent: Option<u64>, blocks: &[(u64, u64)]) -> (u32, bool) {
-        match &self.core {
-            Core::Flat(t) => t.dup_prefix(self.ids[h], parent, blocks),
-            Core::Chain(t) => t.dup_prefix(self.ids[h], parent, blocks),
-        }
-    }
-    fn position_of(&self, h: usize, key: u64) -> Option<u32> {
-        match &self.core {
-            Core::Flat(t) => t.position_of(self.ids[h], key),
-            Core::Chain(t) => t.position_of(self.ids[h], key),
-        }
-    }
-    fn audit(&self) -> Result<(), String> {
-        match &self.core {
-            Core::Flat(t) => t.audit(),
-            Core::Chain(t) => t.audit(),
         }
     }
 }

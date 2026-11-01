@@ -78,6 +78,17 @@ pub(crate) fn convert_proto_to_openai_logprobs(
     logprobs
 }
 
+/// Whether `logprobs` carries at least one token's entry.
+pub(crate) fn has_entries(logprobs: Option<&ChatLogProbs>) -> bool {
+    matches!(
+        logprobs,
+        Some(ChatLogProbs::Detailed {
+            content: Some(items),
+            ..
+        }) if !items.is_empty()
+    )
+}
+
 /// Keep at most `requested` alternatives per token.
 fn truncate_top_logprobs(logprobs: &mut ChatLogProbs, requested: usize) {
     if let ChatLogProbs::Detailed {

@@ -5,6 +5,8 @@ use std::{collections::HashMap, fmt, sync::Arc};
 
 use openai_protocol::worker::{ConnectionMode, RuntimeType, WorkerStatus, WorkerType};
 
+use crate::calls::RlControlCalls;
+
 /// A snapshot of one registered worker, read from the gateway registry.
 /// `Debug` reports whether `api_key` is set, never its value.
 #[derive(Clone)]
@@ -36,6 +38,10 @@ pub struct RlWorkerInfo {
     /// config. `Err` says why the gateway has none; the 422 for the worker
     /// repeats it.
     pub control_client: Result<Arc<reqwest::Client>, String>,
+    /// The worker's engine connection, when it carries the RL routes as
+    /// control calls itself (a TokenSpeed engine on the direct ZMQ lane):
+    /// used for a worker with no `control_url`.
+    pub control_calls: Option<Arc<dyn RlControlCalls>>,
 }
 
 impl fmt::Debug for RlWorkerInfo {
@@ -58,6 +64,7 @@ impl fmt::Debug for RlWorkerInfo {
                 "control_client",
                 &self.control_client.as_ref().map(|_| ".."),
             )
+            .field("control_calls", &self.control_calls.is_some())
             .finish()
     }
 }
@@ -90,6 +97,7 @@ mod tests {
             labels: HashMap::new(),
             control_url: None,
             control_client: Err("no client".to_string()),
+            control_calls: None,
         }
     }
 

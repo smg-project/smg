@@ -6,6 +6,7 @@
 //! launching the headless scheduler and driving this server through the
 //! binding.
 
+mod encode;
 mod engine;
 mod generate;
 mod info;
@@ -16,11 +17,15 @@ mod tests;
 use std::{sync::Arc, time::Duration};
 
 use engine_zmq_adapter::{
-    GridTensors, MropeLayout, StructuredOutputBackend, StructuredOutputsBackendConfig,
-    StructuredOutputsSupport,
+    EncodeRendezvous, GridTensors, MropeLayout, StructuredOutputBackend,
+    StructuredOutputsBackendConfig, StructuredOutputsSupport,
 };
+use engine_zmq_client::{protocol::handshake::REQUEST_KIND_ENCODE, ConnectedEngine};
 use llm_tokenizer::traits::Tokenizer;
-use smg_grpc_client::tokenspeed_proto::token_speed_scheduler_server::TokenSpeedSchedulerServer;
+use smg_grpc_client::{
+    tokenspeed_encoder_proto::token_speed_encoder_server::TokenSpeedEncoderServer,
+    tokenspeed_proto::token_speed_scheduler_server::TokenSpeedSchedulerServer,
+};
 use tonic::service::Routes;
 
 use crate::{
@@ -33,6 +38,9 @@ use crate::{
 
 /// The gRPC service name, as the health service reports it.
 pub const SERVICE_NAME: &str = "tokenspeed.grpc.scheduler.TokenSpeedScheduler";
+/// The encoder service's name, which health reports in the encode role (the
+/// gRPC servicer's primary service there).
+pub const ENCODER_SERVICE_NAME: &str = "tokenspeed.grpc.encoder.TokenSpeedEncoder";
 /// The `wire` label of this servicer's metrics.
 const WIRE: &str = "tokenspeed";
 /// What `HealthCheck`'s message says of a serving engine on this wire.
@@ -166,6 +174,101 @@ pub(super) fn structured_outputs_support(model: &TokenSpeedModelInfo) -> Structu
     }
 }
 
+/// The encode role's rendezvous, read off the launch's server args
+/// (`disaggregation_mode == "encode"`, `--disaggregation-bootstrap-port`,
+/// and `encode_bootstrap_host`, the worker's own address as the launcher
+/// adds it, the way the gRPC servicer's encoder fills it); `None` for the
+/// other roles. An encode launch without the host or the port is refused
+/// before anything starts.
+pub(super) fn encode_role(
+    model: &TokenSpeedModelInfo,
+) -> Result<Option<EncodeRendezvous>, ServicerError> {
+    let args: serde_json::Value = serde_json::from_str(&model.server_args_json).unwrap_or_default();
+    if args
+        .get("disaggregation_mode")
+        .and_then(serde_json::Value::as_str)
+        != Some("encode")
+    {
+        return Ok(None);
+    }
+    let bootstrap_host = args
+        .get("encode_bootstrap_host")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|host| !host.is_empty() && !is_unspecified_address(host))
+        .ok_or_else(|| {
+            ServicerError::InvalidConfig(
+                "the encode role needs encode_bootstrap_host in the server args: the worker's \
+                 own address, one the prefill side can reach, which the launcher adds (it read \
+                 none, or an unspecified one)"
+                    .to_string(),
+            )
+        })?
+        .to_string();
+    let bootstrap_port = args
+        .get("disaggregation_bootstrap_port")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|port| i32::try_from(port).ok())
+        .filter(|port| *port > 0)
+        .ok_or_else(|| {
+            ServicerError::InvalidConfig(
+                "the encode role needs disaggregation_bootstrap_port in the server args"
+                    .to_string(),
+            )
+        })?;
+    Ok(Some(EncodeRendezvous {
+        bootstrap_host,
+        bootstrap_port,
+    }))
+}
+
+/// An address no peer can dial (`0.0.0.0`, `::`): a launch's `--host`, never
+/// a rendezvous.
+fn is_unspecified_address(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_unspecified())
+}
+
+/// The role this servicer was launched for against what the engines'
+/// handshakes list: the encode role needs every engine to list the encode
+/// request (an engine before the wire carried it lists none and cannot take
+/// the role: the Python servicer serves it there); any other role refuses an
+/// engine that lists encode alone (a disaggregated encode worker dialled a
+/// servicer launched for a language role).
+pub(super) fn check_role_against_wire(
+    encode_role: bool,
+    engines: &[ConnectedEngine],
+) -> Result<(), String> {
+    let lists_encode = |engine: &ConnectedEngine| {
+        engine
+            .ready_response
+            .lists_request_kind(REQUEST_KIND_ENCODE)
+    };
+    if encode_role {
+        if let Some(engine) = engines.iter().find(|engine| !lists_encode(engine)) {
+            return Err(format!(
+                "the encode role needs the engine's encode request on the msgpack wire, which \
+                 this engine's handshake does not list (request_types {:?}): a TokenSpeed that \
+                 serves it, or the Python servicer (--servicer-impl python), serves this worker",
+                engine.ready_response.request_types
+            ));
+        }
+        return Ok(());
+    }
+    if let Some(engine) = engines
+        .iter()
+        .find(|engine| lists_encode(engine) && !engine.ready_response.takes_generate())
+    {
+        return Err(format!(
+            "the engine's handshake lists the encode request alone (a disaggregated encode \
+             worker; request_types {:?}), but this servicer was launched for another role: \
+             launch it with --disaggregation-mode encode",
+            engine.ready_response.request_types
+        ));
+    }
+    Ok(())
+}
+
 /// How to bind, where the engines dial in, and what to advertise.
 #[derive(Debug, Clone)]
 pub struct TokenSpeedServicerConfig {
@@ -204,6 +307,11 @@ pub(super) struct State {
     /// Loaded once alongside the engine connect; `Some(None)` records a load
     /// that failed (string stops are then refused).
     pub(super) tokenizer: TokenizerSlot,
+    /// The disaggregated encode role's rendezvous when this servicer runs it
+    /// (`--disaggregation-mode encode`): the encoder service is mounted,
+    /// `Generate` refused, and the engine's handshake must list the encode
+    /// request.
+    pub(super) encode_role: Option<EncodeRendezvous>,
 }
 
 impl WireState for State {
@@ -271,26 +379,43 @@ impl TokenSpeedServicerServer {
             },
             config.servicer.metrics_bind_address.is_some(),
         )?;
+        let encode_role = encode_role(&config.model)?;
         let state = Arc::new(State {
             model: config.model,
             shared: Shared::new(kv_relay, metrics, config.servicer.tokenizer_dir.clone()),
             tokenizer: TokenizerSlot::new(),
+            encode_role,
         });
         if let Some(tokenizer) = tokenizer {
             let _ = state.tokenizer.set(Some(tokenizer));
         }
-        let routes = Routes::new(
-            TokenSpeedSchedulerServer::new(service::TokenSpeedService {
-                state: Arc::clone(&state),
-            })
-            .max_decoding_message_size(usize::MAX)
-            .max_encoding_message_size(usize::MAX),
-        );
+        let scheduler = TokenSpeedSchedulerServer::new(service::TokenSpeedService {
+            state: Arc::clone(&state),
+        })
+        .max_decoding_message_size(usize::MAX)
+        .max_encoding_message_size(usize::MAX);
+        // The encode role mounts the encoder service next to the scheduler's
+        // discovery surface and reports health under the encoder's name, as
+        // the gRPC servicer does.
+        let (routes, service_name) = match &state.encode_role {
+            Some(rendezvous) => (
+                Routes::new(scheduler).add_service(
+                    TokenSpeedEncoderServer::new(encode::TokenSpeedEncodeService {
+                        state: Arc::clone(&state),
+                        rendezvous: rendezvous.clone(),
+                    })
+                    .max_decoding_message_size(usize::MAX)
+                    .max_encoding_message_size(usize::MAX),
+                ),
+                ENCODER_SERVICE_NAME,
+            ),
+            None => (Routes::new(scheduler), SERVICE_NAME),
+        };
         let connect_state = Arc::clone(&state);
         let server = servicer::Server::start(
             "smg-tokenspeed-servicer",
             config.servicer,
-            SERVICE_NAME,
+            service_name,
             "TokenSpeed",
             &state,
             routes,

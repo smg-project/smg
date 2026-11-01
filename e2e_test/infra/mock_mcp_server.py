@@ -3,7 +3,7 @@
 Overview
 --------
 This module provides a reusable, in-process mock ``MCP`` server built on top of
-the official ``mcp`` SDK (``FastMCP``). It exposes ``streamable``-HTTP transport
+the standalone ``FastMCP`` server. It exposes ``streamable``-HTTP transport
 on a local port so the gateway's MCP client (which already speaks streamable
 HTTP against Brave in production) can connect without any code changes to the
 Rust side.
@@ -57,7 +57,7 @@ import time
 from typing import Any
 
 import uvicorn
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 from .constants import host_port
 
@@ -222,7 +222,7 @@ class MockMcpServer:
             raise RuntimeError("MockMcpServer already started")
 
         fastmcp = self._build_fastmcp()
-        app = fastmcp.streamable_http_app()
+        app = fastmcp.http_app(path=self._mount_path, stateless_http=True)
 
         config = uvicorn.Config(
             app,
@@ -340,11 +340,7 @@ class MockMcpServer:
         call produces an isolated FastMCP instance — important for session
         isolation across tests that run back-to-back.
         """
-        fastmcp = FastMCP(
-            name="smg-e2e-mock",
-            host=self.host,
-            stateless_http=True,
-        )
+        fastmcp = FastMCP(name="smg-e2e-mock")
         self._register_tools(fastmcp)
         return fastmcp
 

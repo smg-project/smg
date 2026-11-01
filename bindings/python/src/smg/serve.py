@@ -82,7 +82,7 @@ _ZMQ_HANDSHAKE_PORT_SPAN = 10000
 def _zmq_handshake_port(ipc_url: str) -> int:
     """The tcp handshake port SMG derives from an ipc:// URL.
 
-    Mirrors `derive_handshake_port` in model_gateway/src/worker/worker.rs exactly
+    Mirrors `derive_handshake_port` in crates/engine_zmq_adapter/src/sockets.rs exactly
     (FNV-1a over the path after `ipc://`, mapped into 20000..=29999) so the engine
     can be launched with the matching `--data-parallel-rpc-port`.
     """

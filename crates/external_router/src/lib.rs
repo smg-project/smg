@@ -32,6 +32,9 @@ pub mod tenant;
 pub mod upstream_body;
 pub mod worker;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use context::ExternalContext;
 pub use retry_config::RetryConfig;
 pub use router::{

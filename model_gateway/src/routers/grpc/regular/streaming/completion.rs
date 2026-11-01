@@ -43,7 +43,21 @@ pub(super) enum CompletionStreamUnit {
         prefill: ProtoStream,
         decode: Box<ProtoStream>,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
+        /// PD timing context, for honest PD TTFT (prefill start to first
+        /// decode token).
+        pd_timing: context::PdTiming,
     },
+}
+
+impl CompletionStreamUnit {
+    /// The prefill dispatch instant of a disaggregated unit: the base its
+    /// TTFT and generation duration are measured from.
+    pub(super) fn prefill_start(&self) -> Option<Instant> {
+        match self {
+            Self::Single(_) => None,
+            Self::PrefillDecode { pd_timing, .. } => Some(pd_timing.prefill_start),
+        }
+    }
 }
 
 /// Per-stream token/timing totals returned by the completion chunk loop; the
@@ -79,6 +93,10 @@ pub(super) struct CompletionStream<'a> {
     prompt_text: &'a str,
     index_offset: u32,
     tx: &'a SseSender,
+    pd_timing: Option<context::PdTiming>,
+    /// The processor's backend label, for the PD first-token pair and the
+    /// local-stop abort record.
+    backend_type: &'static str,
 
     first_token_time: Option<Instant>,
 
@@ -142,7 +160,9 @@ fn completion_choice(
 
 impl<'a> CompletionStream<'a> {
     /// What the spec and the dispatch decide for the whole unit, the frame,
-    /// and the empty per-choice state and totals.
+    /// and the empty per-choice state and totals. `pd_timing` is `Some` only
+    /// in PD mode.
+    #[expect(clippy::too_many_arguments)]
     pub(super) fn open(
         dispatch: &'a context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
@@ -151,6 +171,8 @@ impl<'a> CompletionStream<'a> {
         prompt_text: &'a str,
         index_offset: u32,
         tx: &'a SseSender,
+        pd_timing: Option<context::PdTiming>,
+        backend_type: &'static str,
     ) -> Self {
         let frame = CompletionChunkFrame::new(
             &dispatch.request_id,
@@ -166,6 +188,8 @@ impl<'a> CompletionStream<'a> {
             prompt_text,
             index_offset,
             tx,
+            pd_timing,
+            backend_type,
             first_token_time: None,
             stop_decoders: HashMap::new(),
             is_firsts: HashMap::new(),
@@ -221,6 +245,9 @@ impl<'a> CompletionStream<'a> {
     ) -> Result<(), utils::StreamFailure> {
         if self.first_token_time.is_none() {
             self.first_token_time = Some(Instant::now());
+            if let Some(timing) = &self.pd_timing {
+                timing.record_first_decode_token(self.backend_type, &self.dispatch.model);
+            }
         }
 
         let index = self.index_offset + chunk.index();
@@ -474,14 +501,14 @@ impl<'a> CompletionStream<'a> {
     /// takes, so the slot goes back to the engine's batch within a step
     /// instead of running to `max_tokens` for nobody. An engine that ended
     /// on its own is marked completed, so that its drop sends no abort.
-    pub(super) fn release_engine(&self, mut grpc_stream: ProtoStream, backend_type: &'static str) {
+    pub(super) fn release_engine(&self, mut grpc_stream: ProtoStream) {
         if !self.engine_outlived {
             grpc_stream.mark_completed();
             return;
         }
         Metrics::record_local_stop_abort(LocalStopAbort {
             router_type: metrics_labels::ROUTER_GRPC,
-            backend_type,
+            backend_type: self.backend_type,
             model_id: &self.dispatch.model,
             endpoint: metrics_labels::ENDPOINT_COMPLETIONS,
             tail_tokens: self.tail_tokens,
