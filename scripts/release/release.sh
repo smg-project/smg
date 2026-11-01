@@ -294,7 +294,7 @@ cmd_pick() {
     if [ "$n" -le 3 ]; then topic="$topic-$(git rev-parse --short "$full")"; fi
   done
   [ "$n" -le 3 ] || topic="$topic-and-$((n - 3))-more"
-  has_ref "refs/heads/$topic" && die "the branch $topic exists: delete it or finish it (release.sh pick-pr $release)"
+  has_ref "refs/heads/$topic" && die "the branch $topic exists: delete it or finish it (make release-pick-pr RELEASE=$release PICK=$topic)"
   note "pick: ${#ordered[@]} commit(s) onto $topic (from $base)"
   git switch --quiet --no-track -c "$topic" "$base"
   if ! git cherry-pick -x --signoff "${ordered[@]}"; then
@@ -321,8 +321,10 @@ cmd_pick_pr() {
   local topic
   topic=$(git rev-parse --abbrev-ref HEAD)
   # The pick branch may lack the release targets (a line cut before a tooling change on main): the command runs from
-  # main with the branch named, and checks it out itself.
+  # main with the branch named, and checks it out itself, after every refusal: a wrong name or a dirty tree never
+  # moves the clone.
   if [ -n "$named" ] && [ "$named" != "$topic" ]; then
+    case "$named" in pick/"$release"-*) ;; *) die "$named is not a pick/$release-* branch (the pick branches are pick/$release-<sha>...)" ;; esac
     has_ref "refs/heads/$named" || die "no branch $named here (the pick branches are pick/$release-<sha>...)"
     require_clean "commit or discard them before switching to $named"
     git switch --quiet "$named"

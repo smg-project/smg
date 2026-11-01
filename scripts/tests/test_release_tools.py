@@ -500,6 +500,13 @@ def test_pick_conflict_stops_with_the_steps_and_pick_pr_finishes(repo: Sandbox) 
     assert f"(cherry picked from commit {four})" in repo.git("log", "-1", "--format=%B")
     # finished from main, the branch named: the pick branch may lack the release targets
     repo.git("switch", "--quiet", "main")
+    again = repo.tool(
+        "pick", "1.14", four, check=False
+    )  # the same pick once more: the hint names the branch
+    assert (
+        f"the branch {topic} exists: delete it or finish it (make release-pick-pr RELEASE=1.14 PICK={topic})"
+        in again.stderr
+    )
     repo.tool("pick-pr", "1.14", topic)
     assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == topic
     assert repo.origin_ref(f"refs/heads/{topic}") == repo.git("rev-parse", "HEAD")
@@ -519,17 +526,24 @@ def test_pick_pr_refuses_other_branches(repo: Sandbox) -> None:
         "no branch pick/1.14-0000000 here"
         in repo.tool("pick-pr", "1.14", "pick/1.14-0000000", check=False).stderr
     )
+    # a wrong name is refused before the clone moves (a later `make release-*` would run from the named branch)
     assert (
-        "not on a pick/1.14-* branch (on main)"
+        "main is not a pick/1.14-* branch (the pick branches are pick/1.14-<sha>...)"
         in repo.tool("pick-pr", "1.14", "main", check=False).stderr
-    )  # named and checked out, then refused by its name
+    )
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "release/1.14", (
+        "a wrong name is not switched to"
+    )
+    repo.git("branch", "--quiet", "pick/1.14-0000001")
     repo.put("Cargo.toml", repo.read("Cargo.toml") + "# edited\n")
-    dirty = repo.tool("pick-pr", "1.14", "release/1.14", check=False)
+    dirty = repo.tool("pick-pr", "1.14", "pick/1.14-0000001", check=False)
     assert (
-        "uncommitted changes: commit or discard them before switching to release/1.14"
+        "uncommitted changes: commit or discard them before switching to pick/1.14-0000001"
         in dirty.stderr
     )
-    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "main", "a dirty tree is not switched"
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "release/1.14", (
+        "a dirty tree is not switched"
+    )
     repo.git("checkout", "--", "Cargo.toml")
 
 
