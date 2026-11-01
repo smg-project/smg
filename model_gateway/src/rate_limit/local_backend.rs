@@ -750,10 +750,17 @@ mod tests {
         .await
         .expect("the sweep task never dropped the idle bucket");
 
-        // The task holds only a Weak, so the backend goes with its last
-        // owner.
+        // The task holds only a Weak between sweeps, so the backend goes
+        // with its last owner once a sweep in flight on the blocking pool
+        // (which can outlast the emptying of the map) has returned.
         let weak = Arc::downgrade(&backend);
         drop(backend);
-        assert!(weak.upgrade().is_none());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while weak.strong_count() > 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the sweep task kept the backend alive after its owner dropped it");
     }
 }
