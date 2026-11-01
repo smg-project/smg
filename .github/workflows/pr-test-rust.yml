@@ -442,7 +442,7 @@ jobs:
         run: |
           sudo=""; command -v sudo >/dev/null 2>&1 && sudo=sudo
           export DEBIAN_FRONTEND=noninteractive
-          $sudo apt-get update
+          bash scripts/ci_apt_update.sh $sudo
           bash scripts/ci_retry.sh 3 10 $sudo apt-get install -y --no-install-recommends ffmpeg
 
       - name: Build the Rust tests
@@ -2144,7 +2144,7 @@ jobs:
       - name: Install build tools
         run: |
           bash scripts/ci_apt_mirror.sh
-          sudo apt-get update
+          bash scripts/ci_apt_update.sh sudo
           bash scripts/ci_retry.sh 3 10 sudo apt-get install -y build-essential
 
       - name: Download build artifacts
