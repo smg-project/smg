@@ -51,9 +51,9 @@ pushed, the read-only commands (`check`, `status`, `publish-plan`, `notes`) read
   a version once). A version a tag carries with this very code needs nothing. A version
   published without a release tag is not seen by the tags: `make release-check` reads crates.io
   and PyPI for every crate and package at the branch head and fails on a version they hold
-  already with changes after it (counted from the first tag that published it, or from its
-  bump when no tag of this process carries it; crates.io is read through the sparse index
-  cargo reads, one component at a time), and `make release-publish-plan` marks such versions
+  already with changes after it (the commits since the registry's own publish time of that
+  version, or since its bump when the registry gives none; crates.io is read through the sparse
+  index cargo reads, one component at a time), and `make release-publish-plan` marks such versions
   (`REGISTRY=0` skips the reads).
 - `main` keeps the last final release's versions. After a final, `make release-bump-main` opens
   the pull request that moves them: the gateway and its mirrors to the release's version, every

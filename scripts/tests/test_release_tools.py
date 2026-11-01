@@ -13,6 +13,8 @@ import os
 import shutil
 import subprocess
 import sys
+import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -74,14 +76,22 @@ CARGO_STUB = r"""#!/usr/bin/env bash
 printf 'cargo %s\n' "$*" >> "$CARGO_STUB_LOG"
 """
 # The registries as the release tool reads them: crates.io's sparse index (one JSON line per version) from
-# CRATES_STUB ("name=v1,v2 other=v3"), PyPI's JSON from PYPI_STUB (the same shape); "down" answers nothing (exit 7);
-# an unlisted name is a 404. With -w the http code follows the body on its own line, as curl prints it.
+# CRATES_STUB ("name=v1,v2 other=v3@2026-01-01T00:00:00Z": a version may carry its publish time), PyPI's JSON from
+# PYPI_STUB (the same shape); "down" answers nothing (exit 7); an unlisted name is a 404. With -w the http code
+# follows the body on its own line, as curl prints it.
 REGISTRY_STUB = r"""#!/usr/bin/env bash
 printf 'curl %s\n' "$*" >> "$CURL_STUB_LOG"
-body_of() { # <crate|package> <v1,v2>: the registry's body for those versions
-  local items="" v
+body_of() { # <crate|package> <v1[@time],v2>: the body for those versions, a publish time when given
+  local items="" v t p
   for v in ${2//,/ }; do
-    if [ "$1" = crate ]; then items="$items"$'\n'"{\"vers\":\"$v\",\"yanked\":false}"; else items="$items,\"$v\":[]"; fi
+    t=""; case $v in *@*) t=${v#*@}; v=${v%%@*} ;; esac
+    if [ "$1" = crate ]; then
+      p=""; [ -z "$t" ] || p=",\"pubtime\":\"$t\""
+      items="$items"$'\n'"{\"vers\":\"$v\",\"yanked\":false$p}"
+    else
+      p=""; [ -z "$t" ] || p="{\"upload_time_iso_8601\":\"$t\"}"
+      items="$items,\"$v\":[$p]"
+    fi
   done
   if [ "$1" = crate ]; then printf '%s' "${items#$'\n'}"; else printf '{"releases":{%s}}' "${items#,}"; fi
 }
@@ -135,6 +145,12 @@ jobs:
             "tokenspeed": {"release_bases": [""]}
           }'
 """
+
+
+def utc_second_after(iso: str) -> str:
+    """One second after a git ``%cI`` date, in the UTC spelling the tool prints for a publish time."""
+    moment = datetime.fromisoformat(iso).astimezone(UTC) + timedelta(seconds=1)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def versioned(name: str, version: str) -> str:
@@ -1117,14 +1133,30 @@ def test_check_reads_the_registries_for_versions_published_already(repo: Sandbox
     assert (
         "[FAIL] registry: at a version crates.io or PyPI hold already, with changes after it (the publish"
         " dispatch skips them and ships none of those changes; a bump pull request against release/1.14"
-        " moves them): tool-parser 0.6.0 (1 commit(s) after its bump)" in held.stdout
+        " moves them): tool-parser 0.6.0 (1 commit(s) after its bump; the registry gave no publish time)"
+        in held.stdout
     )
-    # the candidate is tagged with that change in: its dispatch published 0.6.0 from the tag, nothing is missing...
+    # the registry held 0.6.0 before the candidate was tagged (published on main the older way, or by another
+    # line): the tag's dispatch skipped it, so the commits after the publish time keep counting, tag or no tag
     repo.tool("tag", "1.14.0-rc.1", PUSH="1")
-    tagged = repo.tool("check", "1.14.0-rc.1", check=False, CRATES_STUB="tool-parser=0.6.0")
+    early = "2000-01-01T00:00:00Z"
+    since_early = repo.git(
+        "rev-list", "--count", f"--after={early}", "origin/release/1.14", "--", "crates/tool_parser"
+    )
+    held = repo.tool("check", "1.14.0-rc.1", check=False, CRATES_STUB=f"tool-parser=0.6.0@{early}")
+    assert (
+        f"tool-parser 0.6.0 ({since_early} commit(s) after it was published ({early}))"
+        in held.stdout
+    )
+    # published by the tag's dispatch, after the branch's last commit: nothing is missing...
+    published = utc_second_after(repo.git("log", "-1", "--format=%cI", "origin/release/1.14"))
+    tagged = repo.tool(
+        "check", "1.14.0-rc.1", check=False, CRATES_STUB=f"tool-parser=0.6.0@{published}"
+    )
     assert "[ok]   registry:" in tagged.stdout
     assert "tool-parser 0.6.0" in tagged.stdout.split("[note] registry:")[-1]
-    # ...and a change after the tag is counted from the tag, where the publish ran, not from the bump
+    # ...until the next change lands, counted from that publish time
+    time.sleep(1.1)
     repo.git("switch", "--quiet", "release/1.14")
     repo.put(
         "crates/tool_parser/src/lib.rs", "pub fn parse() {}\npub fn more() {}\npub fn later() {}\n"
@@ -1132,12 +1164,10 @@ def test_check_reads_the_registries_for_versions_published_already(repo: Sandbox
     repo.git("commit", "--quiet", "-am", "fix(tool_parser): later")
     repo.land_on_release()
     repo.git("switch", "--quiet", "main")
-    later = repo.tool("check", "1.14.0-rc.1", check=False, CRATES_STUB="tool-parser=0.6.0")
-    assert (
-        "[FAIL] registry:" in later.stdout
-        and "tool-parser 0.6.0 (1 commit(s) after v1.14.0-rc.1, the tag it was published from)"
-        in later.stdout
+    later = repo.tool(
+        "check", "1.14.0-rc.1", check=False, CRATES_STUB=f"tool-parser=0.6.0@{published}"
     )
+    assert f"tool-parser 0.6.0 (1 commit(s) after it was published ({published}))" in later.stdout
     # the registries do not answer: the gate says so and does not pass
     down = repo.tool("check", "1.14.0-rc.1", check=False, CRATES_STUB="down")
     assert down.returncode == 1

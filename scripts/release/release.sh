@@ -621,11 +621,13 @@ component_list() { # <ref> <file>: publishable's lines into <file>, or a failure
 # --- the registries ---------------------------------------------------------------------
 # crates.io and PyPI take a version once: a component whose version at the branch head is published already is skipped
 # by its publish dispatch, and when its code changed after that version was published the release ships none of those
-# changes while every repository-side check reads green. A version is published from the first tag of this process
-# that carries it (the dispatch runs against the tag); a version no such tag carries was published at its bump, the
-# way of the older push-triggered publishes. The reads run one at a time: crates.io through the sparse index cargo
-# itself reads (one static file per crate, no API call: the API asks its clients for one request a second), PyPI's
-# JSON API at most once a second; 20 s each. REGISTRY=0 skips them.
+# changes while every repository-side check reads green. The commits a published version misses are counted from the
+# registry's own publish time of that version (the sparse index line's pubtime, PyPI's upload time): a version
+# published on main the older way, at its bump, counts every commit since, tag or no tag; a version a tag's dispatch
+# published counts only what landed after that dispatch. A held version whose line gives no time counts from its
+# bump. The reads run one at a time: crates.io through the sparse index cargo itself reads (one static file per
+# crate, no API call: the API asks its clients for one request a second), PyPI's JSON API at most once a second; 20 s
+# each. REGISTRY=0 skips them.
 
 USER_AGENT='smg-release-tooling (https://github.com/smg-project/smg)'
 index_path() { # <crate name>: the crate's file in the sparse index, as cargo spells it (1/x, 2/xy, 3/x/xyz, xy/zw/xyzw...)
@@ -638,45 +640,60 @@ index_path() { # <crate name>: the crate's file in the sparse index, as cargo sp
     *) printf '%s/%s/%s' "${name:0:2}" "${name:2:2}" "$name" ;;
   esac
 }
-registry_versions() { # <crate|package> <name>: the versions the registry holds, one per line (yanked ones too: a name takes a version once); "unread" when it did not answer; nothing for a name it has not
+registry_versions() { # <crate|package> <name>: "version [publish time]" per version the registry holds (yanked ones too: a name takes a version once; the time in UTC, whole seconds, empty when the registry gives none); "unread" when it did not answer; nothing for a name it has not
   local url out code body
   case $1 in crate) url="https://index.crates.io/$(index_path "$2")" ;; *) url="https://pypi.org/pypi/$2/json" ;; esac
   out=$("$CURL" -sS -L -m 20 -A "$USER_AGENT" -w '\n%{http_code}' "$url" 2>/dev/null) || { say unread; return 0; }
   code=${out##*$'\n'}; body=${out%$'\n'*}
   case $code in
     200) "$PYTHON" -c 'import json, sys
+from datetime import datetime, timezone
+
+
+def utc(text):
+    if not text:
+        return ""
+    moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 if sys.argv[1] == "crate":
-    print("\n".join(json.loads(line)["vers"] for line in sys.stdin if line.strip()))
+    for line in sys.stdin:
+        if line.strip():
+            entry = json.loads(line)
+            print(entry["vers"], utc(entry.get("pubtime", "")))
 else:
-    print("\n".join(json.load(sys.stdin)["releases"]))' "$1" <<< "$body" 2>/dev/null || say unread ;;
+    for version, files in json.load(sys.stdin)["releases"].items():
+        times = sorted(f["upload_time_iso_8601"] for f in files if f.get("upload_time_iso_8601"))
+        print(version, utc(times[0]) if times else "")' "$1" <<< "$body" 2>/dev/null || say unread ;;
     404) ;;
     *) say unread ;;
   esac
 }
-published_from() { # <ref> <bump commit>: the first release tag of this process (none is on $REMOTE/main) reachable from <ref> that carries the bump, where its publish dispatch ran; empty when no tag does
-  comm -23 <(git tag --list 'v[0-9]*' --merged "$1" --contains "$2" | sort) <(git tag --list 'v[0-9]*' --merged "$REMOTE/main" | sort) \
-    | sed 's/-rc\./~rc./' | sort -V | head -n 1 | sed 's/~rc\./-rc./'
+after_text() { # <count> <bump|publish time>: the commits a published version misses, and from where they are counted
+  if [ "$2" = bump ]; then printf '%s commit(s) after its bump; the registry gave no publish time' "$1"; else printf '%s commit(s) after it was published (%s)' "$1" "$2"; fi
 }
-after_text() { # <count> <bump|tag>: the commits a published version misses, and from where they are counted
-  if [ "$2" = bump ]; then printf '%s commit(s) after its bump' "$1"; else printf '%s commit(s) after %s, the tag it was published from' "$1" "$2"; fi
-}
-registry_report() { # <ref> <list>: "name version held|free|unread <commits after> <bump|tag>" per line of <list> (publishable's output), one registry read at a time
-  local ref=$1 list=$2 kind name version manifest path moved from after state line pypi=0
+registry_report() { # <ref> <list>: "name version held|free|unread <commits after> <bump|publish time>" per line of <list> (publishable's output), one registry read at a time
+  local ref=$1 list=$2 kind name version manifest path moved published after state line when pypi=0
   while read -r kind name version manifest path; do
-    moved=$(git log -1 --format=%H -G'^version = ' "$ref" -- "$manifest")
-    from=$(published_from "$ref" "${moved:-$ref}")
-    after=$(git rev-list --count "${from:-${moved:-$ref}}..$ref" -- "$path")
-    state=free
+    state=free; published=""
     if [ "${REGISTRY:-1}" = 0 ]; then
       state=unread
     else
       if [ "$kind" = package ]; then [ "$pypi" -eq 0 ] || sleep 1; pypi=$((pypi + 1)); fi
-      while IFS= read -r line; do
+      while read -r line when; do
         [ "$line" = unread ] && state=unread
-        [ "$line" = "$version" ] && state=held
+        [ "$line" = "$version" ] && { state=held; published=$when; }
       done < <(registry_versions "$kind" "$name")
     fi
-    printf '%s %s %s %s %s\n' "$name" "$version" "$state" "$after" "${from:-bump}"
+    if [ -n "$published" ]; then
+      # the commits that landed after the publish (committer dates: a pick merged later counts, a pick merged before does not)
+      after=$(git rev-list --count --after="$published" "$ref" -- "$path")
+    else
+      moved=$(git log -1 --format=%H -G'^version = ' "$ref" -- "$manifest")
+      after=$(git rev-list --count "${moved:-$ref}..$ref" -- "$path")
+    fi
+    printf '%s %s %s %s %s\n' "$name" "$version" "$state" "$after" "${published:-bump}"
   done < "$list" | sort
 }
 
@@ -708,7 +725,7 @@ PYEOF
 }
 
 registry_mark() { # <report file> <name> <registry>: the mark a plan line carries when the registry holds that version already
-  awk -v n="$2" -v r="$3" '$1 == n && $3 == "held" { printf " (on %s already: the dispatch skips it%s)", r, ($4 > 0 ? "; " $4 " commit(s) after " ($5 == "bump" ? "its bump" : $5 ", the tag it was published from") : "") }' "$1"
+  awk -v n="$2" -v r="$3" '$1 == n && $3 == "held" { printf " (on %s already: the dispatch skips it%s)", r, ($4 > 0 ? "; " $4 " commit(s) after " ($5 == "bump" ? "its bump" : "it was published, " $5) : "") }' "$1"
 }
 
 cmd_publish_plan() {
