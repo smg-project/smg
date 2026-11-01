@@ -11,16 +11,22 @@ on:
       - grpc_servicer/**
       - crates/grpc_client/**
   workflow_dispatch:
+    inputs:
+      verify_brave_search_auth:
+        description: "Verify Brave Search authentication once (no SMG or GPU tests)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-tooling-${{ github.event.pull_request.number || github.ref }}
+  group: ci-tooling-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'workflow_dispatch' && inputs.verify_brave_search_auth && '-brave-auth' || '' }}
   cancel-in-progress: true
 
 jobs:
   tooling:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.verify_brave_search_auth }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
@@ -46,5 +52,26 @@ jobs:
         with:
           name: ci-tooling-results
           path: ci-tooling-results.xml
+          if-no-files-found: error
+          retention-days: 7
+
+  brave-auth:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.verify_brave_search_auth }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify Brave Search authentication once
+        env:
+          BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
+        run: python3 scripts/check_brave_search_auth.py
+      - name: Upload safe Brave authentication result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: brave-search-auth-${{ github.run_id }}-${{ github.run_attempt }}
+          path: brave-search-auth-result.json
           if-no-files-found: error
           retention-days: 7
