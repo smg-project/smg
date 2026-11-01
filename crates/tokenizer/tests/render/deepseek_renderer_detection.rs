@@ -264,44 +264,60 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_v32_renderer_honors_thinking_kwarg_only() {
-        // `thinking: true` → prompt ends with <think> (thinking mode).
-        // `enable_thinking: true` alone → ignored (chat mode), matching
-        // `thinking_key_name() == Some(Thinking)` and the serving engine's DeepSeek path.
+    fn deepseek_v32_renderer_honors_the_enable_thinking_alias_like_thinking() {
+        // The engine's tokenizer wrapper switches thinking on from `thinking`
+        // or its `enable_thinking` alias: either alone ends the prompt with
+        // <think> (thinking mode); `thinking` wins when both are present, as
+        // the gateway reads them when it arms the reasoning parser; and the
+        // profile declares the alias so the gateway reads it at all.
         let (_tmp, tok) = write_dir(Some(&["DeepseekV32ForCausalLM"]));
         let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+        assert!(
+            tokenizer.renderer_capabilities().enable_thinking_alias,
+            "the V3.2 renderer declares the enable_thinking alias"
+        );
         let messages = vec![json!({ "role": "user", "content": "Hi" })];
+        let render = |kwargs: &HashMap<String, serde_json::Value>| {
+            tokenizer
+                .apply_chat_template(
+                    &messages,
+                    ChatTemplateParams {
+                        template_kwargs: Some(kwargs),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
 
-        let mut thinking_kwargs: HashMap<String, serde_json::Value> = HashMap::new();
-        thinking_kwargs.insert("thinking".to_string(), serde_json::Value::Bool(true));
-        let out_thinking = tokenizer
-            .apply_chat_template(
-                &messages,
-                ChatTemplateParams {
-                    template_kwargs: Some(&thinking_kwargs),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let thinking_kwargs = HashMap::from([("thinking".to_string(), json!(true))]);
+        let out_thinking = render(&thinking_kwargs);
         assert!(
             out_thinking.ends_with("<think>"),
             "thinking=true should enter thinking mode: {out_thinking}"
         );
 
-        let mut enable_thinking_kwargs: HashMap<String, serde_json::Value> = HashMap::new();
-        enable_thinking_kwargs.insert("enable_thinking".to_string(), serde_json::Value::Bool(true));
-        let out_enable = tokenizer
-            .apply_chat_template(
-                &messages,
-                ChatTemplateParams {
-                    template_kwargs: Some(&enable_thinking_kwargs),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let alias_kwargs = HashMap::from([("enable_thinking".to_string(), json!(true))]);
+        let out_alias = render(&alias_kwargs);
+        assert_eq!(
+            out_alias, out_thinking,
+            "enable_thinking=true must render like thinking=true"
+        );
+
+        let alias_off = HashMap::from([("enable_thinking".to_string(), json!(false))]);
+        let out_alias_off = render(&alias_off);
         assert!(
-            out_enable.ends_with("</think>"),
-            "enable_thinking alone must NOT enter thinking mode: {out_enable}"
+            out_alias_off.ends_with("</think>"),
+            "enable_thinking=false stays in chat mode: {out_alias_off}"
+        );
+
+        let both = HashMap::from([
+            ("thinking".to_string(), json!(false)),
+            ("enable_thinking".to_string(), json!(true)),
+        ]);
+        let out_both = render(&both);
+        assert!(
+            out_both.ends_with("</think>"),
+            "thinking=false outranks the alias: {out_both}"
         );
     }
 

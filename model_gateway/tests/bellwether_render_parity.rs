@@ -178,6 +178,14 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          message after a user turn otherwise",
     ),
     (
+        "deepseek-v3.2-exp/render/thinking-kwarg-on",
+        "the gateway renders this checkpoint through its port of the checkpoint's own \
+         encoder, as the serving engine does for this architecture, and switches thinking on \
+         from the `enable_thinking` alias as the engine's wrapper does; the reference is the \
+         run of the Jinja template the checkpoint ships, which reads no alias and leaves the \
+         thought closed; the entry goes when the group is re-recorded under the engine's rule",
+    ),
+    (
         "deepseek-v3.2-exp/render/tools-declared-user-asks",
         "the gateway renders this checkpoint through its port of the checkpoint's own \
          encoder, as the engines do, where the reference is the run of the Jinja \
