@@ -12,14 +12,14 @@ OPENAPI_GENERATOR_CLI_VERSION := 2.30.0
 NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 8)
 JOBS ?= $(shell echo $$(($(NPROC) > 16 ? 16 : $(NPROC))))
 
-# Check if sccache is available and set RUSTC_WRAPPER accordingly. The note is printed for goals that compile only:
-# the help, version and release targets print output that is read as such, and the note would come first in it.
+# Check if sccache is available and set RUSTC_WRAPPER accordingly. The note is printed for every goal but the help,
+# version and release targets, whose output is read as such (the note would come first in it).
 SCCACHE := $(shell which sccache 2>/dev/null)
 ifdef SCCACHE
     export RUSTC_WRAPPER := $(SCCACHE)
 endif
-COMPILING_GOALS := $(filter-out help show-version bump-version check-versions release-%,$(MAKECMDGOALS))
-ifneq ($(strip $(COMPILING_GOALS)),)
+NOTED_GOALS := $(filter-out help show-version bump-version check-versions release-%,$(MAKECMDGOALS))
+ifneq ($(strip $(NOTED_GOALS)),)
     ifdef SCCACHE
         $(info Using sccache for compilation caching)
     else

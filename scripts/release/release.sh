@@ -225,7 +225,7 @@ cmd_cut() {
   local version=${1:-} from=${2:-}
   [ -n "$version" ] || die "usage: release.sh cut <version> [<from>]"
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
-  local release branch from_sha since
+  local release branch from_sha since start
   release=$(release_of "$version"); branch="release/$release"
   require_identity; require_clean; fetch
   from=${from:-$REMOTE/main}
@@ -243,17 +243,19 @@ cmd_cut() {
     die "$from reads $(manifest_version "$from_sha"), below ${since#v}: merge the release-bump-main pull request for $since first (release.sh bump-main ${since#v}), or cut from a commit after it"
   fi
   note "cut: $branch from $(git rev-parse --short "$from_sha") ($from); the versions move from $since to $version"
+  # The start is read before the branch is made (`git switch -` and `@{-1}` read the HEAD reflog, which a clone can be
+  # without): the cut comes back to it, since the next commands run from a checkout that has scripts/release/ (a line
+  # cut from a commit before a tooling change on main has none), and the push below names the branch, not HEAD.
+  start=$(git symbolic-ref --quiet --short HEAD || git rev-parse HEAD)
   git switch --quiet --no-track -c "$branch" "$from_sha"
   bump_tree "$version" "$since"
   commit_all "chore(release): bump versions for v$version" \
     "The release branch $branch, cut from $from_sha ($from). Versions since $since."
-  # Back to where the cut started: the next commands run from a checkout that has scripts/release/ (a line cut from a
-  # commit before a tooling change on main has none), and the push below names the branch, not HEAD.
-  git switch --quiet - 2>/dev/null || git switch --quiet --detach '@{-1}'
+  git switch --quiet "$start" 2>/dev/null || git switch --quiet --detach "$start"
   say ""
   say "$branch is at $(git rev-parse --short "$branch"): $(git log -1 --format=%s "$branch")"
   git show --stat --oneline "$branch" | sed -n '2,$p' | sed 's/^/  /'
-  say "(You are back on $(git rev-parse --abbrev-ref HEAD); the release commands run from a checkout that has scripts/release/, main for instance.)"
+  say "(You are back on $(git symbolic-ref --quiet --short HEAD || git rev-parse --short HEAD); the release commands run from a checkout that has scripts/release/, main for instance.)"
   push_release_ref "refs/heads/$branch:refs/heads/$branch" "runs the test matrix on $branch (nothing is published); then 'release.sh tag $version'"
 }
 
@@ -531,7 +533,7 @@ cmd_bump_main() {
   [ -n "$version" ] || die "usage: release.sh bump-main <version>"
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
   is_final "$version" || die "main follows a final release (X.Y.Z), not a candidate"
-  local release source topic body current moved
+  local release source topic body current moved start
   release=$(release_of "$version")
   require_identity; require_clean; fetch
   if has_ref "refs/tags/v$version"; then
@@ -542,6 +544,7 @@ cmd_bump_main() {
   fi
   topic="chore/main-versions-$version"
   has_ref "refs/heads/$topic" && die "the branch $topic exists: delete it or finish it"
+  start=$(git symbolic-ref --quiet --short HEAD || git rev-parse HEAD)
   git switch --quiet --no-track -c "$topic" "$REMOTE/main"
   current=$(manifest_version "$REMOTE/main")
   # Main never goes back: after a patch of an older line (v1.14.1 once v1.15.0 is out), the gateway and its mirrors
@@ -559,7 +562,7 @@ cmd_bump_main() {
   "$PYTHON" "$root/scripts/release/sync_versions.py" "$source" "$version"
   refresh_lock
   if git diff --quiet && git diff --cached --quiet; then
-    git switch --quiet - 2>/dev/null || git switch --quiet --detach '@{-1}'
+    git switch --quiet "$start" 2>/dev/null || git switch --quiet --detach "$start"
     git branch --quiet -D "$topic"
     die "bump-main: main carries v$version's versions already (the gateway at $current, every crate and package at least the release's): nothing to move"
   fi

@@ -400,8 +400,21 @@ def test_cut_from_a_detached_head_leaves_you_detached_there(repo: Sandbox) -> No
     done = repo.tool("cut", "1.14.0-rc.1")
     assert repo.git("rev-parse", "HEAD") == start
     assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
-    assert "(You are back on HEAD;" in done.stdout
+    assert f"(You are back on {repo.git('rev-parse', '--short', start)};" in done.stdout
     assert repo.git("rev-parse", "release/1.14~1") == start
+
+
+def test_cut_comes_back_without_a_head_reflog(repo: Sandbox) -> None:
+    """`git switch -` and `@{-1}` read the HEAD reflog, which a clone can be without (core.logAllRefUpdates=false, or
+    the logs expired): the cut reads where it started before it makes the branch, and comes back to that."""
+    repo.git("config", "core.logAllRefUpdates", "false")
+    (repo.work / ".git" / "logs" / "HEAD").unlink()
+    done = repo.tool("cut", "1.14.0-rc.1")
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert "(You are back on main;" in done.stdout
+    assert not (repo.work / ".git" / "logs" / "HEAD").exists(), (
+        "the sandbox stayed without a HEAD reflog"
+    )
 
 
 def test_cut_refusals(repo: Sandbox) -> None:
