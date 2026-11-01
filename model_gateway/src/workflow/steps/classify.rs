@@ -140,14 +140,19 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
         let endpoint = &app_context.router_config.health_check.endpoint;
 
         // 4. health endpoint → Local (only local backends expose this)
-        if try_http_reachable(&config.url, endpoint, timeout, client)
-            .await
-            .is_ok()
+        if try_http_reachable(
+            &config.url,
+            endpoint,
+            config.api_key.as_ref(),
+            timeout,
+            client,
+        )
+        .await
+        .is_ok()
         {
             debug!(
-                "Worker {} responded to {} → Local",
-                Endpoint::redacted_str(&config.url),
-                endpoint
+                "Worker {} responded to the health endpoint → Local",
+                Endpoint::redacted_str(&config.url)
             );
             context.data.worker_kind = Some(WorkerKind::Local);
             return Ok(StepResult::Success);

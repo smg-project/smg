@@ -88,18 +88,22 @@ fn grpc_reachable_url(url: &str) -> Result<String, String> {
 pub(crate) async fn try_http_reachable(
     url: &str,
     endpoint: &str,
+    api_key: Option<&String>,
     timeout_secs: u64,
     client: &Client,
 ) -> Result<(), String> {
     let health_url = http_health_url(url, endpoint)?;
 
-    client
+    let mut req = client
         .get(&health_url)
-        .timeout(Duration::from_secs(timeout_secs))
-        .send()
+        .timeout(Duration::from_secs(timeout_secs));
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+    req.send()
         .await
         .and_then(reqwest::Response::error_for_status)
-        .map_err(|e| format!("Health check failed: {e}"))?;
+        .map_err(|e| format!("Health check failed: {}", e.without_url()))?;
 
     Ok(())
 }

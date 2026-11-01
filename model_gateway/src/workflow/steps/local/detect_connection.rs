@@ -62,6 +62,7 @@ async fn probe_http(
     let config = &data.config;
     let cache = &app_context.worker_client_cache;
     let endpoint = &app_context.router_config.health_check.endpoint;
+    let api_key = config.api_key.as_ref();
     let policy = HttpVersionPolicy::resolve(
         &config.url,
         config.http_pool.http2,
@@ -70,15 +71,15 @@ async fn probe_http(
     match policy {
         HttpVersionPolicy::Fixed(http2) => {
             let client = cache.get(&config.http_pool, http2)?;
-            try_http_reachable(&config.url, endpoint, timeout, &client).await?;
+            try_http_reachable(&config.url, endpoint, api_key, timeout, &client).await?;
             Ok(HttpProbe { http2, client })
         }
         HttpVersionPolicy::Negotiate => {
             let h2 = cache.get(&config.http_pool, true)?;
             let h1 = cache.get(&config.http_pool, false)?;
             let (h2_result, h1_result) = tokio::join!(
-                try_http_reachable(&config.url, endpoint, timeout, &h2),
-                try_http_reachable(&config.url, endpoint, timeout, &h1)
+                try_http_reachable(&config.url, endpoint, api_key, timeout, &h2),
+                try_http_reachable(&config.url, endpoint, api_key, timeout, &h1)
             );
             match (h2_result, h1_result) {
                 (Ok(()), _) => Ok(HttpProbe {
