@@ -49,8 +49,10 @@ pushed, the read-only commands (`check`, `status`, `publish-plan`, `notes`) read
   below it, that `release-bump-main` moved to `main` or that a cut found there), and a
   proposed version a release tag carries steps to the next free patch (crates.io and PyPI take
   a version once). A version a tag carries with this very code needs nothing. A version
-  published without a release tag is not seen: the publish workflows skip a version the
-  registry holds, and the release owner reads their output while two lines are live.
+  published without a release tag is not seen by the tags: `make release-check` reads crates.io
+  and PyPI for every crate and package at the branch head and fails on a version they hold
+  already with changes after it, and `make release-publish-plan` marks such versions
+  (`REGISTRY=0` skips the reads).
 - `main` keeps the last final release's versions. After a final, `make release-bump-main` opens
   the pull request that moves them: the gateway and its mirrors to the release's version, every
   other crate or package to the release's version where that is higher than main's (crates.io
@@ -85,7 +87,10 @@ A candidate or a final is tagged when, on the branch head:
    `main`; a documentation-only merge runs none, so `make release-check` names the dispatch,
    `gh workflow run pr-test-rust.yml --ref release/<x.y>`);
 2. the versions are consistent (`make release-check` reads them; `make release-tag` refuses
-   otherwise);
+   otherwise), and no crate or package sits at a version crates.io or PyPI hold already with
+   changes after it (`make release-check` reads the registries; such a version is skipped by
+   its publish dispatch and the release would ship none of those changes: a bump pull request
+   against the release branch moves it);
 3. the four model-provider verifiers (DeepSeek, GLM, Kimi, MiniMax) ran against the candidate
    build: the release owner records one link each. `make release-check` prints the four lines
    to fill; the final's bump pull request carries them in its "Release gate" section.
