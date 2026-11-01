@@ -149,7 +149,8 @@ pub(crate) fn is_moriio_worker(worker: &dyn Worker) -> bool {
 /// The host defaults to the worker URL's host and the ports to vLLM's.
 pub(crate) fn moriio_endpoint(worker: &dyn Worker) -> Result<MoriIoEndpoint, String> {
     let spec = &worker.metadata().spec;
-    let url = worker.url();
+    // The address as the refusals name it: a userinfo in it masked.
+    let url = worker.redacted_url();
     if !is_moriio_worker(worker) {
         return Err(format!("{url} is not a {MORIIO_CONNECTOR} worker"));
     }
@@ -540,7 +541,7 @@ pub(crate) fn connector_mode_for_worker(worker: &dyn Worker) -> KvConnectorMode 
         // could target the wrong engine core, so fail closed: no mint, decode
         // recomputes the prompt.
         warn!(
-            worker = %worker.url(),
+            worker = %worker.redacted_url(),
             dp_size = ?dp_label,
             "invalid dp_size label; treating DP topology as unknown and \
              skipping KV engine-id minting"

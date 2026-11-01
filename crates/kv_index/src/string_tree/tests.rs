@@ -278,38 +278,43 @@ fn test_partial_match_concurrent() {
     }
 }
 
-#[test]
-fn test_group_prefix_insert_match_concurrent() {
-    static PREFIXES: [&str; 4] = [
-        "Clock strikes midnight, I'm still wide awake",
-        "Got dreams bigger than these city lights",
-        "Time waits for no one, gotta make my move",
-        "Started from the bottom, that's no metaphor",
-    ];
-    let suffixes = [
-        "Got too much to prove, ain't got time to lose",
-        "History in the making, yeah, you can't erase this",
-    ];
-    let tree = Arc::new(Tree::new());
+/// Four lyric prefixes, each continued by two suffixes: eight texts over
+/// four tenants, the fixture of the two concurrent insert-and-match tests.
+static LYRIC_PREFIXES: [&str; 4] = [
+    "Clock strikes midnight, I'm still wide awake",
+    "Got dreams bigger than these city lights",
+    "Time waits for no one, gotta make my move",
+    "Started from the bottom, that's no metaphor",
+];
+static LYRIC_SUFFIXES: [&str; 2] = [
+    "Got too much to prove, ain't got time to lose",
+    "History in the making, yeah, you can't erase this",
+];
 
+/// Inserts the eight lyric texts from one thread each (tenant `i` for
+/// prefix `i`) and returns the handles: the caller joins them, or mixes
+/// its own readers in first.
+fn spawn_lyric_inserts(tree: &Arc<Tree>) -> Vec<thread::JoinHandle<()>> {
     let mut handles = vec![];
-
-    for (i, prefix) in PREFIXES.iter().enumerate() {
-        for suffix in &suffixes {
-            let tree_clone = Arc::clone(&tree);
+    for (i, prefix) in LYRIC_PREFIXES.iter().enumerate() {
+        for suffix in &LYRIC_SUFFIXES {
+            let tree_clone = Arc::clone(tree);
             let text = format!("{prefix} {suffix}");
             let tenant = format!("tenant{i}");
-
-            let handle = thread::spawn(move || {
+            handles.push(thread::spawn(move || {
                 tree_clone.insert_text(&text, &tenant);
-            });
-
-            handles.push(handle);
+            }));
         }
     }
+    handles
+}
+
+#[test]
+fn test_group_prefix_insert_match_concurrent() {
+    let tree = Arc::new(Tree::new());
 
     // wait
-    for handle in handles {
+    for handle in spawn_lyric_inserts(&tree) {
         handle.join().unwrap();
     }
 
@@ -318,7 +323,7 @@ fn test_group_prefix_insert_match_concurrent() {
     // check matching using multi threads
     let mut handles = vec![];
 
-    for (i, prefix) in PREFIXES.iter().enumerate() {
+    for (i, prefix) in LYRIC_PREFIXES.iter().enumerate() {
         let tree_clone = Arc::clone(&tree);
 
         let handle = thread::spawn(move || {
@@ -341,36 +346,11 @@ fn test_group_prefix_insert_match_concurrent() {
 fn test_mixed_concurrent_insert_match() {
     // ensure it does not deadlock instead of doing correctness check
 
-    static PREFIXES: [&str; 4] = [
-        "Clock strikes midnight, I'm still wide awake",
-        "Got dreams bigger than these city lights",
-        "Time waits for no one, gotta make my move",
-        "Started from the bottom, that's no metaphor",
-    ];
-    let suffixes = [
-        "Got too much to prove, ain't got time to lose",
-        "History in the making, yeah, you can't erase this",
-    ];
     let tree = Arc::new(Tree::new());
-
-    let mut handles = vec![];
-
-    for (i, prefix) in PREFIXES.iter().enumerate() {
-        for suffix in &suffixes {
-            let tree_clone = Arc::clone(&tree);
-            let text = format!("{prefix} {suffix}");
-            let tenant = format!("tenant{i}");
-
-            let handle = thread::spawn(move || {
-                tree_clone.insert_text(&text, &tenant);
-            });
-
-            handles.push(handle);
-        }
-    }
+    let mut handles = spawn_lyric_inserts(&tree);
 
     // check matching using multi threads
-    for prefix in &PREFIXES {
+    for prefix in &LYRIC_PREFIXES {
         let tree_clone = Arc::clone(&tree);
 
         let handle = thread::spawn(move || {

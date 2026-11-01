@@ -57,7 +57,7 @@ impl Assembler {
 
     /// Append the next bytes and push the events they complete; the number of bytes taken: every
     /// byte up to the value's end, and none after it.
-    pub fn feed(&mut self, bytes: &str, declared: &Declared, out: &mut Events) -> usize {
+    pub fn feed<'d>(&mut self, bytes: &'d str, declared: &Declared, out: &mut Events<'d>) -> usize {
         if self.unnamed {
             unnamed(bytes, out);
             return bytes.len();
@@ -121,7 +121,7 @@ fn unnamed(bytes: &str, out: &mut Events) {
 }
 
 impl crate::engine::CallAssembler for Assembler {
-    fn feed(&mut self, text: &str, declared: &Declared, out: &mut Events) -> usize {
+    fn feed<'d>(&mut self, text: &'d str, declared: &Declared, out: &mut Events<'d>) -> usize {
         self.feed(text, declared, out)
     }
 
@@ -139,7 +139,7 @@ impl crate::engine::CallAssembler for Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::names;
+    use crate::testing::{arguments, names};
 
     const ARGUMENTS: &str = "{\"city\": \"Paris\", \"days\": [1, 2]}";
 
@@ -151,17 +151,7 @@ mod tests {
             taken += assembler.feed(piece, declared, &mut out);
         }
         assembler.finish(&mut out);
-        (out.drain(), taken)
-    }
-
-    fn arguments(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|e| match e {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
-                _ => None,
-            })
-            .collect()
+        (out.into_owned().drain(), taken)
     }
 
     fn ends(events: &[Event]) -> usize {

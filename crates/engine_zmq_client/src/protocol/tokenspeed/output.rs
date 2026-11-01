@@ -32,6 +32,30 @@ pub const BATCH_TOKEN_ID_OUT_SLIM_TAG: &str = "BatchTokenIDOutSlim";
 pub const FINISHED_STATUS_CODES: &str = "finished_status_codes";
 pub const FINISHED_MESSAGES: &str = "finished_messages";
 
+/// The column a TokenSpeed engine carries each request's finish reason in
+/// full under, parallel to `finished_reasons`: a map with the finish's
+/// `type` and, for an abort, its `message` and `status_code` (`None` while
+/// the request runs). The status and words are read from it.
+pub const FINISH_REASON_DETAILS: &str = "finish_reason_details";
+
+/// The prompt-logprob and ranked-candidate columns a TokenSpeed engine
+/// appends, by its names: per request, the prompt positions' logprobs
+/// (`None` for the first) and their tokens, each position's top-k
+/// alternatives (`None` for the first), and each new token's top-k. A
+/// column holds one entry per request in a frame where some request carries
+/// one, and is empty for the whole frame otherwise.
+pub const INPUT_TOKEN_LOGPROBS_VAL: &str = "input_token_logprobs_val";
+/// See [`INPUT_TOKEN_LOGPROBS_VAL`].
+pub const INPUT_TOKEN_LOGPROBS_IDX: &str = "input_token_logprobs_idx";
+/// See [`INPUT_TOKEN_LOGPROBS_VAL`].
+pub const INPUT_TOP_LOGPROBS_VAL: &str = "input_top_logprobs_val";
+/// See [`INPUT_TOKEN_LOGPROBS_VAL`].
+pub const INPUT_TOP_LOGPROBS_IDX: &str = "input_top_logprobs_idx";
+/// See [`INPUT_TOKEN_LOGPROBS_VAL`].
+pub const OUTPUT_TOP_LOGPROBS_VAL: &str = "output_top_logprobs_val";
+/// See [`INPUT_TOKEN_LOGPROBS_VAL`].
+pub const OUTPUT_TOP_LOGPROBS_IDX: &str = "output_top_logprobs_idx";
+
 /// The columns every engine emits, in wire order (the field indices of a
 /// declared layout, the tag not counted). An optional column an engine
 /// declares sits at or past their end.
@@ -62,6 +86,20 @@ pub struct SlimOutputLayout {
     pub finish_status: Option<usize>,
     /// The field index of [`FINISHED_MESSAGES`].
     pub finish_message: Option<usize>,
+    /// The field index of [`FINISH_REASON_DETAILS`].
+    pub finish_details: Option<usize>,
+    /// The field index of [`INPUT_TOKEN_LOGPROBS_VAL`].
+    pub input_logprobs_val: Option<usize>,
+    /// The field index of [`INPUT_TOKEN_LOGPROBS_IDX`].
+    pub input_logprobs_idx: Option<usize>,
+    /// The field index of [`INPUT_TOP_LOGPROBS_VAL`].
+    pub input_top_logprobs_val: Option<usize>,
+    /// The field index of [`INPUT_TOP_LOGPROBS_IDX`].
+    pub input_top_logprobs_idx: Option<usize>,
+    /// The field index of [`OUTPUT_TOP_LOGPROBS_VAL`].
+    pub output_top_logprobs_val: Option<usize>,
+    /// The field index of [`OUTPUT_TOP_LOGPROBS_IDX`].
+    pub output_top_logprobs_idx: Option<usize>,
 }
 
 impl SlimOutputLayout {
@@ -79,8 +117,37 @@ impl SlimOutputLayout {
         Self {
             finish_status: position(FINISHED_STATUS_CODES),
             finish_message: position(FINISHED_MESSAGES),
+            finish_details: position(FINISH_REASON_DETAILS),
+            input_logprobs_val: position(INPUT_TOKEN_LOGPROBS_VAL),
+            input_logprobs_idx: position(INPUT_TOKEN_LOGPROBS_IDX),
+            input_top_logprobs_val: position(INPUT_TOP_LOGPROBS_VAL),
+            input_top_logprobs_idx: position(INPUT_TOP_LOGPROBS_IDX),
+            output_top_logprobs_val: position(OUTPUT_TOP_LOGPROBS_VAL),
+            output_top_logprobs_idx: position(OUTPUT_TOP_LOGPROBS_IDX),
         }
     }
+
+    /// Whether the engine reports prompt logprobs: it declares both columns.
+    pub fn carries_prompt_logprobs(&self) -> bool {
+        self.input_logprobs_val.is_some() && self.input_logprobs_idx.is_some()
+    }
+
+    /// Whether the engine reports each new token's top-k alternatives: it
+    /// declares both columns.
+    pub fn carries_top_logprobs(&self) -> bool {
+        self.output_top_logprobs_val.is_some() && self.output_top_logprobs_idx.is_some()
+    }
+}
+
+/// A request's finish reason in full ([`FINISH_REASON_DETAILS`]), as much of
+/// it as this client reads: the abort's words and status. Its other keys
+/// (the finish's `type`, a matched token or length) are skipped.
+#[derive(Debug, Deserialize)]
+struct FinishDetails {
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    status_code: Option<u16>,
 }
 
 /// Decode one slim batch, reading the optional columns where `layout` puts
@@ -147,6 +214,22 @@ pub struct BatchTokenIDOutSlim {
     /// parallel to `finished_reasons`; `None` for a finish without them.
     /// Empty from an engine that does not declare the column.
     pub finished_messages: Vec<Option<String>>,
+    /// Each request's prompt logprobs (`None` for the first position) and
+    /// their tokens, in the one frame that carries them; empty from an engine
+    /// that does not declare the columns and in a frame where no request
+    /// carries them.
+    pub input_logprobs_val: Vec<Vec<Option<f64>>>,
+    /// See `input_logprobs_val`.
+    pub input_logprobs_idx: Vec<Vec<u32>>,
+    /// Each prompt position's top-k alternatives (`None` for the first),
+    /// beside `input_logprobs_val`.
+    pub input_top_logprobs_val: Vec<Vec<Option<Vec<f64>>>>,
+    /// See `input_top_logprobs_val`.
+    pub input_top_logprobs_idx: Vec<Vec<Option<Vec<u32>>>>,
+    /// Each new token's top-k alternatives, when requested.
+    pub output_top_logprobs_val: Vec<Vec<Vec<f64>>>,
+    /// See `output_top_logprobs_val`.
+    pub output_top_logprobs_idx: Vec<Vec<Vec<u32>>>,
 }
 
 impl Serialize for BatchTokenIDOutSlim {
@@ -243,10 +326,49 @@ fn read_token_batch_after_tag<'de, A: SeqAccess<'de>>(
         kv_total_pages: seq.next_element::<u64>()?.unwrap_or(0),
         finished_status_codes: Vec::new(),
         finished_messages: Vec::new(),
+        input_logprobs_val: Vec::new(),
+        input_logprobs_idx: Vec::new(),
+        input_top_logprobs_val: Vec::new(),
+        input_top_logprobs_idx: Vec::new(),
+        output_top_logprobs_val: Vec::new(),
+        output_top_logprobs_idx: Vec::new(),
     };
     let mut index = BASE_COLUMN_NAMES.len();
+    // Each optional column is read into its field where the layout puts it.
+    macro_rules! column {
+        ($field:expr) => {{
+            let Some(column) = seq.next_element()? else {
+                break;
+            };
+            $field = column;
+        }};
+    }
     loop {
-        if Some(index) == layout.finish_status {
+        if Some(index) == layout.finish_details {
+            let Some(details) = seq.next_element::<Vec<Option<FinishDetails>>>()? else {
+                break;
+            };
+            batch.finished_status_codes = details
+                .iter()
+                .map(|details| details.as_ref().and_then(|details| details.status_code))
+                .collect();
+            batch.finished_messages = details
+                .into_iter()
+                .map(|details| details.and_then(|details| details.message))
+                .collect();
+        } else if Some(index) == layout.input_logprobs_val {
+            column!(batch.input_logprobs_val);
+        } else if Some(index) == layout.input_logprobs_idx {
+            column!(batch.input_logprobs_idx);
+        } else if Some(index) == layout.input_top_logprobs_val {
+            column!(batch.input_top_logprobs_val);
+        } else if Some(index) == layout.input_top_logprobs_idx {
+            column!(batch.input_top_logprobs_idx);
+        } else if Some(index) == layout.output_top_logprobs_val {
+            column!(batch.output_top_logprobs_val);
+        } else if Some(index) == layout.output_top_logprobs_idx {
+            column!(batch.output_top_logprobs_idx);
+        } else if Some(index) == layout.finish_status {
             let Some(column) = seq.next_element()? else {
                 break;
             };
@@ -360,6 +482,19 @@ pub struct TokenSpeedOutput {
     /// without them, and always `None` from an engine that does not declare
     /// the column.
     pub finish_message: Option<String>,
+    /// The prompt logprobs (`None` for the first position) and their tokens,
+    /// in the one output that carries them; empty otherwise.
+    pub input_logprobs_val: Vec<Option<f64>>,
+    /// See `input_logprobs_val`.
+    pub input_logprobs_idx: Vec<u32>,
+    /// Each prompt position's top-k alternatives (`None` for the first).
+    pub input_top_logprobs_val: Vec<Option<Vec<f64>>>,
+    /// See `input_top_logprobs_val`.
+    pub input_top_logprobs_idx: Vec<Option<Vec<u32>>>,
+    /// Each new token's top-k alternatives, when requested.
+    pub output_top_logprobs_val: Vec<Vec<f64>>,
+    /// See `output_top_logprobs_val`.
+    pub output_top_logprobs_idx: Vec<Vec<u32>>,
 }
 
 impl EngineOutput for TokenSpeedOutput {
@@ -387,7 +522,13 @@ impl BatchTokenIDOutSlim {
             || self.output_token_logprobs_val.len() != n
             || self.output_token_logprobs_idx.len() != n
             || detail_ragged(self.finished_status_codes.len())
-            || detail_ragged(self.finished_messages.len());
+            || detail_ragged(self.finished_messages.len())
+            || detail_ragged(self.input_logprobs_val.len())
+            || detail_ragged(self.input_logprobs_idx.len())
+            || detail_ragged(self.input_top_logprobs_val.len())
+            || detail_ragged(self.input_top_logprobs_idx.len())
+            || detail_ragged(self.output_top_logprobs_val.len())
+            || detail_ragged(self.output_top_logprobs_idx.len());
         if ragged {
             return Err(Error::Decode {
                 target_type: "BatchTokenIDOutSlim",
@@ -421,6 +562,12 @@ impl BatchTokenIDOutSlim {
             output_token_logprobs_idx,
             finished_status_codes,
             finished_messages,
+            input_logprobs_val,
+            input_logprobs_idx,
+            input_top_logprobs_val,
+            input_top_logprobs_idx,
+            output_top_logprobs_val,
+            output_top_logprobs_idx,
             // Batch-level fields, not per-request columns; the caller reads
             // them off the batch before splitting.
             engine_index: _,
@@ -434,6 +581,12 @@ impl BatchTokenIDOutSlim {
         // every request; present ones are parallel to `rids` (checked above).
         let mut statuses = finished_status_codes.into_iter();
         let mut messages = finished_messages.into_iter();
+        let mut input_val = input_logprobs_val.into_iter();
+        let mut input_idx = input_logprobs_idx.into_iter();
+        let mut input_top_val = input_top_logprobs_val.into_iter();
+        let mut input_top_idx = input_top_logprobs_idx.into_iter();
+        let mut output_top_val = output_top_logprobs_val.into_iter();
+        let mut output_top_idx = output_top_logprobs_idx.into_iter();
         Ok(rids
             .into_iter()
             .zip(output_ids)
@@ -460,6 +613,12 @@ impl BatchTokenIDOutSlim {
                         output_logprobs_idx: logprobs_idx,
                         finish_status: statuses.next().flatten(),
                         finish_message: messages.next().flatten(),
+                        input_logprobs_val: input_val.next().unwrap_or_default(),
+                        input_logprobs_idx: input_idx.next().unwrap_or_default(),
+                        input_top_logprobs_val: input_top_val.next().unwrap_or_default(),
+                        input_top_logprobs_idx: input_top_idx.next().unwrap_or_default(),
+                        output_top_logprobs_val: output_top_val.next().unwrap_or_default(),
+                        output_top_logprobs_idx: output_top_idx.next().unwrap_or_default(),
                     }
                 },
             )
@@ -520,6 +679,7 @@ mod tests {
             kv_total_pages: 400,
             finished_status_codes: Vec::new(),
             finished_messages: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -724,8 +884,8 @@ mod tests {
             names.push(match *name {
                 FINISHED_STATUS_CODES => FINISHED_STATUS_CODES,
                 FINISHED_MESSAGES => FINISHED_MESSAGES,
-                "output_top_logprobs_val" => "output_top_logprobs_val",
-                "output_top_logprobs_idx" => "output_top_logprobs_idx",
+                "spec_verify_ct" => "spec_verify_ct",
+                "accept_draft_tokens" => "accept_draft_tokens",
                 other => panic!("unexpected test column {other}"),
             });
         }
@@ -763,18 +923,20 @@ mod tests {
             SlimOutputLayout {
                 finish_status: Some(13),
                 finish_message: Some(14),
+                ..Default::default()
             }
         );
         assert_eq!(
             layout_of(&names_with(&[
-                "output_top_logprobs_val",
-                "output_top_logprobs_idx",
+                "spec_verify_ct",
+                "accept_draft_tokens",
                 FINISHED_STATUS_CODES,
                 FINISHED_MESSAGES,
             ])),
             SlimOutputLayout {
                 finish_status: Some(15),
                 finish_message: Some(16),
+                ..Default::default()
             }
         );
         assert_eq!(
@@ -782,6 +944,7 @@ mod tests {
             SlimOutputLayout {
                 finish_status: None,
                 finish_message: Some(13),
+                ..Default::default()
             }
         );
         assert_eq!(layout_of(&names_with(&[])), SlimOutputLayout::default());
@@ -840,8 +1003,8 @@ mod tests {
         let mut bytes = Vec::new();
         rmpv::encode::write_value(&mut bytes, &Value::Array(array)).unwrap();
         let layout = layout_of(&names_with(&[
-            "output_top_logprobs_val",
-            "output_top_logprobs_idx",
+            "spec_verify_ct",
+            "accept_draft_tokens",
             FINISHED_STATUS_CODES,
             FINISHED_MESSAGES,
         ]));
@@ -888,5 +1051,117 @@ mod tests {
         let error = ragged.into_outputs().unwrap_err().to_string();
         assert!(error.contains("ragged columns"), "{error}");
         assert!(error.contains("finished_status_codes=1"), "{error}");
+    }
+
+    /// The columns a TokenSpeed engine host emits and declares, in its order
+    /// (`ts-wire`'s `BatchTokenIDOutSlim::FIELDS`).
+    const TOKENSPEED_COLUMNS: [&str; 22] = [
+        "rids",
+        "output_ids",
+        "finished_reasons",
+        "prompt_tokens",
+        "completion_tokens",
+        "cached_tokens",
+        "output_token_logprobs_val",
+        "output_token_logprobs_idx",
+        "engine_index",
+        "num_running",
+        "num_waiting",
+        "kv_active_pages",
+        "kv_total_pages",
+        "finish_reason_details",
+        "spec_verify_ct",
+        "accept_draft_tokens",
+        "input_token_logprobs_val",
+        "input_token_logprobs_idx",
+        "input_top_logprobs_val",
+        "input_top_logprobs_idx",
+        "output_top_logprobs_val",
+        "output_top_logprobs_idx",
+    ];
+
+    /// A TokenSpeed batch is read by its declared column names: the finish
+    /// details give an abort's status and words, the prompt logprobs and both
+    /// top-k columns reach their requests, and the speculative columns this
+    /// client does not read are skipped.
+    #[test]
+    fn a_tokenspeed_batch_is_read_by_its_declared_column_names() {
+        let mut layouts = BTreeMap::new();
+        layouts.insert(
+            BATCH_TOKEN_ID_OUT_SLIM_TAG.to_string(),
+            TOKENSPEED_COLUMNS
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
+        );
+        let layout = SlimOutputLayout::declared(&layouts);
+        assert!(layout.carries_prompt_logprobs() && layout.carries_top_logprobs());
+        let batch = serde_json::json!([
+            BATCH_TOKEN_ID_OUT_SLIM_TAG,
+            ["scored", "refused"],
+            [[7], []],
+            ["length", "abort"],
+            [3, 9000],
+            [1, 0],
+            [0, 0],
+            [[-0.5], []],
+            [[7], []],
+            0, 1, 0, 4, 100,
+            [
+                {"type": "length", "length": 1},
+                {"type": "abort", "message": "the prompt is too long", "status_code": 400}
+            ],
+            [],
+            [],
+            [[null, -1.25, -2.5], []],
+            [[1, 2, 3], []],
+            [[null, [-1.25, -3.0], [-2.5, -2.75]], []],
+            [[null, [2, 9], [3, 8]], []],
+            [[[-0.5, -1.5]], []],
+            [[[7, 4]], []],
+        ]);
+        let bytes = rmp_serde::to_vec(&batch).unwrap();
+        let outputs = decode_slim_batch(&bytes, &layout)
+            .unwrap()
+            .into_outputs()
+            .unwrap();
+        let [scored, refused] = outputs.as_slice() else {
+            panic!("two outputs");
+        };
+        assert_eq!(scored.input_logprobs_val, [None, Some(-1.25), Some(-2.5)]);
+        assert_eq!(scored.input_logprobs_idx, [1, 2, 3]);
+        assert_eq!(
+            scored.input_top_logprobs_val,
+            [None, Some(vec![-1.25, -3.0]), Some(vec![-2.5, -2.75])]
+        );
+        assert_eq!(scored.input_top_logprobs_idx[1], Some(vec![2, 9]));
+        assert_eq!(scored.output_top_logprobs_val, [vec![-0.5, -1.5]]);
+        assert_eq!(scored.output_top_logprobs_idx, [vec![7, 4]]);
+        assert_eq!(
+            (scored.finish_status, scored.finish_message.as_deref()),
+            (None, None)
+        );
+        assert_eq!(refused.finish_status, Some(400));
+        assert_eq!(
+            refused.finish_message.as_deref(),
+            Some("the prompt is too long")
+        );
+        assert!(refused.input_logprobs_val.is_empty());
+
+        // A frame where no request carries prompt logprobs or top-k leaves
+        // those columns empty for the whole frame.
+        let mut quiet = batch;
+        for column in 16..22 {
+            quiet[column + 1] = serde_json::json!([]);
+        }
+        let bytes = rmp_serde::to_vec(&quiet).unwrap();
+        let outputs = decode_slim_batch(&bytes, &layout)
+            .unwrap()
+            .into_outputs()
+            .unwrap();
+        assert!(outputs
+            .iter()
+            .all(|output| output.input_logprobs_val.is_empty()
+                && output.output_top_logprobs_val.is_empty()));
     }
 }
