@@ -907,7 +907,7 @@ async def bridge(request):
         await server.stop(None)
         for sock in pubs + routers:
             sock.close(linger=0)
-        ctx.term()
+        await asyncio.to_thread(ctx.term)
 
 
 async def read(call):
