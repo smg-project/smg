@@ -438,10 +438,18 @@ def check(
     # another line made (a patch of an older line synced to main, a cut before that patch). The
     # version is bumped only when no tag carries it, or the carrier's code is this code already.
     carrier = tag if verdict.version == verdict.tag_version else tagged.get(verdict.version)
+    changed_since_tag = verdict.files_changed
     if carrier is not None and carrier != tag:
         verdict.carried_by = carrier
         verdict.files_changed = files_changed(repo, carrier, component)
     if verdict.files_changed == 0:
+        # Changed since the comparison tag, at a version another line's tag carries with this very
+        # code: nothing to publish, but the workspace pin still has to follow the version (the
+        # comparison tag's path reads it below; this path must not skip it).
+        if changed_since_tag and component.dep_key:
+            pinned = workspace_dep_version(root_toml, component.dep_key)
+            if pinned != verdict.version:
+                verdict.workspace_version = pinned or ""
         return verdict
     verdict.unbumped = carrier is not None
     if verdict.unbumped:
@@ -527,6 +535,10 @@ def report(verdict: Verdict, out: Out) -> None:
         )
     elif verdict.tag_version is None:
         out.line(f"  {ok} {name} {where} — new {c.kind} (v{verdict.version}), {n}")
+    elif verdict.carried_by and not verdict.files_changed:
+        out.line(
+            f"  {ok} {name} {where} — v{verdict.version} is {verdict.carried_by}'s, with this code"
+        )
     else:
         out.line(f"  {ok} {name} {where} — v{verdict.tag_version} → v{verdict.version} ({n})")
     if verdict.workspace_version is not None:
@@ -551,7 +563,7 @@ def examine(
     for component in (*crates, *packages):
         verdict = check(repo, tag, component, root_toml, tagged.get(component.name, {}))
         verdicts.append(verdict)
-        if verdict.files_changed:
+        if verdict.files_changed or verdict.workspace_version is not None:
             report(verdict, out)
 
     gateway = next((v for v in verdicts if v.component.name == GATEWAY), None)

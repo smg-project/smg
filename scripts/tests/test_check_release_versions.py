@@ -430,8 +430,10 @@ def test_a_version_any_release_tag_carries_is_not_a_bump(mod, repo):
     alpha, raised to 1.1.0 since v1.0.0 but at the version that tag carries with other code,
     reads unbumped too and its minor bump lands on 1.2.0 (the 1.2.0 of a tag of another shape
     counts for nothing); gamma, changed since v1.0.0 but at the version that tag carries with
-    this very code, needs nothing. Against the other line's tag, beta's 1.0.0 sits below its
-    1.0.1, a difference the equality rule read as a bump: it is v1.0.0's version, so unbumped."""
+    this very code, needs no bump, and its workspace pin, still at 1.0.0, is the one thing it
+    needs (the comparison tag's path reads the pin of every changed crate; this path must too).
+    Against the other line's tag, beta's 1.0.0 sits below its 1.0.1, a difference the equality
+    rule read as a bump: it is v1.0.0's version, so unbumped."""
     side_line(repo)
     assert mod.Repo(repo).release_tags() == ["v1.0.0", "v1.0.9"]
     code, out = run(mod, repo, tag="v1.0.0")
@@ -443,7 +445,9 @@ def test_a_version_any_release_tag_carries_is_not_a_bump(mod, repo):
         "  ! alpha (crates/alpha/) — 1 file(s) changed but version not bumped (v1.1.0, v1.0.9's) [minor]"
         in out
     )
-    assert "gamma" not in out, "the tag's copy of gamma is this very code: nothing to publish"
+    assert "gamma (crates/gamma/) — v1.0.1 is v1.0.9's, with this code" in out
+    assert "    ✗ workspace Cargo.toml has gamma v1.0.0, expected v1.0.1" in out
+    assert "not bumped (v1.0.1" not in out, "the tag's copy of gamma is this very code: no bump"
     code, out = run(mod, repo, tag="v1.0.9")
     assert (
         "  ! beta (crates/beta/) — 1 file(s) changed but version not bumped (v1.0.0, v1.0.0's) [patch]"
@@ -453,6 +457,7 @@ def test_a_version_any_release_tag_carries_is_not_a_bump(mod, repo):
     assert "  patch beta v1.0.0 → v1.0.2 (crates/beta/Cargo.toml; v1.0.1 is v1.0.9's)" in out
     assert "       sync workspace Cargo.toml beta → v1.0.2" in out
     assert "  minor alpha v1.1.0 → v1.2.0 (crates/alpha/Cargo.toml)" in out
+    assert "  sync workspace Cargo.toml gamma v1.0.0 → v1.0.1" in out
     code, out = run(mod, repo, tag="v1.0.0", mode="fix")
     assert code == 0, out
     assert mod.read_version("cargo", (repo / "crates/beta/Cargo.toml").read_text(), "") == "1.0.2"
@@ -460,6 +465,7 @@ def test_a_version_any_release_tag_carries_is_not_a_bump(mod, repo):
     root = (repo / "Cargo.toml").read_text()
     assert mod.workspace_dep_version(root, "beta") == "1.0.2"
     assert mod.workspace_dep_version(root, "alpha") == "1.2.0"
+    assert mod.workspace_dep_version(root, "gamma") == "1.0.1"
     code, out = run(mod, repo, tag="v1.0.0")
     assert code == 0, out
     assert "All versions consistent." in out
