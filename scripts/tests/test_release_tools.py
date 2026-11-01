@@ -533,8 +533,16 @@ def test_status_lists_what_main_has_and_the_branch_does_not(repo: Sandbox) -> No
     assert (
         "chore(release): bump versions for v1.14.0-rc.1" in out.split("the branch's own commits")[1]
     )
-    assert "  v1.13.0" in out.split("== tags")[1]
+    tags = out.split("== tags made on release/1.14")[1].split("== open pull requests")[0]
+    assert tags.startswith(" (the versions are compared against v1.13.0):\n  (none yet)\n")
+    assert "v1.13.0" not in tags.split("\n", 1)[1], (
+        "main's history of release tags is not the branch's"
+    )
     assert "#7  fix(router): y  pick/1.14-0000000" in out.split("open pull requests")[1]
+    repo.tool("tag", "1.14.0-rc.1", PUSH="1")
+    tagged = repo.tool("status", "1.14").stdout
+    tags = tagged.split("== tags made on release/1.14")[1].split("== open pull requests")[0]
+    assert tags == " (the versions are compared against v1.14.0-rc.1):\n  v1.14.0-rc.1\n"
 
 
 # --- tag ----------------------------------------------------------------------------------
