@@ -432,6 +432,11 @@ pub(crate) struct PromptThought {
     pub alone: bool,
 }
 
+/// A table's replay of a rendered prompt ([`reasoning_open`]'s answer): the thought's state where
+/// a table reads the response, `None` where none does. Preparation keeps its replay for request
+/// building (`ProcessingState::prompt_thought`), which decides over the same prompt.
+pub(crate) type PromptReplay = Option<PromptThought>;
+
 impl PromptThought {
     /// Whether the prompt leaves the model inside its thought, as request building decides it:
     /// the replay's answer, or the request's thinking `switch` where the replay does not decide

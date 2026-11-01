@@ -41,7 +41,10 @@ use super::{
         EncodeItemBootstrapInfo, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
         ProtoInputLogProbs, ProtoRequest, ProtoStream,
     },
-    regular::stages::decisions::scoring::{DecisionPrompt, DecisionScoring},
+    regular::{
+        stages::decisions::scoring::{DecisionPrompt, DecisionScoring},
+        symphony::PromptReplay,
+    },
     spec::ResponseSpec,
     utils::{Names, ParserResolver, WorkerDecoding},
 };
@@ -250,6 +253,12 @@ pub(crate) struct ProcessingState {
     /// derivation of their own (the output budget, the constraint's tool-call reading, the
     /// response spec). `None` on the other endpoints; a read then derives it itself.
     pub provider: Option<ProviderProfile>,
+    /// The table's replay of the rendered prompt, as preparation read it for the forced call's
+    /// tag (`reading::prepare`): request building's reasoning decision takes it in place of a
+    /// second replay of the same prompt (`reading::reasoning_decision`). `None` when preparation
+    /// did not replay (the request's thinking switch armed the reasoning, or the endpoint's
+    /// preparation reads no prompt); a decision then replays itself.
+    pub prompt_thought: Option<PromptReplay>,
 
     /// Owned here rather than inside `PreparationOutput` so EPD's `EncodeStage`
     /// can borrow it for the with-pixels encode serialization before request
