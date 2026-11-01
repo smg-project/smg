@@ -424,7 +424,9 @@ struct RoutingArgs {
     /// --worker-overload-shed asks for a 503 instead. Unless
     /// --worker-overload-shed is set, a cache-aware prefill pool of gRPC and
     /// HTTP prefill/decode pair placement is not steered by them: its spill
-    /// gate balances it. Evaluated once per load report, never per request. Per-worker `overload` blocks on a
+    /// gate balances it; nor is a regular request that consistent_hashing
+    /// places by its routing key, which stays on its ring owner.
+    /// Evaluated once per load report, never per request. Per-worker `overload` blocks on a
     /// WorkerSpec override the gateway values per signal
     #[arg(long, default_value_t = true, help_heading = "Routing Policy")]
     worker_overload_protection: bool,
@@ -454,7 +456,8 @@ struct RoutingArgs {
     /// Refuse a request with a 503 (worker_overload_protection_shed,
     /// Retry-After the load poll interval) when every worker it could use is
     /// overloaded, instead of routing it to the least-loaded one (or, for a
-    /// cache-aware prefill pool, by its policy); also sheds a worker that
+    /// cache-aware prefill pool or a regular request that consistent_hashing
+    /// places by its routing key, by its policy); also sheds a worker that
     /// crossed a threshold between selection and dispatch. Off by default:
     /// steering never turns a load signal into an outage
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
