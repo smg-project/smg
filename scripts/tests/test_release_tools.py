@@ -404,6 +404,15 @@ def test_cut_from_a_detached_head_leaves_you_detached_there(repo: Sandbox) -> No
     assert repo.git("rev-parse", "release/1.14~1") == start
 
 
+def test_cut_comes_back_to_the_branch_when_a_tag_shares_its_name(repo: Sandbox) -> None:
+    """A tag named like the branch makes `git symbolic-ref --short HEAD` answer `heads/main`, which `git switch` does
+    not take as the branch: the cut reads the start with `git branch --show-current` and comes back to the branch."""
+    repo.git("tag", "main")
+    done = repo.tool("cut", "1.14.0-rc.1")
+    assert repo.git("branch", "--show-current") == "main"
+    assert "(You are back on main;" in done.stdout
+
+
 def test_cut_comes_back_without_a_head_reflog(repo: Sandbox) -> None:
     """`git switch -` and `@{-1}` read the HEAD reflog, which a clone can be without (core.logAllRefUpdates=false, or
     the logs expired): the cut reads where it started before it makes the branch, and comes back to that."""
