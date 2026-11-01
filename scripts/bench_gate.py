@@ -310,18 +310,28 @@ class Row:
 
     @property
     def change(self) -> float | None:
-        if not self.base or not self.pr:
+        """The relative change of the medians against the base median's magnitude (an
+        idle-subtracted count can sit below zero: a rise stays a rise); None without both
+        sides, or when the base median is zero (a count that was zero before: the absolute
+        values tell)."""
+        if not self.base or not self.pr or not self.base_median:
             return None
-        return self.pr_median / self.base_median - 1.0
+        return (self.pr_median - self.base_median) / abs(self.base_median)
 
     @property
     def spread(self) -> float | None:
         """The larger of the two sides' (max - min) / median: the noise of this job."""
-        spreads = [
-            (max(values) - min(values)) / statistics.median(values)
-            for values in (self.base, self.pr)
-            if values
-        ]
+        spreads = []
+        for values in (self.base, self.pr):
+            if not values:
+                continue
+            median = statistics.median(values)
+            if median:
+                spreads.append((max(values) - min(values)) / abs(median))
+            elif max(values) != min(values):
+                return None
+            else:
+                spreads.append(0.0)
         return max(spreads) if spreads else None
 
     @property
@@ -344,6 +354,16 @@ def judge(row: Row) -> str:
     if row.gate is None:
         return "report only"
     change = row.change
+    if change is None:
+        # A zero base median: the absolute head values tell. Above zero, every
+        # head run above every base run is a regression and an overlap is
+        # suspect, as for a change beyond the threshold; below zero and
+        # separated, an improvement.
+        if row.pr_median > 0:
+            return "regression" if row.separated else "suspect (runs overlap)"
+        if row.pr_median < 0 and row.separated:
+            return "improvement"
+        return "ok"
     if change > row.gate.threshold:
         return "regression" if row.separated else "suspect (runs overlap)"
     if change < -row.gate.threshold and row.separated:
@@ -380,13 +400,25 @@ def fmt_time(ns: float, unit_ns: float) -> str:
     return f"{ns / scale:.4g} {unit}"
 
 
-def fmt_side(values: list[float], unit_ns: float) -> str:
+def fmt_value(value: float, unit_ns: float, unit: str | None) -> str:
+    """A criterion median is nanoseconds and is scaled to a time unit; a results file
+    that names its own `unit` (an empty string for a bare count: the ids then carry the
+    unit in their names) prints its values as they are, with that unit."""
+    if unit is None:
+        return fmt_time(value, unit_ns)
+    return f"{value:.4g} {unit}".rstrip()
+
+
+def fmt_side(values: list[float], unit_ns: float, unit: str | None = None) -> str:
     if not values:
         return "-"
     median = statistics.median(values)
     if len(values) == 1:
-        return fmt_time(median, unit_ns)
-    return f"{fmt_time(median, unit_ns)} ({fmt_time(min(values), unit_ns)} - {fmt_time(max(values), unit_ns)})"
+        return fmt_value(median, unit_ns, unit)
+    return (
+        f"{fmt_value(median, unit_ns, unit)} "
+        f"({fmt_value(min(values), unit_ns, unit)} - {fmt_value(max(values), unit_ns, unit)})"
+    )
 
 
 def fmt_pct(value: float | None, signed: bool = True) -> str:
@@ -397,6 +429,9 @@ def fmt_pct(value: float | None, signed: bool = True) -> str:
 
 def markdown(results: dict, rows: list[Row]) -> str:
     repeats = results["repeats"]
+    # Criterion results carry nanoseconds; another producer (scripts/bench/gateway_perf)
+    # names the unit of its values, "" when the id names it. Lower is better either way.
+    unit = results.get("unit")
     failed = [row for row in rows if row.fails]
     suspect = [row for row in rows if row.verdict.startswith("suspect")]
     verdict = "FAIL" if failed else "PASS"
@@ -405,7 +440,7 @@ def markdown(results: dict, rows: list[Row]) -> str:
         "",
         f"Medians of {repeats} interleaved runs per side on this runner, (min - max) per side; "
         "spread = the larger side's (max - min) / median. A gated id fails when its change is "
-        "worse than the threshold and every pull-request run is slower than every base run.",
+        "worse than the threshold and every pull-request run is worse (higher) than every base run.",
         "",
         "| benchmark | base | pull request | change | spread | threshold | verdict |",
         "|---|---|---|---|---|---|---|",
@@ -417,7 +452,7 @@ def markdown(results: dict, rows: list[Row]) -> str:
             row.verdict, ""
         )
         lines.append(
-            f"| {row.bench_id} | {fmt_side(row.base, unit_ns)} | {fmt_side(row.pr, unit_ns)} "
+            f"| {row.bench_id} | {fmt_side(row.base, unit_ns, unit)} | {fmt_side(row.pr, unit_ns, unit)} "
             f"| {fmt_pct(row.change)} | {fmt_pct(row.spread, signed=False)} | {threshold} "
             f"| {mark}{row.verdict} |"
         )
@@ -427,6 +462,7 @@ def markdown(results: dict, rows: list[Row]) -> str:
         f"{len(rows)} ids, {gated} gated, {len(failed)} failed, {len(suspect)} suspect "
         f"(beyond the threshold, runs overlap: not failed)."
     )
+    unit_suffix = " ns" if unit is None else (f" {unit}" if unit else "")
     for row in failed:
         if row.verdict == "missing":
             lines.append(
@@ -437,8 +473,8 @@ def markdown(results: dict, rows: list[Row]) -> str:
         else:
             lines.append(
                 f"- `{row.bench_id}`: {fmt_pct(row.change)} against a {fmt_pct(row.gate.threshold, signed=False)} "
-                f"threshold; base runs {[round(v) for v in row.base]} ns, pull request runs "
-                f"{[round(v) for v in row.pr]} ns."
+                f"threshold; base runs {[round(v, 3) for v in row.base]}{unit_suffix}, pull request runs "
+                f"{[round(v, 3) for v in row.pr]}{unit_suffix}."
             )
     return "\n".join(lines) + "\n"
 
