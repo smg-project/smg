@@ -12,12 +12,15 @@
 //! (see `LocalRateLimitBackend::sweep_idle_buckets`); without it the map
 //! grows with every distinct client for the life of the process.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use dashmap::{mapref::entry::Entry, DashMap};
 use tokio::time::MissedTickBehavior;
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::{
@@ -86,9 +89,10 @@ impl LocalRateLimitBackend {
         })?;
         let backend = Arc::new(Self::new(policy));
         let weak = Arc::downgrade(&backend);
-        // Holds only a Weak<Self> and exits within one interval of the
-        // backend being dropped. Nothing waits for it at shutdown: a sweep
-        // cut short only leaves buckets in a map that is going away.
+        // Holds only a Weak<Self> between sweeps and exits within one
+        // interval of the backend being dropped. Nothing waits for the task
+        // at shutdown; a sweep already on the blocking pool delays the
+        // runtime's drop by at most its own run.
         runtime.spawn(async move {
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -98,13 +102,23 @@ impl LocalRateLimitBackend {
                 let Some(backend) = weak.upgrade() else {
                     break;
                 };
-                let evicted = backend.sweep_idle_buckets(idle_ttl);
-                if evicted > 0 {
-                    debug!(
-                        evicted,
-                        remaining = backend.buckets.len(),
-                        "tenant rate limiter dropped idle buckets"
-                    );
+                // The scan is synchronous and grows with the number of
+                // buckets, so it runs on the blocking pool, not on a worker
+                // that serves requests.
+                let swept = tokio::task::spawn_blocking(move || {
+                    let evicted = backend.sweep_idle_buckets(idle_ttl);
+                    (evicted, backend.buckets.len())
+                })
+                .await;
+                match swept {
+                    Ok((0, _)) => {}
+                    Ok((evicted, remaining)) => {
+                        debug!(
+                            evicted,
+                            remaining, "tenant rate limiter dropped idle buckets"
+                        );
+                    }
+                    Err(error) => warn!(%error, "tenant rate limiter's idle-bucket sweep failed"),
                 }
             }
         });
@@ -112,6 +126,12 @@ impl LocalRateLimitBackend {
     }
 
     fn bucket_for(&self, key: ScopeKey, limits: ScopeLimits) -> Arc<ScopeBucket> {
+        // A shard read lock first: an existing bucket is the common case,
+        // and the sweep's scan holds shard read locks, which never make a
+        // reader wait.
+        if let Some(bucket) = self.buckets.get(&key) {
+            return Arc::clone(&bucket);
+        }
         self.buckets
             .entry(key)
             .or_insert_with(|| Arc::new(ScopeBucket::new(limits)))
@@ -124,24 +144,43 @@ impl LocalRateLimitBackend {
     /// next request, which is the state it was dropped in, so no usage is
     /// forgiven (a bucket still paying off settlement debt is kept).
     ///
-    /// Race-free against `reserve`: `retain` tests and removes each entry
-    /// under its shard's write lock, and `bucket_for` clones the map's `Arc`
-    /// under that same lock, so a strong count of one here means no reserve
-    /// holds the bucket and none can take it before it is gone. A reserve
-    /// that comes after finds the slot vacant and starts a fresh bucket.
+    /// Two passes, so no shard's write lock is held for more than one
+    /// entry. The first scans under shard read locks and only reads two
+    /// atomics per bucket to pick out the ones that look evictable: a
+    /// reserve of an existing bucket never waits on it, and one that
+    /// creates a bucket waits for at most the scan of its own shard. The
+    /// second evicts each candidate with `remove_if`, which re-checks
+    /// everything under the entry's shard write lock.
+    ///
+    /// That re-check is what makes the sweep race-free against `reserve`:
+    /// `bucket_for` clones the map's `Arc` under the same shard's read or
+    /// write lock, so a strong count of one there means no reserve holds the
+    /// bucket and none can take it before it is gone. A reserve that comes
+    /// after finds the slot vacant and starts a fresh bucket.
     fn sweep_idle_buckets(&self, idle_ttl: Duration) -> usize {
-        let mut evicted = 0;
-        self.buckets.retain(|_, bucket| {
-            // Cheapest checks first; `is_full` takes the bucket's lock, which
-            // nothing else can hold once the count is one.
-            let keep =
-                Arc::strong_count(bucket) > 1 || bucket.idle_for() < idle_ttl || !bucket.is_full();
-            if !keep {
-                evicted += 1;
-            }
-            keep
-        });
-        evicted
+        let now = Instant::now();
+        let candidates: Vec<ScopeKey> = self
+            .buckets
+            .iter()
+            .filter(|entry| {
+                Arc::strong_count(entry.value()) == 1 && entry.value().idle_at(now) >= idle_ttl
+            })
+            .map(|entry| entry.key().clone())
+            .collect();
+        candidates
+            .iter()
+            .filter(|key| {
+                self.buckets
+                    .remove_if(*key, |_, bucket| {
+                        // `is_full` takes the bucket's lock, which nothing
+                        // else can hold once the count is one.
+                        Arc::strong_count(bucket) == 1
+                            && bucket.idle_at(Instant::now()) >= idle_ttl
+                            && bucket.is_full()
+                    })
+                    .is_some()
+            })
+            .count()
     }
 }
 

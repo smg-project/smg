@@ -74,10 +74,10 @@ impl ScopeBucket {
         self.last_touched_ns.load(Ordering::Relaxed)
     }
 
-    /// How long since the last `lock()` (or since creation, if never locked).
-    pub fn idle_for(&self) -> Duration {
-        self.created_at
-            .elapsed()
+    /// How long the bucket had gone without a `lock()` (or since creation,
+    /// if never locked) as of `now`; zero if it was touched after `now`.
+    pub fn idle_at(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.created_at)
             .saturating_sub(Duration::from_nanos(self.last_touched_ns()))
     }
 
@@ -264,16 +264,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_for_counts_from_the_last_lock_and_is_full_is_not_a_touch() {
+    async fn idle_at_counts_from_the_last_lock_and_is_full_is_not_a_touch() {
         let bucket = ScopeBucket::new(limits(600, 10));
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(bucket.idle_for() >= Duration::from_millis(50));
+        assert!(bucket.idle_at(Instant::now()) >= Duration::from_millis(50));
 
         assert!(bucket.is_full());
-        assert!(bucket.idle_for() >= Duration::from_millis(50));
+        assert!(bucket.idle_at(Instant::now()) >= Duration::from_millis(50));
 
+        let before_touch = Instant::now();
         drop(bucket.lock());
-        assert!(bucket.idle_for() < Duration::from_millis(50));
+        assert!(bucket.idle_at(Instant::now()) < Duration::from_millis(50));
+        // Touched after `before_touch`: idle as of then reads zero.
+        assert_eq!(bucket.idle_at(before_touch), Duration::ZERO);
     }
 
     #[test]
