@@ -425,6 +425,42 @@ def test_the_plan_lists_the_bump_quietly_and_changes_nothing(mod, repo):
     assert "5 component(s) and mirror(s) move" in out
 
 
+def test_the_plan_lists_a_gateway_already_at_the_cuts_version_among_the_bumped(mod, repo):
+    """After a local ``make bump-version VERSION=<cut>`` the gateway carries the cut's version: the plan prints no
+    ``set`` line for it and names it among the components bumped already, in both closing lines."""
+    put(repo, "model_gateway/Cargo.toml", manifest("smg", "1.1.0-rc.1"))
+    code, out = run(mod, repo, mode="plan", tag="v1.0.0", override="1.1.0-rc.1")
+    assert code == 0
+    assert "set smg" not in out and "major smg" not in out
+    assert "  sync chart v1.0.0 → v1.1.0-rc.1 (chart/Chart.yaml)" in out
+    assert out.rstrip().endswith(
+        "7 component(s) and mirror(s) move (a crate's workspace pin follows it)."
+        " Bumped already since v1.0.0, left as they are: smg v1.1.0-rc.1, alpha v1.1.0, delta v0.2.0 (new)."
+    )
+    # the whole tree at the cut's version (the crates bumped, the gateway and its mirrors set): nothing to bump,
+    # the gateway named among the bumped
+    assert run(mod, repo, mode="fix")[0] == 0
+    put(repo, "model_gateway/Cargo.toml", manifest("smg", "2.1.0-rc.1"))
+    put(repo, "bindings/Cargo.toml", manifest("smg-binding", "2.1.0-rc.1"))
+    put(repo, "bindings/pyproject.toml", '[project]\nname = "smg"\nversion = "2.1.0-rc.1"\n')
+    put(
+        repo,
+        "chart/Chart.yaml",
+        'apiVersion: v2\nname: smg\nversion: 2.1.0-rc.1\nappVersion: "2.1.0-rc.1"\n',
+    )
+    put(
+        repo,
+        "wf.yml",
+        "run-name: smg=${{ env.SMG_RELEASE_TAG }}\nenv:\n  SMG_RELEASE_TAG: v2.1.0-rc.1\n",
+    )
+    code, out = run(mod, repo, mode="plan", tag="v1.0.0", override="2.1.0-rc.1")
+    assert code == 0
+    assert out.rstrip() == (
+        "Nothing to bump against v1.0.0: every crate and package changed since it is bumped already"
+        " (smg v2.1.0-rc.1, alpha v1.1.0, beta v1.0.1, delta v0.2.0 (new), pkg v0.2.0); the mirrors agree."
+    )
+
+
 def test_the_plan_compares_against_the_highest_final_tag_by_default(mod, repo):
     put(repo, "crates/beta/src/lib.rs", "// beta 3\n")
     git(repo, "add", "-A")

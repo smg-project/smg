@@ -692,9 +692,10 @@ def show_plan(plan: Plan, tag: str, out: Out) -> None:
         for v in plan.verdicts
         if v.files_changed
         and not v.unbumped
-        and not (v.component.name == GATEWAY and plan.cut_version)
+        and not (v.component.name == GATEWAY and plan.gateway_set)
     ]
-    # what the proposal lists: the issues, the gateway counted once as a set when the cut's version is known
+    # what the proposal lists: the issues, the gateway counted once as a set when the cut's version is known (a gateway
+    # already at that version is set nowhere: it stays among the components bumped already)
     moving = (
         plan.issues
         - (1 if gateway_unbumped and plan.cut_version else 0)
