@@ -879,6 +879,10 @@ pub struct ChatTemplateParams<'a> {
 pub struct PreparedTools {
     tools: Vec<JsonValue>,
     value: Value,
+    /// The same tools with the keys of every map in them sorted, prepared
+    /// as these were, for a checkpoint whose own tokenizer class reads them
+    /// so ([`Self::key_sorted`]); made on the first such render.
+    key_sorted: OnceLock<Box<PreparedTools>>,
 }
 
 impl PreparedTools {
@@ -898,7 +902,11 @@ impl PreparedTools {
                 .map(PreparedTool::value)
                 .collect::<Vec<Value>>(),
         );
-        Self { tools, value }
+        Self {
+            tools,
+            value,
+            key_sorted: OnceLock::new(),
+        }
     }
 
     /// How many `tojson` texts the tools keep between them.
@@ -921,11 +929,35 @@ impl PreparedTools {
         &self.tools
     }
 
+    /// Whether this was made of `tools` (the same slice): the only tools it
+    /// is read for.
+    pub(crate) fn is_of(&self, tools: &[JsonValue]) -> bool {
+        std::ptr::eq(self.tools.as_ptr(), tools.as_ptr()) && self.tools.len() == tools.len()
+    }
+
+    /// These tools with the keys of every map in them sorted, at every depth
+    /// (a tool's `function` before its `type`, a schema's `properties` before
+    /// its `type`), prepared as these were: what a checkpoint whose own
+    /// tokenizer class sorts the tools before its template or tool encoder
+    /// reads them renders. Made once, on the first call, and kept beside the
+    /// plain form, so a caller that keeps a prepared set per distinct tool
+    /// set spares the sort and the conversion per request as it spares them
+    /// for the plain form.
+    pub(crate) fn key_sorted(&self) -> &PreparedTools {
+        self.key_sorted
+            .get_or_init(|| Box::new(Self::key_sorted_of(&self.tools)))
+    }
+
+    /// `tools` with the keys of every map in them sorted, prepared
+    /// ([`Self::new`] of the sorted values); see [`Self::key_sorted`].
+    pub(crate) fn key_sorted_of(tools: &[JsonValue]) -> PreparedTools {
+        Self::new(tools.iter().map(sort_json_keys).collect())
+    }
+
     /// The render's value of `tools`, when they are the values this was made
     /// of (the same slice).
     fn value_of(&self, tools: &[JsonValue]) -> Option<Value> {
-        (std::ptr::eq(self.tools.as_ptr(), tools.as_ptr()) && self.tools.len() == tools.len())
-            .then(|| self.value.clone())
+        self.is_of(tools).then(|| self.value.clone())
     }
 }
 
@@ -3741,6 +3773,62 @@ mod tests {
             .unwrap();
         assert_eq!(kept, plain);
         assert_eq!(prepared.kept_tojson_texts(), vec![0, 0, 1]);
+    }
+
+    /// The key-sorted form of a prepared set is the tools with every map's
+    /// keys sorted at every depth (lists keep their order, a tool that is not
+    /// a map is as it was), made once and kept; a render with it is the
+    /// render of the sorted values, with their own kept `tojson` texts.
+    #[test]
+    fn a_prepared_set_keeps_its_key_sorted_form_once() {
+        let state = ChatTemplateState::new(Some(
+            "[{% for tool in tools %}{{ tool | tojson(separators=(',', ':')) }}\
+             {% if not loop.last %},{% endif %}{% endfor %}]"
+                .to_string(),
+        ))
+        .unwrap();
+        let messages = [serde_json::json!({"role": "user", "content": "Hi"})];
+        let tools = vec![
+            serde_json::json!({"type": "function", "function": {"name": "f", "description": "d",
+                "parameters": {"type": "object", "properties": {
+                    "b": {"type": "string"}, "a": {"enum": ["z", "a"], "type": "string"}},
+                    "required": ["b", "a"]}}}),
+            serde_json::json!("not a map"),
+        ];
+        let prepared = PreparedTools::new(tools.clone());
+        let sorted = prepared.key_sorted();
+        assert!(std::ptr::eq(sorted, prepared.key_sorted()), "made once");
+        let sorted_text = concat!(
+            r#"[{"function":{"description":"d","name":"f","parameters":{"properties":"#,
+            r#"{"a":{"enum":["z","a"],"type":"string"},"b":{"type":"string"}},"#,
+            r#""required":["b","a"],"type":"object"}},"type":"function"},"not a map"]"#
+        );
+        assert_eq!(serde_json::to_string(sorted.tools()).unwrap(), sorted_text);
+        assert_eq!(
+            serde_json::to_string(PreparedTools::key_sorted_of(&tools).tools()).unwrap(),
+            sorted_text
+        );
+        let render = |tools: &[serde_json::Value], prepared: Option<&PreparedTools>| {
+            state
+                .apply(
+                    &messages,
+                    ChatTemplateParams {
+                        tools: Some(tools),
+                        prepared_tools: prepared,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        assert_eq!(render(sorted.tools(), Some(sorted)), sorted_text);
+        assert_eq!(sorted.kept_tojson_texts(), vec![1, 0]);
+        assert_eq!(render(sorted.tools(), Some(sorted)), sorted_text);
+        assert_eq!(render(sorted.tools(), None), sorted_text);
+        assert!(
+            render(prepared.tools(), Some(&prepared)).starts_with(r#"[{"type":"function","#),
+            "the plain form is as it was"
+        );
+        assert_eq!(prepared.kept_tojson_texts(), vec![1, 0]);
     }
 
     /// A checkpoint's processor template renders the requests that declare no
