@@ -950,6 +950,7 @@ def test_a_branch_the_remote_has_but_this_clone_never_fetched_is_not_read_as_a_r
     branch the cut left behind goes stale as pull requests move the remote: the remote is asked before a local
     branch is read."""
     repo.cut()  # pushed: the remote has release/1.14
+    first = repo.origin_ref("refs/heads/release/1.14")
     repo.git("update-ref", "-d", "refs/remotes/origin/release/1.14")
     repo.git("config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main")
     for command in (("check", "1.14.0-rc.1"), ("status", "1.14"), ("publish-plan", "1.14.0-rc.1")):
@@ -957,16 +958,25 @@ def test_a_branch_the_remote_has_but_this_clone_never_fetched_is_not_read_as_a_r
         assert refused.returncode == 1, command
         assert (
             "release/1.14 is on origin but not fetched here:"
-            " git fetch origin refs/heads/release/1.14:refs/remotes/origin/release/1.14"
+            " git remote set-branches --add origin release/1.14 && git fetch origin"
             in refused.stderr
         ), command
         assert "reading the local branch" not in refused.stderr, command
-    repo.git(
-        "fetch", "--quiet", "origin", "refs/heads/release/1.14:refs/remotes/origin/release/1.14"
-    )
+    repo.git("remote", "set-branches", "--add", "origin", "release/1.14")
+    repo.git("fetch", "--quiet", "origin")
     done = repo.tool("status", "1.14")
+    assert "reading the local branch" not in done.stderr
+    assert f"== release/1.14 is at {first[:7]}" in done.stdout
+    # The branch is part of the refspec now: when the remote moves (a bump merges), the tool's own fetch follows it.
+    repo.tool("bump", "1.14.0-rc.2")
+    repo.land_on_release()
+    moved = repo.origin_ref("refs/heads/release/1.14")
+    assert moved != first
+    repo.git("switch", "--quiet", "main")
+    done = repo.tool("status", "1.14")
+    assert f"== release/1.14 is at {moved[:7]}" in done.stdout
     assert (
-        "reading the local branch" not in done.stderr and "== versions: 1.14.0-rc.1" in done.stdout
+        "== versions: 1.14.0-rc.2" in done.stdout and "reading the local branch" not in done.stderr
     )
 
 
