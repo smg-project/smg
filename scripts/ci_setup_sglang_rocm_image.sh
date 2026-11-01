@@ -10,6 +10,21 @@
 
 set -euo pipefail
 
+verify_only=0
+verify_output=()
+if [ "$#" -gt 0 ]; then
+    if [ "$1" != --verify-only ] || [ "$#" -gt 2 ]; then
+        echo "usage: $0 [--verify-only [REPORT.json]]" >&2
+        exit 2
+    fi
+    verify_only=1
+    [ "$#" -eq 1 ] || verify_output=("$2")
+    if [ "${SMG_SGLANG_ROCM_IMAGE:-}" != "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d" ]; then
+        echo "unsupported E2E SGLang image" >&2
+        exit 1
+    fi
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RETRY="bash ${SCRIPT_DIR}/ci_retry.sh"
 
@@ -40,30 +55,20 @@ api = getattr(torch.Tensor, "__dlpack_c_exchange_api__", None)
 if api is None or type(api).__name__ != "PyCapsule":
     raise SystemExit("ERROR: SGLang ROCm image lacks the Torch builtin DLPack C API")
 '
-$RETRY 3 10 python3 -m pip install --no-cache-dir --no-build-isolation \
-    --no-binary=torch-c-dlpack-ext \
-    "apache-tvm-ffi==0.1.12" "tilelang==0.1.15" \
-    "torch-c-dlpack-ext @ https://files.pythonhosted.org/packages/37/de/921b6491efce5c389a5ef9bbed3d2d6660005840dae488124173180859ab/torch_c_dlpack_ext-0.1.5.tar.gz#sha256=d06f0357d575d22a168cc77acb9020fc4bae30968ceb6718a055dcbe92bacabe"
+if [ "$verify_only" -eq 0 ]; then
+    $RETRY 3 10 python3 -m pip install --no-cache-dir --no-build-isolation \
+        --no-binary=torch-c-dlpack-ext \
+        "apache-tvm-ffi==0.1.12" "tilelang==0.1.15" \
+        "torch-c-dlpack-ext @ https://files.pythonhosted.org/packages/37/de/921b6491efce5c389a5ef9bbed3d2d6660005840dae488124173180859ab/torch_c_dlpack_ext-0.1.5.tar.gz#sha256=d06f0357d575d22a168cc77acb9020fc4bae30968ceb6718a055dcbe92bacabe"
 
-# Install gRPC packages from source (not PyPI) so PR changes are always tested
-$RETRY 3 10 python3 -m pip install -e crates/grpc_client/python/ -e grpc_servicer/
+    # Install gRPC packages from source (not PyPI) so PR changes are always tested
+    $RETRY 3 10 python3 -m pip install -e crates/grpc_client/python/ -e grpc_servicer/
 
-python3 -c '
-from importlib.metadata import version
-import torch, sglang, mooncake, smg_grpc_servicer
-assert torch.version.hip
-api = torch.Tensor.__dlpack_c_exchange_api__
-import tvm_ffi, tilelang
-from torch_c_dlpack_ext import core
-assert core._lib is None and api is torch.Tensor.__dlpack_c_exchange_api__
-assert tuple(version(name) for name in (
-    "apache-tvm-ffi", "tilelang", "torch-c-dlpack-ext"
-)) == ("0.1.12", "0.1.15", "0.1.5")
-print("sglang", sglang.__version__, "HIP", torch.version.hip)
-'
-python3 -m pip check
+fi
+
+python3 "$SCRIPT_DIR/ci_verify_sglang_rocm_cohort.py" "${verify_output[@]}"
 
 # Carry the observed image version into the next Actions step.
-if [ -n "${GITHUB_ENV:-}" ]; then
+if [ "$verify_only" -eq 0 ] && [ -n "${GITHUB_ENV:-}" ]; then
     echo "SMG_CI_GRPC_COMPANION_VERSION=${SMG_CI_GRPC_COMPANION_VERSION}" >> "$GITHUB_ENV"
 fi

@@ -992,6 +992,7 @@ jobs:
               ("scripts/ci_node_health.py",                      NONE),
               ("scripts/ci_prune_tokenspeed_images.sh",          NONE),
               ("scripts/ci_setup_sglang_rocm_image.sh",          SGLANG),
+              ("scripts/ci_verify_sglang_rocm_cohort.py",          SGLANG),
               ("scripts/ci_setup_vllm_rocm_image.sh",             VLLM + " embeddings"),
               ("scripts/ci_*",                                   FULL),
               ("scripts/**",                                     NONE),

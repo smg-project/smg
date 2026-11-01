@@ -1,5 +1,8 @@
 """Verify installer HTTP requirements and ROCm image companion handoff."""
 
+import base64
+import hashlib
+import importlib.util
 import json
 import os
 import subprocess
@@ -23,6 +26,17 @@ import sys
 import types
 
 args = sys.argv[1:]
+if args[0].endswith("ci_verify_sglang_rocm_cohort.py"):
+    with open(os.environ["TOOL_NATIVE_LOG"], "a") as log:
+        log.write(json.dumps(args) + "\n")
+    if os.environ.get("FAIL_NATIVE_CHECK"):
+        raise SystemExit(44)
+    if len(args) == 2 and os.environ.get("FAIL_PIP_STAGE") != "check":
+        with open(args[1], "w") as report:
+            json.dump({"verified": True, "fixture": True}, report)
+    # This dependency is a software fixture; the real verifier is exercised by
+    # the installation and by RECORD controls below, not by fake native modules.
+    args = ["-m", "pip", "check"]
 if args == ["-V"]:
     print("Python (test fixture)")
 elif args[0] == "-c":
@@ -59,15 +73,6 @@ elif args[0] == "-c":
                 type("PyCapsule", (), {})() if mode == "present" else object()
             )
         sys.modules["torch"] = torch
-    if "import torch, sglang, mooncake, smg_grpc_servicer" in args[1]:
-        if os.environ.get("FAIL_NATIVE_CHECK"):
-            raise SystemExit(44)
-        for name in ("sglang", "mooncake", "smg_grpc_servicer", "tvm_ffi", "tilelang"):
-            sys.modules[name] = types.ModuleType(name)
-        sys.modules["sglang"].__version__ = "fixture"
-        extension = types.ModuleType("torch_c_dlpack_ext")
-        extension.core = types.SimpleNamespace(_lib=None)
-        sys.modules["torch_c_dlpack_ext"] = extension
     exec(args[1])
 elif args[:2] == ["-m", "pip"]:
     with open(os.environ["TOOL_LOG"], "a") as log:
@@ -87,7 +92,7 @@ else:
 
 
 def run_installer(
-    tmp_path, packages, *, broken=False, script="ci_install_e2e_deps.sh", extra_env=None
+    tmp_path, packages, *, broken=False, script="ci_install_e2e_deps.sh", extra_env=None, arguments=()
 ):
     binary = tmp_path / "bin"
     binary.mkdir(exist_ok=True)
@@ -105,11 +110,13 @@ def run_installer(
         "ENGINE_REQUIREMENTS": json.dumps(packages),
         "TOOL_LOG": str(log),
         "TOOL_ENV_LOG": str(tmp_path / "pip-env.jsonl"),
+        "TOOL_NATIVE_LOG": str(tmp_path / "native.jsonl"),
         "BROKEN_METADATA": "1" if broken else "",
         "GITHUB_ENV": str(tmp_path / "github.env"),
     }
     for name in (
         "SMG_CI_GRPC_COMPANION_VERSION",
+        "SMG_SGLANG_ROCM_IMAGE",
         "IMAGE_REFLECTION_VERSION",
         "IMAGE_SGLANG_VERSION",
         "IMAGE_TORCH_VERSION",
@@ -121,7 +128,7 @@ def run_installer(
         env.pop(name, None)
     env.update(extra_env or {})
     result = subprocess.run(
-        ["bash", str(ROOT / "scripts" / script)],
+        ["bash", str(ROOT / "scripts" / script), *arguments],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -195,6 +202,8 @@ def test_sglang_image_companion_survives_separate_actions_steps(tmp_path, image_
     assert github_env.read_text() == (
         "EXISTING=value\nSMG_CI_GRPC_COMPANION_VERSION=" + image_version + "\n"
     )
+    native = [json.loads(line) for line in (tmp_path / "native.jsonl").read_text().splitlines()]
+    assert native == [[str(ROOT / "scripts/ci_verify_sglang_rocm_cohort.py")]]
     name, value = github_env.read_text().splitlines()[-1].split("=", 1)
     (tmp_path / "pip.jsonl").unlink()
     # A new bash process consumes the real producer output, not the setup shell.
@@ -301,3 +310,67 @@ def test_generic_cuda_install_does_not_repair_the_rocm_cohort(tmp_path):
         for call in calls
     )
     assert not (tmp_path / "github.env").exists()
+
+
+FIXED_IMAGE = (
+    "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:"
+    "4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d"
+)
+
+
+def test_verify_only_does_not_install_or_publish_handoff(tmp_path):
+    handoff = tmp_path / "github.env"
+    handoff.write_text("EXISTING=value\n")
+    report = tmp_path / "native.json"
+    result, calls = run_installer(
+        tmp_path, {}, script="ci_setup_sglang_rocm_image.sh",
+        arguments=("--verify-only", str(report)),
+        extra_env={"IMAGE_REFLECTION_VERSION": "1.84.0", "SMG_SGLANG_ROCM_IMAGE": FIXED_IMAGE},
+    )
+    assert result.returncode == 0, result.stderr
+    assert calls == [["-m", "pip", "check"]]
+    assert handoff.read_text() == "EXISTING=value\n"
+    assert json.loads(report.read_text())["verified"] is True
+    native = [json.loads(line) for line in (tmp_path / "native.jsonl").read_text().splitlines()]
+    assert native == [[str(ROOT / "scripts/ci_verify_sglang_rocm_cohort.py"), str(report)]]
+
+
+def test_verify_only_keeps_a_failed_check_nonzero(tmp_path):
+    result, calls = run_installer(
+        tmp_path, {}, script="ci_setup_sglang_rocm_image.sh",
+        arguments=("--verify-only", str(tmp_path / "native.json")),
+        extra_env={"IMAGE_REFLECTION_VERSION": "1.84.0", "SMG_SGLANG_ROCM_IMAGE": FIXED_IMAGE,
+                   "FAIL_PIP_STAGE": "check"},
+    )
+    assert result.returncode == 43
+    assert calls == [["-m", "pip", "check"]]
+    assert not (tmp_path / "github.env").exists()
+
+
+@pytest.mark.parametrize("state", ["valid", "modified", "escape"])
+def test_cohort_record_requires_matching_bodies_and_contained_paths(tmp_path, state):
+    spec = importlib.util.spec_from_file_location(
+        "cohort_verifier", ROOT / "scripts/ci_verify_sglang_rocm_cohort.py"
+    )
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    root = tmp_path / "site-packages"
+    folder = root / "fixture.dist-info"
+    folder.mkdir(parents=True)
+    body = b"original payload\n"
+    (root / "payload.py").write_bytes(body)
+    encoded = base64.urlsafe_b64encode(hashlib.sha256(body).digest()).rstrip(b"=").decode()
+    name = "payload.py"
+    if state == "modified":
+        (root / name).write_bytes(b"modified payload\n")
+    elif state == "escape":
+        name = "../outside.py"
+        (tmp_path / "outside.py").write_bytes(body)
+    (folder / "RECORD").write_text(
+        f"{name},sha256={encoded},{len(body)}\nfixture.dist-info/RECORD,,\n"
+    )
+    if state == "valid":
+        assert verifier.verify_record(root, folder) == {"payload.py", "fixture.dist-info/RECORD"}
+    else:
+        with pytest.raises(RuntimeError):
+            verifier.verify_record(root, folder)
