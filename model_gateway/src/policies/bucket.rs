@@ -14,7 +14,7 @@ use super::{
     get_healthy_worker_indices, normalize_model_key, utils::PeriodicTask, BucketConfig,
     LoadBalancingPolicy, SelectWorkerInfo,
 };
-use crate::worker::Worker;
+use crate::worker::{endpoint::Endpoint, Worker};
 
 #[derive(Debug)]
 pub struct BucketPolicy {
@@ -157,7 +157,10 @@ impl LoadBalancingPolicy for BucketPolicy {
                     .unwrap_or_else(|| {
                         let idx = rng.random_range(0..healthy_indices.len());
                         let url = workers[healthy_indices[idx]].url();
-                        warn!("No URL found, randomly selecting: {}", url);
+                        warn!(
+                            "No URL found, randomly selecting: {}",
+                            Endpoint::redacted_str(url)
+                        );
                         url.to_string()
                     });
                 min_url
@@ -170,7 +173,7 @@ impl LoadBalancingPolicy for BucketPolicy {
                         let selected_url = workers[healthy_indices[idx]].url();
                         warn!(
                             "The bucket lists none of the offered workers for a size of {}, randomly selecting: {}",
-                            char_count, selected_url
+                            char_count, Endpoint::redacted_str(selected_url)
                         );
                         selected_url.to_string()
                     }
@@ -215,7 +218,9 @@ impl LoadBalancingPolicy for BucketPolicy {
             if bucket.remove_prefill_worker_url(url) {
                 info!(
                     "Removed worker {} from bucket for model {} (remaining workers: {})",
-                    url, model_key, bucket.bucket_cnt
+                    Endpoint::redacted_str(url),
+                    model_key,
+                    bucket.bucket_cnt
                 );
             }
         }
@@ -634,18 +639,10 @@ impl Bucket {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::HealthCheckConfig;
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, WorkerType};
-
-    fn no_health_check() -> HealthCheckConfig {
-        HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        }
-    }
+    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder, WorkerType};
 
     #[test]
     fn test_drop_stops_adjustment_thread() {
@@ -680,99 +677,29 @@ mod tests {
             bucket_adjust_interval_secs: 10,
         };
         let policy = BucketPolicy::with_config(config);
-        let prefill_workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w3:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-        ];
+        let workers = prefill_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
-        // Initialize the policy with prefill_workers
-        policy.init_prefill_worker_urls(&prefill_workers);
+        // Initialize the policy with the prefill workers
+        policy.init_prefill_worker_urls(&workers);
 
         // === Phase S1: Construct bucket boundaries ===
         // Requests len =33 -> Bucket 1(expected range: 0-33)
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(33)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        select(&policy, &workers, 33).unwrap();
         // Two requests len =34 ->load balancing
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(34)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(34)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        select(&policy, &workers, 34).unwrap();
+        select(&policy, &workers, 34).unwrap();
 
         tokio::time::sleep(Duration::from_secs(11)).await;
         {
-            let boundaries = boundaries(&policy, &prefill_workers);
+            let boundaries = boundaries(&policy, &workers);
             // Expected Boundary: [0, 33] [34, 34] [35, MAX]
             assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (33, 34));
         }
         // === Phase S2: Validate load balancing ===
         // Three consecutive len=33 requests (Should route to different buckets)
-        let idx_1 = policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(33)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        let idx_2 = policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(33)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        let idx_3 = policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(33)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let idx_1 = select(&policy, &workers, 33).unwrap();
+        let idx_2 = select(&policy, &workers, 33).unwrap();
+        let idx_3 = select(&policy, &workers, 33).unwrap();
         assert_eq!(idx_1, 0, "Should not trigger load balancing");
         assert_ne!(idx_2, idx_3, "Should trigger load balancing");
         assert_ne!(idx_2, 0, "Should trigger load balancing");
@@ -785,38 +712,14 @@ mod tests {
             ..Default::default()
         };
         let policy = BucketPolicy::with_config(config);
-        policy.init_prefill_worker_urls(&prefill_workers);
+        policy.init_prefill_worker_urls(&workers);
 
         // Create load difference below absolute threshold(20 + 8 = 28 < 30)
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(20)),
-                    ..Default::default()
-                },
-            )
-            .unwrap(); // worker1: 20
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(8)),
-                    ..Default::default()
-                },
-            )
-            .unwrap(); // worker1: 8
+        select(&policy, &workers, 20).unwrap(); // worker1: 20
+        select(&policy, &workers, 8).unwrap(); // worker1: 8
 
         // Next request should not use bucket scheduling (no load balancing)
-        let idx = policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some("request"),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let idx = select(&policy, &workers, 7).unwrap();
         assert_eq!(
             idx, 0,
             "Should not trigger load balancing when relative threshold not met"
@@ -829,48 +732,16 @@ mod tests {
             ..Default::default()
         };
         let policy = BucketPolicy::with_config(config);
-        policy.init_prefill_worker_urls(&prefill_workers);
+        policy.init_prefill_worker_urls(&workers);
 
         // Create load difference (but relative threshold not met)
         // Max/Min ratio = 15/5 = 3.0
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(15)),
-                    ..Default::default()
-                },
-            )
-            .unwrap(); // worker1: 15
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some("short"),
-                    ..Default::default()
-                },
-            )
-            .unwrap(); // worker2: 5
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(10)),
-                    ..Default::default()
-                },
-            )
-            .unwrap(); // worker3: 10
+        select(&policy, &workers, 15).unwrap(); // worker1: 15
+        select(&policy, &workers, 5).unwrap(); // worker2: 5
+        select(&policy, &workers, 10).unwrap(); // worker3: 10
 
         // Next request should use bucket scheduling (load balancing)
-        let idx = policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some("request"),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let idx = select(&policy, &workers, 7).unwrap();
         assert_eq!(
             idx, 0,
             "Should not trigger load balancing when relative threshold not met"
@@ -879,253 +750,49 @@ mod tests {
 
     #[tokio::test]
     async fn test_adjust_boundary_1() {
-        // Test configuration: Set high threshold to prevent load balancing policy.
-        let config = BucketConfig {
-            balance_abs_threshold: 300,
-            balance_rel_threshold: 1.0001,
-            bucket_adjust_interval_secs: 3,
-        };
-        let policy = BucketPolicy::with_config(config);
-        let prefill_workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w3:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-        ];
+        let (policy, workers) = adjusting_policy_over_three_prefill_workers();
 
-        // Initialize the policy with prefill_workers
-        policy.init_prefill_worker_urls(&prefill_workers);
-
-        // Initial boundary
-        {
-            let boundaries = boundaries(&policy, &prefill_workers);
-            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (1364, 2729));
-        }
-
-        // ===Phase S1: Initial requests to trigger boundary adjustment ===
-        // Send requests with lengths: [5, 10, 15, 20, 24, 26] (total = 100)
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(5)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(10)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(15)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(20)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(24)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(26)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-
-        tokio::time::sleep(Duration::from_secs(4)).await;
-        // Verify boundaries adjusted to: [0, 20], [21, 24], [25, MAX]: a share
-        // of 33; the second worker stops at 24 because the one class left, 26,
-        // is the third worker's (an open end no seen size reaches is never
-        // written while a class remains).
-        {
-            let boundaries = boundaries(&policy, &prefill_workers);
-            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 24));
-        }
+        first_phase(&policy, &workers).await;
 
         // ===Phase S2: Second set of  requests to trigger boundary adjustment ===
         // Send requests with lengths: [10, 20, 30, 40, 45, 57] (total = 202)
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(10)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(20)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(30)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(40)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(45)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(57)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        select(&policy, &workers, 10).unwrap();
+        select(&policy, &workers, 20).unwrap();
+        select(&policy, &workers, 30).unwrap();
+        select(&policy, &workers, 40).unwrap();
+        select(&policy, &workers, 45).unwrap();
+        select(&policy, &workers, 57).unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
         // Verify boundaries adjusted to: [0, 40], [41, 45], [46, MAX]: a share
         // of 67; the second worker stops at 45, 57 being the third worker's.
         {
-            let boundaries = boundaries(&policy, &prefill_workers);
+            let boundaries = boundaries(&policy, &workers);
             assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (40, 45));
         }
     }
 
     #[tokio::test]
     async fn test_adjust_boundary_2() {
-        let config = BucketConfig {
-            balance_abs_threshold: 300,
-            balance_rel_threshold: 1.0001,
-            bucket_adjust_interval_secs: 3,
-        };
-        let policy = BucketPolicy::with_config(config);
-        let prefill_workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w3:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-        ];
-
-        // Initialize the policy with prefill_workers
-        policy.init_prefill_worker_urls(&prefill_workers);
-
-        // Initial boundary
-        {
-            let boundaries = boundaries(&policy, &prefill_workers);
-            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (1364, 2729));
-        }
+        let (policy, workers) = adjusting_policy_over_three_prefill_workers();
 
         // Send requests with char_count 20
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(20)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        select(&policy, &workers, 20).unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
         {
-            let boundaries = boundaries(&policy, &prefill_workers);
+            let boundaries = boundaries(&policy, &workers);
             // Expected Boundary: [0, 20] [21, MAX]: one size seen, the
             // second worker owns no range, the third takes the open end.
             assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, usize::MAX));
             assert_eq!(boundaries.len(), 2);
         }
 
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(7)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        select(&policy, &workers, 7).unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
         {
-            let boundaries = boundaries(&policy, &prefill_workers);
+            let boundaries = boundaries(&policy, &workers);
             // Expected Boundary: [0, 7] [8, MAX]
             assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (7, usize::MAX));
             assert_eq!(boundaries.len(), 2);
@@ -1134,167 +801,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_not_adjust_boundary() {
-        let config = BucketConfig {
-            balance_abs_threshold: 300,
-            balance_rel_threshold: 1.0001,
-            bucket_adjust_interval_secs: 3,
-        };
-        let policy = BucketPolicy::with_config(config);
-        let prefill_workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(
-                BasicWorkerBuilder::new("http://w1:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w2:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-            Arc::new(
-                BasicWorkerBuilder::new("http://w3:8000")
-                    .worker_type(WorkerType::Regular)
-                    .api_key("test_api_key")
-                    .health_config(no_health_check())
-                    .build(),
-            ),
-        ];
+        let (policy, workers) = adjusting_policy_over_three_prefill_workers();
 
-        // Initialize the policy with prefill_workers
-        policy.init_prefill_worker_urls(&prefill_workers);
+        first_phase(&policy, &workers).await;
 
-        // Initial boundary
-        {
-            let boundaries = boundaries(&policy, &prefill_workers);
-            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (1364, 2729));
-        }
-
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(5)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(10)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(15)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(20)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(24)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(26)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-
-        tokio::time::sleep(Duration::from_secs(4)).await;
-        // [0, 20] [21, 24] [25, MAX], as in test_adjust_boundary_1's first phase.
-        {
-            let boundaries = boundaries(&policy, &prefill_workers);
-            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 24));
-        }
-
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(10)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(20)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(30)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(32)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(45)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        policy
-            .select_worker(
-                &prefill_workers,
-                &SelectWorkerInfo {
-                    request_text: Some(&*"a".repeat(55)),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        select(&policy, &workers, 10).unwrap();
+        select(&policy, &workers, 20).unwrap();
+        select(&policy, &workers, 30).unwrap();
+        select(&policy, &workers, 32).unwrap();
+        select(&policy, &workers, 45).unwrap();
+        select(&policy, &workers, 55).unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
         // The second set moves the per-worker share from 33 to 64, within the
         // factor of two: the partition stays.
         {
-            let boundaries = boundaries(&policy, &prefill_workers);
+            let boundaries = boundaries(&policy, &workers);
             assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 24));
         }
     }
@@ -1310,6 +832,42 @@ mod tests {
                 ) as Arc<dyn Worker>
             })
             .collect()
+    }
+
+    /// The first phase both boundary tests start from: six requests of sizes
+    /// 5, 10, 15, 20, 24 and 26 (a total of 100), the adjustment interval
+    /// waited out, and the boundaries at [0, 20], [21, 24], [25, MAX]: a share
+    /// of 33; the second worker stops at 24 because the one class left, 26,
+    /// is the third worker's (an open end no seen size reaches is never
+    /// written while a class remains).
+    async fn first_phase(policy: &BucketPolicy, workers: &[Arc<dyn Worker>]) {
+        select(policy, workers, 5).unwrap();
+        select(policy, workers, 10).unwrap();
+        select(policy, workers, 15).unwrap();
+        select(policy, workers, 20).unwrap();
+        select(policy, workers, 24).unwrap();
+        select(policy, workers, 26).unwrap();
+
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let boundaries = boundaries(policy, workers);
+        assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 24));
+    }
+
+    /// A policy whose boundaries adjust every three seconds while the load
+    /// balancing stays out of the way (an absolute threshold of 300
+    /// characters), over three prefill workers; asserts the initial partition
+    /// the boundary tests start from.
+    fn adjusting_policy_over_three_prefill_workers() -> (BucketPolicy, Vec<Arc<dyn Worker>>) {
+        let policy = BucketPolicy::with_config(BucketConfig {
+            balance_abs_threshold: 300,
+            balance_rel_threshold: 1.0001,
+            bucket_adjust_interval_secs: 3,
+        });
+        let workers = prefill_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        policy.init_prefill_worker_urls(&workers);
+        let boundaries = boundaries(&policy, &workers);
+        assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (1364, 2729));
+        (policy, workers)
     }
 
     /// A policy whose selection follows the boundaries alone: the load spill

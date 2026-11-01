@@ -93,10 +93,20 @@ experiments against it transfer to engines:
 - **cached tokens** — a request sharing a prefix with cached blocks pays less
   prefill and reports `cached_tokens` (gRPC chunks, HTTP
   `usage.prompt_tokens_details.cached_tokens`).
+- **repeatable output** — `--output-seed prompt` derives synthetic output from
+  the complete prompt token sequence, including its partial last block. Equal
+  token inputs then produce equal output regardless of transport request ID,
+  worker placement, cache warmth, or preemption. Repeated prompts can share
+  decode blocks too. Request IDs still identify cancellation and records.
+  The default `request-id` mode preserves existing stress workloads. This option
+  applies to the realistic engine; canned and scripted responses are unchanged.
+  Synthetic output remains in the existing token range 100–30099; a benchmark
+  must separately verify those IDs against its pinned tokenizer and special IDs.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--timing` | polynomial | `polynomial`, `linear`, or `fit:<path>` (a hardware calibration JSON, below) |
+| `--output-seed` | request-id | `prompt` selects output from normalized input tokens for cross-router/retry comparisons |
 | `--prefill-poly a,b,c` | AISimulate | prefill ms = a + b·T + c·T² |
 | `--decode-poly a,b,c` | AISimulate | decode ms = max(1, a + b·u + c·u²) |
 | `--request-overhead-ms` | 0 | fixed per-request latency added to every event of a stream (TTFT and e2e grow by it, ITL does not) |
@@ -111,6 +121,7 @@ experiments against it transfer to engines:
 | `--prefill-first` | false | SGLang-style prefill-only passes |
 | `--reserve-full-isl` | true | admit a waiting prompt only when the free and evictable blocks could hold all of it beyond its cached blocks, stopping at the first that does not fit (vLLM's `scheduler_reserve_full_isl`: a gate, only the pass's chunk is allocated at admission); `false` skips the gate |
 | `--context-length` | 32768 | advertised context length |
+| `--output-prefix-ids` | none | the token ids every output starts with, before the synthetic ids: a stream shaped for a gateway that parses the engine's tokens (a channel header, say); the canned gRPC and ZMQ workers and the realistic engine shape their output with it (the canned HTTP worker does not read it) |
 | `--loads-like` | mock | `vllm`: report only what the vLLM servicer reports (running, waiting, `token_usage`, maxima), so the gateway's expected-wait routes as it does on a vLLM fleet |
 | `--admin-port` | off | process-wide admin API (below) |
 | `--drain-timeout-secs` | 5 | on SIGTERM or SIGINT: stop accepting, let the requests in flight finish for this long, then exit 0 either way |

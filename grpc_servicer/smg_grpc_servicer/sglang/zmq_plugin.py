@@ -122,6 +122,15 @@ def register() -> None:
     HookRegistry.register(f"{_SCHEDULER}.maybe_init_rust_server", after_rust_server, HookType.AFTER)
     HookRegistry.register(f"{_RECEIVER}._pull_raw_reqs", pull_raw_reqs, HookType.AROUND)
     HookRegistry.register(f"{_SCHEDULER}.run_event_loop", run_event_loop, HookType.AROUND)
+    from smg_grpc_servicer.sglang import mm_broadcast
+
+    if mm_broadcast.enabled():
+        target = f"{_RECEIVER}._broadcast_reqs_across_ranks"
+        if _resolves(target):
+            HookRegistry.register(target, mm_broadcast.broadcast_with_shm, HookType.AROUND)
+        else:
+            logger.info("SMG plugin: %s is unavailable; using inline media broadcast", target)
+
     logger.info("SMG ZMQ plugin: scheduler will dial %s", handshake_address())
 
 

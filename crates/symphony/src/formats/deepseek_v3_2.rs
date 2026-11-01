@@ -30,6 +30,12 @@
 //! own parser reads it in the tests below, and on the probes; the recorded set replays from the
 //! fixture pin once bellwether has it.
 //!
+//! The block's opener is spelled as the encoder's parser spells it: the blank line the encoder
+//! writes before the block and the tag, `\n\n<｜DSML｜function_calls>`, so the blank line leaves
+//! with the tag wherever the block opens, after a text preamble, after the thought's close, at the
+//! turn's start or after a tool result, and the content ends where the model's text does. The tag
+//! alone opens the block too, for a block the model writes without the blank line.
+//!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 //!
 //! [`deepseek_v4`]: super::deepseek_v4()
@@ -45,6 +51,12 @@ pub fn deepseek_v3_2() -> Format {
         .terminal("think_open", "<think>")
         .terminal("think_close", "</think>")
         .terminal("calls_open", "<｜DSML｜function_calls>")
+        // The opener with the blank line the encoder writes before the block (the syntax's
+        // `before_block`), the spelling its parser looks for: the scanner takes the longer marker
+        // where the blank line stands, and holds a newline that may begin it, so a stream reads
+        // as the whole does. Its rows come after the bare opener's, which the structural tags
+        // derive the block's opener from.
+        .terminal("separated_calls_open", "\n\n<｜DSML｜function_calls>")
         .terminal("calls_close", "</｜DSML｜function_calls>")
         .terminal("invoke_open", "<｜DSML｜invoke name=\"")
         .terminal("invoke_close", Tags::DSML_V4.invoke_close)
@@ -56,6 +68,8 @@ pub fn deepseek_v3_2() -> Format {
         .transition("reasoning", "think_close", "content")
         .transition("content", "calls_open", "calls")
         .transition("reasoning", "calls_open", "calls")
+        .transition("content", "separated_calls_open", "calls")
+        .transition("reasoning", "separated_calls_open", "calls")
         .transition("calls", "invoke_open", "invoke")
         .transition("invoke", "invoke_close", "calls")
         .transition("invoke", "invoke_open", "invoke")
@@ -81,10 +95,11 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, FinishReason, MalformedReason, Text},
+        event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
         formats::{deepseek_v4, deepseek_v4_1},
-        input::EngineFinish,
-        testing::{self, bytes, content, drive_to, reasoning},
+        input::{EngineFinish, Input},
+        parser::Parser,
+        testing::{self, bytes, content, drive_to, reasoning, the_same_at_every_cut},
         Declared,
     };
 
@@ -153,19 +168,14 @@ mod tests {
         let events = run(THINKING, &[OUTPUT]);
         assert_eq!(bytes(&events), OUTPUT);
         assert_eq!(
-            events[..6],
+            events[..5],
             [
                 Event::ReasoningStart,
                 Event::Reasoning(Text::uncounted("Need the weather.")),
                 dropped("</think>"),
                 Event::ReasoningEnd,
-                // The encoder's two newlines before the block: held until the block's opener said
-                // they were its spacing, not content.
-                Event::Dropped {
-                    text: Text::uncounted("\n\n"),
-                    why: DropReason::Whitespace,
-                },
-                dropped("<｜DSML｜function_calls>"),
+                // The encoder's blank line before the block is the opener's: one marker.
+                dropped("\n\n<｜DSML｜function_calls>"),
             ]
         );
         assert_eq!(
@@ -300,21 +310,46 @@ mod tests {
         assert!(!format.reasoning_open(&chat_after_result));
         let events = run(&chat_after_result, &["It is 18 degrees."]);
         assert_eq!(content(&events), "It is 18 degrees.");
-        // The two newlines before a block after a tool result in chat mode start a stay with
-        // nothing begun: the encoder's spacing, dropped as at the turn's start.
-        let events = run(
-            &chat_after_result,
-            &[concat!(
-                "\n\n<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n",
-                "<｜DSML｜parameter name=\"location\" string=\"true\">Rome</｜DSML｜parameter>\n",
-                "</｜DSML｜invoke>\n</｜DSML｜function_calls>"
-            )],
+        // The blank line before a block after a tool result is the opener's: in chat mode with
+        // nothing before it and after a preamble, in thinking mode after the thought's close and
+        // after a preamble; the encoder's parser reads the content up to the blank line and the
+        // tag, and so does the table, wherever the block opens.
+        let rome = concat!(
+            "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n",
+            "<｜DSML｜parameter name=\"location\" string=\"true\">Rome</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n</｜DSML｜function_calls>"
         );
-        assert_eq!(content(&events), "");
-        assert_eq!(
-            calls(&events),
-            vec![("get_weather".to_string(), value!({"location": "Rome"}))]
-        );
+        for (prompt, output, expected) in [
+            (chat_after_result.as_str(), format!("\n\n{rome}"), ("", "")),
+            (
+                chat_after_result.as_str(),
+                format!("It is 18 degrees; checking Rome.\n\n{rome}"),
+                ("It is 18 degrees; checking Rome.", ""),
+            ),
+            (
+                after_result,
+                format!("Check Rome.</think>\n\n{rome}"),
+                ("", "Check Rome."),
+            ),
+            (
+                after_result,
+                format!("Check Rome.</think>It is 18 degrees; checking Rome.\n\n{rome}"),
+                ("It is 18 degrees; checking Rome.", "Check Rome."),
+            ),
+        ] {
+            let events = run(prompt, &[&output]);
+            assert_eq!(bytes(&events), output);
+            assert_eq!(
+                (content(&events).as_str(), reasoning(&events).as_str()),
+                expected,
+                "{output:?}"
+            );
+            assert_eq!(
+                calls(&events),
+                vec![("get_weather".to_string(), value!({"location": "Rome"}))],
+                "{output:?}"
+            );
+        }
         // A marker quoted in a tool result moves nothing: the replay starts after the tail the
         // encoder writes behind the result, so the result's text is never walked.
         let quoted_result = after_result.replace(
@@ -411,5 +446,126 @@ mod tests {
                 "</function_results>\n\n</think>",
             ]
         );
+    }
+
+    /// A block with one call and no arguments, as the encoder writes it.
+    const BARE_BLOCK: &str = "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"f\">\n\n\
+                              </｜DSML｜invoke>\n</｜DSML｜function_calls>";
+
+    /// The content deltas a client of the stream receives when `pieces` arrive one by one after
+    /// `prompt`: the content of each feed's events, the end's included, empty ones left out.
+    fn content_deltas(prompt: &str, pieces: &[&str]) -> Vec<String> {
+        let mut parser = Engine::new(deepseek_v3_2(), Declared::default());
+        let mut out = Events::new();
+        parser
+            .feed(
+                Input::Prompt {
+                    token_ids: &[],
+                    text: prompt,
+                },
+                &mut out,
+            )
+            .expect("prompt");
+        let mut deltas = Vec::new();
+        for piece in pieces {
+            parser
+                .feed(
+                    Input::Delta {
+                        token_ids: &[],
+                        text: piece,
+                        spans: &[],
+                    },
+                    &mut out,
+                )
+                .expect("delta");
+            deltas.push(content(&out.drain()));
+        }
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        deltas.push(content(&out.drain()));
+        deltas.retain(|delta| !delta.is_empty());
+        deltas
+    }
+
+    #[test]
+    fn a_preamble_ends_where_the_encoders_blank_line_before_the_block_begins() {
+        // The turns the encoder renders for a call after content, in thinking and in chat mode:
+        // the content is the text alone, as the encoder's parser reads it, whole, a character at
+        // a time and at every cut; the call reads as before.
+        let block = concat!(
+            "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n",
+            "<｜DSML｜parameter name=\"location\" string=\"true\">Paris</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n</｜DSML｜function_calls>"
+        );
+        for (prompt, output, thought) in [
+            (
+                THINKING,
+                format!("Say something first.</think>Let me check.\n\n{block}"),
+                "Say something first.",
+            ),
+            (CHAT, format!("Let me check.\n\n{block}"), ""),
+        ] {
+            let events = run(prompt, &[&output]);
+            assert_eq!(bytes(&events), output);
+            let said = the_same_at_every_cut(|pieces| run(prompt, pieces), &output);
+            assert_eq!(said.content, "Let me check.", "{output:?}");
+            assert_eq!(said.reasoning, thought, "{output:?}");
+            assert_eq!(
+                calls(&events),
+                [("get_weather".to_string(), value!({"location": "Paris"}))],
+                "{output:?}"
+            );
+        }
+        // Exactly the blank line is the opener's, as the encoder's parser reads it: a third
+        // newline or a space before it stays content; the bare tag opens a block written without
+        // it, and the one newline before such a block is content.
+        for (between, expected) in [
+            ("\n\n", "Sure."),
+            ("\n\n\n", "Sure.\n"),
+            (" \n\n", "Sure. "),
+            ("", "Sure."),
+            ("\n", "Sure.\n"),
+        ] {
+            let output = format!("Sure.{between}{BARE_BLOCK}");
+            let said = the_same_at_every_cut(|pieces| run(CHAT, pieces), &output);
+            assert_eq!(said.content, expected, "{between:?}");
+            assert_eq!(
+                said.calls,
+                [("f".to_string(), "{}".to_string())],
+                "{between:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_blank_line_before_the_block_leaves_no_content_delta() {
+        // Streamed in a tokenizer's pieces, the content deltas carry the preamble and nothing
+        // after it, so the stream shows the content the whole has; the blank line alone in a
+        // delta, then the opener, is no content at all.
+        assert_eq!(
+            content_deltas(CHAT, &["Let", " me", " check", ".\n\n", BARE_BLOCK]),
+            ["Let", " me", " check", "."]
+        );
+        assert_eq!(
+            content_deltas(CHAT, &["\n\n", BARE_BLOCK]),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            content_deltas(THINKING, &["Thinking.", "</think>", "\n\n", BARE_BLOCK]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn the_opener_with_its_blank_line_is_spelled_as_the_tags_write_it() {
+        // The reading and the writing agree on what the encoder puts before the block.
+        let spelled = format!("{}<｜DSML｜function_calls>", Tags::DSML_V4.before_block);
+        assert!(deepseek_v3_2().terminal_texts().any(|text| text == spelled));
     }
 }
