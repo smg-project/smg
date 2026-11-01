@@ -5,7 +5,10 @@ use tracing::debug;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::find_workers_by_url;
-use crate::{worker::registry::WorkerId, workflow::data::WorkerUpdateWorkflowData};
+use crate::{
+    worker::{endpoint::Endpoint, registry::WorkerId},
+    workflow::data::WorkerUpdateWorkflowData,
+};
 
 /// Step to find workers to update based on URL.
 ///
@@ -41,7 +44,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for FindWorkerToUpdateStep {
         debug!(
             "Found {} worker(s) to update for {}",
             workers_to_update.len(),
-            worker_url
+            Endpoint::redacted_str(worker_url)
         );
 
         // The update writes back against the registration found here, by id

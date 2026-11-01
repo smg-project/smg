@@ -10,7 +10,7 @@ use axum::response::Response;
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams, PreparedTools},
-    traits::{MediaHandling, PromptEncoding, RendererCapabilities, Tokenizer},
+    traits::{MediaHandling, PromptEncoding, Tokenizer},
 };
 use openai_protocol::{
     common::{Tool as ChatTool, ToolChoice as ChatToolChoice},
@@ -245,6 +245,7 @@ pub(crate) fn process_messages_prompt(
             text,
             unbilled_prompt_tokens: rendered.unbilled_prompt_tokens,
             continued_final_message: rendered.continued_final_message,
+            generation_prompt: rendered.generation_prompt,
         },
         rendered.encoding,
     ))
@@ -252,21 +253,15 @@ pub(crate) fn process_messages_prompt(
 
 /// The tools the template renders for a request: `chat_tools` (the custom
 /// tools as chat tools) narrowed by `tool_choice` the way the chat path
-/// narrows them (a forced tool renders alone, and `none` renders none unless
-/// the renderer declares the tools under `none` itself, see
-/// [`RendererCapabilities::declares_tools_under_tool_choice_none`]); borrowed
-/// when the choice does not narrow. Shared by the preparation stage and
-/// count_tokens so both render the same prompt.
+/// narrows them (a forced tool renders alone; `none` renders them all, as
+/// the chat path and the engine's own server render them, the choice
+/// reaching the template as a kwarg); borrowed when the choice does not
+/// narrow. Shared by the preparation stage and count_tokens so both render
+/// the same prompt.
 pub fn template_tools<'a>(
     chat_tools: &'a [ChatTool],
     tool_choice: Option<&messages::ToolChoice>,
-    capabilities: RendererCapabilities,
 ) -> Cow<'a, [ChatTool]> {
-    if matches!(tool_choice, Some(messages::ToolChoice::None))
-        && !capabilities.declares_tools_under_tool_choice_none
-    {
-        return Cow::Borrowed(&[]);
-    }
     match tool_choice
         .map(ChatToolChoice::from)
         .and_then(|choice| choice.narrow_tools(chat_tools))
@@ -374,10 +369,15 @@ pub(crate) async fn resolve_media(
             media: None,
         });
     }
-    let tokenizer_entry = components
-        .tokenizer_registry
-        .get_by_name(model_id)
-        .or_else(|| components.tokenizer_registry.get_by_id(model_id));
+    // The tokenizer's registry entry (its id and source) is read for the
+    // media paths alone, which need the multimodal components; a gateway
+    // without them looks nothing up.
+    let tokenizer_entry = components.multimodal.as_ref().and_then(|_| {
+        components
+            .tokenizer_registry
+            .get_by_name(model_id)
+            .or_else(|| components.tokenizer_registry.get_by_id(model_id))
+    });
     // The media-part order comes from the model registry so every path
     // renders a model consistently.
     let media_order = match (components.multimodal.as_ref(), tokenizer_entry.as_ref()) {
@@ -578,7 +578,7 @@ fn convert_system_message(content: &InputContent) -> Value {
 }
 
 /// For a renderer whose reference writes no turn for a system message after
-/// the first ([`RendererCapabilities::leading_system_only`]): every `system`
+/// the first ([`llm_tokenizer::traits::RendererCapabilities::leading_system_only`]): every `system`
 /// message past the leading run becomes a user turn at its position. A
 /// coding agent sends its environment block and its notes as `system`-role
 /// messages inside `messages[]`, after tool results too; such a renderer
@@ -917,6 +917,7 @@ pub(crate) fn omit_thinking_text(content: &mut [messages::ContentBlock]) {
 
 #[cfg(test)]
 mod tests {
+    use llm_tokenizer::traits::RendererCapabilities;
     use messages::{InputMessage, Role, TextBlock};
 
     use super::*;
@@ -1651,11 +1652,7 @@ mod tests {
         }))
         .unwrap();
         let chat_tools = request.chat_tools();
-        let tools = template_tools(
-            &chat_tools,
-            request.tool_choice.as_ref(),
-            RendererCapabilities::default(),
-        );
+        let tools = template_tools(&chat_tools, request.tool_choice.as_ref());
         assert_eq!(tools.len(), 1, "a forced tool renders alone");
 
         let counted = count_input_tokens(
@@ -1670,11 +1667,11 @@ mod tests {
         assert_eq!(counted, 5);
     }
 
-    /// `tool_choice: {"type": "none"}` renders no tool, as on the chat path,
-    /// unless the renderer declares the tools under `none` itself; `auto`
-    /// renders them all.
+    /// `tool_choice: {"type": "none"}` renders every tool, as on the chat
+    /// path and as the engine's own server renders it (the choice reaches
+    /// the template as a kwarg); `auto` renders them all too.
     #[test]
-    fn tool_choice_none_renders_no_tool() {
+    fn tool_choice_none_renders_the_tools_as_auto_does() {
         let request = |tool_choice: Value| -> CountMessageTokensRequest {
             serde_json::from_value(json!({
                 "model": "m",
@@ -1687,21 +1684,18 @@ mod tests {
             }))
             .unwrap()
         };
-        let plain = RendererCapabilities::default();
-        let declaring = RendererCapabilities {
-            declares_tools_under_tool_choice_none: true,
-            ..RendererCapabilities::default()
-        };
         let none = request(json!({"type": "none"}));
-        assert!(template_tools(&none.chat_tools(), none.tool_choice.as_ref(), plain).is_empty());
-        assert_eq!(
-            template_tools(&none.chat_tools(), none.tool_choice.as_ref(), declaring).len(),
-            1,
-            "the renderer that declares the tools under none gets them"
+        let none_tools = none.chat_tools();
+        let under_none = template_tools(&none_tools, none.tool_choice.as_ref());
+        assert!(
+            matches!(under_none, Cow::Borrowed(_)),
+            "none narrows nothing: the tools are the request's own"
         );
+        assert_eq!(under_none.len(), 1, "the tool stays declared under none");
         let auto = request(json!({"type": "auto"}));
+        let auto_tools = auto.chat_tools();
         assert_eq!(
-            template_tools(&auto.chat_tools(), auto.tool_choice.as_ref(), plain).len(),
+            template_tools(&auto_tools, auto.tool_choice.as_ref()).len(),
             1
         );
     }
@@ -1729,11 +1723,7 @@ mod tests {
             }
             let request: CreateMessageRequest = serde_json::from_value(body).unwrap();
             let chat_tools = request.chat_tools();
-            let tools = template_tools(
-                &chat_tools,
-                request.tool_choice.as_ref(),
-                tok.renderer_capabilities(),
-            );
+            let tools = template_tools(&chat_tools, request.tool_choice.as_ref());
             let tools_for_template = if tools.is_empty() {
                 None
             } else {
@@ -1753,9 +1743,10 @@ mod tests {
         );
         let none = rendered(Some(json!({"type": "none"})));
         assert_eq!(none["template_kwargs"]["tool_choice"], json!("none"));
-        assert!(
-            none.get("tools").is_none(),
-            "a plain renderer gets no tool under none: {none}"
+        assert_eq!(
+            none["tools"].as_array().map(Vec::len),
+            Some(1),
+            "the tool stays declared under none, the template told the choice: {none}"
         );
         let unset = rendered(None);
         assert!(
@@ -1813,11 +1804,7 @@ mod tests {
         }))
         .expect("the request");
         let chat_tools = request.chat_tools();
-        let tools = template_tools(
-            &chat_tools,
-            request.tool_choice.as_ref(),
-            tok.renderer_capabilities(),
-        );
+        let tools = template_tools(&chat_tools, request.tool_choice.as_ref());
         let (processed, _) = process_messages(
             &request,
             tok.as_ref(),

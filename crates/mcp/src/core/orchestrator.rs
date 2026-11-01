@@ -2421,8 +2421,6 @@ mod tests {
 
     #[test]
     fn test_find_builtin_server_web_search() {
-        use crate::approval::{audit::AuditLog, policy::PolicyEngine};
-
         // Create config with a server configured for web_search_preview
         let config = McpConfig {
             servers: vec![McpServerConfig {
@@ -2433,23 +2431,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (refresh_tx, _) = mpsc::channel(10);
-        let audit_log = Arc::new(AuditLog::new());
-        let policy_engine = Arc::new(PolicyEngine::new(Arc::clone(&audit_log)));
-        let approval_manager = Arc::new(ApprovalManager::new(policy_engine, audit_log));
-
-        let orchestrator = McpOrchestrator {
-            static_servers: Arc::new(DashMap::new()),
-            tool_inventory: Arc::new(ToolInventory::new()),
-            approval_manager,
-            connection_pool: Arc::new(McpConnectionPool::new()),
-            metrics: Arc::new(McpMetrics::new()),
-            refresh_tx,
-            active_executions: Arc::new(AtomicUsize::new(0)),
-            shutdown_token: CancellationToken::new(),
-            reconnection_locks: DashMap::new(),
-            config,
-        };
+        let orchestrator = McpOrchestrator::new_test_with_config(config);
 
         // Should find the brave server for web_search_preview
         let result = orchestrator.find_builtin_server(BuiltinToolType::WebSearchPreview);
@@ -2466,13 +2448,6 @@ mod tests {
 
     #[test]
     fn test_find_builtin_server_with_custom_response_format() {
-        use std::collections::HashMap;
-
-        use crate::{
-            approval::{audit::AuditLog, policy::PolicyEngine},
-            core::config::{ResponseFormatConfig, ToolConfig},
-        };
-
         // Create config with custom response_format for the tool
         let mut tools = HashMap::new();
         tools.insert(
@@ -2494,23 +2469,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (refresh_tx, _) = mpsc::channel(10);
-        let audit_log = Arc::new(AuditLog::new());
-        let policy_engine = Arc::new(PolicyEngine::new(Arc::clone(&audit_log)));
-        let approval_manager = Arc::new(ApprovalManager::new(policy_engine, audit_log));
-
-        let orchestrator = McpOrchestrator {
-            static_servers: Arc::new(DashMap::new()),
-            tool_inventory: Arc::new(ToolInventory::new()),
-            approval_manager,
-            connection_pool: Arc::new(McpConnectionPool::new()),
-            metrics: Arc::new(McpMetrics::new()),
-            refresh_tx,
-            active_executions: Arc::new(AtomicUsize::new(0)),
-            shutdown_token: CancellationToken::new(),
-            reconnection_locks: DashMap::new(),
-            config,
-        };
+        let orchestrator = McpOrchestrator::new_test_with_config(config);
 
         let result = orchestrator.find_builtin_server(BuiltinToolType::WebSearchPreview);
         assert!(result.is_some());

@@ -33,6 +33,7 @@ pub(super) async fn connect_engine(state: Arc<State>, inputs: ConnectInputs) {
             if super::places_by_rendezvous_room(&state.model) {
                 client.note_engine_places_by_rendezvous_room();
             }
+            Ok(())
         },
     )
     .await;

@@ -64,3 +64,5 @@ webpki-roots = { workspace = true }
 
 [dev-dependencies]
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
+# The capture tests read the crate's own log lines through the tracing subscriber.
+tracing-test = "0.2"

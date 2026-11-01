@@ -91,6 +91,17 @@ pub fn default_ready_response() -> EngineCoreReadyResponse {
         kv_events_config: None,
         cache_trace_epochs: Vec::new(),
         positional_layouts: std::collections::BTreeMap::new(),
+        tensor_aux_frames: false,
+        request_types: Vec::new(),
+        disaggregation_mode: None,
+        bootstrap_host: None,
+        bootstrap_port: None,
+        model_type: None,
+        architectures: Vec::new(),
+        mrope_positions: None,
+        spatial_merge_size: None,
+        image_token_id: None,
+        video_token_id: None,
     }
 }
 
@@ -250,12 +261,13 @@ impl MockEngine {
     }
 }
 
-fn ready_message(status: &str) -> ReadyMessage {
+fn ready_message(status: &str, engine_count: Option<usize>) -> ReadyMessage {
     ReadyMessage {
         status: Some(status.to_string()),
         local: Some(true),
         headless: Some(true),
         parallel_config_hash: None,
+        engine_count,
     }
 }
 
@@ -280,12 +292,17 @@ async fn within<T>(step: &'static str, future: impl std::future::Future<Output =
 }
 
 async fn wait_for_endpoint(endpoint: &str) -> Result<()> {
-    let Some(socket_path) = endpoint.strip_prefix("ipc://") else {
-        return Ok(());
-    };
+    // A dial to an endpoint nothing listens on yet fails at once, so wait
+    // for the frontend's bind: its socket file, or its TCP port.
     timeout(CONNECT_TIMEOUT, async {
-        while tokio::net::UnixStream::connect(socket_path).await.is_err() {
-            sleep(Duration::from_millis(20)).await;
+        if let Some(socket_path) = endpoint.strip_prefix("ipc://") {
+            while tokio::net::UnixStream::connect(socket_path).await.is_err() {
+                sleep(Duration::from_millis(20)).await;
+            }
+        } else if let Some(address) = endpoint.strip_prefix("tcp://") {
+            while tokio::net::TcpStream::connect(address).await.is_err() {
+                sleep(Duration::from_millis(20)).await;
+            }
         }
     })
     .await
@@ -310,6 +327,16 @@ pub async fn hello(
     handshake_address: &str,
     engine_id: impl Into<EngineId>,
 ) -> Result<MockEngineHandshake> {
+    hello_in_group(handshake_address, engine_id, None).await
+}
+
+/// [`hello`] from an engine whose HELLO declares the size of the group it
+/// dials with (`engine_count`, none when `None`).
+pub async fn hello_in_group(
+    handshake_address: &str,
+    engine_id: impl Into<EngineId>,
+    engine_count: Option<usize>,
+) -> Result<MockEngineHandshake> {
     let engine_id = engine_id.into();
     let identity = peer_identity(&engine_id)?;
 
@@ -324,7 +351,10 @@ pub async fn hello(
     .await??;
 
     handshake
-        .send(ZmqMessage::from(encode_msgpack(&ready_message("HELLO"))?))
+        .send(ZmqMessage::from(encode_msgpack(&ready_message(
+            "HELLO",
+            engine_count,
+        ))?))
         .await?;
     let init_frames = within("mock engine: INIT from the servicer", handshake.recv())
         .await??
@@ -389,7 +419,9 @@ impl MockEngineHandshake {
             init,
         } = self;
         handshake
-            .send(ZmqMessage::from(encode_msgpack(&ready_message("READY"))?))
+            .send(ZmqMessage::from(encode_msgpack(&ready_message(
+                "READY", None,
+            ))?))
             .await?;
         Self::register(identity, init, ready_response).await
     }
