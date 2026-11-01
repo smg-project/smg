@@ -972,6 +972,10 @@ def test_a_branch_the_remote_has_but_this_clone_never_fetched_is_not_read_as_a_r
     repo.land_on_release()
     moved = repo.origin_ref("refs/heads/release/1.14")
     assert moved != first
+    # The push above came from this clone and moved the remote-tracking ref itself (the branch is in the refspec
+    # now): set it back, so only the tool's own fetch can bring it forward, and the read below proves that fetch.
+    repo.git("update-ref", "refs/remotes/origin/release/1.14", first)
+    assert repo.git("rev-parse", "refs/remotes/origin/release/1.14") == first
     repo.git("switch", "--quiet", "main")
     done = repo.tool("status", "1.14")
     assert f"== release/1.14 is at {moved[:7]}" in done.stdout
