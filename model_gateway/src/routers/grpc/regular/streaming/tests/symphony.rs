@@ -48,6 +48,7 @@ pub(super) fn assigned(
         format: Arc::new(format),
         prompt: prompt.to_string(),
         forbids_calls: false,
+        past_the_end: false,
     });
     spec
 }
@@ -695,6 +696,7 @@ pub(super) fn assigned_message(
             format: Arc::new(format),
             prompt: prompt.to_string(),
             forbids_calls: false,
+            past_the_end: false,
         }),
     }
 }
@@ -1406,6 +1408,56 @@ async fn a_malformed_region_in_a_stream_is_counted_and_written_once() {
     ));
     assert!(logs_contain("table=\"qwen3\""));
     assert!(logs_contain("choice=0"));
+}
+
+/// A stream the request ran past the model's own end (`ignore_eos`): the thought's close the
+/// unconstrained tail wrote reaches the client as content like any marker out of place, the
+/// output is counted clean, no malformed run is counted, and the line such a marker writes in
+/// any other output stays unwritten; one line says so at debug.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_marker_in_a_stream_run_past_the_models_end_is_content_and_counts_as_nothing() {
+    let mut spec = assigned(
+        chat_spec(true),
+        qwen3(CallSyntax::Json),
+        "<|im_start|>assistant\n",
+    );
+    spec.symphony.as_mut().expect("assigned").past_the_end = true;
+    let ((result, events), scrape) = scraped(stream_events(
+        vec![
+            chunk(0, "OK"),
+            chunk(0, "OK</think> OK"),
+            complete(0, "length"),
+        ],
+        true,
+        spec,
+    ))
+    .await;
+    result.expect("the stream ends well");
+    assert_eq!(chat_text(&events, 0, "content"), "OKOK</think> OK");
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"clean\""],
+    )
+    .expect("the outputs counter");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    assert!(
+        series_line(
+            &scrape,
+            "smg_symphony_outputs_total",
+            &["table=\"qwen3\"", "outcome=\"malformed\""]
+        )
+        .is_none_or(|line| line.ends_with(" 0")),
+        "{scrape}"
+    );
+    assert!(!scrape.contains("smg_symphony_malformed"), "{scrape}");
+    assert!(!logs_contain("Symphony did not read the whole output"));
+    assert!(logs_contain(
+        "Symphony kept markers of the table as text in an output the request ran past the model's own end"
+    ));
+    assert!(logs_contain("markers=1"));
+    assert!(logs_contain("finish=\"length\""));
 }
 
 /// A streamed call to a function the request did not declare: the deltas carry the name as the
