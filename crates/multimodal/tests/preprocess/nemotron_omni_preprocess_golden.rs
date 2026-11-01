@@ -14,7 +14,6 @@
 
 use std::f64::consts::PI;
 
-use image::{DynamicImage, RgbImage};
 use llm_multimodal::{
     audio::{DecodedAudio, ParakeetAudioProcessor},
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
@@ -25,6 +24,8 @@ use llm_multimodal::{
     RgbFrameRef,
 };
 use serde::Deserialize;
+
+use super::make_seeded_image;
 
 /// Normalized pixels: the float resize differs from torch's only in summation order (~1e-6).
 const IMAGE_TOL: f64 = 1e-5;
@@ -92,17 +93,6 @@ struct AudioCase {
     summary: Summary,
 }
 
-/// The generator's `seeded_image`.
-fn seeded_image(width: u32, height: u32, seed: u8) -> DynamicImage {
-    DynamicImage::ImageRgb8(RgbImage::from_fn(width, height, |x, y| {
-        image::Rgb([
-            seed.wrapping_add(((x * 7 + y * 3) % 256) as u8),
-            seed.wrapping_add(((x * 5 + y * 11) % 256) as u8),
-            seed.wrapping_add(((x + y * 2) % 256) as u8),
-        ])
-    }))
-}
-
 /// The generator's `audio_pcm`.
 fn audio_pcm(seconds: f64, gain: f64) -> Vec<f32> {
     let n = (seconds * 16000.0).round() as usize;
@@ -164,7 +154,7 @@ fn images_match_the_reference_tiler() {
                 seed,
             } => (
                 format!("seed {seed} {width}x{height}"),
-                seeded_image(*width, *height, *seed),
+                make_seeded_image(*width, *height, *seed),
             ),
             Source::File { file } => (
                 file.clone(),
@@ -212,7 +202,7 @@ fn video_frames_match_the_reference_sizing() {
         let name = format!("video {width}x{height} x{}", seeds.len());
         let frames: Vec<_> = seeds
             .iter()
-            .map(|&seed| seeded_image(*width, *height, seed))
+            .map(|&seed| make_seeded_image(*width, *height, seed))
             .collect();
         let rgb: Vec<_> = frames.iter().map(rgb_bytes).collect();
         let refs: Vec<_> = rgb

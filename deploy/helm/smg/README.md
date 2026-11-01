@@ -245,6 +245,15 @@ A router that gets its workers at runtime through the admin API (`POST /workers`
 
 The gateway drains in-flight requests for `router.shutdownGracePeriodSeconds` (default 180, passed as `--shutdown-grace-period-secs`); the pod's `terminationGracePeriodSeconds` is that plus `router.terminationGraceMarginSeconds` (default 30), so the kubelet does not kill the drain at its default 30 s.
 
+During shutdown, readiness fails immediately while listeners stay open for
+`min(router.shutdownGracePeriodSeconds / 2, 5 seconds)` by default.
+Set `router.shutdownSettleSeconds` (`--shutdown-settle-secs`) to adjust this
+propagation window; the effective window is the smaller of this value and half
+the grace. For example, a 180-second grace and a 30-second window leaves
+150 seconds for draining existing requests. Longer windows also delay idle
+shutdowns and local Ctrl+C exits. A value of 0 skips the propagation wait
+(mesh departure still shares the total grace budget).
+
 #### Dashboard and Alerts
 
 `grafana.dashboard.enabled` ships a Grafana dashboard as a ConfigMap (label `grafana_dashboard: "1"` for the sidecar loader) with `namespace` and `job` variables that pick the release (every query is scoped to both) and 41 panels in seven rows: traffic (request rate, responses by status, 5xx ratio, errors by API code and router error type, token throughput), latency (TTFT and time per output token p50/p95/p99 and per model, request and HTTP duration p99), capacity and queues (admission in-flight and queued, rejections, engine running and waiting requests, KV cache usage and in-flight request age per worker, connections), workers (healthy count, health and circuit-breaker state per worker, health checks, overload shed and fallback, retries), cache and KV events (engine prefix cache hit rate, cache-aware decisions and match ratio, KV event lag, integrity counters, degraded ranks, index size), Symphony (outputs by outcome, malformed outputs by reason, fallbacks and refusals) and runtime (tokio busy ratio, event-loop stalls and delay, dropped log lines, memory, tasks, tokenizer cache). Every panel queries a family the gateway describes; the gateway's test suite holds the dashboard to the catalog.

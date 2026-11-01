@@ -92,20 +92,13 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorke
 
 #[cfg(test)]
 mod tests {
-    use std::sync::OnceLock;
-
-    use llm_tokenizer::registry::TokenizerRegistry;
     use openai_protocol::worker::WorkerSpec;
-    use smg_data_connector::{
-        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
-    };
     use wfaas::WorkflowInstanceId;
 
     use super::*;
     use crate::{
-        app_context::AppContext,
+        app_context::{testing::app_context_for_tests, AppContext},
         config::RouterConfig,
-        policies::PolicyRegistry,
         worker::{event::WorkerEvent, BasicWorkerBuilder, WorkerRegistry},
         workflow::{data::WorkerRegistrationMode, steps::create_worker_workflow_data},
     };
@@ -150,26 +143,10 @@ mod tests {
     }
 
     fn test_app_context() -> Arc<AppContext> {
-        let router_config = RouterConfig::default();
-        Arc::new(
-            AppContext::builder()
-                .client(crate::clients::http_client())
-                .rate_limiter(None)
-                .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
-                .reasoning_parser_factory(None)
-                .tool_parser_factory(None)
-                .worker_registry(Arc::new(WorkerRegistry::new()))
-                .policy_registry(Arc::new(PolicyRegistry::new(router_config.policy.clone())))
-                .router_config(router_config)
-                .response_storage(Arc::new(MemoryResponseStorage::new()))
-                .conversation_storage(Arc::new(MemoryConversationStorage::new()))
-                .conversation_item_storage(Arc::new(MemoryConversationItemStorage::new()))
-                .worker_monitor(None)
-                .worker_job_queue(Arc::new(OnceLock::new()))
-                .workflow_engines(Arc::new(OnceLock::new()))
-                .mcp_orchestrator(Arc::new(OnceLock::new()))
-                .build()
-                .expect("app context"),
+        app_context_for_tests(
+            RouterConfig::default(),
+            Arc::new(WorkerRegistry::new()),
+            None,
         )
     }
 

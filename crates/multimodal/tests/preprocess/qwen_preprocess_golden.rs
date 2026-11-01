@@ -1,7 +1,7 @@
 //! Mandatory HuggingFace golden checks for Qwen image preprocessing.
 #![allow(clippy::expect_used, clippy::panic)]
 
-use image::{DynamicImage, RgbImage};
+use image::DynamicImage;
 use llm_multimodal::{
     vision::{
         processor::ModelSpecificValue, PreProcessorConfig, Qwen2VLProcessor, Qwen3VLProcessor,
@@ -10,6 +10,8 @@ use llm_multimodal::{
     Modality,
 };
 use serde::Deserialize;
+
+use super::make_seeded_image;
 
 #[derive(Deserialize)]
 struct GoldenDocument {
@@ -43,16 +45,6 @@ struct GoldenVideoCase {
 
 fn make_image(width: u32, height: u32) -> DynamicImage {
     make_seeded_image(width, height, 0)
-}
-
-fn make_seeded_image(width: u32, height: u32, seed: u8) -> DynamicImage {
-    DynamicImage::ImageRgb8(RgbImage::from_fn(width, height, |x, y| {
-        image::Rgb([
-            seed.wrapping_add(((x * 7 + y * 3) % 256) as u8),
-            seed.wrapping_add(((x * 5 + y * 11) % 256) as u8),
-            seed.wrapping_add(((x + y * 2) % 256) as u8),
-        ])
-    }))
 }
 
 fn image_grid(result: &llm_multimodal::vision::PreprocessedEncoderInputs) -> &[i64] {

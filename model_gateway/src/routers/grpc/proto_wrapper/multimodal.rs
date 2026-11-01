@@ -119,6 +119,7 @@ impl VllmMultimodalData {
 /// SGLang multimodal data: preprocessed tensors with patch-only placeholders.
 #[derive(Debug)]
 pub struct SglangMultimodalData {
+    pub modality: String,
     pub image_data: Vec<Vec<u8>>,
     pub pixel_values: Vec<u8>,
     pub pixel_values_shape: Vec<u32>,
@@ -288,13 +289,14 @@ impl SglangMultimodalData {
             .collect();
 
         sglang::MultimodalInputs {
+            feature_hash: None,
             image_urls: vec![],
             video_urls: vec![],
             audio_urls: vec![],
             image_data: self.image_data,
             video_data: vec![],
             audio_data: vec![],
-            modalities: vec!["image".to_string()],
+            modalities: vec![self.modality],
             pixel_values: Some(sglang::TensorData {
                 data: self.pixel_values.into(),
                 shape: self.pixel_values_shape,

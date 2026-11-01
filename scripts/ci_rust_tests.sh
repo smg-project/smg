@@ -10,7 +10,8 @@
 #   ci_rust_tests.sh commands <shard>      the shard's cargo test invocations, one per line
 #   ci_rust_tests.sh build <shard>         compile the shard's tests (cargo test --no-run)
 #   ci_rust_tests.sh run <shard>           run the shard's tests
-#   ci_rust_tests.sh lint <leg>            one lint configuration: all-features, self-hosted, anthropic-only,
+#   ci_rust_tests.sh lint <leg>            one lint configuration: all-features (clippy with every feature, then
+#                                          the workspace's rustdoc under -D warnings), self-hosted, anthropic-only,
 #                                          default-build (the default feature set compiles without OpenCV)
 #   ci_rust_tests.sh check                 every workspace package, every gateway test binary and every
 #                                          radix-tree test binary belongs to exactly one shard
@@ -215,7 +216,10 @@ run_commands() {
 lint() {
     case "$1" in
         all-features)
-            (set -x; cargo clippy --all-targets --all-features -- -D warnings) ;;
+            (set -x; cargo clippy --all-targets --all-features -- -D warnings)
+            # The workspace's public documentation, every feature on, builds without a warning,
+            # so a moved or renamed item cannot leave a dangling or private link behind.
+            (set -x; RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --all-features) ;;
         # Meaningful only because the gateway crate's self dev-dependency
         # disables default features; see model_gateway/Cargo.toml.
         self-hosted)

@@ -48,7 +48,7 @@ on:
         required: false
         type: string
         default: ""
-        description: "The gateway's --parser, legacy or symphony; blank leaves its default, legacy"
+        description: "The gateway's --parser, legacy or symphony; blank leaves its default, symphony"
       setup_agentic_deps:
         required: false
         type: boolean
@@ -110,7 +110,7 @@ on:
         default: false
         description: "Also run grpc_servicer/tests here, where the importorskip('vllm') / importorskip('sglang') cases meet a real engine; set on one lane per engine"
       servicer_impl:
-        description: "Which gRPC servicer the workers of the job's engine run (rust or python), handed to that engine's harness flag; empty keeps the engine default"
+        description: "Which gRPC servicer the workers of the job's engine run (rust or python), handed to that engine's harness flag; empty follows the servicer package's default"
         required: false
         type: string
         default: ""
@@ -129,9 +129,15 @@ on:
         required: false
         type: string
         default: ""
+      enabled:
+        description: "Whether this row runs: false skips the job before it takes a runner (a caller's matrix row the changed paths do not reach)"
+        required: false
+        type: boolean
+        default: true
 
 jobs:
   run:
+    if: ${{ inputs.enabled }}
     runs-on: ${{ inputs.runner }}
     container: ${{ inputs.container_image != '' && fromJSON(format('{{"image":{0},"options":{1}}}', toJSON(inputs.container_image), toJSON(inputs.container_options))) || vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     timeout-minutes: ${{ inputs.timeout }}
@@ -149,7 +155,7 @@ jobs:
       E2E_CONNECTION_MODE: ${{ inputs.connection_mode }}
       E2E_ZMQ_ENGINE_COUNT: ${{ inputs.zmq_engine_count }}
       E2E_MM_PROCESSING: ${{ inputs.mm_processing }}
-      # The harness passes this to the gateway as --parser (blank: the gateway's default, legacy).
+      # The harness passes this to the gateway as --parser (blank: the gateway's default, symphony).
       E2E_PARSER: ${{ inputs.parser }}
       # The servicer choice reaches the harness flag of the job's engine only.
       E2E_SGLANG_SERVICER_IMPL: ${{ inputs.engine == 'sglang' && inputs.servicer_impl || '' }}
@@ -282,6 +288,7 @@ jobs:
           E2E_LOG_DIR: e2e-logs
           E2E_MIN_SELECTED: ${{ inputs.min_selected }}
           E2E_AMD_REQUIRE_PASSING_CALL: ${{ inputs.gpu_vendor == 'amd' && '1' || '' }}
+          E2E_GPU_VENDOR: ${{ inputs.gpu_vendor }}
           BRAVE_MCP_HOST: ${{ inputs.setup_agentic_deps && 'brave-search-mcp' || '' }}
           # Every gRPC servicer runs a planned warm-up before it reports
           # SERVING (grpc_servicer/smg_grpc_servicer/warmup.py). At its default
@@ -341,8 +348,8 @@ jobs:
           if [ -n "$MM" ]; then
             SUFFIX="${SUFFIX}-mm-${MM}"
           fi
-          # A Rust-servicer leg runs the same suite as the engine's Python
-          # servicer leg; keep their log artifacts apart.
+          # A leg that names its servicer runs the same suite as the engine's
+          # default leg; keep their log artifacts apart.
           IMPL="${{ inputs.servicer_impl }}"
           if [ -n "$IMPL" ]; then
             SUFFIX="${SUFFIX}-${IMPL}-servicer"

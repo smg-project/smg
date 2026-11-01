@@ -9,10 +9,7 @@ use std::{
 
 use futures_util::StreamExt;
 use smg::worker::Worker;
-use smg_grpc_client::{
-    sglang_proto as proto,
-    sglang_scheduler::{AbortOnDropStream, SglangSchedulerClient},
-};
+use smg_grpc_client::{sglang_proto as proto, sglang_scheduler::AbortOnDropStream};
 
 use super::{
     error::{set_error_message, SglErrorCode},
@@ -30,15 +27,9 @@ use super::{
 ///
 /// * `stream` - The gRPC stream wrapped in AbortOnDropStream for automatic cleanup
 /// * `converter` - Response converter that transforms proto messages to OpenAI format
-/// * `client` - The underlying gRPC client connection
-/// * `prompt_tokens` - Number of prompt tokens from the original request
 pub struct SglangStreamHandle {
     pub(crate) stream: Arc<tokio::sync::Mutex<AbortOnDropStream>>,
     pub(crate) converter: Arc<tokio::sync::Mutex<GrpcResponseConverterHandle>>,
-    #[expect(dead_code)]
-    pub(crate) client: Arc<SglangSchedulerClient>,
-    #[expect(dead_code)]
-    pub(crate) prompt_tokens: u32, // Number of prompt tokens for this request
     /// The load this stream holds on the worker a policy selected, given
     /// back when the handle is freed. None for single-client streams.
     pub(crate) load: Option<HeldLoad>,

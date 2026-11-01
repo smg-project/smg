@@ -107,14 +107,6 @@ const HAND_WRITTEN_SET: &str = "common";
 /// content would be.
 const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 
-/// The reason of the render sets of a Llama-class checkpoint whose
-/// `tokenizer.json` keeps the legacy pipeline: the reference's ids were
-/// recorded from that file read as it is, the engines' tokenizer class
-/// rebuilds the pipeline, and the loader follows the class (see
-/// `huggingface::HuggingFaceTokenizer::llama_class_pipeline`). The tokenizer
-/// crate's fixture harness lists the same sets under the same reason.
-const LEGACY_FILE_PIPELINE: &str = "the render ids of this Llama-class checkpoint were recorded from its raw tokenizer.json read by `tokenizers` (the file's legacy pipeline, the ids transformers 4.x gave by taking the file as is: a word marker after every special token, a marker token missed after a newline or a letter); transformers 5.17.0, the version the engines run, rebuilds the class's pipeline (no normalizer, a Metaspace pre-tokenizer) and the loader matches it since smg-project/smg#4248, so the reference's ids differ from the engine's at the special tokens and the markers while the text is equal; every render case of the model, until the sets are re-recorded with the class (smg-project/bellwether#210), when this entry heals and the run asks for its removal";
-
 /// Cases known to differ from the reference, each with the reason and where
 /// it is tracked: a fixture id, `<slug>/render/<name>`; a prefix ending in
 /// `*`, which stands for every case whose id begins with what is before it
@@ -135,62 +127,6 @@ const LEGACY_FILE_PIPELINE: &str = "the render ids of this Llama-class checkpoin
 /// tree omits (`bellwether unpack --sample-sets` writes every Nth) are left
 /// alone, an id of one of its cases among them.
 const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
-    (
-        "*/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is \
-         always appended (smg-project/smg#2780): one case of every model",
-    ),
-    (
-        "*/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template \
-         has no developer branch, as the engine's renderer does (smg-project/smg#3022); \
-         the recorded template run keeps or drops the role: one case of every such model",
-    ),
-    (
-        "*/render/tools-history-content-and-call",
-        "the gateway parses a history call's arguments into an object before rendering, \
-         which the templates that write the string as recorded render otherwise: one \
-         case of every such model",
-    ),
-    (
-        "*/render/tools-history-parallel-calls",
-        "the gateway parses a history call's arguments into an object before rendering, \
-         which the templates that write the string as recorded render otherwise: one \
-         case of every such model",
-    ),
-    (
-        "*/render/tools-history-results-reordered",
-        "the gateway parses a history call's arguments into an object before rendering, \
-         which the templates that write the string as recorded render otherwise: one \
-         case of every such model",
-    ),
-    (
-        "*/render/tools-history-single-call",
-        "the gateway parses a history call's arguments into an object before rendering, \
-         which the templates that write the string as recorded render otherwise: one \
-         case of every such model",
-    ),
-    (
-        "apertus-70b-instruct-2509/render/*",
-        "the template writes the day of the render into the prompt with strftime_now and \
-         the group was recorded on 2026-10-13, where the job renders SOURCE_DATE_EPOCH's \
-         day, 2026-10-14, the day most of the dated groups were recorded; every case of \
-         the model, until the recorder pins the day",
-    ),
-    (
-        "apertus-8b-instruct-2509/render/*",
-        "the template writes the day of the render into the prompt with strftime_now and \
-         the group was recorded on 2026-10-12, where the job renders SOURCE_DATE_EPOCH's \
-         day, 2026-10-14, the day most of the dated groups were recorded; every case of \
-         the model, until the recorder pins the day",
-    ),
-    (
-        "arcee-blitz/render/*",
-        "the template writes the day of the render into the prompt with strftime_now and \
-         the group was recorded on 2026-10-13, where the job renders SOURCE_DATE_EPOCH's \
-         day, 2026-10-14, the day most of the dated groups were recorded; every case of \
-         the model, until the recorder pins the day",
-    ),
     (
         "deepseek-v3.1/render/bfcl-*",
         "the checkpoint's template never reads the request's tools and the reference is \
@@ -222,34 +158,17 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          as the engines' tool chat templates do (smg-project/smg#3946)",
     ),
     (
-        "deepseek-v3.1/render/tools-history-content-and-call",
-        "the checkpoint's template never reads the request's tools and the reference is \
-         its own render; the gateway writes the family's tools block into the system prompt \
-         as the engines' tool chat templates do (smg-project/smg#3946)",
-    ),
-    (
-        "deepseek-v3.1/render/tools-history-parallel-calls",
-        "the checkpoint's template never reads the request's tools and the reference is \
-         its own render; the gateway writes the family's tools block into the system prompt \
-         as the engines' tool chat templates do (smg-project/smg#3946)",
-    ),
-    (
-        "deepseek-v3.1/render/tools-history-results-reordered",
-        "the checkpoint's template never reads the request's tools and the reference is \
-         its own render; the gateway writes the family's tools block into the system prompt \
-         as the engines' tool chat templates do (smg-project/smg#3946)",
-    ),
-    (
-        "deepseek-v3.1/render/tools-history-single-call",
-        "the checkpoint's template never reads the request's tools and the reference is \
-         its own render; the gateway writes the family's tools block into the system prompt \
-         as the engines' tool chat templates do (smg-project/smg#3946)",
-    ),
-    (
         "deepseek-v3.1/render/tools-schema-with-defs",
         "the checkpoint's template never reads the request's tools and the reference is \
          its own render; the gateway writes the family's tools block into the system prompt \
          as the engines' tool chat templates do (smg-project/smg#3946)",
+    ),
+    (
+        "deepseek-v3.2-exp/render/no-generation-prompt",
+        "the native renderer writes the generation header whatever `add_generation_prompt` \
+         says, as the engine's own encoder for this family does (it reads neither that flag \
+         nor `continue_final_message`); the recorded template run leaves the conversation \
+         closed",
     ),
     (
         "deepseek-v3.2-exp/render/text-system-after-user",
@@ -289,74 +208,11 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          a call history, not the encoder's (the cases without a call history match)",
     ),
     (
-        "deepseek-v4.1-flash/render/tools-history-content-and-call",
-        "the checkpoint's own encoder, which this renderer follows and the engines port, \
-         parses a history call's `arguments` string into one DSML parameter per key; the \
-         checkpoint's Jinja template writes the string whole as a single `arguments` \
-         parameter",
-    ),
-    (
-        "deepseek-v4.1-flash/render/tools-history-parallel-calls",
-        "the checkpoint's own encoder, which this renderer follows and the engines port, \
-         parses a history call's `arguments` string into one DSML parameter per key; the \
-         checkpoint's Jinja template writes the string whole as a single `arguments` \
-         parameter",
-    ),
-    (
-        "deepseek-v4.1-flash/render/tools-history-results-reordered",
-        "the checkpoint's own encoder, which this renderer follows and the engines port, \
-         parses a history call's `arguments` string into one DSML parameter per key; the \
-         checkpoint's Jinja template writes the string whole as a single `arguments` \
-         parameter",
-    ),
-    (
-        "deepseek-v4.1-flash/render/tools-history-single-call",
-        "the checkpoint's own encoder, which this renderer follows and the engines port, \
-         parses a history call's `arguments` string into one DSML parameter per key; the \
-         checkpoint's Jinja template writes the string whole as a single `arguments` \
-         parameter",
-    ),
-    (
-        "dots.mocr/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
-        "dots.ocr.base/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
-        "eagle2-2b/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
-        "game-rl-llava-ov-7b/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
-        "granite-3.2-8b-instruct-preview/render/*",
-        "the template writes the day of the render into the prompt with strftime_now and \
-         the group was recorded on 2026-10-13, where the job renders SOURCE_DATE_EPOCH's \
-         day, 2026-10-14, the day most of the dated groups were recorded; every case of \
-         the model, until the recorder pins the day",
-    ),
-    (
-        "granite-3.3-8b-math-prm-v2/render/*",
-        "the template writes the day of the render into the prompt with strftime_now and \
-         the group was recorded on 2026-10-13, where the job renders SOURCE_DATE_EPOCH's \
-         day, 2026-10-14, the day most of the dated groups were recorded; every case of \
-         the model, until the recorder pins the day",
+        "deepseek-v4.1-flash/render/no-generation-prompt",
+        "the native renderer writes the generation header whatever `add_generation_prompt` \
+         says, as the engine's own encoder for this family does (it reads neither that flag \
+         nor `continue_final_message`); the recorded template run leaves the conversation \
+         closed",
     ),
     (
         "hermes-4-14b/render/hermes-func-calling-*",
@@ -371,31 +227,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          differently (smg-project/smg#2783)",
     ),
     (
-        "hermes-4-14b/render/tools-history-content-and-call",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "hermes-4-14b/render/tools-history-parallel-calls",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "hermes-4-14b/render/tools-history-results-reordered",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "hermes-4-14b/render/tools-history-single-call",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "idefics3-8b-llama3/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
+        "kimi-k3/render/continue-final-message",
+        "the checkpoint's own encoder, which the gateway ports (smg-project/smg#1968), reads no \
+         `continue_final_message`: the vendor-code reference renders the final assistant \
+         message closed (an empty thought, the response, the end of the message), while the \
+         gateway appends the prefill after the generation prompt as the serving engine's \
+         prefix append does (smg-project/smg#2434)",
     ),
     (
         "llama-3.1-nemotron-nano-8b-v1/render/glaive-v2-32.jsonl",
@@ -416,70 +253,11 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          differently (smg-project/smg#2783)",
     ),
     (
-        "llama-xlam-2-8b-fc-r/render/tools-history-content-and-call",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "llama-xlam-2-8b-fc-r/render/tools-history-parallel-calls",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "llama-xlam-2-8b-fc-r/render/tools-history-results-reordered",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "llama-xlam-2-8b-fc-r/render/tools-history-single-call",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "llava-onevision-qwen2-0.5b-ov-hf/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
-        "llava-v1.6-mistral-7b-hf/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
-        "locateanything-3b/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
         "mimo-vl-7b-rl-2508/render/glaive-v2-61.jsonl",
         "the gateway parses a history call's arguments into an object before rendering, \
          which the template, writing the string as recorded, renders otherwise: a \
          benchmark set in the tree's sample, every case with a call in its history",
     ),
-    (
-        "mistral-small-24b-instruct-2501/render/*",
-        "the template writes the day of the render into the prompt with strftime_now and \
-         the group was recorded on 2026-10-12, where the job renders SOURCE_DATE_EPOCH's \
-         day, 2026-10-14, the day most of the dated groups were recorded; every case of \
-         the model, until the recorder pins the day",
-    ),
-    (
-        "muse-glimmer-30b/render/*",
-        "the template writes the day of the render into the prompt with strftime_now and \
-         the group was recorded on 2026-10-12, where the job renders SOURCE_DATE_EPOCH's \
-         day, 2026-10-14, the day most of the dated groups were recorded; every case of \
-         the model, until the recorder pins the day",
-    ),
-    ("nanbeige4-3b-thinking-2510/render/*", LEGACY_FILE_PIPELINE),
-    ("nanbeige4-3b-thinking-2511/render/*", LEGACY_FILE_PIPELINE),
-    ("nanbeige4.1-3b/render/*", LEGACY_FILE_PIPELINE),
-    ("nanollama/render/*", LEGACY_FILE_PIPELINE),
     (
         "nft-7b/render/swehero-5.jsonl",
         "the gateway parses a history call's arguments into an object before rendering, \
@@ -505,34 +283,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          differently (smg-project/smg#2783)",
     ),
     (
-        "qwen2.5-7b-instruct-1m/render/tools-history-content-and-call",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "qwen2.5-7b-instruct-1m/render/tools-history-parallel-calls",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "qwen2.5-7b-instruct-1m/render/tools-history-results-reordered",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "qwen2.5-7b-instruct-1m/render/tools-history-single-call",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "qwen3-omni-30b-a3b-instruct/render/continue-final-message",
-        "the reference was recorded with string content, while the gateway hands this template \
-         text parts, as the engine does (smg-project/bellwether#105 recorded the Thinking \
-         variant that way, not this one); the template finds the last user query only in \
-         string content, so only the reference opens an empty thought block in the continued \
-         turn",
-    ),
-    (
         "qwq-32b/render/hermes-func-calling-*",
         "the gateway parses tool-call arguments into objects before rendering and this \
          template writes them as the API's string, so a call in the history renders \
@@ -545,63 +295,10 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          differently (smg-project/smg#2783)",
     ),
     (
-        "qwq-32b/render/tools-history-content-and-call",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
         "shieldvlm-7b-qwen/render/glaive-v2-12.jsonl",
         "the gateway parses a history call's arguments into an object before rendering, \
          which the template, writing the string as recorded, renders otherwise: a \
          benchmark set in the tree's sample, every case with a call in its history",
-    ),
-    (
-        "smolvlm-256m-base/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
-        "smolvlm-500m-base/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
-        "smolvlm2-2.2b-base/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
-        "spec-decoding-subfolder-fixture/render/*",
-        LEGACY_FILE_PIPELINE,
-    ),
-    ("tinyllama-1.1b-chat-v1.0/render/*", LEGACY_FILE_PIPELINE),
-    ("toolmind-web-3b/render/*", LEGACY_FILE_PIPELINE),
-    (
-        "step3/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
-        "ui-tars-72b-dpo/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
-    ),
-    (
-        "ui-tars-7b-dpo/render/*",
-        "the references of this checkpoint were recorded with the tokenizer chat template; \
-         the engine server renders a request without tools with the processor template, as \
-         the gateway does now; every tool-less case of the model, until the references \
-         re-recorded under the engine rule are pinned",
     ),
 ];
 /// Models whose tokenizer is known not to load, with the reason and where it
@@ -682,12 +379,6 @@ const KNOWN_UNLOADED: &[(&str, &str)] = &[
          own secret)",
     ),
     (
-        "kimi-k3",
-        "the checkpoint ships tiktoken.model and no tokenizer.json; this harness fetches \
-         tokenizer.json only (the tokenizer harness reads the tiktoken file since \
-         smg-project/smg#2923)",
-    ),
-    (
         "llama-3.2-11b-vision-instruct",
         "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
          files behind the gate are not fetched (bellwether recorded the group with its \
@@ -695,6 +386,12 @@ const KNOWN_UNLOADED: &[(&str, &str)] = &[
     ),
     (
         "llama-3.2-1b-instruct",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "llama-3.3-70b-instruct",
         "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
          files behind the gate are not fetched (bellwether recorded the group with its \
          own secret)",
@@ -1613,8 +1310,8 @@ impl Drop for StopOnPanic<'_> {
 /// migration, the `tool_choice` default; a request the gateway would answer
 /// with 400 is a difference, not a rendering), then the tools narrowed by
 /// `tool_choice` as the chat preparation stage does before rendering (every
-/// tool for a named choice, the subset for `allowed_tools`, none for `none`
-/// unless the renderer declares them itself), through the stage's own rule.
+/// tool for a named choice, the subset for `allowed_tools`, every tool under
+/// `none`), through the stage's own rule.
 /// `process_chat_messages` then renders it exactly as the gateway does before
 /// tokenizing, and the ids are the flat encode of that text, which is the
 /// gateway's tokenize step for a renderer that returns text to encode.
@@ -1631,8 +1328,8 @@ fn render(tok: &dyn Tokenizer, model: &str, request: &Value) -> Result<Rendered,
     // The preparation stage's own rule: a named `tool_choice` renders every
     // tool (the engine's own server renders them all and forces the call with
     // its grammar); an `allowed_tools` choice renders its subset; `none`
-    // renders no tool unless the renderer declares the tools itself.
-    let request = request_as_rendered(&request, tok.renderer_capabilities());
+    // renders every tool, as the engine's own server does.
+    let request = request_as_rendered(&request);
     let processed = process_chat_messages(&request, tok, None)?;
     let ids = tok
         .encode(&processed.text, false)
@@ -1863,9 +1560,16 @@ fn recorded_with(provenance: &Value) -> String {
 }
 
 /// The vocabulary files a checkpoint may ship, in the order they are tried:
-/// a `tokenizers` file, or the `vocab.json` + `merges.txt` pair of the models
-/// that have no `tokenizer.json` (Qwen3-Omni), which counts only whole.
-const VOCABULARIES: [&[&str]; 2] = [&["tokenizer.json"], &["vocab.json", "merges.txt"]];
+/// a `tokenizers` file; a tiktoken file for the models that have no
+/// `tokenizer.json` (Kimi); the `vocab.json` + `merges.txt` pair of the
+/// models that ship neither (Qwen3-Omni), which counts only whole. The same
+/// list, in the same order, as the tokenizer harness's: the two harnesses
+/// share one cache directory, so each asks for what the other would.
+const VOCABULARIES: [&[&str]; 3] = [
+    &["tokenizer.json"],
+    &["tiktoken.model"],
+    &["vocab.json", "merges.txt"],
+];
 
 /// The checkpoint's tokenizer files at the manifest's revision: the Hugging
 /// Face cache snapshot when it is there, else a one-time download of the files
@@ -1914,7 +1618,7 @@ fn tokenizer_dir(model: &str, revision: &str, slug: &str) -> Result<PathBuf, Str
     Ok(dir)
 }
 
-/// [`VOCABULARIES`] for a message: `tokenizer.json, vocab.json + merges.txt`.
+/// [`VOCABULARIES`] for a message: `tokenizer.json, tiktoken.model, vocab.json + merges.txt`.
 fn vocabularies() -> String {
     VOCABULARIES
         .iter()
@@ -1963,7 +1667,10 @@ fn download(
             bytes.len()
         ));
     }
-    let part = dir.join(format!("{file}.part"));
+    // Named for this process: two test binaries may fetch the same file into one
+    // shared directory at the same moment, and each renames its own whole file
+    // into place.
+    let part = dir.join(format!("{file}.{}.part", std::process::id()));
     fs::write(&part, &bytes).map_err(|e| format!("cannot write {}: {e}", part.display()))?;
     fs::rename(&part, &path)
         .map_err(|e| format!("cannot rename {} into place: {e}", part.display()))?;
@@ -2310,6 +2017,7 @@ fn a_cache_snapshot_with_any_whole_vocabulary_is_the_tokenizer_dir() {
     };
     let files = [
         snapshot("org/json", &["tokenizer_config.json", "tokenizer.json"]),
+        snapshot("org/tiktoken", &["tokenizer_config.json", "tiktoken.model"]),
         snapshot(
             "org/pair",
             &["tokenizer_config.json", "vocab.json", "merges.txt"],
@@ -2325,6 +2033,7 @@ fn a_cache_snapshot_with_any_whole_vocabulary_is_the_tokenizer_dir() {
     let hub = tree(&files).unwrap();
     for (model, found) in [
         ("org/json", true),
+        ("org/tiktoken", true),
         ("org/pair", true),
         ("org/half-pair", false),
         ("org/no-config", false),
@@ -3057,7 +2766,9 @@ fn a_download_whose_body_breaks_is_sent_again_and_lands_on_the_second_try() {
         "the wait before the second try was {elapsed:?}"
     );
     assert!(
-        !dir.path().join("tokenizer.json.part").exists(),
+        !dir.path()
+            .join(format!("tokenizer.json.{}.part", std::process::id()))
+            .exists(),
         "no part is left behind"
     );
     println!("a body broken once: 2 requests, the file landed after {elapsed:?}");
@@ -3160,7 +2871,10 @@ fn a_download_that_breaks_at_every_try_fails_after_the_bounded_retries() {
         "the waits of {waits:?} in all were honoured: {elapsed:?}"
     );
     assert!(!dir.path().join("tokenizer.json").exists());
-    assert!(!dir.path().join("tokenizer.json.part").exists());
+    assert!(!dir
+        .path()
+        .join(format!("tokenizer.json.{}.part", std::process::id()))
+        .exists());
     println!(
         "broken at every try: {} requests, failed after {elapsed:?}: {error}",
         served.load(Ordering::SeqCst)

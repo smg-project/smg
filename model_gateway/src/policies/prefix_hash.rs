@@ -366,7 +366,7 @@ impl LoadBalancingPolicy for PrefixHashPolicy {
         debug!(
             branch = branch.as_str(),
             level,
-            worker = result.map_or("none", |idx| workers[idx].url()),
+            worker = result.map_or("none", |idx| workers[idx].redacted_url()),
             model_id = result.map_or("none", |idx| workers[idx].model_id()),
             "Prefix-hash selection"
         );
@@ -384,31 +384,18 @@ impl LoadBalancingPolicy for PrefixHashPolicy {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use openai_protocol::worker::WorkerStatus;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, HashRing, WorkerLoadGuard, WorkerType};
-
-    fn create_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
-        urls.iter()
-            .map(|url| {
-                Arc::new(
-                    BasicWorkerBuilder::new(*url)
-                        .worker_type(WorkerType::Regular)
-                        .health_config(HealthCheckConfig {
-                            disable_health_check: true,
-                            ..Default::default()
-                        })
-                        .build(),
-                ) as Arc<dyn Worker>
-            })
-            .collect()
-    }
+    use crate::{
+        policies::test_support::make_workers,
+        worker::{HashRing, WorkerLoadGuard},
+    };
 
     #[test]
     fn test_prefix_hash_consistent_routing() {
         let policy = PrefixHashPolicy::with_defaults();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
 
         // Same tokens should always route to same worker
@@ -434,7 +421,7 @@ mod tests {
     #[test]
     fn overloaded_worker_is_skipped_by_the_ring_lookup() {
         let policy = PrefixHashPolicy::with_defaults();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
 
         let tokens: Vec<u32> = vec![11, 22, 33, 44, 55, 66, 77, 88];
@@ -461,7 +448,7 @@ mod tests {
     #[test]
     fn test_different_prefixes_distribute() {
         let policy = PrefixHashPolicy::with_defaults();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
 
         let mut distribution = std::collections::HashMap::new();
@@ -491,7 +478,7 @@ mod tests {
             prefix_token_count: 5, // Only look at first 5 tokens
             ..Default::default()
         });
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
 
         // Two sequences with same first 5 tokens should route to same worker
@@ -518,7 +505,7 @@ mod tests {
     #[test]
     fn test_untokenized_request_routes_consistently() {
         let policy = PrefixHashPolicy::with_defaults();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
 
         // Chat and completions requests reach the policy with text only.
@@ -545,7 +532,7 @@ mod tests {
             prefix_token_count: 2, // 8 characters of text
             ..Default::default()
         });
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
 
         let info1 = SelectWorkerInfo {
@@ -574,7 +561,7 @@ mod tests {
             prefix_token_count: 1, // 4 characters, mid-way through the emoji run
             ..Default::default()
         });
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
 
         let info = SelectWorkerInfo {
@@ -591,7 +578,7 @@ mod tests {
     #[test]
     fn test_tokens_take_priority_over_text() {
         let policy = PrefixHashPolicy::with_defaults();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
 
         let tokens: Vec<u32> = vec![7, 8, 9];
@@ -616,7 +603,7 @@ mod tests {
     #[test]
     fn test_routing_key_hint_overrides_token_and_text_keying() {
         let policy = PrefixHashPolicy::with_defaults();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
 
         let key_only = SelectWorkerInfo {
@@ -645,7 +632,7 @@ mod tests {
     #[test]
     fn test_routing_key_hint_consistent_and_distributes() {
         let policy = PrefixHashPolicy::with_defaults();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
 
         let info = SelectWorkerInfo {
@@ -679,7 +666,7 @@ mod tests {
     #[test]
     fn test_no_routing_key_falls_back_to_load() {
         let policy = PrefixHashPolicy::with_defaults();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
         let _busy = WorkerLoadGuard::new(workers[0].clone(), None);
 
@@ -711,7 +698,7 @@ mod tests {
     #[test]
     fn test_no_healthy_workers() {
         let policy = PrefixHashPolicy::with_defaults();
-        let workers = create_workers(&["http://w1:8000"]);
+        let workers = make_workers(&["http://w1:8000"]);
         workers[0].set_status(WorkerStatus::NotReady);
 
         let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
@@ -789,7 +776,7 @@ mod tests {
             cache_boundaries: vec![16, 64],
             ..Default::default()
         });
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
 
         // 70 and 100 tokens sharing the first 64: both key at boundary 64,
@@ -832,7 +819,7 @@ mod tests {
             ..Default::default()
         });
         let legacy = PrefixHashPolicy::with_defaults();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
 
         let tokens: Vec<u32> = (0..15).collect();
@@ -857,7 +844,7 @@ mod tests {
             cache_boundaries: vec![2048, 32768],
             ..Default::default()
         });
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
 
         let head: Vec<u32> = (0..2048).map(|i| i * 7 % 50000).collect();
@@ -892,7 +879,7 @@ mod tests {
             cache_boundaries: vec![16, 32],
             ..Default::default()
         });
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
 
         // Find a stream whose level-32 and level-16 ring targets differ.
@@ -955,7 +942,7 @@ mod tests {
             cache_boundaries: vec![4], // 16 characters of text
             ..Default::default()
         });
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
 
         let info1 = SelectWorkerInfo {
@@ -1004,7 +991,7 @@ mod tests {
             prefix_token_count: 5,
             ..Default::default()
         });
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
         let ring = Arc::new(HashRing::new(workers.iter().map(|w| w.url())));
 
         let tokens: Vec<u32> = (0..40).collect();
