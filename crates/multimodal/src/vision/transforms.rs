@@ -1574,6 +1574,7 @@ mod tests {
     use image::Rgba;
 
     use super::*;
+    use crate::test_support::create_test_image;
 
     #[test]
     fn catmull_rom_rgb_matches_image_resize() {
@@ -1654,10 +1655,6 @@ mod tests {
             pad_to_size_pil(&wide, 42_882, 42, Rgb([127, 127, 127])),
             Err(TransformError::ShapeError(_))
         ));
-    }
-
-    fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
-        DynamicImage::from(RgbImage::from_pixel(width, height, color))
     }
 
     /// The raw-RGB torchvision `uint8` resizer must be byte-for-byte identical

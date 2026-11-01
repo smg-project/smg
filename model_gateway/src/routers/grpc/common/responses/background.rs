@@ -1120,6 +1120,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+    use crate::routers::grpc::common::responses::test_support::completed_response;
 
     fn request() -> ResponsesRequest {
         serde_json::from_value(json!({
@@ -1189,6 +1190,21 @@ mod tests {
                 let _ = tx.send(());
             }
         }
+    }
+
+    /// Work that never ends on its own; the receiver fires when it is dropped.
+    fn pending_work() -> (
+        impl Future<Output = Result<(), Value>>,
+        oneshot::Receiver<()>,
+    ) {
+        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
+        let flag = DropFlag(Some(dropped_tx));
+        let work = async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+            Ok(())
+        };
+        (work, dropped_rx)
     }
 
     /// A memory store that counts its writes.
@@ -1879,13 +1895,7 @@ mod tests {
         store_queued(&storage, "resp_1").await;
         let registry = Arc::new(BackgroundResponses::new(4));
         let slot = registry.admit("resp_1").unwrap();
-        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
-        let flag = DropFlag(Some(dropped_tx));
-        let work = async move {
-            let _flag = flag;
-            std::future::pending::<()>().await;
-            Ok(())
-        };
+        let (work, dropped_rx) = pending_work();
         #[expect(
             clippy::disallowed_methods,
             reason = "the test awaits the task it spawns"
@@ -1909,13 +1919,7 @@ mod tests {
         store_queued(&storage, "resp_1").await;
         let registry = Arc::new(BackgroundResponses::new(4));
         let slot = registry.admit("resp_1").unwrap();
-        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
-        let flag = DropFlag(Some(dropped_tx));
-        let work = async move {
-            let _flag = flag;
-            std::future::pending::<()>().await;
-            Ok(())
-        };
+        let (work, dropped_rx) = pending_work();
         #[expect(
             clippy::disallowed_methods,
             reason = "the test awaits the task it spawns"
@@ -1980,13 +1984,7 @@ mod tests {
         store_queued(&storage, "resp_1").await;
         let registry = Arc::new(BackgroundResponses::new(4));
         let slot = registry.admit("resp_1").unwrap();
-        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
-        let flag = DropFlag(Some(dropped_tx));
-        let work = async move {
-            let _flag = flag;
-            std::future::pending::<()>().await;
-            Ok(())
-        };
+        let (work, dropped_rx) = pending_work();
         // The in_progress write fails: the record stays queued and the run
         // starts without having seen it.
         flaky.fail_next(1);
@@ -2164,13 +2162,7 @@ mod tests {
         let owner = Arc::new(BackgroundResponses::new(4));
         let other = Arc::new(BackgroundResponses::new(4));
         let slot = owner.admit("resp_1").unwrap();
-        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
-        let flag = DropFlag(Some(dropped_tx));
-        let work = async move {
-            let _flag = flag;
-            std::future::pending::<()>().await;
-            Ok(())
-        };
+        let (work, dropped_rx) = pending_work();
         #[expect(
             clippy::disallowed_methods,
             reason = "the test awaits the task it spawns"
@@ -2294,25 +2286,6 @@ mod tests {
             "max_output_tokens": 64
         }))
         .unwrap()
-    }
-
-    /// The terminal object of `request` with one output message.
-    fn completed_response(id: &str, request: &ResponsesRequest) -> ResponsesResponse {
-        let message = serde_json::from_value(json!({
-            "type": "message",
-            "id": "msg_1",
-            "role": "assistant",
-            "status": "completed",
-            "content": [{"type": "output_text", "text": "hello", "annotations": []}]
-        }))
-        .unwrap();
-        ResponsesResponse::builder(id, &request.model)
-            .copy_from_request(request)
-            .created_at(chrono::Utc::now().timestamp())
-            .completed_at(chrono::Utc::now().timestamp())
-            .status(ResponseStatus::Completed)
-            .add_output(message)
-            .build()
     }
 
     /// With background mode off the sweeper still runs once at start-up, for

@@ -53,38 +53,43 @@ This is handled in `scripts/ci_install_sglang.sh`.
 
 ## Release Process
 
-Both `smg-grpc-proto` and `smg-grpc-servicer` are published to PyPI via GitHub Actions.
-Releases are triggered by version bumps in the respective `pyproject.toml` files on `main`.
+Both `smg-grpc-proto` and `smg-grpc-servicer` are published to PyPI by the `release-grpc.yml`
+workflow, dispatched by the release owner against the release tag (nothing publishes on a push;
+`make release-publish-plan VERSION=<x.y.z>` prints the dispatch, see
+[scripts/release/README.md](../scripts/release/README.md)). A version bump in the respective
+`pyproject.toml` is what makes the dispatch publish a package: a version PyPI already has is skipped.
 
 ### Scenario 1: Changing only the servicer
 
 1. Make changes to servicer code
 2. Bump version in `grpc_servicer/pyproject.toml`
 3. Open PR, CI tests pass (both packages installed from source)
-4. Merge to `main` — `release-grpc-servicer.yml` fires, publishes to PyPI
+4. Merge; the next dispatch of `release-grpc.yml` publishes it
 
 ### Scenario 2: Changing only the proto
 
 1. Make changes to proto files and regenerate stubs
 2. Bump version in `crates/grpc_client/python/pyproject.toml`
 3. Open PR, CI tests pass
-4. Merge to `main` — `release-grpc-proto.yml` fires, publishes to PyPI
+4. Merge; the next dispatch of `release-grpc.yml` publishes it
 
 ### Scenario 3: Changing both proto and servicer (one PR)
 
 1. Make all changes (proto + servicer) in a single PR
 2. Bump versions in both `crates/grpc_client/python/pyproject.toml` and `grpc_servicer/pyproject.toml`
 3. Open PR, CI tests pass (both installed from source)
-4. Merge to `main` — both release workflows trigger
-5. `release-grpc-servicer.yml` waits for `release-grpc-proto.yml` to complete via `workflow_run`
-6. Proto publishes first, then servicer publishes (can resolve the new proto from PyPI)
+4. Merge; one dispatch of `release-grpc.yml` publishes both
+5. The workflow uploads the proto first, then the servicer (which can resolve the new proto from PyPI)
 
 ### Scenario 4: Changing both proto and servicer (two PRs)
 
 1. Open PR 1 with proto changes, bump proto version
-2. Merge PR 1 — proto publishes to PyPI
+2. Merge PR 1; the proto publishes with the next release tag's dispatch of `release-grpc.yml`
+   (the workflow refuses a dispatch from a branch, `main` included)
 3. Open PR 2 with servicer changes, bump servicer version
-4. Merge PR 2 — servicer publishes to PyPI (new proto already available)
+4. Merge PR 2; the servicer publishes with a later release's dispatch, once the proto's release
+   is on PyPI (consumers that need the new fields get it from there; the servicer's `>=` pin
+   accepts the previous proto too)
 
 ## Version Pinning
 

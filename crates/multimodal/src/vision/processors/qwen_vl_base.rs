@@ -414,6 +414,16 @@ impl QwenVLProcessorBase {
         self.transforms.filter
     }
 
+    /// Preserve an already aligned native-loader video grid and its pixel bytes.
+    /// Only the caller's clone is changed; ordinary Qwen/vLLM planning is unchanged.
+    pub(super) fn with_aligned_video_frames(mut self, pixels: usize) -> Self {
+        self.config.video_min_pixels = pixels;
+        self.config.video_max_pixels = pixels;
+        self.config.video_resize_mode = QwenVideoResizeMode::PerFrame;
+        self.transforms.do_resize = false;
+        self
+    }
+
     /// Allow non-zero video dimensions below the patch-alignment factor.
     ///
     /// Some model families upscale these inputs to the minimum aligned size,
@@ -2094,6 +2104,24 @@ mod tests {
         DynamicImage::ImageRgb8(image)
     }
 
+    /// The borrowed RGB views of `frames`, as a decoded video hands them to
+    /// the processor; every test frame is RGB8.
+    fn rgb_views(frames: &[DynamicImage]) -> Vec<RgbFrameRef<'_>> {
+        frames
+            .iter()
+            .map(|frame| {
+                let DynamicImage::ImageRgb8(rgb) = frame else {
+                    panic!("test frame is not RGB8");
+                };
+                RgbFrameRef {
+                    width: rgb.width(),
+                    height: rgb.height(),
+                    data: rgb.as_raw(),
+                }
+            })
+            .collect()
+    }
+
     fn create_sized_pattern_frame(w: u32, h: u32, seed: u8) -> DynamicImage {
         let mut image = RgbImage::new(w, h);
         for y in 0..h {
@@ -2288,19 +2316,7 @@ mod tests {
             "test must force a resize; target {target_w}x{target_h} should differ from 7x9"
         );
 
-        let rgb_frames = frames
-            .iter()
-            .map(|frame| {
-                let DynamicImage::ImageRgb8(rgb) = frame else {
-                    panic!("test frame is not RGB8");
-                };
-                RgbFrameRef {
-                    width: rgb.width(),
-                    height: rgb.height(),
-                    data: rgb.as_raw(),
-                }
-            })
-            .collect::<Vec<_>>();
+        let rgb_frames = rgb_views(&frames);
 
         let dynamic = processor
             .preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0))
@@ -2350,19 +2366,7 @@ mod tests {
             "test must force a resize; target {target_w}x{target_h} should differ from 7x9"
         );
 
-        let rgb_frames = frames
-            .iter()
-            .map(|frame| {
-                let DynamicImage::ImageRgb8(rgb) = frame else {
-                    panic!("test frame is not RGB8");
-                };
-                RgbFrameRef {
-                    width: rgb.width(),
-                    height: rgb.height(),
-                    data: rgb.as_raw(),
-                }
-            })
-            .collect::<Vec<_>>();
+        let rgb_frames = rgb_views(&frames);
 
         let dynamic = processor
             .preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0))
@@ -2550,19 +2554,7 @@ mod tests {
             create_pattern_frame(177),
         ];
 
-        let rgb_frames = frames
-            .iter()
-            .map(|frame| {
-                let DynamicImage::ImageRgb8(rgb) = frame else {
-                    panic!("test frame is not RGB8");
-                };
-                RgbFrameRef {
-                    width: rgb.width(),
-                    height: rgb.height(),
-                    data: rgb.as_raw(),
-                }
-            })
-            .collect::<Vec<_>>();
+        let rgb_frames = rgb_views(&frames);
 
         let dynamic_result = processor
             .preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0))
@@ -2606,19 +2598,7 @@ mod tests {
             create_sized_pattern_frame(280, 280, 101),
         ];
 
-        let rgb_frames = frames
-            .iter()
-            .map(|frame| {
-                let DynamicImage::ImageRgb8(rgb) = frame else {
-                    panic!("test frame is not RGB8");
-                };
-                RgbFrameRef {
-                    width: rgb.width(),
-                    height: rgb.height(),
-                    data: rgb.as_raw(),
-                }
-            })
-            .collect::<Vec<_>>();
+        let rgb_frames = rgb_views(&frames);
 
         let dynamic_result = processor
             .preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0))

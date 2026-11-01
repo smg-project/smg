@@ -28,13 +28,26 @@ over same-host headless TokenSpeed scheduler(s) on their msgpack ZMQ wire, with 
 same lifecycle shape; its launcher is ``serve_rust`` in
 ``smg_grpc_servicer.tokenspeed.rust``, reached by setting
 ``SMG_TOKENSPEED_SERVICER_IMPL=rust`` on ``python -m smg_grpc_servicer.tokenspeed``.
+
+:class:`TrtllmGrpcServer` serves ``trtllm.TrtllmService`` over a same-host
+TensorRT-LLM engine behind the shim beside its LLM API (the shim dials the
+msgpack ZMQ wire), with the same lifecycle shape; its launcher is ``serve_rust``
+in ``smg_grpc_servicer.trtllm``, reached by setting ``SMG_TRTLLM_SERVICER_IMPL=rust``
+on the engine's gRPC entrypoint.
 """
 
 from smg.smg_rs import (
     SglangGrpcServer,
     TokenSpeedGrpcServer,
+    TrtllmGrpcServer,
     VllmGrpcServer,
     init_servicer_tracing,
 )
 
-__all__ = ["SglangGrpcServer", "TokenSpeedGrpcServer", "VllmGrpcServer", "init_servicer_tracing"]
+__all__ = [
+    "SglangGrpcServer",
+    "TokenSpeedGrpcServer",
+    "TrtllmGrpcServer",
+    "VllmGrpcServer",
+    "init_servicer_tracing",
+]
