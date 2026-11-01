@@ -33,12 +33,12 @@ use crate::{
     config::types::RetryConfig,
     observability::metrics::{metrics_labels, Metrics},
     worker::{
+        basic::{RuntimeType, WorkerType},
         circuit_breaker::CircuitState,
         event::{WorkerConnected, WorkerEvent},
         hash_ring::HashRing,
         pd_pair_index::{PdPairIndex, PdWire},
         pd_pairing::PdPairingMode,
-        worker::{RuntimeType, WorkerType},
         ConnectionMode, Worker, DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
     },
 };
@@ -97,14 +97,16 @@ pub struct WorkerDescriptor {
 pub(crate) enum RoutingPool {
     HttpRegular,
     GrpcPipelineRegular,
-    /// Strictly gRPC, unlike [`Self::GrpcPipelineRegular`]: the ZMQ wire
-    /// carries no KV-transfer rendezvous, so a ZMQ worker must never join a
-    /// PD pool even though it rides the gRPC pipeline elsewhere.
+    /// gRPC workers, and direct-ZMQ TokenSpeed engines, unlike
+    /// [`Self::GrpcPipelineRegular`]'s every ZMQ worker: the other ZMQ wires
+    /// carry no KV-transfer rendezvous, so such a worker must never join a PD
+    /// pool even though it rides the gRPC pipeline elsewhere.
     GrpcPrefill,
-    /// Strictly gRPC (see [`Self::GrpcPrefill`]).
+    /// The members [`Self::GrpcPrefill`] admits.
     GrpcDecode,
-    /// Strictly gRPC: encode dispatch is a gRPC encoder RPC the direct-ZMQ
-    /// worker has no path for.
+    /// The members [`Self::GrpcPrefill`] admits: a TokenSpeed encode server
+    /// takes its encode request on the ZMQ lane; the other runtimes' encode
+    /// dispatch is a gRPC encoder RPC.
     GrpcEncode,
     /// HTTP-transport prefill pool for the HTTP PD router: it proxies plain
     /// HTTP to the selected worker's URL, so a gRPC or ZMQ worker must never
@@ -146,16 +148,13 @@ impl RoutingPool {
                     && worker.connection_mode().uses_grpc_pipeline()
             }
             Self::GrpcPrefill => {
-                *worker.worker_type() == WorkerType::Prefill
-                    && *worker.connection_mode() == ConnectionMode::Grpc
+                *worker.worker_type() == WorkerType::Prefill && serves_disaggregated_role(worker)
             }
             Self::GrpcDecode => {
-                *worker.worker_type() == WorkerType::Decode
-                    && *worker.connection_mode() == ConnectionMode::Grpc
+                *worker.worker_type() == WorkerType::Decode && serves_disaggregated_role(worker)
             }
             Self::GrpcEncode => {
-                *worker.worker_type() == WorkerType::Encode
-                    && *worker.connection_mode() == ConnectionMode::Grpc
+                *worker.worker_type() == WorkerType::Encode && serves_disaggregated_role(worker)
             }
             Self::HttpPrefill => {
                 *worker.worker_type() == WorkerType::Prefill
@@ -167,6 +166,18 @@ impl RoutingPool {
             }
             Self::External => worker.metadata().spec.runtime_type == RuntimeType::External,
         }
+    }
+}
+
+/// Whether a worker of a disaggregated role rides the gRPC pipeline's
+/// encode/prefill/decode dispatch: a gRPC worker, or a direct-ZMQ TokenSpeed
+/// engine, whose wire carries the rendezvous and the encode request (the
+/// other ZMQ wires carry neither, and registration refuses them a role).
+fn serves_disaggregated_role(worker: &Arc<dyn Worker>) -> bool {
+    match worker.connection_mode() {
+        ConnectionMode::Grpc => true,
+        ConnectionMode::Zmq => worker.metadata().spec.runtime_type == RuntimeType::TokenSpeed,
+        ConnectionMode::Http => false,
     }
 }
 

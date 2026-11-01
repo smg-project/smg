@@ -2,8 +2,9 @@
 //! and connector are generic over.
 //!
 //! vLLM's EngineCore protocol, TokenSpeed's native msgpack protocol (issues
-//! #2003/#2006) and SGLang's scheduler structs (spoken by the SMG plugin inside
-//! the scheduler) live alongside each other. All are msgpack-over-ZMQ with a
+//! #2003/#2006), SGLang's scheduler structs (spoken by the SMG plugin inside
+//! the scheduler) and the TensorRT-LLM shim's request (answered with that
+//! plugin's slim records) live alongside each other. All are msgpack-over-ZMQ with a
 //! single-byte request-type frame and share the same transport — only the
 //! message struct shapes differ, so the transport and connector are
 //! parameterized over the [`EngineProtocol`] trait and each engine family
@@ -19,6 +20,7 @@ pub mod handshake;
 pub(crate) mod positional;
 pub mod sglang;
 pub mod tokenspeed;
+pub mod trtllm;
 pub mod vllm;
 
 /// Engine-neutral per-rank load signal. Each protocol maps its native scheduler
@@ -118,10 +120,12 @@ pub trait EngineProtocol: Send + Sync + 'static {
     /// The typed per-request output streamed back.
     type Output: EngineOutput + Send + 'static;
     /// What this protocol reads off an engine's handshake and needs when it
-    /// decodes that engine's outputs: where the engine declared the optional
-    /// output columns this client knows (`()` for a protocol whose outputs
-    /// carry none). Read once per connection ([`EngineProtocol::read_layout`])
-    /// and handed to every [`EngineProtocol::decode_batch`].
+    /// frames that engine's requests or decodes its outputs: where the engine
+    /// declared the optional output columns this client knows, whether its
+    /// request decoder resolves tensors sent as auxiliary frames (`()` for a
+    /// protocol that needs neither). Read once per connection
+    /// ([`EngineProtocol::read_layout`]) and handed to every
+    /// [`EngineProtocol::encode_add`] and [`EngineProtocol::decode_batch`].
     type Layout: Clone + Default + PartialEq + std::fmt::Debug + Send + Sync + 'static;
 
     /// The single-byte request-type frame prepended to an add-request.
@@ -146,8 +150,9 @@ pub trait EngineProtocol: Send + Sync + 'static {
     fn data_parallel_rank(request: &Self::Request) -> Option<u32>;
     /// Reject fields this client cannot represent on the wire.
     fn validate(request: &Self::Request) -> Result<()>;
-    /// Encode the add payload plus any aux tensor frames (empty on the text path).
-    fn encode_add(request: &Self::Request) -> Result<(Vec<u8>, Vec<Bytes>)>;
+    /// Encode the add payload plus any aux tensor frames (empty on the text
+    /// path) for an engine of `layout`.
+    fn encode_add(request: &Self::Request, layout: &Self::Layout) -> Result<(Vec<u8>, Vec<Bytes>)>;
     /// Encode the abort payload for one request id.
     fn encode_abort(request_id: &str) -> Result<Vec<u8>>;
     /// Encode "start `wave` on every rank" as `(request-type frame, payload)`.
@@ -180,8 +185,10 @@ pub trait EngineProtocol: Send + Sync + 'static {
     /// The connection's [`EngineProtocol::Layout`], read off the engine's
     /// ready response: the positions the engine declares for the optional
     /// output columns this protocol knows, unset (the default) for a column
-    /// it does not declare. Never an error: an undeclared column is an older
-    /// engine, whose outputs decode as they always did.
+    /// it does not declare, and what it declares its request decoder
+    /// resolves. Never an error: an engine that declares nothing is an older
+    /// engine, whose requests are framed and whose outputs decode as they
+    /// always were.
     fn read_layout(_ready: &EngineCoreReadyResponse) -> Self::Layout {
         Self::Layout::default()
     }

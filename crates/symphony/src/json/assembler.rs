@@ -20,7 +20,7 @@
 use crate::{
     event::{Event, Events, MalformedReason, Text},
     json::{
-        fragments::Fragments,
+        fragments::{Arrived, Fragments},
         outline::{Scanner, Span},
     },
 };
@@ -116,8 +116,9 @@ impl Assembler {
 
     /// Append the next bytes of the object, push the events they complete, and return how many of
     /// the bytes the object took: all of them before the close, up to the closing brace in the
-    /// piece that carries it, none after it.
-    pub fn feed(&mut self, bytes: &str, out: &mut Events) -> usize {
+    /// piece that carries it, none after it. An argument fragment that lies within `bytes`
+    /// borrows them (`'d`, the delta's life, as the events of a text delta borrow it).
+    pub fn feed<'d>(&mut self, bytes: &'d str, out: &mut Events<'d>) -> usize {
         if self.done {
             return 0;
         }
@@ -131,6 +132,10 @@ impl Assembler {
                 close - before
             }
             None => bytes.len(),
+        };
+        let arrived = Arrived {
+            at: before,
+            text: &bytes[..taken],
         };
         // Two offsets and a span: nothing of the outline is copied per piece but what this
         // piece needs, and the name only once, when the call starts.
@@ -172,7 +177,7 @@ impl Assembler {
             });
             self.started = true;
         }
-        self.emit_new_argument_bytes(arguments.as_ref(), out);
+        self.emit_new_argument_bytes(arguments.as_ref(), arrived, out);
         if self.ended_at.is_none() {
             self.ended_at = self.stopped_at();
         }
@@ -181,7 +186,7 @@ impl Assembler {
             // nothing after them, or where its outline stopped, with what the outline read after
             // them. The call ends with what arrived, and the bytes from there on are the caller's
             // (`refused_tail`).
-            self.send_held(arguments.as_ref(), out);
+            self.send_held(arguments.as_ref(), Some(arrived), out);
             self.no_arguments(arguments.as_ref(), out);
             // An object that ended where its arguments broke said so at the break
             // (`Fragments::send`) and handed the bytes from there back; one whose outline
@@ -205,7 +210,7 @@ impl Assembler {
             return taken;
         }
         if let Some(close) = close {
-            self.send_held(arguments.as_ref(), out);
+            self.send_held(arguments.as_ref(), Some(arrived), out);
             self.no_arguments(arguments.as_ref(), out);
             // The object closed, and the arguments value with it. A value the judge refused said
             // so at the break, where the first byte a strict reader refuses stands; one the
@@ -242,7 +247,7 @@ impl Assembler {
         if arguments.is_none() && !self.scanner.found().arguments_named {
             out.push(Event::ToolCallArguments {
                 index: self.index,
-                json: "{}".to_string(),
+                json: "{}".into(),
                 source: Text::default(),
             });
         }
@@ -264,7 +269,7 @@ impl Assembler {
             // never closed, so what follows the arguments value is the tail of an unterminated
             // region: a comma cut short, a complete member, or bytes that are no member at all. A
             // closed object's tail is the source of its `ToolCallEnd` instead.
-            self.send_held(found.arguments.as_ref(), out);
+            self.send_held(found.arguments.as_ref(), None, out);
             // The arguments value itself may be what the close cut: a string or a container left
             // open, a word or a number the bytes end on. The fragments sent are not revised and
             // no value is made up for one the model never finished: the call ends as it stands,
@@ -318,10 +323,19 @@ impl Assembler {
 
     /// The argument bytes held back ([`Self::emit_new_argument_bytes`]), sent as the prefix they
     /// are when the value can take no more bytes: at its end, or the stream's.
-    fn send_held(&mut self, arguments: Option<&Span>, out: &mut Events) {
+    fn send_held<'d>(
+        &mut self,
+        arguments: Option<&Span>,
+        arrived: Option<Arrived<'d>>,
+        out: &mut Events<'d>,
+    ) {
         if let Some(span) = arguments {
-            self.fragments
-                .send_held(span.text(&self.text), self.index, out);
+            self.fragments.send_held(
+                span.text(&self.text),
+                arrived.map(|arrived| arrived.from(span.start)),
+                self.index,
+                out,
+            );
         }
     }
 
@@ -329,14 +343,20 @@ impl Assembler {
     /// arguments a valid JSON prefix, the break said once where they stop being one, the rest as
     /// the model wrote it, and the bytes the judge may still go back to held while the value is
     /// open ([`Fragments::send`], [`Fragments::send_rest`]).
-    fn emit_new_argument_bytes(&mut self, arguments: Option<&Span>, out: &mut Events) {
+    fn emit_new_argument_bytes<'d>(
+        &mut self,
+        arguments: Option<&Span>,
+        arrived: Arrived<'d>,
+        out: &mut Events<'d>,
+    ) {
         let Some(span) = arguments else {
             return;
         };
         let bytes = span.text(&self.text);
-        let Some(sent_to) = self
-            .fragments
-            .send(bytes, span.end.is_none(), self.index, out)
+        let arrived = Some(arrived.from(span.start));
+        let Some(sent_to) =
+            self.fragments
+                .send(bytes, arrived, span.end.is_none(), self.index, out)
         else {
             return;
         };
@@ -346,12 +366,17 @@ impl Assembler {
             self.ended_at = Some(span.start + sent_to);
             return;
         }
-        self.fragments.send_rest(bytes, self.index, out);
+        self.fragments.send_rest(bytes, arrived, self.index, out);
     }
 }
 
 impl crate::engine::CallAssembler for Assembler {
-    fn feed(&mut self, text: &str, _declared: &crate::Declared, out: &mut Events) -> usize {
+    fn feed<'d>(
+        &mut self,
+        text: &'d str,
+        _declared: &crate::Declared,
+        out: &mut Events<'d>,
+    ) -> usize {
         self.feed(text, out)
     }
 
@@ -369,6 +394,7 @@ impl crate::engine::CallAssembler for Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::arguments;
 
     const CALL: &str = r#"{"name": "get_weather", "arguments": {"city": "Paris", "days": [1, 2]}}"#;
     const ARGUMENTS: &str = r#"{"city": "Paris", "days": [1, 2]}"#;
@@ -380,7 +406,7 @@ mod tests {
             assembler.feed(piece, &mut out);
         }
         assembler.finish(&mut out);
-        out.drain()
+        out.into_owned().drain()
     }
 
     fn sources(events: &[Event]) -> String {
@@ -392,16 +418,6 @@ mod tests {
                 | Event::ToolCallEnd { source, .. } => &*source.text,
                 Event::Malformed { text, .. } => &*text.text,
                 _ => "",
-            })
-            .collect()
-    }
-
-    fn arguments(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|e| match e {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
-                _ => None,
             })
             .collect()
     }
@@ -1181,7 +1197,7 @@ mod tests {
             );
             assert_eq!(assembler.feed("more", &mut out), 0, "{text:?}");
             assembler.finish(&mut out);
-            (out.drain(), tail)
+            (out.into_owned().drain(), tail)
         };
         let start = |source: &str| Event::ToolCallStart {
             index: 0,
@@ -1314,15 +1330,6 @@ mod tests {
         let mut whole = Events::new();
         Assembler::new(0, "call_0").feed(&call, &mut whole);
         let whole = whole.drain();
-        let arguments = |events: &[Event]| -> String {
-            events
-                .iter()
-                .filter_map(|event| match event {
-                    Event::ToolCallArguments { json, .. } => Some(json.as_str()),
-                    _ => None,
-                })
-                .collect()
-        };
         assert_eq!(arguments(&by_char), arguments(&whole));
         assert!(
             matches!(by_char.last(), Some(Event::ToolCallEnd { .. })),

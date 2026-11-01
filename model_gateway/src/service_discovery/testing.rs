@@ -2,76 +2,26 @@
 
 use std::sync::Arc;
 
-use crate::{
-    app_context::AppContext,
-    middleware::AuthConfig,
-    routers::{common::openai_bridge, grpc::multimodal::MultimodalConfigRegistry},
-};
+use crate::app_context::AppContext;
 
 /// An `AppContext` with an uninitialized worker job queue: submitted jobs are
 /// accepted and queued but never processed, so tests observe what discovery
 /// *submits* without spawning workflow background tasks. [`live_app_context`]
 /// is the one whose jobs run.
 pub(crate) fn create_test_app_context() -> Arc<AppContext> {
-    use crate::{
-        config::RouterConfig, middleware::TokenBucket,
-        observability::inflight_tracker::InFlightRequestTracker,
-        routers::common::realtime::RealtimeRegistry, worker::WorkerService,
-    };
+    use crate::{app_context::testing::app_context_for_tests, config::RouterConfig};
 
     let router_config = RouterConfig::builder()
         .worker_startup_timeout_secs(1)
         .build_unchecked();
 
-    let worker_registry = Arc::new(crate::worker::WorkerRegistry::new());
-    let worker_job_queue = Arc::new(std::sync::OnceLock::new());
-
     // Note: Using uninitialized queue for tests to avoid spawning background workers
     // Jobs submitted during tests will queue but not be processed
-    Arc::new(AppContext {
-        gateway_auth: AuthConfig::new(None),
-        client: crate::clients::http_client(),
-        router_config: router_config.clone(),
-        rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
-        rate_limit_manager: None,
-        worker_registry: worker_registry.clone(),
-        prefill_admission: None,
-        policy_registry: Arc::new(crate::policies::PolicyRegistry::with_override(
-            router_config.policy.clone(),
-            router_config.routing_key_override.clone(),
-        )),
-        reasoning_parser_factory: None,
-        tool_parser_factory: None,
-        gateway: None,
-        response_storage: Arc::new(smg_data_connector::MemoryResponseStorage::new()),
-        conversation_storage: Arc::new(smg_data_connector::MemoryConversationStorage::new()),
-        conversation_item_storage: Arc::new(
-            smg_data_connector::MemoryConversationItemStorage::new(),
-        ),
-        worker_monitor: None,
-        configured_reasoning_parser: None,
-        configured_tool_parser: None,
-        worker_job_queue: worker_job_queue.clone(),
-        workflow_engines: Arc::new(std::sync::OnceLock::new()),
-        mcp_orchestrator: Arc::new(std::sync::OnceLock::new()),
-        mcp_format_registry: openai_bridge::FormatRegistry::new(),
-        tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
-        multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
-        tokenizer_load_failures: Arc::default(),
-        wasm_manager: None,
-        worker_client_cache: Arc::new(crate::worker::WorkerHttpClientCache::new(&router_config)),
-        worker_service: Arc::new(WorkerService::new(
-            worker_registry,
-            worker_job_queue,
-            router_config,
-        )),
-        inflight_tracker: InFlightRequestTracker::new(),
-        kv_event_monitor: None,
-        rl: None,
-        realtime_registry: Arc::new(RealtimeRegistry::new()),
-        webrtc_bind_addr: None,
-        webrtc_stun_server: None,
-    })
+    app_context_for_tests(
+        router_config,
+        Arc::new(crate::worker::WorkerRegistry::new()),
+        None,
+    )
 }
 
 /// An `AppContext` whose jobs run: a live job queue and workflow engines, so

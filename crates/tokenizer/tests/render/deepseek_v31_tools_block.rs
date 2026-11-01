@@ -28,6 +28,8 @@ use llm_tokenizer::{
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
+use crate::common::MIN_TOKENIZER_JSON_WITH_SENTINELS;
+
 /// The chat template of the V3.1 checkpoint (its `tokenizer_config.json`).
 const V31_TEMPLATE: &str = r"{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{% if not thinking is defined %}{% set thinking = false %}{% endif %}{% set ns = namespace(is_first=false, is_tool=false, system_prompt='', is_first_sp=true, is_last_user=false) %}{%- for message in messages %}{%- if message['role'] == 'system' %}{%- if ns.is_first_sp %}{% set ns.system_prompt = ns.system_prompt + message['content'] %}{% set ns.is_first_sp = false %}{%- else %}{% set ns.system_prompt = ns.system_prompt + '
 
@@ -40,23 +42,6 @@ const EARLIER_TEMPLATE: &str = r"{{ bos_token }}{% for message in messages %}{% 
 /// A replacement template with the V3.1 thinking switch that renders the
 /// request's tools itself, as an engine's tool template does.
 const TOOLS_AWARE_TEMPLATE: &str = r"{% if not thinking is defined %}{% set thinking = false %}{% endif %}{{ bos_token }}{% if tools is defined and tools is not none %}TOOLS:{{ tools | length }}{% endif %}{% for message in messages %}<|{{ message['role'] }}|>{{ message['content'] }}{% endfor %}{% if add_generation_prompt %}<｜Assistant｜>{% if not thinking %}</think>{% else %}<think>{% endif %}{% endif %}";
-
-/// A minimal tokenizer.json that loads; the rendering never encodes here.
-const MIN_TOKENIZER_JSON: &str = r#"{
-    "version": "1.0",
-    "truncation": null,
-    "padding": null,
-    "added_tokens": [],
-    "normalizer": null,
-    "pre_tokenizer": { "type": "Whitespace" },
-    "post_processor": null,
-    "decoder": null,
-    "model": {
-        "type": "BPE",
-        "vocab": { "hello": 0, "<s>": 1, "</s>": 2 },
-        "merges": []
-    }
-}"#;
 
 /// The issue's request: one small tool, the user's question, no system prompt.
 const ONE_TOOL: &str = r#"<｜begin▁of▁sentence｜>
@@ -176,7 +161,7 @@ fn user(text: &str) -> Value {
 fn load(architecture: &str, template: &str) -> (TempDir, HuggingFaceTokenizer) {
     let dir = TempDir::new().unwrap();
     let tokenizer_path = dir.path().join("tokenizer.json");
-    fs::write(&tokenizer_path, MIN_TOKENIZER_JSON).unwrap();
+    fs::write(&tokenizer_path, MIN_TOKENIZER_JSON_WITH_SENTINELS).unwrap();
     fs::write(
         dir.path().join("config.json"),
         json!({"architectures": [architecture], "model_type": "deepseek_v3"}).to_string(),

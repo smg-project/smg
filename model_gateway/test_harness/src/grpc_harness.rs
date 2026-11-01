@@ -178,6 +178,28 @@ pub fn grpc_test_context_with_tokenizer(
     })
 }
 
+/// [`grpc_test_context_with_tokenizer`] with a tenant rate limiter of the
+/// caller's (a manager over a backend of the test's) in place of the one
+/// `config` would build.
+pub fn grpc_test_context_with_rate_limiter(
+    mut config: RouterConfig,
+    model: &str,
+    tokenizer: Arc<dyn Tokenizer>,
+    rate_limit_manager: Arc<smg::rate_limit::RateLimitManager>,
+) -> Pin<Box<dyn Future<Output = Arc<AppContext>> + Send>> {
+    config.health_check.disable_health_check = true;
+    let model = model.to_owned();
+    Box::pin(async move {
+        let tokenizer_registry = super::tokenizer_registry_with(&model, tokenizer).await;
+        super::create_test_context_with_rate_limiter(
+            config,
+            tokenizer_registry,
+            Some(rate_limit_manager),
+        )
+        .await
+    })
+}
+
 /// [`grpc_test_context_with_tokenizer`] with the mock tokenizer: `common`'s
 /// `create_test_context_with_mock_tokenizer`, the health checks off.
 pub fn grpc_test_context(

@@ -109,6 +109,7 @@ pub fn entry(info: &RlWorkerInfo, dp_ranks: usize) -> RlWorkerEntry {
         worker_type: enum_str(&info.worker_type),
         connection_mode: enum_str(&info.connection_mode),
         control_url: info.control_url.clone(),
+        engine_control_calls: info.control_calls.is_some(),
         tp_size: int_label(&info.labels, "tp_size"),
         dp_size: int_label(&info.labels, "dp_size"),
         pp_size: int_label(&info.labels, "pp_size"),
@@ -319,7 +320,8 @@ mod tests {
         let mut n = worker("n1", "grpc://b:1", RuntimeType::TokenSpeed);
         n.connection_mode = ConnectionMode::Grpc;
         n.control_url = None;
-        let app = crate::router::<()>(state(vec![g, n]));
+        let z = crate::testing::zmq_worker("z1", crate::testing::FakeCalls::succeeding(1));
+        let app = crate::router::<()>(state(vec![g, n, z]));
         let resp = app
             .oneshot(Request::get("/workers").body(Body::empty()).unwrap())
             .await
@@ -337,5 +339,10 @@ mod tests {
         assert_eq!(by_id("g1")["control_url"], "http://a:40100");
         assert_eq!(by_id("n1")["control_url"], Value::Null);
         assert_eq!(by_id("g1")["engine"], "tokenspeed");
+        // A worker controlled over its engine connection says so; the
+        // others leave the flag out.
+        assert_eq!(by_id("z1")["control_url"], Value::Null);
+        assert_eq!(by_id("z1")["engine_control_calls"], true);
+        assert_eq!(by_id("n1").get("engine_control_calls"), None);
     }
 }

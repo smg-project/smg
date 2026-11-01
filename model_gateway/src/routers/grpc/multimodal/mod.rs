@@ -67,6 +67,8 @@ mod transparency;
 mod transport;
 pub mod worker;
 
+#[cfg(test)]
+pub(crate) use assemble::tests::single_image_intermediate;
 pub(crate) use assemble::{
     assemble_multimodal_data, assemble_multimodal_data_after_encode,
     assemble_tokenspeed_for_encode, encode_routing_hashes,
