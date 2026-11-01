@@ -1784,6 +1784,7 @@ jobs:
       timeout: 25
       test_dirs: e2e_test/router
       test_filter: "-k TestIGWMixedWorkerClassification"
+      provider_api_keys: true
     secrets: inherit
 
   e2e-4gpu-epd:
