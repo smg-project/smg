@@ -98,7 +98,7 @@ use crate::{
             request_stream::{CappedBodyStream, StreamProgress},
             stream_failure::{cause, head_success_recorded, RelaySource},
             stream_relay::{relay_streaming_body, ChunkMode, Relay},
-            tenant_rate_limit,
+            tenant_rate_limit::{self, TenantCharge},
         },
         BodyPolicy, RouterTrait,
     },
@@ -419,7 +419,7 @@ impl Router {
     /// reserves its estimate once, before any dispatch, and the one answer the
     /// dispatch paths converge on resolves the reservation once
     /// (`tenant_rate_limit::resolve`).
-    pub async fn route_typed_request<T: GenerationRequest + serde::Serialize>(
+    pub(crate) async fn route_typed_request<T: TenantCharge + serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: Option<&TenantRequestMeta>,
@@ -477,10 +477,9 @@ impl Router {
         let (reservation, denial) = match (&self.rate_limit_manager, tenant_meta) {
             (Some(manager), Some(tenant_meta)) => {
                 let cell = RateLimitCell::new();
-                let estimate =
-                    tenant_rate_limit::estimated_input_tokens(&typed_req, text.as_deref());
+                let estimate = typed_req.estimated_input_tokens(text.as_deref());
                 match cell.reserve(manager, tenant_meta, model_id, estimate).await {
-                    Ok(()) => (Some(cell), None),
+                    Ok(()) => (Some((cell, typed_req.samples_per_prompt())), None),
                     Err(mut denied) => {
                         mark_non_retryable(&mut denied);
                         (None, Some(denied))
@@ -591,9 +590,16 @@ impl Router {
         // reservation, once: settled, handed to the streamed body, or closed
         // at the estimate.
         let response = match &reservation {
-            Some(cell) => {
-                tenant_rate_limit::resolve(cell, route, is_stream, response, self.max_payload_size)
-                    .await
+            Some((cell, samples_per_prompt)) => {
+                tenant_rate_limit::resolve(
+                    cell,
+                    route,
+                    *samples_per_prompt,
+                    is_stream,
+                    response,
+                    self.max_payload_size,
+                )
+                .await
             }
             None => response,
         };

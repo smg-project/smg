@@ -9,9 +9,9 @@
 //! one goes through the full app, to prove the body-path layer does not
 //! stream a request past the typed route that holds it to its budget.
 //!
-//! This router has no tokenizer: the reserve-time estimate is 1.3 tokens per
-//! word of the request's text, rounded up, so [`PROMPT_TEXT`]'s two words
-//! reserve [`ESTIMATED_INPUT_TOKENS`]. The budget cases run on the in-memory
+//! This router has no tokenizer: the reserve-time estimate is a request's
+//! own token ids, or 1.3 tokens per word of its text, rounded up, so
+//! [`PROMPT_TEXT`]'s two words reserve [`ESTIMATED_INPUT_TOKENS`]. The budget cases run on the in-memory
 //! backend a policy YAML configures; the cases that check exactly what a
 //! request reserved and how its answer resolved it run on a backend that
 //! records every call ([`RecordingBackend`]).
@@ -421,23 +421,36 @@ impl Endpoint {
     }
 
     /// The usage body a worker answers this endpoint with, reporting
-    /// `input` and `output` tokens in the endpoint's own shape.
+    /// `input` and `output` tokens in the endpoint's own shape. Embeddings
+    /// and classify generate nothing and report no `output`, as OpenAI's
+    /// embeddings usage has no `completion_tokens`.
     fn usage_body(self, input: u32, output: u32) -> Value {
         match self {
             Self::Generate => json!({
                 "text": "hi",
                 "meta_info": {"prompt_tokens": input, "completion_tokens": output},
             }),
-            Self::Chat | Self::Completion | Self::Embeddings | Self::Classify => json!({
+            Self::Chat | Self::Completion => json!({
                 "usage": {
                     "prompt_tokens": input,
                     "completion_tokens": output,
                     "total_tokens": input + output,
                 },
             }),
+            Self::Embeddings | Self::Classify => json!({
+                "usage": {"prompt_tokens": input, "total_tokens": input},
+            }),
             Self::Messages | Self::Responses => json!({
                 "usage": {"input_tokens": input, "output_tokens": output},
             }),
+        }
+    }
+
+    /// What [`Self::usage_body`] settles.
+    fn settlement(self, input: u32, output: u32) -> UsageSettlement {
+        match self {
+            Self::Embeddings | Self::Classify => usage(input, 0),
+            _ => usage(input, output),
         }
     }
 }
@@ -503,6 +516,43 @@ async fn an_impossible_request_is_denied_without_retry_after() {
     }
 }
 
+/// A request reserves every input it carries, past what routing reads: each
+/// sequence of a tokenized batch, the token ids of embeddings and classify,
+/// a Responses request's instructions.
+#[tokio::test]
+async fn every_input_the_request_carries_is_reserved() {
+    let worker = mock_worker().await;
+    let backend = Arc::new(RecordingBackend::default());
+    let (router, _dir) = router(Limiter::Recording(backend.clone()), &worker, true).await;
+    let tenant = tenant();
+
+    worker.answer(Endpoint::Generate.usage_body(1, 1));
+    let batch = request::<GenerateRequest>(json!({
+        "model": MODEL, "input_ids": [[1, 2], [3, 4, 5, 6]],
+    }));
+    router.route_generate(None, &tenant, batch, MODEL).await;
+
+    worker.answer(Endpoint::Embeddings.usage_body(1, 0));
+    let ids = request::<EmbeddingRequest>(json!({"model": MODEL, "input": [1, 2, 3, 4]}));
+    router.route_embeddings(None, &tenant, ids, MODEL).await;
+    let sequences = request::<ClassifyRequest>(json!({"model": MODEL, "input": [[1, 2], [3]]}));
+    router.route_classify(None, &tenant, sequences, MODEL).await;
+
+    worker.answer(Endpoint::Responses.usage_body(1, 1));
+    let instructed = request::<ResponsesRequest>(json!({
+        "model": MODEL,
+        "instructions": "one two three four five six seven eight nine ten",
+        "input": PROMPT_TEXT,
+        "store": false,
+    }));
+    router
+        .route_responses(None, &tenant, instructed, MODEL)
+        .await;
+
+    // Ten words of instructions and two of input: ceil(12 * 1.3).
+    assert_eq!(backend.estimates(), vec![6, 4, 3, 16]);
+}
+
 // ---------------------------------------------------------------------------
 // Settlement.
 // ---------------------------------------------------------------------------
@@ -540,27 +590,49 @@ async fn a_buffered_success_settles_the_usage_its_body_reports() {
                 "{case}: the client gets the worker's body"
             );
             assert_eq!(backend.estimates(), vec![ESTIMATED_INPUT_TOKENS], "{case}");
-            assert_eq!(backend.settlements(), vec![usage(11, 7)], "{case}");
+            assert_eq!(
+                backend.settlements(),
+                vec![endpoint.settlement(11, 7)],
+                "{case}"
+            );
             assert_eq!((backend.closes(), backend.abandons()), (0, 0), "{case}");
         }
     }
 }
 
-/// A `/generate` batch answer counts its shared prompt once, at its largest,
-/// and sums the generations' completions.
+/// A `/generate` answer of several entries settles every completion and
+/// each prompt once: the prompts of a batch sum, and the `n` samples of one
+/// prompt repeat its count.
 #[tokio::test]
-async fn a_generate_batch_settles_its_prompt_once_and_its_completions_summed() {
-    let worker = mock_worker().await;
-    worker.answer(json!([
-        {"text": "a", "meta_info": {"prompt_tokens": 4, "completion_tokens": 9}},
-        {"text": "b", "meta_info": {"prompt_tokens": 4, "completion_tokens": 2}},
-    ]));
-    let backend = Arc::new(RecordingBackend::default());
-    let (router, _dir) = router(Limiter::Recording(backend.clone()), &worker, true).await;
+async fn a_generate_batch_settles_each_prompt_once_and_every_completion() {
+    for (body, answer, settled) in [
+        (
+            json!({"model": MODEL, "input_ids": [[1, 2], [3, 4, 5, 6]]}),
+            json!([
+                {"text": "a", "meta_info": {"prompt_tokens": 2, "completion_tokens": 9}},
+                {"text": "b", "meta_info": {"prompt_tokens": 4, "completion_tokens": 2}},
+            ]),
+            usage(6, 11),
+        ),
+        (
+            json!({"model": MODEL, "text": PROMPT_TEXT, "sampling_params": {"n": 2}}),
+            json!([
+                {"text": "a", "meta_info": {"prompt_tokens": 4, "completion_tokens": 9}},
+                {"text": "b", "meta_info": {"prompt_tokens": 4, "completion_tokens": 2}},
+            ]),
+            usage(4, 11),
+        ),
+    ] {
+        let worker = mock_worker().await;
+        worker.answer(answer);
+        let backend = Arc::new(RecordingBackend::default());
+        let (router, _dir) = router(Limiter::Recording(backend.clone()), &worker, true).await;
 
-    let response = Endpoint::Generate.call(&router, false).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(backend.settlements(), vec![usage(4, 11)]);
+        let request = request::<GenerateRequest>(body.clone());
+        let response = router.route_generate(None, &tenant(), request, MODEL).await;
+        assert_eq!(response.status(), StatusCode::OK, "{body}");
+        assert_eq!(backend.settlements(), vec![settled], "{body}");
+    }
 }
 
 /// A success whose body reports no usage this router can read whole closes
