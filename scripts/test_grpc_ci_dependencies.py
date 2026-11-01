@@ -27,6 +27,8 @@ if args[:2] == ["-m", "venv"]:
     (path / "activate").write_text("# fake activation\n")
 elif args == ["-V"]:
     print("Python 3.12.0 (CPU control)")
+elif args[0] == "-c" and args[1].lstrip().startswith("import cairo\n"):
+    pass  # Cairo is already available in this companion-version shell fixture.
 elif args[0] == "-c" and "importlib.metadata" in args[1]:
     def version(name):
         versions = json.loads(os.environ["IMAGE_VERSIONS"])
@@ -95,6 +97,7 @@ def test_amd_image_selection_reaches_later_job_step(tools):
     process, calls = run_script("ci_setup_vllm_rocm_image.sh", tools)
     assert process.returncode == 0, process.stderr
     assert any("vllm==0.31.0+rocm723" in call["args"] for call in calls)
+    assert not any("--no-binary=pycairo" in call["args"] for call in calls)
     assert (
         Path(tools[1]["GITHUB_ENV"]).read_text()
         == "EXISTING=value\nSMG_CI_GRPC_COMPANION_VERSION=1.78.0\n"
