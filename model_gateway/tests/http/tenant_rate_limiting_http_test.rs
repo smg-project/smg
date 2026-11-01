@@ -77,6 +77,7 @@ use crate::common;
 /// Two words: the reserve-time estimate is `ceil(2 * 1.3)` tokens.
 const PROMPT_TEXT: &str = "Hello world";
 const ESTIMATED_INPUT_TOKENS: u32 = 3;
+const TEN_WORDS: &str = "one two three four five six seven eight nine ten";
 const MODEL: &str = "tenant-rl-http-test-model";
 
 // ---------------------------------------------------------------------------
@@ -518,7 +519,8 @@ async fn an_impossible_request_is_denied_without_retry_after() {
 
 /// A request reserves every input it carries, past what routing reads: each
 /// sequence of a tokenized batch, the token ids of embeddings and classify,
-/// a Responses request's instructions.
+/// a Responses request's instructions and custom tool calls, a chat
+/// history's tool-call arguments, a Messages history's tool results.
 #[tokio::test]
 async fn every_input_the_request_carries_is_reserved() {
     let worker = mock_worker().await;
@@ -541,16 +543,54 @@ async fn every_input_the_request_carries_is_reserved() {
     worker.answer(Endpoint::Responses.usage_body(1, 1));
     let instructed = request::<ResponsesRequest>(json!({
         "model": MODEL,
-        "instructions": "one two three four five six seven eight nine ten",
+        "instructions": TEN_WORDS,
         "input": PROMPT_TEXT,
         "store": false,
     }));
     router
         .route_responses(None, &tenant, instructed, MODEL)
         .await;
+    let custom = request::<ResponsesRequest>(json!({
+        "model": MODEL,
+        "input": [
+            {"type": "message", "role": "user", "content": PROMPT_TEXT},
+            {"type": "custom_tool_call", "call_id": "c1", "name": "grep", "input": TEN_WORDS},
+            {"type": "custom_tool_call_output", "call_id": "c1", "output": TEN_WORDS},
+        ],
+        "store": false,
+    }));
+    router.route_responses(None, &tenant, custom, MODEL).await;
 
-    // Ten words of instructions and two of input: ceil(12 * 1.3).
-    assert_eq!(backend.estimates(), vec![6, 4, 3, 16]);
+    worker.answer(Endpoint::Chat.usage_body(1, 1));
+    let tool_call = request::<ChatCompletionRequest>(json!({
+        "model": MODEL,
+        "messages": [
+            {"role": "user", "content": PROMPT_TEXT},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "c1", "type": "function",
+                "function": {"name": "grep", "arguments": TEN_WORDS},
+            }]},
+        ],
+    }));
+    router.route_chat(None, &tenant, tool_call, MODEL).await;
+
+    worker.answer(Endpoint::Messages.usage_body(1, 1));
+    let tool_result = request::<CreateMessageRequest>(json!({
+        "model": MODEL,
+        "max_tokens": 32,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": PROMPT_TEXT},
+            {"type": "tool_result", "tool_use_id": "t1", "content": TEN_WORDS},
+        ]}],
+    }));
+    router
+        .route_messages(None, &tenant, tool_result, MODEL)
+        .await;
+
+    // Ten words of instructions and two of input: ceil(12 * 1.3). Two words
+    // of input and ten of a custom tool's input and ten of its output:
+    // ceil(22 * 1.3). Two words and ten of a tool call or a tool result.
+    assert_eq!(backend.estimates(), vec![6, 4, 3, 16, 29, 16, 16]);
 }
 
 // ---------------------------------------------------------------------------

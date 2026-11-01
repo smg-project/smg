@@ -17,18 +17,21 @@ use axum::{
     response::Response,
 };
 use openai_protocol::{
-    chat::ChatCompletionRequest,
+    chat::{ChatCompletionRequest, ChatMessage},
     classify::ClassifyRequest,
     common::{GenerationRequest, InputIds},
     completion::CompletionRequest,
     decisions::DecisionsRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
-    messages::{CountMessageTokensRequest, CreateMessageRequest},
+    messages::{
+        CountMessageTokensRequest, CreateMessageRequest, InputContent, InputContentBlock,
+        ToolResultContent, ToolResultContentBlock,
+    },
     rerank::RerankRequest,
     responses::{
-        ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponsesRequest,
-        StringOrContentParts,
+        CustomToolCallOutputContent, CustomToolInputContentPart, ResponseContentPart,
+        ResponseInput, ResponseInputOutputItem, ResponsesRequest, StringOrContentParts,
     },
     systemone::SystemOneRequest,
 };
@@ -51,17 +54,24 @@ const TOKENS_PER_WORD: f64 = 1.3;
 /// routes that never reserve take the defaults, which they never ask for.
 pub(crate) trait TenantCharge: GenerationRequest {
     /// The reserve-time estimate of the request's input tokens. By default,
-    /// 1.3 per word of its routing text: `routing_text` when routing already
-    /// extracted it, the body's own otherwise. It is absent when routing keys
-    /// on tokens, and for a request that carries no ids of its own that is
-    /// the client's `x-smg-routing-tokens` hint: a hint says nothing the
-    /// gateway can hold the tenant to, so the estimate reads the body.
+    /// 1.3 per word of its routing text -- `routing_text` when routing
+    /// already extracted it, the body's own otherwise -- and of the input
+    /// that text leaves out ([`Self::unrouted_words`]). `routing_text` is
+    /// absent when routing keys on tokens, and for a request that carries no
+    /// ids of its own that is the client's `x-smg-routing-tokens` hint: a
+    /// hint says nothing the gateway can hold the tenant to, so the estimate
+    /// reads the body.
     fn estimated_input_tokens(&self, routing_text: Option<&str>) -> u32 {
         let words = match routing_text {
             Some(text) => word_count(text),
             None => word_count(&self.extract_text_for_routing()),
         };
-        tokens_for_words(words)
+        tokens_for_words(words + self.unrouted_words())
+    }
+
+    /// The words of the request's input that its routing text leaves out.
+    fn unrouted_words(&self) -> usize {
+        0
     }
 
     /// How many answers each of the request's prompts gets: the entries of
@@ -71,9 +81,56 @@ pub(crate) trait TenantCharge: GenerationRequest {
     }
 }
 
-impl TenantCharge for ChatCompletionRequest {}
+/// The arguments of the assistant's tool calls in the history.
+impl TenantCharge for ChatCompletionRequest {
+    fn unrouted_words(&self) -> usize {
+        self.messages
+            .iter()
+            .filter_map(|message| match message {
+                ChatMessage::Assistant {
+                    tool_calls: Some(calls),
+                    ..
+                } => Some(calls),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|call| call.function.arguments.as_deref())
+            .map(word_count)
+            .sum()
+    }
+}
+
 impl TenantCharge for CompletionRequest {}
-impl TenantCharge for CreateMessageRequest {}
+
+/// The input of each `tool_use` block in the history and the text of each
+/// `tool_result`, a string or text blocks; not their images or documents.
+impl TenantCharge for CreateMessageRequest {
+    fn unrouted_words(&self) -> usize {
+        self.messages
+            .iter()
+            .filter_map(|message| match &message.content {
+                InputContent::Blocks(blocks) => Some(blocks),
+                InputContent::String(_) => None,
+            })
+            .flatten()
+            .map(|block| match block {
+                InputContentBlock::ToolUse(tool_use) => json_words(&tool_use.input),
+                InputContentBlock::ToolResult(result) => match &result.content {
+                    Some(ToolResultContent::String(text)) => word_count(text),
+                    Some(ToolResultContent::Blocks(blocks)) => blocks
+                        .iter()
+                        .map(|block| match block {
+                            ToolResultContentBlock::Text(text) => word_count(&text.text),
+                            _ => 0,
+                        })
+                        .sum(),
+                    None => 0,
+                },
+                _ => 0,
+            })
+            .sum()
+    }
+}
 
 /// Every token id of every sequence: routing keys on the first sequence of
 /// a batch only, but each is a prompt of its own. Without ids, the words
@@ -100,35 +157,44 @@ impl TenantCharge for GenerateRequest {
     }
 }
 
-/// The instructions and the function calls and their outputs, which the
-/// routing text leaves out, on top of the input's messages and reasoning.
-/// Images, files and the built-in tools' items are not counted.
+/// The instructions, and the function and custom tool calls in the history
+/// with their outputs. Images, files and the built-in tools' items are not
+/// counted.
 impl TenantCharge for ResponsesRequest {
-    fn estimated_input_tokens(&self, routing_text: Option<&str>) -> u32 {
-        let mut words = match routing_text {
-            Some(text) => word_count(text),
-            None => word_count(&self.extract_text_for_routing()),
+    fn unrouted_words(&self) -> usize {
+        let instructions = self.instructions.as_deref().map_or(0, word_count);
+        let ResponseInput::Items(items) = &self.input else {
+            return instructions;
         };
-        words += self.instructions.as_deref().map_or(0, word_count);
-        if let ResponseInput::Items(items) = &self.input {
-            for item in items {
-                words += match item {
-                    ResponseInputOutputItem::FunctionToolCall {
-                        arguments, output, ..
-                    } => word_count(arguments) + output.as_deref().map_or(0, word_count),
-                    ResponseInputOutputItem::FunctionCallOutput { output, .. } => match output {
-                        StringOrContentParts::String(text) => word_count(text),
-                        StringOrContentParts::Array(parts) => parts
-                            .iter()
-                            .filter_map(ResponseContentPart::text)
-                            .map(word_count)
-                            .sum(),
-                    },
-                    _ => 0,
-                };
-            }
-        }
-        tokens_for_words(words)
+        let history: usize = items
+            .iter()
+            .map(|item| match item {
+                ResponseInputOutputItem::FunctionToolCall {
+                    arguments, output, ..
+                } => word_count(arguments) + output.as_deref().map_or(0, word_count),
+                ResponseInputOutputItem::FunctionCallOutput { output, .. } => match output {
+                    StringOrContentParts::String(text) => word_count(text),
+                    StringOrContentParts::Array(parts) => parts
+                        .iter()
+                        .filter_map(ResponseContentPart::text)
+                        .map(word_count)
+                        .sum(),
+                },
+                ResponseInputOutputItem::CustomToolCall { input, .. } => word_count(input),
+                ResponseInputOutputItem::CustomToolCallOutput { output, .. } => match output {
+                    CustomToolCallOutputContent::Text(text) => word_count(text),
+                    CustomToolCallOutputContent::Parts(parts) => parts
+                        .iter()
+                        .map(|part| match part {
+                            CustomToolInputContentPart::InputText { text } => word_count(text),
+                            _ => 0,
+                        })
+                        .sum(),
+                },
+                _ => 0,
+            })
+            .sum();
+        instructions + history
     }
 }
 
@@ -175,6 +241,20 @@ fn input_value_tokens(input: &Value) -> u32 {
 
 fn word_count(text: &str) -> usize {
     text.split_whitespace().count()
+}
+
+/// The words of a JSON value: of its strings and its keys, and one for each
+/// number, boolean and null.
+fn json_words(value: &Value) -> usize {
+    match value {
+        Value::String(text) => word_count(text),
+        Value::Array(items) => items.iter().map(json_words).sum(),
+        Value::Object(fields) => fields
+            .iter()
+            .map(|(key, value)| word_count(key) + json_words(value))
+            .sum(),
+        Value::Null | Value::Bool(_) | Value::Number(_) => 1,
+    }
 }
 
 /// 1.3 tokens per word, rounded up.
@@ -482,6 +562,8 @@ mod tests {
         );
     }
 
+    const TEN_WORDS: &str = "one two three four five six seven eight nine ten";
+
     fn request<T: serde::de::DeserializeOwned>(body: Value) -> T {
         serde_json::from_value(body).unwrap()
     }
@@ -562,7 +644,7 @@ mod tests {
     fn a_responses_request_reserves_its_instructions_and_function_calls() {
         let instructed: ResponsesRequest = request(json!({
             "model": "m",
-            "instructions": "one two three four five six seven eight nine ten",
+            "instructions": TEN_WORDS,
             "input": "hello world",
         }));
         assert_eq!(instructed.estimated_input_tokens(Some("hello world")), 16);
@@ -578,6 +660,85 @@ mod tests {
         }));
         assert_eq!(tool_turn.extract_text_for_routing(), "weather in Paris");
         assert_eq!(tool_turn.estimated_input_tokens(None), 11);
+    }
+
+    /// A custom tool's input and its output, a string or text parts.
+    #[test]
+    fn a_responses_request_reserves_its_custom_tool_calls() {
+        for output in [
+            json!(TEN_WORDS),
+            json!([{"type": "input_text", "text": TEN_WORDS}]),
+        ] {
+            let custom: ResponsesRequest = request(json!({
+                "model": "m",
+                "input": [
+                    {"type": "message", "role": "user", "content": "hello world"},
+                    {"type": "custom_tool_call", "call_id": "c1", "name": "grep", "input": TEN_WORDS},
+                    {"type": "custom_tool_call_output", "call_id": "c1", "output": output},
+                ],
+            }));
+            assert_eq!(custom.extract_text_for_routing(), "hello world");
+            // 2 + 10 + 10 words: ceil(22 * 1.3).
+            assert_eq!(custom.estimated_input_tokens(None), 29);
+        }
+    }
+
+    /// The arguments of the assistant's tool calls, whatever text routing saw.
+    #[test]
+    fn a_chat_history_reserves_its_tool_call_arguments() {
+        let chat: ChatCompletionRequest = request(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "weather in Paris"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "arguments": "{\"query\": \"one two three four five six seven eight nine\"}",
+                    },
+                }]},
+            ],
+        }));
+        assert_eq!(chat.extract_text_for_routing(), "weather in Paris");
+        // 3 words of text and 10 of arguments: ceil(13 * 1.3).
+        assert_eq!(chat.estimated_input_tokens(None), 17);
+        assert_eq!(chat.estimated_input_tokens(Some("weather in Paris")), 17);
+    }
+
+    /// A tool result's text, a string or text blocks, and a tool use's input.
+    #[test]
+    fn a_messages_history_reserves_its_tool_uses_and_results() {
+        for content in [
+            json!(TEN_WORDS),
+            json!([{"type": "text", "text": TEN_WORDS}]),
+        ] {
+            let result: CreateMessageRequest = request(json!({
+                "model": "m",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "hello world"},
+                    {"type": "tool_result", "tool_use_id": "t1", "content": content},
+                ]}],
+            }));
+            assert_eq!(result.extract_text_for_routing(), "hello world");
+            // 2 + 10 words: ceil(12 * 1.3).
+            assert_eq!(result.estimated_input_tokens(None), 16);
+        }
+
+        let tool_use: CreateMessageRequest = request(json!({
+            "model": "m",
+            "max_tokens": 8,
+            "messages": [
+                {"role": "user", "content": "weather in Paris"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "weather",
+                     "input": {"city": "Paris", "days": 3}},
+                ]},
+            ],
+        }));
+        assert_eq!(tool_use.extract_text_for_routing(), "weather in Paris");
+        // 3 words of text; two keys, a word and a number of input: ceil(7 * 1.3).
+        assert_eq!(tool_use.estimated_input_tokens(None), 10);
     }
 
     /// Routing on the client's tokens hint extracts no text; the estimate
