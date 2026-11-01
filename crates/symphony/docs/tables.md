@@ -110,7 +110,10 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
   names the thought as the state an unopened turn starts in, with `<｜end▁of▁sentence｜>` as the end of
   a turn the model wrote: a prompt with no opener, or whose last opener's turn ended, starts the
   output in the thought, and nothing of it is replayed (an earlier turn's markers and a `</think>`
-  quoted in a tool result move nothing). The legacy reasoning parser for this checkpoint starts
+  quoted in a tool result move nothing). A prompt that is the thought's markers with no opener
+  before them is such a prompt too: the corpus replay feeds the turn opener before the template's
+  tail for this reason (the tail alone read a thinking-off turn's text as reasoning; the gateway
+  replays the whole prompt and never meets it). The legacy reasoning parser for this checkpoint starts
   inside the thought whenever the request leaves thinking on, whatever the prompt; the two agree
   on this shape. The V4.1 template opens the turn after a mid-conversation system message too, so
   its table meets no unopened turn. The table is pinned against the turns the
