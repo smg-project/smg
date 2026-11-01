@@ -70,11 +70,6 @@ pub struct RendererCapabilities {
     /// concatenates them cannot render an object); the gateway must forward
     /// them as written instead of pre-parsing them.
     pub raw_tool_call_arguments: bool,
-    /// The renderer declares the request's tools when `tool_choice` is
-    /// `none` and tells the model not to call them, as its reference does;
-    /// the gateway keeps the tools for it. Without it the gateway renders no
-    /// tool under `none`, so the model is not offered a call it may not make.
-    pub declares_tools_under_tool_choice_none: bool,
     /// The renderer's reference writes a turn of its own, and the assistant
     /// header after the last one, for user and developer messages only: a
     /// `system` message after the first renders as bare text with no role
@@ -113,6 +108,15 @@ pub struct ChatTemplateOutput {
     /// the generation prompt instead: the completion then starts wherever
     /// that prompt leaves it, inside a reasoning block it opens for one.
     pub continued_final_message: bool,
+    /// The prompt is rendered for generation, as `add_generation_prompt: true`
+    /// renders it: the renderer's generation header follows the last turn
+    /// where its reference writes one. False when the request asked for no
+    /// header and the renderer honoured it, and when the final message was
+    /// continued instead. A renderer with an encoder of its own writes the
+    /// header whatever the request asked, as the engines' own encoders do,
+    /// and reports true; the reasoning decisions read this rather than the
+    /// request, since nothing opens a reasoning block without the header.
+    pub generation_prompt: bool,
 }
 
 /// Core encoding trait - separate from decoding for modularity
@@ -320,8 +324,10 @@ pub trait Tokenizer: Encoder + Decoder {
     /// prefill to the flat rendering and reports [`PromptEncoding::FromText`];
     /// renderers whose ids are not a function of the text override it and
     /// hand back a deferred encode instead. The default reports a requested
-    /// `continue_final_message` as honored; renderers that can fall back
-    /// from it override this to report what they did.
+    /// `continue_final_message` as honored, and the generation header as
+    /// `add_generation_prompt` asked for it; renderers that can fall back
+    /// from a continuation, or write the header whatever was asked, override
+    /// this to report what they did.
     fn apply_chat_template_with_encoding(
         &self,
         messages: &[serde_json::Value],
@@ -329,6 +335,7 @@ pub trait Tokenizer: Encoder + Decoder {
         assistant_prefix: Option<&str>,
     ) -> Result<ChatTemplateOutput> {
         let continued_final_message = params.continue_final_message;
+        let generation_prompt_unless_continued = params.generation_prompt_unless_continued();
         let mut text = self.apply_chat_template(messages, params)?;
         if let Some(prefix) = assistant_prefix {
             text.push_str(prefix);
@@ -338,6 +345,7 @@ pub trait Tokenizer: Encoder + Decoder {
             encoding: PromptEncoding::FromText,
             unbilled_prompt_tokens: 0,
             continued_final_message,
+            generation_prompt: generation_prompt_unless_continued && !continued_final_message,
         })
     }
 

@@ -22,7 +22,7 @@ use std::{
 };
 
 use engine_zmq_client::{
-    mock_engine::{connect_to_frontend, default_ready_response, EngineInbound},
+    mock_engine::{connect_to_frontend, default_ready_response, EngineInbound, MockEngine},
     protocol::vllm::output::{
         EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
         StopReason,
@@ -107,11 +107,11 @@ fn usage(events: &[Value]) -> Value {
         .expect("the usage chunk")
 }
 
-#[tokio::test]
-async fn a_local_stop_ends_the_chat_read_and_the_engine_request() {
-    // The engine streams on past the stop (the `zzzz` chunk: a stop it did
-    // not see); the rest of its tail and its Complete wait behind the gate,
-    // and a read past the tail's first chunk would wait with them.
+/// A single-choice stream that streams on past the local stop (`ab`, `cSTOPd`,
+/// then `zzzz`: a stop the engine did not see); the rest of its tail and its
+/// Complete wait behind the returned gate, and a read past the tail's first
+/// chunk would wait with them.
+async fn stream_past_a_local_stop() -> (oneshot::Sender<()>, ProtoStream, JoinHandle<()>) {
     let (gate_tx, gate) = oneshot::channel::<()>();
     let (stream, server) = gated_stream(
         vec![
@@ -124,6 +124,12 @@ async fn a_local_stop_ends_the_chat_read_and_the_engine_request() {
         "0",
     )
     .await;
+    (gate_tx, stream, server)
+}
+
+#[tokio::test]
+async fn a_local_stop_ends_the_chat_read_and_the_engine_request() {
+    let (gate_tx, stream, server) = stream_past_a_local_stop().await;
     let (tx, rx) = sse_channel();
     let result = timeout(
         Duration::from_secs(5),
@@ -230,18 +236,7 @@ async fn a_local_stop_ends_the_completion_read_and_the_engine_request() {
     }))
     .unwrap();
     let spec = CompletionResponseSpec::from(&request);
-    let (gate_tx, gate) = oneshot::channel::<()>();
-    let (stream, server) = gated_stream(
-        vec![
-            counted_chunk(0, "ab", 7),
-            counted_chunk(0, "cSTOPd", 7),
-            counted_chunk(0, "zzzz", 7),
-        ],
-        gate,
-        vec![counted_chunk(0, "more", 7), complete(0, "length")],
-        "0",
-    )
-    .await;
+    let (gate_tx, stream, server) = stream_past_a_local_stop().await;
     let (tx, rx) = sse_channel();
     let outcome = timeout(
         Duration::from_secs(5),
@@ -297,18 +292,7 @@ fn messages_spec() -> MessagesResponseSpec {
 
 #[tokio::test]
 async fn a_local_stop_ends_the_messages_read_and_the_engine_request() {
-    let (gate_tx, gate) = oneshot::channel::<()>();
-    let (stream, server) = gated_stream(
-        vec![
-            counted_chunk(0, "ab", 7),
-            counted_chunk(0, "cSTOPd", 7),
-            counted_chunk(0, "zzzz", 7),
-        ],
-        gate,
-        vec![counted_chunk(0, "more", 7), complete(0, "length")],
-        "0",
-    )
-    .await;
+    let (gate_tx, stream, server) = stream_past_a_local_stop().await;
     let (tx, rx) = sse_channel();
     let result = timeout(
         Duration::from_secs(5),
@@ -506,13 +490,9 @@ fn engine_step(request_id: &str, token_ids: Vec<u32>) -> EngineCoreOutputs {
     })
 }
 
-#[tokio::test]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "the mock engine runs beside the stream under test; its task is awaited"
-)]
-async fn the_engine_is_aborted_at_the_local_stop_over_the_zmq_link() {
-    const STEP: Duration = Duration::from_millis(10);
+/// A ZMQ engine client and the mock engine it is linked to over ipc sockets
+/// in a fresh temp dir; the dir handle keeps the sockets' paths alive.
+async fn connected_zmq_pair() -> (tempfile::TempDir, ZmqEngineClient, MockEngine) {
     let base = tempfile::tempdir().unwrap();
     let ep = |name: &str| format!("ipc://{}", base.path().join(name).display());
     let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
@@ -533,8 +513,21 @@ async fn the_engine_is_aborted_at_the_local_stop_over_the_zmq_link() {
             default_ready_response()
         ),
     );
-    let client = client.expect("adapter connect");
-    let engine = engine.expect("mock engine");
+    (
+        base,
+        client.expect("adapter connect"),
+        engine.expect("mock engine"),
+    )
+}
+
+#[tokio::test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the mock engine runs beside the stream under test; its task is awaited"
+)]
+async fn the_engine_is_aborted_at_the_local_stop_over_the_zmq_link() {
+    const STEP: Duration = Duration::from_millis(10);
+    let (_base, client, engine) = connected_zmq_pair().await;
     let stream = client
         .generate_vllm(vllm::GenerateRequest {
             request_id: "local-stop-zmq".to_string(),
@@ -790,28 +783,7 @@ fn finished_step(request_id: &str, token_ids: Vec<u32>, stop_id: u32) -> EngineC
     reason = "the mock engine runs beside the stream under test; its task is awaited"
 )]
 async fn the_zmq_link_sends_no_abort_for_a_stop_the_engine_ends_the_request_on() {
-    let base = tempfile::tempdir().unwrap();
-    let ep = |name: &str| format!("ipc://{}", base.path().join(name).display());
-    let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-    let (client, engine) = tokio::join!(
-        ZmqEngineClient::connect(
-            &handshake,
-            &input,
-            &output,
-            1,
-            "m".to_string(),
-            EosTokenIds::default(),
-            RuntimeType::Vllm,
-            Duration::from_secs(10)
-        ),
-        connect_to_frontend(
-            &handshake,
-            EngineId::from_engine_index(0),
-            default_ready_response()
-        ),
-    );
-    let client = client.expect("adapter connect");
-    let engine = engine.expect("mock engine");
+    let (_base, client, engine) = connected_zmq_pair().await;
     let stop_id = u32::from('S');
     let stream = client
         .generate_vllm(vllm::GenerateRequest {

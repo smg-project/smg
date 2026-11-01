@@ -211,7 +211,7 @@ difference. **Pending** means no table yet.
 **SMG today** is what the gateway takes for the group's primary before Symphony is wired in: the
 `--tool-call-parser` and `--reasoning-parser` names its registries resolve from the model id, as
 in `smg serve --model-path Qwen/Qwen3-8B --tool-call-parser qwen --reasoning-parser qwen3`; none
-means passthrough, the output read as content. Under `--parser symphony`, a worker's parser labels
+means passthrough, the output read as content. Under `--parser symphony` (the gateway's default), a worker's parser labels
 decide for its model, else the registry's table for a model it knows, else the two flags, for the
 models the registry does not know: a table's name in them reads those models with that table, and
 the name `hf` reads each with the table its tokenizer's `response_template` compiles into
@@ -224,16 +224,16 @@ or renamed checkpoint is not listed: the flags, or its workers' labels, name its
 group names it, else it keeps the older parsers). The flags stay: under `--parser symphony` the gateway maps a legacy tool-call or reasoning parser's
 name whose format a table reads to that table (`qwen` for `qwen3`, `qwen_xml` for `qwen3_tagged`, a
 launcher's `muse` for `muse_spark`; the map is the gateway's `routers::grpc::utils::ALIASES`, beside
-its parser resolution), so a deployment's existing flags keep a working parser when the gateway's
-default parser changes; a legacy name no table answers to keeps the legacy parsers as a tool-call
+its parser resolution), so a deployment's existing flags keep a working parser under Symphony, the
+gateway's default parser; a legacy name no table answers to keeps the legacy parsers as a tool-call
 name and selects nothing as a reasoning name alone, and the gateway lists each such name with the
 reason (`utils::UNANSWERED`); its test over both legacy registries holds every legacy name to one of
 three: a table's own name (`qwen3`, `gemma4`), a row of `ALIASES`, or a row of `UNANSWERED`. The crate knows a table by its own name only (`Table::named`). The Harmony family (gpt-oss) has no
 table and no alias: it stays on the Harmony pipeline, by the maintainers' decision of 2026-10-17.
 
 <!-- models: begin -->
-222 groups, 389 checkpoints, newest first.
-12 ready, 149 replaying a recorded set, 12 on main awaiting fixtures, 49 pending.
+224 groups, 396 checkpoints, newest first.
+12 ready, 150 replaying a recorded set, 13 on main awaiting fixtures, 49 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
@@ -453,9 +453,11 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2025-01-20 | [deepseek-r1-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-r1-bf16) | arcee-ai/DeepSeek-R1-bf16 |  | `deepseek_v3` | 3,110 | replaying the set | `pythonic`, `deepseek_r1` |
 | 2025-01-20 | [deepseek-r1-distill-llama-8b](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-r1-distill-llama-8b) | deepseek-ai/DeepSeek-R1-Distill-Llama-8B | DeepSeek-R1-Distill-Llama-70B | `deepseek_v3` | 94,830 | replaying the set | `pythonic`, `deepseek_r1` |
 | 2025-01-20 | [deepseek-r1-distill-qwen-1.5b](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-r1-distill-qwen-1.5b) | deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B | DeepSeek-R1-Distill-Qwen-7B, DeepSeek-R1-Distill-Qwen-14B, DeepSeek-R1-Distill-Qwen-32B | `deepseek_v3` | 94,830 | replaying the set | `pythonic`, `deepseek_r1` |
+| 2024-11-26 | [llama-3.3-70b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.3-70b-instruct) | meta-llama/Llama-3.3-70B-Instruct |  | `json` | 14 | replaying the set | `json`, none |
 | 2024-09-18 | [llama-3.2-11b-vision-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.2-11b-vision-instruct) | meta-llama/Llama-3.2-11B-Vision-Instruct | Llama-3.2-90B-Vision-Instruct | `json` | 458,203 | replaying the set | `llama`, none |
 | 2024-09-18 | [llama-3.2-1b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.2-1b-instruct) | meta-llama/Llama-3.2-1B-Instruct | Llama-3.2-3B-Instruct | `json` | 458,185 | replaying the set | `llama`, none |
 | 2024-09-16 | [qwen2.5-0.5b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen2.5-0.5b-instruct) | Qwen/Qwen2.5-0.5B-Instruct | Qwen2.5-1.5B-Instruct, Qwen2.5-3B-Instruct, Qwen2.5-7B-Instruct, Qwen2.5-14B-Instruct, Qwen2.5-32B-Instruct, Qwen2.5-72B-Instruct, Qwen2.5-Coder-0.5B-Instruct, Qwen2.5-Coder-1.5B-Instruct, Qwen2.5-Coder-3B-Instruct, Qwen2.5-Coder-7B-Instruct, Qwen2.5-Coder-14B-Instruct, Qwen2.5-Coder-32B-Instruct | `qwen2.5` | 576,772 | replaying the set | `qwen`, `qwen3` |
+| 2024-07-18 | [llama-3.1-8b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/llama-3.1-8b-instruct) | meta-llama/Llama-3.1-8B-Instruct | Llama-3.1-70B-Instruct, Llama-3.1-405B-Instruct, Meta-Llama-3.1-8B-Instruct, Meta-Llama-3.1-70B-Instruct, Meta-Llama-3.1-405B-Instruct | `json` | — | awaiting fixtures | `json`, none |
 | 2024-05-22 | [mistral-7b-instruct-v0.3](https://github.com/smg-project/bellwether/tree/main/fixtures/mistral-7b-instruct-v0.3) | mistralai/Mistral-7B-Instruct-v0.3 |  | `mistral` | — | awaiting fixtures | `mistral`, none |
 | 2023-12-30 | [tinyllama-1.1b-chat-v1.0](https://github.com/smg-project/bellwether/tree/main/fixtures/tinyllama-1.1b-chat-v1.0) | TinyLlama/TinyLlama-1.1B-Chat-v1.0 |  | `plain` | 27,865 | ready | `json`, none |
 | 2023-12-05 | [llava-1.5-7b-hf](https://github.com/smg-project/bellwether/tree/main/fixtures/llava-1.5-7b-hf) | llava-hf/llava-1.5-7b-hf |  | — | — | pending | none |

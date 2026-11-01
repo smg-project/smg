@@ -1,19 +1,20 @@
 //! Drive cancellation through the gateway's gRPC client, including its
 //! abort-on-drop path, and check the simulated engine's own load.
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use futures::StreamExt;
 use mock_worker::{
     config::Config,
     engine::{EngineParams, TimingModel},
-    grpc::serve_with_listener,
 };
 use smg_grpc_client::{
     tokenspeed_proto as ts, tokenspeed_scheduler::AbortOnDropStream, TokenSpeedSchedulerClient,
 };
-use tokio::{net::TcpListener, time::timeout};
+use tokio::time::timeout;
 use ts::generate_response::Response as GenResp;
+
+mod common;
 
 async fn start(max_running: usize, overhead_ms: f64) -> TokenSpeedSchedulerClient {
     let cfg = Config {
@@ -30,16 +31,7 @@ async fn start(max_running: usize, overhead_ms: f64) -> TokenSpeedSchedulerClien
         },
         ..Config::default()
     };
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the server serves until the test process exits"
-    )]
-    let _server = tokio::spawn(serve_with_listener(Arc::new(cfg), listener));
-    TokenSpeedSchedulerClient::connect(&format!("http://{address}"))
-        .await
-        .unwrap()
+    common::start(cfg).await
 }
 
 fn request(id: &str, max_new: u32, stream: bool) -> ts::GenerateRequest {

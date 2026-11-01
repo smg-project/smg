@@ -89,6 +89,12 @@ pub struct VllmModelInfo {
     pub kv_connector: String,
     pub kv_role: String,
     pub kv_engine_id: String,
+    /// Whether a Mooncake connector runs in the engine at all, as the
+    /// launcher reads it off the raw `kv_transfer_config` (the top-level
+    /// connector or any child a wrapper lists, whatever `kv_connector`
+    /// projects): a PD decode side's KV-transfer rejection notice is
+    /// withheld there (see `generate.rs`).
+    pub runs_mooncake: bool,
     /// PD pairing facts the Router matches before a handoff: requested KV
     /// cache dtype and attention backend (empty when auto), and the model
     /// dtype / block size the handshake confirms (these two are fallbacks
@@ -146,6 +152,13 @@ pub struct VllmModelInfo {
     /// parser to see the thought's end, `first_token` when the grammar runs
     /// from the first generated token; empty when the config does not say.
     pub constrained_decoding_start: String,
+    /// The vocabulary of structural-tag nodes the engine's grammar compiler
+    /// takes, as the launcher read it off the xgrammar installed beside the
+    /// engine (`structural_tag_vocabulary` label): `older` for one that
+    /// predates the `optional`, `plus`, `star` and `token` nodes and refuses
+    /// a tag that carries one; empty for a current one, another backend, or
+    /// nothing known.
+    pub structural_tag_vocabulary: String,
     /// Whether the engine's scheduler statistics are on (vLLM's
     /// `--disable-log-stats` not given), as the launcher started it: such an
     /// engine's wire reports every scheduler step, and the pushed load record

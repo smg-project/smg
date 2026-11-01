@@ -60,6 +60,7 @@ from smg_grpc_servicer.constrained_decoding import (
     grammar_start_labels,
     sglang_constrained_decoding_start,
     sglang_grammar_backend,
+    structural_tag_vocabulary_entry,
 )
 from smg_grpc_servicer.mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
@@ -240,7 +241,12 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     # The grammar backend the scheduler runs, resolved (the raw argument is
     # None unless set): the Rust servicer refuses a constraint that backend
     # cannot enforce before the scheduler.
-    grammar_backend_entry(args_dict, sglang_grammar_backend(server_args))
+    grammar_backend = sglang_grammar_backend(server_args)
+    grammar_backend_entry(args_dict, grammar_backend)
+    # The vocabulary of structural-tag nodes that backend takes, when the
+    # xgrammar installed beside the engine predates the current one: the
+    # Router spells such a worker's structural tags in the older vocabulary.
+    structural_tag_vocabulary_entry(args_dict, grammar_backend)
     try:
         from sglang.version import __version__ as sglang_version
     except ImportError:  # the launcher's unit tests run without SGLang
@@ -558,6 +564,44 @@ class SglangLauncher(RustLauncher):
             dispatches_from_the_frontend,
         )
 
+        processor = os.environ.get("SMG_SGLANG_MM_PROCESSOR", "").strip().lower()
+        if processor not in ("", "smg"):
+            raise ValueError("SMG_SGLANG_MM_PROCESSOR must be empty or smg")
+        if processor:
+            if dispatches_from_the_frontend(args):
+                raise ValueError(
+                    "native media processing cannot be combined with encode disaggregation"
+                )
+            if not tokenizer_dir:
+                raise ValueError("native media processing requires a tokenizer directory")
+            try:
+                concurrency = int(os.environ.get("SMG_SGLANG_MM_MAX_INFLIGHT", "64"))
+            except ValueError as error:
+                raise ValueError("SMG_SGLANG_MM_MAX_INFLIGHT must be positive integer") from error
+            if concurrency <= 0:
+                raise ValueError("SMG_SGLANG_MM_MAX_INFLIGHT must be positive integer")
+            from smg_grpc_servicer.sglang.mm_defaults import configure_threads, encoder_dtype
+
+            dtype = encoder_dtype(
+                os.environ.get("SMG_SGLANG_MM_DTYPE"),
+                lambda: _model_config(args).dtype,
+            )
+            configure_threads()
+            return {
+                "smg_media_processor": {
+                    "model_dir": str(args.model_path),
+                    "model_id": str(args.model_path),
+                    "encoder_dtype": dtype,
+                    "source": "env",
+                    "max_inflight": concurrency,
+                    "engine_item_limits": {
+                        modality: int(count)
+                        for entry in sglang_item_limits(args).split(",")
+                        if entry
+                        for modality, count in [entry.split("=", 1)]
+                    },
+                }
+            }
         if not dispatches_from_the_frontend(args):
             return {}
         self.encode = EncodeDispatchBridge(args)

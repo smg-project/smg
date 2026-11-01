@@ -16,6 +16,7 @@ name = "smg_rl"
 
 [dependencies]
 openai-protocol.workspace = true
+async-trait.workspace = true
 axum = { workspace = true, features = ["macros"] }
 http.workspace = true
 reqwest = { workspace = true, features = ["rustls-no-provider", "json", "http2"] }

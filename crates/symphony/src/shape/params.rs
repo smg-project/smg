@@ -187,7 +187,7 @@ impl Params {
         let close = if self.written == 0 { "{}" } else { "}" };
         out.push(Event::ToolCallArguments {
             index: self.index,
-            json: close.to_string(),
+            json: close.to_string().into(),
             source: Text::default(),
         });
     }
@@ -314,7 +314,7 @@ impl Params {
         member.push_str(&self.values.reader().read(self.parser, value, schema));
         out.push(Event::ToolCallArguments {
             index: self.index,
-            json: member,
+            json: member.into(),
             source: Text::uncounted(parameter.to_owned()),
         });
         self.written += 1;
