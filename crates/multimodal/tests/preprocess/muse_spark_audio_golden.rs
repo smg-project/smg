@@ -18,6 +18,8 @@ use llm_multimodal::{
 };
 use serde::Deserialize;
 
+use super::{fnv1a_f32, fnv1a_update};
+
 const GOLDEN: &str = include_str!("../fixtures/golden/muse_spark_audio_fingerprints.json");
 
 #[derive(Deserialize)]
@@ -62,22 +64,6 @@ fn make_waveform(count: usize, seed: u32, amplitude: f32) -> Vec<f32> {
             raw as f32 / 32_768.0 * amplitude
         })
         .collect()
-}
-
-fn fnv1a_update(mut hash: u64, bytes: &[u8]) -> u64 {
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-fn fnv1a_f32(values: &[f32]) -> String {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for value in values {
-        hash = fnv1a_update(hash, &value.to_le_bytes());
-    }
-    format!("{hash:016x}")
 }
 
 fn fnv1a_bf16(values: &[f32]) -> String {

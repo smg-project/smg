@@ -1176,7 +1176,7 @@ fn typed(tail: &str) -> Option<&str> {
 }
 
 impl crate::engine::CallAssembler for Assembler {
-    fn feed(&mut self, text: &str, declared: &Declared, out: &mut Events) -> usize {
+    fn feed<'d>(&mut self, text: &'d str, declared: &Declared, out: &mut Events<'d>) -> usize {
         self.feed(text, declared, out);
         text.len()
     }
@@ -1207,7 +1207,10 @@ mod tests {
     use serde_json::json as value;
 
     use super::*;
-    use crate::testing::bytes;
+    use crate::{
+        tagged::{dropped, nothing_empty, refused, shown},
+        testing::{arguments, bytes, malformed},
+    };
 
     fn declared() -> Declared {
         Declared::of(&[Tool {
@@ -1248,67 +1251,6 @@ mod tests {
         out.drain()
     }
 
-    fn arguments(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn malformed(events: &[Event]) -> Vec<(String, MalformedReason)> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// The bytes dropped as the template's wrapping, in order.
-    fn dropped(events: &[Event]) -> Vec<String> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Dropped {
-                    text,
-                    why: DropReason::Wrapper,
-                } => Some(text.text.to_string()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// The bytes refused as the model's failed call, in order: the `Dropped { MalformedCall }`
-    /// events, which no adapter shows.
-    fn refused(events: &[Event]) -> Vec<String> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Dropped {
-                    text,
-                    why: DropReason::MalformedCall,
-                } => Some(text.text.to_string()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// The content a chat client reads: every content and malformed text, in order, as the chat
-    /// adapter folds it.
-    fn shown(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) | Event::Malformed { text, .. } => Some(&*text.text),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// A streamed string still open at the invoke's own closing marker, with the start of a cut
     /// tag held before it: the tag the marker cut short leaves before the call's end, as it came
     /// in, so the event bytes read as the input did.
@@ -1336,29 +1278,6 @@ mod tests {
         "<|open|>argument key=\"prefs\" type=\"object\"<|sep|>{\"size\": \"large\"}",
         "<|close|>argument<|sep|>"
     );
-
-    /// No fragment is empty and no `Malformed` or `Dropped` text is empty, but for the one event
-    /// of no bytes that counts a refused run and stands right before its `Dropped {
-    /// MalformedCall }`: any other empty report would claim a byte where none was.
-    fn nothing_empty(events: &[Event]) {
-        for (at, event) in events.iter().enumerate() {
-            match event {
-                Event::ToolCallArguments { json, .. } => assert!(!json.is_empty(), "{event:?}"),
-                Event::Malformed { text, .. } if text.text.is_empty() => assert!(
-                    matches!(
-                        events.get(at + 1),
-                        Some(Event::Dropped { text, why: DropReason::MalformedCall })
-                            if !text.text.is_empty()
-                    ),
-                    "{event:?}: an empty report with no refused bytes after it"
-                ),
-                Event::Malformed { text, .. } | Event::Dropped { text, .. } => {
-                    assert!(!text.text.is_empty(), "{event:?}");
-                }
-                _ => {}
-            }
-        }
-    }
 
     #[test]
     fn an_xtml_call_gives_its_name_its_typed_arguments_and_every_byte_however_it_is_cut() {
@@ -1411,7 +1330,7 @@ mod tests {
         let fragments: Vec<&str> = streamed
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
+                Event::ToolCallArguments { json, .. } => Some(json.as_ref()),
                 _ => None,
             })
             .collect();
@@ -1520,7 +1439,7 @@ mod tests {
         let fragments: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
+                Event::ToolCallArguments { json, .. } => Some(json.as_ref()),
                 _ => None,
             })
             .collect();

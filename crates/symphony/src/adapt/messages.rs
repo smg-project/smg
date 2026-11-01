@@ -411,7 +411,7 @@ mod tests {
     fn arguments(index: u32, json: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index,
-            json: json.into(),
+            json: json.to_owned().into(),
             source: Text::default(),
         }
     }

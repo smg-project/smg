@@ -650,6 +650,8 @@ fn compute_desired_state(pods: &[Arc<Pod>], config: &ServiceDiscoveryConfig) -> 
             // A socket address always parses; the fallible form keeps the
             // provider honest if the address ever stops coming from one.
             let Ok(endpoint) = Endpoint::parse(&url) else {
+                // A socket address carries no userinfo, and the masked form of
+                // one the parser refused would only read as its marker.
                 warn!(
                     "Pod {} has an unusable worker address '{}', skipping",
                     info.name, url
@@ -702,7 +704,24 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::worker::{endpoint::Endpoint, registry::WorkerId, EndpointKey};
+    use crate::{
+        test_support::make_labeled_pod,
+        worker::{endpoint::Endpoint, registry::WorkerId, EndpointKey},
+    };
+
+    /// The pod's Ready condition at `status` ("True", "False" or "Unknown"),
+    /// every other field unset.
+    fn ready_condition(status: &str) -> PodCondition {
+        PodCondition {
+            type_: "Ready".to_string(),
+            status: status.to_string(),
+            last_probe_time: None,
+            last_transition_time: None,
+            message: None,
+            reason: None,
+            observed_generation: None,
+        }
+    }
 
     fn create_k8s_pod(
         name: Option<&str>,
@@ -731,15 +750,7 @@ mod tests {
             };
 
             if let Some(status_str) = ready_status {
-                let condition = PodCondition {
-                    type_: "Ready".to_string(),
-                    status: status_str.to_string(),
-                    last_probe_time: None,
-                    last_transition_time: None,
-                    message: None,
-                    reason: None,
-                    observed_generation: None,
-                };
+                let condition = ready_condition(status_str);
                 pod_status.conditions = Some(vec![condition]);
             }
             pod.status = Some(pod_status);
@@ -747,40 +758,18 @@ mod tests {
         pod
     }
 
+    /// A running, ready pod of the PD deployment: the `app` and `component`
+    /// labels the selectors read, and the bootstrap-port annotation when the
+    /// role has one (an empty, not absent, annotation map otherwise).
     fn create_pd_k8s_pod(name: &str, ip: &str, pod_type: &str, bootstrap_port: Option<u16>) -> Pod {
-        let mut labels = BTreeMap::new();
-        labels.insert("app".to_string(), "sglang".to_string());
-        labels.insert("component".to_string(), pod_type.to_string());
-
-        let mut annotations = BTreeMap::new();
-        if let Some(port) = bootstrap_port {
-            annotations.insert("sglang.ai/bootstrap-port".to_string(), port.to_string());
-        }
-
-        Pod {
-            metadata: ObjectMeta {
-                name: Some(name.to_string()),
-                uid: Some(format!("uid-{name}")),
-                labels: Some(labels),
-                annotations: Some(annotations),
-                ..Default::default()
-            },
-            spec: Some(PodSpec::default()),
-            status: Some(PodStatus {
-                pod_ip: Some(ip.to_string()),
-                phase: Some("Running".to_string()),
-                conditions: Some(vec![PodCondition {
-                    type_: "Ready".to_string(),
-                    status: "True".to_string(),
-                    last_probe_time: None,
-                    last_transition_time: None,
-                    message: None,
-                    reason: None,
-                    observed_generation: None,
-                }]),
-                ..Default::default()
-            }),
-        }
+        let mut pod = make_labeled_pod(name, ip, &[("app", "sglang"), ("component", pod_type)]);
+        pod.metadata.annotations = Some(
+            bootstrap_port
+                .into_iter()
+                .map(|port| ("sglang.ai/bootstrap-port".to_string(), port.to_string()))
+                .collect(),
+        );
+        pod
     }
 
     fn create_pd_config() -> ServiceDiscoveryConfig {
@@ -1278,15 +1267,7 @@ mod tests {
         let config = make_regular_config();
         let mut pod = pod_with_annotations("w", &[("smg.ai/worker-ports", "8080,8081")]);
         if let Some(status) = pod.status.as_mut() {
-            status.conditions = Some(vec![PodCondition {
-                type_: "Ready".to_string(),
-                status: "False".to_string(),
-                last_probe_time: None,
-                last_transition_time: None,
-                message: None,
-                reason: None,
-                observed_generation: None,
-            }]);
+            status.conditions = Some(vec![ready_condition("False")]);
         }
         let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
         let registered = [
@@ -1376,15 +1357,7 @@ mod tests {
         let config = make_regular_config();
         let mut pod = pod_with_annotations("w", &[("smg.ai/worker-ports", "8080,8081")]);
         if let Some(status) = pod.status.as_mut() {
-            status.conditions = Some(vec![PodCondition {
-                type_: "Ready".to_string(),
-                status: "False".to_string(),
-                last_probe_time: None,
-                last_transition_time: None,
-                message: None,
-                reason: None,
-                observed_generation: None,
-            }]);
+            status.conditions = Some(vec![ready_condition("False")]);
         }
         let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
         assert!(desired.workers.is_empty());
@@ -1395,15 +1368,7 @@ mod tests {
         let config = make_regular_config();
         let mut pod = make_labeled_pod("w", "10.0.0.1", &[("app", "sglang")]);
         if let Some(status) = pod.status.as_mut() {
-            status.conditions = Some(vec![PodCondition {
-                type_: "Ready".to_string(),
-                status: "Unknown".to_string(),
-                last_probe_time: None,
-                last_transition_time: None,
-                message: None,
-                reason: None,
-                observed_generation: None,
-            }]);
+            status.conditions = Some(vec![ready_condition("Unknown")]);
         }
         let desired = compute_desired_state(&store_snapshot(vec![pod]), &config);
         assert!(desired.workers.is_empty());
@@ -1665,36 +1630,6 @@ mod tests {
         }
     }
 
-    fn make_labeled_pod(name: &str, ip: &str, labels: &[(&str, &str)]) -> Pod {
-        let mut label_map = BTreeMap::new();
-        for &(k, v) in labels {
-            label_map.insert(k.to_string(), v.to_string());
-        }
-        Pod {
-            metadata: ObjectMeta {
-                name: Some(name.to_string()),
-                uid: Some(format!("uid-{name}")),
-                labels: Some(label_map),
-                ..Default::default()
-            },
-            spec: Some(PodSpec::default()),
-            status: Some(PodStatus {
-                pod_ip: Some(ip.to_string()),
-                phase: Some("Running".to_string()),
-                conditions: Some(vec![PodCondition {
-                    type_: "Ready".to_string(),
-                    status: "True".to_string(),
-                    last_probe_time: None,
-                    last_transition_time: None,
-                    message: None,
-                    reason: None,
-                    observed_generation: None,
-                }]),
-                ..Default::default()
-            }),
-        }
-    }
-
     #[test]
     fn test_pod_info_from_pod_missing_uid() {
         let mut k8s_pod = create_k8s_pod(
@@ -1722,18 +1657,7 @@ mod tests {
 
     #[test]
     fn test_list_label_selector_pd_mode_common_labels() {
-        let mut prefill = HashMap::new();
-        prefill.insert("app".to_string(), "sglang".to_string());
-        prefill.insert("component".to_string(), "prefill".to_string());
-        let mut decode = HashMap::new();
-        decode.insert("app".to_string(), "sglang".to_string());
-        decode.insert("component".to_string(), "decode".to_string());
-        let config = ServiceDiscoveryConfig {
-            disaggregated_mode: true,
-            prefill_selector: prefill,
-            decode_selector: decode,
-            ..Default::default()
-        };
+        let config = create_pd_config();
         // Only the common label "app=sglang" should be in the selector.
         assert_eq!(config.list_label_selector(), "app=sglang");
     }
@@ -1788,18 +1712,7 @@ mod tests {
 
     #[test]
     fn test_build_watcher_config_for_pd_mode_pushes_intersection() {
-        let mut prefill = HashMap::new();
-        prefill.insert("app".to_string(), "sglang".to_string());
-        prefill.insert("component".to_string(), "prefill".to_string());
-        let mut decode = HashMap::new();
-        decode.insert("app".to_string(), "sglang".to_string());
-        decode.insert("component".to_string(), "decode".to_string());
-        let config = ServiceDiscoveryConfig {
-            disaggregated_mode: true,
-            prefill_selector: prefill,
-            decode_selector: decode,
-            ..Default::default()
-        };
+        let config = create_pd_config();
         let watcher_config = build_watcher_config(&config.list_label_selector());
         assert_eq!(watcher_config.label_selector.as_deref(), Some("app=sglang"));
     }

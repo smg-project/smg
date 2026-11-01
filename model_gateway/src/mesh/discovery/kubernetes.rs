@@ -333,43 +333,11 @@ fn run_mesh_discovery(
 mod tests {
     use std::sync::Arc;
 
-    use k8s_openapi::{
-        api::core::v1::{PodCondition, PodSpec, PodStatus},
-        apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time},
-    };
+    use k8s_openapi::{api::core::v1::PodCondition, apimachinery::pkg::apis::meta::v1::Time};
     use tracing_test::traced_test;
 
     use super::*;
-
-    fn make_labeled_pod(name: &str, ip: &str, labels: &[(&str, &str)]) -> Pod {
-        let mut label_map = std::collections::BTreeMap::new();
-        for &(k, v) in labels {
-            label_map.insert(k.to_string(), v.to_string());
-        }
-        Pod {
-            metadata: ObjectMeta {
-                name: Some(name.to_string()),
-                uid: Some(format!("uid-{name}")),
-                labels: Some(label_map),
-                ..Default::default()
-            },
-            spec: Some(PodSpec::default()),
-            status: Some(PodStatus {
-                pod_ip: Some(ip.to_string()),
-                phase: Some("Running".to_string()),
-                conditions: Some(vec![PodCondition {
-                    type_: "Ready".to_string(),
-                    status: "True".to_string(),
-                    last_probe_time: None,
-                    last_transition_time: None,
-                    message: None,
-                    reason: None,
-                    observed_generation: None,
-                }]),
-                ..Default::default()
-            }),
-        }
-    }
+    use crate::test_support::make_labeled_pod;
 
     fn router_config_and_pod() -> (MeshDiscoveryConfig, Pod) {
         let mut router_selector = HashMap::new();

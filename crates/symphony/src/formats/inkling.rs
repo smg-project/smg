@@ -63,8 +63,8 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, Text},
-        testing::{arguments_of, bytes, content, drive, names, reasoning},
+        event::{Event, Text},
+        testing::{arguments_of, bytes, content, drive, dropped, names, reasoning},
         Declared,
     };
 
@@ -84,13 +84,6 @@ mod tests {
             prompt,
             pieces,
         )
-    }
-
-    fn dropped(text: &str) -> Event<'static> {
-        Event::Dropped {
-            text: Text::uncounted(text.to_owned()),
-            why: DropReason::Wrapper,
-        }
     }
 
     fn malformed_count(events: &[Event]) -> usize {

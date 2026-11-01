@@ -307,67 +307,8 @@ impl RouterFactory {
 
 #[cfg(test)]
 mod grpc_router_type_tests {
-    use std::sync::{Arc, OnceLock};
-
-    use llm_tokenizer::registry::TokenizerRegistry;
-    use reasoning_parser::ParserFactory as ReasoningParserFactory;
-    use smg_data_connector::{
-        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
-    };
-    use smg_mcp::{McpConfig, McpOrchestrator};
-    use tool_parser::ParserFactory as ToolParserFactory;
-
     use super::*;
-    use crate::{app_context::AppContext, config::RouterConfig, policies::PolicyRegistry};
-
-    /// Build an `AppContext` for a gRPC `RoutingMode` with the components
-    /// `GrpcRouter::new` needs (parser factories always; an initialized MCP
-    /// orchestrator for Regular/PD, which build the responses contexts).
-    async fn grpc_ctx(mode: RoutingMode) -> Arc<AppContext> {
-        let config = RouterConfig::builder()
-            .mode(mode)
-            .grpc_connection()
-            .policy(PolicyConfig::Random)
-            .host("127.0.0.1")
-            .port(3001)
-            .max_payload_size(1024 * 1024)
-            .request_timeout_secs(60)
-            .worker_startup_timeout_secs(10)
-            .worker_startup_check_interval_secs(1)
-            .max_concurrent_requests(64)
-            .queue_timeout_secs(60)
-            .build_unchecked();
-
-        let worker_registry = Arc::new(crate::worker::WorkerRegistry::new());
-        let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
-        let mcp_orchestrator = Arc::new(OnceLock::new());
-        mcp_orchestrator
-            .set(Arc::new(
-                McpOrchestrator::new(McpConfig::default())
-                    .await
-                    .expect("mcp orchestrator"),
-            ))
-            .ok();
-
-        Arc::new(
-            AppContext::builder()
-                .router_config(config)
-                .client(crate::clients::http_client())
-                .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
-                .reasoning_parser_factory(Some(ReasoningParserFactory::new()))
-                .tool_parser_factory(Some(ToolParserFactory::new()))
-                .worker_registry(worker_registry)
-                .policy_registry(policy_registry)
-                .response_storage(Arc::new(MemoryResponseStorage::new()))
-                .conversation_storage(Arc::new(MemoryConversationStorage::new()))
-                .conversation_item_storage(Arc::new(MemoryConversationItemStorage::new()))
-                .worker_job_queue(Arc::new(OnceLock::new()))
-                .workflow_engines(Arc::new(OnceLock::new()))
-                .mcp_orchestrator(mcp_orchestrator)
-                .build()
-                .expect("app context"),
-        )
-    }
+    use crate::routers::grpc::testing::grpc_ctx;
 
     #[tokio::test]
     async fn grpc_router_type_reflects_disaggregation_mode() {

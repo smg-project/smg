@@ -9,6 +9,7 @@ pub mod body_limit;
 pub mod body_timeout;
 pub mod concurrency;
 pub mod edge_body;
+pub mod inert;
 pub mod logging;
 pub mod messages_errors;
 pub mod metrics;

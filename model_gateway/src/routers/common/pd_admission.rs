@@ -238,11 +238,11 @@ pub(crate) async fn admit_decode(
     if rooms > window {
         Metrics::record_pd_admission_shed();
         debug!(
-            worker = decode.url(),
+            worker = decode.redacted_url(),
             model_id, window, rooms, "PD admission shed: more rooms than the decode window holds"
         );
         return Err(overload::shed_pd_admission(
-            decode.url(),
+            decode.redacted_url(),
             model_id,
             window,
             rooms,
@@ -271,7 +271,7 @@ pub(crate) async fn admit_decode(
         Claim::Waited => {
             Metrics::record_pd_admission_wait();
             debug!(
-                worker = decode.url(),
+                worker = decode.redacted_url(),
                 model_id, window, rooms, "PD admission waited for decode rooms"
             );
             Ok(Some(PdAdmissionGuard {
@@ -282,7 +282,7 @@ pub(crate) async fn admit_decode(
         Claim::Refused => {
             Metrics::record_pd_admission_shed();
             debug!(
-                worker = decode.url(),
+                worker = decode.redacted_url(),
                 model_id,
                 window,
                 rooms,
@@ -291,7 +291,7 @@ pub(crate) async fn admit_decode(
                 "PD admission shed: no decode rooms freed"
             );
             Err(overload::shed_pd_admission(
-                decode.url(),
+                decode.redacted_url(),
                 model_id,
                 window,
                 rooms,
@@ -317,11 +317,11 @@ pub(crate) fn announce_decode_window(worker: &dyn Worker) {
     Metrics::set_pd_admission_window(worker.url(), window);
     match window {
         Some(window) => debug!(
-            worker = worker.url(),
+            worker = worker.redacted_url(),
             window, "PD admission bounds dispatch to this decode worker by its running window"
         ),
         None => warn!(
-            worker = worker.url(),
+            worker = worker.redacted_url(),
             "PD admission is off for this decode worker: it reports no running window (no \
              `max_num_seqs` or `max_running_requests` label), so a burst wider than its \
              scheduler runs at once queues at the engine instead of waiting at the gateway"
@@ -338,12 +338,12 @@ mod tests {
 
     use axum::http::{header::RETRY_AFTER, StatusCode};
     use futures::future::join_all;
-    use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+    use openai_protocol::model_card::ModelCard;
 
     use super::*;
     use crate::{
         routers::{common::retry::is_retryable_response, error::extract_error_code_from_response},
-        worker::{BasicWorkerBuilder, ConnectionMode, WorkerType},
+        worker::{test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, WorkerType},
     };
 
     fn decode_worker(url: &str, window: Option<u16>) -> Arc<dyn Worker> {
@@ -357,10 +357,7 @@ mod tests {
                 .worker_type(WorkerType::Decode)
                 .connection_mode(ConnectionMode::Grpc)
                 .labels(labels)
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         )
     }
@@ -561,10 +558,7 @@ mod tests {
                 .model(ModelCard::new("m"))
                 .worker_type(WorkerType::Prefill)
                 .connection_mode(ConnectionMode::Grpc)
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
+                .health_config(no_health_check())
                 .build(),
         );
         let rendered = render_with_recorder(|| announce_decode_window(prefill.as_ref()));

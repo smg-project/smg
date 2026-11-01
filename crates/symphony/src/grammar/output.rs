@@ -78,7 +78,7 @@ use self::{
 use super::{json_len, Bound, Grammar};
 use crate::{
     format::{CallSyntax, Emits, Format, Whitespace},
-    markers::{Piece, Scanner},
+    markers::Piece,
     shape::{Arguments, Atom, CallShape, Class, End, NameSource, Slot, ValueParser},
 };
 
@@ -578,7 +578,7 @@ impl Format {
 
     /// The states `text`'s markers move the engine through from `from`, that state first.
     fn walk(&self, text: &str, from: usize) -> Vec<usize> {
-        let mut scanner = Scanner::new(self.terminal_texts());
+        let mut scanner = self.scanner();
         let mut states = vec![from];
         let fed = scanner.feed(text);
         let end = scanner.finish();

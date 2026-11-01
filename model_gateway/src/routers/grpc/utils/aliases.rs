@@ -24,8 +24,8 @@ pub fn answering_to(name: &str) -> Option<Table> {
 /// The other names a table answers to ([`answering_to`]): the gateway's older tool and
 /// reasoning parsers that read the table's format, so that a deployment that names one
 /// (`--tool-call-parser qwen_xml`) reads with the table (`qwen3_tagged`) when the gateway reads
-/// with Symphony. The rule, so that a deployment's existing flags keep a working parser when
-/// the gateway's default parser changes: every legacy tool-call or reasoning parser's name
+/// with Symphony. The rule, so that a deployment's existing flags keep a working parser under
+/// Symphony, the gateway's default parser: every legacy tool-call or reasoning parser's name
 /// whose format a table reads is an alias of that table; a legacy name no table answers to is
 /// in [`UNANSWERED`] with the reason (what it selects then is said there), `passthrough`
 /// among them, which leaves its channel as written, which no table reads for. A row may also be
