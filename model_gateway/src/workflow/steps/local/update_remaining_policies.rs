@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::workflow::data::WorkerRemovalWorkflowData;
+use crate::{worker::endpoint::Endpoint, workflow::data::WorkerRemovalWorkflowData};
 
 /// Step to update cache-aware policies for remaining workers.
 ///
@@ -57,12 +57,15 @@ impl StepExecutor<WorkerRemovalWorkflowData> for UpdateRemainingPoliciesStep {
 
         // Log final result at info level
         if worker_urls.len() == 1 {
-            info!("Removed worker {}", worker_urls[0]);
+            info!("Removed worker {}", Endpoint::redacted_str(&worker_urls[0]));
         } else {
             info!(
                 "Removed {} DP-aware workers: {:?}",
                 worker_urls.len(),
                 worker_urls
+                    .iter()
+                    .map(|url| Endpoint::redacted_str(url))
+                    .collect::<Vec<_>>()
             );
         }
 

@@ -62,9 +62,9 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, MalformedReason, Text},
+        event::{Event, MalformedReason, Text},
         input::EngineFinish,
-        testing::{arguments_of, bytes, content, drive, drive_to, reasoning},
+        testing::{arguments_of, bytes, content, drive, drive_to, dropped, reasoning},
         Declared,
     };
 
@@ -99,13 +99,6 @@ mod tests {
 
     fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         drive(&mut Engine::new(minimax_m2(), declared()), prompt, pieces)
-    }
-
-    fn dropped(text: &str) -> Event<'static> {
-        Event::Dropped {
-            text: Text::uncounted(text.to_owned()),
-            why: DropReason::Wrapper,
-        }
     }
 
     #[test]
@@ -191,7 +184,7 @@ mod tests {
         let fragments: Vec<&str> = streamed
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
+                Event::ToolCallArguments { json, .. } => Some(json.as_ref()),
                 _ => None,
             })
             .collect();

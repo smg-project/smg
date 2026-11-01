@@ -339,8 +339,13 @@ pub struct ImageUrl {
     pub detail: Option<String>, // "auto", "low", or "high"
     /// MiniMax-M3 extension: cap the image's long side before preprocessing.
     ///
-    /// Must be a positive multiple of the vision patch factor (28); larger
-    /// values keep more of the image and therefore cost more prompt tokens.
+    /// For M3 router preprocessing, any positive cap is accepted (default 2016).
+    /// Branch on the source size: shrink if its long side exceeds the cap;
+    /// otherwise raise a short side below 112. Then round both sides to the
+    /// nearest multiple of 28, so the aligned long side can exceed the cap.
+    /// Outputs above 12,845,056 pixels are rejected; the legacy `max_pixels`
+    /// area shrink is not applied a second time. Other families retain their
+    /// connector's positive-multiple-of-28 restriction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_long_side_pixel: Option<u32>,
 }

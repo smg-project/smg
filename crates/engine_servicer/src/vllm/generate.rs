@@ -48,12 +48,6 @@ pub(super) async fn generate(
     submit(state, client, req, trace_headers, arrival).await
 }
 
-/// The connector on which the notice is withheld (see
-/// [`RejectionNotice::send`]), by the name the launcher resolves off the
-/// engine's `kv_transfer_config` (a wrapper's mover) and `GetServerInfo`
-/// reports.
-const MOONCAKE_CONNECTOR: &str = "MooncakeConnector";
-
 /// The rejection notice a refused PD decode side owes its prefill side, so the
 /// connector releases the blocks that side pinned: what vLLM's own frontend
 /// sends, an immediately aborted one-token request under the refused id.
@@ -62,17 +56,23 @@ struct RejectionNotice {
     request_id: String,
     params: serde_json::Value,
     rank: Option<u32>,
-    /// Whether the engine moves its KV with the Mooncake connector, which
-    /// gets no notice (see `send`).
+    /// Whether a Mooncake connector runs in the engine, which gets no
+    /// notice (see `send`): the launcher reads it off the raw
+    /// `kv_transfer_config`, the top-level connector or any child a wrapper
+    /// lists, not off the connector name the projection `GetServerInfo`
+    /// reports settles on (a wrapper hands the notice's allocation to every
+    /// child and merges every child's finished transfers, so a Mooncake
+    /// child dies on it under any projection).
     withheld: bool,
 }
 
 impl RejectionNotice {
-    /// The notice `req` owes when it is a PD decode side, `kv_connector`
-    /// being the engine's connector as the launcher resolved it.
+    /// The notice `req` owes when it is a PD decode side, `runs_mooncake`
+    /// being whether a Mooncake connector runs in the engine, as the
+    /// launcher read it off the raw config.
     fn owed_by(
         client: &ZmqEngineClient,
-        kv_connector: &str,
+        runs_mooncake: bool,
         req: &vllm::GenerateRequest,
     ) -> Option<Self> {
         kv_transfer_rejection_params(req).map(|params| Self {
@@ -82,7 +82,7 @@ impl RejectionNotice {
             rank: req
                 .data_parallel_rank
                 .and_then(|rank| u32::try_from(rank).ok()),
-            withheld: kv_connector == MOONCAKE_CONNECTOR,
+            withheld: runs_mooncake,
         })
     }
 
@@ -169,7 +169,7 @@ async fn submit(
     // hold the request.
     let mut notice = ArmedNotice(RejectionNotice::owed_by(
         client,
-        &state.model.kv_connector,
+        state.model.runs_mooncake,
         &req,
     ));
     // A pooling runner serves no generation task; vLLM's frontend refuses
