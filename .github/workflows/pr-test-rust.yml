@@ -1705,6 +1705,7 @@ jobs:
       test_timeout: 24
       test_dirs: e2e_test/responses
       setup_agentic_deps: true
+      amd_responses: true
       min_selected: 128 # original Responses minimum; fail at collection if it shrinks
       gpu_vendor: amd
       container_image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
