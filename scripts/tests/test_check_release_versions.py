@@ -386,7 +386,7 @@ def test_the_plan_lists_the_bump_quietly_and_changes_nothing(mod, repo):
     assert "  minor pkg v0.1.0 → v0.2.0 (pkg/pyproject.toml)" in out
     assert "  sync chart v1.0.0 → v2.0.0 (chart/Chart.yaml)" in out
     assert out.rstrip().endswith(
-        "8 component(s) and mirror(s) move (a crate's workspace pin follows it)."
+        "9 component(s) and mirror(s) move (a crate's workspace pin follows it)."
         " Bumped already since v1.0.0, left as they are: alpha v1.1.0, delta v0.2.0 (new)."
     )
     for quiet in ("not bumped", "issue(s) found", "Checking workspace", "Summary:", "✓", "!"):
@@ -401,7 +401,7 @@ def test_the_plan_lists_the_bump_quietly_and_changes_nothing(mod, repo):
     assert "major smg" not in out
     assert "  sync chart v1.0.0 → v1.1.0-rc.1 (chart/Chart.yaml)" in out
     assert "  patch beta v1.0.0 → v1.0.1 (crates/beta/Cargo.toml)" in out
-    assert "8 component(s) and mirror(s) move" in out
+    assert "9 component(s) and mirror(s) move" in out
     with pytest.raises(mod.Fatal, match="X.Y.Z format"):
         run(mod, repo, override="1.1.0-rc.1")
     with pytest.raises(mod.Fatal, match="X.Y.Z or X.Y.Z-rc.N format"):
@@ -422,7 +422,7 @@ def test_the_plan_lists_the_bump_quietly_and_changes_nothing(mod, repo):
     assert "  set smg v2.0.0 → v2.1.0-rc.1 (model_gateway/Cargo.toml)" in out
     assert "  sync chart v2.0.0 → v2.1.0-rc.1 (chart/Chart.yaml)" in out
     assert "smg v2.0.0" not in out.split("Bumped already")[-1]
-    assert "5 component(s) and mirror(s) move" in out
+    assert "6 component(s) and mirror(s) move" in out
 
 
 def test_the_plan_lists_a_gateway_already_at_the_cuts_version_among_the_bumped(mod, repo):
@@ -434,7 +434,7 @@ def test_the_plan_lists_a_gateway_already_at_the_cuts_version_among_the_bumped(m
     assert "set smg" not in out and "major smg" not in out
     assert "  sync chart v1.0.0 → v1.1.0-rc.1 (chart/Chart.yaml)" in out
     assert out.rstrip().endswith(
-        "7 component(s) and mirror(s) move (a crate's workspace pin follows it)."
+        "8 component(s) and mirror(s) move (a crate's workspace pin follows it)."
         " Bumped already since v1.0.0, left as they are: smg v1.1.0-rc.1, alpha v1.1.0, delta v0.2.0 (new)."
     )
     # the whole tree at the cut's version (the crates bumped, the gateway and its mirrors set): nothing to bump,
@@ -443,6 +443,7 @@ def test_the_plan_lists_a_gateway_already_at_the_cuts_version_among_the_bumped(m
     put(repo, "model_gateway/Cargo.toml", manifest("smg", "2.1.0-rc.1"))
     put(repo, "bindings/Cargo.toml", manifest("smg-binding", "2.1.0-rc.1"))
     put(repo, "bindings/pyproject.toml", '[project]\nname = "smg"\nversion = "2.1.0-rc.1"\n')
+    put(repo, "bindings/smg/version.py", '__version__ = "2.1.0-rc.1"\n')
     put(
         repo,
         "chart/Chart.yaml",
