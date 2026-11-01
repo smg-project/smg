@@ -143,6 +143,29 @@ jobs:
     timeout-minutes: ${{ inputs.timeout }}
     permissions:
       contents: read
+    # AMD Responses uses the same real providers as the shared NV deployment.
+    # Actions owns their bridge/aliases and cleanup; no Docker socket in the job.
+    services:
+      oracle-db:
+        image: ${{ inputs.gpu_vendor == 'amd' && inputs.engine == 'sglang' && inputs.test_dirs == 'e2e_test/responses' && inputs.setup_agentic_deps && 'gvenzl/oracle-free:23-slim-faststart@sha256:d86d09794ae138a8951e97d7ee010778dcd43088e8d0f83a51002abab8c6d7fd' || '' }}
+        env:
+          ORACLE_PASSWORD: oracle
+        options: >-
+          --cpus=2 --memory=4g --memory-swap=4g --pids-limit=512
+          --health-cmd=healthcheck.sh --health-interval=10s
+          --health-timeout=5s --health-retries=30
+      brave-search-mcp:
+        image: ${{ inputs.gpu_vendor == 'amd' && inputs.engine == 'sglang' && inputs.test_dirs == 'e2e_test/responses' && inputs.setup_agentic_deps && 'mcp/brave-search:latest@sha256:c7fcb7c3f794d8860362c6bcbc2ad959339d07e57503d1a8fc1a5aadf159ac6b' || '' }}
+        env:
+          BRAVE_MCP_TRANSPORT: http
+          BRAVE_MCP_PORT: '8080'
+          BRAVE_MCP_ENABLED_TOOLS: brave_web_search brave_local_search
+          BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
+        options: >-
+          --cpus=0.5 --memory=256m --memory-swap=256m --pids-limit=128
+          --health-cmd="node -e \"fetch('http://127.0.0.1:8080/ping').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""
+          --health-start-period=5s --health-interval=10s
+          --health-timeout=5s --health-retries=3
     env:
       E2E_ENGINE: ${{ inputs.engine }}
       E2E_RUNTIME: ${{ inputs.engine }}
@@ -286,6 +309,7 @@ jobs:
       - name: Run E2E tests
         timeout-minutes: ${{ inputs.test_timeout }}
         env:
+          CI_AMD_RESPONSES: ${{ inputs.gpu_vendor == 'amd' && inputs.engine == 'sglang' && inputs.test_dirs == 'e2e_test/responses' && inputs.setup_agentic_deps }}
           SHOW_WORKER_LOGS: "0"
           SHOW_ROUTER_LOGS: "1"
           E2E_LOG_DIR: e2e-logs
@@ -311,6 +335,11 @@ jobs:
           SMG_SGLANG_SERVICER_WARMUP: fast
           SMG_TOKENSPEED_SERVICER_WARMUP: fast
         run: |
+          set --
+          if [ "$CI_AMD_RESPONSES" = true ]; then
+            mkdir -p e2e-logs
+            set -- --junitxml=e2e-logs/responses-amd.xml
+          fi
           if [ "${{ inputs.gpu_vendor }}" = amd ]; then
             bash scripts/ci_killall_sglang.sh rocm  # the default mode reads nvidia-smi
             if [ "${{ inputs.engine }}" = sglang ]; then
@@ -325,7 +354,36 @@ jobs:
             --ignore=e2e_test/bindings_go \
             ${{ inputs.test_filter }} \
             --reruns 2 --reruns-delay 5 \
+            "$@" \
             -s -vv
+          if [ "$CI_AMD_RESPONSES" = true ]; then
+            python3 - <<'PY_RESPONSES_JUNIT'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          path = Path("e2e-logs/responses-amd.xml")
+          if not path.is_file() or path.is_symlink():
+              raise SystemExit("AMD Responses: actual JUnit file is required")
+          root = ET.parse(path).getroot()
+          cases = root.findall(".//testcase")
+          identities = {(case.get("classname"), case.get("name")) for case in cases}
+          if len(identities) < 128:
+              raise SystemExit(f"AMD Responses: only {len(identities)} unique tests; need >=128")
+          bad = [case for case in cases
+                 if any(case.find(tag) is not None for tag in ("skipped", "failure", "error"))]
+          if bad:
+              raise SystemExit(f"AMD Responses: {len(bad)} skipped/failed/error testcase records")
+          print(f"AMD Responses JUnit: {len(identities)} unique tests / {len(cases)} records; zero skip/failure/error. Original IDs and full current selection still require independent audit.")
+          PY_RESPONSES_JUNIT
+          fi
+
+      - name: Upload AMD Responses complete JUnit
+        if: ${{ always() && inputs.gpu_vendor == 'amd' && inputs.engine == 'sglang' && inputs.test_dirs == 'e2e_test/responses' && inputs.setup_agentic_deps }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: responses-amd-junit
+          path: e2e-logs/responses-amd.xml
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Worker failure diagnostics
         if: failure() || cancelled()
