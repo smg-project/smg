@@ -216,6 +216,10 @@ fn render_message(
     let tools_raw = msg.get("tools").and_then(|v| v.as_array());
     let response_format = msg.get("response_format");
     let tool_calls_raw = msg.get("tool_calls").and_then(|v| v.as_array());
+    // The gateway's protocol takes the `reasoning` spelling as an alias of
+    // `reasoning_content`, so a history assistant's reasoning renders under
+    // either spelling for every renderer: a superset of the serving engine,
+    // whose copy of this encoder reads `reasoning` alone.
     let reasoning_content = msg
         .get("reasoning_content")
         .and_then(|v| v.as_str())
