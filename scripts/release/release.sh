@@ -69,8 +69,12 @@ release_of() { # 1.14.0-rc.1 -> 1.14
 }
 release_ok() { [[ $1 =~ $RELEASE_RE ]] || die "not a release: '$1' (X.Y, the minor version of release/X.Y)"; }
 is_final() { [[ $1 != *-* ]]; }
-version_above() { # <a> <b>: a reads above b (a candidate sorts below its final: 1.14.0-rc.1 < 1.14.0)
-  [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sed 's/-rc\./~rc./' | sort -V | tail -n 1 | sed 's/~rc\./-rc./')" = "$1" ]
+# Under sort -V a `~` sorts before the end of the string, so a pre-release spelled with it sorts below its final,
+# as cargo and PEP 440 order them: 1.14.0 < 1.15.0-dev < 1.15.0-rc.1 < 1.15.0 (main reads X.Y.Z-dev between cuts).
+sortable() { sed 's/-rc\./~rc./; s/-dev$/~dev/'; }
+unsortable() { sed 's/~rc\./-rc./; s/~dev$/-dev/'; }
+version_above() { # <a> <b>: a reads above b
+  [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sortable | sort -V | tail -n 1 | unsortable)" = "$1" ]
 }
 
 fetch() { git fetch --quiet --tags "$REMOTE" || die "cannot fetch $REMOTE"; }
@@ -104,7 +108,7 @@ previous_final_tag() { # the highest final tag below v<version>; empty when ther
 own_tags() { # <ref>: the release tags made on the branch (reachable from <ref>, not from main), oldest version first
   # A candidate sorts below its final: a version sort puts `~` before the end of the string.
   comm -23 <(git tag --list 'v[0-9]*' --merged "$1" | sort) <(git tag --list 'v[0-9]*' --merged "$REMOTE/main" | sort) \
-    | sed 's/-rc\./~rc./' | sort -V | sed 's/~rc\./-rc./'
+    | sortable | sort -V | unsortable
 }
 since_tag() { # <ref> <version>: the tag a bump or a check compares the versions against
   # The branch's own newest tag when it has one (made on the release branch: the last candidate);

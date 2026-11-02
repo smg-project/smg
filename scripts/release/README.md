@@ -30,7 +30,12 @@ pushed, the read-only commands (`check`, `status`, `publish-plan`, `notes`) read
 
 ## Versions
 
-- A version is `X.Y.Z` or `X.Y.Z-rc.N`; its release branch is `release/X.Y`.
+- A version is `X.Y.Z` or `X.Y.Z-rc.N`; its release branch is `release/X.Y`. Between cuts `main`
+  reads `X.Y.Z-dev`, the next development version (the trunk is next): above every release
+  before it, below the `X.Y.Z` line it leads. Cargo and Helm read it as a semver pre-release,
+  Python tooling as `X.Y.Z.dev0` (as it reads `1.14.0-rc.1` as `1.14.0rc1`), so `smg --version`,
+  the nightly wheels (`X.Y.Z.devYYYYMMDD`) and every build of `main` identify above the release
+  branch they are a superset of.
 - Every version file carries the one string as written: `model_gateway/Cargo.toml`, the two
   binding manifests, `bindings/python/pyproject.toml`, `bindings/python/src/smg/version.py`,
   `deploy/helm/smg/Chart.yaml` and the `SMG_RELEASE_TAG` line of the engine-image workflow.
@@ -60,8 +65,9 @@ pushed, the read-only commands (`check`, `status`, `publish-plan`, `notes`) read
   the pull request that moves them: the gateway and its mirrors to the release's version, every
   other crate or package to the release's version where that is higher than main's (crates.io
   and PyPI never take a version twice, so the next cut starts above what was published). The
-  nightly and dev builds derive their versions from main's plain `X.Y.Z`, which is why main
-  carries no suffix. A cut from a `main` that reads below the previous final's version is refused:
+  nightly and dev-wheel builds read a `-dev` version as the number to build (`1.15.0.devYYYYMMDD`)
+  and a plain `X.Y.Z` as the patch above it. A cut from a `main` that reads below the previous
+  final's version is refused:
   merge that pull request first, or cut from a commit after it. `main` never goes back: after a
   patch of an older line (v1.14.1 once v1.15.0 is out), `make release-bump-main` keeps the
   gateway's higher version and moves only the crates and packages the patch raised.
