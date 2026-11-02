@@ -1993,16 +1993,16 @@ jobs:
         env:
           SHOW_WORKER_LOGS: "0"
           E2E_LOG_DIR: e2e-logs
-          # floor ≈ 95% of the 168 cases the mock marker selects: the chat
+          # floor ≈ 95% of the 191 cases the mock marker selects: the chat
           # completion, request-id, concurrency, reasoning-content, EOS
           # stripping, function-calling, tool-choice (three models) and
           # multi-turn classes, the constraint-failure and the reader-panic
-          # classes
-          E2E_MIN_SELECTED: "160"
+          # classes, the completions classes and the context-length class
+          E2E_MIN_SELECTED: "181"
           MOCK_WORKER_BIN: ${{ github.workspace }}/target/debug/mock-worker
           ROUTER_LOCAL_MODEL_PATH: ${{ runner.temp }}/models
         run: |
-          pytest e2e_test/chat_completions \
+          pytest e2e_test/chat_completions e2e_test/completions e2e_test/router \
             --reruns 2 --reruns-delay 5 \
             -s -vv
 
