@@ -10,7 +10,7 @@ use symphony::{formats::qwen3, CallSyntax};
 use super::{
     super::*,
     eof::{chunk, complete, dispatch, scripted_stream, CharacterTokenizer},
-    symphony::{message_blocks, message_events},
+    symphony_chat::{message_blocks, message_events},
 };
 use crate::{
     routers::grpc::{

@@ -6,7 +6,7 @@ mod local_stop;
 mod pd_anchor;
 mod pd_usage;
 mod sse_bytes;
-mod symphony;
+mod symphony_chat;
 mod thinking_display;
 mod usage;
 mod usage_chunk;
