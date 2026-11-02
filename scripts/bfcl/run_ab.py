@@ -244,13 +244,15 @@ def incompleteness(arm: Arm, categories: list[str]) -> str | None:
     missing = [c for c in categories if c not in arm.scores]
     if not missing and not arm.timed_out:
         return None
-    reason = f"no score for {len(missing)}/{len(categories)} categories"
+    reasons = []
+    if missing:
+        reasons.append(f"no score for {len(missing)}/{len(categories)} categories")
     if arm.timed_out:
-        reason += f"; timed out during: {', '.join(arm.timed_out)}"
+        reasons.append(f"timed out during: {', '.join(arm.timed_out)}")
     if missing:
         shown = ", ".join(missing[:8]) + (f", +{len(missing) - 8} more" if len(missing) > 8 else "")
-        reason += f"; unscored: {shown}"
-    return reason
+        reasons.append(f"unscored: {shown}")
+    return "; ".join(reasons)
 
 
 def build_report(baseline: Arm, candidate: Arm, categories: list[str]) -> tuple[str, dict]:

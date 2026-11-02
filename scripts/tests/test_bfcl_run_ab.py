@@ -113,10 +113,16 @@ def test_a_category_this_evaluation_did_not_score_is_missing_not_stale(tmp_path,
     score_arm(arm, monkeypatch, run)
 
     assert arm.scores == {}
-    assert run_ab.incompleteness(arm, ["simple_python"]) is not None
+    assert run_ab.incompleteness(arm, ["simple_python"]) == (
+        "no score for 1/1 categories; unscored: simple_python"
+    )
     assert len(set(score_dirs)) == 2
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux" or not Path("/proc/self/stat").is_file(),
+    reason="requires Linux /proc process identities",
+)
 @pytest.mark.parametrize("hang_after_summary", [False, True], ids=["complete", "timed-out"])
 def test_actual_evaluate_timeout_is_incomplete_even_with_scores(
     tmp_path, monkeypatch, hang_after_summary
@@ -202,6 +208,6 @@ def test_actual_evaluate_timeout_is_incomplete_even_with_scores(
         assert payload[role]["timed_out"] == (["evaluate"] if hang_after_summary else [])
     if hang_after_summary:
         assert set(payload["incomplete"]) == {"vllm", "smg"}
-        assert all("timed out during: evaluate" in v for v in payload["incomplete"].values())
+        assert all(v == "timed out during: evaluate" for v in payload["incomplete"].values())
     else:
         assert payload["incomplete"] == {}
