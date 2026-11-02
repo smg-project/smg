@@ -58,6 +58,10 @@ fi
 # whatever engine/extra-dep installs selected. (grpcio core has no generated
 # protobuf, so it is left at the engine-selected version.) Drop the cap once the
 # stack moves to a protobuf 7 runtime.
-$RETRY 3 10 python3 -m pip install "grpcio-health-checking==1.81.*" "grpcio-reflection==1.81.*"
+# ROCm vLLM setup selects image companions for this Actions job only.
+SMG_CI_GRPC_COMPANION_VERSION="${SMG_CI_GRPC_COMPANION_VERSION:-1.81.*}"
+$RETRY 3 10 python3 -m pip install \
+    "grpcio-health-checking==${SMG_CI_GRPC_COMPANION_VERSION}" \
+    "grpcio-reflection==${SMG_CI_GRPC_COMPANION_VERSION}"
 
 echo "E2E test dependencies installed"
