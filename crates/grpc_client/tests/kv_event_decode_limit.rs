@@ -244,10 +244,12 @@ async fn the_subscribe_methods_differ_in_the_records_they_ask_for() {
             common::SubscribeKvEventsRequest {
                 start_sequence_number: 3,
                 load_records_before_first_batch: false,
+                loads_only: false,
             },
             common::SubscribeKvEventsRequest {
                 start_sequence_number: 5,
                 load_records_before_first_batch: true,
+                loads_only: false,
             },
         ]
     );

@@ -2153,6 +2153,77 @@ async fn get_tokenizer_without_a_tokenizer_dir_is_refused() {
 /// `SubscribeKvEvents` without a publisher is UNIMPLEMENTED with the Python
 /// servicer's message. With one configured, the call resolves before any
 /// event (headers go out eagerly, as the Python relay's initial metadata),
+/// A subscriber that wants the load records alone gets them with or without
+/// a relay (the servicer's own figures need none): `load_only` batches
+/// numbered 0, one per rank, with the engine's telemetry, and never an
+/// event; a rank's record follows its own clock.
+#[tokio::test]
+async fn loads_only_streams_each_ranks_record_without_a_relay() {
+    let (mut h, _rank1_in, mut rank1_out) = two_rank_harness(model_info()).await;
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        h.client
+            .subscribe_kv_events(common::SubscribeKvEventsRequest {
+                loads_only: true,
+                ..Default::default()
+            }),
+    )
+    .await
+    .expect("the call resolves")
+    .expect("subscribe: no relay is needed for the records")
+    .into_inner();
+    let mut ranks = Vec::new();
+    for _ in 0..2 {
+        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
+            .await
+            .expect("a record in time")
+            .expect("stream open")
+            .expect("a batch");
+        assert_eq!(batch.sequence_number, 0);
+        assert!(batch.events.is_empty());
+        let load = batch.load.as_ref().expect("a record");
+        assert!(load.load_only);
+        assert_eq!(load.running_requests, 0);
+        assert_eq!(
+            load.max_total_num_tokens,
+            Some(h.server.state.shared.kv_capacity_tokens())
+        );
+        ranks.push(batch.dp_rank.expect("a rank"));
+    }
+    ranks.sort_unstable();
+    assert_eq!(ranks, vec![0, 1], "one record per rank at the first tick");
+    // Rank 1 reports a scheduler step with work: its record moves, rank 0's
+    // does not, so the next batch is rank 1's alone.
+    rank1_out
+        .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index: 1,
+            scheduler_stats: Some(SchedulerStats {
+                num_waiting_reqs: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    // Rank 1's moved record comes within a tick; a heartbeat of rank 0 may
+    // precede it on a slow box. Every batch is a record without events.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let batch = tokio::time::timeout_at(deadline, stream.message())
+            .await
+            .expect("rank 1's record in time")
+            .expect("stream open")
+            .expect("a batch");
+        let load = batch.load.as_ref().expect("a record");
+        assert!(load.load_only && batch.events.is_empty(), "{batch:?}");
+        if batch.dp_rank == Some(1) && load.waiting_requests == 2 {
+            assert_eq!(load.running_requests, 0);
+            break;
+        }
+    }
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// batches arrive under the publisher's sequence numbers, and stopping the
 /// servicer closes the subscription on the publisher's side.
 #[tokio::test]
@@ -2190,6 +2261,7 @@ async fn subscribe_kv_events_relays_a_publisher_or_is_unimplemented() {
             .subscribe_kv_events(common::SubscribeKvEventsRequest {
                 start_sequence_number: 0,
                 load_records_before_first_batch: false,
+                loads_only: false,
             }),
     )
     .await

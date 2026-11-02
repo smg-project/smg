@@ -322,6 +322,10 @@ pub(crate) trait RankLoads: Send + Sync {
 
     /// The engine link whose liveness the record carries.
     fn engine_link(&self) -> &EngineLink;
+
+    /// The data-parallel ranks the servicer serves now (`Shared::rank_count`):
+    /// how many records a records-only stream reports per tick.
+    fn rank_count(&self) -> usize;
 }
 
 /// The relay's load source over a servicer state, held weakly (the relay
@@ -346,7 +350,7 @@ impl<S: RankLoads> LoadSource for LoadFromState<S> {
 /// Whether a record moved enough from `last` to be worth a `load_only`
 /// batch: any queue, running or window change, KV usage by half a percent,
 /// the rate by 5 % or 50 tokens per second.
-fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool {
+pub(crate) fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool {
     last.running_requests != current.running_requests
         || last.waiting_requests != current.waiting_requests
         || last.waiting_uncached_tokens != current.waiting_uncached_tokens
@@ -1102,7 +1106,7 @@ enum SnapshotPhase {
 }
 
 /// Seconds since the Unix epoch, the way the engines stamp their batches.
-fn unix_seconds() -> f64 {
+pub(crate) fn unix_seconds() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs_f64())

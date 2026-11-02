@@ -151,6 +151,10 @@ impl crate::kv_events::RankLoads for State {
     fn engine_link(&self) -> &EngineLink {
         &self.shared.engine
     }
+
+    fn rank_count(&self) -> usize {
+        self.shared.rank_count(self.model.data_parallel_size)
+    }
 }
 
 pub(super) struct State {
