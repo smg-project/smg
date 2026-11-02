@@ -620,6 +620,9 @@ def test_pick_conflict_stops_with_the_steps_and_pick_pr_finishes(repo: Sandbox) 
 
 def test_pick_pr_refuses_other_branches(repo: Sandbox) -> None:
     repo.cut()
+    repo.git(
+        "switch", "--quiet", "release/1.14"
+    )  # the cut left the clone where it was; the test tries pick-pr from the branch
     refused = repo.tool("pick-pr", "1.14", check=False)
     assert (
         "not on a pick/1.14-* branch (on release/1.14): name it, release.sh pick-pr 1.14 <pick branch>"
@@ -1458,8 +1461,10 @@ def test_a_patch_of_the_older_line_steps_past_the_version_the_newer_line_publish
         "crates/tool_parser/src/lib.rs",
         "pub fn parse() {}\npub fn more() {}\npub fn one() {}\npub fn three() {}\n",
     )
-    repo.cut("1.15.0-rc.1")
-    assert repo.version_of("crates/tool_parser/Cargo.toml") == "0.6.1", "the fixes since v1.14.0"
+    repo.cut("1.15.0-rc.1")  # the clone stays on main; the branch carries the bump
+    assert repo.version_of("crates/tool_parser/Cargo.toml", "release/1.15") == "0.6.1", (
+        "the fixes since v1.14.0"
+    )
     repo.tool("tag", "1.15.0-rc.1", PUSH="1")
     repo.tool("pick", "1.14", fix)
     repo.land_on_release("1.14")
@@ -1495,8 +1500,8 @@ def test_a_patch_of_the_older_line_steps_past_the_version_the_newer_line_publish
         "tool-parser (crates/tool_parser/) — 1 file(s) changed but version not bumped (v0.6.2, v1.14.1's) [patch]"
         in (cut.stdout)
     )
-    assert repo.version_of("crates/tool_parser/Cargo.toml") == "0.6.3"
-    assert 'tool-parser = { version = "0.6.3"' in repo.read("Cargo.toml")
+    assert repo.version_of("crates/tool_parser/Cargo.toml", "release/1.16") == "0.6.3"
+    assert 'tool-parser = { version = "0.6.3"' in repo.read("Cargo.toml", "release/1.16")
 
 
 def grpc_detect(
