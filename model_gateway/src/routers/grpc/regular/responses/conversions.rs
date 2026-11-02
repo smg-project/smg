@@ -15,13 +15,13 @@ use openai_protocol::{
     },
     common::{
         ContentPart, FunctionCallResponse, ImageUrl, JsonSchemaFormat, ResponseFormat, Tool,
-        ToolCall, ToolChoice, ToolChoiceValue, Usage, UsageInfo,
+        ToolCall, ToolChoice, ToolChoiceValue, Usage,
     },
     profile::ProviderProfile,
     responses::{
         CustomToolCallOutputContent, CustomToolInputContentPart, IncludeField, IncompleteDetails,
         IncompleteReason, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
-        ResponseOutputItem, ResponseReasoningContent::ReasoningText, ResponseStatus,
+        ResponseOutputItem, ResponseReasoningContent::ReasoningText, ResponseStatus, ResponseUsage,
         ResponsesRequest, ResponsesResponse, ResponsesUsage, StringOrContentParts, TextConfig,
         TextFormat,
     },
@@ -802,19 +802,10 @@ fn finish_reason_status(
     }
 }
 
-/// The chat usage as the Responses API reports it.
-fn responses_usage(usage: &Usage) -> ResponsesUsage {
-    let usage_info = UsageInfo {
-        prompt_tokens: usage.prompt_tokens,
-        completion_tokens: usage.completion_tokens,
-        total_tokens: usage.total_tokens,
-        reasoning_tokens: usage
-            .completion_tokens_details
-            .as_ref()
-            .and_then(|d| d.reasoning_tokens),
-        prompt_tokens_details: usage.prompt_tokens_details.clone(),
-    };
-    ResponsesUsage::Modern(usage_info.to_response_usage())
+/// The chat usage as the Responses API reports it, through the protocol's
+/// one conversion: the streamed object reads it here as well.
+pub(super) fn responses_usage(usage: &Usage) -> ResponsesUsage {
+    ResponsesUsage::Modern(ResponseUsage::from(usage))
 }
 
 #[cfg(test)]
