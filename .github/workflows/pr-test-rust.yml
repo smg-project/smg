@@ -453,6 +453,10 @@ jobs:
 
       - name: Run the Rust tests
         timeout-minutes: ${{ matrix.test_timeout }}
+        env:
+          # Where ffmpeg is installed, the video container agreement tests must
+          # run: a missing tool or encoder fails them instead of skipping them.
+          SMG_REQUIRE_VIDEO_TOOLS: ${{ contains(matrix.needs, 'ffmpeg') && '1' || '' }}
         run: |
           source "$HOME/.cargo/env"
           bash scripts/ci_rust_tests.sh run ${{ matrix.shard }}
