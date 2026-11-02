@@ -1661,6 +1661,60 @@ def test_sync_versions_never_lowers_a_version_main_already_raised(repo: Sandbox)
     assert "already follows" in again.stdout
 
 
+def test_sync_versions_moves_main_to_the_next_development_version_when_a_release_is_cut(
+    repo: Sandbox,
+) -> None:
+    """The moment release/1.14 is cut, main moves above everything that branch will release: the gateway and its
+    mirrors to 1.15.0-dev (one string in every file: cargo and Helm read a pre-release below 1.15.0, Python tooling
+    normalizes it to 1.15.0.dev0, as it normalizes a candidate), and every crate and package to the version the cut
+    gave the branch, so the next cut's bump starts from the numbers the registries will hold."""
+    repo.cut()
+    main_head = repo.git("rev-parse", "origin/main")
+    done = subprocess.run(
+        [sys.executable, str(repo.work / SYNC), "origin/release/1.14", "1.15.0-dev"],
+        cwd=repo.work,
+        env=repo.env(),
+        capture_output=True,
+        text=True,
+    )
+    assert done.returncode == 0, done.stderr
+    for path in VERSION_FILES:
+        assert repo.version_of(path) == "1.15.0-dev", path
+    assert repo.version_of("crates/tool_parser/Cargo.toml") == "0.6.0", (
+        "the branch's number, not above it"
+    )
+    assert 'tool-parser = { version = "0.6.0"' in repo.read("Cargo.toml")
+    assert "model_gateway/Cargo.toml: 1.13.0 -> 1.15.0-dev" in done.stdout
+    assert "crates/tool_parser/Cargo.toml: 0.5.0 -> 0.6.0" in done.stdout
+    assert repo.git("rev-parse", "origin/main") == main_head, (
+        "the files move; main moves by a pull request"
+    )
+    # the checker reads the moved tree as consistent: 1.15.0-dev is a version no release tag carries,
+    # and the mirrors carry the gateway's string as written
+    checked = subprocess.run(
+        [sys.executable, "scripts/check_release_versions.py", "--check", "v1.13.0"],
+        cwd=repo.work,
+        env=repo.env(),
+        capture_output=True,
+        text=True,
+    )
+    assert checked.returncode == 0, checked.stdout
+    assert "All versions consistent." in checked.stdout
+    # the next cut's guard and bump-main's comparison read the development version above the previous final
+    again = subprocess.run(
+        [sys.executable, str(repo.work / SYNC), "origin/release/1.14", "1.14.0"],
+        cwd=repo.work,
+        env=repo.env(),
+        capture_output=True,
+        text=True,
+    )
+    assert again.returncode == 0, again.stderr
+    assert (
+        "the gateway reads 1.15.0-dev, above 1.14.0: it and its mirrors keep that" in again.stdout
+    )
+    assert repo.version_of("model_gateway/Cargo.toml") == "1.15.0-dev"
+
+
 def test_sync_versions_usage_and_version_order() -> None:
     import importlib.util
 
@@ -1670,8 +1724,13 @@ def test_sync_versions_usage_and_version_order() -> None:
     spec.loader.exec_module(module)
     key = module.version_key
     assert key("1.14.0-rc.1") < key("1.14.0-rc.2") < key("1.14.0") < key("1.14.1-rc.1")
-    with pytest.raises(SystemExit):
-        key("1.14")
+    # main's development version: below the candidates and the final of its number, above every release before it
+    assert (
+        key("1.14.0") < key("1.15.0-dev") < key("1.15.0-rc.1") < key("1.15.0") < key("1.16.0-dev")
+    )
+    for bad in ("1.14", "1.15.0-dev0", "1.15.0.dev0", "1.15.0-dev.1"):
+        with pytest.raises(SystemExit):
+            key(bad)
     assert module.main([]) == 2
 
 

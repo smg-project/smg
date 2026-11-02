@@ -1676,7 +1676,7 @@ dependencies = [
 
 [[package]]
 name = "data-connector"
-version = "2.4.0"
+version = "2.4.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2115,7 +2115,7 @@ dependencies = [
 
 [[package]]
 name = "engine-servicer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "bytes",
@@ -2152,7 +2152,7 @@ dependencies = [
 
 [[package]]
 name = "engine-zmq-adapter"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "engine-zmq-client",
@@ -2173,7 +2173,7 @@ dependencies = [
 
 [[package]]
 name = "engine-zmq-client"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "bytemuck",
  "byteorder",
@@ -3788,7 +3788,7 @@ dependencies = [
 
 [[package]]
 name = "kv-index"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "anyhow",
  "bincode",
@@ -3931,7 +3931,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "llm-multimodal"
-version = "1.14.0"
+version = "1.15.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3970,7 +3970,7 @@ dependencies = [
 
 [[package]]
 name = "llm-tokenizer"
-version = "1.10.0"
+version = "1.11.0"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -4991,7 +4991,7 @@ dependencies = [
 
 [[package]]
 name = "openai-protocol"
-version = "1.16.0"
+version = "1.17.0"
 dependencies = [
  "axum",
  "bitflags 2.13.2",
@@ -6423,7 +6423,7 @@ dependencies = [
 
 [[package]]
 name = "reasoning-parser"
-version = "1.10.0"
+version = "1.10.1"
 dependencies = [
  "parking_lot",
  "regex",
@@ -7567,7 +7567,7 @@ dependencies = [
 
 [[package]]
 name = "smg"
-version = "1.13.0"
+version = "1.15.0-dev"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -7684,7 +7684,7 @@ dependencies = [
 
 [[package]]
 name = "smg-auth"
-version = "1.2.4"
+version = "1.2.5"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -7709,7 +7709,7 @@ dependencies = [
 
 [[package]]
 name = "smg-client"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bytes",
  "futures",
@@ -7724,7 +7724,7 @@ dependencies = [
 
 [[package]]
 name = "smg-external-router"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7766,7 +7766,7 @@ dependencies = [
 
 [[package]]
 name = "smg-golang"
-version = "1.13.0"
+version = "1.15.0-dev"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -7789,7 +7789,7 @@ dependencies = [
 
 [[package]]
 name = "smg-grpc-client"
-version = "1.15.0"
+version = "1.16.0"
 dependencies = [
  "futures",
  "h2",
@@ -7814,7 +7814,7 @@ dependencies = [
 
 [[package]]
 name = "smg-mcp"
-version = "2.3.5"
+version = "2.3.6"
 dependencies = [
  "chrono",
  "dashmap",
@@ -7840,7 +7840,7 @@ dependencies = [
 
 [[package]]
 name = "smg-mesh"
-version = "1.4.4"
+version = "1.4.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7882,7 +7882,7 @@ dependencies = [
 
 [[package]]
 name = "smg-python"
-version = "1.13.0"
+version = "1.15.0-dev"
 dependencies = [
  "bytes",
  "engine-servicer",
@@ -7910,7 +7910,7 @@ dependencies = [
 
 [[package]]
 name = "smg-radix-tree"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "kv-index",
  "rustc-hash 2.1.3",
@@ -7918,7 +7918,7 @@ dependencies = [
 
 [[package]]
 name = "smg-response-template"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "openai-protocol",
  "regex-syntax",
@@ -7931,7 +7931,7 @@ dependencies = [
 
 [[package]]
 name = "smg-rl"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -7952,7 +7952,7 @@ dependencies = [
 
 [[package]]
 name = "smg-symphony"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "openai-protocol",
@@ -8001,7 +8001,7 @@ dependencies = [
 
 [[package]]
 name = "smg-wasm"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -9039,7 +9039,7 @@ dependencies = [
 
 [[package]]
 name = "tool-parser"
-version = "1.10.0"
+version = "1.10.1"
 dependencies = [
  "async-trait",
  "num-traits",
@@ -10142,7 +10142,7 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
 name = "wfaas"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "async-trait",
  "backoff",
