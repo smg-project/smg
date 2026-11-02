@@ -13,6 +13,20 @@
 //! close. A refactor that alters the last mantissa bit fails here and passes
 //! there, which is the point.
 //!
+//! **The float digest is compared on `x86_64` only.** It is FNV-1a over raw `f32`
+//! bits, and `rustfft` makes no promise that the last mantissa bit is the same on
+//! every architecture, so the recorded value describes the machine that recorded it
+//! as well as this crate. The integer assertions -- `shape` and
+//! `feature_token_counts` -- run everywhere, because those drive prompt length and
+//! tensor slicing and an off-by-one in either is a wrong answer rather than a drift.
+//!
+//! The portable form of the bit-identity claim is not here: it is in
+//! `audio::processors::qwen3_audio::tests`, where the optimized projection is
+//! compared against a dense reference computed in the same process. That is what
+//! actually proves a change altered nothing, on whatever target runs it. This file
+//! adds a second, stricter signal on one architecture -- it is not the load-bearing
+//! gate.
+//!
 //! The fingerprints were generated from the unmodified frontend, so they cannot
 //! have been fitted to a later change. To regenerate after a deliberate
 //! numerical change:
@@ -272,12 +286,33 @@ fn qwen3_audio_log_mel_is_bit_identical_to_the_recorded_fingerprints() {
             "{}: feature_token_counts",
             case.name
         );
-        assert_eq!(
-            digest, case.fnv1a_f32,
-            "{}: log-mel bits differ from the recorded fingerprint. A change meant to be \
-             bit-identical is not. If the numbers were supposed to move, regenerate with \
-             SMG_WRITE_QWEN3_MEL_BITS=1 and say so in the commit message.",
-            case.name
-        );
+        // Compared on x86_64 only, and the asymmetry is deliberate.
+        //
+        // This digest is FNV-1a over raw `f32` bits. `rustfft` does not promise the
+        // same last mantissa bit on every architecture, so a recorded digest is a
+        // property of the machine that recorded it as much as of this crate --
+        // checking it on aarch64 tests the host, not the code.
+        //
+        // What survives on every target is above: `shape` and `feature_token_counts`
+        // are integers, they drive prompt length and tensor slicing, an off-by-one in
+        // either is a wrong answer rather than a drift, and they are asserted
+        // unconditionally.
+        //
+        // The portable form of the bit-identity claim lives in
+        // `audio::processors::qwen3_audio::tests`, where the optimized projection is
+        // compared against a dense reference computed in the *same process*. That
+        // proves "this change altered nothing" on whatever target runs it, which is
+        // the property this fixture was added to defend.
+        //
+        // `cfg!` rather than `#[cfg]` so the comparison still type-checks everywhere.
+        if cfg!(target_arch = "x86_64") {
+            assert_eq!(
+                digest, case.fnv1a_f32,
+                "{}: log-mel bits differ from the recorded fingerprint. A change meant to be \
+                 bit-identical is not. If the numbers were supposed to move, regenerate with \
+                 SMG_WRITE_QWEN3_MEL_BITS=1 and say so in the commit message.",
+                case.name
+            );
+        }
     }
 }
