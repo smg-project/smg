@@ -425,7 +425,9 @@ impl<'a> Asks<'a> {
     /// end-of-turn token, and the gateway's stop decoder does not stop on it either
     /// (`utils::create_stop_decoder`), so the output the table reads carries an unconstrained
     /// tail after the model's answer. A marker of the table in that tail is the tail's doing,
-    /// not a frame the table failed to read ([`Assignment::past_the_end`]).
+    /// not a frame the table failed to read, and the tally counts every such marker of the
+    /// output apart, the answer's own included
+    /// ([`Assignment::past_the_end`](super::reader::Assignment::past_the_end)).
     pub(super) fn past_the_end(self) -> bool {
         match self {
             Self::Chat(request) => request.ignore_eos,

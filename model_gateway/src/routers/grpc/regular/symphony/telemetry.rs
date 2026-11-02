@@ -52,10 +52,13 @@
 //! And what is counted as nothing: a marker of the table kept as text in an output the request
 //! ran past the model's own end (`ignore_eos`, `Assignment::past_the_end`). The stop decoder was
 //! told not to stop at the end-of-turn token, the tokens after it are unconstrained, and a marker
-//! among them is the tail's doing, not a frame the table failed to read: it is counted apart
-//! (`markers_past_the_end`), the output is `clean` unless the table refused bytes, which count
-//! and write their line as in any output, and one `debug` line says how many markers the output
-//! kept, so a benchmark that forces every output past its end reads no parse failure from them.
+//! among them is the tail's doing, not a frame the table failed to read. The tally knows the
+//! output, not where the model's end fell in it, so every marker of the table kept as text in
+//! such an output is counted apart (`markers_past_the_end`), the model's own answer included,
+//! and an output the request cut by `max_tokens` before the model reached its end reads the
+//! same way; the output is `clean` unless the table refused bytes, which count and write their
+//! line as in any output, and one `debug` line says how many markers the output kept, so a
+//! benchmark that forces every output past its end reads no parse failure from them.
 //!
 //! And, before any output, what did not reach a table at all:
 //!
@@ -403,8 +406,9 @@ pub(crate) struct Tally {
 
 impl Tally {
     /// The tally of one output; `past_the_end` says the request ran it past the model's own end
-    /// (`Assignment::past_the_end`), so a marker of the table kept as text is the tail's and no
-    /// run.
+    /// (`Assignment::past_the_end`), so every marker of the table kept as text in it is counted
+    /// apart and is no run: the whole output, the model's own answer included, since the tally
+    /// does not know where the model's end fell.
     pub(crate) fn new(past_the_end: bool) -> Self {
         Self {
             past_the_end,
@@ -424,8 +428,10 @@ impl Tally {
             Event::ToolCallArguments { source, .. } | Event::ToolCallEnd { source, .. } => {
                 self.shown += source.text.len() as u64;
             }
-            // A marker of the table kept as text in the tail of an output the request ran past
-            // the model's own end: the tail's doing, counted apart, never a run.
+            // A marker of the table kept as text in an output the request ran past the model's
+            // own end: counted apart, never a run. The guard is per output, not per position: a
+            // marker in the model's own answer before its end is counted here too, as is one in
+            // an output `max_tokens` cut before the model reached its end.
             Event::Malformed {
                 text,
                 why: MalformedReason::MarkerOutOfPlace,
