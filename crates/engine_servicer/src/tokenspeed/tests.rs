@@ -2754,6 +2754,216 @@ async fn the_configured_silence_bound_and_prefill_allowance_reach_the_scheduler_
     server.stop(Duration::from_secs(5)).unwrap();
 }
 
+/// A bound servicer on this wire for the silence cells: `window` of engine
+/// silence allowed past the prompt's prefill at `tokens_per_sec`, a
+/// handshaken mock scheduler and a gRPC client.
+async fn bounded_servicer(
+    dir: &std::path::Path,
+    model: TokenSpeedModelInfo,
+    window: Duration,
+    tokens_per_sec: u64,
+) -> (
+    TokenSpeedServicerServer,
+    MockEngineInput,
+    MockEngineOutput,
+    TokenSpeedSchedulerClient<Channel>,
+) {
+    let handshake = handshake_address(dir);
+    let mut config = config(dir, &handshake, model);
+    config.servicer.engine_silence_timeout = window;
+    config.servicer.engine_prefill_tokens_per_sec = tokens_per_sec;
+    let server = TokenSpeedServicerServer::start(config).unwrap();
+    let engine = connect_to_frontend(
+        &handshake,
+        EngineId::from_engine_index(0),
+        default_ready_response(),
+    )
+    .await
+    .expect("mock scheduler handshake");
+    wait_until(|| server.engine_ready()).await;
+    let client = TokenSpeedSchedulerClient::new(grpc_channel(server.address()).await);
+    let (engine_in, engine_out) = engine.split();
+    (server, engine_in, engine_out, client)
+}
+
+/// A streaming generate of a 4,000-token prompt.
+fn long_prompt(id: &str) -> ts::GenerateRequest {
+    let mut request = generate_request(id, true, Vec::new());
+    request.tokenized = Some(ts::TokenizedInput {
+        input_ids: vec![7; 4_000],
+        original_text: String::new(),
+    });
+    request
+}
+
+/// A scheduler that publishes KV events through a long prefill is not a
+/// dead scheduler. This wire says nothing before a prompt's first token, so
+/// with a 1 s window and an allowance of 400 ms for a 4,000-token prompt
+/// (10k tokens/s allowed) a request first answered at 3 s would be given up
+/// on at 1.4 s; the relay reads the publisher's live batches as the
+/// scheduler's progress and the request is served. Prints a PROOF line.
+#[tokio::test]
+#[expect(
+    clippy::print_stdout,
+    reason = "the cell's measured verdict time is the proof the pull request quotes"
+)]
+async fn kv_events_published_through_a_long_prefill_keep_the_scheduler_alive_past_the_silence_bound(
+) {
+    use zeromq::{prelude::*, PubSocket};
+
+    use crate::{kv_events::golden, testing::bound_port};
+
+    let mut publisher = PubSocket::new();
+    let port = bound_port(
+        &publisher
+            .bind("tcp://127.0.0.1:0")
+            .await
+            .expect("publisher binds")
+            .to_string(),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let window = Duration::from_secs(1);
+    let allowance = Duration::from_millis(400);
+    let first_output_at = Duration::from_secs(3);
+    let mut model = model_info();
+    model.kv_events_endpoint = format!("tcp://*:{port}");
+    model.kv_events_topic = "kv".to_string();
+    let (server, mut engine_in, mut engine_out, mut client) =
+        bounded_servicer(dir.path(), model, window, 10_000).await;
+
+    // The relay's subscription reaches the publisher a moment after the
+    // connect: publish sequence 0 until a subscriber sees it.
+    let mut events = client
+        .subscribe_kv_events(common::SubscribeKvEventsRequest::default())
+        .await
+        .expect("subscribe")
+        .into_inner();
+    let batch1 = golden::bytes(golden::BATCH1);
+    let mut live = false;
+    for _ in 0..200 {
+        publisher
+            .send(golden::frame(b"kv", 0, &batch1))
+            .await
+            .expect("publish");
+        if let Ok(item) = tokio::time::timeout(Duration::from_millis(50), events.message()).await {
+            item.expect("stream open").expect("a batch");
+            live = true;
+            break;
+        }
+    }
+    assert!(live, "the relay's subscription went live");
+    drop(events);
+
+    // The scheduler stores blocks (publishes a batch) every 200 ms through
+    // the prefill and first answers at 3 s; the stream is read meanwhile,
+    // so the elapsed time is the verdict's or the first chunk's.
+    let started = Instant::now();
+    let mut stream = client
+        .generate(long_prompt("r-prefill"))
+        .await
+        .expect("generate")
+        .into_inner();
+    assert_eq!(recv_add(&mut engine_in).await.input_ids.len(), 4_000);
+    let scheduler = async {
+        let batch2 = golden::bytes(golden::BATCH2);
+        let mut published = 0u64;
+        while started.elapsed() + Duration::from_millis(200) < first_output_at {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            published += 1;
+            publisher
+                .send(golden::frame(b"kv", published, &batch2))
+                .await
+                .expect("publish");
+        }
+        tokio::time::sleep(first_output_at.saturating_sub(started.elapsed())).await;
+        let mut done = batch("r-prefill", vec![10], 1, Some("stop"), None);
+        done.prompt_tokens = vec![4_000];
+        send(&mut engine_out, &done).await;
+        published
+    };
+    let ((first, elapsed), published) = tokio::join!(
+        async {
+            let first = stream.message().bounded().await;
+            (first, started.elapsed())
+        },
+        scheduler
+    );
+    println!(
+        "PROOF cell=long_prefill_with_kv_events window_ms={} allowance_ms={} prompt_tokens=4000 \
+         first_output_at_ms={} kv_batches_by_then={published} outcome={} elapsed_ms={}",
+        window.as_millis(),
+        allowance.as_millis(),
+        first_output_at.as_millis(),
+        match &first {
+            Ok(Some(_)) => "served".to_string(),
+            Ok(None) => "ended".to_string(),
+            Err(status) => format!("err({})", status.message()),
+        },
+        elapsed.as_millis(),
+    );
+    let first = first
+        .expect("served: the publisher's live batches were the scheduler's progress")
+        .expect("the first chunk");
+    assert_eq!(chunk_tokens(first), vec![10]);
+    let done = complete(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "stop");
+    assert!(
+        elapsed >= first_output_at && elapsed < first_output_at + window,
+        "served when the scheduler answered: {elapsed:?}"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
+/// The same prompt with no publisher and a scheduler that never answers is
+/// given up on at the window past the prompt's allowance, as before. Prints
+/// a PROOF line.
+#[tokio::test]
+#[expect(
+    clippy::print_stdout,
+    reason = "the cell's measured verdict time is the proof the pull request quotes"
+)]
+async fn a_long_prefill_with_the_publisher_quiet_is_given_up_on_at_the_window_past_the_allowance() {
+    let dir = tempfile::tempdir().unwrap();
+    let window = Duration::from_secs(1);
+    let allowance = Duration::from_millis(400);
+    let (server, mut engine_in, _engine_out, mut client) =
+        bounded_servicer(dir.path(), model_info(), window, 10_000).await;
+    let started = Instant::now();
+    let mut stream = client
+        .generate(long_prompt("r-quiet"))
+        .await
+        .expect("generate")
+        .into_inner();
+    assert_eq!(recv_add(&mut engine_in).await.input_ids.len(), 4_000);
+    let status = stream
+        .message()
+        .bounded()
+        .await
+        .expect_err("a quiet scheduler silent past the window and the allowance is dead");
+    let elapsed = started.elapsed();
+    println!(
+        "PROOF cell=long_prefill_quiet window_ms={} allowance_ms={} prompt_tokens=4000 \
+         first_output_at_ms=never kv_batches_by_then=0 outcome=err({}) elapsed_ms={}",
+        window.as_millis(),
+        allowance.as_millis(),
+        status.message(),
+        elapsed.as_millis(),
+    );
+    assert!(
+        status
+            .message()
+            .contains("engine core reported fatal failure"),
+        "{}",
+        status.message()
+    );
+    assert!(
+        elapsed >= window + allowance && elapsed < Duration::from_secs(15),
+        "given up on at the window plus the prompt's allowance, not before or much after: {elapsed:?}"
+    );
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Metrics: the `/metrics` listener and the families the request path records.
 // ---------------------------------------------------------------------------
