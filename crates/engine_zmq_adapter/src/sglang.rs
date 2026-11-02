@@ -453,7 +453,7 @@ pub(crate) fn translate_request_sglang(
             (!tokenized.original_text.is_empty()).then_some(tokenized.original_text),
         ),
         Some(mm) => (
-            Some(translate_sglang_multimodal(mm, input_ids.len())?),
+            Some(translate_sglang_multimodal(*mm, input_ids.len())?),
             None,
         ),
         None => (None, None),
@@ -1029,7 +1029,7 @@ mod tests {
                 input_ids: vec![1, 7, 7, 7, 2],
                 original_text: String::new(),
             }),
-            mm_inputs: Some(mm),
+            mm_inputs: Some(Box::new(mm)),
             ..Default::default()
         }
     }
