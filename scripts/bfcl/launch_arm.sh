@@ -76,7 +76,7 @@ case "$ARM" in
     # only the observer maps uncapped/long runs to its existing finite bound.
     PROBE_DURATION=$(python3 "$PROBE_SCRIPT" \
       --bounded-duration-for-run-timeout="${RUN_TIMEOUT:-14400}")
-    echo "[launch_arm] bounded availability observer: ${PROBE_DURATION}s (scoring RUN_TIMEOUT unchanged)" >&2
+    echo "[launch_arm] RUN_TIMEOUT validated; arm B observer bound: ${PROBE_DURATION}s (scoring RUN_TIMEOUT unchanged)" >&2
     ;;
 esac
 

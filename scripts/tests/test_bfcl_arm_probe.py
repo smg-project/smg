@@ -376,7 +376,7 @@ def test_launcher_bounds_observer_before_start_without_changing_scoring(
     assert len(events) == (1 if arm == "a" else 3)
     # Preserve the exact scoring setting, including zero and decimal spelling.
     assert all(event["RUN_TIMEOUT"] == run_timeout for event in events)
-    bounded = f"bounded availability observer: {expected}s".encode()
+    bounded = f"RUN_TIMEOUT validated; arm B observer bound: {expected}s".encode()
     assert bounded in result.stderr
     assert result.stderr.index(bounded) < result.stderr.index(b"started arm_")
     if arm == "b":
