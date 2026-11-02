@@ -1221,9 +1221,7 @@ def start_workers(
     if engine is None:
         engine = get_runtime()
 
-    if worker_type == WorkerType.ENCODE and (
-        engine != "tokenspeed" or mode != ConnectionMode.GRPC
-    ):
+    if worker_type == WorkerType.ENCODE and (engine != "tokenspeed" or mode != ConnectionMode.GRPC):
         raise ValueError("EPD encode workers currently require TokenSpeed over gRPC")
 
     spec = get_model_spec(model_id)
