@@ -236,8 +236,9 @@ impl Bed {
     /// there); that bed is not this call's to stop, so the refusal is read here, before
     /// anything starts and before the failure path below could take it down. A start
     /// that fails after the mock fleet or the gateway came up (the gateway's health,
-    /// the workers' registration, the probe) is taken down by the bed's own pid files
-    /// before the error goes out, so a caller leaves no process and no port behind.
+    /// the workers' registration, the probe), or a start whose `bed.json` cannot be read,
+    /// is taken down by the bed's own pid files before the error goes out, so a caller
+    /// leaves no process and no port behind.
     pub fn up(&mut self) -> Result<&BedInfo> {
         fs::create_dir_all(&self.run_dir)?;
         if self.run_dir.join("bed").join("gateway.pid").exists() {
@@ -258,9 +259,20 @@ impl Bed {
             self.down();
             bail!("bed up failed (rc {rc}); {}:\n{tail}", log.display());
         }
-        let text = fs::read_to_string(self.run_dir.join("bed").join("bed.json"))
-            .context("reading bed.json")?;
-        let info: BedInfo = serde_json::from_str(&text).context("reading bed.json")?;
+        let path = self.run_dir.join("bed").join("bed.json");
+        let info = fs::read_to_string(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|text| serde_json::from_str::<BedInfo>(&text).map_err(anyhow::Error::from))
+            .with_context(|| format!("reading {}", path.display()));
+        let info = match info {
+            Ok(info) => info,
+            Err(err) => {
+                // The script said up, but the bed cannot be read: a start that is not usable
+                // is a failed start, and it is taken down like one.
+                self.down();
+                return Err(err);
+            }
+        };
         Ok(self.info.insert(info))
     }
 
@@ -442,6 +454,17 @@ mod tests {
         let err = bed.up().unwrap_err().to_string();
         assert!(err.contains("bed up failed"), "{err}");
         assert!(err.contains("the probe failed"), "{err}");
+        assert_eq!(calls.lock().unwrap().as_slice(), ["up", "down"]);
+        // A script that exits 0 without a readable bed.json is a failed start too: the
+        // error names the file and the bed is taken down, so no process or port is left.
+        calls.lock().unwrap().clear();
+        let script = Box::new(FakeScript {
+            calls: Arc::clone(&calls),
+            up_rc: 0,
+        });
+        let mut bed = Bed::with_script(&config(), Path::new("/h"), &run_dir, true, script);
+        let err = bed.up().unwrap_err().to_string();
+        assert!(err.contains("bed.json"), "{err}");
         assert_eq!(calls.lock().unwrap().as_slice(), ["up", "down"]);
         // A bed that is up already (its pid file under the run directory) is not this
         // call's to stop: the refusal comes before the script runs, nothing is taken down.

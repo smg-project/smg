@@ -69,6 +69,9 @@ pub fn build_base(repo: &Path, rev: &str, out: &Path, target: Option<&Path>) -> 
         repo,
         &["rev-parse", "--verify", &format!("{rev}^{{commit}}")],
     )?;
+    // `cargo clean` deletes the worktree's directory and leaves its record: without the
+    // prune, `worktree add` refuses the registered path.
+    git(repo, &["worktree", "prune"])?;
     if src.exists() {
         git(
             repo,
