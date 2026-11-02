@@ -171,7 +171,11 @@ require_clean() { # [<advice>]: the bump's by default (its commit must carry onl
     || die "the working tree has uncommitted changes: ${1:-commit them first (the bump commit must carry only the bump)}"
 }
 back_to() { # <start branch> <start commit>: the checkout the command started from (detached there when it was)
-  if [ -n "$1" ]; then git switch --quiet "$1"; else git switch --quiet --detach "$2"; fi
+  if [ -n "$1" ]; then
+    git switch --quiet "$1" || die "cannot switch back to $1"
+  else
+    git switch --quiet --detach "$2" || die "cannot switch back to $(git rev-parse --short "$2")"
+  fi
 }
 sign_off() { # "Name <email>", as git commit -s writes it
   local ident
@@ -200,10 +204,11 @@ refresh_lock() { # Cargo.lock follows the workspace crates' versions
   "$CARGO" update --workspace --offline >/dev/null 2>&1 || "$CARGO" update --workspace >/dev/null \
     || die "cargo update --workspace failed: Cargo.lock does not follow the versions"
 }
-commit_all() { # <subject> <body>
-  git add --update
+commit_all() { # <subject> <body>: the tree's changes in one signed-off commit; a failure stops the command in any context
+  git add --update || die "git add failed on $(git branch --show-current)"
   git diff --cached --quiet && die "nothing to commit: the tree already carries these versions"
-  git commit --quiet --signoff --message "$1" --message "$2"
+  git commit --quiet --signoff --message "$1" --message "$2" \
+    || die "the commit '$1' failed: the version edits are staged on $(git branch --show-current) (commit them once the cause is fixed, or drop them: git restore --staged --worktree .)"
 }
 
 # --- pushes and pull requests -------------------------------------------------------
@@ -235,6 +240,14 @@ open_pr() { # <topic> <base> <title> <body file>
   git push --quiet -u "$REMOTE" "refs/heads/$topic:refs/heads/$topic" || die "the push of $topic to $REMOTE failed; nothing opened"
   "$GH" pr create --base "$base" --head "$topic" --title "$title" --body-file "$body" || die "gh pr create failed for $topic; the branch is pushed"
 }
+require_pr_tools() { # <topic> <base>: what open_pr will need under PUSH=1, checked before anything is made or pushed
+  local topic=$1 base=$2 open
+  command -v "$GH" >/dev/null 2>&1 \
+    || die "'$GH' is not installed and PUSH=1 opens the pull request of $topic against $base: install it, or run without PUSH=1 and push by hand"
+  open=$("$GH" pr list --head "$topic" --state open --json number --jq '.[].number' 2>/dev/null | sed 's/^/#/' | paste -sd ' ' -) \
+    || die "gh pr list failed: cannot read whether an open pull request carries $topic (gh auth status?)"
+  [ -z "$open" ] || die "an open pull request already carries $topic ($open): finish or close it first"
+}
 
 # --- the commands -------------------------------------------------------------------
 
@@ -253,6 +266,10 @@ cmd_cut() {
   has_ref "refs/heads/$branch" && die "$branch exists locally: a new candidate on it is 'release.sh bump $version'"
   remote_has_branch "$branch" && die "$branch exists on $REMOTE: a new candidate on it is 'release.sh bump $version'"
   has_ref "refs/heads/$topic" && die "the branch $topic exists (the pull request that moves main after a cut): delete it or finish it"
+  remote_has_branch "$topic" && die "the branch $topic exists on $REMOTE (the pull request that moves main after a cut): finish or delete it"
+  # With PUSH=1 the release branch is pushed before main's move: what the move's pull request needs is checked now,
+  # not by open_pr once the branch is live.
+  [ "${PUSH:-}" != 1 ] || require_pr_tools "$topic" main
   since=$(since_tag "$from_sha" "$version")
   # The previous release's final is the right tag only once main reads above that release: the cut of its line moved
   # main there (bump-main after its final otherwise). A cut from a main below it (that pull request not merged, an
@@ -565,11 +582,13 @@ move_main() { # <topic> <gateway version> <source ref> <subject> <intro>: main's
   # The gateway and its mirrors to <gateway version> when main reads below it; main never goes back (after a patch of
   # an older line, or a cut while main already reads above, they keep main's). Every crate and package to at least
   # <source ref>'s, as sync_versions.py moves them. The commit, the push and the pull request as open_pr makes them.
-  # Returns 1, with nothing made, when main carries the versions already.
+  # Returns 1, with nothing made, when main carries the versions already. Every other failure stops the command
+  # (die): both callers run this under `if` or `||`, where set -e is off and a failed step would read as "nothing
+  # to move" with the version edits left behind.
   local topic=$1 gateway=$2 source=$3 subject=$4 intro=$5 current moved start start_branch body shown
   shown=${source#refs/heads/} # a local release branch is read by its full ref (a tag may share its name), named plainly
   start_branch=$(git branch --show-current); start=${start_branch:-$(git rev-parse HEAD)}
-  git switch --quiet --no-track -c "$topic" "$REMOTE/main"
+  git switch --quiet --no-track -c "$topic" "$REMOTE/main" || die "cannot make $topic from $REMOTE/main"
   current=$(manifest_version "$REMOTE/main")
   if [ "$current" = "$gateway" ] || version_above "$current" "$gateway"; then
     note "main reads $current, not below $gateway: the gateway and its mirrors keep it; the crates and packages $shown raised move"
@@ -583,7 +602,7 @@ move_main() { # <topic> <gateway version> <source ref> <subject> <intro>: main's
   refresh_lock
   if git diff --quiet && git diff --cached --quiet; then
     back_to "$start_branch" "$start"
-    git branch --quiet -D "$topic"
+    git branch --quiet -D "$topic" || die "cannot delete $topic (nothing to move)"
     return 1
   fi
   commit_all "$subject" \

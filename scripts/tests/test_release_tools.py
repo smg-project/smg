@@ -58,7 +58,15 @@ case "$1 $2" in
       if [ "${!i}" = "--body-file" ]; then j=$((i + 1)); cp "${!j}" "$GH_STUB_LOG.body"; fi
     done
     echo "https://example.invalid/pull/1" ;;
-  "pr list") echo "#7  fix(router): y  pick/1.14-0000000" ;;
+  "pr list")
+    case " $* " in
+      *" --head "*) # the cut's precondition: the open pull requests on a head (--json number --jq .[].number)
+        for ((i = 1; i <= $#; i++)); do
+          if [ "${!i}" = "--head" ]; then j=$((i + 1)); head=${!j}; fi
+        done
+        case " ${GH_STUB_OPEN_HEADS-} " in *" $head "*) echo 8 ;; esac ;;
+      *) echo "#7  fix(router): y  pick/1.14-0000000" ;;
+    esac ;;
   "repo view") echo "example/repo" ;;
   "api --paginate")
     [ -z "${GH_STUB_API_ERROR-}" ] || api_error "$GH_STUB_API_ERROR" "${GH_STUB_API_STATUS:-422}"
@@ -542,6 +550,83 @@ def test_cut_refuses_when_the_move_topic_exists(repo: Sandbox) -> None:
     assert refused.returncode == 1
     assert "the branch chore/main-versions-1.15.0-dev exists" in refused.stderr
     assert repo.git("branch", "--list", "release/1.14") == "", "nothing was cut"
+
+
+def nothing_was_cut(repo: Sandbox) -> None:
+    """A refusal before anything is made: no release branch here or on the origin, the clone on main and clean,
+    no pull request opened."""
+    assert repo.git("branch", "--list", "release/1.14") == ""
+    assert repo.origin_ref("refs/heads/release/1.14") is None
+    assert repo.git("branch", "--show-current") == "main"
+    assert repo.git("status", "--porcelain", "--untracked-files=no") == ""
+    assert not any(call.startswith("gh pr create") for call in repo.gh_calls())
+
+
+def test_cut_refuses_when_the_move_topic_exists_on_the_remote(repo: Sandbox) -> None:
+    """The local check alone would let a cut push `release/<x.y>` and fail at the topic's push after it."""
+    topic = "chore/main-versions-1.15.0-dev"
+    repo.git("push", "--quiet", "origin", f"origin/main:refs/heads/{topic}")
+    for env in ({}, {"PUSH": "1"}):
+        refused = repo.tool("cut", "1.14.0-rc.1", check=False, **env)
+        assert refused.returncode == 1, env
+        assert f"the branch {topic} exists on origin" in refused.stderr, env
+        nothing_was_cut(repo)
+
+
+def test_a_pushing_cut_refuses_without_gh_before_the_branch_is_pushed(repo: Sandbox) -> None:
+    """With PUSH=1 the release branch is pushed before main's move: what the move's pull request needs is
+    checked first, not by open_pr once the branch is live."""
+    refused = repo.tool("cut", "1.14.0-rc.1", PUSH="1", GH="gh-missing", check=False)
+    assert refused.returncode == 1
+    assert "'gh-missing' is not installed and PUSH=1 opens the pull request" in refused.stderr
+    nothing_was_cut(repo)
+
+
+def test_a_pushing_cut_refuses_an_open_pull_request_on_the_move_topic(repo: Sandbox) -> None:
+    topic = "chore/main-versions-1.15.0-dev"
+    refused = repo.tool("cut", "1.14.0-rc.1", PUSH="1", GH_STUB_OPEN_HEADS=topic, check=False)
+    assert refused.returncode == 1
+    assert f"an open pull request already carries {topic} (#8)" in refused.stderr
+    assert repo.gh_calls() == [
+        f"gh pr list --head {topic} --state open --json number --jq .[].number"
+    ]
+    nothing_was_cut(repo)
+
+
+def test_a_failed_commit_of_the_move_stops_the_cut_and_leaves_main_untouched(repo: Sandbox) -> None:
+    """`move_main` runs under `if !` in the cut and under `|| die` in bump-main, where `set -e` is off: a git step
+    that fails must stop the command itself, or the cut ends 0 with the version edits carried back to the start
+    branch and the move reported as made."""
+    topic = "chore/main-versions-1.15.0-dev"
+    hook = repo.work / ".git" / "hooks" / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f'[ "$(git branch --show-current)" = {topic} ] || exit 0\n'
+        'echo "pre-commit: refused" >&2\n'
+        "exit 1\n"
+    )
+    hook.chmod(0o755)
+    done = repo.tool("cut", "1.14.0-rc.1", PUSH="1", check=False)
+    assert done.returncode == 1
+    assert (
+        "the commit 'chore(release): main reads 1.15.0-dev, above release/1.14' failed:"
+        f" the version edits are staged on {topic}" in done.stderr
+    )
+    assert "nothing to move" not in done.stdout
+    assert repo.origin_ref("refs/heads/release/1.14") == repo.git("rev-parse", "release/1.14"), (
+        "the branch was cut and pushed before the move"
+    )
+    assert repo.origin_ref(f"refs/heads/{topic}") is None, "nothing of the move is pushed"
+    assert repo.gh_calls() == [
+        f"gh pr list --head {topic} --state open --json number --jq .[].number"
+    ], "no pull request is opened"
+    assert repo.git("branch", "--show-current") == topic, "the staged edits stay on the topic"
+    assert repo.git("rev-parse", topic) == repo.git("rev-parse", "origin/main")
+    assert "M  model_gateway/Cargo.toml" in repo.git("status", "--porcelain")
+    assert repo.git("rev-parse", "main") == repo.git("rev-parse", "origin/main"), (
+        "main is untouched"
+    )
+    assert repo.version_of("model_gateway/Cargo.toml", "main") == "1.13.0"
 
 
 # --- bump ---------------------------------------------------------------------------
