@@ -33,7 +33,7 @@ use super::{
         chunk, collect_events, data_frame, decoded_stream, gated_stream, mock_worker_endpoint,
         processor, scripted_stream, trailers_frame, CharacterTokenizer,
     },
-    symphony::assigned_message,
+    symphony_chat::assigned_message,
 };
 use crate::{
     rate_limit::test_support::RecordingBackend,
