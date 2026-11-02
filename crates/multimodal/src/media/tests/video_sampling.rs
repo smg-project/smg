@@ -1,4 +1,4 @@
-use super::*;
+use super::super::*;
 
 fn cfg() -> VideoFetchConfig {
     VideoFetchConfig {
