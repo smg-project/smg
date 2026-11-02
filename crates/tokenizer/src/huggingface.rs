@@ -1437,11 +1437,11 @@ impl Encoder for HuggingFaceTokenizer {
         if let Some(v1) = &self.v1 {
             return v1.encode(input, add_special_tokens);
         }
-        // The direct path accepts no post-processor that adds tokens, so a
-        // request for special tokens gets the same ids and is served too. An
-        // input it gives up is counted and encoded by `tokenizers`.
+        // The direct path frames the ids itself on a request for special
+        // tokens (what the post-processor it read at load adds). An input it
+        // gives up is counted and encoded by `tokenizers`.
         if let Some(native) = &self.core.native {
-            match native.encode(self.core.tokenizer.get_model(), input) {
+            match native.encode(self.core.tokenizer.get_model(), input, add_special_tokens) {
                 Ok(ids) => return Ok(Encoding::Plain(ids)),
                 Err(fallback) => encode_path::note_fallback(fallback),
             }
