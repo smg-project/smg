@@ -254,8 +254,9 @@ cmd_cut() {
     "The release branch $branch, cut from $from_sha ($from). Versions since $since."
   if [ -n "$start_branch" ]; then git switch --quiet "$start_branch"; else git switch --quiet --detach "$start"; fi
   say ""
-  say "$branch is at $(git rev-parse --short "$branch"): $(git log -1 --format=%s "$branch")"
-  git show --stat --oneline "$branch" | sed -n '2,$p' | sed 's/^/  /'
+  # refs/heads/: a tag named like the branch would answer for a bare name
+  say "$branch is at $(git rev-parse --short "refs/heads/$branch"): $(git log -1 --format=%s "refs/heads/$branch")"
+  git show --stat --oneline "refs/heads/$branch" | sed -n '2,$p' | sed 's/^/  /'
   say "(You are back on ${start_branch:-$(git rev-parse --short "$start")}; the release commands run from a checkout that has scripts/release/, main for instance.)"
   push_release_ref "refs/heads/$branch:refs/heads/$branch" "runs the test matrix on $branch (nothing is published); then 'release.sh tag $version'"
 }

@@ -100,7 +100,7 @@ A candidate or a final is tagged when, on the branch head:
 ## The steps of a release
 
 1. `make release-cut VERSION=1.14.0-rc.1 FROM=<sha>`: the branch and its bump commit, locally;
-   you stay on the branch you ran it from. Read the commit (`git show --stat release/1.14`), then
+   you stay on the branch you ran it from. Read the commit (`git show --stat refs/heads/release/1.14`), then
    `git push origin refs/heads/release/1.14:refs/heads/release/1.14` (or `PUSH=1`). CI runs on
    the branch; nothing is published. `main` is not touched.
 2. `make release-check VERSION=1.14.0-rc.1`, then `make release-tag VERSION=1.14.0-rc.1` and

@@ -413,6 +413,19 @@ def test_cut_comes_back_to_the_branch_when_a_tag_shares_its_name(repo: Sandbox) 
     assert "(You are back on main;" in done.stdout
 
 
+def test_cut_reports_the_branch_beside_a_tag_of_its_name(repo: Sandbox) -> None:
+    """A tag named like the release branch answers for the bare name: the closing lines read the
+    branch by its full ref, so they name the bump commit, not the tag's."""
+    older = repo.git("rev-parse", "origin/main~1")
+    repo.git("tag", "release/1.14", older)
+    done = repo.tool("cut", "1.14.0-rc.1")
+    bump = repo.git("rev-parse", "--short", "refs/heads/release/1.14")
+    assert (
+        f"release/1.14 is at {bump}: chore(release): bump versions for v1.14.0-rc.1" in done.stdout
+    )
+    assert repo.git("rev-parse", "--short", older) not in done.stdout
+
+
 def test_cut_comes_back_without_a_head_reflog(repo: Sandbox) -> None:
     """`git switch -` and `@{-1}` read the HEAD reflog, which a clone can be without (core.logAllRefUpdates=false, or
     the logs expired): the cut reads where it started before it makes the branch, and comes back to that."""
