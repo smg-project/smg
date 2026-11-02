@@ -238,18 +238,31 @@ async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Respon
 
     // A scripted answer, ahead of either engine mode: the worker's queue or
     // the prompt's key decides ([`crate::script`]).
-    if let Some(answer) = script::take(&state.name, &prompt_ids) {
-        // The request's limit ends the answer as it would an engine's.
-        return scripted_response(
-            endpoint,
-            &state.cfg,
-            &parsed,
-            answer.cut_to(extract_max_tokens(&parsed)),
-            prompt_ids.len(),
-            stream_requested,
-            in_flight,
-        )
-        .await;
+    // One scripted answer per choice the request samples (`n`).
+    match script::take_per_choice(&state.name, &prompt_ids, extract_n(&parsed)) {
+        Ok(Some(answers)) => {
+            // The request's limit ends each answer as it would an engine's.
+            let limit = extract_max_tokens(&parsed);
+            let answers = answers
+                .into_iter()
+                .map(|answer| answer.cut_to(limit))
+                .collect();
+            return scripted_response(
+                endpoint,
+                &state.cfg,
+                &parsed,
+                answers,
+                prompt_ids.len(),
+                stream_requested,
+                in_flight,
+            )
+            .await;
+        }
+        Ok(None) => {}
+        // A precondition the script does not meet (the gRPC wire's
+        // `FAILED_PRECONDITION`): a status the gateway does not retry, so the
+        // reason reaches the test instead of a retry's canned choice.
+        Err(why) => return (StatusCode::PRECONDITION_FAILED, why).into_response(),
     }
 
     // Realistic mode: drive the engine simulator.
@@ -379,15 +392,17 @@ fn wants_top(endpoint: Endpoint, request: &Value) -> usize {
         .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX))
 }
 
-/// The usage block of a scripted answer.
-fn scripted_usage(answer: &Answer, prompt_len: usize) -> Value {
-    let prompt_tokens = answer.prompt_tokens(prompt_len);
-    let completion_tokens = answer.completion_tokens();
+/// The usage of a request's scripted answers: the prompt once, every
+/// choice's completion, as an engine reports a request that samples `n` times.
+fn scripted_usage(answers: &[Answer], prompt_len: usize) -> Value {
+    let first = answers.first();
+    let prompt_tokens = first.map_or(0, |answer| answer.prompt_tokens(prompt_len));
+    let completion_tokens: u32 = answers.iter().map(Answer::completion_tokens).sum();
     json!({
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
-        "prompt_tokens_details": { "cached_tokens": answer.cached_tokens },
+        "prompt_tokens_details": { "cached_tokens": first.map_or(0, |answer| answer.cached_tokens) },
     })
 }
 
@@ -442,7 +457,7 @@ async fn scripted_response(
     endpoint: Endpoint,
     cfg: &Config,
     request: &Value,
-    answer: Answer,
+    answers: Vec<Answer>,
     prompt_len: usize,
     stream: bool,
     in_flight: InFlight,
@@ -453,9 +468,8 @@ async fn scripted_response(
     } else {
         0
     };
-    let usage = scripted_usage(&answer, prompt_len);
+    let usage = scripted_usage(&answers, prompt_len);
     let model = cfg.model_id.clone();
-    let frames = answer.text_frames();
     if stream {
         let include_usage = request
             .pointer("/stream_options/include_usage")
@@ -465,48 +479,61 @@ async fn scripted_response(
         return Sse::new(in_flight.until_done(scripted_frames(
             endpoint,
             model,
-            answer,
-            frames,
+            answers,
             want_logprobs,
             top,
             usage,
         )))
         .into_response();
     }
-    let pauses = u32::try_from(frames.len().saturating_sub(1)).unwrap_or(u32::MAX);
-    if pauses > 0 && !answer.delay.is_zero() {
-        tokio::time::sleep(answer.delay * pauses).await;
+    // The pauses the choices' frames would take one after the other, as one wait.
+    let pauses: std::time::Duration = answers
+        .iter()
+        .map(|answer| {
+            answer.delay
+                * u32::try_from(answer.text_frames().len().saturating_sub(1)).unwrap_or(u32::MAX)
+        })
+        .sum();
+    if !pauses.is_zero() {
+        tokio::time::sleep(pauses).await;
     }
-    let text = answer.text();
-    let mut choice = match endpoint {
-        Endpoint::Chat => json!({
-            "index": 0,
-            "message": {"role": "assistant", "content": text},
-            "finish_reason": answer.finish_reason,
-        }),
-        Endpoint::Completions => json!({
-            "index": 0,
-            "text": text,
-            "finish_reason": answer.finish_reason,
-        }),
-    };
-    if let Some(stop) = &answer.matched_stop {
-        choice["matched_stop"] = stop.to_json();
-    }
-    if let (true, Some(pieces), Some(logprobs)) =
-        (want_logprobs, &answer.output_text, &answer.logprobs)
-    {
-        if pieces.len() == logprobs.len() {
-            choice["logprobs"] = scripted_logprobs(endpoint, &answer, pieces, logprobs, top);
-        }
-    }
+    let choices: Vec<Value> = answers
+        .iter()
+        .enumerate()
+        .map(|(index, answer)| {
+            let text = answer.text();
+            let mut choice = match endpoint {
+                Endpoint::Chat => json!({
+                    "index": index,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": answer.finish_reason,
+                }),
+                Endpoint::Completions => json!({
+                    "index": index,
+                    "text": text,
+                    "finish_reason": answer.finish_reason,
+                }),
+            };
+            if let Some(stop) = &answer.matched_stop {
+                choice["matched_stop"] = stop.to_json();
+            }
+            if let (true, Some(pieces), Some(logprobs)) =
+                (want_logprobs, &answer.output_text, &answer.logprobs)
+            {
+                if pieces.len() == logprobs.len() {
+                    choice["logprobs"] = scripted_logprobs(endpoint, answer, pieces, logprobs, top);
+                }
+            }
+            choice
+        })
+        .collect();
     let body = match endpoint {
         Endpoint::Chat => json!({
             "id": "chatcmpl-mock",
             "object": "chat.completion",
             "created": 0,
             "model": model,
-            "choices": [choice],
+            "choices": choices,
             "usage": usage,
         }),
         Endpoint::Completions => json!({
@@ -514,55 +541,88 @@ async fn scripted_response(
             "object": "text_completion",
             "created": 0,
             "model": model,
-            "choices": [choice],
+            "choices": choices,
             "usage": usage,
         }),
     };
     Json(body).into_response()
 }
 
-/// The frames of a scripted stream: the text frames, the finish frame, the
-/// usage chunk when asked for, `[DONE]`.
+/// The frames of a scripted stream, choice by choice in order: each choice's
+/// text frames and its finish frame, then the usage chunk when asked for,
+/// then `[DONE]`.
 fn scripted_frames(
     endpoint: Endpoint,
     model: String,
-    answer: Answer,
-    frames: Vec<script::Frame>,
+    answers: Vec<Answer>,
     want_logprobs: bool,
     top: usize,
     usage: Option<Value>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
+    struct Choice {
+        index: usize,
+        answer: Answer,
+        frames: std::collections::VecDeque<script::Frame>,
+        started: bool,
+    }
     struct Scripted {
         endpoint: Endpoint,
         model: String,
-        answer: Answer,
-        frames: std::collections::VecDeque<script::Frame>,
+        choices: std::collections::VecDeque<Choice>,
         want_logprobs: bool,
         top: usize,
         usage: Option<Value>,
-        started: bool,
-        finished: bool,
         ended: bool,
     }
+    let choices = answers
+        .into_iter()
+        .enumerate()
+        .map(|(index, answer)| Choice {
+            index,
+            frames: answer.text_frames().into(),
+            answer,
+            started: false,
+        })
+        .collect();
     let init = Scripted {
         endpoint,
         model,
-        answer,
-        frames: frames.into(),
+        choices,
         want_logprobs,
         top,
         usage,
-        started: false,
-        finished: false,
         ended: false,
     };
     stream::unfold(init, |mut st| async move {
         if st.ended {
             return None;
         }
-        if st.finished {
-            // The usage rides in a chunk of its own after the finish frame,
-            // with no choices, as the engines send it.
+        if st
+            .choices
+            .front()
+            .is_some_and(|choice| choice.frames.is_empty())
+        {
+            // Every frame of the choice went out: its finish frame, then the
+            // next choice from its first frame.
+            let choice = st.choices.pop_front()?;
+            let mut finish = match st.endpoint {
+                Endpoint::Chat => json!({
+                    "index": choice.index, "delta": {}, "finish_reason": choice.answer.finish_reason
+                }),
+                Endpoint::Completions => json!({
+                    "index": choice.index, "text": "", "finish_reason": choice.answer.finish_reason
+                }),
+            };
+            if let Some(stop) = &choice.answer.matched_stop {
+                finish["matched_stop"] = stop.to_json();
+            }
+            let frame = scripted_chunk(st.endpoint, &st.model, finish);
+            return Some((Ok(Event::default().data(frame.to_string())), st));
+        }
+        let Some(choice) = st.choices.front_mut() else {
+            // Every choice finished. The usage rides in a chunk of its own
+            // after the finish frames, with no choices, as the engines send
+            // it; then the end.
             if let Some(usage) = st.usage.take() {
                 let mut chunk = scripted_chunk(st.endpoint, &st.model, Value::Null);
                 chunk["choices"] = json!([]);
@@ -571,53 +631,40 @@ fn scripted_frames(
             }
             st.ended = true;
             return Some((Ok(Event::default().data("[DONE]")), st));
-        }
-        let Some(frame) = st.frames.pop_front() else {
-            st.finished = true;
-            let mut choice = match st.endpoint {
-                Endpoint::Chat => {
-                    json!({"index": 0, "delta": {}, "finish_reason": st.answer.finish_reason})
-                }
-                Endpoint::Completions => {
-                    json!({"index": 0, "text": "", "finish_reason": st.answer.finish_reason})
-                }
-            };
-            if let Some(stop) = &st.answer.matched_stop {
-                choice["matched_stop"] = stop.to_json();
-            }
-            let frame = scripted_chunk(st.endpoint, &st.model, choice);
-            return Some((Ok(Event::default().data(frame.to_string())), st));
         };
-        if st.started && !st.answer.delay.is_zero() {
-            tokio::time::sleep(st.answer.delay).await;
+        let frame = choice.frames.pop_front()?;
+        if choice.started && !choice.answer.delay.is_zero() {
+            tokio::time::sleep(choice.answer.delay).await;
         }
         let text = frame.text();
-        let mut choice = match st.endpoint {
-            // The first delta names the role, as an engine's does.
-            Endpoint::Chat if !st.started => {
-                json!({"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": Value::Null})
-            }
-            Endpoint::Chat => {
-                json!({"index": 0, "delta": {"content": text}, "finish_reason": Value::Null})
-            }
-            Endpoint::Completions => {
-                json!({"index": 0, "text": text, "finish_reason": Value::Null})
-            }
+        let mut delta = match st.endpoint {
+            // The first delta of a choice names the role, as an engine's does.
+            Endpoint::Chat if !choice.started => json!({
+                "index": choice.index,
+                "delta": {"role": "assistant", "content": text},
+                "finish_reason": Value::Null,
+            }),
+            Endpoint::Chat => json!({
+                "index": choice.index, "delta": {"content": text}, "finish_reason": Value::Null
+            }),
+            Endpoint::Completions => json!({
+                "index": choice.index, "text": text, "finish_reason": Value::Null
+            }),
         };
         if st.want_logprobs
             && !frame.logprobs.is_empty()
             && frame.logprobs.len() == frame.pieces.len()
         {
-            choice["logprobs"] = scripted_logprobs(
+            delta["logprobs"] = scripted_logprobs(
                 st.endpoint,
-                &st.answer,
+                &choice.answer,
                 &frame.pieces,
                 &frame.logprobs,
                 st.top,
             );
         }
-        st.started = true;
-        let frame = scripted_chunk(st.endpoint, &st.model, choice);
+        choice.started = true;
+        let frame = scripted_chunk(st.endpoint, &st.model, delta);
         Some((Ok(Event::default().data(frame.to_string())), st))
     })
 }
@@ -882,6 +929,14 @@ fn hash_word(w: &str) -> u32 {
         h = h.wrapping_mul(16_777_619);
     }
     h % 30_000
+}
+
+/// The choices a request samples: its `n`, one when absent or zero.
+fn extract_n(v: &Value) -> usize {
+    v.get("n")
+        .and_then(Value::as_u64)
+        .map_or(1, |n| usize::try_from(n).unwrap_or(usize::MAX))
+        .max(1)
 }
 
 fn extract_max_tokens(v: &Value) -> Option<u32> {

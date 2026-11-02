@@ -1431,3 +1431,302 @@ async fn zmq_reports_top_alternatives_with_their_ranks() {
         "the second token's alternative wraps to the answer's first token"
     );
 }
+
+/// `frame` with the choice index an `n > 1` request's later choices carry.
+fn at_index(mut frame: ts::GenerateResponse, index: u32) -> ts::GenerateResponse {
+    match frame.response.as_mut() {
+        Some(GenResp::Chunk(chunk)) => chunk.index = index,
+        Some(GenResp::Complete(complete)) => complete.index = index,
+        _ => {}
+    }
+    frame
+}
+
+fn complete_at(
+    id: &str,
+    output_ids: Vec<u32>,
+    prompt_tokens: u32,
+    index: u32,
+) -> ts::GenerateResponse {
+    ts::GenerateResponse {
+        request_id: id.to_string(),
+        response: Some(GenResp::Complete(ts::GenerateComplete {
+            completion_tokens: u32::try_from(output_ids.len()).unwrap_or(u32::MAX),
+            output_ids,
+            finish_reason: "stop".to_string(),
+            prompt_tokens,
+            cached_tokens: 0,
+            output_logprobs: None,
+            matched_stop: None,
+            index,
+            weight_version: None,
+            ..Default::default()
+        })),
+    }
+}
+
+fn answers(values: &[Value]) -> Vec<script::Scripted> {
+    values
+        .iter()
+        .map(|value| script::Answer::parse(value).expect("a scripted answer"))
+        .collect()
+}
+
+#[tokio::test]
+async fn grpc_plays_one_scripted_answer_per_choice_in_order() {
+    let (client, worker) = start_grpc(config(None)).await;
+    // The worker's own queue (the store is shared by the binary's tests): the
+    // choices read the enqueued answers in order.
+    let sampled = |stream: bool| {
+        let mut request = grpc_request("choices", &[51, 52, 53], stream, false);
+        request.sampling_params = Some(ts::SamplingParams {
+            n: 2,
+            ..Default::default()
+        });
+        request
+    };
+
+    script::enqueue(
+        &worker,
+        answers(&[json!({"output_ids": [30, 31]}), json!({"output_ids": [32]})]),
+    )
+    .expect("the worker is known");
+    let streamed = generate(&client, sampled(true)).await;
+    assert_eq!(
+        streamed,
+        vec![
+            chunk("choices", vec![30], 3, 1, 0, None),
+            chunk("choices", vec![31], 3, 2, 0, None),
+            complete_at("choices", vec![30, 31], 3, 0),
+            at_index(chunk("choices", vec![32], 3, 1, 0, None), 1),
+            complete_at("choices", vec![32], 3, 1),
+        ]
+    );
+
+    // Without streaming: the choices' `Complete`s alone, in order.
+    script::enqueue(
+        &worker,
+        answers(&[json!({"output_ids": [40]}), json!({"output_ids": [41, 42]})]),
+    )
+    .expect("the worker is known");
+    let whole = generate(&client, sampled(false)).await;
+    assert_eq!(
+        whole,
+        vec![
+            complete_at("choices", vec![40], 3, 0),
+            complete_at("choices", vec![41, 42], 3, 1),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn grpc_fails_a_request_whose_choices_the_script_does_not_cover() {
+    let (client, worker) = start_grpc(config(None)).await;
+    script::enqueue(&worker, answers(&[json!({"output_ids": [60]})])).expect("the worker is known");
+    let mut request = grpc_request("short", &[61, 62, 63], false, false);
+    request.sampling_params = Some(ts::SamplingParams {
+        n: 3,
+        ..Default::default()
+    });
+
+    let status = client
+        .generate(request)
+        .await
+        .err()
+        .expect("one answer cannot serve three choices");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status
+            .message()
+            .contains("n = 3 choices need 3 scripted answers for this prompt, 1 queued"),
+        "{}",
+        status.message()
+    );
+    // The queue is as it was: the one answer still waits for a request it fits.
+    let state = script::status(&worker).expect("the worker is known");
+    assert_eq!(state["queued"], 1, "{state}");
+
+    // A request for more choices than the mock holds answers for is refused
+    // with nothing taken.
+    let mut request = grpc_request("many", &[61, 62, 63], false, false);
+    request.sampling_params = Some(ts::SamplingParams {
+        n: 129,
+        ..Default::default()
+    });
+    let status = client
+        .generate(request)
+        .await
+        .err()
+        .expect("129 choices are above the limit");
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        status
+            .message()
+            .contains("n = 129 choices is above the mock's limit of 128 per request"),
+        "{}",
+        status.message()
+    );
+    let state = script::status(&worker).expect("the worker is known");
+    assert_eq!(state["queued"], 1, "{state}");
+
+    // The one answer still serves a request for one choice...
+    let one = generate(&client, grpc_request("one", &[61, 62, 63], false, false)).await;
+    assert_eq!(one, vec![complete_at("one", vec![60], 3, 0)]);
+    // ...and a worker with nothing scripted answers any number of choices in
+    // its other mode: the limit binds only a request the script serves.
+    let mut request = grpc_request("unscripted", &[61, 62, 63], false, false);
+    request.sampling_params = Some(ts::SamplingParams {
+        n: 129,
+        ..Default::default()
+    });
+    let canned = generate(&client, request).await;
+    assert!(!canned.is_empty(), "the worker's other mode answered");
+    let state = script::status(&worker).expect("the worker is known");
+    assert_eq!(state["queued"], 0, "{state}");
+}
+
+#[tokio::test]
+async fn http_fails_a_request_whose_choices_the_script_does_not_cover_without_a_retry() {
+    let (base, worker) = start_http(config(None)).await;
+    let http = common::http_client();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while script::status(&worker).is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the HTTP worker did not register"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    script::enqueue(&worker, answers(&[json!({"output_text": "one"})]))
+        .expect("the worker is known");
+
+    let response = http
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "pick two of one"}],
+            "n": 2,
+        }))
+        .send()
+        .await
+        .expect("response");
+    // 412, which the gateway does not retry: a retry would find the queue
+    // empty and read a canned choice instead of this reason.
+    assert_eq!(response.status(), reqwest::StatusCode::PRECONDITION_FAILED);
+    let body = response.text().await.expect("the reason");
+    assert!(
+        body.contains("n = 2 choices need 2 scripted answers for this prompt, 1 queued"),
+        "{body}"
+    );
+    let state = script::status(&worker).expect("the worker is known");
+    assert_eq!(state["queued"], 1, "{state}");
+}
+
+#[tokio::test]
+async fn http_plays_one_scripted_answer_per_choice() {
+    let (base, worker) = start_http(config(None)).await;
+    let http = common::http_client();
+    // The worker registers with the script store as its server task starts.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while script::status(&worker).is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the HTTP worker did not register"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let ask = |stream: bool| {
+        json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "pick two"}],
+            "n": 2,
+            "stream": stream,
+            "stream_options": {"include_usage": true},
+        })
+    };
+
+    script::enqueue(
+        &worker,
+        answers(&[
+            json!({"output_text": "one"}),
+            json!({"output_text": ["two", " more"]}),
+        ]),
+    )
+    .expect("the worker is known");
+    let whole: Value = http
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&ask(false))
+        .send()
+        .await
+        .expect("response")
+        .json()
+        .await
+        .expect("a JSON body");
+    assert_eq!(whole["choices"][0]["index"], 0, "{whole}");
+    assert_eq!(whole["choices"][0]["message"]["content"], "one", "{whole}");
+    assert_eq!(whole["choices"][1]["index"], 1, "{whole}");
+    assert_eq!(
+        whole["choices"][1]["message"]["content"], "two more",
+        "{whole}"
+    );
+    assert_eq!(
+        whole["choices"].as_array().map(Vec::len),
+        Some(2),
+        "{whole}"
+    );
+    assert_eq!(whole["usage"]["completion_tokens"], 3, "{whole}");
+
+    script::enqueue(
+        &worker,
+        answers(&[
+            json!({"output_text": "one"}),
+            json!({"output_text": ["two", " more"]}),
+        ]),
+    )
+    .expect("the worker is known");
+    let body = http
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&ask(true))
+        .send()
+        .await
+        .expect("response")
+        .text()
+        .await
+        .expect("the stream");
+    let frames: Vec<Value> = sse_data(&body)
+        .iter()
+        .filter(|data| data.as_str() != "[DONE]")
+        .map(|data| serde_json::from_str(data).expect("a JSON frame"))
+        .collect();
+    let choice_frames: Vec<(u64, String, Option<String>)> = frames
+        .iter()
+        .filter_map(|frame| frame["choices"].get(0))
+        .map(|choice| {
+            (
+                choice["index"].as_u64().expect("an index"),
+                choice["delta"]["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+                choice["finish_reason"].as_str().map(str::to_string),
+            )
+        })
+        .collect();
+    assert_eq!(
+        choice_frames,
+        vec![
+            (0, "one".to_string(), None),
+            (0, String::new(), Some("stop".to_string())),
+            (1, "two".to_string(), None),
+            (1, " more".to_string(), None),
+            (1, String::new(), Some("stop".to_string())),
+        ],
+        "{body}"
+    );
+    let usage = frames
+        .iter()
+        .find(|frame| !frame["usage"].is_null())
+        .expect("the usage chunk");
+    assert_eq!(usage["usage"]["completion_tokens"], 3, "{body}");
+    assert_eq!(usage["choices"], json!([]), "{body}");
+}
