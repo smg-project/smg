@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as GenerationEvent};
 use tokio::time::timeout;
 
-use super::{usage_tests::harmony_tokens, HarmonyStreamingProcessor};
+use super::{super::HarmonyStreamingProcessor, usage::harmony_tokens};
 use crate::{
     observability::metrics::metrics_labels,
     routers::grpc::{context, regular::streaming::tests::eof::scripted_stream, utils},

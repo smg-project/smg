@@ -11,7 +11,7 @@ use bytes::Bytes;
 use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as GenerationEvent};
 use tokio::sync::oneshot;
 
-use super::{usage_tests::harmony_tokens, HarmonyStreamingProcessor};
+use super::{super::HarmonyStreamingProcessor, usage::harmony_tokens};
 use crate::routers::{
     common::sse::{sse_channel, SseReceiver},
     grpc::{
