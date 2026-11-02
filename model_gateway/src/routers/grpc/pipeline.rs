@@ -548,7 +548,12 @@ impl RequestPipeline {
         )?;
         step!(
             "OutputBudget",
-            enforce_output_budget(&ctx.input.request_type, workers, &ctx.input.model_id)
+            enforce_output_budget(
+                &ctx.input.request_type,
+                workers,
+                &ctx.input.model_id,
+                ctx.state.provider,
+            )
         )?;
         ctx.state.clients = Some(step!(
             "ClientAcquisition",

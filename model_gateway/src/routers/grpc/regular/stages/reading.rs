@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use axum::response::Response;
 use llm_tokenizer::traits::Tokenizer;
-use openai_protocol::common::Tool;
+use openai_protocol::{common::Tool, profile::ProviderProfile};
 use tracing::error;
 
 use crate::{
@@ -333,13 +333,18 @@ pub(crate) fn decide(
         ctx.state.constraint_decided_on = Some(decoding);
     }
     let tool_constraints = decided.constraint.map(|constraint| constraint.to_tuple());
-    let assignment = symphony::assign(
+    let provider = ctx
+        .state
+        .provider
+        .unwrap_or_else(|| ProviderProfile::for_model(model));
+    let assignment = symphony::assign_for(
         parser,
         &names,
         asks,
         tool_constraints.as_ref(),
         processed_text,
         &ctx.components.templates,
+        provider,
     )
     .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
     ctx.state.parser = Some(match assignment {

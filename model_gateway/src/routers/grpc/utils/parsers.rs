@@ -520,6 +520,25 @@ pub fn chat_reasoning_starts_in_rendered_prefill(
     continued_final_message: bool,
     tokenizer: &dyn Tokenizer,
 ) -> bool {
+    chat_reasoning_starts_in_rendered_prefill_for(
+        request,
+        ProviderProfile::for_model(&request.model),
+        generation_prompt,
+        continued_final_message,
+        tokenizer,
+    )
+}
+
+/// [`chat_reasoning_starts_in_rendered_prefill`] with the model's provider
+/// profile already derived: the preparation stage derives it once per request
+/// and the later reads take that copy.
+pub fn chat_reasoning_starts_in_rendered_prefill_for(
+    request: &ChatCompletionRequest,
+    provider: ProviderProfile,
+    generation_prompt: bool,
+    continued_final_message: bool,
+    tokenizer: &dyn Tokenizer,
+) -> bool {
     if !generation_prompt && !continued_final_message {
         return false;
     }
@@ -529,7 +548,7 @@ pub fn chat_reasoning_starts_in_rendered_prefill(
         request.thinking_toggle(),
         continued_final_message,
         tokenizer,
-        ProviderProfile::for_model(&request.model),
+        provider,
     )
 }
 
@@ -540,8 +559,25 @@ pub fn chat_reasoning_starts_in_rendered_prefill(
 /// message with text and no tool call is continued where the template can).
 /// `output_config.effort` is the `reasoning_effort` the template renders, as
 /// a Chat request's effective effort is.
+#[cfg(test)]
 pub fn messages_reasoning_starts_in_prefill(
     request: &openai_protocol::messages::CreateMessageRequest,
+    continued_final_message: bool,
+    tokenizer: &dyn Tokenizer,
+) -> bool {
+    messages_reasoning_starts_in_prefill_for(
+        request,
+        ProviderProfile::for_model(&request.model),
+        continued_final_message,
+        tokenizer,
+    )
+}
+
+/// [`messages_reasoning_starts_in_prefill`] with the model's provider profile
+/// already derived (the preparation stage derives it once per request).
+pub fn messages_reasoning_starts_in_prefill_for(
+    request: &openai_protocol::messages::CreateMessageRequest,
+    provider: ProviderProfile,
     continued_final_message: bool,
     tokenizer: &dyn Tokenizer,
 ) -> bool {
@@ -551,7 +587,7 @@ pub fn messages_reasoning_starts_in_prefill(
         request.thinking_toggle(),
         continued_final_message,
         tokenizer,
-        ProviderProfile::for_model(&request.model),
+        provider,
     )
 }
 
