@@ -30,6 +30,8 @@ logger = logging.getLogger(__name__)
 LOAD_MONITOR_INTERVAL_SECS = 1
 _GATEWAY_ARGS = ["--load-monitor-interval", str(LOAD_MONITOR_INTERVAL_SECS)]
 _REPORT_TIMEOUT_SECS = 8 * LOAD_MONITOR_INTERVAL_SECS
+# The in-flight burst: the threads, and on the mock the paced answers, one per request.
+_BURST_REQUESTS = 32
 
 
 def _worker_urls(gateway) -> set[str]:
@@ -74,13 +76,21 @@ def _assert_report_is_sane(entry: dict) -> None:
     assert entry.get("dp_rank", 0) >= 0, f"negative dp_rank: {entry}"
 
 
-@pytest.mark.engine("sglang", "vllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "tokenspeed", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.e2e
+@pytest.mark.model(
+    "meta-llama/Llama-3.1-8B-Instruct", mock="RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8"
+)
 @pytest.mark.gateway(extra_args=_GATEWAY_ARGS)
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestWorkerLoadReports:
-    """A regular worker reports load, and the report follows real traffic."""
+    """A regular worker reports load, and the report follows real traffic.
+
+    On the mock engine the burst's answers are stated first, each paced by a delay per
+    token so the burst outlasts several polls; the mock counts the requests it is serving
+    in its report as an engine does.
+    """
 
     def test_every_worker_reports_load(self, setup_backend):
         _, _, _, gateway = setup_backend
@@ -92,7 +102,7 @@ class TestWorkerLoadReports:
             assert entry.get("worker_type") == "regular", f"unexpected worker type: {entry}"
             _assert_report_is_sane(entry)
 
-    def test_report_reflects_in_flight_requests(self, setup_backend):
+    def test_report_reflects_in_flight_requests(self, setup_backend, mock_answers):
         """While a burst is in flight, at least one poll must see running or waiting work.
 
         A report that never moves off zero would still pass the presence check
@@ -102,6 +112,10 @@ class TestWorkerLoadReports:
         _, model, client, gateway = setup_backend
         expected = _worker_urls(gateway)
         _wait_for_reports(gateway, expected, _REPORT_TIMEOUT_SECS)
+        # On the mock: one paced answer per request of the burst, 128 tokens at 20 ms
+        # each, so the burst stays in flight across several polls.
+        for _ in range(_BURST_REQUESTS):
+            mock_answers.enqueue(" ".join(["lighthouse"] * 128), delay_ms=20)
 
         errors: list[BaseException] = []
 
@@ -119,7 +133,9 @@ class TestWorkerLoadReports:
             except BaseException as exc:  # surfaced below; never swallow silently
                 errors.append(exc)
 
-        threads = [threading.Thread(target=_long_request, daemon=True) for _ in range(32)]
+        threads = [
+            threading.Thread(target=_long_request, daemon=True) for _ in range(_BURST_REQUESTS)
+        ]
         for t in threads:
             t.start()
 
@@ -138,7 +154,9 @@ class TestWorkerLoadReports:
                 t.join(timeout=300)
 
         assert not errors, f"burst requests failed: {errors[:3]}"
-        assert observed, "no load report showed running or waiting work during a 32-request burst"
+        assert observed, (
+            f"no load report showed running or waiting work during a {_BURST_REQUESTS}-request burst"
+        )
 
 
 @pytest.mark.engine("sglang", "vllm", "tokenspeed")
