@@ -121,6 +121,15 @@
 //! which would take the publisher's first batch for a duplicate of such a
 //! heartbeat, gets its first record with that batch.
 //!
+//! A batch read live off a publisher socket, in the publisher's sequence, is
+//! a sign of the engine's progress (it stored or freed KV blocks in that
+//! step), which the relay tells the load source's engine link
+//! (`LoadSource::note_engine_progress`): the connected engine's silence
+//! count ends on it as on an output, so a chunked prefill that publishes its
+//! blocks chunk by chunk is not a dead engine on a wire that says nothing
+//! before a prompt's first token. A replayed batch, a snapshot chunk and a
+//! `load_only` batch are not progress and tell it nothing.
+//!
 //! `SMG_KV_EVENT_HASH_CHECK=sglang|vllm-sha256-cbor` turns on the relay's
 //! engine-hash verification ([`crate::engine_hash`]); mismatches are counted,
 //! never dropped. The relay's counters ([`RelayCounts`]) are logged on every
@@ -313,6 +322,13 @@ pub(crate) trait LoadSource: Send + Sync {
     /// is known (the engine is not up yet). `sample` and `load_only` are the
     /// relay's to set.
     fn load(&self, dp_rank: Option<i32>) -> Option<common::EngineLoad>;
+
+    /// The relay read a batch live off a publisher socket, in the
+    /// publisher's sequence: the engine stepped (it stored or freed KV
+    /// blocks), whatever its output wire has said since. Not called for a
+    /// replayed batch, a snapshot chunk or a `load_only` batch, none of
+    /// which is the engine's work now. Tells nobody unless implemented.
+    fn note_engine_progress(&self) {}
 }
 
 /// A servicer state's own `GetLoads` figures, the half of a load record that
@@ -348,6 +364,12 @@ impl<S: RankLoads> LoadSource for LoadFromState<S> {
         record.engine_reports_steps = engine.reports_steps();
         record.prefill_pending_tokens = engine.prefill_pending_tokens();
         Some(record)
+    }
+
+    fn note_engine_progress(&self) {
+        if let Some(state) = self.0.upgrade() {
+            state.engine_link().note_engine_progress();
+        }
     }
 }
 
@@ -671,9 +693,10 @@ pub struct KvEventRelay {
     /// A subscriber came while the relay holds nothing: each publisher task
     /// asks its engine replay for the publisher's start again.
     prime_requests: Vec<Arc<Notify>>,
-    /// The servicer's load, attached to every batch sent; none until the
+    /// The servicer's load, attached to every batch sent, and where the
+    /// publisher tasks report the engine's progress; none until the
     /// servicer installs it.
-    load_source: OnceLock<Arc<dyn LoadSource>>,
+    load_source: Arc<OnceLock<Arc<dyn LoadSource>>>,
 }
 
 impl Drop for KvEventRelay {
@@ -738,7 +761,7 @@ impl KvEventRelay {
             live,
             tasks: Mutex::new(Vec::new()),
             prime_requests,
-            load_source: OnceLock::new(),
+            load_source: Arc::new(OnceLock::new()),
         })
     }
 
@@ -860,11 +883,12 @@ impl KvEventRelay {
             let shared = Arc::clone(&self.shared);
             let live = self.live.clone();
             let prime_request = Arc::clone(prime_request);
+            let load_source = Arc::clone(&self.load_source);
             #[expect(
                 clippy::disallowed_methods,
                 reason = "the publisher subscription outlives any one RPC; aborted when the relay drops"
             )]
-            let handle = tokio::spawn(run(config, index, shared, live, prime_request));
+            let handle = tokio::spawn(run(config, index, shared, live, prime_request, load_source));
             tasks.push(handle);
         }
     }
@@ -1415,6 +1439,7 @@ async fn run(
     shared: Arc<Mutex<Shared>>,
     live: broadcast::Sender<Live>,
     prime_request: Arc<Notify>,
+    load_source: Arc<OnceLock<Arc<dyn LoadSource>>>,
 ) {
     let source = &config.sources[index];
     let mut socket = match connect(&source.endpoint, &config.topic).await {
@@ -1434,6 +1459,7 @@ async fn run(
         shared: &shared,
         live: &live,
         normalizer: Normalizer::from_env(),
+        progress: &load_source,
     };
     if index == 0 {
         if let Some(check) = relay.normalizer.hash_check() {
@@ -1508,7 +1534,7 @@ async fn run(
             admission = lock(&shared).ranks[index].admit(sequence, startup_clear);
         }
         match admission {
-            Admission::Accept => relay.relay(sequence, decoded),
+            Admission::Accept => relay.relay_live(sequence, decoded),
             Admission::Gap { .. } | Admission::Duplicate => {}
             Admission::Restart { reason, last } => {
                 let (generation, counts) = {
@@ -1537,7 +1563,7 @@ async fn run(
                         continue;
                     }
                 }
-                relay.relay(sequence, decoded);
+                relay.relay_live(sequence, decoded);
             }
         }
     }
@@ -1578,9 +1604,25 @@ struct Relaying<'a> {
     live: &'a broadcast::Sender<Live>,
     /// This rank's normalizer (its state is the rank's own).
     normalizer: Normalizer,
+    /// Where a batch read live off the socket is reported as the engine's
+    /// progress (the servicer's load source), once installed.
+    progress: &'a OnceLock<Arc<dyn LoadSource>>,
 }
 
 impl Relaying<'_> {
+    /// [`Self::relay`] for a batch read live off the publisher socket, in
+    /// the publisher's sequence: the engine's progress, which the load
+    /// source's engine link is told of first, so the load record the batch
+    /// itself carries to a subscriber already counts from it. The replay
+    /// paths relay through [`Self::relay`] alone: what the engine's replay
+    /// gives back is history, not progress.
+    fn relay_live(&mut self, sequence: u64, decoded: Decoded) {
+        if let Some(source) = self.progress.get() {
+            source.note_engine_progress();
+        }
+        self.relay(sequence, decoded);
+    }
+
     /// Normalize, remember and broadcast one batch under `sequence`, stamped
     /// with this source's rank (the socket's rank wins over the payload's,
     /// as in the Python relay: it is what the gateway keys its cursors by).

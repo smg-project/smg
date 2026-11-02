@@ -1616,6 +1616,18 @@ impl ZmqEngineClient {
         }
     }
 
+    /// A sign of the engine's progress from outside its output wire, a live
+    /// KV-event batch it published: the engine's silence ends now, as on an
+    /// output of any kind (the ZMQ client's `note_progress`).
+    pub fn note_progress(&self) {
+        match &self.backend {
+            ZmqBackend::Vllm(client) => client.note_progress(),
+            ZmqBackend::TokenSpeed(client) => client.note_progress(),
+            ZmqBackend::Sglang(client) => client.note_progress(),
+            ZmqBackend::Trtllm(client) => client.note_progress(),
+        }
+    }
+
     /// Prompt tokens of the in-flight requests without a first output yet
     /// (the ZMQ client's `prefill_pending_tokens`).
     pub fn prefill_pending_tokens(&self) -> u64 {
