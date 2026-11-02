@@ -3376,7 +3376,7 @@ fn the_corpus_replay_reads_a_v3_2_set_recorded_in_chat_mode_without_the_reasonin
             "tool_calls",
         ),
         (
-            "content-thinking-on",
+            "content-unasked",
             &unasked,
             "Hello!".to_string(),
             serde_json::json!({"content": "Hello!"}),
