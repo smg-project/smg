@@ -1,5 +1,6 @@
 """Check two generated gRPC packages over real local peers; no engine is loaded."""
 
+import ast
 import asyncio
 import importlib
 import json
@@ -178,14 +179,21 @@ def check(peers):
         subprocess.check_output([python, script, "fingerprint", generated], text=True)
         for python, generated in peers
     ]
-    assert json.loads(fingerprints[0]) == json.loads(fingerprints[1])
+    first, second = map(json.loads, fingerprints)
+    if first != second:
+        different = sorted(
+            name for name in first.keys() | second.keys() if first.get(name) != second.get(name)
+        )
+        raise AssertionError(f"Descriptor fingerprints differ: {different}")
     results = []
     for python, generated in peers:
         process = subprocess.Popen(
             [python, script, "server", repo, generated], text=True, stdout=subprocess.PIPE
         )
+        clients_completed = False
         try:
-            assert select.select([process.stdout], [], [], 10)[0], "Server startup timeout"
+            if not select.select([process.stdout], [], [], 10)[0]:
+                raise AssertionError("Server startup timeout")
             ready = json.loads(process.stdout.readline())
             for client_python, client_generated in peers:
                 output = subprocess.check_output(
@@ -200,16 +208,56 @@ def check(peers):
                     timeout=15,
                 )
                 results.append({"server": ready, "client": json.loads(output)})
+            clients_completed = True
         finally:
-            process.terminate()
-            process.wait(timeout=5)
+            try:
+                process.terminate()
+                try:
+                    returncode = process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    # A timed-out shutdown remains a failure. Kill/reap only
+                    # this owned child; the extra second is failure settlement,
+                    # not another chance to pass the five-second shutdown gate.
+                    try:
+                        process.kill()
+                        process.wait(timeout=1)
+                    except Exception as settle_error:
+                        print(f"Server kill/reap also failed: {settle_error}", file=sys.stderr)
+                    raise
+                if returncode != 0:
+                    raise RuntimeError(f"Server {python} exited with status {returncode}")
+            except Exception as cleanup_error:
+                if clients_completed:
+                    raise
+                # Keep the startup/client error already in flight as primary.
+                print(f"Server cleanup also failed: {cleanup_error}", file=sys.stderr)
+
+    guard_path = Path(peers[1][1]) / "smg_grpc_proto/generated/common_pb2_grpc.py"
+    minimums = [
+        ast.literal_eval(node.value)
+        for node in ast.parse(guard_path.read_text(), filename=str(guard_path)).body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "GRPC_GENERATED_VERSION"
+            for target in node.targets
+        )
+    ]
+    if len(minimums) != 1 or not isinstance(minimums[0], str) or not minimums[0]:
+        raise RuntimeError(f"Expected one generated gRPC minimum in {guard_path}")
+    # The generator's guard is authoritative; its runtime can be newer than
+    # that minimum. Import it in the old peer unchanged to test the real guard.
+    expected_guard = f"grpcio>={minimums[0]}."
     refused = subprocess.run(
         [peers[0][0], "-c", "from smg_grpc_proto.generated import common_pb2_grpc"],
         env=dict(os.environ, PYTHONPATH=peers[1][1]),
         text=True,
         capture_output=True,
     )
-    assert refused.returncode != 0 and "grpcio>=1.81.1" in refused.stderr
+    if refused.returncode == 0 or expected_guard not in refused.stderr:
+        raise AssertionError(
+            f"Expected incompatible-gencode refusal ({expected_guard}); "
+            f"exit status {refused.returncode}; stderr:\n{refused.stderr}"
+        )
     print(
         json.dumps(
             {
