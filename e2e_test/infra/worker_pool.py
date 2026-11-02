@@ -34,7 +34,7 @@ import threading
 from .constants import DEFAULT_STARTUP_TIMEOUT, ConnectionMode, WorkerType
 from .gateway import Gateway
 from .process_utils import wait_for_workers_ready
-from .worker import Worker, start_workers, stop_workers
+from .worker import Worker, start_workers, stop_workers, validate_encode_worker_pair
 
 logger = logging.getLogger(__name__)
 
@@ -105,13 +105,7 @@ class WorkerPool:
             if self._closed:
                 raise RuntimeError("WorkerPool has been closed")
 
-            if worker_type == WorkerType.ENCODE and (
-                engine != "tokenspeed" or mode != ConnectionMode.GRPC
-            ):
-                raise ValueError(
-                    "EPD encode workers currently require TokenSpeed over gRPC; "
-                    f"got engine={engine!r}, mode={getattr(mode, 'value', mode)!r}"
-                )
+            validate_encode_worker_pair(engine, mode, worker_type)
 
             # Non-REGULAR workers (PD prefill/decode) aren't cached, but we
             # still have to release any cached regular worker first — it

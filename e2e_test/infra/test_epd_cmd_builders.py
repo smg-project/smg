@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 from infra import worker as worker_module
@@ -40,8 +41,42 @@ def test_unsupported_encode_fails_before_worker_start(monkeypatch, engine, mode)
     monkeypatch.setattr(worker_module, "gpu_memory_used_mib", unexpected)
     monkeypatch.setattr(worker, "_build_env", unexpected)
     monkeypatch.setattr(worker, "_spawn_process", unexpected)
-    with pytest.raises(ValueError, match="EPD encode.*TokenSpeed over gRPC"):
+    expected = (
+        "EPD encode workers currently require TokenSpeed over gRPC; "
+        f"got engine={engine!r}, mode={mode.value!r}"
+    )
+    with pytest.raises(ValueError, match="^" + re.escape(expected) + "$"):
         worker.start(wait_ready=False)
+    assert worker.process is None
+
+
+@pytest.mark.parametrize(
+    "engine,mode,expected_suffix",
+    [
+        ("tokenspeed", None, "got engine='tokenspeed', mode=None"),
+        ("vllm", "bad-wire", "got engine='vllm', mode='bad-wire'"),
+    ],
+)
+def test_malformed_encode_mode_has_context_before_command_preparation(
+    monkeypatch, engine, mode, expected_suffix
+):
+    worker = Worker(
+        model_id="never-prepare",
+        engine=engine,
+        port=50104,
+        gpu_ids=[0],
+        mode=mode,
+        worker_type=WorkerType.ENCODE,
+    )
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("malformed encoder reached model preparation")
+
+    monkeypatch.setattr(worker_module, "get_model_spec", forbidden)
+    expected = "EPD encode workers currently require TokenSpeed over gRPC; " + expected_suffix
+    with pytest.raises(ValueError, match="^" + re.escape(expected) + "$") as caught:
+        worker._build_cmd()
+    assert type(caught.value) is ValueError
     assert worker.process is None
 
 
