@@ -5,6 +5,7 @@ import importlib.util
 import json
 import logging
 import sys
+import threading
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -234,6 +235,27 @@ def test_scheduler_launch_failure_never_starts_serving(monkeypatch, server_mod):
     grpc_server_factory.assert_not_called()
     health_servicer_factory.assert_not_called()
     warmup_thread_factory.assert_not_called()
+
+
+def test_dead_prefill_bootstrap_never_launches_schedulers_or_serves(monkeypatch, server_mod):
+    dead_thread = threading.Thread(target=lambda: None)
+    dead_thread.start()
+    dead_thread.join()
+    close = Mock()
+    bootstrap = SimpleNamespace(port=8998, thread=dead_thread, close=close)
+    monkeypatch.setattr(server_mod, "start_disagg_service", lambda: bootstrap)
+    launcher = Mock()
+    health = Mock()
+    monkeypatch.setattr(server_mod, "_launch_scheduler_with_request_manager", launcher)
+    monkeypatch.setattr(server_mod, "SGLangHealthServicer", health)
+    args = SimpleNamespace(
+        disaggregation_mode="prefill", host="127.0.0.1", disaggregation_bootstrap_port=8998
+    )
+    with pytest.raises(RuntimeError, match="exited before its listener was ready"):
+        asyncio.run(server_mod.serve_grpc(args))
+    launcher.assert_not_called()
+    health.assert_not_called()
+    close.assert_called_once_with()
 
 
 def test_generation_warmup_sends_valid_sampling_defaults(monkeypatch, server_mod):

@@ -466,6 +466,14 @@ def test_the_prefill_side_starts_its_bootstrap_server_before_the_ranks(
     recorded = _stub_rank_launch(monkeypatch)
     server = SimpleNamespace(name="bootstrap")
 
+    from smg_grpc_servicer.sglang import bootstrap
+
+    def checked_listener(handle, host, port):
+        assert handle is server and (host, port) == ("127.0.0.1", 8998)
+        recorded["calls"].append("bootstrap-listener")
+
+    monkeypatch.setattr(bootstrap, "wait_for_bootstrap_listener", checked_listener)
+
     def start_disagg_service():
         recorded["calls"].append("bootstrap")
         return server
@@ -480,7 +488,13 @@ def test_the_prefill_side_starts_its_bootstrap_server_before_the_ranks(
     )
     with caplog.at_level("INFO"):
         engine = rust.launch_scheduler_ranks(args, handshake_port=24321)
-    assert recorded["calls"][-4:] == ["publish:tokenizer", "bootstrap", "port_args", "launch"]
+    assert recorded["calls"][-5:] == [
+        "publish:tokenizer",
+        "bootstrap",
+        "bootstrap-listener",
+        "port_args",
+        "launch",
+    ]
     assert engine._manager.holding == [server]
     assert "Bootstrap server started for disaggregation mode on 127.0.0.1:8998" in caplog.text
     for mode in ("decode", "null"):
@@ -489,6 +503,29 @@ def test_the_prefill_side_starts_its_bootstrap_server_before_the_ranks(
             _preparable_args(recorded, disaggregation_mode=mode), handshake_port=24321
         )
         assert "bootstrap" not in recorded["calls"] and engine._manager.holding == []
+
+
+def test_dead_prefill_bootstrap_never_launches_rust_scheduler_ranks(
+    monkeypatch, restore_fault_signals
+):
+    recorded = _stub_rank_launch(monkeypatch)
+    dead_thread = threading.Thread(target=lambda: None)
+    dead_thread.start()
+    dead_thread.join()
+    closed = []
+    server = SimpleNamespace(port=8998, thread=dead_thread, close=lambda: closed.append(True))
+    _install(
+        monkeypatch,
+        "sglang.srt.managers.disagg_service",
+        start_disagg_service=lambda: server,
+    )
+    args = _preparable_args(
+        recorded, disaggregation_mode="prefill", disaggregation_bootstrap_port=8998
+    )
+    with pytest.raises(RuntimeError, match="exited before its listener was ready"):
+        rust.launch_scheduler_ranks(args, handshake_port=24321)
+    assert "launch" not in recorded["calls"]
+    assert closed == [True]
 
 
 def test_the_language_side_starts_its_encode_dispatch_before_the_ranks(

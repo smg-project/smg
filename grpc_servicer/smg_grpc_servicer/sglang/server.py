@@ -37,6 +37,7 @@ from smg_grpc_servicer.rust_lifecycle import (
     configuration_exit,
     guarded_exit,
 )
+from smg_grpc_servicer.sglang.bootstrap import wait_for_bootstrap_listener
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager, init_request_tracing
@@ -183,6 +184,11 @@ async def serve_grpc(
     bootstrap_server = None
     if server_args.disaggregation_mode == "prefill":
         bootstrap_server = start_disagg_service()
+        wait_for_bootstrap_listener(
+            bootstrap_server,
+            server_args.host,
+            server_args.disaggregation_bootstrap_port,
+        )
         if bootstrap_server:
             logger.info(
                 "Bootstrap server started for disaggregation mode on %s:%s",
