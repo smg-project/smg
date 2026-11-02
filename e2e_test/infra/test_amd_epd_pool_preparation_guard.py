@@ -48,6 +48,17 @@ def _load_acquire():
     return namespace
 
 
+def _load_start_workers():
+    namespace = _load_acquire()
+    path = Path(__file__).resolve().parent / "worker.py"
+    source = path.read_text()
+    tree = ast.parse(source, filename=str(path))
+    entrypoint = _one(tree.body, ast.FunctionDef, "start_workers")
+    selected = ast.get_source_segment(source, entrypoint)
+    exec(compile("from __future__ import annotations\n" + selected, str(path), "exec"), namespace)
+    return namespace
+
+
 class PoolPreparationGuardCases(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -203,6 +214,89 @@ class PoolPreparationGuardCases(unittest.TestCase):
                 else:
                     self.assertIs(result, workers)
                     self.assertEqual(events, ["eviction", ("start_workers", role)])
+
+    def test_PG05_direct_invalid_encode_precedes_all_worker_preparation(self):
+        scope = _load_start_workers()
+        mode, role = scope["ConnectionMode"], scope["WorkerType"]
+        cases = [(engine, engine, mode(wire.value)) for engine, wire in self._invalid_pairs()] + [
+            (None, "vllm", mode.GRPC),
+            (None, "tokenspeed", mode.HTTP),
+        ]
+        for engine, resolved, wire in cases:
+            with self.subTest(engine=engine, resolved=resolved, mode=wire):
+                events = []
+                scope["get_gpu_offset"] = lambda: 0
+
+                def runtime():
+                    events.append("resolve_engine")
+                    return resolved
+
+                def forbidden(stage):
+                    def fail(*args, **kwargs):
+                        events.append(stage)
+                        raise AssertionError(f"invalid direct encode reached {stage}")
+
+                    return fail
+
+                scope["get_runtime"] = runtime
+                scope["get_model_spec"] = forbidden("model_lookup")
+                scope["worker_startup_timeout"] = forbidden("timeout_resolution")
+                scope["get_engine_port"] = forbidden("port_reservation")
+                scope["Worker"] = forbidden("Worker_construction")
+                with self.assertRaisesRegex(
+                    ValueError, "^EPD encode workers currently require TokenSpeed over gRPC$"
+                ):
+                    scope["start_workers"](
+                        "never-look-up-this-model",
+                        engine=engine,
+                        mode=wire,
+                        worker_type=role.ENCODE,
+                        log_dir="private-logs",
+                    )
+                self.assertEqual(events, ["resolve_engine"] if engine is None else [])
+
+    def test_PG06_direct_supported_requests_reach_original_model_lookup(self):
+        scope = _load_start_workers()
+        mode, role = scope["ConnectionMode"], scope["WorkerType"]
+        cases = [
+            ("tokenspeed", "tokenspeed", mode.GRPC, role.ENCODE),
+            (None, "tokenspeed", mode.GRPC, role.ENCODE),
+            ("sglang", "sglang", mode.GRPC, role.REGULAR),
+            ("vllm", "vllm", mode.HTTP, role.REGULAR),
+            ("vllm", "vllm", mode.ZMQ, role.REGULAR),
+            ("sglang", "sglang", mode.HTTP, role.PREFILL),
+            ("vllm", "vllm", mode.GRPC, role.DECODE),
+            ("trtllm", "trtllm", mode.GRPC, role.REGULAR),
+            ("mlx", "mlx", mode.HTTP, role.REGULAR),
+            ("mock", "mock", mode.HTTP, role.REGULAR),
+        ]
+        for engine, resolved, wire, worker_role in cases:
+            with self.subTest(engine=engine, resolved=resolved, mode=wire, role=worker_role):
+                events = []
+                scope["get_gpu_offset"] = lambda: 0
+
+                def runtime():
+                    events.append("resolve_engine")
+                    return resolved
+
+                def model_lookup(model_id):
+                    events.append(("model_lookup", model_id))
+                    raise LookupError("stop at original model lookup sentinel")
+
+                scope["get_runtime"] = runtime
+                scope["get_model_spec"] = model_lookup
+                with self.assertRaisesRegex(
+                    LookupError, "^stop at original model lookup sentinel$"
+                ):
+                    scope["start_workers"](
+                        "supported-control-model",
+                        engine=engine,
+                        mode=wire,
+                        worker_type=worker_role,
+                        log_dir="private-logs",
+                    )
+                expected = ["resolve_engine"] if engine is None else []
+                self.assertEqual(events, expected + [("model_lookup", "supported-control-model")])
 
 
 if __name__ == "__main__":
