@@ -939,6 +939,69 @@ fn text_not_in_nfc_is_declined_under_an_nfc_normalizer() {
 }
 
 #[test]
+fn every_shape_merges_its_misses_natively() {
+    let mut state = 0x6666_7777_8888_9999u64;
+    for shape in shapes() {
+        let tokenizer = tokenizer_of(&shape, &mut state);
+        let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        let table = native.merges.as_ref();
+        assert!(table.is_some(), "{}", shape.name);
+        assert_eq!(
+            table.map(|table| table.ignore_merges),
+            Some(shape.ignore_merges),
+            "{}",
+            shape.name
+        );
+    }
+}
+
+#[test]
+fn a_model_the_merge_table_declines_keeps_the_path_through_the_model() {
+    // A vocabulary without the token of byte 0x00: the table declines the
+    // model, the path stays, and its misses take the model's own merge.
+    let mut state = 0x1212_3434_5656_7878u64;
+    let shape = &shapes()[0];
+    let mut tokenizer = tokenizer_of(shape, &mut state);
+    let table = bytes_char();
+    let mut vocab = Vocab::default();
+    let mut alphabet: Vec<char> = table.to_vec();
+    alphabet.sort_unstable();
+    for ch in alphabet.into_iter().filter(|&ch| ch != table[0]) {
+        let id = vocab.len() as u32;
+        vocab.insert(ch.to_string(), id);
+    }
+    let mut merges = Merges::new();
+    for (a, b) in [("a", "b"), ("b", "c"), ("ab", "c"), ("a", "bc")] {
+        let merged = format!("{a}{b}");
+        if !vocab.contains_key(&merged) {
+            let id = vocab.len() as u32;
+            vocab.insert(merged, id);
+        }
+        merges.push((a.to_owned(), b.to_owned()));
+    }
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, merges)
+        .build()
+        .expect("bpe");
+    tokenizer.with_model(bpe);
+    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    assert!(native.merges.is_none());
+    for text in [
+        "abc",
+        "abcabc xabc",
+        "cab abcd",
+        "<|im_start|>abc<|im_end|>",
+    ] {
+        let reference = tokenizer.encode(text, false).expect("encode");
+        assert_eq!(
+            native.encode(tokenizer.get_model(), text),
+            Ok(reference.get_ids().to_vec()),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
 fn a_piece_the_model_declines_is_reported_after_the_work() {
     // A vocabulary without the character for byte 0x7F whose `unk_token`
     // is not in it either: `tokenizers` fails such a piece, and so does

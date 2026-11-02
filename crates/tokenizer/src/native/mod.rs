@@ -18,12 +18,14 @@
 //! 3. each `Split` pre-tokenizer runs as a [`pattern::Pattern`] over `&str`,
 //!    with the same leftmost-first semantics and Unicode tables as the regex
 //!    engine `tokenizers` uses, producing byte ranges instead of strings;
-//! 4. each piece is mapped to the byte-level alphabet and tokenized by the
-//!    tokenizer's own BPE model (so `ignore_merges` and the rest keep their
-//!    meaning), behind two tables from piece bytes to ids (`short_pieces`):
-//!    a small per-thread cache of the pieces the thread has met, filled on a
-//!    first sight from the vocabulary's own pieces, built at load and shared
-//!    by every thread, else from the model.
+//! 4. each piece is tokenized behind two tables from piece bytes to ids
+//!    (`short_pieces`): a small per-thread cache of the pieces the thread
+//!    has met, filled on a first sight from the vocabulary's own pieces,
+//!    built at load and shared by every thread; a piece neither table
+//!    holds is merged over the model's own merges by [`merge::MergeTable`]
+//!    (the model's `tokenize` without its strings; `ignore_merges` looks
+//!    the whole piece up in the model's vocabulary first), or by the model
+//!    itself for a vocabulary the table declines (see `merge`).
 //!
 //! The shape is checked once at load time; a tokenizer that does not fit
 //! (another normalizer, a pre-tokenizer or regex construct outside the
@@ -48,10 +50,12 @@ use thread_local::ThreadLocal;
 use tokenizers::{models::ModelWrapper, Model};
 use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
 
+mod merge;
 mod pattern;
 mod short_pieces;
 mod unicode;
 
+use merge::MergeTable;
 use pattern::Pattern;
 use short_pieces::{ShortPieceKey, ShortPieceTable, SHORT_PIECE_MAX_BYTES};
 
@@ -321,8 +325,13 @@ pub(crate) struct NativeEncoder {
     alphabet: [char; 256],
     /// The vocabulary's own pieces with their ids, read once the model's word
     /// cache is bounded and consulted by a thread for a piece its own cache
-    /// has not met, before the model (see [`Self::seed_vocabulary`]).
+    /// has not met, before the piece is merged (see
+    /// [`Self::seed_vocabulary`]).
     seed: ShortPieceTable,
+    /// The model's merges as a table a piece neither the thread's cache nor
+    /// the seed holds is merged over; `None` for a model the table cannot
+    /// stand in for, whose such pieces the model itself tokenizes.
+    merges: Option<MergeTable>,
     /// Each thread's cache from piece bytes to ids. The encoder owns them, so
     /// they go when it does: tokenizers are added and removed at runtime, and
     /// a thread never has to notice that an encoder it encoded with is gone.
@@ -337,6 +346,7 @@ impl std::fmt::Debug for NativeEncoder {
             .field("normalizer", &self.normalizer)
             .field("stages", &self.stages.len())
             .field("seeded_pieces", &self.seed.len())
+            .field("native_merge", &self.merges.is_some())
             .finish()
     }
 }
@@ -381,6 +391,23 @@ impl NativeEncoder {
             tokenizer.get_post_processor(),
         )?)?;
         let (raw, normalized) = Self::added_tokens_of(tokenizer, normalizer)?;
+        let merges = match MergeTable::from_model(tokenizer.get_model().wrapper()) {
+            Ok(table) => {
+                tracing::debug!(
+                    merges = table.merges(),
+                    bytes = table.bytes(),
+                    "the native encode path merges its piece-cache misses itself"
+                );
+                Some(table)
+            }
+            Err(declined) => {
+                tracing::info!(
+                    %declined,
+                    "the native encode path hands its piece-cache misses to the model's own merge"
+                );
+                None
+            }
+        };
         Ok(Self {
             normalizer,
             raw_added: AddedTokens::build(&raw)?,
@@ -388,6 +415,7 @@ impl NativeEncoder {
             stages,
             alphabet: bytes_char(),
             seed: ShortPieceTable::for_entries(0),
+            merges,
             piece_cache: ThreadLocal::new(),
             threads: AtomicUsize::new(0),
         })
@@ -865,8 +893,10 @@ impl NativeEncoder {
     }
 
     /// Appends the ids of one piece: from the thread's cache, else from the
-    /// encoder's seed or the model over the piece's byte-level alphabet form,
-    /// remembered in the thread's cache either way;
+    /// encoder's seed, else merged over the model's merges (the whole piece
+    /// looked up first under `ignore_merges`), else, for a model the merge
+    /// table declined, from the model itself over the piece's byte-level
+    /// alphabet form; remembered in the thread's cache whichever answered;
     /// [`Fallback::PieceDeclined`] when the model declines the piece. The
     /// thread's cache comes first because it is small and hot: the pieces of
     /// the prompts a thread encodes, a few hundred KB, where the seed is
@@ -900,13 +930,24 @@ impl NativeEncoder {
         }
         let start = ids.len();
         // A piece this thread has not met: the encoder's seed has it when it
-        // is a vocabulary word, else the model merges it.
+        // is a vocabulary word, else it is merged, by the table or by the
+        // model for a table that declined.
         if !key.is_some_and(|key| self.seed.ids_into(key, ids)) {
-            mapped.clear();
-            mapped.extend(bytes.iter().map(|&b| self.alphabet[usize::from(b)]));
-            match model.tokenize(mapped) {
-                Ok(tokens) => ids.extend(tokens.iter().map(|token| token.id)),
-                Err(_) => return Err(Fallback::PieceDeclined),
+            if let Some(table) = &self.merges {
+                let whole = if table.ignore_merges {
+                    model.token_to_id(self.mapped(bytes, mapped))
+                } else {
+                    None
+                };
+                match whole {
+                    Some(id) => ids.push(id),
+                    None => table.merge(bytes, ids),
+                }
+            } else {
+                match model.tokenize(self.mapped(bytes, mapped)) {
+                    Ok(tokens) => ids.extend(tokens.iter().map(|token| token.id)),
+                    Err(_) => return Err(Fallback::PieceDeclined),
+                }
             }
         }
         if let Some(key) = key {
@@ -940,6 +981,14 @@ impl NativeEncoder {
             }
         }
         Ok(())
+    }
+
+    /// The piece in the byte-level alphabet, the form the model's vocabulary
+    /// is keyed by, written into `mapped`.
+    fn mapped<'m>(&self, bytes: &[u8], mapped: &'m mut String) -> &'m str {
+        mapped.clear();
+        mapped.extend(bytes.iter().map(|&b| self.alphabet[usize::from(b)]));
+        mapped
     }
 
     /// Entries one thread's piece cache may hold: the total shared among the

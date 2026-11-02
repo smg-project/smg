@@ -1,11 +1,10 @@
 //! A prompt made of long pieces (clauses in a script without word spaces, a
-//! long identifier, a run of digits) went through the model's merges on
-//! every encode: the encoder's piece cache held pieces of up to 64 bytes
-//! only, and the model's own word cache, which used to hold the rest, stays
-//! empty behind the direct path because it outlived the tokenizer. The
-//! encoder caches long pieces too now, within a byte budget, so re-encoding
-//! such a prompt touches the model for none of its pieces: the second encode
-//! allocates the ids and nothing else.
+//! long identifier, a run of digits) was merged again on every encode: the
+//! encoder's piece cache held pieces of up to 64 bytes only, and the model's
+//! own word cache, which used to hold the rest, stays empty behind the direct
+//! path because it outlived the tokenizer. The encoder caches long pieces too
+//! now, within a byte budget, so re-encoding such a prompt merges none of its
+//! pieces again: the second encode allocates the ids and nothing else.
 
 #![expect(clippy::expect_used, reason = "a test that stops on a broken setup")]
 #![expect(
@@ -72,10 +71,11 @@ fn a_prompt_of_long_pieces_is_encoded_again_without_the_model() {
     assert_eq!(first.token_ids(), reference.get_ids());
     assert_eq!(second.token_ids(), reference.get_ids());
     assert_eq!(first.token_ids().len(), prompt.len(), "one id per byte");
-    // The ids and nothing of the model's: no word of symbols, no heap of
-    // merges, no token strings for any of the clauses.
+    // The ids and nothing of a merge's: no symbols or candidates for any of
+    // the clauses, no cache entry for them either (the first encode pays
+    // those, several times the ids' bytes).
     assert!(
-        second_bytes * 8 < first_bytes,
+        second_bytes * 2 < first_bytes,
         "the second encode allocated {second_bytes} bytes against {first_bytes} for the first"
     );
 }
