@@ -1052,7 +1052,7 @@ impl ResponsesDecode {
     }
 
     /// The message item, if one opened, closes: `text_done`, `content_part.done`, and
-    /// `output_item.done` with the whole text.
+    /// `output_item.done` with the whole text and its status.
     async fn close_message(&self, emitter: &mut ResponseStreamEventEmitter, tx: &SseSender) {
         let Some((output_index, item_id)) = &self.message else {
             return;
@@ -1069,7 +1069,10 @@ impl ResponsesDecode {
             "content": [{
                 "type": "output_text",
                 "text": self.final_text.clone()
-            }]
+            }],
+            // The status the regular stream writes on its message item; the stored object's
+            // typed read keeps an item only with one.
+            "status": emitter.message_status()
         });
         let event = emitter.emit_output_item_done(*output_index, &item);
         // Mark as completed before sending (so it's included in final output even if send fails)

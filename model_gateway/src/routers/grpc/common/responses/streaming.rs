@@ -174,6 +174,27 @@ struct ReasoningStreamItem {
     text: String,
 }
 
+/// The kind of a serde error the stored object's typed read met, for its log
+/// line: serde's invalid-type and unknown-variant texts quote the offending
+/// value, which may be model output, so the text itself is never logged.
+fn serde_error_kind(error: &serde_json::Error) -> &'static str {
+    let text = error.to_string();
+    if text.starts_with("missing field") {
+        "missing field"
+    } else if text.starts_with("invalid type")
+        || text.starts_with("invalid value")
+        || text.starts_with("invalid length")
+    {
+        "type mismatch"
+    } else if text.starts_with("unknown variant") || text.starts_with("unknown field") {
+        "unknown name"
+    } else if text.starts_with("duplicate field") {
+        "duplicate field"
+    } else {
+        "other"
+    }
+}
+
 impl ResponseStreamEventEmitter {
     /// The model label the response's events carry.
     pub(crate) fn model(&self) -> &str {
@@ -881,9 +902,23 @@ impl ResponseStreamEventEmitter {
             .output_items
             .iter()
             .filter_map(|item| {
-                item.item_data
-                    .as_ref()
-                    .and_then(|data| serde_json::from_value(data.clone()).ok())
+                let data = item.item_data.as_ref()?;
+                match serde_json::from_value::<ResponseOutputItem>(data.clone()) {
+                    Ok(typed) => Some(typed),
+                    Err(error) => {
+                        // The terminal event carries the raw item; the stored object carries
+                        // what reads as a typed item, so a drop is said rather than silent.
+                        warn!(
+                            response_id = %self.response_id,
+                            output_index = item.output_index,
+                            item_type = data["type"].as_str().unwrap_or(""),
+                            error_kind = serde_error_kind(&error),
+                            "a streamed output item does not read as a typed output item; \
+                             the stored object drops it"
+                        );
+                        None
+                    }
+                }
             })
             .collect();
 
@@ -1056,6 +1091,21 @@ impl ResponseStreamEventEmitter {
         Ok(())
     }
 
+    /// The status of the message item a stream closes, under the turn's finish
+    /// reason: `in_progress` when the generation failed (closing the event
+    /// sequence does not imply it succeeded; the partial message belongs in
+    /// the terminal output all the same), else `completed`. A stream that
+    /// drives the emitter through its own events and closes its message item
+    /// itself reads it here, so its item carries the status the typed read of
+    /// the stored object requires.
+    pub(crate) fn message_status(&self) -> &'static str {
+        if matches!(self.finish_reason.as_deref(), Some("failed" | "error")) {
+            "in_progress"
+        } else {
+            "completed"
+        }
+    }
+
     /// Closing the event sequence does not imply generation succeeded: partial
     /// messages remain in_progress on the wire, but belong in terminal output.
     async fn close_message_item(&mut self, tx: &SseSender) -> Result<(), String> {
@@ -1077,11 +1127,7 @@ impl ResponseStreamEventEmitter {
                 "type": "message",
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": std::mem::take(&mut self.accumulated_text)}],
-                "status": if matches!(self.finish_reason.as_deref(), Some("failed" | "error")) {
-                    "in_progress"
-                } else {
-                    "completed"
-                },
+                "status": self.message_status(),
             });
             let event = self.emit_output_item_done(output_index, &item);
             self.send_event(&event, tx).await?;
@@ -2277,5 +2323,40 @@ mod process_chunk_tests {
             wire["incomplete_details"],
             json!({"reason": "max_output_tokens"})
         );
+    }
+}
+
+#[cfg(test)]
+mod serde_error_kind_tests {
+    use serde::Deserialize;
+    use serde_json::json;
+
+    use super::serde_error_kind;
+
+    #[derive(Debug, Deserialize)]
+    struct Item {
+        count: u32,
+    }
+
+    /// The drop warning names the error's kind and never its text: a type
+    /// mismatch's text quotes the value, a missing field's names the field.
+    #[test]
+    fn a_serde_error_is_named_by_its_kind_only() {
+        let read: Item = serde_json::from_value(json!({"count": 3})).expect("a count");
+        assert_eq!(read.count, 3);
+
+        let mismatch =
+            serde_json::from_value::<Item>(json!({"count": "the model's words"})).unwrap_err();
+        assert!(
+            mismatch.to_string().contains("the model's words"),
+            "{mismatch}"
+        );
+        assert_eq!(serde_error_kind(&mismatch), "type mismatch");
+
+        let missing = serde_json::from_value::<Item>(json!({})).unwrap_err();
+        assert_eq!(serde_error_kind(&missing), "missing field");
+
+        let truncated = serde_json::from_str::<Item>("{\"count\": ").unwrap_err();
+        assert_eq!(serde_error_kind(&truncated), "other");
     }
 }
