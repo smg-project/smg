@@ -708,6 +708,7 @@ impl Engine {
     /// cut it from the delta alone, owned when the engine held, joined or re-scanned it.
     fn text<'d>(&mut self, text: Cow<'d, str>, out: &mut Events<'d>) {
         if self.format.is_framing(self.state) {
+            self.end_stay(out);
             out.push(Event::Dropped {
                 text: self.tokens.text(text),
                 why: DropReason::Wrapper,
@@ -716,12 +717,19 @@ impl Engine {
         }
         match self.emits() {
             Emits::Content | Emits::Reasoning if self.format.is_trimmed(self.state) => {
+                if !self.stay.begun {
+                    self.end_stay(out);
+                }
                 self.trimmed(text, out);
             }
             Emits::Content if !self.stay.begun && !self.format.is_kept(self.state) => {
                 self.lead(text, out);
             }
-            Emits::Content | Emits::Reasoning => self.show(text, out),
+            Emits::Content | Emits::Reasoning => {
+                self.stay.begun |= !text.chars().all(is_strip_space);
+                self.release_stay(out);
+                self.show(text, out);
+            }
             Emits::Arguments => {
                 let Some(call) = &mut self.call else {
                     // An arguments state always has a call open; kept as content, not lost.
@@ -966,7 +974,10 @@ impl Engine {
             });
             return;
         }
-        let Some(next) = self.format.next(self.state, index) else {
+        let Some(next) = self
+            .format
+            .next_after_text(self.state, index, self.stay.begun)
+        else {
             // No row leads out on it: the marker is the state's text, as the model wrote it.
             // Where that text is the table's own content, a `Malformed` event of no bytes stands
             // before it, so a reader counts a frame the table did not read and no byte moves; in
@@ -991,6 +1002,15 @@ impl Engine {
             self.text(Cow::Owned(text), out);
             return;
         };
+        if self.format.leading_next(self.state, index).is_some() {
+            // A boundary closer does not end the content stay: keep it among the held
+            // whitespace so later text or a call decides the whitespace's ownership.
+            self.stay
+                .held
+                .push(Held::Ignored(self.format.terminal_text(index).to_string()));
+            self.state = next;
+            return;
+        }
         self.take_row(index, next, None, out);
     }
 
@@ -1304,7 +1324,7 @@ impl Engine {
     /// row for (`<|close|>message` with no `<|sep|>` after it), which the model cannot have
     /// written as text. A shaped call's header still being read takes every byte.
     fn cut_tag(&self, text: &str) -> bool {
-        self.pending.is_none() && self.format.is_cut_tag(self.state, text)
+        self.pending.is_none() && self.format.is_cut_tag(self.state, text, self.stay.begun)
     }
 
     /// A tag the end cut short is dropped as the whole tag would have been. Inside a call the
