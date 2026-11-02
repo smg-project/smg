@@ -1,4 +1,4 @@
-"""Observe full Responses selection/phases; verify original IDs and real JUnit."""
+"""Validate pytest phase reports and JUnit XML against 128 reference Responses cases."""
 
 import json
 import os
@@ -61,8 +61,7 @@ def verify(directory, xml_path, original_path):
     errors = []
     result = {
         "business_verified": False,
-        "row_accepted": False,
-        "scope": "Business evidence only; final environment and physical owned cleanup are independent hard gates",
+        "scope": "Validate pytest phases and JUnit XML against the 128 reference Responses cases",
     }
     try:
         for path in [
@@ -72,7 +71,7 @@ def verify(directory, xml_path, original_path):
             original_path,
         ]:
             if not path.is_file() or path.is_symlink():
-                raise ValueError("Missing or symlinked evidence")
+                raise ValueError(f"Missing or symlinked evidence: {path}")
         selection = json.loads((directory / "selected.json").read_text())
         selected = selection["nodeids"]
         source_root, rootpath = Path(selection["source_root"]), Path(selection["rootpath"])
@@ -102,8 +101,12 @@ def verify(directory, xml_path, original_path):
             errors.append("Original128 identity fingerprint mismatch")
         if len(selected) < 128 or len(selected) != len(set(selected)):
             errors.append("Final selection must contain >=128 unique identities")
-        if not set(original).issubset(original_comparison):
-            errors.append("Original128 identities are missing from final selection")
+        missing = sorted(set(original) - set(original_comparison))
+        if missing:
+            errors.append(
+                "Original128 identities are missing from final selection: "
+                f"{missing}; reference list: {original_path}"
+            )
         wanted = {junit_identity(nodeid) for nodeid in selected}
         if len(wanted) != len(selected):
             errors.append("Final selection has ambiguous JUnit identities")
@@ -137,17 +140,24 @@ def verify(directory, xml_path, original_path):
                 if report["nodeid"] == nodeid:
                     phase, outcome = report["when"], report["outcome"]
                     if phase not in ("setup", "call", "teardown"):
-                        errors.append("A selected case has an unexpected phase report")
+                        errors.append(
+                            f"A selected case has an unexpected phase report: {nodeid} ({phase})"
+                        )
                     if phase in phases:
-                        errors.append("A selected case has duplicate phase reports")
+                        errors.append(
+                            f"A selected case has duplicate phase reports: {nodeid} ({phase})"
+                        )
                     else:
                         phases[phase] = outcome
                     if outcome != "passed":
-                        errors.append("A selected case has a non-passing phase report")
+                        errors.append(
+                            "A selected case has a non-passing phase report: "
+                            f"{nodeid} ({phase}={outcome})"
+                        )
                     if outcome == "skipped":
-                        errors.append("An actually selected case skipped")
+                        errors.append(f"An actually selected case skipped: {nodeid} ({phase})")
             if any(phases.get(phase) != "passed" for phase in ["setup", "call", "teardown"]):
-                errors.append("A selected case lacks final passing setup/call/teardown")
+                errors.append("A selected case lacks final passing setup/call/teardown: " + nodeid)
         result.update(
             original_required=128,
             final_selected=len(selected),
@@ -157,10 +167,14 @@ def verify(directory, xml_path, original_path):
             pytest_exitstatus=actual["pytest_exitstatus"],
         )
     except (OSError, ValueError, TypeError, KeyError, ET.ParseError) as error:
-        errors.append("Evidence validation failed: " + type(error).__name__)
+        errors.append(f"Evidence validation failed: {type(error).__name__}: {error}")
     result["errors"] = sorted(set(errors))
     result["business_verified"] = not errors
-    save("validation.json", result)
+    try:
+        save("validation.json", result)
+    except OSError as error:
+        result["business_verified"] = False
+        result["errors"].append(f"Cannot write validation report: {type(error).__name__}: {error}")
     print(json.dumps(result))
     return 0 if result["business_verified"] else 1
 
