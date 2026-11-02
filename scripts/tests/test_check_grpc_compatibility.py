@@ -53,6 +53,7 @@ class CompatibilityOrchestrationTests(unittest.TestCase):
             returncode=1, stderr="RuntimeError: generated code requires grpcio>=1.81.1."
         )
         self.client_error = None
+        self.refusal_error = None
         self.client_calls = 0
         self.fingerprint_calls = 0
         self.spawn_calls = 0
@@ -101,7 +102,12 @@ class CompatibilityOrchestrationTests(unittest.TestCase):
                 mock.patch.object(self.checker.select, "select", side_effect=self.select)
             )
             self.refusal_mock = stack.enter_context(
-                mock.patch.object(self.checker.subprocess, "run", return_value=self.refused)
+                mock.patch.object(
+                    self.checker.subprocess,
+                    "run",
+                    return_value=self.refused,
+                    side_effect=self.refusal_error,
+                )
             )
             self.checker.check(self.peers)
 
@@ -267,6 +273,86 @@ class CompatibilityOrchestrationTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "extra.proto"):
             self.run_check()
         self.assertEqual(self.spawn_calls, 0)
+
+    def test_metadata_subprocess_timeouts_preserve_other_deadlines(self):
+        """Bound metadata children without changing peer arguments or existing budgets."""
+        with mock.patch.object(self, "check_output", wraps=self.check_output) as output:
+            self.run_check()
+        fingerprint_calls = [
+            call for call in output.call_args_list if call.args[0][2] == "fingerprint"
+        ]
+        self.assertEqual(len(fingerprint_calls), 2)
+        for call, peer in zip(fingerprint_calls, self.peers, strict=True):
+            self.assertEqual(call.args[0], [peer[0], str(SCRIPT), "fingerprint", peer[1]])
+            self.assertEqual(call.kwargs, {"text": True, "timeout": 60})
+        client_calls = [call for call in output.call_args_list if call.args[0][2] == "client"]
+        self.assertEqual(len(client_calls), 4)
+        self.assertTrue(all(call.kwargs == {"text": True, "timeout": 15} for call in client_calls))
+        self.refusal_mock.assert_called_once_with(
+            [self.peers[0][0], "-c", "from smg_grpc_proto.generated import common_pb2_grpc"],
+            env=dict(self.checker.os.environ, PYTHONPATH=self.peers[1][1]),
+            text=True,
+            capture_output=True,
+            timeout=60,
+        )
+        for process in self.processes:
+            process.terminate.assert_called_once_with()
+            process.wait.assert_called_once_with(timeout=5)
+            process.kill.assert_not_called()
+        self.assertTrue(json.loads(self.stdout.getvalue())["old_gencode_rejected"])
+
+    def test_first_fingerprint_timeout_stops_before_owned_server(self):
+        """Propagate the original first descriptor timeout before any server is created."""
+        expired = subprocess.TimeoutExpired(["old-python", "fingerprint"], 60)
+
+        def blocked(args, **kwargs):
+            """Represent a child that can expire only when a timeout was supplied."""
+            self.assertEqual(kwargs.get("timeout"), 60)
+            raise expired
+
+        with mock.patch.object(self, "check_output", side_effect=blocked):
+            with self.assertRaises(subprocess.TimeoutExpired) as raised:
+                self.run_check()
+        self.assertIs(raised.exception, expired)
+        self.assertEqual(self.spawn_calls, 0)
+        self.assertEqual(self.stdout.getvalue(), "")
+        self.refusal_mock.assert_not_called()
+
+    def test_second_fingerprint_timeout_stops_before_owned_server(self):
+        """Do not launch a server after the second bounded descriptor child expires."""
+        expired = subprocess.TimeoutExpired(["new-python", "fingerprint"], 60)
+        original = self.check_output
+
+        def blocked(args, **kwargs):
+            """Represent a child that can expire only when a timeout was supplied."""
+            self.assertEqual(kwargs.get("timeout"), 60)
+            if args[0] == "new-python":
+                raise expired
+            return original(args, **kwargs)
+
+        with mock.patch.object(self, "check_output", side_effect=blocked):
+            with self.assertRaises(subprocess.TimeoutExpired) as raised:
+                self.run_check()
+        self.assertIs(raised.exception, expired)
+        self.assertEqual(self.fingerprint_calls, 1)
+        self.assertEqual(self.spawn_calls, 0)
+        self.assertEqual(self.stdout.getvalue(), "")
+        self.refusal_mock.assert_not_called()
+
+    def test_refusal_timeout_propagates_after_server_cleanup(self):
+        """An expired import cannot become compatibility acceptance or leak a server."""
+        expired = subprocess.TimeoutExpired(["old-python", "-c", "import"], 60)
+        self.refusal_error = expired
+        with self.assertRaises(subprocess.TimeoutExpired) as raised:
+            self.run_check()
+        self.assertIs(raised.exception, expired)
+        self.assertEqual(self.refusal_mock.call_args.kwargs["timeout"], 60)
+        self.assertEqual(self.client_calls, 4)
+        self.assertEqual(self.stdout.getvalue(), "")
+        for process in self.processes:
+            process.terminate.assert_called_once_with()
+            process.wait.assert_called_once_with(timeout=5)
+            process.kill.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -176,7 +176,7 @@ def check(peers):
     script = str(Path(__file__).resolve())
     repo = str(Path(script).parents[1])
     fingerprints = [
-        subprocess.check_output([python, script, "fingerprint", generated], text=True)
+        subprocess.check_output([python, script, "fingerprint", generated], text=True, timeout=60)
         for python, generated in peers
     ]
     first, second = map(json.loads, fingerprints)
@@ -252,6 +252,7 @@ def check(peers):
         env=dict(os.environ, PYTHONPATH=peers[1][1]),
         text=True,
         capture_output=True,
+        timeout=60,
     )
     if refused.returncode == 0 or expected_guard not in refused.stderr:
         raise AssertionError(
