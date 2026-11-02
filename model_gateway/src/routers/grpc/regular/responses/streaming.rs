@@ -23,7 +23,7 @@ use openai_protocol::{
         ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
         ChatCompletionStreamResponse,
     },
-    common::{FunctionCallResponse, ToolCall, ToolCallDelta, Usage, UsageInfo},
+    common::{FunctionCallResponse, ToolCall, ToolCallDelta, Usage},
     responses::{
         IncompleteDetails, IncompleteReason, ResponseContentPart, ResponseOutputItem,
         ResponseReasoningContent, ResponseStatus, ResponsesRequest, ResponsesResponse,
@@ -609,19 +609,7 @@ impl StreamingResponseAccumulator {
         };
 
         // Convert usage
-        let usage = self.usage.as_ref().map(|u| {
-            let usage_info = UsageInfo {
-                prompt_tokens: u.prompt_tokens,
-                completion_tokens: u.completion_tokens,
-                total_tokens: u.total_tokens,
-                reasoning_tokens: u
-                    .completion_tokens_details
-                    .as_ref()
-                    .and_then(|d| d.reasoning_tokens),
-                prompt_tokens_details: u.prompt_tokens_details.clone(),
-            };
-            ResponsesUsage::Modern(usage_info.to_response_usage())
-        });
+        let usage = self.usage.as_ref().map(conversions::responses_usage);
 
         let mut builder = ResponsesResponse::builder(&self.response_id, &self.model)
             .copy_from_request(&self.original_request)
