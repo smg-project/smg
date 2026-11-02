@@ -1,7 +1,11 @@
 import importlib.util
 import json
+import os
 import sys
+import textwrap
 from pathlib import Path
+
+import pytest
 
 SPEC = importlib.util.spec_from_file_location(
     "bfcl_run_ab", Path(__file__).resolve().parents[1] / "bfcl" / "run_ab.py"
@@ -111,3 +115,93 @@ def test_a_category_this_evaluation_did_not_score_is_missing_not_stale(tmp_path,
     assert arm.scores == {}
     assert run_ab.incompleteness(arm, ["simple_python"]) is not None
     assert len(set(score_dirs)) == 2
+
+
+@pytest.mark.parametrize("hang_after_summary", [False, True], ids=["complete", "timed-out"])
+def test_actual_evaluate_timeout_is_incomplete_even_with_scores(
+    tmp_path, monkeypatch, hang_after_summary
+):
+    # Exercise the real Popen/wait/kill/reap path without BFCL, a server or a
+    # model. Only this private executable and its own temporary files are used.
+    bfcl = tmp_path / "bounded-bfcl"
+    bfcl.write_text(
+        f"#!{sys.executable}\n"
+        + textwrap.dedent(
+            """\
+            import json
+            import os
+            import sys
+            import time
+            from pathlib import Path
+
+            assert sys.argv[1] == "evaluate"
+            root = Path(os.environ["BFCL_PROJECT_ROOT"])
+            score_dir = sys.argv[sys.argv.index("--score-dir") + 1]
+            target = root / score_dir / "Qwen_Qwen3-4B-FC" / "non_live"
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "BFCL_v4_simple_python_score.json").write_text(
+                json.dumps({"accuracy": 0.9, "total_count": 400}) + "\\n"
+            )
+            fields = Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(")", 1)[1].split()
+            (root / "fixture-process.json").write_text(json.dumps({
+                "pid": os.getpid(), "parent": os.getppid(),
+                "pgid": os.getpgrp(), "start_ticks": int(fields[19]),
+            }))
+            if Path(__file__).with_suffix(".hang").exists():
+                time.sleep(10)  # Self-bounded fallback; actual _run kills it at 3 s.
+            """
+        )
+    )
+    bfcl.chmod(0o755)
+    if hang_after_summary:
+        bfcl.with_suffix(".hang").touch()
+    project = tmp_path / "project"
+    report = tmp_path / "report.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_ab.py",
+            "--baseline",
+            "vllm=http://127.0.0.1:30000",
+            "--candidate",
+            "smg=http://127.0.0.1:30001",
+            "--bfcl-model",
+            "Qwen/Qwen3-4B-FC",
+            "--categories",
+            "simple_python",
+            "--bfcl",
+            str(bfcl),
+            "--project-root",
+            str(project),
+            "--json-out",
+            str(report),
+            "--skip-generate",
+            "--run-timeout",
+            "3",  # Fixture-only; production defaults and original limits are unchanged.
+        ],
+    )
+
+    exit_code = run_ab.main()
+    payload = json.loads(report.read_text())
+    for role in ("baseline", "candidate"):
+        arm = payload[role]
+        assert arm["scores"] == {"simple_python": 0.9}
+        assert arm["counts"] == {"simple_python": 400}
+        identity = json.loads((project / arm["name"] / "fixture-process.json").read_text())
+        assert identity["parent"] == os.getpid()
+        assert identity["pgid"] == identity["pid"]
+        # Check disappearance by birth identity; never signal a pid from a file.
+        stat = Path(f"/proc/{identity['pid']}/stat")
+        if stat.exists():
+            fields = stat.read_text().rsplit(")", 1)[1].split()
+            assert int(fields[19]) != identity["start_ticks"]
+
+    assert exit_code == (run_ab.EXIT_INCOMPLETE if hang_after_summary else run_ab.EXIT_OK)
+    for role in ("baseline", "candidate"):
+        assert payload[role]["timed_out"] == (["evaluate"] if hang_after_summary else [])
+    if hang_after_summary:
+        assert set(payload["incomplete"]) == {"vllm", "smg"}
+        assert all("timed out during: evaluate" in v for v in payload["incomplete"].values())
+    else:
+        assert payload["incomplete"] == {}

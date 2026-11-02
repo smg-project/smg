@@ -150,7 +150,7 @@ def run_bfcl(
     # model, an older BFCL version, or a category this evaluate did not rescore.
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     score_dir = Path("score") / f"run-{stamp}-{uuid.uuid4().hex[:8]}"
-    _run(
+    if not _run(
         [
             bfcl,
             "evaluate",
@@ -164,7 +164,8 @@ def run_bfcl(
         env,
         f"[{arm.name}] evaluate",
         timeout=run_timeout,
-    )
+    ):
+        arm.timed_out.append("evaluate")
     arm.scores, arm.counts = parse_scores(arm.project_root / score_dir, model, categories)
 
 
