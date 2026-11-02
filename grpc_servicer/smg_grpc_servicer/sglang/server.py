@@ -184,11 +184,15 @@ async def serve_grpc(
     bootstrap_server = None
     if server_args.disaggregation_mode == "prefill":
         bootstrap_server = start_disagg_service()
-        wait_for_bootstrap_listener(
-            bootstrap_server,
-            server_args.host,
-            server_args.disaggregation_bootstrap_port,
-        )
+        try:
+            wait_for_bootstrap_listener(
+                bootstrap_server,
+                server_args.host,
+                server_args.disaggregation_bootstrap_port,
+            )
+        except RuntimeError as error:
+            logger.error("The prefill bootstrap server did not start: %s", error)
+            raise guarded_exit(1) from None
         if bootstrap_server:
             logger.info(
                 "Bootstrap server started for disaggregation mode on %s:%s",
