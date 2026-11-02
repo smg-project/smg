@@ -204,11 +204,17 @@ refresh_lock() { # Cargo.lock follows the workspace crates' versions
   "$CARGO" update --workspace --offline >/dev/null 2>&1 || "$CARGO" update --workspace >/dev/null \
     || die "cargo update --workspace failed: Cargo.lock does not follow the versions"
 }
-commit_all() { # <subject> <body>: the tree's changes in one signed-off commit; a failure stops the command in any context
-  git add --update || die "git add failed on $(git branch --show-current)"
+commit_all() { # <subject> <body> <finish>: the tree's changes in one signed-off commit. A failure stops the command in any
+  # context and names both ways out: the commit by hand and then <finish> (the steps the command would have run next), or
+  # dropping the edits and the branch before a rerun (the branch's existence refuses one).
+  local branch
+  branch=$(git branch --show-current)
+  git add --update || die "git add failed on $branch"
   git diff --cached --quiet && die "nothing to commit: the tree already carries these versions"
   git commit --quiet --signoff --message "$1" --message "$2" \
-    || die "the commit '$1' failed: the version edits are staged on $(git branch --show-current) (commit them once the cause is fixed, or drop them: git restore --staged --worktree .)"
+    || die "the commit '$1' failed: the version edits are staged on $branch. Once the cause is fixed, commit them and finish by hand:
+$3
+or drop them (git restore --staged --worktree .), switch back to where you started and delete $branch (git branch -D $branch): a rerun is refused while it exists"
 }
 
 # --- pushes and pull requests -------------------------------------------------------
@@ -227,13 +233,16 @@ push_release_ref() { # <refspec> <what the push triggers>: a release branch or a
 }
 # Pushes name both sides of the refspec and topic branches never track their start point: under
 # push.default=upstream, `git push origin topic` of a branch that tracks origin/main pushes to main.
+pr_commands() { # <topic> <base> <title> <body file>: the push of a topic and its pull request, as lines to run by hand
+  say "  git push -u $REMOTE refs/heads/$1:refs/heads/$1"
+  say "  gh pr create --base $2 --head $1 --title $(printf '%q' "$3") --body-file $(printf '%q' "$4")"
+}
 open_pr() { # <topic> <base> <title> <body file>
   local topic=$1 base=$2 title=$3 body=$4
   if [ "${PUSH:-}" = 0 ]; then
     say ""
     say "Not pushed (PUSH=0). To open the pull request:"
-    say "  git push -u $REMOTE refs/heads/$topic:refs/heads/$topic"
-    say "  gh pr create --base $base --head $topic --title $(printf '%q' "$title") --body-file $(printf '%q' "$body")"
+    pr_commands "$topic" "$base" "$title" "$body"
     return 0
   fi
   command -v "$GH" >/dev/null 2>&1 || die "'$GH' is not installed: push $topic and open the pull request against $base by hand"
@@ -244,8 +253,8 @@ require_pr_tools() { # <topic> <base>: what open_pr will need under PUSH=1, chec
   local topic=$1 base=$2 open
   command -v "$GH" >/dev/null 2>&1 \
     || die "'$GH' is not installed and PUSH=1 opens the pull request of $topic against $base: install it, or run without PUSH=1 and push by hand"
-  open=$("$GH" pr list --head "$topic" --state open --json number --jq '.[].number' 2>/dev/null | sed 's/^/#/' | paste -sd ' ' -) \
-    || die "gh pr list failed: cannot read whether an open pull request carries $topic (gh auth status?)"
+  open=$("$GH" pr list --head "$topic" --state open --json number --jq '.[].number' | sed 's/^/#/' | paste -sd ' ' -) \
+    || die "gh pr list failed (its message is above): cannot read whether an open pull request carries $topic"
   [ -z "$open" ] || die "an open pull request already carries $topic ($open): finish or close it first"
 }
 
@@ -287,7 +296,8 @@ cmd_cut() {
   git switch --quiet --no-track -c "$branch" "$from_sha"
   bump_tree "$version" "$since"
   commit_all "chore(release): bump versions for v$version" \
-    "The release branch $branch, cut from $from_sha ($from). Versions since $since."
+    "The release branch $branch, cut from $from_sha ($from). Versions since $since." \
+    "  git push $REMOTE refs/heads/$branch:refs/heads/$branch (then main's move, the cut's second half, which only a rerun makes: the shorter way is to drop the edits, delete $branch and rerun the cut)"
   back_to "$start_branch" "$start"
   say ""
   # refs/heads/: a tag named like the branch would answer for a bare name
@@ -325,19 +335,20 @@ cmd_bump() {
   note "bump: $kind on $branch, versions since $since"
   git switch --quiet --no-track -c "$topic" "$base"
   bump_tree "$version" "$since"
-  commit_all "chore(release): bump versions for v$version" "$kind on $branch. Versions since $since."
   body=$(mktemp)
   {
     say "The version bump for v$version on \`$branch\` ($kind). Versions since $since:"
     say ""
     say '```'
-    git show --stat --oneline HEAD | sed -n '2,$p'
+    git diff --stat HEAD
     say '```'
     say ""
     say "Merging it makes \`$branch\` read v$version (nothing is published by the merge); then \`make release-tag VERSION=$version\` and \`make release-publish-plan VERSION=$version\`."
     say ""
     gate_section "$version" "$base"
   } > "$body"
+  commit_all "chore(release): bump versions for v$version" "$kind on $branch. Versions since $since." \
+    "$(pr_commands "$topic" "$branch" "chore(release): bump versions for v$version" "$body")"
   open_pr "$topic" "$branch" "chore(release): bump versions for v$version" "$body"
 }
 
@@ -605,16 +616,17 @@ move_main() { # <topic> <gateway version> <source ref> <subject> <intro>: main's
     git branch --quiet -D "$topic" || die "cannot delete $topic (nothing to move)"
     return 1
   fi
-  commit_all "$subject" \
-    "$moved and every crate and package at least the version $shown carries (crates.io and PyPI never take a version twice). Main's artifacts are not published; the release branches' are."
-  body=$(mktemp)
+  body=$(mktemp) || die "cannot make a temporary file for the pull request body of $topic"
   {
     say "$intro"
     say ""
     say '```'
-    git show --stat --oneline HEAD | sed -n '2,$p'
+    git diff --stat HEAD
     say '```'
   } > "$body"
+  commit_all "$subject" \
+    "$moved and every crate and package at least the version $shown carries (crates.io and PyPI never take a version twice). Main's artifacts are not published; the release branches' are." \
+    "$(pr_commands "$topic" main "$subject" "$body")"
   open_pr "$topic" main "$subject" "$body"
 }
 

@@ -59,6 +59,7 @@ case "$1 $2" in
     done
     echo "https://example.invalid/pull/1" ;;
   "pr list")
+    [ -z "${GH_STUB_LIST_ERROR-}" ] || { echo "gh: $GH_STUB_LIST_ERROR" >&2; exit 1; }
     case " $* " in
       *" --head "*) # the cut's precondition: the open pull requests on a head (--json number --jq .[].number)
         for ((i = 1; i <= $#; i++)); do
@@ -582,6 +583,24 @@ def test_a_pushing_cut_refuses_without_gh_before_the_branch_is_pushed(repo: Sand
     nothing_was_cut(repo)
 
 
+def test_a_pushing_cut_shows_ghs_own_error_when_the_pull_request_read_fails(repo: Sandbox) -> None:
+    """The read runs before anything is made, so gh's own stderr is the useful text: it is not swallowed."""
+    refused = repo.tool(
+        "cut",
+        "1.14.0-rc.1",
+        PUSH="1",
+        GH_STUB_LIST_ERROR="could not determine base repo: more than one remote",
+        check=False,
+    )
+    assert refused.returncode == 1
+    assert "gh: could not determine base repo: more than one remote" in refused.stderr
+    assert "gh pr list failed (its message is above)" in refused.stderr
+    assert refused.stderr.index("gh: could not determine") < refused.stderr.index(
+        "gh pr list failed"
+    )
+    nothing_was_cut(repo)
+
+
 def test_a_pushing_cut_refuses_an_open_pull_request_on_the_move_topic(repo: Sandbox) -> None:
     topic = "chore/main-versions-1.15.0-dev"
     refused = repo.tool("cut", "1.14.0-rc.1", PUSH="1", GH_STUB_OPEN_HEADS=topic, check=False)
@@ -610,7 +629,18 @@ def test_a_failed_commit_of_the_move_stops_the_cut_and_leaves_main_untouched(rep
     assert done.returncode == 1
     assert (
         "the commit 'chore(release): main reads 1.15.0-dev, above release/1.14' failed:"
-        f" the version edits are staged on {topic}" in done.stderr
+        f" the version edits are staged on {topic}. Once the cause is fixed, commit them and finish by hand:"
+        in done.stderr
+    )
+    # the lines open_pr would have printed with PUSH=0, with the body written before the commit
+    assert f"  git push -u origin refs/heads/{topic}:refs/heads/{topic}\n" in done.stderr
+    body_line = next(line for line in done.stderr.splitlines() if "gh pr create" in line)
+    assert body_line.startswith(f"  gh pr create --base main --head {topic} --title chore")
+    body_file = Path(body_line.split("--body-file ")[1])
+    assert body_file.is_file() and "`release/1.14` is cut at" in body_file.read_text()
+    assert (
+        f"switch back to where you started and delete {topic} (git branch -D {topic})"
+        in done.stderr
     )
     assert "nothing to move" not in done.stdout
     assert repo.origin_ref("refs/heads/release/1.14") == repo.git("rev-parse", "release/1.14"), (
@@ -627,6 +657,38 @@ def test_a_failed_commit_of_the_move_stops_the_cut_and_leaves_main_untouched(rep
         "main is untouched"
     )
     assert repo.version_of("model_gateway/Cargo.toml", "main") == "1.13.0"
+
+
+def test_a_failed_bump_commit_names_the_finish_lines_and_the_rerun_path(repo: Sandbox) -> None:
+    """The same message serves bump: its topic blocks a rerun through has_ref, so the user is told to finish by
+    hand (the push and the pull request, with the body written before the commit) or to delete it first."""
+    repo.cut()
+    topic = "chore/release-1.14.0-rc.2"
+    hook = repo.work / ".git" / "hooks" / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f'[ "$(git branch --show-current)" = {topic} ] || exit 0\n'
+        'echo "pre-commit: refused" >&2\n'
+        "exit 1\n"
+    )
+    hook.chmod(0o755)
+    repo.git("switch", "--quiet", "main")
+    before = repo.gh_calls()
+    done = repo.tool("bump", "1.14.0-rc.2", check=False)
+    assert done.returncode == 1
+    assert (
+        "the commit 'chore(release): bump versions for v1.14.0-rc.2' failed:"
+        f" the version edits are staged on {topic}." in done.stderr
+    )
+    assert f"  git push -u origin refs/heads/{topic}:refs/heads/{topic}\n" in done.stderr
+    assert f"  gh pr create --base release/1.14 --head {topic} --title chore" in done.stderr
+    assert (
+        f"delete {topic} (git branch -D {topic}): a rerun is refused while it exists" in done.stderr
+    )
+    assert repo.origin_ref(f"refs/heads/{topic}") is None
+    assert repo.gh_calls() == before, "no pull request for the bump"
+    assert repo.git("branch", "--show-current") == topic
+    assert "M  model_gateway/Cargo.toml" in repo.git("status", "--porcelain")
 
 
 # --- bump ---------------------------------------------------------------------------
