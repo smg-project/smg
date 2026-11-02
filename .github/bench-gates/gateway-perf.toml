@@ -2,7 +2,7 @@
 # (crates/gateway_perf, the gateway-perf binary, run by .github/workflows/benchmark-gateway-perf.yml
 # on pull requests; the driver applies scripts/bench_gate.py's rule natively: an id regresses
 # only when its change is worse than the threshold AND every head repeat is worse than every
-# base repeat). The job reports and never fails; the thresholds say what the table marks.
+# base repeat). The job reports and never fails on a verdict (a failed run fails it); the thresholds say what the table marks.
 #
 # Ids are `<path>/<metric>`; the values are counts and sizes per request (the id names the
 # unit), lower is better. Thresholds from measured spreads, the SAME binary on both sides
