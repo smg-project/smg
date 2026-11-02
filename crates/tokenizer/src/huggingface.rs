@@ -459,11 +459,13 @@ impl HuggingFaceTokenizer {
     /// The `tokenizers` pipeline behind this tokenizer, as loaded: the
     /// vocabulary and stages of `tokenizer.json`, with the post-processor
     /// the configuration prescribes when `tokenizer_config.json` sets
-    /// `add_bos_token` or `add_eos_token` (the rule is on
-    /// [`Self::from_file`]). A cross-check of the crate's ids against the
-    /// `tokenizers` crate compares with this pipeline, which adds the same
-    /// special tokens on request, or with `add_special_tokens` off, where it
-    /// and `tokenizer.json` read alone agree.
+    /// `add_bos_token` or `add_eos_token`, and with the file's `truncation`
+    /// and `padding` blocks cleared (both rules are on [`Self::from_file`]).
+    /// A cross-check of the crate's ids against the `tokenizers` crate
+    /// compares with this pipeline, which adds the same special tokens on
+    /// request, or with `add_special_tokens` off, where it and
+    /// `tokenizer.json` read alone agree once that file's blocks are cleared
+    /// too.
     pub fn tokenizers_pipeline(&self) -> &HfTokenizer {
         &self.core.tokenizer
     }
@@ -488,6 +490,12 @@ impl HuggingFaceTokenizer {
     /// the file's post-processor already adds tokens). A cross-check against
     /// the `tokenizers` crate compares with [`Self::tokenizers_pipeline`],
     /// the same post-processor, or with the flag off.
+    ///
+    /// The file's `truncation` and `padding` blocks do not apply: they are
+    /// the defaults the serving engine's tokenizer keeps for a call that asks
+    /// to truncate or pad, and a plain encode runs with both off, so a prompt
+    /// longer than the block's `max_length` encodes to its whole id list here
+    /// as there.
     pub fn from_file(file_path: &str) -> Result<Self> {
         // Try to auto-discover chat template if not explicitly provided
         let path = Path::new(file_path);
@@ -644,6 +652,18 @@ impl HuggingFaceTokenizer {
         tokenizer_path: &Path,
         chat_template_path: Option<&str>,
     ) -> Result<Self> {
+        // The file's `truncation` and `padding` blocks are the defaults the
+        // engine's tokenizer keeps for a call that asks to truncate or pad; a
+        // plain encode runs with both off (the rule is on `from_file`).
+        // Cleared before the encode path is chosen, so the direct encoders
+        // decline nothing for a block that no longer applies. `None` passes
+        // the stride check `with_truncation` runs on a block.
+        tokenizer.with_truncation(None).map_err(|error| {
+            Error::msg(format!(
+                "Failed to load tokenizer: the truncation block did not clear: {error}"
+            ))
+        })?;
+        tokenizer.with_padding(None);
         // Build vocab mappings (include special tokens to get added_tokens like <|im_start|>)
         let vocab = tokenizer.get_vocab(true); // true = include special tokens and added_tokens
         let reverse_vocab: HashMap<TokenIdType, String> = vocab
@@ -2689,6 +2709,7 @@ mod tests {
     use super::{derive_thinking_mode, detect_renderer_from_config, Renderer};
     use crate::{
         chat_template::ChatTemplateParams,
+        encode_path::EncodePath,
         encoders::deepseek_v32::ThinkingMode,
         traits::{Decoder as _, Encoder as _, Tokenizer as _},
         HuggingFaceTokenizer,
@@ -2708,6 +2729,27 @@ mod tests {
             "vocab": { "hello": 0 },
             "merges": []
         }
+    }"#;
+
+    /// A byte-level BPE of the shape the direct encode path takes: two
+    /// letters, the space mark and the merges that join it to a letter.
+    const BYTE_LEVEL_TOKENIZER_JSON: &str = r#"{
+        "version": "1.0", "truncation": null, "padding": null, "added_tokens": [], "normalizer": null,
+        "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true},
+        "post_processor": null,
+        "decoder": {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true},
+        "model": {"type": "BPE", "dropout": null, "unk_token": null, "continuing_subword_prefix": null,
+            "end_of_word_suffix": null, "fuse_unk": false, "byte_fallback": false, "ignore_merges": false,
+            "vocab": {"a": 0, "b": 1, "Ġ": 2, "Ġa": 3, "Ġb": 4},
+            "merges": [["Ġ", "a"], ["Ġ", "b"]]}
+    }"#;
+
+    /// A word-level vocabulary: no direct encode path takes it, so its
+    /// encodes run in `tokenizers`.
+    const WORD_LEVEL_TOKENIZER_JSON: &str = r#"{
+        "version": "1.0", "truncation": null, "padding": null, "added_tokens": [], "normalizer": null,
+        "pre_tokenizer": {"type": "Whitespace"}, "post_processor": null, "decoder": null,
+        "model": {"type": "WordLevel", "vocab": {"a": 0, "b": 1, "<unk>": 2}, "unk_token": "<unk>"}
     }"#;
 
     /// The added tokens a prefix cache may match are those of the raw pass
@@ -3298,6 +3340,52 @@ mod tests {
 
         let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
         assert_eq!(tokenizer.response_template(), None);
+    }
+
+    /// `tokenizer.json`'s `truncation` and `padding` blocks are the defaults
+    /// the engine's tokenizer keeps for a call that asks; a plain encode runs
+    /// with both off. The loader clears them: a prompt longer than
+    /// `max_length` encodes whole on the direct path and on the `tokenizers`
+    /// path alike, and the direct path takes a file whose only obstacle was
+    /// the block.
+    #[test]
+    fn the_files_truncation_and_padding_blocks_do_not_apply_to_an_encode() {
+        let twelve_words = "a b a b a b a b a b a b";
+        let byte_level_ids = [0, 4, 3, 4, 3, 4, 3, 4, 3, 4, 3, 4];
+        let word_level_ids = [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1];
+        let truncation = json!({
+            "direction": "Right", "max_length": 4, "strategy": "LongestFirst", "stride": 0
+        });
+        let padding = json!({
+            "strategy": {"Fixed": 16}, "direction": "Right", "pad_to_multiple_of": null,
+            "pad_id": 1, "pad_type_id": 0, "pad_token": "b"
+        });
+        for (block, params) in [("truncation", &truncation), ("padding", &padding)] {
+            for (file, expected, direct) in [
+                (BYTE_LEVEL_TOKENIZER_JSON, &byte_level_ids[..], true),
+                (WORD_LEVEL_TOKENIZER_JSON, &word_level_ids[..], false),
+            ] {
+                let temp = TempDir::new().unwrap();
+                let tokenizer_path = temp.path().join("tokenizer.json");
+                let mut definition: serde_json::Value = serde_json::from_str(file).unwrap();
+                definition[block] = params.clone();
+                fs::write(&tokenizer_path, definition.to_string()).unwrap();
+
+                let tokenizer =
+                    HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
+                assert_eq!(
+                    tokenizer.encode_path() == EncodePath::Tokenizers,
+                    !direct,
+                    "a {block} block: the encode path"
+                );
+                let ids = tokenizer.encode(twelve_words, false).unwrap();
+                assert_eq!(
+                    ids.token_ids(),
+                    expected,
+                    "a {block} block, direct path {direct}"
+                );
+            }
+        }
     }
 
     /// The DeepSeek V4 encoder port stands in for the encoder module those
