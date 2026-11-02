@@ -13,6 +13,8 @@ import os
 import shutil
 import subprocess
 import sys
+import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -73,6 +75,44 @@ esac
 CARGO_STUB = r"""#!/usr/bin/env bash
 printf 'cargo %s\n' "$*" >> "$CARGO_STUB_LOG"
 """
+# The registries as the release tool reads them: crates.io's sparse index (one JSON line per version) from
+# CRATES_STUB ("name=v1,v2 other=v3@2026-01-01T00:00:00Z": a version may carry its publish time), PyPI's JSON from
+# PYPI_STUB (the same shape); "down" answers nothing (exit 7); an unlisted name is a 404. With -w the http code
+# follows the body on its own line, as curl prints it.
+REGISTRY_STUB = r"""#!/usr/bin/env bash
+printf 'curl %s\n' "$*" >> "$CURL_STUB_LOG"
+body_of() { # <crate|package> <v1[@time],v2>: the body for those versions, a publish time when given
+  local items="" v t p
+  for v in ${2//,/ }; do
+    t=""; case $v in *@*) t=${v#*@}; v=${v%%@*} ;; esac
+    if [ "$1" = crate ]; then
+      p=""; [ -z "$t" ] || p=",\"pubtime\":\"$t\""
+      items="$items"$'\n'"{\"vers\":\"$v\",\"yanked\":false$p}"
+    else
+      p=""; [ -z "$t" ] || p="{\"upload_time_iso_8601\":\"$t\"}"
+      items="$items,\"$v\":[$p]"
+    fi
+  done
+  if [ "$1" = crate ]; then printf '%s' "${items#$'\n'}"; else printf '{"releases":{%s}}' "${items#,}"; fi
+}
+url=${*: -1}; code=404; body=""
+case "$url" in
+  https://index.crates.io/*)
+    name=${url##*/}; [ "${CRATES_STUB-}" = down ] && exit 7
+    for entry in ${CRATES_STUB-}; do
+      [ "${entry%%=*}" = "$name" ] && { code=200; body=$(body_of crate "${entry#*=}"); }
+    done ;;
+  https://pypi.org/pypi/*/json)
+    name=${url#https://pypi.org/pypi/}; name=${name%/json}; [ "${PYPI_STUB-}" = down ] && exit 7
+    for entry in ${PYPI_STUB-}; do
+      [ "${entry%%=*}" = "$name" ] && { code=200; body=$(body_of package "${entry#*=}"); }
+    done ;;
+esac
+case " $* " in
+  *" -w "*) printf '%s\n%s' "$body" "$code" ;;
+  *) [ "$code" = 200 ] && printf '%s' "$body" || exit 22 ;;
+esac
+"""
 DOCKER_NOTES_STUB = """#!/usr/bin/env bash
 echo "### Docker images"
 echo ""
@@ -107,6 +147,12 @@ jobs:
 """
 
 
+def utc_second_after(iso: str) -> str:
+    """One second after a git ``%cI`` date, in the UTC spelling the tool prints for a publish time."""
+    moment = datetime.fromisoformat(iso).astimezone(UTC) + timedelta(seconds=1)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def versioned(name: str, version: str) -> str:
     return f'[package]\nname = "{name}"\nversion = "{version}"\n'
 
@@ -121,8 +167,9 @@ class Sandbox:
         self.bin = base / "bin"
         self.gh_log = base / "gh.log"
         self.cargo_log = base / "cargo.log"
+        self.curl_log = base / "curl.log"
         self.bin.mkdir()
-        for name, text in (("gh", GH_STUB), ("cargo", CARGO_STUB)):
+        for name, text in (("gh", GH_STUB), ("cargo", CARGO_STUB), ("curl", REGISTRY_STUB)):
             stub = self.bin / name
             stub.write_text(text)
             stub.chmod(0o755)
@@ -152,6 +199,7 @@ class Sandbox:
             "GIT_EDITOR": "true",
             "GH_STUB_LOG": str(self.gh_log),
             "CARGO_STUB_LOG": str(self.cargo_log),
+            "CURL_STUB_LOG": str(self.curl_log),
             "PYTHONDONTWRITEBYTECODE": "1",
             "TMPDIR": str(self.base),
         }
@@ -233,6 +281,12 @@ class Sandbox:
         # cargo's other spelling of never published, under [package] like the first (the sandbox's, not the crate's)
         self.put("clients/rust/Cargo.toml", versioned("smg-client", "0.1.0") + "publish = []\n")
         self.put("clients/rust/src/lib.rs", "pub fn client() {}\n")
+        # a Python package the checker lists, published to PyPI by its own dispatch
+        self.put(
+            "grpc_servicer/pyproject.toml",
+            '[project]\nname = "smg-grpc-servicer"\nversion = "0.14.0"\n',
+        )
+        self.put("grpc_servicer/servicer.py", "x = 1\n")
         self.put("bindings/golang/Cargo.toml", versioned("smg-golang", "1.13.0"))
         self.put("bindings/python/Cargo.toml", versioned("smg-python", "1.13.0"))
         self.put("bindings/python/pyproject.toml", '[project]\nname = "smg"\nversion = "1.13.0"\n')
@@ -279,6 +333,9 @@ class Sandbox:
 
     def gh_calls(self) -> list[str]:
         return self.gh_log.read_text().splitlines() if self.gh_log.exists() else []
+
+    def curl_calls(self) -> list[str]:
+        return self.curl_log.read_text().splitlines() if self.curl_log.exists() else []
 
     def pr_body(self) -> str:
         return Path(f"{self.gh_log}.body").read_text()
@@ -1030,6 +1087,141 @@ def test_check_names_every_pending_check_and_reads_a_startup_failure_as_red(repo
     assert "[FAIL] CI: 1 green, 1 red, 2 pending on" in done.stdout
     green = repo.tool("check", "1.14.0-rc.1")
     assert "pending:" not in green.stdout and "red:" not in green.stdout
+
+
+def test_check_reads_the_registries_for_versions_published_already(repo: Sandbox) -> None:
+    """A crate or package at a version crates.io or PyPI hold already is skipped by its publish dispatch: with
+    changes after that version landed the release would ship none of them, so the gate reads the registries."""
+    repo.cut()  # tool-parser 0.6.0 by the cut's bump, smg 1.14.0-rc.1, smg-grpc-servicer 0.14.0 unchanged
+    done = repo.tool("check", "1.14.0-rc.1")
+    assert (
+        "[ok]   registry: no crate or package sits at a version crates.io or PyPI hold already"
+        in done.stdout
+    )
+    assert "(3 of 3 read)" in done.stdout
+    urls = sorted(call.split()[-1] for call in repo.curl_calls())
+    assert (
+        urls
+        == [  # crates.io through the sparse index cargo reads (its path scheme), PyPI's JSON
+            "https://index.crates.io/3/s/smg",
+            "https://index.crates.io/to/ol/tool-parser",
+            "https://pypi.org/pypi/smg-grpc-servicer/json",
+        ]
+    )
+    # published already, nothing changed after the bump: the dispatch skips it and nothing is lost
+    quiet = repo.tool(
+        "check",
+        "1.14.0-rc.1",
+        CRATES_STUB="tool-parser=0.5.0,0.6.0",
+        PYPI_STUB="smg-grpc-servicer=0.14.0",
+    )
+    assert "[ok]   registry:" in quiet.stdout
+    assert (
+        "[note] registry: at a published version with nothing changed after it (the dispatch skips them,"
+        " nothing is lost): smg-grpc-servicer 0.14.0, tool-parser 0.6.0" in quiet.stdout
+    )
+    # a change lands on the branch after the bump: the published version would ship without it
+    repo.git("switch", "--quiet", "release/1.14")
+    repo.put(
+        "crates/tool_parser/src/lib.rs", "pub fn parse() {}\npub fn more() {}\npub fn late() {}\n"
+    )
+    repo.git("commit", "--quiet", "-am", "fix(tool_parser): late")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    held = repo.tool("check", "1.14.0-rc.1", check=False, CRATES_STUB="tool-parser=0.6.0")
+    assert held.returncode == 1
+    assert (
+        "[FAIL] registry: at a version crates.io or PyPI hold already, with changes after it (the publish"
+        " dispatch skips them and ships none of those changes; a bump pull request against release/1.14"
+        " moves them): tool-parser 0.6.0 (1 commit(s) after its bump; the registry gave no publish time)"
+        in held.stdout
+    )
+    # the registry held 0.6.0 before the candidate was tagged (published on main the older way, or by another
+    # line): the tag's dispatch skipped it, so the commits after the publish time keep counting, tag or no tag
+    repo.tool("tag", "1.14.0-rc.1", PUSH="1")
+    early = "2000-01-01T00:00:00Z"
+    since_early = repo.git(
+        "rev-list", "--count", f"--after={early}", "origin/release/1.14", "--", "crates/tool_parser"
+    )
+    held = repo.tool("check", "1.14.0-rc.1", check=False, CRATES_STUB=f"tool-parser=0.6.0@{early}")
+    assert (
+        f"tool-parser 0.6.0 ({since_early} commit(s) after it was published ({early}))"
+        in held.stdout
+    )
+    # published by the tag's dispatch, after the branch's last commit: nothing is missing...
+    published = utc_second_after(repo.git("log", "-1", "--format=%cI", "origin/release/1.14"))
+    tagged = repo.tool(
+        "check", "1.14.0-rc.1", check=False, CRATES_STUB=f"tool-parser=0.6.0@{published}"
+    )
+    assert "[ok]   registry:" in tagged.stdout
+    assert "tool-parser 0.6.0" in tagged.stdout.split("[note] registry:")[-1]
+    # ...until the next change lands, counted from that publish time
+    time.sleep(1.1)
+    repo.git("switch", "--quiet", "release/1.14")
+    repo.put(
+        "crates/tool_parser/src/lib.rs", "pub fn parse() {}\npub fn more() {}\npub fn later() {}\n"
+    )
+    repo.git("commit", "--quiet", "-am", "fix(tool_parser): later")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    later = repo.tool(
+        "check", "1.14.0-rc.1", check=False, CRATES_STUB=f"tool-parser=0.6.0@{published}"
+    )
+    assert f"tool-parser 0.6.0 (1 commit(s) after it was published ({published}))" in later.stdout
+    # the registries do not answer: the gate says so and does not pass
+    down = repo.tool("check", "1.14.0-rc.1", check=False, CRATES_STUB="down")
+    assert down.returncode == 1
+    assert (
+        "[....] registry: 2 of 3 read(s) of crates.io / PyPI did not answer; read again before the tag"
+        in down.stdout
+    )
+    calls = len(repo.curl_calls())
+    skipped = repo.tool("check", "1.14.0-rc.1", check=False, REGISTRY="0")
+    assert "[....] registry: crates.io and PyPI not read (REGISTRY=0)" in skipped.stdout
+    assert len(repo.curl_calls()) == calls, "REGISTRY=0 reads nothing"
+
+
+def test_check_fails_the_registry_item_when_the_component_list_cannot_be_read(
+    repo: Sandbox,
+) -> None:
+    """The crates and packages come from a helper the checker's module reads; a manifest it refuses (workspace
+    versioning) fails the item with the reason, it never shortens the list behind a green line."""
+    repo.cut()
+    repo.git("switch", "--quiet", "release/1.14")
+    repo.put(
+        "crates/tool_parser/Cargo.toml",
+        '[package]\nname = "tool-parser"\nversion.workspace = true\n',
+    )
+    repo.git("commit", "--quiet", "-am", "chore: workspace versioning")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    done = repo.tool("check", "1.14.0-rc.1", check=False)
+    assert done.returncode == 1
+    assert "[FAIL] registry: the crate and package list at " in done.stdout
+    assert "workspace versioning" in done.stdout and "[ok]   registry" not in done.stdout
+    assert repo.curl_calls() == [], "nothing is compared when the list is unknown"
+    plan = repo.tool("publish-plan", "1.14.0-rc.1", check=False)
+    assert plan.returncode == 1
+    assert "could not be read" in plan.stderr and "workspace versioning" in plan.stderr
+
+
+def test_publish_plan_marks_the_versions_the_registries_hold(repo: Sandbox) -> None:
+    finished_release(repo)
+    repo.git("switch", "--quiet", "main")
+    out = repo.tool(
+        "publish-plan",
+        "1.14.0",
+        CRATES_STUB="tool-parser=0.6.0",
+        PYPI_STUB="smg-grpc-servicer=0.14.0",
+    ).stdout
+    assert "     tool-parser 0.6.0 (on crates.io already: the dispatch skips it)\n" in out
+    assert "     smg 1.14.0\n" in out
+    assert "smg-grpc-servicer==0.14.0 (on PyPI already: the dispatch skips it)" in out
+    plain = repo.tool("publish-plan", "1.14.0", REGISTRY="0").stdout
+    assert (
+        "     tool-parser 0.6.0\n" in plain
+        and "(the registries were not read: REGISTRY=0)" in plain
+    )
 
 
 def test_check_without_gh_names_the_branch_page(repo: Sandbox) -> None:
