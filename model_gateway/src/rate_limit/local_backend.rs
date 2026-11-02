@@ -158,15 +158,22 @@ impl LocalRateLimitBackend {
     /// bucket and none can take it before it is gone. A reserve that comes
     /// after finds the slot vacant and starts a fresh bucket.
     fn sweep_idle_buckets(&self, idle_ttl: Duration) -> usize {
+        let candidates = self.idle_bucket_candidates(idle_ttl);
+        self.evict_idle_candidates(&candidates, idle_ttl)
+    }
+
+    fn idle_bucket_candidates(&self, idle_ttl: Duration) -> Vec<ScopeKey> {
         let now = Instant::now();
-        let candidates: Vec<ScopeKey> = self
-            .buckets
+        self.buckets
             .iter()
             .filter(|entry| {
                 Arc::strong_count(entry.value()) == 1 && entry.value().idle_at(now) >= idle_ttl
             })
             .map(|entry| entry.key().clone())
-            .collect();
+            .collect()
+    }
+
+    fn evict_idle_candidates(&self, candidates: &[ScopeKey], idle_ttl: Duration) -> usize {
         candidates
             .iter()
             .filter(|key| {
@@ -686,6 +693,7 @@ mod tests {
         let key = ScopeKey::TenantGlobal(TenantKey::new(TENANT));
         let phases = Barrier::new(4);
         let bad_reserves = AtomicUsize::new(0);
+        let bad_candidates = AtomicUsize::new(0);
         let wrong_bucket = AtomicUsize::new(0);
         let bad_sweeps = AtomicUsize::new(0);
         let seed = || {
@@ -702,13 +710,19 @@ mod tests {
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 for _ in 0..ROUNDS {
-                    phases.wait(); // race the three reserves against an idle bucket
-                    backend.sweep_idle_buckets(Duration::ZERO);
+                    // Pause the actual two-pass sweep after its count-of-one
+                    // observation, then let all three reserves clone that Arc.
+                    let candidates = backend.idle_bucket_candidates(Duration::ZERO);
+                    if candidates.as_slice() != std::slice::from_ref(&key) {
+                        bad_candidates.fetch_add(1, Ordering::Relaxed);
+                    }
+                    phases.wait(); // first pass finished; let reserves run
                     phases.wait(); // all reservations now hold their bucket
-                    if backend.sweep_idle_buckets(Duration::ZERO) != 0 {
+                    if backend.evict_idle_candidates(&candidates, Duration::ZERO) != 0 {
                         bad_sweeps.fetch_add(1, Ordering::Relaxed);
                     }
-                    phases.wait(); // let the reservations close
+                    phases.wait(); // re-check finished; let readers check identity
+                    phases.wait(); // all identity checks finished; let reserves close
                     phases.wait(); // all reservation-held Arcs have been dropped
                     if backend.sweep_idle_buckets(Duration::ZERO) != 1 {
                         bad_sweeps.fetch_add(1, Ordering::Relaxed);
@@ -727,6 +741,7 @@ mod tests {
                         if backend.reserve(req).now_or_never() != Some(ReserveOutcome::Admitted) {
                             bad_reserves.fetch_add(1, Ordering::Relaxed);
                         }
+                        phases.wait();
                         phases.wait();
                         {
                             let matches =
@@ -759,6 +774,7 @@ mod tests {
         // participant at a barrier. Each round checks both held and idle states;
         // progress does not depend on scheduling 1000 opportunistic evictions.
         assert_eq!(bad_reserves.load(Ordering::Relaxed), 0);
+        assert_eq!(bad_candidates.load(Ordering::Relaxed), 0);
         assert_eq!(
             wrong_bucket.load(Ordering::Relaxed),
             0,
