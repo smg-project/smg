@@ -408,6 +408,44 @@ fn models_the_table_cannot_stand_in_for_decline() {
 }
 
 #[test]
+fn the_merges_are_read_without_the_vocabulary() {
+    // A vocabulary with a gap in its ids (256..300 unassigned): the model's
+    // own serializer walks every id up to the largest and warns about each
+    // gap; the table's reader takes the merges field alone, and it is the
+    // same field the full serialization writes.
+    let (mut vocab, alphabet) = alphabet_vocab();
+    let mut list = Merges::new();
+    let mut id = 300;
+    for (a, b) in merges() {
+        let merged = format!("{a}{b}");
+        if !vocab.contains_key(&merged) {
+            vocab.insert(merged, id);
+            id += 1;
+        }
+        list.push((a.to_owned(), b.to_owned()));
+    }
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, list)
+        .build()
+        .expect("a vocabulary with a gap builds");
+    let read: serde_json::Value =
+        serde_json::from_str(&super::serialized::merges_json(&bpe).expect("the merges read"))
+            .expect("the merges are json");
+    let full = serde_json::to_value(&bpe).expect("the model serializes");
+    assert_eq!(read, full["merges"]);
+    assert_eq!(read.as_array().map(Vec::len), Some(merges().len()));
+    let table = table_of(&bpe);
+    for piece in pieces() {
+        assert_eq!(
+            table_ids(&table, &piece),
+            model_ids(&bpe, &alphabet, &piece),
+            "piece {:?}",
+            String::from_utf8_lossy(&piece)
+        );
+    }
+}
+
+#[test]
 fn the_tables_bytes_are_the_grid_the_slots_and_the_ids() {
     let bpe = model_with(&merges(), false);
     let table = table_of(&bpe);

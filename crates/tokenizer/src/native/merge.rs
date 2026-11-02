@@ -8,7 +8,8 @@
 //! the thread has not seen (code identifiers, numbers, a script without
 //! word spaces, the first requests of every thread). This table holds the
 //! same merges, read from the model's serialized form (its merge map is
-//! private; its serialization writes the merges in rank order): a dense grid
+//! private; its serialization writes the merges in rank order, and only that
+//! field is taken, see `serialized`): a dense grid
 //! for the pairs of small ids, which carry most of a piece's first round of
 //! candidates, an open-addressed table for the rest, and the id each merge
 //! produces by rank. A piece of up to [`SHORT_PIECE_SYMBOLS`] symbols merges
@@ -37,6 +38,8 @@ use serde::Deserialize;
 use tokenizers::{models::ModelWrapper, Model};
 
 use crate::encode_path::Declined;
+
+mod serialized;
 
 /// Pairs whose two ids are both below this bound are read from the dense
 /// grid (1 MiB of ranks): the byte tokens and the earliest merges, which a
@@ -72,13 +75,10 @@ pub(super) struct MergeTable {
     pub(super) ignore_merges: bool,
 }
 
-/// The merges of the model's serialized form, the one field this table
-/// reads: `[[a, b], ...]` in rank order (the vocabulary object is skipped).
+/// The model's `merges` field read back: `[[a, b], ...]` in rank order.
 #[derive(Deserialize)]
-struct SerializedMerges<'a> {
-    #[serde(borrow)]
-    merges: Vec<(Cow<'a, str>, Cow<'a, str>)>,
-}
+#[serde(transparent)]
+struct SerializedMerges<'a>(#[serde(borrow)] Vec<(Cow<'a, str>, Cow<'a, str>)>);
 
 impl MergeTable {
     /// The table of `model`'s merges, or why the model's own merge stays in
@@ -104,9 +104,12 @@ impl MergeTable {
                 .token_to_id(alphabet.encode_utf8(&mut utf8))
                 .ok_or_else(|| Declined::from(format!("byte {byte:#04x} has no token")))?;
         }
-        let serialized = serde_json::to_string(bpe)
+        // The merges alone, through the model's `Serialize` (see `serialized`):
+        // its vocabulary is never serialized, so a vocabulary with gaps in its
+        // ids does not have the library warn about them at every load.
+        let serialized = serialized::merges_json(bpe)
             .map_err(|e| Declined::from(format!("the model does not serialize: {e}")))?;
-        let SerializedMerges { merges } = serde_json::from_str(&serialized)
+        let SerializedMerges(merges) = serde_json::from_str(&serialized)
             .map_err(|e| Declined::from(format!("the model's merges do not read back: {e}")))?;
         let mut table = Self::with_capacity(merges.len(), bpe.ignore_merges);
         table.byte_ids = byte_ids;
