@@ -1,7 +1,8 @@
 //! The verdict rule of `scripts/bench_gate.py`, applied to a run's results: a gated id
 //! regresses only when its change is worse than the threshold AND every head repeat is
 //! worse than every base repeat; a change beyond the threshold whose repeats overlap is
-//! suspect, never a failure; an id no gate pattern matches is reported, never failed.
+//! suspect, never a failure; an id no gate pattern matches is reported, never failed; a
+//! pattern that fails at match time is an error, never a skipped gate.
 //! The gate file is the same TOML (`repeats`, `filter`, `bench_args`, `[[gate]]` with
 //! `pattern`, `threshold`, `note`), checked the same way; the patterns are matched by
 //! `fancy-regex`, which takes the look-around the Python patterns use to exclude a
@@ -34,8 +35,13 @@ impl Gate {
         })
     }
 
-    pub fn matches(&self, bench_id: &str) -> bool {
-        self.regex.is_match(bench_id).unwrap_or(false)
+    /// Whether the pattern matches the id. A look-around or back-reference pattern can
+    /// fail at match time (past the backtracking limit); that is an error naming the
+    /// pattern and the id, never a miss, because a miss would skip the gate.
+    pub fn matches(&self, bench_id: &str) -> Result<bool> {
+        self.regex
+            .is_match(bench_id)
+            .map_err(|err| anyhow!("pattern {:?} on {bench_id:?}: {err}", self.pattern))
     }
 }
 
@@ -49,8 +55,13 @@ pub struct Gates {
 
 impl Gates {
     /// The first gate whose pattern matches wins; None means report only.
-    pub fn threshold_for(&self, bench_id: &str) -> Option<&Gate> {
-        self.gates.iter().find(|g| g.matches(bench_id))
+    pub fn threshold_for(&self, bench_id: &str) -> Result<Option<&Gate>> {
+        for gate in &self.gates {
+            if gate.matches(bench_id)? {
+                return Ok(Some(gate));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -278,7 +289,7 @@ pub fn judge(row: &Row) -> String {
     "ok".to_string()
 }
 
-pub fn compare(results: &Results, gates: &Gates) -> Vec<Row> {
+pub fn compare(results: &Results, gates: &Gates) -> Result<Vec<Row>> {
     let sides = per_side(results);
     let empty = Default::default();
     let base = sides.get("base").unwrap_or(&empty);
@@ -292,11 +303,11 @@ pub fn compare(results: &Results, gates: &Gates) -> Vec<Row> {
                 bench_id: bench_id.clone(),
                 base: base.get(bench_id).cloned().unwrap_or_default(),
                 pr: pr.get(bench_id).cloned().unwrap_or_default(),
-                gate: gates.threshold_for(bench_id).cloned(),
+                gate: gates.threshold_for(bench_id)?.cloned(),
                 verdict: String::new(),
             };
             row.verdict = judge(&row);
-            row
+            Ok(row)
         })
         .collect()
 }
@@ -440,7 +451,7 @@ pub fn gate_report(results: &Results, gates_path: Option<&Path>) -> Result<(Stri
             ..Gates::default()
         },
     };
-    let rows = compare(results, &gates);
+    let rows = compare(results, &gates)?;
     let text = markdown(results, &rows);
     let rc = i32::from(rows.iter().any(Row::fails));
     Ok((text, rc))
@@ -467,6 +478,7 @@ threshold = 0.02
 
     fn verdicts(results: &Results, gates: &Gates) -> BTreeMap<String, String> {
         compare(results, gates)
+            .unwrap()
             .into_iter()
             .map(|r| (r.bench_id, r.verdict))
             .collect()
@@ -525,7 +537,7 @@ threshold = 0.02
                 ("chat/cpu_us_per_request", &[900.0, 910.0, 905.0]),
             ],
         );
-        let rows = compare(&res, &gates);
+        let rows = compare(&res, &gates).unwrap();
         assert!(!rows.iter().any(Row::fails));
         let md = markdown(&res, &rows);
         assert!(md.contains("faster improvement"), "{md}");
@@ -557,7 +569,7 @@ threshold = 0.02
             &[("encode/zero", &[2.0, 2.0, 2.0])],
         );
         assert_eq!(verdicts(&grown, &gates)["encode/zero"], "regression");
-        let text = markdown(&grown, &compare(&grown, &gates));
+        let text = markdown(&grown, &compare(&grown, &gates).unwrap());
         assert!(text.contains("| - |"), "{text}");
         let overlapping = results_of(
             &[("encode/zero", &[0.0, 0.0, 0.0])],
@@ -581,7 +593,7 @@ threshold = 0.02
             &[("encode/neg", &[-2.0, -2.0, -2.0])],
             &[("encode/neg", &[-1.0, -1.0, -1.0])],
         );
-        assert!((compare(&rose, &gates)[0].change().unwrap() - 0.5).abs() < 1e-12);
+        assert!((compare(&rose, &gates).unwrap()[0].change().unwrap() - 0.5).abs() < 1e-12);
         assert_eq!(verdicts(&rose, &gates)["encode/neg"], "regression");
         let fell = results_of(
             &[("encode/neg", &[-1.0, -1.0, -1.0])],
@@ -592,7 +604,7 @@ threshold = 0.02
             &[("encode/neg", &[-2.2, -2.0, -1.8])],
             &[("encode/neg", &[-2.0, -2.0, -2.0])],
         );
-        assert!((compare(&noisy, &gates)[0].spread().unwrap() - 0.2).abs() < 1e-12);
+        assert!((compare(&noisy, &gates).unwrap()[0].spread().unwrap() - 0.2).abs() < 1e-12);
     }
 
     #[test]
@@ -603,20 +615,20 @@ threshold = 0.02
             &[("encode/calls", &[290.0, 289.0])],
         );
         res.unit = Some(String::new());
-        let text = markdown(&res, &compare(&res, &gates));
+        let text = markdown(&res, &compare(&res, &gates).unwrap());
         assert!(
             text.contains("| 300.5 (300 - 301) | 289.5 (289 - 290) |"),
             "{text}"
         );
         res.unit = Some("KiB".to_string());
-        let text = markdown(&res, &compare(&res, &gates));
+        let text = markdown(&res, &compare(&res, &gates).unwrap());
         assert!(text.contains("| 300.5 KiB (300 KiB - 301 KiB) |"), "{text}");
         let mut timed = results_of(
             &[("encode/t", &[1500.0, 1600.0])],
             &[("encode/t", &[1550.0, 1650.0])],
         );
         timed.unit = None;
-        let text = markdown(&timed, &compare(&timed, &gates));
+        let text = markdown(&timed, &compare(&timed, &gates).unwrap());
         assert!(text.contains("1.55 µs (1.5 µs - 1.6 µs)"), "{text}");
     }
 
@@ -627,7 +639,7 @@ threshold = 0.02
             &[("a/x", &[1.0, 1.0]), ("a/y", &[2.0, 2.0])],
             &[("a/x", &[1.0, 1.0])],
         );
-        let rows = compare(&res, &gates);
+        let rows = compare(&res, &gates).unwrap();
         let md = markdown(&res, &rows);
         assert!(rows
             .iter()
@@ -637,7 +649,7 @@ threshold = 0.02
             "{md}"
         );
         let regressed = results_of(&[("a/x", &[1.0, 1.0, 1.0])], &[("a/x", &[2.0, 2.0, 2.0])]);
-        let md = markdown(&regressed, &compare(&regressed, &gates));
+        let md = markdown(&regressed, &compare(&regressed, &gates).unwrap());
         assert!(
             md.contains("base runs [1.0, 1.0, 1.0], pull request runs [2.0, 2.0, 2.0]."),
             "{md}"
@@ -650,10 +662,31 @@ threshold = 0.02
             "[[gate]]\npattern = \"^(?!latency/encode_4KB$)(encode_throughput|latency)/\"\nthreshold = 0.05\n",
         )
         .unwrap();
-        assert!(gates.threshold_for("latency/encode_1KB").is_some());
-        assert!(gates.threshold_for("encode_throughput/x").is_some());
-        assert!(gates.threshold_for("latency/encode_4KB").is_none());
-        assert!(gates.threshold_for("decode/x").is_none());
+        assert!(gates.threshold_for("latency/encode_1KB").unwrap().is_some());
+        assert!(gates
+            .threshold_for("encode_throughput/x")
+            .unwrap()
+            .is_some());
+        assert!(gates.threshold_for("latency/encode_4KB").unwrap().is_none());
+        assert!(gates.threshold_for("decode/x").unwrap().is_none());
+    }
+
+    /// A back-reference pattern over nested repeats runs past the backtracking limit on
+    /// a long id: the match fails, and the failure is an error naming the pattern and the
+    /// id, not a miss that would leave the id report-only.
+    #[test]
+    fn a_pattern_that_fails_at_match_time_is_an_error_not_a_skipped_gate() {
+        let gates = gated("^(a+)+\\1$");
+        let id = format!("{}b", "a".repeat(32));
+        let err = gates.threshold_for(&id).unwrap_err().to_string();
+        assert!(
+            err.starts_with("pattern \"^(a+)+") && err.contains(&id),
+            "{err}"
+        );
+        let res = results_of(&[(&id, &[1.0])], &[(&id, &[1.0])]);
+        let err = compare(&res, &gates).unwrap_err().to_string();
+        assert!(err.contains(&id), "{err}");
+        assert!(gates.threshold_for("a/short").unwrap().is_none());
     }
 
     #[test]
@@ -663,8 +696,12 @@ threshold = 0.02
         assert_eq!(gates.gates.len(), 2);
         assert!(gates
             .threshold_for("chat/allocation_calls_per_request")
+            .unwrap()
             .is_some());
-        assert!(gates.threshold_for("chat/cpu_us_per_request").is_none());
+        assert!(gates
+            .threshold_for("chat/cpu_us_per_request")
+            .unwrap()
+            .is_none());
         for (text, what) in [
             ("nonsense = 1\n", "unknown keys"),
             ("repeats = 0\n", "at least 1"),
