@@ -177,6 +177,10 @@ back_to() { # <start branch> <start commit>: the checkout the command started fr
     git switch --quiet --detach "$2" || die "cannot switch back to $(git rev-parse --short "$2")"
   fi
 }
+drop_hint() { # <branch> <rerun>: the second way out of a command that stopped with version edits on <branch>: drop them and the
+  # branch (whose existence refuses a rerun), then <rerun>
+  printf '%s' "drop them (git restore --staged --worktree .), switch back to where you started and delete $1 (git branch -D $1): $2"
+}
 sign_off() { # "Name <email>", as git commit -s writes it
   local ident
   ident=$(git var GIT_COMMITTER_IDENT)
@@ -196,25 +200,28 @@ bump_tree() { # <version> <since tag>: the gateway's files, then every crate, pa
     || die "the versions are still inconsistent: scripts/check_release_versions.py --check $since"
   refresh_lock
 }
-refresh_lock() { # Cargo.lock follows the workspace crates' versions
+refresh_lock() { # [<way out>]: Cargo.lock follows the workspace crates' versions; a failure names <way out> after its cause
   [ -f "$root/Cargo.lock" ] || return 0
   command -v "$CARGO" >/dev/null 2>&1 \
-    || die "Cargo.lock needs a refresh and '$CARGO' is not on PATH (set CARGO=<path to cargo>)"
+    || die "Cargo.lock needs a refresh and '$CARGO' is not on PATH (set CARGO=<path to cargo>)${1:+; $1}"
   note "bump: cargo update --workspace (Cargo.lock follows the crate versions)"
   "$CARGO" update --workspace --offline >/dev/null 2>&1 || "$CARGO" update --workspace >/dev/null \
-    || die "cargo update --workspace failed: Cargo.lock does not follow the versions"
+    || die "cargo update --workspace failed: Cargo.lock does not follow the versions${1:+; $1}"
 }
-commit_all() { # <subject> <body> <finish>: the tree's changes in one signed-off commit. A failure stops the command in any
-  # context and names both ways out: the commit by hand and then <finish> (the steps the command would have run next), or
-  # dropping the edits and the branch before a rerun (the branch's existence refuses one).
-  local branch
+commit_all() { # <subject> <body> <finish> [<rerun>]: the tree's changes in one signed-off commit. A failure stops the command in
+  # any context and names both ways out: <finish> (the lines that finish by hand, the commit among them once, before the push:
+  # every caller's finish carries its commit_command line; the move hands its whole recipe, whose first lines are no-ops on
+  # the topic as it stands), or dropping the edits and the branch (whose existence refuses a rerun) and then <rerun>.
+  local branch rerun=${4:-a rerun is refused while it exists}
   branch=$(git branch --show-current)
-  git add --update || die "git add failed on $branch"
+  git add --update || die "git add failed: the version edits sit on $branch. Once the cause is fixed, finish by hand:
+$3
+or $(drop_hint "$branch" "$rerun")"
   git diff --cached --quiet && die "nothing to commit: the tree already carries these versions"
   git commit --quiet --signoff --message "$1" --message "$2" \
-    || die "the commit '$1' failed: the version edits are staged on $branch. Once the cause is fixed, commit them and finish by hand:
+    || die "the commit '$1' failed: the version edits are staged on $branch. Once the cause is fixed, finish by hand:
 $3
-or drop them (git restore --staged --worktree .), switch back to where you started and delete $branch (git branch -D $branch): a rerun is refused while it exists"
+or $(drop_hint "$branch" "$rerun")"
 }
 
 # --- pushes and pull requests -------------------------------------------------------
@@ -233,11 +240,23 @@ push_release_ref() { # <refspec> <what the push triggers>: a release branch or a
 }
 # Pushes name both sides of the refspec and topic branches never track their start point: under
 # push.default=upstream, `git push origin topic` of a branch that tracks origin/main pushes to main.
+commit_command() { # <subject>: the commit of the tree's changes, as the line to run by hand (in every commit_all caller's finish
+  # lines once, before the push: first for the cut and the bump, after the sync and the lock in the move's recipe; so that a
+  # failure's message never asks for it twice)
+  say "  git add --update && git commit --signoff --message $(printf '%q' "$1")"
+}
 pr_commands() { # <topic> <base> <title> <body file>: the push of a topic and its pull request, as lines to run by hand
   say "  git push -u $REMOTE refs/heads/$1:refs/heads/$1"
   say "  gh pr create --base $2 --head $1 --title $(printf '%q' "$3") --body-file $(printf '%q' "$4")"
 }
-open_pr() { # <topic> <base> <title> <body file>
+move_commands() { # <topic> <source ref> <gateway version> <subject> <body file>: the lines that finish main's move by hand once
+  # its topic exists: the sync (a rerun completes what it started), the lock, the commit, then the push and the pull request
+  say "  $PYTHON scripts/release/sync_versions.py $2 $3"
+  if [ -f "$root/Cargo.lock" ]; then say "  $CARGO update --workspace"; fi
+  commit_command "$4"
+  pr_commands "$1" main "$4" "$5"
+}
+open_pr() { # <topic> <base> <title> <body file>: a failure names the lines that finish by hand (the body file among them)
   local topic=$1 base=$2 title=$3 body=$4
   if [ "${PUSH:-}" = 0 ]; then
     say ""
@@ -245,9 +264,12 @@ open_pr() { # <topic> <base> <title> <body file>
     pr_commands "$topic" "$base" "$title" "$body"
     return 0
   fi
-  command -v "$GH" >/dev/null 2>&1 || die "'$GH' is not installed: push $topic and open the pull request against $base by hand"
-  git push --quiet -u "$REMOTE" "refs/heads/$topic:refs/heads/$topic" || die "the push of $topic to $REMOTE failed; nothing opened"
-  "$GH" pr create --base "$base" --head "$topic" --title "$title" --body-file "$body" || die "gh pr create failed for $topic; the branch is pushed"
+  command -v "$GH" >/dev/null 2>&1 || die "'$GH' is not installed: push $topic and open the pull request against $base by hand:
+$(pr_commands "$topic" "$base" "$title" "$body")"
+  git push --quiet -u "$REMOTE" "refs/heads/$topic:refs/heads/$topic" || die "the push of $topic to $REMOTE failed; nothing opened. Once the cause is fixed, finish by hand:
+$(pr_commands "$topic" "$base" "$title" "$body")"
+  "$GH" pr create --base "$base" --head "$topic" --title "$title" --body-file "$body" || die "gh pr create failed for $topic; the branch is pushed. Once the cause is fixed, open the pull request by hand:
+$(pr_commands "$topic" "$base" "$title" "$body")"
 }
 require_pr_tools() { # <topic> <base>: what open_pr will need under PUSH=1, checked before anything is made or pushed
   local topic=$1 base=$2 open
@@ -297,7 +319,8 @@ cmd_cut() {
   bump_tree "$version" "$since"
   commit_all "chore(release): bump versions for v$version" \
     "The release branch $branch, cut from $from_sha ($from). Versions since $since." \
-    "  git push $REMOTE refs/heads/$branch:refs/heads/$branch (then main's move, the cut's second half, which only a rerun makes: the shorter way is to drop the edits, delete $branch and rerun the cut)"
+    "$(commit_command "chore(release): bump versions for v$version")
+  git push $REMOTE refs/heads/$branch:refs/heads/$branch (then main's move, the cut's second half, which only a rerun makes: the shorter way is to drop the edits, delete $branch and rerun the cut)"
   back_to "$start_branch" "$start"
   say ""
   # refs/heads/: a tag named like the branch would answer for a bare name
@@ -313,7 +336,8 @@ cmd_cut() {
   say ""
   note "cut: main moves above $branch: the gateway and its mirrors to $next, every crate and package to at least the branch's"
   if ! PUSH=$push_move move_main "$topic" "$next" "refs/heads/$branch" "chore(release): main reads $next, above release/$release" \
-    "\`$branch\` is cut at $(git rev-parse --short "refs/heads/$branch") and reads $version; main moves above it the same moment (the trunk is next): the gateway and its mirrors to \`$next\`, the next development version (a semver pre-release below ${next%-dev} for cargo and Helm, ${next%-dev}.dev0 once Python tooling normalizes it), and every crate and package to at least the version the cut gave the branch, so the next cut's bump starts from the numbers the registries will hold. Main's artifacts are not published; the branch's are."; then
+    "\`$branch\` is cut at $(git rev-parse --short "refs/heads/$branch") and reads $version; main moves above it the same moment (the trunk is next): the gateway and its mirrors to \`$next\`, the next development version (a semver pre-release below ${next%-dev} for cargo and Helm, ${next%-dev}.dev0 once Python tooling normalizes it), and every crate and package to at least the version the cut gave the branch, so the next cut's bump starts from the numbers the registries will hold. Main's artifacts are not published; the branch's are." \
+    "a rerun of the cut is refused while $branch exists (it stays, pushed or not): to make the move later, recreate the topic (git switch --no-track -c $topic $REMOTE/main) and run the lines above"; then
     say "main carries $next and the branch's crate and package versions already: nothing to move."
   fi
   back_to "$start_branch" "$start" # the move's topic is behind you too, like the release branch
@@ -348,7 +372,7 @@ cmd_bump() {
     gate_section "$version" "$base"
   } > "$body"
   commit_all "chore(release): bump versions for v$version" "$kind on $branch. Versions since $since." \
-    "$(pr_commands "$topic" "$branch" "chore(release): bump versions for v$version" "$body")"
+    "$(commit_command "chore(release): bump versions for v$version"; pr_commands "$topic" "$branch" "chore(release): bump versions for v$version" "$body")"
   open_pr "$topic" "$branch" "chore(release): bump versions for v$version" "$body"
 }
 
@@ -589,14 +613,16 @@ cmd_notes() {
   fi
 }
 
-move_main() { # <topic> <gateway version> <source ref> <subject> <intro>: main's version files move on <topic>, by a pull request
+move_main() { # <topic> <gateway version> <source ref> <subject> <intro> <rerun>: main's version files move on <topic>, by a pull
+  # request; <rerun> is what the caller offers once a failed move's topic is dropped (the cut: the topic recreated and
+  # the lines above run, its branch stays)
   # The gateway and its mirrors to <gateway version> when main reads below it; main never goes back (after a patch of
   # an older line, or a cut while main already reads above, they keep main's). Every crate and package to at least
   # <source ref>'s, as sync_versions.py moves them. The commit, the push and the pull request as open_pr makes them.
   # Returns 1, with nothing made, when main carries the versions already. Every other failure stops the command
   # (die): both callers run this under `if` or `||`, where set -e is off and a failed step would read as "nothing
   # to move" with the version edits left behind.
-  local topic=$1 gateway=$2 source=$3 subject=$4 intro=$5 current moved start start_branch body shown
+  local topic=$1 gateway=$2 source=$3 subject=$4 intro=$5 rerun=$6 current moved start start_branch body shown finish
   shown=${source#refs/heads/} # a local release branch is read by its full ref (a tag may share its name), named plainly
   start_branch=$(git branch --show-current); start=${start_branch:-$(git rev-parse HEAD)}
   git switch --quiet --no-track -c "$topic" "$REMOTE/main" || die "cannot make $topic from $REMOTE/main"
@@ -608,25 +634,36 @@ move_main() { # <topic> <gateway version> <source ref> <subject> <intro>: main's
     note "main reads $current, below $gateway: the gateway and its mirrors move to $gateway"
     moved="The gateway reads $gateway on main"
   fi
+  # The pull request's body is made before the first edit, so that every failure from here names the lines that finish
+  # the move by hand, the pull request's with its body among them; the stat of the edits joins the intro once they exist.
+  body=$(mktemp) || die "cannot make a temporary file for the pull request body of $topic (nothing is edited yet). Once the cause is fixed, finish by hand, with a body file of your own (body.md below):
+$(move_commands "$topic" "$source" "$gateway" "$subject" body.md)
+or switch back to where you started and delete $topic (git branch -D $topic): $rerun"
+  say "$intro" > "$body"
+  finish=$(move_commands "$topic" "$source" "$gateway" "$subject" "$body")
   note "scripts/release/sync_versions.py $source $gateway (every crate and package at least $shown's)"
-  "$PYTHON" "$root/scripts/release/sync_versions.py" "$source" "$gateway" || die "sync_versions.py failed: the version files of $topic are not moved"
-  refresh_lock
+  "$PYTHON" "$root/scripts/release/sync_versions.py" "$source" "$gateway" \
+    || die "sync_versions.py failed: the version files of $topic are moved in part at most. Once the cause is fixed, finish by hand (a rerun of the sync completes what it started):
+$finish
+or $(drop_hint "$topic" "$rerun")"
+  refresh_lock "the version edits sit on $topic. Once the cause is fixed, finish by hand:
+$finish
+or $(drop_hint "$topic" "$rerun")"
   if git diff --quiet && git diff --cached --quiet; then
+    rm -f "$body"
     back_to "$start_branch" "$start"
     git branch --quiet -D "$topic" || die "cannot delete $topic (nothing to move)"
     return 1
   fi
-  body=$(mktemp) || die "cannot make a temporary file for the pull request body of $topic"
   {
-    say "$intro"
     say ""
     say '```'
     git diff --stat HEAD
     say '```'
-  } > "$body"
+  } >> "$body"
   commit_all "$subject" \
     "$moved and every crate and package at least the version $shown carries (crates.io and PyPI never take a version twice). Main's artifacts are not published; the release branches' are." \
-    "$(pr_commands "$topic" main "$subject" "$body")"
+    "$finish" "$rerun"
   open_pr "$topic" main "$subject" "$body"
 }
 
@@ -653,6 +690,7 @@ cmd_bump_main() {
   next=$(next_dev_version "$version")
   move_main "$topic" "$next" "$source" "chore(release): main's versions follow v$version" \
     "After the v$version release: main's crates and packages follow the release (\`$source\`), so the next cut starts above what crates.io and PyPI already carry; the gateway keeps its development version (the trunk is next), or moves to \`$next\` when main read below the release." \
+    "then 'release.sh bump-main $version' again" \
     || die "bump-main: main carries v$version's versions already (the gateway at $(manifest_version "$REMOTE/main"), every crate and package at least the release's): nothing to move"
 }
 
