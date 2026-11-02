@@ -121,6 +121,17 @@ def test_owned_listener_on_another_host_does_not_qualify_declared_host():
     assert server.closed
 
 
+def test_unknown_ownership_interface_does_not_fall_back_to_foreign_tcp():
+    listener = Listener()
+    server = SimpleNamespace(port=listener.port, thread=listener.thread, close=Mock())
+    try:
+        with pytest.raises(RuntimeError, match="expected backend-owned _runner.addresses"):
+            wait_for_bootstrap_listener(server, listener.host, listener.port, timeout=0.05)
+        server.close.assert_called_once_with()
+    finally:
+        listener.close()
+
+
 def test_live_thread_with_no_listener_times_out_and_closes():
     server = Listener(bind=False)
     with pytest.raises(RuntimeError, match="did not listen.*last connection error"):

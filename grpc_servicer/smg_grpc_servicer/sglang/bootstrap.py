@@ -18,6 +18,10 @@ def wait_for_bootstrap_listener(server: Any, host: str, port: int, *, timeout: f
 
     This precedes scheduler/model startup and does not wait for the ranks to
     register. Keep the returned handle alive after this call, as before.
+    The backend-owned runner is present on CommonKVBootstrapServer in the
+    minimum supported SGLang 0.5.21 and current release 0.5.22. A backend
+    without that ownership signal fails closed, rather than trusting a
+    foreign listener at the expected port.
     """
     endpoint = f"{host}:{port}"
     try:
@@ -46,7 +50,9 @@ def wait_for_bootstrap_listener(server: Any, host: str, port: int, *, timeout: f
             if remaining <= 0:
                 raise RuntimeError(
                     f"SGLang prefill bootstrap {endpoint} did not listen within {timeout:g}s; "
-                    f"owned addresses: {addresses}; last connection error: {last_error}"
+                    f"owned addresses: {addresses}; last connection error: {last_error}; "
+                    f"backend: {type(server).__module__}.{type(server).__qualname__}; "
+                    "expected backend-owned _runner.addresses"
                 )
             # A different process may take the port while the bootstrap
             # thread is still starting. Its accepting socket is not proof
