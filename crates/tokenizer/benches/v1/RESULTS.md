@@ -2,7 +2,7 @@
 
 Tested the optional backend against the default wrapper on upstream base `d52de821`, including the v1 1,024-entry word-cache bound and borrowed serial encode path.
 
-Xeon Platinum 8573C, Linux x86_64, **4 CPU quota**, Rust 1.98.0, repository release profile. Model revisions/hashes and environment are in [environment.json](environment.json). All four models selected the v1 path in the enabled builds. Measurements are CPU text encode calls, not HTTP latency.
+Xeon Platinum 8573C, Linux x86_64, **4 CPU quota**, Rust 1.98.0, repository release profile. Model revisions/hashes and environment are in [environment.json](environment.json). All four models selected the v1 path in the enabled builds (since the reader declines a normalizer that reads the Unicode normalization tables, MiniMax M3 and Qwen3-8B take the direct path in the enabled build; a re-run measures that path for them). Measurements are CPU text encode calls, not HTTP latency.
 
 ## Single caller, no L0/L1
 

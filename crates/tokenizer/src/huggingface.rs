@@ -207,10 +207,18 @@ impl DirectEncoders {
         };
         encode_path::note_load(path);
         // The opt-in pipeline is for BPE tokenizers: one of those it declines
-        // is worth a warning (the opt-in did not take where it could have);
-        // any other model kind was never its business.
+        // is worth a warning (the opt-in did not take where it could have),
+        // unless the decline is the one by design: a normalizer the pipeline
+        // would read with other tables than the reference, left to the
+        // direct path (`v1::reads_normalization_tables`). Any other model
+        // kind was never its business.
         #[cfg(feature = "tokenizers-v1")]
-        if matches!(tokenizer.get_model().wrapper(), ModelWrapper::BPE(_)) {
+        let by_design = path == EncodePath::Native
+            && tokenizer
+                .get_normalizer()
+                .is_some_and(crate::v1::reads_normalization_tables);
+        #[cfg(feature = "tokenizers-v1")]
+        if matches!(tokenizer.get_model().wrapper(), ModelWrapper::BPE(_)) && !by_design {
             tracing::warn!(
                 path = %path,
                 v1_declined = %v1_declined,
@@ -222,7 +230,7 @@ impl DirectEncoders {
                 path = %path,
                 v1_declined = %v1_declined,
                 native_declined = native_declined.as_deref(),
-                "tokenizer encode path (the opt-in v1 pipeline takes BPE models only)"
+                "tokenizer encode path (the opt-in v1 pipeline takes BPE models whose normalizer reads no Unicode tables)"
             );
         }
         #[cfg(not(feature = "tokenizers-v1"))]

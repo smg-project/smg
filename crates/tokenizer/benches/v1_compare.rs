@@ -200,18 +200,23 @@ fn main() {
         let ours =
             Arc::new(HuggingFaceTokenizer::from_file(path.to_str().expect("path")).expect("load"));
         let load_ms = started.elapsed().as_secs_f64() * 1000.0;
-        assert_eq!(
-            ours.uses_v1_encoder(),
-            cfg!(feature = "tokenizers-v1"),
-            "{name}"
-        );
+        // The enabled build's path per model is recorded in models.json: a
+        // normalizer that reads the Unicode tables leaves the pipeline to the
+        // direct path (see `v1.rs`).
+        let expected = model["encode_path"].as_str().expect("encode_path");
+        let encode_path = ours.encode_path().as_str();
+        if cfg!(feature = "tokenizers-v1") {
+            assert_eq!(encode_path, expected, "{name}");
+        } else {
+            assert!(!ours.uses_v1_encoder(), "{name}");
+        }
         let hash = blake3::hash(&fs::read(&path).expect("model bytes"))
             .to_hex()
             .to_string();
         println!(
             "{}",
             json!({"kind":"model","model":name,"revision":model["revision"],
-            "blake3":hash,"v1":ours.uses_v1_encoder(),"load_ms":load_ms,"internal_threads":internal})
+            "blake3":hash,"v1":ours.uses_v1_encoder(),"encode_path":encode_path,"load_ms":load_ms,"internal_threads":internal})
         );
         for tokens in [128, 2048, 50000, 80000] {
             let scenarios: &[&str] = if tokens < 50000 {
@@ -285,6 +290,7 @@ fn main() {
                                 ("round", json!(round)),
                                 ("internal_threads", json!(internal)),
                                 ("v1", json!(ours.uses_v1_encoder())),
+                                ("encode_path", json!(encode_path)),
                                 ("cold_ms", json!(cold)),
                             ] {
                                 obj.insert(key.into(), value);
@@ -310,7 +316,7 @@ fn main() {
                     println!(
                         "{}",
                         json!({"kind":"batch","model":name,"tokens":tokens,
-                    "v1":ours.uses_v1_encoder(),"internal_threads":internal,"ms":ms,"batch_size":8})
+                    "v1":ours.uses_v1_encoder(),"encode_path":encode_path,"internal_threads":internal,"ms":ms,"batch_size":8})
                     );
                 }
             }

@@ -75,11 +75,16 @@ def summarize(output):
     groups = {}
     auxiliary = []
     for path in sorted(output.glob("*.jsonl")):
+        # The build a row came from (the enabled build's rows for a model whose
+        # normalizer reads the Unicode tables measure the direct path: the
+        # row's `encode_path` says which).
+        enabled = path.stem.startswith("v1-")
         for line in path.read_text().splitlines():
             row = json.loads(line)
             if row["kind"] != "timing":
                 auxiliary.append(row)
                 continue
+            row["v1"] = enabled
             key = tuple(
                 row[k]
                 for k in [
@@ -102,6 +107,7 @@ def summarize(output):
                 key,
             )
         )
+        row["encode_path"] = rows[0].get("encode_path")
         for p in ["p50_ms", "p95_ms", "p99_ms"]:
             row[p] = statistics.median(r[p] for r in rows)
         row["requests"] = sum(r["requests"] for r in rows)
@@ -169,7 +175,8 @@ def summarize(output):
         )
     write_csv(output / "comparison.csv", comparisons)
     lines = [
-        "| Model | Tokens | Current ms | v1 / 1 thread ms | Saved ms | Less time | Speedup | v1 / 4 threads ms |",
+        "| Model (enabled build's path) | Tokens | Current ms | enabled build / 1 thread ms "
+        "| Saved ms | Less time | Speedup | enabled build / 4 threads ms |",
         "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for model in MODELS:
@@ -180,7 +187,7 @@ def summarize(output):
             c = lookup[model["name"], tokens, scenario, "off", 1, True, 4]
             old, new = a["p50_ms"], b["p50_ms"]
             lines.append(
-                f"| {model['name']} | {tokens:,} | {old:.3f} | {new:.3f} | {old - new:.3f} | "
+                f"| {model['name']} ({b['encode_path']}) | {tokens:,} | {old:.3f} | {new:.3f} | {old - new:.3f} | "
                 f"{100 * (1 - new / old):.1f}% | {old / new:.2f}x | {c['p50_ms']:.3f} |"
             )
     (output / "table.md").write_text("\n".join(lines) + "\n")

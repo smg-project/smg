@@ -62,8 +62,10 @@ tokenizers-v1 = { package = "tokenizers", version = "=1.0.0-rc.3", optional = tr
     "wordlevel",
     "unicode-scripts",
 ] }
-# The NFC tables of the native encode path: the crate `tokenizers` normalizes with, so the two paths compose
-# the same text (a newer crate's tables know marks and compositions the library's do not).
+# The NFC tables of the native encode path: the crate `tokenizers` 0.23 normalizes with (Unicode 9.0), so the two
+# paths compose the same text; a newer crate's tables know marks and compositions these do not. The opt-in pipeline
+# above normalizes with `unicode-normalization` (Unicode 17.0), so its reader (`v1.rs`) declines a tokenizer whose
+# normalizer reads those tables, and the native path takes it.
 unicode-normalization-alignments = "0.1"
 
 [dev-dependencies]

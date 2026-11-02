@@ -250,7 +250,10 @@ small prefix hits from reuse of large prompts.
 
 `smg_tokenizer_encode_path_loads_total` says which encoder each loaded
 tokenizer's encodes go through (the load also logs the path once, with the
-reasons the faster paths declined); a non-zero `tokenizers` series under the
-`tokenizers-v1` feature names the tokenizers the opt-in pipeline does not take.
+reasons the faster paths declined); under the `tokenizers-v1` feature the
+`native` and `tokenizers` series name the tokenizers the opt-in pipeline does
+not take: by design the ones whose normalizer reads the Unicode normalization
+tables, which the pipeline has newer than the reference (the direct path takes
+NFC alone), and the ones its reader declines, which the load log says.
 `smg_tokenizer_encode_fallbacks_total` counts the inputs that still left the
 direct encoder afterwards, each encoded a second time by `tokenizers`.

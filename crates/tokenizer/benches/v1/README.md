@@ -13,8 +13,12 @@ does not enable either acceleration.
 The pipeline is constructed **after** tokenizer configuration overrides, so
 configured BOS/EOS processing is preserved. Results use `Encoding::Plain`, like
 the existing native encoder. Non-BPE models, stochastic BPE, padding/truncation,
-Split configurations without a usable engine and configurations rejected by the v1
-reader retain the existing encoder. `uses_v1_encoder()` exposes the selection.
+a normalizer that reads the Unicode normalization tables (NFC, NFD, NFKC, NFKD,
+a Bert accent strip: the pipeline's tables are Unicode 17.0, the reference's 9.0,
+so the direct path takes NFC and the reference the rest), Split configurations
+without a usable engine and configurations rejected by the v1 reader retain the
+existing encoder. `uses_v1_encoder()` exposes the selection; `encode_path()` the
+path.
 The Split guard avoids an RC reader issue (rc.3 as rc.2): it can accept a regex
 without a usable engine, even with `regex` enabled. V1 word caches are limited to the same
 1,024 entries as the existing fallback. The RC reader ignores cache capacity, so
@@ -49,7 +53,10 @@ follows reference loading, so it is not cold-filesystem startup time.
 
 ## Measurement contract
 
-- Four models: MiniMax M3, GLM-5.3, Qwen3-8B, DeepSeek-V3.2.
+- Four models: MiniMax M3, GLM-5.3, Qwen3-8B, DeepSeek-V3.2. `models.json`
+  records the path each takes in the enabled build (`encode_path`): MiniMax M3
+  and Qwen3-8B carry an NFC normalizer and take the direct path, so their
+  enabled-build rows measure it; GLM-5.3 and DeepSeek-V3.2 take the pipeline.
 - **Actual** 128 / 2,048 / 50,000 / 80,000 tokens, calibrated per model and checked
   on every timed output. Mixed English, Chinese and code; full IDs checked against
   0.23 before each configuration on four nonce variants, twice each.

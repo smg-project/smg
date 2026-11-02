@@ -9,13 +9,15 @@ use std::sync::Arc;
 use llm_tokenizer::{
     chat_template::ChatTemplateParams,
     traits::{Decoder, Encoder, Tokenizer as _},
-    CacheConfig, CachedTokenizer, DecodeStream, HuggingFaceTokenizer,
+    CacheConfig, CachedTokenizer, DecodeStream, EncodePath, HuggingFaceTokenizer,
 };
 use tokenizers::{
     decoders::byte_level::ByteLevel,
     models::bpe::{Merges, Vocab, BPE},
     normalizers::{
-        unicode::NFC, utils::Lowercase, NormalizerWrapper, Sequence as NormalizerSequence,
+        unicode::{NFC, NFD, NFKC, NFKD},
+        utils::Lowercase,
+        NormalizerWrapper, Sequence as NormalizerSequence,
     },
     pre_tokenizers::{
         metaspace::{Metaspace, PrependScheme},
@@ -26,7 +28,10 @@ use tokenizers::{
     TruncationParams,
 };
 
-fn fixture() -> Tokenizer {
+/// A byte-level BPE over the byte alphabet with a few merges, the byte-level
+/// pre-tokenizer and decoder, two special tokens and the frame that puts them
+/// around a sequence.
+fn byte_level_fixture() -> Tokenizer {
     let mut alphabet: Vec<_> = ByteLevel::alphabet().into_iter().collect();
     alphabet.sort_unstable();
     let mut vocab = Vocab::default();
@@ -50,11 +55,6 @@ fn fixture() -> Tokenizer {
         AddedToken::from("</s>", true),
     ])
     .expect("special tokens");
-    t.add_tokens([AddedToken::from("tag", false)
-        .single_word(true)
-        .lstrip(true)
-        .rstrip(true)])
-        .expect("added token flags");
     let bos = t.token_to_id("<s>").expect("BOS");
     let eos = t.token_to_id("</s>").expect("EOS");
     t.with_post_processor(Some(
@@ -67,6 +67,43 @@ fn fixture() -> Tokenizer {
     ));
     t
 }
+
+/// [`byte_level_fixture`] with an added token carrying every flag.
+fn fixture() -> Tokenizer {
+    let mut t = byte_level_fixture();
+    t.add_tokens([AddedToken::from("tag", false)
+        .single_word(true)
+        .lstrip(true)
+        .rstrip(true)])
+        .expect("added token flags");
+    t
+}
+
+/// [`byte_level_fixture`] under `normalizer`.
+fn normalized_fixture(normalizer: impl Into<NormalizerWrapper>) -> Tokenizer {
+    let mut t = byte_level_fixture();
+    t.with_normalizer(Some(normalizer.into()))
+        .expect("normalizer");
+    t
+}
+
+/// Texts the reference's tables (Unicode 9.0) and the pipeline's (17.0)
+/// normalize differently under NFC: a letter, a mark the older tables do not
+/// know (U+0899 from Unicode 14, U+1DF9 from 10, U+1DFA from 14) and a
+/// composing mark, which the newer tables compose across the unknown mark;
+/// pairs the newer tables compose into one Unicode 16 character; then two
+/// cases both agree on, and the first case in a framed chat turn.
+const TEXTS_NEWER_TABLES_COMPOSE: &[&str] = &[
+    "a\u{899}\u{301}",
+    "a\u{1DF9}\u{301}",
+    "a\u{1DFA}\u{323}",
+    "\u{16D63}\u{16D67}",
+    "\u{1611E}\u{1611E}",
+    "\u{11382}\u{113C9}",
+    "a\u{898}\u{301}",
+    "e\u{301}",
+    "<s>user\nCafe\u{301} a\u{899}\u{301} \u{16D63}\u{16D67}</s>\n",
+];
 
 const TEXTS: &[&str] = &[
     "",
@@ -125,20 +162,84 @@ fn encode_batch_decode_and_added_token_flags_match() {
     }
 }
 
+/// The pipeline takes a normalizer that reads no Unicode normalization
+/// table (an NFC step would send the tokenizer to the next path: see
+/// [`a_normalizer_that_reads_the_unicode_tables_leaves_the_pipeline`]).
 #[test]
 fn normalized_added_tokens_match_after_normalization() {
     let mut reference = fixture();
     reference
-        .with_normalizer(Some(NormalizerSequence::new(vec![
-            NFC.into(),
-            Lowercase.into(),
-        ])))
+        .with_normalizer(Some(NormalizerSequence::new(vec![Lowercase.into()])))
         .expect("normalizers");
     reference
         .add_tokens([AddedToken::from("CAFÉ", false).normalized(true)])
         .expect("normalized token");
     let ours = HuggingFaceTokenizer::from_tokenizer(reference.clone());
     assert_eq!(ours.uses_v1_encoder(), cfg!(feature = "tokenizers-v1"));
+    compare(&reference, &ours);
+}
+
+/// A byte-level vocabulary under an NFC normalizer takes the direct path with
+/// the feature on, and reads the reference's ids on the texts the pipeline's
+/// newer tables would compose: the direct path and the pipeline must never
+/// disagree on a text within one build.
+#[test]
+fn a_normalizer_that_reads_the_unicode_tables_leaves_the_pipeline() {
+    let reference = normalized_fixture(NFC);
+    let ours = HuggingFaceTokenizer::from_tokenizer(reference.clone());
+    assert!(!ours.uses_v1_encoder());
+    assert_eq!(ours.encode_path(), EncodePath::Native);
+    compare_texts(&reference, &ours, TEXTS_NEWER_TABLES_COMPOSE);
+    compare(&reference, &ours);
+    // The ids are those of the text's own bytes, not of the composed form.
+    let raw = ours.encode("a\u{899}\u{301}", false).expect("encode");
+    let composed = ours.encode("\u{E1}\u{899}", false).expect("encode");
+    assert_ne!(raw.token_ids(), composed.token_ids());
+}
+
+/// The other normalization forms, and a sequence with one of them in it,
+/// leave the pipeline the same way (the direct path takes NFC alone, so
+/// these go to the reference itself).
+#[test]
+fn the_other_normalization_forms_leave_the_pipeline_too() {
+    let normalizers: [NormalizerWrapper; 4] = [
+        NFD.into(),
+        NFKC.into(),
+        NFKD.into(),
+        NormalizerSequence::new(vec![NFC.into(), Lowercase.into()]).into(),
+    ];
+    for normalizer in normalizers {
+        let reference = normalized_fixture(normalizer);
+        let ours = HuggingFaceTokenizer::from_tokenizer(reference.clone());
+        assert!(!ours.uses_v1_encoder());
+        assert_eq!(ours.encode_path(), EncodePath::Tokenizers);
+        compare_texts(&reference, &ours, TEXTS_NEWER_TABLES_COMPOSE);
+    }
+}
+
+/// A `Bert` normalizer reads the tables when its accent strip is on, which
+/// it is under `lowercase` unless `strip_accents` says otherwise: that one
+/// leaves the pipeline. With the strip off it reads the character categories
+/// and the case tables both pipelines share, and stays on it.
+#[test]
+fn a_bert_normalizer_leaves_the_pipeline_when_its_accent_strip_is_on() {
+    let reference = normalized_fixture(tokenizers::normalizers::BertNormalizer::new(
+        false, false, None, true,
+    ));
+    let ours = HuggingFaceTokenizer::from_tokenizer(reference.clone());
+    assert!(!ours.uses_v1_encoder());
+    assert_eq!(ours.encode_path(), EncodePath::Tokenizers);
+    compare_texts(&reference, &ours, TEXTS_NEWER_TABLES_COMPOSE);
+
+    let reference = normalized_fixture(tokenizers::normalizers::BertNormalizer::new(
+        false,
+        false,
+        Some(false),
+        true,
+    ));
+    let ours = HuggingFaceTokenizer::from_tokenizer(reference.clone());
+    assert_eq!(ours.uses_v1_encoder(), cfg!(feature = "tokenizers-v1"));
+    compare_texts(&reference, &ours, TEXTS_NEWER_TABLES_COMPOSE);
     compare(&reference, &ours);
 }
 
@@ -532,11 +633,15 @@ fn cached_long_batch_matches_reference_inside_rayon_pool() {
     }
 }
 
-/// Run explicitly with the four pinned model directories from the benchmark.
+/// Run explicitly with the four pinned model directories from the benchmark
+/// (each named as in `benches/v1/models.json`, which records the path each
+/// model takes with the feature on).
 #[test]
 #[ignore = "requires SMG_V1_TOKENIZER_DIRS (comma-separated tokenizer directories)"]
 fn real_models_match_on_unicode_batches_caches_and_concurrent_calls() {
     let dirs = std::env::var("SMG_V1_TOKENIZER_DIRS").expect("set model directories");
+    let pinned: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../benches/v1/models.json")).expect("models.json");
     let alphabet: Vec<char> = "abcXYZ019 !\r\n\t\0éß中日ไทยالعربية🙂\u{301}\u{200d}\u{fffd}"
         .chars()
         .collect();
@@ -558,11 +663,20 @@ fn real_models_match_on_unicode_batches_caches_and_concurrent_calls() {
         let reference = Tokenizer::from_file(std::path::Path::new(dir).join("tokenizer.json"))
             .expect("reference model");
         let ours = Arc::new(HuggingFaceTokenizer::from_tokenizer(reference.clone()));
-        assert_eq!(
-            ours.uses_v1_encoder(),
-            cfg!(feature = "tokenizers-v1"),
-            "{dir}"
-        );
+        let name = std::path::Path::new(dir)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(dir);
+        let expected = pinned
+            .iter()
+            .find(|model| model["name"] == name)
+            .and_then(|model| model["encode_path"].as_str())
+            .unwrap_or_else(|| panic!("{dir}: not a model pinned in benches/v1/models.json"));
+        if cfg!(feature = "tokenizers-v1") {
+            assert_eq!(ours.encode_path().as_str(), expected, "{dir}");
+        } else {
+            assert!(!ours.uses_v1_encoder(), "{dir}");
+        }
         let specials: Vec<_> = reference
             .get_added_tokens_decoder()
             .values()
