@@ -37,6 +37,8 @@ _WINDOW_ARGS = {
     "sglang": ["--context-length", str(_WINDOW)],
     "vllm": ["--max-model-len", str(_WINDOW)],
     "tokenspeed": ["--max-model-len", str(_WINDOW)],
+    # The mock worker advertises the window it is given, like an engine.
+    "mock": ["--context-length", str(_WINDOW)],
 }.get(get_runtime(), [])
 # Common English words are one token each on these tokenizers; twice the
 # window's worth of them is over the window on any of them.
@@ -120,11 +122,16 @@ class TestPDContextLength(_ContextLengthContract):
     """The disaggregated gRPC path: the case #2380 reported."""
 
 
-@pytest.mark.engine("sglang", "vllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "tokenspeed", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.e2e
-@pytest.mark.model(_MODEL, tokenspeed=_MODEL_BY_ENGINE["tokenspeed"])
+@pytest.mark.model(
+    _MODEL,
+    tokenspeed=_MODEL_BY_ENGINE["tokenspeed"],
+    mock="RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8",
+)
 @pytest.mark.workers(extra_engine_args=_WINDOW_ARGS)
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestRegularContextLength(_ContextLengthContract):
-    """The single-worker gRPC path is bounded the same way."""
+    """The single-worker gRPC path is bounded the same way; on the mock engine the
+    gateway's own tokenization and the advertised window decide, as on an engine."""

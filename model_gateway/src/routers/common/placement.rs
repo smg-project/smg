@@ -38,7 +38,7 @@ use crate::{
     worker::{
         overload::{BRANCH_ALL_OVERLOADED_FALLBACK, BRANCH_ALL_STALLED_FALLBACK, STAGE_SELECTION},
         ConnectionMode, ConnectionModeExt, PdPairIndex, PrefillCandidateError,
-        PrefillSelectionContext, RoutingPool, RuntimeType, Worker, WorkerRegistry,
+        PrefillSelectionContext, RoutingPool, RuntimeType, Worker, WorkerRegistry, WorkerType,
     },
 };
 
@@ -263,6 +263,31 @@ pub(crate) fn select_from(
         None => candidates,
     };
 
+    let mut info = SelectWorkerInfo {
+        request_text: inputs.text,
+        tokens: inputs.tokens,
+        headers: inputs.headers,
+        routing_key: policies.resolve_routing_key(inputs.headers),
+        rid_key: inputs.rid_key,
+        cache_namespace: inputs.cache_namespace,
+        // Cached hash ring for consistent hashing (O(log n) lookup).
+        hash_ring: registry.get_hash_ring(model_id),
+        role: WorkerRole::Single,
+        overload_lifted: false,
+    };
+    // A request its policy places by session key keeps a regular owner over
+    // the overload thresholds (`LoadBalancingPolicy::routes_by_session_key`);
+    // `--worker-overload-shed` keeps the veto.
+    info.overload_lifted = !registry.overload_shed_enabled()
+        && policy.routes_by_session_key(&info)
+        && candidates
+            .iter()
+            .all(|w| *w.worker_type() == WorkerType::Regular);
+    let eligible = |worker: &Arc<dyn Worker>| {
+        worker.is_available()
+            || (info.overload_lifted && overload::vetoed_by_overload_alone(worker.as_ref()))
+    };
+
     // Most policies already apply the complete availability predicate. Give
     // them the shared snapshot directly instead of cloning every available
     // worker into a second per-request Vec. Hash policies use a weaker health
@@ -273,7 +298,7 @@ pub(crate) fn select_from(
     } else {
         filtered = candidates
             .iter()
-            .filter(|worker| worker.is_available())
+            .filter(|worker| eligible(worker))
             .cloned()
             .collect::<Vec<_>>();
         &filtered
@@ -292,7 +317,7 @@ pub(crate) fn select_from(
         untried = available
             .iter()
             .filter(|worker| {
-                worker.is_available()
+                eligible(worker)
                     && !inputs
                         .tried
                         .iter()
@@ -310,32 +335,23 @@ pub(crate) fn select_from(
         return overload_fallback(registry, policy.name(), model_id, candidates);
     }
 
-    // Cached hash ring for consistent hashing (O(log n) lookup).
-    let hash_ring = registry.get_hash_ring(model_id);
-
     // The registry applies the routing-key sticky override when enabled and
     // otherwise delegates to the configured policy.
-    let Some(idx) = policies.select_worker_for_model(
-        &policy,
-        model_id,
-        available,
-        &SelectWorkerInfo {
-            request_text: inputs.text,
-            tokens: inputs.tokens,
-            headers: inputs.headers,
-            routing_key: policies.resolve_routing_key(inputs.headers),
-            rid_key: inputs.rid_key,
-            cache_namespace: inputs.cache_namespace,
-            hash_ring,
-            role: WorkerRole::Single,
-            overload_lifted: false,
-        },
-    ) else {
+    let Some(idx) = policies.select_worker_for_model(&policy, model_id, available, &info) else {
         // A policy that filters availability itself misses on an
         // all-overloaded pool the same way the pre-filter empties.
         return overload_fallback(registry, policy.name(), model_id, candidates);
     };
     let selected = available[idx].clone();
+    if info.overload_lifted && !candidates.iter().any(|w| w.is_available()) {
+        Metrics::record_worker_overload_fallback(STAGE_SELECTION);
+        debug!(
+            branch = BRANCH_ALL_OVERLOADED_FALLBACK,
+            worker = selected.redacted_url(),
+            model_id,
+            "Veto fallback: a pool over the overload thresholds placed by session key"
+        );
+    }
 
     Metrics::record_worker_selection(
         metrics_labels::WORKER_REGULAR,
@@ -1233,7 +1249,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::types::{PdPairingMode, PolicyConfig},
+        config::types::{PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
         observability::logging::test_support::test_subscriber,
         policies::{CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy, RoundRobinPolicy},
         worker::{runtime::StallReason, BasicWorkerBuilder, ModelCard, PdWire, WorkerType},
@@ -2874,5 +2890,236 @@ mod tests {
                 pair.prefill.url()
             );
         }
+    }
+
+    fn keyed_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-routing-key", "session-7".parse().unwrap());
+        headers
+    }
+
+    fn with_headers(headers: &HeaderMap) -> PlacementInputs<'_> {
+        PlacementInputs {
+            headers: Some(headers),
+            ..Default::default()
+        }
+    }
+
+    /// A two-worker fleet and the worker that owns the session in `inputs`.
+    fn a_keyed_owner(
+        policies: &PolicyRegistry,
+        inputs: PlacementInputs<'_>,
+    ) -> (WorkerRegistry, Arc<dyn Worker>) {
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let owner = pick(&registry, policies, inputs);
+        (registry, owner)
+    }
+
+    /// One worker over the overload thresholds beside one under them, as the
+    /// two take turns under sustained load: a session key (the routing-key
+    /// header, a configured routing-key header, or the rid-derived key) keeps
+    /// its ring owner without counting a fallback, while a request without a
+    /// key is still steered around the owner, and so is the session under
+    /// `--worker-overload-shed`.
+    #[test]
+    fn a_session_key_keeps_its_overloaded_owner_under_consistent_hashing() {
+        let routing_key = keyed_headers();
+        let mut configured = HeaderMap::new();
+        configured.insert("x-session-id", "session-7".parse().unwrap());
+        let configured_policies = PolicyRegistry::with_override(
+            PolicyConfig::ConsistentHashing,
+            RoutingKeyOverrideConfig {
+                headers: vec!["x-session-id".to_string()],
+                ..Default::default()
+            },
+        );
+        let cases = [
+            (
+                PolicyRegistry::new(PolicyConfig::ConsistentHashing),
+                with_headers(&routing_key),
+            ),
+            (configured_policies, with_headers(&configured)),
+            (
+                PolicyRegistry::new(PolicyConfig::ConsistentHashing),
+                PlacementInputs {
+                    rid_key: Some("session-7"),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (policies, inputs) in cases {
+            let (registry, owner) = a_keyed_owner(&policies, inputs);
+            registry.set_worker_overloaded(&owner, true);
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let selected =
+                metrics::with_local_recorder(&recorder, || pick(&registry, &policies, inputs));
+            assert_eq!(selected.url(), owner.url(), "the veto moved the session");
+            assert!(!handle
+                .render()
+                .contains("smg_worker_overload_fallback_total"));
+            let unkeyed = pick(&registry, &policies, PlacementInputs::default());
+            assert_ne!(
+                unkeyed.url(),
+                owner.url(),
+                "an unkeyed request reached the owner"
+            );
+            registry.set_overload_shed(true);
+            assert_ne!(pick(&registry, &policies, inputs).url(), owner.url());
+        }
+    }
+
+    /// Every worker over the thresholds, the owner the busier: the session
+    /// stays on its owner instead of going to the least-loaded worker, and
+    /// the placement counts as the overload fallback it replaces.
+    #[test]
+    fn a_pool_all_over_the_thresholds_keeps_a_routing_key_on_its_owner() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let headers = keyed_headers();
+        let inputs = with_headers(&headers);
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        let (registry, owner) = a_keyed_owner(&policies, inputs);
+        owner.increment_load();
+        for worker in registry.get_all() {
+            registry.set_worker_overloaded(&worker, true);
+        }
+        let selected =
+            metrics::with_local_recorder(&recorder, || pick(&registry, &policies, inputs));
+        assert_eq!(selected.url(), owner.url(), "the session went by load");
+        assert_one_overload_fallback(&handle.render());
+    }
+
+    fn assert_one_overload_fallback(rendered: &str) {
+        assert!(
+            rendered.lines().any(|line| {
+                line.starts_with("smg_worker_overload_fallback_total{")
+                    && line.contains("stage=\"selection\"")
+                    && line.ends_with(" 1")
+            }),
+            "the placement is not counted as the overload fallback:\n{rendered}"
+        );
+    }
+
+    /// No worker is fully available, but one is only over the thresholds,
+    /// beside one that is not ready: a keyed request takes it, whether it is
+    /// the owner or the owner's ring successor, and counts as the overload
+    /// fallback.
+    #[test]
+    fn a_keyed_request_takes_a_worker_only_over_the_thresholds() {
+        let headers = keyed_headers();
+        let inputs = with_headers(&headers);
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        for owner_over_the_thresholds in [true, false] {
+            let (registry, owner) = a_keyed_owner(&policies, inputs);
+            let other = registry
+                .get_all()
+                .into_iter()
+                .find(|worker| worker.url() != owner.url())
+                .expect("a second worker");
+            let (over, not_ready) = if owner_over_the_thresholds {
+                (&owner, &other)
+            } else {
+                (&other, &owner)
+            };
+            registry.set_worker_overloaded(over, true);
+            not_ready.set_status(WorkerStatus::NotReady);
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let selected =
+                metrics::with_local_recorder(&recorder, || pick(&registry, &policies, inputs));
+            assert_eq!(selected.url(), over.url());
+            assert_one_overload_fallback(&handle.render());
+        }
+    }
+
+    /// Only the overload veto is lifted: an owner over the thresholds that is
+    /// also not ready, behind an open circuit breaker, or stalled loses the
+    /// session.
+    #[test]
+    fn a_session_key_still_leaves_an_owner_vetoed_for_another_reason() {
+        let headers = keyed_headers();
+        let inputs = with_headers(&headers);
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        for veto in ["not ready", "circuit open", "stalled"] {
+            let (registry, owner) = a_keyed_owner(&policies, inputs);
+            registry.set_worker_overloaded(&owner, true);
+            match veto {
+                "not ready" => owner.set_status(WorkerStatus::NotReady),
+                "circuit open" => {
+                    for _ in 0..5 {
+                        owner.record_circuit_breaker_outcome(false);
+                    }
+                    assert!(!owner.circuit_breaker_can_execute());
+                }
+                _ => {
+                    owner.set_stall(Some(StallReason::Wedged));
+                }
+            }
+            assert_ne!(
+                pick(&registry, &policies, inputs).url(),
+                owner.url(),
+                "{veto}"
+            );
+        }
+    }
+
+    /// A keyed retry leaves the owner it was tried on for the next worker
+    /// even when that worker is over the thresholds, instead of replaying on
+    /// the owner.
+    #[test]
+    fn a_keyed_retry_moves_to_a_worker_over_the_thresholds() {
+        let headers = keyed_headers();
+        let inputs = with_headers(&headers);
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        let (registry, owner) = a_keyed_owner(&policies, inputs);
+        for worker in registry.get_all() {
+            if worker.url() != owner.url() {
+                registry.set_worker_overloaded(&worker, true);
+            }
+        }
+        let tried = vec![owner.base_url().to_string()];
+        let retry = PlacementInputs {
+            tried: &tried,
+            ..inputs
+        };
+        assert_ne!(pick(&registry, &policies, retry).url(), owner.url());
+    }
+
+    /// The lift is for regular workers: a keyed placement over a prefill pool
+    /// (the HTTP PD router's token count) keeps the overload veto.
+    #[test]
+    fn a_session_key_over_a_prefill_pool_keeps_the_overload_veto() {
+        let registry = registry_of(&[
+            (
+                "http://p:1",
+                WorkerType::Prefill,
+                ConnectionMode::Http,
+                RuntimeType::Sglang,
+            ),
+            (
+                "http://p:2",
+                WorkerType::Prefill,
+                ConnectionMode::Http,
+                RuntimeType::Sglang,
+            ),
+        ]);
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        let headers = keyed_headers();
+        let inputs = with_headers(&headers);
+        let place = || {
+            select_single(
+                &registry,
+                &policies,
+                MODEL,
+                RoutingPool::HttpPrefill,
+                None,
+                inputs,
+            )
+            .expect("a prefill worker")
+        };
+        let owner = place();
+        registry.set_worker_overloaded(&owner, true);
+        assert_ne!(place().url(), owner.url());
     }
 }

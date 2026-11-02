@@ -39,7 +39,7 @@ After posting all inline comments, write a brief summary with a count per severi
 
 ## Domain knowledge
 
-- Config changes are the #1 source of bugs — they touch CLI args, types.rs, main.rs (two conversion paths), Python bindings, and Go SDK
+- Config changes are the #1 source of bugs — they touch CLI args (main.rs), types.rs, cli/configure.rs (the two conversion paths), Python bindings, and Go SDK
 - The gRPC pipeline has 10 constructors in pipeline.rs — changes to shared stages must work for all of them
 - HTTP and gRPC routers are two separate code paths that must handle the same API contract
 - PD disaggregation adds dual-dispatch complexity on top of regular routing

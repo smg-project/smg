@@ -10,10 +10,12 @@
 use std::sync::Arc;
 
 use openai_protocol::{
-    chat::{ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent},
+    chat::{
+        ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, MessageContent,
+    },
     common::{
         ContentPart, FunctionCallResponse, ImageUrl, JsonSchemaFormat, ResponseFormat, Tool,
-        ToolCall, ToolChoice, ToolChoiceValue, UsageInfo,
+        ToolCall, ToolChoice, ToolChoiceValue, Usage, UsageInfo,
     },
     profile::ProviderProfile,
     responses::{
@@ -648,122 +650,15 @@ pub(crate) fn chat_to_responses(
         .first()
         .ok_or_else(|| "Chat response contains no choices".to_string())?;
 
-    // Convert assistant message to output items. Reasoning comes first (OpenAI
+    // The assistant message as output items. Reasoning comes first (OpenAI
     // order), so items replayed in emitted order rebuild the same turn.
     let mut output: Vec<ResponseOutputItem> = Vec::new();
+    output.extend(reasoning_output_item(choice, &chat_resp.id, original_req));
+    output.extend(message_output_item(choice, &chat_resp.id));
+    push_tool_call_output_items(&mut output, choice, original_req);
 
-    if let Some(reasoning) = &choice.message.reasoning_content {
-        if !reasoning.is_empty() {
-            let id = format!("reasoning_{}", chat_resp.id);
-            let content = vec![ReasoningText {
-                text: reasoning.clone(),
-            }];
-            let status = Some("completed".to_string());
-            let include_encrypted = original_req
-                .include
-                .as_deref()
-                .is_some_and(|f| f.contains(&IncludeField::ReasoningEncryptedContent));
-            output.push(if include_encrypted {
-                ResponseOutputItem::new_reasoning_encrypted(
-                    id,
-                    vec![],
-                    content,
-                    encode_reasoning_content(reasoning),
-                    status,
-                )
-            } else {
-                ResponseOutputItem::new_reasoning(id, vec![], content, status)
-            });
-        }
-    }
-
-    // Convert message content to output item
-    if let Some(content) = &choice.message.content {
-        if !content.is_empty() {
-            output.push(ResponseOutputItem::Message {
-                id: format!("msg_{}", chat_resp.id),
-                role: "assistant".to_string(),
-                content: vec![ResponseContentPart::OutputText {
-                    text: content.clone(),
-                    annotations: vec![],
-                    logprobs: choice.logprobs.clone(),
-                }],
-                status: if matches!(choice.finish_reason.as_deref(), Some("failed" | "error")) {
-                    "in_progress"
-                } else {
-                    "completed"
-                }
-                .to_string(),
-                phase: None,
-            });
-        }
-    }
-
-    // Convert tool calls if present. Calls to downgraded custom tools map back
-    // to `custom_tool_call` items.
-    let custom_names = custom_tool_names(original_req.tools.as_deref());
-    if let Some(tool_calls) = &choice.message.tool_calls {
-        for tool_call in tool_calls {
-            let (name, namespace) =
-                resolve_function_identity(original_req.tools.as_deref(), &tool_call.function.name);
-            if custom_names.contains(&tool_call.function.name) {
-                output.push(ResponseOutputItem::CustomToolCall {
-                    call_id: tool_call.id.clone(),
-                    input: custom_tool_input(
-                        tool_call.function.arguments.as_deref().unwrap_or_default(),
-                    ),
-                    name,
-                    id: Some(tool_call.id.clone()),
-                    namespace,
-                });
-                continue;
-            }
-            output.push(ResponseOutputItem::FunctionToolCall {
-                id: Some(tool_call.id.clone()),
-                call_id: tool_call.id.clone(),
-                name,
-                namespace,
-                arguments: tool_call.function.arguments.clone().unwrap_or_default(),
-                output: None, // Tool execution belongs to the next turn.
-                status: function_call_status(
-                    choice.finish_reason.as_deref(),
-                    tool_call.function.arguments.as_deref().unwrap_or_default(),
-                )
-                .to_string(),
-            });
-        }
-    }
-
-    // Determine response status based on finish_reason. "length" is a
-    // max_output_tokens truncation, which the Responses contract reports as
-    // status=incomplete with incomplete_details.
-    let (status, incomplete_details) = match choice.finish_reason.as_deref() {
-        Some("stop") => (ResponseStatus::Completed, None),
-        Some("length") => (
-            ResponseStatus::Incomplete,
-            Some(IncompleteDetails {
-                reason: IncompleteReason::MaxOutputTokens,
-            }),
-        ),
-        Some("tool_calls") => (ResponseStatus::Completed, None),
-        Some("failed") | Some("error") => (ResponseStatus::Failed, None),
-        _ => (ResponseStatus::Completed, None), // Default to completed
-    };
-
-    // Convert usage from Usage to UsageInfo, then wrap in ResponsesUsage
-    let usage = chat_resp.usage.as_ref().map(|u| {
-        let usage_info = UsageInfo {
-            prompt_tokens: u.prompt_tokens,
-            completion_tokens: u.completion_tokens,
-            total_tokens: u.total_tokens,
-            reasoning_tokens: u
-                .completion_tokens_details
-                .as_ref()
-                .and_then(|d| d.reasoning_tokens),
-            prompt_tokens_details: u.prompt_tokens_details.clone(),
-        };
-        ResponsesUsage::Modern(usage_info.to_response_usage())
-    });
+    let (status, incomplete_details) = finish_reason_status(choice.finish_reason.as_deref());
+    let usage = chat_resp.usage.as_ref().map(responses_usage);
 
     // Generate response
     let response_id = response_id_override.unwrap_or_else(|| chat_resp.id.clone());
@@ -783,12 +678,149 @@ pub(crate) fn chat_to_responses(
     Ok(builder.build())
 }
 
+/// The assistant's reasoning as the turn's first output item, when it
+/// reasoned: with the opaque encrypted copy when the request asked for it.
+fn reasoning_output_item(
+    choice: &ChatChoice,
+    chat_id: &str,
+    original_req: &ResponsesRequest,
+) -> Option<ResponseOutputItem> {
+    let reasoning = choice.message.reasoning_content.as_ref()?;
+    if reasoning.is_empty() {
+        return None;
+    }
+    let id = format!("reasoning_{chat_id}");
+    let content = vec![ReasoningText {
+        text: reasoning.clone(),
+    }];
+    let status = Some("completed".to_string());
+    let include_encrypted = original_req
+        .include
+        .as_deref()
+        .is_some_and(|f| f.contains(&IncludeField::ReasoningEncryptedContent));
+    Some(if include_encrypted {
+        ResponseOutputItem::new_reasoning_encrypted(
+            id,
+            vec![],
+            content,
+            encode_reasoning_content(reasoning),
+            status,
+        )
+    } else {
+        ResponseOutputItem::new_reasoning(id, vec![], content, status)
+    })
+}
+
+/// The assistant's text as a message item, when it said any; a generation
+/// that failed leaves the message in progress.
+fn message_output_item(choice: &ChatChoice, chat_id: &str) -> Option<ResponseOutputItem> {
+    let content = choice.message.content.as_ref()?;
+    if content.is_empty() {
+        return None;
+    }
+    Some(ResponseOutputItem::Message {
+        id: format!("msg_{chat_id}"),
+        role: "assistant".to_string(),
+        content: vec![ResponseContentPart::OutputText {
+            text: content.clone(),
+            annotations: vec![],
+            logprobs: choice.logprobs.clone(),
+        }],
+        status: if matches!(choice.finish_reason.as_deref(), Some("failed" | "error")) {
+            "in_progress"
+        } else {
+            "completed"
+        }
+        .to_string(),
+        phase: None,
+    })
+}
+
+/// The assistant's tool calls as output items, in their order; a call to a
+/// downgraded custom tool maps back to a `custom_tool_call` item.
+fn push_tool_call_output_items(
+    output: &mut Vec<ResponseOutputItem>,
+    choice: &ChatChoice,
+    original_req: &ResponsesRequest,
+) {
+    let custom_names = custom_tool_names(original_req.tools.as_deref());
+    let Some(tool_calls) = &choice.message.tool_calls else {
+        return;
+    };
+    for tool_call in tool_calls {
+        let (name, namespace) =
+            resolve_function_identity(original_req.tools.as_deref(), &tool_call.function.name);
+        if custom_names.contains(&tool_call.function.name) {
+            output.push(ResponseOutputItem::CustomToolCall {
+                call_id: tool_call.id.clone(),
+                input: custom_tool_input(
+                    tool_call.function.arguments.as_deref().unwrap_or_default(),
+                ),
+                name,
+                id: Some(tool_call.id.clone()),
+                namespace,
+            });
+            continue;
+        }
+        output.push(ResponseOutputItem::FunctionToolCall {
+            id: Some(tool_call.id.clone()),
+            call_id: tool_call.id.clone(),
+            name,
+            namespace,
+            arguments: tool_call.function.arguments.clone().unwrap_or_default(),
+            output: None, // Tool execution belongs to the next turn.
+            status: function_call_status(
+                choice.finish_reason.as_deref(),
+                tool_call.function.arguments.as_deref().unwrap_or_default(),
+            )
+            .to_string(),
+        });
+    }
+}
+
+/// The response status for a chat finish reason alone: "length" is a
+/// max_output_tokens truncation, which the Responses contract reports as
+/// status=incomplete with incomplete_details. Unlike the streaming path's
+/// `utils::response_status`, this read has no `cut_call` arm: a turn whose
+/// last call was cut by anything but the token limit reads completed here
+/// and incomplete there, as the non-streaming conversion has always read
+/// it; closing that gap is a behaviour change of its own.
+fn finish_reason_status(
+    finish_reason: Option<&str>,
+) -> (ResponseStatus, Option<IncompleteDetails>) {
+    match finish_reason {
+        Some("stop") => (ResponseStatus::Completed, None),
+        Some("length") => (
+            ResponseStatus::Incomplete,
+            Some(IncompleteDetails {
+                reason: IncompleteReason::MaxOutputTokens,
+            }),
+        ),
+        Some("tool_calls") => (ResponseStatus::Completed, None),
+        Some("failed") | Some("error") => (ResponseStatus::Failed, None),
+        _ => (ResponseStatus::Completed, None), // Default to completed
+    }
+}
+
+/// The chat usage as the Responses API reports it.
+fn responses_usage(usage: &Usage) -> ResponsesUsage {
+    let usage_info = UsageInfo {
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        total_tokens: usage.total_tokens,
+        reasoning_tokens: usage
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|d| d.reasoning_tokens),
+        prompt_tokens_details: usage.prompt_tokens_details.clone(),
+    };
+    ResponsesUsage::Modern(usage_info.to_response_usage())
+}
+
 #[cfg(test)]
 mod tests {
     use openai_protocol::{
-        chat::{ChatChoice, ChatCompletionMessage},
-        common::{StreamOptions, Usage},
-        responses::ReasoningEffort,
+        chat::ChatCompletionMessage, common::StreamOptions, responses::ReasoningEffort,
     };
 
     use super::*;
@@ -904,6 +936,45 @@ mod tests {
         assert_eq!(
             body["usage"]["output_tokens_details"],
             serde_json::json!({"reasoning_tokens": 0})
+        );
+    }
+
+    /// The assistant's reasoning is the turn's first output item, ahead of
+    /// its message, and carries the opaque encrypted copy only when the
+    /// request asked for it.
+    #[test]
+    fn a_reasoning_turn_leads_the_output_and_carries_its_encrypted_copy_only_when_asked() {
+        let chat: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
+            "id":"chat_test","object":"chat.completion","created":0,"model":"test-model",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"done",
+                "reasoning_content":"because"},"finish_reason":"stop"}]
+        }))
+        .unwrap();
+
+        let plain = serde_json::to_value(
+            chat_to_responses(&chat, &ResponsesRequest::default(), None).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(plain["output"][0]["type"], "reasoning");
+        assert_eq!(plain["output"][0]["id"], "reasoning_chat_test");
+        assert_eq!(plain["output"][0]["content"][0]["text"], "because");
+        assert!(
+            plain["output"][0]["encrypted_content"].is_null(),
+            "the encrypted copy comes only when asked for"
+        );
+        assert_eq!(plain["output"][1]["type"], "message");
+        assert_eq!(plain["output"][1]["content"][0]["text"], "done");
+
+        let asking = ResponsesRequest {
+            include: Some(vec![IncludeField::ReasoningEncryptedContent]),
+            ..Default::default()
+        };
+        let encrypted =
+            serde_json::to_value(chat_to_responses(&chat, &asking, None).unwrap()).unwrap();
+        assert_eq!(encrypted["output"][0]["content"][0]["text"], "because");
+        assert!(
+            encrypted["output"][0]["encrypted_content"].is_string(),
+            "the request asked for the encrypted copy"
         );
     }
 
