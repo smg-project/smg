@@ -161,8 +161,20 @@ case "$ARM" in
     [ -n "$SMG_REASONING_PARSER" ] && smg_cmd+=(--reasoning-parser "$SMG_REASONING_PARSER")
     start arm_b_gateway "$RUN_DIR/arm_b_gateway.log" "${smg_cmd[@]}"
     log_tail=$(stream_log "$RUN_DIR/arm_b_gateway.log")
-    wait_http "http://127.0.0.1:$ARM_B_GW_PORT/health" "${BFCL_STARTUP_TIMEOUT:-420}"
+    # /health is process liveness, including while workers/tokenizers are not
+    # ready. Require this model's readiness before handing BFCL the base URL.
+    # Retain bounded state through inference too: startup success cannot explain
+    # a worker that becomes unavailable several minutes into the full suite.
+    probe="$(dirname "${BASH_SOURCE[0]}")/arm_probe.py"
+    python3 "$probe" --base-url "http://127.0.0.1:$ARM_B_GW_PORT" \
+      --model "$MODEL" --run-dir "$RUN_DIR" \
+      --wait-ready "${BFCL_STARTUP_TIMEOUT:-420}"
     kill "$log_tail" 2>/dev/null || true
+    start arm_b_probe "$RUN_DIR/arm_b_probe.log" python3 "$probe" \
+      --base-url "http://127.0.0.1:$ARM_B_GW_PORT" --model "$MODEL" \
+      --run-dir "$RUN_DIR" --duration "${RUN_TIMEOUT:-14400}" \
+      --metrics-url "http://127.0.0.1:$ARM_B_METRICS_PORT" \
+      --worker-port "$ARM_B_GRPC_PORT"
     echo "http://127.0.0.1:$ARM_B_GW_PORT"
     ;;
 

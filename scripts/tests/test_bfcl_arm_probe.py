@@ -1,0 +1,246 @@
+import contextlib
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import pytest
+
+SOURCE = Path(__file__).resolve().parents[1] / "bfcl" / "arm_probe.py"
+SPEC = importlib.util.spec_from_file_location("bfcl_arm_probe", SOURCE)
+probe = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(probe)
+MODEL = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+
+
+@contextlib.contextmanager
+def server(responses):
+    calls = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            calls.append(self.path)
+            status, body, headers = responses.get(self.path, (404, b"missing", {}))
+            self.send_response(status)
+            for key, value in headers.items():
+                self.send_header(key, value)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    http = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=http.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{http.server_port}", calls
+    finally:
+        http.shutdown()
+        thread.join()
+        http.server_close()
+
+
+def response(data, status=200):
+    return status, json.dumps(data).encode(), {}
+
+
+def readiness(model=MODEL, healthy=1):
+    return {
+        "status": "ready",
+        "models": [
+            {
+                "model": model,
+                "ready": True,
+                "healthy_workers": healthy,
+                "total_workers": 1,
+                "unknown": "PRIVATE",
+            }
+        ],
+    }
+
+
+def test_a_live_gateway_needs_the_target_model_and_healthy_worker():
+    for data, status, expected in (
+        (readiness(), 200, True),
+        (readiness("another/model"), 200, False),
+        (readiness(healthy=0), 200, False),
+        (readiness(), 503, False),
+        ({"status": "ready", "healthy_workers": 4}, 200, False),
+    ):
+        with server({"/readiness": response(data, status)}) as (url, _):
+            actual = probe.selected_json(url, "/readiness", MODEL)
+            assert probe.ready(actual) is expected
+            assert "PRIVATE" not in json.dumps(actual)
+
+
+def test_unready_json_remains_observable_without_becoming_ready():
+    with server({"/readiness": response({"status": "not ready", "models": []}, 503)}) as (url, _):
+        actual = probe.selected_json(url, "/readiness", MODEL)
+    assert actual == {"http_status": 503, "ready": False, "models": []}
+
+
+def test_worker_observation_excludes_urls_keys_labels_prompts_and_other_models():
+    data = {
+        "workers": [
+            {
+                "model_id": MODEL,
+                "url": "grpc://user:PRIVATE@localhost:1234",
+                "api_key": "PRIVATE",
+                "labels": {"prompt": "PRIVATE"},
+                "status": "not_ready",
+                "is_healthy": False,
+                "load": 2,
+                "stalled": "wedged",
+                "engine_load": {"secret": "PRIVATE"},
+            },
+            {"model_id": "other/model", "load": 999},
+        ]
+    }
+    with server({"/workers": response(data)}) as (url, _):
+        actual = probe.selected_json(url, "/workers", MODEL)
+    assert actual == {
+        "http_status": 200,
+        "workers": [
+            {
+                "is_healthy": False,
+                "status": "not_ready",
+                "load": 2,
+                "stalled": "wedged",
+            }
+        ],
+    }
+    assert "PRIVATE" not in json.dumps(actual)
+
+
+def test_redirect_is_not_followed_and_error_body_is_not_retained():
+    with server(
+        {
+            "/readiness": (302, b"PRIVATE", {"Location": "/private"}),
+            "/private": response({"secret": "PRIVATE"}),
+        }
+    ) as (url, calls):
+        actual = probe.selected_json(url, "/readiness", MODEL)
+    assert calls == ["/readiness"]
+    assert actual == {"http_status": 302, "error": "invalid_json_schema"}
+
+
+@pytest.mark.parametrize("body", [b"not-json-PRIVATE", b"[]", b"x" * (probe.MAX_BYTES + 1)])
+def test_bad_or_oversize_answer_is_unknown_and_bounded(body):
+    with server({"/readiness": (200, body, {})}) as (url, _):
+        actual = probe.selected_json(url, "/readiness", MODEL)
+    assert actual.get("error") in ("invalid_json_schema", "oversize_response")
+    assert not probe.ready(actual)
+    assert "PRIVATE" not in json.dumps(actual)
+
+
+def test_routing_state_retains_only_this_worker_active_reason():
+    body = (
+        b'smg_worker_state{worker="grpc://127.0.0.1:1234",state="available",reason="none"} 0\n'
+        b'smg_worker_state{worker="grpc://127.0.0.1:1234",state="excluded",reason="circuit_open"} 1\n'
+        b'smg_worker_state{worker="grpc://PRIVATE@127.0.0.1:99",state="excluded",reason="failed"} 1\n'
+        b'some_secret{key="PRIVATE"} 1\n'
+    )
+    with server({"/metrics": (200, body, {})}) as (url, _):
+        actual = probe.routing_states(url, 1234)
+    assert actual == {
+        "http_status": 200,
+        "states": [{"state": "excluded", "reason": "circuit_open"}],
+    }
+    assert "PRIVATE" not in json.dumps(actual)
+
+
+def test_pid_birth_is_compared_and_zombie_does_not_imply_an_exit_code(tmp_path, monkeypatch):
+    (tmp_path / "arm_b_worker.pid").write_text(str(os.getpid()))
+    owned = probe.owned_processes(tmp_path)
+    assert probe.current_processes(owned)["arm_b_worker"]["same_process_present"]
+    original = owned["arm_b_worker"]
+    monkeypatch.setattr(probe, "pid_identity", lambda pid: {**original, "state": "Z"})
+    row = probe.current_processes(owned)["arm_b_worker"]
+    assert row["state"] == "Z" and "exit_code" not in row
+    monkeypatch.setattr(
+        probe,
+        "pid_identity",
+        lambda pid: {
+            **original,
+            "start_ticks": original["start_ticks"] + 1,
+        },
+    )
+    assert not probe.current_processes(owned)["arm_b_worker"]["same_process_present"]
+    monkeypatch.setattr(probe, "pid_identity", lambda pid: None)
+    assert not probe.current_processes(owned)["arm_b_worker"]["same_process_present"]
+
+
+def test_monitor_cli_writes_bounded_snapshots_without_generation(tmp_path):
+    with server(
+        {
+            "/readiness": response(readiness()),
+            "/workers": response({"workers": []}),
+        }
+    ) as (url, calls):
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SOURCE),
+                "--base-url",
+                url,
+                "--model",
+                MODEL,
+                "--run-dir",
+                str(tmp_path),
+                "--duration",
+                "0.01",
+            ],
+            capture_output=True,
+            timeout=5,
+        )
+    rows = [json.loads(line) for line in (tmp_path / "arm_b_state.log").read_text().splitlines()]
+    assert result.returncode == 0, result.stderr
+    assert 1 <= len(rows) <= 2
+    assert set(calls) == {"/readiness", "/workers"}
+    assert all(probe.ready(row["readiness"]) for row in rows)
+
+
+def test_wait_cli_timeout_does_not_accept_process_liveness(tmp_path):
+    with server({"/readiness": response({"status": "ready", "healthy_workers": 2})}) as (
+        url,
+        calls,
+    ):
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SOURCE),
+                "--base-url",
+                url,
+                "--model",
+                MODEL,
+                "--run-dir",
+                str(tmp_path),
+                "--wait-ready",
+                "0.01",
+            ],
+            capture_output=True,
+            timeout=5,
+        )
+    assert result.returncode == 1
+    assert set(calls) == {"/readiness"}
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://example.com:80",
+        "http://user:PRIVATE@127.0.0.1:80",
+        "http://127.0.0.1:80/private",
+        "http://127.0.0.1:80?key=PRIVATE",
+        "https://127.0.0.1:80",
+        "http://127.0.0.1",
+    ],
+)
+def test_probe_rejects_remote_or_authenticated_targets(url):
+    with pytest.raises(ValueError):
+        probe.loopback_url(url)
