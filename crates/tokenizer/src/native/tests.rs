@@ -18,7 +18,10 @@ use tokenizers::{
     AddedToken, SplitDelimiterBehavior, Tokenizer as HfTokenizer,
 };
 
-use super::{short_pieces::ShortPieceKey, *};
+use super::{
+    short_pieces::{ShortPieceKey, MIN_SLOTS},
+    *,
+};
 use crate::{
     encode_path::{encode_fallbacks, EncodeFallbacks, EncodePath},
     huggingface::HuggingFaceTokenizer,
@@ -1278,6 +1281,70 @@ fn piece_caches_stay_within_their_bound_across_threads() {
         caches.iter().sum::<usize>() <= PIECE_CACHE_TOTAL_CAPACITY,
         "{caches:?}"
     );
+    // Every thread joined before any table grew, so none has more slots
+    // than its share takes.
+    let slots: Vec<usize> = native
+        .piece_cache
+        .iter_mut()
+        .map(|cache| {
+            cache
+                .get_mut()
+                .packed
+                .as_ref()
+                .map_or(0, ShortPieceTable::slots)
+        })
+        .collect();
+    assert!(
+        slots
+            .iter()
+            .all(|&slots| slots <= ShortPieceTable::slots_for(share)),
+        "share {share}, slots {slots:?}"
+    );
+}
+
+/// A thread's packed table starts with the fewest slots, grows with the
+/// distinct pieces the thread meets up to its share, and is made anew for a
+/// smaller share (threads joined since it grew) when it is cleared.
+#[test]
+fn a_threads_packed_table_grows_with_use_and_follows_a_fallen_share() {
+    let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+    let shape = &shapes()[0];
+    let tokenizer = tokenizer_of(shape, &mut state);
+    let mut native = seeded(&tokenizer);
+    let model = tokenizer.get_model();
+    let packed = |native: &mut NativeEncoder| -> (usize, usize) {
+        let caches: Vec<(usize, usize)> = native
+            .piece_cache
+            .iter_mut()
+            .filter_map(|cache| cache.get_mut().packed.as_ref())
+            .map(|packed| (packed.slots(), packed.len()))
+            .collect();
+        assert_eq!(caches.len(), 1, "{caches:?}");
+        caches[0]
+    };
+    let short = native.encode(model, "a few words").expect("ids");
+    let (slots, len) = packed(&mut native);
+    assert_eq!(slots, MIN_SLOTS, "a short prompt grows nothing");
+    assert!(len <= 4, "{len}");
+    // More distinct pieces than the fill bound of every table short of the
+    // full share's, fewer than the share: the table grows to its full size.
+    let text: String = (0..15_000).map(|i| format!(" {}", word(i))).collect();
+    native.encode_with(model, &text, false).expect("ids");
+    let (slots, len) = packed(&mut native);
+    assert_eq!(slots, ShortPieceTable::slots_for(PIECE_CACHE_CAPACITY));
+    assert!(len >= 15_000, "{len}");
+    // Threads join (the share falls to a quarter of the entries held): the
+    // clear at the next piece makes the table anew for the new share, and
+    // the thread's pieces are answered as before.
+    native.threads.store(64, Ordering::Relaxed);
+    let share = native.piece_cache_share();
+    assert!(share < len, "{share} < {len}");
+    let more: String = (15_000..20_000).map(|i| format!(" {}", word(i))).collect();
+    native.encode_with(model, &more, false).expect("ids");
+    let (slots, len) = packed(&mut native);
+    assert_eq!(slots, ShortPieceTable::slots_for(share));
+    assert!(len <= share, "{len} <= {share}");
+    assert_eq!(native.encode(model, "a few words"), Ok(short));
 }
 
 /// `len` letters, distinct for distinct `i`: one piece of `len` bytes

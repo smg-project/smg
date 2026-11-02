@@ -87,9 +87,14 @@ const LONG_PIECE_MAX_BYTES: usize = 256;
 const PIECE_CACHE_CAPACITY: usize = 16_384;
 /// Entries all threads together hold for one encoder: a thread's own cap is
 /// this divided by the number of threads that have encoded with the encoder
-/// (and never more than `PIECE_CACHE_CAPACITY`), so the piece caches of one
-/// tokenizer stay under about 40 MB however many runtime and blocking threads
-/// encode with it, and they are freed with the encoder.
+/// (and never more than `PIECE_CACHE_CAPACITY`). A thread's packed table
+/// starts at 64 slots (2 KiB) and doubles as the thread meets pieces, up to
+/// the slots for its cap (33 bytes a slot: 1 MiB at the full cap), and is
+/// made anew for a smaller cap when it is cleared, so a thread that encodes
+/// little holds little and the packed tables of one tokenizer stay under
+/// about 24 MiB however many runtime and blocking threads encode with it
+/// (the maps of the longer pieces share the count); they are freed with the
+/// encoder.
 const PIECE_CACHE_TOTAL_CAPACITY: usize = 262_144;
 /// Bytes of long pieces (each piece, its ids and their slot) a thread holds
 /// for one encoder before its long entries are cleared, at most; see
@@ -149,8 +154,8 @@ impl SeededIds {
 #[derive(Default)]
 struct PieceCache {
     /// Pieces of up to `SHORT_PIECE_MAX_BYTES`, packed; made at the first
-    /// such piece and sized for the thread's share then. Bounded by count
-    /// together with `short`.
+    /// such piece with the fewest slots and grown with the pieces the thread
+    /// meets, up to its share. Bounded by count together with `short`.
     packed: Option<ShortPieceTable>,
     /// Pieces of more than `SHORT_PIECE_MAX_BYTES`, up to
     /// `CACHED_PIECE_MAX_BYTES`, bounded by their count together with
@@ -168,10 +173,11 @@ impl PieceCache {
         self.packed.as_ref().map_or(0, ShortPieceTable::len) + self.short.len()
     }
 
-    /// Forgets the tiers bounded by count.
-    fn clear_short(&mut self) {
+    /// Forgets the tiers bounded by count; the packed table keeps its slots
+    /// unless `share` fell below them.
+    fn clear_short(&mut self, share: usize) {
         if let Some(packed) = &mut self.packed {
-            packed.clear();
+            packed.clear(share);
         }
         self.short.clear();
     }
@@ -517,7 +523,7 @@ impl NativeEncoder {
             .collect();
         let mut table = ShortPieceTable::for_entries(seeded.len());
         for (key, ids) in &seeded {
-            table.insert(*key, ids.as_slice());
+            table.insert(*key, ids.as_slice(), seeded.len());
         }
         tracing::debug!(
             entries = table.len(),
@@ -907,16 +913,17 @@ impl NativeEncoder {
             let share = self.piece_cache_share();
             let mut pieces = cache.borrow_mut();
             if pieces.short_entries() >= share {
-                pieces.clear_short();
+                pieces.clear_short(share);
             }
             pieces
                 .packed
-                .get_or_insert_with(|| ShortPieceTable::for_entries(share))
-                .insert(key, &ids[start..]);
+                .get_or_insert_with(ShortPieceTable::new)
+                .insert(key, &ids[start..], share);
         } else if bytes.len() <= CACHED_PIECE_MAX_BYTES {
+            let share = self.piece_cache_share();
             let mut pieces = cache.borrow_mut();
-            if pieces.short_entries() >= self.piece_cache_share() {
-                pieces.clear_short();
+            if pieces.short_entries() >= share {
+                pieces.clear_short(share);
             }
             pieces.short.insert(bytes.into(), ids[start..].into());
         } else if cacheable {

@@ -14,7 +14,9 @@
 //! line of tags where the entries would be a line each, and a clear is a
 //! memset of the tags alone. The encoder builds one table at load from the
 //! vocabulary, read by a thread for a piece it has not met; each thread keeps
-//! the pieces it met in a table of its own (see `native`).
+//! the pieces it met in a table of its own (see `native`), which starts at
+//! [`MIN_SLOTS`] and doubles as the thread meets pieces, up to the slots for
+//! the thread's share, so a thread that encodes little holds little.
 
 /// Longest piece the table keys: its bytes and length fit a `u128`.
 pub(super) const SHORT_PIECE_MAX_BYTES: usize = 15;
@@ -30,8 +32,9 @@ const KEY_MASK: u128 = (1u128 << COUNT_SHIFT) - 1;
 /// Most ids an entry stands for: the count has four bits, and a piece of
 /// `n` bytes has at most `n` ids on a byte-level vocabulary.
 const MAX_IDS: usize = 15;
-/// Fewest slots a table has, whatever it was sized for.
-const MIN_SLOTS: usize = 64;
+/// Fewest slots a table has, whatever it was sized for; a thread's table
+/// starts here and grows.
+pub(super) const MIN_SLOTS: usize = 64;
 /// The tag of an empty slot; a stored slot's tag has its high bit set.
 const EMPTY_TAG: u8 = 0;
 /// The two halves of a key are salted before they are multiplied, so a
@@ -118,10 +121,25 @@ pub(super) struct ShortPieceTable {
 }
 
 impl ShortPieceTable {
+    /// A table of [`MIN_SLOTS`] slots: what a thread starts with and grows
+    /// (see [`Self::insert`]).
+    pub(super) fn new() -> Self {
+        Self::with_slots(MIN_SLOTS)
+    }
+
     /// A table for about `entries` pieces: the slots that hold them under the
     /// fill bound.
     pub(super) fn for_entries(entries: usize) -> Self {
-        let slots = (entries * 4 / 3 + 1).next_power_of_two().max(MIN_SLOTS);
+        Self::with_slots(Self::slots_for(entries))
+    }
+
+    /// The slots a table for about `entries` pieces has: a power of two that
+    /// holds them under the fill bound, [`MIN_SLOTS`] at least.
+    pub(super) fn slots_for(entries: usize) -> usize {
+        (entries * 4 / 3 + 1).next_power_of_two().max(MIN_SLOTS)
+    }
+
+    fn with_slots(slots: usize) -> Self {
         Self {
             tags: vec![EMPTY_TAG; slots],
             entries: vec![Entry::EMPTY; slots],
@@ -187,13 +205,22 @@ impl ShortPieceTable {
         }
     }
 
-    /// Stores `ids` as the piece's encoding and answers true; false when the
-    /// table is at its fill bound or the ids are not 1..=15 in number, and
+    /// Stores `ids` as the piece's encoding and answers true. A table at its
+    /// fill bound with fewer slots than `bound` entries take doubles its
+    /// slots first (every stored entry placed again; the spill stays), so a
+    /// table starts small and grows with use, up to the slots for `bound`;
+    /// there it refuses, as it does ids that are not 1..=15 in number, and
     /// the piece is merged again on every encode. A piece already stored
     /// keeps its ids (they are the model's for that piece either way).
-    pub(super) fn insert(&mut self, key: ShortPieceKey, ids: &[u32]) -> bool {
-        if self.len >= self.fill_bound() || ids.is_empty() || ids.len() > MAX_IDS {
+    pub(super) fn insert(&mut self, key: ShortPieceKey, ids: &[u32], bound: usize) -> bool {
+        if ids.is_empty() || ids.len() > MAX_IDS {
             return false;
+        }
+        if self.len >= self.fill_bound() {
+            if self.slots() >= Self::slots_for(bound) {
+                return false;
+            }
+            self.grow();
         }
         let (mut slot, tag) = self.first_slot(key);
         while self.tags[slot] != EMPTY_TAG {
@@ -218,9 +245,35 @@ impl ShortPieceTable {
         true
     }
 
-    /// Forgets every piece; the slots stay allocated. Only the tags are
-    /// cleared: an empty tag is an empty slot whatever its entry holds.
-    pub(super) fn clear(&mut self) {
+    /// Doubles the slots and places every stored entry again. A tag does not
+    /// depend on the slot count, so the tags move with their entries.
+    fn grow(&mut self) {
+        let slots = self.entries.len() * 2;
+        let tags = std::mem::replace(&mut self.tags, vec![EMPTY_TAG; slots]);
+        let entries = std::mem::replace(&mut self.entries, vec![Entry::EMPTY; slots]);
+        self.mask = slots - 1;
+        for (tag, entry) in tags.into_iter().zip(entries) {
+            if tag == EMPTY_TAG {
+                continue;
+            }
+            let (mut slot, _) = self.first_slot(ShortPieceKey(entry.key & KEY_MASK));
+            while self.tags[slot] != EMPTY_TAG {
+                slot = (slot + 1) & self.mask;
+            }
+            self.tags[slot] = tag;
+            self.entries[slot] = entry;
+        }
+    }
+
+    /// Forgets every piece. The slots stay allocated, only the tags are
+    /// cleared (an empty tag is an empty slot whatever its entry holds),
+    /// unless the table has more slots than `bound` entries take: then it is
+    /// made anew for `bound`, which fell since the table grew.
+    pub(super) fn clear(&mut self, bound: usize) {
+        if self.slots() > Self::slots_for(bound) {
+            *self = Self::for_entries(bound);
+            return;
+        }
         self.tags.fill(EMPTY_TAG);
         self.spill.clear();
         self.len = 0;
@@ -291,13 +344,13 @@ mod tests {
 
     #[test]
     fn a_table_starts_empty_and_answers_what_it_was_given() {
-        let mut table = ShortPieceTable::for_entries(0);
+        let mut table = ShortPieceTable::new();
         assert_eq!(table.len(), 0);
         assert_eq!(table.slots(), MIN_SLOTS);
         assert_eq!(ids_of(&table, b"a"), None);
-        assert!(table.insert(key(b"a"), &[7]));
-        assert!(table.insert(key(&[b'z'; 15]), &[1, 2]));
-        assert!(table.insert(key(&[0xFF; 15]), &[3, 4, 5, 6]));
+        assert!(table.insert(key(b"a"), &[7], 3));
+        assert!(table.insert(key(&[b'z'; 15]), &[1, 2], 3));
+        assert!(table.insert(key(&[0xFF; 15]), &[3, 4, 5, 6], 3));
         assert_eq!(table.len(), 3);
         assert_eq!(ids_of(&table, b"a"), Some(vec![7]));
         assert_eq!(ids_of(&table, &[b'z'; 15]), Some(vec![1, 2]));
@@ -311,9 +364,9 @@ mod tests {
     fn five_ids_and_more_spill_and_read_back_whole() {
         let mut table = ShortPieceTable::for_entries(4);
         let fifteen: Vec<u32> = (100..115).collect();
-        assert!(table.insert(key(&[0x80; 15]), &fifteen));
-        assert!(table.insert(key(b"abcde"), &[1, 2, 3, 4, 5]));
-        assert!(table.insert(key(b"abcd"), &[1, 2, 3, 4]));
+        assert!(table.insert(key(&[0x80; 15]), &fifteen, 4));
+        assert!(table.insert(key(b"abcde"), &[1, 2, 3, 4, 5], 4));
+        assert!(table.insert(key(b"abcd"), &[1, 2, 3, 4], 4));
         assert_eq!(ids_of(&table, &[0x80; 15]), Some(fifteen));
         assert_eq!(ids_of(&table, b"abcde"), Some(vec![1, 2, 3, 4, 5]));
         assert_eq!(ids_of(&table, b"abcd"), Some(vec![1, 2, 3, 4]));
@@ -323,7 +376,7 @@ mod tests {
     #[test]
     fn ids_are_appended_after_what_the_buffer_held() {
         let mut table = ShortPieceTable::for_entries(1);
-        table.insert(key(b"x"), &[9, 8]);
+        table.insert(key(b"x"), &[9, 8], 1);
         let mut out = vec![1];
         assert!(table.ids_into(key(b"x"), &mut out));
         assert_eq!(out, [1, 9, 8]);
@@ -332,22 +385,64 @@ mod tests {
     #[test]
     fn no_ids_or_too_many_are_refused() {
         let mut table = ShortPieceTable::for_entries(1);
-        assert!(!table.insert(key(b"x"), &[]));
-        assert!(!table.insert(key(b"y"), &[0; 16]));
-        assert!(table.insert(key(b"z"), &[0; 15]));
+        assert!(!table.insert(key(b"x"), &[], 1));
+        assert!(!table.insert(key(b"y"), &[0; 16], 1));
+        assert!(table.insert(key(b"z"), &[0; 15], 1));
         assert_eq!(table.len(), 1);
     }
 
+    /// A thread's table: the fewest slots at first, doubled at the fill
+    /// bound while `bound` entries take more slots, every piece kept across
+    /// the doublings (the spilled ones too), and at the slots for `bound` the
+    /// fill bound refuses and a probe still ends.
     #[test]
-    fn the_fill_bound_refuses_and_a_probe_still_ends() {
+    fn a_table_starts_small_doubles_with_use_and_refuses_at_its_bound() {
+        let mut table = ShortPieceTable::new();
+        let bound = 1000;
+        let fifteen: Vec<u32> = (100..115).collect();
+        assert!(table.insert(key(&[0x80; 15]), &fifteen, bound));
+        assert!(table.insert(key(b"abcde"), &[1, 2, 3, 4, 5], bound));
+        let mut sizes = vec![table.slots()];
+        let mut stored: usize = 2;
+        while table.insert(key(&stored.to_le_bytes()), &[stored as u32], bound) {
+            stored += 1;
+            if table.slots() != *sizes.last().expect("one size") {
+                sizes.push(table.slots());
+            }
+        }
+        assert_eq!(sizes, [64, 128, 256, 512, 1024, 2048]);
+        assert_eq!(table.slots(), ShortPieceTable::slots_for(bound));
+        assert_eq!(stored, table.fill_bound());
+        assert_eq!(table.len(), stored);
+        assert!(table.fill_bound() >= bound);
+        assert!(!table.insert(key(b"one more"), &[1], bound));
+        assert_eq!(ids_of(&table, b"one more"), None);
+        assert_eq!(ids_of(&table, &[0x80; 15]), Some(fifteen));
+        assert_eq!(ids_of(&table, b"abcde"), Some(vec![1, 2, 3, 4, 5]));
+        for i in 2..stored {
+            assert_eq!(
+                ids_of(&table, &i.to_le_bytes()),
+                Some(vec![i as u32]),
+                "{i}"
+            );
+        }
+        // A larger bound lets it grow again.
+        assert!(table.insert(key(b"one more"), &[1], bound * 2));
+        assert_eq!(table.slots(), 4096);
+        assert_eq!(ids_of(&table, b"one more"), Some(vec![1]));
+    }
+
+    #[test]
+    fn a_table_at_its_bound_from_the_start_refuses_at_the_fill_bound() {
         let mut table = ShortPieceTable::for_entries(0);
         let bound = table.fill_bound();
         assert!(bound < table.slots());
         for i in 0..bound {
-            assert!(table.insert(key(&i.to_le_bytes()), &[i as u32]), "{i}");
+            assert!(table.insert(key(&i.to_le_bytes()), &[i as u32], 0), "{i}");
         }
-        assert!(!table.insert(key(b"one more"), &[1]));
+        assert!(!table.insert(key(b"one more"), &[1], 0));
         assert_eq!(table.len(), bound);
+        assert_eq!(table.slots(), MIN_SLOTS);
         assert_eq!(ids_of(&table, b"one more"), None);
         for i in 0..bound {
             assert_eq!(ids_of(&table, &i.to_le_bytes()), Some(vec![i as u32]));
@@ -357,8 +452,8 @@ mod tests {
     #[test]
     fn a_stored_piece_keeps_its_ids_on_a_second_insert() {
         let mut table = ShortPieceTable::for_entries(2);
-        assert!(table.insert(key(b"x"), &[1]));
-        assert!(table.insert(key(b"x"), &[2]));
+        assert!(table.insert(key(b"x"), &[1], 2));
+        assert!(table.insert(key(b"x"), &[2], 2));
         assert_eq!(table.len(), 1);
         assert_eq!(ids_of(&table, b"x"), Some(vec![1]));
     }
@@ -366,14 +461,38 @@ mod tests {
     #[test]
     fn a_cleared_table_forgets_and_takes_pieces_again() {
         let mut table = ShortPieceTable::for_entries(8);
-        table.insert(key(b"a"), &[1]);
-        table.insert(key(b"abcdef"), &[1, 2, 3, 4, 5, 6]);
-        table.clear();
+        table.insert(key(b"a"), &[1], 8);
+        table.insert(key(b"abcdef"), &[1, 2, 3, 4, 5, 6], 8);
+        table.clear(8);
         assert_eq!(table.len(), 0);
+        assert_eq!(table.slots(), MIN_SLOTS);
         assert!(table.spill.is_empty());
         assert_eq!(ids_of(&table, b"a"), None);
         assert_eq!(ids_of(&table, b"abcdef"), None);
-        assert!(table.insert(key(b"a"), &[2]));
+        assert!(table.insert(key(b"a"), &[2], 8));
+        assert_eq!(ids_of(&table, b"a"), Some(vec![2]));
+    }
+
+    /// A table keeps its slots through a clear for a bound they fit, and is
+    /// made anew for a bound that fell below them.
+    #[test]
+    fn a_clear_for_a_smaller_bound_makes_the_table_anew() {
+        let mut table = ShortPieceTable::new();
+        for i in 0..1000u32 {
+            assert!(table.insert(key(&i.to_le_bytes()), &[i], 1000));
+        }
+        assert_eq!(table.slots(), 2048);
+        table.clear(1000);
+        assert_eq!(table.slots(), 2048);
+        assert_eq!(table.len(), 0);
+        table.clear(1536);
+        assert_eq!(table.slots(), 2048, "a bound the slots fit keeps them");
+        table.clear(100);
+        assert_eq!(table.slots(), ShortPieceTable::slots_for(100));
+        assert_eq!(table.len(), 0);
+        assert!(table.spill.is_empty());
+        assert_eq!(ids_of(&table, &7u32.to_le_bytes()), None);
+        assert!(table.insert(key(b"a"), &[2], 100));
         assert_eq!(ids_of(&table, b"a"), Some(vec![2]));
     }
 
@@ -420,12 +539,12 @@ mod tests {
         let mut table = ShortPieceTable::for_entries(150_000);
         let bound = table.fill_bound();
         for i in 0..bound / 2 {
-            assert!(table.insert(key(&word(i)), &[i as u32]));
+            assert!(table.insert(key(&word(i)), &[i as u32], 150_000));
         }
         let probes = table.mean_probes();
         assert!(probes < 1.6, "{probes} probes on average at three eighths");
         for i in bound / 2..bound {
-            assert!(table.insert(key(&word(i)), &[i as u32]));
+            assert!(table.insert(key(&word(i)), &[i as u32], 150_000));
         }
         let probes = table.mean_probes();
         assert!(probes < 3.0, "{probes} probes on average at the fill bound");
