@@ -120,7 +120,10 @@ impl Answer {
     ///
     /// Everything is optional but one of `output_ids` and `output_text`;
     /// `key` and `input_ids` file the answer under a prompt (a `--script`
-    /// line needs one of them, an enqueued answer may carry one).
+    /// line needs one of them, an enqueued answer may carry one). An empty
+    /// `output_text` without `output_ids` is an answer of no tokens: the
+    /// completion alone, as an engine answers a request it may not generate
+    /// for. Beside ids, an empty string is one whole-text piece like any other.
     pub fn parse(value: &Value) -> Result<Scripted, String> {
         let object = value.as_object().ok_or("an answer is a JSON object")?;
         let known = [
@@ -164,6 +167,12 @@ impl Answer {
         let output_ids = ids("output_ids")?.unwrap_or_default();
         let output_text = match object.get("output_text") {
             None | Some(Value::Null) => None,
+            // No tokens: nothing said and no ids to say it with. An empty
+            // string beside ids is the one whole-text piece it always was (a
+            // recorded answer of one special token decodes to "").
+            Some(Value::String(text)) if text.is_empty() && output_ids.is_empty() => {
+                Some(Vec::new())
+            }
             Some(Value::String(text)) => Some(vec![text.clone()]),
             Some(Value::Array(pieces)) => Some(
                 pieces
@@ -312,6 +321,41 @@ impl Answer {
             }
         }
         Ok(self)
+    }
+
+    /// The answer under the request's token limit, as an engine would end
+    /// it: cut after `max_new_tokens` tokens with the `length` finish and no
+    /// matched stop when it is longer, whole when it fits or when the request
+    /// names no limit. A token is an output id, or a text piece on an answer
+    /// without ids (the text wire's units): a whole text written as one
+    /// piece beside ids is kept as the ids say.
+    pub fn cut_to(mut self, max_new_tokens: Option<u32>) -> Self {
+        let Some(limit) = max_new_tokens else {
+            return self;
+        };
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        let units = if self.output_ids.is_empty() {
+            self.output_text.as_ref().map_or(0, Vec::len)
+        } else {
+            self.output_ids.len()
+        };
+        if units <= limit {
+            return self;
+        }
+        self.output_ids.truncate(limit);
+        if let Some(pieces) = &mut self.output_text {
+            if pieces.len() == units {
+                pieces.truncate(limit);
+            }
+        }
+        if let Some(logprobs) = &mut self.logprobs {
+            if logprobs.len() == units {
+                logprobs.truncate(limit);
+            }
+        }
+        self.finish_reason = "length".to_string();
+        self.matched_stop = None;
+        self
     }
 
     /// The prompt tokens to report for a prompt of `prompt_len` ids.
@@ -724,6 +768,21 @@ mod tests {
             parse(r#"{"key": "1:7", "output_ids": [3], "matched_stop": 3}"#).expect("keyed");
         assert_eq!(token.key.as_deref(), Some("1:7"));
         assert_eq!(token.answer.matched_stop, Some(MatchedStop::Token(3)));
+    }
+
+    #[test]
+    fn an_empty_text_is_no_tokens_alone_and_one_piece_beside_ids() {
+        let silent = parse(r#"{"output_text": ""}"#).expect("no tokens").answer;
+        assert_eq!(silent.completion_tokens(), 0);
+        assert_eq!(silent.text(), "");
+        // A recorded answer of one special token decodes to an empty string:
+        // the one whole-text piece for its ids, as any one string is.
+        let eos = parse(r#"{"output_ids": [2], "output_text": ""}"#)
+            .expect("ids beside an empty string")
+            .answer;
+        assert_eq!(eos.output_ids, vec![2]);
+        assert_eq!(eos.completion_tokens(), 1);
+        assert_eq!(eos.text(), "");
     }
 
     #[test]

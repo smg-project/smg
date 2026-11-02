@@ -2630,6 +2630,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "gateway-perf"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "fancy-regex 0.13.0",
+ "minijinja",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "generator"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

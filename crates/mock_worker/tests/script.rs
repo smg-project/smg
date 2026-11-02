@@ -721,6 +721,234 @@ async fn zmq_pushes_the_scripted_tokens_with_their_stats_finish_and_stop() {
     );
 }
 
+// ── the request's token limit ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn grpc_cuts_a_scripted_answer_at_the_requests_max_new_tokens() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let script = script_file(
+        dir.path(),
+        "cut.jsonl",
+        &[json!({
+            "input_ids": [7, 8, 9],
+            "output_ids": [30, 31, 32],
+            "finish_reason": "stop",
+            "matched_stop": 32,
+            "logprobs": [-0.1, -0.2, -0.3],
+        })],
+    );
+    let (client, _) = start_grpc(config(Some(script))).await;
+    let limited = |limit: u32| {
+        let mut request = grpc_request("c", &[7, 8, 9], true, true);
+        request.sampling_params = Some(ts::SamplingParams {
+            max_new_tokens: Some(limit),
+            ..Default::default()
+        });
+        request
+    };
+
+    // Longer than the limit: cut there, the length finish, no matched stop.
+    let streamed = generate(&client, limited(2)).await;
+    assert_eq!(
+        streamed,
+        vec![
+            chunk("c", vec![30], 3, 1, 0, logprobs(&[30], &[-0.1])),
+            chunk("c", vec![31], 3, 2, 0, logprobs(&[31], &[-0.2])),
+            ts::GenerateResponse {
+                request_id: "c".to_string(),
+                response: Some(GenResp::Complete(ts::GenerateComplete {
+                    output_ids: vec![30, 31],
+                    finish_reason: "length".to_string(),
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    cached_tokens: 0,
+                    output_logprobs: logprobs(&[30, 31], &[-0.1, -0.2]),
+                    matched_stop: None,
+                    index: 0,
+                    weight_version: None,
+                    ..Default::default()
+                })),
+            },
+        ]
+    );
+
+    // Within the limit: the answer as scripted, its stop included.
+    let whole = generate(&client, limited(5)).await;
+    assert!(matches!(
+        whole.last().and_then(|f| f.response.as_ref()),
+        Some(GenResp::Complete(c))
+            if c.output_ids == vec![30, 31, 32]
+                && c.finish_reason == "stop"
+                && c.matched_stop == Some(ts::generate_complete::MatchedStop::MatchedTokenId(32))
+    ));
+}
+
+#[tokio::test]
+async fn grpc_answers_an_empty_scripted_text_with_the_completion_alone() {
+    // The word-level tokenizer of the encode test: an empty text encodes to no ids.
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        dir.path().join("tokenizer.json"),
+        r#"{"version":"1.0","model":{"type":"WordLevel","vocab":{"[UNK]":0,"the":1},"unk_token":"[UNK]"},"pre_tokenizer":{"type":"Whitespace"}}"#,
+    )
+    .expect("write the tokenizer");
+    let cfg = Config {
+        tokenizer_path: dir.path().display().to_string(),
+        ..config(None)
+    };
+    let (client, worker) = start_grpc(cfg).await;
+    script::enqueue(
+        &worker,
+        vec![
+            script::Answer::parse(&json!({"output_text": "", "finish_reason": "stop"}))
+                .expect("an empty answer"),
+        ],
+    )
+    .expect("a started worker");
+
+    let frames = generate(&client, grpc_request("z", &[7, 7], true, false)).await;
+    assert_eq!(
+        frames,
+        vec![ts::GenerateResponse {
+            request_id: "z".to_string(),
+            response: Some(GenResp::Complete(ts::GenerateComplete {
+                output_ids: Vec::new(),
+                finish_reason: "stop".to_string(),
+                prompt_tokens: 2,
+                completion_tokens: 0,
+                cached_tokens: 0,
+                output_logprobs: None,
+                matched_stop: None,
+                index: 0,
+                weight_version: None,
+                ..Default::default()
+            })),
+        }],
+        "no chunk, a completion of zero tokens"
+    );
+}
+
+#[tokio::test]
+async fn http_cuts_a_scripted_text_at_the_requests_max_tokens() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let prompt = "count for me";
+    let script = script_file(
+        dir.path(),
+        "http-cut.jsonl",
+        &[json!({
+            "input_ids": http::synth_token_ids(prompt),
+            "output_text": ["one", " two", " three"],
+            "finish_reason": "stop",
+            "matched_stop": "\n",
+        })],
+    );
+    let (base, _) = start_http(config(Some(script))).await;
+    let http = common::http_client();
+    let ask = |max_tokens: u32| {
+        json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+        })
+    };
+
+    let cut: Value = http
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&ask(2))
+        .send()
+        .await
+        .expect("response")
+        .json()
+        .await
+        .expect("a JSON body");
+    assert_eq!(cut["choices"][0]["message"]["content"], "one two", "{cut}");
+    assert_eq!(cut["choices"][0]["finish_reason"], "length", "{cut}");
+    assert!(cut["choices"][0]["matched_stop"].is_null(), "{cut}");
+    assert_eq!(cut["usage"]["completion_tokens"], 2, "{cut}");
+
+    let whole: Value = http
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&ask(8))
+        .send()
+        .await
+        .expect("response")
+        .json()
+        .await
+        .expect("a JSON body");
+    assert_eq!(
+        whole["choices"][0]["message"]["content"], "one two three",
+        "{whole}"
+    );
+    assert_eq!(whole["choices"][0]["finish_reason"], "stop", "{whole}");
+    assert_eq!(whole["usage"]["completion_tokens"], 3, "{whole}");
+}
+
+#[tokio::test]
+async fn zmq_cuts_a_scripted_answer_at_the_requests_max_tokens() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let endpoint = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+    let (handshake, input, output) = (
+        endpoint("hs.sock"),
+        endpoint("in.sock"),
+        endpoint("out.sock"),
+    );
+    let script = script_file(
+        dir.path(),
+        "zmq-cut.jsonl",
+        &[json!({
+            "input_ids": [14, 15, 16],
+            "output_ids": [40, 41, 42],
+            "finish_reason": "stop",
+            "matched_stop": 42,
+        })],
+    );
+    // Rank 8 and prompts of this test's own: the store is process-wide.
+    let rank = 8;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "serve loops until the test drops its handles"
+    )]
+    let _engine = tokio::spawn(zmq::serve(
+        Arc::new(config(Some(script))),
+        handshake.clone(),
+        rank,
+    ));
+    let transport = connect_handshake(&handshake, 1, &input, &output, Duration::from_secs(10))
+        .await
+        .expect("frontend handshake");
+    let client = EngineCoreClient::new(transport);
+
+    let mut stream = client
+        .submit(EngineCoreRequest {
+            request_id: "cut".to_string(),
+            prompt_token_ids: Some(vec![14, 15, 16]),
+            sampling_params: Some(EngineCoreSamplingParams {
+                max_tokens: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("submit");
+    let mut outputs = Vec::new();
+    while let Some(item) = stream.next().await {
+        let output = item.expect("output ok");
+        let finished = output.finished();
+        outputs.push(output);
+        if finished {
+            break;
+        }
+    }
+    let tokens: Vec<u32> = outputs
+        .iter()
+        .flat_map(|o| o.new_token_ids.clone())
+        .collect();
+    assert_eq!(tokens, vec![40, 41], "cut after two tokens");
+    let last = outputs.last().expect("a finishing batch");
+    assert_eq!(last.finish_reason, Some(EngineCoreFinishReason::Length));
+    assert_eq!(last.stop_reason, None, "no matched stop on a cut answer");
+}
+
 // ── the binary ──────────────────────────────────────────────────────────────
 
 #[test]
@@ -747,4 +975,178 @@ fn the_binary_refuses_a_script_it_cannot_load_before_any_worker_starts() {
         assert!(stderr.contains("cannot load script"), "{stderr}");
         assert!(stderr.contains(reason), "{stderr}");
     }
+}
+
+// ── load reports ────────────────────────────────────────────────────────────
+
+/// The gRPC load once its running count reads `running` (within two seconds).
+async fn grpc_running_settles_to(
+    client: &TokenSpeedSchedulerClient,
+    running: i32,
+) -> ts::SchedulerLoad {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let load = client
+                .get_loads(vec![])
+                .await
+                .expect("loads")
+                .loads
+                .remove(0);
+            if load.num_running_reqs == running {
+                return load;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the running count never read {running}"))
+}
+
+#[tokio::test]
+async fn grpc_reports_the_scripted_answers_in_flight_as_running() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let script = script_file(
+        dir.path(),
+        "running.jsonl",
+        &[json!({
+            "input_ids": [8],
+            "output_ids": [1, 2, 3, 4, 5],
+            "chunk_tokens": 1,
+            "delay_ms": 40,
+        })],
+    );
+    let (client, _) = start_grpc(config(Some(script))).await;
+    let idle = grpc_running_settles_to(&client, 0).await;
+    assert_eq!(idle.num_total_reqs, 0, "{idle:?}");
+
+    // The answer is paced over four pauses: a poll during them reads the one
+    // request as running, and as the whole of the load.
+    let (frames, busy) = tokio::join!(
+        generate(&client, grpc_request("r", &[8], true, false)),
+        grpc_running_settles_to(&client, 1)
+    );
+    assert_eq!(busy.num_total_reqs, 1, "{busy:?}");
+    assert_eq!(busy.num_waiting_reqs, 0, "{busy:?}");
+    assert_eq!(
+        frames.len(),
+        6,
+        "five chunks and the completion: {frames:?}"
+    );
+
+    let idle = grpc_running_settles_to(&client, 0).await;
+    assert_eq!(idle.num_total_reqs, 0, "{idle:?}");
+}
+
+#[tokio::test]
+async fn a_worker_reports_its_own_requests_in_flight_not_the_process_total() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let script = script_file(
+        dir.path(),
+        "own.jsonl",
+        &[json!({
+            "input_ids": [8],
+            "output_ids": [1, 2, 3, 4, 5],
+            "chunk_tokens": 1,
+            "delay_ms": 40,
+        })],
+    );
+    let (serving, _) = start_grpc(config(Some(script))).await;
+    let (other, _) = start_grpc(config(None)).await;
+    grpc_running_settles_to(&serving, 0).await;
+
+    // While the paced answer runs on one worker, the other worker of the same
+    // process reports none of it: a gateway that polls both sees where the
+    // work is.
+    let (frames, (busy, idle)) = tokio::join!(
+        generate(&serving, grpc_request("r", &[8], true, false)),
+        async {
+            let busy = grpc_running_settles_to(&serving, 1).await;
+            let idle = other
+                .get_loads(vec![])
+                .await
+                .expect("loads")
+                .loads
+                .remove(0);
+            (busy, idle)
+        }
+    );
+    assert_eq!(busy.num_total_reqs, 1, "{busy:?}");
+    assert_eq!(
+        idle.num_running_reqs, 0,
+        "the other worker's own count: {idle:?}"
+    );
+    assert_eq!(idle.num_total_reqs, 0, "{idle:?}");
+    assert_eq!(frames.len(), 6, "{frames:?}");
+}
+
+/// The HTTP load once its running count reads `running` (within two seconds).
+async fn http_running_settles_to(http: &reqwest::Client, base: &str, running: u64) -> Value {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let body: Value = http
+                .get(format!("{base}/v1/loads"))
+                .send()
+                .await
+                .expect("loads")
+                .json()
+                .await
+                .expect("a JSON body");
+            if body["loads"][0]["num_running_reqs"].as_u64() == Some(running) {
+                return body["loads"][0].clone();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the running count never read {running}"))
+}
+
+#[tokio::test]
+async fn http_reports_the_scripted_answers_in_flight_as_running() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let prompt = "count me while I run";
+    let script = script_file(
+        dir.path(),
+        "running.jsonl",
+        &[json!({
+            "input_ids": http::synth_token_ids(prompt),
+            "output_ids": [20, 21, 22, 23, 24],
+            "output_text": ["a", "b", "c", "d", "e"],
+            "chunk_tokens": 1,
+            "delay_ms": 40,
+        })],
+    );
+    let (base, _) = start_http(config(Some(script))).await;
+    let http = common::http_client();
+    let idle = http_running_settles_to(&http, &base, 0).await;
+    assert_eq!(idle["num_total_reqs"], 0, "{idle}");
+
+    // The whole answer is paced before its one body: a poll meanwhile reads
+    // the one request as running, and as the whole of the load.
+    let request = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": false,
+    });
+    let (response, busy) = tokio::join!(
+        async {
+            http.post(format!("{base}/v1/chat/completions"))
+                .json(&request)
+                .send()
+                .await
+                .expect("chat")
+        },
+        http_running_settles_to(&http, &base, 1)
+    );
+    assert_eq!(response.status(), 200);
+    assert_eq!(busy["num_total_reqs"], 1, "{busy}");
+    assert_eq!(busy["num_waiting_reqs"], 0, "{busy}");
+    let whole: Value = response.json().await.expect("a JSON body");
+    assert_eq!(
+        whole["choices"][0]["message"]["content"], "abcde",
+        "{whole}"
+    );
+
+    let idle = http_running_settles_to(&http, &base, 0).await;
+    assert_eq!(idle["num_total_reqs"], 0, "{idle}");
 }

@@ -13,6 +13,8 @@ import os
 import shutil
 import subprocess
 import sys
+import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -73,6 +75,44 @@ esac
 CARGO_STUB = r"""#!/usr/bin/env bash
 printf 'cargo %s\n' "$*" >> "$CARGO_STUB_LOG"
 """
+# The registries as the release tool reads them: crates.io's sparse index (one JSON line per version) from
+# CRATES_STUB ("name=v1,v2 other=v3@2026-01-01T00:00:00Z": a version may carry its publish time), PyPI's JSON from
+# PYPI_STUB (the same shape); "down" answers nothing (exit 7); an unlisted name is a 404. With -w the http code
+# follows the body on its own line, as curl prints it.
+REGISTRY_STUB = r"""#!/usr/bin/env bash
+printf 'curl %s\n' "$*" >> "$CURL_STUB_LOG"
+body_of() { # <crate|package> <v1[@time],v2>: the body for those versions, a publish time when given
+  local items="" v t p
+  for v in ${2//,/ }; do
+    t=""; case $v in *@*) t=${v#*@}; v=${v%%@*} ;; esac
+    if [ "$1" = crate ]; then
+      p=""; [ -z "$t" ] || p=",\"pubtime\":\"$t\""
+      items="$items"$'\n'"{\"vers\":\"$v\",\"yanked\":false$p}"
+    else
+      p=""; [ -z "$t" ] || p="{\"upload_time_iso_8601\":\"$t\"}"
+      items="$items,\"$v\":[$p]"
+    fi
+  done
+  if [ "$1" = crate ]; then printf '%s' "${items#$'\n'}"; else printf '{"releases":{%s}}' "${items#,}"; fi
+}
+url=${*: -1}; code=404; body=""
+case "$url" in
+  https://index.crates.io/*)
+    name=${url##*/}; [ "${CRATES_STUB-}" = down ] && exit 7
+    for entry in ${CRATES_STUB-}; do
+      [ "${entry%%=*}" = "$name" ] && { code=200; body=$(body_of crate "${entry#*=}"); }
+    done ;;
+  https://pypi.org/pypi/*/json)
+    name=${url#https://pypi.org/pypi/}; name=${name%/json}; [ "${PYPI_STUB-}" = down ] && exit 7
+    for entry in ${PYPI_STUB-}; do
+      [ "${entry%%=*}" = "$name" ] && { code=200; body=$(body_of package "${entry#*=}"); }
+    done ;;
+esac
+case " $* " in
+  *" -w "*) printf '%s\n%s' "$body" "$code" ;;
+  *) [ "$code" = 200 ] && printf '%s' "$body" || exit 22 ;;
+esac
+"""
 DOCKER_NOTES_STUB = """#!/usr/bin/env bash
 echo "### Docker images"
 echo ""
@@ -107,6 +147,12 @@ jobs:
 """
 
 
+def utc_second_after(iso: str) -> str:
+    """One second after a git ``%cI`` date, in the UTC spelling the tool prints for a publish time."""
+    moment = datetime.fromisoformat(iso).astimezone(UTC) + timedelta(seconds=1)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def versioned(name: str, version: str) -> str:
     return f'[package]\nname = "{name}"\nversion = "{version}"\n'
 
@@ -121,8 +167,9 @@ class Sandbox:
         self.bin = base / "bin"
         self.gh_log = base / "gh.log"
         self.cargo_log = base / "cargo.log"
+        self.curl_log = base / "curl.log"
         self.bin.mkdir()
-        for name, text in (("gh", GH_STUB), ("cargo", CARGO_STUB)):
+        for name, text in (("gh", GH_STUB), ("cargo", CARGO_STUB), ("curl", REGISTRY_STUB)):
             stub = self.bin / name
             stub.write_text(text)
             stub.chmod(0o755)
@@ -152,6 +199,7 @@ class Sandbox:
             "GIT_EDITOR": "true",
             "GH_STUB_LOG": str(self.gh_log),
             "CARGO_STUB_LOG": str(self.cargo_log),
+            "CURL_STUB_LOG": str(self.curl_log),
             "PYTHONDONTWRITEBYTECODE": "1",
             "TMPDIR": str(self.base),
         }
@@ -224,6 +272,21 @@ class Sandbox:
         self.put("model_gateway/src/main.rs", 'fn main() {\n    println!("one");\n}\n')
         self.put("crates/tool_parser/Cargo.toml", versioned("tool-parser", "0.5.0"))
         self.put("crates/tool_parser/src/lib.rs", "pub fn parse() {}\n")
+        # a crate the checker lists that cargo never publishes (the real one is a generator's scaffold)
+        self.put(
+            "clients/openapi-gen/Cargo.toml",
+            versioned("openapi-gen", "0.2.0") + "publish = false\n",
+        )
+        self.put("clients/openapi-gen/src/main.rs", "fn main() {}\n")
+        # cargo's other spelling of never published, under [package] like the first (the sandbox's, not the crate's)
+        self.put("clients/rust/Cargo.toml", versioned("smg-client", "0.1.0") + "publish = []\n")
+        self.put("clients/rust/src/lib.rs", "pub fn client() {}\n")
+        # a Python package the checker lists, published to PyPI by its own dispatch
+        self.put(
+            "grpc_servicer/pyproject.toml",
+            '[project]\nname = "smg-grpc-servicer"\nversion = "0.14.0"\n',
+        )
+        self.put("grpc_servicer/servicer.py", "x = 1\n")
         self.put("bindings/golang/Cargo.toml", versioned("smg-golang", "1.13.0"))
         self.put("bindings/python/Cargo.toml", versioned("smg-python", "1.13.0"))
         self.put("bindings/python/pyproject.toml", '[project]\nname = "smg"\nversion = "1.13.0"\n')
@@ -271,6 +334,9 @@ class Sandbox:
     def gh_calls(self) -> list[str]:
         return self.gh_log.read_text().splitlines() if self.gh_log.exists() else []
 
+    def curl_calls(self) -> list[str]:
+        return self.curl_log.read_text().splitlines() if self.curl_log.exists() else []
+
     def pr_body(self) -> str:
         return Path(f"{self.gh_log}.body").read_text()
 
@@ -285,21 +351,25 @@ def repo(tmp_path: Path) -> Sandbox:
 
 def test_cut_creates_the_branch_and_the_bump_commit(repo: Sandbox) -> None:
     done = repo.tool("cut", "1.14.0-rc.1")
-    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "release/1.14"
+    # the branch is behind you: the next commands run from the checkout the cut started on
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert "release/1.14 is at " in done.stdout and "(You are back on main;" in done.stdout
+    branch = "release/1.14"
     for path in VERSION_FILES:
-        assert repo.version_of(path) == "1.14.0-rc.1", path
+        assert repo.version_of(path, branch) == "1.14.0-rc.1", path
+        assert repo.version_of(path) == "1.13.0", f"{path}: main's tree is untouched"
     assert (
-        repo.version_of("crates/tool_parser/Cargo.toml") == "0.6.0"
+        repo.version_of("crates/tool_parser/Cargo.toml", branch) == "0.6.0"
     )  # a feat since v1.13.0: minor
-    assert 'tool-parser = { version = "0.6.0"' in repo.read("Cargo.toml")
-    message = repo.git("log", "-1", "--format=%B")
+    assert 'tool-parser = { version = "0.6.0"' in repo.read("Cargo.toml", branch)
+    message = repo.git("log", "-1", "--format=%B", branch)
     assert message.startswith("chore(release): bump versions for v1.14.0-rc.1\n")
     assert "Signed-off-by: Release Owner <owner@example.invalid>" in message
     assert (
-        repo.git("log", "-1", "--format=%an <%ae> %cn")
+        repo.git("log", "-1", "--format=%an <%ae> %cn", branch)
         == "Release Owner <owner@example.invalid> Release Owner"
     )
-    assert repo.git("rev-parse", "HEAD~1") == repo.origin_ref("refs/heads/main")
+    assert repo.git("rev-parse", f"{branch}~1") == repo.origin_ref("refs/heads/main")
     assert repo.origin_ref("refs/heads/release/1.14") is None, (
         "the cut is not pushed without PUSH=1"
     )
@@ -309,18 +379,64 @@ def test_cut_creates_the_branch_and_the_bump_commit(repo: Sandbox) -> None:
 
 def test_cut_pushes_the_branch_only_on_request(repo: Sandbox) -> None:
     repo.tool("cut", "1.14.0-rc.1", PUSH="1")
-    assert repo.origin_ref("refs/heads/release/1.14") == repo.git("rev-parse", "HEAD")
-    assert repo.origin_ref("refs/heads/main") == repo.git("rev-parse", "HEAD~1"), (
+    assert repo.origin_ref("refs/heads/release/1.14") == repo.git("rev-parse", "release/1.14")
+    assert repo.origin_ref("refs/heads/main") == repo.git("rev-parse", "release/1.14~1"), (
         "main is untouched"
     )
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "main"
 
 
 def test_cut_starts_from_the_named_commit(repo: Sandbox) -> None:
     older = repo.git("rev-parse", "origin/main~1")
     repo.tool("cut", "1.14.0-rc.1", older)
-    assert repo.git("rev-parse", "HEAD~1") == older
+    assert repo.git("rev-parse", "release/1.14~1") == older
     # the gateway did not change between v1.13.0 and that commit, its version still moves
-    assert repo.version_of("model_gateway/Cargo.toml") == "1.14.0-rc.1"
+    assert repo.version_of("model_gateway/Cargo.toml", "release/1.14") == "1.14.0-rc.1"
+
+
+def test_cut_from_a_detached_head_leaves_you_detached_there(repo: Sandbox) -> None:
+    start = repo.git("rev-parse", "origin/main")
+    repo.git("switch", "--quiet", "--detach", start)
+    done = repo.tool("cut", "1.14.0-rc.1")
+    assert repo.git("rev-parse", "HEAD") == start
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
+    assert f"(You are back on {repo.git('rev-parse', '--short', start)};" in done.stdout
+    assert repo.git("rev-parse", "release/1.14~1") == start
+
+
+def test_cut_comes_back_to_the_branch_when_a_tag_shares_its_name(repo: Sandbox) -> None:
+    """A tag named like the branch makes `git symbolic-ref --short HEAD` answer `heads/main`, which `git switch` does
+    not take as the branch: the cut reads the start with `git branch --show-current` and comes back to the branch."""
+    repo.git("tag", "main")
+    done = repo.tool("cut", "1.14.0-rc.1")
+    assert repo.git("branch", "--show-current") == "main"
+    assert "(You are back on main;" in done.stdout
+
+
+def test_cut_reports_the_branch_beside_a_tag_of_its_name(repo: Sandbox) -> None:
+    """A tag named like the release branch answers for the bare name: the closing lines read the
+    branch by its full ref, so they name the bump commit, not the tag's."""
+    older = repo.git("rev-parse", "origin/main~1")
+    repo.git("tag", "release/1.14", older)
+    done = repo.tool("cut", "1.14.0-rc.1")
+    bump = repo.git("rev-parse", "--short", "refs/heads/release/1.14")
+    assert (
+        f"release/1.14 is at {bump}: chore(release): bump versions for v1.14.0-rc.1" in done.stdout
+    )
+    assert repo.git("rev-parse", "--short", older) not in done.stdout
+
+
+def test_cut_comes_back_without_a_head_reflog(repo: Sandbox) -> None:
+    """`git switch -` and `@{-1}` read the HEAD reflog, which a clone can be without (core.logAllRefUpdates=false, or
+    the logs expired): the cut reads where it started before it makes the branch, and comes back to that."""
+    repo.git("config", "core.logAllRefUpdates", "false")
+    (repo.work / ".git" / "logs" / "HEAD").unlink()
+    done = repo.tool("cut", "1.14.0-rc.1")
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert "(You are back on main;" in done.stdout
+    assert not (repo.work / ".git" / "logs" / "HEAD").exists(), (
+        "the sandbox stayed without a HEAD reflog"
+    )
 
 
 def test_cut_refusals(repo: Sandbox) -> None:
@@ -489,16 +605,26 @@ def test_pick_conflict_stops_with_the_steps_and_pick_pr_finishes(repo: Sandbox) 
     assert f"the pick of {four[:7]} (fix(router): four (#125)) conflicts on:" in done.stdout
     assert "    model_gateway/src/main.rs" in done.stdout
     assert "git cherry-pick --continue" in done.stdout
-    assert "make release-pick-pr RELEASE=1.14" in done.stdout
-    assert repo.gh_calls() == [], "no pull request for an unresolved pick"
     topic = f"pick/1.14-{four[:7]}"
+    assert f"make release-pick-pr RELEASE=1.14 PICK={topic}" in done.stdout
+    assert repo.gh_calls() == [], "no pull request for an unresolved pick"
     assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == topic
     assert "still in progress" in repo.tool("pick-pr", "1.14", check=False).stderr
     repo.put("model_gateway/src/main.rs", 'fn main() {\n    println!("four");\n}\n')
     repo.git("add", "model_gateway/src/main.rs")
     repo.git("cherry-pick", "--continue")
     assert f"(cherry picked from commit {four})" in repo.git("log", "-1", "--format=%B")
-    repo.tool("pick-pr", "1.14")
+    # finished from main, the branch named: the pick branch may lack the release targets
+    repo.git("switch", "--quiet", "main")
+    again = repo.tool(
+        "pick", "1.14", four, check=False
+    )  # the same pick once more: the hint names the branch
+    assert (
+        f"the branch {topic} exists: delete it or finish it (make release-pick-pr RELEASE=1.14 PICK={topic})"
+        in again.stderr
+    )
+    repo.tool("pick-pr", "1.14", topic)
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == topic
     assert repo.origin_ref(f"refs/heads/{topic}") == repo.git("rev-parse", "HEAD")
     assert repo.gh_calls()[-1].startswith(
         f"gh pr create --base release/1.14 --head {topic} --title fix(router): four"
@@ -507,7 +633,37 @@ def test_pick_conflict_stops_with_the_steps_and_pick_pr_finishes(repo: Sandbox) 
 
 def test_pick_pr_refuses_other_branches(repo: Sandbox) -> None:
     repo.cut()
-    assert "not on a pick/1.14-* branch" in repo.tool("pick-pr", "1.14", check=False).stderr
+    repo.git(
+        "switch", "--quiet", "release/1.14"
+    )  # the cut left the clone where it was; the test tries pick-pr from the branch
+    refused = repo.tool("pick-pr", "1.14", check=False)
+    assert (
+        "not on a pick/1.14-* branch (on release/1.14): name it, release.sh pick-pr 1.14 <pick branch>"
+        in refused.stderr
+    )
+    assert (
+        "no branch pick/1.14-0000000 here"
+        in repo.tool("pick-pr", "1.14", "pick/1.14-0000000", check=False).stderr
+    )
+    # a wrong name is refused before the clone moves (a later `make release-*` would run from the named branch)
+    assert (
+        "main is not a pick/1.14-* branch (the pick branches are pick/1.14-<sha>...)"
+        in repo.tool("pick-pr", "1.14", "main", check=False).stderr
+    )
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "release/1.14", (
+        "a wrong name is not switched to"
+    )
+    repo.git("branch", "--quiet", "pick/1.14-0000001")
+    repo.put("Cargo.toml", repo.read("Cargo.toml") + "# edited\n")
+    dirty = repo.tool("pick-pr", "1.14", "pick/1.14-0000001", check=False)
+    assert (
+        "uncommitted changes: commit or discard them before switching to pick/1.14-0000001"
+        in dirty.stderr
+    )
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "release/1.14", (
+        "a dirty tree is not switched"
+    )
+    repo.git("checkout", "--", "Cargo.toml")
 
 
 # --- status ------------------------------------------------------------------------------
@@ -632,7 +788,9 @@ def test_the_next_cut_compares_against_the_previous_final_on_its_own_branch(repo
     assert "v1.14.0" not in repo.git("tag", "--merged", "origin/main").split(), (
         "the premise: a release tag is made on its branch and never reaches main"
     )
-    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "release/1.15"
+    repo.git(
+        "switch", "--quiet", "release/1.15"
+    )  # the cut left the clone where it was; the test reads the branch
     for path in VERSION_FILES:
         assert repo.version_of(path) == "1.15.0-rc.1", path
     # Against v1.14.0 (where tool-parser read 0.6.0): a feat and a fix since, so a minor bump.
@@ -826,6 +984,13 @@ def test_publish_plan_prints_the_dispatches_and_runs_nothing(repo: Sandbox) -> N
     assert "smg==1.14.0rc1" in out
     assert "latest does not move" in out
     assert "     smg 1.14.0-rc.1\n" in out and "     tool-parser 0.6.0\n" in out
+    assert "openapi-gen" not in out, (
+        "a crate with publish = false is never published: not in the plan"
+    )
+    assert "smg-client" not in out, (
+        "a crate with publish = [] is never published either: not in the plan"
+    )
+    assert "publish = false or publish = [] is never published and not listed" in out
     final = repo.tool("publish-plan", "1.14.0").stdout
     assert "smg==1.14.0," in final and "and latest" in final
 
@@ -979,11 +1144,222 @@ def test_check_names_every_pending_check_and_reads_a_startup_failure_as_red(repo
     assert "pending:" not in green.stdout and "red:" not in green.stdout
 
 
+def test_check_reads_the_registries_for_versions_published_already(repo: Sandbox) -> None:
+    """A crate or package at a version crates.io or PyPI hold already is skipped by its publish dispatch: with
+    changes after that version landed the release would ship none of them, so the gate reads the registries."""
+    repo.cut()  # tool-parser 0.6.0 by the cut's bump, smg 1.14.0-rc.1, smg-grpc-servicer 0.14.0 unchanged
+    done = repo.tool("check", "1.14.0-rc.1")
+    assert (
+        "[ok]   registry: no crate or package sits at a version crates.io or PyPI hold already"
+        in done.stdout
+    )
+    assert "(3 of 3 read)" in done.stdout
+    urls = sorted(call.split()[-1] for call in repo.curl_calls())
+    assert (
+        urls
+        == [  # crates.io through the sparse index cargo reads (its path scheme), PyPI's JSON
+            "https://index.crates.io/3/s/smg",
+            "https://index.crates.io/to/ol/tool-parser",
+            "https://pypi.org/pypi/smg-grpc-servicer/json",
+        ]
+    )
+    # published already, nothing changed after the bump: the dispatch skips it and nothing is lost
+    quiet = repo.tool(
+        "check",
+        "1.14.0-rc.1",
+        CRATES_STUB="tool-parser=0.5.0,0.6.0",
+        PYPI_STUB="smg-grpc-servicer=0.14.0",
+    )
+    assert "[ok]   registry:" in quiet.stdout
+    assert (
+        "[note] registry: at a published version with nothing changed after it (the dispatch skips them,"
+        " nothing is lost): smg-grpc-servicer 0.14.0, tool-parser 0.6.0" in quiet.stdout
+    )
+    # a change lands on the branch after the bump: the published version would ship without it
+    repo.git("switch", "--quiet", "release/1.14")
+    repo.put(
+        "crates/tool_parser/src/lib.rs", "pub fn parse() {}\npub fn more() {}\npub fn late() {}\n"
+    )
+    repo.git("commit", "--quiet", "-am", "fix(tool_parser): late")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    held = repo.tool("check", "1.14.0-rc.1", check=False, CRATES_STUB="tool-parser=0.6.0")
+    assert held.returncode == 1
+    assert (
+        "[FAIL] registry: at a version crates.io or PyPI hold already, with changes after it (the publish"
+        " dispatch skips them and ships none of those changes; a bump pull request against release/1.14"
+        " moves them): tool-parser 0.6.0 (1 commit(s) after its bump; the registry gave no publish time)"
+        in held.stdout
+    )
+    # the registry held 0.6.0 before the candidate was tagged (published on main the older way, or by another
+    # line): the tag's dispatch skipped it, so the commits after the publish time keep counting, tag or no tag
+    repo.tool("tag", "1.14.0-rc.1", PUSH="1")
+    early = "2000-01-01T00:00:00Z"
+    since_early = repo.git(
+        "rev-list", "--count", f"--after={early}", "origin/release/1.14", "--", "crates/tool_parser"
+    )
+    held = repo.tool("check", "1.14.0-rc.1", check=False, CRATES_STUB=f"tool-parser=0.6.0@{early}")
+    assert (
+        f"tool-parser 0.6.0 ({since_early} commit(s) after it was published ({early}))"
+        in held.stdout
+    )
+    # published by the tag's dispatch, after the branch's last commit: nothing is missing...
+    published = utc_second_after(repo.git("log", "-1", "--format=%cI", "origin/release/1.14"))
+    tagged = repo.tool(
+        "check", "1.14.0-rc.1", check=False, CRATES_STUB=f"tool-parser=0.6.0@{published}"
+    )
+    assert "[ok]   registry:" in tagged.stdout
+    assert "tool-parser 0.6.0" in tagged.stdout.split("[note] registry:")[-1]
+    # ...until the next change lands, counted from that publish time
+    time.sleep(1.1)
+    repo.git("switch", "--quiet", "release/1.14")
+    repo.put(
+        "crates/tool_parser/src/lib.rs", "pub fn parse() {}\npub fn more() {}\npub fn later() {}\n"
+    )
+    repo.git("commit", "--quiet", "-am", "fix(tool_parser): later")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    later = repo.tool(
+        "check", "1.14.0-rc.1", check=False, CRATES_STUB=f"tool-parser=0.6.0@{published}"
+    )
+    assert f"tool-parser 0.6.0 (1 commit(s) after it was published ({published}))" in later.stdout
+    # the registries do not answer: the gate says so and does not pass
+    down = repo.tool("check", "1.14.0-rc.1", check=False, CRATES_STUB="down")
+    assert down.returncode == 1
+    assert (
+        "[....] registry: 2 of 3 read(s) of crates.io / PyPI did not answer; read again before the tag"
+        in down.stdout
+    )
+    calls = len(repo.curl_calls())
+    skipped = repo.tool("check", "1.14.0-rc.1", check=False, REGISTRY="0")
+    assert "[....] registry: crates.io and PyPI not read (REGISTRY=0)" in skipped.stdout
+    assert len(repo.curl_calls()) == calls, "REGISTRY=0 reads nothing"
+
+
+def test_check_fails_the_registry_item_when_the_component_list_cannot_be_read(
+    repo: Sandbox,
+) -> None:
+    """The crates and packages come from a helper the checker's module reads; a manifest it refuses (workspace
+    versioning) fails the item with the reason, it never shortens the list behind a green line."""
+    repo.cut()
+    repo.git("switch", "--quiet", "release/1.14")
+    repo.put(
+        "crates/tool_parser/Cargo.toml",
+        '[package]\nname = "tool-parser"\nversion.workspace = true\n',
+    )
+    repo.git("commit", "--quiet", "-am", "chore: workspace versioning")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    done = repo.tool("check", "1.14.0-rc.1", check=False)
+    assert done.returncode == 1
+    assert "[FAIL] registry: the crate and package list at " in done.stdout
+    assert "workspace versioning" in done.stdout and "[ok]   registry" not in done.stdout
+    assert repo.curl_calls() == [], "nothing is compared when the list is unknown"
+    plan = repo.tool("publish-plan", "1.14.0-rc.1", check=False)
+    assert plan.returncode == 1
+    assert "could not be read" in plan.stderr and "workspace versioning" in plan.stderr
+
+
+def test_publish_plan_marks_the_versions_the_registries_hold(repo: Sandbox) -> None:
+    finished_release(repo)
+    repo.git("switch", "--quiet", "main")
+    out = repo.tool(
+        "publish-plan",
+        "1.14.0",
+        CRATES_STUB="tool-parser=0.6.0",
+        PYPI_STUB="smg-grpc-servicer=0.14.0",
+    ).stdout
+    assert "     tool-parser 0.6.0 (on crates.io already: the dispatch skips it)\n" in out
+    assert "     smg 1.14.0\n" in out
+    assert "smg-grpc-servicer==0.14.0 (on PyPI already: the dispatch skips it)" in out
+    plain = repo.tool("publish-plan", "1.14.0", REGISTRY="0").stdout
+    assert (
+        "     tool-parser 0.6.0\n" in plain
+        and "(the registries were not read: REGISTRY=0)" in plain
+    )
+
+
 def test_check_without_gh_names_the_branch_page(repo: Sandbox) -> None:
     repo.cut()
     (repo.bin / "gh").unlink()
     out = repo.tool("check", "1.14.0-rc.1").stdout
     assert "[....] CI: not readable here" in out
+
+
+# --- a rehearsal: the cut before its push ------------------------------------------------------------
+
+
+def test_the_read_only_commands_read_a_local_cut_before_its_push(repo: Sandbox) -> None:
+    """A cut without PUSH=1 is local. check, status, publish-plan and notes read the local branch and say so,
+    which rehearses a release on a clone; bump, pick and tag still need the branch on the remote."""
+    repo.tool("cut", "1.14.0-rc.1")
+    assert repo.origin_ref("refs/heads/release/1.14") is None
+    repo.git("switch", "--quiet", "main")
+    said = (
+        "release: release/1.14 is not on origin yet: reading the local branch"
+        " (the push: git push origin refs/heads/release/1.14:refs/heads/release/1.14)"
+    )
+    check = repo.tool("check", "1.14.0-rc.1")
+    assert said in check.stderr and "[ok]   versions: the branch reads 1.14.0-rc.1" in check.stdout
+    status = repo.tool("status", "1.14")
+    assert said in status.stderr and "== versions: 1.14.0-rc.1" in status.stdout
+    plan = repo.tool("publish-plan", "1.14.0-rc.1")
+    assert (
+        said in plan.stderr and "gh workflow run release-pypi.yml --ref v1.14.0-rc.1" in plan.stdout
+    )
+    notes = repo.tool("notes", "1.14.0-rc.1")
+    assert said in notes.stderr and "## SMG v1.14.0-rc.1" in notes.stdout
+    assert repo.origin_ref("refs/heads/release/1.14") is None, "a read pushes nothing"
+    on_main = repo.git("rev-parse", "origin/main")
+    for command in (("bump", "1.14.0-rc.2"), ("pick", "1.14", on_main), ("tag", "1.14.0-rc.1")):
+        refused = repo.tool(*command, check=False)
+        assert refused.returncode == 1, command
+        assert "no release/1.14 on origin: cut it first" in refused.stderr, command
+    assert "no release/1.15 on origin or here" in repo.tool("status", "1.15", check=False).stderr
+    # Once pushed, the remote's branch is read and nothing is said.
+    repo.git("push", "--quiet", "origin", "refs/heads/release/1.14:refs/heads/release/1.14")
+    assert "reading the local branch" not in repo.tool("check", "1.14.0-rc.1").stderr
+
+
+def test_a_branch_the_remote_has_but_this_clone_never_fetched_is_not_read_as_a_rehearsal(
+    repo: Sandbox,
+) -> None:
+    """A single-branch clone or a narrowed fetch refspec never creates origin/release/<x.y>, while the local
+    branch the cut left behind goes stale as pull requests move the remote: the remote is asked before a local
+    branch is read."""
+    repo.cut()  # pushed: the remote has release/1.14
+    first = repo.origin_ref("refs/heads/release/1.14")
+    repo.git("update-ref", "-d", "refs/remotes/origin/release/1.14")
+    repo.git("config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main")
+    for command in (("check", "1.14.0-rc.1"), ("status", "1.14"), ("publish-plan", "1.14.0-rc.1")):
+        refused = repo.tool(*command, check=False)
+        assert refused.returncode == 1, command
+        assert (
+            "release/1.14 is on origin but not fetched here:"
+            " git remote set-branches --add origin release/1.14 && git fetch origin"
+            in refused.stderr
+        ), command
+        assert "reading the local branch" not in refused.stderr, command
+    repo.git("remote", "set-branches", "--add", "origin", "release/1.14")
+    repo.git("fetch", "--quiet", "origin")
+    done = repo.tool("status", "1.14")
+    assert "reading the local branch" not in done.stderr
+    assert f"== release/1.14 is at {first[:7]}" in done.stdout
+    # The branch is part of the refspec now: when the remote moves (a bump merges), the tool's own fetch follows it.
+    repo.tool("bump", "1.14.0-rc.2")
+    repo.land_on_release()
+    moved = repo.origin_ref("refs/heads/release/1.14")
+    assert moved != first
+    # The push above came from this clone and moved the remote-tracking ref itself (the branch is in the refspec
+    # now): set it back, so only the tool's own fetch can bring it forward, and the read below proves that fetch.
+    repo.git("update-ref", "refs/remotes/origin/release/1.14", first)
+    assert repo.git("rev-parse", "refs/remotes/origin/release/1.14") == first
+    repo.git("switch", "--quiet", "main")
+    done = repo.tool("status", "1.14")
+    assert f"== release/1.14 is at {moved[:7]}" in done.stdout
+    assert (
+        "== versions: 1.14.0-rc.2" in done.stdout and "reading the local branch" not in done.stderr
+    )
 
 
 # --- bump-main ---------------------------------------------------------------------------------
@@ -1066,9 +1442,9 @@ def test_bump_main_after_a_patch_of_an_older_line_keeps_mains_higher_version(rep
     assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "main"
     assert repo.git("branch", "--list", "chore/main-versions-1.14.1") == ""
     repo.cut("1.16.0-rc.1")  # accepted: main reads the previous final's version, v1.15.0's
-    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "release/1.16"
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "main"
     for path in VERSION_FILES:
-        assert repo.version_of(path) == "1.16.0-rc.1", path
+        assert repo.version_of(path, "release/1.16") == "1.16.0-rc.1", path
 
 
 def test_a_patch_of_the_older_line_steps_past_the_version_the_newer_line_published(
@@ -1098,8 +1474,10 @@ def test_a_patch_of_the_older_line_steps_past_the_version_the_newer_line_publish
         "crates/tool_parser/src/lib.rs",
         "pub fn parse() {}\npub fn more() {}\npub fn one() {}\npub fn three() {}\n",
     )
-    repo.cut("1.15.0-rc.1")
-    assert repo.version_of("crates/tool_parser/Cargo.toml") == "0.6.1", "the fixes since v1.14.0"
+    repo.cut("1.15.0-rc.1")  # the clone stays on main; the branch carries the bump
+    assert repo.version_of("crates/tool_parser/Cargo.toml", "release/1.15") == "0.6.1", (
+        "the fixes since v1.14.0"
+    )
     repo.tool("tag", "1.15.0-rc.1", PUSH="1")
     repo.tool("pick", "1.14", fix)
     repo.land_on_release("1.14")
@@ -1135,8 +1513,8 @@ def test_a_patch_of_the_older_line_steps_past_the_version_the_newer_line_publish
         "tool-parser (crates/tool_parser/) — 1 file(s) changed but version not bumped (v0.6.2, v1.14.1's) [patch]"
         in (cut.stdout)
     )
-    assert repo.version_of("crates/tool_parser/Cargo.toml") == "0.6.3"
-    assert 'tool-parser = { version = "0.6.3"' in repo.read("Cargo.toml")
+    assert repo.version_of("crates/tool_parser/Cargo.toml", "release/1.16") == "0.6.3"
+    assert 'tool-parser = { version = "0.6.3"' in repo.read("Cargo.toml", "release/1.16")
 
 
 def grpc_detect(
@@ -1179,6 +1557,50 @@ def grpc_selection(tmp_path: Path, pypi: str, packages: str = "auto") -> dict[st
     done, output = grpc_detect(tmp_path, pypi, packages)
     assert done.returncode == 0, done.stderr
     return dict(line.split("=", 1) for line in output.read_text().splitlines())
+
+
+def go_guard(
+    ref_type: str, ref_name: str, version: str = "1.14.0"
+) -> subprocess.CompletedProcess[str]:
+    """The first step of release-go.yml, run as the workflow runs it: dispatched with the version input, on a ref
+    of the given type and name."""
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "release-go.yml").read_text())
+    step = workflow["jobs"]["release"]["steps"][0]
+    assert step["env"] == {"VERSION": "${{ inputs.version }}"}, (
+        "the input reaches the step through env"
+    )
+    return subprocess.run(
+        ["bash", "-eo", "pipefail", "-c", step["run"]],
+        env={
+            "PATH": os.pathsep.join(["/usr/bin", "/bin"]),
+            "GITHUB_REF_TYPE": ref_type,
+            "GITHUB_REF_NAME": ref_name,
+            "VERSION": version,
+        },
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_the_go_module_tag_is_made_on_a_dispatch_against_a_tag_only() -> None:
+    """release-go.yml publishes a Go module tag: no push or pull request runs it (the job used to be skipped by its
+    `if`, after a run that did nothing), and its first step refuses a dispatch whose ref is not the tag of the version
+    it publishes: a branch moves between a dispatch and a retry, and another release's tag would give the module tag
+    that release's code (the proxies keep what they fetched first)."""
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "release-go.yml").read_text())
+    assert list(workflow[True]) == ["workflow_dispatch"], "the yaml key `on` reads as True"
+    job = workflow["jobs"]["release"]
+    assert "if" not in job, "nothing to skip once the dispatch is the only trigger"
+    assert "tag" in job["steps"][0]["name"]
+    header = (ROOT / ".github" / "workflows" / "release-go.yml").read_text().splitlines()[2]
+    assert header.startswith("# Published only on a maintainer's dispatch against a release tag")
+    assert go_guard("tag", "v1.14.0").returncode == 0
+    branch = go_guard("branch", "release/1.14")
+    assert branch.returncode == 1
+    assert "release tag" in branch.stderr and "release/1.14 is a branch" in branch.stderr
+    other = go_guard("tag", "v1.14.0", version="1.15.0")
+    assert other.returncode == 1
+    assert "against v1.15.0" in other.stderr and "v1.14.0 is another tag" in other.stderr
 
 
 def test_the_grpc_release_refuses_a_dispatch_against_a_branch(tmp_path: Path) -> None:
@@ -1286,6 +1708,25 @@ def test_make_dry_run_of_every_target(target: str, command: str) -> None:
     )
     assert done.returncode == 0, done.stderr
     assert f"scripts/release/release.sh {command} " in done.stdout
+
+
+def test_make_release_plan_runs_the_checker_quietly() -> None:
+    if shutil.which("make") is None:
+        pytest.skip("make is not installed")
+    done = subprocess.run(
+        ["make", "-n", "release-plan", "TAG=v1.13.0", "VERSION=1.14.0-rc.1"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert done.returncode == 0, done.stderr
+    assert (
+        'VERSION_OVERRIDE="1.14.0-rc.1" python3 scripts/check_release_versions.py --plan v1.13.0'
+        in done.stdout
+    )
+    assert "release.sh" not in done.stdout, "the plan reads; nothing of the release tool runs"
+    help_text = subprocess.run(["make", "help"], cwd=ROOT, capture_output=True, text=True).stdout
+    assert "release-plan" in help_text
 
 
 def test_make_help_lists_every_target() -> None:

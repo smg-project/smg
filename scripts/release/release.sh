@@ -8,7 +8,8 @@
 #                                          commit on a topic branch and its pull request against the release branch
 #   release.sh pick <x.y> <sha>[,<sha>..]  cherry-pick commits of main (-x -s) onto a topic branch off
 #                                          release/<x.y> and open the pull request; a conflict stops with the steps
-#   release.sh pick-pr <x.y>               after a resolved conflict: push the pick branch and open its pull request
+#   release.sh pick-pr <x.y> [<branch>]    after a resolved conflict: push the pick branch (the current one, or the
+#                                          named one, checked out first) and open its pull request
 #   release.sh status <x.y>                what is on main and not on release/<x.y>, the branch's own commits,
 #                                          its tags, the open pull requests against it
 #   release.sh tag <version>               check the versions at release/<x.y>'s head and tag it v<version>
@@ -30,7 +31,8 @@
 # string as written (Python tooling normalizes 1.14.0-rc.1 to 1.14.0rc1 on its own).
 #
 # Environment: REMOTE (origin); PUSH (cut and tag push nothing unless PUSH=1; bump, pick and bump-main push
-# their topic branch and open the pull request unless PUSH=0); GH, CARGO, PYTHON, MAKE (the tools).
+# their topic branch and open the pull request unless PUSH=0); REGISTRY=0 (check and publish-plan do not read
+# crates.io and PyPI); GH, CARGO, CURL, PYTHON, MAKE (the tools).
 # The commits, the picks and the tag carry the caller's git identity and sign-off.
 set -euo pipefail
 export PYTHONDONTWRITEBYTECODE=1 # the version checker is imported from the tree; no scripts/__pycache__ left behind
@@ -38,6 +40,7 @@ export PYTHONDONTWRITEBYTECODE=1 # the version checker is imported from the tree
 REMOTE=${REMOTE:-origin}
 GH=${GH:-gh}
 CARGO=${CARGO:-cargo}
+CURL=${CURL:-curl}
 PYTHON=${PYTHON:-python3}
 MAKE=${MAKE:-make}
 VERSION_RE='^([0-9]+)\.([0-9]+)\.([0-9]+)(-rc\.([0-9]+))?$'
@@ -74,10 +77,21 @@ fetch() { git fetch --quiet --tags "$REMOTE" || die "cannot fetch $REMOTE"; }
 has_ref() { git rev-parse --verify --quiet "$1^{commit}" >/dev/null 2>&1; }
 remote_has_branch() { git ls-remote --exit-code --heads "$REMOTE" "$1" >/dev/null 2>&1; }
 remote_has_tag() { git ls-remote --exit-code --tags "$REMOTE" "refs/tags/$1" >/dev/null 2>&1; }
-release_base() { # the remote-tracking release branch, fetched
+release_base() { # the remote-tracking release branch, fetched: what a bump, a pick or a tag builds on
   local branch="release/$1"
   has_ref "$REMOTE/$branch" || die "no $branch on $REMOTE: cut it first (release.sh cut <version> [<from>])"
   printf '%s/%s' "$REMOTE" "$branch"
+}
+release_ref() { # the release branch a read-only command reads: the remote's, else a local cut not pushed yet (a rehearsal), said so
+  local branch="release/$1"
+  if has_ref "$REMOTE/$branch"; then printf '%s/%s' "$REMOTE" "$branch"; return 0; fi
+  # No remote-tracking ref is not the same as no branch on the remote (a single-branch clone, a narrowed fetch refspec):
+  # the remote is asked, once, before a local branch is read as a rehearsal; a stale local cut must never pass for the remote's.
+  # The branch joins the clone's fetch refspec (a one-off fetch would leave the remote-tracking ref behind the next merge).
+  remote_has_branch "$branch" && die "$branch is on $REMOTE but not fetched here: git remote set-branches --add $REMOTE $branch && git fetch $REMOTE"
+  has_ref "refs/heads/$branch" || die "no $branch on $REMOTE or here: cut it first (release.sh cut <version> [<from>])"
+  note "$branch is not on $REMOTE yet: reading the local branch (the push: git push $REMOTE refs/heads/$branch:refs/heads/$branch)"
+  printf 'refs/heads/%s' "$branch"
 }
 previous_tag() { # the newest release tag reachable from $1
   git describe --tags --abbrev=0 --match 'v[0-9]*' "$1" 2>/dev/null \
@@ -211,7 +225,7 @@ cmd_cut() {
   local version=${1:-} from=${2:-}
   [ -n "$version" ] || die "usage: release.sh cut <version> [<from>]"
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
-  local release branch from_sha since
+  local release branch from_sha since start start_branch
   release=$(release_of "$version"); branch="release/$release"
   require_identity; require_clean; fetch
   from=${from:-$REMOTE/main}
@@ -229,14 +243,21 @@ cmd_cut() {
     die "$from reads $(manifest_version "$from_sha"), below ${since#v}: merge the release-bump-main pull request for $since first (release.sh bump-main ${since#v}), or cut from a commit after it"
   fi
   note "cut: $branch from $(git rev-parse --short "$from_sha") ($from); the versions move from $since to $version"
+  # The start is read before the branch is made (`git switch -` and `@{-1}` read the HEAD reflog, which a clone can be
+  # without; `git branch --show-current` is the plain branch name even when a tag shares it, and empty when detached):
+  # the cut comes back to it, since the next commands run from a checkout that has scripts/release/ (a line cut from a
+  # commit before a tooling change on main has none), and the push below names the branch, not HEAD.
+  start_branch=$(git branch --show-current); start=${start_branch:-$(git rev-parse HEAD)}
   git switch --quiet --no-track -c "$branch" "$from_sha"
   bump_tree "$version" "$since"
   commit_all "chore(release): bump versions for v$version" \
     "The release branch $branch, cut from $from_sha ($from). Versions since $since."
+  if [ -n "$start_branch" ]; then git switch --quiet "$start_branch"; else git switch --quiet --detach "$start"; fi
   say ""
-  say "$branch is at $(git rev-parse --short HEAD): $(git log -1 --format=%s)"
-  git show --stat --oneline HEAD | sed -n '2,$p' | sed 's/^/  /'
-  say "(You are on $branch now; the release commands run from a checkout that has scripts/release/, main for instance.)"
+  # refs/heads/: a tag named like the branch would answer for a bare name
+  say "$branch is at $(git rev-parse --short "refs/heads/$branch"): $(git log -1 --format=%s "refs/heads/$branch")"
+  git show --stat --oneline "refs/heads/$branch" | sed -n '2,$p' | sed 's/^/  /'
+  say "(You are back on ${start_branch:-$(git rev-parse --short "$start")}; the release commands run from a checkout that has scripts/release/, main for instance.)"
   push_release_ref "refs/heads/$branch:refs/heads/$branch" "runs the test matrix on $branch (nothing is published); then 'release.sh tag $version'"
 }
 
@@ -294,7 +315,7 @@ cmd_pick() {
     if [ "$n" -le 3 ]; then topic="$topic-$(git rev-parse --short "$full")"; fi
   done
   [ "$n" -le 3 ] || topic="$topic-and-$((n - 3))-more"
-  has_ref "refs/heads/$topic" && die "the branch $topic exists: delete it or finish it (release.sh pick-pr $release)"
+  has_ref "refs/heads/$topic" && die "the branch $topic exists: delete it or finish it (make release-pick-pr RELEASE=$release PICK=$topic)"
   note "pick: ${#ordered[@]} commit(s) onto $topic (from $base)"
   git switch --quiet --no-track -c "$topic" "$base"
   if ! git cherry-pick -x --signoff "${ordered[@]}"; then
@@ -307,19 +328,30 @@ cmd_pick() {
     say "    1. edit the files above, then: git add <file>..."
     say "    2. git cherry-pick --continue   (keeps the '(cherry picked from commit ...)' line and your sign-off;"
     say "                                    git cherry-pick --abort gives the pick up)"
-    say "    3. make release-pick-pr RELEASE=$release   (pushes $topic and opens the pull request against release/$release)"
+    say "    3. make release-pick-pr RELEASE=$release PICK=$topic   (pushes $topic and opens the pull request against release/$release;"
+    say "                                    run it from main, as the other release commands)"
     exit 1
   fi
   pick_pr "$release" "$topic"
 }
 
 cmd_pick_pr() {
-  local release=${1:-}
-  [ -n "$release" ] || die "usage: release.sh pick-pr <x.y>"
+  local release=${1:-} named=${2:-}
+  [ -n "$release" ] || die "usage: release.sh pick-pr <x.y> [<pick branch>]"
   release_ok "$release"
   local topic
   topic=$(git rev-parse --abbrev-ref HEAD)
-  case "$topic" in pick/"$release"-*) ;; *) die "not on a pick/$release-* branch (on $topic)" ;; esac
+  # The pick branch may lack the release targets (a line cut before a tooling change on main): the command runs from
+  # main with the branch named, and checks it out itself, after every refusal: a wrong name or a dirty tree never
+  # moves the clone.
+  if [ -n "$named" ] && [ "$named" != "$topic" ]; then
+    case "$named" in pick/"$release"-*) ;; *) die "$named is not a pick/$release-* branch (the pick branches are pick/$release-<sha>...)" ;; esac
+    has_ref "refs/heads/$named" || die "no branch $named here (the pick branches are pick/$release-<sha>...)"
+    require_clean "commit or discard them before switching to $named"
+    git switch --quiet "$named"
+    topic=$named
+  fi
+  case "$topic" in pick/"$release"-*) ;; *) die "not on a pick/$release-* branch (on $topic): name it, release.sh pick-pr $release <pick branch>" ;; esac
   has_ref CHERRY_PICK_HEAD && die "a cherry-pick is still in progress: git cherry-pick --continue (or --abort) first"
   [ ! -d "$(git rev-parse --git-path sequencer)" ] || die "a cherry-pick sequence is still in progress: git cherry-pick --continue (or --abort) first"
   # A stray change (a lock file a build rewrote after the conflict resolution) would ride into the squash unnamed.
@@ -360,7 +392,7 @@ cmd_status() {
   release_ok "$release"
   local base picked full short subject n=0
   fetch
-  base=$(release_base "$release")
+  base=$(release_ref "$release")
   picked=$(picked_into "$base")
   say "== release/$release is at $(git rev-parse --short "$base"): $(git log -1 --format=%s "$base")"
   say "== versions: $(manifest_version "$base") ($GATEWAY_MANIFEST)"
@@ -422,7 +454,7 @@ cmd_notes() {
   if has_ref "refs/tags/$tagname"; then
     ref=$tagname
   else
-    ref=$(release_base "$release")
+    ref=$(release_ref "$release")
     note "notes: $tagname is not tagged yet; reading release/$release's head"
   fi
   if [ -z "$since" ]; then
@@ -503,7 +535,7 @@ cmd_bump_main() {
   [ -n "$version" ] || die "usage: release.sh bump-main <version>"
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
   is_final "$version" || die "main follows a final release (X.Y.Z), not a candidate"
-  local release source topic body current moved
+  local release source topic body current moved start start_branch
   release=$(release_of "$version")
   require_identity; require_clean; fetch
   if has_ref "refs/tags/v$version"; then
@@ -514,6 +546,7 @@ cmd_bump_main() {
   fi
   topic="chore/main-versions-$version"
   has_ref "refs/heads/$topic" && die "the branch $topic exists: delete it or finish it"
+  start_branch=$(git branch --show-current); start=${start_branch:-$(git rev-parse HEAD)}
   git switch --quiet --no-track -c "$topic" "$REMOTE/main"
   current=$(manifest_version "$REMOTE/main")
   # Main never goes back: after a patch of an older line (v1.14.1 once v1.15.0 is out), the gateway and its mirrors
@@ -531,7 +564,7 @@ cmd_bump_main() {
   "$PYTHON" "$root/scripts/release/sync_versions.py" "$source" "$version"
   refresh_lock
   if git diff --quiet && git diff --cached --quiet; then
-    git switch --quiet - 2>/dev/null || git switch --quiet --detach '@{-1}'
+    if [ -n "$start_branch" ]; then git switch --quiet "$start_branch"; else git switch --quiet --detach "$start"; fi
     git branch --quiet -D "$topic"
     die "bump-main: main carries v$version's versions already (the gateway at $current, every crate and package at least the release's): nothing to move"
   fi
@@ -554,11 +587,14 @@ pep440() { # 1.14.0-rc.1 -> 1.14.0rc1, the spelling PyPI shows
 ref_version() { # <ref> <file>: the version line a file carries at a ref (empty when the file is not there)
   git show "$1:$2" 2>/dev/null | grep -m1 '^version = ' | sed 's/version = "\(.*\)"/\1/' || true
 }
-crate_versions() { # <ref>: "name version" of every workspace crate the version checker lists, at a ref
+publishable() { # <ref>: "kind name version manifest path" of every crate and package the version checker lists, at a ref
+  # A manifest whose [package] says `publish = false` or `publish = []` names a crate cargo never publishes (and
+  # release-crates.yml has no tier for): left out. The key is read from the parsed manifest, not matched as a line.
   "$PYTHON" - "$1" <<'PYEOF'
 import importlib.util
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location("check_release_versions", Path("scripts/check_release_versions.py"))
@@ -566,11 +602,107 @@ crv = importlib.util.module_from_spec(spec)
 sys.modules["check_release_versions"] = crv  # its dataclasses resolve their annotations through sys.modules
 spec.loader.exec_module(crv)
 ref = sys.argv[1]
-for crate in crv.CRATES:
-    shown = subprocess.run(["git", "show", f"{ref}:{crate.version_file}"], capture_output=True, text=True)
-    if shown.returncode == 0:
-        print(crate.name, crv.read_version("cargo", shown.stdout, crate.version_file))
+for component in (*crv.CRATES, *crv.PACKAGES):
+    shown = subprocess.run(["git", "show", f"{ref}:{component.version_file}"], capture_output=True, text=True)
+    if shown.returncode != 0:
+        continue
+    if component.kind == "crate":
+        if tomllib.loads(shown.stdout).get("package", {}).get("publish", True) in (False, []):
+            continue
+        kind = "cargo"
+    else:
+        kind = crv.version_kind(component.version_file)
+    version = crv.read_version(kind, shown.stdout, component.version_file)
+    print(component.kind, component.name, version, component.version_file, component.path)
 PYEOF
+}
+component_list() { # <ref> <file>: publishable's lines into <file>, or a failure naming the error (a manifest the checker refuses, an import
+  # failure): read outside a pipe or a process substitution, where the exit status would be lost and a short list pass for the whole
+  local err
+  err=$(mktemp)
+  if ! publishable "$1" > "$2" 2> "$err"; then
+    say "the crate and package list at $(git rev-parse --short "$1") could not be read ($(tail -n 1 "$err"))" >&2
+    return 1
+  fi
+}
+
+# --- the registries ---------------------------------------------------------------------
+# crates.io and PyPI take a version once: a component whose version at the branch head is published already is skipped
+# by its publish dispatch, and when its code changed after that version was published the release ships none of those
+# changes while every repository-side check reads green. The commits a published version misses are counted from the
+# registry's own publish time of that version (the sparse index line's pubtime, PyPI's upload time): a version
+# published on main the older way, at its bump, counts every commit since, tag or no tag; a version a tag's dispatch
+# published counts only what landed after that dispatch. A held version whose line gives no time counts from its
+# bump. The reads run one at a time: crates.io through the sparse index cargo itself reads (one static file per
+# crate, no API call: the API asks its clients for one request a second), PyPI's JSON API at most once a second; 20 s
+# each. REGISTRY=0 skips them.
+
+USER_AGENT='smg-release-tooling (https://github.com/smg-project/smg)'
+index_path() { # <crate name>: the crate's file in the sparse index, as cargo spells it (1/x, 2/xy, 3/x/xyz, xy/zw/xyzw...)
+  local name
+  name=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case ${#name} in
+    1) printf '1/%s' "$name" ;;
+    2) printf '2/%s' "$name" ;;
+    3) printf '3/%s/%s' "${name:0:1}" "$name" ;;
+    *) printf '%s/%s/%s' "${name:0:2}" "${name:2:2}" "$name" ;;
+  esac
+}
+registry_versions() { # <crate|package> <name>: "version [publish time]" per version the registry holds (yanked ones too: a name takes a version once; the time in UTC, whole seconds, empty when the registry gives none); "unread" when it did not answer; nothing for a name it has not
+  local url out code body
+  case $1 in crate) url="https://index.crates.io/$(index_path "$2")" ;; *) url="https://pypi.org/pypi/$2/json" ;; esac
+  out=$("$CURL" -sS -L -m 20 -A "$USER_AGENT" -w '\n%{http_code}' "$url" 2>/dev/null) || { say unread; return 0; }
+  code=${out##*$'\n'}; body=${out%$'\n'*}
+  case $code in
+    200) "$PYTHON" -c 'import json, sys
+from datetime import datetime, timezone
+
+
+def utc(text):
+    if not text:
+        return ""
+    moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+if sys.argv[1] == "crate":
+    for line in sys.stdin:
+        if line.strip():
+            entry = json.loads(line)
+            print(entry["vers"], utc(entry.get("pubtime", "")))
+else:
+    for version, files in json.load(sys.stdin)["releases"].items():
+        times = sorted(f["upload_time_iso_8601"] for f in files if f.get("upload_time_iso_8601"))
+        print(version, utc(times[0]) if times else "")' "$1" <<< "$body" 2>/dev/null || say unread ;;
+    404) ;;
+    *) say unread ;;
+  esac
+}
+after_text() { # <count> <bump|publish time>: the commits a published version misses, and from where they are counted
+  if [ "$2" = bump ]; then printf '%s commit(s) after its bump; the registry gave no publish time' "$1"; else printf '%s commit(s) after it was published (%s)' "$1" "$2"; fi
+}
+registry_report() { # <ref> <list>: "name version held|free|unread <commits after> <bump|publish time>" per line of <list> (publishable's output), one registry read at a time
+  local ref=$1 list=$2 kind name version manifest path moved published after state line when pypi=0
+  while read -r kind name version manifest path; do
+    state=free; published=""
+    if [ "${REGISTRY:-1}" = 0 ]; then
+      state=unread
+    else
+      if [ "$kind" = package ]; then [ "$pypi" -eq 0 ] || sleep 1; pypi=$((pypi + 1)); fi
+      while read -r line when; do
+        [ "$line" = unread ] && state=unread
+        [ "$line" = "$version" ] && { state=held; published=$when; }
+      done < <(registry_versions "$kind" "$name")
+    fi
+    if [ -n "$published" ]; then
+      # the commits that landed after the publish (committer dates: a pick merged later counts, a pick merged before does not)
+      after=$(git rev-list --count --after="$published" "$ref" -- "$path")
+    else
+      moved=$(git log -1 --format=%H -G'^version = ' "$ref" -- "$manifest")
+      after=$(git rev-list --count "${moved:-$ref}..$ref" -- "$path")
+    fi
+    printf '%s %s %s %s %s\n' "$name" "$version" "$state" "$after" "${published:-bump}"
+  done < "$list" | sort
 }
 
 engine_dispatches() { # <ref> <tag>: one dispatch per (engine, release base), the table read from the workflow at <ref>
@@ -600,17 +732,21 @@ for engine, entry in json.loads(match.group(1)).items():
 PYEOF
 }
 
+registry_mark() { # <report file> <name> <registry>: the mark a plan line carries when the registry holds that version already
+  awk -v n="$2" -v r="$3" '$1 == n && $3 == "held" { printf " (on %s already: the dispatch skips it%s)", r, ($4 > 0 ? "; " $4 " commit(s) after " ($5 == "bump" ? "its bump" : "it was published, " $5) : "") }' "$1"
+}
+
 cmd_publish_plan() {
   local version=${1:-}
   [ -n "$version" ] || die "usage: release.sh publish-plan <version>"
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
-  local release tagname ref latest proto servicer
+  local release tagname ref latest proto servicer list marks crate_name crate_version
   release=$(release_of "$version"); tagname="v$version"
   fetch
   if has_ref "refs/tags/$tagname"; then
     ref=$tagname
   else
-    ref=$(release_base "$release")
+    ref=$(release_ref "$release")
     note "publish-plan: $tagname is not tagged yet; the plan reads release/$release's head and names the tag as the ref to dispatch on"
   fi
   [ "$(manifest_version "$ref")" = "$version" ] || die "$ref reads $(manifest_version "$ref"), not $version"
@@ -624,8 +760,14 @@ cmd_publish_plan() {
   say "   gh workflow run release-pypi.yml --ref $tagname"
   say "2. Rust crates (crates.io: every workspace crate whose version at $tagname is not published yet; smg $version)"
   say "   gh workflow run release-crates.yml --ref $tagname"
-  say "   crate versions at $tagname:"
-  crate_versions "$ref" | sed 's/^/     /'
+  say "   crate versions at $tagname (a crate whose manifest says publish = false or publish = [] is never published and not listed; a version crates.io holds already is skipped by the dispatch and marked):"
+  list=$(mktemp); marks=$(mktemp)
+  component_list "$ref" "$list" || die "publish-plan: the crates and packages at $ref are unknown; nothing listed"
+  registry_report "$ref" "$list" > "$marks"
+  while read -r crate_name crate_version; do
+    say "     $crate_name $crate_version$(registry_mark "$marks" "$crate_name" crates.io)"
+  done < <(awk '$1 == "crate" { print $2, $3 }' "$list")
+  [ "${REGISTRY:-1}" != 0 ] || say "     (the registries were not read: REGISTRY=0)"
   say "3. Gateway image (Docker Hub lightseekorg/smg:$version and ghcr.io/smg-project/smg:$version $latest)"
   say "   gh workflow run release-docker.yml --ref $tagname"
   say "4. Helm chart (oci://ghcr.io/smg-project/charts/smg, version $version)"
@@ -634,7 +776,7 @@ cmd_publish_plan() {
   say "   one dispatch per engine and release base, the table of .github/workflows/release-engine-docker.yml at $tagname: a dispatch"
   say "   without base_image_ref builds the engine's first base only, so every other base is a dispatch of its own)"
   engine_dispatches "$ref" "$tagname" | sed 's/^/   /'
-  say "6. gRPC Python packages (PyPI: smg-grpc-proto==${proto:-?}, smg-grpc-servicer==${servicer:-?}; versions already on PyPI are skipped)"
+  say "6. gRPC Python packages (PyPI: smg-grpc-proto==${proto:-?}$(registry_mark "$marks" smg-grpc-proto PyPI), smg-grpc-servicer==${servicer:-?}$(registry_mark "$marks" smg-grpc-servicer PyPI); versions already on PyPI are skipped)"
   say "   gh workflow run release-grpc.yml --ref $tagname"
   say "7. Go module tag (crates/grpc_client/go/v$version)"
   say "   gh workflow run release-go.yml --ref $tagname -f version=$version"
@@ -669,9 +811,10 @@ cmd_check() {
   [ -n "$version" ] || die "usage: release.sh check <version>"
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
   local release branch base head tagname carried since scratch slug checks runs drift=0 family failed=0 full picked
+  local name state after from list listed held="" quiet="" unread=0 read=0
   release=$(release_of "$version"); branch="release/$release"; tagname="v$version"
   fetch
-  base=$(release_base "$release"); head=$(git rev-parse "$base")
+  base=$(release_ref "$release"); head=$(git rev-parse "$base")
   say "Release gate for v$version ($branch at $(git rev-parse --short "$head"): $(git log -1 --format=%s "$head"))"
   say ""
   # 1. the versions at the head
@@ -690,6 +833,39 @@ cmd_check() {
   else
     say "[FAIL] versions: the branch reads $carried, not $version (release.sh bump $version)"
     failed=1
+  fi
+  # 1b. the registries: a component at a version crates.io or PyPI hold already is skipped by its publish dispatch;
+  # with changes after that version was published, the release ships none of them. REGISTRY=0 skips the reads.
+  # The component list is read first, with its exit status: a list the checker could not produce is a failure of
+  # this item, never a shorter list that passes.
+  list=$(mktemp)
+  if ! listed=$(component_list "$head" "$list" 2>&1); then
+    say "[FAIL] registry: $listed; nothing was compared with crates.io or PyPI"
+    failed=1
+  else
+    while read -r name carried state after from; do
+      read=$((read + 1))
+      case $state in
+        held) if [ "$after" -gt 0 ]; then held="$held, $name $carried ($(after_text "$after" "$from"))"; else quiet="$quiet, $name $carried"; fi ;;
+        unread) unread=$((unread + 1)) ;;
+      esac
+    done < <(registry_report "$head" "$list")
+    if [ "$read" -ne "$(grep -c . "$list")" ]; then
+      say "[FAIL] registry: $read of $(grep -c . "$list") crates and packages compared with crates.io / PyPI (the report is short)"
+      failed=1
+    elif [ "${REGISTRY:-1}" = 0 ]; then
+      say "[....] registry: crates.io and PyPI not read (REGISTRY=0): a version they hold already is skipped by its publish dispatch"
+      failed=1
+    elif [ -n "$held" ]; then
+      say "[FAIL] registry: at a version crates.io or PyPI hold already, with changes after it (the publish dispatch skips them and ships none of those changes; a bump pull request against $branch moves them): ${held#, }"
+      failed=1
+    elif [ "$unread" -gt 0 ]; then
+      say "[....] registry: $unread of $read read(s) of crates.io / PyPI did not answer; read again before the tag"
+      failed=1
+    else
+      say "[ok]   registry: no crate or package sits at a version crates.io or PyPI hold already with changes after it ($read of $read read)"
+    fi
+    [ -z "$quiet" ] || say "[note] registry: at a published version with nothing changed after it (the dispatch skips them, nothing is lost): ${quiet#, }"
   fi
   # 2. CI on the head
   if command -v "$GH" >/dev/null 2>&1 && slug=$("$GH" repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null) && [ -n "$slug" ]; then

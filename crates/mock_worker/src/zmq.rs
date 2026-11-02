@@ -203,6 +203,15 @@ pub async fn serve_until(
                     }
                 };
                 if let Some(answer) = scripted {
+                    // The request's limit ends the answer as it would an
+                    // engine's; the worker default is the canned path's.
+                    let answer = answer.cut_to(
+                        request
+                            .sampling_params
+                            .as_ref()
+                            .map(|params| params.max_tokens)
+                            .filter(|&max| max > 0),
+                    );
                     let want_logprobs = request
                         .sampling_params
                         .as_ref()

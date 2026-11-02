@@ -17,6 +17,7 @@ use openai_protocol::{
     embedding::{EmbeddingRequest, EmbeddingResponse},
     generate::{GenerateRequest, GenerateResponse},
     messages::{CreateMessageRequest, Message},
+    profile::ProviderProfile,
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
@@ -40,7 +41,10 @@ use super::{
         EncodeItemBootstrapInfo, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
         ProtoInputLogProbs, ProtoRequest, ProtoStream,
     },
-    regular::stages::decisions::scoring::{DecisionPrompt, DecisionScoring},
+    regular::{
+        stages::decisions::scoring::{DecisionPrompt, DecisionScoring},
+        symphony::{PromptReplay, Reading},
+    },
     spec::ResponseSpec,
     utils::{Names, ParserResolver, WorkerDecoding},
 };
@@ -243,6 +247,29 @@ pub(crate) struct ProcessingState {
     /// themselves; they are the next read. `None` on the endpoints whose preparation resolves
     /// no names; a read then resolves them itself.
     pub parser_names: Option<Names>,
+
+    /// The provider profile of the request's model (`ProviderProfile::for_model`), derived once
+    /// by the chat and Messages preparations and read by the later stages in place of a
+    /// derivation of their own (the output budget, the constraint's tool-call reading, the
+    /// response spec). `None` on the other endpoints; a read then derives it itself.
+    pub provider: Option<ProviderProfile>,
+    /// The table's replay of the rendered prompt, as preparation read it for the forced call's
+    /// tag (`reading::prepare`): request building's reasoning decision takes it in place of a
+    /// second replay of the same prompt (`reading::reasoning_decision`). `None` when preparation
+    /// did not replay (the request's thinking switch armed the reasoning, or the endpoint's
+    /// preparation reads no prompt); a decision then replays itself.
+    pub prompt_thought: Option<PromptReplay>,
+    /// The table decision for the request's model under its parser (`regular::symphony::reading`:
+    /// the table that reads the response, or why the legacy parsers do), as the chat and Messages
+    /// preparations made it once for the replay, the constraint and the decoder's special tokens
+    /// (`reading::prepare`): request building's assignment reads it in its place
+    /// (`reading::decide`), so those four share one decision. The whole turn's grammar and the
+    /// `auto` tag still decide over the same inputs, shaped for the selected worker's start
+    /// (`regular::symphony::turn_constraint`, `AutoTag`). Transcription shares the chat
+    /// preparation and keeps the legacy decision it makes, which nothing reads. `None` on the
+    /// endpoints whose preparation decides nothing, and when the names refused (the constraint
+    /// carries the refusal); the assignment then decides itself.
+    pub reading: Option<Reading>,
 
     /// Owned here rather than inside `PreparationOutput` so EPD's `EncodeStage`
     /// can borrow it for the with-pixels encode serialization before request

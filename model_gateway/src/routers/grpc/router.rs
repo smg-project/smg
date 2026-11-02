@@ -1332,4 +1332,4 @@ fn canonicalize_responses_request<'a>(
 }
 
 #[cfg(test)]
-mod pd_tests;
+mod tests;
