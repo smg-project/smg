@@ -12,6 +12,14 @@
 //! that can match the empty string is declined like everything else outside
 //! the subset, and the caller keeps the `tokenizers` pipeline for it.
 //!
+//! The pre-tokenizer of the GPT-4 family (Qwen 2 and 3, Llama 3, GLM 4.6
+//! and their kin ship one template, the digit rule's bound apart) is matched
+//! by a [`Scanner`] instead of the program: each of its seven alternatives
+//! is decided at a position by a few class tests and class runs, which is
+//! what the backtracking engine arrives at for that shape, so the pieces are
+//! the same and no character is interpreted op by op. The classes are the
+//! parser's, so the two matchers cannot read a category differently.
+//!
 //! Character categories come from [`super::unicode`], generated from that
 //! same engine, so `\p{L}` or `\s` cannot mean one thing here and another
 //! there.
@@ -239,6 +247,8 @@ pub(crate) struct Pattern {
     program: Vec<Op>,
     /// The first-character sets the `Split` ops index.
     firsts: Vec<First>,
+    /// The matcher of the GPT-4 family's template, when the pattern is one.
+    scanner: Option<Scanner>,
 }
 
 /// One instruction of a compiled pattern. The tree is flattened into a
@@ -309,6 +319,7 @@ impl Pattern {
         if choices(&root) > MAX_CHOICES {
             return None;
         }
+        let scanner = Scanner::recognize(&root, &parser.classes);
         let mut program = Vec::new();
         let mut firsts = Vec::new();
         compile(&root, &mut program, &mut firsts);
@@ -317,7 +328,18 @@ impl Pattern {
             classes: parser.classes,
             program,
             firsts,
+            scanner,
         })
+    }
+
+    /// This pattern matched by its program alone, the scanner set aside: the
+    /// tests hold the two against each other.
+    #[cfg(test)]
+    fn program_only(&self) -> Self {
+        Self {
+            scanner: None,
+            ..self.clone()
+        }
     }
 
     /// The matches in `text`, leftmost first, each continuing after the last.
@@ -447,6 +469,355 @@ impl Pattern {
     }
 }
 
+/// A part of the GPT-4 family's template that one class fills: the bit of
+/// [`Scanner::ascii`] and the slot of [`Scanner::classes`] that hold it.
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+enum Role {
+    /// The first character of a clitic alternative (a bit only: beyond
+    /// ASCII the alternatives are tried).
+    CliticStart,
+    /// The optional lead-in of a letter run (`[^\r\n\p{L}\p{N}]?`).
+    WordPrefix,
+    /// A letter run (`\p{L}+`).
+    Word,
+    /// A digit (`\p{N}`, up to the digit cap at once).
+    Digit,
+    /// The optional space before a punctuation run (` ?`).
+    PunctPrefix,
+    /// A punctuation run (`[^\s\p{L}\p{N}]+`).
+    Punct,
+    /// The line breaks after a punctuation run (`[\r\n]*`).
+    PunctBreak,
+    /// The whitespace before line breaks (`\s*`).
+    BreakSpace,
+    /// A run of line breaks (`[\r\n]+`).
+    Break,
+    /// Whitespace that leaves its last character to what follows (`\s+`
+    /// before `(?!\S)`).
+    TrailSpace,
+    /// What may not follow that whitespace (`\S`).
+    NotTrail,
+    /// A whitespace run (`\s+`).
+    Space,
+}
+
+/// The roles, so many slots of [`Scanner::classes`].
+const ROLES: usize = 12;
+
+/// The roles that one class fills, every role but the clitic start.
+const CLASSED_ROLES: [Role; ROLES - 1] = [
+    Role::WordPrefix,
+    Role::Word,
+    Role::Digit,
+    Role::PunctPrefix,
+    Role::Punct,
+    Role::PunctBreak,
+    Role::BreakSpace,
+    Role::Break,
+    Role::TrailSpace,
+    Role::NotTrail,
+    Role::Space,
+];
+
+impl Role {
+    #[inline(always)]
+    fn bit(self) -> u16 {
+        1 << (self as u16)
+    }
+}
+
+/// The matcher of the GPT-4 family's pre-tokenizer template,
+///
+/// ```text
+/// (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+/// ```
+///
+/// with whatever classes stand in those places and whatever bound the digit
+/// rule has (Qwen 2 and 3 take one digit, Llama 3 and GLM 4.6 up to three,
+/// Qwen 3.5 counts marks among the letters). For this shape, leftmost-first
+/// alternation over greedy runs comes down to a decision per alternative
+/// that one scan settles:
+///
+/// 1. a clitic: the first alternative whose characters follow in order;
+/// 2. a letter run, with the lead-in when a letter follows it;
+/// 3. up to the bound of digits;
+/// 4. a punctuation run, with the space when punctuation follows it, and
+///    the line breaks after the run;
+/// 5. whitespace ending in line breaks: the whitespace run up to and
+///    including its last line break, when it holds one;
+/// 6. whitespace before a non-space: the run short of its last character,
+///    or whole at the end of the text, when it has a character to give;
+/// 7. the whitespace run.
+///
+/// Each is what the engine's backtracking arrives at: a greedy optional
+/// lead-in is kept only when the run after it can start, a greedy run before
+/// a required class gives back characters until the class follows, and the
+/// first alternative to reach the end of the pattern wins.
+#[derive(Debug, Clone)]
+struct Scanner {
+    /// Per ASCII code point, a bit per [`Role`] whose class holds it.
+    ascii: [u16; 128],
+    /// The class of each role, read for characters beyond ASCII (the clitic
+    /// start's slot is unused).
+    classes: [usize; ROLES],
+    /// Whether a clitic alternative may begin beyond ASCII.
+    clitic_beyond_ascii: bool,
+    /// The clitic alternatives, each the classes of its characters in order.
+    clitics: Vec<Vec<usize>>,
+    /// The most digits the digit alternative takes at once.
+    digit_cap: u32,
+}
+
+impl Scanner {
+    /// The scanner of `root`, when it is the template; `None` for every other
+    /// shape, which the program matches.
+    fn recognize(root: &Node, classes: &[Class]) -> Option<Self> {
+        let Node::Alt { alternatives, .. } = root else {
+            return None;
+        };
+        let [clitics, word, digits, punct, breaks, trail, space] = alternatives.as_slice() else {
+            return None;
+        };
+        let Node::Alt {
+            alternatives: clitic_alternatives,
+            ..
+        } = clitics
+        else {
+            return None;
+        };
+        let clitics = clitic_alternatives
+            .iter()
+            .map(|alternative| match alternative {
+                Node::Class(class) => Some(vec![*class]),
+                Node::Concat(nodes) => nodes.iter().map(plain_class).collect(),
+                _ => None,
+            })
+            .collect::<Option<Vec<Vec<usize>>>>()?;
+        if clitics.iter().any(Vec::is_empty) {
+            return None;
+        }
+        let [word_prefix, word_run] = concat(word)? else {
+            return None;
+        };
+        let (digit, digit_cap) = match digits {
+            Node::Class(class) => (*class, 1),
+            Node::ClassRepeat { class, min: 1, max } => (*class, *max),
+            _ => return None,
+        };
+        let [punct_prefix, punct_run, punct_break] = concat(punct)? else {
+            return None;
+        };
+        let [break_space, break_run] = concat(breaks)? else {
+            return None;
+        };
+        let [trail_space, not_trail] = concat(trail)? else {
+            return None;
+        };
+        let Node::NotAhead(not_trail) = not_trail else {
+            return None;
+        };
+        let mut roles = [0usize; ROLES];
+        roles[Role::WordPrefix as usize] = repeat(word_prefix, 0, 1)?;
+        roles[Role::Word as usize] = repeat(word_run, 1, u32::MAX)?;
+        roles[Role::Digit as usize] = digit;
+        roles[Role::PunctPrefix as usize] = repeat(punct_prefix, 0, 1)?;
+        roles[Role::Punct as usize] = repeat(punct_run, 1, u32::MAX)?;
+        roles[Role::PunctBreak as usize] = repeat(punct_break, 0, u32::MAX)?;
+        roles[Role::BreakSpace as usize] = repeat(break_space, 0, u32::MAX)?;
+        roles[Role::Break as usize] = repeat(break_run, 1, u32::MAX)?;
+        roles[Role::TrailSpace as usize] = repeat(trail_space, 1, u32::MAX)?;
+        roles[Role::NotTrail as usize] = *not_trail;
+        roles[Role::Space as usize] = repeat(space, 1, u32::MAX)?;
+        let mut ascii = [0u16; 128];
+        for (code, bits) in ascii.iter_mut().enumerate() {
+            let c = char::from(code as u8);
+            for role in CLASSED_ROLES {
+                if classes[roles[role as usize]].contains(c) {
+                    *bits |= role.bit();
+                }
+            }
+            if clitics
+                .iter()
+                .any(|alternative| classes[alternative[0]].contains(c))
+            {
+                *bits |= Role::CliticStart.bit();
+            }
+        }
+        let clitic_beyond_ascii = clitics
+            .iter()
+            .any(|alternative| classes[alternative[0]].first().non_ascii);
+        Some(Self {
+            ascii,
+            classes: roles,
+            clitic_beyond_ascii,
+            clitics,
+            digit_cap,
+        })
+    }
+
+    /// Whether `c` is in the class of `role`.
+    #[inline(always)]
+    fn has(&self, classes: &[Class], role: Role, c: char) -> bool {
+        let code = u32::from(c);
+        if code < 128 {
+            self.ascii[code as usize] & role.bit() != 0
+        } else {
+            classes[self.classes[role as usize]].contains(c)
+        }
+    }
+
+    /// The end of the run of `role`'s class that starts at `pos`.
+    #[inline(always)]
+    fn run_end(&self, classes: &[Class], text: &str, mut pos: usize, role: Role) -> usize {
+        while let Some((c, len)) = next_char(text, pos) {
+            if !self.has(classes, role, c) {
+                break;
+            }
+            pos += len;
+        }
+        pos
+    }
+
+    /// The end of the piece that starts at `pos`, if one does: the first of
+    /// the seven alternatives that matches there, as the engine picks it.
+    fn match_at(&self, classes: &[Class], text: &str, pos: usize) -> Option<usize> {
+        let (c, len) = next_char(text, pos)?;
+        let after = pos + len;
+        // 1. A clitic: the first alternative whose characters follow in order.
+        let may_start_clitic = if u32::from(c) < 128 {
+            self.ascii[u32::from(c) as usize] & Role::CliticStart.bit() != 0
+        } else {
+            self.clitic_beyond_ascii
+        };
+        if may_start_clitic {
+            'alternatives: for alternative in &self.clitics {
+                let mut p = pos;
+                for &class in alternative {
+                    match next_char(text, p) {
+                        Some((d, n)) if classes[class].contains(d) => p += n,
+                        _ => continue 'alternatives,
+                    }
+                }
+                return Some(p);
+            }
+        }
+        // 2. A letter run, with the lead-in when a letter follows it.
+        if self.has(classes, Role::WordPrefix, c) {
+            if let Some((d, n)) = next_char(text, after) {
+                if self.has(classes, Role::Word, d) {
+                    return Some(self.run_end(classes, text, after + n, Role::Word));
+                }
+            }
+        }
+        if self.has(classes, Role::Word, c) {
+            return Some(self.run_end(classes, text, after, Role::Word));
+        }
+        // 3. Up to the bound of digits.
+        if self.has(classes, Role::Digit, c) {
+            let mut end = after;
+            let mut count = 1;
+            while count < self.digit_cap {
+                match next_char(text, end) {
+                    Some((d, n)) if self.has(classes, Role::Digit, d) => {
+                        end += n;
+                        count += 1;
+                    }
+                    _ => break,
+                }
+            }
+            return Some(end);
+        }
+        // 4. A punctuation run, with the space when punctuation follows it,
+        //    and the line breaks after the run.
+        if self.has(classes, Role::PunctPrefix, c) {
+            if let Some((d, n)) = next_char(text, after) {
+                if self.has(classes, Role::Punct, d) {
+                    let end = self.run_end(classes, text, after + n, Role::Punct);
+                    return Some(self.run_end(classes, text, end, Role::PunctBreak));
+                }
+            }
+        }
+        if self.has(classes, Role::Punct, c) {
+            let end = self.run_end(classes, text, after, Role::Punct);
+            return Some(self.run_end(classes, text, end, Role::PunctBreak));
+        }
+        // 5. Whitespace ending in line breaks: the greedy whitespace run
+        //    gives back characters until a line break follows it.
+        let mut end = self.run_end(classes, text, pos, Role::BreakSpace);
+        loop {
+            if let Some((d, n)) = next_char(text, end) {
+                if self.has(classes, Role::Break, d) {
+                    return Some(self.run_end(classes, text, end + n, Role::Break));
+                }
+            }
+            if end == pos {
+                break;
+            }
+            end = previous_boundary(text, end);
+        }
+        // 6. Whitespace before a non-space: the greedy run gives back its last
+        //    character while a non-space follows it, down to one.
+        if self.has(classes, Role::TrailSpace, c) {
+            let mut end = self.run_end(classes, text, after, Role::TrailSpace);
+            loop {
+                match next_char(text, end) {
+                    Some((d, _)) if self.has(classes, Role::NotTrail, d) => {}
+                    _ => return Some(end),
+                }
+                let shorter = previous_boundary(text, end);
+                if shorter == pos {
+                    break;
+                }
+                end = shorter;
+            }
+        }
+        // 7. The whitespace run.
+        if self.has(classes, Role::Space, c) {
+            return Some(self.run_end(classes, text, after, Role::Space));
+        }
+        None
+    }
+}
+
+/// The class of a node that is one character of a class.
+fn plain_class(node: &Node) -> Option<usize> {
+    match node {
+        Node::Class(class) => Some(*class),
+        _ => None,
+    }
+}
+
+/// The class of a node that is a run of `min..=max` characters of one class.
+fn repeat(node: &Node, min: u32, max: u32) -> Option<usize> {
+    match node {
+        Node::ClassRepeat {
+            class,
+            min: node_min,
+            max: node_max,
+        } if *node_min == min && *node_max == max => Some(*class),
+        _ => None,
+    }
+}
+
+/// The nodes of a concatenation.
+fn concat(node: &Node) -> Option<&[Node]> {
+    match node {
+        Node::Concat(nodes) => Some(nodes),
+        _ => None,
+    }
+}
+
+/// The start of the character before `pos`, a character boundary past 0.
+#[inline]
+fn previous_boundary(text: &str, pos: usize) -> usize {
+    let mut p = pos - 1;
+    while !text.is_char_boundary(p) {
+        p -= 1;
+    }
+    p
+}
+
 /// Appends the ops of `node` to `program`; the first-character sets the
 /// splits index go to `firsts`. Alternatives are laid out in order, each
 /// ending in a jump past the alternation, so that the program tries them the
@@ -565,7 +936,11 @@ impl Iterator for Matches<'_, '_> {
     fn next(&mut self) -> Option<(usize, usize)> {
         while self.pos < self.text.len() {
             let start = self.pos;
-            match self.pattern.match_at(self.text, start, &mut self.choices) {
+            let end = match &self.pattern.scanner {
+                Some(scanner) => scanner.match_at(&self.pattern.classes, self.text, start),
+                None => self.pattern.match_at(self.text, start, &mut self.choices),
+            };
+            match end {
                 Some(end) if end > start => {
                     self.pos = end;
                     return Some((start, end));
@@ -1016,12 +1391,18 @@ mod tests {
     const QWEN2: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
     const QWEN35: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
     const CL100K: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+    /// The template with a digit rule of up to two digits, and with an
+    /// unbounded one: the other two bounds the scanner takes.
+    const TWO_DIGITS: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+    const ANY_DIGITS: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}+| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
     const DIGITS: &str = r"\p{N}{1,3}";
     const CJK: &str = "[一-龥぀-ゟ゠-ヿ]+";
     const DEEPSEEK: &str = "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
     const CASED: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
-    const PATTERNS: [&str; 8] = [GPT2, QWEN2, QWEN35, CL100K, DIGITS, CJK, DEEPSEEK, CASED];
+    const PATTERNS: [&str; 10] = [
+        GPT2, QWEN2, QWEN35, CL100K, TWO_DIGITS, ANY_DIGITS, DIGITS, CJK, DEEPSEEK, CASED,
+    ];
 
     /// Characters that exercise every class the patterns use: ASCII of all
     /// kinds, spaces and line breaks of several scripts, letters with and
@@ -1271,6 +1652,88 @@ mod tests {
                     ours,
                     oracle_matches(pattern, &text),
                     "pattern {pattern:?} text {text:?}"
+                );
+                if parsed.scanner.is_some() {
+                    let program: Vec<(usize, usize)> =
+                        parsed.program_only().find_iter(&text).collect();
+                    assert_eq!(ours, program, "pattern {pattern:?} text {text:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_gpt4_family_template_takes_the_scanner_and_no_other_shape_does() {
+        for (pattern, digit_cap) in [
+            (QWEN2, 1),
+            (QWEN35, 1),
+            (CL100K, 3),
+            (TWO_DIGITS, 2),
+            (ANY_DIGITS, u32::MAX),
+        ] {
+            let scanner = Pattern::parse(pattern)
+                .expect("parses")
+                .scanner
+                .expect("the template takes the scanner");
+            assert_eq!(scanner.digit_cap, digit_cap, "{pattern}");
+            assert_eq!(scanner.clitics.len(), 7, "{pattern}");
+            assert!(!scanner.clitic_beyond_ascii, "{pattern}");
+        }
+        // The last two alternatives the other way round, a digit rule of two
+        // or more, a lead-in run: the same classes in another shape.
+        const SWAPPED: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+|\s+(?!\S)";
+        const TWO_OR_MORE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{2,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+        const LEAD_IN_RUN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]*\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+        for pattern in [
+            GPT2,
+            DIGITS,
+            CJK,
+            DEEPSEEK,
+            CASED,
+            SWAPPED,
+            TWO_OR_MORE,
+            LEAD_IN_RUN,
+        ] {
+            assert!(
+                Pattern::parse(pattern).expect("parses").scanner.is_none(),
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scanner_agrees_with_the_program_and_the_engine_on_shaped_text() {
+        // Text shaped like JSON, code and prose: runs of spaces and line
+        // breaks before letters, digits, quotes and brackets, where the
+        // whitespace alternatives give characters back, clitics in every
+        // case, lead-ins of every kind, and the characters beyond ASCII
+        // that the classes hold or exclude.
+        const PARTS: &[&str] = &[
+            " ", "  ", "   ", "\n", "\n\n", "\r\n", "\t", "\u{A0}", "\u{2028}", "\u{3000}", "\"",
+            "'", "'s", "'S", "'ll", "'LL", "'ve", "'re", "'d", "'m", "'t", "'x", "'ſ", ":", ",",
+            ".", "{", "}", "[", "]", "(", ")", "-", "_", "a", "Word", "ſ", "é", "ß", "1", "22",
+            "333", "4444", "٣", "²", "中", "ก", "\u{301}", "\u{93E}", "😀", "\u{200D}", "\u{FE0F}",
+            "x",
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for pattern in [QWEN2, QWEN35, CL100K, TWO_DIGITS, ANY_DIGITS] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            assert!(parsed.scanner.is_some(), "{pattern}");
+            let program = parsed.program_only();
+            for round in 0..2000 {
+                let text: String = (0..1 + round % 40)
+                    .map(|_| PARTS[(pseudo_random(&mut state) % PARTS.len() as u64) as usize])
+                    .collect();
+                let ours: Vec<(usize, usize)> = parsed.find_iter(&text).collect();
+                assert_eq!(
+                    ours,
+                    program.find_iter(&text).collect::<Vec<_>>(),
+                    "the program; pattern {pattern:?} text {text:?}"
+                );
+                assert_eq!(
+                    ours,
+                    oracle_matches(pattern, &text),
+                    "the engine; pattern {pattern:?} text {text:?}"
                 );
             }
         }
