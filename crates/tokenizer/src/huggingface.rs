@@ -459,11 +459,13 @@ impl HuggingFaceTokenizer {
     /// The `tokenizers` pipeline behind this tokenizer, as loaded: the
     /// vocabulary and stages of `tokenizer.json`, with the post-processor
     /// the configuration prescribes when `tokenizer_config.json` sets
-    /// `add_bos_token` or `add_eos_token` (the rule is on
-    /// [`Self::from_file`]). A cross-check of the crate's ids against the
-    /// `tokenizers` crate compares with this pipeline, which adds the same
-    /// special tokens on request, or with `add_special_tokens` off, where it
-    /// and `tokenizer.json` read alone agree.
+    /// `add_bos_token` or `add_eos_token`, and with the file's `truncation`
+    /// and `padding` blocks cleared (both rules are on [`Self::from_file`]).
+    /// A cross-check of the crate's ids against the `tokenizers` crate
+    /// compares with this pipeline, which adds the same special tokens on
+    /// request, or with `add_special_tokens` off, where it and
+    /// `tokenizer.json` read alone agree once that file's blocks are cleared
+    /// too.
     pub fn tokenizers_pipeline(&self) -> &HfTokenizer {
         &self.core.tokenizer
     }
