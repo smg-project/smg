@@ -16,8 +16,8 @@ use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as 
 use tokio::task::JoinHandle;
 
 use super::{
-    eof_tests::{chunk, complete, processor, scripted_stream, CharacterTokenizer},
-    *,
+    super::*,
+    eof::{chunk, complete, processor, scripted_stream, CharacterTokenizer},
 };
 use crate::{
     observability::metrics::test_support::render_with_recorder,

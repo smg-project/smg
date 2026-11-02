@@ -17,7 +17,7 @@ use super::{usage_tests::harmony_tokens, HarmonyStreamingProcessor};
 use crate::{
     observability::metrics::metrics_labels,
     routers::grpc::{
-        context, harmony::try_harmony_encoding, regular::streaming::eof_tests::scripted_stream,
+        context, harmony::try_harmony_encoding, regular::streaming::tests::eof::scripted_stream,
         utils,
     },
 };

@@ -28,12 +28,12 @@ use symphony::{formats::qwen3, CallSyntax};
 use tokio::{sync::oneshot, task::JoinHandle};
 
 use super::{
-    eof_tests::{
+    super::*,
+    eof::{
         chunk, collect_events, data_frame, decoded_stream, gated_stream, mock_worker_endpoint,
         processor, scripted_stream, trailers_frame, CharacterTokenizer,
     },
-    symphony_tests::assigned_message,
-    *,
+    symphony::assigned_message,
 };
 use crate::{
     rate_limit::test_support::RecordingBackend,

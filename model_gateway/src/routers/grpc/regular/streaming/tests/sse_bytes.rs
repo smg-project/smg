@@ -16,11 +16,11 @@ use openai_protocol::{
 use smg_grpc_client::vllm_engine::proto;
 
 use super::{
-    eof_tests::{
+    super::*,
+    eof::{
         chunk, chunk_with_logprobs, complete, complete_with_prompt, processor, scripted_stream,
         CharacterTokenizer,
     },
-    *,
 };
 
 struct Scenario {
@@ -222,7 +222,7 @@ async fn stream_bytes(scenario: &Scenario) -> Vec<u8> {
 /// scenario against `fixtures/<name>.sse`.
 fn assert_recorded_bytes(name: &str, must_contain: &str, actual: &[u8]) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("src/routers/grpc/regular/streaming/fixtures");
+        .join("src/routers/grpc/regular/streaming/tests/fixtures");
     let record = std::env::var_os("SMG_RECORD_SSE_FIXTURES").is_some();
     let text = String::from_utf8_lossy(actual);
     assert!(

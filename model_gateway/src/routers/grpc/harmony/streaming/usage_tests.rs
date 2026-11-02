@@ -27,7 +27,7 @@ use crate::{
                 processor::{HarmonyResponseProcessor, ResponsesIterationResult},
                 try_harmony_encoding,
             },
-            regular::streaming::eof_tests::scripted_stream,
+            regular::streaming::tests::eof::scripted_stream,
             utils,
         },
     },
