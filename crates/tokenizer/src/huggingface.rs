@@ -831,24 +831,29 @@ impl HuggingFaceTokenizer {
     ///
     /// `transformers` builds the tokenizer of a checkpoint whose
     /// `tokenizer_config.json` names `LlamaTokenizer` (or the `Fast`
-    /// spelling) and whose `config.json` says model type `llama` from the
-    /// file's vocabulary and merges with a pipeline of its own: no
-    /// normalizer, and a `Metaspace` pre-tokenizer whose prepend scheme the
-    /// configuration selects (`add_prefix_space: false`: the word marker is
-    /// prepended nowhere; `legacy: true`: before every split; otherwise at
-    /// the start of the text only). The serving engines load their
-    /// tokenizer through that class, so those are the ids a prompt gets. A
-    /// `tokenizer.json` converted the legacy way keeps instead a `Prepend`
-    /// normalizer, which puts the word marker before every split (after
-    /// every special token too) and into the pattern of every added token
-    /// matched after normalization, so that a marker such as `</think>` is
-    /// found only behind a space, and takes the space with it. For a file of
-    /// that legacy shape the loader installs the class's pipeline (no
-    /// normalizer, the `Metaspace` pre-tokenizer, and the class's decoder,
-    /// which strips the one leading space of the decoded text only where the
-    /// marker is prepended) over the file's vocabulary, added tokens and
-    /// post-processor; any other file, and any other model type (which
-    /// `transformers` reads as its file), stays as it is.
+    /// spelling) from the file's vocabulary and merges with a pipeline of
+    /// its own: no normalizer, and a `Metaspace` pre-tokenizer whose prepend
+    /// scheme the configuration selects (`add_prefix_space: false`: the word
+    /// marker is prepended nowhere; `legacy: true`: before every split;
+    /// otherwise at the start of the text only). The serving engines load
+    /// their tokenizer through that class, so those are the ids a prompt
+    /// gets. A `tokenizer.json` converted the legacy way keeps instead a
+    /// `Prepend` normalizer, which puts the word marker before every split
+    /// (after every special token too) and into the pattern of every added
+    /// token matched after normalization, so that a marker such as
+    /// `</think>` is found only behind a space, and takes the space with it.
+    /// For a file of that legacy shape the loader installs the class's
+    /// pipeline (no normalizer, the `Metaspace` pre-tokenizer, and the
+    /// class's decoder, which strips the one leading space of the decoded
+    /// text only where the marker is prepended) over the file's vocabulary,
+    /// added tokens and post-processor; any other file stays as it is.
+    ///
+    /// The class is read from `tokenizer_config.json`, as the reference reads
+    /// it, before any `config.json`: a checkpoint shipped as the tokenizer's
+    /// files alone, with no `config.json` or none that says a `model_type`,
+    /// is the class's. A `config.json` that names a model type other than
+    /// `llama` keeps the file (the reference reads several of those, `phi3`
+    /// and `llava` among them, as their file).
     fn llama_class_pipeline(
         tokenizer: &mut LoadingTokenizer,
         dir: Option<&Path>,
@@ -860,7 +865,10 @@ impl HuggingFaceTokenizer {
         ) {
             return;
         }
-        if dir.and_then(model_type_from_config).as_deref() != Some("llama") {
+        if dir
+            .and_then(model_type_from_config)
+            .is_some_and(|model_type| model_type != "llama")
+        {
             return;
         }
         if tokenizer.get_pre_tokenizer().is_some()
@@ -3021,6 +3029,71 @@ mod tests {
             [6, 7, 4, 6, 8]
         );
         assert_eq!(ids_of(&tokenizer, " a<|im_end|> b"), [6, 7, 4, 6, 8]);
+    }
+
+    /// A byte-fallback fixture vocabulary as a legacy conversion writes it:
+    /// the `Prepend` + `Replace` normalizer, no pre-tokenizer, the template
+    /// post-processor, and the pieces of the text `> <s> </s> <|` under the
+    /// ids a 32k byte-fallback vocabulary gives them, so that the ids below
+    /// are the reference's on that text.
+    const BYTE_FALLBACK_TOKENIZER_JSON: &str = r#"{
+        "version": "1.0", "truncation": null, "padding": null,
+        "added_tokens": [
+            {"id": 0, "content": "<unk>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+            {"id": 1, "content": "<s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+            {"id": 2, "content": "</s>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}],
+        "normalizer": {"type": "Sequence", "normalizers": [
+            {"type": "Prepend", "prepend": "▁"},
+            {"type": "Replace", "pattern": {"String": " "}, "content": "▁"}]},
+        "pre_tokenizer": null,
+        "post_processor": {"type": "TemplateProcessing",
+            "single": [{"SpecialToken": {"id": "<s>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}}],
+            "pair": [{"SpecialToken": {"id": "<s>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}},
+                {"SpecialToken": {"id": "<s>", "type_id": 1}}, {"Sequence": {"id": "B", "type_id": 1}}],
+            "special_tokens": {"<s>": {"id": "<s>", "ids": [1], "tokens": ["<s>"]}}},
+        "decoder": {"type": "Sequence", "decoders": [
+            {"type": "Replace", "pattern": {"String": "▁"}, "content": " "},
+            {"type": "ByteFallback"}, {"type": "Fuse"}, {"type": "Strip", "content": " ", "start": 1, "stop": 0}]},
+        "model": {"type": "BPE", "dropout": null, "unk_token": "<unk>", "continuing_subword_prefix": null,
+            "end_of_word_suffix": null, "fuse_unk": true, "byte_fallback": true, "ignore_merges": false,
+            "vocab": {"<unk>": 0, "<s>": 1, "</s>": 2, "▁▁": 259, "▁<": 529, "▁>": 1405, "▁": 29871,
+                "<": 29966, ">": 29958, "|": 29989},
+            "merges": ["▁ <", "▁ ▁", "▁ >"]}
+    }"#;
+
+    /// The reference picks the class from `tokenizer_config.json` before it
+    /// reads any `config.json`, so a checkpoint shipped as the tokenizer's
+    /// files alone is the class's too: after a special token spelled in the
+    /// text, the class prepends no word marker where the file's normalizer
+    /// prepends one (the file: `[1405, 29871, 1, 259, 2, 29871, 529, 29989]`,
+    /// one id more). A `config.json` that says no model type reads the same.
+    #[test]
+    fn a_llama_class_checkpoint_shipped_without_config_json_encodes_as_its_class() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("tokenizer.json");
+        fs::write(&path, BYTE_FALLBACK_TOKENIZER_JSON).unwrap();
+        fs::write(
+            temp.path().join("tokenizer_config.json"),
+            json!({
+                "tokenizer_class": "LlamaTokenizer", "legacy": false, "bos_token": "<s>",
+                "eos_token": "</s>", "unk_token": "<unk>", "clean_up_tokenization_spaces": false,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let text = "> <s> </s> <|";
+        let class = [1405, 29871, 1, 29871, 2, 529, 29989];
+        let tokenizer = HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
+        assert!(tokenizer.tokenizers_pipeline().get_normalizer().is_none());
+        assert_eq!(ids_of(&tokenizer, text), class);
+
+        fs::write(
+            temp.path().join("config.json"),
+            json!({"architectures": ["LlamaForCausalLM"]}).to_string(),
+        )
+        .unwrap();
+        let tokenizer = HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(ids_of(&tokenizer, text), class);
     }
 
     #[test]
