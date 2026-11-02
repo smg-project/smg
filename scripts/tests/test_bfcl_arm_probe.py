@@ -6,6 +6,7 @@ import socketserver
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -284,3 +285,110 @@ def test_wait_cli_timeout_does_not_accept_process_liveness(tmp_path):
 def test_probe_rejects_remote_or_authenticated_targets(url):
     with pytest.raises(ValueError):
         probe.loopback_url(url)
+
+
+def launcher_cli_without_engines(tmp_path, arm, run_timeout):
+    """Run the actual launcher, replacing only process launch and arm-A curl.
+
+    setsid records commands but never executes an engine, gateway or observer.
+    The loopback fixture satisfies arm-B TCP/readiness checks. No model, GPU,
+    production process or launcher stop/cleanup path is used.
+    """
+    stub_bin = tmp_path / "bin"
+    stub_bin.mkdir()
+    events_path = tmp_path / "launch-events.jsonl"
+    setsid = stub_bin / "setsid"
+    setsid.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "with open(os.environ['BFCL_FIXTURE_EVENTS'], 'a') as out:\n"
+        "    out.write(json.dumps({'argv': sys.argv[1:], "
+        "'RUN_TIMEOUT': os.environ.get('RUN_TIMEOUT')}) + '\\n')\n"
+    )
+    setsid.chmod(0o755)
+    curl = stub_bin / "curl"
+    curl.write_text("#!/bin/sh\nexit 0\n")
+    curl.chmod(0o755)
+    run_dir = tmp_path / "state with spaces"
+    env = {
+        **os.environ,
+        "PATH": f"{stub_bin}{os.pathsep}{os.environ['PATH']}",
+        "BFCL_FIXTURE_EVENTS": str(events_path),
+        "BFCL_RUN_DIR": str(run_dir),
+        "BFCL_MODEL": MODEL,
+        "BFCL_STARTUP_TIMEOUT": "1",
+        "VLLM_BIN": "/must-not-run-a-real-engine",
+        "VLLM_PYTHON": "/must-not-run-a-real-engine",
+        "SMG_LAUNCH": "/must-not-run-a-real-gateway",
+        "CUDA_VISIBLE_DEVICES": "",
+        "HIP_VISIBLE_DEVICES": "",
+        "ROCR_VISIBLE_DEVICES": "",
+    }
+    if run_timeout is None:
+        env.pop("RUN_TIMEOUT", None)
+    else:
+        env["RUN_TIMEOUT"] = run_timeout
+    with server({"/readiness": response(readiness())}) as (url, _):
+        port = url.rsplit(":", 1)[1]
+        for name in ("ARM_A_PORT", "ARM_B_GRPC_PORT", "ARM_B_GW_PORT", "ARM_B_METRICS_PORT"):
+            env[f"BFCL_{name}"] = port
+        result = subprocess.run(
+            ["bash", str(SOURCE.with_name("launch_arm.sh")), arm],
+            env=env,
+            capture_output=True,
+            timeout=10,
+        )
+    expected_events = 1 if arm == "a" else 3
+    deadline = time.monotonic() + 1
+    while True:
+        events = (
+            [json.loads(line) for line in events_path.read_text().splitlines()]
+            if events_path.exists()
+            else []
+        )
+        if len(events) >= expected_events or result.returncode or time.monotonic() >= deadline:
+            return result, events, run_dir
+        time.sleep(0.01)
+
+
+@pytest.mark.parametrize("arm", ["a", "b"])
+@pytest.mark.parametrize(
+    "run_timeout,expected",
+    [
+        pytest.param(None, 14400, id="default"),
+        pytest.param("", 14400, id="empty-default"),
+        pytest.param("0", 21600, id="uncapped-scoring"),
+        pytest.param("14400", 14400, id="normal"),
+        pytest.param("21600", 21600, id="observer-cap"),
+        pytest.param("21601", 21600, id="above-cap"),
+        pytest.param("00008", 8, id="leading-zero-decimal"),
+        pytest.param("0000", 21600, id="leading-zero-uncapped"),
+        pytest.param("9" * 100, 21600, id="beyond-shell-integer-range"),
+        pytest.param(" +0008 ", 8, id="integer-whitespace-and-plus"),
+        pytest.param("1_000", 1000, id="python-integer-separator"),
+    ],
+)
+def test_launcher_bounds_observer_before_start_without_changing_scoring(
+    tmp_path, arm, run_timeout, expected
+):
+    result, events, _ = launcher_cli_without_engines(tmp_path, arm, run_timeout)
+    assert result.returncode == 0, result.stderr
+    assert len(events) == (1 if arm == "a" else 3)
+    # Preserve the exact scoring setting, including zero and decimal spelling.
+    assert all(event["RUN_TIMEOUT"] == run_timeout for event in events)
+    bounded = f"bounded availability observer: {expected}s".encode()
+    assert bounded in result.stderr
+    assert result.stderr.index(bounded) < result.stderr.index(b"started arm_")
+    if arm == "b":
+        observer = next(event for event in events if "--duration" in event["argv"])
+        assert observer["argv"][observer["argv"].index("--duration") + 1] == str(expected)
+
+
+@pytest.mark.parametrize("arm", ["a", "b"])
+@pytest.mark.parametrize("run_timeout", ["-1", "1.5", "1e4", "not-an-integer", "   "])
+def test_launcher_rejects_invalid_timeout_before_any_process_start(tmp_path, arm, run_timeout):
+    result, events, run_dir = launcher_cli_without_engines(tmp_path, arm, run_timeout)
+    assert result.returncode == 2
+    assert b"RUN_TIMEOUT" in result.stderr
+    assert events == []
+    assert not run_dir.exists()

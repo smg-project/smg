@@ -69,6 +69,17 @@ VLLM_BIN="${VLLM_BIN:-vllm}"                      # `vllm serve` console script
 VLLM_PYTHON="${VLLM_PYTHON:-python}"             # python that can `-m vllm.entrypoints.grpc_server`
 SMG_LAUNCH="${SMG_LAUNCH:-smg launch}"           # SMG launcher (binary subcmd or `python -m smg.launch_router`)
 
+PROBE_SCRIPT="$(dirname "${BASH_SOURCE[0]}")/arm_probe.py"
+case "$ARM" in
+  a|b)
+    # Validate before either engine starts. Scoring keeps RUN_TIMEOUT verbatim;
+    # only the observer maps uncapped/long runs to its existing finite bound.
+    PROBE_DURATION=$(python3 "$PROBE_SCRIPT" \
+      --bounded-duration-for-run-timeout="${RUN_TIMEOUT:-14400}")
+    echo "[launch_arm] bounded availability observer: ${PROBE_DURATION}s (scoring RUN_TIMEOUT unchanged)" >&2
+    ;;
+esac
+
 mkdir -p "$RUN_DIR"
 
 # start <name> <logfile> <command...> — detached, pidfile-tracked.
@@ -165,14 +176,13 @@ case "$ARM" in
     # ready. Require this model's readiness before handing BFCL the base URL.
     # Retain bounded state through inference too: startup success cannot explain
     # a worker that becomes unavailable several minutes into the full suite.
-    probe="$(dirname "${BASH_SOURCE[0]}")/arm_probe.py"
-    python3 "$probe" --base-url "http://127.0.0.1:$ARM_B_GW_PORT" \
+    python3 "$PROBE_SCRIPT" --base-url "http://127.0.0.1:$ARM_B_GW_PORT" \
       --model "$MODEL" --run-dir "$RUN_DIR" \
       --wait-ready "${BFCL_STARTUP_TIMEOUT:-420}"
     kill "$log_tail" 2>/dev/null || true
-    start arm_b_probe "$RUN_DIR/arm_b_probe.log" python3 "$probe" \
+    start arm_b_probe "$RUN_DIR/arm_b_probe.log" python3 "$PROBE_SCRIPT" \
       --base-url "http://127.0.0.1:$ARM_B_GW_PORT" --model "$MODEL" \
-      --run-dir "$RUN_DIR" --duration "${RUN_TIMEOUT:-14400}" \
+      --run-dir "$RUN_DIR" --duration "$PROBE_DURATION" \
       --metrics-url "http://127.0.0.1:$ARM_B_METRICS_PORT" \
       --worker-port "$ARM_B_GRPC_PORT"
     echo "http://127.0.0.1:$ARM_B_GW_PORT"

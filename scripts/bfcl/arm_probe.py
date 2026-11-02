@@ -20,7 +20,24 @@ import urllib.request
 from pathlib import Path
 
 MAX_BYTES = 1024 * 1024
+MAX_OBSERVATION_SECONDS = 21600
 ROLES = ("arm_a", "arm_b_worker", "arm_b_gateway")
+
+
+def bounded_observer_duration(run_timeout):
+    """Keep scoring's integer syntax and zero-as-uncapped meaning separate.
+
+    Python's decimal integers handle leading zeroes and values beyond shell
+    arithmetic without octal interpretation or overflow. The scoring setting
+    is never modified: only observations are capped at the existing job bound.
+    """
+    try:
+        seconds = int(run_timeout, 10)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("RUN_TIMEOUT must be a nonnegative integer") from error
+    if seconds < 0:
+        raise argparse.ArgumentTypeError("RUN_TIMEOUT must be a nonnegative integer")
+    return min(seconds, MAX_OBSERVATION_SECONDS) if seconds else MAX_OBSERVATION_SECONDS
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -192,6 +209,17 @@ def ready(observation):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1].split("=", 1)[0] == "--bounded-duration-for-run-timeout":
+        # Pure preflight: no directories, process launches or HTTP requests.
+        parser = argparse.ArgumentParser(
+            description="Bound BFCL observations before engine startup"
+        )
+        parser.add_argument(
+            "--bounded-duration-for-run-timeout", required=True, type=bounded_observer_duration
+        )
+        args = parser.parse_args()
+        print(args.bounded_duration_for_run_timeout)
+        return 0
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", required=True, type=loopback_url)
     parser.add_argument("--model", required=True)
@@ -201,7 +229,7 @@ def main():
     parser.add_argument("--metrics-url", type=loopback_url)
     parser.add_argument("--worker-port", type=int)
     args = parser.parse_args()
-    if not 0 <= args.wait_ready <= 7200 or not 0 < args.duration <= 21600:
+    if not 0 <= args.wait_ready <= 7200 or not 0 < args.duration <= MAX_OBSERVATION_SECONDS:
         parser.error("readiness bound must be 0..7200 s and duration must be > 0 and <= 21600 s")
     owned = owned_processes(args.run_dir)
     started = time.monotonic()
