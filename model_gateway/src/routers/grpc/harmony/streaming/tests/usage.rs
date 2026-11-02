@@ -12,7 +12,7 @@ use openai_protocol::{chat::ChatCompletionRequest, responses::ResponsesRequest};
 use serde_json::{json, Value};
 use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as GenerationEvent};
 
-use super::HarmonyStreamingProcessor;
+use super::super::HarmonyStreamingProcessor;
 use crate::{
     observability::metrics::metrics_labels,
     rate_limit::{test_support::RecordingBackend, SharedReservationHandle, UsageSettlement},
