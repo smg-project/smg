@@ -264,6 +264,45 @@ duplicated work. `status=499` makes a gRPC worker answer `cancelled`, the code
 a call gets when the worker's connection closes under it (a worker dying as
 the request arrives); an HTTP worker answers the bare 499.
 
+## Prefill/decode roles
+
+`--worker-type prefill|decode` gives the gRPC workers a role in a
+disaggregated fleet, so a gateway in PD mode (`--prefill <url> <bootstrap
+port> --decode <url>`) runs with no engine behind it. The gateway detects
+the mock by the scheduler service it serves and runs that wire's PD
+protocol: both sides get the same request, with the rendezvous the gateway
+mints (`kv_bootstrap_info`), and the client reads the decode side's output.
+
+- A **prefill** worker answers every request with the prompt side's
+  completion alone (`prompt_tokens`, no output, `stop`), ahead of the script
+  and of either engine mode, and advertises `disaggregation_mode: prefill`.
+  With `--bootstrap-base-port <port>`, worker `i` also binds `port + i`,
+  where a decode partner's engine would rendezvous for the KV handoff: it
+  accepts and closes each connection (the gateway probes the port once the
+  worker is registered) and advertises it as
+  `disaggregation_bootstrap_port`.
+- A **decode** worker generates as a regular worker (canned, realistic or
+  scripted: the answers a test states go to the decode side) and advertises
+  `disaggregation_mode: decode`.
+
+No KV moves between the two: the decode side has the prompt. HTTP and ZMQ
+workers take no role.
+
+Every gRPC worker advertises the pairing protocol its environment names
+(`SMG_PAIRING_PROTOCOL`) as `pairing_protocol`, as the engine servicers do:
+a prefill and a decode that name the same one pair; name different ones for
+the two to see the gateway refuse the pair.
+
+In realistic mode (`--engine realistic`) a prefill worker honors the
+[fault hooks](#fault-hooks) as any request: the stall, a status before
+admission (`fail?status=S`, counted under `failed_total`), the admission
+delay and rate (`pause` freezes the passes, which the prompt side never
+takes). With no output to cut after, an armed cut (`after_tokens=K`) fires
+as its status at once, and `finish=error` ends the prompt side with `error`
+whatever the status; both count under `cut_total`, as on any worker. The
+engine itself never runs the prompt: nothing is admitted and no record is
+left.
+
 ## Long prompts
 
 A gRPC worker decodes and encodes messages of any size by default, as the
