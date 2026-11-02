@@ -654,12 +654,16 @@ def refuse_encode_role_without_wire(server_args: Any) -> None:
     engine that lists no encode request is never reached: the worker would
     wait in silence past its scheduler-startup bound (the engine rank's own
     start counts as its sign of life), SERVING nothing. The capability is read
-    off the installed engine (``zmq_wire.REQ_TYPE_ENCODE``,
-    the request-type byte the wire gained with the encode request). The other
-    roles pass; an engine that is not installed (the launcher's unit tests) is
-    left to the handshake-time check, while an installed engine whose wire
-    module does not import is refused by name (a broken engine would otherwise
-    wait in silence too)."""
+    off the installed engine's wire module: the encode role's own READY
+    builder (``zmq_wire.encode_ready_response``, the registration an encode
+    rank dials in with on an engine whose ranks run its Rust control plane,
+    where the encode request type lives in the wire crate, not in the Python
+    module), or the request-type byte of a wire whose Python side carries the
+    encode request itself (``zmq_wire.REQ_TYPE_ENCODE``). The other roles
+    pass; an engine that is not installed (the launcher's unit tests) is left
+    to the handshake-time check, while an installed engine whose wire module
+    does not import is refused by name (a broken engine would otherwise wait
+    in silence too)."""
     if EngineConfigView(server_args).server_args.disaggregation_mode != "encode":
         return
     try:
@@ -672,7 +676,8 @@ def refuse_encode_role_without_wire(server_args: Any) -> None:
             f"build ({error}): its wire module does not import; run this worker on the Python "
             f"servicer (unset {SERVICER_IMPL_ENV} or pass --servicer-impl python)"
         ) from None
-    if getattr(zmq_wire, "REQ_TYPE_ENCODE", None) is None:
+    registers_encode_role = getattr(zmq_wire, "encode_ready_response", None) is not None
+    if not registers_encode_role and getattr(zmq_wire, "REQ_TYPE_ENCODE", None) is None:
         raise ServicerConfigError(
             f"{SERVICER_IMPL_ENV}=rust does not serve the EPD encode role on this engine build "
             "(disaggregation_mode='encode'): its direct msgpack wire carries no encode request, "

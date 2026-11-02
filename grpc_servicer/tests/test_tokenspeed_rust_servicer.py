@@ -1321,10 +1321,13 @@ def test_an_encode_launch_on_an_engine_without_the_encode_wire_is_refused_first(
     handshake in the encode role, so the handshake-time refusal is
     unreachable: the capability is read off the installed engine's wire
     module before anything starts and the launch fails by name (a
-    configuration error, exit code 2 through ``main``). An engine whose wire
-    carries the request passes, the other roles pass on either, an installed
-    engine whose wire module does not import is refused by name too, and only
-    a missing engine is left to the handshake-time check."""
+    configuration error, exit code 2 through ``main``). An engine whose
+    encode ranks register over the wire (its wire module builds the encode
+    role's READY response; the request type lives in its wire crate) passes,
+    as does a wire whose Python side carries the request type itself; the
+    other roles pass on either, an installed engine whose wire module does
+    not import is refused by name too, and only a missing engine is left to
+    the handshake-time check."""
     wire = types.ModuleType("tokenspeed.runtime.engine.zmq_wire")
     monkeypatch.setitem(sys.modules, "tokenspeed.runtime.engine.zmq_wire", wire)
     encode = FakeServerArgs(disaggregation_mode="encode")
@@ -1334,6 +1337,9 @@ def test_an_encode_launch_on_an_engine_without_the_encode_wire_is_refused_first(
         asyncio.run(rust.serve_rust(encode))
     for mode in ("null", "prefill", "decode"):
         rust.refuse_encode_role_without_wire(FakeServerArgs(disaggregation_mode=mode))
+    wire.encode_ready_response = lambda **facts: facts
+    rust.refuse_encode_role_without_wire(encode)
+    del wire.encode_ready_response
     wire.REQ_TYPE_ENCODE = b"\x03"
     rust.refuse_encode_role_without_wire(encode)
     monkeypatch.delitem(sys.modules, "tokenspeed.runtime.engine.zmq_wire")
