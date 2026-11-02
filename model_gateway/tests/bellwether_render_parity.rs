@@ -124,8 +124,8 @@ const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 /// none when several do, so an entry does not outlive its cause on the cases
 /// another entry names), and when the tree holds its
 /// set and no loaded case is under it; the entries of a benchmark set the
-/// tree omits (`bellwether unpack --sample-sets` writes every Nth) are left
-/// alone, an id of one of its cases among them.
+/// tree omits (`bellwether unpack --sample-sets` writes one set in N, picked
+/// by its id) are left alone, an id of one of its cases among them.
 const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     (
         "deepseek-v3.1/render/bfcl-*",
@@ -231,6 +231,93 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          closed",
     ),
     (
+        "falcon-h1-3b-instruct/render/glaive-v2-24087-0",
+        "a declared tool without parameters: the gateway renders its parameters as an empty \
+         object where the template reference writes null (2 cases of glaive-v2-15)",
+    ),
+    (
+        "falcon-h1-3b-instruct/render/glaive-v2-24087-2",
+        "a declared tool without parameters: the gateway renders its parameters as an empty \
+         object where the template reference writes null (2 cases of glaive-v2-15)",
+    ),
+    (
+        "harc-llama-3.1-8b-instruct/render/text-long-user",
+        "the crate's loader applies the file's truncation block (max_length 256), which the \
+         engine's tokenizer clears: the ids stop at 256 where the re-recorded reference \
+         carries the whole prompt; smg-project/smg#4830 clears the block on load and removes \
+         this entry",
+    ),
+    (
+        "harc-llama-3.1-8b-instruct/render/tools-call-arguments-object",
+        "the crate's loader applies the file's truncation block (max_length 256), which the \
+         engine's tokenizer clears: the ids stop at 256 where the re-recorded reference \
+         carries the whole prompt; smg-project/smg#4830 clears the block on load and removes \
+         this entry",
+    ),
+    (
+        "harc-llama-3.1-8b-instruct/render/tools-declared-user-asks",
+        "the crate's loader applies the file's truncation block (max_length 256), which the \
+         engine's tokenizer clears: the ids stop at 256 where the re-recorded reference \
+         carries the whole prompt; smg-project/smg#4830 clears the block on load and removes \
+         this entry",
+    ),
+    (
+        "harc-llama-3.1-8b-instruct/render/tools-history-content-and-call",
+        "the crate's loader applies the file's truncation block (max_length 256), which the \
+         engine's tokenizer clears: the ids stop at 256 where the re-recorded reference \
+         carries the whole prompt; smg-project/smg#4830 clears the block on load and removes \
+         this entry",
+    ),
+    (
+        "harc-llama-3.1-8b-instruct/render/tools-history-single-call",
+        "the crate's loader applies the file's truncation block (max_length 256), which the \
+         engine's tokenizer clears: the ids stop at 256 where the re-recorded reference \
+         carries the whole prompt; smg-project/smg#4830 clears the block on load and removes \
+         this entry",
+    ),
+    (
+        "harc-llama-3.1-8b-instruct/render/tools-schema-with-defs",
+        "the crate's loader applies the file's truncation block (max_length 256), which the \
+         engine's tokenizer clears: the ids stop at 256 where the re-recorded reference \
+         carries the whole prompt; smg-project/smg#4830 clears the block on load and removes \
+         this entry",
+    ),
+    (
+        "harc-qwen2.5-7b-instruct/render/text-long-user",
+        "the crate's loader applies the file's truncation block (max_length 256), which the \
+         engine's tokenizer clears: the ids stop at 256 where the re-recorded reference \
+         carries the whole prompt; smg-project/smg#4830 clears the block on load and removes \
+         this entry",
+    ),
+    (
+        "harc-qwen2.5-7b-instruct/render/tools-declared-user-asks",
+        "the crate's loader applies the file's truncation block (max_length 256), which the \
+         engine's tokenizer clears: the ids stop at 256 where the re-recorded reference \
+         carries the whole prompt; smg-project/smg#4830 clears the block on load and removes \
+         this entry",
+    ),
+    (
+        "harc-qwen2.5-7b-instruct/render/tools-history-parallel-calls",
+        "the crate's loader applies the file's truncation block (max_length 256), which the \
+         engine's tokenizer clears: the ids stop at 256 where the re-recorded reference \
+         carries the whole prompt; smg-project/smg#4830 clears the block on load and removes \
+         this entry",
+    ),
+    (
+        "harc-qwen2.5-7b-instruct/render/tools-history-results-reordered",
+        "the crate's loader applies the file's truncation block (max_length 256), which the \
+         engine's tokenizer clears: the ids stop at 256 where the re-recorded reference \
+         carries the whole prompt; smg-project/smg#4830 clears the block on load and removes \
+         this entry",
+    ),
+    (
+        "harc-qwen2.5-7b-instruct/render/tools-schema-with-defs",
+        "the crate's loader applies the file's truncation block (max_length 256), which the \
+         engine's tokenizer clears: the ids stop at 256 where the re-recorded reference \
+         carries the whole prompt; smg-project/smg#4830 clears the block on load and removes \
+         this entry",
+    ),
+    (
         "hermes-4-14b/render/hermes-func-calling-*",
         "the gateway parses tool-call arguments into objects before rendering and this \
          template writes them as the API's string, so a call in the history renders \
@@ -251,10 +338,18 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          prefix append does (smg-project/smg#2434)",
     ),
     (
-        "llama-3.1-nemotron-nano-8b-v1/render/glaive-v2-32.jsonl",
-        "the gateway parses a history call's arguments into an object before rendering, \
-         which the template, writing the string as recorded, renders otherwise: a \
-         benchmark set in the tree's sample, every case with a call in its history",
+        "llama-3-1-nemotron-ultra-253b-cpt-v1/render/glaive-v2-*",
+        "the gateway parses a history call's arguments into an object before rendering, which \
+         the template, writing the string as recorded, renders otherwise: a benchmark set in \
+         the tree's sample, every case with a call in the history (1,500 of the 4,012 cases \
+         of glaive-v2-44)",
+    ),
+    (
+        "llama-3.1-nemotron-8b-ultralong-2m-instruct/render/glaive-v2-*",
+        "the gateway parses a history call's arguments into an object before rendering, which \
+         the template, writing the string as recorded, renders otherwise: a benchmark set in \
+         the tree's sample, every case with a call in the history (1,405 of the 3,975 cases \
+         of glaive-v2-57)",
     ),
     (
         "llama-xlam-2-8b-fc-r/render/hermes-func-calling-*",
@@ -269,16 +364,195 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          differently (smg-project/smg#2783)",
     ),
     (
-        "mimo-vl-7b-rl-2508/render/glaive-v2-61.jsonl",
-        "the gateway parses a history call's arguments into an object before rendering, \
-         which the template, writing the string as recorded, renders otherwise: a \
-         benchmark set in the tree's sample, every case with a call in its history",
+        "llava-critic-r1-7b-llama32v/render/glaive-v2-*",
+        "the template writes today's date into the system header: the reference was recorded \
+         on 13 Oct 2026 and the job renders at SOURCE_DATE_EPOCH's 14 Oct 2026, so every case \
+         of the set differs by that one line (4,046 of 4,046 cases of glaive-v2-27; a \
+         recording-date class, nothing of the gateway's)",
     ),
     (
-        "nft-7b/render/swehero-5.jsonl",
-        "the gateway parses a history call's arguments into an object before rendering, \
-         which the template, writing the string as recorded, renders otherwise: a \
-         benchmark set in the tree's sample, every case with a call in its history",
+        "mimo-v2.6-distill-qwen-9b/render/glaive-v2-*",
+        "a history call's arguments: the gateway hands them to the template as an object, \
+         which its tool-call branch writes as parameter tags, where the template reference, \
+         given the string as recorded, writes the JSON text inside the function tag (1,482 of \
+         the 4,144 cases of glaive-v2-19; the arguments-object class in this template's form)",
+    ),
+    (
+        "nanollama/render/swehero-*",
+        "the set's reference encodes a space piece after BOS (`<s> [INST]`, the legacy Llama \
+         tokenizer form) where the checkpoint's fast tokenizer, the engine and the crate \
+         write `<s>[INST]`: every case of the set differs from its second id on with the text \
+         equal, and the model's hand-written sets match (a recording-era class on the \
+         reference side; a re-record of the set removes this entry; 2,500 of 2,500 cases of \
+         swehero-0)",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/continue-final-message",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/no-generation-prompt",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/text-assistant-first",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/text-cjk-emoji",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/text-developer-role",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/text-empty-user",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/text-long-user",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/text-markup-in-user-text",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/text-multi-turn",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/text-system-after-user",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/text-system-user",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/text-user-only",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/text-user-with-name",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/thinking-history-with-reasoning-content",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/thinking-kwarg-off",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/thinking-kwarg-on",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/thinking-reasoning-effort-kwarg",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/tools-call-arguments-object",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/tools-declared-user-asks",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/tools-history-content-and-call",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/tools-history-parallel-calls",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/tools-history-results-reordered",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/tools-history-single-call",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
+    ),
+    (
+        "nvidia-nemotron-parse-2.0/render/tools-schema-with-defs",
+        "the crate's loader applies the file's padding block (every prompt padded to 9,000 \
+         ids), which the engine's tokenizer clears: the ids carry the padding where the \
+         re-recorded reference does not; smg-project/smg#4830 clears the block on load and \
+         removes this entry",
     ),
     (
         "nvidia-nemotronlabs-ai-for-media-sports-tennis/render/*",
@@ -311,10 +585,23 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          differently (smg-project/smg#2783)",
     ),
     (
-        "shieldvlm-7b-qwen/render/glaive-v2-12.jsonl",
-        "the gateway parses a history call's arguments into an object before rendering, \
-         which the template, writing the string as recorded, renders otherwise: a \
-         benchmark set in the tree's sample, every case with a call in its history",
+        "scithinker-30b/render/tau2-o4-mini-2025-04-16-retail-default-287-16",
+        "a non-ASCII character inside a history call's arguments: the gateway writes the \
+         character itself, the template's JSON filter escapes it as a JSON unicode escape (a \
+         backslash, u and four hex digits) (2 cases of the 5,635 of the set)",
+    ),
+    (
+        "scithinker-30b/render/tau2-o4-mini-2025-04-16-retail-default-382-22",
+        "a non-ASCII character inside a history call's arguments: the gateway writes the \
+         character itself, the template's JSON filter escapes it as a JSON unicode escape (a \
+         backslash, u and four hex digits) (2 cases of the 5,635 of the set)",
+    ),
+    (
+        "swerankllm-small/render/tau2-gpt-4-1-mini-2025-04-14-telecom-base-*",
+        "the gateway parses a history call's arguments into an object before rendering, which \
+         the template, writing the string as recorded, renders otherwise: a benchmark set in \
+         the tree's sample, every case with a call in the history (12,357 of the 12,673 cases \
+         of the set)",
     ),
 ];
 /// Models whose tokenizer is known not to load, with the reason and where it
@@ -932,7 +1219,7 @@ impl Report {
     /// hand-written case's shape. A benchmark case is `<set>-<n>` and a
     /// hand-written case a name, so an id that no read set prefixes is a
     /// hand-written case unless it ends in `-<n>`: a benchmark set the tree
-    /// omits, the unpack's sample being every Nth, leaves its entries alone,
+    /// omits, the sample being one set in N picked by its id, leaves its entries alone,
     /// an id of one of its cases among them, while an id of a hand-written
     /// case the tree no longer has (renamed, dropped, or a typo in the entry)
     /// is held to the hand-written set and read as gone.
@@ -2151,8 +2438,8 @@ fn a_prefix_entry_covers_the_cases_under_it_and_must_cover_one() {
     );
     // A prefix under which every loaded case matches must go, and so must one
     // under a set the tree holds that no loaded case begins with; one under a
-    // set the tree omits is left alone, since the tree holds every Nth
-    // benchmark set.
+    // set the tree omits is left alone, since the tree holds one benchmark
+    // set in N, picked by its id.
     let stale = BTreeMap::from([
         (
             "m/render/bfcl-multi-turn-*",
@@ -2208,7 +2495,7 @@ fn an_id_entry_of_an_omitted_benchmark_case_is_left_alone_and_of_a_lost_hand_wri
     // A hand-written case that matches now, a case of a set the tree holds
     // that is not among its cases, and a hand-written name the tree's set
     // lacks (renamed, dropped, or a typo) are stale; a case of a set the tree
-    // omits is left alone, since the tree holds every Nth benchmark set.
+    // omits is left alone, since the tree holds one benchmark set in N, picked by its id.
     let stale = BTreeMap::from([
         ("m/render/bfcl-multi-turn-base-9", "no such case"),
         ("m/render/text-developer-role", "matches now"),
