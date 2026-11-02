@@ -35,9 +35,11 @@ try:
         if len(addresses) > 64:
             raise OSError(socket.EAI_FAIL, "too many bootstrap addresses")
     result = {"addresses": addresses}
-except OSError as error:
-    code = error.errno if isinstance(error.errno, int) else socket.EAI_FAIL
-    result = {"error": [code, str(error)[:1024]]}
+except (OSError, UnicodeError) as error:
+    code = getattr(error, "errno", None)
+    code = code if isinstance(code, int) else socket.EAI_FAIL
+    message = getattr(error, "strerror", None) or str(error)
+    result = {"error": [code, message[:1024]]}
 frame = json.dumps(result, separators=(",", ":")).encode("ascii")
 if len(frame) > 65536:
     raise SystemExit(1)

@@ -471,3 +471,55 @@ def test_failed_resolver_reap_and_backend_close_preserve_primary_timeout(monkeyp
     assert resolver.killed and len(resolver.waits) == 2 and resolver.waits[-1] == 1.0
     assert "Could not reap the owned bootstrap resolver" in caplog.text
     server.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_errno", "message"),
+    [
+        ("gaierror", socket.EAI_NONAME, "controlled hostname failure"),
+        ("unicode-error", socket.EAI_FAIL, "controlled IDNA label too long"),
+    ],
+    ids=["gaierror", "unicode-error"],
+)
+def test_real_resolver_child_preserves_error_diagnostics(
+    monkeypatch, failure, expected_errno, message
+):
+    """Exercise the real child/frame/helper path, without backend cleanup credit."""
+    popen = subprocess.Popen
+    children = []
+    raise_error = {
+        "gaierror": "raise socket.gaierror(socket.EAI_NONAME, 'controlled hostname failure')",
+        "unicode-error": "raise UnicodeError('controlled IDNA label too long')",
+    }[failure]
+    prefix = (
+        "import socket\n"
+        "def controlled_getaddrinfo(*args, **kwargs):\n"
+        f"    {raise_error}\n"
+        "socket.getaddrinfo = controlled_getaddrinfo\n"
+    )
+
+    def failing_resolver(argv, **kwargs):
+        assert argv[1:4] == ["-I", "-S", "-c"]
+        assert argv[4] == bootstrap._RESOLVER_CODE
+        assert argv[-2:] == ["controlled.invalid", "8998"]
+        assert kwargs["stdin"] == subprocess.DEVNULL
+        assert kwargs["stderr"] == subprocess.DEVNULL
+        assert kwargs["close_fds"] is True and "shell" not in kwargs
+        child = popen([*argv[:4], prefix + argv[4], *argv[5:]], **kwargs)
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(bootstrap.subprocess, "Popen", failing_resolver)
+    try:
+        with pytest.raises(socket.gaierror) as caught:
+            bootstrap._resolve_addresses("controlled.invalid", 8998, deadline=time.monotonic() + 5)
+        assert caught.value.errno == expected_errno
+        assert caught.value.strerror == message
+        assert str(caught.value) == f"[Errno {expected_errno}] {message}"
+        assert len(children) == 1 and children[0].returncode == 0
+    finally:
+        # Safety only: successful product wait/reap must precede the assertions.
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=1)
