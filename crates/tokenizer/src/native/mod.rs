@@ -20,7 +20,10 @@
 //!    engine `tokenizers` uses, producing byte ranges instead of strings;
 //! 4. each piece is mapped to the byte-level alphabet and tokenized by the
 //!    tokenizer's own BPE model (so `ignore_merges` and the rest keep their
-//!    meaning), through a small per-thread cache from piece bytes to ids.
+//!    meaning), behind two tables from piece bytes to ids (`short_pieces`):
+//!    a small per-thread cache of the pieces the thread has met, filled on a
+//!    first sight from the vocabulary's own pieces, built at load and shared
+//!    by every thread, else from the model.
 //!
 //! The shape is checked once at load time; a tokenizer that does not fit
 //! (another normalizer, a pre-tokenizer or regex construct outside the
@@ -33,6 +36,7 @@
 use std::{
     cell::RefCell,
     sync::atomic::{AtomicUsize, Ordering},
+    time::Instant,
 };
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
@@ -45,9 +49,11 @@ use tokenizers::{models::ModelWrapper, Model};
 use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
 
 mod pattern;
+mod short_pieces;
 mod unicode;
 
 use pattern::Pattern;
+use short_pieces::{ShortPieceKey, ShortPieceTable, SHORT_PIECE_MAX_BYTES};
 
 use crate::{
     encode_path::{Declined, Fallback},
@@ -60,8 +66,10 @@ const BYTE_LEVEL_PATTERN: &str =
     r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
 
 /// Pieces up to this many bytes are cached per thread by their count (see
-/// `PIECE_CACHE_CAPACITY`); longer ones, up to `LONG_PIECE_MAX_BYTES`, by
-/// the bytes they take (see `LONG_PIECE_BYTES_CAPACITY`).
+/// `PIECE_CACHE_CAPACITY`): those of up to `SHORT_PIECE_MAX_BYTES` in a
+/// packed table, the longer ones in a map; longer pieces still, up to
+/// `LONG_PIECE_MAX_BYTES`, by the bytes they take (see
+/// `LONG_PIECE_BYTES_CAPACITY`).
 const CACHED_PIECE_MAX_BYTES: usize = 64;
 /// Longest piece cached at all (a clause of some 80 characters in a script
 /// without word spaces, 256 of ASCII): a longer piece is rare and tokenized
@@ -70,16 +78,23 @@ const LONG_PIECE_MAX_BYTES: usize = 256;
 /// Entries a thread's piece cache holds for one encoder before it is cleared,
 /// at most; see `PIECE_CACHE_TOTAL_CAPACITY`. This is also the cliff of a
 /// repeated document: one with fewer distinct pieces is encoded again at the
-/// cost of its lookups, one with more at first-pass cost on every pass, since
-/// the clear takes the pieces that recur with the rest (the crate bench
+/// cost of its lookups, one with more at first-sight cost on every pass,
+/// since the clear takes the pieces that recur with the rest (the crate bench
 /// `encode_volume` shows both, and that the cost of text no pass has seen
-/// does not depend on how much a thread encoded before).
+/// does not depend on how much a thread encoded before); a first sight of a
+/// vocabulary word costs a read of the encoder's seed, of another piece the
+/// model's merges.
 const PIECE_CACHE_CAPACITY: usize = 16_384;
 /// Entries all threads together hold for one encoder: a thread's own cap is
 /// this divided by the number of threads that have encoded with the encoder
-/// (and never more than `PIECE_CACHE_CAPACITY`), so the piece caches of one
-/// tokenizer stay under about 40 MB however many runtime and blocking threads
-/// encode with it, and they are freed with the encoder.
+/// (and never more than `PIECE_CACHE_CAPACITY`). A thread's packed table
+/// starts at 64 slots (2 KiB) and doubles as the thread meets pieces, up to
+/// the slots for its cap (33 bytes a slot: 1 MiB at the full cap), and is
+/// made anew for a smaller cap when it is cleared, so a thread that encodes
+/// little holds little and the packed tables of one tokenizer stay under
+/// about 24 MiB however many runtime and blocking threads encode with it
+/// (the maps of the longer pieces share the count); they are freed with the
+/// encoder.
 const PIECE_CACHE_TOTAL_CAPACITY: usize = 262_144;
 /// Bytes of long pieces (each piece, its ids and their slot) a thread holds
 /// for one encoder before its long entries are cleared, at most; see
@@ -112,10 +127,39 @@ const MAX_REJECTED_CUT_CANDIDATES: usize = 64;
 /// Piece bytes to the ids they tokenize to.
 type PieceIds = FxHashMap<Box<[u8]>, Box<[u32]>>;
 
-/// One thread's cache of the pieces it tokenized with one encoder.
+/// The ids of one vocabulary entry while the seed is built, in a fixed slot
+/// (a byte-level piece of `n` bytes has at most `n` ids), so the pass over
+/// the vocabulary allocates one list rather than one per entry.
+#[derive(Clone, Copy, Default)]
+struct SeededIds {
+    count: u8,
+    ids: [u32; SHORT_PIECE_MAX_BYTES],
+}
+
+impl SeededIds {
+    /// Takes one more id; `None` when the slot is full.
+    fn push(&mut self, id: u32) -> Option<()> {
+        *self.ids.get_mut(usize::from(self.count))? = id;
+        self.count += 1;
+        Some(())
+    }
+
+    fn as_slice(&self) -> &[u32] {
+        &self.ids[..usize::from(self.count)]
+    }
+}
+
+/// One thread's cache of the pieces it met with one encoder, each with the
+/// ids the encoder's seed or the model gave it.
 #[derive(Default)]
 struct PieceCache {
-    /// Pieces of up to `CACHED_PIECE_MAX_BYTES`, bounded by their count.
+    /// Pieces of up to `SHORT_PIECE_MAX_BYTES`, packed; made at the first
+    /// such piece with the fewest slots and grown with the pieces the thread
+    /// meets, up to its share. Bounded by count together with `short`.
+    packed: Option<ShortPieceTable>,
+    /// Pieces of more than `SHORT_PIECE_MAX_BYTES`, up to
+    /// `CACHED_PIECE_MAX_BYTES`, bounded by their count together with
+    /// `packed`.
     short: PieceIds,
     /// Longer pieces, up to `LONG_PIECE_MAX_BYTES`, bounded by their bytes.
     long: PieceIds,
@@ -124,7 +168,21 @@ struct PieceCache {
 }
 
 impl PieceCache {
-    /// The ids cached for `piece`, if any.
+    /// Entries of the tiers bounded by count, `packed` and `short`.
+    fn short_entries(&self) -> usize {
+        self.packed.as_ref().map_or(0, ShortPieceTable::len) + self.short.len()
+    }
+
+    /// Forgets the tiers bounded by count; the packed table keeps its slots
+    /// unless `share` fell below them.
+    fn clear_short(&mut self, share: usize) {
+        if let Some(packed) = &mut self.packed {
+            packed.clear(share);
+        }
+        self.short.clear();
+    }
+
+    /// The ids cached for a piece longer than the packed tier keys, if any.
     fn get(&self, piece: &[u8]) -> Option<&[u32]> {
         let tier = if piece.len() <= CACHED_PIECE_MAX_BYTES {
             &self.short
@@ -261,6 +319,10 @@ pub(crate) struct NativeEncoder {
     normalized_added: Option<AddedTokens>,
     stages: Vec<Stage>,
     alphabet: [char; 256],
+    /// The vocabulary's own pieces with their ids, read once the model's word
+    /// cache is bounded and consulted by a thread for a piece its own cache
+    /// has not met, before the model (see [`Self::seed_vocabulary`]).
+    seed: ShortPieceTable,
     /// Each thread's cache from piece bytes to ids. The encoder owns them, so
     /// they go when it does: tokenizers are added and removed at runtime, and
     /// a thread never has to notice that an encoder it encoded with is gone.
@@ -274,6 +336,7 @@ impl std::fmt::Debug for NativeEncoder {
         f.debug_struct("NativeEncoder")
             .field("normalizer", &self.normalizer)
             .field("stages", &self.stages.len())
+            .field("seeded_pieces", &self.seed.len())
             .finish()
     }
 }
@@ -295,7 +358,8 @@ fn type_of<'v>(what: &str, component: &'v Value) -> Result<&'v str, Declined> {
 
 impl NativeEncoder {
     /// This path's encoder for `tokenizer`, or why it declines: a shape
-    /// outside what the module documentation lists.
+    /// outside what the module documentation lists. Its seed is empty until
+    /// [`Self::seed_vocabulary`] reads the vocabulary.
     pub(crate) fn from_tokenizer<M: Model + ModelView>(
         tokenizer: &TokenizerOf<M>,
     ) -> Result<Self, Declined> {
@@ -323,6 +387,7 @@ impl NativeEncoder {
             normalized_added: AddedTokens::build(&normalized)?,
             stages,
             alphabet: bytes_char(),
+            seed: ShortPieceTable::for_entries(0),
             piece_cache: ThreadLocal::new(),
             threads: AtomicUsize::new(0),
         })
@@ -401,6 +466,72 @@ impl NativeEncoder {
         raw.sort();
         normalized.sort();
         Ok((raw, normalized))
+    }
+
+    /// The vocabulary's own pieces with their ids, the table every thread
+    /// reads before its own cache: each entry of the model's vocabulary whose
+    /// spelling maps back from the byte-level alphabet to 1..=15 raw bytes,
+    /// with the ids the model gives that spelling, exactly what a cache miss
+    /// on the piece computes (its own id under `ignore_merges`, else the
+    /// merge result, which is several ids for an entry the merges do not
+    /// reach). An entry with a character outside the alphabet is no
+    /// byte-level piece; one the model declines, or whose ids the table
+    /// cannot hold, is left to the miss path. A model with merge dropout
+    /// tokenizes at random and gets no seed. The entries are read by id, on
+    /// the thread pool, without a copy of the vocabulary.
+    ///
+    /// Called once the model's word cache is bounded (see `word_cache`): the
+    /// words the seed merges would otherwise fill that cache on every thread
+    /// of the pool, and the crate never clears a thread's cache of a dropped
+    /// model.
+    pub(crate) fn seed_vocabulary(&mut self, model: &ModelWrapper) {
+        self.seed = Self::vocabulary_seed(model, &self.alphabet);
+    }
+
+    /// The table [`Self::seed_vocabulary`] reads.
+    fn vocabulary_seed(model: &ModelWrapper, alphabet: &[char; 256]) -> ShortPieceTable {
+        let ModelWrapper::BPE(bpe) = model else {
+            return ShortPieceTable::for_entries(0);
+        };
+        if bpe.dropout.is_some_and(|dropout| dropout > 0.0) {
+            return ShortPieceTable::for_entries(0);
+        }
+        let started = Instant::now();
+        // The byte each alphabet character stands for, by character.
+        let mut byte_of = vec![None; alphabet.iter().map(|&c| c as usize).max().unwrap_or(0) + 1];
+        for (byte, &c) in alphabet.iter().enumerate() {
+            byte_of[c as usize] = Some(byte as u8);
+        }
+        let seeded: Vec<(ShortPieceKey, SeededIds)> = (0..bpe.get_vocab_size() as u32)
+            .into_par_iter()
+            .with_min_len(2048)
+            .filter_map(|id| {
+                let entry = bpe.id_to_token(id)?;
+                let mut piece = [0u8; SHORT_PIECE_MAX_BYTES];
+                let mut len = 0;
+                for c in entry.chars() {
+                    *piece.get_mut(len)? = byte_of.get(c as usize).copied().flatten()?;
+                    len += 1;
+                }
+                let key = ShortPieceKey::of(&piece[..len])?;
+                let mut ids = SeededIds::default();
+                for token in &model.tokenize(&entry).ok()? {
+                    ids.push(token.id)?;
+                }
+                Some((key, ids))
+            })
+            .collect();
+        let mut table = ShortPieceTable::for_entries(seeded.len());
+        for (key, ids) in &seeded {
+            table.insert(*key, ids.as_slice(), seeded.len());
+        }
+        tracing::debug!(
+            entries = table.len(),
+            slots = table.slots(),
+            ms = started.elapsed().as_millis() as u64,
+            "the native encoder's vocabulary pieces"
+        );
+        table
     }
 
     /// The `Split` stages of a pre-tokenizer that is zero or more `Split`s
@@ -733,9 +864,14 @@ impl NativeEncoder {
         }
     }
 
-    /// Appends the ids of one piece, from the thread's cache or from the
-    /// model over the piece's byte-level alphabet form;
-    /// [`Fallback::PieceDeclined`] when the model declines the piece.
+    /// Appends the ids of one piece: from the thread's cache, else from the
+    /// encoder's seed or the model over the piece's byte-level alphabet form,
+    /// remembered in the thread's cache either way;
+    /// [`Fallback::PieceDeclined`] when the model declines the piece. The
+    /// thread's cache comes first because it is small and hot: the pieces of
+    /// the prompts a thread encodes, a few hundred KB, where the seed is
+    /// several MB of lines a warm encode would read at random (measured:
+    /// the seed first cost a warm prose encode a tenth more).
     fn tokenize_piece(
         &self,
         model: &ModelWrapper,
@@ -744,28 +880,50 @@ impl NativeEncoder {
         ids: &mut Vec<u32>,
     ) -> Result<(), Fallback> {
         let bytes = piece.as_bytes();
+        let key = ShortPieceKey::of(bytes);
         let cacheable = bytes.len() <= LONG_PIECE_MAX_BYTES;
         let cache = self.piece_cache.get_or(|| {
             self.threads.fetch_add(1, Ordering::Relaxed);
             RefCell::default()
         });
-        if cacheable {
+        if let Some(key) = key {
+            if let Some(packed) = &cache.borrow().packed {
+                if packed.ids_into(key, ids) {
+                    return Ok(());
+                }
+            }
+        } else if cacheable {
             if let Some(found) = cache.borrow().get(bytes) {
                 ids.extend_from_slice(found);
                 return Ok(());
             }
         }
-        mapped.clear();
-        mapped.extend(bytes.iter().map(|&b| self.alphabet[usize::from(b)]));
         let start = ids.len();
-        match model.tokenize(mapped) {
-            Ok(tokens) => ids.extend(tokens.iter().map(|token| token.id)),
-            Err(_) => return Err(Fallback::PieceDeclined),
+        // A piece this thread has not met: the encoder's seed has it when it
+        // is a vocabulary word, else the model merges it.
+        if !key.is_some_and(|key| self.seed.ids_into(key, ids)) {
+            mapped.clear();
+            mapped.extend(bytes.iter().map(|&b| self.alphabet[usize::from(b)]));
+            match model.tokenize(mapped) {
+                Ok(tokens) => ids.extend(tokens.iter().map(|token| token.id)),
+                Err(_) => return Err(Fallback::PieceDeclined),
+            }
         }
-        if bytes.len() <= CACHED_PIECE_MAX_BYTES {
+        if let Some(key) = key {
+            let share = self.piece_cache_share();
             let mut pieces = cache.borrow_mut();
-            if pieces.short.len() >= self.piece_cache_share() {
-                pieces.short.clear();
+            if pieces.short_entries() >= share {
+                pieces.clear_short(share);
+            }
+            pieces
+                .packed
+                .get_or_insert_with(ShortPieceTable::new)
+                .insert(key, &ids[start..], share);
+        } else if bytes.len() <= CACHED_PIECE_MAX_BYTES {
+            let share = self.piece_cache_share();
+            let mut pieces = cache.borrow_mut();
+            if pieces.short_entries() >= share {
+                pieces.clear_short(share);
             }
             pieces.short.insert(bytes.into(), ids[start..].into());
         } else if cacheable {
