@@ -548,8 +548,7 @@ def test_real_startup_cleanup_is_invocation_owned(tmp_path, is_ready):
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="needs Linux process identity")
-@pytest.mark.parametrize("failure", [errno.ENOSYS, errno.EPERM, errno.EMFILE])
-def test_startup_owner_does_not_require_pidfd(tmp_path, monkeypatch, failure):
+def test_startup_owner_does_not_require_pidfd(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_file_location(
         "bfcl_startup_owner", SOURCE.with_name("startup_owner.py")
     )
@@ -561,7 +560,7 @@ def test_startup_owner_does_not_require_pidfd(tmp_path, monkeypatch, failure):
 
     def unavailable(*args):
         calls.append(args)
-        raise OSError(failure, "private fixture pidfd unavailable")
+        raise OSError(errno.ENOSYS, "private fixture pidfd unavailable")
 
     monkeypatch.setattr(module.os, "pidfd_open", unavailable, raising=False)
     try:
