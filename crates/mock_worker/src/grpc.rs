@@ -35,7 +35,7 @@ use ts::{
 
 use crate::{
     config::Config,
-    drain::InFlight,
+    drain::{InFlight, WorkerInFlight},
     engine::{self, Engine, KvEventStream, LoadsLike, NewRequest},
     replay::Capture,
     script::{self, Answer, MatchedStop},
@@ -131,6 +131,7 @@ pub async fn serve_with_listener_until(
         capture,
         stopped,
         prefill_pending: Arc::new(AtomicU64::new(0)),
+        in_flight: WorkerInFlight::default(),
         overrides,
     };
     let server = async {
@@ -212,6 +213,9 @@ struct MockScheduler {
     /// Prompt tokens of the requests handed to the engine with no token yet:
     /// the prefill work in hand, as a servicer reports it on its load record.
     prefill_pending: Arc<AtomicU64>,
+    /// The requests this worker is serving: what its load report counts as
+    /// running when no engine simulation runs.
+    in_flight: WorkerInFlight,
     /// What the admin API made this worker report about itself (serving,
     /// server args, model capabilities).
     overrides: Arc<crate::overrides::WorkerOverrides>,
@@ -232,8 +236,9 @@ impl TokenSpeedScheduler for MockScheduler {
         request: Request<ts::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
         // In flight from here until the stream is done (or dropped by the
-        // gateway), so a shutdown knows what it waits for.
-        let in_flight = InFlight::enter();
+        // gateway), so a shutdown knows what it waits for and this worker's
+        // load report counts it.
+        let in_flight = InFlight::enter_on(&self.in_flight);
         let req = request.into_inner();
         // Record before anything else: the line is in the file before the
         // stream is returned, so before the gateway can read any frame.
@@ -471,23 +476,30 @@ impl TokenSpeedScheduler for MockScheduler {
             Some(engine) => {
                 snapshot_to_scheduler_load(&engine.load().as_reported_by(self.cfg.loads_like))
             }
-            None => ts::SchedulerLoad {
-                active_token_usage: None,
-                dp_rank: 0,
-                num_running_reqs: 0,
-                num_waiting_reqs: 0,
-                num_waiting_uncached_tokens: 0,
-                num_total_reqs: 0,
-                num_used_tokens: 0,
-                max_total_num_tokens: 1_000_000,
-                max_running_requests: 0,
-                token_usage: 0.0,
-                gen_throughput: 0.0,
-                cache_hit_rate: 0.0,
-                utilization: 0.0,
-                memory: None,
-                queues: None,
-            },
+            None => {
+                // Without an engine simulation the work in flight is the
+                // canned and scripted answers whose streams are still open on
+                // this worker (not the process's other workers): the running
+                // count a load poll asks about, and nothing waits.
+                let running = i32::try_from(self.in_flight.get()).unwrap_or(i32::MAX);
+                ts::SchedulerLoad {
+                    active_token_usage: None,
+                    dp_rank: 0,
+                    num_running_reqs: running,
+                    num_waiting_reqs: 0,
+                    num_waiting_uncached_tokens: 0,
+                    num_total_reqs: running,
+                    num_used_tokens: 0,
+                    max_total_num_tokens: 1_000_000,
+                    max_running_requests: 0,
+                    token_usage: 0.0,
+                    gen_throughput: 0.0,
+                    cache_hit_rate: 0.0,
+                    utilization: 0.0,
+                    memory: None,
+                    queues: None,
+                }
+            }
         };
         Ok(Response::new(ts::GetLoadsResponse {
             timestamp: String::new(),

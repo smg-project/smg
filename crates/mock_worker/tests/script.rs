@@ -748,3 +748,177 @@ fn the_binary_refuses_a_script_it_cannot_load_before_any_worker_starts() {
         assert!(stderr.contains(reason), "{stderr}");
     }
 }
+
+// ── load reports ────────────────────────────────────────────────────────────
+
+/// The gRPC load once its running count reads `running` (within two seconds).
+async fn grpc_running_settles_to(
+    client: &TokenSpeedSchedulerClient,
+    running: i32,
+) -> ts::SchedulerLoad {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let load = client
+                .get_loads(vec![])
+                .await
+                .expect("loads")
+                .loads
+                .remove(0);
+            if load.num_running_reqs == running {
+                return load;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the running count never read {running}"))
+}
+
+#[tokio::test]
+async fn grpc_reports_the_scripted_answers_in_flight_as_running() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let script = script_file(
+        dir.path(),
+        "running.jsonl",
+        &[json!({
+            "input_ids": [8],
+            "output_ids": [1, 2, 3, 4, 5],
+            "chunk_tokens": 1,
+            "delay_ms": 40,
+        })],
+    );
+    let (client, _) = start_grpc(config(Some(script))).await;
+    let idle = grpc_running_settles_to(&client, 0).await;
+    assert_eq!(idle.num_total_reqs, 0, "{idle:?}");
+
+    // The answer is paced over four pauses: a poll during them reads the one
+    // request as running, and as the whole of the load.
+    let (frames, busy) = tokio::join!(
+        generate(&client, grpc_request("r", &[8], true, false)),
+        grpc_running_settles_to(&client, 1)
+    );
+    assert_eq!(busy.num_total_reqs, 1, "{busy:?}");
+    assert_eq!(busy.num_waiting_reqs, 0, "{busy:?}");
+    assert_eq!(
+        frames.len(),
+        6,
+        "five chunks and the completion: {frames:?}"
+    );
+
+    let idle = grpc_running_settles_to(&client, 0).await;
+    assert_eq!(idle.num_total_reqs, 0, "{idle:?}");
+}
+
+#[tokio::test]
+async fn a_worker_reports_its_own_requests_in_flight_not_the_process_total() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let script = script_file(
+        dir.path(),
+        "own.jsonl",
+        &[json!({
+            "input_ids": [8],
+            "output_ids": [1, 2, 3, 4, 5],
+            "chunk_tokens": 1,
+            "delay_ms": 40,
+        })],
+    );
+    let (serving, _) = start_grpc(config(Some(script))).await;
+    let (other, _) = start_grpc(config(None)).await;
+    grpc_running_settles_to(&serving, 0).await;
+
+    // While the paced answer runs on one worker, the other worker of the same
+    // process reports none of it: a gateway that polls both sees where the
+    // work is.
+    let (frames, (busy, idle)) = tokio::join!(
+        generate(&serving, grpc_request("r", &[8], true, false)),
+        async {
+            let busy = grpc_running_settles_to(&serving, 1).await;
+            let idle = other
+                .get_loads(vec![])
+                .await
+                .expect("loads")
+                .loads
+                .remove(0);
+            (busy, idle)
+        }
+    );
+    assert_eq!(busy.num_total_reqs, 1, "{busy:?}");
+    assert_eq!(
+        idle.num_running_reqs, 0,
+        "the other worker's own count: {idle:?}"
+    );
+    assert_eq!(idle.num_total_reqs, 0, "{idle:?}");
+    assert_eq!(frames.len(), 6, "{frames:?}");
+}
+
+/// The HTTP load once its running count reads `running` (within two seconds).
+async fn http_running_settles_to(http: &reqwest::Client, base: &str, running: u64) -> Value {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let body: Value = http
+                .get(format!("{base}/v1/loads"))
+                .send()
+                .await
+                .expect("loads")
+                .json()
+                .await
+                .expect("a JSON body");
+            if body["loads"][0]["num_running_reqs"].as_u64() == Some(running) {
+                return body["loads"][0].clone();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the running count never read {running}"))
+}
+
+#[tokio::test]
+async fn http_reports_the_scripted_answers_in_flight_as_running() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let prompt = "count me while I run";
+    let script = script_file(
+        dir.path(),
+        "running.jsonl",
+        &[json!({
+            "input_ids": http::synth_token_ids(prompt),
+            "output_ids": [20, 21, 22, 23, 24],
+            "output_text": ["a", "b", "c", "d", "e"],
+            "chunk_tokens": 1,
+            "delay_ms": 40,
+        })],
+    );
+    let (base, _) = start_http(config(Some(script))).await;
+    let http = common::http_client();
+    let idle = http_running_settles_to(&http, &base, 0).await;
+    assert_eq!(idle["num_total_reqs"], 0, "{idle}");
+
+    // The whole answer is paced before its one body: a poll meanwhile reads
+    // the one request as running, and as the whole of the load.
+    let request = json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": false,
+    });
+    let (response, busy) = tokio::join!(
+        async {
+            http.post(format!("{base}/v1/chat/completions"))
+                .json(&request)
+                .send()
+                .await
+                .expect("chat")
+        },
+        http_running_settles_to(&http, &base, 1)
+    );
+    assert_eq!(response.status(), 200);
+    assert_eq!(busy["num_total_reqs"], 1, "{busy}");
+    assert_eq!(busy["num_waiting_reqs"], 0, "{busy}");
+    let whole: Value = response.json().await.expect("a JSON body");
+    assert_eq!(
+        whole["choices"][0]["message"]["content"], "abcde",
+        "{whole}"
+    );
+
+    let idle = http_running_settles_to(&http, &base, 0).await;
+    assert_eq!(idle["num_total_reqs"], 0, "{idle}");
+}
