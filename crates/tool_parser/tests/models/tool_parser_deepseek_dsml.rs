@@ -294,21 +294,20 @@ async fn test_deepseek32_factory_registration() {
         assert_eq!(calls[0].function.name, "search");
     }
 
-    // V3.2-Exp resolves to deepseek31 parser (V3.1 format)
-    let v31_input = concat!(
-        "<｜tool▁calls▁begin｜>",
-        "<｜tool▁call▁begin｜>search<｜tool▁sep｜>",
-        r#"{"query": "test"}"#,
-        "<｜tool▁call▁end｜>",
-        "<｜tool▁calls▁end｜>",
-    );
+    // V3.2-Exp resolves to the deepseek32 parser too: its own template spells V3.1's calls, but
+    // the engine renders the checkpoint through the V3.2 encoder, so its calls are DSML.
     for model in ["deepseek-v3.2-exp", "deepseek-ai/DeepSeek-V3.2-Exp"] {
+        assert_eq!(
+            factory.registry().resolve_model_to_parser(model).as_deref(),
+            Some("deepseek32"),
+            "model {model} should resolve to the V3.2 parser"
+        );
         let parser = factory
             .registry()
             .create_for_model(model)
             .expect("parser should exist");
-        let (_text, calls) = parser.parse_complete(v31_input).await.unwrap();
-        assert_eq!(calls.len(), 1, "model {model} should parse V3.1 format");
+        let (_text, calls) = parser.parse_complete(dsml_input).await.unwrap();
+        assert_eq!(calls.len(), 1, "model {model} should parse DSML format");
         assert_eq!(calls[0].function.name, "search");
     }
 

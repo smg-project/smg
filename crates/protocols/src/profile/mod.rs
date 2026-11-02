@@ -193,13 +193,6 @@ impl ProviderProfile {
         }
     }
 
-    /// Whether an explicit `reasoning_effort` outranks `thinking.type:
-    /// disabled`: under the MiniMax contract it does (an effort asks for
-    /// thinking at that depth); every other profile honours the toggle.
-    pub fn effort_outranks_thinking_disabled(self) -> bool {
-        matches!(self, ProviderProfile::Minimax)
-    }
-
     /// Record the configured model aliases (`alias -> served model id`).
     ///
     /// A served model id whose own name selects no vendor contract takes the

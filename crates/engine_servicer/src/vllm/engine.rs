@@ -39,6 +39,7 @@ pub(super) async fn connect_engine(state: Arc<State>, inputs: ConnectInputs) {
             if state.model.log_stats == Some(true) {
                 client.note_reports_steps();
             }
+            Ok(())
         },
     )
     .await;

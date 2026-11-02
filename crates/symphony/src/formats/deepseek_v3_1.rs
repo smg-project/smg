@@ -9,13 +9,15 @@
 //! Let me check.<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{"city": "Paris"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>
 //! ```
 //!
-//! The templates of DeepSeek V3.1, V3.1-Terminus and V3.2-Exp write this spelling (the gateway's
-//! older `deepseek31` parser's); DeepSeek V3's puts `function<｜tool▁sep｜>` before the name and a
+//! The templates of DeepSeek V3.1 and V3.1-Terminus write this spelling (the gateway's older
+//! `deepseek31` parser's); DeepSeek V3's puts `function<｜tool▁sep｜>` before the name and a
 //! `json` code fence around the arguments ([`deepseek_v3`]), and V3.2 and V4 write DSML, each with
-//! a table of its own ([`deepseek_v3_2`], [`deepseek_v4`]). Recorded as `deepseek-v3.1`, whose
-//! parse sets hold content alone: the template takes a call's arguments as a string, so the
-//! recorder, whose corpus holds them as an object, refused every call case; the calls stand on
-//! the turns the template renders, held in the tests below.
+//! a table of its own ([`deepseek_v3_2`], [`deepseek_v4`]). DeepSeek-V3.2-Exp's template writes
+//! this spelling too, but the engine renders that checkpoint through the V3.2 encoder, so its
+//! group reads with [`deepseek_v3_2`]. Recorded as `deepseek-v3.1`, whose parse sets hold content
+//! alone: the template takes a call's arguments as a string, so the recorder, whose corpus holds
+//! them as an object, refused every call case; the calls stand on the turns the template renders,
+//! held in the tests below.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 //!
@@ -59,7 +61,7 @@ pub fn deepseek_v3_1() -> Format {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::common::{Function, Tool};
+    use openai_protocol::common::Tool;
     use serde_json::{json as value, Value};
 
     use super::*;
@@ -70,6 +72,7 @@ mod tests {
         grammar::{GrammarStart, Options},
         input::{EngineFinish, Input},
         parser::Parser,
+        testing::{bytes, calls, content, finish, reasoning, tool},
         Declared,
     };
 
@@ -113,55 +116,6 @@ mod tests {
         out.into_owned().drain()
     }
 
-    /// Every byte the events carry, in order: the output, when the engine accounts for all of it.
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|event| match event {
-                Event::Content(text) | Event::Reasoning(text) => &*text.text,
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => &*text.text,
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => &*source.text,
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
-    }
-
-    fn calls(events: &[Event]) -> Vec<(String, String)> {
-        let mut calls: Vec<(String, String)> = Vec::new();
-        for event in events {
-            match event {
-                Event::ToolCallStart { name, .. } => calls.push((name.clone(), String::new())),
-                Event::ToolCallArguments { json, .. } => {
-                    calls.last_mut().expect("a call started").1.push_str(json);
-                }
-                _ => {}
-            }
-        }
-        calls
-    }
-
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(&*text.text),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn reasoning(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(&*text.text),
-                _ => None,
-            })
-            .collect()
-    }
-
     fn malformed<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
@@ -170,20 +124,6 @@ mod tests {
                 _ => None,
             })
             .collect()
-    }
-
-    /// The engine's finish: its reason as the engine gave it (the adapters refine it to
-    /// `tool_calls`), and the calls counted.
-    fn finish(events: &[Event]) -> (FinishReason, u32) {
-        events
-            .iter()
-            .find_map(|event| match event {
-                Event::Finish {
-                    reason, tool_calls, ..
-                } => Some((reason.clone(), *tool_calls)),
-                _ => None,
-            })
-            .expect("a finish")
     }
 
     /// A turn as the checkpoint's chat template renders it (`chat_template` of
@@ -549,19 +489,6 @@ mod tests {
     /// The required case's answer under the older path: the list of calls the older constraint
     /// asks for.
     const FORCED_REQUIRED_LIST: &str = "[{\"name\": \"metropolitan_museum_get_top_artworks\", \"parameters\": {\"number\": 5, \"sort_by\": \"popularity\"}}]";
-
-    fn tool(name: &str, parameters: Value) -> Tool {
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: name.to_string(),
-                description: None,
-                parameters,
-                strict: None,
-                extra: Default::default(),
-            },
-        }
-    }
 
     /// The tools of the two forced cases, with the schemas their calls were recorded under.
     fn forecast() -> Tool {

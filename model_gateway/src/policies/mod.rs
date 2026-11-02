@@ -25,6 +25,8 @@ mod prefix_hash;
 mod random;
 mod registry;
 mod round_robin;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;
@@ -110,6 +112,17 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// holding its prefix (see `placement::select_pair`). A constant for the
     /// policy's lifetime.
     fn balances_load_against_affinity(&self) -> bool {
+        false
+    }
+
+    /// Whether this policy places `info`'s request on the owner of its
+    /// explicit session key (a routing key, or the rid-derived key under the
+    /// routing-key override) rather than by load: consistent hashing's ring
+    /// owner. Single-worker placement over regular workers then leaves the
+    /// absolute overload veto off the selection instead of moving the session
+    /// off the worker holding its cache each time that worker crosses a
+    /// threshold (see `placement::select_from`).
+    fn routes_by_session_key(&self, _info: &SelectWorkerInfo) -> bool {
         false
     }
 
@@ -403,7 +416,9 @@ pub struct SelectWorkerInfo<'a> {
     /// when every worker is over them (health, the circuit breaker and the
     /// liveness veto still apply). Set by disaggregated pair placement for
     /// such a prefill pool (see `placement::select_pair`); every other pool
-    /// keeps the veto and the least-loaded steering default.
+    /// keeps the veto and the least-loaded steering default. Single-worker
+    /// placement over regular workers also sets it for a request its policy
+    /// places by session key ([`LoadBalancingPolicy::routes_by_session_key`]).
     pub overload_lifted: bool,
 }
 
@@ -422,17 +437,12 @@ impl SelectWorkerInfo<'_> {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use openai_protocol::worker::WorkerStatus;
 
     use super::*;
-    use crate::worker::{runtime::StallReason, BasicWorkerBuilder, WorkerType};
-
-    fn no_health_check() -> HealthCheckConfig {
-        HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        }
-    }
+    use crate::worker::{
+        runtime::StallReason, test_support::no_health_check, BasicWorkerBuilder, WorkerType,
+    };
 
     #[test]
     fn test_get_healthy_worker_indices() {

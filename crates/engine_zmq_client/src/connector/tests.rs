@@ -1,12 +1,14 @@
 use std::time::Duration;
 
-use futures::StreamExt;
+use futures::{channel::mpsc::channel as monitor_channel, SinkExt, StreamExt};
+use zeromq::{util::PeerIdentity, Endpoint, SocketEvent};
 
 use super::*;
 use crate::{
     codec::{decode_msgpack, encode_msgpack},
     mock_engine::{
-        connect_to_frontend, default_ready_response, EngineInbound, IpcNamespace, MockEngine,
+        connect_to_frontend, default_ready_response, hello, redial_input, EngineInbound,
+        IpcNamespace, MockEngine,
     },
     protocol::{
         handshake::EngineCoreReadyResponse,
@@ -234,10 +236,10 @@ async fn output_silence_counts_from_the_dispatch_and_ends_with_the_requests() {
     // A stats-only step is output: the engine is alive, if quiet.
     let stats_only = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
         engine_index: 0,
-        scheduler_stats: Some(Box::new(SchedulerStats {
+        scheduler_stats: Some(SchedulerStats {
             num_running_reqs: 1,
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     });
     engine
@@ -340,11 +342,11 @@ async fn scheduler_stats_surface_as_load_signal() {
             new_token_ids: vec![7],
             ..Default::default()
         }],
-        scheduler_stats: Some(Box::new(SchedulerStats {
+        scheduler_stats: Some(SchedulerStats {
             num_running_reqs: 3,
             num_waiting_reqs: 5,
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     });
     engine
@@ -376,11 +378,11 @@ async fn unpinned_requests_prefer_the_least_loaded_engine() {
             new_token_ids: vec![7],
             ..Default::default()
         }],
-        scheduler_stats: Some(Box::new(SchedulerStats {
+        scheduler_stats: Some(SchedulerStats {
             num_running_reqs: 3,
             num_waiting_reqs: 5,
             ..Default::default()
-        })),
+        }),
         ..Default::default()
     });
     engines[0]
@@ -545,11 +547,11 @@ async fn an_emptied_rank_sheds_its_stale_queue_counts() {
             finish_reason: Some(EngineCoreFinishReason::Stop),
             ..Default::default()
         }],
-        scheduler_stats: Some(Box::new(SchedulerStats {
+        scheduler_stats: Some(SchedulerStats {
             num_running_reqs: 3,
             num_waiting_reqs: 5,
             ..Default::default()
-        })),
+        }),
         finished_requests: Some(std::collections::BTreeSet::from(["last".to_string()])),
         ..Default::default()
     });
@@ -1714,6 +1716,219 @@ async fn disconnected_peer_fails_already_accepted_requests() {
     assert!(!client.is_alive());
 }
 
+/// One request through `client`, served by `engine`: the add reaches the
+/// engine and the engine's terminal output reaches the stream.
+async fn round_trip(client: &EngineCoreClient, engine: &mut MockEngine, request_id: &str) {
+    let mut stream = client.submit(request_for(request_id, 0)).await.unwrap();
+    assert!(matches!(
+        engine.recv().await.unwrap(),
+        EngineInbound::Add(_)
+    ));
+    engine
+        .send_output(batch(
+            0,
+            EngineCoreOutput {
+                request_id: request_id.into(),
+                new_token_ids: vec![1],
+                finish_reason: Some(EngineCoreFinishReason::Stop),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap();
+    let output = tokio::time::timeout(TIMEOUT, stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(output.finished());
+}
+
+/// The input monitor is opened when the frontend binds its input socket,
+/// before the handshake, and holds every peer event since; the client built
+/// from the handshake reads it from the start. A disconnect queued there
+/// before the handshake admitted the link is of a connection the handshake
+/// did not admit: the data socket of a previous engine generation, which
+/// dialed this frontend's new bind by itself and closed when that
+/// generation was replaced, under the identity the next generation
+/// registers with. Replayed on the monitor stream in the socket's order (the
+/// previous connection's accept and end, then the admitted connection's
+/// accept): queued before the client is built, it leaves the link up and
+/// serving; after, a disconnect of another identity leaves it up too, and
+/// one of the link's own engine ends it.
+#[tokio::test]
+async fn a_disconnect_queued_before_the_link_was_admitted_does_not_end_it() {
+    let ns = IpcNamespace::new().unwrap();
+    let (handshake, input, output) = (
+        ns.handshake_endpoint(),
+        ns.input_endpoint(),
+        ns.output_endpoint(),
+    );
+    let (transport, engine) = tokio::join!(
+        connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
+        connect_to_frontend(
+            &handshake,
+            EngineId::from_engine_index(0),
+            default_ready_response()
+        ),
+    );
+    let mut transport = transport.unwrap();
+    let mut engine = engine.unwrap();
+
+    // The monitor stream, replayed in the order the socket reports a
+    // previous generation's connection and the admitted one: its accept, its
+    // end, then the accept of the connection that carried the registration,
+    // all queued when the client is built.
+    let own = PeerIdentity::try_from(EngineId::from_engine_index(0)).unwrap();
+    let (mut events, replay) = monitor_channel(8);
+    for event in [
+        SocketEvent::Accepted(Endpoint::Ipc(None), own.clone()),
+        SocketEvent::Disconnected(own.clone()),
+        SocketEvent::Accepted(Endpoint::Ipc(None), own.clone()),
+    ] {
+        events.try_send(event).unwrap();
+    }
+    transport.input_events = replay;
+    let client = EngineCoreClient::new(transport);
+
+    round_trip(&client, &mut engine, "after-a-disconnect-queued-before").await;
+    assert!(client.is_alive());
+
+    // After the admission: a peer that is not an engine of this link.
+    let other = PeerIdentity::try_from(EngineId::from_engine_index(7)).unwrap();
+    events.send(SocketEvent::Disconnected(other)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    round_trip(&client, &mut engine, "after-another-peers-disconnect").await;
+    assert!(client.is_alive());
+
+    // After the admission: this link's engine.
+    events.send(SocketEvent::Disconnected(own)).await.unwrap();
+    tokio::time::timeout(TIMEOUT, async {
+        while client.is_alive() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the link ends on its own engine's disconnect");
+    assert!(matches!(
+        client.submit(request_for("after-the-end", 0)).await,
+        Err(Error::ClientClosed { .. })
+    ));
+}
+
+/// The same on the sockets, as a frontend restart under a live engine plays
+/// it: the engine's input socket dials the frontend's new bind by itself (no
+/// handshake and no registration: an engine says both once), the engine is
+/// then replaced, and the next generation handshakes under the same
+/// identity. Its READY turns the frontend to its input socket, where the
+/// old connection's end is read before the new generation registers there;
+/// the link admitted then stays up.
+#[tokio::test]
+async fn a_previous_generations_disconnect_does_not_end_the_next_link() {
+    let ns = IpcNamespace::new().unwrap();
+    let (handshake, input, output) = (
+        ns.handshake_endpoint(),
+        ns.input_endpoint(),
+        ns.output_endpoint(),
+    );
+    let engine_id = EngineId::from_engine_index(0);
+
+    // Generation one serves on the first link.
+    let (transport, engine) = tokio::join!(
+        connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
+        connect_to_frontend(&handshake, engine_id.clone(), default_ready_response()),
+    );
+    let client = EngineCoreClient::new(transport.unwrap());
+    let mut engine = engine.unwrap();
+    round_trip(&client, &mut engine, "generation-one").await;
+
+    // The frontend restarts: its sockets go with the client, and it binds
+    // again (the dropped listeners' socket files go on their own tasks).
+    drop(client);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (transport, next) = tokio::join!(
+        connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
+        async {
+            // The surviving engine's input socket dials the new bind by
+            // itself; then the engine is replaced and its sockets close.
+            let reconnected = redial_input(&input, engine_id.clone()).await?;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(reconnected);
+            drop(engine);
+            // The next generation handshakes, and registers once the
+            // frontend has turned to its input socket.
+            let ready = hello(&handshake, engine_id.clone())
+                .await?
+                .announce_ready()
+                .await?;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            ready.register(default_ready_response()).await
+        },
+    );
+    let client = EngineCoreClient::new(transport.unwrap());
+    let mut next = next.unwrap();
+    round_trip(&client, &mut next, "generation-two").await;
+    assert!(client.is_alive());
+}
+
+/// A link of several engines admits them together, and an engine that
+/// registered first can go away while the handshake still waits for the
+/// others: its disconnect is queued on the monitor before the client is
+/// built, after its own accept, and no second event for it ever comes (the
+/// socket has forgotten the peer). Replayed: the first engine's accept, its
+/// disconnect, then the second engine's accept; the link ends at its
+/// admission (`is_alive()` false, submits refused), as the monitor arm ends
+/// it on a loss after.
+#[tokio::test]
+async fn an_engine_lost_while_the_handshake_waited_for_the_others_ends_the_link() {
+    let ns = IpcNamespace::new().unwrap();
+    let (handshake, input, output) = (
+        ns.handshake_endpoint(),
+        ns.input_endpoint(),
+        ns.output_endpoint(),
+    );
+    let (transport, first, second) = tokio::join!(
+        connect_handshake(&handshake, 2, &input, &output, TIMEOUT),
+        connect_to_frontend(
+            &handshake,
+            EngineId::from_engine_index(0),
+            default_ready_response()
+        ),
+        connect_to_frontend(
+            &handshake,
+            EngineId::from_engine_index(1),
+            default_ready_response()
+        ),
+    );
+    let mut transport = transport.unwrap();
+    let (_first, _second) = (first.unwrap(), second.unwrap());
+
+    let lost = PeerIdentity::try_from(EngineId::from_engine_index(0)).unwrap();
+    let other = PeerIdentity::try_from(EngineId::from_engine_index(1)).unwrap();
+    let (mut events, replay) = monitor_channel(8);
+    for event in [
+        SocketEvent::Accepted(Endpoint::Ipc(None), lost.clone()),
+        SocketEvent::Disconnected(lost),
+        SocketEvent::Accepted(Endpoint::Ipc(None), other),
+    ] {
+        events.try_send(event).unwrap();
+    }
+    transport.input_events = replay;
+    let client = EngineCoreClient::new(transport);
+
+    tokio::time::timeout(TIMEOUT, async {
+        while client.is_alive() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the link ends at its admission on a registered engine's loss");
+    assert!(matches!(
+        client.submit(request_for("after-the-end", 0)).await,
+        Err(Error::ClientClosed { .. })
+    ));
+}
+
 /// Local admission completes before receipt; output silence still detects stalls.
 #[tokio::test]
 async fn accepted_large_frame_uses_output_silence_not_input_timeout() {
@@ -2110,6 +2325,33 @@ async fn a_blocked_input_refuses_add_requests_past_the_frame_bound() {
         .await
         .unwrap();
     assert!(stream.next().await.unwrap().unwrap().finished());
+}
+
+/// A typed frame (an encode worker's request, the largest payload) is admitted
+/// against the same bound as an add frame: past it, refused at once.
+#[tokio::test]
+async fn a_blocked_input_refuses_typed_frames_past_the_byte_bound() {
+    let (client, engine, _ns) = connect().await;
+    client.set_send_timeout(SEND_WINDOW);
+    client.set_input_queue_limit(usize::MAX, 1 << 20);
+    saturate_input(&client).await;
+    // The writer has been stuck for its window: the input counts as blocked.
+    tokio::time::sleep(SEND_WINDOW).await;
+    let engine_id = client.engines()[0].engine_id.clone();
+    let started = std::time::Instant::now();
+    let error = client
+        .send_typed(
+            &engine_id,
+            Bytes::from_static(b"\x03"),
+            vec![0u8; 8],
+            vec![Bytes::from(vec![0u8; 2 << 20])],
+        )
+        .await
+        .expect_err("the waiting payload would pass the bound");
+    assert!(matches!(error, Error::EngineInputFull { .. }), "{error:?}");
+    assert!(started.elapsed() < SEND_WINDOW / 2, "refused at once");
+    assert!(client.is_alive());
+    drop(engine);
 }
 
 /// The bound in bytes: behind a blocked frame a small add-request within
@@ -2602,8 +2844,11 @@ async fn an_abandoned_typed_tensor_submit_aborts_its_request_on_the_tagged_wire(
     let (client, mut engine, _ns) = connect_tagged().await;
     client.set_send_timeout(SEND_WINDOW);
     for _ in 0..3 {
-        let (payload, aux) =
-            TokenSpeedProtocol::encode_add(&large_tagged_request("queue-saturation")).unwrap();
+        let (payload, aux) = TokenSpeedProtocol::encode_add(
+            &large_tagged_request("queue-saturation"),
+            &Default::default(),
+        )
+        .unwrap();
         client
             .inner
             .queue_frame(
@@ -3106,4 +3351,37 @@ fn the_default_prefill_allowance_is_500_s_per_million_tokens() {
     );
     registry.prefill_tokens_per_sec = 0;
     assert_eq!(registry.prefill_allowance(1_000_000), Duration::ZERO);
+}
+
+/// The connection's layout is the one every rank declared; a rank that
+/// disagrees anywhere in the group, the middle included, fails the agreement
+/// and the connection falls back to the default layout; no engines read as
+/// the default.
+#[test]
+fn a_disagreeing_rank_in_the_middle_of_the_group_fails_the_agreement() {
+    use crate::protocol::sglang::{SglangLayout, SglangProtocol};
+
+    let engine = |index: u32, tensor_aux_frames: bool| ConnectedEngine {
+        engine_id: EngineId::from_engine_index(index),
+        ready_response: EngineCoreReadyResponse {
+            tensor_aux_frames,
+            ..default_ready_response()
+        },
+    };
+    let agreeing = [engine(0, true), engine(1, true), engine(2, true)];
+    assert_eq!(
+        connection_layout::<SglangProtocol>(&agreeing),
+        SglangLayout {
+            tensor_aux_frames: true
+        }
+    );
+    let middle_rank_behind = [engine(0, true), engine(1, false), engine(2, true)];
+    assert_eq!(
+        connection_layout::<SglangProtocol>(&middle_rank_behind),
+        SglangLayout::default()
+    );
+    assert_eq!(
+        connection_layout::<SglangProtocol>(&[]),
+        SglangLayout::default()
+    );
 }

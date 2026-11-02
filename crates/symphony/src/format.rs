@@ -94,8 +94,9 @@
 //! in a state of its own has no start to choose.
 //!
 //! An **unopened row** names the state a turn starts in when the prompt opens no turn for the
-//! model. A template that writes the turn opener after a user message only (DeepSeek's) leaves
-//! the turn unopened when the conversation ends with a system message rendered in place, and the
+//! model. A template that writes the turn opener after some messages only (DeepSeek's: not after
+//! a system message a latest reminder follows; the checkpoint's own encoder file, after user and
+//! developer turns only) leaves the turn unopened when the conversation ends there, and the
 //! model starts its turn as its default has it: DeepSeek inside its thought. The prompt opens no
 //! turn when it holds no turn opener, or when the turn's end the row names (`<｜end▁of▁sentence｜>`)
 //! follows the last one: the turn it opened is over, and nothing opened the next. Nothing of such
@@ -295,6 +296,9 @@ pub enum CallId {
 pub struct Format {
     name: String,
     terminals: Vec<Terminal>,
+    /// The terminals' texts as the engine's scanner takes them ([`Self::terminal_texts`]), built
+    /// once here and shared by every scanner the format makes, so that a request copies nothing.
+    scanner_markers: Arc<[String]>,
     states: Vec<State>,
     transitions: Vec<Transition>,
     calls: Option<CallSyntax>,
@@ -411,6 +415,7 @@ impl Format {
         Self {
             name: name.into(),
             terminals: Vec::new(),
+            scanner_markers: Arc::from([]),
             states: Vec::new(),
             transitions: Vec::new(),
             calls: None,
@@ -439,6 +444,7 @@ impl Format {
             shown: false,
             frames_messages: false,
         });
+        self.rebuild_scanner_markers();
         self
     }
 
@@ -453,7 +459,20 @@ impl Format {
             shown: false,
             frames_messages: false,
         });
+        self.rebuild_scanner_markers();
         self
+    }
+
+    /// The shared marker list follows the terminals: rebuilt when one is added (at build time,
+    /// a handful of times per format), never per request.
+    fn rebuild_scanner_markers(&mut self) {
+        self.scanner_markers = self.terminal_texts().map(str::to_owned).collect();
+    }
+
+    /// A scanner over the format's terminals, numbered as [`Self::terminal_texts`] lists them:
+    /// what [`Scanner::new`] over those texts would be, sharing the format's list.
+    pub(crate) fn scanner(&self) -> Scanner {
+        Scanner::sharing(Arc::clone(&self.scanner_markers))
     }
 
     /// A token of the model's vocabulary that the format's tags begin with (`<|open|>`,
@@ -648,9 +667,10 @@ impl Format {
     /// The state a turn starts in when the prompt opens no turn for the model (see the unopened
     /// row in [`crate::format`]): the prompt holds no turn opener, or `turn_end`, the text that
     /// ends a turn the model wrote in the prompt (`<｜end▁of▁sentence｜>`), follows the last one.
-    /// DeepSeek's template writes the turn opener after a user message only, so a conversation
-    /// that ends with a system message rendered in place leaves the turn unopened, and the model,
-    /// which thinks unless told not to, starts inside its thought. Nothing of such a prompt is
+    /// DeepSeek's template writes no turn opener after a system message a latest reminder
+    /// follows (the checkpoint's own encoder file, after no system message at all), so such a
+    /// conversation leaves the turn unopened, and the model, which thinks unless told not to,
+    /// starts inside its thought. Nothing of such a prompt is
     /// replayed. The state must already be in the table; the table must name a turn opener.
     #[must_use]
     pub fn unopened_turn_starts_in(mut self, state: &str, turn_end: &str) -> Self {
@@ -946,8 +966,10 @@ impl Format {
             .collect()
     }
 
-    /// The turn opener, if the table names one.
-    pub(crate) fn turn_opener(&self) -> Option<&str> {
+    /// The turn opener, if the table names one: what the template writes before the model's turn.
+    /// The corpus replay feeds it before a generation prompt's tail, since a table may key the
+    /// turn's start on it ([`Self::unopened_turn_starts_in`]).
+    pub fn turn_opener(&self) -> Option<&str> {
         self.turn_opener.as_deref()
     }
 
@@ -1086,7 +1108,7 @@ impl Format {
             .turn_opener()
             .filter(|opener| self.anchors.is_empty() && turn.starts_with(opener))
             .map_or(0, str::len);
-        let mut scanner = Scanner::new(self.terminal_texts());
+        let mut scanner = self.scanner();
         let (mut state, mut rest) = (start, start);
         // Whether the prompt wrote text other than whitespace in the stay the output continues;
         // a marker is the template's, whether or not a row reads it here.

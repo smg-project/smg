@@ -2,7 +2,7 @@
 
 Build the gateway with `cargo build --release -p smg --features tokenizers-v1`.
 The default build continues using tokenizers 0.23. The optional dependency is
-aliased as `tokenizers_v1` and pinned to `1.0.0-rc.2`. Enabling it accelerates
+aliased as `tokenizers_v1` and pinned to `1.0.0-rc.3`. Enabling it accelerates
 single and batch text encoding inside `HuggingFaceTokenizer`. Full decode with a
 plain ByteLevel decoder also reuses SMG's existing byte table (see
 [decode benchmarks](../decode/README.md)). Streaming, other decoders, model metadata
@@ -15,8 +15,8 @@ configured BOS/EOS processing is preserved. Results use `Encoding::Plain`, like
 the existing native encoder. Non-BPE models, stochastic BPE, padding/truncation,
 Split configurations without a usable engine and configurations rejected by the v1
 reader retain the existing encoder. `uses_v1_encoder()` exposes the selection.
-The Split guard avoids an rc.2 reader issue: it can accept a regex without a
-usable engine, even with `regex` enabled. V1 word caches are limited to the same
+The Split guard avoids an RC reader issue (rc.3 as rc.2): it can accept a regex
+without a usable engine, even with `regex` enabled. V1 word caches are limited to the same
 1,024 entries as the existing fallback. The RC reader ignores cache capacity, so
 the adapter rebuilds its BPE model with that bound and reuses the parsed pipeline
 configuration. Short/serial calls use the borrowed `encode_into` API to avoid

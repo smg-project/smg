@@ -367,7 +367,8 @@ jobs:
           bash scripts/ci_killall_sglang.sh nuke_gpus 9>&- || true
           cleanup() {
             bash scripts/tau2/launch_arms.sh stop 9>&- || true
-            bash scripts/ci_killall_sglang.sh nuke_gpus 9>&- || true
+            # the verdict is discarded here: one reading, no wait for a draining card
+            CI_GPU_GUARD_WAIT_SECS=0 bash scripts/ci_killall_sglang.sh nuke_gpus 9>&- || true
           }
           trap cleanup EXIT
           trap 'cleanup; exit 143' INT TERM

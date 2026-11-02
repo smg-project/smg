@@ -10,6 +10,9 @@ use crate::{
     tagged::xml,
 };
 
+/// The separator token the template writes before every tag, dropped wherever it stands.
+pub const SEPARATOR: &str = "]<]minimax[>[";
+
 /// The MiniMax M3 table.
 pub fn minimax_m3() -> Format {
     Format::new("minimax_m3")
@@ -19,7 +22,7 @@ pub fn minimax_m3() -> Format {
         .terminal("calls_close", "</tool_call>")
         .terminal("invoke_open", "<invoke name=\"")
         .terminal("invoke_close", xml::INVOKE_CLOSE)
-        .ignores("separator", "]<]minimax[>[")
+        .ignores("separator", SEPARATOR)
         .state("start", Emits::Content)
         .state("reasoning", Emits::Reasoning)
         .state("content", Emits::Content)
@@ -49,13 +52,11 @@ mod tests {
     use crate::{
         adapt::chat,
         engine::Engine,
-        event::{DropReason, Event, MalformedReason, Text},
+        event::{DropReason, Event, MalformedReason},
         input::EngineFinish,
-        testing::{arguments_of, bytes, content, drive, drive_to, names, reasoning},
+        testing::{arguments_of, bytes, content, drive, drive_to, dropped, names, reasoning},
         Declared,
     };
-
-    const SEP: &str = "]<]minimax[>[";
 
     /// A recorded output, separators and all: an empty thought, one invoke with a string and a
     /// nested object.
@@ -133,7 +134,7 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 Event::ToolCallArguments { index, json, .. } if *index == call => {
-                    Some(json.as_str())
+                    Some(json.as_ref())
                 }
                 _ => None,
             })
@@ -145,13 +146,6 @@ mod tests {
             .iter()
             .filter(|event| matches!(event, Event::ToolCallEnd { .. }))
             .count()
-    }
-
-    fn dropped(text: &str) -> Event<'static> {
-        Event::Dropped {
-            text: Text::uncounted(text.to_owned()),
-            why: DropReason::Wrapper,
-        }
     }
 
     /// Prose where the invoke has tags, before its first child or after its last: refused word by
@@ -342,8 +336,8 @@ mod tests {
         assert!(!events.iter().any(|e| matches!(e, Event::ReasoningStart)));
         // Every separator is dropped, and the one after `latte` stays in the fragment that holds
         // the value, so the bytes keep their order.
-        assert!(events.contains(&dropped(SEP)));
-        let held = format!("<drink_id>latte{SEP}</drink_id>");
+        assert!(events.contains(&dropped(SEPARATOR)));
+        let held = format!("<drink_id>latte{SEPARATOR}</drink_id>");
         assert!(events.iter().any(|event| matches!(
             event,
             Event::ToolCallArguments { source, .. } if source.text.ends_with(&held)
@@ -399,7 +393,7 @@ mod tests {
         let pieces = [
             "</mm:think><tool_call>\n<invoke name=\"alert\"><name>Pa",
             "ris",
-            SEP,
+            SEPARATOR,
             "</name></invoke>\n</tool_call>",
         ];
         let events = run_with(tools(), "", &pieces);
@@ -408,7 +402,7 @@ mod tests {
             fragments_of(&events, 0),
             [r#"{"name": ""#, "Pa", "ris", "\"", "}"]
         );
-        assert!(events.contains(&dropped(SEP)));
+        assert!(events.contains(&dropped(SEPARATOR)));
     }
 
     #[test]
@@ -446,9 +440,12 @@ mod tests {
         assert!(!events.iter().any(|e| matches!(e, Event::ReasoningStart)));
 
         // Later in the content both markers are text, and a separator anywhere is dropped.
-        let events = run("", &["</mm:think>Say <mm:think>x</mm:think>", SEP, " done"]);
+        let events = run(
+            "",
+            &["</mm:think>Say <mm:think>x</mm:think>", SEPARATOR, " done"],
+        );
         assert_eq!(content(&events), "Say <mm:think>x</mm:think> done");
-        assert!(events.contains(&dropped(SEP)));
+        assert!(events.contains(&dropped(SEPARATOR)));
 
         // No marker at all: content.
         let events = run("", &["Hello."]);

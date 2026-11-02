@@ -90,3 +90,13 @@ def test_the_launcher_builds_the_real_router(args: RouterArgs):
     # providers' mappings are parsed, no file read, no command run and no
     # request sent); nothing is bound.
     assert Router.from_args(args) is not None
+
+
+@pytest.mark.parametrize("settle", [None, 0, 30, 120])
+def test_shutdown_settle_reaches_native_constructor(settle):
+    """The optional propagation window reaches the native router unchanged."""
+    args = RouterArgs(worker_urls=["http://worker:8000"], shutdown_settle_secs=settle)
+    with patch("smg.router._Router") as constructor:
+        Router.from_args(args)
+    assert constructor.call_args.kwargs["shutdown_settle_secs"] == settle
+    assert isinstance(Router.from_args(args), Router)

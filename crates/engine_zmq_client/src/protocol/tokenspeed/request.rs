@@ -14,7 +14,10 @@ use crate::{
     codec::tensor::{TensorFields, WireArrayData},
     protocol::{
         positional::{drain_trailing, expect_tag, next_field},
-        tokenspeed::{multimodal::TokenSpeedWireMmInputs, sampling::SamplingParams},
+        tokenspeed::{
+            multimodal::{TokenSpeedWireMmInputs, TokenSpeedWireMmItem},
+            sampling::SamplingParams,
+        },
     },
 };
 
@@ -22,10 +25,13 @@ use crate::{
 pub const TOKENIZED_GENERATE_REQ_INPUT_TAG: &str = "TokenizedGenerateReqInput";
 
 /// Request types are single-byte protocol constants sent as a raw ZMQ frame
-/// ahead of the msgpack payload (TokenSpeed's `REQ_TYPE_ADD`/`REQ_TYPE_ABORT`),
-/// so the receiver can dispatch without decoding first.
-/// The wire's full set: add 0, abort 1, control 2 (the scheduler's control
-/// call), encode 3 (a disaggregated encode worker's request, its own change).
+/// ahead of the msgpack payload (TokenSpeed's `REQ_TYPE_ADD`/`REQ_TYPE_ABORT`/
+/// `REQ_TYPE_CONTROL`/`REQ_TYPE_ENCODE`), so the receiver can dispatch without
+/// decoding first. The wire's full set: add 0, abort 1, control 2 (the
+/// scheduler's control call), encode 3 (a disaggregated encode worker's
+/// request). A disaggregated encode worker takes [`Encode`](Self::Encode)
+/// alone, as its handshake lists
+/// ([`EngineCoreReadyResponse::request_types`](crate::protocol::handshake::EngineCoreReadyResponse::request_types)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TokenSpeedRequestType {
@@ -36,6 +42,7 @@ pub enum TokenSpeedRequestType {
     /// same call id on the output socket. Sent only to a scheduler whose
     /// handshake declared that reply.
     Control = 2,
+    Encode = 3,
 }
 
 impl TokenSpeedRequestType {
@@ -48,6 +55,7 @@ impl TokenSpeedRequestType {
             0 => Some(Self::Add),
             1 => Some(Self::Abort),
             2 => Some(Self::Control),
+            3 => Some(Self::Encode),
             _ => None,
         }
     }
@@ -58,7 +66,57 @@ impl TokenSpeedRequestType {
             Self::Add => b"\x00",
             Self::Abort => b"\x01",
             Self::Control => b"\x02",
+            Self::Encode => b"\x03",
         })
+    }
+}
+
+/// The msgspec tag for [`TokenSpeedEncodeRequest`] (element 0 on the wire).
+pub const ENCODE_REQUEST_TAG: &str = "EncodeRequest";
+
+/// An encode worker's request: the engine's `EncodeRequest`
+/// (`runtime/epd/encode_worker.py`), a tagged positional struct on the same
+/// base as the generate request, so the wire is the tag, the base's two
+/// unset fields (`rid`, `http_worker_ipc`), then its own five in declaration
+/// order. `bootstrap_host`/`port` are the encode worker's own rendezvous (it
+/// hosts the transfer the prefill side pulls from), `bootstrap_room` the
+/// request's room; the items are the generate request's multimodal items
+/// with their features set (the worker runs the tower on them). Nothing
+/// answers it: the embedding reaches the prefill peer over the transfer
+/// engine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenSpeedEncodeRequest {
+    pub request_id: String,
+    pub bootstrap_host: String,
+    pub bootstrap_port: i32,
+    pub bootstrap_room: i64,
+    pub items: Vec<TokenSpeedWireMmItem>,
+}
+
+impl TensorFields for TokenSpeedEncodeRequest {
+    /// The items' features and model-specific tensors, in item order.
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        self.items.for_each_tensor(visit);
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        self.items.for_each_tensor_mut(visit);
+    }
+}
+
+impl Serialize for TokenSpeedEncodeRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        const NIL: Option<()> = None;
+        let mut tuple = serializer.serialize_tuple(8)?;
+        tuple.serialize_element(ENCODE_REQUEST_TAG)?;
+        tuple.serialize_element(&NIL)?; // rid
+        tuple.serialize_element(&NIL)?; // http_worker_ipc
+        tuple.serialize_element(&self.request_id)?;
+        tuple.serialize_element(&self.bootstrap_host)?;
+        tuple.serialize_element(&self.bootstrap_port)?;
+        tuple.serialize_element(&self.bootstrap_room)?;
+        tuple.serialize_element(&self.items)?;
+        tuple.end()
     }
 }
 
@@ -315,11 +373,16 @@ mod tests {
 
     #[test]
     fn request_type_frames_roundtrip() {
-        for ty in [TokenSpeedRequestType::Add, TokenSpeedRequestType::Abort] {
+        for ty in [
+            TokenSpeedRequestType::Add,
+            TokenSpeedRequestType::Abort,
+            TokenSpeedRequestType::Encode,
+        ] {
             assert_eq!(TokenSpeedRequestType::from_frame(&ty.to_frame()), Some(ty));
         }
         assert_eq!(TokenSpeedRequestType::Add.to_frame().as_ref(), b"\x00");
         assert_eq!(TokenSpeedRequestType::Abort.to_frame().as_ref(), b"\x01");
+        assert_eq!(TokenSpeedRequestType::Encode.to_frame().as_ref(), b"\x03");
         assert_eq!(TokenSpeedRequestType::from_frame(b"\x09"), None);
         assert_eq!(TokenSpeedRequestType::from_frame(b""), None);
     }
@@ -576,5 +639,96 @@ mod tests {
             error.to_string().contains("missing positional field"),
             "{error}"
         );
+    }
+
+    fn encode_item(feature_bytes: usize) -> TokenSpeedWireMmItem {
+        use crate::{
+            codec::tensor::WireTensor,
+            protocol::tokenspeed::multimodal::{mm_pad_value, TokenSpeedWireModality},
+        };
+
+        let mut model_specific_data = std::collections::BTreeMap::new();
+        model_specific_data.insert(
+            "vit_grid".to_string(),
+            WireTensor::from_raw(
+                "uint32",
+                vec![1, 3],
+                vec![1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0],
+            ),
+        );
+        TokenSpeedWireMmItem {
+            modality: TokenSpeedWireModality::Image,
+            hash: 0xDEAD_BEEF,
+            pad_value: mm_pad_value(TokenSpeedWireModality::Image, 0xDEAD_BEEF),
+            offsets: vec![(1, 3)],
+            feature: Some(WireTensor::from_raw(
+                "bfloat16",
+                vec![feature_bytes / 2, 1],
+                (0..feature_bytes).map(|i| i as u8).collect(),
+            )),
+            model_specific_data,
+            encode_handshake: None,
+        }
+    }
+
+    /// The engine's `EncodeRequest` is a tagged positional struct on the
+    /// generate request's base: the tag, the base's two unset fields, then
+    /// request id, rendezvous host, port and room, then the items (the
+    /// prefix the engine's own wire test pins as
+    /// `["EncodeRequest", None, None, "e1", "h", 1, 7]`).
+    #[test]
+    fn encode_request_emits_the_engines_tagged_tuple() {
+        let request = TokenSpeedEncodeRequest {
+            request_id: "e1".to_string(),
+            bootstrap_host: "h".to_string(),
+            bootstrap_port: 1,
+            bootstrap_room: 7,
+            items: vec![encode_item(12)],
+        };
+        let encoded = encode_msgpack(&request).unwrap();
+        let Value::Array(array) = decode_value(&encoded).unwrap() else {
+            panic!("expected positional array");
+        };
+        assert_eq!(array.len(), 8);
+        assert_eq!(array[0], Value::from(ENCODE_REQUEST_TAG));
+        assert_eq!(array[1], Value::Nil); // rid
+        assert_eq!(array[2], Value::Nil); // http_worker_ipc
+        assert_eq!(array[3], Value::from("e1"));
+        assert_eq!(array[4], Value::from("h"));
+        assert_eq!(array[5], Value::from(1));
+        assert_eq!(array[6], Value::from(7));
+        let Value::Array(items) = &array[7] else {
+            panic!("expected the items array");
+        };
+        assert_eq!(items.len(), 1);
+        // One multimodal item is the generate request's 10-slot item.
+        assert!(matches!(&items[0], Value::Array(item) if item.len() == 10));
+    }
+
+    /// An item's feature at the auxiliary bar leaves the payload as a frame,
+    /// as a generate request's multimodal tensors do; a smaller one stays
+    /// inline.
+    #[test]
+    fn encode_request_rides_a_large_feature_as_an_auxiliary_frame() {
+        use crate::codec::tensor::{encode_with_aux_frames, TENSOR_AUX_MIN_BYTES};
+
+        let small = TokenSpeedEncodeRequest {
+            request_id: "e1".to_string(),
+            bootstrap_host: "h".to_string(),
+            bootstrap_port: 1,
+            bootstrap_room: 7,
+            items: vec![encode_item(12)],
+        };
+        let (_, frames) = encode_with_aux_frames(&small).unwrap();
+        assert!(frames.is_empty());
+
+        let large = TokenSpeedEncodeRequest {
+            items: vec![encode_item(TENSOR_AUX_MIN_BYTES)],
+            ..small
+        };
+        let (payload, frames) = encode_with_aux_frames(&large).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].len(), TENSOR_AUX_MIN_BYTES);
+        assert!(payload.len() < TENSOR_AUX_MIN_BYTES);
     }
 }
