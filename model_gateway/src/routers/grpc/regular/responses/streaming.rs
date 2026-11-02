@@ -25,9 +25,8 @@ use openai_protocol::{
     },
     common::{FunctionCallResponse, ToolCall, ToolCallDelta, Usage},
     responses::{
-        IncompleteDetails, IncompleteReason, ResponseContentPart, ResponseOutputItem,
-        ResponseReasoningContent, ResponseStatus, ResponsesRequest, ResponsesResponse,
-        ResponsesUsage,
+        ResponseContentPart, ResponseOutputItem, ResponseReasoningContent, ResponseStatus,
+        ResponsesRequest, ResponsesResponse, ResponsesUsage,
     },
 };
 use serde_json::{json, Value};
@@ -67,7 +66,8 @@ use crate::{
                         attach_mcp_server_label, ResponseStreamEventEmitter, StreamStartupSender,
                     },
                     utils::{
-                        function_call_status, generation_failure_error, resolve_function_identity,
+                        custom_tool_input, custom_tool_names, cut_call, function_call_status,
+                        generation_failure_error, resolve_function_identity, response_status,
                     },
                     BackgroundStream, ResponsesContext,
                 },
@@ -573,40 +573,60 @@ impl StreamingResponseAccumulator {
             ));
         }
 
-        // Add tool calls
-        output.extend(self.tool_calls.into_iter().map(|mut item| {
-            if let ResponseOutputItem::FunctionToolCall {
+        // The cut-call read comes first, on the calls' function-shaped
+        // arguments: a custom tool's item carries no status.
+        let finish_reason = self.finish_reason.as_deref();
+        let cut = cut_call(
+            finish_reason,
+            self.tool_calls.iter().filter_map(|item| match item {
+                ResponseOutputItem::FunctionToolCall { arguments, .. } => Some(arguments.as_str()),
+                _ => None,
+            }),
+        );
+
+        // Add tool calls: a call to a custom tool maps back to its
+        // `custom_tool_call` item, as the non-streaming conversion maps it; a
+        // function call takes the status its arguments and the finish say.
+        let tools = self.original_request.tools.as_deref();
+        let custom_names = custom_tool_names(tools);
+        output.extend(self.tool_calls.into_iter().map(|item| match item {
+            ResponseOutputItem::FunctionToolCall {
+                id,
+                call_id,
                 name,
-                namespace,
                 arguments,
-                status,
+                output,
                 ..
-            } = &mut item
-            {
-                *status =
-                    function_call_status(self.finish_reason.as_deref(), arguments).to_string();
-                (*name, *namespace) =
-                    resolve_function_identity(self.original_request.tools.as_deref(), name);
+            } => {
+                let custom = custom_names.contains(&name);
+                let (name, namespace) = resolve_function_identity(tools, &name);
+                if custom {
+                    ResponseOutputItem::CustomToolCall {
+                        call_id,
+                        input: custom_tool_input(&arguments),
+                        name,
+                        id,
+                        namespace,
+                    }
+                } else {
+                    let status = function_call_status(finish_reason, &arguments).to_string();
+                    ResponseOutputItem::FunctionToolCall {
+                        id,
+                        call_id,
+                        name,
+                        namespace,
+                        arguments,
+                        output,
+                        status,
+                    }
+                }
             }
-            item
+            other => other,
         }));
 
-        // Determine final status. A `length` finish is a max_output_tokens
-        // truncation, reported as status=incomplete with incomplete_details,
-        // matching the non-streaming conversion and the streamed terminal
-        // event.
-        let (status, incomplete_details) = match self.finish_reason.as_deref() {
-            Some("stop") => (ResponseStatus::Completed, None),
-            Some("length") => (
-                ResponseStatus::Incomplete,
-                Some(IncompleteDetails {
-                    reason: IncompleteReason::MaxOutputTokens,
-                }),
-            ),
-            Some("tool_calls") => (ResponseStatus::Completed, None),
-            Some("failed") | Some("error") => (ResponseStatus::Failed, None),
-            _ => (ResponseStatus::Completed, None),
-        };
+        // The stored object's status is the terminal event's: a `length`
+        // finish is the token limit, a cut call leaves it incomplete as well.
+        let (status, incomplete_details) = response_status(finish_reason, cut);
 
         // Convert usage
         let usage = self.usage.as_ref().map(conversions::responses_usage);
@@ -1524,6 +1544,77 @@ mod tests {
         assert_eq!(wire["output"][1]["status"], "incomplete");
         assert_eq!(wire["output"][1]["call_id"], "call_time");
         assert_eq!(wire["output"][1]["arguments"], "{\"tz\":");
+    }
+
+    #[test]
+    fn a_stored_streamed_turn_whose_call_was_cut_reads_incomplete() {
+        for finish_reason in [
+            serde_json::json!("abort"),
+            serde_json::json!("stop"),
+            serde_json::json!(null),
+        ] {
+            let mut accumulator = StreamingResponseAccumulator::new(&ResponsesRequest::default());
+            let partial = serde_json::from_value(serde_json::json!({
+                "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
+                "choices":[{"index":0,"delta":{"tool_calls":[
+                    {"index":0,"id":"call_time","type":"function","function":{"name":"time","arguments":"{\"tz\":"}}
+                ]},"finish_reason":null}]
+            }))
+            .unwrap();
+            accumulator.process_chunk(&partial);
+            let end = serde_json::from_value(serde_json::json!({
+                "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
+                "choices":[{"index":0,"delta":{},"finish_reason":finish_reason}]
+            }))
+            .unwrap();
+            accumulator.process_chunk(&end);
+            let wire = serde_json::to_value(accumulator.finalize()).unwrap();
+            assert_eq!(wire["status"], "incomplete", "{finish_reason}");
+            assert!(wire["incomplete_details"].is_null(), "{finish_reason}");
+            assert_eq!(wire["output"][0]["status"], "incomplete", "{finish_reason}");
+            assert_eq!(
+                wire["output"][0]["arguments"], "{\"tz\":",
+                "{finish_reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_streamed_turn_whose_custom_call_was_cut_reads_incomplete_and_keeps_its_item() {
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "test-model", "input": "hi",
+            "tools": [{"type": "custom", "name": "emit_command"}]
+        }))
+        .unwrap();
+        for finish_reason in [
+            serde_json::json!("abort"),
+            serde_json::json!("stop"),
+            serde_json::json!(null),
+        ] {
+            let mut accumulator = StreamingResponseAccumulator::new(&request);
+            let partial = serde_json::from_value(serde_json::json!({
+                "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
+                "choices":[{"index":0,"delta":{"tool_calls":[
+                    {"index":0,"id":"call_c","type":"function","function":{"name":"emit_command","arguments":"{\"input\": \"pw"}}
+                ]},"finish_reason":null}]
+            }))
+            .unwrap();
+            accumulator.process_chunk(&partial);
+            let end = serde_json::from_value(serde_json::json!({
+                "id":"chat_test","object":"chat.completion.chunk","created":0,"model":"test-model",
+                "choices":[{"index":0,"delta":{},"finish_reason":finish_reason}]
+            }))
+            .unwrap();
+            accumulator.process_chunk(&end);
+            let wire = serde_json::to_value(accumulator.finalize()).unwrap();
+            assert_eq!(wire["status"], "incomplete", "{finish_reason}");
+            assert!(wire["incomplete_details"].is_null(), "{finish_reason}");
+            assert_eq!(
+                wire["output"][0]["type"], "custom_tool_call",
+                "{finish_reason}"
+            );
+            assert_eq!(wire["output"][0]["call_id"], "call_c", "{finish_reason}");
+        }
     }
 
     #[tokio::test]
