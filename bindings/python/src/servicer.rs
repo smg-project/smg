@@ -589,7 +589,7 @@ impl SglangMediaProcessor for SmgSglangMediaProcessor {
                     }
                 })?;
                 tokenized.input_ids = tokens;
-                request.mm_inputs = Some(inputs);
+                request.mm_inputs = Some(Box::new(inputs));
                 Ok(request)
             }, span)).await.map_err(|error| tonic::Status::internal(format!("media task: {error}")))?
         })
