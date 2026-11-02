@@ -458,7 +458,15 @@ async fn start_http(cfg: Config) -> (String, String) {
         reason = "the server serves until the test process exits"
     )]
     let _server = tokio::spawn(http::serve_with_listener(Arc::new(cfg), listener));
-    (format!("http://127.0.0.1:{port}"), format!("http:{port}"))
+    let base = format!("http://127.0.0.1:{port}");
+    // The worker registers itself before it serves: once `/health` answers,
+    // the script store and the admin API know it.
+    common::http_client()
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .expect("the worker serves");
+    (base, format!("http:{port}"))
 }
 
 /// The `data:` payloads of an SSE body, in order.
@@ -1729,4 +1737,157 @@ async fn http_plays_one_scripted_answer_per_choice() {
         .expect("the usage chunk");
     assert_eq!(usage["usage"]["completion_tokens"], 3, "{body}");
     assert_eq!(usage["choices"], json!([]), "{body}");
+}
+
+// ── answers filed under a prompt text ───────────────────────────────────────
+
+#[tokio::test]
+async fn grpc_serves_an_answer_filed_under_a_text_to_the_prompt_that_holds_it() {
+    // A word-level tokenizer: the prompt's ids decode to the words a test
+    // names in `prompt_contains`.
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        dir.path().join("tokenizer.json"),
+        r#"{"version":"1.0","model":{"type":"WordLevel","vocab":{"[UNK]":0,"say":1,"apricot":2,"bramble":3},"unk_token":"[UNK]"},"pre_tokenizer":{"type":"Whitespace"}}"#,
+    )
+    .expect("write the tokenizer");
+    let cfg = Config {
+        tokenizer_path: dir.path().display().to_string(),
+        ..config(None)
+    };
+    let (client, worker) = start_grpc(cfg).await;
+    let state = script::enqueue(
+        &worker,
+        answers(&[
+            json!({"prompt_contains": "apricot", "output_ids": [20]}),
+            json!({"prompt_contains": "bramble", "output_ids": [30]}),
+        ]),
+    )
+    .expect("a started worker");
+    assert_eq!(state["queued"], 0, "{state}");
+    assert_eq!(state["marked"], 2, "{state}");
+
+    let output =
+        |frames: Vec<ts::GenerateResponse>| match frames.last().and_then(|f| f.response.as_ref()) {
+            Some(GenResp::Complete(complete)) => complete.output_ids.clone(),
+            other => panic!("a Complete at the end, not {other:?}"),
+        };
+    // "say bramble" first: the answers match by the prompt's text, not by
+    // the order they were filed in.
+    assert_eq!(
+        output(generate(&client, grpc_request("b", &[1, 3], false, false)).await),
+        vec![30]
+    );
+    assert_eq!(
+        output(generate(&client, grpc_request("a", &[1, 2], false, false)).await),
+        vec![20]
+    );
+    // A prompt that holds neither text is a miss, answered canned.
+    assert_eq!(
+        output(generate(&client, grpc_request("n", &[1, 1], false, false)).await),
+        vec![100, 101, 102]
+    );
+    let state = script::status(&worker).expect("a started worker");
+    assert_eq!(
+        state["marked"], 0,
+        "each filed answer was served once: {state}"
+    );
+    assert_eq!(state["hits"], 2, "{state}");
+    assert_eq!(state["misses"], 1, "{state}");
+}
+
+#[tokio::test]
+async fn http_serves_an_answer_filed_under_a_text_by_the_requests_own_text() {
+    let (base, worker) = start_http(config(None)).await;
+    script::enqueue(
+        &worker,
+        answers(&[json!({"prompt_contains": "apricot", "output_text": "apricot it is"})]),
+    )
+    .expect("a started worker");
+    let http = common::http_client();
+    let ask = |content: &str| {
+        http.post(format!("{base}/v1/chat/completions"))
+            .json(&json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": content}],
+            }))
+    };
+
+    // The text wire reads the prompt it was sent: no tokenizer needed.
+    let body: Value = ask("Repeat exactly this one word: apricot")
+        .send()
+        .await
+        .expect("chat")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        body["choices"][0]["message"]["content"], "apricot it is",
+        "{body}"
+    );
+    let state = script::status(&worker).expect("a started worker");
+    assert_eq!(state["marked"], 0, "served once: {state}");
+    assert_eq!(state["hits"], 1, "{state}");
+
+    // Served once: the same prompt again reads the canned answer.
+    let body: Value = ask("Repeat exactly this one word: apricot")
+        .send()
+        .await
+        .expect("chat")
+        .json()
+        .await
+        .expect("json");
+    assert_ne!(
+        body["choices"][0]["message"]["content"], "apricot it is",
+        "{body}"
+    );
+    assert_eq!(
+        script::status(&worker).expect("a started worker")["misses"],
+        1
+    );
+}
+
+#[tokio::test]
+async fn grpc_reads_the_rendered_prompt_beside_the_ids_and_fails_a_prompt_it_cannot_read() {
+    // No tokenizer this worker can load: the rendered text the gateway sends
+    // beside the ids is what it reads for the answers filed under a text.
+    let (client, worker) = start_grpc(config(None)).await;
+    script::enqueue(
+        &worker,
+        answers(&[json!({"prompt_contains": "apricot", "output_ids": [20]})]),
+    )
+    .expect("a started worker");
+    let mut rendered = grpc_request("r", &[1, 2], false, false);
+    rendered
+        .tokenized
+        .as_mut()
+        .expect("tokenized input")
+        .original_text = "say apricot".to_string();
+    let frames = generate(&client, rendered).await;
+    match frames.last().and_then(|f| f.response.as_ref()) {
+        Some(GenResp::Complete(complete)) => assert_eq!(complete.output_ids, vec![20]),
+        other => panic!("a Complete at the end, not {other:?}"),
+    }
+
+    // Filed again, and a prompt that carries its ids alone: the request
+    // fails with the reason instead of reading canned; the answer stays.
+    script::enqueue(
+        &worker,
+        answers(&[json!({"prompt_contains": "bramble", "output_ids": [30]})]),
+    )
+    .expect("a started worker");
+    let refused = client
+        .generate(grpc_request("n", &[1, 3], false, false))
+        .await
+        .err()
+        .expect("a failed request, not a stream");
+    assert_eq!(
+        refused.code(),
+        tonic::Code::FailedPrecondition,
+        "{refused:?}"
+    );
+    assert!(refused.message().contains("cannot be read"), "{refused:?}");
+    let state = script::status(&worker).expect("a started worker");
+    assert_eq!(state["marked"], 1, "the filed answer stays: {state}");
+    assert_eq!(state["hits"], 1, "{state}");
 }

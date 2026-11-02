@@ -7,20 +7,27 @@
 //!   recorded corpora and bisects (one line per answer, see [`Answer::parse`]);
 //! - `POST /admin/script/{worker}`: answers enqueued in order for the next
 //!   requests of one worker, or of every worker (`all`), for a test that
-//!   states the model's answer right before it sends the request.
+//!   states the model's answer right before it sends the request; an answer
+//!   given a `prompt_contains` text is filed for the first request whose
+//!   prompt holds the text instead, whatever order the requests arrive in
+//!   (concurrent requests, or a fleet whose worker the gateway picks).
 //!
 //! For a request a worker looks in this order: its own queue, the shared
-//! queue, the keyed answers under its prompt's key. Nothing found is a miss,
-//! counted per worker, and the request goes on to the worker's canned or
-//! realistic engine as if no script existed. A scripted answer is served by
-//! the wire, not by the engine simulator: it adds no load, publishes no KV
-//! events and leaves no request record.
+//! queue, the answers filed under a text its prompt holds (its own, then the
+//! shared ones, each served once), the keyed answers under its prompt's key.
+//! Nothing found is a miss, counted per worker, and the request goes on to
+//! the worker's canned or realistic engine as if no script existed. A
+//! scripted answer is served by the wire, not by the engine simulator: it
+//! adds no load, publishes no KV events and leaves no request record.
 //!
 //! The prompt's key is `<len>:<fold>` with `fold` the FNV-style fold of the
 //! prompt's token ids: `h = (h * 1099511628211) ^ id` over a `u64` starting at
 //! 0, wrapping. gRPC and ZMQ workers key on the ids the gateway sent; an HTTP
 //! worker keys on its synthetic ids, one per whitespace word of the prompt
-//! text, the ids its realistic engine runs on.
+//! text, the ids its realistic engine runs on. The prompt's text, for the
+//! answers filed under one, is the text an HTTP worker was sent, and the ids
+//! decoded with the worker's tokenizer on the token wires: read only while
+//! such answers are filed for the worker.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -140,9 +147,11 @@ fn top_k<T: Clone + PartialEq>(
     (picked, values)
 }
 
-/// An answer with the key it is filed under, when it has one.
+/// An answer with what it is filed under, when it is: the prompt's key, or
+/// a text the prompt must hold (never both).
 pub struct Scripted {
     pub key: Option<String>,
+    pub prompt_contains: Option<String>,
     pub answer: Answer,
 }
 
@@ -150,7 +159,7 @@ impl Answer {
     /// Read one answer from its JSON object:
     ///
     /// ```json
-    /// {"key": "<len>:<fold>" | "input_ids": [...],
+    /// {"key": "<len>:<fold>" | "input_ids": [...] | "prompt_contains": "...",
     ///  "output_ids": [...], "output_text": "..." | ["piece", ...],
     ///  "finish_reason": "stop", "matched_stop": 2 | "</s>",
     ///  "cached_tokens": 0, "prompt_tokens": 12, "logprobs": [-0.1, ...],
@@ -159,7 +168,9 @@ impl Answer {
     ///
     /// Everything is optional but one of `output_ids` and `output_text`;
     /// `key` and `input_ids` file the answer under a prompt (a `--script`
-    /// line needs one of them, an enqueued answer may carry one). An empty
+    /// line needs one of them, an enqueued answer may carry one), and
+    /// `prompt_contains` files an enqueued answer for the first request
+    /// whose prompt holds the text (one of the three at most). An empty
     /// `output_text` without `output_ids` is an answer of no tokens: the
     /// completion alone, as an engine answers a request it may not generate
     /// for. Beside ids, an empty string is one whole-text piece like any other.
@@ -168,6 +179,7 @@ impl Answer {
         let known = [
             "key",
             "input_ids",
+            "prompt_contains",
             "output_ids",
             "output_text",
             "finish_reason",
@@ -203,6 +215,17 @@ impl Answer {
             (None, Some(input_ids)) => Some(script_key(&input_ids)),
             (None, None) => None,
         };
+        let prompt_contains = match object.get("prompt_contains") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(text)) if text.is_empty() => {
+                return Err("prompt_contains: every prompt holds an empty text".to_string())
+            }
+            Some(Value::String(text)) => Some(text.clone()),
+            Some(other) => return Err(format!("prompt_contains: expected a string, got {other}")),
+        };
+        if key.is_some() && prompt_contains.is_some() {
+            return Err("prompt_contains and a prompt key exclude each other".to_string());
+        }
         let output_ids = ids("output_ids")?.unwrap_or_default();
         let output_text = match object.get("output_text") {
             None | Some(Value::Null) => None,
@@ -317,6 +340,7 @@ impl Answer {
         };
         Ok(Scripted {
             key,
+            prompt_contains,
             answer: Answer {
                 output_ids,
                 output_text,
@@ -546,6 +570,9 @@ struct Store {
     keyed: HashMap<String, Answer>,
     /// Answers in order, per worker name; [`ALL`] is the shared queue.
     queues: HashMap<String, VecDeque<Answer>>,
+    /// Answers filed under a text the prompt must hold, in order, per worker
+    /// name; [`ALL`]'s serve every worker. Each is served once.
+    marked: HashMap<String, Vec<(String, Answer)>>,
     hits: HashMap<String, u64>,
     misses: HashMap<String, u64>,
     /// Whether anything was ever scripted: misses are counted from then on.
@@ -597,30 +624,63 @@ impl Store {
         ACTIVE.store(true, Ordering::Release);
     }
 
-    /// The answer for `worker`'s next request whose prompt has `key`.
-    fn take(&mut self, worker: &str, key: &str) -> Option<Answer> {
+    /// The answer for `worker`'s next request whose prompt has `key` and
+    /// reads `prompt_text`.
+    fn take(&mut self, worker: &str, key: &str, prompt_text: Option<&str>) -> Option<Answer> {
         // One choice never runs short: the queues hold it or the key does.
-        self.take_n(worker, key, 1)
+        self.take_n(worker, key, prompt_text, 1)
             .ok()
             .flatten()
             .and_then(|mut answers| answers.pop())
     }
 
+    /// Whether answers filed under a text wait for `worker`'s requests (its
+    /// own or every worker's): whether a request's prompt is worth reading.
+    fn has_marked(&self, worker: &str) -> bool {
+        [worker, ALL].iter().any(|scope| {
+            self.marked
+                .get(*scope)
+                .is_some_and(|filed| !filed.is_empty())
+        })
+    }
+
+    /// The first answer filed under a text `prompt_text` holds, for `worker`
+    /// (its own first, then every worker's): where it is filed and its place
+    /// there.
+    fn marked_for(&self, worker: &str, prompt_text: &str) -> Option<(String, usize)> {
+        [worker, ALL].iter().find_map(|scope| {
+            self.marked
+                .get(*scope)?
+                .iter()
+                .position(|(text, _)| prompt_text.contains(text.as_str()))
+                .map(|at| ((*scope).to_string(), at))
+        })
+    }
+
     /// The answers for the `n` choices of `worker`'s next request whose
-    /// prompt has `key`, taken under this one lock: the worker's queue, then
-    /// the shared one, then the keyed answer for the rest. `None` when
-    /// nothing is scripted for the first choice (the request takes the
-    /// worker's other mode, whatever `n`); an `Err` when `n` is above
-    /// [`CHOICES_LIMIT`], or naming the counts when the queues hold some of
-    /// the choices but not all and no keyed answer fills the rest, with the
+    /// prompt has `key` and reads `prompt_text` (`None`: unread, no answer
+    /// filed under a text is looked at), taken under this one lock: the
+    /// worker's queue, then the shared one, then the answer filed under a
+    /// text the prompt holds (served once) or the keyed answer for the rest.
+    /// `None` when nothing is scripted for the first choice (the request
+    /// takes the worker's other mode, whatever `n`); an `Err` when `n` is
+    /// above [`CHOICES_LIMIT`], or naming the counts when the queues hold
+    /// some of the choices but not all and nothing fills the rest, with the
     /// queues as they were.
-    fn take_n(&mut self, worker: &str, key: &str, n: usize) -> Result<Option<Vec<Answer>>, String> {
+    fn take_n(
+        &mut self,
+        worker: &str,
+        key: &str,
+        prompt_text: Option<&str>,
+        n: usize,
+    ) -> Result<Option<Vec<Answer>>, String> {
         let queued = [worker, ALL]
             .iter()
             .map(|queue| self.queues.get(*queue).map_or(0, VecDeque::len))
             .sum::<usize>();
+        let marked = prompt_text.and_then(|text| self.marked_for(worker, text));
         let keyed = self.keyed.get(key);
-        if queued == 0 && keyed.is_none() {
+        if queued == 0 && marked.is_none() && keyed.is_none() {
             if self.active {
                 *self.misses.entry(worker.to_string()).or_insert(0) += 1;
             }
@@ -631,7 +691,7 @@ impl Store {
                 "n = {n} choices is above the mock's limit of {CHOICES_LIMIT} per request"
             ));
         }
-        if queued < n && keyed.is_none() {
+        if queued < n && marked.is_none() && keyed.is_none() {
             return Err(format!(
                 "n = {n} choices need {n} scripted answers for this prompt, {queued} queued"
             ));
@@ -647,9 +707,15 @@ impl Store {
                 }
             }
         }
-        if let Some(keyed) = keyed {
-            while answers.len() < n {
-                answers.push(keyed.clone());
+        if answers.len() < n {
+            let filed = marked.and_then(|(scope, at)| {
+                let filed = self.marked.get_mut(&scope)?;
+                (at < filed.len()).then(|| filed.remove(at).1)
+            });
+            if let Some(answer) = filed.as_ref().or(keyed) {
+                while answers.len() < n {
+                    answers.push(answer.clone());
+                }
             }
         }
         *self.hits.entry(worker.to_string()).or_insert(0) +=
@@ -665,11 +731,16 @@ impl Store {
     fn enqueue(&mut self, worker: &str, answers: Vec<Scripted>) {
         self.activate();
         for scripted in answers {
-            match scripted.key {
-                Some(key) => {
+            match (scripted.key, scripted.prompt_contains) {
+                (Some(key), _) => {
                     self.keyed.insert(key, scripted.answer);
                 }
-                None => self
+                (None, Some(text)) => self
+                    .marked
+                    .entry(worker.to_string())
+                    .or_default()
+                    .push((text, scripted.answer)),
+                (None, None) => self
                     .queues
                     .entry(worker.to_string())
                     .or_default()
@@ -680,6 +751,7 @@ impl Store {
 
     fn status(&self, worker: &str) -> Value {
         let queued = self.queues.get(worker).map_or(0, VecDeque::len);
+        let marked = self.marked.get(worker).map_or(0, Vec::len);
         let (hits, misses) = if worker == ALL {
             (self.hits.values().sum(), self.misses.values().sum())
         } else {
@@ -691,6 +763,7 @@ impl Store {
         json!({
             "worker": worker,
             "queued": queued,
+            "marked": marked,
             "hits": hits,
             "misses": misses,
             "keyed": self.keyed.len(),
@@ -700,8 +773,10 @@ impl Store {
     fn clear(&mut self, worker: &str) {
         if worker == ALL {
             self.queues.clear();
+            self.marked.clear();
         } else {
             self.queues.remove(worker);
+            self.marked.remove(worker);
         }
     }
 }
@@ -764,12 +839,55 @@ pub fn tokenizer(cfg: &Config) -> LoadedTokenizer {
         .clone()
 }
 
-/// [`take`], with a text-only answer encoded for a token wire: the answer
-/// with its ids. An answer that cannot be encoded (no tokenizer to load, or
-/// logprobs that do not align) is an `Err` the wire fails the request with,
-/// so a test learns the reason instead of reading a canned answer.
+/// The prompt's text for the answers filed under one: the rendered text the
+/// request carries beside its ids (`rendered`, what the gateway sends on the
+/// gRPC wire), else the ids decoded with the worker's tokenizer. Read only
+/// while such answers are filed for the worker (a decode per request for
+/// nothing otherwise). A prompt that cannot be read then (no tokenizer to
+/// load, ids it refuses) is an `Err` the wire fails the request with, the
+/// filed answers left where they are, so a test learns the reason instead of
+/// reading a canned answer.
+fn prompt_text_when_marked(
+    cfg: &Config,
+    worker: &str,
+    prompt_ids: &[u32],
+    rendered: &str,
+) -> Result<Option<String>, String> {
+    if !store().has_marked(worker) {
+        return Ok(None);
+    }
+    if !rendered.is_empty() {
+        return Ok(Some(rendered.to_string()));
+    }
+    tokenizer(cfg)
+        .and_then(|tokenizer| {
+            tokenizer
+                .decode(prompt_ids, true)
+                .map_err(|e| format!("decoding the prompt: {e}"))
+        })
+        .map(Some)
+        .map_err(|e| {
+            tracing::error!(
+                "{worker}: the prompt cannot be read for the answers filed under a text: {e}"
+            );
+            format!("the prompt cannot be read for the answers filed under a text: {e}")
+        })
+}
+
+/// [`take`] on a token wire that carries the prompt's ids alone, with the
+/// prompt decoded for the answers filed under a text and a text-only answer
+/// encoded for the wire: the answer with its ids. A prompt that cannot be
+/// read while such answers wait, or an answer that cannot be encoded (no
+/// tokenizer to load, or logprobs that do not align), is an `Err` the wire
+/// fails the request with, so a test learns the reason instead of reading a
+/// canned answer.
 pub fn take_ids(cfg: &Config, worker: &str, prompt_ids: &[u32]) -> Result<Option<Answer>, String> {
-    let Some(answer) = take(worker, prompt_ids) else {
+    if !active() {
+        return Ok(None);
+    }
+    let prompt_text = prompt_text_when_marked(cfg, worker, prompt_ids, "")?;
+    let key = script_key(prompt_ids);
+    let Some(answer) = store().take(worker, &key, prompt_text.as_deref()) else {
         return Ok(None);
     };
     encode_for_wire(cfg, worker, answer).map(Some)
@@ -795,39 +913,51 @@ fn encode_for_wire(cfg: &Config, worker: &str, answer: Answer) -> Result<Answer,
 /// is not bound by it.
 pub const CHOICES_LIMIT: usize = 128;
 
-/// [`take`] for every choice of a request that samples `n` times, under the
-/// store's one lock: one scripted answer per choice, in the order they were
-/// enqueued (the worker's queue, then the shared one), the answer keyed by
-/// the prompt for the rest. `None` when nothing is scripted for the first
-/// choice: the request takes the worker's other mode, as a request for one
-/// choice does, whatever `n`. An `Err` when `n` is above [`CHOICES_LIMIT`],
-/// or when the queues hold some of the choices but not all and no keyed
-/// answer fills the rest, the queues left as they were either way: a test
-/// learns what it stated instead of reading a canned choice.
+/// [`take`] for every choice of a request that samples `n` times and whose
+/// prompt reads `prompt_text` (the text wire's own; `None` leaves the answers
+/// filed under a text alone), under the store's one lock: one scripted
+/// answer per choice, in the order they were enqueued (the worker's queue,
+/// then the shared one), the answer filed under a text the prompt holds or
+/// keyed by the prompt for the rest. `None` when nothing is scripted for the
+/// first choice: the request takes the worker's other mode, as a request for
+/// one choice does, whatever `n`. An `Err` when `n` is above
+/// [`CHOICES_LIMIT`], or when the queues hold some of the choices but not
+/// all and nothing fills the rest, the queues left as they were either way:
+/// a test learns what it stated instead of reading a canned choice.
 pub fn take_per_choice(
     worker: &str,
     prompt_ids: &[u32],
+    prompt_text: Option<&str>,
     n: usize,
 ) -> Result<Option<Vec<Answer>>, String> {
     if !active() {
         return Ok(None);
     }
     let key = script_key(prompt_ids);
-    store().take_n(worker, &key, n.max(1)).map_err(|why| {
-        tracing::error!("{worker}: {why}");
-        why
-    })
+    store()
+        .take_n(worker, &key, prompt_text, n.max(1))
+        .map_err(|why| {
+            tracing::error!("{worker}: {why}");
+            why
+        })
 }
 
-/// [`take_per_choice`] with the text-only answers encoded for a token wire
-/// (outside the lock), as [`take_ids`] encodes one.
+/// [`take_per_choice`] on a token wire: the prompt read for the answers
+/// filed under a text (`rendered`, the text the request carries beside its
+/// ids, else the ids decoded), and the text-only answers encoded for the
+/// wire (outside the lock), as [`take_ids`] reads and encodes.
 pub fn take_ids_per_choice(
     cfg: &Config,
     worker: &str,
     prompt_ids: &[u32],
+    rendered: &str,
     n: usize,
 ) -> Result<Option<Vec<Answer>>, String> {
-    let Some(answers) = take_per_choice(worker, prompt_ids, n)? else {
+    if !active() {
+        return Ok(None);
+    }
+    let prompt_text = prompt_text_when_marked(cfg, worker, prompt_ids, rendered)?;
+    let Some(answers) = take_per_choice(worker, prompt_ids, prompt_text.as_deref(), n)? else {
         return Ok(None);
     };
     answers
@@ -855,20 +985,21 @@ pub fn ensure_loaded(cfg: &Config) -> Result<(), String> {
 }
 
 /// The answer for `worker`'s next request with `prompt_ids`, if one is
-/// scripted: its queue, then the shared queue, then the prompt's key. A miss
-/// is counted once anything was ever scripted in the process; until then
-/// nothing is computed and the store is not locked.
+/// scripted: its queue, then the shared queue, then the prompt's key (the
+/// answers filed under a text need the prompt read: [`take_per_choice`],
+/// [`take_ids`]). A miss is counted once anything was ever scripted in the
+/// process; until then nothing is computed and the store is not locked.
 pub fn take(worker: &str, prompt_ids: &[u32]) -> Option<Answer> {
     if !active() {
         return None;
     }
     let key = script_key(prompt_ids);
-    store().take(worker, &key)
+    store().take(worker, &key, None)
 }
 
 /// Enqueue `answers` for `worker` ([`ALL`] for every worker), the keyed ones
-/// under their key instead; answers the worker's state, or `None` for a
-/// name no worker of the process has.
+/// under their key and the ones given a text under it instead; answers the
+/// worker's state, or `None` for a name no worker of the process has.
 pub fn enqueue(worker: &str, answers: Vec<Scripted>) -> Option<Value> {
     let mut store = store();
     if !store.knows(worker) {
@@ -878,17 +1009,19 @@ pub fn enqueue(worker: &str, answers: Vec<Scripted>) -> Option<Value> {
     Some(store.status(worker))
 }
 
-/// The worker's queue length, hits and misses, and the keyed answers of the
-/// process; [`ALL`] reports the shared queue and the totals. `None` for a
-/// name no worker of the process has.
+/// The worker's queue length, the answers filed under a text for it
+/// (`marked`), its hits and misses, and the keyed answers of the process;
+/// [`ALL`] reports the shared queue, the shared filed answers and the
+/// totals. `None` for a name no worker of the process has.
 pub fn status(worker: &str) -> Option<Value> {
     let store = store();
     store.knows(worker).then(|| store.status(worker))
 }
 
-/// Drop the worker's queued answers ([`ALL`]: every queue); the keyed
-/// answers and the counters stay. Answers the worker's state, or `None` for
-/// a name no worker of the process has.
+/// Drop the worker's queued answers and the ones filed under a text
+/// ([`ALL`]: every worker's); the keyed answers and the counters stay.
+/// Answers the worker's state, or `None` for a name no worker of the process
+/// has.
 pub fn clear(worker: &str) -> Option<Value> {
     let mut store = store();
     if !store.knows(worker) {
@@ -1039,7 +1172,7 @@ mod tests {
         let mut store = Store::default();
         let worker = "grpc:19000";
         assert!(
-            store.take(worker, &script_key(&[1, 2, 3])).is_none(),
+            store.take(worker, &script_key(&[1, 2, 3]), None).is_none(),
             "nothing scripted"
         );
         assert_eq!(
@@ -1066,24 +1199,30 @@ mod tests {
         store.enqueue(ALL, vec![shared]);
 
         let ids = |answer: Option<Answer>| answer.map(|a| a.output_ids);
-        assert_eq!(ids(store.take(worker, &script_key(&[9]))), Some(vec![1]));
-        assert_eq!(ids(store.take(worker, &script_key(&[9]))), Some(vec![2]));
         assert_eq!(
-            ids(store.take(worker, &script_key(&[9]))),
+            ids(store.take(worker, &script_key(&[9]), None)),
+            Some(vec![1])
+        );
+        assert_eq!(
+            ids(store.take(worker, &script_key(&[9]), None)),
+            Some(vec![2])
+        );
+        assert_eq!(
+            ids(store.take(worker, &script_key(&[9]), None)),
             Some(vec![3]),
             "the shared queue"
         );
         assert_eq!(
-            ids(store.take(worker, &script_key(&[1, 2, 3]))),
+            ids(store.take(worker, &script_key(&[1, 2, 3]), None)),
             Some(vec![7]),
             "the key"
         );
         assert_eq!(
-            ids(store.take(worker, &script_key(&[1, 2, 3]))),
+            ids(store.take(worker, &script_key(&[1, 2, 3]), None)),
             Some(vec![7]),
             "a key stays"
         );
-        assert!(store.take(worker, &script_key(&[9])).is_none());
+        assert!(store.take(worker, &script_key(&[9]), None).is_none());
         let state = store.status(worker);
         assert_eq!(
             (state["hits"].as_u64(), state["misses"].as_u64()),
@@ -1097,7 +1236,132 @@ mod tests {
         );
         store.clear(worker);
         assert_eq!(store.status(worker)["queued"], 0);
-        assert!(store.take(worker, &script_key(&[9])).is_none(), "cleared");
+        assert!(
+            store.take(worker, &script_key(&[9]), None).is_none(),
+            "cleared"
+        );
+    }
+
+    #[test]
+    fn an_answer_filed_under_a_text_serves_the_first_prompt_that_holds_it_once() {
+        let mut store = Store::default();
+        let worker = "grpc:19001";
+        store.workers.insert(worker.to_string());
+        let marked = |text: &str, id: u32| {
+            parse(&format!(
+                r#"{{"prompt_contains": "{text}", "output_ids": [{id}]}}"#
+            ))
+            .expect("an answer filed under a text")
+        };
+        store.enqueue(ALL, vec![marked("apricot", 1), marked("bramble", 2)]);
+        store.enqueue(worker, vec![marked("bramble", 3)]);
+        assert_eq!(store.status(ALL)["marked"], 2);
+        assert_eq!(store.status(worker)["marked"], 1);
+        let key = script_key(&[9]);
+        let ids = |answer: Option<Answer>| answer.map(|a| a.output_ids);
+
+        assert_eq!(
+            ids(store.take(worker, &key, Some("say cobalt"))),
+            None,
+            "a prompt that holds no filed text is a miss"
+        );
+        assert_eq!(
+            ids(store.take(worker, &key, None)),
+            None,
+            "an unread prompt matches nothing"
+        );
+        assert_eq!(
+            ids(store.take(worker, &key, Some("say bramble"))),
+            Some(vec![3]),
+            "the worker's own answer before the shared one"
+        );
+        assert_eq!(
+            ids(store.take(worker, &key, Some("say bramble"))),
+            Some(vec![2]),
+            "then the shared one"
+        );
+        assert_eq!(
+            ids(store.take(worker, &key, Some("say bramble"))),
+            None,
+            "each is served once"
+        );
+        store.enqueue(
+            worker,
+            vec![parse(r#"{"output_ids": [4]}"#).expect("queued")],
+        );
+        assert_eq!(
+            ids(store.take(worker, &key, Some("say apricot"))),
+            Some(vec![4]),
+            "the queues come first"
+        );
+        let two = store
+            .take_n(worker, &key, Some("say apricot"), 2)
+            .expect("filled")
+            .expect("scripted");
+        assert_eq!(
+            two.iter().map(|a| a.output_ids.clone()).collect::<Vec<_>>(),
+            vec![vec![1], vec![1]],
+            "a filed answer fills every choice, like a keyed one"
+        );
+        assert_eq!(store.status(ALL)["marked"], 0);
+        let state = store.status(worker);
+        assert_eq!(
+            (state["hits"].as_u64(), state["misses"].as_u64()),
+            (Some(5), Some(3))
+        );
+
+        store.enqueue(ALL, vec![marked("cobalt", 5)]);
+        store.enqueue(worker, vec![marked("dahlia", 6)]);
+        store.clear(worker);
+        assert_eq!(
+            store.status(worker)["marked"],
+            0,
+            "a worker's clear drops its own filed answers"
+        );
+        assert_eq!(store.status(ALL)["marked"], 1, "and not the shared ones");
+        store.clear(ALL);
+        assert_eq!(
+            store.status(ALL)["marked"],
+            0,
+            "the shared clear drops them all"
+        );
+    }
+
+    #[test]
+    fn a_text_to_file_an_answer_under_is_one_of_the_prompts_handles_and_not_empty() {
+        let filed = parse(r#"{"prompt_contains": "apricot", "output_ids": [1]}"#)
+            .expect("an answer filed under a text");
+        assert_eq!(
+            (filed.key, filed.prompt_contains.as_deref()),
+            (None, Some("apricot"))
+        );
+        assert!(parse(r#"{"prompt_contains": "", "output_ids": [1]}"#)
+            .err()
+            .expect("an empty text is refused")
+            .contains("every prompt holds an empty text"));
+        assert!(parse(r#"{"prompt_contains": 7, "output_ids": [1]}"#).is_err());
+        assert!(
+            parse(r#"{"prompt_contains": "apricot", "input_ids": [1], "output_ids": [1]}"#)
+                .err()
+                .expect("a text and a key exclude each other")
+                .contains("exclude each other")
+        );
+        assert!(
+            parse(r#"{"prompt_contains": "apricot", "key": "1:1", "output_ids": [1]}"#).is_err()
+        );
+
+        let mut store = Store::default();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("filed.jsonl");
+        std::fs::write(
+            &path,
+            "{\"prompt_contains\": \"apricot\", \"output_ids\": [1]}\n",
+        )
+        .expect("write");
+        assert!(store
+            .load(&path)
+            .expect_err("a script line is keyed by its prompt, never by a text")
+            .contains("needs key or input_ids"));
     }
 
     #[test]
@@ -1158,14 +1422,16 @@ mod tests {
         );
         assert_eq!(store.keyed.len(), 2);
         let answer = store
-            .take("http:9000", &script_key(&[5, 6]))
+            .take("http:9000", &script_key(&[5, 6]), None)
             .expect("the keyed answer");
         assert_eq!(
             (answer.output_ids, answer.finish_reason),
             (vec![8, 9], "length".to_string())
         );
         assert_eq!(
-            store.take("zmq:0", &script_key(&[4])).map(|a| a.text()),
+            store
+                .take("zmq:0", &script_key(&[4]), None)
+                .map(|a| a.text()),
             Some("four".to_string())
         );
 

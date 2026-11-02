@@ -227,19 +227,25 @@ async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Respon
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    // The prompt as this wire knows it: synthetic ids, one per whitespace
-    // word, the realistic engine's prompt and the script's key alike. The
-    // canned path does without them until something is scripted.
-    let prompt_ids = if script::active() || state.engine.is_some() {
-        synth_token_ids(&extract_prompt_text(&parsed))
+    // The prompt as this wire knows it: its text, and synthetic ids, one per
+    // whitespace word, the realistic engine's prompt and the script's key
+    // alike. The canned path does without them until something is scripted.
+    let prompt_text = if script::active() || state.engine.is_some() {
+        extract_prompt_text(&parsed)
     } else {
-        Vec::new()
+        String::new()
     };
+    let prompt_ids = synth_token_ids(&prompt_text);
 
-    // A scripted answer, ahead of either engine mode: the worker's queue or
-    // the prompt's key decides ([`crate::script`]).
+    // A scripted answer, ahead of either engine mode: the worker's queue, the
+    // prompt's text or its key decides ([`crate::script`]).
     // One scripted answer per choice the request samples (`n`).
-    match script::take_per_choice(&state.name, &prompt_ids, extract_n(&parsed)) {
+    match script::take_per_choice(
+        &state.name,
+        &prompt_ids,
+        Some(&prompt_text),
+        extract_n(&parsed),
+    ) {
         Ok(Some(answers)) => {
             // The request's limit ends each answer as it would an engine's.
             let limit = extract_max_tokens(&parsed);
@@ -896,21 +902,43 @@ fn final_chunk(endpoint: Endpoint, model: &str) -> Value {
 
 // ── HTTP prompt helpers ──────────────────────────────────────────────────────
 
-/// Extract prompt text from a chat/completions/generate body.
+/// Extract prompt text from a chat/completions/generate body: the messages'
+/// content (a string, or the `text` of its parts), else the prompt (a
+/// string, or an array of them), joined by spaces.
 fn extract_prompt_text(v: &Value) -> String {
     if let Some(messages) = v.get("messages").and_then(Value::as_array) {
         return messages
             .iter()
-            .filter_map(|m| m.get("content").and_then(Value::as_str))
+            .filter_map(|m| m.get("content"))
+            .flat_map(texts_of)
             .collect::<Vec<_>>()
             .join(" ");
     }
     for key in ["prompt", "text", "inputs"] {
-        if let Some(s) = v.get(key).and_then(Value::as_str) {
-            return s.to_string();
+        if let Some(value) = v.get(key) {
+            let texts = texts_of(value);
+            if !texts.is_empty() {
+                return texts.join(" ");
+            }
         }
     }
     String::new()
+}
+
+/// The texts of a content value: the string itself, or the `text` fields of
+/// an array's parts (`{"type": "text", "text": ...}`) and its plain strings.
+fn texts_of(value: &Value) -> Vec<&str> {
+    match value {
+        Value::String(s) => vec![s.as_str()],
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                part.as_str()
+                    .or_else(|| part.get("text").and_then(Value::as_str))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Approximate a prompt's token ids from its text: one id per whitespace word,
@@ -960,6 +988,35 @@ mod tests {
     use futures::StreamExt;
 
     use super::*;
+
+    #[test]
+    fn the_prompt_text_is_read_from_string_content_text_parts_and_prompt_arrays() {
+        use serde_json::json;
+        assert_eq!(
+            extract_prompt_text(&json!({"messages": [{"role": "user", "content": "say apricot"}]})),
+            "say apricot"
+        );
+        assert_eq!(
+            extract_prompt_text(&json!({"messages": [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "say"},
+                    {"type": "image_url", "image_url": {"url": "data:,"}},
+                    {"type": "text", "text": "apricot"},
+                ]},
+            ]})),
+            "be brief say apricot"
+        );
+        assert_eq!(
+            extract_prompt_text(&json!({"prompt": "say apricot"})),
+            "say apricot"
+        );
+        assert_eq!(
+            extract_prompt_text(&json!({"prompt": ["say", "apricot"]})),
+            "say apricot"
+        );
+        assert_eq!(extract_prompt_text(&json!({"prompt": [1, 2, 3]})), "");
+    }
 
     fn token() -> engine::GenEvent {
         engine::GenEvent::Token {
