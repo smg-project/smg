@@ -114,10 +114,10 @@ class TestSamplingParamsLocal(_SamplingParamsBase):
     """Regular model (Qwen via SGLang)."""
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.e2e
-@pytest.mark.model("openai/gpt-oss-20b")
+@pytest.mark.model("openai/gpt-oss-20b", mock="openai/gpt-oss-20b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestSamplingParamsHarmony(_SamplingParamsBase):
