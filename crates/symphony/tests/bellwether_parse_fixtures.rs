@@ -3273,6 +3273,161 @@ fn the_corpus_replay_reads_a_thinking_off_turn_of_the_unopened_row_table_as_cont
     );
 }
 
+/// Every row the DeepSeek V3.2 table reads states the generation prompt as the family's encoder
+/// renders it: chat mode unless the request turns thinking on. The tail the replay feeds for a
+/// request that leaves the switch alone, or turns it off, is the thought closed, so the output
+/// starts in content, and only `enable_thinking: true` gets it opened; and a row that writes no
+/// thought unasked does not list the reasoning probe, whose request leaves the switch alone,
+/// among the family's differences (a set recorded through the encoder cannot hold it: the turn
+/// carries no reasoning). Stated as opening the thought unless told otherwise, a row fed the open
+/// thought for a request that said nothing and listed the probe.
+#[test]
+fn a_v3_2_rows_generation_prompt_closes_the_thought_unless_the_request_turns_thinking_on() {
+    let request = |text: &str| -> Request { serde_json::from_str(text).expect("a request") };
+    let rows: Vec<(&str, GenerationPrompt)> = MODELS
+        .iter()
+        .copied()
+        .filter(|(slug, _)| table_for(&model_of(slug)) == Some(Table::DeepSeekV3_2))
+        .collect();
+    assert!(
+        !rows.is_empty(),
+        "no recorded slug reads with the V3.2 table"
+    );
+    let table = Table::DeepSeekV3_2;
+    let (open, close) = table.think_markers();
+    let (opened, closed) = (format!("{open}\n"), format!("{open}\n\n{close}\n\n"));
+    for (slug, prompt) in rows {
+        for unasked in [
+            "{}",
+            "{\"chat_template_kwargs\": null}",
+            "{\"chat_template_kwargs\": {\"enable_thinking\": false}}",
+        ] {
+            assert_eq!(
+                prompt.tail_for(&request(unasked), table),
+                closed,
+                "{slug} ({prompt:?}): the prompt's tail for the request {unasked}"
+            );
+        }
+        assert_eq!(
+            prompt.tail_for(
+                &request("{\"chat_template_kwargs\": {\"enable_thinking\": true}}"),
+                table
+            ),
+            opened,
+            "{slug} ({prompt:?}): the prompt's tail for a request that turns thinking on"
+        );
+        assert!(
+            table
+                .known_differences(slug, prompt)
+                .iter()
+                .all(|known| known.id != REASONING_PROBE.id),
+            "{slug} ({prompt:?}): the reasoning probe is among the listed differences"
+        );
+    }
+}
+
+/// The corpus replay, as [`replay_model`] runs it for a slug, reads a DeepSeek V3.2 set as the
+/// encoder records one: chat mode, so every case starts in content whether its request turns
+/// thinking off or says nothing, and the reasoning probe, whose request says nothing, is refused
+/// at record time and not among the set's cases. Three cases in the family's shapes, written here
+/// in a tree of their own (content alone and content before a calls block under thinking off,
+/// content alone under a request that says nothing), replayed under every row the V3.2 table
+/// reads with that row's statement: every case bitwise, nothing to fail. The table names no turn
+/// opener and the tail holds none of its anchors, so the cases read from content under either
+/// statement; what the statement decides is the family's expected list, and stated as opening
+/// the thought unless told otherwise, a row expected the probe and failed the set for not holding
+/// it (`listed in KNOWN_DIFFERENCES but not among the fixtures`).
+#[test]
+fn the_corpus_replay_reads_a_v3_2_set_recorded_in_chat_mode_without_the_reasoning_probe() {
+    let rows: Vec<(&str, GenerationPrompt)> = MODELS
+        .iter()
+        .copied()
+        .filter(|(slug, _)| table_for(&model_of(slug)) == Some(Table::DeepSeekV3_2))
+        .collect();
+    assert!(
+        !rows.is_empty(),
+        "no recorded slug reads with the V3.2 table"
+    );
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("v3-2-chat-mode-replay-{}", std::process::id()));
+    let block = concat!(
+        "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n",
+        "<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n",
+        "</｜DSML｜invoke>\n</｜DSML｜function_calls>"
+    );
+    let off = serde_json::json!({"chat_template_kwargs": {"enable_thinking": false}});
+    let unasked = serde_json::json!({});
+    let call = serde_json::json!([
+        {"function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}
+    ]);
+    let cases = [
+        (
+            "content-thinking-off",
+            &off,
+            "Hello!".to_string(),
+            serde_json::json!({"content": "Hello!"}),
+            "stop",
+        ),
+        (
+            "call-with-content",
+            &off,
+            format!("Let me check.\n\n{block}"),
+            serde_json::json!({"content": "Let me check.", "tool_calls": call}),
+            "tool_calls",
+        ),
+        (
+            "content-thinking-on",
+            &unasked,
+            "Hello!".to_string(),
+            serde_json::json!({"content": "Hello!"}),
+            "stop",
+        ),
+    ];
+    let replayed: Vec<(&str, GenerationPrompt, Replayed)> = rows
+        .iter()
+        .map(|&(slug, prompt)| {
+            let dir = root.join(slug).join("parse");
+            fs::create_dir_all(&dir).expect("the set's directory");
+            let lines: Vec<String> = cases
+                .iter()
+                .map(|(name, request, text, message, finish)| {
+                    serde_json::json!({
+                        "id": format!("{slug}/parse/{name}"),
+                        "request": request,
+                        "reference": {"text": text, "message": message, "finish_reason": finish},
+                    })
+                    .to_string()
+                })
+                .collect();
+            fs::write(dir.join("common.jsonl"), lines.join("\n") + "\n").expect("the set");
+            (slug, prompt, replay_model(&root, slug, prompt))
+        })
+        .collect();
+    fs::remove_dir_all(&root).expect("the tree removed");
+    for (slug, prompt, replayed) in replayed {
+        let (report, failures) = match replayed {
+            Replayed::Compared {
+                report, failures, ..
+            } => (report, failures),
+            Replayed::Skipped(why) => (why, vec!["the slug was skipped".to_string()]),
+        };
+        assert!(
+            failures.is_empty(),
+            "{slug} ({prompt:?}): {failures:#?}\n{report}"
+        );
+        for (name, ..) in &cases {
+            let verdict = report
+                .lines()
+                .find(|line| line.ends_with(&format!("parse/{name}")))
+                .map_or("not in the report", str::trim_start);
+            assert!(
+                verdict.starts_with("bitwise"),
+                "{slug}/{name}: {verdict}\n{report}"
+            );
+        }
+    }
+}
+
 /// Spins until `ready` holds, for at most ten seconds, so that a test waiting on another thread's
 /// progress fails with `never` rather than hangs.
 fn wait_until(ready: impl Fn() -> bool, never: &str) {
