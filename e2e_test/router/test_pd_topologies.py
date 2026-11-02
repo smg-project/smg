@@ -39,7 +39,9 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
+import json
 import logging
 import os
 import re
@@ -569,6 +571,85 @@ def _stream_chat(
     return outcome
 
 
+async def _wait_for_death_stream_fleet(
+    gateway: Gateway, client: httpx.AsyncClient, deadline: float
+) -> None:
+    """Observe the whole fixture ready and drained inside the first-token budget.
+
+    The previous case may have returned while abandoned PD sides still retire.
+    Phase timeouts on a synchronous HTTP call do not bound this whole wait: all
+    I/O here is cancellable under the caller's one absolute work deadline.
+    """
+    expected = {w.base_url for w in gateway.prefill_workers + gateway.decode_workers}
+    assert expected, "death-stream fixture has no expected workers"
+    last: dict = {}
+
+    async def _json(path: str) -> dict:
+        assert time.monotonic() < deadline, "fleet readiness used the work budget"
+        body = bytearray()
+        async with client.stream("GET", f"{gateway.base_url}{path}", timeout=None) as response:
+            response.raise_for_status()
+            async for chunk in response.aiter_bytes(chunk_size=16384):
+                body.extend(chunk)
+                assert len(body) <= 262144, f"{path} exceeded the metadata size bound"
+        value = json.loads(body)
+        assert isinstance(value, dict), f"{path} did not return a JSON object"
+        assert time.monotonic() < deadline, "fleet observation returned after the work deadline"
+        return value
+
+    try:
+        async with asyncio.timeout(max(0.0, deadline - time.monotonic())):
+            while True:
+                workers = (await _json("/workers")).get("workers")
+                loads = (await _json("/loads")).get("loads")
+                assert isinstance(workers, list), "/workers omitted its worker list"
+                assert isinstance(loads, list), "/loads omitted its load list"
+                healthy: set[str] = set()
+                seen_workers: set[str] = set()
+                for worker in workers:
+                    assert isinstance(worker, dict), f"invalid worker report: {worker}"
+                    if worker.get("url") not in expected:
+                        continue
+                    url = worker["url"]
+                    assert url not in seen_workers, f"ambiguous worker report: {url}"
+                    seen_workers.add(url)
+                    assert isinstance(worker.get("is_healthy"), bool), (
+                        f"worker omitted its actual health state: {worker}"
+                    )
+                    if worker["is_healthy"]:
+                        healthy.add(url)
+                reported: set[str] = set()
+                seen_ranks: set[tuple[str, int]] = set()
+                busy: list[dict] = []
+                for load in loads:
+                    assert isinstance(load, dict), f"invalid load report: {load}"
+                    if load.get("worker") not in expected:
+                        continue
+                    # Every reported DP rank must explicitly be idle. Missing,
+                    # bool, negative or non-integer counters never stand for zero.
+                    for key in ("dp_rank", "num_running_reqs", "num_waiting_reqs"):
+                        value = load.get(key)
+                        assert (
+                            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                        ), f"invalid {key} in load report: {load}"
+                    rank = (load["worker"], load["dp_rank"])
+                    assert rank not in seen_ranks, f"ambiguous load report: {rank}"
+                    seen_ranks.add(rank)
+                    reported.add(load["worker"])
+                    if load["num_running_reqs"] or load["num_waiting_reqs"]:
+                        busy.append(load)
+                last = {"healthy": sorted(healthy), "reported": sorted(reported), "busy": busy}
+                if expected <= healthy and expected <= reported and not busy:
+                    assert time.monotonic() < deadline, "fleet readiness used the work budget"
+                    logger.info("fault cohort starts with all workers healthy and idle: %s", last)
+                    return
+                await asyncio.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+    except TimeoutError as exc:
+        raise AssertionError(
+            f"fleet not healthy and idle within the first-token budget: {last}"
+        ) from exc
+
+
 def _long_prompt(secret: str) -> str:
     filler = (
         "The harbor office logs every vessel by name, tonnage and berth, and the "
@@ -958,37 +1039,145 @@ class TestPDTopology:
             )
         peers = {w.base_url for w in decodes[:-1]}
 
+        # Async sockets let every owned stream be cancelled and awaited even
+        # when a pre-kill assertion fails. Preserve the fixture's existing host
+        # and HTTPX environment/proxy configuration.
         streams = 4 * len(decodes)
-        before = len(_pairs_logged())
-        outcomes: list[_StreamOutcome] = []
-        first_tokens = [threading.Event() for _ in range(streams)]
-
-        def _run(event: threading.Event) -> None:
-            outcomes.append(_stream_chat(gateway, model, max_tokens=600, first_token=event))
-
-        threads = [threading.Thread(target=_run, args=(e,), daemon=True) for e in first_tokens]
-        for t in threads:
-            t.start()
-        # Every stream is past its first token before the kill, so the engine
-        # dies under live decode, on the victim and on its peers alike.
         deadline = time.monotonic() + 60.0
-        for event in first_tokens:
-            assert event.wait(max(0.0, deadline - time.monotonic())), (
-                "a stream had no first token within 60s"
-            )
-        pairs = _wait_for_pairs(before + streams)[before:]
-        decodes_used = {d for _, d in pairs}
-        assert victim.base_url in decodes_used, f"no stream landed on {victim.base_url}: {pairs}"
+        outcomes: list[_StreamOutcome] = []
+        kill_attempted = False
 
-        killed = victim.kill_engine()
-        assert killed, f"{victim.base_url}: the launcher had no engine process to kill"
-        logger.info(
-            "%s: engine processes %s killed under %d streams", victim.base_url, killed, streams
-        )
+        async def _run_streams() -> None:
+            nonlocal kill_attempted
+            client = httpx.AsyncClient(timeout=120.0)
+            tasks: list[asyncio.Task] = []
+            primary: BaseException | None = None
 
-        for t in threads:
-            t.join(timeout=120.0)
+            async def _run(event: asyncio.Event) -> None:
+                body = {
+                    "model": model,
+                    "messages": [
+                        {"role": "user", "content": "Write a very long story about the sea."}
+                    ],
+                    "max_tokens": 600,
+                    "temperature": 0,
+                    "stream": True,
+                    "ignore_eos": True,
+                }
+                outcome = _StreamOutcome()
+                try:
+                    assert time.monotonic() < deadline, "stream start used the work budget"
+                    async with client.stream(
+                        "POST", f"{gateway.base_url}/v1/chat/completions", json=body
+                    ) as response:
+                        outcome.status = response.status_code
+                        if response.status_code != 200:
+                            outcome.end.error = {
+                                "http_status": response.status_code,
+                                "body": (await response.aread())[:300],
+                            }
+                        else:
+                            async for line in response.aiter_lines():
+                                # Reuse the original SSE decoder, incrementally:
+                                # only a frame with choices is a first token,
+                                # error/finish state survives later frames, and
+                                # [DONE] closes consumption immediately.
+                                part = read_sse_chat([line])
+                                if part.error is not None:
+                                    outcome.end.error = part.error
+                                if part.finish_reason:
+                                    outcome.end.finish_reason = part.finish_reason
+                                if part.chunks:
+                                    if outcome.end.chunks == 0:
+                                        event.set()
+                                    outcome.end.chunks += part.chunks
+                                if part.done:
+                                    outcome.end.done = True
+                                    break
+                except Exception as exc:  # CancelledError must reach the owner.
+                    # Match _stream_chat: a broken iterator never returns its
+                    # partial SseChatEnd; its exception is the failure oracle.
+                    outcome.end = SseChatEnd()
+                    outcome.exception = repr(exc)
+                outcomes.append(outcome)
+
+            try:
+                # Readiness, baseline and all eight first-token observations
+                # share the original absolute 60s deadline, never 60s + 60s.
+                await _wait_for_death_stream_fleet(gateway, client, deadline)
+                before = len(_pairs_logged())
+                assert time.monotonic() < deadline, "placement baseline used the work budget"
+                first_tokens = [asyncio.Event() for _ in range(streams)]
+                tasks = [
+                    asyncio.create_task(_run(event), name=f"pd-death-stream-{i}")
+                    for i, event in enumerate(first_tokens)
+                ]
+                try:
+                    async with asyncio.timeout(max(0.0, deadline - time.monotonic())):
+                        for event in first_tokens:
+                            await event.wait()
+                        assert time.monotonic() < deadline, "first-token work used the work budget"
+                except TimeoutError as exc:
+                    raise AssertionError("a stream had no first token within 60s") from exc
+                # As in _wait_for_pairs, log flushing starts after first tokens
+                # and keeps its original independent fifteen-second allowance.
+                pairs = _pairs_logged()
+                log_deadline = time.monotonic() + LOG_FLUSH_TIMEOUT_S
+                while len(pairs) < before + streams and time.monotonic() < log_deadline:
+                    await asyncio.sleep(min(0.5, max(0.0, log_deadline - time.monotonic())))
+                    pairs = _pairs_logged()
+                assert len(pairs) >= before + streams, (
+                    f"router logged {len(pairs)} PD pair selections, expected at least {before + streams}; "
+                    f"is --log-level debug reaching {_LOG_DIR}/smg*?"
+                )
+                pairs = pairs[before:]
+                decodes_used = {d for _, d in pairs}
+                assert victim.base_url in decodes_used, (
+                    f"no stream landed on {victim.base_url}: {pairs}"
+                )
+
+                kill_attempted = True
+                killed = victim.kill_engine()
+                assert killed, f"{victim.base_url}: the launcher had no engine process to kill"
+                logger.info(
+                    "%s: engine processes %s killed under %d streams",
+                    victim.base_url,
+                    killed,
+                    streams,
+                )
+                # Preserve the original per-thread 120s join semantics, using
+                # cancellable owned tasks. The original outcome assertion below
+                # still judges any streams left running after these waits.
+                for task in tasks:
+                    await asyncio.wait({task}, timeout=120.0)
+            except BaseException as exc:
+                primary = exc
+                raise
+            finally:
+                # This is a separate 5s cleanup attempt, not extra work time.
+                # Only this cohort's async tasks and client are touched.
+                cleanup_deadline = time.monotonic() + 5.0
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                try:
+                    async with asyncio.timeout(max(0.0, cleanup_deadline - time.monotonic())):
+                        if tasks:
+                            await asyncio.gather(*tasks, return_exceptions=True)
+                        await client.aclose()
+                    assert all(task.done() for task in tasks), "owned stream tasks did not settle"
+                    logger.info(
+                        "stream cohort cleanup settled %d owned tasks and closed its client",
+                        len(tasks),
+                    )
+                except BaseException as exc:
+                    if primary is None:
+                        raise
+                    primary.add_note(f"owned stream cleanup also failed: {exc!r}")
+
+        primary: BaseException | None = None
         try:
+            asyncio.run(_run_streams())
             assert len(outcomes) == streams, (
                 f"{streams - len(outcomes)} streams still running 120s after the kill"
             )
@@ -1019,13 +1208,22 @@ class TestPDTopology:
             used = {d for _, d in pairs}
             assert victim.base_url not in used, "gateway kept routing to the dead decode worker"
             assert used <= peers, f"unknown decode workers in placement: {used - peers}"
+        except BaseException as exc:
+            primary = exc
+            raise
         finally:
-            # Whatever the verdict, the class's later tests need the pool back.
-            # stop() reaps the engine's processes and waits for the device
-            # memory before the same GPU is loaded again.
-            victim.stop()
-            victim.start(timeout=_RESTART_TIMEOUT)
-            _wait_for_status(gateway, victim.base_url, "healthy", timeout=60.0)
+            # A precondition failure must not restart an engine we never killed.
+            # Once a kill was attempted, keep the original recovery sequence,
+            # preserving the fault verdict if recovery itself also fails.
+            if kill_attempted:
+                try:
+                    victim.stop()
+                    victim.start(timeout=_RESTART_TIMEOUT)
+                    _wait_for_status(gateway, victim.base_url, "healthy", timeout=60.0)
+                except BaseException as exc:
+                    if primary is None:
+                        raise
+                    primary.add_note(f"decode recovery also failed: {exc!r}")
         before = len(_pairs_logged())
         count = 4 * len(decodes)
         for i in range(count):
