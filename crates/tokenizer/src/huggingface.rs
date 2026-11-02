@@ -54,7 +54,7 @@ mod glm;
 enum Renderer {
     Jinja,
     DeepseekV32,
-    DeepseekV4(deepseek_v4::EffortEncoding),
+    DeepseekV4,
     DeepseekV41(deepseek_v41::EffortTable),
     Glm53(glm53::Template),
 }
@@ -67,7 +67,7 @@ impl Renderer {
             // GLM keeps the active template's switchless thinking contract.
             Self::Jinja | Self::Glm53(_) => None,
             Self::DeepseekV32 => Some(deepseek_v32::PROFILE),
-            Self::DeepseekV4(encoding) => Some(encoding.profile()),
+            Self::DeepseekV4 => Some(deepseek_v4::PROFILE),
             Self::DeepseekV41(_) => Some(deepseek_v41::PROFILE),
         }
     }
@@ -1809,7 +1809,7 @@ impl HuggingFaceTokenizer {
                 "the Jinja and GLM renderers render no marked prompt",
             )),
             Renderer::DeepseekV32 => apply_deepseek_v32(messages, &params),
-            Renderer::DeepseekV4(encoding) => apply_deepseek_v4(messages, &params, encoding),
+            Renderer::DeepseekV4 => apply_deepseek_v4(messages, &params),
             Renderer::DeepseekV41(table) => apply_deepseek_v41(messages, &params, table),
         }
     }
@@ -1835,9 +1835,7 @@ impl HuggingFaceTokenizer {
         let mut marked = self.render_marked(messages, params)?;
         let generation_prompt = match self.renderer {
             Renderer::DeepseekV32 => !final_message_is_assistant(messages),
-            Renderer::DeepseekV4(_) | Renderer::DeepseekV41(_) => {
-                ends_with_generation_header(&marked)
-            }
+            Renderer::DeepseekV4 | Renderer::DeepseekV41(_) => ends_with_generation_header(&marked),
             // No marked prompt: `render_marked` refused above.
             Renderer::Jinja | Renderer::Glm53(_) => false,
         };
@@ -2129,30 +2127,10 @@ fn detect_renderer_from_config(dir: &Path, has_chat_template: bool) -> Renderer 
             );
             return Renderer::Jinja;
         }
-        let encoding = detect_dsv4_effort_encoding(dir);
-        debug!(
-            ?path,
-            ?encoding,
-            "selected DeepseekV4 chat-template renderer"
-        );
-        return Renderer::DeepseekV4(encoding);
+        debug!(?path, "selected DeepseekV4 chat-template renderer");
+        return Renderer::DeepseekV4;
     }
     Renderer::Jinja
-}
-
-/// Pick the effort-prompt revision for a V4 checkpoint. `config.json`,
-/// `tokenizer_config.json` and `generation_config.json` do not tell the
-/// revisions apart (the DSpark checkpoints share the 0731 config with the
-/// original effort table), so the only discriminator is the shipped
-/// `encoding/encoding_dsv4.py`. Without it (a tokenizer directory streamed
-/// from a worker carries no `encoding/`), render the table the engine's own
-/// server renders: its port of the encoder carries the refreshed table for
-/// every V4 checkpoint.
-fn detect_dsv4_effort_encoding(dir: &Path) -> deepseek_v4::EffortEncoding {
-    match std::fs::read_to_string(dir.join("encoding").join("encoding_dsv4.py")) {
-        Ok(source) => deepseek_v4::EffortEncoding::detect_from_encoder_source(&source),
-        Err(_) => deepseek_v4::EffortEncoding::V0731,
-    }
 }
 
 /// Pick the effort table of a V4.1 checkpoint from its shipped
@@ -2308,7 +2286,9 @@ fn explicit_thinking_kwarg(params: &ChatTemplateParams) -> Option<bool> {
 /// `reasoning_effort` maps as the engine maps it: `max` is the top level, `low`,
 /// `minimal` and `medium` the bottom one (which renders no prefix), every
 /// other string and an absent value `high`. Which text a level renders is
-/// the detected revision's table (see `detect_dsv4_effort_encoding`).
+/// the table the engine's copy of the encoder carries for every V4
+/// checkpoint, whatever the checkpoint's own `encoding/encoding_dsv4.py`
+/// says: the engine never reads it, so neither does this renderer.
 ///
 /// Deliberate divergence from the engine's Python renderer: there `reasoning_effort: "none"`
 /// forces chat mode even over an explicit `thinking: true`. Here the explicit
@@ -2318,7 +2298,6 @@ fn explicit_thinking_kwarg(params: &ChatTemplateParams) -> Option<bool> {
 fn apply_deepseek_v4(
     messages: &[serde_json::Value],
     params: &ChatTemplateParams,
-    effort_encoding: deepseek_v4::EffortEncoding,
 ) -> Result<String> {
     let messages = developer_messages_as_system_first(messages);
     let owned = inject_tools_into_messages(&messages, params.tools);
@@ -2350,7 +2329,6 @@ fn apply_deepseek_v4(
         add_default_bos_token: true,
         drop_thinking: resolve_drop_thinking(msgs),
         reasoning_effort,
-        effort_encoding,
     };
     deepseek_v4::render_messages(msgs, thinking_mode, &encode_params)
         .map_err(|e| Error::msg(format!("DeepSeek V4 encode failed: {e}")))
@@ -3097,7 +3075,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             detect_renderer_from_config(temp.path(), false),
-            Renderer::DeepseekV4(_)
+            Renderer::DeepseekV4
         ));
         assert!(matches!(
             detect_renderer_from_config(temp.path(), true),
@@ -3503,7 +3481,7 @@ mod segment_tests {
     /// The same vocabulary served by the V4 renderer.
     fn v4_like(added: &[&str]) -> HuggingFaceTokenizer {
         let mut wrapped = v41_like(added);
-        wrapped.renderer = Renderer::DeepseekV4(deepseek_v4::EffortEncoding::Original);
+        wrapped.renderer = Renderer::DeepseekV4;
         wrapped.profile = wrapped.renderer.profile();
         wrapped
     }
