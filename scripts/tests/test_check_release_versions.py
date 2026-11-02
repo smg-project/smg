@@ -425,6 +425,50 @@ def test_the_plan_lists_the_bump_quietly_and_changes_nothing(mod, repo):
     assert "6 component(s) and mirror(s) move" in out
 
 
+def test_the_plan_reads_the_candidate_from_mains_development_version(mod, repo):
+    """Between cuts main reads the next development version (1.1.0-dev once release/1.0 is cut): without
+    VERSION_OVERRIDE the plan takes its first candidate as what the cut writes, and says where it read it."""
+    assert mod.first_candidate("1.15.0-dev") == "1.15.0-rc.1"
+    assert mod.first_candidate("1.15.0") is None and mod.first_candidate("1.15.0-rc.1") is None
+    put(repo, "model_gateway/Cargo.toml", manifest("smg", "1.1.0-dev"))
+    for path, text in (
+        ("bindings/Cargo.toml", manifest("smg-binding", "1.1.0-dev")),
+        ("bindings/pyproject.toml", '[project]\nname = "smg"\nversion = "1.1.0-dev"\n'),
+        ("bindings/smg/version.py", '__version__ = "1.1.0-dev"\n'),
+        (
+            "chart/Chart.yaml",
+            'apiVersion: v2\nname: smg\nversion: 1.1.0-dev\nappVersion: "1.1.0-dev"\n',
+        ),
+        (
+            "wf.yml",
+            "run-name: smg=${{ env.SMG_RELEASE_TAG }}\nenv:\n  SMG_RELEASE_TAG: v1.1.0-dev\n",
+        ),
+    ):
+        put(repo, path, text)
+    code, out = run(mod, repo, mode="plan", tag="v1.0.0")
+    assert code == 0
+    assert (
+        "the gateway and its mirrors to 1.1.0-rc.1 (the first candidate of main's development version"
+        " 1.1.0-dev; VERSION_OVERRIDE names another). Nothing is changed here" in out
+    )
+    assert "  set smg v1.1.0-dev → v1.1.0-rc.1 (model_gateway/Cargo.toml)" in out
+    assert "  sync chart v1.1.0-dev → v1.1.0-rc.1 (chart/Chart.yaml)" in out
+    assert "major smg" not in out and "smg v1.1.0-dev" not in out.split("Bumped already")[-1]
+    # a version given still wins, and the plan does not say it was read from main
+    code, out = run(mod, repo, mode="plan", tag="v1.0.0", override="1.2.0-rc.1")
+    assert code == 0
+    assert "the gateway and its mirrors to 1.2.0-rc.1. Nothing is changed here" in out
+    assert "  set smg v1.1.0-dev → v1.2.0-rc.1 (model_gateway/Cargo.toml)" in out
+    assert "development version" not in out
+    # the check reads a development version as consistent: no release tag carries it, the mirrors carry the string
+    code, out = run(mod, repo, mode="check", tag="v1.0.0")
+    assert code == 1, "the fixture's other crates are still unbumped"
+    assert "✓ smg (model_gateway/) — v1.0.0 → v1.1.0-dev" in out
+    for mirror in ("binding", "pyproject", "version.py", "chart", "workflow"):
+        assert f"✓ {mirror} (" in out, mirror
+    assert "expected v1.1" not in out, "no mirror disagrees with the development version"
+
+
 def test_the_plan_lists_a_gateway_already_at_the_cuts_version_among_the_bumped(mod, repo):
     """After a local ``make bump-version VERSION=<cut>`` the gateway carries the cut's version: the plan prints no
     ``set`` line for it and names it among the components bumped already, in both closing lines."""

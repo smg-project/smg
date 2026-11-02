@@ -3,7 +3,9 @@
 # pull requests, so main never pauses for a release.
 #
 #   release.sh cut <version> [<from>]      cut release/<x.y> from <from> (default <remote>/main) and commit the
-#                                          version bump to <version> on it (nothing is pushed unless PUSH=1)
+#                                          version bump to <version> on it; then the pull request that moves main
+#                                          above the branch, to the next development version (1.15.0-dev for a
+#                                          1.14 cut: the trunk is next); nothing is pushed unless PUSH=1
 #   release.sh bump <version>              the next candidate or the final on an existing release/<x.y>: a bump
 #                                          commit on a topic branch and its pull request against the release branch
 #   release.sh pick <x.y> <sha>[,<sha>..]  cherry-pick commits of main (-x -s) onto a topic branch off
@@ -16,8 +18,9 @@
 #                                          (annotated, signed off; pushed only with PUSH=1)
 #   release.sh notes <version> [<since>]   the release notes skeleton on stdout: the merged pull requests since the
 #                                          previous final (or <since>) by type, the Docker image list
-#   release.sh bump-main <version>         after a final: a pull request that moves main's version files to the
-#                                          release's (the gateway to <version>, every crate at least the published)
+#   release.sh bump-main <version>         after a final: a pull request that moves main's crates and packages to
+#                                          at least the release's; the gateway keeps its development version, or
+#                                          moves to the one after <version> when main reads below the release
 #   release.sh publish-plan <version>      the publishing steps for v<version>: the workflow dispatches a maintainer
 #                                          runs against the tag and the artifact names they produce (prints, runs nothing)
 #   release.sh check <version>             the release gate for v<version>: what the repository can read (the versions
@@ -28,11 +31,13 @@
 # come from the release-* workflows dispatched by hand against the release tag, as publish-plan lists them.
 #
 # <version> is X.Y.Z or X.Y.Z-rc.N; the release branch is release/X.Y. Every version file carries the one
-# string as written (Python tooling normalizes 1.14.0-rc.1 to 1.14.0rc1 on its own).
+# string as written (Python tooling normalizes 1.14.0-rc.1 to 1.14.0rc1 on its own). Between cuts main reads
+# X.Y.Z-dev, the next development version: above every release before it, below the X.Y.Z line it leads
+# (a semver pre-release for cargo and Helm, X.Y.Z.dev0 once Python tooling normalizes it).
 #
-# Environment: REMOTE (origin); PUSH (cut and tag push nothing unless PUSH=1; bump, pick and bump-main push
-# their topic branch and open the pull request unless PUSH=0); REGISTRY=0 (check and publish-plan do not read
-# crates.io and PyPI); GH, CARGO, CURL, PYTHON, MAKE (the tools).
+# Environment: REMOTE (origin); PUSH (cut and tag push nothing unless PUSH=1, the cut's main-move pull request
+# included; bump, pick and bump-main push their topic branch and open the pull request unless PUSH=0);
+# REGISTRY=0 (check and publish-plan do not read crates.io and PyPI); GH, CARGO, CURL, PYTHON, MAKE (the tools).
 # The commits, the picks and the tag carry the caller's git identity and sign-off.
 set -euo pipefail
 export PYTHONDONTWRITEBYTECODE=1 # the version checker is imported from the tree; no scripts/__pycache__ left behind
@@ -75,6 +80,10 @@ sortable() { sed 's/-rc\./~rc./; s/-dev$/~dev/'; }
 unsortable() { sed 's/~rc\./-rc./; s/~dev$/-dev/'; }
 version_above() { # <a> <b>: a reads above b
   [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sortable | sort -V | tail -n 1 | unsortable)" = "$1" ]
+}
+next_dev_version() { # <version>: main's development version once that version's line is cut: X.(Y+1).0-dev
+  [[ $1 =~ $VERSION_RE ]] || die "not a version: '$1' (X.Y.Z or X.Y.Z-rc.N)"
+  printf '%s.%s.0-dev' "${BASH_REMATCH[1]}" "$((BASH_REMATCH[2] + 1))"
 }
 
 fetch() { git fetch --quiet --tags "$REMOTE" || die "cannot fetch $REMOTE"; }
@@ -161,6 +170,13 @@ require_clean() { # [<advice>]: the bump's by default (its commit must carry onl
   [ -z "$(git status --porcelain --untracked-files=no)" ] \
     || die "the working tree has uncommitted changes: ${1:-commit them first (the bump commit must carry only the bump)}"
 }
+back_to() { # <start branch> <start commit>: the checkout the command started from (detached there when it was)
+  if [ -n "$1" ]; then
+    git switch --quiet "$1" || die "cannot switch back to $1"
+  else
+    git switch --quiet --detach "$2" || die "cannot switch back to $(git rev-parse --short "$2")"
+  fi
+}
 sign_off() { # "Name <email>", as git commit -s writes it
   local ident
   ident=$(git var GIT_COMMITTER_IDENT)
@@ -185,12 +201,20 @@ refresh_lock() { # Cargo.lock follows the workspace crates' versions
   command -v "$CARGO" >/dev/null 2>&1 \
     || die "Cargo.lock needs a refresh and '$CARGO' is not on PATH (set CARGO=<path to cargo>)"
   note "bump: cargo update --workspace (Cargo.lock follows the crate versions)"
-  "$CARGO" update --workspace --offline >/dev/null 2>&1 || "$CARGO" update --workspace >/dev/null
+  "$CARGO" update --workspace --offline >/dev/null 2>&1 || "$CARGO" update --workspace >/dev/null \
+    || die "cargo update --workspace failed: Cargo.lock does not follow the versions"
 }
-commit_all() { # <subject> <body>
-  git add --update
+commit_all() { # <subject> <body> <finish>: the tree's changes in one signed-off commit. A failure stops the command in any
+  # context and names both ways out: the commit by hand and then <finish> (the steps the command would have run next), or
+  # dropping the edits and the branch before a rerun (the branch's existence refuses one).
+  local branch
+  branch=$(git branch --show-current)
+  git add --update || die "git add failed on $branch"
   git diff --cached --quiet && die "nothing to commit: the tree already carries these versions"
-  git commit --quiet --signoff --message "$1" --message "$2"
+  git commit --quiet --signoff --message "$1" --message "$2" \
+    || die "the commit '$1' failed: the version edits are staged on $branch. Once the cause is fixed, commit them and finish by hand:
+$3
+or drop them (git restore --staged --worktree .), switch back to where you started and delete $branch (git branch -D $branch): a rerun is refused while it exists"
 }
 
 # --- pushes and pull requests -------------------------------------------------------
@@ -209,18 +233,29 @@ push_release_ref() { # <refspec> <what the push triggers>: a release branch or a
 }
 # Pushes name both sides of the refspec and topic branches never track their start point: under
 # push.default=upstream, `git push origin topic` of a branch that tracks origin/main pushes to main.
+pr_commands() { # <topic> <base> <title> <body file>: the push of a topic and its pull request, as lines to run by hand
+  say "  git push -u $REMOTE refs/heads/$1:refs/heads/$1"
+  say "  gh pr create --base $2 --head $1 --title $(printf '%q' "$3") --body-file $(printf '%q' "$4")"
+}
 open_pr() { # <topic> <base> <title> <body file>
   local topic=$1 base=$2 title=$3 body=$4
   if [ "${PUSH:-}" = 0 ]; then
     say ""
     say "Not pushed (PUSH=0). To open the pull request:"
-    say "  git push -u $REMOTE refs/heads/$topic:refs/heads/$topic"
-    say "  gh pr create --base $base --head $topic --title $(printf '%q' "$title") --body-file $(printf '%q' "$body")"
+    pr_commands "$topic" "$base" "$title" "$body"
     return 0
   fi
   command -v "$GH" >/dev/null 2>&1 || die "'$GH' is not installed: push $topic and open the pull request against $base by hand"
-  git push --quiet -u "$REMOTE" "refs/heads/$topic:refs/heads/$topic"
-  "$GH" pr create --base "$base" --head "$topic" --title "$title" --body-file "$body"
+  git push --quiet -u "$REMOTE" "refs/heads/$topic:refs/heads/$topic" || die "the push of $topic to $REMOTE failed; nothing opened"
+  "$GH" pr create --base "$base" --head "$topic" --title "$title" --body-file "$body" || die "gh pr create failed for $topic; the branch is pushed"
+}
+require_pr_tools() { # <topic> <base>: what open_pr will need under PUSH=1, checked before anything is made or pushed
+  local topic=$1 base=$2 open
+  command -v "$GH" >/dev/null 2>&1 \
+    || die "'$GH' is not installed and PUSH=1 opens the pull request of $topic against $base: install it, or run without PUSH=1 and push by hand"
+  open=$("$GH" pr list --head "$topic" --state open --json number --jq '.[].number' | sed 's/^/#/' | paste -sd ' ' -) \
+    || die "gh pr list failed (its message is above): cannot read whether an open pull request carries $topic"
+  [ -z "$open" ] || die "an open pull request already carries $topic ($open): finish or close it first"
 }
 
 # --- the commands -------------------------------------------------------------------
@@ -229,8 +264,9 @@ cmd_cut() {
   local version=${1:-} from=${2:-}
   [ -n "$version" ] || die "usage: release.sh cut <version> [<from>]"
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
-  local release branch from_sha since start start_branch
+  local release branch from_sha since start start_branch next topic push_move
   release=$(release_of "$version"); branch="release/$release"
+  next=$(next_dev_version "$version"); topic="chore/main-versions-$next"
   require_identity; require_clean; fetch
   from=${from:-$REMOTE/main}
   from_sha=$(git rev-parse --verify --quiet "$from^{commit}") || die "unknown commit: $from"
@@ -238,13 +274,18 @@ cmd_cut() {
     || die "$from is not on $REMOTE/main: a release is cut from main's history"
   has_ref "refs/heads/$branch" && die "$branch exists locally: a new candidate on it is 'release.sh bump $version'"
   remote_has_branch "$branch" && die "$branch exists on $REMOTE: a new candidate on it is 'release.sh bump $version'"
+  has_ref "refs/heads/$topic" && die "the branch $topic exists (the pull request that moves main after a cut): delete it or finish it"
+  remote_has_branch "$topic" && die "the branch $topic exists on $REMOTE (the pull request that moves main after a cut): finish or delete it"
+  # With PUSH=1 the release branch is pushed before main's move: what the move's pull request needs is checked now,
+  # not by open_pr once the branch is live.
+  [ "${PUSH:-}" != 1 ] || require_pr_tools "$topic" main
   since=$(since_tag "$from_sha" "$version")
-  # The previous release's final is the right tag only once main carries that release's versions: a cut before the
-  # release-bump-main pull request merged (or from an older commit) would start from versions below the release
-  # that is out (the checker steps a changed crate past the exact versions release tags carry, not above them;
-  # the gateway's files would still read below it).
+  # The previous release's final is the right tag only once main reads above that release: the cut of its line moved
+  # main there (bump-main after its final otherwise). A cut from a main below it (that pull request not merged, an
+  # older commit) would start from versions below the release that is out (the checker steps a changed crate past
+  # the exact versions release tags carry, not above them; the gateway's files would still read below it).
   if ! git merge-base --is-ancestor "$since" "$from_sha" && version_above "${since#v}" "$(manifest_version "$from_sha")"; then
-    die "$from reads $(manifest_version "$from_sha"), below ${since#v}: merge the release-bump-main pull request for $since first (release.sh bump-main ${since#v}), or cut from a commit after it"
+    die "$from reads $(manifest_version "$from_sha"), below ${since#v}: merge the pull request that moves main's versions first (release.sh bump-main ${since#v} opens it), or cut from a commit after it"
   fi
   note "cut: $branch from $(git rev-parse --short "$from_sha") ($from); the versions move from $since to $version"
   # The start is read before the branch is made (`git switch -` and `@{-1}` read the HEAD reflog, which a clone can be
@@ -255,14 +296,27 @@ cmd_cut() {
   git switch --quiet --no-track -c "$branch" "$from_sha"
   bump_tree "$version" "$since"
   commit_all "chore(release): bump versions for v$version" \
-    "The release branch $branch, cut from $from_sha ($from). Versions since $since."
-  if [ -n "$start_branch" ]; then git switch --quiet "$start_branch"; else git switch --quiet --detach "$start"; fi
+    "The release branch $branch, cut from $from_sha ($from). Versions since $since." \
+    "  git push $REMOTE refs/heads/$branch:refs/heads/$branch (then main's move, the cut's second half, which only a rerun makes: the shorter way is to drop the edits, delete $branch and rerun the cut)"
+  back_to "$start_branch" "$start"
   say ""
   # refs/heads/: a tag named like the branch would answer for a bare name
   say "$branch is at $(git rev-parse --short "refs/heads/$branch"): $(git log -1 --format=%s "refs/heads/$branch")"
   git show --stat --oneline "refs/heads/$branch" | sed -n '2,$p' | sed 's/^/  /'
   say "(You are back on ${start_branch:-$(git rev-parse --short "$start")}; the release commands run from a checkout that has scripts/release/, main for instance.)"
   push_release_ref "refs/heads/$branch:refs/heads/$branch" "runs the test matrix on $branch (nothing is published); then 'release.sh tag $version'"
+  # The trunk is next: the moment the branch exists, main moves above everything it will ever release, by a pull
+  # request: the gateway and its mirrors to the next development version, every crate and package to at least
+  # the version the cut gave the branch (so the next cut bumps from the numbers the registries will hold). The
+  # push follows the cut's switch: PUSH=1 pushes the topic and opens the pull request, anything else prints both.
+  if [ "${PUSH:-}" = 1 ]; then push_move=1; else push_move=0; fi
+  say ""
+  note "cut: main moves above $branch: the gateway and its mirrors to $next, every crate and package to at least the branch's"
+  if ! PUSH=$push_move move_main "$topic" "$next" "refs/heads/$branch" "chore(release): main reads $next, above release/$release" \
+    "\`$branch\` is cut at $(git rev-parse --short "refs/heads/$branch") and reads $version; main moves above it the same moment (the trunk is next): the gateway and its mirrors to \`$next\`, the next development version (a semver pre-release below ${next%-dev} for cargo and Helm, ${next%-dev}.dev0 once Python tooling normalizes it), and every crate and package to at least the version the cut gave the branch, so the next cut's bump starts from the numbers the registries will hold. Main's artifacts are not published; the branch's are."; then
+    say "main carries $next and the branch's crate and package versions already: nothing to move."
+  fi
+  back_to "$start_branch" "$start" # the move's topic is behind you too, like the release branch
 }
 
 cmd_bump() {
@@ -281,19 +335,20 @@ cmd_bump() {
   note "bump: $kind on $branch, versions since $since"
   git switch --quiet --no-track -c "$topic" "$base"
   bump_tree "$version" "$since"
-  commit_all "chore(release): bump versions for v$version" "$kind on $branch. Versions since $since."
   body=$(mktemp)
   {
     say "The version bump for v$version on \`$branch\` ($kind). Versions since $since:"
     say ""
     say '```'
-    git show --stat --oneline HEAD | sed -n '2,$p'
+    git diff --stat HEAD
     say '```'
     say ""
     say "Merging it makes \`$branch\` read v$version (nothing is published by the merge); then \`make release-tag VERSION=$version\` and \`make release-publish-plan VERSION=$version\`."
     say ""
     gate_section "$version" "$base"
   } > "$body"
+  commit_all "chore(release): bump versions for v$version" "$kind on $branch. Versions since $since." \
+    "$(pr_commands "$topic" "$branch" "chore(release): bump versions for v$version" "$body")"
   open_pr "$topic" "$branch" "chore(release): bump versions for v$version" "$body"
 }
 
@@ -534,12 +589,53 @@ cmd_notes() {
   fi
 }
 
+move_main() { # <topic> <gateway version> <source ref> <subject> <intro>: main's version files move on <topic>, by a pull request
+  # The gateway and its mirrors to <gateway version> when main reads below it; main never goes back (after a patch of
+  # an older line, or a cut while main already reads above, they keep main's). Every crate and package to at least
+  # <source ref>'s, as sync_versions.py moves them. The commit, the push and the pull request as open_pr makes them.
+  # Returns 1, with nothing made, when main carries the versions already. Every other failure stops the command
+  # (die): both callers run this under `if` or `||`, where set -e is off and a failed step would read as "nothing
+  # to move" with the version edits left behind.
+  local topic=$1 gateway=$2 source=$3 subject=$4 intro=$5 current moved start start_branch body shown
+  shown=${source#refs/heads/} # a local release branch is read by its full ref (a tag may share its name), named plainly
+  start_branch=$(git branch --show-current); start=${start_branch:-$(git rev-parse HEAD)}
+  git switch --quiet --no-track -c "$topic" "$REMOTE/main" || die "cannot make $topic from $REMOTE/main"
+  current=$(manifest_version "$REMOTE/main")
+  if [ "$current" = "$gateway" ] || version_above "$current" "$gateway"; then
+    note "main reads $current, not below $gateway: the gateway and its mirrors keep it; the crates and packages $shown raised move"
+    moved="The gateway keeps $current on main (not below $gateway)"
+  else
+    note "main reads $current, below $gateway: the gateway and its mirrors move to $gateway"
+    moved="The gateway reads $gateway on main"
+  fi
+  note "scripts/release/sync_versions.py $source $gateway (every crate and package at least $shown's)"
+  "$PYTHON" "$root/scripts/release/sync_versions.py" "$source" "$gateway" || die "sync_versions.py failed: the version files of $topic are not moved"
+  refresh_lock
+  if git diff --quiet && git diff --cached --quiet; then
+    back_to "$start_branch" "$start"
+    git branch --quiet -D "$topic" || die "cannot delete $topic (nothing to move)"
+    return 1
+  fi
+  body=$(mktemp) || die "cannot make a temporary file for the pull request body of $topic"
+  {
+    say "$intro"
+    say ""
+    say '```'
+    git diff --stat HEAD
+    say '```'
+  } > "$body"
+  commit_all "$subject" \
+    "$moved and every crate and package at least the version $shown carries (crates.io and PyPI never take a version twice). Main's artifacts are not published; the release branches' are." \
+    "$(pr_commands "$topic" main "$subject" "$body")"
+  open_pr "$topic" main "$subject" "$body"
+}
+
 cmd_bump_main() {
   local version=${1:-}
   [ -n "$version" ] || die "usage: release.sh bump-main <version>"
   version_ok "$version" || die "not a version: '$version' (X.Y.Z or X.Y.Z-rc.N)"
   is_final "$version" || die "main follows a final release (X.Y.Z), not a candidate"
-  local release source topic body current moved start start_branch
+  local release source topic next
   release=$(release_of "$version")
   require_identity; require_clean; fetch
   if has_ref "refs/tags/v$version"; then
@@ -550,39 +646,14 @@ cmd_bump_main() {
   fi
   topic="chore/main-versions-$version"
   has_ref "refs/heads/$topic" && die "the branch $topic exists: delete it or finish it"
-  start_branch=$(git branch --show-current); start=${start_branch:-$(git rev-parse HEAD)}
-  git switch --quiet --no-track -c "$topic" "$REMOTE/main"
-  current=$(manifest_version "$REMOTE/main")
-  # Main never goes back: after a patch of an older line (v1.14.1 once v1.15.0 is out), the gateway and its mirrors
-  # keep main's higher version (the nightly and the next cut derive from it) and only the crates and packages the
-  # patch raised move, as sync_versions.py moves them: to at least the release's, never lower.
-  if version_above "$current" "$version"; then
-    note "bump-main: main reads $current, above $version: the gateway keeps it; the crates and packages v$version raised move"
-    moved="The gateway keeps $current on main (above v$version)"
-  else
-    note "bump-main: make bump-version VERSION=$version"
-    "$MAKE" --no-print-directory -C "$root" bump-version "VERSION=$version" >/dev/null
-    moved="The gateway reads $version on main"
-  fi
-  note "bump-main: scripts/release/sync_versions.py $source $version (every crate and package at least the release's)"
-  "$PYTHON" "$root/scripts/release/sync_versions.py" "$source" "$version"
-  refresh_lock
-  if git diff --quiet && git diff --cached --quiet; then
-    if [ -n "$start_branch" ]; then git switch --quiet "$start_branch"; else git switch --quiet --detach "$start"; fi
-    git branch --quiet -D "$topic"
-    die "bump-main: main carries v$version's versions already (the gateway at $current, every crate and package at least the release's): nothing to move"
-  fi
-  commit_all "chore(release): main's versions follow v$version" \
-    "$moved and every crate and package at least the version released from release/$release (crates.io and PyPI never take a version twice). Main's artifacts are not published; the release branches' are."
-  body=$(mktemp)
-  {
-    say "After the v$version release: main's version files follow the release (\`$source\`), so the next cut starts above what crates.io and PyPI already carry."
-    say ""
-    say '```'
-    git show --stat --oneline HEAD | sed -n '2,$p'
-    say '```'
-  } > "$body"
-  open_pr "$topic" main "chore(release): main's versions follow v$version" "$body"
+  # The cut of this line moved main to its next development version already (the trunk is next): the gateway keeps
+  # it, and the crates and packages the release raised since the cut (its candidates' and final's bumps) move to at
+  # least the release's. A main that still reads below the release (a line cut before the rule, a move not merged)
+  # takes that development version here.
+  next=$(next_dev_version "$version")
+  move_main "$topic" "$next" "$source" "chore(release): main's versions follow v$version" \
+    "After the v$version release: main's crates and packages follow the release (\`$source\`), so the next cut starts above what crates.io and PyPI already carry; the gateway keeps its development version (the trunk is next), or moves to \`$next\` when main read below the release." \
+    || die "bump-main: main carries v$version's versions already (the gateway at $(manifest_version "$REMOTE/main"), every crate and package at least the release's): nothing to move"
 }
 
 pep440() { # 1.14.0-rc.1 -> 1.14.0rc1, the spelling PyPI shows

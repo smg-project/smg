@@ -58,7 +58,16 @@ case "$1 $2" in
       if [ "${!i}" = "--body-file" ]; then j=$((i + 1)); cp "${!j}" "$GH_STUB_LOG.body"; fi
     done
     echo "https://example.invalid/pull/1" ;;
-  "pr list") echo "#7  fix(router): y  pick/1.14-0000000" ;;
+  "pr list")
+    [ -z "${GH_STUB_LIST_ERROR-}" ] || { echo "gh: $GH_STUB_LIST_ERROR" >&2; exit 1; }
+    case " $* " in
+      *" --head "*) # the cut's precondition: the open pull requests on a head (--json number --jq .[].number)
+        for ((i = 1; i <= $#; i++)); do
+          if [ "${!i}" = "--head" ]; then j=$((i + 1)); head=${!j}; fi
+        done
+        case " ${GH_STUB_OPEN_HEADS-} " in *" $head "*) echo 8 ;; esac ;;
+      *) echo "#7  fix(router): y  pick/1.14-0000000" ;;
+    esac ;;
   "repo view") echo "example/repo" ;;
   "api --paginate")
     [ -z "${GH_STUB_API_ERROR-}" ] || api_error "$GH_STUB_API_ERROR" "${GH_STUB_API_STATUS:-422}"
@@ -458,12 +467,228 @@ def test_cut_refusals(repo: Sandbox) -> None:
 def test_cut_refreshes_the_lock_file_through_cargo(repo: Sandbox) -> None:
     repo.commit_main("chore: a lock file", "Cargo.lock", "# lock\n")
     repo.tool("cut", "1.14.0-rc.1")
-    assert repo.cargo_log.read_text().splitlines() == ["cargo update --workspace --offline"]
+    assert repo.cargo_log.read_text().splitlines() == ["cargo update --workspace --offline"] * 2, (
+        "the branch's bump and main's move each refresh the lock"
+    )
     (repo.bin / "cargo").unlink()
     repo.git("switch", "--quiet", "main")
     repo.git("branch", "--quiet", "-D", "release/1.14")
+    repo.git("branch", "--quiet", "-D", "chore/main-versions-1.15.0-dev")
     done = repo.tool("cut", "1.14.0-rc.1", check=False)
     assert done.returncode == 1 and "Cargo.lock needs a refresh" in done.stderr
+
+
+def land_main_move(repo: Sandbox, dev: str) -> None:
+    """The pull request a cut opened to move main 'merges': origin's main moves to the topic; the clone follows."""
+    repo.git("push", "--quiet", "origin", f"refs/heads/chore/main-versions-{dev}:refs/heads/main")
+    repo.git("switch", "--quiet", "main")
+    repo.git("pull", "--quiet", "--ff-only", "origin", "main")
+
+
+def test_cut_moves_main_to_the_next_development_version_by_a_pull_request(repo: Sandbox) -> None:
+    """The trunk is next: the cut leaves the release branch behind and, with PUSH=1, pushes the topic that moves main
+    above it and opens its pull request. main itself moves by that pull request alone."""
+    main_head = repo.git("rev-parse", "origin/main")
+    done = repo.tool("cut", "1.14.0-rc.1", PUSH="1")
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "main"
+    topic = "chore/main-versions-1.15.0-dev"
+    assert repo.origin_ref(f"refs/heads/{topic}") == repo.git("rev-parse", topic)
+    assert repo.origin_ref("refs/heads/main") == main_head, "main moves by its pull request only"
+    assert repo.git("rev-parse", f"{topic}~1") == main_head
+    for path in VERSION_FILES:
+        assert repo.version_of(path, topic) == "1.15.0-dev", path
+        assert repo.version_of(path, "release/1.14") == "1.14.0-rc.1", path
+        assert repo.version_of(path) == "1.13.0", f"{path}: the checkout's main is untouched"
+    assert repo.version_of("crates/tool_parser/Cargo.toml", topic) == "0.6.0", "the branch's number"
+    assert 'tool-parser = { version = "0.6.0"' in repo.read("Cargo.toml", topic)
+    message = repo.git("log", "-1", "--format=%B", topic)
+    assert message.startswith("chore(release): main reads 1.15.0-dev, above release/1.14\n")
+    assert (
+        "The gateway reads 1.15.0-dev on main and every crate and package at least the version"
+        " release/1.14 carries" in message
+    )
+    assert "Signed-off-by: Release Owner <owner@example.invalid>" in message
+    assert repo.gh_calls()[-1].startswith(
+        f"gh pr create --base main --head {topic}"
+        " --title chore(release): main reads 1.15.0-dev, above release/1.14"
+    )
+    body = repo.pr_body()
+    assert "`release/1.14` is cut at" in body
+    assert "reads 1.14.0-rc.1; main moves above it the same moment" in body
+    assert "1.15.0.dev0 once Python tooling normalizes it" in body
+    assert (
+        "cut: main moves above release/1.14: the gateway and its mirrors to 1.15.0-dev"
+        in done.stderr
+    )
+    # the checker reads the moved main as consistent against the previous final
+    repo.git("switch", "--quiet", topic)
+    checked = subprocess.run(
+        [sys.executable, "scripts/check_release_versions.py", "--check", "v1.13.0"],
+        cwd=repo.work,
+        env=repo.env(),
+        capture_output=True,
+        text=True,
+    )
+    assert checked.returncode == 0, checked.stdout
+
+
+def test_cut_without_push_leaves_the_move_local_and_prints_its_commands(repo: Sandbox) -> None:
+    done = repo.tool("cut", "1.14.0-rc.1")
+    topic = "chore/main-versions-1.15.0-dev"
+    assert repo.origin_ref("refs/heads/release/1.14") is None
+    assert repo.origin_ref(f"refs/heads/{topic}") is None, "the move follows the cut's switch"
+    assert repo.gh_calls() == [], "no pull request without the push"
+    assert repo.version_of("model_gateway/Cargo.toml", topic) == "1.15.0-dev"
+    assert "git push origin refs/heads/release/1.14:refs/heads/release/1.14" in done.stdout
+    assert f"git push -u origin refs/heads/{topic}:refs/heads/{topic}" in done.stdout
+    assert f"gh pr create --base main --head {topic}" in done.stdout
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "main"
+
+
+def test_cut_refuses_when_the_move_topic_exists(repo: Sandbox) -> None:
+    repo.git("branch", "--quiet", "chore/main-versions-1.15.0-dev", "origin/main")
+    refused = repo.tool("cut", "1.14.0-rc.1", check=False)
+    assert refused.returncode == 1
+    assert "the branch chore/main-versions-1.15.0-dev exists" in refused.stderr
+    assert repo.git("branch", "--list", "release/1.14") == "", "nothing was cut"
+
+
+def nothing_was_cut(repo: Sandbox) -> None:
+    """A refusal before anything is made: no release branch here or on the origin, the clone on main and clean,
+    no pull request opened."""
+    assert repo.git("branch", "--list", "release/1.14") == ""
+    assert repo.origin_ref("refs/heads/release/1.14") is None
+    assert repo.git("branch", "--show-current") == "main"
+    assert repo.git("status", "--porcelain", "--untracked-files=no") == ""
+    assert not any(call.startswith("gh pr create") for call in repo.gh_calls())
+
+
+def test_cut_refuses_when_the_move_topic_exists_on_the_remote(repo: Sandbox) -> None:
+    """The local check alone would let a cut push `release/<x.y>` and fail at the topic's push after it."""
+    topic = "chore/main-versions-1.15.0-dev"
+    repo.git("push", "--quiet", "origin", f"origin/main:refs/heads/{topic}")
+    for env in ({}, {"PUSH": "1"}):
+        refused = repo.tool("cut", "1.14.0-rc.1", check=False, **env)
+        assert refused.returncode == 1, env
+        assert f"the branch {topic} exists on origin" in refused.stderr, env
+        nothing_was_cut(repo)
+
+
+def test_a_pushing_cut_refuses_without_gh_before_the_branch_is_pushed(repo: Sandbox) -> None:
+    """With PUSH=1 the release branch is pushed before main's move: what the move's pull request needs is
+    checked first, not by open_pr once the branch is live."""
+    refused = repo.tool("cut", "1.14.0-rc.1", PUSH="1", GH="gh-missing", check=False)
+    assert refused.returncode == 1
+    assert "'gh-missing' is not installed and PUSH=1 opens the pull request" in refused.stderr
+    nothing_was_cut(repo)
+
+
+def test_a_pushing_cut_shows_ghs_own_error_when_the_pull_request_read_fails(repo: Sandbox) -> None:
+    """The read runs before anything is made, so gh's own stderr is the useful text: it is not swallowed."""
+    refused = repo.tool(
+        "cut",
+        "1.14.0-rc.1",
+        PUSH="1",
+        GH_STUB_LIST_ERROR="could not determine base repo: more than one remote",
+        check=False,
+    )
+    assert refused.returncode == 1
+    assert "gh: could not determine base repo: more than one remote" in refused.stderr
+    assert "gh pr list failed (its message is above)" in refused.stderr
+    assert refused.stderr.index("gh: could not determine") < refused.stderr.index(
+        "gh pr list failed"
+    )
+    nothing_was_cut(repo)
+
+
+def test_a_pushing_cut_refuses_an_open_pull_request_on_the_move_topic(repo: Sandbox) -> None:
+    topic = "chore/main-versions-1.15.0-dev"
+    refused = repo.tool("cut", "1.14.0-rc.1", PUSH="1", GH_STUB_OPEN_HEADS=topic, check=False)
+    assert refused.returncode == 1
+    assert f"an open pull request already carries {topic} (#8)" in refused.stderr
+    assert repo.gh_calls() == [
+        f"gh pr list --head {topic} --state open --json number --jq .[].number"
+    ]
+    nothing_was_cut(repo)
+
+
+def test_a_failed_commit_of_the_move_stops_the_cut_and_leaves_main_untouched(repo: Sandbox) -> None:
+    """`move_main` runs under `if !` in the cut and under `|| die` in bump-main, where `set -e` is off: a git step
+    that fails must stop the command itself, or the cut ends 0 with the version edits carried back to the start
+    branch and the move reported as made."""
+    topic = "chore/main-versions-1.15.0-dev"
+    hook = repo.work / ".git" / "hooks" / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f'[ "$(git branch --show-current)" = {topic} ] || exit 0\n'
+        'echo "pre-commit: refused" >&2\n'
+        "exit 1\n"
+    )
+    hook.chmod(0o755)
+    done = repo.tool("cut", "1.14.0-rc.1", PUSH="1", check=False)
+    assert done.returncode == 1
+    assert (
+        "the commit 'chore(release): main reads 1.15.0-dev, above release/1.14' failed:"
+        f" the version edits are staged on {topic}. Once the cause is fixed, commit them and finish by hand:"
+        in done.stderr
+    )
+    # the lines open_pr would have printed with PUSH=0, with the body written before the commit
+    assert f"  git push -u origin refs/heads/{topic}:refs/heads/{topic}\n" in done.stderr
+    body_line = next(line for line in done.stderr.splitlines() if "gh pr create" in line)
+    assert body_line.startswith(f"  gh pr create --base main --head {topic} --title chore")
+    body_file = Path(body_line.split("--body-file ")[1])
+    assert body_file.is_file() and "`release/1.14` is cut at" in body_file.read_text()
+    assert (
+        f"switch back to where you started and delete {topic} (git branch -D {topic})"
+        in done.stderr
+    )
+    assert "nothing to move" not in done.stdout
+    assert repo.origin_ref("refs/heads/release/1.14") == repo.git("rev-parse", "release/1.14"), (
+        "the branch was cut and pushed before the move"
+    )
+    assert repo.origin_ref(f"refs/heads/{topic}") is None, "nothing of the move is pushed"
+    assert repo.gh_calls() == [
+        f"gh pr list --head {topic} --state open --json number --jq .[].number"
+    ], "no pull request is opened"
+    assert repo.git("branch", "--show-current") == topic, "the staged edits stay on the topic"
+    assert repo.git("rev-parse", topic) == repo.git("rev-parse", "origin/main")
+    assert "M  model_gateway/Cargo.toml" in repo.git("status", "--porcelain")
+    assert repo.git("rev-parse", "main") == repo.git("rev-parse", "origin/main"), (
+        "main is untouched"
+    )
+    assert repo.version_of("model_gateway/Cargo.toml", "main") == "1.13.0"
+
+
+def test_a_failed_bump_commit_names_the_finish_lines_and_the_rerun_path(repo: Sandbox) -> None:
+    """The same message serves bump: its topic blocks a rerun through has_ref, so the user is told to finish by
+    hand (the push and the pull request, with the body written before the commit) or to delete it first."""
+    repo.cut()
+    topic = "chore/release-1.14.0-rc.2"
+    hook = repo.work / ".git" / "hooks" / "pre-commit"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f'[ "$(git branch --show-current)" = {topic} ] || exit 0\n'
+        'echo "pre-commit: refused" >&2\n'
+        "exit 1\n"
+    )
+    hook.chmod(0o755)
+    repo.git("switch", "--quiet", "main")
+    before = repo.gh_calls()
+    done = repo.tool("bump", "1.14.0-rc.2", check=False)
+    assert done.returncode == 1
+    assert (
+        "the commit 'chore(release): bump versions for v1.14.0-rc.2' failed:"
+        f" the version edits are staged on {topic}." in done.stderr
+    )
+    assert f"  git push -u origin refs/heads/{topic}:refs/heads/{topic}\n" in done.stderr
+    assert f"  gh pr create --base release/1.14 --head {topic} --title chore" in done.stderr
+    assert (
+        f"delete {topic} (git branch -D {topic}): a rerun is refused while it exists" in done.stderr
+    )
+    assert repo.origin_ref(f"refs/heads/{topic}") is None
+    assert repo.gh_calls() == before, "no pull request for the bump"
+    assert repo.git("branch", "--show-current") == topic
+    assert "M  model_gateway/Cargo.toml" in repo.git("status", "--porcelain")
 
 
 # --- bump ---------------------------------------------------------------------------
@@ -500,7 +725,9 @@ def test_bump_without_push_prints_the_commands(repo: Sandbox) -> None:
         "--title chore\\(release\\):\\ bump\\ versions\\ for\\ v1.14.0 --body-file " in done.stdout
     ), "the printed title is shell-quoted (a bump-main title carries an apostrophe)"
     assert repo.origin_ref("refs/heads/chore/release-1.14.0") is None
-    assert repo.gh_calls() == []
+    assert not [call for call in repo.gh_calls() if "chore/release-1.14.0" in call], (
+        "no pull request without the push (the cut's own, moving main, is the only call)"
+    )
     assert (
         "the four model-provider verifiers ran against this release line's candidate build"
         in repo.read(done.stdout.split("--body-file ")[1].split()[0])
@@ -607,7 +834,9 @@ def test_pick_conflict_stops_with_the_steps_and_pick_pr_finishes(repo: Sandbox) 
     assert "git cherry-pick --continue" in done.stdout
     topic = f"pick/1.14-{four[:7]}"
     assert f"make release-pick-pr RELEASE=1.14 PICK={topic}" in done.stdout
-    assert repo.gh_calls() == [], "no pull request for an unresolved pick"
+    assert not [call for call in repo.gh_calls() if "pick/" in call], (
+        "no pull request for an unresolved pick (the cut's own, moving main, is the only call)"
+    )
     assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == topic
     assert "still in progress" in repo.tool("pick-pr", "1.14", check=False).stderr
     repo.put("model_gateway/src/main.rs", 'fn main() {\n    println!("four");\n}\n')
@@ -816,7 +1045,8 @@ def test_a_patch_bump_compares_against_the_final_not_its_candidate(repo: Sandbox
 
 def test_a_cut_before_the_previous_releases_bump_main_merged_is_refused(repo: Sandbox) -> None:
     """Against the previous final, a crate bumped for that release reads as bumped already: a cut from a main that
-    does not carry the release's versions yet would ship nothing for the crate, and nothing would say so."""
+    does not read above the release yet (the move its cut opened never merged) would ship nothing for the crate,
+    and nothing would say so."""
     finished_release(repo)  # v1.14.0 on its branch; main still reads 1.13.0
     repo.commit_main(
         "fix(tool_parser): after the release (#125)",
@@ -826,8 +1056,8 @@ def test_a_cut_before_the_previous_releases_bump_main_merged_is_refused(repo: Sa
     refused = repo.tool("cut", "1.15.0-rc.1", check=False)
     assert refused.returncode == 1
     assert (
-        "origin/main reads 1.13.0, below 1.14.0: merge the release-bump-main pull request for v1.14.0 first"
-        in refused.stderr
+        "origin/main reads 1.13.0, below 1.14.0: merge the pull request that moves main's versions first"
+        " (release.sh bump-main 1.14.0 opens it)" in refused.stderr
     )
     assert repo.git("branch", "--list", "release/1.15") == "", "nothing was cut"
 
@@ -1365,17 +1595,29 @@ def test_a_branch_the_remote_has_but_this_clone_never_fetched_is_not_read_as_a_r
 # --- bump-main ---------------------------------------------------------------------------------
 
 
-def test_bump_main_moves_mains_versions_to_the_release(repo: Sandbox) -> None:
+def test_bump_main_gives_a_main_still_below_the_release_its_development_version(
+    repo: Sandbox,
+) -> None:
+    """main never merged the move its cut opened and reads 1.13.0 under v1.14.0: bump-main moves the crates the
+    release raised and the gateway to the development version after the release, never to the release itself."""
     finished_release(repo)
     main_head = repo.commit_main("docs: after the release", "README.md", "# smg\n")
-    repo.tool("bump-main", "1.14.0")
+    done = repo.tool("bump-main", "1.14.0")
     assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "chore/main-versions-1.14.0"
     assert repo.git("rev-parse", "HEAD~1") == main_head
+    assert (
+        "main reads 1.13.0, below 1.15.0-dev: the gateway and its mirrors move to 1.15.0-dev"
+        in done.stderr
+    )
     for path in VERSION_FILES:
-        assert repo.version_of(path) == "1.14.0", path
+        assert repo.version_of(path) == "1.15.0-dev", path
     assert repo.version_of("crates/tool_parser/Cargo.toml") == "0.6.0"
     assert 'tool-parser = { version = "0.6.0"' in repo.read("Cargo.toml")
     assert repo.git("log", "-1", "--format=%s") == "chore(release): main's versions follow v1.14.0"
+    assert repo.git("log", "-1", "--format=%b").startswith(
+        "The gateway reads 1.15.0-dev on main and every crate and package at least the version"
+        " v1.14.0 carries"
+    )
     assert repo.gh_calls()[-1].startswith(
         "gh pr create --base main --head chore/main-versions-1.14.0"
         " --title chore(release): main's versions follow v1.14.0"
@@ -1389,9 +1631,10 @@ def test_bump_main_refuses_a_candidate(repo: Sandbox) -> None:
 
 
 def test_bump_main_after_a_patch_of_an_older_line_keeps_mains_higher_version(repo: Sandbox) -> None:
-    """v1.15.0 is out and main follows it; a v1.14.1 patch of the older line releases a tool-parser fix. bump-main for
-    the patch moves that crate alone: main's gateway stays at 1.15.0 (the nightly and the next cut derive from it) and
-    the next cut is accepted against v1.15.0. Run again once merged, it has nothing to move and says so."""
+    """v1.15.0 is out and main reads 1.16.0-dev; a v1.14.1 patch of the older line releases a tool-parser fix.
+    bump-main for the patch moves that crate alone: main's gateway stays at 1.16.0-dev (the nightly and the next cut
+    derive from it) and the next cut is accepted against v1.15.0. Run again once merged, it has nothing to move and
+    says so."""
     repo.cut()  # 1.14.0-rc.1: tool-parser 0.6.0 for the feat on main since v1.13.0
     repo.tool("tag", "1.14.0-rc.1", PUSH="1")
     repo.tool("bump", "1.14.0")
@@ -1408,9 +1651,10 @@ def test_bump_main_after_a_patch_of_an_older_line_keeps_mains_higher_version(rep
     repo.tool("bump", "1.15.0")
     repo.land_on_release("1.15")
     repo.tool("tag", "1.15.0", PUSH="1")
+    # main read 1.15.0-dev, below its own line's final: it takes the development version after it
     repo.tool("bump-main", "1.15.0")
     repo.git("push", "--quiet", "origin", "HEAD:refs/heads/main")
-    assert repo.version_of("model_gateway/Cargo.toml", "origin/main") == "1.15.0"
+    assert repo.version_of("model_gateway/Cargo.toml", "origin/main") == "1.16.0-dev"
     assert repo.version_of("crates/tool_parser/Cargo.toml", "origin/main") == "0.6.0"
     # The patch of the older line: a tool-parser fix picked into release/1.14, bumped there, released as v1.14.1.
     fix = repo.commit_main(
@@ -1425,14 +1669,20 @@ def test_bump_main_after_a_patch_of_an_older_line_keeps_mains_higher_version(rep
     repo.tool("tag", "1.14.1", PUSH="1")
     assert repo.version_of("crates/tool_parser/Cargo.toml", "v1.14.1") == "0.6.1"
     done = repo.tool("bump-main", "1.14.1")
-    assert "main reads 1.15.0, above 1.14.1: the gateway keeps it" in done.stderr
-    assert "the gateway reads 1.15.0, above 1.14.1: it and its mirrors keep that" in done.stdout
+    assert (
+        "main reads 1.16.0-dev, not below 1.15.0-dev: the gateway and its mirrors keep it"
+        in done.stderr
+    )
+    assert (
+        "the gateway reads 1.16.0-dev, above 1.15.0-dev: it and its mirrors keep that"
+        in done.stdout
+    )
     for path in VERSION_FILES:
-        assert repo.version_of(path) == "1.15.0", path
+        assert repo.version_of(path) == "1.16.0-dev", path
     assert repo.version_of("crates/tool_parser/Cargo.toml") == "0.6.1"
     assert 'tool-parser = { version = "0.6.1"' in repo.read("Cargo.toml")
     assert repo.git("log", "-1", "--format=%b").startswith(
-        "The gateway keeps 1.15.0 on main (above v1.14.1)"
+        "The gateway keeps 1.16.0-dev on main (not below 1.15.0-dev)"
     )
     repo.git("push", "--quiet", "origin", "HEAD:refs/heads/main")  # the pull request merges
     repo.git("switch", "--quiet", "main")
@@ -1441,7 +1691,7 @@ def test_bump_main_after_a_patch_of_an_older_line_keeps_mains_higher_version(rep
     assert again.returncode == 1 and "nothing to move" in again.stderr
     assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "main"
     assert repo.git("branch", "--list", "chore/main-versions-1.14.1") == ""
-    repo.cut("1.16.0-rc.1")  # accepted: main reads the previous final's version, v1.15.0's
+    repo.cut("1.16.0-rc.1")  # accepted: main reads 1.16.0-dev, above the previous final v1.15.0
     assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "main"
     for path in VERSION_FILES:
         assert repo.version_of(path, "release/1.16") == "1.16.0-rc.1", path
@@ -1629,6 +1879,109 @@ def test_the_grpc_release_selects_a_package_until_pypi_holds_both_its_files(tmp_
         "proto": "true",
         "servicer": "true",
     }
+
+
+def test_the_rule_end_to_end_the_trunk_is_next(repo: Sandbox) -> None:
+    """cut 1.14 -> main 1.15.0-dev (the move merged) -> the final 1.14.0 with a crate bumped on the branch ->
+    bump-main moves that crate alone and keeps the gateway -> the next cut, from 1.15.0-dev, writes 1.15.0-rc.1 on
+    the branch and 1.16.0-dev on main. The gate's versions item and drift note read a development main as before."""
+    repo.cut()
+    land_main_move(repo, "1.15.0-dev")
+    assert repo.version_of("model_gateway/Cargo.toml", "origin/main") == "1.15.0-dev"
+    repo.tool("tag", "1.14.0-rc.1", PUSH="1")
+    fix = repo.commit_main(
+        "fix(tool_parser): x (#124)", "crates/tool_parser/src/lib.rs", "pub fn x() {}\n"
+    )
+    repo.tool("pick", "1.14", fix)
+    repo.land_on_release()
+    repo.tool("bump", "1.14.0")
+    assert repo.version_of("crates/tool_parser/Cargo.toml") == "0.6.1", (
+        "the branch bumps the picked crate"
+    )
+    repo.land_on_release()
+    repo.tool("tag", "1.14.0", PUSH="1")
+    checked = repo.tool("check", "1.14.0")
+    assert "[ok]   versions: the branch reads 1.14.0" in checked.stdout
+    assert "[note] main: 1 commit(s) on origin/main are not on release/1.14" in checked.stdout, (
+        "the move; the picked fix is excluded"
+    )
+    done = repo.tool("bump-main", "1.14.0")
+    assert (
+        "main reads 1.15.0-dev, not below 1.15.0-dev: the gateway and its mirrors keep it"
+        in done.stderr
+    )
+    for path in VERSION_FILES:
+        assert repo.version_of(path) == "1.15.0-dev", path
+    assert repo.version_of("crates/tool_parser/Cargo.toml") == "0.6.1"
+    assert 'tool-parser = { version = "0.6.1"' in repo.read("Cargo.toml")
+    assert repo.git("log", "-1", "--format=%b").startswith(
+        "The gateway keeps 1.15.0-dev on main (not below 1.15.0-dev)"
+    )
+    repo.git("push", "--quiet", "origin", "HEAD:refs/heads/main")  # the pull request merges
+    repo.git("switch", "--quiet", "main")
+    repo.git("branch", "--quiet", "-D", "chore/main-versions-1.14.0")
+    again = repo.tool("bump-main", "1.14.0", check=False)
+    assert again.returncode == 1 and "nothing to move" in again.stderr
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "main"
+    # the next cut: from 1.15.0-dev, accepted against v1.14.0; the branch reads 1.15.0-rc.1, main moves to 1.16.0-dev
+    repo.commit_main(
+        "fix(router): after (#125)",
+        "model_gateway/src/main.rs",
+        'fn main() {\n    println!("after");\n}\n',
+    )
+    cut = repo.tool("cut", "1.15.0-rc.1", PUSH="1")
+    assert "the versions move from v1.14.0 to 1.15.0-rc.1" in cut.stderr
+    for path in VERSION_FILES:
+        assert repo.version_of(path, "release/1.15") == "1.15.0-rc.1", path
+        assert repo.version_of(path, "chore/main-versions-1.16.0-dev") == "1.16.0-dev", path
+    assert repo.version_of("crates/tool_parser/Cargo.toml", "release/1.15") == "0.6.1", (
+        "nothing of it changed since v1.14.0: it keeps the number v1.14.0 published"
+    )
+
+
+def test_a_cut_is_refused_while_main_reads_the_development_version_of_a_line_already_final(
+    repo: Sandbox,
+) -> None:
+    """1.15.0-dev sorts below 1.15.0, as a pre-release does: once v1.15.0 is out, a main still at 1.15.0-dev (the
+    1.15 cut's move never merged) is below the previous final, and the cut of 1.16 is refused until bump-main 1.15.0
+    moves it to 1.16.0-dev."""
+    repo.cut()
+    land_main_move(repo, "1.15.0-dev")
+    repo.tool("tag", "1.14.0-rc.1", PUSH="1")
+    repo.tool("bump", "1.14.0")
+    repo.land_on_release()
+    repo.tool("tag", "1.14.0", PUSH="1")
+    assert "nothing to move" in repo.tool("bump-main", "1.14.0", check=False).stderr, (
+        "main moved at the cut; the final raised no crate"
+    )
+    repo.commit_main(
+        "fix(router): y (#130)", "model_gateway/src/main.rs", 'fn main() {\n    println!("y");\n}\n'
+    )
+    repo.cut("1.15.0-rc.1")  # main stays 1.15.0-dev: its move (to 1.16.0-dev) is not merged
+    repo.tool("tag", "1.15.0-rc.1", PUSH="1")
+    repo.tool("bump", "1.15.0")
+    repo.land_on_release("1.15")
+    repo.tool("tag", "1.15.0", PUSH="1")
+    refused = repo.tool("cut", "1.16.0-rc.1", check=False)
+    assert refused.returncode == 1
+    assert (
+        "origin/main reads 1.15.0-dev, below 1.15.0: merge the pull request that moves main's versions first"
+        " (release.sh bump-main 1.15.0 opens it)" in refused.stderr
+    )
+    assert repo.git("branch", "--list", "release/1.16") == "", "nothing was cut"
+    done = repo.tool("bump-main", "1.15.0")
+    assert (
+        "main reads 1.15.0-dev, below 1.16.0-dev: the gateway and its mirrors move to 1.16.0-dev"
+        in done.stderr
+    )
+    repo.git("push", "--quiet", "origin", "HEAD:refs/heads/main")
+    repo.git("switch", "--quiet", "main")
+    repo.tool("cut", "1.16.0-rc.1")
+    assert repo.version_of("model_gateway/Cargo.toml", "release/1.16") == "1.16.0-rc.1"
+    assert (
+        repo.version_of("model_gateway/Cargo.toml", "chore/main-versions-1.17.0-dev")
+        == "1.17.0-dev"
+    )
 
 
 def test_sync_versions_never_lowers_a_version_main_already_raised(repo: Sandbox) -> None:
