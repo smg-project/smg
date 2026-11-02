@@ -157,6 +157,7 @@ impl MessagePreparationStage {
             json_schema: json_schema_constraint,
             keeps_special_tokens: preserve_reasoning_special_tokens,
             names: parser_names,
+            prompt_thought,
         } = reading::prepare(
             ctx,
             symphony::Asks::Messages {
@@ -175,6 +176,7 @@ impl MessagePreparationStage {
             "MessagePreparationStage::execute",
         )?;
         ctx.state.parser_names = Some(parser_names);
+        ctx.state.prompt_thought = prompt_thought;
 
         // Derive skip_special_tokens from parser and constraint type:
         // - typed reasoning parsers need their control tokens preserved

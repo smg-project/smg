@@ -143,7 +143,7 @@ pub(crate) use self::{
     },
     names::{
         check_names, keeps_special_tokens, labels_select_nothing, named_table, reasoning_open,
-        set_aside_by_the_registry, table_label_read,
+        set_aside_by_the_registry, table_label_read, PromptReplay,
     },
     reader::{assign_for, engine_finish, finished, Assignment, Delta, Reader},
 };

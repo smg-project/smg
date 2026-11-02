@@ -23,7 +23,9 @@ use crate::{
         grpc::{
             common::stages::helpers::TagForStart,
             context::RequestContext,
-            regular::symphony::{self, Asks, Assignment, AutoRequest, PreparedConstraint},
+            regular::symphony::{
+                self, Asks, Assignment, AutoRequest, PreparedConstraint, PromptReplay,
+            },
             utils::{self, Names},
         },
     },
@@ -47,6 +49,11 @@ pub(crate) struct Prepared {
     /// stores them (`ProcessingState::parser_names`) and request building reads them in
     /// place of a second resolution.
     pub names: Names,
+    /// The table's replay of the rendered prompt, when preparation replayed it for the forced
+    /// call's tag: the stage stores it (`ProcessingState::prompt_thought`) and request building's
+    /// reasoning decision reads it in place of a second replay of the same prompt. `None` when
+    /// the request's thinking switch armed the reasoning and no replay was needed.
+    pub prompt_thought: Option<PromptReplay>,
 }
 
 /// The constraint preparation finds for what the request asks, and whether
@@ -97,17 +104,16 @@ pub(crate) fn prepare(
         .components
         .worker_registry
         .get_by_model(&ctx.input.model_id);
-    let replay = (!switch)
-        .then(|| {
-            symphony::reasoning_open(
-                parser,
-                &names,
-                model,
-                &ctx.components.templates,
-                processed_text,
-            )
-        })
-        .flatten();
+    let prompt_thought = (!switch).then(|| {
+        symphony::reasoning_open(
+            parser,
+            &names,
+            model,
+            &ctx.components.templates,
+            processed_text,
+        )
+    });
+    let replay = prompt_thought.flatten();
     let reasoning = switch || replay.is_some_and(|thought| thought.open);
     // The prompt closed the thought itself and wrote the template's text
     // after it (thinking switched off): the calls' tag owes none of it.
@@ -176,6 +182,7 @@ pub(crate) fn prepare(
         json_schema,
         keeps_special_tokens,
         names: names.labels,
+        prompt_thought,
     })
 }
 
@@ -203,15 +210,23 @@ pub(crate) fn reasoning_decision(
         ctx.tokenizer_arc()
             .is_some_and(|tokenizer| switch(tokenizer.as_ref()))
     };
-    match symphony::reasoning_open(
-        ctx.state.parser.unwrap_or(ParserChoice::Legacy),
-        &ctx.components
-            .parser_resolver
-            .names_for(ctx.state.parser_names.as_ref(), model),
-        model,
-        &ctx.components.templates,
-        processed_text,
-    ) {
+    let parser = ctx.state.parser.unwrap_or(ParserChoice::Legacy);
+    // Preparation's replay of the same prompt stands where a table reads the response: the
+    // names are the request's (`parser_names`), so the table is the same; where the assignment
+    // left the response to the legacy parsers, no table replays.
+    let replay = match (parser, ctx.state.prompt_thought) {
+        (ParserChoice::Symphony, Some(replayed)) => replayed,
+        _ => symphony::reasoning_open(
+            parser,
+            &ctx.components
+                .parser_resolver
+                .names_for(ctx.state.parser_names.as_ref(), model),
+            model,
+            &ctx.components.templates,
+            processed_text,
+        ),
+    };
+    match replay {
         Some(thought) => (thought.or_switch(switch), thought.closed),
         None => (
             utils::rendered_prompt_reasoning_in_prefill(
@@ -371,6 +386,8 @@ mod tests {
     /// A model the registry has a table for, named by no label or flag.
     const MODEL: &str = "Qwen/Qwen3-8B";
     const PROMPT: &str = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n";
+    /// A model the registry has no table for, with no flag naming one: the legacy parsers read it.
+    const NO_TABLE_MODEL: &str = "acme/plain-7b";
 
     /// What [`decide`] said: the state's parser after, the table assigned with the prompt it
     /// replays, and the constraint.
@@ -398,6 +415,70 @@ mod tests {
                 .map(|assignment| (assignment.format.name().to_string(), assignment.prompt)),
             constraint: decided.tool_constraints,
         }
+    }
+
+    /// Request building's reasoning decision reads the replay preparation kept where a table reads
+    /// the response (the same prompt, replayed once per request), replays the prompt itself where
+    /// none was kept, and leaves a kept replay unread under a legacy assignment, where no table
+    /// replays and the legacy parser's reading of the prompt answers. A kept `None` under the
+    /// Symphony choice is the table's own answer that no table reads the model (the Messages
+    /// stage and the chat `auto` tag decide before [`decide`] records the assignment, so the
+    /// choice they see is preparation's): the decision reads it as it reads a fresh replay's
+    /// `None`.
+    #[test]
+    fn the_reasoning_decision_reads_the_replay_preparation_kept() {
+        let chat: Arc<ChatCompletionRequest> = Arc::new(
+            serde_json::from_value(
+                json!({"model": MODEL, "messages": [{"role": "user", "content": "hi"}]}),
+            )
+            .expect("chat request"),
+        );
+        let mut ctx = RequestContext::for_chat(Arc::clone(&chat), None, MODEL.into(), components());
+        ctx.state.parser = Some(ParserChoice::Symphony);
+        // Nothing kept: the decision replays the prompt, which leaves the thought open.
+        assert_eq!(
+            reasoning_decision(&ctx, MODEL, PROMPT, |_| false),
+            (true, false)
+        );
+        // Preparation's replay stands in place of a second one: its answer, not the prompt's.
+        ctx.state.prompt_thought = Some(symphony::reasoning_open(
+            ParserChoice::Symphony,
+            &ctx.components.parser_resolver.names(MODEL),
+            MODEL,
+            &ctx.components.templates,
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        ));
+        assert_eq!(
+            reasoning_decision(&ctx, MODEL, PROMPT, |_| false),
+            (false, true)
+        );
+        // Under a legacy assignment the kept replay is not read: no closed thought is reported.
+        ctx.state.parser = Some(ParserChoice::Legacy);
+        ctx.state.prompt_thought = Some(symphony::reasoning_open(
+            ParserChoice::Symphony,
+            &ctx.components.parser_resolver.names(MODEL),
+            MODEL,
+            &ctx.components.templates,
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        ));
+        assert!(!reasoning_decision(&ctx, MODEL, PROMPT, |_| false).1);
+        // A model no table reads, under the Symphony choice: preparation keeps the table's `None`
+        // and the decision reads it as it would read a fresh replay's.
+        ctx.state.parser = Some(ParserChoice::Symphony);
+        ctx.state.prompt_thought = None;
+        let replayed = reasoning_decision(&ctx, NO_TABLE_MODEL, PROMPT, |_| false);
+        ctx.state.prompt_thought = Some(symphony::reasoning_open(
+            ParserChoice::Symphony,
+            &ctx.components.parser_resolver.names(NO_TABLE_MODEL),
+            NO_TABLE_MODEL,
+            &ctx.components.templates,
+            PROMPT,
+        ));
+        assert_eq!(ctx.state.prompt_thought, Some(None));
+        assert_eq!(
+            reasoning_decision(&ctx, NO_TABLE_MODEL, PROMPT, |_| false),
+            replayed
+        );
     }
 
     /// A chat request and a Messages request that ask the same of the table decide the same,
