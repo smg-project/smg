@@ -17,7 +17,9 @@
 //!    path when they are in NFC) and anything else goes back to `tokenizers`;
 //! 3. each `Split` pre-tokenizer runs as a [`pattern::Pattern`] over `&str`,
 //!    with the same leftmost-first semantics and Unicode tables as the regex
-//!    engine `tokenizers` uses, producing byte ranges instead of strings;
+//!    engine `tokenizers` uses, producing byte ranges instead of strings (a
+//!    chain of three stages of one known shape runs as one scan instead,
+//!    see [`chain`]);
 //! 4. each piece is tokenized behind two tables from piece bytes to ids
 //!    (`short_pieces`): a small per-thread cache of the pieces the thread
 //!    has met, filled on a first sight from the vocabulary's own pieces,
@@ -50,6 +52,7 @@ use thread_local::ThreadLocal;
 use tokenizers::{models::ModelWrapper, Model};
 use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
 
+mod chain;
 mod merge;
 mod pattern;
 mod short_pieces;
@@ -322,6 +325,9 @@ pub(crate) struct NativeEncoder {
     /// Added tokens matched after normalization (`normalized: true`).
     normalized_added: Option<AddedTokens>,
     stages: Vec<Stage>,
+    /// The one-pass matcher of the stages, when they are a chain it covers
+    /// (the stages stay for the cut checks and as the matcher of record).
+    chain: Option<chain::Scanner>,
     alphabet: [char; 256],
     /// The vocabulary's own pieces with their ids, read once the model's word
     /// cache is bounded and consulted by a thread for a piece its own cache
@@ -347,6 +353,7 @@ impl std::fmt::Debug for NativeEncoder {
             .field("stages", &self.stages.len())
             .field("seeded_pieces", &self.seed.len())
             .field("native_merge", &self.merges.is_some())
+            .field("chain", &self.chain.is_some())
             .finish()
     }
 }
@@ -408,11 +415,13 @@ impl NativeEncoder {
                 None
             }
         };
+        let chain = chain::Scanner::recognize(&stages);
         Ok(Self {
             normalizer,
             raw_added: AddedTokens::build(&raw)?,
             normalized_added: AddedTokens::build(&normalized)?,
             stages,
+            chain,
             alphabet: bytes_char(),
             seed: ShortPieceTable::for_entries(0),
             merges,
@@ -856,11 +865,24 @@ impl NativeEncoder {
     ) -> Result<(), Fallback> {
         let mut fallback = None;
         let mut tokenize = |segment: &str, ids: &mut Vec<u32>| {
-            self.pieces(0, segment, &mut |piece| {
+            let mut per_piece = |piece: &str| {
                 if let Err(declined) = self.tokenize_piece(model, piece, mapped, ids) {
                     fallback = Some(declined);
                 }
-            });
+            };
+            match &self.chain {
+                // The chain's pieces come back through the stage walk's leaf,
+                // so that `per_piece` is called from one place only and the
+                // work it carries is compiled into the walk, as it is without
+                // a chain (a second caller left it out of line: measured).
+                Some(chain) => {
+                    let leaf = self.stages.len();
+                    chain.pieces(segment, &mut |piece| {
+                        self.pieces(leaf, piece, &mut per_piece);
+                    });
+                }
+                None => self.pieces(0, segment, &mut per_piece),
+            }
         };
         match *unit {
             Segment::Added(id) => ids.push(id),
