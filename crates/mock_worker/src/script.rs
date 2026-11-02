@@ -599,21 +599,62 @@ impl Store {
 
     /// The answer for `worker`'s next request whose prompt has `key`.
     fn take(&mut self, worker: &str, key: &str) -> Option<Answer> {
-        let queued = self
-            .queues
-            .get_mut(worker)
-            .and_then(VecDeque::pop_front)
-            .or_else(|| self.queues.get_mut(ALL).and_then(VecDeque::pop_front));
-        let answer = queued.or_else(|| self.keyed.get(key).cloned());
-        let counter = if answer.is_some() {
-            &mut self.hits
-        } else if self.active {
-            &mut self.misses
-        } else {
-            return None;
-        };
-        *counter.entry(worker.to_string()).or_insert(0) += 1;
-        answer
+        // One choice never runs short: the queues hold it or the key does.
+        self.take_n(worker, key, 1)
+            .ok()
+            .flatten()
+            .and_then(|mut answers| answers.pop())
+    }
+
+    /// The answers for the `n` choices of `worker`'s next request whose
+    /// prompt has `key`, taken under this one lock: the worker's queue, then
+    /// the shared one, then the keyed answer for the rest. `None` when
+    /// nothing is scripted for the first choice (the request takes the
+    /// worker's other mode, whatever `n`); an `Err` when `n` is above
+    /// [`CHOICES_LIMIT`], or naming the counts when the queues hold some of
+    /// the choices but not all and no keyed answer fills the rest, with the
+    /// queues as they were.
+    fn take_n(&mut self, worker: &str, key: &str, n: usize) -> Result<Option<Vec<Answer>>, String> {
+        let queued = [worker, ALL]
+            .iter()
+            .map(|queue| self.queues.get(*queue).map_or(0, VecDeque::len))
+            .sum::<usize>();
+        let keyed = self.keyed.get(key);
+        if queued == 0 && keyed.is_none() {
+            if self.active {
+                *self.misses.entry(worker.to_string()).or_insert(0) += 1;
+            }
+            return Ok(None);
+        }
+        if n > CHOICES_LIMIT {
+            return Err(format!(
+                "n = {n} choices is above the mock's limit of {CHOICES_LIMIT} per request"
+            ));
+        }
+        if queued < n && keyed.is_none() {
+            return Err(format!(
+                "n = {n} choices need {n} scripted answers for this prompt, {queued} queued"
+            ));
+        }
+        let mut answers = Vec::with_capacity(n);
+        for queue in [worker, ALL] {
+            if let Some(queue) = self.queues.get_mut(queue) {
+                while answers.len() < n {
+                    match queue.pop_front() {
+                        Some(answer) => answers.push(answer),
+                        None => break,
+                    }
+                }
+            }
+        }
+        if let Some(keyed) = keyed {
+            while answers.len() < n {
+                answers.push(keyed.clone());
+            }
+        }
+        *self.hits.entry(worker.to_string()).or_insert(0) +=
+            u64::try_from(answers.len()).unwrap_or(u64::MAX);
+        Ok(Some(answers))
     }
 
     /// Whether `worker` names a worker of the process, or every worker.
@@ -731,16 +772,69 @@ pub fn take_ids(cfg: &Config, worker: &str, prompt_ids: &[u32]) -> Result<Option
     let Some(answer) = take(worker, prompt_ids) else {
         return Ok(None);
     };
+    encode_for_wire(cfg, worker, answer).map(Some)
+}
+
+/// `answer` with its ids for a token wire: a text-only answer encoded with
+/// the worker's tokenizer, any other as it is.
+fn encode_for_wire(cfg: &Config, worker: &str, answer: Answer) -> Result<Answer, String> {
     if !answer.output_ids.is_empty() || answer.output_text.is_none() {
-        return Ok(Some(answer));
+        return Ok(answer);
     }
     tokenizer(cfg)
         .and_then(|tokenizer| answer.encoded_with(tokenizer.as_ref()))
-        .map(Some)
         .map_err(|e| {
             tracing::error!("{worker}: a scripted text cannot go on this wire: {e}");
             format!("the scripted answer cannot go on this wire: {e}")
         })
+}
+
+/// The most choices one request takes scripted answers for: a bound on what
+/// a request's `n` makes the worker hold (a keyed answer is cloned once per
+/// choice), reported like a short script; a request nothing is scripted for
+/// is not bound by it.
+pub const CHOICES_LIMIT: usize = 128;
+
+/// [`take`] for every choice of a request that samples `n` times, under the
+/// store's one lock: one scripted answer per choice, in the order they were
+/// enqueued (the worker's queue, then the shared one), the answer keyed by
+/// the prompt for the rest. `None` when nothing is scripted for the first
+/// choice: the request takes the worker's other mode, as a request for one
+/// choice does, whatever `n`. An `Err` when `n` is above [`CHOICES_LIMIT`],
+/// or when the queues hold some of the choices but not all and no keyed
+/// answer fills the rest, the queues left as they were either way: a test
+/// learns what it stated instead of reading a canned choice.
+pub fn take_per_choice(
+    worker: &str,
+    prompt_ids: &[u32],
+    n: usize,
+) -> Result<Option<Vec<Answer>>, String> {
+    if !active() {
+        return Ok(None);
+    }
+    let key = script_key(prompt_ids);
+    store().take_n(worker, &key, n.max(1)).map_err(|why| {
+        tracing::error!("{worker}: {why}");
+        why
+    })
+}
+
+/// [`take_per_choice`] with the text-only answers encoded for a token wire
+/// (outside the lock), as [`take_ids`] encodes one.
+pub fn take_ids_per_choice(
+    cfg: &Config,
+    worker: &str,
+    prompt_ids: &[u32],
+    n: usize,
+) -> Result<Option<Vec<Answer>>, String> {
+    let Some(answers) = take_per_choice(worker, prompt_ids, n)? else {
+        return Ok(None);
+    };
+    answers
+        .into_iter()
+        .map(|answer| encode_for_wire(cfg, worker, answer))
+        .collect::<Result<Vec<Answer>, String>>()
+        .map(Some)
 }
 
 /// Load a `--script` file: one answer per line, each with a `key` or its

@@ -339,20 +339,27 @@ impl TokenSpeedScheduler for MockScheduler {
             .as_ref()
             .map(|tokenized| tokenized.input_ids.as_slice())
             .unwrap_or(&[]);
-        let scripted = script::take_ids(&self.cfg, &self.name, prompt_ids)
+        // One scripted answer per choice the request samples (`n`).
+        let choices = req
+            .sampling_params
+            .as_ref()
+            .map_or(1, |params| usize::try_from(params.n).unwrap_or(usize::MAX));
+        let scripted = script::take_ids_per_choice(&self.cfg, &self.name, prompt_ids, choices)
             .map_err(Status::failed_precondition)?;
-        if let Some(answer) = scripted {
-            // The request's limit ends the answer as it would an engine's.
-            let answer = answer.cut_to(
-                req.sampling_params
-                    .as_ref()
-                    .and_then(|params| params.max_new_tokens),
-            );
-            let prompt_tokens = answer.prompt_tokens(prompt_ids.len());
+        if let Some(answers) = scripted {
+            // The request's limit ends each answer as it would an engine's.
+            let limit = req
+                .sampling_params
+                .as_ref()
+                .and_then(|params| params.max_new_tokens);
+            let answers = answers
+                .into_iter()
+                .map(|answer| answer.cut_to(limit))
+                .collect();
             let stream = scripted_stream(
-                answer,
+                answers,
                 req.request_id.clone(),
-                prompt_tokens,
+                prompt_ids.len(),
                 req.stream,
                 req.return_logprob,
                 usize::try_from(req.top_logprobs_num).unwrap_or(0),
@@ -1019,57 +1026,71 @@ fn generate_stream(
     }))
 }
 
-/// The generate stream of a scripted answer: a `Chunk` per frame when the
-/// request streams, then the `Complete`, with the answer's pause before every
-/// frame but the first; the logprobs ride along when the request asked for
-/// them, with the request's `top_logprobs_num` alternatives per token. A
-/// `Complete` that follows no chunk is what a non-streaming request reads, as
-/// it reads the engine's.
+/// The generate stream of the scripted answers of a request, one per choice
+/// in order: a `Chunk` per frame when the request streams, then the choice's
+/// `Complete` with its index, with the answer's pause before every frame but
+/// the first; the logprobs ride along when the request asked for them, with
+/// the request's `top_logprobs_num` alternatives per token. The `Complete`s
+/// that follow no chunk are what a non-streaming request reads, as it reads
+/// the engine's.
 fn scripted_stream(
-    answer: Answer,
+    answers: Vec<Answer>,
     request_id: String,
-    prompt_tokens: u32,
+    prompt_len: usize,
     stream_chunks: bool,
     return_logprob: bool,
     top_logprobs: usize,
     weight_version: Option<String>,
 ) -> GenStream {
-    struct Scripted {
+    struct Choice {
+        index: u32,
         answer: Answer,
         frames: std::collections::VecDeque<script::Frame>,
+        /// Output tokens sent so far (the chunks' running `completion_tokens`).
+        sent: u32,
+        started: bool,
+    }
+    struct Scripted {
+        choices: std::collections::VecDeque<Choice>,
         request_id: String,
-        prompt_tokens: u32,
+        prompt_len: usize,
         stream_chunks: bool,
         return_logprob: bool,
         top_logprobs: usize,
         weight_version: Option<String>,
-        /// Output tokens sent so far (the chunks' running `completion_tokens`).
-        sent: u32,
-        started: bool,
-        done: bool,
     }
-    let frames = answer.token_frames().into();
+    let choices = answers
+        .into_iter()
+        .enumerate()
+        .map(|(index, answer)| Choice {
+            index: u32::try_from(index).unwrap_or(u32::MAX),
+            frames: answer.token_frames().into(),
+            answer,
+            sent: 0,
+            started: false,
+        })
+        .collect();
     let init = Scripted {
-        answer,
-        frames,
+        choices,
         request_id,
-        prompt_tokens,
+        prompt_len,
         stream_chunks,
         return_logprob,
         top_logprobs,
         weight_version,
-        sent: 0,
-        started: false,
-        done: false,
     };
     Box::pin(stream::unfold(init, |mut st| async move {
         loop {
-            if st.done {
-                return None;
-            }
-            let Some(frame) = st.frames.pop_front() else {
-                st.done = true;
-                let answer = &st.answer;
+            if st
+                .choices
+                .front()
+                .is_some_and(|choice| choice.frames.is_empty())
+            {
+                // Every frame of the choice went out: its `Complete`, then
+                // the next choice from its first frame.
+                let choice = st.choices.pop_front()?;
+                let answer = &choice.answer;
+                let prompt_tokens = answer.prompt_tokens(st.prompt_len);
                 let output_logprobs = answer
                     .logprobs
                     .as_ref()
@@ -1098,23 +1119,25 @@ fn scripted_stream(
                     response: Some(GenResp::Complete(ts::GenerateComplete {
                         output_ids: answer.output_ids.clone(),
                         finish_reason: answer.finish_reason.clone(),
-                        prompt_tokens: st.prompt_tokens,
+                        prompt_tokens,
                         completion_tokens: answer.completion_tokens(),
                         cached_tokens: answer.cached_tokens,
                         output_logprobs,
                         matched_stop,
-                        index: 0,
+                        index: choice.index,
                         weight_version: st.weight_version.clone(),
                         ..Default::default()
                     })),
                 };
                 return Some((Ok(complete), st));
-            };
-            if st.started && !st.answer.delay.is_zero() {
-                tokio::time::sleep(st.answer.delay).await;
             }
-            st.started = true;
-            st.sent += u32::try_from(frame.ids.len()).unwrap_or(u32::MAX);
+            let choice = st.choices.front_mut()?;
+            let frame = choice.frames.pop_front()?;
+            if choice.started && !choice.answer.delay.is_zero() {
+                tokio::time::sleep(choice.answer.delay).await;
+            }
+            choice.started = true;
+            choice.sent += u32::try_from(frame.ids.len()).unwrap_or(u32::MAX);
             if !st.stream_chunks {
                 continue;
             }
@@ -1122,7 +1145,7 @@ fn scripted_stream(
                 .then(|| ts::OutputLogProbs {
                     token_logprobs: frame.logprobs.clone(),
                     token_ids: frame.ids.clone(),
-                    top_logprobs: top_logprobs_wire(st.answer.top_logprobs(
+                    top_logprobs: top_logprobs_wire(choice.answer.top_logprobs(
                         &frame.ids,
                         &frame.logprobs,
                         st.top_logprobs,
@@ -1132,11 +1155,11 @@ fn scripted_stream(
                 request_id: st.request_id.clone(),
                 response: Some(GenResp::Chunk(ts::GenerateStreamChunk {
                     token_ids: frame.ids,
-                    prompt_tokens: st.prompt_tokens,
-                    completion_tokens: st.sent,
-                    cached_tokens: st.answer.cached_tokens,
+                    prompt_tokens: choice.answer.prompt_tokens(st.prompt_len),
+                    completion_tokens: choice.sent,
+                    cached_tokens: choice.answer.cached_tokens,
                     output_logprobs,
-                    index: 0,
+                    index: choice.index,
                     weight_version: st.weight_version.clone(),
                 })),
             };
