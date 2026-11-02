@@ -176,3 +176,26 @@ def test_nonzero_reported_rate_cannot_be_silently_discarded(summary, tmp_path):
     assert not run.is_error_free
     assert "disagrees" in run.error_note
     assert "Reported error_rate disagrees" in summary.generate_summary(tmp_path).markdown
+
+
+def test_completed_count_above_attempted_is_a_conflict(summary, tmp_path):
+    exp = experiment(summary, tmp_path, {"num_requests": 100, "num_completed_requests": 120})
+    run = exp.runs[0]
+    assert run.error_rate is None
+    assert not run.is_error_free
+    assert run.error_note == "Request/error counts disagree"
+
+
+@pytest.mark.parametrize(
+    "agg,field",
+    [
+        ({"num_requests": -1}, "num_requests"),
+        ({"num_error_requests": True}, "num_error_requests"),
+        ({"num_completed_requests": "1"}, "num_completed_requests"),
+        ({"error_codes_frequency": {"503": -1}}, "error_codes_frequency[503]"),
+    ],
+)
+def test_invalid_count_diagnostics_name_the_field(summary, tmp_path, agg, field):
+    run = experiment(summary, tmp_path, agg).runs[0]
+    assert run.error_rate is None
+    assert run.error_note == f"Invalid error metrics: {field}: expected a nonnegative integer"

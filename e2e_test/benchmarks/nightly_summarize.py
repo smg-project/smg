@@ -239,15 +239,15 @@ def _error_metrics(data: dict) -> tuple[float | None, str]:
     errors = []
     totals = []
 
-    def count(value):
+    def count(field, value):
         if type(value) is not int or value < 0:
-            raise ValueError("expected a nonnegative integer")
+            raise ValueError(f"{field}: expected a nonnegative integer")
         return value
 
     try:
         for key in ("num_requests", "num_error_requests", "num_completed_requests"):
             if key in agg:
-                counts[key] = count(agg[key])
+                counts[key] = count(key, agg[key])
         if "num_error_requests" in counts:
             errors.append(counts["num_error_requests"])
         if "num_requests" in counts:
@@ -256,7 +256,12 @@ def _error_metrics(data: dict) -> tuple[float | None, str]:
             frequencies = agg["error_codes_frequency"]
             if not isinstance(frequencies, dict):
                 raise ValueError("error_codes_frequency must be an object")
-            errors.append(sum(count(value) for value in frequencies.values()))
+            errors.append(
+                sum(
+                    count(f"error_codes_frequency[{key}]", value)
+                    for key, value in frequencies.items()
+                )
+            )
         if "individual_request_metrics" in data:
             records = data["individual_request_metrics"]
             if not isinstance(records, list) or any(
@@ -275,7 +280,9 @@ def _error_metrics(data: dict) -> tuple[float | None, str]:
         if "num_completed_requests" in counts:
             completed = counts["num_completed_requests"]
             if totals:
-                errors.append(count(totals[0] - completed))
+                if completed > totals[0]:
+                    return None, "Request/error counts disagree"
+                errors.append(totals[0] - completed)
             if errors:
                 totals.append(completed + errors[0])
     except ValueError as exc:
