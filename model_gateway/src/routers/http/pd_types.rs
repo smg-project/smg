@@ -18,6 +18,17 @@ pub fn generate_room_id() -> u64 {
     rand::random::<u64>() & (i64::MAX as u64)
 }
 
+/// Generate a random bootstrap room ID in the same range, congruent to `rank`
+/// modulo `dp_size`: SGLang's prefill side, under its default
+/// `follow_bootstrap_room` placement, fails a request whose
+/// `bootstrap_room % dp_size` is not the rank it runs on. The caller passes
+/// `dp_size > 1` and `rank < dp_size`.
+pub fn generate_room_id_for_rank(rank: usize, dp_size: usize) -> u64 {
+    let dp_size = dp_size as u64;
+    let base = rand::random_range(0..i64::MAX as u64 - dp_size);
+    base - base % dp_size + rank as u64
+}
+
 /// PD-specific routing policies.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PDSelectionPolicy {

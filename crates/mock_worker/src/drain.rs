@@ -1,14 +1,20 @@
 //! The requests in flight across the process, for the shutdown that drains
-//! them.
+//! them, and on each worker, for the load report a gateway polls.
 //!
 //! Every worker flavour enters a request here when it starts serving it and
 //! leaves when the response is complete (or its stream is dropped), so the
 //! termination signal can say how many requests it waits for, and a count that
-//! does not reach zero before the drain deadline is reported as such.
+//! does not reach zero before the drain deadline is reported as such. A worker
+//! that reports loads counts the same requests on its own [`WorkerInFlight`]
+//! as well: one process serves many workers, and each report is that worker's
+//! own work.
 
 use std::{
     pin::Pin,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
 };
 
@@ -22,22 +28,44 @@ pub fn in_flight() -> usize {
     IN_FLIGHT.load(Ordering::Relaxed)
 }
 
+/// The requests in flight on one worker: its share of the process count, what
+/// its load report says while the shutdown drains on [`in_flight`].
+#[derive(Clone, Debug, Default)]
+pub struct WorkerInFlight(Arc<AtomicUsize>);
+
+impl WorkerInFlight {
+    /// The requests this worker is serving right now.
+    pub fn get(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 /// One request in flight: created when a worker starts serving a request and
 /// dropped when its response is complete (or its stream is dropped).
 #[must_use = "a request is in flight only while its guard is alive"]
 pub struct InFlight {
     counter: &'static AtomicUsize,
+    worker: Option<WorkerInFlight>,
 }
 
 impl InFlight {
-    /// Count a request as in flight until the guard is dropped.
+    /// Count a request as in flight in the process until the guard is dropped.
     pub fn enter() -> Self {
-        Self::enter_in(&IN_FLIGHT)
+        Self::enter_in(&IN_FLIGHT, None)
     }
 
-    fn enter_in(counter: &'static AtomicUsize) -> Self {
+    /// Count a request as in flight in the process and on `worker` until the
+    /// guard is dropped.
+    pub fn enter_on(worker: &WorkerInFlight) -> Self {
+        Self::enter_in(&IN_FLIGHT, Some(worker.clone()))
+    }
+
+    fn enter_in(counter: &'static AtomicUsize, worker: Option<WorkerInFlight>) -> Self {
         counter.fetch_add(1, Ordering::Relaxed);
-        Self { counter }
+        if let Some(worker) = &worker {
+            worker.0.fetch_add(1, Ordering::Relaxed);
+        }
+        Self { counter, worker }
     }
 
     /// Keep the request in flight for as long as `stream` lives: the guard
@@ -54,6 +82,9 @@ impl InFlight {
 impl Drop for InFlight {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::Relaxed);
+        if let Some(worker) = &self.worker {
+            worker.0.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -87,8 +118,8 @@ mod tests {
     #[test]
     fn a_guard_counts_until_it_is_dropped() {
         static COUNT: AtomicUsize = AtomicUsize::new(0);
-        let first = InFlight::enter_in(&COUNT);
-        let second = InFlight::enter_in(&COUNT);
+        let first = InFlight::enter_in(&COUNT, None);
+        let second = InFlight::enter_in(&COUNT, None);
         assert_eq!(COUNT.load(Ordering::Relaxed), 2);
         drop(first);
         assert_eq!(COUNT.load(Ordering::Relaxed), 1);
@@ -96,10 +127,25 @@ mod tests {
         assert_eq!(COUNT.load(Ordering::Relaxed), 0);
     }
 
+    #[test]
+    fn a_worker_counts_its_own_requests_beside_the_process() {
+        static COUNT: AtomicUsize = AtomicUsize::new(0);
+        let (a, b) = (WorkerInFlight::default(), WorkerInFlight::default());
+        let on_a = InFlight::enter_in(&COUNT, Some(a.clone()));
+        let on_b = InFlight::enter_in(&COUNT, Some(b.clone()));
+        let on_neither = InFlight::enter_in(&COUNT, None);
+        assert_eq!((COUNT.load(Ordering::Relaxed), a.get(), b.get()), (3, 1, 1));
+        drop(on_a);
+        assert_eq!((COUNT.load(Ordering::Relaxed), a.get(), b.get()), (2, 0, 1));
+        drop(on_b);
+        drop(on_neither);
+        assert_eq!((COUNT.load(Ordering::Relaxed), a.get(), b.get()), (0, 0, 0));
+    }
+
     #[tokio::test]
     async fn a_counted_stream_is_in_flight_until_its_end() {
         static COUNT: AtomicUsize = AtomicUsize::new(0);
-        let mut counted = InFlight::enter_in(&COUNT).until_done(stream::iter([1, 2]));
+        let mut counted = InFlight::enter_in(&COUNT, None).until_done(stream::iter([1, 2]));
         assert_eq!(counted.next().await, Some(1));
         assert_eq!(
             COUNT.load(Ordering::Relaxed),
@@ -120,7 +166,7 @@ mod tests {
     #[tokio::test]
     async fn a_counted_stream_dropped_by_its_reader_leaves_the_count() {
         static COUNT: AtomicUsize = AtomicUsize::new(0);
-        let mut counted = InFlight::enter_in(&COUNT).until_done(stream::pending::<u8>());
+        let mut counted = InFlight::enter_in(&COUNT, None).until_done(stream::pending::<u8>());
         assert_eq!(COUNT.load(Ordering::Relaxed), 1);
         // A reader that gives up mid-stream (the client went away): the
         // request leaves the count with the stream, not at its end.

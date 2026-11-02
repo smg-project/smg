@@ -58,6 +58,7 @@ use crate::{
         otel_trace::inject_trace_context_http,
     },
     policies::{CacheNamespace, PolicyRegistry},
+    rate_limit::RateLimitManager,
     routers::{
         common::{
             attach_sized_body,
@@ -70,13 +71,14 @@ use crate::{
             decisions::{SglangDecisionAdapter, UPSTREAM_ROUTE},
             header_utils, overload,
             placement::{self, CandidateFilter, PlacementFailure, PlacementInputs, RefusalSite},
+            rate_limit_cell::RateLimitCell,
             realtime::{
                 rest::forward_realtime_rest, webrtc, webrtc::handle_realtime_webrtc,
                 ws::handle_realtime_ws, RealtimeLabels, RealtimeRegistry,
             },
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             retry::{
-                is_request_timeout, is_retryable_response, is_retryable_status,
+                is_request_timeout, is_retryable_response, is_retryable_status, mark_non_retryable,
                 request_timeout_response, RetryExecutor,
             },
             sse_rechunk::{NoopObserver, SseRechunker},
@@ -96,6 +98,7 @@ use crate::{
             request_stream::{CappedBodyStream, StreamProgress},
             stream_failure::{cause, head_success_recorded, RelaySource},
             stream_relay::{relay_streaming_body, ChunkMode, Relay},
+            tenant_rate_limit::{self, TenantCharge},
         },
         BodyPolicy, RouterTrait,
     },
@@ -124,6 +127,30 @@ struct StreamRelayMode {
     rechunk: bool,
 }
 
+/// One dispatch attempt of a typed request: the inputs every stage of
+/// `Router::route_typed_request_once` reads. The route builds it once and
+/// every retry attempt reads the same one; the lease, the ledger and the
+/// tried list are the state the attempts share.
+struct TypedAttempt<'a, T> {
+    headers: Option<&'a HeaderMap>,
+    /// The parsed request and its routing derivatives, held until the
+    /// lease's release point.
+    lease: &'a RequestLease<T>,
+    route: &'static str,
+    /// The canonical model id every registry, policy and metrics lookup is
+    /// keyed by.
+    model_id: &'a str,
+    /// The alias the client named, resolved, for the upstream body.
+    canonical_model: Option<&'a str>,
+    is_stream: bool,
+    /// The request's bookkeeping across attempts: breaker charges and the
+    /// workers whose answer was definitive.
+    ledger: &'a AttemptLedger,
+    /// The engines a failed attempt of this request dispatched to; a retry
+    /// re-selects away from them while another available worker is left.
+    tried: &'a parking_lot::Mutex<Vec<String>>,
+}
+
 /// Regular router that uses injected load balancing policies
 pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
@@ -141,6 +168,10 @@ pub struct Router {
     realtime_registry: Arc<RealtimeRegistry>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
+    /// The tenant rate limiter, `None` when it is off. The typed routes that
+    /// take a tenant reservation reserve through it in
+    /// [`Router::route_typed_request`].
+    rate_limit_manager: Option<Arc<RateLimitManager>>,
 }
 
 trait RealtimeRestRequest: serde::Serialize + Clone {
@@ -208,6 +239,7 @@ impl Router {
             realtime_registry: ctx.realtime_registry.clone(),
             webrtc_bind_addr: ctx.webrtc_bind_addr,
             webrtc_stun_server: ctx.webrtc_stun_server.clone(),
+            rate_limit_manager: ctx.rate_limit_manager.clone(),
         })
     }
 
@@ -405,9 +437,16 @@ impl Router {
         )
     }
 
-    pub async fn route_typed_request<T: GenerationRequest + serde::Serialize>(
+    /// Route a typed request to a worker serving `model_id`, retried as the
+    /// model's retry config allows. With `tenant_meta` (the routes that take a
+    /// tenant reservation) and the tenant rate limiter on, the request
+    /// reserves its estimate once, before any dispatch, and the one answer the
+    /// dispatch paths converge on resolves the reservation once
+    /// (`tenant_rate_limit::resolve`).
+    pub(crate) async fn route_typed_request<T: TenantCharge + serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
+        tenant_meta: Option<&TenantRequestMeta>,
         typed_req: T,
         route: &'static str,
         model_id: &str,
@@ -456,6 +495,24 @@ impl Router {
             .as_ref()
             .unwrap_or(&self.retry_config);
 
+        // Reserve once per logical request, before any dispatch: every attempt
+        // below dispatches under this one reservation. A denial is the
+        // request's answer, never retried.
+        let (reservation, denial) = match (&self.rate_limit_manager, tenant_meta) {
+            (Some(manager), Some(tenant_meta)) => {
+                let cell = RateLimitCell::new();
+                let estimate = typed_req.estimated_input_tokens(text.as_deref());
+                match cell.reserve(manager, tenant_meta, model_id, estimate).await {
+                    Ok(()) => (Some((cell, typed_req.samples_per_prompt())), None),
+                    Err(mut denied) => {
+                        mark_non_retryable(&mut denied);
+                        (None, Some(denied))
+                    }
+                }
+            }
+            _ => (None, None),
+        };
+
         // The lease owns the parsed request and its routing derivatives for
         // the dispatch phase; its release point encodes the retry policy.
         let lease = RequestLease::new(
@@ -477,21 +534,23 @@ impl Router {
         // definitive takes no further attempt.
         let ledger = AttemptLedger::default();
 
-        let response = if lease.release_point() == ReleasePoint::AfterDispatch {
+        let attempt = TypedAttempt {
+            headers,
+            lease: &lease,
+            route,
+            model_id,
+            canonical_model: canonical_model.as_deref(),
+            is_stream,
+            ledger: &ledger,
+            tried: &tried,
+        };
+
+        let response = if let Some(denied) = denial {
+            denied
+        } else if lease.release_point() == ReleasePoint::AfterDispatch {
             // Retries disabled: one dispatch; the lease frees the parsed
             // request the moment the upstream bytes are serialized.
-            let res = self
-                .route_typed_request_once(
-                    headers,
-                    &lease,
-                    route,
-                    model_id,
-                    canonical_model.as_deref(),
-                    is_stream,
-                    &ledger,
-                    &tried,
-                )
-                .await;
+            let res = self.route_typed_request_once(&attempt).await;
             Metrics::record_router_upstream_response(
                 metrics_labels::ROUTER_HTTP,
                 res.status().as_u16(),
@@ -510,18 +569,7 @@ impl Router {
                 // for replay until the retry window closes (first
                 // non-retryable response).
                 |_: u32| async {
-                    let res = self
-                        .route_typed_request_once(
-                            headers,
-                            &lease,
-                            route,
-                            model_id,
-                            canonical_model.as_deref(),
-                            is_stream,
-                            &ledger,
-                            &tried,
-                        )
-                        .await;
+                    let res = self.route_typed_request_once(&attempt).await;
 
                     // Need to be outside `route_typed_request_once` because that function has multiple return paths
                     Metrics::record_router_upstream_response(
@@ -551,6 +599,24 @@ impl Router {
             .await
         };
 
+        // The one answer both dispatch paths converge on resolves the
+        // reservation, once: settled, handed to the streamed body, or closed
+        // at the estimate.
+        let response = match &reservation {
+            Some((cell, samples_per_prompt)) => {
+                tenant_rate_limit::resolve(
+                    cell,
+                    route,
+                    *samples_per_prompt,
+                    is_stream,
+                    response,
+                    self.max_payload_size,
+                )
+                .await
+            }
+            None => response,
+        };
+
         if response.status().is_success() {
             let duration = start.elapsed();
             Metrics::record_router_duration(
@@ -576,39 +642,88 @@ impl Router {
         response
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one dispatch attempt takes the request's lease, its route, its attempt ledger and the engines it tried"
-    )]
+    /// One attempt of a typed request as a sequence of named stages: the
+    /// worker, the dispatch-time overload re-check, the adapter, the
+    /// dispatch, the adapter's verdict, the accounting. Every stage reads the
+    /// same `TypedAttempt`; its lease, ledger and tried list carry what the
+    /// next attempt must know.
     async fn route_typed_request_once<T: GenerationRequest + serde::Serialize>(
         &self,
-        headers: Option<&HeaderMap>,
-        lease: &RequestLease<T>,
-        route: &'static str,
-        model_id: &str,
-        canonical_model: Option<&str>,
-        is_stream: bool,
-        ledger: &AttemptLedger,
-        tried: &parking_lot::Mutex<Vec<String>>,
+        attempt: &TypedAttempt<'_, T>,
     ) -> Response {
+        let worker = match self.select_worker_for_attempt(attempt) {
+            Ok(worker) => worker,
+            Err(refusal) => return refusal,
+        };
+
+        // Dispatch-time re-check of the one chosen worker: O(1), and the only
+        // thing that closes the window between selection and dispatch in which
+        // a load report can flip the veto.
+        if let Some(shed) = overload::shed_if_worker_overloaded(
+            worker.as_ref(),
+            attempt.model_id,
+            self.worker_registry.overload_shed_enabled(),
+        ) {
+            return shed;
+        }
+
+        let mut decision_adapter =
+            match Self::decision_adapter_for_attempt(attempt, worker.as_ref()) {
+                Ok(adapter) => adapter,
+                Err(response) => return response,
+            };
+
+        let response = self
+            .dispatch_attempt(attempt, &worker, &mut decision_adapter)
+            .await;
+
+        // A streamed head's success was recorded before its relay task was
+        // spawned (see `forward_worker_response`); the adapter's verdict
+        // below may still turn the answer into a failure, which is recorded.
+        let head_success_recorded = head_success_recorded(&response);
+
+        // Judge the converted result so malformed successes become backend
+        // failures and follow the same outcome accounting and retry policy.
+        let response = if let Some(adapter) = decision_adapter {
+            adapter
+                .convert_response(response, self.max_payload_size)
+                .await
+        } else {
+            response
+        };
+
+        events::RequestReceivedEvent {}.emit();
+
+        self.account_attempt_outcome(attempt, &worker, response, head_success_recorded)
+    }
+
+    /// The worker of one attempt: selected away from the engines the request
+    /// already tried and from those whose answer was definitive, or the
+    /// refusal this router answers when the pool has none to give.
+    fn select_worker_for_attempt<T>(
+        &self,
+        attempt: &TypedAttempt<'_, T>,
+    ) -> Result<Arc<dyn Worker>, Response> {
+        let model_id = attempt.model_id;
+        let ledger = attempt.ledger;
         // A retry never goes back to a worker whose answer was definitive.
         let admits = |worker: &dyn Worker| ledger.admits(worker);
-        let worker = match lease.with_view(|view| {
+        match attempt.lease.with_view(|view| {
             // A retry re-selects away from the engines this request already
             // tried, while another available worker is left to take it.
-            let tried = tried.lock();
+            let tried = attempt.tried.lock();
             self.select_worker_for_model(
                 model_id,
                 view.text,
                 view.tokens,
-                headers,
+                attempt.headers,
                 view.rid_key,
                 view.cache_namespace,
                 Some(&admits),
                 &tried,
             )
         }) {
-            Some(w) => w,
+            Some(worker) => Ok(worker),
             None => {
                 // The verdict is judged from exactly the pool selection drew
                 // from, wildcard model included: that is what makes the shed
@@ -629,27 +744,22 @@ impl Router {
                         "All workers are unavailable (circuit breaker open or unhealthy)",
                     ),
                 };
-                return self.report_refusal("Router::route_typed_request", model_id, refusal);
+                Err(self.report_refusal("Router::route_typed_request", model_id, refusal))
             }
-        };
-
-        // Dispatch-time re-check of the one chosen worker: O(1), and the only
-        // thing that closes the window between selection and dispatch in which
-        // a load report can flip the veto.
-        if let Some(shed) = overload::shed_if_worker_overloaded(
-            worker.as_ref(),
-            model_id,
-            self.worker_registry.overload_shed_enabled(),
-        ) {
-            return shed;
         }
+    }
 
-        // Select the adapter for the chosen worker. Native Decisions workers
-        // keep the original typed serialization path, including extensions.
-        let mut decision_adapter = if route == "/v1/decisions"
+    /// The adapter of a `/v1/decisions` request bound for a worker that does
+    /// not speak the Decisions protocol itself; a worker that does keeps the
+    /// typed serialization path, extensions included.
+    fn decision_adapter_for_attempt<T: serde::Serialize>(
+        attempt: &TypedAttempt<'_, T>,
+        worker: &dyn Worker,
+    ) -> Result<Option<SglangDecisionAdapter>, Response> {
+        if attempt.route == "/v1/decisions"
             && worker.metadata().spec.runtime_type == RuntimeType::Sglang
         {
-            let adapter = lease.with_view(|view| {
+            attempt.lease.with_view(|view| {
                 let request = serde_json::to_value(view.request)
                     .and_then(serde_json::from_value::<DecisionsRequest>)
                     .map_err(|error| {
@@ -659,15 +769,27 @@ impl Router {
                         )
                     })?;
                 SglangDecisionAdapter::new(&request)
+                    .map(Some)
                     .map_err(|message| error::bad_request("unsupported_decisions_request", message))
-            });
-            match adapter {
-                Ok(adapter) => Some(adapter),
-                Err(response) => return response,
-            }
+            })
         } else {
-            None
-        };
+            Ok(None)
+        }
+    }
+
+    /// The attempt's dispatch: the worker's load guard, the request-sent
+    /// event, the trace headers, the relay mode, the serialized body and the
+    /// send through the relay. Once the bytes exist the lease frees the parsed
+    /// request when retries are disabled.
+    async fn dispatch_attempt<T: GenerationRequest + serde::Serialize>(
+        &self,
+        attempt: &TypedAttempt<'_, T>,
+        worker: &Arc<dyn Worker>,
+        decision_adapter: &mut Option<SglangDecisionAdapter>,
+    ) -> Response {
+        let headers = attempt.headers;
+        let lease = attempt.lease;
+        let route = attempt.route;
         let upstream_route = if decision_adapter.is_some() {
             UPSTREAM_ROUTE
         } else {
@@ -691,34 +813,13 @@ impl Router {
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
-        // The profile comes from the model the client asked for, as request
-        // validation selects it, not from the alias-resolved id.
-        let rechunk = is_stream
-            && route == "/v1/chat/completions"
-            && lease.with_view(|view| {
-                view.request.get_model().is_some_and(|model| {
-                    ProviderProfile::for_model(model) == ProviderProfile::Minimax
-                })
-            });
-        let response = match lease.serialize_with(|view| {
-            if let Some(adapter) = &decision_adapter {
-                serialize_request_body(
-                    adapter.request(),
-                    canonical_model,
-                    worker.as_ref(),
-                    raw_body_len,
-                )
-            } else if matches!(route, "/v1/decisions" | "/v1/systemone") {
-                serialize_request_body_preserving_fields(
-                    view.request,
-                    canonical_model,
-                    worker.as_ref(),
-                    raw_body_len,
-                )
-            } else {
-                serialize_request_body(view.request, canonical_model, worker.as_ref(), raw_body_len)
-            }
-        }) {
+        let mode = Self::relay_mode_for_attempt(attempt);
+        match Self::serialize_attempt_body(
+            attempt,
+            decision_adapter.as_ref(),
+            worker.as_ref(),
+            raw_body_len,
+        ) {
             Ok(body) => {
                 // Past this point dispatch needs only the serialized bytes;
                 // the lease frees the parsed request and its routing
@@ -727,44 +828,92 @@ impl Router {
                 if let Some(adapter) = decision_adapter.as_mut() {
                     adapter.release_request();
                 }
-                let mode = StreamRelayMode { is_stream, rechunk };
                 self.send_serialized_request(
                     headers,
                     body,
                     upstream_route,
                     mode,
-                    RelaySource::new(model_id, route, Arc::clone(&worker)),
+                    RelaySource::new(attempt.model_id, route, Arc::clone(worker)),
                     load_guard,
                 )
                 .await
             }
-            Err(RequestBodyError::Serialize(e)) => error::bad_request(
-                "serialization_failed",
-                format!("Failed to serialize request body: {e}"),
-            ),
-            Err(RequestBodyError::Prepare(e)) => error::bad_request(
-                "request_preparation_failed",
-                format!("Failed to prepare request: {e}"),
-            ),
-        };
+            Err(response) => response,
+        }
+    }
 
-        // A streamed head's success was recorded before its relay task was
-        // spawned (see `forward_worker_response`); the adapter's verdict
-        // below may still turn the answer into a failure, which is recorded.
-        let head_success_recorded = head_success_recorded(&response);
+    /// How the attempt's answer is relayed: streamed or buffered, and
+    /// re-chunked to the provider's packet-size contract when the model the
+    /// client asked for has one (the profile follows the requested model, as
+    /// request validation selects it, not the alias-resolved id).
+    fn relay_mode_for_attempt<T: GenerationRequest>(
+        attempt: &TypedAttempt<'_, T>,
+    ) -> StreamRelayMode {
+        let is_stream = attempt.is_stream;
+        let rechunk = is_stream
+            && attempt.route == "/v1/chat/completions"
+            && attempt.lease.with_view(|view| {
+                view.request.get_model().is_some_and(|model| {
+                    ProviderProfile::for_model(model) == ProviderProfile::Minimax
+                })
+            });
+        StreamRelayMode { is_stream, rechunk }
+    }
 
-        // Judge the converted result so malformed successes become backend
-        // failures and follow the same outcome accounting and retry policy.
-        let mut response = if let Some(adapter) = decision_adapter {
-            adapter
-                .convert_response(response, self.max_payload_size)
-                .await
-        } else {
-            response
-        };
+    /// The upstream body of one attempt: the adapter's request when the
+    /// worker takes one, the typed request with its backend fields kept on the
+    /// routes whose extensions have no shared defaults, the typed request
+    /// otherwise; a serialization or preparation failure is the 400 it was.
+    fn serialize_attempt_body<T: serde::Serialize>(
+        attempt: &TypedAttempt<'_, T>,
+        decision_adapter: Option<&SglangDecisionAdapter>,
+        worker: &dyn Worker,
+        raw_body_len: Option<usize>,
+    ) -> Result<Bytes, Response> {
+        let route = attempt.route;
+        let canonical_model = attempt.canonical_model;
+        attempt
+            .lease
+            .serialize_with(|view| {
+                if let Some(adapter) = decision_adapter {
+                    serialize_request_body(adapter.request(), canonical_model, worker, raw_body_len)
+                } else if matches!(route, "/v1/decisions" | "/v1/systemone") {
+                    serialize_request_body_preserving_fields(
+                        view.request,
+                        canonical_model,
+                        worker,
+                        raw_body_len,
+                    )
+                } else {
+                    serialize_request_body(view.request, canonical_model, worker, raw_body_len)
+                }
+            })
+            .map_err(|failure| match failure {
+                RequestBodyError::Serialize(e) => error::bad_request(
+                    "serialization_failed",
+                    format!("Failed to serialize request body: {e}"),
+                ),
+                RequestBodyError::Prepare(e) => error::bad_request(
+                    "request_preparation_failed",
+                    format!("Failed to prepare request: {e}"),
+                ),
+            })
+    }
 
-        events::RequestReceivedEvent {}.emit();
-
+    /// The attempt's answer on the request's ledger: the worker's breaker
+    /// outcome, unless a streamed head already recorded a success that the
+    /// verdict kept; the retry window settled on a definitive answer; the
+    /// engine on the tried list after a replayable failure; the worker error
+    /// metric on a server error.
+    fn account_attempt_outcome<T>(
+        &self,
+        attempt: &TypedAttempt<'_, T>,
+        worker: &Arc<dyn Worker>,
+        mut response: Response,
+        head_success_recorded: bool,
+    ) -> Response {
+        let model_id = attempt.model_id;
+        let ledger = attempt.ledger;
         let status = response.status();
         if !head_success_recorded || !status.is_success() {
             ledger.record_outcome(worker.as_ref(), status.as_u16());
@@ -773,7 +922,7 @@ impl Router {
         // attempt goes to another available worker, or the answer stands.
         ledger.settle(
             &mut response,
-            [&worker],
+            [worker],
             self.worker_registry
                 .get_routing_pool(model_id, RoutingPool::HttpRegular)
                 .iter(),
@@ -781,7 +930,7 @@ impl Router {
         // A replayable failure: the retry re-selects away from this engine
         // while another available worker is left to take the request.
         if is_retryable_response(&response) {
-            let mut tried = tried.lock();
+            let mut tried = attempt.tried.lock();
             if !tried.iter().any(|engine| engine == worker.base_url()) {
                 tried.push(worker.base_url().to_string());
             }
@@ -1966,6 +2115,7 @@ impl Router {
                     .worker_registry
                     .any_model_retry_override_enables_retries(),
             max_buffered_request_bytes: self.max_buffered_request_bytes,
+            tenant_rate_limited: self.rate_limit_manager.is_some(),
         })
     }
 
@@ -2291,23 +2441,24 @@ impl RouterTrait for Router {
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: GenerateRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/generate", model_id)
+        self.route_typed_request(headers, Some(tenant_meta), body, "/generate", model_id)
             .await
     }
 
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
         self.route_typed_request(
             headers,
+            Some(tenant_meta),
             super::chat_for_upstream(body),
             "/v1/chat/completions",
             model_id,
@@ -2318,14 +2469,14 @@ impl RouterTrait for Router {
     async fn route_messages(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: CreateMessageRequest,
         model_id: &str,
     ) -> Response {
         if let Some(refused) = super::refuse_max_tokens_zero(&body) {
             return refused;
         }
-        self.route_typed_request(headers, body, "/v1/messages", model_id)
+        self.route_typed_request(headers, Some(tenant_meta), body, "/v1/messages", model_id)
             .await
     }
 
@@ -2336,29 +2487,35 @@ impl RouterTrait for Router {
         body: CountMessageTokensRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/messages/count_tokens", model_id)
+        self.route_typed_request(headers, None, body, "/v1/messages/count_tokens", model_id)
             .await
     }
 
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: CompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/completions", model_id)
-            .await
+        self.route_typed_request(
+            headers,
+            Some(tenant_meta),
+            body,
+            "/v1/completions",
+            model_id,
+        )
+        .await
     }
 
     async fn route_responses(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/responses", model_id)
+        self.route_typed_request(headers, Some(tenant_meta), body, "/v1/responses", model_id)
             .await
     }
 
@@ -2375,22 +2532,22 @@ impl RouterTrait for Router {
     async fn route_embeddings(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: EmbeddingRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/embeddings", model_id)
+        self.route_typed_request(headers, Some(tenant_meta), body, "/v1/embeddings", model_id)
             .await
     }
 
     async fn route_classify(
         &self,
         headers: Option<&HeaderMap>,
-        _tenant_meta: &TenantRequestMeta,
+        tenant_meta: &TenantRequestMeta,
         body: ClassifyRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/classify", model_id)
+        self.route_typed_request(headers, Some(tenant_meta), body, "/v1/classify", model_id)
             .await
     }
 
@@ -2401,7 +2558,7 @@ impl RouterTrait for Router {
         body: DecisionsRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/decisions", model_id)
+        self.route_typed_request(headers, None, body, "/v1/decisions", model_id)
             .await
     }
 
@@ -2423,7 +2580,7 @@ impl RouterTrait for Router {
         {
             return error::model_not_found(model_id);
         }
-        self.route_typed_request(headers, body, "/v1/systemone", model_id)
+        self.route_typed_request(headers, None, body, "/v1/systemone", model_id)
             .await
     }
 
@@ -2455,7 +2612,7 @@ impl RouterTrait for Router {
         let canonical_model = self.worker_registry.resolve_model_alias(model_id);
         let response_spec = RerankResponseSpec::from(&body);
         let response = self
-            .route_typed_request(headers, body, "/v1/rerank", model_id)
+            .route_typed_request(headers, None, body, "/v1/rerank", model_id)
             .await;
         if response.status().is_success() {
             Self::build_rerank_response(
@@ -2730,6 +2887,7 @@ mod tests {
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
+            rate_limit_manager: None,
         }
     }
 
@@ -3016,6 +3174,7 @@ mod tests {
         let response = router
             .route_typed_request(
                 None,
+                None,
                 DropProbeRequest {
                     text: "unavailable".to_string(),
                     _probe: Arc::new(()),
@@ -3123,12 +3282,14 @@ mod tests {
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
+            rate_limit_manager: None,
         }
     }
 
     async fn generate(router: &Router, text: &str) -> Response {
         router
             .route_typed_request(
+                None,
                 None,
                 DropProbeRequest {
                     text: text.to_string(),
@@ -3619,6 +3780,7 @@ mod tests {
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
+            rate_limit_manager: None,
         }
     }
 
@@ -3831,7 +3993,13 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "text": "hello" })).unwrap();
         assert_eq!(req.model, crate::worker::UNKNOWN_MODEL_ID);
         let response = router
-            .route_typed_request(None, req, "/generate", crate::worker::UNKNOWN_MODEL_ID)
+            .route_typed_request(
+                None,
+                None,
+                req,
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
             .await;
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -4200,7 +4368,13 @@ mod tests {
             _probe: Arc::clone(&probe),
         };
         let response = router
-            .route_typed_request(None, req, "/generate", crate::worker::UNKNOWN_MODEL_ID)
+            .route_typed_request(
+                None,
+                None,
+                req,
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -4303,6 +4477,7 @@ mod tests {
         let typed = router
             .route_typed_request(
                 Some(&headers),
+                None,
                 DropProbeRequest {
                     text: "hello".to_string(),
                     _probe: Arc::new(()),
@@ -4478,7 +4653,13 @@ mod tests {
             _probe: Arc::new(()),
         };
         let response = router
-            .route_typed_request(None, req, "/generate", crate::worker::UNKNOWN_MODEL_ID)
+            .route_typed_request(
+                None,
+                None,
+                req,
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -4694,6 +4875,7 @@ mod tests {
             let response = router
                 .route_typed_request(
                     Some(&headers),
+                    None,
                     DropProbeRequest {
                         text: "pinned".to_string(),
                         _probe: Arc::new(()),
@@ -5035,6 +5217,7 @@ mod tests {
         let response = router
             .route_typed_request(
                 None,
+                None,
                 streaming_chat_request(),
                 "/v1/chat/completions",
                 crate::worker::UNKNOWN_MODEL_ID,
@@ -5162,6 +5345,7 @@ mod tests {
             let response = router
                 .route_typed_request(
                     None,
+                    None,
                     streaming_chat_request(),
                     "/v1/chat/completions",
                     crate::worker::UNKNOWN_MODEL_ID,
@@ -5239,6 +5423,7 @@ mod tests {
         let response = router
             .route_typed_request(
                 None,
+                None,
                 streaming_chat_request(),
                 "/v1/chat/completions",
                 crate::worker::UNKNOWN_MODEL_ID,
@@ -5290,6 +5475,7 @@ mod tests {
         let response = router
             .route_typed_request(
                 None,
+                None,
                 streaming_chat_request(),
                 "/v1/chat/completions",
                 crate::worker::UNKNOWN_MODEL_ID,
@@ -5334,6 +5520,7 @@ mod tests {
 
         let response = router
             .route_typed_request(
+                None,
                 None,
                 request,
                 "/v1/messages",
@@ -5382,6 +5569,7 @@ mod tests {
         let response = router
             .route_typed_request(
                 None,
+                None,
                 streaming_chat_request(),
                 "/v1/chat/completions",
                 crate::worker::UNKNOWN_MODEL_ID,
@@ -5415,6 +5603,7 @@ mod tests {
 
         let response = router
             .route_typed_request(
+                None,
                 None,
                 streaming_chat_request(),
                 "/v1/chat/completions",
@@ -5490,6 +5679,7 @@ mod tests {
                 let response = router
                     .route_typed_request(
                         None,
+                        None,
                         DropProbeRequest {
                             text: "refused".to_string(),
                             _probe: Arc::new(()),
@@ -5535,6 +5725,7 @@ mod tests {
         let handle = recorder.handle();
         let response = metrics::with_local_recorder(&recorder, || {
             runtime.block_on(router.route_typed_request(
+                None,
                 None,
                 DropProbeRequest {
                     text: "refused".to_string(),

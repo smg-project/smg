@@ -23,12 +23,13 @@
 //! last of them, in the state it names, so the turn's earlier block and a tool result's text are
 //! not walked, and the turn is never unopened (the table has no unopened row: V4's would read the
 //! `<｜end▁of▁sentence｜>` after a tool result as one and start the output in the thought).
-//! DeepSeek-V3.2-Speciale ships the identical encoder; DeepSeek-V3.2-Exp, before
-//! it, writes the V3.1 spelling. The gateway's older `deepseek32` parser reads this format, and
-//! the alias takes a deployment that names it to this table. bellwether has no recorded group for
-//! the family yet: the table stands on the turns the encoder renders, each read as the encoder's
-//! own parser reads it in the tests below, and on the probes; the recorded set replays from the
-//! fixture pin once bellwether has it.
+//! DeepSeek-V3.2-Speciale ships the identical encoder; DeepSeek-V3.2-Exp, before it, ships a chat
+//! template in the V3.1 spelling, but the engine renders its architecture through this encoder
+//! and bellwether records it so, and its group reads here too. The gateway's older `deepseek32`
+//! parser reads this format, and the alias takes a deployment that names it to this table. The
+//! table stands on the turns the encoder renders, each read as the encoder's own parser reads it
+//! in the tests below, and on the probes; the recorded sets replay from the fixture pin as
+//! bellwether records them.
 //!
 //! The block's opener is spelled as the encoder's parser spells it: the blank line the encoder
 //! writes before the block and the tag, `\n\n<｜DSML｜function_calls>`, so the blank line leaves

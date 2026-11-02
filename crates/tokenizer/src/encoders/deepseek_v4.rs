@@ -1,6 +1,9 @@
 // Ported from the `encoding/encoding_dsv4.py` shipped with the DeepSeek V4
-// checkpoints (deepseek-ai/DeepSeek-V4-Flash and -Flash-0731 on HF); the two
-// revisions differ only in the reasoning-effort block.
+// checkpoints (deepseek-ai/DeepSeek-V4-Flash and -Flash-0731 on HF). The two
+// revisions differ only in the reasoning-effort block, and the serving engine
+// renders every V4 checkpoint with its own copy of the encoder, which carries
+// the refreshed table: that table is the one here, whatever the checkpoint's
+// own file says (the engine never reads it).
 
 use std::fmt::Write as _;
 
@@ -31,97 +34,44 @@ use crate::{
     traits::RendererCapabilities,
 };
 
-/// Which reasoning-effort prompt revision the checkpoint was trained with.
-///
-/// The 0731 refresh shifted the levels down one: the original's `max` text
-/// became 0731's `high`, and 0731's `max` is a new, stronger prompt. The engine's
-/// port of the encoder renders the refreshed table for every V4 checkpoint,
-/// so it is also what a checkpoint directory without its own encoder gets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum EffortEncoding {
-    /// `DeepSeek-V4-Flash` / `-DSpark` / `-Pro`.
-    #[default]
-    Original,
-    /// `DeepSeek-V4-Flash-0731`.
-    V0731,
-}
+/// Native effort names the engine's copy of the encoder accepts (the keys of
+/// its effort table).
+const NATIVE_EFFORT_VALUES: &[&str] = &["low", "high", "max"];
 
-impl EffortEncoding {
-    /// Native effort names this revision's Python encoder accepts.
-    pub fn valid_native_values(self) -> &'static [&'static str] {
-        match self {
-            Self::Original => &["high", "max"],
-            Self::V0731 => &["low", "high", "max"],
-        }
-    }
+/// What this renderer answers around a render (see [`RendererProfile`]).
+pub(crate) const PROFILE: RendererProfile = RendererProfile {
+    // No opinion on content parts: the (usually absent) template's format.
+    content_format: None,
+    // Thinking defaults ON like the engine's own server: `thinking: false`,
+    // its `enable_thinking` alias or `reasoning_effort: "none"` turns it off.
+    thinking_toggle: ThinkingToggle::DefaultOn,
+    thinking_key_name: ThinkingKeyName::Thinking,
+    native_effort_values: NATIVE_EFFORT_VALUES,
+    // `reasoning_effort` is read as the engine's own server reads it:
+    // `"none"` is chat mode, every other value (`"minimal"` included, which
+    // the engine maps to the low effort) keeps thinking on. Declaring the
+    // off word keeps the gateway's parser arming on that rule.
+    native_effort_off_values: &["none"],
+    // `<｜Assistant｜><think>` ends the prompt when thinking is on.
+    think_in_prefill: true,
+    // The shim reads the engine's `enable_thinking` alias too. The encoder
+    // writes a system message after the first as bare text and the
+    // assistant header after user and developer turns only
+    // (`render_message`), so the gateway renders a system message sent
+    // after the first as a user turn, which the encoder merges into the
+    // turn before it and follows with the header.
+    capabilities: RendererCapabilities {
+        enable_thinking_alias: true,
+        leading_system_only: true,
+        ..RendererProfile::NO_CAPABILITIES
+    },
+    thinking_mode: None,
+};
 
-    /// What this renderer answers around a render under this effort
-    /// encoding (see [`RendererProfile`]).
-    pub(crate) fn profile(self) -> RendererProfile {
-        RendererProfile {
-            // No opinion on content parts: the (usually absent) template's format.
-            content_format: None,
-            // Thinking defaults ON like the engine's own server: `thinking:
-            // false`, its `enable_thinking` alias or `reasoning_effort:
-            // "none"` turns it off.
-            thinking_toggle: ThinkingToggle::DefaultOn,
-            thinking_key_name: ThinkingKeyName::Thinking,
-            native_effort_values: self.valid_native_values(),
-            // `reasoning_effort` is read as the engine's own server reads it:
-            // `"none"` is chat mode, every other value (`"minimal"` included,
-            // which the engine maps to the low effort) keeps thinking on.
-            // Declaring the off word keeps the gateway's parser arming on
-            // that rule.
-            native_effort_off_values: &["none"],
-            // `<｜Assistant｜><think>` ends the prompt when thinking is on.
-            think_in_prefill: true,
-            // The shim reads the engine's `enable_thinking` alias too. The
-            // encoder writes a system message after the first as bare text
-            // and the assistant header after user and developer turns only
-            // (`render_message`), so the gateway renders a system message
-            // sent after the first as a user turn, which the encoder merges
-            // into the turn before it and follows with the header.
-            capabilities: RendererCapabilities {
-                enable_thinking_alias: true,
-                leading_system_only: true,
-                ..RendererProfile::NO_CAPABILITIES
-            },
-            thinking_mode: None,
-        }
-    }
-
-    /// Parse a native effort name against this revision's accepted set.
-    pub fn parse_native(self, value: &str) -> Option<ReasoningEffort> {
-        if !self.valid_native_values().contains(&value) {
-            return None;
-        }
-        match value {
-            "low" => Some(ReasoningEffort::Low),
-            "high" => Some(ReasoningEffort::High),
-            "max" => Some(ReasoningEffort::Max),
-            _ => None,
-        }
-    }
-
-    /// Identify the revision from the checkpoint's own `encoding_dsv4.py`
-    /// source: only the 0731 file contains its new `max` prompt text.
-    pub fn detect_from_encoder_source(source: &str) -> Self {
-        let marker = REASONING_EFFORT_BEYOND_MAXIMUM
-            .split_inclusive('\n')
-            .next()
-            .unwrap_or(REASONING_EFFORT_BEYOND_MAXIMUM);
-        if source.contains(marker.trim_end()) {
-            Self::V0731
-        } else {
-            Self::Original
-        }
-    }
-}
-
-/// Reasoning effort for the V4 prompt prefix.
-///
-/// Union of the levels across both encoding revisions; which values are
-/// accepted and what they render is decided by [`EffortEncoding`].
+/// Reasoning effort for the V4 prompt prefix: the levels of the table the
+/// serving engine's copy of the encoder renders (`low` writes no prefix,
+/// `high` the text the checkpoint's original file reserved for `max`, `max`
+/// the refreshed, stronger one).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningEffort {
     Low,
@@ -138,7 +88,6 @@ pub struct EncodeParams {
     pub add_default_bos_token: bool,
     pub drop_thinking: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
-    pub effort_encoding: EffortEncoding,
 }
 impl Default for EncodeParams {
     fn default() -> Self {
@@ -146,7 +95,6 @@ impl Default for EncodeParams {
             add_default_bos_token: true,
             drop_thinking: true,
             reasoning_effort: None,
-            effort_encoding: EffortEncoding::Original,
         }
     }
 }
@@ -199,7 +147,6 @@ fn render_message(
     thinking_mode: ThinkingMode,
     drop_thinking: bool,
     reasoning_effort: Option<ReasoningEffort>,
-    effort_encoding: EffortEncoding,
 ) -> Result<String, DsEncodingError> {
     if index >= messages.len() {
         return Err(DsEncodingError::IndexOutOfRange {
@@ -216,6 +163,10 @@ fn render_message(
     let tools_raw = msg.get("tools").and_then(|v| v.as_array());
     let response_format = msg.get("response_format");
     let tool_calls_raw = msg.get("tool_calls").and_then(|v| v.as_array());
+    // The gateway's protocol takes the `reasoning` spelling as an alias of
+    // `reasoning_content`, so a history assistant's reasoning renders under
+    // either spelling for every renderer: a superset of the serving engine,
+    // whose copy of this encoder reads `reasoning` alone.
     let reasoning_content = msg
         .get("reasoning_content")
         .and_then(|v| v.as_str())
@@ -226,19 +177,13 @@ fn render_message(
     let tool_calls_owned = tool_calls_raw.map(|tc| tool_calls_from_openai_format(tc));
     let tool_calls = tool_calls_owned.as_deref();
 
-    // Reasoning effort prefix: index 0, thinking mode only.
+    // Reasoning effort prefix: index 0, thinking mode only, the table the
+    // engine's copy of the encoder renders for every V4 checkpoint.
     if index == 0 && thinking_mode == ThinkingMode::Thinking {
-        match (effort_encoding, reasoning_effort) {
-            (EffortEncoding::Original, Some(ReasoningEffort::Max)) => {
-                prompt.push_str(REASONING_EFFORT_ABSOLUTE_MAXIMUM);
-            }
-            (EffortEncoding::V0731, Some(ReasoningEffort::High)) => {
-                prompt.push_str(REASONING_EFFORT_ABSOLUTE_MAXIMUM);
-            }
-            (EffortEncoding::V0731, Some(ReasoningEffort::Max)) => {
-                prompt.push_str(REASONING_EFFORT_BEYOND_MAXIMUM);
-            }
-            _ => {}
+        match reasoning_effort {
+            Some(ReasoningEffort::High) => prompt.push_str(REASONING_EFFORT_ABSOLUTE_MAXIMUM),
+            Some(ReasoningEffort::Max) => prompt.push_str(REASONING_EFFORT_BEYOND_MAXIMUM),
+            None | Some(ReasoningEffort::Low) => {}
         }
     }
 
@@ -578,7 +523,6 @@ pub(crate) fn render_messages(
             thinking_mode,
             effective_drop_thinking,
             params.reasoning_effort,
-            params.effort_encoding,
         )?);
     }
     Ok(prompt)
@@ -621,50 +565,26 @@ mod tests {
     }
 
     #[test]
-    fn original_encoding_only_max_prepends_prefix() {
-        let msgs = [user("Hello")];
-        // `max` emits the prefix immediately after BOS.
-        let params = EncodeParams {
-            reasoning_effort: Some(ReasoningEffort::Max),
-            ..EncodeParams::default()
-        };
-        let out = encode_messages(&msgs, ThinkingMode::Thinking, &params).unwrap();
-        let expected_start = format!("{BOS_TOKEN}{REASONING_EFFORT_ABSOLUTE_MAXIMUM}");
-        assert!(
-            out.starts_with(&expected_start),
-            "expected prompt to start with BOS + the original max prefix, got: {:?}",
-            &out[..120.min(out.len())]
-        );
-        // `high` is accepted but renders nothing in the original encoding.
-        let params_high = EncodeParams {
-            reasoning_effort: Some(ReasoningEffort::High),
-            ..EncodeParams::default()
-        };
-        let out_high = encode_messages(&msgs, ThinkingMode::Thinking, &params_high).unwrap();
-        assert!(!out_high.contains("Reasoning Effort"));
-        // Outside thinking mode the prefix is absent.
-        let out_chat = encode_messages(&msgs, ThinkingMode::Chat, &params).unwrap();
-        assert!(!out_chat.contains("Reasoning Effort"));
-    }
-
-    #[test]
-    fn v0731_encoding_shifts_effort_levels() {
+    fn effort_levels_render_the_engines_table() {
+        // The table the serving engine's copy of the encoder renders for
+        // every V4 checkpoint: `low` and no effort write nothing, `high` the
+        // text the checkpoint's original file reserved for `max`, `max` the
+        // refreshed, stronger one; nothing outside thinking mode.
         let msgs = [user("Hello")];
         for (effort, expected_prefix) in [
             (None, None),
             (Some(ReasoningEffort::Low), None),
             (
                 Some(ReasoningEffort::High),
-                Some("Reasoning Effort: Absolute maximum"),
+                Some(REASONING_EFFORT_ABSOLUTE_MAXIMUM),
             ),
             (
                 Some(ReasoningEffort::Max),
-                Some("Reasoning Effort: Beyond maximum"),
+                Some(REASONING_EFFORT_BEYOND_MAXIMUM),
             ),
         ] {
             let params = EncodeParams {
                 reasoning_effort: effort,
-                effort_encoding: EffortEncoding::V0731,
                 ..EncodeParams::default()
             };
             let out = encode_messages(&msgs, ThinkingMode::Thinking, &params).unwrap();
@@ -676,31 +596,13 @@ mod tests {
                 ),
                 None => assert!(!out.contains("Reasoning Effort"), "effort {effort:?}"),
             }
+            let out_chat = encode_messages(&msgs, ThinkingMode::Chat, &params).unwrap();
+            assert!(
+                !out_chat.contains("Reasoning Effort"),
+                "effort {effort:?} outside thinking mode"
+            );
         }
-    }
-
-    #[test]
-    fn effort_encoding_native_value_sets() {
-        // `low` only exists in the 0731 revision; unknown names parse nowhere.
-        assert_eq!(EffortEncoding::Original.parse_native("low"), None);
-        assert_eq!(
-            EffortEncoding::V0731.parse_native("low"),
-            Some(ReasoningEffort::Low)
-        );
-        assert_eq!(EffortEncoding::V0731.parse_native("medium"), None);
-    }
-
-    #[test]
-    fn effort_encoding_detected_from_encoder_source() {
-        let v0731_src = format!("PROMPTS = {{'max': {REASONING_EFFORT_BEYOND_MAXIMUM:?}}}");
-        assert_eq!(
-            EffortEncoding::detect_from_encoder_source(&v0731_src),
-            EffortEncoding::V0731
-        );
-        assert_eq!(
-            EffortEncoding::detect_from_encoder_source("REASONING_EFFORT_MAX = '...'"),
-            EffortEncoding::Original
-        );
+        assert_eq!(PROFILE.native_effort_values, &["low", "high", "max"]);
     }
 
     #[test]
@@ -823,18 +725,6 @@ mod tests {
         assert_eq!(
             out,
             format!("{BOS_TOKEN}S{USER_SP_TOKEN}TaskEnvA{EOS_TOKEN}{USER_SP_TOKEN}Q2Note")
-        );
-        assert!(
-            EffortEncoding::Original
-                .profile()
-                .capabilities
-                .leading_system_only
-        );
-        assert!(
-            EffortEncoding::V0731
-                .profile()
-                .capabilities
-                .leading_system_only
         );
 
         let as_user_turns = [

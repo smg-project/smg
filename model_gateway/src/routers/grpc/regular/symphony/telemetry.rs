@@ -49,6 +49,17 @@
 //!   finish, the empty arguments of a call without an `arguments` member and the chunking rule's
 //!   stated exception are the crate's contract and are not.
 //!
+//! And what is counted as nothing: a marker of the table kept as text in an output the request
+//! ran past the model's own end (`ignore_eos`, `Assignment::past_the_end`). The stop decoder was
+//! told not to stop at the end-of-turn token, the tokens after it are unconstrained, and a marker
+//! among them is the tail's doing, not a frame the table failed to read. The tally knows the
+//! output, not where the model's end fell in it, so every marker of the table kept as text in
+//! such an output is counted apart (`markers_past_the_end`), the model's own answer included,
+//! and an output the request cut by `max_tokens` before the model reached its end reads the
+//! same way; the output is `clean` unless the table refused bytes, which count and write their
+//! line as in any output, and one `debug` line says how many markers the output kept, so a
+//! benchmark that forces every output past its end reads no parse failure from them.
+//!
 //! And, before any output, what did not reach a table at all:
 //!
 //! - `fallback`: a request Symphony was configured for (the gateway's flag, or the request's
@@ -74,7 +85,9 @@
 //! token bucket allows it, one `warn` line: the only allocations. One counted `unknown_tool` adds
 //! the per-reason counters, the first undeclared name cut to [`NAME_SHOWN`] bytes (one small
 //! allocation, made when the call starts) and, from a bucket of its own, one `warn` line; no
-//! histogram observation, the table having read it whole. A run's text is model output and is
+//! histogram observation, the table having read it whole. A marker kept as text in an output run
+//! past the model's end adds one count to the tally and, where the debug level is on, one
+//! `debug` line at the end; nothing otherwise. A run's text is model output and is
 //! never logged, at any level: `at` and `bytes` locate it in the response for a reader with
 //! access to it; the undeclared name on the `unknown_tool` line is the one exception, an
 //! identifier where a declared name was expected. Suppressed calls are counted and write no line,
@@ -94,7 +107,7 @@ use std::{
 use metrics::{Key, Label, Level, Metadata};
 use parking_lot::Mutex;
 use symphony::{formats::Table, DropReason, Event, FinishReason, MalformedReason};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::names::Fallback;
 
@@ -382,9 +395,27 @@ pub(crate) struct Tally {
     /// stream carries it), or the refused call blocks an output that made no call ended in,
     /// from the first of them's opener to the last refused byte, which every surface carries.
     released: u64,
+    /// The output carries an unconstrained tail after the model's own end
+    /// (`Assignment::past_the_end`): a marker of the table kept as text is counted below, not
+    /// as a run.
+    past_the_end: bool,
+    /// The markers of the table kept as text in such an output (the `MarkerOutOfPlace` events,
+    /// of no bytes), for the debug line.
+    markers_past_the_end: u32,
 }
 
 impl Tally {
+    /// The tally of one output; `past_the_end` says the request ran it past the model's own end
+    /// (`Assignment::past_the_end`), so every marker of the table kept as text in it is counted
+    /// apart and is no run: the whole output, the model's own answer included, since the tally
+    /// does not know where the model's end fell.
+    pub(crate) fn new(past_the_end: bool) -> Self {
+        Self {
+            past_the_end,
+            ..Self::default()
+        }
+    }
+
     /// Accounts for `event`, the next of the output; `first_call_only` says whether the reader
     /// drops the calls after the first, which are then counted as suppressed.
     pub(crate) fn see(&mut self, event: &Event, first_call_only: bool) {
@@ -396,6 +427,17 @@ impl Tally {
             }
             Event::ToolCallArguments { source, .. } | Event::ToolCallEnd { source, .. } => {
                 self.shown += source.text.len() as u64;
+            }
+            // A marker of the table kept as text in an output the request ran past the model's
+            // own end: counted apart, never a run. The guard is per output, not per position: a
+            // marker in the model's own answer before its end is counted here too, as is one in
+            // an output `max_tokens` cut before the model reached its end.
+            Event::Malformed {
+                text,
+                why: MalformedReason::MarkerOutOfPlace,
+            } if self.past_the_end => {
+                self.shown += text.text.len() as u64;
+                self.markers_past_the_end += 1;
             }
             Event::Malformed { text, why } => {
                 self.shown += text.text.len() as u64;
@@ -669,6 +711,19 @@ impl Tally {
                 "Symphony read an output with no text, reasoning or call: whitespace and framing alone, or nothing"
             );
             return;
+        }
+        if self.markers_past_the_end > 0 {
+            debug!(
+                target: "smg::symphony",
+                request_id = who.request_id,
+                choice = who.choice,
+                model = who.model,
+                table,
+                markers = self.markers_past_the_end,
+                finish = self.finish,
+                bytes = self.at,
+                "Symphony kept markers of the table as text in an output the request ran past the model's own end"
+            );
         }
         if malformed == 0 && self.suppressed_calls == 0 {
             return;
@@ -1307,6 +1362,143 @@ mod tests {
             reason_label(MalformedReason::MarkerOutOfPlace),
             "marker_out_of_place"
         );
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_marker_in_an_output_run_past_the_models_end_is_no_run_and_writes_a_debug_line() {
+        // The request ran the output past the model's own end: the two closes the tail wrote
+        // are kept as text like any marker out of place, counted apart from the runs, and the
+        // output is clean. One line says so, at debug.
+        let scrape = rendered(|| {
+            let mut tally = Tally::new(true);
+            tally.see(&Event::Content(Text::uncounted("OK")), false);
+            tally.see(&malformed("", MalformedReason::MarkerOutOfPlace), false);
+            tally.see(&Event::Content(Text::uncounted("</think>OK")), false);
+            tally.see(&malformed("", MalformedReason::MarkerOutOfPlace), false);
+            tally.see(&Event::Content(Text::uncounted("</think>")), false);
+            tally.see(&finished(FinishReason::Length), false);
+            assert_eq!(tally.malformed(), 0);
+            assert_eq!(tally.reasons_seen(), "");
+            assert_eq!(tally.first, None);
+            assert_eq!(tally.markers_past_the_end, 2);
+            assert!(!tally.is_empty());
+            tally.report(
+                "qwen3",
+                Who {
+                    request_id: "req-past-the-end",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+        });
+        let outputs = line_with(&scrape, OUTPUTS, &["table=\"qwen3\"", "outcome=\"clean\""])
+            .expect("the outputs counter");
+        assert!(outputs.ends_with(" 1"), "{outputs}");
+        assert!(
+            line_with(
+                &scrape,
+                OUTPUTS,
+                &["table=\"qwen3\"", "outcome=\"malformed\""]
+            )
+            .is_none_or(|line| line.ends_with(" 0")),
+            "{scrape}"
+        );
+        assert!(!scrape.contains(MALFORMED), "{scrape}");
+        assert!(!scrape.contains(MALFORMED_BYTES), "{scrape}");
+        assert!(!logs_contain("did not read the whole output"));
+        logs_assert(|lines: &[&str]| {
+            let line = lines
+                .iter()
+                .find(|line| line.contains("req-past-the-end"))
+                .ok_or_else(|| "no line for the output".to_string())?;
+            if !line.contains("DEBUG") {
+                return Err(format!("the line is not at debug: {line}"));
+            }
+            for field in [
+                "Symphony kept markers of the table as text in an output the request ran past the model's own end",
+                "markers=2",
+                "finish=\"length\"",
+                "table=\"qwen3\"",
+                "bytes=20",
+                "choice=0",
+            ] {
+                if !line.contains(field) {
+                    return Err(format!("{field} missing from the line: {line}"));
+                }
+            }
+            Ok(())
+        });
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_refused_run_in_an_output_run_past_the_models_end_still_counts_and_warns() {
+        // The tail's marker is counted apart; the region the table gave up on is a run as in
+        // any output: the output is malformed under its reason alone, and the warning stands.
+        let scrape = rendered(|| {
+            let mut tally = Tally::new(true);
+            tally.see(&Event::Content(Text::uncounted("Hello ")), false);
+            tally.see(
+                &malformed("<tool_call>{", MalformedReason::UnterminatedRegion),
+                false,
+            );
+            tally.see(&malformed("", MalformedReason::MarkerOutOfPlace), false);
+            tally.see(&Event::Content(Text::uncounted("</think>")), false);
+            tally.see(&finished(FinishReason::Length), false);
+            assert_eq!(tally.malformed(), 1);
+            assert_eq!(tally.reasons_seen(), "unterminated_region");
+            assert_eq!(tally.markers_past_the_end, 1);
+            tally.report(
+                "qwen3",
+                Who {
+                    request_id: "req-past-the-end-refused",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+        });
+        let outputs = line_with(
+            &scrape,
+            OUTPUTS,
+            &["table=\"qwen3\"", "outcome=\"malformed\""],
+        )
+        .expect("the outputs counter");
+        assert!(outputs.ends_with(" 1"), "{outputs}");
+        let runs = line_with(
+            &scrape,
+            MALFORMED,
+            &["table=\"qwen3\"", "reason=\"unterminated_region\""],
+        )
+        .expect("the reason counter");
+        assert!(runs.ends_with(" 1"), "{runs}");
+        assert!(
+            line_with(
+                &scrape,
+                MALFORMED,
+                &["table=\"qwen3\"", "reason=\"marker_out_of_place\""]
+            )
+            .is_none_or(|line| line.ends_with(" 0")),
+            "{scrape}"
+        );
+        assert!(logs_contain(
+            "Symphony did not read the whole output as content, reasoning and calls"
+        ));
+        assert!(logs_contain("reason=\"unterminated_region\""));
+        assert!(logs_contain("reasons=unterminated_region"));
+        assert!(logs_contain("malformed=1"));
+        assert!(logs_contain("markers=1"));
+    }
+
+    #[test]
+    fn a_tally_not_run_past_the_end_counts_a_marker_as_a_run() {
+        let mut tally = Tally::new(false);
+        tally.see(&Event::Content(Text::uncounted("a")), false);
+        tally.see(&malformed("", MalformedReason::MarkerOutOfPlace), false);
+        tally.see(&Event::Content(Text::uncounted("</think>b")), false);
+        assert_eq!(tally.malformed(), 1);
+        assert_eq!(tally.reasons_seen(), "marker_out_of_place");
+        assert_eq!(tally.markers_past_the_end, 0);
     }
 
     #[test]

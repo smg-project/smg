@@ -245,14 +245,19 @@ impl crate::engine::CallAssembler for Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{arguments, bytes};
+    use crate::{
+        formats::{inkling, mistral_v13},
+        testing::{arguments, bytes},
+    };
 
-    const OBJECT_MARKER: &str = "<|content_invoke_tool_json|>";
+    /// Inkling's marker between the name and the object, as its table spells it.
+    const OBJECT_MARKER: &str = inkling::INVOKE_JSON;
     const OBJECT_CALL: &str = concat!(
         "get_weather<|content_invoke_tool_json|>",
         "{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}"
     );
-    const ARGUMENTS_MARKER: &str = "[ARGS]";
+    /// Mistral v13's marker between the name and the arguments, as its table spells it.
+    const ARGUMENTS_MARKER: &str = mistral_v13::ARGS;
     const ARGUMENTS_CALL: &str = "get_weather[ARGS]{\"city\": \"Paris\", \"days\": [1, 2]}";
     const ARGUMENTS: &str = "{\"city\": \"Paris\", \"days\": [1, 2]}";
 

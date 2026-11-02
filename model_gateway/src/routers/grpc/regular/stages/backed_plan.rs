@@ -117,7 +117,10 @@ pub(crate) fn build(
     // The unshaped constraint stays on the attempt stamp, or what derives the
     // table's tag for a start (the `auto` tag, a JSON answer's): a retry gives
     // the worker it selects the same shaping (`helpers::ToolConstraintStamp`).
-    let tool_parser = ctx.components.parser_resolver.tool_parser(model);
+    let tool_parser = ctx
+        .components
+        .parser_resolver
+        .tool_parser_for(ctx.state.parser_names.as_ref(), model);
     let unshaped_tool_constraints = tool_constraints.clone();
     let (tool_constraints, led_for_first_token) = utils::tool_constraints_for_worker(
         &ctx.components.tool_parser_factory,
