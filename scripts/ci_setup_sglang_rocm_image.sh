@@ -33,12 +33,25 @@ python3 -c '
 from importlib.metadata import version
 import torch
 
-if (version("sglang") != "0.5.21"
-        or version("torch") != "2.11.0+rocm10.0.0" or not torch.version.hip):
-    raise SystemExit("ERROR: unsupported SGLang ROCm native dependency cohort")
+sglang_version = version("sglang")
+torch_version = version("torch")
+hip_version = torch.version.hip
+if (sglang_version != "0.5.21"
+        or torch_version != "2.11.0+rocm10.0.0" or not hip_version):
+    raise SystemExit(
+        "ERROR: unsupported SGLang ROCm native dependency cohort: "
+        "observed sglang=%s torch=%s hip=%r; "
+        "expected sglang=0.5.21 torch=2.11.0+rocm10.0.0 and HIP enabled. "
+        "Update TVM/TileLang/DLPack pins in "
+        "scripts/ci_setup_sglang_rocm_image.sh with the image."
+        % (sglang_version, torch_version, hip_version)
+    )
 api = getattr(torch.Tensor, "__dlpack_c_exchange_api__", None)
 if api is None or type(api).__name__ != "PyCapsule":
-    raise SystemExit("ERROR: SGLang ROCm image lacks the Torch builtin DLPack C API")
+    raise SystemExit(
+        "ERROR: SGLang ROCm image lacks the Torch builtin DLPack C API: "
+        "expected PyCapsule, observed %s" % type(api).__name__
+    )
 '
 $RETRY 3 10 python3 -m pip install --no-cache-dir --no-build-isolation \
     --no-binary=torch-c-dlpack-ext \
@@ -51,14 +64,22 @@ $RETRY 3 10 python3 -m pip install -e crates/grpc_client/python/ -e grpc_service
 python3 -c '
 from importlib.metadata import version
 import torch, sglang, mooncake, smg_grpc_servicer
-assert torch.version.hip
+assert torch.version.hip, "ERROR: expected ROCm Torch; observed HIP=%r" % torch.version.hip
 api = torch.Tensor.__dlpack_c_exchange_api__
 import tvm_ffi, tilelang
 from torch_c_dlpack_ext import core
-assert core._lib is None and api is torch.Tensor.__dlpack_c_exchange_api__
-assert tuple(version(name) for name in (
+assert core._lib is None, "ERROR: DLPack extension loaded its own library: %r" % core._lib
+assert api is torch.Tensor.__dlpack_c_exchange_api__, (
+    "ERROR: DLPack extension replaced the Torch builtin C API"
+)
+observed = tuple(version(name) for name in (
     "apache-tvm-ffi", "tilelang", "torch-c-dlpack-ext"
-)) == ("0.1.12", "0.1.15", "0.1.5")
+))
+expected = ("0.1.12", "0.1.15", "0.1.5")
+assert observed == expected, (
+    "ERROR: native dependency versions (TVM, TileLang, DLPack): observed=%r expected=%r"
+    % (observed, expected)
+)
 print("sglang", sglang.__version__, "HIP", torch.version.hip)
 '
 python3 -m pip check

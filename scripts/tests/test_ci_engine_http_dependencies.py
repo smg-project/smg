@@ -218,16 +218,16 @@ def test_missing_sglang_image_companion_stops_before_install(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "bad_image",
+    "bad_image,diagnostic",
     [
-        {"IMAGE_SGLANG_VERSION": "0.5.22"},
-        {"IMAGE_TORCH_VERSION": "2.13.0"},
-        {"IMAGE_TORCH_HIP": ""},
-        {"IMAGE_TORCH_C_API": "absent"},
-        {"IMAGE_TORCH_C_API": "invalid"},
+        ({"IMAGE_SGLANG_VERSION": "0.5.22"}, "observed sglang=0.5.22"),
+        ({"IMAGE_TORCH_VERSION": "2.13.0"}, "torch=2.13.0"),
+        ({"IMAGE_TORCH_HIP": ""}, "hip=''"),
+        ({"IMAGE_TORCH_C_API": "absent"}, "expected PyCapsule, observed NoneType"),
+        ({"IMAGE_TORCH_C_API": "invalid"}, "expected PyCapsule, observed object"),
     ],
 )
-def test_unsupported_rocm_cohort_stops_before_pip(tmp_path, bad_image):
+def test_unsupported_rocm_cohort_stops_before_pip(tmp_path, bad_image, diagnostic):
     result, calls = run_installer(
         tmp_path,
         {},
@@ -236,6 +236,7 @@ def test_unsupported_rocm_cohort_stops_before_pip(tmp_path, bad_image):
     )
     assert result.returncode != 0
     assert "ERROR:" in result.stderr
+    assert diagnostic in result.stderr
     assert calls == [] and not (tmp_path / "github.env").exists()
 
 
