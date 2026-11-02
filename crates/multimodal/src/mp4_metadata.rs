@@ -25,6 +25,11 @@
 //! - `avg_frame_rate`: the time scale times the sample count over the track
 //!   duration, in lowest terms (the demuxer's own derivation);
 //! - the movie header's duration and time scale for the container's duration.
+//!
+//! The edit list may start at the track's first sample or at the codec's
+//! reorder delay, where ffmpeg's muxer starts it by default for a video with
+//! B-frames; the demuxer reports the same numbers either way (see
+//! `edit_list_is_whole_track`).
 
 use std::{
     fs::File,
@@ -212,16 +217,6 @@ fn parse_moov(moov: &[u8]) -> Option<ContainerVideoInfo> {
         if timescale == 0 || duration_ts == 0 {
             return None;
         }
-        if let Some(edts) = child(&trak, *b"edts") {
-            if !edit_list_is_whole_track(
-                child(&boxes(edts)?, *b"elst")?,
-                duration_ts,
-                timescale,
-                movie_timescale,
-            ) {
-                return None;
-            }
-        }
         let stbl = boxes(child(&boxes(child(&mdia, *b"minf")?)?, *b"stbl")?)?;
         let (width, height) = sample_entry_size(child(&stbl, *b"stsd")?)?;
         let stts = child(&stbl, *b"stts")?;
@@ -231,6 +226,18 @@ fn parse_moov(moov: &[u8]) -> Option<ContainerVideoInfo> {
         let (count, delta) = (u64::from(be_u32(stts, 8)?), u64::from(be_u32(stts, 12)?));
         if count == 0 || delta == 0 || count.checked_mul(delta)? != duration_ts {
             return None;
+        }
+        // After the sample table: a codec delay is counted in its frames.
+        if let Some(edts) = child(&trak, *b"edts") {
+            if !edit_list_is_whole_track(
+                child(&boxes(edts)?, *b"elst")?,
+                duration_ts,
+                timescale,
+                movie_timescale,
+                delta,
+            ) {
+                return None;
+            }
         }
         let sample_count = match (child(&stbl, *b"stsz"), child(&stbl, *b"stz2")) {
             (Some(stsz), _) => u64::from(be_u32(stsz, 8)?),
@@ -257,14 +264,50 @@ fn parse_moov(moov: &[u8]) -> Option<ContainerVideoInfo> {
     None
 }
 
-/// True for an edit list of one entry that maps the whole track from its
-/// start at normal speed: the shape under which the demuxer's stream
-/// duration is the media header's.
+/// The deepest codec reorder delay accepted as the start of an edit list, in
+/// frames. A muxer starts the list at the delay so that the first frame is
+/// presented at zero, and the decoded picture buffer bounds the delay: 16
+/// frames in H.264 (`max_num_reorder_frames` <= `max_dec_frame_buffering`
+/// <= 16), 15 in HEVC (`sps_max_num_reorder_pics` <=
+/// `sps_max_dec_pic_buffering_minus1` <= 15).
+const MAX_REORDER_FRAMES: u64 = 16;
+
+/// Whether an edit list that starts `media_time` media ticks into the track
+/// starts where a muxer starts one: at the first sample, or at a codec
+/// reorder delay of whole frames (`delta` ticks each) up to
+/// [`MAX_REORDER_FRAMES`]. A negative start is neither: `-1` is an empty
+/// edit, which presents nothing for its duration, and the format defines no
+/// other.
+fn is_codec_reorder_delay(media_time: i64, delta: u64) -> bool {
+    let Ok(media_time) = u64::try_from(media_time) else {
+        return false;
+    };
+    delta != 0 && media_time % delta == 0 && media_time / delta <= MAX_REORDER_FRAMES
+}
+
+/// True for an edit list of one entry, at normal speed, whose duration is
+/// the track's and which starts at the first sample or at a codec reorder
+/// delay: the shapes under which the demuxer's stream duration is the media
+/// header's and its frame count the sample count.
+///
+/// The start is in none of those numbers. The demuxer takes the stream
+/// duration from the media header, the sample table and the edit's
+/// duration, and the frame count and average rate from the sample table, so
+/// a whole-track edit reports the same numbers wherever it starts, and an
+/// edit shorter than the track is refused by the duration clause, since the
+/// demuxer reports the edit's length. The start is held to what a muxer
+/// writes all the same, whole frames up to [`MAX_REORDER_FRAMES`], so that a
+/// shape nobody has compared with the probe keeps the probe. Nor is it
+/// checked against the track's composition offsets: a start past the codec's
+/// own delay drops frames from the decoded output, and the probe still
+/// counts them. `delta` is the track's one frame duration, which the caller
+/// has read and checked.
 fn edit_list_is_whole_track(
     elst: &[u8],
     duration_ts: u64,
     timescale: u32,
     movie_timescale: u32,
+    delta: u64,
 ) -> bool {
     let Some(entries) = be_u32(elst, 4) else {
         return false;
@@ -294,9 +337,13 @@ fn edit_list_is_whole_track(
         },
         _ => return false,
     };
-    // media_time 0 at rate 1.0 exactly, and the edit's duration (in the
-    // movie's time scale) equal to the track's (in the media's).
-    media_time == 0
+    // A start a muxer writes (in the media's time scale), rate 1.0 exactly,
+    // and the edit's duration (in the movie's time scale) equal to the
+    // track's (in the media's). Not every cut reaches the duration clause: a
+    // B-frame clip stream-copied with `-t` to a point inside a group of
+    // B-frames keeps an edit as long as its media header, which then runs
+    // past the sample table, and is refused before, by the header check.
+    is_codec_reorder_delay(media_time, delta)
         && rate == 1
         && fraction == 0
         && u128::from(segment_duration) * u128::from(timescale)
