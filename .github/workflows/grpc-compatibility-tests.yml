@@ -36,8 +36,15 @@ jobs:
           .grpc178/bin/python -m pip install pytest pytest-asyncio msgspec pydantic numpy pyzmq pillow
           .grpc178/bin/python -m pip check
           .grpc178/bin/python - <<'PYTHON'
+          import tomllib
           from importlib.metadata import version
-          expected = {"grpcio": "1.78.0", "grpcio-tools": "1.78.0", "grpcio-health-checking": "1.78.0", "grpcio-reflection": "1.78.0", "protobuf": "6.33.5", "smg-grpc-proto": "0.4.29", "smg-grpc-servicer": "0.14.2"}
+          from pathlib import Path
+
+          def project_version(path):
+              with Path(path).open("rb") as project:
+                  return tomllib.load(project)["project"]["version"]
+
+          expected = {"grpcio": "1.78.0", "grpcio-tools": "1.78.0", "grpcio-health-checking": "1.78.0", "grpcio-reflection": "1.78.0", "protobuf": "6.33.5", "smg-grpc-proto": project_version("crates/grpc_client/python/pyproject.toml"), "smg-grpc-servicer": project_version("grpc_servicer/pyproject.toml")}
           actual = {name: version(name) for name in expected}
           print(actual)
           assert actual == expected, (actual, expected)
