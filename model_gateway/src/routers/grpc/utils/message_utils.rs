@@ -122,7 +122,7 @@ pub fn process_messages_with_encoding(
 }
 
 /// [`process_messages`] over the prompt parts alone.
-pub(crate) fn process_messages_prompt(
+fn process_messages_prompt(
     request: MessagesPrompt<'_>,
     tokenizer: &dyn Tokenizer,
     chat_tools: Option<&[ChatTool]>,
@@ -525,7 +525,7 @@ pub(crate) async fn count_input_tokens(
 /// - User messages with Blocks → text/image blocks stay as user content,
 ///   ToolResult blocks become separate `{"role": "tool", ...}` messages
 /// - Assistant messages → `{"role": "assistant", "content": ..., "tool_calls": [...], "reasoning_content": ...}`
-pub(crate) fn process_message_content_format(
+fn process_message_content_format(
     messages: &[InputMessage],
     content_format: ChatTemplateContentFormat,
     placeholder_tokens: Option<&PlaceholderTokens>,
@@ -682,10 +682,7 @@ fn convert_user_message(
 /// text renders: a text source, or a content source made of text blocks. A
 /// PDF or URL source needs a document reader this gateway has no path for
 /// and is refused naming the block (`at`), not handed to the template.
-pub(crate) fn render_document(
-    document: &messages::DocumentBlock,
-    at: &str,
-) -> Result<String, String> {
+fn render_document(document: &messages::DocumentBlock, at: &str) -> Result<String, String> {
     let text = match &document.source {
         messages::DocumentSource::Text { data } => data.as_str(),
         messages::DocumentSource::Content { content } => {
