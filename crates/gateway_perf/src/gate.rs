@@ -3,12 +3,14 @@
 //! worse than every base repeat; a change beyond the threshold whose repeats overlap is
 //! suspect, never a failure; an id no gate pattern matches is reported, never failed.
 //! The gate file is the same TOML (`repeats`, `filter`, `bench_args`, `[[gate]]` with
-//! `pattern`, `threshold`, `note`), checked the same way.
+//! `pattern`, `threshold`, `note`), checked the same way; the patterns are matched by
+//! `fancy-regex`, which takes the look-around the Python patterns use to exclude a
+//! renamed id from a group (`^(?!latency/encode_4KB$)(encode_throughput|latency)/`).
 
 use std::{fs, path::Path};
 
 use anyhow::{anyhow, bail, Context, Result};
-use regex::Regex;
+use fancy_regex::Regex;
 
 use crate::{cells::Results, median, py_float, py_g, report::per_side, round3};
 
@@ -33,7 +35,7 @@ impl Gate {
     }
 
     pub fn matches(&self, bench_id: &str) -> bool {
-        self.regex.is_match(bench_id)
+        self.regex.is_match(bench_id).unwrap_or(false)
     }
 }
 
@@ -640,6 +642,18 @@ threshold = 0.02
             md.contains("base runs [1.0, 1.0, 1.0], pull request runs [2.0, 2.0, 2.0]."),
             "{md}"
         );
+    }
+
+    #[test]
+    fn a_group_pattern_excludes_a_renamed_id_with_a_negative_lookahead() {
+        let gates = parse_gates(
+            "[[gate]]\npattern = \"^(?!latency/encode_4KB$)(encode_throughput|latency)/\"\nthreshold = 0.05\n",
+        )
+        .unwrap();
+        assert!(gates.threshold_for("latency/encode_1KB").is_some());
+        assert!(gates.threshold_for("encode_throughput/x").is_some());
+        assert!(gates.threshold_for("latency/encode_4KB").is_none());
+        assert!(gates.threshold_for("decode/x").is_none());
     }
 
     #[test]

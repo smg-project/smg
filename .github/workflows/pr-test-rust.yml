@@ -820,6 +820,7 @@ jobs:
               - 'crates/engine_zmq_adapter/**'
               - 'crates/engine_servicer/**'
               - 'crates/mock_worker/**'
+              - 'crates/gateway_perf/**'
               - 'crates/protocols/**'
               - 'crates/tokenizer/**'
               - 'crates/kv_index/**'

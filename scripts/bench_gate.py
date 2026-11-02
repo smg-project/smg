@@ -429,7 +429,7 @@ def fmt_pct(value: float | None, signed: bool = True) -> str:
 
 def markdown(results: dict, rows: list[Row]) -> str:
     repeats = results["repeats"]
-    # Criterion results carry nanoseconds; another producer (scripts/bench/gateway_perf)
+    # Criterion results carry nanoseconds; another producer (crates/gateway_perf)
     # names the unit of its values, "" when the id names it. Lower is better either way.
     unit = results.get("unit")
     failed = [row for row in rows if row.fails]

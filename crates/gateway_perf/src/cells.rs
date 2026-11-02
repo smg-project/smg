@@ -1081,8 +1081,8 @@ pub fn elapsed_since(t: f64) -> f64 {
 pub(crate) mod tests {
     use super::*;
 
-    /// A results file from per-id samples (as `scripts/tests/test_gateway_perf_report.py`
-    /// builds one): run i holds the i-th value of every id that has one.
+    /// A results file from per-id samples: run i holds the i-th value of every id that
+    /// has one.
     pub(crate) fn results_of(base: &[(&str, &[f64])], pr: &[(&str, &[f64])]) -> Results {
         fn runs(values: &[(&str, &[f64])]) -> Vec<BTreeMap<String, f64>> {
             let n = values.iter().map(|(_, v)| v.len()).max().unwrap_or(0);
