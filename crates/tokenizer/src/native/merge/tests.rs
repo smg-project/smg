@@ -408,11 +408,11 @@ fn models_the_table_cannot_stand_in_for_decline() {
 }
 
 #[test]
-fn the_merges_are_read_without_the_vocabulary() {
-    // A vocabulary with a gap in its ids (256..300 unassigned): the model's
-    // own serializer walks every id up to the largest and warns about each
-    // gap; the table's reader takes the merges field alone, and it is the
-    // same field the full serialization writes.
+fn the_merges_read_are_the_models_merges_with_a_gap_in_the_ids_too() {
+    // The merges the reader takes are the field the full serialization
+    // writes, on a vocabulary with a gap in its ids (256..300 unassigned),
+    // and the table built from them merges as the model does. That the
+    // reader never serializes the vocabulary is `serialized::tests`'.
     let (mut vocab, alphabet) = alphabet_vocab();
     let mut list = Merges::new();
     let mut id = 300;

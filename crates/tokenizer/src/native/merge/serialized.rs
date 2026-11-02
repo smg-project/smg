@@ -15,6 +15,12 @@ use tokenizers::models::bpe::BPE;
 
 /// The model's `merges` field as JSON (`[[a, b], ...]` in rank order).
 pub(super) fn merges_json(model: &BPE) -> Result<String, String> {
+    merges_of(model)
+}
+
+/// The `merges` field of a struct that serializes one, as JSON; the values
+/// of its other fields are never serialized.
+fn merges_of(model: &impl Serialize) -> Result<String, String> {
     match model.serialize(MergesOnly) {
         Ok(Some(merges)) => Ok(merges),
         Ok(None) => Err("the model's serialized form has no merges field".to_owned()),
@@ -192,3 +198,6 @@ impl Serializer for MergesOnly {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests;
