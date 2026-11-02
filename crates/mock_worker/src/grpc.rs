@@ -355,6 +355,7 @@ impl TokenSpeedScheduler for MockScheduler {
                 prompt_tokens,
                 req.stream,
                 req.return_logprob,
+                usize::try_from(req.top_logprobs_num).unwrap_or(0),
                 self.cfg.weight_version.clone(),
             );
             return Ok(Response::new(Box::pin(in_flight.until_done(stream))));
@@ -1021,14 +1022,16 @@ fn generate_stream(
 /// The generate stream of a scripted answer: a `Chunk` per frame when the
 /// request streams, then the `Complete`, with the answer's pause before every
 /// frame but the first; the logprobs ride along when the request asked for
-/// them. A `Complete` that follows no chunk is what a non-streaming request
-/// reads, as it reads the engine's.
+/// them, with the request's `top_logprobs_num` alternatives per token. A
+/// `Complete` that follows no chunk is what a non-streaming request reads, as
+/// it reads the engine's.
 fn scripted_stream(
     answer: Answer,
     request_id: String,
     prompt_tokens: u32,
     stream_chunks: bool,
     return_logprob: bool,
+    top_logprobs: usize,
     weight_version: Option<String>,
 ) -> GenStream {
     struct Scripted {
@@ -1038,6 +1041,7 @@ fn scripted_stream(
         prompt_tokens: u32,
         stream_chunks: bool,
         return_logprob: bool,
+        top_logprobs: usize,
         weight_version: Option<String>,
         /// Output tokens sent so far (the chunks' running `completion_tokens`).
         sent: u32,
@@ -1052,6 +1056,7 @@ fn scripted_stream(
         prompt_tokens,
         stream_chunks,
         return_logprob,
+        top_logprobs,
         weight_version,
         sent: 0,
         started: false,
@@ -1074,7 +1079,11 @@ fn scripted_stream(
                     .map(|logprobs| ts::OutputLogProbs {
                         token_logprobs: logprobs.clone(),
                         token_ids: answer.output_ids.clone(),
-                        top_logprobs: Vec::new(),
+                        top_logprobs: top_logprobs_wire(answer.top_logprobs(
+                            &answer.output_ids,
+                            logprobs,
+                            st.top_logprobs,
+                        )),
                     });
                 let matched_stop = answer.matched_stop.as_ref().map(|stop| match stop {
                     MatchedStop::Token(id) => {
@@ -1113,7 +1122,11 @@ fn scripted_stream(
                 .then(|| ts::OutputLogProbs {
                     token_logprobs: frame.logprobs.clone(),
                     token_ids: frame.ids.clone(),
-                    top_logprobs: Vec::new(),
+                    top_logprobs: top_logprobs_wire(st.answer.top_logprobs(
+                        &frame.ids,
+                        &frame.logprobs,
+                        st.top_logprobs,
+                    )),
                 });
             let chunk = ts::GenerateResponse {
                 request_id: st.request_id.clone(),
@@ -1130,6 +1143,16 @@ fn scripted_stream(
             return Some((Ok(chunk), st));
         }
     }))
+}
+
+/// The answer's top alternatives in the wire's shape, one entry per position.
+fn top_logprobs_wire(top: Vec<script::TopAlternatives>) -> Vec<ts::TopLogProbs> {
+    top.into_iter()
+        .map(|position| ts::TopLogProbs {
+            values: position.values,
+            token_ids: position.ids,
+        })
+        .collect()
 }
 
 /// Map an engine load snapshot to the TokenSpeed `SchedulerLoad` wire type.

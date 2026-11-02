@@ -1150,3 +1150,284 @@ async fn http_reports_the_scripted_answers_in_flight_as_running() {
     let idle = http_running_settles_to(&http, &base, 0).await;
     assert_eq!(idle["num_total_reqs"], 0, "{idle}");
 }
+
+#[tokio::test]
+async fn grpc_reports_top_alternatives_from_the_answers_own_tokens() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let script = script_file(
+        dir.path(),
+        "grpc-top.jsonl",
+        &[json!({
+            "input_ids": [70, 80, 90],
+            "output_ids": [10, 11, 12],
+            "finish_reason": "stop",
+            "logprobs": [-0.5, -1.0, -1.5],
+        })],
+    );
+    // A prompt of this test's own: the store is process-wide.
+    let (client, _) = start_grpc(config(Some(script))).await;
+    let top = |values: &[f32], token_ids: &[u32]| ts::TopLogProbs {
+        values: values.to_vec(),
+        token_ids: token_ids.to_vec(),
+    };
+    let top_of = |responses: &[ts::GenerateResponse]| -> Vec<Vec<ts::TopLogProbs>> {
+        responses
+            .iter()
+            .filter_map(|r| match &r.response {
+                Some(GenResp::Complete(c)) => c.output_logprobs.clone(),
+                Some(GenResp::Chunk(c)) => c.output_logprobs.clone(),
+                None => None,
+            })
+            .map(|lp| lp.top_logprobs)
+            .collect()
+    };
+
+    // Two per position: the sampled token first, then the next distinct one of
+    // the answer, half a nat less likely; the last position wraps around.
+    let mut request = grpc_request("two", &[70, 80, 90], false, true);
+    request.top_logprobs_num = 2;
+    let whole = generate(&client, request).await;
+    assert_eq!(
+        top_of(&whole),
+        vec![vec![
+            top(&[-0.5, -1.0], &[10, 11]),
+            top(&[-1.0, -1.5], &[11, 12]),
+            top(&[-1.5, -2.0], &[12, 10]),
+        ]]
+    );
+
+    // More asked than the answer has distinct tokens: as many as it has.
+    let mut request = grpc_request("five", &[70, 80, 90], false, true);
+    request.top_logprobs_num = 5;
+    let whole = generate(&client, request).await;
+    assert_eq!(
+        top_of(&whole),
+        vec![vec![
+            top(&[-0.5, -1.0, -1.5], &[10, 11, 12]),
+            top(&[-1.0, -1.5, -2.0], &[11, 12, 10]),
+            top(&[-1.5, -2.0, -2.5], &[12, 10, 11]),
+        ]]
+    );
+
+    // Streamed: each chunk carries its own token's alternatives, the
+    // completion all of them; none asked, none sent.
+    let mut request = grpc_request("stream", &[70, 80, 90], true, true);
+    request.top_logprobs_num = 2;
+    let streamed = generate(&client, request).await;
+    assert_eq!(
+        top_of(&streamed),
+        vec![
+            vec![top(&[-0.5, -1.0], &[10, 11])],
+            vec![top(&[-1.0, -1.5], &[11, 12])],
+            vec![top(&[-1.5, -2.0], &[12, 10])],
+            vec![
+                top(&[-0.5, -1.0], &[10, 11]),
+                top(&[-1.0, -1.5], &[11, 12]),
+                top(&[-1.5, -2.0], &[12, 10]),
+            ],
+        ]
+    );
+    let plain = generate(&client, grpc_request("plain", &[70, 80, 90], false, true)).await;
+    assert_eq!(top_of(&plain), vec![Vec::<ts::TopLogProbs>::new()]);
+}
+
+#[tokio::test]
+async fn http_reports_top_alternatives_from_the_answers_own_pieces() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let prompt = "top alternatives please";
+    let script = script_file(
+        dir.path(),
+        "http-top.jsonl",
+        &[json!({
+            "input_ids": http::synth_token_ids(prompt),
+            "output_ids": [20, 21, 22],
+            "output_text": ["Hello", " world", "!"],
+            "finish_reason": "stop",
+            "logprobs": [-0.5, -1.0, -1.5],
+        })],
+    );
+    let (base, _worker) = start_http(config(Some(script))).await;
+    let http = common::http_client();
+
+    // Chat: `top_logprobs` entries per content item, the piece itself first.
+    let chat: Value = http
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "logprobs": true,
+            "top_logprobs": 2,
+        }))
+        .send()
+        .await
+        .expect("completion")
+        .json()
+        .await
+        .expect("body json");
+    let entry =
+        |token: &str, logprob: f64| json!({"token": token, "logprob": logprob, "bytes": null});
+    let content = &chat["choices"][0]["logprobs"]["content"];
+    assert_eq!(
+        content[0]["top_logprobs"],
+        json!([entry("Hello", -0.5), entry(" world", -1.0)])
+    );
+    assert_eq!(
+        content[2]["top_logprobs"],
+        json!([entry("!", -1.5), entry("Hello", -2.0)]),
+        "the last position wraps around the answer"
+    );
+
+    // Completions: `logprobs: n` is the count, as a piece-to-logprob map.
+    let completion: Value = http
+        .post(format!("{base}/v1/completions"))
+        .json(&json!({"model": MODEL, "prompt": prompt, "logprobs": 2}))
+        .send()
+        .await
+        .expect("completion")
+        .json()
+        .await
+        .expect("body json");
+    assert_eq!(
+        completion["choices"][0]["logprobs"]["top_logprobs"],
+        json!([
+            {"Hello": -0.5, " world": -1.0},
+            {" world": -1.0, "!": -1.5},
+            {"!": -1.5, "Hello": -2.0},
+        ])
+    );
+
+    // Streamed chat: the alternatives ride on each delta's own piece.
+    let streamed = http
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": true,
+            "logprobs": true,
+            "top_logprobs": 3,
+        }))
+        .send()
+        .await
+        .expect("stream");
+    let frames = sse_data(&streamed.text().await.expect("body"));
+    let second: Value = serde_json::from_str(&frames[1]).expect("a JSON frame");
+    assert_eq!(
+        second["choices"][0]["logprobs"]["content"][0]["top_logprobs"],
+        json!([
+            entry(" world", -1.0),
+            entry("!", -1.5),
+            entry("Hello", -2.0)
+        ])
+    );
+}
+
+#[tokio::test]
+async fn zmq_reports_top_alternatives_with_their_ranks() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let endpoint = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+    let (handshake, input, output) = (
+        endpoint("hs.sock"),
+        endpoint("in.sock"),
+        endpoint("out.sock"),
+    );
+    let script = script_file(
+        dir.path(),
+        "zmq-top.jsonl",
+        &[json!({
+            "input_ids": [44, 55, 66],
+            "output_ids": [20, 21],
+            "finish_reason": "stop",
+            "logprobs": [-0.25, -0.75],
+        })],
+    );
+    // Rank 8 and prompts of this test's own: the store is process-wide.
+    let rank = 8;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "serve loops until the test drops its handles"
+    )]
+    let _engine = tokio::spawn(zmq::serve(
+        Arc::new(config(Some(script))),
+        handshake.clone(),
+        rank,
+    ));
+    let transport = connect_handshake(&handshake, 1, &input, &output, Duration::from_secs(10))
+        .await
+        .expect("frontend handshake");
+    let client = EngineCoreClient::new(transport);
+    let mut stream = client
+        .submit(EngineCoreRequest {
+            request_id: "top".to_string(),
+            prompt_token_ids: Some(vec![44, 55, 66]),
+            sampling_params: Some(EngineCoreSamplingParams {
+                logprobs: Some(2),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("submit");
+    let first = stream
+        .next()
+        .await
+        .expect("a first batch")
+        .expect("output ok");
+    let logprobs = first
+        .new_logprobs
+        .as_ref()
+        .expect("logprobs were asked for");
+    // The engine's `n + 1` columns per position: the sampled token's own,
+    // then the ranked ones with the sampled token repeated at rank 1.
+    assert_eq!(
+        logprobs.positions[0].entries,
+        vec![
+            TokenLogprob {
+                token_id: 20,
+                logprob: -0.25,
+                rank: 1
+            },
+            TokenLogprob {
+                token_id: 20,
+                logprob: -0.25,
+                rank: 1
+            },
+            TokenLogprob {
+                token_id: 21,
+                logprob: -0.75,
+                rank: 2
+            },
+        ],
+        "the sampled token's own column, then the two ranked columns"
+    );
+    // One token per frame: the second position rides the second batch.
+    let second = stream
+        .next()
+        .await
+        .expect("a second batch")
+        .expect("output ok");
+    let logprobs = second
+        .new_logprobs
+        .as_ref()
+        .expect("logprobs ride on every frame");
+    assert_eq!(
+        logprobs.positions[0].entries,
+        vec![
+            TokenLogprob {
+                token_id: 21,
+                logprob: -0.75,
+                rank: 1
+            },
+            TokenLogprob {
+                token_id: 21,
+                logprob: -0.75,
+                rank: 1
+            },
+            TokenLogprob {
+                token_id: 20,
+                logprob: -1.25,
+                rank: 2
+            },
+        ],
+        "the second token's alternative wraps to the answer's first token"
+    );
+}
