@@ -799,10 +799,11 @@ def launch_cloud_gateway(
                 raise
             last_error = error
             logger.warning(
-                "Cloud gateway startup attempt %d/%d timed out: %s",
+                "Cloud gateway startup attempt %d/%d timed out: %s (log: %s)",
                 attempt,
                 max_attempts,
                 error,
+                gateway.log_path,
             )
             # Cleanup failures propagate from here, never becoming another
             # startup attempt with ownership of the previous router uncertain.

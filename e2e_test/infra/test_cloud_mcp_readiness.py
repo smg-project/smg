@@ -255,3 +255,47 @@ def test_callback_cleanup_error_does_not_start_another_attempt(cloud_parts):
         gateway_module.launch_cloud_gateway("openai", post_start=fail)
     assert len(state.gateways) == 1 and cleanup_calls == [0]
     assert isinstance(error.value.__context__, RuntimeError)
+
+
+def test_retried_registration_log_path_is_reported_even_when_next_attempt_succeeds(
+    monkeypatch, caplog
+):
+    monkeypatch.delenv("E2E_LOG_DIR", raising=False)
+    gateway_class = gateway_module.Gateway
+    gateways = []
+    log_paths = []
+    sentinel = "private diagnostic content must not appear in the warning"
+
+    def factory():
+        index = len(gateways)
+        gateway = gateway_class(port=12345 + index * 2, prometheus_port=12346 + index * 2)
+        log = gateway._open_log_file()
+        log.write(sentinel)
+        log.flush()
+        log_paths.append(Path(gateway.log_path))
+
+        def started(**_):
+            gateway._started = True
+
+        gateway.start = started
+        gateways.append(gateway)
+        return gateway
+
+    def register(gateway, _):
+        if gateway is gateways[0]:
+            raise TimeoutError("private first registration timeout")
+
+    monkeypatch.setattr(gateway_module, "Gateway", factory)
+    try:
+        with caplog.at_level("WARNING", logger=gateway_module.__name__):
+            result = gateway_module.launch_cloud_gateway("openai", post_start=register)
+        assert len(gateways) == 2 and result is gateways[1]
+        assert log_paths[0].is_file() and gateways[0]._log_file is None
+        assert str(log_paths[0]) in caplog.text, "retried registration log has no reported path"
+        assert "private first registration timeout" in caplog.text
+        assert sentinel not in caplog.text
+    finally:
+        for gateway in gateways:
+            gateway.shutdown()
+        for path in log_paths:
+            path.unlink(missing_ok=True)
