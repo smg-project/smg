@@ -18,8 +18,10 @@ use symphony::{
 };
 use tool_parser::{GrammarStart as WorkerGrammarStart, ToolConstraint};
 
+#[cfg(test)]
+use super::names::reading;
 use super::{
-    names::{reads, table_reading},
+    names::{reads, table_reading, Reading},
     template::Templates,
     SymphonyError,
 };
@@ -462,6 +464,7 @@ pub(super) fn callable<'t>(choice: Option<&ToolChoice>, declared: &'t [Tool]) ->
 /// refusal comes with the derivation), or a chat request's `regex` or `ebnf` constraint would
 /// apply outside its format. `thought_closed` says the prompt closed the thought itself and wrote
 /// the template's text after it, which the calls' tag then owes nothing of.
+#[cfg(test)]
 #[expect(
     clippy::too_many_arguments,
     reason = "the table, the request's ask, where the prompt and the engines leave the model"
@@ -477,9 +480,33 @@ pub(crate) fn constraint(
     vocabulary: TagVocabulary,
     templates: &Templates,
 ) -> PreparedConstraint {
-    let Some((format, compiled)) = table_reading(parser, names, asks.model(), templates)? else {
+    constraint_for(
+        &reading(parser, names, asks.model(), templates)?,
+        asks,
+        tools,
+        reasoning_open,
+        thought_closed,
+        start,
+        vocabulary,
+    )
+}
+
+/// [`constraint`] over the table decision already read for the request (`read`), which
+/// preparation reads once for the replay, the constraint and the decoder's special tokens
+/// (`regular::stages::reading::prepare`); the tests ask through [`constraint`].
+pub(crate) fn constraint_for(
+    read: &Reading,
+    asks: Asks<'_>,
+    tools: &[Tool],
+    reasoning_open: bool,
+    thought_closed: bool,
+    start: GrammarStart,
+    vocabulary: TagVocabulary,
+) -> PreparedConstraint {
+    let Reading::Table(format, compiled) = read else {
         return Ok(Prepared::None);
     };
+    let (format, compiled) = (Arc::clone(format), *compiled);
     if compiled && asks.constrains_outside_the_format() {
         return Err(SymphonyError::Constraint(format!(
             "model '{}' writes its output in the format its response template declares, and a \
