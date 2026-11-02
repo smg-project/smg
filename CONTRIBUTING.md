@@ -165,10 +165,11 @@ edits, so upstream syncs stay conflict-free.
 
 The `e2e-1gpu-gateway-amd` job in `pr-test-rust.yml` requires both
 `SMG_RUN_AMD_VLLM_LOCAL_LEGS` and `SMG_RUN_AMD_LEGS` to be `true`.
-The extra `SMG_RUN_AMD_VLLM_LOCAL_LEGS` flag opts in to this local-runner
-test without changing the existing AMD chat and nightly gates. On pull
-requests, `SMG_RUN_AMD_ON_PRS` must also be `true`. Unset values skip this
-job; normal workflow triggers, wheel builds and change filters still apply.
+The extra switch allows this AMD vLLM gateway lane to be qualified
+separately on shared runners; "local" does not select a model-cache
+location. On pull requests, `SMG_RUN_AMD_ON_PRS` must also be `true`.
+Unset values skip the job; normal workflow triggers, wheel builds and
+change filters still apply.
 
 GitHub-hosted labels (`ubuntu-latest`, `macos-latest`) are left as-is — every
 fork already has those.
