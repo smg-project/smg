@@ -1913,11 +1913,15 @@ jobs:
       # engine rows need.
       # The models of the classes on the mock marker (`@pytest.mark.model`,
       # or its `mock=` override), each pinned to a revision of its hub
-      # repository as `repository@commit`, space-separated: a class that
-      # brings another model adds it here. Their tokenizer files land under
-      # the runner's temporary directory, one directory per model id, where
-      # the harness reads them (ROUTER_LOCAL_MODEL_PATH on the steps below).
-      MOCK_MODELS: RedHatAI/Llama-3.2-1B-Instruct-FP8@6b92f62217b2f2d88f38575eadb157cf7a6dd5c9
+      # repository as `repository@commit`, one per line (folded into one
+      # space-separated word list): a class that brings another model adds
+      # it here. Their tokenizer files land under the runner's temporary
+      # directory, one directory per model id, where the harness reads them
+      # (ROUTER_LOCAL_MODEL_PATH on the steps below).
+      MOCK_MODELS: >-
+        RedHatAI/Llama-3.2-1B-Instruct-FP8@6b92f62217b2f2d88f38575eadb157cf7a6dd5c9
+        Qwen/Qwen3-4B-Instruct-2507@cdbee75f17c01a7cc42f958dc650907174af0554
+        mistralai/Mistral-7B-Instruct-v0.3@c170c708c41dac9275d15a8fff4eca08d52bab71
       SHOW_ROUTER_LOGS: "1"
     steps:
       - name: Checkout code
@@ -1987,10 +1991,11 @@ jobs:
         env:
           SHOW_WORKER_LOGS: "0"
           E2E_LOG_DIR: e2e-logs
-          # floor ≈ 95% of the 24 cases the mock marker selects: the
-          # function-calling class with its two clients, the constraint-failure
-          # and the reader-panic classes
-          E2E_MIN_SELECTED: "22"
+          # floor ≈ 95% of the 106 cases the mock marker selects: the
+          # function-calling, tool-choice (three models) and multi-turn
+          # classes with their two clients, the constraint-failure and the
+          # reader-panic classes
+          E2E_MIN_SELECTED: "100"
           MOCK_WORKER_BIN: ${{ github.workspace }}/target/debug/mock-worker
           ROUTER_LOCAL_MODEL_PATH: ${{ runner.temp }}/models
         run: |
