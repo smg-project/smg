@@ -615,7 +615,8 @@ def test_a_pushing_cut_refuses_an_open_pull_request_on_the_move_topic(repo: Sand
 def test_a_failed_commit_of_the_move_stops_the_cut_and_leaves_main_untouched(repo: Sandbox) -> None:
     """`move_main` runs under `if !` in the cut and under `|| die` in bump-main, where `set -e` is off: a git step
     that fails must stop the command itself, or the cut ends 0 with the version edits carried back to the start
-    branch and the move reported as made."""
+    branch and the move reported as made. The failure names the move's whole recipe as its finish lines, so the
+    way back under the cut (the drop steps, the topic recreated, the lines run) completes the move."""
     topic = "chore/main-versions-1.15.0-dev"
     hook = repo.work / ".git" / "hooks" / "pre-commit"
     hook.write_text(
@@ -629,8 +630,11 @@ def test_a_failed_commit_of_the_move_stops_the_cut_and_leaves_main_untouched(rep
     assert done.returncode == 1
     assert (
         "the commit 'chore(release): main reads 1.15.0-dev, above release/1.14' failed:"
-        f" the version edits are staged on {topic}. Once the cause is fixed, commit them and finish by hand:"
+        f" the version edits are staged on {topic}. Once the cause is fixed, finish by hand:"
         in done.stderr
+    )
+    assert done.stderr.count("git add --update && git commit") == 1, (
+        "the commit is among the finish lines, once: the message never asks for it twice"
     )
     # the lines open_pr would have printed with PUSH=0, with the body written before the commit
     assert f"  git push -u origin refs/heads/{topic}:refs/heads/{topic}\n" in done.stderr
@@ -657,6 +661,27 @@ def test_a_failed_commit_of_the_move_stops_the_cut_and_leaves_main_untouched(rep
         "main is untouched"
     )
     assert repo.version_of("model_gateway/Cargo.toml", "main") == "1.13.0"
+    # the finish lines are the move's whole recipe, so the way back the cut's rerun text names completes it: the
+    # hook gone, the drop steps, the recreate line, the lines as printed
+    lines = finish_lines(done.stderr)
+    assert lines[0] == "python3 scripts/release/sync_versions.py refs/heads/release/1.14 1.15.0-dev"
+    assert lines[1].startswith("git add --update && git commit --signoff --message chore")
+    assert f"or {drop_steps(topic, CUT_RERUN)}" in done.stderr
+    hook.unlink()
+    repo.git("restore", "--staged", "--worktree", ".")
+    repo.git("switch", "--quiet", "main")
+    repo.git("branch", "--quiet", "-D", topic)
+    assert repo.git("status", "--porcelain") == ""
+    for line in [f"git switch --no-track -c {topic} origin/main", *lines]:
+        ran = subprocess.run(
+            ["bash", "-c", line], cwd=repo.work, env=repo.env(), capture_output=True, text=True
+        )
+        assert ran.returncode == 0, f"{line}\n{ran.stdout}\n{ran.stderr}"
+    assert repo.origin_ref(f"refs/heads/{topic}") == repo.git("rev-parse", topic)
+    assert repo.git("rev-parse", f"{topic}~1") == repo.git("rev-parse", "origin/main")
+    for path in VERSION_FILES:
+        assert repo.version_of(path, topic) == "1.15.0-dev", path
+    assert repo.gh_calls()[-1].startswith(f"gh pr create --base main --head {topic}")
 
 
 def test_a_failed_bump_commit_names_the_finish_lines_and_the_rerun_path(repo: Sandbox) -> None:
@@ -682,6 +707,11 @@ def test_a_failed_bump_commit_names_the_finish_lines_and_the_rerun_path(repo: Sa
     )
     assert f"  git push -u origin refs/heads/{topic}:refs/heads/{topic}\n" in done.stderr
     assert f"  gh pr create --base release/1.14 --head {topic} --title chore" in done.stderr
+    # the commit is the first finish line and the message asks for it once
+    lines = finish_lines(done.stderr)
+    assert lines[0].startswith("git add --update && git commit --signoff --message chore")
+    assert lines[1] == f"git push -u origin refs/heads/{topic}:refs/heads/{topic}"
+    assert done.stderr.count("git add --update && git commit") == 1
     assert (
         f"delete {topic} (git branch -D {topic}): a rerun is refused while it exists" in done.stderr
     )
@@ -689,6 +719,220 @@ def test_a_failed_bump_commit_names_the_finish_lines_and_the_rerun_path(repo: Sa
     assert repo.gh_calls() == before, "no pull request for the bump"
     assert repo.git("branch", "--show-current") == topic
     assert "M  model_gateway/Cargo.toml" in repo.git("status", "--porcelain")
+
+
+def drop_steps(topic: str, rerun: str) -> str:
+    """The second way out every failure of a move names once its topic exists: the text `commit_all` prints, then
+    what the command offers as a rerun."""
+    return (
+        f"drop them (git restore --staged --worktree .), switch back to where you started and delete {topic}"
+        f" (git branch -D {topic}): {rerun}"
+    )
+
+
+CUT_RERUN = (
+    "a rerun of the cut is refused while release/1.14 exists (it stays, pushed or not): to make"
+    " the move later, recreate the topic (git switch --no-track -c chore/main-versions-1.15.0-dev"
+    " origin/main) and run the lines above"
+)
+MAIN_RERUN = "then 'release.sh bump-main 1.14.0' again"
+# the sandbox's sync_versions.py: the real one, or a tool that stops half way while a marker file exists
+SYNC_STUB = (
+    "#!/usr/bin/env python3\n"
+    "import pathlib\n"
+    "import runpy\n"
+    "import sys\n"
+    "\n"
+    "root = pathlib.Path(__file__).resolve().parents[2]\n"
+    "if (root / '.sync-stops').exists():\n"
+    "    manifest = root / 'model_gateway' / 'Cargo.toml'\n"
+    "    manifest.write_text(manifest.read_text().replace('1.13.0', '1.15.0-dev'))\n"
+    "    sys.exit('sync_versions: FAILED to set bindings/python/pyproject.toml to 1.15.0-dev')\n"
+    "sys.argv[0] = str(root / 'scripts' / 'release' / 'sync_versions.real.py')\n"
+    "runpy.run_path(sys.argv[0], run_name='__main__')\n"
+)
+
+
+def finish_lines(stderr: str) -> list[str]:
+    """The lines between 'finish by hand' and 'or drop them' of a failure message: what the owner runs."""
+    lines = stderr.splitlines()
+    start = next(i for i, line in enumerate(lines) if "finish by hand" in line)
+    end = next(i for i, line in enumerate(lines) if i > start and line.startswith("or drop them"))
+    return [line.strip() for line in lines[start + 1 : end]]
+
+
+def test_a_failed_sync_of_the_move_names_the_finish_lines_and_they_complete_it(
+    repo: Sandbox,
+) -> None:
+    """`move_main` sits on its topic when `sync_versions.py` runs: a failure there leaves what it moved before it
+    stopped on the topic. Under the cut nothing reruns the move (the release branch is made, and pushed with PUSH=1),
+    so the message names the lines that finish it by hand, the pull request's with its body among them; run once the
+    cause is gone, they complete the move."""
+    topic = "chore/main-versions-1.15.0-dev"
+    repo.put("scripts/release/sync_versions.real.py", repo.read("scripts/release/sync_versions.py"))
+    repo.commit_main(
+        "chore: a sync that stops while a marker exists",
+        "scripts/release/sync_versions.py",
+        SYNC_STUB,
+    )
+    (repo.work / ".sync-stops").touch()
+    done = repo.tool("cut", "1.14.0-rc.1", PUSH="1", check=False)
+    assert done.returncode == 1
+    assert "sync_versions: FAILED to set bindings/python/pyproject.toml" in done.stderr
+    assert (
+        f"sync_versions.py failed: the version files of {topic} are moved in part at most."
+        " Once the cause is fixed, finish by hand (a rerun of the sync completes what it started):"
+        in done.stderr
+    )
+    assert f"or {drop_steps(topic, CUT_RERUN)}" in done.stderr
+    assert repo.git("branch", "--show-current") == topic
+    assert repo.git("diff", "--name-only") == "model_gateway/Cargo.toml", (
+        "the stub's edit, unstaged"
+    )
+    assert repo.origin_ref("refs/heads/release/1.14") is not None, "the cut's first half is done"
+    assert repo.origin_ref(f"refs/heads/{topic}") is None
+    lines = finish_lines(done.stderr)
+    assert lines[0] == "python3 scripts/release/sync_versions.py refs/heads/release/1.14 1.15.0-dev"
+    assert "cargo update --workspace" not in lines, "no lock file in this tree"
+    assert lines[1].startswith("git add --update && git commit --signoff --message chore")
+    assert lines[2] == f"git push -u origin refs/heads/{topic}:refs/heads/{topic}"
+    assert lines[3].startswith(f"gh pr create --base main --head {topic} --title chore")
+    body_file = Path(lines[3].split("--body-file ")[1])
+    assert "`release/1.14` is cut at" in body_file.read_text(), "the body exists with its intro"
+    # the cause is gone: the printed lines, run as printed, complete the move
+    (repo.work / ".sync-stops").unlink()
+    for line in lines:
+        ran = subprocess.run(
+            ["bash", "-c", line], cwd=repo.work, env=repo.env(), capture_output=True, text=True
+        )
+        assert ran.returncode == 0, f"{line}\n{ran.stdout}\n{ran.stderr}"
+    assert repo.origin_ref(f"refs/heads/{topic}") == repo.git("rev-parse", topic)
+    assert repo.git("rev-parse", f"{topic}~1") == repo.git("rev-parse", "origin/main")
+    for path in VERSION_FILES:
+        assert repo.version_of(path, topic) == "1.15.0-dev", path
+    assert repo.version_of("crates/tool_parser/Cargo.toml", topic) == "0.6.0"
+    assert repo.gh_calls()[-1].startswith(f"gh pr create --base main --head {topic}")
+
+
+def test_a_failed_lock_refresh_of_the_move_names_the_finish_lines_and_the_drop_steps(
+    repo: Sandbox,
+) -> None:
+    """The lock refresh runs once the sync moved the version files: its own `die` names the same ways out, the lock
+    line among the finish lines. The drop steps clean the clone, and under the cut that is where they lead: the
+    release branch stays and refuses the cut's rerun, as the message says; the way back it names (the topic
+    recreated, the lines above run once the cause is gone) completes the move."""
+    topic = "chore/main-versions-1.15.0-dev"
+    repo.commit_main("chore: a lock file", "Cargo.lock", "# lock\n")
+    # the branch's refresh passes, the move's fails
+    failing = (
+        f'[ "$(git branch --show-current)" = {topic} ] || exit 0\n'
+        'echo "error: failed to select a version for the requirement" >&2\n'
+        "exit 101\n"
+    )
+    (repo.bin / "cargo").write_text(CARGO_STUB + failing)
+    done = repo.tool("cut", "1.14.0-rc.1", PUSH="1", check=False)
+    assert done.returncode == 1
+    assert "error: failed to select a version" in done.stderr, "cargo's own reason stays visible"
+    assert (
+        "cargo update --workspace failed: Cargo.lock does not follow the versions;"
+        f" the version edits sit on {topic}. Once the cause is fixed, finish by hand:"
+        in done.stderr
+    )
+    assert finish_lines(done.stderr)[:2] == [
+        "python3 scripts/release/sync_versions.py refs/heads/release/1.14 1.15.0-dev",
+        "cargo update --workspace",
+    ]
+    assert f"or {drop_steps(topic, CUT_RERUN)}" in done.stderr
+    assert repo.git("branch", "--show-current") == topic
+    assert "model_gateway/Cargo.toml" in repo.git("diff", "--name-only").splitlines(), (
+        "the sync's edits"
+    )
+    assert repo.origin_ref(f"refs/heads/{topic}") is None
+    # the drop steps leave a clean clone on main; the cut's rerun is refused by the release branch, as said
+    repo.git("restore", "--staged", "--worktree", ".")
+    repo.git("switch", "--quiet", "main")
+    repo.git("branch", "--quiet", "-D", topic)
+    assert repo.git("status", "--porcelain") == ""
+    rerun = repo.tool("cut", "1.14.0-rc.1", PUSH="1", check=False)
+    assert rerun.returncode == 1 and "release/1.14 exists locally" in rerun.stderr
+    # the cause gone, the way back the message names: the topic recreated, the lines above run as printed
+    (repo.bin / "cargo").write_text(CARGO_STUB)
+    recreate = f"git switch --no-track -c {topic} origin/main"
+    assert f"recreate the topic ({recreate}) and run the lines above" in done.stderr
+    for line in [recreate, *finish_lines(done.stderr)]:
+        ran = subprocess.run(
+            ["bash", "-c", line], cwd=repo.work, env=repo.env(), capture_output=True, text=True
+        )
+        assert ran.returncode == 0, f"{line}\n{ran.stdout}\n{ran.stderr}"
+    assert repo.origin_ref(f"refs/heads/{topic}") == repo.git("rev-parse", topic)
+    assert repo.git("rev-parse", f"{topic}~1") == repo.git("rev-parse", "origin/main")
+    for path in VERSION_FILES:
+        assert repo.version_of(path, topic) == "1.15.0-dev", path
+    assert repo.gh_calls()[-1].startswith(f"gh pr create --base main --head {topic}")
+
+
+def test_a_failed_body_file_of_the_move_names_the_topic_to_delete(repo: Sandbox) -> None:
+    """The body file is made first, before any edit: its failure leaves a clean topic, the finish lines name a body
+    file of the owner's own, and bump-main's message names its own rerun."""
+    repo.cut()
+    topic = "chore/main-versions-1.14.0"
+    done = repo.tool("bump-main", "1.14.0", TMPDIR=str(repo.base / "missing"), check=False)
+    assert done.returncode == 1
+    assert (
+        f"cannot make a temporary file for the pull request body of {topic} (nothing is edited yet)."
+        " Once the cause is fixed, finish by hand, with a body file of your own (body.md below):"
+        in done.stderr
+    )
+    lines = [line.strip() for line in done.stderr.splitlines() if line.startswith("  ")]
+    assert lines[0] == "python3 scripts/release/sync_versions.py origin/release/1.14 1.15.0-dev"
+    assert lines[-1].startswith(f"gh pr create --base main --head {topic} --title chore")
+    assert lines[-1].endswith("--body-file body.md")
+    assert (
+        f"or switch back to where you started and delete {topic} (git branch -D {topic}): {MAIN_RERUN}"
+        in done.stderr
+    )
+    assert repo.git("branch", "--show-current") == topic
+    assert repo.git("status", "--porcelain") == "", "nothing is edited yet"
+    assert repo.origin_ref(f"refs/heads/{topic}") is None
+
+
+def test_a_failed_push_of_the_move_names_the_lines_that_finish_it(repo: Sandbox) -> None:
+    """After the commit, a failed push (the topic taken on the remote by another history here) names the push and
+    the pull request lines, the body file the tool wrote among them."""
+    repo.cut()
+    topic = "chore/main-versions-1.14.0"
+    repo.git("push", "--quiet", "origin", f"refs/heads/release/1.14:refs/heads/{topic}")
+    before = repo.gh_calls()
+    done = repo.tool("bump-main", "1.14.0", check=False)
+    assert done.returncode == 1
+    assert (
+        f"the push of {topic} to origin failed; nothing opened. Once the cause is fixed, finish by hand:"
+        in done.stderr
+    )
+    assert f"  git push -u origin refs/heads/{topic}:refs/heads/{topic}\n" in done.stderr
+    body_line = next(line for line in done.stderr.splitlines() if "gh pr create" in line)
+    assert body_line.startswith(f"  gh pr create --base main --head {topic} --title chore")
+    body = Path(body_line.split("--body-file ")[1]).read_text()
+    assert "After the v1.14.0 release" in body and "model_gateway/Cargo.toml" in body
+    assert repo.gh_calls() == before, "no pull request is opened"
+    assert repo.git("branch", "--show-current") == topic
+    assert repo.git("log", "-1", "--format=%s") == "chore(release): main's versions follow v1.14.0"
+
+
+def test_a_move_without_gh_names_the_lines_to_run_by_hand(repo: Sandbox) -> None:
+    """bump-main runs no pull-request precondition: without `gh` the move is committed and its message names the
+    push and the pull request lines."""
+    repo.cut()
+    topic = "chore/main-versions-1.14.0"
+    done = repo.tool("bump-main", "1.14.0", GH="gh-missing", check=False)
+    assert done.returncode == 1
+    assert (
+        f"'gh-missing' is not installed: push {topic} and open the pull request against main by hand:"
+        in done.stderr
+    )
+    assert f"  git push -u origin refs/heads/{topic}:refs/heads/{topic}\n" in done.stderr
+    assert f"  gh pr create --base main --head {topic} --title chore" in done.stderr
+    assert repo.origin_ref(f"refs/heads/{topic}") is None
 
 
 # --- bump ---------------------------------------------------------------------------
