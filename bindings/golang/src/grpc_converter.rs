@@ -821,6 +821,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Flush pending byte fallback at completion while enforcing the configured stop boundary.
     async fn byte_fallback_complete_releases_tail_and_enforces_stop() {
         let tokenizer = byte_fallback_tokenizer();
         for stop in ["NEVER", "é"] {
@@ -841,6 +842,7 @@ mod tests {
                 skip_special_tokens: true,
             };
             let chunk = proto::GenerateResponse {
+                media_identity: None,
                 request_id: String::new(),
                 response: Some(proto::generate_response::Response::Chunk(
                     proto::GenerateStreamChunk {
@@ -863,6 +865,7 @@ mod tests {
                 assert!(streamed.choices[0].finish_reason.is_none());
             }
             let complete = proto::GenerateResponse {
+                media_identity: None,
                 request_id: String::new(),
                 response: Some(proto::generate_response::Response::Complete(
                     proto::GenerateComplete {
@@ -913,6 +916,7 @@ mod tests {
                 skip_special_tokens: true,
             };
             let chunk = proto::GenerateResponse {
+                media_identity: None,
                 request_id: String::new(),
                 response: Some(proto::generate_response::Response::Chunk(
                     proto::GenerateStreamChunk {
@@ -939,6 +943,7 @@ mod tests {
             let disabled = tool_choice.is_some();
             let mut handle = tool_test_handle(tokenizer.clone(), tool_choice);
             let chunk = proto::GenerateResponse {
+                media_identity: None,
                 request_id: String::new(),
                 response: Some(proto::generate_response::Response::Chunk(
                     proto::GenerateStreamChunk {
@@ -975,6 +980,7 @@ mod tests {
             let mut handle = tool_test_handle(tokenizer.clone(), None);
             handle.system_fingerprint = fingerprint.clone();
             let chunk = proto::GenerateResponse {
+                media_identity: None,
                 request_id: String::new(),
                 response: Some(proto::generate_response::Response::Chunk(
                     proto::GenerateStreamChunk {
@@ -1026,6 +1032,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Process the final tool-parser tail while respecting disabled tool choice.
     async fn byte_fallback_complete_parses_tool_tail_and_respects_none() {
         let tokenizer = byte_fallback_tokenizer();
         let tool_text = r#"{"name":"get_weather","arguments":{"city":"Paris"}}"#;
@@ -1035,6 +1042,7 @@ mod tests {
             let disabled = tool_choice.is_some();
             let mut handle = tool_test_handle(tokenizer.clone(), tool_choice);
             let chunk = proto::GenerateResponse {
+                media_identity: None,
                 request_id: String::new(),
                 response: Some(proto::generate_response::Response::Chunk(
                     proto::GenerateStreamChunk {
@@ -1054,6 +1062,7 @@ mod tests {
             let streamed_choice = &streamed.choices[0];
             assert!(streamed_choice.finish_reason.is_none());
             let complete = proto::GenerateResponse {
+                media_identity: None,
                 request_id: String::new(),
                 response: Some(proto::generate_response::Response::Complete(
                     proto::GenerateComplete {
@@ -1114,11 +1123,13 @@ mod tests {
         }
     }
     #[tokio::test]
+    /// Recognize a tool control sequence split across chunks before completion.
     async fn byte_fallback_complete_closed_split_tool_control() {
         let tokenizer = byte_fallback_tokenizer();
         let tail = r#""Paris"}}"#;
         let mut handle = tool_test_handle(tokenizer.clone(), None);
         let prefix_chunk = proto::GenerateResponse {
+            media_identity: None,
             request_id: String::new(),
             response: Some(proto::generate_response::Response::Chunk(
                 proto::GenerateStreamChunk {
@@ -1154,6 +1165,7 @@ mod tests {
         let tail_ids: Vec<u32> = tail.bytes().map(|byte| u32::from(byte) + 1).collect();
         let completion_tokens = 1 + tail_ids.len() as u32;
         let tail_chunk = proto::GenerateResponse {
+            media_identity: None,
             request_id: String::new(),
             response: Some(proto::generate_response::Response::Chunk(
                 proto::GenerateStreamChunk {
@@ -1187,6 +1199,7 @@ mod tests {
         let mut output_ids = vec![257];
         output_ids.extend(tail_ids);
         let complete = proto::GenerateResponse {
+            media_identity: None,
             request_id: String::new(),
             response: Some(proto::generate_response::Response::Complete(
                 proto::GenerateComplete {

@@ -14,23 +14,8 @@ mod tests {
     use openai_protocol::common::{Function, Tool};
     use serde_json::json;
     use tempfile::TempDir;
-    /// A minimal tokenizer.json that loads cleanly. The only requirement is that
-    /// it parses; the encoder logic does not call back into the tokenizer here.
-    const MIN_TOKENIZER_JSON: &str = r#"{
-        "version": "1.0",
-        "truncation": null,
-        "padding": null,
-        "added_tokens": [],
-        "normalizer": null,
-        "pre_tokenizer": { "type": "Whitespace" },
-        "post_processor": null,
-        "decoder": null,
-        "model": {
-            "type": "BPE",
-            "vocab": { "hello": 0, "<s>": 1, "</s>": 2 },
-            "merges": []
-        }
-    }"#;
+
+    use crate::common::MIN_TOKENIZER_JSON_WITH_SENTINELS;
     fn write_dir(architectures: Option<&[&str]>) -> (TempDir, String) {
         write_model_dir(None, architectures, None, None)
     }
@@ -56,7 +41,7 @@ mod tests {
             None => temp.path().to_path_buf(),
         };
         let tok_path = model_dir.join("tokenizer.json");
-        fs::write(&tok_path, MIN_TOKENIZER_JSON).unwrap();
+        fs::write(&tok_path, MIN_TOKENIZER_JSON_WITH_SENTINELS).unwrap();
         if architectures.is_some() || model_type.is_some() {
             let mut config = serde_json::Map::new();
             if let Some(archs) = architectures {
@@ -156,7 +141,7 @@ mod tests {
     fn malformed_config_json_falls_back_to_jinja() {
         let temp = TempDir::new().unwrap();
         let tok_path = temp.path().join("tokenizer.json");
-        fs::write(&tok_path, MIN_TOKENIZER_JSON).unwrap();
+        fs::write(&tok_path, MIN_TOKENIZER_JSON_WITH_SENTINELS).unwrap();
         fs::write(temp.path().join("config.json"), "{ this is not json").unwrap();
         let tokenizer = HuggingFaceTokenizer::from_file(tok_path.to_str().unwrap()).unwrap();
         let messages = vec![json!({ "role": "user", "content": "Hello" })];
@@ -1080,29 +1065,40 @@ DEFAULT_REASONING_EFFORT = "high""#;
         );
     }
 
+    /// V4.1 continues a trailing assistant message when `continue_final_message`
+    /// asks: no trailing EOS, no generation header. `add_generation_prompt:
+    /// false` alone is not read, and the message is closed with EOS as the
+    /// renderer's reference closes it.
     #[test]
-    fn v41_add_generation_prompt_false_continues_the_final_assistant_message() {
+    fn v41_continues_the_final_assistant_message_only_when_asked() {
         let (_tmp, tok) = write_dir(Some(&["DeepseekV41ForCausalLM"]));
         let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
         let messages = vec![
             json!({"role": "user", "content": "q"}),
             json!({"role": "assistant", "reasoning_content": "r", "content": "Sure,"}),
         ];
-        let out = tokenizer
-            .apply_chat_template(
-                &messages,
-                ChatTemplateParams {
-                    add_generation_prompt: false,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let render = |continue_final_message: bool| {
+            tokenizer
+                .apply_chat_template(
+                    &messages,
+                    ChatTemplateParams {
+                        add_generation_prompt: false,
+                        continue_final_message,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
         // Thinking mode (default ON), reasoning kept (the assistant turn is
-        // after the last user turn), and no trailing EOS since
-        // `add_generation_prompt: false` continues the final message.
+        // after the last user turn), and no trailing EOS since the request
+        // continues the final message.
+        let continued = "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}><\u{FF5C}System\u{FF5C}>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<\u{FF5C}User\u{FF5C}>q<\u{FF5C}Assistant\u{FF5C}><think>r</think>Sure,";
+        assert_eq!(render(true), continued);
+        // Without the continuation the same conversation ends with the
+        // message closed: the flag alone does not leave it open.
         assert_eq!(
-            out,
-            "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}><\u{FF5C}System\u{FF5C}>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<\u{FF5C}User\u{FF5C}>q<\u{FF5C}Assistant\u{FF5C}><think>r</think>Sure,"
+            render(false),
+            format!("{continued}<\u{FF5C}end\u{2581}of\u{2581}sentence\u{FF5C}>")
         );
     }
 

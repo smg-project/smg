@@ -1292,7 +1292,7 @@ mod tests {
     fn arguments(index: u32, json: &str, source: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index,
-            json: json.to_string(),
+            json: json.to_string().into(),
             source: Text::uncounted(source.to_string()),
         }
     }

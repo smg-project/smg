@@ -295,6 +295,9 @@ pub enum CallId {
 pub struct Format {
     name: String,
     terminals: Vec<Terminal>,
+    /// The terminals' texts as the engine's scanner takes them ([`Self::terminal_texts`]), built
+    /// once here and shared by every scanner the format makes, so that a request copies nothing.
+    scanner_markers: Arc<[String]>,
     states: Vec<State>,
     transitions: Vec<Transition>,
     calls: Option<CallSyntax>,
@@ -411,6 +414,7 @@ impl Format {
         Self {
             name: name.into(),
             terminals: Vec::new(),
+            scanner_markers: Arc::from([]),
             states: Vec::new(),
             transitions: Vec::new(),
             calls: None,
@@ -439,6 +443,7 @@ impl Format {
             shown: false,
             frames_messages: false,
         });
+        self.rebuild_scanner_markers();
         self
     }
 
@@ -453,7 +458,20 @@ impl Format {
             shown: false,
             frames_messages: false,
         });
+        self.rebuild_scanner_markers();
         self
+    }
+
+    /// The shared marker list follows the terminals: rebuilt when one is added (at build time,
+    /// a handful of times per format), never per request.
+    fn rebuild_scanner_markers(&mut self) {
+        self.scanner_markers = self.terminal_texts().map(str::to_owned).collect();
+    }
+
+    /// A scanner over the format's terminals, numbered as [`Self::terminal_texts`] lists them:
+    /// what [`Scanner::new`] over those texts would be, sharing the format's list.
+    pub(crate) fn scanner(&self) -> Scanner {
+        Scanner::sharing(Arc::clone(&self.scanner_markers))
     }
 
     /// A token of the model's vocabulary that the format's tags begin with (`<|open|>`,
@@ -1086,7 +1104,7 @@ impl Format {
             .turn_opener()
             .filter(|opener| self.anchors.is_empty() && turn.starts_with(opener))
             .map_or(0, str::len);
-        let mut scanner = Scanner::new(self.terminal_texts());
+        let mut scanner = self.scanner();
         let (mut state, mut rest) = (start, start);
         // Whether the prompt wrote text other than whitespace in the stay the output continues;
         // a marker is the template's, whether or not a row reads it here.

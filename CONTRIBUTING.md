@@ -163,11 +163,13 @@ edits, so upstream syncs stay conflict-free.
 | `SMG_RUNNER_AMD_GPU_4` | `4-gpu-mi300x` | AMD nightly benchmark (off unless `SMG_RUN_AMD_LEGS` is `true`) |
 | `SMG_RUNNER_AMD_GPU_8` | `8-gpu-mi300x` | AMD legs of the BFCL A/B and AMD rows of the nightly PD sweep (off unless `SMG_RUN_AMD_LEGS` is `true`) |
 
-Additional AMD vLLM jobs guarded by `SMG_RUN_AMD_VLLM_LOCAL_LEGS` require
-both that variable and `SMG_RUN_AMD_LEGS` to be `true`. On pull requests,
-`SMG_RUN_AMD_ON_PRS` must also be `true`. Unset values skip those jobs;
-normal workflow triggers, wheel builds and change filters still apply.
-This additional opt-in leaves the existing AMD chat and nightly gates unchanged.
+The `e2e-1gpu-chat-mm-worker-amd` job in
+`pr-test-rust.yml` require both `SMG_RUN_AMD_VLLM_LOCAL_LEGS` and
+`SMG_RUN_AMD_LEGS` to be `true`. The extra switch allows these additional
+AMD vLLM lanes to be qualified separately on shared runners; "local" does
+not select a model-cache location. On pull requests, `SMG_RUN_AMD_ON_PRS`
+must also be `true`. Unset values skip those jobs; normal workflow triggers,
+wheel builds and change filters still apply.
 
 GitHub-hosted labels (`ubuntu-latest`, `macos-latest`) are left as-is — every
 fork already has those.
@@ -220,6 +222,15 @@ They stay off in a fork until you set `SMG_RUN_BENCHMARKS` to `true`. Only
 
 The `release-*`, `nightly-*` and `stale` workflows are deliberately **not**
 opt-in — a fork should not publish artifacts or manage upstream's issues.
+
+---
+
+## Releases
+
+A release is cut from `main` onto a `release/<x.y>` branch and moves there by pull requests
+(cherry-picks from `main`, candidate and final bumps); `main` never pauses, and nothing is
+published without a maintainer's dispatch. The steps, the `make release-*` targets and the
+gate are in [`scripts/release/README.md`](./scripts/release/README.md).
 
 ---
 

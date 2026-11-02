@@ -1502,6 +1502,33 @@ def test_the_media_leg_material_comes_from_the_models_own_template(caplog):
     assert "could not be rendered: no tokenizer.json" in caplog.text
 
 
+def test_a_render_that_raises_is_a_warning_with_its_traceback(caplog):
+    """The two expected omissions (no tokenizer directory, a chat template
+    that renders no image placeholder) are INFO lines. A render that raises
+    (a tokenizer that does not load, a template that fails, a tokenization
+    error) is a fault worth a look: its line is a WARNING and carries the
+    traceback; the leg is still left out and the servicer starts."""
+
+    class _Tokenizer:
+        def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+            raise ValueError("the template failed to render")
+
+    def broken(directory):
+        raise OSError("no tokenizer.json")
+
+    with caplog.at_level(logging.INFO):
+        assert sglang_warmup.media_warmup("/tok", load_tokenizer=broken) is None
+        assert sglang_warmup.media_warmup("/tok", load_tokenizer=lambda d: _Tokenizer()) is None
+        assert sglang_warmup.media_warmup(None, load_tokenizer=broken) is None
+    legs = [r for r in caplog.records if r.getMessage().startswith("Planned warm-up: no image leg")]
+    assert [r.levelno for r in legs] == [logging.WARNING, logging.WARNING, logging.INFO]
+    assert [type(r.exc_info[1]) for r in legs[:2]] == [OSError, ValueError]
+    assert legs[2].exc_info is None
+    assert "Traceback (most recent call last)" in caplog.text
+    assert "OSError: no tokenizer.json" in caplog.text
+    assert "ValueError: the template failed to render" in caplog.text
+
+
 def test_a_wire_over_a_borrowed_channel_leaves_it_open():
     seen = _Seen()
     server, target = _serve(sgl_grpc.add_SglangSchedulerServicer_to_server, _SglangEngine(seen))
