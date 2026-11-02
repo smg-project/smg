@@ -472,12 +472,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 0731-vs-original effort-encoding identification
+    // The effort table is the engine's, never the shipped encoder file's
     // -----------------------------------------------------------------------
 
-    /// Stand-ins for the `encoding/encoding_dsv4.py` each checkpoint ships;
-    /// only the effort block differs between revisions, so the fingerprint is
-    /// the 0731-only `max` prompt text.
+    /// Stand-ins for the `encoding/encoding_dsv4.py` each checkpoint revision
+    /// ships (only the effort block differs between them); the renderer reads
+    /// neither, as the serving engine reads neither.
     const BASE_ENCODER_SNIPPET: &str = r#"REASONING_EFFORT_MAX = (
     "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n"
 )"#;
@@ -510,23 +510,42 @@ mod tests {
     }
 
     #[test]
-    fn shipped_encoder_fingerprint_beats_dir_name() {
-        // Neutral dir name + 0731 encoder -> 0731 encoding.
-        let (_tmp, tok) = write_v4_model_dir("my-local-v4-copy", Some(V0731_ENCODER_SNIPPET));
-        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
-        let out = render_with_native_effort(&tokenizer, "max").unwrap();
-        assert!(out.contains("Reasoning Effort: Beyond maximum"), "{out}");
-
-        // 0731 dir name + base encoder -> original encoding, where `max` is
-        // the only level with a prompt; `low` is thinking mode without one.
-        let (_tmp, tok) = write_v4_model_dir("DeepSeek-V4-Flash-0731", Some(BASE_ENCODER_SNIPPET));
-        let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
-        let out = render_with_native_effort(&tokenizer, "max").unwrap();
-        assert!(out.contains("Reasoning Effort: Absolute maximum"), "{out}");
-        assert!(!out.contains("Beyond maximum"), "{out}");
-        let out = render_with_native_effort(&tokenizer, "low").unwrap();
-        assert!(!out.contains("Reasoning Effort:"), "{out}");
-        assert!(out.ends_with("<think>"), "{out}");
+    fn the_shipped_encoder_file_never_picks_the_effort_table() {
+        // The serving engine renders every V4 checkpoint with its own copy of
+        // the encoder, whose table is the refreshed one, and never reads the
+        // `encoding/encoding_dsv4.py` the checkpoint ships; so the file,
+        // whichever table it carries, and the directory name change nothing:
+        // a plain thinking request (the `high` effort) writes the "Absolute
+        // maximum" prompt, `max` the "Beyond maximum" one, `low` none.
+        for (name, encoder) in [
+            ("DeepSeek-V4-Flash", Some(BASE_ENCODER_SNIPPET)),
+            ("DeepSeek-V4-Flash-0731", Some(BASE_ENCODER_SNIPPET)),
+            ("my-local-v4-copy", Some(V0731_ENCODER_SNIPPET)),
+        ] {
+            let (_tmp, tok) = write_v4_model_dir(name, encoder);
+            let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+            assert_eq!(
+                tokenizer.native_reasoning_effort_values(),
+                &["low", "high", "max"],
+                "{name}"
+            );
+            assert!(
+                tokenizer.renderer_capabilities().leading_system_only,
+                "{name}: the one profile declares it (a system message after the first is a user turn)"
+            );
+            let out = render_v4(&tokenizer, None, None);
+            assert!(out.contains(V4_HIGH_PREFIX), "{name}: {out}");
+            let out = render_with_native_effort(&tokenizer, "max").unwrap();
+            assert!(out.contains(V4_MAX_PREFIX), "{name}: {out}");
+            let out = render_with_native_effort(&tokenizer, "high").unwrap();
+            assert!(
+                out.contains(V4_HIGH_PREFIX) && !out.contains(V4_MAX_PREFIX),
+                "{name}: {out}"
+            );
+            let out = render_with_native_effort(&tokenizer, "low").unwrap();
+            assert!(!out.contains("Reasoning Effort:"), "{name}: {out}");
+            assert!(out.ends_with("<think>"), "{name}: {out}");
+        }
     }
 
     #[test]
