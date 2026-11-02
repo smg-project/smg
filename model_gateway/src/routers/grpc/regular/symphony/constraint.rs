@@ -1397,8 +1397,9 @@ mod tests {
         );
     }
 
-    /// A prompt the template leaves without a turn opener (a system message rendered in place
-    /// after the user turn) starts the model inside its thought on the DeepSeek V4 table, and the
+    /// A prompt with no turn opener after a system message (as the checkpoint's own encoder file
+    /// writes one, or the template one a latest reminder follows) starts the model inside its
+    /// thought on the DeepSeek V4 table, and the
     /// grammar built for the request reads it as the engine does, whatever the thinking switch
     /// said: the answer tag of a JSON `response_format` takes the closed thought first where the
     /// engine starts the grammar at the first token, and is the engine's own schema where it does

@@ -387,7 +387,8 @@ fn checked_names(
 /// Whether the rendered `prompt` leaves the model inside its thought as the table reads it: the
 /// table's replay of the prompt ([`Format::reasoning_open`]), which starts a turn the prompt leaves
 /// unopened inside the thought where the template writes no opener (DeepSeek's after a system
-/// message rendered in place). The grammar built for the request takes it OR'd with the request's
+/// message a latest reminder follows, or the checkpoint's own encoder file's after any system
+/// message). The grammar built for the request takes it OR'd with the request's
 /// thinking switch, so the tag and the engine read the prompt the same way: a JSON answer the
 /// switch would place at the first token follows the thought's close instead of streaming as
 /// reasoning. `None` when no table reads the response, leaving the switch's answer as it was;
