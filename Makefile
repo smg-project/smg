@@ -241,10 +241,10 @@ check-versions: ## Check workspace crate versions against latest tag (usage: mak
 # Release process (scripts/release/README.md): release branches cut from main, moved by pull requests
 RELEASE_TOOL := scripts/release/release.sh
 
-release-plan: ## Before a cut: the bump the next cut writes against TAG (default: the highest final release tag), quietly; nothing is changed (usage: make release-plan [TAG=v1.13.0] [VERSION=1.14.0-rc.1])
+release-plan: ## Before a cut: the bump the next cut writes against TAG (default: the highest final release tag), quietly; nothing is changed (usage: make release-plan [TAG=v1.13.0] [VERSION=1.14.0-rc.1]; VERSION defaults to the first candidate of main's development version)
 	@VERSION_OVERRIDE="$(VERSION)" python3 scripts/check_release_versions.py --plan $(TAG)
 
-release-cut: ## Cut release/<x.y> from FROM (default origin/main) and bump it to VERSION (usage: make release-cut VERSION=1.14.0-rc.1 [FROM=<sha>] [PUSH=1])
+release-cut: ## Cut release/<x.y> from FROM (default origin/main), bump it to VERSION, and open the pull request that moves main to the next development version (usage: make release-cut VERSION=1.14.0-rc.1 [FROM=<sha>] [PUSH=1])
 	@PUSH="$(PUSH)" $(RELEASE_TOOL) cut "$(VERSION)" $(FROM)
 
 release-bump: ## Bump an existing release branch to VERSION through a pull request (usage: make release-bump VERSION=1.14.0-rc.2 [PUSH=0])
@@ -265,7 +265,7 @@ release-tag: ## Check the versions at release/<x.y>'s head and tag it vVERSION (
 release-notes: ## The release notes skeleton for VERSION on stdout (usage: make release-notes VERSION=1.14.0 [SINCE=v1.13.0] > notes.md)
 	@$(RELEASE_TOOL) notes "$(VERSION)" $(SINCE)
 
-release-bump-main: ## After a final: a pull request that moves main's version files to vVERSION's (usage: make release-bump-main VERSION=1.14.0 [PUSH=0])
+release-bump-main: ## After a final: a pull request that moves main's crates and packages to at least vVERSION's; the gateway keeps its development version (usage: make release-bump-main VERSION=1.14.0 [PUSH=0])
 	@PUSH="$(PUSH)" $(RELEASE_TOOL) bump-main "$(VERSION)"
 
 release-publish-plan: ## The publishing steps for vVERSION: the workflow dispatches to run against the tag and the artifacts they produce; prints, runs nothing (usage: make release-publish-plan VERSION=1.14.0)
