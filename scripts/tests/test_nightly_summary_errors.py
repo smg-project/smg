@@ -26,9 +26,7 @@ def experiment(summary, tmp_path, agg, records=None, protocol="grpc", runtime="v
     (folder / "experiment_metadata.json").write_text(
         json.dumps({"model": "llama", "server_engine": runtime})
     )
-    data = {
-        "aggregated_metrics": {"scenario": "D(2000,200)", "num_concurrency": 128, **agg}
-    }
+    data = {"aggregated_metrics": {"scenario": "D(2000,200)", "num_concurrency": 128, **agg}}
     if records is not None:
         data["individual_request_metrics"] = records
     (folder / "result.json").write_text(json.dumps(data))
@@ -80,12 +78,8 @@ def test_original_nov1_false_zero_cells(
     assert run.error_rate == pytest.approx(errors / total)
     assert not run.is_error_free
     assert "Reported error_rate disagrees" in run.error_note
-    clean_http = experiment(
-        summary, tmp_path, {"error_rate": 0, **identity}, protocol="http"
-    )
-    clean_sg = experiment(
-        summary, tmp_path, {"error_rate": 0, **identity}, runtime="sglang"
-    )
+    clean_http = experiment(summary, tmp_path, {"error_rate": 0, **identity}, protocol="http")
+    clean_sg = experiment(summary, tmp_path, {"error_rate": 0, **identity}, runtime="sglang")
     assert summary.build_comparisons([bad, clean_http]) == []
     assert summary.build_runtime_comparisons([bad, clean_sg]) == []
     report = summary.generate_summary(tmp_path).markdown

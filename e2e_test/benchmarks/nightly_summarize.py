@@ -268,8 +268,7 @@ def _error_metrics(data: dict) -> tuple[float | None, str]:
             totals.append(len(records))
             errors.append(
                 sum(
-                    record.get("error_code") is not None
-                    or bool(record.get("error_message"))
+                    record.get("error_code") is not None or bool(record.get("error_message"))
                     for record in records
                 )
             )
