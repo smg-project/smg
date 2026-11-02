@@ -33,10 +33,12 @@ from .constants import (
     get_runtime,
     get_servicer_impl,
     get_servicer_impl_setting,
+    get_startup_profile,
     get_vllm_mm_processor,
     get_zmq_engine_count,
     host_port,
     moriio_host,
+    original_startup_timeout,
     sglang_transfer_backend,
     vllm_kv_backend,
     vllm_moriio_backend,
@@ -1162,11 +1164,71 @@ def _require_rust_servicer_hook() -> None:
 def worker_startup_timeout(model_id: str, timeout: int = DEFAULT_STARTUP_TIMEOUT) -> int:
     """The bound the harness gives a worker of ``model_id`` to start: its spec's
     ``startup_timeout`` (else ``timeout``), raised to the ``E2E_STARTUP_TIMEOUT``
-    floor. ``start_workers`` waits this long for the worker's health; a gateway
+    floor, unless an explicit original timer profile selects its frozen value.
+    ``start_workers`` waits this long for the worker's health; a gateway
     that registers the same worker needs the same bound for its own wait, so
     both read it here and a term added to one reaches the other.
     """
-    return effective_startup_timeout(get_model_spec(model_id).get("startup_timeout", timeout))
+    spec = get_model_spec(model_id)
+    original = original_startup_timeout(model_id, spec.get("tp", 1))
+    if original is not None:
+        return original
+    return effective_startup_timeout(spec.get("startup_timeout", timeout))
+
+
+def validate_startup_profile_worker(
+    model_id: str,
+    engine: str | None = None,
+    mode: ConnectionMode = ConnectionMode.HTTP,
+    worker_type: WorkerType = WorkerType.REGULAR,
+    count: int = 1,
+    gpus: int | None = None,
+    tp: int | None = None,
+    extra_engine_args: list[str] | None = None,
+    extra_env: dict[str, str] | None = None,
+    **_kwargs,
+) -> None:
+    """Validate the opt-in profile before start_workers prepares any worker."""
+    profile = get_startup_profile()
+    if profile is None:
+        return
+    if type(count) is not int or count != 1:
+        raise ValueError(f"{profile} requires exactly one worker group")
+    expected_mode = (
+        mode == ConnectionMode.ZMQ
+        if profile == "original38-13"
+        else mode in (ConnectionMode.GRPC, ConnectionMode.HTTP)
+    )
+    if (
+        (engine or get_runtime()) != "vllm"
+        or not expected_mode
+        or worker_type != WorkerType.REGULAR
+    ):
+        raise ValueError(f"{profile} does not match the effective worker engine/wire/type")
+    spec = get_model_spec(model_id)
+    actual_tp = spec.get("tp", 1) if tp is None else tp
+    original_startup_timeout(model_id, actual_tp)
+    # _build_cmd uses the spec unless an explicit tp was supplied; a process
+    # override in get_model_spec must match the frozen TP as well.
+    original_startup_timeout(model_id, spec.get("tp", 1))
+    expected_gpus = actual_tp * (2 if mode == ConnectionMode.ZMQ else 1)
+    if gpus is not None and (type(gpus) is not int or gpus != expected_gpus):
+        raise ValueError(f"{profile} requires {expected_gpus} GPUs per worker")
+    for arg in extra_engine_args or ():
+        option = arg.split("=", 1)[0].replace("_", "-")
+        if option in (
+            "--tensor-parallel-size",
+            "--data-parallel-size",
+            "--data-parallel-size-local",
+            "--model",
+            "--tokenizer",
+            "--config",
+        ) or option.startswith(("-tp", "-dp")):
+            raise ValueError(f"{profile} forbids appended TP/DP/model override arguments")
+    if extra_env and any(
+        key.startswith("E2E_") or key == "SMG_VLLM_SERVICER_WARMUP" for key in extra_env
+    ):
+        raise ValueError(f"{profile} forbids a worker environment override of its lane/warm-up")
 
 
 def start_workers(
@@ -1209,6 +1271,18 @@ def start_workers(
     Returns:
         List of started Worker instances.
     """
+    validate_startup_profile_worker(
+        model_id=model_id,
+        engine=engine,
+        mode=mode,
+        worker_type=worker_type,
+        count=count,
+        gpus=gpus,
+        tp=tp,
+        extra_engine_args=extra_engine_args,
+        extra_env=extra_env,
+        kv_backend=kv_backend,
+    )
     # The lane's GPU slice: every worker shifts by E2E_GPU_OFFSET.
     gpu_offset += get_gpu_offset()
     if log_dir is None:

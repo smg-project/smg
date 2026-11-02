@@ -99,3 +99,149 @@ def test_a_workers_bound_takes_the_env_floor(monkeypatch):
     monkeypatch.setattr(worker_module, "get_model_spec", lambda model_id: specs[model_id])
     assert worker_startup_timeout("slow") == 1800
     assert worker_startup_timeout("slower") == 3600
+
+
+def _original_profile(monkeypatch, profile):
+    from infra import constants as constants_module
+
+    monkeypatch.setattr(constants_module, "_STARTUP_PROFILE_CONTEXT", None)
+    monkeypatch.delenv(ENV_STARTUP_TIMEOUT, raising=False)
+    values = {
+        "E2E_STARTUP_PROFILE": profile,
+        "E2E_ENGINE": "vllm",
+        "E2E_RUNTIME": "vllm",
+        "E2E_GPU_VENDOR": "amd",
+        "E2E_GPU_TIER": "1" if profile == "original38-13" else "4",
+        "E2E_CONNECTION_MODE": "zmq" if profile == "original38-13" else "",
+        "E2E_ZMQ_ENGINE_COUNT": "2" if profile == "original38-13" else "",
+        "TEST_DIRS": "e2e_test/chat_completions",
+        "TEST_FILTER": "",
+        "E2E_MIN_SELECTED": "202" if profile == "original38-13" else "32",
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+
+
+_ORIGINAL13_MODELS = (
+    "Qwen/Qwen3-30B-A3B",
+    "Qwen/Qwen3-4B-Instruct-2507",
+    "Qwen/Qwen3-VL-8B-Instruct",
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+    "meta-llama/Llama-3.1-8B-Instruct",
+    "meta-llama/Llama-3.2-1B-Instruct",
+    "mistralai/Mistral-7B-Instruct-v0.3",
+    "openai/gpt-oss-20b",
+)
+
+
+def test_original13_all_models_can_run_sequentially_in_one_profile(monkeypatch):
+    _original_profile(monkeypatch, "original38-13")
+    assert [worker_startup_timeout(model) for model in _ORIGINAL13_MODELS] == [300] * 8
+
+
+def test_original29_both_models_keep_distinct_frozen_bounds_in_one_process(monkeypatch):
+    _original_profile(monkeypatch, "original38-29")
+    assert worker_startup_timeout("meta-llama/Llama-4-Scout-17B-16E-Instruct") == 1200
+    assert worker_startup_timeout("openai/gpt-oss-120b") == 600
+    assert worker_startup_timeout("meta-llama/Llama-4-Scout-17B-16E-Instruct") == 1200
+
+
+@pytest.mark.parametrize(
+    "profile,floor",
+    [
+        ("original38-13", ""),
+        ("original38-13", " "),
+        ("original38-13", "1"),
+        ("original38-13", "300"),
+        ("original38-29", ""),
+        ("original38-29", "60"),
+    ],
+)
+def test_a_compatible_floor_cannot_extend_a_profile(monkeypatch, profile, floor):
+    _original_profile(monkeypatch, profile)
+    monkeypatch.setenv(ENV_STARTUP_TIMEOUT, floor)
+    model, bound = (
+        (_ORIGINAL13_MODELS[0], 300) if profile == "original38-13" else ("openai/gpt-oss-120b", 600)
+    )
+    assert worker_startup_timeout(model, timeout=9999) == bound
+
+
+@pytest.mark.parametrize("floor", ["301", "1201", "601", "0", "-1", "bad", "1.5"])
+def test_original13_rejects_extended_or_invalid_floor(monkeypatch, floor):
+    _original_profile(monkeypatch, "original38-13")
+    monkeypatch.setenv(ENV_STARTUP_TIMEOUT, floor)
+    with pytest.raises(ValueError):
+        worker_startup_timeout(_ORIGINAL13_MODELS[0])
+
+
+def test_original29_rejects_floor61_before_its_shorter_gateway_wait(monkeypatch):
+    _original_profile(monkeypatch, "original38-29")
+    monkeypatch.setenv(ENV_STARTUP_TIMEOUT, "61")
+    with pytest.raises(ValueError, match="frozen wait"):
+        worker_startup_timeout("openai/gpt-oss-120b")
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("E2E_STARTUP_PROFILE", "original38-12"),
+        ("E2E_ENGINE", "sglang"),
+        ("E2E_RUNTIME", "sglang"),
+        ("E2E_GPU_VENDOR", "nvidia"),
+        ("E2E_GPU_TIER", "4"),
+        ("E2E_CONNECTION_MODE", "grpc"),
+        ("E2E_ZMQ_ENGINE_COUNT", "1"),
+        ("TEST_DIRS", "e2e_test/router"),
+        ("TEST_FILTER", "-k subset"),
+        ("E2E_MIN_SELECTED", "1"),
+    ],
+)
+def test_unknown_or_mismatched_profile_never_falls_back(monkeypatch, key, value):
+    _original_profile(monkeypatch, "original38-13")
+    monkeypatch.setenv(key, value)
+    with pytest.raises(ValueError):
+        worker_startup_timeout(_ORIGINAL13_MODELS[0])
+
+
+def test_unknown_profile_model_is_rejected_even_with_an_ordinary_spec(monkeypatch):
+    _original_profile(monkeypatch, "original38-13")
+    monkeypatch.setattr(worker_module, "get_model_spec", lambda _: {"tp": 1})
+    with pytest.raises(ValueError, match="no frozen startup contract"):
+        worker_startup_timeout("different-model")
+
+
+def test_spec_tp_override_is_rejected_without_changing_the_model_spec(monkeypatch):
+    _original_profile(monkeypatch, "original38-13")
+    monkeypatch.setattr(worker_module, "get_model_spec", lambda _: {"tp": 2})
+    with pytest.raises(ValueError, match="requires TP1"):
+        worker_startup_timeout(_ORIGINAL13_MODELS[0])
+
+
+@pytest.mark.parametrize("new_value", ["", "original38-29"])
+def test_selected_profile_cannot_change_in_process(monkeypatch, new_value):
+    _original_profile(monkeypatch, "original38-13")
+    assert worker_startup_timeout(_ORIGINAL13_MODELS[0]) == 300
+    monkeypatch.setenv("E2E_STARTUP_PROFILE", new_value)
+    with pytest.raises(ValueError):
+        worker_startup_timeout(_ORIGINAL13_MODELS[0])
+
+
+def test_profile_floor_cannot_change_after_a_model_was_resolved(monkeypatch):
+    _original_profile(monkeypatch, "original38-13")
+    assert worker_startup_timeout(_ORIGINAL13_MODELS[0]) == 300
+    monkeypatch.setenv(ENV_STARTUP_TIMEOUT, "1")
+    with pytest.raises(ValueError, match="context changed"):
+        worker_startup_timeout(_ORIGINAL13_MODELS[1])
+
+
+def test_blank_profile_retains_current_model_and_floor_semantics(monkeypatch):
+    from infra import constants as constants_module
+
+    monkeypatch.setattr(constants_module, "_STARTUP_PROFILE_CONTEXT", None)
+    monkeypatch.setenv("E2E_STARTUP_PROFILE", " ")
+    monkeypatch.delenv(ENV_STARTUP_TIMEOUT, raising=False)
+    assert worker_startup_timeout(_ORIGINAL13_MODELS[0]) == 600
+    assert worker_startup_timeout("meta-llama/Llama-4-Scout-17B-16E-Instruct") == 1500
+    assert worker_startup_timeout("openai/gpt-oss-120b") == 900
+    monkeypatch.setenv(ENV_STARTUP_TIMEOUT, "1800")
+    assert worker_startup_timeout("openai/gpt-oss-120b") == 1800

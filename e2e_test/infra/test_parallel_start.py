@@ -3,8 +3,10 @@
 from itertools import count
 
 import pytest
+
+from infra import constants as constants_module
 from infra import worker as worker_module
-from infra.constants import ENV_STARTUP_TIMEOUT, WorkerType
+from infra.constants import ENV_STARTUP_TIMEOUT, ConnectionMode, WorkerType
 
 
 @pytest.fixture
@@ -13,6 +15,8 @@ def launch(monkeypatch):
     clock = [100.0]
     ports = count(20000)
     monkeypatch.delenv(ENV_STARTUP_TIMEOUT, raising=False)
+    monkeypatch.delenv("E2E_STARTUP_PROFILE", raising=False)
+    monkeypatch.setattr(constants_module, "_STARTUP_PROFILE_CONTEXT", None)
     monkeypatch.setattr(worker_module, "get_gpu_offset", lambda: 0)
     monkeypatch.setattr(worker_module, "get_model_spec", lambda _: {"tp": 1})
     monkeypatch.setattr(worker_module, "detect_ib_device", lambda: None)
@@ -175,3 +179,105 @@ def test_model_timeout_and_environment_floor_apply_to_whole_fleet(launch, monkey
     worker_module.start_workers("model", engine="vllm", count=2, timeout=10)
     assert [event[2] for event in events[:2]] == [30, 30]
     assert [event[2] for event in events[2:]] == [30, 26]
+
+
+def _original_profile(monkeypatch, profile):
+    from infra import constants as constants_module
+
+    monkeypatch.setattr(constants_module, "_STARTUP_PROFILE_CONTEXT", None)
+    monkeypatch.delenv(ENV_STARTUP_TIMEOUT, raising=False)
+    values = {
+        "E2E_STARTUP_PROFILE": profile,
+        "E2E_ENGINE": "vllm",
+        "E2E_RUNTIME": "vllm",
+        "E2E_GPU_VENDOR": "amd",
+        "E2E_GPU_TIER": "1" if profile == "original38-13" else "4",
+        "E2E_CONNECTION_MODE": "zmq" if profile == "original38-13" else "",
+        "E2E_ZMQ_ENGINE_COUNT": "2" if profile == "original38-13" else "",
+        "TEST_DIRS": "e2e_test/chat_completions",
+        "TEST_FILTER": "",
+        "E2E_MIN_SELECTED": "202" if profile == "original38-13" else "32",
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+
+
+@pytest.mark.parametrize(
+    "profile,model,tp,bound,mode",
+    [
+        ("original38-13", "meta-llama/Llama-3.1-8B-Instruct", 1, 300, ConnectionMode.ZMQ),
+        (
+            "original38-29",
+            "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+            4,
+            1200,
+            ConnectionMode.GRPC,
+        ),
+        ("original38-29", "openai/gpt-oss-120b", 4, 600, ConnectionMode.GRPC),
+    ],
+)
+def test_profile_value_reaches_actual_spawn_and_wait_seams(
+    launch,
+    monkeypatch,
+    profile,
+    model,
+    tp,
+    bound,
+    mode,
+):
+    events, _ = launch
+    _original_profile(monkeypatch, profile)
+    monkeypatch.setattr(
+        worker_module, "get_model_spec", lambda _: {"tp": tp, "startup_timeout": 9999}
+    )
+    workers = worker_module.start_workers(model, engine="vllm", mode=mode)
+    assert [event[0] for event in events] == ["start", "ready"]
+    assert [event[2] for event in events] == [bound, bound]
+    assert workers[0].gpu_ids == list(range(tp * (2 if mode == ConnectionMode.ZMQ else 1)))
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"engine": "sglang"},
+        {"mode": ConnectionMode.HTTP},
+        {"tp": 2},
+        {"gpus": 1},
+        {"count": 2},
+        {"count": True},
+        {"count": 1.0},
+        {"count": 0},
+        {"worker_type": WorkerType.PREFILL},
+        {"extra_engine_args": ["--tensor-parallel-size", "2"]},
+        {"extra_engine_args": ["--tensor-parallel-size=2"]},
+        {"extra_engine_args": ["-tp2"]},
+        {"extra_engine_args": ["--data-parallel-size=1"]},
+        {"extra_engine_args": ["--tensor_parallel_size=2"]},
+        {"extra_engine_args": ["--data_parallel_size=1"]},
+        {"extra_engine_args": ["--model", "different-model"]},
+        {"extra_engine_args": ["--config=override.yaml"]},
+        {"extra_env": {"SMG_VLLM_SERVICER_WARMUP": "off"}},
+    ],
+)
+def test_profile_conflict_fails_before_any_fake_spawn(launch, monkeypatch, options):
+    events, _ = launch
+    _original_profile(monkeypatch, "original38-13")
+    kwargs = {"engine": "vllm", "mode": ConnectionMode.ZMQ, **options}
+    with pytest.raises(ValueError):
+        worker_module.start_workers("meta-llama/Llama-3.1-8B-Instruct", **kwargs)
+    assert events == []
+
+
+def test_profile_readiness_failure_still_cleans_up(launch, monkeypatch):
+    events, _ = launch
+    _original_profile(monkeypatch, "original38-29")
+    monkeypatch.setattr(worker_module, "get_model_spec", lambda _: {"tp": 4})
+
+    def fail(worker, timeout):
+        assert timeout == 600
+        raise TimeoutError("profile readiness failed")
+
+    monkeypatch.setattr(worker_module.Worker, "wait_ready", fail)
+    with pytest.raises(TimeoutError, match="profile readiness failed"):
+        worker_module.start_workers("openai/gpt-oss-120b", engine="vllm", mode=ConnectionMode.GRPC)
+    assert [event[0] for event in events] == ["start", "stop"]
