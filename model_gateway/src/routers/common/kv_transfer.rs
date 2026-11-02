@@ -515,7 +515,7 @@ pub(crate) fn moriio_side_channel_error(
 /// Connector id of the engine core serving the prefill side. With DP the cores
 /// suffix the configured id as `{base}_dp{rank}`, so minting needs a pinned
 /// rank; unpinned DP>1 yields None (no mint — decode recomputes locally).
-pub(crate) fn effective_kv_engine_id(
+fn effective_kv_engine_id(
     base: Option<&str>,
     dp_size: Option<usize>,
     dp_rank: Option<usize>,

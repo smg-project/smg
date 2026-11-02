@@ -77,7 +77,7 @@ pub(crate) const STREAM_UPSTREAM_BODY_OVER: usize = 1 << 20;
 /// Buffer capacity for reserializing a parsed request of `raw_len` incoming
 /// bytes: the round trip stays close to raw size, and the 1/16 + 512B slack
 /// absorbs injected fields (bootstrap, kv_transfer_params, dp ranks).
-pub(crate) fn serialized_capacity(raw_len: usize) -> usize {
+fn serialized_capacity(raw_len: usize) -> usize {
     raw_len + raw_len / 16 + 512
 }
 
