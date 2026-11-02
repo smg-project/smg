@@ -1112,7 +1112,7 @@ fn inject_kv_bootstrap_room(
     // rate stays negligible. See the proto field doc.
     //
     // Under `DpPlacement::RoomResidue`, mint the room congruent to the
-    // dp-aware prefill worker's rank: the engine dispatches by
+    // prefill rank worker's rank: the engine dispatches by
     // `room % dp_size`, so the residue is the placement carrier. The low
     // bits therefore carry structure — do not shard on them elsewhere. Under
     // round_robin the decode side follows the same residue and deliberately

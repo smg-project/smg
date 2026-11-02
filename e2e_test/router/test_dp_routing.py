@@ -1,5 +1,8 @@
-"""DP rank-pinning verification for vLLM gRPC workers (``--dp-aware``), and
-its twin on the mock worker.
+"""DP rank-pinning verification for vLLM gRPC workers, and its twin on the
+mock worker.
+
+The router discovers an engine's data-parallel size on every registration and
+registers one worker per rank, with no flag on its command line.
 
 Output correctness alone cannot catch broken pinning: when no rank reaches the
 engine, vLLM load-balances across DP ranks internally and still produces
@@ -87,7 +90,7 @@ def _assert_requests_pinned_to_both_ranks(setup_backend, worker_log_glob: str) -
 @pytest.mark.gpu(2)
 @pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct")
 @pytest.mark.e2e
-@pytest.mark.gateway(log_level="debug", log_dir=str(_LOG_DIR), extra_args=["--dp-aware"])
+@pytest.mark.gateway(log_level="debug", log_dir=str(_LOG_DIR))
 @pytest.mark.workers(count=1, gpus=2, extra_engine_args=["--data-parallel-size", "2"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestDpAwareRankPinning:
@@ -101,7 +104,7 @@ class TestDpAwareRankPinning:
 @pytest.mark.gpu(1)
 @pytest.mark.model("RedHatAI/Llama-3.2-1B-Instruct-FP8")
 @pytest.mark.e2e
-@pytest.mark.gateway(log_level="debug", log_dir=str(_LOG_DIR), extra_args=["--dp-aware"])
+@pytest.mark.gateway(log_level="debug", log_dir=str(_LOG_DIR))
 @pytest.mark.workers(count=1, extra_engine_args=["--engine", "realistic", "--grpc-dp-size", "2"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestDpAwareRankPinningOnTheMockWorker:

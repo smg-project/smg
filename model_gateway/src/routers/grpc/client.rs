@@ -978,7 +978,7 @@ const SGLANG_GRPC_KEYS: &[&str] = &[
     "max_running_requests",
     // Whether the engine splits `max_running_requests` across its
     // attention-DP workers (the flag, or the width its newer releases resolve
-    // it into): under `--dp-aware` each rank worker then gets its share of
+    // it into): each rank worker then gets its share of
     // the window (see `create_worker::labels_for_rank`).
     "enable_dp_attention",
     "attn_dp_size",

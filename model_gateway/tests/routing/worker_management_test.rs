@@ -109,7 +109,6 @@ mod dp_removal_tests {
             (WorkerType::Decode, WorkerType::Prefill),
         ] {
             let context = create_test_context(RouterConfig {
-                dp_aware: true,
                 disable_load_monitoring: true,
                 ..Default::default()
             })
@@ -174,7 +173,6 @@ mod dp_removal_tests {
     #[tokio::test]
     async fn dp_group_removal_skips_only_the_rank_whose_revision_moved() {
         let context = create_test_context(RouterConfig {
-            dp_aware: true,
             disable_load_monitoring: true,
             ..Default::default()
         })
@@ -212,7 +210,6 @@ mod dp_removal_tests {
     #[tokio::test]
     async fn dp_group_removal_leaves_ranks_absent_from_the_snapshot() {
         let context = create_test_context(RouterConfig {
-            dp_aware: true,
             disable_load_monitoring: true,
             ..Default::default()
         })
@@ -276,52 +273,49 @@ mod dp_removal_tests {
     }
 
     #[tokio::test]
-    async fn discovery_removal_resolves_plain_and_dp_groups_without_global_dp_setting() {
-        for dp_aware in [false, true] {
-            for scheme in ["http", "grpc"] {
-                let context = create_test_context(RouterConfig {
-                    dp_aware,
-                    disable_load_monitoring: true,
-                    ..Default::default()
-                })
-                .await;
-                let base = format!("{scheme}://worker:30000");
-                let plain = register(&context, &base, WorkerType::Prefill, None);
-                let rank0 = register(&context, &base, WorkerType::Decode, Some(0));
-                let rank1 = register(&context, &base, WorkerType::Decode, Some(1));
-                let other = register(
-                    &context,
-                    &format!("{scheme}://worker:30001"),
-                    WorkerType::Prefill,
-                    None,
-                );
+    async fn discovery_removal_resolves_plain_and_dp_groups() {
+        for scheme in ["http", "grpc"] {
+            let context = create_test_context(RouterConfig {
+                disable_load_monitoring: true,
+                ..Default::default()
+            })
+            .await;
+            let base = format!("{scheme}://worker:30000");
+            let plain = register(&context, &base, WorkerType::Prefill, None);
+            let rank0 = register(&context, &base, WorkerType::Decode, Some(0));
+            let rank1 = register(&context, &base, WorkerType::Decode, Some(1));
+            let other = register(
+                &context,
+                &format!("{scheme}://worker:30001"),
+                WorkerType::Prefill,
+                None,
+            );
 
-                // A mismatched revision must preserve every current registration.
-                let stale: HashMap<String, u64> = guards(&context, &[&plain, &rank0, &rank1])
-                    .into_iter()
-                    .map(|(id, revision)| (id, revision + 1))
-                    .collect();
-                run_removal(&context, "worker:30000", Some(stale))
-                    .await
-                    .unwrap();
-                assert_eq!(context.worker_registry.len(), 4);
+            // A mismatched revision must preserve every current registration.
+            let stale: HashMap<String, u64> = guards(&context, &[&plain, &rank0, &rank1])
+                .into_iter()
+                .map(|(id, revision)| (id, revision + 1))
+                .collect();
+            run_removal(&context, "worker:30000", Some(stale))
+                .await
+                .unwrap();
+            assert_eq!(context.worker_registry.len(), 4);
 
-                let current = guards(&context, &[&plain, &rank0, &rank1]);
-                run_removal(&context, "worker:30000", Some(current))
-                    .await
-                    .unwrap();
-                for removed in [plain, rank0, rank1] {
-                    assert!(context.worker_registry.get_by_url(removed.url()).is_none());
-                }
-                assert!(context.worker_registry.get_by_url(other.url()).is_some());
-                assert_eq!(context.worker_registry.len(), 1);
-
-                // Discovery removal is idempotent; an explicit missing target errors.
-                run_removal(&context, "worker:30000", Some(HashMap::new()))
-                    .await
-                    .unwrap();
-                assert!(run_removal(&context, "worker:30000", None).await.is_err());
+            let current = guards(&context, &[&plain, &rank0, &rank1]);
+            run_removal(&context, "worker:30000", Some(current))
+                .await
+                .unwrap();
+            for removed in [plain, rank0, rank1] {
+                assert!(context.worker_registry.get_by_url(removed.url()).is_none());
             }
+            assert!(context.worker_registry.get_by_url(other.url()).is_some());
+            assert_eq!(context.worker_registry.len(), 1);
+
+            // Discovery removal is idempotent; an explicit missing target errors.
+            run_removal(&context, "worker:30000", Some(HashMap::new()))
+                .await
+                .unwrap();
+            assert!(run_removal(&context, "worker:30000", None).await.is_err());
         }
     }
 }
@@ -749,4 +743,178 @@ async fn the_manifest_format_exports_the_registered_fleet() {
     );
 
     ctx.shutdown().await;
+}
+
+/// The data-parallel width of an HTTP worker, through the API: the step that
+/// decides the workers reads the engine's width endpoint when metadata
+/// discovery delivered none, so a read that fails refuses the registration
+/// once the step's retries are spent (no worker is registered), while a
+/// nested gateway whose old-form endpoint answers 501 registers as one
+/// worker under its models-list name.
+#[cfg(test)]
+mod width_read_tests {
+    use std::{net::Ipv4Addr, time::Duration};
+
+    use axum::{routing::get, Json};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    /// An engine's HTTP endpoints as a test serves them: each route answers
+    /// every GET with its status and JSON body, `/health` with 200 (the
+    /// registration's reachability probe), any other path a 404.
+    async fn serve_engine(routes: Vec<(&'static str, StatusCode, serde_json::Value)>) -> String {
+        let mut router = axum::Router::new().route("/health", get(|| async { StatusCode::OK }));
+        for (path, status, body) in routes {
+            router = router.route(
+                path,
+                get(move || {
+                    let body = body.clone();
+                    async move { (status, Json(body)) }
+                }),
+            );
+        }
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        #[expect(clippy::disallowed_methods, reason = "test infrastructure")]
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        url
+    }
+
+    async fn post_worker(app: &axum::Router, spec: serde_json::Value) -> StatusCode {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/workers")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(spec.to_string()))
+            .unwrap();
+        app.clone().oneshot(request).await.unwrap().status()
+    }
+
+    /// Two engines through `POST /workers`: one detected as the runtime that
+    /// takes rank workers whose `/server_info` fails, one `generic` (a nested
+    /// gateway, 501 on the old-form endpoint); both answer `/v1/models`.
+    /// Returns their URLs: the failing engine's, then the nested gateway's.
+    async fn post_the_two_engines(app: &axum::Router) -> (String, String) {
+        let failing = serve_engine(vec![
+            (
+                "/server_info",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": "down"}),
+            ),
+            (
+                "/v1/models",
+                StatusCode::OK,
+                json!({"data": [{"id": "served-f"}]}),
+            ),
+        ])
+        .await;
+        let nested_gateway = serve_engine(vec![
+            (
+                "/get_server_info",
+                StatusCode::NOT_IMPLEMENTED,
+                json!({"error": "not implemented"}),
+            ),
+            (
+                "/v1/models",
+                StatusCode::OK,
+                json!({"data": [{"id": "served-h", "max_model_len": 4096}]}),
+            ),
+        ])
+        .await;
+        for (url, runtime) in [(&failing, "sglang"), (&nested_gateway, "generic")] {
+            let spec = json!({
+                "url": url,
+                "runtime_type": runtime,
+                "health": {"disable_health_check": true},
+            });
+            assert_eq!(post_worker(app, spec).await, StatusCode::ACCEPTED, "{url}");
+        }
+        (failing, nested_gateway)
+    }
+
+    /// Under cache-aware, where the width decides the workers: the engine
+    /// whose width read fails is refused once the DP step's retries are
+    /// spent, the nested gateway registers under its models-list name.
+    #[tokio::test]
+    async fn a_failed_width_read_refuses_the_registration_once_the_retries_are_spent() {
+        let ctx =
+            AppTestContext::new_with_config(TestRouterConfig::cache_aware(3905), vec![]).await;
+        let app = ctx.create_app();
+        let (failing, nested_gateway) = post_the_two_engines(&app).await;
+
+        let queue = ctx
+            .app_context
+            .worker_job_queue
+            .get()
+            .expect("the job queue")
+            .clone();
+        let registry = &ctx.app_context.worker_registry;
+        let refused = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let refused = queue
+                    .get_status(&failing)
+                    .filter(|status| status.status == "failed");
+                if let Some(refused) =
+                    refused.filter(|_| registry.get_by_url(&nested_gateway).is_some())
+                {
+                    return refused;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the failed width read ends its registration and the nested gateway registers");
+        assert!(
+            refused
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("server_info")),
+            "the refusal names the read that failed: {refused:?}"
+        );
+        assert!(
+            registry.get_by_url(&failing).is_none(),
+            "a width the gateway could not read registers no worker"
+        );
+        assert_eq!(
+            registry.get_by_url(&nested_gateway).unwrap().model_id(),
+            "served-h"
+        );
+        assert_eq!(registry.len(), 1);
+        ctx.shutdown().await;
+    }
+
+    /// Under round-robin, where the width decides nothing: the same failing
+    /// engine is not asked and registers as one worker under its models-list
+    /// name, as before, beside the nested gateway.
+    #[tokio::test]
+    async fn a_failed_width_read_registers_one_worker_where_the_width_decides_nothing() {
+        let ctx =
+            AppTestContext::new_with_config(TestRouterConfig::round_robin(3906), vec![]).await;
+        let app = ctx.create_app();
+        let (failing, nested_gateway) = post_the_two_engines(&app).await;
+
+        let registry = &ctx.app_context.worker_registry;
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while registry.get_by_url(&failing).is_none()
+                || registry.get_by_url(&nested_gateway).is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("both engines register where the width decides nothing");
+        assert_eq!(
+            registry.get_by_url(&failing).unwrap().model_id(),
+            "served-f"
+        );
+        assert_eq!(
+            registry.get_by_url(&nested_gateway).unwrap().model_id(),
+            "served-h"
+        );
+        assert_eq!(registry.len(), 2);
+        ctx.shutdown().await;
+    }
 }

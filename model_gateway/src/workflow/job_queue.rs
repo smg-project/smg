@@ -1124,7 +1124,7 @@ fn apply_startup_worker_config(spec: &mut WorkerSpec, router_config: &RouterConf
     }
     // Grouped ZMQ worker: the handshake awaits this many DP engines on one
     // socket set. Only ZMQ URLs — dp_size on an HTTP/gRPC startup worker would
-    // misread as dp-awareness.
+    // misread as a rank group.
     if let Some(count) = router_config.zmq_engine_count.filter(|&n| n > 1) {
         if ConnectionMode::from_url(&spec.url) == Some(ConnectionMode::Zmq) {
             spec.dp_size = Some(count);
@@ -1278,7 +1278,7 @@ mod tests {
 
     /// One engine is an ungrouped worker, not a group of one: the ZMQ client
     /// awaits a single engine by default, and `Some(1)` must not turn the
-    /// worker into a dp-aware one.
+    /// worker into a grouped one.
     #[test]
     fn a_single_engine_leaves_dp_size_unset() {
         let mut config = RouterConfig {

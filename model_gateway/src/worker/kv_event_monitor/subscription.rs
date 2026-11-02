@@ -1498,7 +1498,7 @@ mod tests {
         }
     }
 
-    /// Under `--dp-aware` an engine's stream names every rank's batches; a
+    /// A data-parallel engine's stream names every rank's batches; a
     /// rank worker indexes its rank's and the unranked ones, never another
     /// rank's, so its overlap is its own cache, while every rank's batch
     /// moves its cursor, so the resubscribe cursor is the unpinned worker's.

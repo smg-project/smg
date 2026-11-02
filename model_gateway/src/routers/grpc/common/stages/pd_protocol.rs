@@ -45,7 +45,7 @@ pub(crate) enum PdRendezvous {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DpPlacement {
     /// The engine honors the per-request `data_parallel_rank` pin field, set
-    /// on each side from its selected dp-aware virtual worker.
+    /// on each side from its selected rank worker.
     PinField,
     /// The room encodes the prefill rank so TokenSpeed's decode receiver can
     /// locate its KV source. Each request also carries its selected rank pin;

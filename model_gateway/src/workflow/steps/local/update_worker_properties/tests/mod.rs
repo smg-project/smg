@@ -193,8 +193,8 @@ fn grpc_decode_worker(
 /// the share, not the whole window.
 #[tokio::test]
 async fn a_rank_whose_dp_flag_only_the_operator_set_follows_the_engines_window() {
-    // Registered dp-aware over an engine that reports no DP label, with
-    // `enable_dp_attention` set in the worker's config: the rank carries
+    // Registered as a rank worker of an engine that reports no DP label,
+    // with `enable_dp_attention` in the worker's config: the rank carries
     // the share of the engine's 256, and the record has it in rank space.
     let worker = grpc_decode_worker(
         Some((2, 8)),

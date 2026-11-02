@@ -622,11 +622,11 @@ impl WorkerService {
         validate_spec(&config)?;
         Self::require_provider_router(&config)?;
 
-        // A data-parallel router expands one spec into one worker per rank,
-        // each registered under a rank-suffixed URL. Re-running registration
-        // for a single ID cannot express that, so refuse here instead of
-        // answering 202 and failing in the background.
-        if self.router_config.dp_aware {
+        // A data-parallel engine registers as one worker per rank, each under
+        // a rank-suffixed URL. Re-running registration for one rank's ID
+        // cannot express the group, so refuse here instead of answering 202
+        // and failing in the background.
+        if existing.is_dp_aware() {
             return Err(WorkerServiceError::BadRequest {
                 message: format!(
                     "Worker '{url}' belongs to a data-parallel group. \
@@ -1036,7 +1036,7 @@ mod tests {
         }
         // A window wider than 65535 passes the boundary: the routers saturate
         // it. A window set here is the worker's only window, kept as set on
-        // every dp-aware rank worker; only a discovered one is divided per rank.
+        // every rank worker; only a discovered one is divided per rank.
         let spec: WorkerSpec = serde_json::from_value(json!({
             "url": url, "cost": 2.5, "kv_block_size": 16, "dp_rank": 1, "dp_size": 2,
             "labels": {
@@ -1259,6 +1259,45 @@ mod tests {
                 .expect_err("queue is uninitialized"),
             WorkerServiceError::QueueNotInitialized
         ));
+    }
+
+    /// A rank worker cannot be replaced by its ID: its engine registered as
+    /// one worker per rank, and a PUT of one rank cannot express the group. A
+    /// plain worker's PUT is taken (here as far as the job queue, which this
+    /// service has none of).
+    #[tokio::test]
+    async fn put_is_refused_for_a_rank_worker_and_accepted_for_a_plain_one() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let base = "grpc://10.0.0.10:8000";
+        let rank: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(base)
+                .worker_type(WorkerType::Regular)
+                .model(ModelCard::new("m"))
+                .dp_config(1, 2)
+                .build(),
+        );
+        registry.register(Arc::clone(&rank)).unwrap();
+        let rank_id = registry.reserve_id_for_url(rank.url());
+        let plain = "grpc://10.0.0.11:8000";
+        register_worker(&registry, plain, Some("m"));
+        let plain_id = registry.reserve_id_for_url(plain);
+        let service = make_service(Arc::clone(&registry));
+
+        let err = service
+            .replace_worker(rank_id.as_str(), worker_spec(base))
+            .await
+            .expect_err("a rank's PUT");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST, "{err}");
+        assert!(err.to_string().contains("data-parallel group"), "{err}");
+
+        let err = service
+            .replace_worker(plain_id.as_str(), worker_spec(plain))
+            .await
+            .expect_err("this service has no job queue");
+        assert!(
+            matches!(err, WorkerServiceError::QueueNotInitialized),
+            "{err}"
+        );
     }
 
     /// A discovered worker's spec and labels are changed at its discovery

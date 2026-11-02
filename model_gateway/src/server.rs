@@ -2278,12 +2278,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     for warning in crate::config::unused_credentials_warnings(&config.router_config.mode) {
         tracing::warn!("{warning}");
     }
-    // A rank scheduler under rank expansion chooses nothing: the operator's
-    // configuration runs, with the word that one of its flags does nothing.
-    if let Some(warning) = crate::config::dp_minimum_tokens_scheduler_scope_warning(
-        config.router_config.dp_aware,
-        config.router_config.dp_minimum_tokens_scheduler,
-    ) {
+    // `--dp-aware` does nothing any more: the operator's configuration runs,
+    // with the word that the flag is a no-op and the release it goes in.
+    if let Some(warning) =
+        crate::config::dp_aware_deprecation_warning(config.router_config.dp_aware)
+    {
         tracing::warn!("{warning}");
     }
 

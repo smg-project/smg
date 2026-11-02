@@ -738,6 +738,8 @@ impl RouterConfigBuilder {
     // ==================== Boolean Setters ====================
     // Accept bool parameters to conditionally set flags without if statements
 
+    /// Deprecated since 1.16.0, no effect (see `RouterConfig::dp_aware`);
+    /// accepted for one release, then removed.
     pub fn dp_aware(mut self, enable: bool) -> Self {
         self.config.dp_aware = enable;
         self

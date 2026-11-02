@@ -261,9 +261,11 @@ impl Router {
 
         match self.select_first_worker() {
             Ok(worker) => {
+                // The engine's address: a rank worker's URL carries the router's
+                // `@rank` suffix, which is no part of the host.
                 let mut request_builder = worker
                     .http_client()
-                    .get(format!("{}/{endpoint}", worker.url()));
+                    .get(format!("{}/{endpoint}", worker.base_url()));
                 // A public route outside the auth middleware: the allow-listed
                 // caller headers go as they are and nothing is added (a
                 // configured worker key here would authenticate an anonymous
@@ -3208,6 +3210,51 @@ mod tests {
         let url = result.unwrap().url().to_string();
         // DashMap doesn't guarantee order, so just check we get one of the workers
         assert!(url == "http://worker1:8080" || url == "http://worker2:8080");
+    }
+
+    /// A rank worker's URL carries the router's `@rank` suffix, which is no
+    /// part of the engine's address: the first-worker GET proxy goes to the
+    /// worker's base URL, so `/health_generate`, `/get_server_info` and
+    /// `/get_model_info` reach a data-parallel engine registered per rank.
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a loopback stub for one test; it ends with the test runtime"
+    )]
+    async fn the_get_proxy_reaches_a_rank_workers_engine_at_its_base_url() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = Arc::clone(&seen);
+        let app = axum::Router::new().fallback(axum::routing::any(move |req: Request<Body>| {
+            let log = Arc::clone(&log);
+            async move {
+                log.lock().unwrap().push(req.uri().path().to_string());
+                "{}"
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        worker_registry.register_or_replace(Arc::new(
+            BasicWorkerBuilder::new(format!("http://{addr}"))
+                .worker_type(WorkerType::Regular)
+                .dp_config(0, 2)
+                .health_config(no_health_check())
+                .build(),
+        ));
+        let router = Router {
+            worker_registry,
+            ..create_test_regular_router()
+        };
+
+        let response = router
+            .proxy_get_request(Request::new(Body::empty()), "get_server_info")
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(seen.lock().unwrap().as_slice(), ["/get_server_info"]);
     }
 
     #[test]

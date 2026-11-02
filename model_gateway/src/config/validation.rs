@@ -454,27 +454,18 @@ pub fn runtime_worker_threads_oversubscription(threads: usize, cpus: usize) -> O
     })
 }
 
-/// The warning for `--dp-minimum-tokens-scheduler` set with `--dp-aware`,
-/// `None` for every other pair. The scheduler chooses a data-parallel rank
-/// for a request from the ranks' reported token loads where an engine is
-/// registered as one worker (the HTTP prefill-decode router's rank choice
-/// for an engine the gateway does not expand); under `--dp-aware` an engine
-/// registers as one worker per rank, the routing policy's pick among those
-/// workers is the rank choice, and the scheduler, asked about a worker that
-/// is one rank, can only answer that rank: it chooses nothing. Advice at
-/// start-up, not a refusal: the pair runs as `--dp-aware` alone does, and
-/// the flag's cache of per-rank token loads is kept up for nothing. Pure
-/// over the two settings so the rule is testable; start-up logs it with the
-/// configuration's other warnings.
-pub fn dp_minimum_tokens_scheduler_scope_warning(
-    dp_aware: bool,
-    dp_minimum_tokens_scheduler: bool,
-) -> Option<String> {
-    (dp_aware && dp_minimum_tokens_scheduler).then(|| {
-        "dp_minimum_tokens_scheduler chooses nothing under dp_aware: the engine's ranks are \
-         registered as workers and the routing policy's pick among them is the rank choice; \
-         the scheduler applies to the HTTP prefill-decode router for an engine registered as \
-         one worker"
+/// The warning for `--dp-aware` set, `None` when it is not. The flag has no
+/// effect: the gateway discovers an engine's data-parallel width at every
+/// registration (metadata discovery reads it on every transport) and
+/// registers one worker per rank where the transport and the policy take a
+/// pin. It is accepted for one release from 1.16.0 so launch lines keep
+/// working, then removed. Advice at start-up, not a refusal; pure, so the
+/// rule is testable, and logged with the configuration's other warnings.
+pub fn dp_aware_deprecation_warning(dp_aware: bool) -> Option<String> {
+    dp_aware.then(|| {
+        "--dp-aware is deprecated since 1.16.0 and has no effect: the gateway always discovers \
+         an engine's data-parallel ranks at registration and registers one worker per rank; \
+         the flag is accepted for one release, then removed"
             .to_string()
     })
 }
@@ -2404,75 +2395,10 @@ impl ConfigValidator {
 
         Self::validate_mtls(config)?;
 
-        // Under dp_aware each URL registers one worker per DP rank.
-        if !has_service_discovery && !config.dp_aware {
-            if let PolicyConfig::PowerOfTwo { .. } = &config.policy {
-                let worker_count = config.mode.worker_count();
-                if worker_count < 2 {
-                    return Err(ConfigError::IncompatibleConfig {
-                        reason: "Power-of-two policy requires at least 2 workers".to_string(),
-                    });
-                }
-            }
-
-            if let RoutingMode::PrefillDecode {
-                prefill_urls,
-                decode_urls,
-                prefill_policy,
-                decode_policy,
-            } = &config.mode
-            {
-                if let Some(PolicyConfig::PowerOfTwo { .. }) = prefill_policy {
-                    if prefill_urls.len() < 2 {
-                        return Err(ConfigError::IncompatibleConfig {
-                            reason: "Power-of-two policy for prefill requires at least 2 prefill workers".to_string(),
-                        });
-                    }
-                }
-
-                if let Some(PolicyConfig::PowerOfTwo { .. }) = decode_policy {
-                    if decode_urls.len() < 2 {
-                        return Err(ConfigError::IncompatibleConfig {
-                            reason:
-                                "Power-of-two policy for decode requires at least 2 decode workers"
-                                    .to_string(),
-                        });
-                    }
-                }
-            }
-
-            if let RoutingMode::EncodePrefillDecode {
-                prefill_urls,
-                decode_urls,
-                prefill_policy,
-                decode_policy,
-                ..
-            } = &config.mode
-            {
-                let effective_prefill_policy = prefill_policy.as_ref().unwrap_or(&config.policy);
-                let effective_decode_policy = decode_policy.as_ref().unwrap_or(&config.policy);
-
-                if matches!(effective_prefill_policy, PolicyConfig::PowerOfTwo { .. })
-                    && prefill_urls.len() < 2
-                {
-                    return Err(ConfigError::IncompatibleConfig {
-                        reason:
-                            "Power-of-two policy for prefill requires at least 2 prefill workers"
-                                .to_string(),
-                    });
-                }
-
-                if matches!(effective_decode_policy, PolicyConfig::PowerOfTwo { .. })
-                    && decode_urls.len() < 2
-                {
-                    return Err(ConfigError::IncompatibleConfig {
-                        reason: "Power-of-two policy for decode requires at least 2 decode workers"
-                            .to_string(),
-                    });
-                }
-            }
-        }
-
+        // No count rule for power_of_two: one URL may be a data-parallel
+        // engine of several ranks (discovered at registration, where the
+        // validator cannot see), and the policy picks the one healthy worker
+        // when it is not.
         Ok(())
     }
 
@@ -3105,26 +3031,20 @@ mod tests {
         }
     }
 
-    /// The minimum-tokens scheduler set with rank expansion is a warning,
-    /// not a refusal: the pure rule names the pair and the scheduler's
-    /// scope, says nothing for the other three settings, and the validator
-    /// passes the pair.
+    /// `--dp-aware` is accepted for one release and does nothing: set, the
+    /// pure rule names the flag, that it has no effect, and the release it
+    /// goes in; unset, it says nothing; the validator passes it, with the
+    /// minimum-tokens scheduler beside it or not.
     #[test]
-    fn the_minimum_tokens_scheduler_under_dp_aware_warns_without_a_refusal() {
-        let warning = dp_minimum_tokens_scheduler_scope_warning(true, true).expect("a warning");
+    fn the_dp_aware_flag_warns_that_it_has_no_effect() {
+        let warning = dp_aware_deprecation_warning(true).expect("a warning");
         assert!(
-            warning.contains("chooses nothing under dp_aware")
-                && warning.contains("HTTP prefill-decode router"),
+            warning.contains("--dp-aware")
+                && warning.contains("no effect")
+                && warning.contains("1.16.0"),
             "{warning}"
         );
-        for (dp_aware, scheduler) in [(false, false), (true, false), (false, true)] {
-            assert_eq!(
-                dp_minimum_tokens_scheduler_scope_warning(dp_aware, scheduler),
-                None,
-                "dp_aware {dp_aware}, scheduler {scheduler}"
-            );
-        }
-        // The pair validates: advice, not a refusal.
+        assert_eq!(dp_aware_deprecation_warning(false), None);
         let config = RouterConfig::builder()
             .regular_mode(vec![])
             .round_robin_policy()
@@ -4679,31 +4599,34 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// One URL under power_of_two is accepted, as a regular worker and on
+    /// either side of a prefill-decode pair: the URL may be a data-parallel
+    /// engine of several ranks, which registration discovers and the
+    /// validator cannot see, and the policy picks the one healthy worker
+    /// when it is not.
     #[test]
-    fn test_validate_pd_mode_power_of_two_insufficient_workers() {
-        let mut config = RouterConfig::new(
+    fn a_single_url_under_power_of_two_is_accepted_it_may_be_a_data_parallel_engine() {
+        let power_of_two = || PolicyConfig::PowerOfTwo {
+            load_metric: Default::default(),
+        };
+        let regular = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker1:8000".to_string()],
+            },
+            power_of_two(),
+        );
+        assert!(ConfigValidator::validate(&regular).is_ok());
+
+        let pd = RouterConfig::new(
             RoutingMode::PrefillDecode {
-                prefill_urls: vec![("http://prefill1:8000".to_string(), None)], // Only 1 prefill
-                decode_urls: vec![
-                    "http://decode1:8000".to_string(),
-                    "http://decode2:8000".to_string(),
-                ],
-                prefill_policy: Some(PolicyConfig::PowerOfTwo {
-                    load_metric: Default::default(),
-                }), // Requires 2+ workers
-                decode_policy: None,
+                prefill_urls: vec![("http://prefill1:8000".to_string(), None)],
+                decode_urls: vec!["http://decode1:8000".to_string()],
+                prefill_policy: Some(power_of_two()),
+                decode_policy: Some(power_of_two()),
             },
             PolicyConfig::Random,
         );
-
-        let result = ConfigValidator::validate(&config);
-        assert!(result.is_err());
-        if let Err(e) = result {
-            assert!(e.to_string().contains("prefill requires at least 2"));
-        }
-
-        config.dp_aware = true;
-        assert!(ConfigValidator::validate(&config).is_ok());
+        assert!(ConfigValidator::validate(&pd).is_ok());
     }
 
     #[test]

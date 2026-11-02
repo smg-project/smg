@@ -65,8 +65,8 @@ struct WorkerResponse {
 
 /// Fan out requests to workers in parallel
 ///
-/// Requests are addressed to `worker.base_url()`, so under `--dp-aware`
-/// every rank of the same base worker targets the rank-free endpoint —
+/// Requests are addressed to `worker.base_url()`, so every rank worker
+/// of the same base worker targets the rank-free endpoint —
 /// `worker.url()` carries an `@{dp_rank}` suffix that is SMG-internal and
 /// not a valid server address (#1993). Callers that want one request per
 /// base worker must dedupe by base URL first (see `get_engine_metrics`).
@@ -1556,8 +1556,8 @@ impl WorkerManager {
     /// with no HTTP worker gets the comment lines alone, a 200: the
     /// aggregate of zero HTTP workers, not a failed scrape.
     ///
-    /// An address is scraped once. Under `--dp-aware` all ranks share one
-    /// base URL (#1993). Registrations of one host and port under other
+    /// An address is scraped once: a data-parallel engine's rank workers
+    /// share one base URL (#1993). Registrations of one host and port under other
     /// credentials share the masked address the label carries, and the
     /// aggregator refuses two series with one label set: they are tried in
     /// the order of their URLs, one per round, until one answers or a

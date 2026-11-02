@@ -372,7 +372,9 @@ impl PDRouter {
         endpoint: &str,
         headers: Option<Vec<(String, String)>>,
     ) -> Response {
-        let url = format!("{}/{endpoint}", worker.url());
+        // The engine's address: a rank worker's URL carries the router's
+        // `@rank` suffix, which is no part of the host.
+        let url = format!("{}/{endpoint}", worker.base_url());
         let mut request_builder = worker.http_client().get(&url);
 
         // A public route outside the auth middleware: the caller's headers go
@@ -2612,12 +2614,14 @@ impl RouterTrait for PDRouter {
                 },
             };
 
-        let prefill_url = format!("{}/health_generate", prefill.url());
+        // The engines' addresses: a rank worker's URL carries the router's
+        // `@rank` suffix, which is no part of the host.
+        let prefill_url = format!("{}/health_generate", prefill.base_url());
         let (prefill_result, decode_result) = tokio::join!(
             prefill.http_client().get(&prefill_url).send(),
             decode
                 .http_client()
-                .get(format!("{}/health_generate", decode.url()))
+                .get(format!("{}/health_generate", decode.base_url()))
                 .send()
         );
 
@@ -3545,6 +3549,65 @@ mod tests {
         (format!("http://{addr}"), seen)
     }
 
+    /// A rank worker's URL carries the router's `@rank` suffix, which is no
+    /// part of the engine's address: the GET proxy goes to the worker's base
+    /// URL, so `/get_server_info` and `/get_model_info` reach a prefill
+    /// engine registered per rank.
+    #[tokio::test]
+    async fn the_get_proxy_reaches_a_rank_workers_engine_at_its_base_url() {
+        let (prefill_url, seen) = spawn_recording_stub("{}").await;
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(prefill_url)
+                .worker_type(WorkerType::Prefill)
+                .dp_config(1, 2)
+                .build(),
+        );
+
+        let response = PDRouter::proxy_to_worker(&worker, "get_server_info", None).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let paths: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect();
+        assert_eq!(paths, ["/get_server_info"]);
+    }
+
+    /// The pair probe of `/health_generate` reaches both engines of a pair
+    /// registered per rank at their base URLs.
+    #[tokio::test]
+    async fn the_health_generate_probe_reaches_a_rank_pairs_engines_at_their_base_urls() {
+        let (prefill_url, prefill_seen) = spawn_recording_stub("{}").await;
+        let (decode_url, decode_seen) = spawn_recording_stub("{}").await;
+        let router = create_test_pd_router();
+        for (url, worker_type) in [
+            (prefill_url, WorkerType::Prefill),
+            (decode_url, WorkerType::Decode),
+        ] {
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .dp_config(0, 2)
+                .build();
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            router.worker_registry.register_or_replace(Arc::new(worker));
+        }
+
+        let response = router.health_generate(Request::new(Body::empty())).await;
+
+        assert_eq!(response.status(), StatusCode::OK, "{response:?}");
+        let paths = |seen: &Arc<std::sync::Mutex<Vec<(String, Value)>>>| -> Vec<String> {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect()
+        };
+        assert_eq!(paths(&prefill_seen), ["/health_generate"]);
+        assert_eq!(paths(&decode_seen), ["/health_generate"]);
+    }
+
     /// A side that does not answer within the request's timeout ends the
     /// request, on the concurrent dispatch shape and on the sequential one:
     /// one attempt on the pair, the 504 `call_upstream_timeout` to the client
@@ -3817,8 +3880,8 @@ mod tests {
 
     /// SGLang's prefill side, under its default `follow_bootstrap_room`
     /// placement, fails a request whose `bootstrap_room % dp_size` is not the
-    /// rank it runs on, so every room of a request routed to a dp-aware
-    /// prefill worker is congruent to that worker's rank, single and batched.
+    /// rank it runs on, so every room of a request routed to a prefill
+    /// rank worker is congruent to that worker's rank, single and batched.
     #[tokio::test]
     async fn the_room_is_congruent_to_the_dp_aware_prefill_rank() {
         let (prefill_url, prefill_seen) = spawn_recording_stub("{}").await;
