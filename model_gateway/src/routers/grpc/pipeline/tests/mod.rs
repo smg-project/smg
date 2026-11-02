@@ -548,7 +548,7 @@ async fn components_with_multimodal(
         multimodal,
         tokenizer_autoload: true,
         tokenizer_load_failures: Arc::default(),
-        parser: crate::config::ParserChoice::Legacy,
+        parser: ParserChoice::Legacy,
     })
 }
 
@@ -2898,7 +2898,7 @@ async fn v41_components(
         multimodal,
         tokenizer_autoload: true,
         tokenizer_load_failures: Arc::default(),
-        parser: crate::config::ParserChoice::Legacy,
+        parser: ParserChoice::Legacy,
     })
 }
 
@@ -3470,7 +3470,7 @@ async fn a_404_from_the_preparation_stage_is_reported_once_and_marked() {
         multimodal: None,
         tokenizer_autoload: true,
         tokenizer_load_failures: Arc::default(),
-        parser: crate::config::ParserChoice::Legacy,
+        parser: ParserChoice::Legacy,
     });
 
     let response = pipeline
