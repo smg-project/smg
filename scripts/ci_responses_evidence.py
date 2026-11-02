@@ -50,7 +50,7 @@ def pytest_sessionfinish(session, exitstatus):
 def junit_identity(nodeid):
     path, *parts = nodeid.split("::")
     if not path.endswith(".py") or not parts:
-        raise ValueError("Unexpected pytest identity")
+        raise ValueError(f"Unexpected pytest identity: {nodeid!r}")
     module = path[:-3].replace("/", ".")
     return (".".join([module, *parts[:-1]]), parts[-1])
 
@@ -84,7 +84,9 @@ def verify(directory, xml_path, original_path):
         for nodeid in selected:
             path, *parts = nodeid.split("::")
             if Path(path).is_absolute() or any(part in ("", ".", "..") for part in path.split("/")):
-                raise ValueError("Unexpected raw pytest path")
+                raise ValueError(
+                    f"{directory / 'selected.json'}: unexpected raw pytest path: {nodeid!r}"
+                )
             original_comparison.append("::".join([(root_prefix / path).as_posix(), *parts]))
         result.update(
             source_root=str(source_root),

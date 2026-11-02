@@ -412,3 +412,26 @@ def test_real_pytest_hooks_generate_verifiable_complete_evidence(evidence, skip_
         assert any(skipped in error and "skipped" in error for error in report["errors"])
     else:
         assert report["errors"] == []
+
+
+@pytest.mark.parametrize(
+    "nodeid,diagnostic",
+    [
+        ("/absolute/test_bad.py::test_bad", "unexpected raw pytest path"),
+        ("../outside/test_bad.py::test_bad", "unexpected raw pytest path"),
+        ("responses/test_no_identity.py", "Unexpected pytest identity"),
+    ],
+    ids=["absolute-path", "parent-traversal", "missing-test-identity"],
+)
+def test_malformed_nodeid_diagnostic_names_the_case(evidence, nodeid, diagnostic):
+    complete_records(evidence)
+    evidence["selection"]["nodeids"][0] = nodeid
+    report = verify(evidence, "Evidence validation failed: ValueError")
+    detail = f"{diagnostic}: {nodeid!r}"
+    assert any(detail in message for message in report["errors"])
+    selected_path = evidence["directory"] / "selected.json"
+    if diagnostic == "unexpected raw pytest path":
+        assert any(
+            str(selected_path) in message and detail in message for message in report["errors"]
+        )
+    assert json.loads(selected_path.read_text())["nodeids"][0] == nodeid
