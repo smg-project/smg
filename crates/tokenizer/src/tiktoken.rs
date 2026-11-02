@@ -846,6 +846,7 @@ impl TokenizerTrait for TiktokenTokenizer {
         assistant_prefix: Option<&str>,
     ) -> Result<ChatTemplateOutput> {
         if !matches!(self.renderer, Renderer::KimiK3Xtml) {
+            let generation_prompt_unless_continued = params.generation_prompt_unless_continued();
             let (mut text, continued_final_message) =
                 self.apply_with_continuation(messages, params)?;
             if let Some(prefix) = assistant_prefix {
@@ -856,6 +857,7 @@ impl TokenizerTrait for TiktokenTokenizer {
                 encoding: PromptEncoding::FromText,
                 unbilled_prompt_tokens: 0,
                 continued_final_message,
+                generation_prompt: generation_prompt_unless_continued && !continued_final_message,
             });
         }
         // K3's ids are not a function of the flat text: render the reference's
@@ -879,6 +881,9 @@ impl TokenizerTrait for TiktokenTokenizer {
             encoding: PromptEncoding::Deferred(job),
             unbilled_prompt_tokens,
             continued_final_message: false,
+            // K3 writes the generation header under the flag and never
+            // continues a message (its prefill is the assistant prefix).
+            generation_prompt: params.add_generation_prompt,
         })
     }
 
@@ -1862,6 +1867,52 @@ mod tests {
         );
         assert!(matches!(rendered.encoding, PromptEncoding::FromText));
         assert_eq!(rendered.unbilled_prompt_tokens, 0);
+    }
+
+    /// A continuation the template cannot render falls back to the header
+    /// with the message's text after it, and the render reports the header
+    /// it fell back to; a continuation the template renders reports none.
+    #[test]
+    fn a_continuation_the_template_cannot_render_reports_the_header_it_fell_back_to() {
+        let dir = write_minimal_tiktoken_dir("{}", None);
+        let mut tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+        let continuing = || ChatTemplateParams {
+            add_generation_prompt: false,
+            continue_final_message: true,
+            ..Default::default()
+        };
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "hello"}),
+            serde_json::json!({"role": "assistant", "content": " there"}),
+        ];
+        // No assistant turns: the final message's text never reaches the
+        // prompt, so the continuation falls back to the header plus the text.
+        tokenizer
+            .set_chat_template(
+                "{% for m in messages %}{% if m.role != 'assistant' %}{{ m.content }}{% endif %}{% endfor %}{% if add_generation_prompt %}A:{% endif %}"
+                    .to_string(),
+            )
+            .unwrap();
+        let rendered = tokenizer
+            .apply_chat_template_with_encoding(&messages, continuing(), None)
+            .unwrap();
+        assert_eq!(rendered.text, "helloA: there");
+        assert!(!rendered.continued_final_message);
+        assert!(rendered.generation_prompt, "the fallback wrote the header");
+
+        // A continuation the template renders has no header.
+        tokenizer
+            .set_chat_template(
+                "{% for m in messages %}{{ m.content }}{% endfor %}{% if add_generation_prompt %}A:{% endif %}"
+                    .to_string(),
+            )
+            .unwrap();
+        let rendered = tokenizer
+            .apply_chat_template_with_encoding(&messages, continuing(), None)
+            .unwrap();
+        assert_eq!(rendered.text, "hello there");
+        assert!(rendered.continued_final_message);
+        assert!(!rendered.generation_prompt);
     }
 
     #[test]

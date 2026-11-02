@@ -364,30 +364,7 @@ mod tests {
     /// intermediate, no references, no pipeline pin.
     #[tokio::test]
     async fn a_prompt_without_media_is_the_renderers_tokens_and_nothing_else() {
-        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
-        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-        let loaded = tokenizer.clone();
-        tokenizer_registry
-            .load("tokenizer-id", "m", "test", || async move { Ok(loaded) })
-            .await
-            .unwrap();
-        let components = Arc::new(SharedComponents {
-            templates: Arc::new(Templates::new(tokenizer_registry.clone())),
-            tokenizer_registry,
-            worker_registry: Arc::new(WorkerRegistry::new()),
-            tool_parser_factory: ToolParserFactory::default(),
-            reasoning_parser_factory: ReasoningParserFactory::default(),
-            parser_resolver: ParserResolver::disabled(),
-            multimodal: None,
-            tokenizer_autoload: true,
-            tokenizer_load_failures: Arc::default(),
-            parser: crate::config::ParserChoice::Legacy,
-        });
-        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
-            "model": "m", "messages": [{"role": "user", "content": "Hello world"}]
-        }))
-        .unwrap();
-        let mut ctx = RequestContext::for_chat(Arc::new(request), None, "m".into(), components);
+        let (mut ctx, tokenizer) = context().await;
 
         let Ok(rendered) = prepare_rendered_prompt(
             &mut ctx,

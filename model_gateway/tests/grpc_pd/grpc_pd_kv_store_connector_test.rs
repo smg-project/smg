@@ -9,7 +9,6 @@
 
 use std::{
     future::Future,
-    net::TcpListener as StdTcpListener,
     sync::{Arc, Mutex},
 };
 
@@ -21,6 +20,7 @@ use smg::{
     middleware::TenantRequestMeta,
     routers::RouterTrait,
     tenant::TenantKey,
+    test_support::RefusedAddress,
     worker::{RuntimeType, Worker, WorkerType},
 };
 use smg_grpc_client::vllm_proto as proto;
@@ -218,17 +218,6 @@ async fn start_mock_engine(engine: RecordingEngine) -> u16 {
     serve_engine(proto::vllm_engine_server::VllmEngineServer::new(engine)).await
 }
 
-/// A loopback port nothing listens on: the bootstrap port of the rendezvous
-/// recipe, registered on a worker that never rendezvous.
-#[expect(
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
-fn closed_port() -> u16 {
-    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind");
-    listener.local_addr().expect("address").port()
-}
-
 /// One worker of the pair as it is registered: its mock engine's port, its type
 /// and its KV connector; a prefill worker also carries the engine id and the
 /// bootstrap port the rendezvous recipe registers.
@@ -340,12 +329,13 @@ fn a_store_pair_runs_prefill_then_decode_with_no_handoff_params() {
     let rendered = render_after(|| async move {
         let prefill_port = start_mock_engine(prefill_engine).await;
         let decode_port = start_mock_engine(decode_engine).await;
+        let refused = RefusedAddress::reserve();
         let router = build_pd_router(&[
             PairWorker {
                 port: prefill_port,
                 worker_type: WorkerType::Prefill,
                 connector: STORE_CONNECTOR,
-                bootstrap_port: Some(closed_port()),
+                bootstrap_port: Some(refused.port()),
             },
             PairWorker {
                 port: decode_port,
@@ -377,12 +367,13 @@ fn a_store_worker_never_pairs_with_a_rendezvous_worker_of_the_same_family() {
     render_after(|| async move {
         let prefill_port = start_mock_engine(prefill_engine).await;
         let decode_port = start_mock_engine(decode_engine).await;
+        let refused = RefusedAddress::reserve();
         let router = build_pd_router(&[
             PairWorker {
                 port: prefill_port,
                 worker_type: WorkerType::Prefill,
                 connector: RENDEZVOUS_CONNECTOR,
-                bootstrap_port: Some(closed_port()),
+                bootstrap_port: Some(refused.port()),
             },
             PairWorker {
                 port: decode_port,

@@ -1628,32 +1628,6 @@ async fn engine_loader_frames(path: &Path, width: usize, height: usize) -> Vec<V
         .collect()
 }
 
-/// The RGB bytes of each decoded frame, whichever runner produced them.
-fn decoded_rgb_frames(decoded: DecodedVideoFrames) -> (Vec<Vec<u8>>, Option<VideoSamplingInfo>) {
-    match decoded {
-        DecodedVideoFrames::Rgb {
-            video, sampling, ..
-        } => (
-            video
-                .frame_refs()
-                .expect("frame refs")
-                .iter()
-                .map(|frame| frame.data.to_vec())
-                .collect(),
-            sampling,
-        ),
-        DecodedVideoFrames::Images {
-            frames, sampling, ..
-        } => (
-            frames
-                .iter()
-                .map(|frame| frame.to_rgb8().into_raw())
-                .collect(),
-            sampling,
-        ),
-    }
-}
-
 /// The pipeline's frames are the engine loader's frames, pixel for pixel,
 /// on every ffmpeg runner. Skipped when ffmpeg or ffprobe is not on PATH.
 #[tokio::test]
@@ -1704,7 +1678,7 @@ async fn ffmpeg_path_converts_frames_like_the_engine_loader() {
     let decoded = decode_video_with_ffmpeg(&path, input_bytes, cfg())
         .await
         .expect("ffmpeg decode");
-    let (frames, sampling) = decoded_rgb_frames(decoded);
+    let (frames, sampling) = frames_and_sampling(decoded);
     let sampling = sampling.expect("ffprobe reports the frame rate and count");
     assert_eq!(sampling.frame_indices, selection.frame_indices);
     let raw = decode_video_with_ffmpeg_raw(&path, cfg(), metadata, Some(&selection))

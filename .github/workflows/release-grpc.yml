@@ -1,21 +1,25 @@
 name: Release gRPC packages to PyPI
 
+# Published only on a maintainer's dispatch against a release tag (scripts/release/README.md):
+# no push publishes, and the first step refuses a dispatch whose ref is not a tag.
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - crates/grpc_client/python/pyproject.toml
-      - grpc_servicer/pyproject.toml
   workflow_dispatch:
+    inputs:
+      packages:
+        description: >-
+          auto: the packages whose version at this ref is not complete on PyPI (wheel and sdist);
+          proto, servicer or both: named outright, for a retry
+        type: choice
+        options: [auto, proto, servicer, both]
+        default: auto
 
 permissions:
   contents: read
 
 jobs:
-  # ── Detect which packages changed ──
+  # ── The packages whose version at the dispatched ref is not complete on PyPI (or the ones named) build and upload; --skip-existing passes the files PyPI has ──
   detect:
-    name: Detect changed packages
+    name: Select packages
     runs-on: ubuntu-latest
     outputs:
       proto: ${{ steps.changes.outputs.proto }}
@@ -25,21 +29,43 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Detect changes
+      - name: Select packages
         id: changes
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "proto=true" >> "$GITHUB_OUTPUT"
-            echo "servicer=true" >> "$GITHUB_OUTPUT"
-          else
-            base="${{ github.event.before }}"
-            head="${{ github.sha }}"
-            changed="$(git diff --name-only "$base" "$head")"
-            proto=$(echo "$changed" | grep -q '^crates/grpc_client/python/pyproject.toml$' && echo true || echo false)
-            servicer=$(echo "$changed" | grep -q '^grpc_servicer/pyproject.toml$' && echo true || echo false)
-            echo "proto=$proto" >> "$GITHUB_OUTPUT"
-            echo "servicer=$servicer" >> "$GITHUB_OUTPUT"
+          # A tag alone: a branch can move between a failed upload and its retry, and the retry would complete the
+          # version on PyPI with the missing file built from another commit (--skip-existing keeps the file there).
+          if [ "${GITHUB_REF_TYPE:-}" != tag ]; then
+            echo "dispatch this workflow against a release tag, not a branch (${GITHUB_REF_NAME:-the ref} is a ${GITHUB_REF_TYPE:-?})" >&2
+            exit 1
           fi
+          # A package is selected when the version its pyproject.toml carries at this ref is not complete on PyPI yet:
+          # both files there, the wheel and the sdist. A servicer-only release never runs the proto upload (a proto
+          # token failure cannot hold it up), and a run that failed after one of the two files uploaded is retried
+          # as it is (--skip-existing passes the file PyPI has). The packages input names them outright.
+          selected() {
+            local name=$1 file=$2 package=$3 version
+            case "${PACKAGES:-auto}" in
+              auto) ;;
+              both | "$package") echo "${name}: selected by the packages input (${PACKAGES})" >&2; echo true; return ;;
+              *) echo "${name}: not selected (packages=${PACKAGES})" >&2; echo false; return ;;
+            esac
+            version=$(grep -m1 '^version = ' "$file" | sed 's/version = "\(.*\)"/\1/; s/-rc\./rc/')
+            if curl -fsS "https://pypi.org/pypi/${name}/${version}/json" 2>/dev/null | python3 -c '
+          import json, sys
+          kinds = {file["packagetype"] for file in json.load(sys.stdin)["urls"]}
+          sys.exit(0 if {"bdist_wheel", "sdist"} <= kinds else 1)
+          ' 2>/dev/null; then
+              echo "${name} ${version} is complete on PyPI (wheel and sdist): not selected" >&2
+              echo false
+            else
+              echo "${name} ${version} is not complete on PyPI: selected" >&2
+              echo true
+            fi
+          }
+          echo "proto=$(selected smg-grpc-proto crates/grpc_client/python/pyproject.toml proto)" >> "$GITHUB_OUTPUT"
+          echo "servicer=$(selected smg-grpc-servicer grpc_servicer/pyproject.toml servicer)" >> "$GITHUB_OUTPUT"
+        env:
+          PACKAGES: ${{ inputs.packages }}
 
   # ── Tier 1: Proto (no dependencies) ──
   build-proto:

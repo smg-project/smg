@@ -191,7 +191,7 @@ fn word() -> Class {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::common::{Function, Tool};
+    use openai_protocol::common::Tool;
     use serde_json::{json as value, Value};
 
     use super::*;
@@ -200,22 +200,9 @@ mod tests {
         event::{DropReason, Event, Text},
         grammar::{GrammarStart, Options},
         input::EngineFinish,
-        testing::{bytes, content, drive_to, reasoning},
+        testing::{bytes, content, drive_to, reasoning, tool},
         Declared,
     };
-
-    fn tool(name: &str, parameters: Value) -> Tool {
-        Tool {
-            tool_type: "function".to_string(),
-            function: Function {
-                name: name.to_string(),
-                description: None,
-                parameters,
-                strict: None,
-                extra: Default::default(),
-            },
-        }
-    }
 
     fn tools() -> Vec<Tool> {
         vec![

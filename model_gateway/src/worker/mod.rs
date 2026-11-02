@@ -1,6 +1,7 @@
 //! Worker domain — identity, registry, health, resilience, monitoring, service.
 
 pub(crate) mod admin_json;
+pub mod basic;
 pub(crate) mod bootstrap_probe;
 pub mod builder;
 pub mod capacity;
@@ -27,20 +28,21 @@ pub mod pd_pairing;
 pub mod prefill_admission;
 pub mod registry;
 pub mod resilience;
+pub mod rl_adapter;
 pub mod runtime;
 pub mod sampling_defaults;
 pub mod service;
 pub mod stream;
-// FIXME: worker.rs is a 1800-line monolith containing the Worker trait,
-// BasicWorker impl, HealthChecker, WorkerType, ConnectionMode, and more.
-// Break it apart into focused modules (e.g. health_checker.rs, types.rs).
-#[expect(
-    clippy::module_inception,
-    reason = "FIXME: worker.rs needs to be broken apart into focused modules"
-)]
-pub mod worker;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 // Re-export commonly used types for convenience
+pub(crate) use basic::ConnectionModeExt;
+pub use basic::{
+    BasicWorker, ConnectionMode, RequestCompletionSink, RuntimeType, Worker, WorkerLoadGuard,
+    WorkerType, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, MORIIO_CONNECTOR, MORIIO_MODE_LABEL,
+    NIXL_CONNECTOR,
+};
 pub use builder::BasicWorkerBuilder;
 pub use capacity::{CapacitySource, CapacityTrackerSettings, WorkerCapacity};
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
@@ -54,6 +56,7 @@ pub use kv_event_monitor::KvEventMonitor;
 pub use kv_index_backend::{KvIndex, WorkerBlocks};
 pub use liveness::{budgets as liveness_budgets, Budgets as LivenessBudgets};
 pub use manager::WorkerManager;
+pub use metadata::DecodingLabels;
 pub use monitor::{WorkerLoadManager, WorkerMonitor};
 // Re-export UNKNOWN_MODEL_ID from protocols
 pub use openai_protocol::UNKNOWN_MODEL_ID;
@@ -76,9 +79,3 @@ pub use resilience::{resolve_resilience, ResolvedResilience, DEFAULT_RETRYABLE_S
 pub use sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL;
 pub use service::WorkerService;
 pub use stream::GuardedStream;
-pub(crate) use worker::ConnectionModeExt;
-pub use worker::{
-    BasicWorker, ConnectionMode, RequestCompletionSink, RuntimeType, Worker, WorkerLoadGuard,
-    WorkerType, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, MORIIO_CONNECTOR, MORIIO_MODE_LABEL,
-    NIXL_CONNECTOR,
-};
