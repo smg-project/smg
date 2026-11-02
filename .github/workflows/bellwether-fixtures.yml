@@ -149,10 +149,11 @@ jobs:
       # Not the whole tree: at this pin that is 864 GB of compressed sets in
       # Git LFS over 1,470 models. `--plain` writes the hand-written sets alone
       # (common, turns, render common: a few MB, nothing fetched), and
-      # `--sample-sets N` every Nth compressed set of the tree besides, whole,
-      # the same sets on every run of the same pin, so the benchmark-scale
-      # sets keep a rotating foothold in the job. At N=5000 that is about 40
-      # sets and 5 GB of plain lines; the sampled run of 2026-10-22 at N=1000
+      # `--sample-sets N` one compressed set in N besides, whole, picked by a
+      # hash of the set's own id, so the same sets come on every run of the
+      # same pin and a set added elsewhere in the tree moves no other set's
+      # place in the sample. At N=3500 that is 42 sets and 3.9 GB of
+      # plain lines; the sampled run of 2026-10-22 at N=1000
       # (195 sets, 25 GB) took the render-parity harness 4.3 min and the
       # tokenizer harness 8.5 min on 8 threads, so the knob is the runner's
       # disk, not the step's time. Each model's sets.toml in the tree lists
@@ -161,7 +162,7 @@ jobs:
         run: >-
           uv run --locked --project .bellwether bellwether unpack
           --fixtures .bellwether/fixtures --out .bellwether/fixtures-plain
-          --plain --sample-sets 5000
+          --plain --sample-sets 3500
 
       # This job builds the bellwether_* test targets and the response-template
       # crate's two, and nothing else, so it keeps its own cache entry instead
