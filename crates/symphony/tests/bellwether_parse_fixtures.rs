@@ -250,8 +250,12 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // DeepSeek V3.2 and V3.2-Speciale write DSML; the encoder ends the prompt with `<think>` in
     // thinking mode and `</think>` in chat mode, right after `<｜Assistant｜>`. bellwether holds
     // their manifests and no set yet: each slug is skipped with the notice until the pin holds it.
+    // DeepSeek-V3.2-Exp ships a chat template in V3.1's spelling, but the engine renders its
+    // architecture through the same encoder, and bellwether records it so: its sets read with the
+    // V3.2 table and this statement.
     ("deepseek-v3.2", GenerationPrompt::OpensTheThought),
     ("deepseek-v3.2-speciale", GenerationPrompt::OpensTheThought),
+    ("deepseek-v3.2-exp", GenerationPrompt::OpensTheThought),
     // The Kimi K2 line reads with one table, and each template ends the generation prompt its own
     // way: K2 Instruct and Instruct-0905 write no thought; K2 Thinking ends at the turn's opener
     // and the model writes its own `<think>`; K2.5, K2.6 and K2.7-Code open the thought in the
@@ -266,14 +270,13 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("kimi-k2.5", GenerationPrompt::AlwaysOpensTheThought),
     ("kimi-k2.6", GenerationPrompt::AlwaysOpensTheThought),
     ("kimi-k2.7-code", GenerationPrompt::AlwaysOpensTheThought),
-    // DeepSeek V3.1 and V3.2-Exp close the thought in the prompt (`</think>` right after the
-    // opener) unless the request's `thinking` kwarg opens it; the recorded requests carry
-    // `enable_thinking`, which these templates do not read, so every recorded prompt closes it
-    // and the output starts in content. DeepSeek V3's template writes no thought. Their sets hold
-    // content alone: the templates take a call's arguments as a string, and the recorder refused every
-    // call case of the corpus, whose arguments are objects.
+    // DeepSeek V3.1 closes the thought in the prompt (`</think>` right after the opener) unless
+    // the request's `thinking` kwarg opens it; the recorded requests carry `enable_thinking`,
+    // which its template does not read, so every recorded prompt closes it and the output starts
+    // in content. DeepSeek V3's template writes no thought. Their sets hold content alone: the
+    // templates take a call's arguments as a string, and the recorder refused every call case of
+    // the corpus, whose arguments are objects.
     ("deepseek-v3.1", GenerationPrompt::Plain),
-    ("deepseek-v3.2-exp", GenerationPrompt::Plain),
     ("deepseek-v3-0324", GenerationPrompt::Plain),
     ("deepseek-v3-0324-bf16", GenerationPrompt::Plain),
     // The R1 line writes V3's call spelling from its history and a thought of its own. The
@@ -1185,6 +1188,10 @@ const REFUSED_PROBES: &[(&str, &str)] = &[
         "llama-3-3-nemotron-super-49b-v1-5",
         "parse/reasoning-with-marker-text",
     ),
+    // Its reference is the V3.2 encoder in chat mode (the probe's request leaves the switch
+    // alone), which writes no thought; the checkpoint's own template, which rendered the earlier
+    // set, closed it too: the reasoning probe is not among the slug's fixtures either way.
+    ("deepseek-v3.2-exp", "parse/reasoning-with-marker-text"),
 ];
 
 /// The reasoning probe: its reasoning holds a `</think>`, which every table with that marker

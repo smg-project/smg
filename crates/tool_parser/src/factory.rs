@@ -616,10 +616,9 @@ impl ParserFactory {
         registry.map_model("deepseek-ai/DeepSeek-V3*", "deepseek");
         registry.map_model("deepseek-v3.1*", "deepseek31");
         registry.map_model("deepseek-ai/DeepSeek-V3.1*", "deepseek31");
-        // V3.2-Exp uses V3.1 format (longer patterns take precedence)
-        registry.map_model("deepseek-v3.2-exp*", "deepseek31");
-        registry.map_model("deepseek-ai/DeepSeek-V3.2-Exp*", "deepseek31");
-        // V3.2 DSML format (outer block: function_calls)
+        // V3.2 DSML format (outer block: function_calls); V3.2-Exp reads here too: its own
+        // template spells V3.1's calls, but the engine renders the checkpoint through the V3.2
+        // encoder
         registry.map_model("deepseek-v3.2*", "deepseek32");
         registry.map_model("deepseek-ai/DeepSeek-V3.2*", "deepseek32");
         // V4 DSML format (outer block: tool_calls — same parser as V3.2, different block name)
