@@ -1,6 +1,10 @@
 //! Runtime configuration for the mock worker fleet, parsed from CLI flags.
 
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use crate::engine::{Calibration, EngineParams, LoadsLike, OutputSeed, TimingModel};
 
@@ -34,6 +38,12 @@ pub struct Config {
     pub model_id: String,
     /// Tokenizer path advertised by gRPC workers (for gateway autoload).
     pub tokenizer_path: String,
+    /// The model's sampling defaults as a gRPC worker's model info reports
+    /// them: the compact JSON of the `generation_config.json` keys an engine
+    /// servicer advertises (`temperature`, `top_p`, `top_k`, `min_p`,
+    /// `repetition_penalty`), read from the model directory at startup; empty
+    /// when the model is not a directory or its config declares none.
+    pub default_sampling_params_json: String,
     /// Simulated per-request generation latency (canned mode only).
     pub gen_delay: Duration,
     /// Number of canned output tokens per generation; also the default output
@@ -178,6 +188,7 @@ impl Default for Config {
             zmq_start_index: 0,
             model_id: "mock-model".to_string(),
             tokenizer_path: String::new(),
+            default_sampling_params_json: String::new(),
             gen_delay: Duration::from_millis(0),
             output_tokens: 8,
             realistic: false,
@@ -334,6 +345,7 @@ impl Config {
         if cfg.tokenizer_path.is_empty() {
             cfg.tokenizer_path = cfg.model_id.clone();
         }
+        cfg.default_sampling_params_json = sampling_defaults_json(Path::new(&cfg.model_id));
         let (model, calibration) = timing.resolve()?;
         cfg.engine.timing = model;
         if let Some(c) = calibration {
@@ -457,7 +469,9 @@ pub fn usage() -> String {
        --zmq-handshake <addr>   frontend ipc:// handshake addr (required if --zmq-count > 0)\n\
        --zmq-count <n>          number of ZMQ mock EngineCore ranks (default 0)\n\
        --zmq-start-index <n>    engine index of the first ZMQ rank (default 0)\n\
-       --model <id>             advertised model id (default mock-model)\n\
+       --model <id|dir>         advertised model id, or a model directory whose\n\
+                                generation_config.json gives the sampling defaults gRPC\n\
+                                workers report (default mock-model)\n\
        --tokenizer <path>       tokenizer path for gRPC autoload (default = model)\n\
        --gen-ms <ms>            canned per-request latency (default 0)\n\
        --output-tokens <n>      output tokens per request when unspecified (default 8)\n\
@@ -512,12 +526,126 @@ pub fn usage() -> String {
         .to_string()
 }
 
+/// The `generation_config.json` keys an engine servicer reports as the
+/// model's sampling defaults, in the order they are written.
+const SAMPLING_DEFAULT_KEYS: [&str; 5] = [
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "repetition_penalty",
+];
+
+/// The sampling defaults of the model at `model_dir`, as an engine servicer
+/// reports them: the compact JSON of `SAMPLING_DEFAULT_KEYS` present and
+/// non-null in `generation_config.json`. Empty when `model_dir` is not a
+/// directory (a model id, a file), has no such config, the file does not
+/// parse, or it declares none of the keys.
+pub fn sampling_defaults_json(model_dir: &Path) -> String {
+    if !model_dir.is_dir() {
+        return String::new();
+    }
+    let path = model_dir.join("generation_config.json");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        // A model without the file declares no defaults; anything else that
+        // keeps the file from being read is said, so a bed with a broken
+        // fixture does not read like such a model.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return String::new(),
+        Err(e) => {
+            tracing::warn!("{}: not read, no sampling defaults: {e}", path.display());
+            return String::new();
+        }
+    };
+    let config = match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(serde_json::Value::Object(config)) => config,
+        Ok(_) => {
+            tracing::warn!(
+                "{}: not a JSON object, no sampling defaults",
+                path.display()
+            );
+            return String::new();
+        }
+        Err(e) => {
+            tracing::warn!(
+                "{}: does not parse, no sampling defaults: {e}",
+                path.display()
+            );
+            return String::new();
+        }
+    };
+    let defaults: serde_json::Map<String, serde_json::Value> = SAMPLING_DEFAULT_KEYS
+        .iter()
+        .filter_map(|&key| {
+            config
+                .get(key)
+                .filter(|value| !value.is_null())
+                .map(|value| (key.to_string(), value.clone()))
+        })
+        .collect();
+    if defaults.is_empty() {
+        String::new()
+    } else {
+        serde_json::Value::Object(defaults).to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn parse(flags: &[&str]) -> Result<Config, String> {
         Config::parse(flags.iter().map(|flag| (*flag).to_string()))
+    }
+
+    #[test]
+    fn sampling_defaults_are_the_generation_configs_advertised_keys() {
+        let dir = tempfile::tempdir().expect("a model directory");
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            r#"{"bos_token_id": 1, "do_sample": true, "temperature": 0.7, "top_p": 0.8,
+                "top_k": 20, "min_p": null, "repetition_penalty": 1.05, "max_new_tokens": 32}"#,
+        )
+        .expect("write the config");
+        assert_eq!(
+            sampling_defaults_json(dir.path()),
+            r#"{"temperature":0.7,"top_p":0.8,"top_k":20,"repetition_penalty":1.05}"#
+        );
+        // The parsed configuration reads the directory it was given as the model.
+        let flags = ["--grpc-base-port", "19000", "--grpc-count", "1", "--model"];
+        let cfg = parse(&[&flags[..], &[dir.path().to_str().expect("utf-8 path")]].concat())
+            .expect("a model directory");
+        assert_eq!(
+            cfg.default_sampling_params_json,
+            r#"{"temperature":0.7,"top_p":0.8,"top_k":20,"repetition_penalty":1.05}"#
+        );
+    }
+
+    #[test]
+    fn sampling_defaults_are_empty_without_a_directory_a_config_or_the_keys() {
+        assert_eq!(sampling_defaults_json(Path::new("owner/model-id")), "");
+        let dir = tempfile::tempdir().expect("a model directory");
+        assert_eq!(sampling_defaults_json(dir.path()), "", "no config file");
+        let config = dir.path().join("generation_config.json");
+        std::fs::write(
+            &config,
+            r#"{"bos_token_id": 1, "max_new_tokens": 32, "top_k": null}"#,
+        )
+        .expect("write the config");
+        assert_eq!(sampling_defaults_json(dir.path()), "", "none of the keys");
+        std::fs::write(&config, "not json").expect("write the config");
+        assert_eq!(
+            sampling_defaults_json(dir.path()),
+            "",
+            "a config that does not parse"
+        );
+        assert_eq!(
+            parse(&["--grpc-base-port", "19000", "--grpc-count", "1"])
+                .expect("defaults")
+                .default_sampling_params_json,
+            "",
+            "the default model id is no directory"
+        );
     }
 
     #[test]
