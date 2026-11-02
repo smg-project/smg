@@ -257,6 +257,15 @@ impl DirectEncoders {
             HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD
         }
     }
+
+    /// Reads the vocabulary into the direct encoder's seed, through the model
+    /// once its word cache is bounded: the words the seed merges then leave
+    /// nothing in the model's per-thread caches.
+    fn seed_native(&mut self, model: &ModelWrapper) {
+        if let Some(native) = &mut self.native {
+            native.seed_vocabulary(model);
+        }
+    }
 }
 
 /// What an encode runs on, shared between the wrapper and the deferred
@@ -730,11 +739,12 @@ impl HuggingFaceTokenizer {
             .map(|dir| detect_renderer_from_config(dir, chat_template_str.is_some()))
             .unwrap_or(Renderer::Jinja);
 
-        let encoders = DirectEncoders::choose(&tokenizer);
+        let mut encoders = DirectEncoders::choose(&tokenizer);
         // The bound rides on the file's model into the built tokenizer: no
         // copy of the model (see `word_cache`).
         tokenizer.get_model().bound(encoders.bpe_words_cached());
         let tokenizer = HfTokenizer::from(tokenizer);
+        encoders.seed_native(tokenizer.get_model());
         let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
         let byte_fallback_values = byte_fallback_values(&reverse_vocab, has_byte_fallback);
         let glm = tokenizer_path.parent().and_then(glm::Checkpoint::load);
@@ -991,8 +1001,9 @@ impl HuggingFaceTokenizer {
 
     /// Create from an existing HuggingFace tokenizer
     pub fn from_tokenizer(mut tokenizer: HfTokenizer) -> Self {
-        let encoders = DirectEncoders::choose(&tokenizer);
+        let mut encoders = DirectEncoders::choose(&tokenizer);
         Self::bound_bpe_cache(&mut tokenizer, encoders.bpe_words_cached());
+        encoders.seed_native(tokenizer.get_model());
         let special_tokens = Self::extract_special_tokens(&tokenizer, &ConfigTokens::default());
         let vocab = tokenizer.get_vocab(true); // true = include special tokens and added_tokens
         let reverse_vocab: HashMap<TokenIdType, String> = vocab

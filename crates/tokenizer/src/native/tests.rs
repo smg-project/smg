@@ -18,7 +18,7 @@ use tokenizers::{
     AddedToken, SplitDelimiterBehavior, Tokenizer as HfTokenizer,
 };
 
-use super::*;
+use super::{short_pieces::ShortPieceKey, *};
 use crate::{
     encode_path::{encode_fallbacks, EncodeFallbacks, EncodePath},
     huggingface::HuggingFaceTokenizer,
@@ -354,6 +354,14 @@ fn tokenizer_of(shape: &Shape, state: &mut u64) -> HfTokenizer {
         )
         .expect("added tokens");
     tokenizer
+}
+
+/// The native encoder of `tokenizer` with its seed read, as the loaders
+/// build it.
+fn seeded(tokenizer: &HfTokenizer) -> NativeEncoder {
+    let mut native = NativeEncoder::from_tokenizer(tokenizer).expect("native path");
+    native.seed_vocabulary(tokenizer.get_model());
+    native
 }
 
 #[test]
@@ -697,7 +705,7 @@ fn ids_match_tokenizers_on_random_text_for_every_shape() {
     let mut state = 0x0F0F_1234_ABCD_9876u64;
     for shape in shapes() {
         let tokenizer = tokenizer_of(&shape, &mut state);
-        let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        let native = seeded(&tokenizer);
         let added: Vec<&str> = shape
             .special
             .iter()
@@ -761,7 +769,7 @@ fn fixed_texts_match_tokenizers_for_every_shape() {
     let mut state = 0x7777_1111_2222_3333u64;
     for shape in shapes() {
         let tokenizer = tokenizer_of(&shape, &mut state);
-        let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+        let native = seeded(&tokenizer);
         for text in texts {
             let reference = tokenizer
                 .encode(text, false)
@@ -990,7 +998,7 @@ fn the_piece_cache_returns_the_same_ids() {
     let mut state = 0xABCD_EF01_2345_6789u64;
     let shape = &shapes()[0];
     let tokenizer = tokenizer_of(shape, &mut state);
-    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let native = seeded(&tokenizer);
     let text = "the same words the same words, again and again and again";
     let first = native.encode(tokenizer.get_model(), text).expect("ids");
     let second = native.encode(tokenizer.get_model(), text).expect("ids");
@@ -1031,7 +1039,7 @@ fn piece_caches_belong_to_their_encoder() {
     let mut state = 0x1357_9BDF_2468_ACE0u64;
     let shape = &shapes()[0];
     let tokenizer = tokenizer_of(shape, &mut state);
-    let mut native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let mut native = seeded(&tokenizer);
     let model = tokenizer.get_model();
     let threads = 4;
     let barrier = std::sync::Barrier::new(threads);
@@ -1047,11 +1055,170 @@ fn piece_caches_belong_to_their_encoder() {
     let caches: Vec<usize> = native
         .piece_cache
         .iter_mut()
-        .map(|cache| cache.get_mut().short.len())
+        .map(|cache| cache.get_mut().short_entries())
         .collect();
     assert_eq!(caches.len(), threads, "{caches:?}");
     assert!(caches.iter().all(|&entries| entries > 0), "{caches:?}");
     drop(native);
+}
+
+/// The raw bytes a vocabulary entry stands for, back through the byte-level
+/// alphabet; `None` for an entry with a character outside it.
+fn raw_bytes(entry: &str) -> Option<Vec<u8>> {
+    let table = bytes_char();
+    entry
+        .chars()
+        .map(|c| table.iter().position(|&a| a == c).map(|b| b as u8))
+        .collect()
+}
+
+#[test]
+fn the_seed_holds_every_short_vocabulary_entry_with_the_models_ids() {
+    let mut state = 0x5EED_5EED_5EED_5EEDu64;
+    for shape in shapes() {
+        let tokenizer = tokenizer_of(&shape, &mut state);
+        let native = seeded(&tokenizer);
+        let model = tokenizer.get_model();
+        let mut seeded = 0;
+        for entry in tokenizer.get_vocab(false).keys() {
+            let Some(key) = raw_bytes(entry).and_then(|bytes| ShortPieceKey::of(&bytes)) else {
+                continue;
+            };
+            let expected: Vec<u32> = model
+                .tokenize(entry)
+                .expect("the model tokenizes its own entry")
+                .iter()
+                .map(|token| token.id)
+                .collect();
+            let mut ids = Vec::new();
+            assert!(
+                native.seed.ids_into(key, &mut ids),
+                "{}: {entry:?} is not seeded",
+                shape.name
+            );
+            assert_eq!(ids, expected, "{}: {entry:?}", shape.name);
+            seeded += 1;
+        }
+        assert_eq!(native.seed.len(), seeded, "{}", shape.name);
+        assert!(seeded > 256, "{}: {seeded}", shape.name);
+    }
+}
+
+#[test]
+fn an_entry_the_merges_do_not_reach_is_seeded_as_the_model_tokenizes_it() {
+    // The vocabulary has "xyz" but the merges make only "xy": the model
+    // tokenizes its own entry as two ids under the merges and as itself under
+    // `ignore_merges`; the seed holds what the model gives, either way, and
+    // so does the encode.
+    for ignore_merges in [false, true] {
+        let mut vocab = Vocab::default();
+        for (id, c) in bytes_char().iter().enumerate() {
+            vocab.insert(c.to_string(), id as u32);
+        }
+        let xy = vocab.len() as u32;
+        vocab.insert("xy".to_owned(), xy);
+        let xyz = vocab.len() as u32;
+        vocab.insert("xyz".to_owned(), xyz);
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, vec![("x".to_owned(), "y".to_owned())])
+            .ignore_merges(ignore_merges)
+            .build()
+            .expect("bpe");
+        let mut tokenizer = HfTokenizer::new(bpe);
+        tokenizer.with_pre_tokenizer(Some(byte_level(true)));
+        tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+        let native = seeded(&tokenizer);
+        let model = tokenizer.get_model();
+        let z = model.token_to_id("z").expect("z");
+        let expected = if ignore_merges {
+            vec![xyz]
+        } else {
+            vec![xy, z]
+        };
+        let mut ids = Vec::new();
+        assert!(native
+            .seed
+            .ids_into(ShortPieceKey::of(b"xyz").expect("key"), &mut ids));
+        assert_eq!(ids, expected, "ignore_merges {ignore_merges}");
+        assert_eq!(
+            tokenizer.encode("xyz", false).expect("encode").get_ids(),
+            expected.as_slice(),
+            "ignore_merges {ignore_merges}"
+        );
+        assert_eq!(
+            native.encode(model, "xyz"),
+            Ok(expected),
+            "ignore_merges {ignore_merges}"
+        );
+    }
+}
+
+#[test]
+fn the_seed_answers_a_vocabulary_piece_before_the_model_does() {
+    // The encoder is built over a model with `ignore_merges` on, so its seed
+    // holds "xyz" as the entry's own id; the encode then runs over a copy of
+    // the model with `ignore_merges` off, which merges "xyz" into two ids.
+    // A vocabulary word is answered by the seed (the entry's id), a piece the
+    // vocabulary lacks by the model; both land in the thread's packed tier.
+    let mut vocab = Vocab::default();
+    for (id, c) in bytes_char().iter().enumerate() {
+        vocab.insert(c.to_string(), id as u32);
+    }
+    let xy = vocab.len() as u32;
+    vocab.insert("xy".to_owned(), xy);
+    let xyz = vocab.len() as u32;
+    vocab.insert("xyz".to_owned(), xyz);
+    let bpe = BPE::builder()
+        .vocab_and_merges(vocab, vec![("x".to_owned(), "y".to_owned())])
+        .ignore_merges(true)
+        .build()
+        .expect("bpe");
+    let mut merging = bpe.clone();
+    merging.ignore_merges = false;
+    let merging = ModelWrapper::BPE(merging);
+    let mut tokenizer = HfTokenizer::new(bpe);
+    tokenizer.with_pre_tokenizer(Some(byte_level(true)));
+    tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+    let mut native = seeded(&tokenizer);
+    let z = merging.token_to_id("z").expect("z");
+    let q = merging.token_to_id("q").expect("q");
+    assert_eq!(
+        merging
+            .tokenize("xyz")
+            .expect("tokenize")
+            .iter()
+            .map(|t| t.id)
+            .collect::<Vec<_>>(),
+        [xy, z],
+        "the merging copy merges the entry"
+    );
+    assert_eq!(
+        native.encode(&merging, "xyz"),
+        Ok(vec![xyz]),
+        "the seed answered"
+    );
+    assert_eq!(
+        native.encode(&merging, "xyz"),
+        Ok(vec![xyz]),
+        "the thread tier answered"
+    );
+    assert_eq!(
+        native.encode(&merging, "xyq"),
+        Ok(vec![xy, q]),
+        "the model answered"
+    );
+    let caches: Vec<(usize, usize)> = native
+        .piece_cache
+        .iter_mut()
+        .map(|cache| {
+            let cache = cache.get_mut();
+            (
+                cache.packed.as_ref().map_or(0, ShortPieceTable::len),
+                cache.short.len(),
+            )
+        })
+        .collect();
+    assert_eq!(caches, [(2, 0)]);
 }
 
 /// Distinct words for distinct `i`: distinct pieces.
@@ -1071,7 +1238,7 @@ fn piece_caches_stay_within_their_bound_across_threads() {
     let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
     let shape = &shapes()[0];
     let tokenizer = tokenizer_of(shape, &mut state);
-    let mut native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let mut native = seeded(&tokenizer);
     let model = tokenizer.get_model();
     let threads = 24u32;
     let barrier = std::sync::Barrier::new(threads as usize);
@@ -1100,7 +1267,7 @@ fn piece_caches_stay_within_their_bound_across_threads() {
     let caches: Vec<usize> = native
         .piece_cache
         .iter_mut()
-        .map(|cache| cache.get_mut().short.len())
+        .map(|cache| cache.get_mut().short_entries())
         .collect();
     assert_eq!(caches.len(), threads as usize, "{caches:?}");
     assert!(
@@ -1134,7 +1301,7 @@ fn long_pieces_are_cached_by_their_bytes() {
     let mut state = 0x0BAD_F00D_1234_5678u64;
     let shape = &shapes()[0];
     let tokenizer = tokenizer_of(shape, &mut state);
-    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let native = seeded(&tokenizer);
     let model = tokenizer.get_model();
     let short = letters(CACHED_PIECE_MAX_BYTES, 1);
     let long = letters(CACHED_PIECE_MAX_BYTES + 1, 2);
@@ -1187,7 +1354,7 @@ fn long_pieces_stay_within_their_byte_share() {
     let mut state = 0x7A7A_5B5B_3C3C_1D1Du64;
     let shape = &shapes()[0];
     let tokenizer = tokenizer_of(shape, &mut state);
-    let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
+    let native = seeded(&tokenizer);
     let model = tokenizer.get_model();
     // Distinct long pieces worth more than one thread's share: each
     // entry takes its 80 bytes, its ids (at least 27, the model merges
