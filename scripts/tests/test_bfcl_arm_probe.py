@@ -1,7 +1,10 @@
 import contextlib
+import ctypes
 import importlib.util
 import json
 import os
+import select
+import signal
 import socketserver
 import subprocess
 import sys
@@ -271,6 +274,80 @@ def test_wait_cli_timeout_does_not_accept_process_liveness(tmp_path):
     assert b'"models": []' in result.stderr
 
 
+@contextlib.contextmanager
+def trickle_http_server(phase):
+    stopped = threading.Event()
+    calls = []
+
+    class Handler(socketserver.BaseRequestHandler):
+        def handle(self):
+            self.request.recv(8192)
+            calls.append("request")
+            body = json.dumps(readiness()).encode()
+            header = b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n"
+            chunks = (
+                [bytes([byte]) for byte in header] + [body]
+                if phase == "header"
+                else [header] + [bytes([byte]) for byte in body]
+            )
+            for chunk in chunks:
+                if stopped.is_set():
+                    break
+                try:
+                    self.request.sendall(chunk)
+                except OSError:
+                    break
+                if stopped.wait(0.04):
+                    break
+
+    class Server(socketserver.ThreadingTCPServer):
+        daemon_threads = True
+
+    http = Server(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=http.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{http.server_address[1]}", calls
+    finally:
+        stopped.set()
+        http.shutdown()
+        thread.join()
+        http.server_close()
+
+
+@pytest.mark.parametrize("phase", ["header", "body"])
+@pytest.mark.parametrize("mode", ["--wait-ready", "--duration"])
+@pytest.mark.parametrize("budget", ["0.01", "0.2"])
+def test_real_slow_http_cannot_overrun_the_whole_probe_budget(tmp_path, phase, mode, budget):
+    with trickle_http_server(phase) as (url, calls):
+        started = time.monotonic()
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SOURCE),
+                "--base-url",
+                url,
+                "--model",
+                MODEL,
+                "--run-dir",
+                str(tmp_path),
+                mode,
+                budget,
+            ],
+            capture_output=True,
+            timeout=1.2,
+        )
+        elapsed = time.monotonic() - started
+    assert elapsed < 1
+    assert result.returncode == (1 if mode == "--wait-ready" else 0), result.stderr
+    rows = [json.loads(line) for line in (tmp_path / "arm_b_state.log").read_text().splitlines()]
+    assert len(rows) == 1
+    assert "error" in rows[0]["readiness"]
+    assert not probe.ready(rows[0]["readiness"])
+    assert len(calls) == 1  # No further I/O once the shared caller budget is spent.
+    assert "PRIVATE" not in json.dumps(rows)
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -287,25 +364,249 @@ def test_probe_rejects_remote_or_authenticated_targets(url):
         probe.loopback_url(url)
 
 
+@contextlib.contextmanager
+def real_startup_fixture(tmp_path, is_ready):
+    """Private CPU processes only; adopt/reap our original RED's orphan children."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    previous = ctypes.c_int()
+    assert libc.prctl(37, ctypes.byref(previous), 0, 0, 0) == 0
+    assert libc.prctl(36, 1, 0, 0, 0) == 0
+    identities = tmp_path / "identities"
+    identities.mkdir()
+    state = tmp_path / "state"
+    state.mkdir()
+    bins = tmp_path / "bin"
+    bins.mkdir()
+    record = (
+        "import json, os, sys, time\nfrom pathlib import Path\n"
+        "fields = Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()\n"
+        "identity = {'pid': os.getpid(), 'start_ticks': int(fields[19])}\n"
+    )
+    service = bins / "private-service"
+    service.write_text(
+        f"#!{sys.executable}\n"
+        + record
+        + "role = 'gateway' if '--model-path' in sys.argv else 'worker'\n"
+        "(Path(os.environ['BFCL_FIXTURE_PID_DIR']) / (role + '.json')).write_text(json.dumps(identity))\n"
+        "time.sleep(10)\n"
+    )
+    service.chmod(0o755)
+    tail = bins / "tail"
+    tail.write_text(
+        f"#!{sys.executable}\n"
+        + record
+        + "target = Path(os.environ['BFCL_FIXTURE_PID_DIR']) / ('tail-' + str(os.getpid()) + '.json')\n"
+        "target.write_text(json.dumps(identity))\n"
+        "os.execv('/usr/bin/tail', ['/usr/bin/tail', *sys.argv[1:]])\n"
+    )
+    tail.chmod(0o755)
+    sentinel = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+    (state / "foreign.pid").write_text(str(sentinel.pid))
+    try:
+        data = readiness() if is_ready else {"status": "not ready", "models": []}
+        with server({"/readiness": response(data)}) as (url, _):
+            port = url.rsplit(":", 1)[1]
+            env = {
+                **os.environ,
+                "PATH": f"{bins}{os.pathsep}{os.environ['PATH']}",
+                "BFCL_FIXTURE_PID_DIR": str(identities),
+                "BFCL_RUN_DIR": str(state),
+                "BFCL_MODEL": MODEL,
+                "BFCL_STARTUP_TIMEOUT": "0.2",
+                "BFCL_ARM_B_GRPC_PORT": port,
+                "BFCL_ARM_B_GW_PORT": port,
+                "BFCL_ARM_B_METRICS_PORT": port,
+                "VLLM_PYTHON": str(service),
+                "SMG_LAUNCH": str(service),
+                "RUN_TIMEOUT": "2",
+                "CUDA_VISIBLE_DEVICES": "",
+                "HIP_VISIBLE_DEVICES": "",
+                "ROCR_VISIBLE_DEVICES": "",
+            }
+            with (tmp_path / "stdout").open("wb") as out, (tmp_path / "stderr").open("wb") as err:
+                launcher = subprocess.Popen(
+                    ["bash", str(SOURCE.with_name("launch_arm.sh")), "b"],
+                    env=env,
+                    stdout=out,
+                    stderr=err,
+                )
+                try:
+                    launcher.wait(timeout=3)
+                finally:
+                    if launcher.poll() is None:
+                        launcher.kill()
+                        launcher.wait()
+            # Only this invocation can create this private role pidfile.
+            probe_pid = state / "arm_b_probe.pid"
+            if probe_pid.exists():
+                identity = probe.pid_identity(int(probe_pid.read_text()))
+                if identity:
+                    (identities / "probe.json").write_text(json.dumps(identity))
+            yield launcher, identities, sentinel
+    finally:
+        # Exact identity + pidfd cleanup of our private RED fixtures; no group,
+        # process-name, foreign pidfile or shared resource is used here.
+        for path in identities.glob("*.json"):
+            identity = json.loads(path.read_text())
+            pid = identity["pid"]
+            try:
+                fd = os.pidfd_open(pid)
+            except ProcessLookupError:
+                continue
+            try:
+                current = probe.pid_identity(pid)
+                if current and current["start_ticks"] == identity["start_ticks"]:
+                    signal.pidfd_send_signal(fd, signal.SIGKILL)
+            finally:
+                os.close(fd)
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(pid, 0)
+        sentinel.kill()
+        sentinel.wait()
+        assert libc.prctl(36, previous.value, 0, 0, 0) == 0
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or not hasattr(os, "pidfd_open"), reason="needs Linux process handles"
+)
+@pytest.mark.parametrize("is_ready", [False, True], ids=["readiness-fails", "commit-success"])
+def test_real_startup_cleanup_is_invocation_owned(tmp_path, is_ready):
+    with real_startup_fixture(tmp_path, is_ready) as (launcher, identities, sentinel):
+        assert launcher.returncode == (0 if is_ready else 1)
+        assert (identities / "worker.json").exists()
+        assert (identities / "gateway.json").exists()
+        for path in identities.glob("*.json"):
+            identity = json.loads(path.read_text())
+            current = probe.pid_identity(identity["pid"])
+            same = bool(current and current["start_ticks"] == identity["start_ticks"])
+            if is_ready and path.stem in ("worker", "gateway"):
+                assert same, f"successful startup unexpectedly stopped {path.stem}"
+            elif not is_ready:
+                assert not same, f"startup failure leaked {path.stem}"
+        assert sentinel.poll() is None
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or not hasattr(os, "pidfd_open"), reason="needs Linux process handles"
+)
+@pytest.mark.parametrize(
+    "ending", ["eof", "malformed", "failed-start", "foreign-handle", "exited-leader"]
+)
+def test_startup_owner_aborts_only_its_retained_child(tmp_path, ending):
+    libc = ctypes.CDLL(None, use_errno=True)
+    previous = ctypes.c_int()
+    assert libc.prctl(37, ctypes.byref(previous), 0, 0, 0) == 0
+    assert libc.prctl(36, 1, 0, 0, 0) == 0
+    owner = subprocess.Popen(
+        [sys.executable, str(SOURCE.with_name("startup_owner.py"))],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    sentinel = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+    child_identity = None
+
+    def send(*fields):
+        owner.stdin.write(b"\0".join(os.fsencode(str(v)) for v in fields) + b"\0")
+        owner.stdin.flush()
+
+    try:
+        marker = tmp_path / "child.json"
+        code = (
+            "import json, os, time; from pathlib import Path; "
+            "s=Path('/proc/self/stat').read_text().rsplit(')',1)[1].split(); "
+            f"Path({str(marker)!r}).write_text(json.dumps({{'pid':os.getpid(),'start_ticks':int(s[19])}})); "
+            "time.sleep(10)"
+        )
+        if ending == "exited-leader":
+            code = "import os\nif os.fork():\n    os._exit(0)\n" + code
+        send("start", tmp_path / "child.log", 3, sys.executable, "-c", code)
+        assert select.select([owner.stdout], [], [], 1)[0]
+        handle, pid = owner.stdout.readline().split()
+        child_identity = probe.pid_identity(int(pid))
+        deadline = time.monotonic() + 1
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        child_identity = json.loads(marker.read_text())
+        if ending != "exited-leader":
+            assert child_identity["pid"] == int(pid)
+        if ending == "exited-leader":
+            assert child_identity["pid"] != int(pid)
+            assert probe.pid_identity(int(pid))["state"] == "Z"  # Still unreaped: PGID reserved.
+            send("abort")
+        elif ending == "eof":
+            owner.stdin.close()
+        elif ending == "malformed":
+            send("invalid-command")
+        elif ending == "failed-start":
+            send("start", tmp_path / "failed.log", 1, "/must-not-exist-private-bfcl-executable")
+        else:
+            # The API accepts opaque returned handles, never arbitrary PIDs.
+            assert int(handle) != sentinel.pid
+            send("stop", sentinel.pid)
+        assert owner.wait(timeout=2) == (0 if ending == "exited-leader" else 1)
+        if ending == "exited-leader":
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                current = probe.pid_identity(child_identity["pid"])
+                if current is None or current["state"] == "Z":
+                    break
+                time.sleep(0.01)
+            assert current is None or current["state"] == "Z"
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(child_identity["pid"], 0)
+        assert probe.pid_identity(child_identity["pid"]) is None
+        assert sentinel.poll() is None
+    finally:
+        if owner.poll() is None:
+            with contextlib.suppress(BrokenPipeError, ValueError):
+                send("abort")
+                owner.stdin.close()
+            try:
+                owner.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                owner.kill()
+                owner.wait()
+        if child_identity:
+            try:
+                fd = os.pidfd_open(child_identity["pid"])
+            except ProcessLookupError:
+                pass
+            else:
+                try:
+                    current = probe.pid_identity(child_identity["pid"])
+                    if current and current["start_ticks"] == child_identity["start_ticks"]:
+                        signal.pidfd_send_signal(fd, signal.SIGKILL)
+                finally:
+                    os.close(fd)
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(child_identity["pid"], 0)
+        sentinel.kill()
+        sentinel.wait()
+        for stream in (owner.stdin, owner.stdout, owner.stderr):
+            stream.close()
+        assert libc.prctl(36, previous.value, 0, 0, 0) == 0
+
+
 def launcher_cli_without_engines(tmp_path, arm, run_timeout):
     """Run the actual launcher, replacing only process launch and arm-A curl.
 
-    setsid records commands but never executes an engine, gateway or observer.
+    env records commands but never executes an engine, gateway or observer.
     The loopback fixture satisfies arm-B TCP/readiness checks. No model, GPU,
     production process or launcher stop/cleanup path is used.
     """
     stub_bin = tmp_path / "bin"
     stub_bin.mkdir()
     events_path = tmp_path / "launch-events.jsonl"
-    setsid = stub_bin / "setsid"
-    setsid.write_text(
+    launch_env = stub_bin / "env"
+    launch_env.write_text(
         "#!/usr/bin/env python3\n"
         "import json, os, sys\n"
         "with open(os.environ['BFCL_FIXTURE_EVENTS'], 'a') as out:\n"
         "    out.write(json.dumps({'argv': sys.argv[1:], "
         "'RUN_TIMEOUT': os.environ.get('RUN_TIMEOUT')}) + '\\n')\n"
     )
-    setsid.chmod(0o755)
+    launch_env.chmod(0o755)
     curl = stub_bin / "curl"
     curl.write_text("#!/bin/sh\nexit 0\n")
     curl.chmod(0o755)

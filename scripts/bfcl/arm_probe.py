@@ -10,6 +10,7 @@ establish an exit code or an engine child's health. Full arm logs remain needed.
 import argparse
 import datetime
 import http.client
+import io
 import json
 import re
 import sys
@@ -45,6 +46,70 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def remaining_seconds(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("observation deadline expired")
+    return remaining
+
+
+class DeadlineReader(io.RawIOBase):
+    def __init__(self, stream, sock, deadline):
+        self.stream, self.sock, self.deadline = stream, sock, deadline
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        # SocketIO performs one recv, so headers and bodies cannot reset the
+        # same relative timeout indefinitely by delivering another byte.
+        self.sock.settimeout(remaining_seconds(self.deadline))
+        return self.stream.readinto(buffer)
+
+    def close(self):
+        try:
+            self.stream.close()
+        finally:
+            super().close()
+
+
+class DeadlineConnection(http.client.HTTPConnection):
+    def __init__(self, *args, deadline, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.deadline = deadline
+
+    def connect(self):
+        super().connect()
+        self.sock.settimeout(remaining_seconds(self.deadline))
+
+    def send(self, data):
+        if self.sock is not None:
+            self.sock.settimeout(remaining_seconds(self.deadline))
+        super().send(data)
+
+    def response_class(self, sock, *args, **kwargs):
+        response = http.client.HTTPResponse(sock, *args, **kwargs)
+        response.fp.close()
+        # Keep SocketIO's descriptor reference: urllib closes its connection
+        # socket before the caller consumes the response body.
+        response.fp = io.BufferedReader(
+            DeadlineReader(sock.makefile("rb", buffering=0), sock, self.deadline)
+        )
+        return response
+
+
+class DeadlineHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, deadline):
+        super().__init__()
+        self.deadline = deadline
+
+    def http_open(self, request):
+        def connection(host, **kwargs):
+            return DeadlineConnection(host, deadline=self.deadline, **kwargs)
+
+        return self.do_open(connection, request)
+
+
 def loopback_url(value):
     parsed = urllib.parse.urlsplit(value)
     if (
@@ -61,12 +126,18 @@ def loopback_url(value):
     return value.rstrip("/")
 
 
-def fetch(base, path):
+def fetch(base, path, deadline=None):
     """Read local selected endpoints only; do not follow redirects or proxies."""
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     try:
+        request_deadline = time.monotonic() + 2
+        if deadline is not None:
+            request_deadline = min(request_deadline, deadline)
+        timeout = remaining_seconds(request_deadline)
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), NoRedirect(), DeadlineHTTPHandler(request_deadline)
+        )
         try:
-            response = opener.open(loopback_url(base) + path, timeout=2)
+            response = opener.open(loopback_url(base) + path, timeout=timeout)
         except urllib.error.HTTPError as error:
             response = error
         with response:
@@ -78,8 +149,8 @@ def fetch(base, path):
         return {"error": type(error).__name__}, None
 
 
-def selected_json(base, path, model):
-    status, body = fetch(base, path)
+def selected_json(base, path, model, deadline=None):
+    status, body = fetch(base, path, deadline)
     if body is None:
         return status
     try:
@@ -164,8 +235,8 @@ def current_processes(owned):
     return result
 
 
-def routing_states(metrics_base, worker_port):
-    status, body = fetch(metrics_base, "/metrics")
+def routing_states(metrics_base, worker_port, deadline=None):
+    status, body = fetch(metrics_base, "/metrics", deadline)
     if body is None:
         return status
     status["states"] = []
@@ -233,10 +304,11 @@ def main():
         parser.error("readiness bound must be 0..7200 s and duration must be > 0 and <= 21600 s")
     owned = owned_processes(args.run_dir)
     started = time.monotonic()
+    deadline = started + (args.wait_ready or args.duration)
     # The existing always-upload BFCL arm-log artifact retains *.log files.
     with (args.run_dir / "arm_b_state.log").open("a", buffering=1) as output:
         while True:
-            observation = selected_json(args.base_url, "/readiness", args.model)
+            observation = selected_json(args.base_url, "/readiness", args.model, deadline)
             row = {
                 # The launcher also runs on hosts whose python3 is Python 3.10.
                 "utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),  # noqa: UP017
@@ -246,9 +318,18 @@ def main():
             }
             if args.wait_ready:
                 output.write(json.dumps(row) + "\n")
-                if ready(observation):
+                if ready(observation) and time.monotonic() <= deadline:
                     return 0
-                if time.monotonic() - started >= args.wait_ready:
+            else:
+                row["workers"] = selected_json(args.base_url, "/workers", args.model, deadline)
+                if args.metrics_url and args.worker_port:
+                    row["routing"] = routing_states(args.metrics_url, args.worker_port, deadline)
+                output.write(json.dumps(row) + "\n")
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(2 if args.wait_ready else 30, remaining))
+            if time.monotonic() >= deadline:
+                if args.wait_ready:
                     print(
                         "[bfcl arm probe] TIMEOUT waiting for target model readiness; "
                         f"latest observation: {json.dumps(observation)}; "
@@ -256,16 +337,7 @@ def main():
                         file=sys.stderr,
                     )
                     return 1
-                time.sleep(2)
-            else:
-                row["workers"] = selected_json(args.base_url, "/workers", args.model)
-                if args.metrics_url and args.worker_port:
-                    row["routing"] = routing_states(args.metrics_url, args.worker_port)
-                output.write(json.dumps(row) + "\n")
-                remaining = args.duration - (time.monotonic() - started)
-                if remaining <= 0:
-                    return 0
-                time.sleep(min(30, remaining))
+                return 0
 
 
 if __name__ == "__main__":
