@@ -163,8 +163,9 @@ edits, so upstream syncs stay conflict-free.
 | `SMG_RUNNER_AMD_GPU_4` | `4-gpu-mi300x` | AMD nightly benchmark (off unless `SMG_RUN_AMD_LEGS` is `true`) |
 | `SMG_RUNNER_AMD_GPU_8` | `8-gpu-mi300x` | AMD legs of the BFCL A/B and AMD rows of the nightly PD sweep (off unless `SMG_RUN_AMD_LEGS` is `true`) |
 
-The `e2e-1gpu-completions-amd`, `e2e-1gpu-embeddings-amd` and
-`e2e-1gpu-gateway-amd` jobs in `pr-test-rust.yml` require both
+The `e2e-1gpu-completions-amd`, `e2e-1gpu-embeddings-amd`,
+`e2e-1gpu-gateway-amd` and `e2e-1gpu-chat-mm-worker-amd` jobs in
+`pr-test-rust.yml` require both
 `SMG_RUN_AMD_VLLM_LOCAL_LEGS` and `SMG_RUN_AMD_LEGS` to be `true`.
 The extra switch allows these AMD vLLM lanes to be qualified separately
 on shared runners; "local" does not select a model-cache location. On
