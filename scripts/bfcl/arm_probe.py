@@ -9,8 +9,10 @@ establish an exit code or an engine child's health. Full arm logs remain needed.
 
 import argparse
 import datetime
+import http.client
 import json
 import re
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -55,7 +57,7 @@ def fetch(base, path):
             if len(body) > MAX_BYTES:
                 return {"error": "oversize_response"}, None
             return {"http_status": response.code}, body
-    except (OSError, ValueError, urllib.error.URLError) as error:
+    except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException) as error:
         return {"error": type(error).__name__}, None
 
 
@@ -200,7 +202,7 @@ def main():
     parser.add_argument("--worker-port", type=int)
     args = parser.parse_args()
     if not 0 <= args.wait_ready <= 7200 or not 0 < args.duration <= 21600:
-        parser.error("readiness bound must be0..7200s and observation duration0..21600s")
+        parser.error("readiness bound must be 0..7200 s and duration must be > 0 and <= 21600 s")
     owned = owned_processes(args.run_dir)
     started = time.monotonic()
     # The existing always-upload BFCL arm-log artifact retains *.log files.
@@ -208,7 +210,7 @@ def main():
         while True:
             observation = selected_json(args.base_url, "/readiness", args.model)
             row = {
-                # The launcher also runs on hosts whose python3 is Python3.10.
+                # The launcher also runs on hosts whose python3 is Python 3.10.
                 "utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),  # noqa: UP017
                 "elapsed_s": round(time.monotonic() - started, 3),
                 "processes": current_processes(owned),
@@ -219,6 +221,12 @@ def main():
                 if ready(observation):
                     return 0
                 if time.monotonic() - started >= args.wait_ready:
+                    print(
+                        "[bfcl arm probe] TIMEOUT waiting for target model readiness; "
+                        f"latest observation: {json.dumps(observation)}; "
+                        f"see {args.run_dir / 'arm_b_state.log'}",
+                        file=sys.stderr,
+                    )
                     return 1
                 time.sleep(2)
             else:

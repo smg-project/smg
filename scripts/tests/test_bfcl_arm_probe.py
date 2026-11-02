@@ -2,6 +2,7 @@ import contextlib
 import importlib.util
 import json
 import os
+import socketserver
 import subprocess
 import sys
 import threading
@@ -47,6 +48,24 @@ def server(responses):
 
 def response(data, status=200):
     return status, json.dumps(data).encode(), {}
+
+
+@contextlib.contextmanager
+def broken_http_server(payload):
+    class Handler(socketserver.BaseRequestHandler):
+        def handle(self):
+            self.request.recv(8192)
+            self.request.sendall(payload)
+
+    http = socketserver.TCPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=http.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{http.server_address[1]}"
+    finally:
+        http.shutdown()
+        thread.join()
+        http.server_close()
 
 
 def readiness(model=MODEL, healthy=1):
@@ -135,6 +154,24 @@ def test_bad_or_oversize_answer_is_unknown_and_bounded(body):
         actual = probe.selected_json(url, "/readiness", MODEL)
     assert actual.get("error") in ("invalid_json_schema", "oversize_response")
     assert not probe.ready(actual)
+    assert "PRIVATE" not in json.dumps(actual)
+
+
+@pytest.mark.parametrize("endpoint", ["readiness", "metrics"])
+@pytest.mark.parametrize(
+    "payload,error",
+    [
+        (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10\r\nPRIVATE", "IncompleteRead"),
+        (b"PRIVATE\r\n\r\n", "BadStatusLine"),
+    ],
+)
+def test_broken_http_is_unknown_without_ending_observation(endpoint, payload, error):
+    with broken_http_server(payload) as url:
+        if endpoint == "metrics":
+            actual = probe.routing_states(url, 1234)
+        else:
+            actual = probe.selected_json(url, "/readiness", MODEL)
+    assert actual == {"error": error}
     assert "PRIVATE" not in json.dumps(actual)
 
 
@@ -228,6 +265,9 @@ def test_wait_cli_timeout_does_not_accept_process_liveness(tmp_path):
         )
     assert result.returncode == 1
     assert set(calls) == {"/readiness"}
+    assert b"TIMEOUT" in result.stderr
+    assert b'"http_status": 200' in result.stderr
+    assert b'"models": []' in result.stderr
 
 
 @pytest.mark.parametrize(
