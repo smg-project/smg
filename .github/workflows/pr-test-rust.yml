@@ -1649,6 +1649,7 @@ jobs:
       test_timeout: 24
       test_dirs: e2e_test/responses
       setup_agentic_deps: true
+      responses_evidence: true
       min_selected: 92 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     secrets: inherit
 

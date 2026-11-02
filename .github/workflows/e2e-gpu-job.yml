@@ -54,6 +54,11 @@ on:
         type: boolean
         default: false
         description: "Set up Oracle DB and Brave MCP for agentic tests"
+      responses_evidence:
+        required: false
+        type: boolean
+        default: false
+        description: "Verify the original Responses identities and complete current selection with real phase/JUnit evidence"
       provider_api_keys:
         required: false
         type: boolean
@@ -220,6 +225,39 @@ jobs:
           wasm-fixtures: 'true'
           client-types: 'true'
 
+      - name: Prepare full Responses evidence
+        id: responses-evidence
+        if: inputs.responses_evidence
+        env:
+          CHECK_ENGINE: ${{ inputs.engine }}
+          CHECK_GPU_TIER: ${{ inputs.gpu_tier }}
+          CHECK_DIRS: ${{ inputs.test_dirs }}
+          CHECK_FILTER: ${{ inputs.test_filter }}
+          CHECK_WIRE: ${{ inputs.connection_mode }}
+          CHECK_SERVICES: ${{ inputs.setup_agentic_deps }}
+        run: |
+          case "$CHECK_DIRS" in
+            e2e_test/responses|e2e_test/responses/) ;;
+            *) echo "Responses evidence requires the complete Responses directory" >&2; exit 1 ;;
+          esac
+          if [ "$CHECK_ENGINE" != sglang ] || [ "$CHECK_GPU_TIER" != 1 ] || [ "$CHECK_SERVICES" != true ] || [ -n "$CHECK_FILTER" ] || [ -n "$CHECK_WIRE" ]; then
+            echo "Responses evidence requires the original SGLang/tier1/default-wire/service profile without a filter" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from uuid import uuid4
+          token = uuid4().hex
+          directory = Path("e2e-logs") / ("responses-" + token)
+          directory.mkdir(parents=True, exist_ok=False)
+          context = {key: os.environ.get(key) for key in ("GITHUB_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_JOB", "E2E_ENGINE", "E2E_GPU_TIER")}
+          (directory / "workflow-context.json").write_text(json.dumps({"declared_workflow_context": context}, indent=2) + "\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
+              stream.write(f"directory={directory}\nartifact=responses-evidence-{token}\n")
+          PY
+
       # Agentic service dependencies (Oracle DB, Brave MCP)
       - name: Check shared services
         if: inputs.setup_agentic_deps
@@ -306,12 +344,39 @@ jobs:
           else
             bash scripts/ci_killall_sglang.sh "nuke_gpus"
           fi
-          pytest ${{ inputs.test_dirs }} \
-            --ignore=e2e_test/benchmarks \
-            --ignore=e2e_test/bindings_go \
-            ${{ inputs.test_filter }} \
-            --reruns 2 --reruns-delay 5 \
-            -s -vv
+          if [ "${{ inputs.responses_evidence }}" = true ]; then
+            export RESPONSES_EVIDENCE_DIR="${{ steps.responses-evidence.outputs.directory }}"
+            python3 -m pytest ${{ inputs.test_dirs }} \
+              -p scripts.ci_responses_evidence \
+              --junitxml="$RESPONSES_EVIDENCE_DIR/junit.xml" \
+              --ignore=e2e_test/benchmarks \
+              --ignore=e2e_test/bindings_go \
+              ${{ inputs.test_filter }} \
+              --reruns 2 --reruns-delay 5 \
+              -s -vv
+          else
+            pytest ${{ inputs.test_dirs }} \
+              --ignore=e2e_test/benchmarks \
+              --ignore=e2e_test/bindings_go \
+              ${{ inputs.test_filter }} \
+              --reruns 2 --reruns-delay 5 \
+              -s -vv
+          fi
+
+      - name: Verify complete Responses business evidence
+        if: always() && inputs.responses_evidence && steps.responses-evidence.outcome == 'success'
+        env:
+          RESPONSES_EVIDENCE_DIR: ${{ steps.responses-evidence.outputs.directory }}
+        run: python3 scripts/ci_responses_evidence.py verify "$RESPONSES_EVIDENCE_DIR" "$RESPONSES_EVIDENCE_DIR/junit.xml" scripts/ci_responses_original128.json
+
+      - name: Upload Responses evidence
+        if: always() && inputs.responses_evidence && steps.responses-evidence.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.responses-evidence.outputs.artifact }}
+          path: ${{ steps.responses-evidence.outputs.directory }}/
+          retention-days: 7
+          if-no-files-found: error
 
       - name: Worker failure diagnostics
         if: failure() || cancelled()
