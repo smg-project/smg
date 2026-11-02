@@ -139,36 +139,45 @@ def gateway_with_mcp_config_grpc(require_brave_server, mcp_config_file):
     except Exception as e:
         pytest.skip(f"gRPC worker not available: {e}")
 
-    worker = workers[0]
-    model_path = get_model_spec("openai/gpt-oss-20b")["model"]
-
-    gateway = Gateway()
+    gateway = None
     try:
-        # The worker has its own startup budget above. MCP registration shares
-        # the original router-start budget, instead of starting a second wait.
-        deadline = time.monotonic() + DEFAULT_ROUTER_TIMEOUT
-        gateway.start(
-            worker_urls=[worker.base_url],
-            model_path=model_path,
-            timeout=DEFAULT_ROUTER_TIMEOUT,
-            extra_args=[
-                "--mcp-config-path",
-                mcp_config_file,
-                "--history-backend",
-                "memory",
-            ],
-        )
-        wait_for_single_mcp_registration(gateway, deadline=deadline)
+        worker = workers[0]
+        model_path = get_model_spec("openai/gpt-oss-20b")["model"]
+        gateway = Gateway()
+        try:
+            # The worker has its own startup budget above. MCP registration shares
+            # the original router-start budget, instead of starting a second wait.
+            deadline = time.monotonic() + DEFAULT_ROUTER_TIMEOUT
+            gateway.start(
+                worker_urls=[worker.base_url],
+                model_path=model_path,
+                timeout=DEFAULT_ROUTER_TIMEOUT,
+                extra_args=[
+                    "--mcp-config-path",
+                    mcp_config_file,
+                    "--history-backend",
+                    "memory",
+                ],
+            )
+            wait_for_single_mcp_registration(gateway, deadline=deadline)
 
-        client = openai.OpenAI(
-            base_url=f"{gateway.base_url}/v1",
-            api_key="not-used",
-        )
+            client = openai.OpenAI(
+                base_url=f"{gateway.base_url}/v1",
+                api_key="not-used",
+            )
+        except BaseException as error:
+            # Registration is still part of setup. Preserve a failed launch's
+            # private log without copying potentially sensitive output into errors.
+            gateway._started = False
+            if gateway.log_path is not None:
+                error.add_note(f"Gateway setup log retained at {gateway.log_path}")
+            raise
 
         yield gateway, client, model_path
     finally:
         try:
-            gateway.shutdown()
+            if gateway is not None:
+                gateway.shutdown()
         finally:
             stop_workers(workers)
 

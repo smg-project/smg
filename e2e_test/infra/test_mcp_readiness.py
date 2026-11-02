@@ -9,6 +9,7 @@ import os
 import subprocess
 import threading
 import time
+from contextlib import asynccontextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,7 +33,7 @@ class Clock:
 def _mock_metrics(monkeypatch, handler, clock=None):
     client_type = httpx.AsyncClient
     sleep = asyncio.sleep
-    state = SimpleNamespace(closed=0, clients=[])
+    state = SimpleNamespace(closed=0, clients=[], timeout_budgets=[])
 
     class Body(httpx.AsyncByteStream):
         def __init__(self, content):
@@ -66,6 +67,15 @@ def _mock_metrics(monkeypatch, handler, clock=None):
             await sleep(0)
 
         monkeypatch.setattr(mcp_readiness.asyncio, "sleep", advance)
+
+        @asynccontextmanager
+        async def virtual_timeout(seconds):
+            # These cases test virtual budget arithmetic; the real HTTP cases
+            # below exercise the actual asyncio cancellation scope and deadline.
+            state.timeout_budgets.append(seconds)
+            yield
+
+        monkeypatch.setattr(mcp_readiness.asyncio, "timeout", virtual_timeout)
     return state
 
 
@@ -99,7 +109,10 @@ def fixture_parts(monkeypatch):
 
     state = SimpleNamespace(stopped=False, shutdown=False, started=False)
     gateway = SimpleNamespace(
-        is_running=True, metrics_url="http://127.0.0.1:1", base_url="http://127.0.0.1:2"
+        is_running=True,
+        metrics_url="http://127.0.0.1:1",
+        base_url="http://127.0.0.1:2",
+        log_path=None,
     )
 
     def start(**kwargs):
@@ -370,11 +383,16 @@ def test_gateway_exit_cancels_an_in_flight_request(monkeypatch):
     gateway = SimpleNamespace(is_running=True, metrics_url="http://127.0.0.1:1")
     client_type = httpx.AsyncClient
     closed = threading.Event()
+    cancelled = threading.Event()
 
     class SlowBody(httpx.AsyncByteStream):
         async def __aiter__(self):
             gateway.is_running = False
-            await asyncio.sleep(10)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
             yield b"smg_mcp_servers_active 1\n"
 
         async def aclose(self):
@@ -389,6 +407,67 @@ def test_gateway_exit_cancels_an_in_flight_request(monkeypatch):
     monkeypatch.setattr(mcp_readiness.httpx, "AsyncClient", client)
     started = time.monotonic()
     with pytest.raises(RuntimeError, match="exited"):
-        mcp_readiness.wait_for_single_mcp_registration(gateway, deadline=started + 60)
-    assert time.monotonic() - started < 0.3
-    assert closed.is_set()
+        mcp_readiness.wait_for_single_mcp_registration(gateway, deadline=started + 0.3)
+    assert cancelled.is_set() and closed.is_set()
+
+
+@pytest.mark.parametrize("failure", ["model_spec", "gateway_constructor", "worker_index"])
+def test_initial_setup_failure_stops_created_workers(monkeypatch, fixture_parts, failure):
+    import infra
+    from infra import model_specs
+    from infra import worker as worker_module
+
+    _, state = fixture_parts
+
+    def fail(*_, **__):
+        raise RuntimeError(f"private setup {failure}")
+
+    if failure == "model_spec":
+        monkeypatch.setattr(model_specs, "get_model_spec", fail)
+    elif failure == "gateway_constructor":
+        monkeypatch.setattr(infra, "Gateway", fail)
+    else:
+        monkeypatch.setattr(worker_module, "start_workers", lambda *_, **__: [])
+
+    with pytest.raises((RuntimeError, IndexError)):
+        next(_fixture()(None, "unused.yaml"))
+    assert state.stopped, "fixture did not release workers after initial setup failure"
+    assert not state.shutdown, "fixture tried to shut down a gateway that was not constructed"
+
+
+def test_registration_failure_preserves_private_router_log_without_dumping_it(
+    monkeypatch, fixture_parts
+):
+    import infra
+    from infra.gateway import Gateway
+
+    _, state = fixture_parts
+    monkeypatch.delenv("E2E_LOG_DIR", raising=False)
+    gateway = Gateway(port=12345, prometheus_port=12346)
+    sentinel = "private diagnostic content must stay in its log"
+    log = gateway._open_log_file()
+    log.write(sentinel)
+    log.flush()
+    log_path = Path(gateway.log_path)
+
+    def started(**_):
+        gateway._started = True
+
+    def fail(*_, **__):
+        raise TimeoutError("private registration failure")
+
+    gateway.start = started
+    monkeypatch.setattr(infra, "Gateway", lambda: gateway)
+    fixture = _fixture()
+    fixture.__globals__["wait_for_single_mcp_registration"] = fail
+    try:
+        with pytest.raises(TimeoutError, match="private registration failure") as error:
+            next(fixture(None, "unused.yaml"))
+        assert state.stopped and gateway._log_file is None
+        assert log_path.is_file(), "failed MCP registration deleted the only temporary router log"
+        notes = "\n".join(getattr(error.value, "__notes__", []))
+        assert str(log_path) in notes
+        assert sentinel not in str(error.value) and sentinel not in notes
+    finally:
+        gateway.shutdown()
+        log_path.unlink(missing_ok=True)
