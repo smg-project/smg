@@ -1,9 +1,9 @@
-//! The answers to a candidate pool whose every worker is vetoed, by the
+//! The answers to a candidate pool whose every routable worker is vetoed, by the
 //! overload thresholds or by the liveness tracker: by default the request
 //! steers to the least-loaded of them ([`fallback_if_all_vetoed`]); under
 //! `--worker-overload-shed` an all-overloaded pool is refused with a distinct
 //! 503 ([`shed_if_all_overloaded`]) while a liveness veto still steers.
-//! Nothing here runs while some worker is free of both vetoes: such workers
+//! Nothing here runs while some routable worker is free of both vetoes: such workers
 //! are simply left out of selection.
 //!
 //! The verdict is taken from the candidate pool the caller selected over, never
@@ -55,6 +55,11 @@ pub fn set_shed_retry_after_secs(secs: u64) {
     SHED_RETRY_AFTER_SECS.store(secs.max(1), Ordering::Relaxed);
 }
 
+/// Ready and permitted by the circuit breaker, before overload/liveness vetoes.
+fn routable_but_for_veto(worker: &dyn Worker) -> bool {
+    worker.is_healthy() && worker.circuit_breaker_can_execute()
+}
+
 /// Whether every otherwise-routable worker in a non-empty pool is overloaded.
 ///
 /// `candidates` is the pool *before* the `is_available()` filter, narrowed by
@@ -63,7 +68,7 @@ pub fn set_shed_retry_after_secs(secs: u64) {
 pub fn all_overloaded(candidates: &[Arc<dyn Worker>]) -> bool {
     let mut ready = candidates
         .iter()
-        .filter(|w| w.is_healthy() && w.circuit_breaker_can_execute())
+        .filter(|w| routable_but_for_veto(w.as_ref()))
         .peekable();
     ready.peek().is_some() && ready.all(|w| w.is_overloaded())
 }
@@ -100,7 +105,7 @@ pub fn shed_if_all_overloaded(
 pub fn all_vetoed(candidates: &[Arc<dyn Worker>]) -> bool {
     let mut ready = candidates
         .iter()
-        .filter(|w| w.is_healthy() && w.circuit_breaker_can_execute())
+        .filter(|w| routable_but_for_veto(w.as_ref()))
         .peekable();
     ready.peek().is_some() && ready.all(|w| w.is_overloaded() || w.stall_reason().is_some())
 }
@@ -137,7 +142,7 @@ pub fn fallback_if_all_vetoed(
         return None;
     }
     let mut rng = rand::rng();
-    let ready = |w: &Arc<dyn Worker>| w.is_healthy() && w.circuit_breaker_can_execute();
+    let ready = |w: &Arc<dyn Worker>| routable_but_for_veto(w.as_ref());
     let overloaded_first = (!shedding)
         .then(|| {
             least_loaded_uniform(

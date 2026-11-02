@@ -671,62 +671,98 @@ mod tests {
     /// key, never one the sweep removed out from under it.
     #[test]
     fn a_reserve_racing_the_sweep_never_debits_a_removed_bucket() {
-        use std::{
-            sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-            time::Instant,
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Barrier,
         };
 
         use futures::FutureExt;
 
         const TENANT: &str = "ip:203.0.113.7";
+        const ROUNDS: usize = 128;
         // Refills a one-token draw in nanoseconds, so the bucket is full,
         // and sweepable, almost whenever no reserve holds it.
         let backend = LocalRateLimitBackend::new(policy_set(u32::MAX, u32::MAX));
         let key = ScopeKey::TenantGlobal(TenantKey::new(TENANT));
-        let stop = AtomicBool::new(false);
-        let evicted = AtomicUsize::new(0);
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let phases = Barrier::new(4);
+        let bad_reserves = AtomicUsize::new(0);
+        let wrong_bucket = AtomicUsize::new(0);
+        let bad_sweeps = AtomicUsize::new(0);
+        let seed = || {
+            drop(backend.bucket_for(
+                key.clone(),
+                ScopeLimits {
+                    tokens_per_minute: u32::MAX,
+                    requests_per_minute: u32::MAX,
+                },
+            ));
+        };
+        seed();
 
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                while !stop.load(Ordering::Relaxed) {
-                    let n = backend.sweep_idle_buckets(Duration::ZERO);
-                    evicted.fetch_add(n, Ordering::Relaxed);
+                for _ in 0..ROUNDS {
+                    phases.wait(); // race the three reserves against an idle bucket
+                    backend.sweep_idle_buckets(Duration::ZERO);
+                    phases.wait(); // all reservations now hold their bucket
+                    if backend.sweep_idle_buckets(Duration::ZERO) != 0 {
+                        bad_sweeps.fetch_add(1, Ordering::Relaxed);
+                    }
+                    phases.wait(); // let the reservations close
+                    phases.wait(); // all reservation-held Arcs have been dropped
+                    if backend.sweep_idle_buckets(Duration::ZERO) != 1 {
+                        bad_sweeps.fetch_add(1, Ordering::Relaxed);
+                    }
+                    seed();
+                    phases.wait(); // prepare the next race before releasing readers
                 }
             });
             for _ in 0..3 {
                 scope.spawn(|| {
-                    while !stop.load(Ordering::Relaxed) {
+                    for _ in 0..ROUNDS {
+                        phases.wait();
                         let req = request(TENANT, 1);
                         let charge_id = req.request_charge_id;
                         // reserve/close never await, so one poll finishes them.
-                        let outcome = backend.reserve(req).now_or_never().unwrap();
-                        assert_eq!(outcome, ReserveOutcome::Admitted);
-                        {
-                            let held = backend.active.get(&charge_id).unwrap();
-                            let served = backend.buckets.get(&key);
-                            assert!(
-                                served.is_some_and(|b| Arc::ptr_eq(&held.buckets[0], b.value())),
-                                "an admitted reservation holds a bucket the map no longer serves"
-                            );
+                        if backend.reserve(req).now_or_never() != Some(ReserveOutcome::Admitted) {
+                            bad_reserves.fetch_add(1, Ordering::Relaxed);
                         }
-                        backend
-                            .close_reserved_only(charge_id)
-                            .now_or_never()
-                            .unwrap();
+                        phases.wait();
+                        {
+                            let matches = match (
+                                backend.active.get(&charge_id),
+                                backend.buckets.get(&key),
+                            ) {
+                                (Some(held), Some(served)) => {
+                                    Arc::ptr_eq(&held.buckets[0], served.value())
+                                }
+                                _ => false,
+                            };
+                            if !matches {
+                                wrong_bucket.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        phases.wait();
+                        if backend.close_reserved_only(charge_id).now_or_never().is_none() {
+                            bad_reserves.fetch_add(1, Ordering::Relaxed);
+                        }
+                        phases.wait();
+                        phases.wait();
                     }
                 });
             }
-            while evicted.load(Ordering::Relaxed) < 1000 && Instant::now() < deadline {
-                std::thread::yield_now();
-            }
-            stop.store(true, Ordering::Relaxed);
         });
 
-        assert!(
-            evicted.load(Ordering::Relaxed) >= 1000,
-            "the sweep never got to race a reserve"
+        // Assert after joining, so an invariant failure cannot strand another
+        // participant at a barrier. Each round checks both held and idle states;
+        // progress does not depend on scheduling 1000 opportunistic evictions.
+        assert_eq!(bad_reserves.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            wrong_bucket.load(Ordering::Relaxed),
+            0,
+            "an admitted reservation holds a bucket the map no longer serves"
         );
+        assert_eq!(bad_sweeps.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
