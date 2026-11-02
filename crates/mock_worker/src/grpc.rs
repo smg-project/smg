@@ -344,8 +344,15 @@ impl TokenSpeedScheduler for MockScheduler {
             .sampling_params
             .as_ref()
             .map_or(1, |params| usize::try_from(params.n).unwrap_or(usize::MAX));
-        let scripted = script::take_ids_per_choice(&self.cfg, &self.name, prompt_ids, choices)
-            .map_err(Status::failed_precondition)?;
+        // The rendered prompt the gateway sends beside the ids, for the
+        // answers filed under a text (read without a tokenizer).
+        let rendered: &str = req
+            .tokenized
+            .as_ref()
+            .map_or("", |tokenized| tokenized.original_text.as_str());
+        let scripted =
+            script::take_ids_per_choice(&self.cfg, &self.name, prompt_ids, rendered, choices)
+                .map_err(Status::failed_precondition)?;
         if let Some(answers) = scripted {
             // The request's limit ends each answer as it would an engine's.
             let limit = req

@@ -302,17 +302,30 @@ gRPC, ZMQ), ahead of either engine mode. Two sources feed one store:
 - `POST /admin/script/{worker}` on the admin API, with one such answer or an
   array of them: the answers the worker's next requests get, in order
   (`all`: whichever worker gets the request). An answer with a `key` or
-  `input_ids` is filed under its prompt for every worker instead.
-  `GET /admin/script/{worker}` reads `queued`, `hits`, `misses` and the
-  `keyed` count; `DELETE` drops the queue; a name no worker of the process
-  has is a 404. This is the form a test wants: it states the model's answer
-  right before it sends the request, no tokenizer prediction needed.
+  `input_ids` is filed under its prompt for every worker instead. An answer
+  with a `prompt_contains` text is filed for the first request whose prompt
+  holds the text, served once, whatever order the requests arrive in: what
+  a test states when its requests run concurrently, or when the gateway
+  picks the worker. `GET /admin/script/{worker}` reads `queued`, `marked`
+  (the answers filed under a text), `hits`, `misses` and the `keyed` count;
+  `DELETE` drops the queue and the answers filed under a text; a name no
+  worker of the process has is a 404. This is the form a test wants: it
+  states the model's answer right before it sends the request, no tokenizer
+  prediction needed.
 
 For a request a worker looks in this order: its own queue, the shared queue,
-the keyed answers under its prompt's key. Nothing found is a miss, counted
-per worker, and the request goes to the canned or realistic engine as if no
-script existed. A scripted answer is served by the wire, not by the engine
-simulator: no load, no KV events, no request record.
+the answers filed under a text its prompt holds (its own, then the shared
+ones), the keyed answers under its prompt's key. Nothing found is a miss,
+counted per worker, and the request goes to the canned or realistic engine as
+if no script existed. A scripted answer is served by the wire, not by the
+engine simulator: no load, no KV events, no request record. The prompt's text
+is what an HTTP worker was sent (a message's string content or the `text` of
+its parts, a prompt string or the strings of a prompt array); a gRPC worker
+reads the rendered text the gateway sends beside the ids (`original_text`)
+and decodes the ids with its `--tokenizer` only when that is empty, as a ZMQ
+worker always does. Either reads the prompt only while answers filed under a
+text wait for it, and a prompt it cannot read then fails the request with
+the reason, the filed answers left where they are.
 
 Per wire: a gRPC worker streams `chunk_tokens` ids per `Chunk` and ends with
 the `Complete` (`output_ids`, `finish_reason`, `matched_stop`,
