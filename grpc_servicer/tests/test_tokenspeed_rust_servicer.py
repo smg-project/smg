@@ -1244,26 +1244,33 @@ def test_a_decode_or_aggregated_launch_starts_no_bootstrap_server(
     assert "Bootstrap server started" not in caplog.text
 
 
-def test_a_prefill_launch_on_an_engine_whose_launcher_hosts_the_bootstrap_server_starts_none(
-    monkeypatch, tmp_path, caplog
+@pytest.mark.parametrize(
+    "missing",
+    [None, "run_event_loop"],
+    ids=["every in-process entry point present", "one entry point missing"],
+)
+def test_a_prefill_launch_on_an_engine_whose_launcher_hosts_the_bootstrap_server_is_left_to_it(
+    monkeypatch, tmp_path, caplog, missing
 ):
     """Since the engine's Rust control plane its headless launcher brings the
     prefill side's bootstrap server up itself, and its PD registry no longer
-    hands the server class out; such an engine lacks the in-process entry
-    points too, so its ranks are left to that launcher. The servicer reads
-    the registry, starts none and says so: the port is bound once."""
-    _stub_rank_launch(monkeypatch, missing="run_event_loop")
+    hands the server class out. A prefill launch on such an engine is left to
+    that launcher whatever entry points the engine has: ranks started from
+    this process would have no server to register with (the engine of today
+    lacks an entry point as well; one with every entry point is the launcher
+    follow-up's case). The servicer starts none and says so: no rank starts
+    here, no preparation call runs, the port is bound once."""
+    launch = _stub_rank_launch(monkeypatch, missing=missing)
     asked = _install_fake_pd_utils(monkeypatch, hands_out_bootstrap_server=False)
     recorded = _serve_rust_role(monkeypatch, tmp_path, caplog, "prefill", in_process=False)
     assert recorded["exit"] == 0 and recorded["supervised"] == "engine-handle"
     assert recorded["launched_with_servers"] == [] and _FakeBootstrapServer.built == []
-    assert asked == {}
+    assert asked == {} and _FakeRankProcess.started == [] and launch["calls"] == []
     assert "Bootstrap server started" not in caplog.text
     assert (
-        "Bootstrap server for disaggregation mode on port 8998 left to the engine's headless "
-        "launcher, which hosts its own" in caplog.text
+        "left to TokenSpeed's headless launcher in a spawned process (it hosts the prefill "
+        "side's KV bootstrap server)" in caplog.text
     )
-    assert "left to TokenSpeed's headless launcher in a spawned process" in caplog.text
 
 
 def test_a_prefill_launch_left_to_an_older_engines_launcher_hosts_the_bootstrap_server_here(
