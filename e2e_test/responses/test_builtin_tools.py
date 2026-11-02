@@ -20,6 +20,8 @@ import openai
 import pytest
 import yaml
 from infra import BRAVE_MCP_HOST, BRAVE_MCP_PORT, BRAVE_MCP_URL
+from infra.constants import DEFAULT_ROUTER_TIMEOUT
+from infra.mcp_readiness import wait_for_single_mcp_registration
 from infra.streams import collect_streamed_response
 from infra.web_search import skip_if_web_search_found_nothing
 
@@ -141,26 +143,34 @@ def gateway_with_mcp_config_grpc(require_brave_server, mcp_config_file):
     model_path = get_model_spec("openai/gpt-oss-20b")["model"]
 
     gateway = Gateway()
-    gateway.start(
-        worker_urls=[worker.base_url],
-        model_path=model_path,
-        extra_args=[
-            "--mcp-config-path",
-            mcp_config_file,
-            "--history-backend",
-            "memory",
-        ],
-    )
+    try:
+        # The worker has its own startup budget above. MCP registration shares
+        # the original router-start budget, instead of starting a second wait.
+        deadline = time.monotonic() + DEFAULT_ROUTER_TIMEOUT
+        gateway.start(
+            worker_urls=[worker.base_url],
+            model_path=model_path,
+            timeout=DEFAULT_ROUTER_TIMEOUT,
+            extra_args=[
+                "--mcp-config-path",
+                mcp_config_file,
+                "--history-backend",
+                "memory",
+            ],
+        )
+        wait_for_single_mcp_registration(gateway, deadline=deadline)
 
-    client = openai.OpenAI(
-        base_url=f"{gateway.base_url}/v1",
-        api_key="not-used",
-    )
+        client = openai.OpenAI(
+            base_url=f"{gateway.base_url}/v1",
+            api_key="not-used",
+        )
 
-    yield gateway, client, model_path
-
-    gateway.shutdown()
-    stop_workers(workers)
+        yield gateway, client, model_path
+    finally:
+        try:
+            gateway.shutdown()
+        finally:
+            stop_workers(workers)
 
 
 # Note: These tests require manual gateway configuration with MCP config.
