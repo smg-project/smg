@@ -2,9 +2,11 @@
 
 import copy
 import json
+import os
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
+from collections import Counter
 from hashlib import sha256
 from pathlib import Path
 
@@ -72,7 +74,7 @@ def run_validator(evidence):
             "verify",
             str(directory),
             str(xml_path),
-            str(ORIGINAL_PATH),
+            str(evidence.get("original_path", ORIGINAL_PATH)),
         ],
         cwd=evidence["source"],
         stdin=subprocess.DEVNULL,
@@ -95,6 +97,7 @@ def verify(evidence, error=None):
     child = run_validator(evidence)
     report = json.loads((directory / "validation.json").read_text())
     assert json.loads(child.stdout) == report
+    assert "Traceback" not in child.stderr
     assert child.returncode == (0 if error is None else 1), child.stdout + child.stderr
     assert report["business_verified"] is (error is None)
     if error is None:
@@ -260,3 +263,152 @@ def test_missing_reference_case_names_the_id_and_manifest(evidence):
     complete_records(evidence)
     report = verify(evidence, "Original128 identities are missing from final selection")
     assert any(missing in message and str(ORIGINAL_PATH) in message for message in report["errors"])
+
+
+@pytest.mark.parametrize(
+    "scenario,artifact,field",
+    [
+        ("selected-container", "selected.json", "nodeids"),
+        ("selected-entry", "selected.json", "nodeids"),
+        ("selected-integer", "selected.json", "nodeids"),
+        ("original-container", "original-malformed.json", "reference identities"),
+        ("original-entry", "original-malformed.json", "reference identities"),
+        ("reports-container", "outcomes.json", "reports"),
+        ("reports-entry", "outcomes.json", "reports[0]"),
+        ("report-nodeid", "outcomes.json", "reports[0].nodeid"),
+        ("report-when", "outcomes.json", "reports[0].when"),
+        ("report-outcome", "outcomes.json", "reports[0].outcome"),
+    ],
+)
+def test_malformed_evidence_types_write_a_failure_report(evidence, scenario, artifact, field):
+    complete_records(evidence)
+    if scenario == "selected-container":
+        evidence["selection"]["nodeids"] = None
+    elif scenario in ("selected-entry", "selected-integer"):
+        evidence["selection"]["nodeids"][0] = None if scenario == "selected-entry" else 17
+    elif scenario.startswith("original-"):
+        original = None if scenario == "original-container" else [None, *evidence["original"][1:]]
+        path = evidence["directory"] / artifact
+        path.write_text(json.dumps(original) + "\n")
+        evidence["original_path"] = path
+    elif scenario == "reports-container":
+        evidence["outcomes"]["reports"] = None
+    elif scenario == "reports-entry":
+        evidence["outcomes"]["reports"][0] = None
+    else:
+        key = scenario.removeprefix("report-")
+        value = {"nodeid": None, "when": [], "outcome": {}}[key]
+        evidence["outcomes"]["reports"][0][key] = value
+    report = verify(evidence, "Evidence validation failed: ValueError")
+    assert any(
+        str(evidence["directory"] / artifact) in error and field in error
+        for error in report["errors"]
+    )
+
+
+def write_original128_pytest_fixture(source, original, skipped):
+    """Define trivial tests with reference identities; exercise real pytest observer hooks."""
+    modules = {}
+    for nodeid in original:
+        path, cls, qualified = nodeid.split("::")
+        method, bracket, parameter = qualified.partition("[")
+        methods = modules.setdefault(path, {}).setdefault(cls, {})
+        methods.setdefault(method, []).append(parameter[:-1] if bracket else None)
+    for path, classes in modules.items():
+        lines = ["import pytest", ""]
+        for cls, methods in classes.items():
+            lines.append(f"class {cls}:")
+            for method, parameters in methods.items():
+                arguments = "self, request"
+                if parameters != [None]:
+                    lines.append(
+                        f"    @pytest.mark.parametrize('_identity', {parameters!r}, "
+                        f"ids={parameters!r})"
+                    )
+                    arguments += ", _identity"
+                lines.extend(
+                    [
+                        f"    def {method}({arguments}):",
+                        f"        if request.node.nodeid == {skipped!r}:",
+                        "            pytest.skip('synthetic observer control')",
+                        "",
+                    ]
+                )
+        target = source / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("\n".join(lines) + "\n")
+
+
+@pytest.mark.parametrize("skip_one", [False, True], ids=["all-pass", "one-skipped"])
+def test_real_pytest_hooks_generate_verifiable_complete_evidence(evidence, skip_one):
+    original = evidence["original"]
+    source, directory = evidence["source"], evidence["directory"]
+    skipped = original[0] if skip_one else None
+    write_original128_pytest_fixture(source, original, skipped)
+    bootstrap = (
+        f"import sys; sys.path.insert(0, {str(SCRIPTS)!r}); "
+        "import pytest; raise SystemExit(pytest.main(sys.argv[1:]))"
+    )
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            bootstrap,
+            "--noconftest",
+            "-p",
+            "no:cacheprovider",
+            "-p",
+            "ci_responses_evidence",
+            "-o",
+            "addopts=",
+            "--rootdir",
+            str(source),
+            "--junitxml",
+            str(directory / "responses.xml"),
+            "-q",
+            str(source / "e2e_test/responses"),
+        ],
+        cwd=source,
+        env={
+            "PATH": os.defpath,
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+            "RESPONSES_EVIDENCE_DIR": str(directory),
+        },
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert child.returncode == 0, child.stdout + child.stderr
+    assert "Traceback" not in child.stderr
+    selection = json.loads((directory / "selected.json").read_text())
+    outcomes = json.loads((directory / "outcomes.json").read_text())
+    assert len(selection["nodeids"]) == 128 and set(selection["nodeids"]) == set(original)
+    assert selection["rootpath"] == selection["source_root"] == str(source)
+    assert outcomes["pytest_exitstatus"] == 0
+    reports = outcomes["reports"]
+    assert Counter((row["nodeid"], row["when"]) for row in reports) == Counter(
+        {(nodeid, phase): 1 for nodeid in original for phase in ("setup", "call", "teardown")}
+    )
+    nonpassing = [row for row in reports if row["outcome"] != "passed"]
+    assert nonpassing == (
+        [{"nodeid": skipped, "when": "call", "outcome": "skipped"}] if skip_one else []
+    )
+    xml = ET.parse(directory / "responses.xml")
+    assert len(list(xml.getroot().iter("testcase"))) == 128
+    assert len(list(xml.getroot().iter("skipped"))) == int(skip_one)
+    verified = run_validator(evidence)
+    report = json.loads((directory / "validation.json").read_text())
+    assert json.loads(verified.stdout) == report
+    assert verified.returncode == int(skip_one), verified.stdout + verified.stderr
+    assert "Traceback" not in verified.stderr
+    assert report["business_verified"] is (not skip_one)
+    assert report["final_selected"] == report["junit_records"] == report["junit_unique"] == 128
+    assert report["phase_records"] == 384
+    if skip_one:
+        assert any(skipped in error and "skipped" in error for error in report["errors"])
+    else:
+        assert report["errors"] == []

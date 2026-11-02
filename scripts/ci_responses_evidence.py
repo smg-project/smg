@@ -74,6 +74,8 @@ def verify(directory, xml_path, original_path):
                 raise ValueError(f"Missing or symlinked evidence: {path}")
         selection = json.loads((directory / "selected.json").read_text())
         selected = selection["nodeids"]
+        if not isinstance(selected, list) or any(not isinstance(item, str) for item in selected):
+            raise ValueError(f"{directory / 'selected.json'}: nodeids must be a list of strings")
         source_root, rootpath = Path(selection["source_root"]), Path(selection["rootpath"])
         if not source_root.is_absolute() or not rootpath.is_absolute():
             raise ValueError("Collection source root and pytest rootpath must be absolute")
@@ -94,7 +96,22 @@ def verify(directory, xml_path, original_path):
             ),
         )
         actual = json.loads((directory / "outcomes.json").read_text())
+        reports = actual["reports"]
+        if not isinstance(reports, list):
+            raise ValueError(f"{directory / 'outcomes.json'}: reports must be a list of objects")
+        for index, report in enumerate(reports):
+            if not isinstance(report, dict):
+                raise ValueError(
+                    f"{directory / 'outcomes.json'}: reports[{index}] must be an object"
+                )
+            for field in ("nodeid", "when", "outcome"):
+                if not isinstance(report.get(field), str):
+                    raise ValueError(
+                        f"{directory / 'outcomes.json'}: reports[{index}].{field} must be a string"
+                    )
         original = json.loads(original_path.read_text())
+        if not isinstance(original, list) or any(not isinstance(item, str) for item in original):
+            raise ValueError(f"{original_path}: reference identities must be a list of strings")
         if len(original) != 128 or len(set(original)) != 128:
             errors.append("Original128 identity data is not exact and unique")
         if sha256(("\n".join(sorted(original)) + "\n").encode()).hexdigest() != ORIGINAL_SHA256:
@@ -127,7 +144,6 @@ def verify(directory, xml_path, original_path):
         }
         if any(node.tag in bad_tags for case in cases for node in case.iter()):
             errors.append("Actual JUnit contains skipped/failed/error records")
-        reports = actual["reports"]
         if {report["nodeid"] for report in reports} != set(selected):
             errors.append("Phase-report identities differ from complete final selection")
         if actual["pytest_exitstatus"] != 0:
