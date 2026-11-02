@@ -55,12 +55,17 @@ pub fn set_shed_retry_after_secs(secs: u64) {
     SHED_RETRY_AFTER_SECS.store(secs.max(1), Ordering::Relaxed);
 }
 
-/// Whether every worker in a non-empty candidate pool is vetoed.
+/// Whether every otherwise-routable worker in a non-empty pool is overloaded.
 ///
 /// `candidates` is the pool *before* the `is_available()` filter, narrowed by
-/// exactly the worker-type / connection-mode filter selection used.
+/// exactly the worker-type / connection-mode filter selection used. Unhealthy
+/// or circuit-blocked workers must not suppress the verdict on the ready pool.
 pub fn all_overloaded(candidates: &[Arc<dyn Worker>]) -> bool {
-    !candidates.is_empty() && candidates.iter().all(|w| w.is_overloaded())
+    let mut ready = candidates
+        .iter()
+        .filter(|w| w.is_healthy() && w.circuit_breaker_can_execute())
+        .peekable();
+    ready.peek().is_some() && ready.all(|w| w.is_overloaded())
 }
 
 /// Shed when every worker selection could have used is flagged overloaded
@@ -86,16 +91,18 @@ pub fn shed_if_all_overloaded(
     ))
 }
 
-/// Whether every worker in a non-empty candidate pool is vetoed, by the
-/// overload flag or by the liveness tracker (`Worker::stall_reason`).
+/// Whether every otherwise-routable worker in a non-empty pool is vetoed, by
+/// the overload flag or by the liveness tracker (`Worker::stall_reason`).
 ///
 /// `candidates` is the pool *before* the `is_available()` filter, narrowed by
-/// exactly the worker-type / connection-mode filter selection used.
+/// exactly the worker-type / connection-mode filter selection used. A dead
+/// worker without either veto must not prevent fallback to the ready pool.
 pub fn all_vetoed(candidates: &[Arc<dyn Worker>]) -> bool {
-    !candidates.is_empty()
-        && candidates
-            .iter()
-            .all(|w| w.is_overloaded() || w.stall_reason().is_some())
+    let mut ready = candidates
+        .iter()
+        .filter(|w| w.is_healthy() && w.circuit_breaker_can_execute())
+        .peekable();
+    ready.peek().is_some() && ready.all(|w| w.is_overloaded() || w.stall_reason().is_some())
 }
 
 /// Whether `worker` is kept out of selection by the overload thresholds
@@ -291,6 +298,101 @@ mod tests {
                 })
                 .build(),
         )
+    }
+
+    #[test]
+    fn unready_unvetoed_worker_does_not_block_the_ready_pool_verdict() {
+        let dead = worker("http://127.0.0.1:9850", "m");
+        let a = worker("http://127.0.0.1:9851", "m");
+        let b = worker("http://127.0.0.1:9852", "m");
+        let c = worker("http://127.0.0.1:9853", "m");
+        dead.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+        assert!(!dead.is_overloaded());
+        assert!(dead.stall_reason().is_none());
+        for w in [&a, &b, &c] {
+            w.set_overloaded(true);
+            w.increment_load();
+        }
+        a.increment_load();
+        c.increment_load();
+        let pool = vec![dead, Arc::clone(&a), Arc::clone(&b), c];
+        assert!(all_vetoed(&pool));
+        assert!(all_overloaded(&pool));
+        let picked = fallback_if_all_vetoed(&pool, "m", STAGE_SELECTION, false)
+            .expect("the least-loaded healthy overloaded worker is still routable");
+        assert!(Arc::ptr_eq(&picked, &b));
+        let shed = shed_if_all_overloaded(&pool, "m", true).expect("explicit overload shed");
+        assert_eq!(shed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            extract_error_code_from_response(&shed),
+            "worker_overload_protection_shed"
+        );
+        assert!(fallback_if_all_vetoed(&pool, "m", STAGE_SELECTION, true).is_none());
+
+        a.set_overloaded(false);
+        assert!(!all_vetoed(&pool));
+        assert!(!all_overloaded(&pool));
+        assert!(fallback_if_all_vetoed(&pool, "m", STAGE_SELECTION, false).is_none());
+        assert!(shed_if_all_overloaded(&pool, "m", true).is_none());
+    }
+
+    #[test]
+    fn an_unready_pool_is_neither_a_fallback_nor_an_overload_shed() {
+        let a = worker("http://127.0.0.1:9861", "m");
+        let b = worker("http://127.0.0.1:9862", "m");
+        let pool = vec![a, b];
+        for w in &pool {
+            w.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+            w.set_overloaded(true);
+        }
+        assert!(!all_vetoed(&pool));
+        assert!(!all_overloaded(&pool));
+        assert!(fallback_if_all_vetoed(&pool, "m", STAGE_SELECTION, false).is_none());
+        assert!(shed_if_all_overloaded(&pool, "m", true).is_none());
+    }
+
+    #[test]
+    fn fallback_respects_open_and_half_open_circuit_execution() {
+        use crate::worker::circuit_breaker::{CircuitBreakerConfig, CircuitState};
+
+        let w: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://127.0.0.1:9871")
+                .model(ModelCard::new("m"))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    timeout_duration: std::time::Duration::from_secs(3600),
+                    ..Default::default()
+                })
+                .build(),
+        );
+        w.set_overloaded(true);
+        w.record_circuit_breaker_outcome(false);
+        let pool = vec![Arc::clone(&w)];
+        assert_eq!(w.circuit_breaker_state(), CircuitState::Open);
+        assert!(!all_vetoed(&pool));
+        assert!(!all_overloaded(&pool));
+        assert!(fallback_if_all_vetoed(&pool, "m", STAGE_SELECTION, false).is_none());
+        assert!(shed_if_all_overloaded(&pool, "m", true).is_none());
+
+        assert!(w.readmit_circuit_breaker());
+        assert_eq!(w.circuit_breaker_state(), CircuitState::HalfOpen);
+        assert!(w.circuit_breaker_can_execute());
+        assert!(all_vetoed(&pool));
+        let picked = fallback_if_all_vetoed(&pool, "m", STAGE_SELECTION, false)
+            .expect("half-open uses the existing circuit execution permission");
+        assert!(Arc::ptr_eq(&picked, &w));
+        assert_eq!(w.circuit_breaker_state(), CircuitState::HalfOpen);
+        assert!(fallback_if_all_vetoed(&pool, "m", STAGE_SELECTION, true).is_none());
+        assert!(shed_if_all_overloaded(&pool, "m", true).is_some());
+        w.record_circuit_breaker_outcome(false);
+        assert_eq!(w.circuit_breaker_state(), CircuitState::Open);
+        assert!(fallback_if_all_vetoed(&pool, "m", STAGE_SELECTION, false).is_none());
     }
 
     /// The shed is a distinct 503, taken from the candidate pool rather than
