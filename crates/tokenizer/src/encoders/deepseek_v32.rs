@@ -1,4 +1,9 @@
 // Ported from https://huggingface.co/deepseek-ai/DeepSeek-V3.2/blob/main/encoding/encoding_dsv32.py
+//
+// The tools template follows the serving engines' own copies of that module
+// instead: they render this architecture from their copy, never from the
+// checkpoint's file, and the copies agree with each other byte for byte
+// (see `render_tools_template`).
 
 use std::fmt::Write as _;
 
@@ -120,15 +125,18 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
 // Templates
 // ---------------------------------------------------------------------------
 
-/// Mirrors `TOOLS_SYSTEM_TEMPLATE` from the Python source, including the
-/// blank lines between paragraphs that the upstream template preserves.
+/// Mirrors `TOOLS_SYSTEM_TEMPLATE` as the serving engines' own copies of the
+/// encoder module write it (each renders this architecture from its copy of
+/// `encoding_dsv32.py`, never from the checkpoint's file, and the copies agree
+/// byte for byte): no blank line after the `## Tools` header or between the
+/// paragraphs. The checkpoint's own file separates them with blank lines,
+/// which the model is never served.
 fn render_tools_template(tool_schemas: &str) -> String {
     let dsml = DSML;
     let tstart = THINKING_START;
     let tend = THINKING_END;
     format!(
 "## Tools
-
 You have access to a set of tools you can use to answer the user's question.
 You can invoke functions by writing a \"<{dsml}function_calls>\" block like the following as part of your reply to the user:
 <{dsml}function_calls>
@@ -140,21 +148,15 @@ You can invoke functions by writing a \"<{dsml}function_calls>\" block like the 
 ...
 </{dsml}invoke>
 </{dsml}function_calls>
-
 String and scalar parameters should be specified as is without any escaping or quotes, while lists and objects should use JSON format. The \"string\" attribute should be set to \"true\" for string type parameters and \"false\" for other types (numbers, booleans, arrays, objects).
-
 If the thinking_mode is enabled, then after function results you should strongly consider outputting a thinking block. Here is an example:
-
 <{dsml}function_calls>
 ...
 </{dsml}function_calls>
-
 <function_results>
 ...
 </function_results>
-
 {tstart}...thinking about results{tend}
-
 Here are the functions available in JSONSchema format:
 <functions>
 {tool_schemas}
@@ -247,6 +249,10 @@ fn render_message(
     let tools_raw = msg.get("tools").and_then(|v| v.as_array());
     let response_format = msg.get("response_format");
     let tool_calls_raw = msg.get("tool_calls").and_then(|v| v.as_array());
+    // The gateway's protocol takes the `reasoning` spelling as an alias of
+    // `reasoning_content`, so a history assistant's reasoning renders under
+    // either spelling for every renderer: a superset of the serving engines'
+    // copies of this encoder, each of which reads one spelling alone.
     let reasoning_content = msg
         .get("reasoning_content")
         .and_then(|v| v.as_str())
@@ -711,6 +717,69 @@ mod tests {
         )));
         assert!(out.contains(&format!("</{DSML_TOKEN}function_calls>")));
         assert!(out.ends_with(EOS_TOKEN));
+    }
+
+    #[test]
+    fn tools_template_renders_as_the_engines_copy_of_the_encoder_writes_it() {
+        // The serving engines render this architecture with their own copies
+        // of the encoder, whose tools template has no blank line after the
+        // `## Tools` header nor between its paragraphs; the checkpoint's own
+        // `encoding_dsv32.py` separates them with blank lines, which the
+        // model is never served.
+        let msgs = [
+            json!({
+                "role": "system",
+                "content": "",
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get the current weather for a city",
+                        "parameters": {
+                            "type": "object",
+                            "properties": { "city": { "type": "string" } },
+                            "required": ["city"]
+                        }
+                    }
+                }]
+            }),
+            user("What is the weather in Paris?"),
+        ];
+        let out = encode_messages(&msgs, ThinkingMode::Chat, &EncodeParams::default()).unwrap();
+        let start = out.find("## Tools").expect("the tools block");
+        let block = &out[start..];
+        let expected_head = format!(
+            "## Tools\n\
+             You have access to a set of tools you can use to answer the user's question.\n\
+             You can invoke functions by writing a \"<{DSML_TOKEN}function_calls>\" block like the following as part of your reply to the user:\n\
+             <{DSML_TOKEN}function_calls>\n\
+             <{DSML_TOKEN}invoke name=\"$FUNCTION_NAME\">\n\
+             <{DSML_TOKEN}parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</{DSML_TOKEN}parameter>\n\
+             ...\n\
+             </{DSML_TOKEN}invoke>\n\
+             <{DSML_TOKEN}invoke name=\"$FUNCTION_NAME2\">\n\
+             ...\n\
+             </{DSML_TOKEN}invoke>\n\
+             </{DSML_TOKEN}function_calls>\n\
+             String and scalar parameters should be specified as is without any escaping or quotes, while lists and objects should use JSON format. The \"string\" attribute should be set to \"true\" for string type parameters and \"false\" for other types (numbers, booleans, arrays, objects).\n\
+             If the thinking_mode is enabled, then after function results you should strongly consider outputting a thinking block. Here is an example:\n\
+             <{DSML_TOKEN}function_calls>\n\
+             ...\n\
+             </{DSML_TOKEN}function_calls>\n\
+             <function_results>\n\
+             ...\n\
+             </function_results>\n\
+             {THINKING_START_TOKEN}...thinking about results{THINKING_END_TOKEN}\n\
+             Here are the functions available in JSONSchema format:\n\
+             <functions>\n"
+        );
+        assert!(block.starts_with(&expected_head), "{block}");
+        assert!(
+            block.contains(&format!(
+                "\n</functions>\n{USER_SP_TOKEN}What is the weather in Paris?"
+            )),
+            "{block}"
+        );
     }
 
     #[test]
