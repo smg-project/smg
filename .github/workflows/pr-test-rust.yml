@@ -1890,6 +1890,7 @@ jobs:
         RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8@870a1177ed082c0ba5dbefd62573ab8f91803f6a
         deepseek-ai/DeepSeek-R1-Distill-Qwen-7B@916b56a44061fd5cd7d6a8fb632557ed4f724f60
         Qwen/Qwen2.5-14B-Instruct@cf98f3b3bbb457ad9e2bb7baf9a0125b6b88caa8
+        openai/gpt-oss-20b@6cee5e81ee83917806bbde320786a8fb61efebee
       SHOW_ROUTER_LOGS: "1"
     steps:
       - name: Checkout code
@@ -1953,23 +1954,36 @@ jobs:
             bash scripts/ci_retry.sh 3 30 hf download "$repository" --revision "$revision" \
               --include '*.json' --local-dir "$ROUTER_LOCAL_MODEL_PATH/$repository"
           done
+          # The Harmony vocab the gateway loads when a gpt-oss worker registers
+          # (from this directory, TIKTOKEN_ENCODINGS_BASE on the test step; a
+          # download on first use otherwise). Fetched only when the restored
+          # copy is missing or wrong: the digest is the one the loader checks.
+          mkdir -p "$ROUTER_LOCAL_MODEL_PATH/tiktoken"
+          vocab="$ROUTER_LOCAL_MODEL_PATH/tiktoken/o200k_base.tiktoken"
+          echo "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d  $vocab" | sha256sum -c --status 2>/dev/null \
+            || bash scripts/ci_retry.sh 3 30 curl -fsSL --connect-timeout 10 --max-time 120 -o "$vocab" \
+              https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken
 
       - name: Run the mock e2e tests
         timeout-minutes: 15
         env:
           SHOW_WORKER_LOGS: "0"
           E2E_LOG_DIR: e2e-logs
-          # floor ≈ 95% of the 225 cases the mock marker selects: the chat
+          # floor ≈ 95% of the 350 cases the mock marker selects: the chat
           # completion, request-id, concurrency, reasoning-content, EOS
           # stripping, function-calling, tool-choice (three models),
           # multi-turn and sampling-defaults classes, the constraint-failure
           # and the reader-panic classes, the completions classes, the
-          # context-length and load-report classes, and the Responses local
+          # context-length and load-report classes, the Responses local
           # classes (state, background, streaming events, sampling
-          # parameters, item references, the object shape)
-          E2E_MIN_SELECTED: "214"
+          # parameters, item references, the object shape), and the gpt-oss
+          # classes of chat and Responses on the Harmony token stream (the
+          # mock's tokenizer turns a scripted answer's channel markers into
+          # the special tokens)
+          E2E_MIN_SELECTED: "332"
           MOCK_WORKER_BIN: ${{ github.workspace }}/target/debug/mock-worker
           ROUTER_LOCAL_MODEL_PATH: ${{ runner.temp }}/models
+          TIKTOKEN_ENCODINGS_BASE: ${{ runner.temp }}/models/tiktoken
         run: |
           pytest e2e_test/chat_completions e2e_test/completions e2e_test/router e2e_test/responses \
             --reruns 2 --reruns-delay 5 \

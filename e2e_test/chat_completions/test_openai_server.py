@@ -442,9 +442,9 @@ convenient hands-free control to your smart devices.
         return delta.content or getattr(delta, "reasoning_content", "") or ""
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed", "mock")
 @pytest.mark.gpu(1)
-@pytest.mark.model("openai/gpt-oss-20b")
+@pytest.mark.model("openai/gpt-oss-20b", mock="openai/gpt-oss-20b")
 @pytest.mark.gateway(reuse=True, extra_args=["--history-backend", "memory"])
 class TestChatCompletionGptOss(TestChatCompletion):
     """Tests for chat completions API with Harmony model (GPT-OSS).
@@ -521,9 +521,9 @@ class TestChatCompletionGptOss(TestChatCompletion):
         pass
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed", "mock")
 @pytest.mark.gpu(4)
-@pytest.mark.model("openai/gpt-oss-120b")
+@pytest.mark.model("openai/gpt-oss-120b", mock="openai/gpt-oss-20b")
 @pytest.mark.gateway(reuse=True, extra_args=["--history-backend", "memory"])
 class TestChatCompletionGptOss120B(TestChatCompletionGptOss):
     """Tests for chat completions API with Harmony model (GPT-OSS 120B, 4 GPU)."""
