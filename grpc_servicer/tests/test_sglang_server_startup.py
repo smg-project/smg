@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import json
 import logging
+import socket
 import sys
 import threading
 from pathlib import Path
@@ -237,21 +238,36 @@ def test_scheduler_launch_failure_never_starts_serving(monkeypatch, server_mod):
     warmup_thread_factory.assert_not_called()
 
 
-def test_dead_prefill_bootstrap_never_launches_schedulers_or_serves(
-    monkeypatch, server_mod, caplog
+@pytest.mark.parametrize("failure", ["dead-thread", "dns"])
+def test_failed_prefill_bootstrap_never_launches_schedulers_or_serves(
+    monkeypatch, server_mod, caplog, failure
 ):
     dead_thread = threading.Thread(target=lambda: None)
     dead_thread.start()
     dead_thread.join()
     close = Mock()
     bootstrap = SimpleNamespace(port=8998, thread=dead_thread, close=close)
+    if failure == "dns":
+        # Exercise the actual helper's resolver, not a replacement helper.
+        def fail_resolution(host, port, **kwargs):
+            assert (host, port) == ("prefill.invalid", 8998)
+            raise socket.gaierror(socket.EAI_NONAME, "test bootstrap host cannot resolve")
+
+        monkeypatch.setattr(socket, "getaddrinfo", fail_resolution)
+        expected_error = "test bootstrap host cannot resolve"
+    else:
+        expected_error = "exited before its listener was ready"
     monkeypatch.setattr(server_mod, "start_disagg_service", lambda: bootstrap)
     launcher = Mock()
     health = Mock()
+    grpc_server = Mock()
     monkeypatch.setattr(server_mod, "_launch_scheduler_with_request_manager", launcher)
     monkeypatch.setattr(server_mod, "SGLangHealthServicer", health)
+    monkeypatch.setattr(server_mod.grpc.aio, "server", grpc_server, raising=False)
     args = SimpleNamespace(
-        disaggregation_mode="prefill", host="127.0.0.1", disaggregation_bootstrap_port=8998
+        disaggregation_mode="prefill",
+        host="prefill.invalid" if failure == "dns" else "127.0.0.1",
+        disaggregation_bootstrap_port=8998,
     )
     with pytest.raises(SystemExit) as raised:
         asyncio.run(server_mod.serve_grpc(args))
@@ -259,10 +275,11 @@ def test_dead_prefill_bootstrap_never_launches_schedulers_or_serves(
     errors = [record for record in caplog.records if record.levelno >= logging.ERROR]
     assert len(errors) == 1
     assert "The prefill bootstrap server did not start" in errors[0].getMessage()
-    assert "exited before its listener was ready" in errors[0].getMessage()
+    assert expected_error in errors[0].getMessage()
     assert errors[0].exc_info is None
     launcher.assert_not_called()
     health.assert_not_called()
+    grpc_server.assert_not_called()
     close.assert_called_once_with()
 
 

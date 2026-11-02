@@ -190,7 +190,7 @@ async def serve_grpc(
                 server_args.host,
                 server_args.disaggregation_bootstrap_port,
             )
-        except RuntimeError as error:
+        except (OSError, RuntimeError) as error:
             logger.error("The prefill bootstrap server did not start: %s", error)
             raise guarded_exit(1) from None
         if bootstrap_server:

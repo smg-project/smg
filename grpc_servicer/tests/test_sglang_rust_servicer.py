@@ -15,6 +15,7 @@ import inspect
 import json
 import os
 import signal
+import socket
 import sys
 import threading
 import time
@@ -505,8 +506,9 @@ def test_the_prefill_side_starts_its_bootstrap_server_before_the_ranks(
         assert "bootstrap" not in recorded["calls"] and engine._manager.holding == []
 
 
-def test_dead_prefill_bootstrap_never_launches_rust_scheduler_ranks(
-    monkeypatch, restore_fault_signals
+@pytest.mark.parametrize("failure", ["dead-thread", "dns"])
+def test_failed_prefill_bootstrap_never_launches_rust_scheduler_ranks(
+    monkeypatch, restore_fault_signals, failure
 ):
     recorded = _stub_rank_launch(monkeypatch)
     dead_thread = threading.Thread(target=lambda: None)
@@ -514,15 +516,28 @@ def test_dead_prefill_bootstrap_never_launches_rust_scheduler_ranks(
     dead_thread.join()
     closed = []
     server = SimpleNamespace(port=8998, thread=dead_thread, close=lambda: closed.append(True))
+    if failure == "dns":
+
+        def fail_resolution(host, port, **kwargs):
+            assert (host, port) == ("prefill.invalid", 8998)
+            raise socket.gaierror(socket.EAI_NONAME, "test bootstrap host cannot resolve")
+
+        monkeypatch.setattr(socket, "getaddrinfo", fail_resolution)
+        error_type, expected_error = socket.gaierror, "test bootstrap host cannot resolve"
+    else:
+        error_type, expected_error = RuntimeError, "exited before its listener was ready"
     _install(
         monkeypatch,
         "sglang.srt.managers.disagg_service",
         start_disagg_service=lambda: server,
     )
     args = _preparable_args(
-        recorded, disaggregation_mode="prefill", disaggregation_bootstrap_port=8998
+        recorded,
+        disaggregation_mode="prefill",
+        host="prefill.invalid" if failure == "dns" else "127.0.0.1",
+        disaggregation_bootstrap_port=8998,
     )
-    with pytest.raises(RuntimeError, match="exited before its listener was ready"):
+    with pytest.raises(error_type, match=expected_error):
         rust.launch_scheduler_ranks(args, handshake_port=24321)
     assert "launch" not in recorded["calls"]
     assert closed == [True]
