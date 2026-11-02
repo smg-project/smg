@@ -1,5 +1,6 @@
 import contextlib
 import ctypes
+import errno
 import importlib.util
 import json
 import os
@@ -216,44 +217,98 @@ def test_pid_birth_is_compared_and_zombie_does_not_imply_an_exit_code(tmp_path, 
     assert not probe.current_processes(owned)["arm_b_worker"]["same_process_present"]
 
 
-def test_monitor_cli_writes_bounded_snapshots_without_generation(tmp_path):
-    with server(
+@pytest.fixture
+def controlled_main(monkeypatch):
+    def run(arguments, responses):
+        now = [100.0]
+        calls = []
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        def fetch(base, path, deadline=None):
+            calls.append(path)
+            status, body, _ = responses[path]
+            return {"http_status": status}, body
+
+        # Positive logging/schema assertions should not require a CI scheduler
+        # to complete two real HTTP requests within a 10ms caller deadline.
+        # Separate real CLI fixtures enforce that deadline under actual I/O.
+        monkeypatch.setattr(probe.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(probe.time, "sleep", sleep)
+        monkeypatch.setattr(probe, "fetch", fetch)
+        monkeypatch.setattr(sys, "argv", [str(SOURCE), *arguments])
+        return probe.main(), calls
+
+    return run
+
+
+def test_monitor_main_writes_bounded_snapshots_without_generation(tmp_path, controlled_main):
+    result, calls = controlled_main(
+        [
+            "--base-url",
+            "http://127.0.0.1:1234",
+            "--model",
+            MODEL,
+            "--run-dir",
+            str(tmp_path),
+            "--duration",
+            "0.01",
+        ],
         {
             "/readiness": response(readiness()),
             "/workers": response({"workers": []}),
-        }
-    ) as (url, calls):
-        result = subprocess.run(
-            [
-                sys.executable,
-                str(SOURCE),
-                "--base-url",
-                url,
-                "--model",
-                MODEL,
-                "--run-dir",
-                str(tmp_path),
-                "--duration",
-                "0.01",
-            ],
-            capture_output=True,
-            timeout=5,
-        )
+        },
+    )
     rows = [json.loads(line) for line in (tmp_path / "arm_b_state.log").read_text().splitlines()]
-    assert result.returncode == 0, result.stderr
+    assert result == 0
     assert 1 <= len(rows) <= 2
     assert set(calls) == {"/readiness", "/workers"}
     assert all(probe.ready(row["readiness"]) for row in rows)
 
 
-def test_wait_cli_timeout_does_not_accept_process_liveness(tmp_path):
-    with server({"/readiness": response({"status": "ready", "healthy_workers": 2})}) as (
-        url,
-        calls,
-    ):
+def test_wait_main_timeout_does_not_accept_process_liveness(tmp_path, controlled_main, capsys):
+    result, calls = controlled_main(
+        [
+            "--base-url",
+            "http://127.0.0.1:1234",
+            "--model",
+            MODEL,
+            "--run-dir",
+            str(tmp_path),
+            "--wait-ready",
+            "0.01",
+        ],
+        {"/readiness": response({"status": "ready", "healthy_workers": 2})},
+    )
+    assert result == 1
+    assert set(calls) == {"/readiness"}
+    stderr = capsys.readouterr().err
+    assert "TIMEOUT" in stderr
+    assert '"http_status": 200' in stderr
+    assert '"models": []' in stderr
+
+
+def test_real_cli_setup_can_exhaust_10ms_without_an_http_observation(tmp_path):
+    wrapper = """
+import importlib.util, sys, time
+source = sys.argv.pop(1)
+spec = importlib.util.spec_from_file_location('private_bfcl_probe', source)
+probe = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(probe)
+original = probe.urllib.request.build_opener
+def delayed(*args, **kwargs):
+    time.sleep(0.03)
+    return original(*args, **kwargs)
+probe.urllib.request.build_opener = delayed
+raise SystemExit(probe.main())
+"""
+    with server({"/readiness": response(readiness())}) as (url, calls):
         result = subprocess.run(
             [
                 sys.executable,
+                "-c",
+                wrapper,
                 str(SOURCE),
                 "--base-url",
                 url,
@@ -265,13 +320,16 @@ def test_wait_cli_timeout_does_not_accept_process_liveness(tmp_path):
                 "0.01",
             ],
             capture_output=True,
-            timeout=5,
+            timeout=1.2,
         )
     assert result.returncode == 1
-    assert set(calls) == {"/readiness"}
+    assert calls == []
     assert b"TIMEOUT" in result.stderr
-    assert b'"http_status": 200' in result.stderr
-    assert b'"models": []' in result.stderr
+    rows = [json.loads(line) for line in (tmp_path / "arm_b_state.log").read_text().splitlines()]
+    assert len(rows) == 1
+    # urllib can wrap the connection's absolute-deadline TimeoutError.
+    assert rows[0]["readiness"]["error"] in ("TimeoutError", "URLError")
+    assert not probe.ready(rows[0]["readiness"])
 
 
 @contextlib.contextmanager
@@ -473,6 +531,9 @@ def real_startup_fixture(tmp_path, is_ready):
 def test_real_startup_cleanup_is_invocation_owned(tmp_path, is_ready):
     with real_startup_fixture(tmp_path, is_ready) as (launcher, identities, sentinel):
         assert launcher.returncode == (0 if is_ready else 1)
+        for role in ("arm_b_worker", "arm_b_gateway"):
+            assert (tmp_path / "state" / f"{role}.pid").exists() == is_ready
+        assert (tmp_path / "state" / "foreign.pid").read_text() == str(sentinel.pid)
         assert (identities / "worker.json").exists()
         assert (identities / "gateway.json").exists()
         for path in identities.glob("*.json"):
@@ -484,6 +545,39 @@ def test_real_startup_cleanup_is_invocation_owned(tmp_path, is_ready):
             elif not is_ready:
                 assert not same, f"startup failure leaked {path.stem}"
         assert sentinel.poll() is None
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="needs Linux process identity")
+@pytest.mark.parametrize("failure", [errno.ENOSYS, errno.EPERM, errno.EMFILE])
+def test_startup_owner_does_not_require_pidfd(tmp_path, monkeypatch, failure):
+    spec = importlib.util.spec_from_file_location(
+        "bfcl_startup_owner", SOURCE.with_name("startup_owner.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    owner = module.StartupOwner()
+    sentinel = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+    calls = []
+
+    def unavailable(*args):
+        calls.append(args)
+        raise OSError(failure, "private fixture pidfd unavailable")
+
+    monkeypatch.setattr(module.os, "pidfd_open", unavailable, raising=False)
+    try:
+        handle, pid = owner.start(
+            str(tmp_path / "child.log"), [sys.executable, "-c", "import time; time.sleep(10)"]
+        )
+        assert probe.pid_identity(pid) is not None
+        owner.stop([handle])
+        assert probe.pid_identity(pid) is None
+        assert not calls  # The unreaped original leader, not a pidfd, anchors the PGID.
+        assert sentinel.poll() is None
+    finally:
+        owner.stop(list(owner.children))
+        owner.release()
+        sentinel.kill()
+        sentinel.wait()
 
 
 @pytest.mark.skipif(

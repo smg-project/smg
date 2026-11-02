@@ -51,17 +51,15 @@ class StartupOwner:
                 output.close()
         handle = str(self.next_handle)
         self.next_handle += 1
-        self.children[handle] = (child, None)
-        # No poll/wait before acquiring the handle or completing all signals:
+        self.children[handle] = child
+        # No poll/wait before completing all signals:
         # even an already-exited child stays unreaped and reserves its PID/PGID.
-        if hasattr(os, "pidfd_open"):
-            self.children[handle] = (child, os.pidfd_open(child.pid))
         return handle, child.pid
 
     def stop(self, handles):
         children = [self.children[handle] for handle in handles]
         for sig in (signal.SIGTERM, signal.SIGKILL):
-            for child, _ in children:
+            for child in children:
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(child.pid, sig)
             if sig == signal.SIGTERM and children:
@@ -69,16 +67,11 @@ class StartupOwner:
         # All intended group signaling precedes reaping any original leader.
         deadline = time.monotonic() + 1
         for handle in handles:
-            child, fd = self.children[handle]
+            child = self.children[handle]
             child.wait(timeout=max(0, deadline - time.monotonic()))
-            if fd is not None:
-                os.close(fd)
             del self.children[handle]
 
     def release(self):
-        for _, fd in self.children.values():
-            if fd is not None:
-                os.close(fd)
         self.children.clear()
 
 

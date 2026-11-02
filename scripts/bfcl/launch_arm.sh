@@ -90,11 +90,22 @@ if [[ "$ARM" == a || "$ARM" == b ]]; then
   OWNER_READ=${BFCL_OWNER[0]}
   OWNER_WRITE=${BFCL_OWNER[1]}
   STARTUP_COMMITTED=0
+  STARTED_PIDFILES=()
+  STARTED_PIDS=()
   startup_exit() {
-    local status="$1"
+    local status="$1" index saved_pid
     trap - EXIT INT TERM
     if [[ "$STARTUP_COMMITTED" != 1 ]]; then
-      owner_request abort >/dev/null 2>/dev/null || true
+      if owner_request abort >/dev/null 2>/dev/null && [[ "$OWNER_HANDLE" == ok ]]; then
+        # These groups were reaped. A later legacy stop must not signal their
+        # recycled numeric PIDs. Leave unrelated or replaced pidfiles alone.
+        for index in "${!STARTED_PIDFILES[@]}"; do
+          if IFS= read -r saved_pid <"${STARTED_PIDFILES[index]}" \
+            && [[ "$saved_pid" == "${STARTED_PIDS[index]}" ]]; then
+            rm -f -- "${STARTED_PIDFILES[index]}" || true
+          fi
+        done
+      fi
     fi
     exec {OWNER_WRITE}>&- || true
     exec {OWNER_READ}<&- || true
@@ -126,11 +137,13 @@ start() {
   local name="$1" log="$2"; shift 2
   owner_request start "$log" "$(($# + 1))" env "$@"
   echo "$OWNER_CHILD_PID" >"$RUN_DIR/$name.pid"
+  STARTED_PIDFILES+=("$RUN_DIR/$name.pid")
+  STARTED_PIDS+=("$OWNER_CHILD_PID")
   echo "[launch_arm] started $name (pid $OWNER_CHILD_PID) -> $log" >&2
 }
 
 # Tail a logfile to stderr (streams live in CI; stdout is reserved for the
-# base_url). Prints the tail pid so the caller can stop it once healthy.
+# base_url). Call directly, not via $(...): LOG_TAIL_HANDLE is kept for stop_log.
 stream_log() {
   owner_request start - 5 tail -n +1 -F "$1"
   LOG_TAIL_HANDLE=$OWNER_HANDLE
