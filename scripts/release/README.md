@@ -5,8 +5,8 @@ never pauses for it. Nothing publishes by itself: a push to a release branch run
 artifacts come from the release workflows a maintainer dispatches against the release tag.
 
 The tooling is `scripts/release/release.sh`, reached through `make` (run the targets from a
-checkout that has this directory, `main` for instance; `cut`, `bump` and `pick` leave you on the
-branch they created):
+checkout that has this directory, `main` for instance; `cut` leaves you where you were with the
+release branch behind you, `bump` and `pick` leave you on the topic branch they created):
 
 | step | command | what it does | who |
 |---|---|---|---|
@@ -100,9 +100,10 @@ A candidate or a final is tagged when, on the branch head:
 
 ## The steps of a release
 
-1. `make release-cut VERSION=1.14.0-rc.1 FROM=<sha>`: the branch and its bump commit, locally.
-   Read the commit, then `git push origin refs/heads/release/1.14:refs/heads/release/1.14`
-   (or `PUSH=1`). CI runs on the branch; nothing is published. `main` is not touched.
+1. `make release-cut VERSION=1.14.0-rc.1 FROM=<sha>`: the branch and its bump commit, locally;
+   you stay on the branch you ran it from. Read the commit (`git show --stat refs/heads/release/1.14`), then
+   `git push origin refs/heads/release/1.14:refs/heads/release/1.14` (or `PUSH=1`). CI runs on
+   the branch; nothing is published. `main` is not touched.
 2. `make release-check VERSION=1.14.0-rc.1`, then `make release-tag VERSION=1.14.0-rc.1` and
    its push (`PUSH=1`, by a maintainer with tag rights).
 3. `make release-publish-plan VERSION=1.14.0-rc.1` lists the dispatches for the candidate's

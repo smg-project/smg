@@ -351,21 +351,25 @@ def repo(tmp_path: Path) -> Sandbox:
 
 def test_cut_creates_the_branch_and_the_bump_commit(repo: Sandbox) -> None:
     done = repo.tool("cut", "1.14.0-rc.1")
-    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "release/1.14"
+    # the branch is behind you: the next commands run from the checkout the cut started on
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert "release/1.14 is at " in done.stdout and "(You are back on main;" in done.stdout
+    branch = "release/1.14"
     for path in VERSION_FILES:
-        assert repo.version_of(path) == "1.14.0-rc.1", path
+        assert repo.version_of(path, branch) == "1.14.0-rc.1", path
+        assert repo.version_of(path) == "1.13.0", f"{path}: main's tree is untouched"
     assert (
-        repo.version_of("crates/tool_parser/Cargo.toml") == "0.6.0"
+        repo.version_of("crates/tool_parser/Cargo.toml", branch) == "0.6.0"
     )  # a feat since v1.13.0: minor
-    assert 'tool-parser = { version = "0.6.0"' in repo.read("Cargo.toml")
-    message = repo.git("log", "-1", "--format=%B")
+    assert 'tool-parser = { version = "0.6.0"' in repo.read("Cargo.toml", branch)
+    message = repo.git("log", "-1", "--format=%B", branch)
     assert message.startswith("chore(release): bump versions for v1.14.0-rc.1\n")
     assert "Signed-off-by: Release Owner <owner@example.invalid>" in message
     assert (
-        repo.git("log", "-1", "--format=%an <%ae> %cn")
+        repo.git("log", "-1", "--format=%an <%ae> %cn", branch)
         == "Release Owner <owner@example.invalid> Release Owner"
     )
-    assert repo.git("rev-parse", "HEAD~1") == repo.origin_ref("refs/heads/main")
+    assert repo.git("rev-parse", f"{branch}~1") == repo.origin_ref("refs/heads/main")
     assert repo.origin_ref("refs/heads/release/1.14") is None, (
         "the cut is not pushed without PUSH=1"
     )
@@ -375,18 +379,64 @@ def test_cut_creates_the_branch_and_the_bump_commit(repo: Sandbox) -> None:
 
 def test_cut_pushes_the_branch_only_on_request(repo: Sandbox) -> None:
     repo.tool("cut", "1.14.0-rc.1", PUSH="1")
-    assert repo.origin_ref("refs/heads/release/1.14") == repo.git("rev-parse", "HEAD")
-    assert repo.origin_ref("refs/heads/main") == repo.git("rev-parse", "HEAD~1"), (
+    assert repo.origin_ref("refs/heads/release/1.14") == repo.git("rev-parse", "release/1.14")
+    assert repo.origin_ref("refs/heads/main") == repo.git("rev-parse", "release/1.14~1"), (
         "main is untouched"
     )
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "main"
 
 
 def test_cut_starts_from_the_named_commit(repo: Sandbox) -> None:
     older = repo.git("rev-parse", "origin/main~1")
     repo.tool("cut", "1.14.0-rc.1", older)
-    assert repo.git("rev-parse", "HEAD~1") == older
+    assert repo.git("rev-parse", "release/1.14~1") == older
     # the gateway did not change between v1.13.0 and that commit, its version still moves
-    assert repo.version_of("model_gateway/Cargo.toml") == "1.14.0-rc.1"
+    assert repo.version_of("model_gateway/Cargo.toml", "release/1.14") == "1.14.0-rc.1"
+
+
+def test_cut_from_a_detached_head_leaves_you_detached_there(repo: Sandbox) -> None:
+    start = repo.git("rev-parse", "origin/main")
+    repo.git("switch", "--quiet", "--detach", start)
+    done = repo.tool("cut", "1.14.0-rc.1")
+    assert repo.git("rev-parse", "HEAD") == start
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
+    assert f"(You are back on {repo.git('rev-parse', '--short', start)};" in done.stdout
+    assert repo.git("rev-parse", "release/1.14~1") == start
+
+
+def test_cut_comes_back_to_the_branch_when_a_tag_shares_its_name(repo: Sandbox) -> None:
+    """A tag named like the branch makes `git symbolic-ref --short HEAD` answer `heads/main`, which `git switch` does
+    not take as the branch: the cut reads the start with `git branch --show-current` and comes back to the branch."""
+    repo.git("tag", "main")
+    done = repo.tool("cut", "1.14.0-rc.1")
+    assert repo.git("branch", "--show-current") == "main"
+    assert "(You are back on main;" in done.stdout
+
+
+def test_cut_reports_the_branch_beside_a_tag_of_its_name(repo: Sandbox) -> None:
+    """A tag named like the release branch answers for the bare name: the closing lines read the
+    branch by its full ref, so they name the bump commit, not the tag's."""
+    older = repo.git("rev-parse", "origin/main~1")
+    repo.git("tag", "release/1.14", older)
+    done = repo.tool("cut", "1.14.0-rc.1")
+    bump = repo.git("rev-parse", "--short", "refs/heads/release/1.14")
+    assert (
+        f"release/1.14 is at {bump}: chore(release): bump versions for v1.14.0-rc.1" in done.stdout
+    )
+    assert repo.git("rev-parse", "--short", older) not in done.stdout
+
+
+def test_cut_comes_back_without_a_head_reflog(repo: Sandbox) -> None:
+    """`git switch -` and `@{-1}` read the HEAD reflog, which a clone can be without (core.logAllRefUpdates=false, or
+    the logs expired): the cut reads where it started before it makes the branch, and comes back to that."""
+    repo.git("config", "core.logAllRefUpdates", "false")
+    (repo.work / ".git" / "logs" / "HEAD").unlink()
+    done = repo.tool("cut", "1.14.0-rc.1")
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert "(You are back on main;" in done.stdout
+    assert not (repo.work / ".git" / "logs" / "HEAD").exists(), (
+        "the sandbox stayed without a HEAD reflog"
+    )
 
 
 def test_cut_refusals(repo: Sandbox) -> None:
@@ -583,6 +633,9 @@ def test_pick_conflict_stops_with_the_steps_and_pick_pr_finishes(repo: Sandbox) 
 
 def test_pick_pr_refuses_other_branches(repo: Sandbox) -> None:
     repo.cut()
+    repo.git(
+        "switch", "--quiet", "release/1.14"
+    )  # the cut left the clone where it was; the test tries pick-pr from the branch
     refused = repo.tool("pick-pr", "1.14", check=False)
     assert (
         "not on a pick/1.14-* branch (on release/1.14): name it, release.sh pick-pr 1.14 <pick branch>"
@@ -735,7 +788,9 @@ def test_the_next_cut_compares_against_the_previous_final_on_its_own_branch(repo
     assert "v1.14.0" not in repo.git("tag", "--merged", "origin/main").split(), (
         "the premise: a release tag is made on its branch and never reaches main"
     )
-    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "release/1.15"
+    repo.git(
+        "switch", "--quiet", "release/1.15"
+    )  # the cut left the clone where it was; the test reads the branch
     for path in VERSION_FILES:
         assert repo.version_of(path) == "1.15.0-rc.1", path
     # Against v1.14.0 (where tool-parser read 0.6.0): a feat and a fix since, so a minor bump.
@@ -1387,9 +1442,9 @@ def test_bump_main_after_a_patch_of_an_older_line_keeps_mains_higher_version(rep
     assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "main"
     assert repo.git("branch", "--list", "chore/main-versions-1.14.1") == ""
     repo.cut("1.16.0-rc.1")  # accepted: main reads the previous final's version, v1.15.0's
-    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "release/1.16"
+    assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == "main"
     for path in VERSION_FILES:
-        assert repo.version_of(path) == "1.16.0-rc.1", path
+        assert repo.version_of(path, "release/1.16") == "1.16.0-rc.1", path
 
 
 def test_a_patch_of_the_older_line_steps_past_the_version_the_newer_line_published(
@@ -1419,8 +1474,10 @@ def test_a_patch_of_the_older_line_steps_past_the_version_the_newer_line_publish
         "crates/tool_parser/src/lib.rs",
         "pub fn parse() {}\npub fn more() {}\npub fn one() {}\npub fn three() {}\n",
     )
-    repo.cut("1.15.0-rc.1")
-    assert repo.version_of("crates/tool_parser/Cargo.toml") == "0.6.1", "the fixes since v1.14.0"
+    repo.cut("1.15.0-rc.1")  # the clone stays on main; the branch carries the bump
+    assert repo.version_of("crates/tool_parser/Cargo.toml", "release/1.15") == "0.6.1", (
+        "the fixes since v1.14.0"
+    )
     repo.tool("tag", "1.15.0-rc.1", PUSH="1")
     repo.tool("pick", "1.14", fix)
     repo.land_on_release("1.14")
@@ -1456,8 +1513,8 @@ def test_a_patch_of_the_older_line_steps_past_the_version_the_newer_line_publish
         "tool-parser (crates/tool_parser/) — 1 file(s) changed but version not bumped (v0.6.2, v1.14.1's) [patch]"
         in (cut.stdout)
     )
-    assert repo.version_of("crates/tool_parser/Cargo.toml") == "0.6.3"
-    assert 'tool-parser = { version = "0.6.3"' in repo.read("Cargo.toml")
+    assert repo.version_of("crates/tool_parser/Cargo.toml", "release/1.16") == "0.6.3"
+    assert 'tool-parser = { version = "0.6.3"' in repo.read("Cargo.toml", "release/1.16")
 
 
 def grpc_detect(
