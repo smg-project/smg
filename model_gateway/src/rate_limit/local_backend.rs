@@ -729,21 +729,23 @@ mod tests {
                         }
                         phases.wait();
                         {
-                            let matches = match (
-                                backend.active.get(&charge_id),
-                                backend.buckets.get(&key),
-                            ) {
-                                (Some(held), Some(served)) => {
-                                    Arc::ptr_eq(&held.buckets[0], served.value())
-                                }
-                                _ => false,
-                            };
+                            let matches =
+                                match (backend.active.get(&charge_id), backend.buckets.get(&key)) {
+                                    (Some(held), Some(served)) => {
+                                        Arc::ptr_eq(&held.buckets[0], served.value())
+                                    }
+                                    _ => false,
+                                };
                             if !matches {
                                 wrong_bucket.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                         phases.wait();
-                        if backend.close_reserved_only(charge_id).now_or_never().is_none() {
+                        if backend
+                            .close_reserved_only(charge_id)
+                            .now_or_never()
+                            .is_none()
+                        {
                             bad_reserves.fetch_add(1, Ordering::Relaxed);
                         }
                         phases.wait();
