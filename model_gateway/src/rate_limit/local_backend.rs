@@ -874,8 +874,7 @@ mod tests {
         });
 
         // Assert after joining, so an invariant failure cannot strand another
-        // participant at a barrier. Each round checks both held and idle states;
-        // progress does not depend on scheduling 1000 opportunistic evictions.
+        // participant at a barrier. Each round checks both held and idle states.
         assert_eq!(bad_reserves.load(Ordering::Relaxed), 0);
         assert_eq!(bad_candidates.load(Ordering::Relaxed), 0);
         assert_eq!(
