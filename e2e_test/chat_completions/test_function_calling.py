@@ -547,7 +547,7 @@ class TestOpenAIServerFunctionCalling:
         assert function_name == "get_weather", "Function name should be 'get_weather'"
         assert "city" in args_obj, "Function arguments should have 'city'"
 
-    @pytest.mark.skipif(get_runtime() == "mock", reason="the mock answers one choice per request")
+    @pytest.mark.skip_for_runtime("mock", reason="the mock answers one choice per request")
     def test_streaming_multiple_choices_finish_reason(self, model, api_client):
         """Test: Verify that each choice gets its own finish_reason chunk in streaming mode with n > 1.
 
@@ -683,7 +683,7 @@ class TestOpenAIServerFunctionCalling:
             "Final response of no function calling should have finish_reason 'stop'"
         )
 
-    @pytest.mark.skipif(get_runtime() == "mock", reason="the mock answers one choice per request")
+    @pytest.mark.skip_for_runtime("mock", reason="the mock answers one choice per request")
     def test_streaming_multiple_choices_without_tools(self, model, api_client):
         """Test: Verify that each choice gets its own finish_reason chunk without tool calls.
 
