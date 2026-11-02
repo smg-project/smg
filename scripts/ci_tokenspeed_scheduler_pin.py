@@ -1,9 +1,10 @@
 """Select the CI scheduler for the installed TokenSpeed runtime.
 
-Retain the lower-bound pin for older nightlies. The 20261023 runtime imports
-StorageConfig, which first appears in scheduler 0.1.42 although that runtime
-declares >=0.1.41. Use its explicit compatible pair and check real imports
-after installation. Prints ``tokenspeed-scheduler==<version>`` for ``pip install``; prints
+Use the nightly's declared lower bound unless a selected runtime needs a
+recorded compatible scheduler pair. For example, an explicit selection of
+0.1.1.post20261023 needs StorageConfig from scheduler 0.1.42 despite declaring
+>=0.1.41. Current CI selects its runtime from the nightly pin file. Check real
+imports after installation. Prints ``tokenspeed-scheduler==<version>`` for ``pip install``; prints
 nothing (a note on stderr) when the runtime declares no lower bound or exact
 version, so the caller keeps pip's choice.
 """

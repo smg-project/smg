@@ -158,10 +158,9 @@ for package, variable in (
         raise RuntimeError(f"Expected {package}=={expected}, installed {version}")
     print(f"{package} nightly date: {nightly.group(1)}", flush=True)
 PY
-    # The nightly requires the scheduler package with a lower bound only, so
-    # the install above resolves the newest scheduler release, which can be
-    # newer than the nightly and refuse its configuration at start. Pin the
-    # scheduler to its known compatible pair, or its older lower-bound policy.
+    # Select the scheduler from the nightly's declared requirement, with a
+    # checked compatible pair for known bad metadata. The historical pair is
+    # used only when that runtime is explicitly selected, not by today's CI pin.
     scheduler="$(python3 "${SCRIPT_DIR}/ci_tokenspeed_scheduler_pin.py")"
     if [ -n "$scheduler" ]; then
         echo "Pinning ${scheduler} for the installed nightly"
