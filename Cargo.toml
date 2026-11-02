@@ -254,6 +254,18 @@ opt-level = 3
 [profile.release.package.smg-response-template]
 opt-level = 3
 
+# The aarch64 wheels are cross-compiled on 16 GiB hosted runners, and the
+# release profile's fat LTO of the Python extension (the whole gateway graph
+# as one module) outgrew them in 1.14: the final rustc peaks at 18.0 GiB for
+# aarch64 against 8.3 GiB for x86_64 on the same source, and the runner's
+# OOM killer stopped it after 13 minutes. Thin LTO keeps the cross-crate
+# optimisation with the module split per crate and peaks at 7.8 GiB.
+# Only the two aarch64 Linux wheel jobs of release-pypi select this profile;
+# the x86_64 wheels and every binary keep `release`.
+[profile.wheel-aarch64]
+inherits = "release"
+lto = "thin"
+
 [profile.ci]
 inherits = "release"
 opt-level = 2       # Lighter optimization (still fast runtime, much faster compile)

@@ -43,6 +43,10 @@ jobs:
             # manylinux2014's aarch64 cross-gcc is too old for aws-lc-sys 0.41;
             # 2_28 (AlmaLinux 8) has stdatomic.h + armv8.4 support.
             manylinux: "2_28"
+            # Thin LTO: the release profile's fat LTO of the extension module
+            # no longer fits the 16 GiB hosted runner for this cross build
+            # (see [profile.wheel-aarch64] in the workspace Cargo.toml).
+            profile: wheel-aarch64
           # musllinux
           - os: ubuntu
             platform: linux
@@ -52,6 +56,7 @@ jobs:
             platform: linux
             target: aarch64
             manylinux: musllinux_1_1
+            profile: wheel-aarch64
         exclude:
           - os: windows
             target: aarch64
@@ -92,7 +97,7 @@ jobs:
           working-directory: smg-repo/bindings/python
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
-          args: --release --out dist --features vendored-openssl --interpreter ${{ matrix.interpreter || '3.9 3.10 3.11 3.12 3.13 3.14' }}
+          args: --profile ${{ matrix.profile || 'release' }} --out dist --features vendored-openssl --interpreter ${{ matrix.interpreter || '3.9 3.10 3.11 3.12 3.13 3.14' }}
           rust-toolchain: 1.98.0
           docker-options: -e CI -e JEMALLOC_SYS_WITH_LG_PAGE -e CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc -e CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
           before-script-linux: |
