@@ -366,6 +366,120 @@ def test_the_fixes_make_the_tree_consistent(mod, repo):
     assert "All versions consistent." in out
 
 
+def test_the_plan_lists_the_bump_quietly_and_changes_nothing(mod, repo):
+    """Before a cut, main reads every changed crate as unbumped by design: the plan names what the
+    cut's bump writes, without the verdicts and the issue count, and exits 0."""
+    files = ("Cargo.toml", "crates/beta/Cargo.toml", "model_gateway/Cargo.toml", "chart/Chart.yaml")
+    before = {path: (repo / path).read_text() for path in files}
+    code, out = run(mod, repo, mode="plan", tag="v1.0.0")
+    assert code == 0
+    assert (
+        "The bump the next cut writes against v1.0.0: the crates and packages by their conventional"
+        " commits since it, the gateway and its mirrors by the checker's own step (the cut writes the"
+        " VERSION it is given there: pass it as VERSION_OVERRIDE for those lines). Nothing is changed here"
+        in out
+    )
+    assert "  patch beta v1.0.0 → v1.0.1 (crates/beta/Cargo.toml)" in out
+    assert "       sync workspace Cargo.toml beta → v1.0.1" in out
+    assert "  sync workspace Cargo.toml delta v0.1.0 → v0.2.0" in out
+    assert "  major smg v1.0.0 → v2.0.0 (model_gateway/Cargo.toml)" in out
+    assert "  minor pkg v0.1.0 → v0.2.0 (pkg/pyproject.toml)" in out
+    assert "  sync chart v1.0.0 → v2.0.0 (chart/Chart.yaml)" in out
+    assert out.rstrip().endswith(
+        "9 component(s) and mirror(s) move (a crate's workspace pin follows it)."
+        " Bumped already since v1.0.0, left as they are: alpha v1.1.0, delta v0.2.0 (new)."
+    )
+    for quiet in ("not bumped", "issue(s) found", "Checking workspace", "Summary:", "✓", "!"):
+        assert quiet not in out, quiet
+    assert {path: (repo / path).read_text() for path in files} == before
+    # the cut's own version for the gateway and its mirrors: a candidate is allowed here, and only here; the gateway
+    # is set to it whatever its conventional commits say (the fixture's are breaking: the checker alone says major)
+    code, out = run(mod, repo, mode="plan", tag="v1.0.0", override="1.1.0-rc.1")
+    assert code == 0
+    assert "the gateway and its mirrors to 1.1.0-rc.1. Nothing is changed here" in out
+    assert "  set smg v1.0.0 → v1.1.0-rc.1 (model_gateway/Cargo.toml)" in out
+    assert "major smg" not in out
+    assert "  sync chart v1.0.0 → v1.1.0-rc.1 (chart/Chart.yaml)" in out
+    assert "  patch beta v1.0.0 → v1.0.1 (crates/beta/Cargo.toml)" in out
+    assert "9 component(s) and mirror(s) move" in out
+    with pytest.raises(mod.Fatal, match="X.Y.Z format"):
+        run(mod, repo, override="1.1.0-rc.1")
+    with pytest.raises(mod.Fatal, match="X.Y.Z or X.Y.Z-rc.N format"):
+        run(mod, repo, mode="plan", override="1.1.0-rc1")
+    assert {path: (repo / path).read_text() for path in files} == before
+    # once the tree is consistent there is nothing to plan, still exit 0
+    assert run(mod, repo, mode="fix")[0] == 0
+    code, out = run(mod, repo, mode="plan", tag="v1.0.0")
+    assert code == 0
+    assert out.startswith(
+        "Nothing to bump against v1.0.0: every crate and package changed since it is bumped already ("
+    )
+    assert "alpha v1.1.0" in out and "beta v1.0.1" in out and "smg v2.0.0" in out
+    # a gateway bumped already (2.0.0 against v1.0.0) is still set to the cut's version, with its mirrors: the cut
+    # writes that version unconditionally, so the plan never lists the gateway as left alone when it is given one
+    code, out = run(mod, repo, mode="plan", tag="v1.0.0", override="2.1.0-rc.1")
+    assert code == 0
+    assert "  set smg v2.0.0 → v2.1.0-rc.1 (model_gateway/Cargo.toml)" in out
+    assert "  sync chart v2.0.0 → v2.1.0-rc.1 (chart/Chart.yaml)" in out
+    assert "smg v2.0.0" not in out.split("Bumped already")[-1]
+    assert "6 component(s) and mirror(s) move" in out
+
+
+def test_the_plan_lists_a_gateway_already_at_the_cuts_version_among_the_bumped(mod, repo):
+    """After a local ``make bump-version VERSION=<cut>`` the gateway carries the cut's version: the plan prints no
+    ``set`` line for it and names it among the components bumped already, in both closing lines."""
+    put(repo, "model_gateway/Cargo.toml", manifest("smg", "1.1.0-rc.1"))
+    code, out = run(mod, repo, mode="plan", tag="v1.0.0", override="1.1.0-rc.1")
+    assert code == 0
+    assert "set smg" not in out and "major smg" not in out
+    assert "  sync chart v1.0.0 → v1.1.0-rc.1 (chart/Chart.yaml)" in out
+    assert out.rstrip().endswith(
+        "8 component(s) and mirror(s) move (a crate's workspace pin follows it)."
+        " Bumped already since v1.0.0, left as they are: smg v1.1.0-rc.1, alpha v1.1.0, delta v0.2.0 (new)."
+    )
+    # the whole tree at the cut's version (the crates bumped, the gateway and its mirrors set): nothing to bump,
+    # the gateway named among the bumped
+    assert run(mod, repo, mode="fix")[0] == 0
+    put(repo, "model_gateway/Cargo.toml", manifest("smg", "2.1.0-rc.1"))
+    put(repo, "bindings/Cargo.toml", manifest("smg-binding", "2.1.0-rc.1"))
+    put(repo, "bindings/pyproject.toml", '[project]\nname = "smg"\nversion = "2.1.0-rc.1"\n')
+    put(repo, "bindings/smg/version.py", '__version__ = "2.1.0-rc.1"\n')
+    put(
+        repo,
+        "chart/Chart.yaml",
+        'apiVersion: v2\nname: smg\nversion: 2.1.0-rc.1\nappVersion: "2.1.0-rc.1"\n',
+    )
+    put(
+        repo,
+        "wf.yml",
+        "run-name: smg=${{ env.SMG_RELEASE_TAG }}\nenv:\n  SMG_RELEASE_TAG: v2.1.0-rc.1\n",
+    )
+    code, out = run(mod, repo, mode="plan", tag="v1.0.0", override="2.1.0-rc.1")
+    assert code == 0
+    assert out.rstrip() == (
+        "Nothing to bump against v1.0.0: every crate and package changed since it is bumped already"
+        " (smg v2.1.0-rc.1, alpha v1.1.0, beta v1.0.1, delta v0.2.0 (new), pkg v0.2.0); the mirrors agree."
+    )
+
+
+def test_the_plan_compares_against_the_highest_final_tag_by_default(mod, repo):
+    put(repo, "crates/beta/src/lib.rs", "// beta 3\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "chore: a candidate", date="2026-06-01T00:00:00Z")
+    git(
+        repo, "tag", "v1.1.0-rc.1"
+    )  # the newest tag by date, a candidate: not what a cut compares against
+    code, out = run(mod, repo, mode="plan")
+    assert code == 0 and "against v1.0.0" in out
+    assert "against tag: v1.1.0-rc.1" in run(mod, repo)[1], (
+        "--check keeps the newest tag as its default"
+    )
+    git(
+        repo, "tag", "v1.0.9", "v1.0.0"
+    )  # a patch of an older line, lower than v1.1.0-rc.1 by date and by value
+    assert "against v1.0.9" in run(mod, repo, mode="plan")[1]
+
+
 def test_the_override_applies_to_the_gateway_only(mod, repo):
     code, out = run(mod, repo, mode="prompt", override="3.5.0")
     assert "Version override: 3.5.0" in out
