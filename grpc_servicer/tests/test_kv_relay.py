@@ -44,7 +44,7 @@ def _key_shape(key):
 # ---------------------------------------------------------------------------
 # Parity with the Rust relay
 #
-# The scenarios of ``crates/engine_servicer/src/kv_wire_shapes.rs``, encoded
+# The scenarios of ``crates/engine_servicer/src/kv_wire/tests/shapes.rs``, encoded
 # here with msgspec through mirrors of the engines' own structs so the bytes
 # are what the publishers put on the wire:
 #
@@ -907,7 +907,7 @@ async def bridge(request):
         await server.stop(None)
         for sock in pubs + routers:
             sock.close(linger=0)
-        ctx.term()
+        await asyncio.to_thread(ctx.term)
 
 
 async def read(call):

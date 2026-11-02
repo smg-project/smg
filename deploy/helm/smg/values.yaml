@@ -145,6 +145,7 @@ router:
   # -- Request handling
   maxPayloadSize: 536870912    # 512MB in bytes
   requestTimeoutSecs: 1800
+  grpcRequestTimeoutSecs: 0    # bound on a request to a gRPC worker, from its dispatch to its last message; 0 = no bound
   maxConcurrentRequests: -1    # -1 = unlimited
   queueSize: 100
   queueTimeoutSecs: 60
@@ -295,6 +296,9 @@ router:
   #    terminationGracePeriodSeconds is this plus terminationGraceMarginSeconds,
   #    so the drain is not cut short by the kubelet's default 30 s.
   shutdownGracePeriodSeconds: 180
+  # -- Listener propagation window; null retains the default 5 seconds.
+  #    Explicit seconds are capped at half the grace period; 0 skips the window.
+  shutdownSettleSeconds: null
   terminationGraceMarginSeconds: 30
 
   # -- Optional features
@@ -306,6 +310,12 @@ router:
     configPath: ""
   reasoningParser: ""
   toolCallParser: ""
+  # -- Which parser reads a chat completion's reasoning and tool calls: "symphony"
+  #    (one table per model family) or "legacy" (the older per-model parsers). Empty
+  #    renders no --parser, so the image's own default applies (Symphony from the
+  #    release after 1.13.0 on, the older parsers on 1.13.0). A set value needs an
+  #    image of 1.13.0 or later and applies to gRPC and ZMQ workers only.
+  parser: ""
 
 # =============================================================================
 # HuggingFace Configuration

@@ -20,14 +20,21 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed", "mock")
 @pytest.mark.gpu(1)
-@pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct")
+@pytest.mark.model(
+    "meta-llama/Llama-3.1-8B-Instruct", mock="RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8"
+)
 @pytest.mark.gateway(reuse=True, extra_args=["--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestChatCompletion:
-    """Tests for OpenAI-compatible chat completions API."""
+    """Tests for OpenAI-compatible chat completions API.
+
+    On the mock engine each test states the model's answer first (``mock_answers``, a
+    no-op on a real engine), through the same checkpoint's tokenizer from an ungated
+    repository, one answer per choice the request samples.
+    """
 
     # Whether the backend trims stop sequences from output.
     # Harmony (gpt-oss) does not trim because its detokenization is not channel-aware.
@@ -39,20 +46,27 @@ class TestChatCompletion:
             None,
             pytest.param(
                 5,
-                marks=pytest.mark.skip_for_runtime(
-                    "tokenspeed",
-                    reason=(
-                        "tokenspeed's --enable-top-logprobs is not yet implemented "
-                        "(raises at startup); base output logprobs work via "
-                        "--enable-output-logprobs but the test requires top_logprobs=5"
+                marks=[
+                    pytest.mark.skip_for_runtime(
+                        "tokenspeed",
+                        reason=(
+                            "tokenspeed's --enable-top-logprobs is not yet implemented "
+                            "(raises at startup); base output logprobs work via "
+                            "--enable-output-logprobs but the test requires top_logprobs=5"
+                        ),
                     ),
-                ),
+                ],
             ),
         ],
     )
     @pytest.mark.parametrize("parallel_sample_num", [1, 2])
-    def test_chat_completion(self, model, api_client, logprobs, parallel_sample_num):
+    def test_chat_completion(self, model, api_client, logprobs, parallel_sample_num, mock_answers):
         """Test non-streaming chat completion with logprobs and parallel sampling."""
+        # One answer per choice, stated with a logprob per token so the logprobs
+        # cases read them, and long enough for top_logprobs=5: the mock's
+        # alternatives are the answer's own distinct tokens.
+        for _ in range(parallel_sample_num):
+            mock_answers.enqueue_with_logprobs("The capital of France is Paris.")
         # Use temperature > 0 for n > 1 (greedy sampling rejects n > 1)
         temperature = 0.7 if parallel_sample_num > 1 else 0
         response = api_client.chat.completions.create(
@@ -97,20 +111,28 @@ class TestChatCompletion:
             None,
             pytest.param(
                 5,
-                marks=pytest.mark.skip_for_runtime(
-                    "tokenspeed",
-                    reason=(
-                        "tokenspeed's --enable-top-logprobs is not yet implemented "
-                        "(raises at startup); base output logprobs work via "
-                        "--enable-output-logprobs but the test requires top_logprobs=5"
+                marks=[
+                    pytest.mark.skip_for_runtime(
+                        "tokenspeed",
+                        reason=(
+                            "tokenspeed's --enable-top-logprobs is not yet implemented "
+                            "(raises at startup); base output logprobs work via "
+                            "--enable-output-logprobs but the test requires top_logprobs=5"
+                        ),
                     ),
-                ),
+                ],
             ),
         ],
     )
     @pytest.mark.parametrize("parallel_sample_num", [1, 2])
-    def test_chat_completion_stream(self, model, api_client, logprobs, parallel_sample_num):
+    def test_chat_completion_stream(
+        self, model, api_client, logprobs, parallel_sample_num, mock_answers
+    ):
         """Test streaming chat completion with logprobs and parallel sampling."""
+        # As above: one answer per choice, a logprob per token, at least five
+        # distinct tokens.
+        for _ in range(parallel_sample_num):
+            mock_answers.enqueue_with_logprobs("The capital of France is Paris.")
         temperature = 0.7 if parallel_sample_num > 1 else 0
         generator = api_client.chat.completions.create(
             model=model,
@@ -178,12 +200,14 @@ class TestChatCompletion:
         "trtllm",
         reason="TRT-LLM gRPC bug: uses 'guided_decoding_params' instead of 'guided_decoding'",
     )
-    def test_regex(self, model, api_client):
+    def test_regex(self, model, api_client, mock_answers):
         """Test structured output with regex constraint."""
 
         regex = (
             r"""\{\n""" + r"""   "name": "[\w]+",\n""" + r"""   "population": [\d]+\n""" + r"""\}"""
         )
+        # The constraint is the engine's; the mock states an output that fits it.
+        mock_answers.enqueue('{\n   "name": "Paris",\n   "population": 2102650\n}')
 
         response = api_client.chat.completions.create(
             model=model,
@@ -204,8 +228,9 @@ class TestChatCompletion:
         assert isinstance(js_obj["name"], str)
         assert isinstance(js_obj["population"], int)
 
-    def test_penalty(self, model, api_client):
+    def test_penalty(self, model, api_client, mock_answers):
         """Test that frequency_penalty parameter is accepted and produces output."""
+        mock_answers.enqueue("Paris.")
 
         response = api_client.chat.completions.create(
             model=model,
@@ -219,8 +244,14 @@ class TestChatCompletion:
         assert isinstance(response.choices[0].message.content, str)
         assert response.usage.completion_tokens > 0
 
-    def test_multi_content_parts(self, model, api_client):
-        """Test that multiple content parts in a single message are all processed."""
+    def test_multi_content_parts(self, model, api_client, mock_answers):
+        """Test that multiple content parts in a single message are all processed.
+
+        On the mock engine the stated answer is served whatever prompt the gateway
+        renders, so there this is a smoke test of the request's shape; the rendering
+        is the engine rows' verdict, which keeps this test on an engine row.
+        """
+        mock_answers.enqueue("Paris and Beijing.")
 
         response = api_client.chat.completions.create(
             model=model,
@@ -241,8 +272,17 @@ class TestChatCompletion:
         assert "paris" in content.lower(), f"Expected 'Paris' in response: {content}"
         assert "beijing" in content.lower(), f"Expected 'Beijing' in response: {content}"
 
-    def test_response_prefill(self, model, api_client):
-        """Test assistant message prefill with continue_final_message."""
+    def test_response_prefill(self, model, api_client, mock_answers):
+        """Test assistant message prefill with continue_final_message.
+
+        On the mock engine the stated answer is served whatever prompt the gateway
+        renders (a smoke test of the request's shape there); the continuation itself
+        is the engine rows' verdict, which keeps this test on an engine row.
+        """
+        mock_answers.enqueue(
+            '"name": "SmartHome Mini", "size": "5 inches", "price": "$49.99", '
+            '"color": "black or white"\n}'
+        )
 
         response = api_client.chat.completions.create(
             model=model,
@@ -272,8 +312,9 @@ convenient hands-free control to your smart devices.
 
         assert response.choices[0].message.content.strip().startswith('"name": "SmartHome Mini",')
 
-    def test_streaming_token_count_matches_chunks(self, model, api_client):
+    def test_streaming_token_count_matches_chunks(self, model, api_client, mock_answers):
         """Test that streaming completion_tokens matches the number of content chunks."""
+        mock_answers.enqueue("The capital of France is Paris.")
 
         generator = api_client.chat.completions.create(
             model=model,
@@ -326,8 +367,11 @@ convenient hands-free control to your smart devices.
         models = list(api_client.models.list().data)
         assert len(models) == 1
 
-    def test_stop_sequences(self, model, api_client):
+    def test_stop_sequences(self, model, api_client, mock_answers):
         """Test that stop sequences cause the model to stop generating."""
+        # An engine ends the output at the stop sequence and names it; its ids
+        # still carry the sequence, which the gateway trims.
+        mock_answers.enqueue("1,", finish_reason="stop", matched_stop=",")
 
         response = api_client.chat.completions.create(
             model=model,
@@ -349,8 +393,9 @@ convenient hands-free control to your smart devices.
                 f"Stop sequence ',' should be the suffix of output: {content}"
             )
 
-    def test_stop_sequences_stream(self, model, api_client):
+    def test_stop_sequences_stream(self, model, api_client, mock_answers):
         """Test that stop sequences work in streaming mode."""
+        mock_answers.enqueue("1,", finish_reason="stop", matched_stop=",")
 
         chunks = list(
             api_client.chat.completions.create(
@@ -431,9 +476,9 @@ class TestChatCompletionGptOss(TestChatCompletion):
         ],
     )
     @pytest.mark.parametrize("parallel_sample_num", [1, 2])
-    def test_chat_completion(self, model, api_client, logprobs, parallel_sample_num):
+    def test_chat_completion(self, model, api_client, logprobs, parallel_sample_num, mock_answers):
         """Test non-streaming chat completion with logprobs and parallel sampling."""
-        super().test_chat_completion(model, api_client, logprobs, parallel_sample_num)
+        super().test_chat_completion(model, api_client, logprobs, parallel_sample_num, mock_answers)
 
     @pytest.mark.parametrize(
         "logprobs",
@@ -456,12 +501,16 @@ class TestChatCompletionGptOss(TestChatCompletion):
     @pytest.mark.skip_for_runtime(
         "trtllm", reason="trtllm may return more top_logprobs than requested in streaming"
     )
-    def test_chat_completion_stream(self, model, api_client, logprobs, parallel_sample_num):
+    def test_chat_completion_stream(
+        self, model, api_client, logprobs, parallel_sample_num, mock_answers
+    ):
         """Test streaming chat completion with logprobs and parallel sampling."""
-        super().test_chat_completion_stream(model, api_client, logprobs, parallel_sample_num)
+        super().test_chat_completion_stream(
+            model, api_client, logprobs, parallel_sample_num, mock_answers
+        )
 
-    def test_stop_sequences_stream(self, model, api_client):
-        super().test_stop_sequences_stream(model, api_client)
+    def test_stop_sequences_stream(self, model, api_client, mock_answers):
+        super().test_stop_sequences_stream(model, api_client, mock_answers)
 
     @pytest.mark.skip(reason="gpt-oss models don't support regex constraints")
     def test_regex(self, model, api_client):
@@ -485,15 +534,18 @@ class TestChatCompletionGptOss120B(TestChatCompletionGptOss):
 # =============================================================================
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed", "mock")
 @pytest.mark.gpu(1)
-@pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct")
+@pytest.mark.model(
+    "meta-llama/Llama-3.1-8B-Instruct", mock="RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8"
+)
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 class TestRequestIdPassthrough:
     """Backend request ids derive from client correlation signals."""
 
-    def test_rid_becomes_response_id(self, model, api_client):
+    def test_rid_becomes_response_id(self, model, api_client, mock_answers):
         """A protocol `rid` is used as the backend request id verbatim."""
+        mock_answers.enqueue("Hi!")
         resp = api_client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": "Say hi"}],
@@ -503,8 +555,9 @@ class TestRequestIdPassthrough:
 
         assert resp.id == "my-correlation-id-1"
 
-    def test_x_request_id_header_prefixes_response_id(self, model, api_client):
+    def test_x_request_id_header_prefixes_response_id(self, model, api_client, mock_answers):
         """The middleware request id (client x-request-id) prefixes backend ids."""
+        mock_answers.enqueue("Hi!")
         resp = api_client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": "Say hi"}],

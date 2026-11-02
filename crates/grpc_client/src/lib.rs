@@ -20,7 +20,9 @@ pub mod constraint_failure;
 pub mod engine_load;
 pub mod media_fault;
 pub mod mlx_engine;
+pub mod request_deadline;
 mod request_fields;
+pub mod sglang_media_identity;
 pub mod sglang_scheduler;
 pub mod tokenizer_bundle;
 pub mod tokenspeed_encoder;
@@ -44,6 +46,7 @@ pub use constraint_failure::{
 pub use h2;
 pub use media_fault::{media_code, stamp_media_code, WorkerMediaFault, MEDIA_CODE_METADATA_KEY};
 pub use mlx_engine::{proto as mlx_proto, MlxEngineClient};
+pub use request_deadline::{is_request_timeout, RequestDeadline};
 pub use sglang_scheduler::{
     proto as sglang_proto, SglangGenerateRequestOptions, SglangSchedulerClient,
 };
@@ -340,23 +343,36 @@ macro_rules! impl_engine_client_basics {
         /// Submit a generation request; the returned stream aborts the request
         /// when it is dropped before `mark_completed()`, so a client that goes
         /// away mid-stream does not leave the engine generating.
-        pub async fn generate(
+        ///
+        /// The request is wrapped for the wire before the future exists, so the
+        /// future holds it once, as the call's own request, not again as an
+        /// argument and a local kept across the await. The dispatch boxes this
+        /// future for every request, so the largest engine's request sets the
+        /// box's size class on every path: keep this a plain fn, not an async fn.
+        ///
+        /// The trace context is injected when the future is first polled, from
+        /// the span active then, so an instrumented future's span is the parent.
+        pub fn generate(
             &self,
             req: $proto::GenerateRequest,
-        ) -> Result<AbortOnDropStream, tonic::Status> {
+        ) -> impl std::future::Future<Output = Result<AbortOnDropStream, tonic::Status>> + '_ {
             let request_id = req.request_id.clone();
             let mut client = self.client.clone();
             let mut request = tonic::Request::new(req);
-            // W3C trace context into the gRPC metadata for distributed tracing.
-            if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
-                tracing::warn!("Failed to inject trace context: {}", e);
+            async move {
+                // W3C trace context into the gRPC metadata for distributed tracing,
+                // read when the future first runs so an instrumented future's span
+                // is the parent.
+                if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
+                    tracing::warn!("Failed to inject trace context: {}", e);
+                }
+                let response = client.generate(request).await?;
+                Ok(AbortOnDropStream::new(
+                    response.into_inner(),
+                    request_id,
+                    self.clone(),
+                ))
             }
-            let response = client.generate(request).await?;
-            Ok(AbortOnDropStream::new(
-                response.into_inner(),
-                request_id,
-                self.clone(),
-            ))
         }
 
         /// Perform a health check.

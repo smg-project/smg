@@ -33,15 +33,16 @@ use tokio::{
     task::JoinHandle,
     time::Instant,
 };
-use tracing::{trace, warn};
+use tracing::{info, trace, warn};
 use zeromq::{RouterSendHalf, SocketRecv};
 
 use crate::{
     codec::OpaqueValue,
     error::{Error, Result},
     protocol::{
-        sglang::SglangProtocol, tokenspeed::TokenSpeedProtocol, vllm::VllmProtocol, EngineBatch,
-        EngineLoad, EngineOutput, EngineProtocol, UtilityReply, WaveEvent,
+        sglang::SglangProtocol, tokenspeed::TokenSpeedProtocol, trtllm::TrtllmProtocol,
+        vllm::VllmProtocol, EngineBatch, EngineLoad, EngineOutput, EngineProtocol, UtilityReply,
+        WaveEvent,
     },
     transport::{run_output_loop, send_message, ConnectedEngine, ConnectedTransport, EngineId},
 };
@@ -58,6 +59,10 @@ pub type TokenSpeedStream = RequestStream<TokenSpeedProtocol>;
 pub type SglangClient = Client<SglangProtocol>;
 /// The per-request output stream for the SGLang connector.
 pub type SglangStream = RequestStream<SglangProtocol>;
+/// The TensorRT-LLM connector.
+pub type TrtllmClient = Client<TrtllmProtocol>;
+/// The per-request output stream for the TensorRT-LLM connector.
+pub type TrtllmStream = RequestStream<TrtllmProtocol>;
 
 /// Per-request output channels are unbounded on purpose. The dispatcher fans
 /// one engine tick out to every request in it while holding the registry lock,
@@ -559,6 +564,9 @@ struct ClientInner<P: EngineProtocol> {
     /// frame, for one log line when it does.
     refused: AtomicUsize,
     engines: Vec<ConnectedEngine>,
+    /// What `P` read off the engines' handshakes ([`connection_layout`]):
+    /// handed to every request it frames and every output it decodes.
+    layout: P::Layout,
     registry: Mutex<RequestRegistry<P::Output>>,
     routing: Mutex<RoutingState>,
     /// Rotates the selection scan start so all-zero ties (cold start, fresh
@@ -1062,24 +1070,38 @@ impl<P: EngineProtocol> ClientInner<P> {
     }
 }
 
-/// The output layout of a connection: what its engines declared for the
-/// optional output columns `P` knows. The ranks of one connection run one
-/// engine build and declare one layout; a group that disagrees reads none of
-/// the optional columns (the default layout) rather than a column at the
-/// wrong position on some rank, and says so once.
+/// The layout of a connection: what its engines declared for the optional
+/// output columns `P` knows and for its request decoder. The ranks of one
+/// connection run one engine build and declare one layout; a group that
+/// disagrees is read at the default layout (none of the optional columns,
+/// every tensor inline) rather than a column at the wrong position on some
+/// rank, and says so once. Every rank's declaration is logged with its id at
+/// the handshake: on a running connection that is the one place that tells
+/// which form the wire takes, and which rank fell behind when they disagree.
 fn connection_layout<P: EngineProtocol>(engines: &[ConnectedEngine]) -> P::Layout {
-    let mut layouts = engines
+    // Every rank is read, and logged, before the decision: the ranks behind a
+    // disagreeing one are the ones that tell which rank fell behind.
+    let layouts: Vec<P::Layout> = engines
         .iter()
-        .map(|engine| P::read_layout(&engine.ready_response));
-    let Some(first) = layouts.next() else {
+        .map(|engine| {
+            let layout = P::read_layout(&engine.ready_response);
+            info!(
+                engine_id = ?engine.engine_id,
+                ?layout,
+                "engine's wire layout declared at the handshake"
+            );
+            layout
+        })
+        .collect();
+    let Some(first) = layouts.first() else {
         return P::Layout::default();
     };
-    if layouts.all(|layout| layout == first) {
-        first
+    if layouts.iter().all(|layout| layout == first) {
+        first.clone()
     } else {
         warn!(
-            "the engines of this connection declare different output layouts; the optional \
-             output columns are not read"
+            "the engines of this connection declare different layouts; the optional output \
+             columns are not read and every tensor is sent inline"
         );
         P::Layout::default()
     }
@@ -1115,6 +1137,7 @@ impl<P: EngineProtocol> Client<P> {
         let lockstep = engines
             .iter()
             .any(|engine| engine.ready_response.data_parallel_size > 1);
+        let layout = connection_layout::<P>(&engines);
 
         let (abort_tx, abort_rx) = mpsc::unbounded_channel();
         let (input_tx, input_rx) = mpsc::unbounded_channel();
@@ -1132,6 +1155,7 @@ impl<P: EngineProtocol> Client<P> {
             writing_since: Mutex::new(None),
             refused: AtomicUsize::new(0),
             engines,
+            layout,
             registry: Mutex::new(RequestRegistry::default()),
             routing: Mutex::new(RoutingState::default()),
             scan_start: AtomicUsize::new(0),
@@ -1142,6 +1166,49 @@ impl<P: EngineProtocol> Client<P> {
             last_output_ms: AtomicU64::new(0),
             steps_reported: AtomicBool::new(false),
         });
+
+        // The input monitor was opened when the frontend bound the input
+        // socket, before the handshake, and holds every peer event since.
+        // Read from the start, a disconnect queued there would pass for the
+        // fresh engine's transport loss; which of them are this link's, the
+        // order per identity tells. A connection under an identity the
+        // socket already holds replaces the earlier one, in the peer map and
+        // in the receive queue, before its accept is reported, and a replaced
+        // connection's end is never read again. So the data socket of a
+        // previous engine generation, which dialed this frontend's new bind
+        // by itself and closed when that generation was replaced, under the
+        // identity the next generation registers with, is a disconnect
+        // before the accept of the connection that carried the registration:
+        // not this link's, and read off here, else it would end a client
+        // whose engine, having handshaken once, never dials again. A
+        // disconnect after an engine's last accept is that engine's own
+        // loss: on a link of several engines, one that registered first can
+        // go away while the handshake still waits for the others, and the
+        // monitor arm below, armed at the admission, would never see a
+        // second event for a peer the socket has forgotten. Such a loss ends
+        // the link at its admission, as the arm ends it on a loss after.
+        let mut gone: HashSet<Bytes> = HashSet::new();
+        while let Ok(event) = input_events.try_recv() {
+            match event {
+                zeromq::SocketEvent::Accepted(_, peer) => {
+                    gone.remove(&peer[..]);
+                }
+                zeromq::SocketEvent::Disconnected(peer) => {
+                    info!(
+                        ?peer,
+                        "an input peer disconnected before this link was admitted"
+                    );
+                    gone.insert(Bytes::from(peer));
+                }
+                _ => {}
+            }
+        }
+        let lost_at_admission = inner
+            .engines
+            .iter()
+            .map(|engine| &engine.engine_id)
+            .find(|engine_id| gone.contains(&engine_id[..]))
+            .cloned();
 
         // Input writer: the one owner of the input socket's send half.
         let writer_inner = inner.clone();
@@ -1171,13 +1238,36 @@ impl<P: EngineProtocol> Client<P> {
                 } => {}
 
                 () = async {
+                    if let Some(engine_id) = lost_at_admission {
+                        warn!(
+                            ?engine_id,
+                            "an engine of this link disconnected while the handshake admitted it"
+                        );
+                        writer_inner.registry.lock().fail_all(Arc::new(Error::EngineCoreDead));
+                        writer_inner.routing.lock().inflight.clear();
+                        return;
+                    }
                     while let Some(event) = input_events.next().await {
-                        if let zeromq::SocketEvent::Disconnected(peer) = event {
-                            warn!(?peer, "engine input transport disconnected after queue admission");
-                            writer_inner.registry.lock().fail_all(Arc::new(Error::EngineCoreDead));
-                            writer_inner.routing.lock().inflight.clear();
-                            return;
+                        let zeromq::SocketEvent::Disconnected(peer) = event else {
+                            continue;
+                        };
+                        // The monitor reports every peer of the shared input
+                        // socket; only this link's engines are its loss.
+                        if !writer_inner
+                            .engines
+                            .iter()
+                            .any(|engine| engine.engine_id[..] == peer[..])
+                        {
+                            info!(
+                                ?peer,
+                                "an input peer that is not an engine of this link disconnected; ignored"
+                            );
+                            continue;
                         }
+                        warn!(?peer, "engine input transport disconnected after queue admission");
+                        writer_inner.registry.lock().fail_all(Arc::new(Error::EngineCoreDead));
+                        writer_inner.routing.lock().inflight.clear();
+                        return;
                     }
                     // Monitor closure alone does not prove engine death.
                     std::future::pending::<()>().await;
@@ -1193,7 +1283,7 @@ impl<P: EngineProtocol> Client<P> {
         let output_task = tokio::spawn(run_output_loop::<P>(
             output_socket,
             out_tx,
-            connection_layout::<P>(&inner.engines),
+            inner.layout.clone(),
         ));
         #[expect(
             clippy::disallowed_methods,
@@ -1390,7 +1480,7 @@ impl<P: EngineProtocol> Client<P> {
             request_id,
             armed: true,
         };
-        let (payload, mut aux_frames) = match P::encode_add(&request) {
+        let (payload, mut aux_frames) = match P::encode_add(&request, &self.inner.layout) {
             Ok(encoded) => encoded,
             Err(error) => {
                 guard.take_back(false);
@@ -1454,6 +1544,30 @@ impl<P: EngineProtocol> Client<P> {
     pub async fn notify(&self, engine_id: &EngineId, payload: Vec<u8>) -> Result<()> {
         self.inner
             .send_to_engine(engine_id, P::add_frame(), payload, Vec::new())
+            .await
+    }
+
+    /// [`notify`](Self::notify) under a request-type frame of the caller's
+    /// choosing, with `aux_frames` behind the payload: a message of the
+    /// engine's vocabulary outside the add/abort pair that the engine consumes
+    /// itself (an encode worker's encode request, the largest payload this
+    /// wire carries). Nothing answers it, no stream is opened, no registration
+    /// or in-flight slot is taken; the frame is admitted against the input
+    /// queue bound and counted while it waits, as an add frame is (see
+    /// `ClientInner::admit_add`): once the engine has stopped reading for
+    /// a whole send window, a frame that would take the waiting payload past
+    /// the bound is refused at once rather than parked and delivered later.
+    pub async fn send_typed(
+        &self,
+        engine_id: &EngineId,
+        request_type: Bytes,
+        payload: Vec<u8>,
+        aux_frames: Vec<Bytes>,
+    ) -> Result<()> {
+        let bytes = payload.len() + aux_frames.iter().map(Bytes::len).sum::<usize>();
+        self.inner.admit_add(bytes)?;
+        self.inner
+            .send_frame(engine_id, request_type, payload, aux_frames, Some(bytes))
             .await
     }
 }

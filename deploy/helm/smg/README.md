@@ -137,6 +137,27 @@ A `metrics.port` equal to the serving port is refused when the chart renders.
 An HTTP worker runs the engine's own server, which has its own `/metrics`; the
 setting is ignored there.
 
+#### Parser
+
+`router.parser` picks the parser that reads a chat completion's reasoning and
+tool calls: `symphony` (one table per model family, the gateway's default from
+the release after 1.13.0 on) or `legacy` (the older per-model parsers). Empty,
+the default, renders no `--parser`, so the image's own default applies and the
+value is safe on every image. A set value needs a gateway image of 1.13.0 or
+later: the flag arrived in 1.13.0 (with `legacy` as its default there), and an
+earlier image rejects it and exits at startup. The choice applies to gRPC and
+ZMQ workers; an HTTP worker's engine parses its own output, so the value changes
+nothing there. A deployment that set `--parser` through `router.extraArgs` removes
+it there when it sets this value: the gateway refuses the flag twice and exits at
+startup. A request's `X-SMG-Parser` header overrides the flag for that
+request. `router.toolCallParser` and `router.reasoningParser` are read
+differently by each parser: under Symphony, a model the registry knows keeps
+its own table and the flags apply only to models it does not know; under
+`legacy`, each flag takes only a legacy parser's name of its own kind: `hf`
+and a Symphony-only name (`muse`, for one) are refused at startup, while a
+name a legacy parser of that kind also has (`qwen` as `toolCallParser`, for
+one) keeps that parser.
+
 #### Worker Discovery
 
 `router.discovery.provider` selects where the router finds its workers at runtime, passed as `--discovery-provider` with the settings of that provider's block under `router.discovery`: `kubernetes`, `file`, `slurm` or `consul` (empty, the default, discovers nothing). `router.discovery.checkIntervalSecs` sets the provider's periodic pass (`--discovery-check-interval-secs`, 30 s when unset), under `router.serviceDiscovery` too. Selecting a provider turns IGW mode on in the gateway, and the chart's `workers` are then not passed as `--worker-urls`: the provider is the source of workers.
@@ -244,6 +265,15 @@ requests themselves.
 A router that gets its workers at runtime through the admin API (`POST /workers`) rather than from `workers`, `router.workerUrls`, `router.serviceDiscovery` or `router.discovery` has no healthy worker when it starts, so `/readiness` answers 503 until one is registered, the Service has no endpoint for the pod, and a registration sent through the Service cannot reach it (a rolling update's new pod then never becomes Ready). Such deployments set `router.readinessProbe.path: /health`, or register their workers through a port-forward to the pod.
 
 The gateway drains in-flight requests for `router.shutdownGracePeriodSeconds` (default 180, passed as `--shutdown-grace-period-secs`); the pod's `terminationGracePeriodSeconds` is that plus `router.terminationGraceMarginSeconds` (default 30), so the kubelet does not kill the drain at its default 30 s.
+
+During shutdown, readiness fails immediately while listeners stay open for
+`min(router.shutdownGracePeriodSeconds / 2, 5 seconds)` by default.
+Set `router.shutdownSettleSeconds` (`--shutdown-settle-secs`) to adjust this
+propagation window; the effective window is the smaller of this value and half
+the grace. For example, a 180-second grace and a 30-second window leaves
+150 seconds for draining existing requests. Longer windows also delay idle
+shutdowns and local Ctrl+C exits. A value of 0 skips the propagation wait
+(mesh departure still shares the total grace budget).
 
 #### Dashboard and Alerts
 

@@ -506,18 +506,29 @@ impl PDRouter {
 
     /// The bootstrap rendezvous for one request, generated once so both sides
     /// carry the same rooms: one value per prompt for a batch, scalars
-    /// otherwise.
+    /// otherwise. With a selected prefill DP rank on a worker of `dp_size > 1`,
+    /// every room is congruent to that rank; otherwise the rooms are free.
     fn bootstrap_fields(
         prefill_worker: &dyn Worker,
         batch_size: Option<usize>,
+        prefill_rank: Option<isize>,
     ) -> serde_json::Result<BootstrapFields> {
         let host = prefill_worker.bootstrap_host();
         let port = prefill_worker.bootstrap_port();
+        let room_rank = match (prefill_rank, prefill_worker.dp_size()) {
+            (Some(rank), Some(dp_size)) if dp_size > 1 => usize::try_from(rank)
+                .ok()
+                .filter(|&rank| rank < dp_size)
+                .map(|rank| (rank, dp_size)),
+            _ => None,
+        };
+        let room = || match room_rank {
+            Some((rank, dp_size)) => super::pd_types::generate_room_id_for_rank(rank, dp_size),
+            None => super::pd_types::generate_room_id(),
+        };
         match batch_size {
             Some(n) => {
-                let rooms: Vec<u64> = (0..n)
-                    .map(|_| super::pd_types::generate_room_id())
-                    .collect();
+                let rooms: Vec<u64> = (0..n).map(|_| room()).collect();
                 Ok(BootstrapFields {
                     host: to_raw_value(&vec![host; n])?,
                     port: to_raw_value(&vec![port; n])?,
@@ -527,7 +538,7 @@ impl PDRouter {
             None => Ok(BootstrapFields {
                 host: to_raw_value(host)?,
                 port: to_raw_value(&port)?,
-                room: to_raw_value(&super::pd_types::generate_room_id())?,
+                room: to_raw_value(&room())?,
             }),
         }
     }
@@ -762,8 +773,8 @@ impl PDRouter {
         debug!(
             "PD retry attempt {} using prefill={} decode={}",
             attempt,
-            prefill.url(),
-            decode.url()
+            prefill.redacted_url(),
+            decode.redacted_url()
         );
 
         // Dispatch-time re-check of both sides, the same one the regular HTTP
@@ -909,8 +920,8 @@ impl PDRouter {
                     } else {
                         "sequential"
                     },
-                    prefill.url(),
-                    decode.url()
+                    prefill.redacted_url(),
+                    decode.redacted_url()
                 );
             }
             lease.release_dispatch();
@@ -964,12 +975,6 @@ impl PDRouter {
                 // The prefill and decode workers only know the canonical name, so
                 // forward that, not the alias the client sent.
                 body.set_model(to_raw_value(context.model_id).map_err(serialization_error)?);
-                let bootstrap = Self::bootstrap_fields(prefill.as_ref(), context.batch_size)
-                    .map_err(serialization_error)?;
-                Self::inject_bootstrap(&mut body, bootstrap);
-
-                let mut prefill_body = body.clone();
-                let mut decode_body = body;
 
                 let mut prefill_rank = prefill.dp_rank().map(|rank| rank as isize);
                 let mut decode_rank = decode.dp_rank().map(|rank| rank as isize);
@@ -1000,6 +1005,14 @@ impl PDRouter {
                         decode_rank = Some(rank);
                     }
                 }
+
+                let bootstrap =
+                    Self::bootstrap_fields(prefill.as_ref(), context.batch_size, prefill_rank)
+                        .map_err(serialization_error)?;
+                Self::inject_bootstrap(&mut body, bootstrap);
+
+                let mut prefill_body = body.clone();
+                let mut decode_body = body;
 
                 if let Some(p_rank) = prefill_rank {
                     Self::inject_dp_rank(&mut prefill_body, p_rank, "routed_dp_rank")
@@ -1150,7 +1163,7 @@ impl PDRouter {
         if !status.is_success() {
             error!(
                 "Decode server returned error status decode_url={} status={}",
-                decode.url(),
+                decode.redacted_url(),
                 status
             );
             return Self::side_refused(PdSide::Decode, decode_response).await;
@@ -1289,8 +1302,8 @@ impl PDRouter {
         // Send both requests concurrently and wait for both
         // Note: Using borrowed references avoids heap allocation
         events::RequestPDSentEvent {
-            prefill_url: prefill.url(),
-            decode_url: decode.url(),
+            prefill_url: prefill.redacted_url(),
+            decode_url: decode.redacted_url(),
         }
         .emit();
 
@@ -1405,7 +1418,7 @@ impl PDRouter {
             Err(DispatchError::Decode(response)) => {
                 error!(
                     "Decode server returned error status decode_url={} status={}",
-                    decode.url(),
+                    decode.redacted_url(),
                     response.status()
                 );
                 return Self::side_refused(PdSide::Decode, response).await;
@@ -1630,8 +1643,8 @@ impl PDRouter {
         let dispatch_start = Instant::now();
         let harvested = if relay {
             events::RequestPDSentEvent {
-                prefill_url: prefill.url(),
-                decode_url: decode.url(),
+                prefill_url: prefill.redacted_url(),
+                decode_url: decode.redacted_url(),
             }
             .emit();
 
@@ -1654,7 +1667,7 @@ impl PDRouter {
             if !prefill_status.is_success() {
                 error!(
                     "Prefill server returned error status prefill_url={} status={}",
-                    prefill.url(),
+                    prefill.redacted_url(),
                     prefill_status
                 );
                 Self::record_sequential_side(
@@ -1823,8 +1836,8 @@ impl PDRouter {
         let headers = Some(&headers_with_trace);
         Metrics::record_pd_kv_connector_mode(KvConnectorMode::MoriIo.metrics_label());
         events::RequestPDSentEvent {
-            prefill_url: prefill.url(),
-            decode_url: decode.url(),
+            prefill_url: prefill.redacted_url(),
+            decode_url: decode.redacted_url(),
         }
         .emit();
 
@@ -1859,7 +1872,7 @@ impl PDRouter {
             if !status.is_success() {
                 error!(
                     "Prefill server returned error status prefill_url={} status={}",
-                    prefill.url(),
+                    prefill.redacted_url(),
                     status
                 );
                 Self::record_sequential_side(
@@ -1997,7 +2010,7 @@ impl PDRouter {
 
             let mut response_headers =
                 header_utils::preserve_response_headers(decode_response.headers());
-            header_utils::insert_routed_worker_id(&mut response_headers, decode.url());
+            header_utils::insert_routed_worker_id(&mut response_headers, decode.redacted_url());
 
             self.create_streaming_response(
                 decode_response.bytes_stream(),
@@ -2043,7 +2056,7 @@ impl PDRouter {
 
             // The decode worker is the one that produced the body the client
             // sees, on both the merged-logprob and passthrough paths.
-            header_utils::insert_routed_worker_id(response.headers_mut(), decode.url());
+            header_utils::insert_routed_worker_id(response.headers_mut(), decode.redacted_url());
             response
         }
     }
@@ -2311,7 +2324,8 @@ impl PDRouter {
         if !prefill_status.is_success() {
             error!(
                 "Prefill server returned error status prefill_url={} status={}",
-                prefill_url, prefill_status
+                Endpoint::redacted_str(prefill_url),
+                prefill_status
             );
             return Err(Self::side_refused(PdSide::Prefill, prefill_response).await);
         }
@@ -2551,7 +2565,7 @@ impl RouterTrait for PDRouter {
             Ok(res) if res.status().is_success() => {
                 debug!(
                     "Health generate passed for prefill server: {}",
-                    prefill.url()
+                    prefill.redacted_url()
                 );
             }
             Ok(res) => {
@@ -2568,7 +2582,10 @@ impl RouterTrait for PDRouter {
 
         match decode_result {
             Ok(res) if res.status().is_success() => {
-                debug!("Health generate passed for decode server: {}", decode.url());
+                debug!(
+                    "Health generate passed for decode server: {}",
+                    decode.redacted_url()
+                );
             }
             Ok(res) => {
                 errors.push(format!(
@@ -2747,7 +2764,7 @@ impl RouterTrait for PDRouter {
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let mut response_headers = header_utils::preserve_response_headers(res.headers());
-        header_utils::insert_routed_worker_id(&mut response_headers, worker.url());
+        header_utils::insert_routed_worker_id(&mut response_headers, worker.redacted_url());
         match res.bytes().await {
             Ok(bytes) => {
                 worker.record_outcome(status.as_u16());
@@ -2848,6 +2865,7 @@ mod tests {
         observability::logging::test_support::test_subscriber,
         routers::common::sse::SSE_CHANNEL_BUFFER,
         tenant::TenantKey,
+        test_support::RefusedAddress,
         worker::{circuit_breaker::CircuitState, BasicWorkerBuilder, WorkerType},
     };
 
@@ -2877,10 +2895,9 @@ mod tests {
     /// told what happened, not where the gateway's workers are.
     #[tokio::test]
     async fn a_side_that_failed_below_http_is_answered_without_the_workers_address() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        let worker = BasicWorkerBuilder::new(format!("http://{addr}")).build();
+        let refused = RefusedAddress::reserve();
+        let addr = refused.addr();
+        let worker = BasicWorkerBuilder::new(refused.http_url()).build();
         let error = call_refused_by(addr).await;
         assert!(
             error.url().is_some(),
@@ -3115,7 +3132,7 @@ mod tests {
 
         let bytes = serde_json::to_vec(&request).unwrap();
         let mut body = RawBody::parse(&bytes).unwrap();
-        let fields = PDRouter::bootstrap_fields(&prefill, None).unwrap();
+        let fields = PDRouter::bootstrap_fields(&prefill, None, None).unwrap();
         PDRouter::inject_bootstrap(&mut body, fields);
         let body: Value = serde_json::from_slice(&body.to_bytes(None).unwrap()).unwrap();
 
@@ -3717,6 +3734,69 @@ mod tests {
             assert_eq!(body["temperature"], json!(0.7));
             assert_eq!(body["top_p"], json!(0.95));
             assert!(body.get("bootstrap_room").is_some());
+        }
+    }
+
+    /// SGLang's prefill side, under its default `follow_bootstrap_room`
+    /// placement, fails a request whose `bootstrap_room % dp_size` is not the
+    /// rank it runs on, so every room of a request routed to a dp-aware
+    /// prefill worker is congruent to that worker's rank, single and batched.
+    #[tokio::test]
+    async fn the_room_is_congruent_to_the_dp_aware_prefill_rank() {
+        let (prefill_url, prefill_seen) = spawn_recording_stub("{}").await;
+        let (decode_url, decode_seen) = spawn_recording_stub("{}").await;
+
+        let router = create_test_pd_router();
+        let prefill = BasicWorkerBuilder::new(prefill_url)
+            .worker_type(WorkerType::Prefill)
+            .dp_config(3, 4)
+            .build();
+        prefill.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        router
+            .worker_registry
+            .register_or_replace(Arc::new(prefill));
+        router
+            .worker_registry
+            .register_or_replace(Arc::from(create_test_worker(
+                decode_url,
+                WorkerType::Decode,
+                true,
+            )));
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        for request in [
+            json!({"text": "hi"}),
+            json!({"input_ids": [[1, 2], [3, 4], [5, 6]]}),
+        ] {
+            for _ in 0..16 {
+                let request: GenerateRequest =
+                    serde_json::from_value(request.clone()).expect("valid generate request");
+                let response = router
+                    .route_generate(None, &tenant, request, UNKNOWN_MODEL_ID)
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        }
+
+        let prefill_seen = taken(&prefill_seen);
+        let decode_seen = taken(&decode_seen);
+        assert_eq!(prefill_seen.len(), 32);
+        assert_eq!(decode_seen.len(), 32);
+        for ((_, prefill_body), (_, decode_body)) in prefill_seen.iter().zip(&decode_seen) {
+            assert_eq!(
+                prefill_body["bootstrap_room"],
+                decode_body["bootstrap_room"]
+            );
+            let rooms: Vec<u64> = match &prefill_body["bootstrap_room"] {
+                Value::Array(rooms) => rooms.iter().map(|r| r.as_u64().unwrap()).collect(),
+                room => vec![room.as_u64().unwrap()],
+            };
+            for room in rooms {
+                assert!(room <= i64::MAX as u64 && room % 4 == 3, "{room}");
+            }
+            assert_eq!(prefill_body["routed_dp_rank"], json!(3));
+            assert_eq!(decode_body["disagg_prefill_dp_rank"], json!(3));
+            assert_eq!(decode_body.get("routed_dp_rank"), None);
         }
     }
 
@@ -5353,10 +5433,8 @@ mod tests {
     async fn vllm_pd_moriio_write_fails_fast_when_the_decode_is_unreachable() {
         let computing = std::time::Duration::from_secs(30);
         let (prefill_url, _) = spawn_delayed_stub(StatusCode::OK, json!({}), computing).await;
-        let decode_url = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            format!("http://{}", listener.local_addr().unwrap())
-        };
+        let refused = RefusedAddress::reserve();
+        let decode_url = refused.http_url();
         let router = single_attempt_router();
         register_moriio_pair_with(
             &router,
@@ -5497,11 +5575,58 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_rooms_follow_the_prefill_rank_only_on_a_multi_rank_worker() {
+        let worker = |dp: Option<(usize, usize)>| {
+            let builder =
+                BasicWorkerBuilder::new("http://prefill:8000").worker_type(WorkerType::Prefill);
+            match dp {
+                Some((rank, size)) => builder.dp_config(rank, size),
+                None => builder,
+            }
+            .build()
+        };
+        let rooms = |worker: &dyn Worker, batch_size: Option<usize>, rank: Option<isize>| {
+            let fields = PDRouter::bootstrap_fields(worker, batch_size, rank).unwrap();
+            match serde_json::from_str::<Value>(fields.room.get()).unwrap() {
+                Value::Array(rooms) => rooms.iter().map(|r| r.as_u64().unwrap()).collect(),
+                room => vec![room.as_u64().unwrap()],
+            }
+        };
+        let in_range = |room: &u64| *room <= i64::MAX as u64;
+
+        let rank1_of_4 = worker(Some((1, 4)));
+        for batch_size in [None, Some(3)] {
+            for _ in 0..64 {
+                for room in rooms(&rank1_of_4, batch_size, Some(1)) {
+                    assert!(in_range(&room) && room % 4 == 1, "{room}");
+                }
+            }
+        }
+
+        // Without a selected rank, on a single-rank worker, on a worker with no
+        // DP size, or with a rank outside the worker's DP size, the room is free.
+        let rank0_of_1 = worker(Some((0, 1)));
+        let plain = worker(None);
+        for (worker, rank) in [
+            (&rank1_of_4, None),
+            (&rank0_of_1, Some(0)),
+            (&plain, Some(1)),
+            (&rank1_of_4, Some(4)),
+            (&rank1_of_4, Some(-1)),
+        ] {
+            let free: Vec<u64> = (0..64).flat_map(|_| rooms(worker, Some(2), rank)).collect();
+            assert!(free.iter().all(in_range));
+            let residues: std::collections::HashSet<u64> = free.iter().map(|r| r % 4).collect();
+            assert!(residues.len() > 1, "{rank:?}: {residues:?}");
+        }
+    }
+
+    #[test]
     fn bootstrap_and_rank_edits_match_the_value_pipeline_bytes() {
         let prefill =
             create_test_worker("http://prefill:8000".to_string(), WorkerType::Prefill, true);
         for batch_size in [None, Some(3)] {
-            let fields = PDRouter::bootstrap_fields(prefill.as_ref(), batch_size).unwrap();
+            let fields = PDRouter::bootstrap_fields(prefill.as_ref(), batch_size, None).unwrap();
             let as_value = |raw: &RawValue| serde_json::from_str::<Value>(raw.get()).unwrap();
             let (host, port, room) = (
                 as_value(&fields.host),
@@ -5764,13 +5889,24 @@ mod tests {
         );
     }
 
+    /// The admission tests' hang guard: a verdict that follows a stub's
+    /// release or the router's own cancellation must arrive within it; the
+    /// guard only turns a hung dispatch into a failure. A loaded runner
+    /// changes the tests' duration, never their verdict.
+    const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// How long a pending side's stub waits before answering by itself: far
+    /// past `HANG_GUARD`, so an answer within the guard is the test's doing
+    /// (a release) or the router's (a cancellation), never the stub's.
+    const PENDING_ANSWER: std::time::Duration = std::time::Duration::from_secs(3600);
+
+    /// A router with one prefill seat and a queue of one, over the two stubs.
+    /// The queue's own timeout is as far out as a pending stub's answer: a
+    /// queued request that is never admitted runs into `HANG_GUARD`, not into
+    /// the queue's clock.
     fn admission_test_router(prefill_url: String, decode_url: String) -> PDRouter {
         let router = PDRouter {
-            prefill_admission: Some(Arc::new(PrefillAdmission::new(
-                1,
-                1,
-                std::time::Duration::from_secs(3),
-            ))),
+            prefill_admission: Some(Arc::new(PrefillAdmission::new(1, 1, PENDING_ANSWER))),
             ..create_test_pd_router()
         };
         for (url, role) in [
@@ -5784,11 +5920,17 @@ mod tests {
         router
     }
 
+    /// The prefill side's answer frees its seat before the decode side's
+    /// head: a request queued behind it is admitted once the prefill stub is
+    /// released, while the dispatch still waits for the decode stub. Both
+    /// stubs answer only when the test lets go of their probe (their own
+    /// answer is `PENDING_ANSWER` away), so each verdict is a release's
+    /// effect awaited under `HANG_GUARD`, never a clock's.
     #[tokio::test]
     async fn pd_prefill_release_admits_next_request_before_decode_head() {
-        use std::{sync::atomic::Ordering, time::Duration};
+        use std::sync::atomic::Ordering;
 
-        use crate::routers::common::request_lease::test_probe::spawn_release_gated_stub;
+        use crate::routers::common::request_lease::test_probe::spawn_release_gated_stub_with_deadline;
 
         for is_stream in [false, true] {
             for return_logprob in [false, true] {
@@ -5796,10 +5938,16 @@ mod tests {
                 let prefill_hold = Arc::clone(&prefill_probe);
                 let decode_probe = Arc::new(());
                 let decode_hold = Arc::clone(&decode_probe);
-                let (prefill_url, prefill_released) =
-                    spawn_release_gated_stub(Arc::downgrade(&prefill_probe)).await;
-                let (decode_url, decode_released) =
-                    spawn_release_gated_stub(Arc::downgrade(&decode_probe)).await;
+                let (prefill_url, prefill_released) = spawn_release_gated_stub_with_deadline(
+                    Arc::downgrade(&prefill_probe),
+                    PENDING_ANSWER,
+                )
+                .await;
+                let (decode_url, decode_released) = spawn_release_gated_stub_with_deadline(
+                    Arc::downgrade(&decode_probe),
+                    PENDING_ANSWER,
+                )
+                .await;
                 let router = admission_test_router(prefill_url, decode_url);
                 let ((prefill, decode), guards) = router
                     .select_pd_pair_with_admission(
@@ -5852,7 +6000,7 @@ mod tests {
                 drop(prefill_hold);
                 let (_, next_guards) = tokio::select! {
                     _ = &mut dispatch => panic!("Decode must remain blocked"),
-                    result = tokio::time::timeout(Duration::from_secs(2), &mut next) => {
+                    result = tokio::time::timeout(HANG_GUARD, &mut next) => {
                         result.expect("completed Prefill must admit the queued request").unwrap()
                     }
                 };
@@ -5864,7 +6012,7 @@ mod tests {
                 assert_eq!(decode.load(), 1);
 
                 drop(decode_hold);
-                let response = tokio::time::timeout(Duration::from_secs(2), dispatch)
+                let response = tokio::time::timeout(HANG_GUARD, dispatch)
                     .await
                     .expect("released Decode must finish");
                 assert_eq!(response.status(), StatusCode::OK);
@@ -5943,29 +6091,34 @@ mod tests {
         }
     }
 
+    /// Each side can fail while the other is still waiting for its head: a
+    /// missing route exercises HTTP errors, a port that refuses the connection
+    /// exercises transport errors, and a cancellation drops two pending
+    /// sides. The pending side's stub answers by itself only after
+    /// `PENDING_ANSWER`, far past `HANG_GUARD`, so the dispatch ending at all
+    /// is the router cancelling that side; the guard only turns a hung
+    /// dispatch into a failure. A loaded runner changes the test's duration,
+    /// never its verdict.
     #[tokio::test]
     async fn pd_prefill_release_on_error_or_cancellation() {
-        use std::time::Duration;
+        use crate::routers::common::request_lease::test_probe::spawn_immediate_stub;
 
-        use crate::routers::common::request_lease::test_probe::{
-            spawn_immediate_stub, spawn_release_gated_stub,
-        };
-
-        // Each side can fail while the other is still waiting for its head.
-        // A missing route exercises HTTP errors; a dropped listener exercises
-        // transport errors. Cancellation drops two pending sides.
         for failed_prefill in [false, true] {
             for failure in ["http", "transport", "cancel"] {
-                let probe = Arc::new(());
-                let hold = Arc::clone(&probe);
-                let (blocked_url, _) = spawn_release_gated_stub(Arc::downgrade(&probe)).await;
-                let failed_url = match failure {
-                    "http" => format!("{}/missing", spawn_immediate_stub().await),
+                let (blocked_url, _) =
+                    spawn_delayed_stub(StatusCode::OK, json!({}), PENDING_ANSWER).await;
+                let (failed_url, _refusing) = match failure {
+                    "http" => (format!("{}/missing", spawn_immediate_stub().await), None),
                     "transport" => {
-                        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                        format!("http://{}", listener.local_addr().unwrap())
+                        let refused = RefusedAddress::reserve();
+                        (refused.http_url(), Some(refused))
                     }
-                    _ => spawn_release_gated_stub(Arc::downgrade(&probe)).await.0,
+                    _ => (
+                        spawn_delayed_stub(StatusCode::OK, json!({}), PENDING_ANSWER)
+                            .await
+                            .0,
+                        None,
+                    ),
                 };
                 let (prefill_url, decode_url) = if failed_prefill {
                     (failed_url, blocked_url)
@@ -6010,7 +6163,7 @@ mod tests {
                         assert_eq!(prefill.load(), 1);
                         assert_eq!(decode.load(), 1);
                     } else {
-                        let response = tokio::time::timeout(Duration::from_secs(2), dispatch)
+                        let response = tokio::time::timeout(HANG_GUARD, dispatch)
                             .await
                             .expect("a failed side must cancel the pending side");
                         assert_eq!(
@@ -6025,7 +6178,6 @@ mod tests {
                 }
                 assert_eq!(prefill.load(), 0);
                 assert_eq!(decode.load(), 0);
-                drop(hold);
             }
         }
     }
@@ -6808,32 +6960,34 @@ mod tests {
         }
     }
 
-    /// A server with `fault` for the failing side.
-    async fn faulty_stub(fault: Fault) -> String {
+    /// A server with `fault` for the failing side; an unreachable side's
+    /// refused address comes along and holds its port for the row.
+    async fn faulty_stub(fault: Fault) -> (String, Option<RefusedAddress>) {
         match fault {
             Fault::Unreachable => {
-                // The listener drops with the block: the port is closed.
-                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-                format!("http://{}", listener.local_addr().unwrap())
+                let refused = RefusedAddress::reserve();
+                (refused.http_url(), Some(refused))
             }
-            Fault::Refuses(status) => {
+            Fault::Refuses(status) => (
                 spawn_delayed_stub(
                     status,
                     json!({"error": {"message": REFUSAL}}),
                     std::time::Duration::ZERO,
                 )
                 .await
-                .0
-            }
-            Fault::CutAfterHead => {
+                .0,
+                None,
+            ),
+            Fault::CutAfterHead => (
                 spawn_cut_stub(
                     "/v1/chat/completions",
                     "application/json",
                     &["{\"choices\":["],
                     true,
                 )
-                .await
-            }
+                .await,
+                None,
+            ),
         }
     }
 
@@ -6966,7 +7120,7 @@ mod tests {
         let mut mismatches = Vec::new();
         for (shape, side, fault, streamed, status, phase) in rows {
             let case = format!("{shape:?} {side:?} {fault:?} streamed={streamed}");
-            let failing = faulty_stub(fault).await;
+            let (failing, _refusing) = faulty_stub(fault).await;
             let healthy = healthy_stub(shape, side.partner()).await;
             let (prefill_url, decode_url) = match side {
                 Prefill => (failing, healthy),

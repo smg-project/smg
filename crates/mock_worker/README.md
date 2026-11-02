@@ -93,10 +93,20 @@ experiments against it transfer to engines:
 - **cached tokens** — a request sharing a prefix with cached blocks pays less
   prefill and reports `cached_tokens` (gRPC chunks, HTTP
   `usage.prompt_tokens_details.cached_tokens`).
+- **repeatable output** — `--output-seed prompt` derives synthetic output from
+  the complete prompt token sequence, including its partial last block. Equal
+  token inputs then produce equal output regardless of transport request ID,
+  worker placement, cache warmth, or preemption. Repeated prompts can share
+  decode blocks too. Request IDs still identify cancellation and records.
+  The default `request-id` mode preserves existing stress workloads. This option
+  applies to the realistic engine; canned and scripted responses are unchanged.
+  Synthetic output remains in the existing token range 100–30099; a benchmark
+  must separately verify those IDs against its pinned tokenizer and special IDs.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
 | `--timing` | polynomial | `polynomial`, `linear`, or `fit:<path>` (a hardware calibration JSON, below) |
+| `--output-seed` | request-id | `prompt` selects output from normalized input tokens for cross-router/retry comparisons |
 | `--prefill-poly a,b,c` | AISimulate | prefill ms = a + b·T + c·T² |
 | `--decode-poly a,b,c` | AISimulate | decode ms = max(1, a + b·u + c·u²) |
 | `--request-overhead-ms` | 0 | fixed per-request latency added to every event of a stream (TTFT and e2e grow by it, ITL does not) |
@@ -111,6 +121,7 @@ experiments against it transfer to engines:
 | `--prefill-first` | false | SGLang-style prefill-only passes |
 | `--reserve-full-isl` | true | admit a waiting prompt only when the free and evictable blocks could hold all of it beyond its cached blocks, stopping at the first that does not fit (vLLM's `scheduler_reserve_full_isl`: a gate, only the pass's chunk is allocated at admission); `false` skips the gate |
 | `--context-length` | 32768 | advertised context length |
+| `--output-prefix-ids` | none | the token ids every output starts with, before the synthetic ids: a stream shaped for a gateway that parses the engine's tokens (a channel header, say); the canned gRPC and ZMQ workers and the realistic engine shape their output with it (the canned HTTP worker does not read it) |
 | `--loads-like` | mock | `vllm`: report only what the vLLM servicer reports (running, waiting, `token_usage`, maxima), so the gateway's expected-wait routes as it does on a vLLM fleet |
 | `--admin-port` | off | process-wide admin API (below) |
 | `--drain-timeout-secs` | 5 | on SIGTERM or SIGINT: stop accepting, let the requests in flight finish for this long, then exit 0 either way |
@@ -291,17 +302,30 @@ gRPC, ZMQ), ahead of either engine mode. Two sources feed one store:
 - `POST /admin/script/{worker}` on the admin API, with one such answer or an
   array of them: the answers the worker's next requests get, in order
   (`all`: whichever worker gets the request). An answer with a `key` or
-  `input_ids` is filed under its prompt for every worker instead.
-  `GET /admin/script/{worker}` reads `queued`, `hits`, `misses` and the
-  `keyed` count; `DELETE` drops the queue; a name no worker of the process
-  has is a 404. This is the form a test wants: it states the model's answer
-  right before it sends the request, no tokenizer prediction needed.
+  `input_ids` is filed under its prompt for every worker instead. An answer
+  with a `prompt_contains` text is filed for the first request whose prompt
+  holds the text, served once, whatever order the requests arrive in: what
+  a test states when its requests run concurrently, or when the gateway
+  picks the worker. `GET /admin/script/{worker}` reads `queued`, `marked`
+  (the answers filed under a text), `hits`, `misses` and the `keyed` count;
+  `DELETE` drops the queue and the answers filed under a text; a name no
+  worker of the process has is a 404. This is the form a test wants: it
+  states the model's answer right before it sends the request, no tokenizer
+  prediction needed.
 
 For a request a worker looks in this order: its own queue, the shared queue,
-the keyed answers under its prompt's key. Nothing found is a miss, counted
-per worker, and the request goes to the canned or realistic engine as if no
-script existed. A scripted answer is served by the wire, not by the engine
-simulator: no load, no KV events, no request record.
+the answers filed under a text its prompt holds (its own, then the shared
+ones), the keyed answers under its prompt's key. Nothing found is a miss,
+counted per worker, and the request goes to the canned or realistic engine as
+if no script existed. A scripted answer is served by the wire, not by the
+engine simulator: no load, no KV events, no request record. The prompt's text
+is what an HTTP worker was sent (a message's string content or the `text` of
+its parts, a prompt string or the strings of a prompt array); a gRPC worker
+reads the rendered text the gateway sends beside the ids (`original_text`)
+and decodes the ids with its `--tokenizer` only when that is empty, as a ZMQ
+worker always does. Either reads the prompt only while answers filed under a
+text wait for it, and a prompt it cannot read then fails the request with
+the reason, the filed answers left where they are.
 
 Per wire: a gRPC worker streams `chunk_tokens` ids per `Chunk` and ends with
 the `Complete` (`output_ids`, `finish_reason`, `matched_stop`,

@@ -10,7 +10,8 @@
 #   ci_rust_tests.sh commands <shard>      the shard's cargo test invocations, one per line
 #   ci_rust_tests.sh build <shard>         compile the shard's tests (cargo test --no-run)
 #   ci_rust_tests.sh run <shard>           run the shard's tests
-#   ci_rust_tests.sh lint <leg>            one lint configuration: all-features, self-hosted, anthropic-only,
+#   ci_rust_tests.sh lint <leg>            one lint configuration: all-features (clippy with every feature, then
+#                                          the workspace's rustdoc under -D warnings), self-hosted, anthropic-only,
 #                                          default-build (the default feature set compiles without OpenCV)
 #   ci_rust_tests.sh check                 every workspace package, every gateway test binary and every
 #                                          radix-tree test binary belongs to exactly one shard
@@ -76,7 +77,7 @@ packages_of() {
         symphony)   echo smg-symphony tool-parser reasoning-parser smg-response-template ;;
         agentic)    echo data-connector smg-mcp smg-wasm wfaas ;;
         protocols)  echo openai-protocol smg-external-router smg-auth smg-rl smg-client openapi-gen ;;
-        engine)     echo smg-grpc-client engine-zmq-client engine-zmq-adapter engine-servicer mock-worker ;;
+        engine)     echo smg-grpc-client engine-zmq-client engine-zmq-adapter engine-servicer mock-worker gateway-perf ;;
         kv)         echo kv-index smg-mesh smg-mm-rdma smg-radix-tree ;;
         radix-fuzz) echo smg-radix-tree ;;
         *) shard_row "$1" >/dev/null ;;
@@ -174,7 +175,7 @@ commands_of() {
         protocols)
             echo "-p openai-protocol -p smg-external-router -p smg-auth -p smg-rl -p smg-client -p openapi-gen --features openai-protocol/axum,smg-external-router/openai,smg-external-router/anthropic,smg-external-router/gemini" ;;
         engine)
-            echo "-p smg-grpc-client -p engine-zmq-client -p engine-zmq-adapter -p engine-servicer -p mock-worker --features engine-zmq-client/mock-engine" ;;
+            echo "-p smg-grpc-client -p engine-zmq-client -p engine-zmq-adapter -p engine-servicer -p mock-worker -p gateway-perf --features engine-zmq-client/mock-engine" ;;
         kv)
             local selectors
             echo "-p kv-index -p smg-mesh -p smg-mm-rdma"
@@ -215,7 +216,10 @@ run_commands() {
 lint() {
     case "$1" in
         all-features)
-            (set -x; cargo clippy --all-targets --all-features -- -D warnings) ;;
+            (set -x; cargo clippy --all-targets --all-features -- -D warnings)
+            # The workspace's public documentation, every feature on, builds without a warning,
+            # so a moved or renamed item cannot leave a dangling or private link behind.
+            (set -x; RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --all-features) ;;
         # Meaningful only because the gateway crate's self dev-dependency
         # disables default features; see model_gateway/Cargo.toml.
         self-hosted)

@@ -49,6 +49,17 @@
 //!   finish, the empty arguments of a call without an `arguments` member and the chunking rule's
 //!   stated exception are the crate's contract and are not.
 //!
+//! And what is counted as nothing: a marker of the table kept as text in an output the request
+//! ran past the model's own end (`ignore_eos`, `Assignment::past_the_end`). The stop decoder was
+//! told not to stop at the end-of-turn token, the tokens after it are unconstrained, and a marker
+//! among them is the tail's doing, not a frame the table failed to read. The tally knows the
+//! output, not where the model's end fell in it, so every marker of the table kept as text in
+//! such an output is counted apart (`markers_past_the_end`), the model's own answer included,
+//! and an output the request cut by `max_tokens` before the model reached its end reads the
+//! same way; the output is `clean` unless the table refused bytes, which count and write their
+//! line as in any output, and one `debug` line says how many markers the output kept, so a
+//! benchmark that forces every output past its end reads no parse failure from them.
+//!
 //! And, before any output, what did not reach a table at all:
 //!
 //! - `fallback`: a request Symphony was configured for (the gateway's flag, or the request's
@@ -74,10 +85,13 @@
 //! token bucket allows it, one `warn` line: the only allocations. One counted `unknown_tool` adds
 //! the per-reason counters, the first undeclared name cut to [`NAME_SHOWN`] bytes (one small
 //! allocation, made when the call starts) and, from a bucket of its own, one `warn` line; no
-//! histogram observation, the table having read it whole. A run's text is model output and is
+//! histogram observation, the table having read it whole. A marker kept as text in an output run
+//! past the model's end adds one count to the tally and, where the debug level is on, one
+//! `debug` line at the end; nothing otherwise. A run's text is model output and is
 //! never logged, at any level: `at` and `bytes` locate it in the response for a reader with
 //! access to it; the undeclared name on the `unknown_tool` line is the one exception, an
-//! identifier where a declared name was expected. Suppressed calls are counted and write no line.
+//! identifier where a declared name was expected. Suppressed calls are counted and write no line,
+//! and so are the calls a request forbade (`tool_choice: none`), which the reader drops whole.
 //! A request the legacy parsers read under Symphony records one counter increment, through a key
 //! built once per reason and table, and nothing where a table reads. A refused message records
 //! one, through the table's key built once.
@@ -93,7 +107,7 @@ use std::{
 use metrics::{Key, Label, Level, Metadata};
 use parking_lot::Mutex;
 use symphony::{formats::Table, DropReason, Event, FinishReason, MalformedReason};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use super::names::Fallback;
 
@@ -107,6 +121,9 @@ pub(crate) const MALFORMED: &str = "smg_symphony_malformed_total";
 pub(crate) const MALFORMED_BYTES: &str = "smg_symphony_malformed_bytes";
 /// Calls after the first dropped under `parallel_tool_calls: false`, by `table`.
 pub(crate) const CALLS_SUPPRESSED: &str = "smg_symphony_calls_suppressed_total";
+/// Calls the model wrote under `tool_choice: none`, read whole and dropped, by `table`: the
+/// request forbade them, as the engine's own server reads and withholds such a call.
+pub(crate) const CALLS_FORBIDDEN: &str = "smg_symphony_calls_forbidden_total";
 /// Requests Symphony was configured for that the legacy parsers read, by `reason` and `table`
 /// ([`record_fallback`]).
 pub(crate) const FALLBACK: &str = "smg_symphony_fallback_total";
@@ -357,6 +374,9 @@ pub(crate) struct Tally {
     /// shows it; allocated only for an output with one.
     undeclared: Option<Undeclared>,
     suppressed_calls: u32,
+    /// The calls the request forbade (`tool_choice: none`) that the model wrote anyway, each
+    /// read whole and dropped ([`Self::see_forbidden`]).
+    forbidden_calls: u32,
     tool_calls: u32,
     /// The bytes the client was shown: content, reasoning, malformed text kept as content, and
     /// the source of the call events.
@@ -375,9 +395,27 @@ pub(crate) struct Tally {
     /// stream carries it), or the refused call blocks an output that made no call ended in,
     /// from the first of them's opener to the last refused byte, which every surface carries.
     released: u64,
+    /// The output carries an unconstrained tail after the model's own end
+    /// (`Assignment::past_the_end`): a marker of the table kept as text is counted below, not
+    /// as a run.
+    past_the_end: bool,
+    /// The markers of the table kept as text in such an output (the `MarkerOutOfPlace` events,
+    /// of no bytes), for the debug line.
+    markers_past_the_end: u32,
 }
 
 impl Tally {
+    /// The tally of one output; `past_the_end` says the request ran it past the model's own end
+    /// (`Assignment::past_the_end`), so every marker of the table kept as text in it is counted
+    /// apart and is no run: the whole output, the model's own answer included, since the tally
+    /// does not know where the model's end fell.
+    pub(crate) fn new(past_the_end: bool) -> Self {
+        Self {
+            past_the_end,
+            ..Self::default()
+        }
+    }
+
     /// Accounts for `event`, the next of the output; `first_call_only` says whether the reader
     /// drops the calls after the first, which are then counted as suppressed.
     pub(crate) fn see(&mut self, event: &Event, first_call_only: bool) {
@@ -389,6 +427,17 @@ impl Tally {
             }
             Event::ToolCallArguments { source, .. } | Event::ToolCallEnd { source, .. } => {
                 self.shown += source.text.len() as u64;
+            }
+            // A marker of the table kept as text in an output the request ran past the model's
+            // own end: counted apart, never a run. The guard is per output, not per position: a
+            // marker in the model's own answer before its end is counted here too, as is one in
+            // an output `max_tokens` cut before the model reached its end.
+            Event::Malformed {
+                text,
+                why: MalformedReason::MarkerOutOfPlace,
+            } if self.past_the_end => {
+                self.shown += text.text.len() as u64;
+                self.markers_past_the_end += 1;
             }
             Event::Malformed { text, why } => {
                 self.shown += text.text.len() as u64;
@@ -458,11 +507,57 @@ impl Tally {
             Event::Finish {
                 reason, tool_calls, ..
             } => {
-                self.tool_calls = *tool_calls;
+                // The count the client gets: the pass that drops the calls after the first caps
+                // it after this tally sees the event (`event::first_call_only`).
+                self.tool_calls = if first_call_only {
+                    (*tool_calls).min(1)
+                } else {
+                    *tool_calls
+                };
                 self.finish = finish_label(reason);
             }
             Event::ReasoningStart | Event::ReasoningEnd => {}
         }
+        self.at += bytes_of(event);
+    }
+
+    /// Accounts for `event` of an output whose calls the request forbade (`tool_choice: none`):
+    /// the reader drops every call after this tally sees it (`event::forbidden_calls`), so a
+    /// call's bytes count as dropped, not shown, it begins no call the client sees and names no
+    /// undeclared function to it (the `UnknownTool` event announcing its name goes with it), each
+    /// is counted as forbidden, none as suppressed; the finish counts no call, and one the engine
+    /// gave as `tool_calls` is the `stop` the client gets.
+    pub(crate) fn see_forbidden(&mut self, event: &Event) {
+        match event {
+            Event::ToolCallStart { source, .. } => {
+                self.forbidden_calls += 1;
+                self.dropped_wrapping += source.text.len() as u64;
+                self.dropped_tokens += source.tokens.unwrap_or(0);
+            }
+            Event::ToolCallArguments { source, .. } | Event::ToolCallEnd { source, .. } => {
+                self.dropped_wrapping += source.text.len() as u64;
+                self.dropped_tokens += source.tokens.unwrap_or(0);
+            }
+            Event::Malformed {
+                why: MalformedReason::UnknownTool,
+                ..
+            } => {}
+            Event::Finish { reason, .. } => {
+                self.tool_calls = 0;
+                self.finish = finish_label(match reason {
+                    FinishReason::ToolCalls => &FinishReason::Stop,
+                    other => other,
+                });
+            }
+            _ => {
+                self.see(event, false);
+                return;
+            }
+        }
+        // The flags a `Malformed` event sets for the event after it belong to a run this tally
+        // did not see as such: an announced run is never a call's events.
+        self.announced = false;
+        self.naming = false;
         self.at += bytes_of(event);
     }
 
@@ -589,6 +684,11 @@ impl Tally {
             CLEAN
         };
         increment(&series.outputs[outcome], 1);
+        // A forbidden call is counted whatever the outcome: an output of forbidden calls alone
+        // is an empty one for the client, and this counter says why.
+        if self.forbidden_calls > 0 {
+            increment(&series.calls_forbidden, u64::from(self.forbidden_calls));
+        }
         if empty {
             let Some(suppressed_lines) = series.empty_lines.allow() else {
                 return;
@@ -605,11 +705,25 @@ impl Tally {
                 whitespace_bytes = self.dropped_space,
                 wrapper_bytes = self.dropped_wrapping,
                 dropped_tokens = self.dropped_tokens,
+                forbidden_calls = self.forbidden_calls,
                 released_bytes = self.released,
                 suppressed_lines,
                 "Symphony read an output with no text, reasoning or call: whitespace and framing alone, or nothing"
             );
             return;
+        }
+        if self.markers_past_the_end > 0 {
+            debug!(
+                target: "smg::symphony",
+                request_id = who.request_id,
+                choice = who.choice,
+                model = who.model,
+                table,
+                markers = self.markers_past_the_end,
+                finish = self.finish,
+                bytes = self.at,
+                "Symphony kept markers of the table as text in an output the request ran past the model's own end"
+            );
         }
         if malformed == 0 && self.suppressed_calls == 0 {
             return;
@@ -697,15 +811,16 @@ pub(crate) fn record_fallback(why: Fallback, table: Option<&'static str>) {
 
 /// Publishes the series of the table labelled `table` at zero, so a dashboard or an alert finds
 /// `failed`, `malformed` and the rest before the first such output instead of no series at all:
-/// the outcomes, the malformed reasons, the suppressed calls, the refusal, the fallback of a forced
-/// call the table has no tag for, and the empty distribution of the malformed bytes. Called where
-/// the table that reads a model becomes known: by the registration step once a worker of the
-/// model is in the registry (`workflow::steps::shared::register`; the create step resolves the
-/// table); a table published again sets nothing.
+/// the outcomes, the malformed reasons, the suppressed calls, the forbidden calls, the refusal, the
+/// fallback of a forced call the table has no tag for, and the empty distribution of the malformed
+/// bytes. Called where the table that reads a model becomes known: by the registration step once a
+/// worker of the model is in the registry (`workflow::steps::shared::register`; the create step
+/// resolves the table); a table published again sets nothing.
 pub(crate) fn init_table_series(table: &'static str) {
     let series = series(table);
     for key in series.outputs.iter().chain(series.malformed.iter()).chain([
         &series.calls_suppressed,
+        &series.calls_forbidden,
         &series.refused,
         &series.fallback[FORCED_CALL_WITHOUT_TAG],
     ]) {
@@ -757,6 +872,7 @@ struct Series {
     malformed: [Key; REASONS.len()],
     malformed_bytes: Key,
     calls_suppressed: Key,
+    calls_forbidden: Key,
     /// [`FALLBACK`] by reason, in the order of [`FALLBACK_REASONS`]: the series of the table
     /// that had no tag for a forced call, or of `none`, under which the other reasons count.
     fallback: [Key; 5],
@@ -790,6 +906,7 @@ impl Series {
             malformed: REASONS.map(|reason| key(MALFORMED, &[("reason", reason)])),
             malformed_bytes: key(MALFORMED_BYTES, &[]),
             calls_suppressed: key(CALLS_SUPPRESSED, &[]),
+            calls_forbidden: key(CALLS_FORBIDDEN, &[]),
             fallback: FALLBACK_REASONS.map(|reason| key(FALLBACK, &[("reason", reason)])),
             refused: key(REFUSED, &[("reason", REFUSED_TOOL_USE_INPUT)]),
             sampler: Sampler::new(),
@@ -1247,6 +1364,143 @@ mod tests {
         );
     }
 
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_marker_in_an_output_run_past_the_models_end_is_no_run_and_writes_a_debug_line() {
+        // The request ran the output past the model's own end: the two closes the tail wrote
+        // are kept as text like any marker out of place, counted apart from the runs, and the
+        // output is clean. One line says so, at debug.
+        let scrape = rendered(|| {
+            let mut tally = Tally::new(true);
+            tally.see(&Event::Content(Text::uncounted("OK")), false);
+            tally.see(&malformed("", MalformedReason::MarkerOutOfPlace), false);
+            tally.see(&Event::Content(Text::uncounted("</think>OK")), false);
+            tally.see(&malformed("", MalformedReason::MarkerOutOfPlace), false);
+            tally.see(&Event::Content(Text::uncounted("</think>")), false);
+            tally.see(&finished(FinishReason::Length), false);
+            assert_eq!(tally.malformed(), 0);
+            assert_eq!(tally.reasons_seen(), "");
+            assert_eq!(tally.first, None);
+            assert_eq!(tally.markers_past_the_end, 2);
+            assert!(!tally.is_empty());
+            tally.report(
+                "qwen3",
+                Who {
+                    request_id: "req-past-the-end",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+        });
+        let outputs = line_with(&scrape, OUTPUTS, &["table=\"qwen3\"", "outcome=\"clean\""])
+            .expect("the outputs counter");
+        assert!(outputs.ends_with(" 1"), "{outputs}");
+        assert!(
+            line_with(
+                &scrape,
+                OUTPUTS,
+                &["table=\"qwen3\"", "outcome=\"malformed\""]
+            )
+            .is_none_or(|line| line.ends_with(" 0")),
+            "{scrape}"
+        );
+        assert!(!scrape.contains(MALFORMED), "{scrape}");
+        assert!(!scrape.contains(MALFORMED_BYTES), "{scrape}");
+        assert!(!logs_contain("did not read the whole output"));
+        logs_assert(|lines: &[&str]| {
+            let line = lines
+                .iter()
+                .find(|line| line.contains("req-past-the-end"))
+                .ok_or_else(|| "no line for the output".to_string())?;
+            if !line.contains("DEBUG") {
+                return Err(format!("the line is not at debug: {line}"));
+            }
+            for field in [
+                "Symphony kept markers of the table as text in an output the request ran past the model's own end",
+                "markers=2",
+                "finish=\"length\"",
+                "table=\"qwen3\"",
+                "bytes=20",
+                "choice=0",
+            ] {
+                if !line.contains(field) {
+                    return Err(format!("{field} missing from the line: {line}"));
+                }
+            }
+            Ok(())
+        });
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_refused_run_in_an_output_run_past_the_models_end_still_counts_and_warns() {
+        // The tail's marker is counted apart; the region the table gave up on is a run as in
+        // any output: the output is malformed under its reason alone, and the warning stands.
+        let scrape = rendered(|| {
+            let mut tally = Tally::new(true);
+            tally.see(&Event::Content(Text::uncounted("Hello ")), false);
+            tally.see(
+                &malformed("<tool_call>{", MalformedReason::UnterminatedRegion),
+                false,
+            );
+            tally.see(&malformed("", MalformedReason::MarkerOutOfPlace), false);
+            tally.see(&Event::Content(Text::uncounted("</think>")), false);
+            tally.see(&finished(FinishReason::Length), false);
+            assert_eq!(tally.malformed(), 1);
+            assert_eq!(tally.reasons_seen(), "unterminated_region");
+            assert_eq!(tally.markers_past_the_end, 1);
+            tally.report(
+                "qwen3",
+                Who {
+                    request_id: "req-past-the-end-refused",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+        });
+        let outputs = line_with(
+            &scrape,
+            OUTPUTS,
+            &["table=\"qwen3\"", "outcome=\"malformed\""],
+        )
+        .expect("the outputs counter");
+        assert!(outputs.ends_with(" 1"), "{outputs}");
+        let runs = line_with(
+            &scrape,
+            MALFORMED,
+            &["table=\"qwen3\"", "reason=\"unterminated_region\""],
+        )
+        .expect("the reason counter");
+        assert!(runs.ends_with(" 1"), "{runs}");
+        assert!(
+            line_with(
+                &scrape,
+                MALFORMED,
+                &["table=\"qwen3\"", "reason=\"marker_out_of_place\""]
+            )
+            .is_none_or(|line| line.ends_with(" 0")),
+            "{scrape}"
+        );
+        assert!(logs_contain(
+            "Symphony did not read the whole output as content, reasoning and calls"
+        ));
+        assert!(logs_contain("reason=\"unterminated_region\""));
+        assert!(logs_contain("reasons=unterminated_region"));
+        assert!(logs_contain("malformed=1"));
+        assert!(logs_contain("markers=1"));
+    }
+
+    #[test]
+    fn a_tally_not_run_past_the_end_counts_a_marker_as_a_run() {
+        let mut tally = Tally::new(false);
+        tally.see(&Event::Content(Text::uncounted("a")), false);
+        tally.see(&malformed("", MalformedReason::MarkerOutOfPlace), false);
+        tally.see(&Event::Content(Text::uncounted("</think>b")), false);
+        assert_eq!(tally.malformed(), 1);
+        assert_eq!(tally.reasons_seen(), "marker_out_of_place");
+        assert_eq!(tally.markers_past_the_end, 0);
+    }
+
     #[test]
     fn calls_after_the_first_count_as_suppressed_only_when_the_reader_drops_them() {
         let events = [
@@ -1263,7 +1517,9 @@ mod tests {
         }
         assert_eq!(dropping.suppressed_calls, 2);
         assert_eq!(keeping.suppressed_calls, 0);
-        assert_eq!(dropping.tool_calls, 3);
+        // The count the client gets: one call where the reader drops the rest.
+        assert_eq!(dropping.tool_calls, 1);
+        assert_eq!(keeping.tool_calls, 3);
         assert_eq!(dropping.at, 33);
     }
 
@@ -1412,6 +1668,95 @@ mod tests {
         let suppressed = line_with(&scrape, CALLS_SUPPRESSED, &["table=\"qwen3\""])
             .expect("the suppressed counter");
         assert!(suppressed.ends_with(" 1"), "{suppressed}");
+    }
+
+    /// A forbidden call's bytes are dropped, not shown: the text around it decides the outcome,
+    /// the call is counted as forbidden and never as suppressed, begun or undeclared, and the
+    /// finish is the `stop` the client gets.
+    #[test]
+    fn forbidden_calls_are_counted_and_their_bytes_are_dropped_not_shown() {
+        let mut seen = None;
+        let scrape = rendered(|| {
+            let mut tally = Tally::default();
+            tally.see_forbidden(&Event::Content(Text::uncounted("Hello")));
+            tally.see_forbidden(&call_start(0, "<tool_call>"));
+            tally.see_forbidden(&Event::ToolCallEnd {
+                index: 0,
+                source: Text::uncounted("</tool_call>"),
+            });
+            tally.see_forbidden(&malformed("", MalformedReason::UnknownTool));
+            tally.see_forbidden(&call_named(1, "nope", "<tool_call>"));
+            tally.see_forbidden(&Event::Finish {
+                reason: FinishReason::ToolCalls,
+                tool_calls: 2,
+                reasoning_tokens: 0,
+            });
+            tally.report(
+                "qwen3",
+                Who {
+                    request_id: "req-5",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+            seen = Some((
+                tally.shown,
+                tally.calls_begun,
+                tally.forbidden_calls,
+                tally.dropped_wrapping,
+                tally.tool_calls,
+                tally.finish,
+                tally.undeclared_calls(),
+                tally.malformed(),
+                tally.at,
+            ));
+        });
+        assert_eq!(
+            seen,
+            Some((5, 0, 2, 34, 0, "stop", 0, 0, 39)),
+            "shown, calls begun, forbidden, dropped bytes, tool_calls, finish, undeclared, malformed, at"
+        );
+        let outputs = line_with(&scrape, OUTPUTS, &["table=\"qwen3\"", "outcome=\"clean\""])
+            .expect("the outputs counter");
+        assert!(outputs.ends_with(" 1"), "{outputs}");
+        let forbidden = line_with(&scrape, CALLS_FORBIDDEN, &["table=\"qwen3\""])
+            .expect("the forbidden counter");
+        assert!(forbidden.ends_with(" 2"), "{forbidden}");
+        assert!(
+            !scrape.contains(CALLS_SUPPRESSED),
+            "a forbidden call is not a suppressed one: {scrape}"
+        );
+        assert!(
+            !scrape.contains("outcome=\"unknown_tool\""),
+            "a forbidden call to an undeclared function names nothing to the client: {scrape}"
+        );
+    }
+
+    /// An output of forbidden calls alone is an empty one for the client, counted as such, and
+    /// the forbidden counter still says why.
+    #[test]
+    fn an_output_of_forbidden_calls_alone_is_empty_and_still_counts_them() {
+        let scrape = rendered(|| {
+            let mut tally = Tally::default();
+            tally.see_forbidden(&call_start(0, "<tool_call>"));
+            tally.see_forbidden(&call_start(1, "<tool_call>"));
+            tally.see_forbidden(&finish(2));
+            assert!(tally.is_empty(), "the client was shown nothing");
+            tally.report(
+                "qwen3",
+                Who {
+                    request_id: "req-6",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+        });
+        let outputs = line_with(&scrape, OUTPUTS, &["table=\"qwen3\"", "outcome=\"empty\""])
+            .expect("the outputs counter");
+        assert!(outputs.ends_with(" 1"), "{outputs}");
+        let forbidden = line_with(&scrape, CALLS_FORBIDDEN, &["table=\"qwen3\""])
+            .expect("the forbidden counter");
+        assert!(forbidden.ends_with(" 2"), "{forbidden}");
     }
 
     #[test]
@@ -2035,6 +2380,7 @@ mod tests {
             line_with(&scrape, name, labels).is_some_and(|line| line.ends_with(" 0"))
         };
         assert!(zero(CALLS_SUPPRESSED, &["table=\"qwen3\""]), "{scrape}");
+        assert!(zero(CALLS_FORBIDDEN, &["table=\"qwen3\""]), "{scrape}");
         assert!(
             zero(REFUSED, &["table=\"qwen3\"", "reason=\"tool_use_input\""]),
             "{scrape}"

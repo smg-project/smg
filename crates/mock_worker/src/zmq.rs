@@ -203,16 +203,29 @@ pub async fn serve_until(
                     }
                 };
                 if let Some(answer) = scripted {
-                    let want_logprobs = request
+                    // The request's limit ends the answer as it would an
+                    // engine's; the worker default is the canned path's.
+                    let answer = answer.cut_to(
+                        request
+                            .sampling_params
+                            .as_ref()
+                            .map(|params| params.max_tokens)
+                            .filter(|&max| max > 0),
+                    );
+                    // `logprobs: n` asks for the n most likely tokens per
+                    // position beside the sampled one's own column; `0` for
+                    // the sampled one alone; unset for none.
+                    let top_logprobs = request
                         .sampling_params
                         .as_ref()
-                        .is_some_and(|params| params.logprobs.is_some());
+                        .and_then(|params| params.logprobs)
+                        .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
                     let forwarder = forwarders.spawn(scripted_request(
                         request_id.clone(),
                         engine_index,
                         prompt.len(),
                         answer,
-                        want_logprobs,
+                        top_logprobs,
                         out_tx.clone(),
                         engine.clone(),
                         in_flight,
@@ -230,11 +243,12 @@ pub async fn serve_until(
                     }),
                     None => {
                         let delay = cfg.gen_delay;
+                        let prefix = cfg.engine.output_prefix.clone();
                         #[expect(
                             clippy::disallowed_methods,
                             reason = "canned producer self-terminates after Done"
                         )]
-                        let _canned = tokio::spawn(canned_generate(gen_tx, max_new, delay));
+                        let _canned = tokio::spawn(canned_generate(gen_tx, max_new, delay, prefix));
                     }
                 }
 
@@ -349,7 +363,8 @@ async fn forward_request(
 /// the answer's pause before every frame but the first, the prompt's prefill
 /// stats on the first batch, the finish reason and the matched stop on the
 /// last (a batch of its own when the answer has no tokens); the logprobs
-/// ride along when the request asked for them.
+/// ride along when the request asked for them, in the engine's columns
+/// ([`wire_columns`]).
 #[expect(
     clippy::too_many_arguments,
     reason = "one request's wire facts, handed to its forwarder task"
@@ -359,7 +374,7 @@ async fn scripted_request(
     engine_index: u32,
     prompt_len: usize,
     answer: Answer,
-    want_logprobs: bool,
+    top_logprobs: Option<usize>,
     out_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
     engine: Option<Engine>,
     // Held until the last batch is in the funnel: the request's share of
@@ -389,22 +404,17 @@ async fn scripted_request(
         let load = engine
             .as_ref()
             .map(|engine| to_scheduler_stats(&engine.load()));
-        let new_logprobs =
-            (want_logprobs && !frame.ids.is_empty() && frame.logprobs.len() == frame.ids.len())
-                .then(|| Logprobs {
-                    positions: frame
-                        .ids
-                        .iter()
-                        .zip(&frame.logprobs)
-                        .map(|(&token_id, &logprob)| PositionLogprobs {
-                            entries: vec![TokenLogprob {
-                                token_id,
-                                logprob,
-                                rank: 1,
-                            }],
-                        })
-                        .collect(),
-                });
+        let new_logprobs = top_logprobs
+            .filter(|_| !frame.ids.is_empty() && frame.logprobs.len() == frame.ids.len())
+            .map(|n| Logprobs {
+                positions: answer
+                    .top_logprobs(&frame.ids, &frame.logprobs, n.max(1))
+                    .into_iter()
+                    .map(|position| PositionLogprobs {
+                        entries: wire_columns(&position, n),
+                    })
+                    .collect(),
+            });
         let (finish_reason, stop_reason) = if frame.last {
             (
                 Some(map_finish(&answer.finish_reason)),
@@ -427,7 +437,7 @@ async fn scripted_request(
                 prefill_stats: (n == 0).then(|| prefill.clone()),
                 ..Default::default()
             }],
-            scheduler_stats: load.map(Box::new),
+            scheduler_stats: load,
             finished_requests: frame.last.then(|| BTreeSet::from([request_id.clone()])),
             ..Default::default()
         });
@@ -437,19 +447,52 @@ async fn scripted_request(
     }
 }
 
-/// Canned generator for non-realistic mode: emit `output_tokens` synthetic
-/// tokens then a terminal Done.
+/// One position's logprob columns as the engine fills them under
+/// `logprobs: n`: the sampled token's own column first, at its rank among
+/// the candidates (1 on the mock, whose sampled token is always the most
+/// likely), then the `n` ranked columns from rank 1 up, the sampled token in
+/// its ranked column as well (the gateway's shaping skips the repeat). `n`
+/// of 0 leaves the own column alone. `position` holds the candidates in rank
+/// order, the sampled token first: at least that one, at most `max(n, 1)`.
+fn wire_columns(position: &script::TopAlternatives, n: usize) -> Vec<TokenLogprob> {
+    let candidates = position
+        .ids
+        .iter()
+        .copied()
+        .zip(position.values.iter().copied());
+    let own = candidates
+        .clone()
+        .next()
+        .map(|(token_id, logprob)| TokenLogprob {
+            token_id,
+            logprob,
+            rank: 1,
+        });
+    let ranked = candidates
+        .take(n)
+        .enumerate()
+        .map(|(index, (token_id, logprob))| TokenLogprob {
+            token_id,
+            logprob,
+            rank: u32::try_from(index + 1).unwrap_or(u32::MAX),
+        });
+    own.into_iter().chain(ranked).collect()
+}
+
+/// Canned generator for non-realistic mode: emit `output_tokens` tokens (the
+/// configured prefix first, then synthetic ids) then a terminal Done.
 async fn canned_generate(
     gen_tx: mpsc::UnboundedSender<GenEvent>,
     output_tokens: u32,
     gen_delay: Duration,
+    output_prefix: Vec<u32>,
 ) {
     for i in 0..output_tokens {
         if !gen_delay.is_zero() {
             tokio::time::sleep(gen_delay).await;
         }
         let event = GenEvent::Token {
-            token_id: 100 + i,
+            token_id: output_prefix.get(i as usize).copied().unwrap_or(100 + i),
             prompt_tokens: 1,
             cached_tokens: 0,
         };
@@ -482,7 +525,7 @@ fn token_batch(
             finish_reason,
             ..Default::default()
         }],
-        scheduler_stats: scheduler_stats.map(Box::new),
+        scheduler_stats,
         finished_requests,
         ..Default::default()
     })

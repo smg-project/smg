@@ -217,8 +217,10 @@ mod tests {
         text.bytes().map(|byte| u32::from(byte) + 1).collect()
     }
 
+    /// Build an indexed SGLang chunk for forced-tool conversion tests.
     fn chunk_at(index: u32, text: &str) -> proto::GenerateResponse {
         proto::GenerateResponse {
+            media_identity: None,
             request_id: String::new(),
             response: Some(proto::generate_response::Response::Chunk(
                 proto::GenerateStreamChunk {
@@ -230,8 +232,10 @@ mod tests {
         }
     }
 
+    /// Build an indexed terminal response without optional media control metadata.
     fn complete_at(index: u32, finish_reason: &str) -> proto::GenerateResponse {
         proto::GenerateResponse {
+            media_identity: None,
             request_id: String::new(),
             response: Some(proto::generate_response::Response::Complete(
                 proto::GenerateComplete {
