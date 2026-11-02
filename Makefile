@@ -13,14 +13,14 @@ NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 8)
 JOBS ?= $(shell echo $$(($(NPROC) > 16 ? 16 : $(NPROC))))
 
 # Check if sccache is available and set RUSTC_WRAPPER accordingly. The note is printed for the goals that compile (the
-# ones that run cargo or maturin): the help, version and release targets print output that is read as such, and the
-# note would come first in it; a goal that cleans, formats or installs has no compilation for it to precede.
+# ones that build with cargo or maturin): the help, version and release targets print output that is read as such, and
+# the note would come first in it; a goal that cleans, formats or sets up a tool has no compilation for it to precede.
 SCCACHE := $(shell which sccache 2>/dev/null)
 ifdef SCCACHE
     export RUSTC_WRAPPER := $(SCCACHE)
 endif
 COMPILING_GOALS := $(filter build test docs check dev-setup pre-commit python-dev python-build python-build-release \
-    python-install dev install generate-%,$(MAKECMDGOALS))
+    python-install python-check dev install generate-%,$(MAKECMDGOALS))
 ifneq ($(strip $(COMPILING_GOALS)),)
     ifdef SCCACHE
         $(info Using sccache for compilation caching)
