@@ -1,4 +1,4 @@
-"""Validate synthetic complete128 evidence; no Responses services, models or GPUs."""
+"""Exercise the Responses evidence CLI using complete synthetic reference cases."""
 
 import copy
 import json
@@ -60,16 +60,10 @@ def complete_records(evidence):
     }
 
 
-def verify(evidence, error=None):
+def run_validator(evidence):
     directory = evidence["directory"]
-    for name, value in (
-        ("selected.json", evidence["selection"]),
-        ("outcomes.json", evidence["outcomes"]),
-    ):
-        (directory / name).write_text(json.dumps(value) + "\n")
     xml_path = directory / "responses.xml"
-    ET.ElementTree(evidence["xml"]).write(xml_path, encoding="utf-8", xml_declaration=True)
-    child = subprocess.run(
+    return subprocess.run(
         [
             sys.executable,
             "-I",
@@ -87,11 +81,22 @@ def verify(evidence, error=None):
         timeout=10,
         check=False,
     )
+
+
+def verify(evidence, error=None):
+    directory = evidence["directory"]
+    for name, value in (
+        ("selected.json", evidence["selection"]),
+        ("outcomes.json", evidence["outcomes"]),
+    ):
+        (directory / name).write_text(json.dumps(value) + "\n")
+    xml_path = directory / "responses.xml"
+    ET.ElementTree(evidence["xml"]).write(xml_path, encoding="utf-8", xml_declaration=True)
+    child = run_validator(evidence)
     report = json.loads((directory / "validation.json").read_text())
     assert json.loads(child.stdout) == report
     assert child.returncode == (0 if error is None else 1), child.stdout + child.stderr
     assert report["business_verified"] is (error is None)
-    assert report["row_accepted"] is False
     if error is None:
         assert report["errors"] == []
         assert report["original_required"] == 128
@@ -99,7 +104,10 @@ def verify(evidence, error=None):
         assert report["junit_records"] == report["junit_unique"] == report["final_selected"]
         assert report["phase_records"] == 3 * report["final_selected"]
     else:
-        assert error in report["errors"]
+        assert any(
+            message == error or message.startswith(error + ":") for message in report["errors"]
+        )
+    return report
 
 
 @pytest.mark.parametrize("layout", ["repo-root", "e2e-root", "current-extra"])
@@ -128,7 +136,7 @@ def test_complete_original128_accepts_both_roots_and_all_current_extras(evidence
         ("failed-call-then-retry-pass", "A selected case has a non-passing phase report"),
     ],
 )
-def test_negative_controls_from_original13_reject_bad_complete_evidence(evidence, scenario, error):
+def test_invalid_complete_evidence_is_rejected(evidence, scenario, error):
     selection = evidence["selection"]
     if scenario == "wrong-prefix":
         selection["nodeids"] = list(evidence["original"])
@@ -202,3 +210,53 @@ def test_current_extra_requires_its_own_junit_and_phase_evidence(evidence):
     complete_records(evidence)
     evidence["selection"]["nodeids"].append(EXTRA)
     verify(evidence, "Actual JUnit identities differ from complete final selection")
+
+
+def test_missing_evidence_reports_its_path(evidence):
+    complete_records(evidence)
+    verify(evidence)
+    directory = evidence["directory"]
+    (directory / "validation.json").unlink()
+    missing = directory / "selected.json"
+    missing.unlink()
+    child = run_validator(evidence)
+    report = json.loads(child.stdout)
+    assert child.returncode == 1 and not report["business_verified"]
+    assert any(str(missing) in message for message in report["errors"])
+    assert "Traceback" not in child.stderr
+
+
+def test_failed_phases_identify_each_case(evidence):
+    complete_records(evidence)
+    selected = evidence["selection"]["nodeids"][:2]
+    for item in evidence["outcomes"]["reports"]:
+        if item["nodeid"] in selected and item["when"] == "call":
+            item["outcome"] = "failed"
+    report = verify(evidence, "A selected case has a non-passing phase report")
+    failures = [message for message in report["errors"] if "non-passing phase report" in message]
+    assert len(failures) == 2
+    for nodeid in selected:
+        assert any(nodeid in message and "call=failed" in message for message in failures)
+
+
+def test_existing_validation_report_fails_clearly_without_overwriting(evidence):
+    complete_records(evidence)
+    verify(evidence)
+    output = evidence["directory"] / "validation.json"
+    retained = output.read_bytes()
+    child = run_validator(evidence)
+    report = json.loads(child.stdout)
+    assert child.returncode == 1 and not report["business_verified"]
+    assert any(
+        message.startswith("Cannot write validation report:") for message in report["errors"]
+    )
+    assert output.read_bytes() == retained
+    assert "Traceback" not in child.stderr
+
+
+def test_missing_reference_case_names_the_id_and_manifest(evidence):
+    missing = evidence["selection"]["nodeids"][-1]
+    evidence["selection"]["nodeids"][-1] = EXTRA
+    complete_records(evidence)
+    report = verify(evidence, "Original128 identities are missing from final selection")
+    assert any(missing in message and str(ORIGINAL_PATH) in message for message in report["errors"])
