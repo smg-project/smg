@@ -476,28 +476,6 @@ class TestChatCompletionGptOss(TestChatCompletion):
         ],
     )
     @pytest.mark.parametrize("parallel_sample_num", [1, 2])
-    def test_chat_completion(self, model, api_client, logprobs, parallel_sample_num, mock_answers):
-        """Test non-streaming chat completion with logprobs and parallel sampling."""
-        super().test_chat_completion(model, api_client, logprobs, parallel_sample_num, mock_answers)
-
-    @pytest.mark.parametrize(
-        "logprobs",
-        [
-            None,
-            pytest.param(
-                5,
-                marks=pytest.mark.skip_for_runtime(
-                    "tokenspeed",
-                    reason=(
-                        "the engine computes top-k alternatives only for "
-                        "prefill-sampled tokens; a decode step returns none and "
-                        "the request is aborted"
-                    ),
-                ),
-            ),
-        ],
-    )
-    @pytest.mark.parametrize("parallel_sample_num", [1, 2])
     @pytest.mark.skip_for_runtime(
         "trtllm", reason="trtllm may return more top_logprobs than requested in streaming"
     )
