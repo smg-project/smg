@@ -971,6 +971,7 @@ jobs:
               (".github/actions/**",                             FULL),
               (".github/versions/tokenspeed.ref",                TOKENSPEED),
               (".github/versions/tokenspeed-nightly.txt",        TOKENSPEED),
+              (".github/versions/tokenspeed-engine.txt",         TOKENSPEED),
               (".github/**",                                     NONE),
               # the CI scripts: an engine's installers its rows; the agentic services the
               # Responses, Messages and vendor lanes; the scripts of other workflows none;

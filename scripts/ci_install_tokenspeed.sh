@@ -22,10 +22,15 @@ fi
 # Keep the carrier stamp compatible with the image cache tooling. The ref
 # identifies the carrier; the runtime version is the pinned nightly
 # (.github/versions/tokenspeed-nightly.txt, moved by a pull request that its
-# own TokenSpeed lanes gate) unless TOKENSPEED_VERSION names another one.
+# own TokenSpeed lanes gate) unless TOKENSPEED_VERSION names another one; the
+# engine package's version is its own pin (.github/versions/tokenspeed-engine.txt),
+# because the nightly requires that package with a lower bound only and a bare
+# runner would otherwise take the newest engine wheel on the index, built
+# after the runtime it serves. The three files move together.
 TOKENSPEED_REF="${TOKENSPEED_REF:-$(tr -d '[:space:]' < "${REPO_ROOT}/.github/versions/tokenspeed.ref")}"
 TOKENSPEED_VERSION="${TOKENSPEED_VERSION:-$(tr -d '[:space:]' < "${REPO_ROOT}/.github/versions/tokenspeed-nightly.txt")}"
-export TOKENSPEED_VERSION
+TOKENSPEED_ENGINE_VERSION="${TOKENSPEED_ENGINE_VERSION:-$(tr -d '[:space:]' < "${REPO_ROOT}/.github/versions/tokenspeed-engine.txt")}"
+export TOKENSPEED_VERSION TOKENSPEED_ENGINE_VERSION
 TOKENSPEED_PREBUILT_STAMP="${TOKENSPEED_PREBUILT_STAMP:-/opt/smg-ci/tokenspeed.ref}"
 
 # Install uv for faster package management (mirrors ci_install_sglang.sh).
@@ -125,26 +130,33 @@ install_tokenspeed() {
             export PIP_CACHE_DIR="$cache"
         fi
     fi
-    # The exact pin: on the carrier's payload pip finds it installed and
-    # changes nothing; a bare runner installs it from the nightly index.
+    # The exact pins, runtime and engine package in one resolver call so that
+    # neither moves the other: on the carrier's payload pip finds both
+    # installed and changes nothing; a bare runner installs them from the
+    # nightly index.
     requirement="tokenspeed==${TOKENSPEED_VERSION}"
-    echo "Installing ${requirement}"
-    $RETRY 3 10 python3 -m pip install --upgrade "$requirement" \
+    engine_requirement="tokenspeed-engine==${TOKENSPEED_ENGINE_VERSION}"
+    echo "Installing ${requirement} ${engine_requirement}"
+    $RETRY 3 10 python3 -m pip install --upgrade "$requirement" "$engine_requirement" \
         --extra-index-url https://lightseek.org/whl/nightly
     python3 - <<'PY'
 import os
 import re
 from importlib import metadata
 
-version = metadata.version("tokenspeed")
-print(f"Installed tokenspeed=={version}", flush=True)
-nightly = re.fullmatch(r"\d+\.\d+\.\d+\.post(\d{8})", version)
-if nightly is None:
-    raise RuntimeError(f"Expected a dated TokenSpeed nightly, installed {version}")
-expected = os.environ.get("TOKENSPEED_VERSION")
-if expected and version != expected:
-    raise RuntimeError(f"Expected tokenspeed=={expected}, installed {version}")
-print(f"TokenSpeed nightly date: {nightly.group(1)}", flush=True)
+for package, variable in (
+    ("tokenspeed", "TOKENSPEED_VERSION"),
+    ("tokenspeed-engine", "TOKENSPEED_ENGINE_VERSION"),
+):
+    version = metadata.version(package)
+    print(f"Installed {package}=={version}", flush=True)
+    nightly = re.fullmatch(r"\d+\.\d+\.\d+\.post(\d{8})", version)
+    if nightly is None:
+        raise RuntimeError(f"Expected a dated {package} nightly, installed {version}")
+    expected = os.environ.get(variable)
+    if expected and version != expected:
+        raise RuntimeError(f"Expected {package}=={expected}, installed {version}")
+    print(f"{package} nightly date: {nightly.group(1)}", flush=True)
 PY
     # The nightly requires the scheduler package with a lower bound only, so
     # the install above resolves the newest scheduler release, which can be
