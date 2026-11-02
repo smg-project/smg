@@ -20,6 +20,7 @@ from .constants import (
     DEFAULT_HOST,
     DEFAULT_STARTUP_TIMEOUT,
     ENV_SHOW_WORKER_LOGS,
+    ENV_STARTUP_PROFILE,
     ENV_VLLM_SERVICER_IMPL,
     HEALTH_CHECK_INTERVAL,
     LAUNCH_STAGGER_DELAY,
@@ -40,6 +41,7 @@ from .constants import (
     moriio_host,
     profile_startup_timeout,
     sglang_transfer_backend,
+    startup_profile_definition,
     vllm_kv_backend,
     vllm_moriio_backend,
     vllm_moriio_mode,
@@ -1169,10 +1171,13 @@ def worker_startup_timeout(model_id: str, timeout: int = DEFAULT_STARTUP_TIMEOUT
     that registers the same worker needs the same bound for its own wait, so
     both read it here and a term added to one reaches the other.
     """
+    # Prove an opt-in selection before even resolving its model spec.
+    if os.environ.get(ENV_STARTUP_PROFILE, "").strip():
+        get_startup_profile()
     spec = get_model_spec(model_id)
-    original = profile_startup_timeout(model_id, spec.get("tp", 1))
-    if original is not None:
-        return original
+    profile_bound = profile_startup_timeout(model_id, spec.get("tp", 1))
+    if profile_bound is not None:
+        return profile_bound
     return effective_startup_timeout(spec.get("startup_timeout", timeout))
 
 
@@ -1194,11 +1199,8 @@ def validate_startup_profile_worker(
         return
     if type(count) is not int or count != 1:
         raise ValueError(f"{profile} requires exactly one worker group")
-    expected_mode = (
-        mode == ConnectionMode.ZMQ
-        if profile == "vllm-zmq-dp2-chat"
-        else mode in (ConnectionMode.GRPC, ConnectionMode.HTTP)
-    )
+    definition = startup_profile_definition()
+    expected_mode = mode in definition.modes
     if (
         (engine or get_runtime()) != "vllm"
         or not expected_mode
@@ -1211,7 +1213,7 @@ def validate_startup_profile_worker(
     # _build_cmd uses the spec unless an explicit tp was supplied; a process
     # override in get_model_spec must match the frozen TP as well.
     profile_startup_timeout(model_id, spec.get("tp", 1))
-    expected_gpus = actual_tp * (2 if mode == ConnectionMode.ZMQ else 1)
+    expected_gpus = actual_tp * definition.gpu_multiplier
     if gpus is not None and (type(gpus) is not int or gpus != expected_gpus):
         raise ValueError(f"{profile} requires {expected_gpus} GPUs per worker")
     for arg in extra_engine_args or ():

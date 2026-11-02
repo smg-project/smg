@@ -2,7 +2,10 @@
 floor on startup waits."""
 
 import ast
+import importlib
+import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from infra import worker as worker_module
@@ -15,6 +18,7 @@ from infra.constants import (
     get_startup_timeout,
 )
 from infra.model_specs import MODEL_SPECS
+from infra.startup_profile_test_support import set_profile_lane
 from infra.worker import worker_startup_timeout
 
 _SERVICER_WARMUP = (
@@ -101,28 +105,7 @@ def test_a_workers_bound_takes_the_env_floor(monkeypatch):
     assert worker_startup_timeout("slower") == 3600
 
 
-def _original_profile(monkeypatch, profile):
-    from infra import constants as constants_module
-
-    monkeypatch.setattr(constants_module, "_STARTUP_PROFILE_CONTEXT", None)
-    monkeypatch.delenv(ENV_STARTUP_TIMEOUT, raising=False)
-    values = {
-        "E2E_STARTUP_PROFILE": profile,
-        "E2E_ENGINE": "vllm",
-        "E2E_RUNTIME": "vllm",
-        "E2E_GPU_VENDOR": "amd",
-        "E2E_GPU_TIER": "1" if profile == "vllm-zmq-dp2-chat" else "4",
-        "E2E_CONNECTION_MODE": "zmq" if profile == "vllm-zmq-dp2-chat" else "",
-        "E2E_ZMQ_ENGINE_COUNT": "2" if profile == "vllm-zmq-dp2-chat" else "",
-        "TEST_DIRS": "e2e_test/chat_completions",
-        "TEST_FILTER": "",
-        "E2E_MIN_SELECTED": "202" if profile == "vllm-zmq-dp2-chat" else "32",
-    }
-    for key, value in values.items():
-        monkeypatch.setenv(key, value)
-
-
-_ORIGINAL13_MODELS = (
+_ZMQ_DP2_MODELS = (
     "Qwen/Qwen3-30B-A3B",
     "Qwen/Qwen3-4B-Instruct-2507",
     "Qwen/Qwen3-VL-8B-Instruct",
@@ -134,13 +117,13 @@ _ORIGINAL13_MODELS = (
 )
 
 
-def test_original13_all_models_can_run_sequentially_in_one_profile(monkeypatch):
-    _original_profile(monkeypatch, "vllm-zmq-dp2-chat")
-    assert [worker_startup_timeout(model) for model in _ORIGINAL13_MODELS] == [300] * 8
+def test_zmq_dp2_all_models_can_run_sequentially_in_one_profile(monkeypatch):
+    set_profile_lane(monkeypatch, "vllm-zmq-dp2-chat")
+    assert [worker_startup_timeout(model) for model in _ZMQ_DP2_MODELS] == [300] * 8
 
 
-def test_original29_both_models_keep_distinct_frozen_bounds_in_one_process(monkeypatch):
-    _original_profile(monkeypatch, "vllm-4gpu-chat")
+def test_4gpu_both_models_keep_distinct_frozen_bounds_in_one_process(monkeypatch):
+    set_profile_lane(monkeypatch, "vllm-4gpu-chat")
     assert worker_startup_timeout("meta-llama/Llama-4-Scout-17B-16E-Instruct") == 1200
     assert worker_startup_timeout("openai/gpt-oss-120b") == 600
     assert worker_startup_timeout("meta-llama/Llama-4-Scout-17B-16E-Instruct") == 1200
@@ -158,10 +141,9 @@ def test_original29_both_models_keep_distinct_frozen_bounds_in_one_process(monke
     ],
 )
 def test_a_compatible_floor_cannot_extend_a_profile(monkeypatch, profile, floor):
-    _original_profile(monkeypatch, profile)
-    monkeypatch.setenv(ENV_STARTUP_TIMEOUT, floor)
+    set_profile_lane(monkeypatch, profile, floor=floor)
     model, bound = (
-        (_ORIGINAL13_MODELS[0], 300)
+        (_ZMQ_DP2_MODELS[0], 300)
         if profile == "vllm-zmq-dp2-chat"
         else ("openai/gpt-oss-120b", 600)
     )
@@ -169,15 +151,15 @@ def test_a_compatible_floor_cannot_extend_a_profile(monkeypatch, profile, floor)
 
 
 @pytest.mark.parametrize("floor", ["301", "1201", "601", "0", "-1", "bad", "1.5"])
-def test_original13_rejects_extended_or_invalid_floor(monkeypatch, floor):
-    _original_profile(monkeypatch, "vllm-zmq-dp2-chat")
+def test_zmq_dp2_rejects_extended_or_invalid_floor(monkeypatch, floor):
+    set_profile_lane(monkeypatch, "vllm-zmq-dp2-chat")
     monkeypatch.setenv(ENV_STARTUP_TIMEOUT, floor)
     with pytest.raises(ValueError):
-        worker_startup_timeout(_ORIGINAL13_MODELS[0])
+        worker_startup_timeout(_ZMQ_DP2_MODELS[0])
 
 
-def test_original29_rejects_floor61_before_its_shorter_gateway_wait(monkeypatch):
-    _original_profile(monkeypatch, "vllm-4gpu-chat")
+def test_4gpu_rejects_floor61_before_its_shorter_gateway_wait(monkeypatch):
+    set_profile_lane(monkeypatch, "vllm-4gpu-chat")
     monkeypatch.setenv(ENV_STARTUP_TIMEOUT, "61")
     with pytest.raises(ValueError, match="frozen wait"):
         worker_startup_timeout("openai/gpt-oss-120b")
@@ -186,54 +168,52 @@ def test_original29_rejects_floor61_before_its_shorter_gateway_wait(monkeypatch)
 @pytest.mark.parametrize(
     "key,value",
     [
-        ("E2E_STARTUP_PROFILE", "original38-12"),
+        ("E2E_STARTUP_PROFILE", "unsupported-profile"),
         ("E2E_ENGINE", "sglang"),
         ("E2E_RUNTIME", "sglang"),
         ("E2E_GPU_VENDOR", "nvidia"),
         ("E2E_GPU_TIER", "4"),
         ("E2E_CONNECTION_MODE", "grpc"),
         ("E2E_ZMQ_ENGINE_COUNT", "1"),
-        ("TEST_DIRS", "e2e_test/router"),
-        ("TEST_FILTER", "-k subset"),
         ("E2E_MIN_SELECTED", "1"),
     ],
 )
 def test_unknown_or_mismatched_profile_never_falls_back(monkeypatch, key, value):
-    _original_profile(monkeypatch, "vllm-zmq-dp2-chat")
+    set_profile_lane(monkeypatch, "vllm-zmq-dp2-chat")
     monkeypatch.setenv(key, value)
     with pytest.raises(ValueError):
-        worker_startup_timeout(_ORIGINAL13_MODELS[0])
+        worker_startup_timeout(_ZMQ_DP2_MODELS[0])
 
 
 def test_unknown_profile_model_is_rejected_even_with_an_ordinary_spec(monkeypatch):
-    _original_profile(monkeypatch, "vllm-zmq-dp2-chat")
+    set_profile_lane(monkeypatch, "vllm-zmq-dp2-chat")
     monkeypatch.setattr(worker_module, "get_model_spec", lambda _: {"tp": 1})
     with pytest.raises(ValueError, match="no frozen startup contract"):
         worker_startup_timeout("different-model")
 
 
 def test_spec_tp_override_is_rejected_without_changing_the_model_spec(monkeypatch):
-    _original_profile(monkeypatch, "vllm-zmq-dp2-chat")
+    set_profile_lane(monkeypatch, "vllm-zmq-dp2-chat")
     monkeypatch.setattr(worker_module, "get_model_spec", lambda _: {"tp": 2})
     with pytest.raises(ValueError, match="requires TP1"):
-        worker_startup_timeout(_ORIGINAL13_MODELS[0])
+        worker_startup_timeout(_ZMQ_DP2_MODELS[0])
 
 
 @pytest.mark.parametrize("new_value", ["", "vllm-4gpu-chat"])
 def test_selected_profile_cannot_change_in_process(monkeypatch, new_value):
-    _original_profile(monkeypatch, "vllm-zmq-dp2-chat")
-    assert worker_startup_timeout(_ORIGINAL13_MODELS[0]) == 300
+    set_profile_lane(monkeypatch, "vllm-zmq-dp2-chat")
+    assert worker_startup_timeout(_ZMQ_DP2_MODELS[0]) == 300
     monkeypatch.setenv("E2E_STARTUP_PROFILE", new_value)
     with pytest.raises(ValueError):
-        worker_startup_timeout(_ORIGINAL13_MODELS[0])
+        worker_startup_timeout(_ZMQ_DP2_MODELS[0])
 
 
 def test_profile_floor_cannot_change_after_a_model_was_resolved(monkeypatch):
-    _original_profile(monkeypatch, "vllm-zmq-dp2-chat")
-    assert worker_startup_timeout(_ORIGINAL13_MODELS[0]) == 300
+    set_profile_lane(monkeypatch, "vllm-zmq-dp2-chat")
+    assert worker_startup_timeout(_ZMQ_DP2_MODELS[0]) == 300
     monkeypatch.setenv(ENV_STARTUP_TIMEOUT, "1")
     with pytest.raises(ValueError, match="context changed"):
-        worker_startup_timeout(_ORIGINAL13_MODELS[1])
+        worker_startup_timeout(_ZMQ_DP2_MODELS[1])
 
 
 def test_blank_profile_retains_current_model_and_floor_semantics(monkeypatch):
@@ -242,8 +222,203 @@ def test_blank_profile_retains_current_model_and_floor_semantics(monkeypatch):
     monkeypatch.setattr(constants_module, "_STARTUP_PROFILE_CONTEXT", None)
     monkeypatch.setenv("E2E_STARTUP_PROFILE", " ")
     monkeypatch.delenv(ENV_STARTUP_TIMEOUT, raising=False)
-    assert worker_startup_timeout(_ORIGINAL13_MODELS[0]) == 600
+    assert worker_startup_timeout(_ZMQ_DP2_MODELS[0]) == 600
     assert worker_startup_timeout("meta-llama/Llama-4-Scout-17B-16E-Instruct") == 1500
     assert worker_startup_timeout("openai/gpt-oss-120b") == 900
     monkeypatch.setenv(ENV_STARTUP_TIMEOUT, "1800")
     assert worker_startup_timeout("openai/gpt-oss-120b") == 1800
+
+
+def test_declared_profile_literals_preserve_models_lane_and_limits():
+    from infra.constants import ConnectionMode, _STARTUP_PROFILES
+
+    zmq = _STARTUP_PROFILES["vllm-zmq-dp2-chat"]
+    four = _STARTUP_PROFILES["vllm-4gpu-chat"]
+    assert dict(zmq.models) == {model: (300, 1) for model in _ZMQ_DP2_MODELS}
+    assert dict(four.models) == {
+        "meta-llama/Llama-4-Scout-17B-16E-Instruct": (1200, 4),
+        "openai/gpt-oss-120b": (600, 4),
+    }
+    assert dict(zmq.lane) == {
+        "E2E_ENGINE": "vllm",
+        "E2E_RUNTIME": "vllm",
+        "E2E_GPU_VENDOR": "amd",
+        "E2E_GPU_TIER": "1",
+        "E2E_CONNECTION_MODE": "zmq",
+        "E2E_ZMQ_ENGINE_COUNT": "2",
+        "E2E_MIN_SELECTED": "202",
+    }
+    assert dict(four.lane) == {
+        "E2E_ENGINE": "vllm",
+        "E2E_RUNTIME": "vllm",
+        "E2E_GPU_VENDOR": "amd",
+        "E2E_GPU_TIER": "4",
+        "E2E_CONNECTION_MODE": "",
+        "E2E_ZMQ_ENGINE_COUNT": "",
+        "E2E_MIN_SELECTED": "32",
+    }
+    assert (zmq.max_floor, zmq.modes, zmq.gpu_multiplier) == (300, {ConnectionMode.ZMQ}, 2)
+    assert (four.max_floor, four.modes, four.gpu_multiplier) == (
+        60,
+        {ConnectionMode.HTTP, ConnectionMode.GRPC},
+        1,
+    )
+    assert zmq.test_dir == four.test_dir == "e2e_test/chat_completions"
+
+
+@pytest.mark.parametrize("model", _ZMQ_DP2_MODELS)
+def test_zmq_gateway_helper_enforces_real_model_load_bound(monkeypatch, model):
+    setup = importlib.import_module("fixtures.setup_backend")
+    set_profile_lane(monkeypatch, "vllm-zmq-dp2-chat")
+    assert setup._gateway_readiness_timeout(setup.ConnectionMode.ZMQ, model, 60) == 300
+    assert setup._gateway_readiness_timeout(setup.ConnectionMode.ZMQ, model, 300) == 300
+    with pytest.raises(ValueError, match="exceeds frozen wait 300"):
+        setup._gateway_readiness_timeout(setup.ConnectionMode.ZMQ, model, 301)
+
+
+@pytest.mark.parametrize("mode", ["grpc", "http"])
+def test_4gpu_gateway_helper_keeps_short_wait_after_long_worker(monkeypatch, mode):
+    setup = importlib.import_module("fixtures.setup_backend")
+    set_profile_lane(monkeypatch, "vllm-4gpu-chat")
+    for model, worker_bound in [
+        ("meta-llama/Llama-4-Scout-17B-16E-Instruct", 1200),
+        ("openai/gpt-oss-120b", 600),
+    ]:
+        assert worker_startup_timeout(model) == worker_bound
+        assert setup._gateway_readiness_timeout(setup.ConnectionMode(mode), model, 60) == 60
+        with pytest.raises(ValueError, match="exceeds frozen wait 60"):
+            setup._gateway_readiness_timeout(setup.ConnectionMode(mode), model, 61)
+
+
+def test_ordinary_gateway_helper_preserves_model_max_and_environment_floor(monkeypatch):
+    setup = importlib.import_module("fixtures.setup_backend")
+    monkeypatch.delenv("E2E_STARTUP_PROFILE", raising=False)
+    monkeypatch.delenv(ENV_STARTUP_TIMEOUT, raising=False)
+    monkeypatch.setattr(setup, "get_model_spec", lambda _: {"startup_timeout": 600})
+    assert setup._gateway_readiness_timeout(setup.ConnectionMode.ZMQ, "model", 60) == 600
+    assert setup._gateway_readiness_timeout(setup.ConnectionMode.ZMQ, "model", 900) == 900
+    assert setup._gateway_readiness_timeout(setup.ConnectionMode.GRPC, "model", 60) == 60
+    monkeypatch.setenv(ENV_STARTUP_TIMEOUT, "1800")
+    assert setup._gateway_readiness_timeout(setup.ConnectionMode.ZMQ, "model", 900) == 1800
+    assert setup._gateway_readiness_timeout(setup.ConnectionMode.HTTP, "model", 60) == 1800
+
+
+def test_zmq_local_fixture_passes_profile_bound_to_actual_gateway_start(monkeypatch):
+    setup = importlib.import_module("fixtures.setup_backend")
+    set_profile_lane(monkeypatch, "vllm-zmq-dp2-chat")
+    calls = []
+    workers = [SimpleNamespace(base_url="zmq://test-only")]
+    gateway = SimpleNamespace(
+        base_url="http://test-only",
+        shutdown=lambda: calls.append("shutdown"),
+        start=lambda **kwargs: calls.append(kwargs),
+    )
+    monkeypatch.setattr(setup, "_start_workers_tracked", lambda **kwargs: workers)
+    monkeypatch.setattr(setup, "set_class_workers", lambda _: None)
+    monkeypatch.setattr(setup, "clear_class_workers", lambda: None)
+    monkeypatch.setattr(setup, "stop_workers", lambda ws: calls.append(("stop", ws)))
+    monkeypatch.setattr(setup, "_make_openai_client", lambda _: object())
+    generator = setup._setup_local(
+        _ZMQ_DP2_MODELS[0],
+        "model-path",
+        "vllm",
+        setup.ConnectionMode.ZMQ,
+        {},
+        dict(setup._GW_DEFAULTS),
+        gateway,
+        "vllm",
+        None,
+    )
+    next(generator)
+    assert calls[0]["timeout"] == 300
+    assert calls[0]["workers"] is workers
+    assert calls[0]["backend"] == "vllm"
+    generator.close()
+    assert calls[1:] == ["shutdown", ("stop", workers)]
+
+
+@pytest.mark.parametrize("profile", ["vllm-zmq-dp2-chat", "vllm-4gpu-chat"])
+def test_real_pytest_config_binds_chat_selection_without_test_env(monkeypatch, profile):
+    from infra.constants import get_startup_profile
+
+    config = set_profile_lane(monkeypatch, profile)
+    assert "TEST_DIRS" not in os.environ and "TEST_FILTER" not in os.environ
+    assert len(config.args) == 1 and Path(config.args[0]).name == "chat_completions"
+    assert get_startup_profile() == profile
+
+
+@pytest.mark.parametrize(
+    "restriction",
+    [
+        "keyword",
+        "markexpr",
+        "deselect",
+        "ignore",
+        "ignore_glob",
+        "lf",
+        "stepwise",
+        "nodeid",
+        "different-directory",
+        "multiple-directories",
+    ],
+)
+def test_real_pytest_config_rejects_restricted_selection_before_setup(monkeypatch, restriction):
+    chat = Path(__file__).resolve().parents[1] / "chat_completions"
+    args = [str(chat)]
+    options = {
+        "keyword": ["-k", "subset"],
+        "markexpr": ["-m", "e2e"],
+        "deselect": ["--deselect", str(chat / "test_one.py") + "::test_one"],
+        "ignore": ["--ignore", str(chat / "test_one.py")],
+        "ignore_glob": ["--ignore-glob", "*one*"],
+        "lf": ["--lf"],
+        "stepwise": ["--sw"],
+    }
+    if restriction == "nodeid":
+        args = [str(chat) + "::selected"]
+    elif restriction == "different-directory":
+        args = [str(Path(__file__).parent)]
+    elif restriction == "multiple-directories":
+        args += [str(Path(__file__).parent)]
+    else:
+        args += options[restriction]
+    with pytest.raises(ValueError, match="pytest|chat selection"):
+        set_profile_lane(monkeypatch, "vllm-zmq-dp2-chat", args=args)
+
+
+@pytest.mark.parametrize("fault", ["missing-proof", "changed-keyword", "changed-directory"])
+def test_direct_profile_rejects_absent_or_changed_selection_before_preparation(monkeypatch, fault):
+    from infra import constants as constants_module
+
+    config = set_profile_lane(monkeypatch, "vllm-zmq-dp2-chat")
+    if fault == "missing-proof":
+        monkeypatch.setattr(constants_module, "_STARTUP_PROFILE_SELECTION", None)
+    elif fault == "changed-keyword":
+        config.option.keyword = "subset"
+    else:
+        config.args[:] = [str(Path(__file__).parent)]
+    monkeypatch.setattr(worker_module, "get_model_spec", lambda _: pytest.fail("model prepared"))
+    monkeypatch.setattr(worker_module, "get_engine_port", lambda: pytest.fail("port prepared"))
+    with pytest.raises(ValueError, match="pytest"):
+        worker_startup_timeout(_ZMQ_DP2_MODELS[0])
+    with pytest.raises(ValueError, match="pytest"):
+        worker_module.start_workers(
+            _ZMQ_DP2_MODELS[0], engine="vllm", mode=constants_module.ConnectionMode.ZMQ
+        )
+
+
+def test_collection_finish_checks_actual_paths_and_declared_minimum(monkeypatch):
+    hooks = importlib.import_module("fixtures.hooks")
+    config = set_profile_lane(monkeypatch, "vllm-zmq-dp2-chat")
+    reporter = config.pluginmanager.get_plugin("e2e_selection_reporter")
+    chat = Path(__file__).resolve().parents[1] / "chat_completions"
+    item = SimpleNamespace(path=chat / "test_chat.py", nodeid="chat::selected")
+    session = SimpleNamespace(config=config, items=[item] * 202)
+    reporter.pytest_collection_finish(session)
+    session.items = [item] * 201
+    with pytest.raises(pytest.exit.Exception, match="floor of 202"):
+        reporter.pytest_collection_finish(session)
+    session.items = [SimpleNamespace(path=Path(__file__), nodeid="infra::wrong")] * 202
+    with pytest.raises(ValueError, match="outside"):
+        reporter.pytest_collection_finish(session)
+    assert hooks._SelectionReporter is type(reporter)

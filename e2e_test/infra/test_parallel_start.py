@@ -7,6 +7,7 @@ import pytest
 from infra import constants as constants_module
 from infra import worker as worker_module
 from infra.constants import ENV_STARTUP_TIMEOUT, ConnectionMode, WorkerType
+from infra.startup_profile_test_support import set_profile_lane
 
 
 @pytest.fixture
@@ -17,6 +18,7 @@ def launch(monkeypatch):
     monkeypatch.delenv(ENV_STARTUP_TIMEOUT, raising=False)
     monkeypatch.delenv("E2E_STARTUP_PROFILE", raising=False)
     monkeypatch.setattr(constants_module, "_STARTUP_PROFILE_CONTEXT", None)
+    monkeypatch.setattr(constants_module, "_STARTUP_PROFILE_SELECTION", None)
     monkeypatch.setattr(worker_module, "get_gpu_offset", lambda: 0)
     monkeypatch.setattr(worker_module, "get_model_spec", lambda _: {"tp": 1})
     monkeypatch.setattr(worker_module, "detect_ib_device", lambda: None)
@@ -181,27 +183,6 @@ def test_model_timeout_and_environment_floor_apply_to_whole_fleet(launch, monkey
     assert [event[2] for event in events[2:]] == [30, 26]
 
 
-def _original_profile(monkeypatch, profile):
-    from infra import constants as constants_module
-
-    monkeypatch.setattr(constants_module, "_STARTUP_PROFILE_CONTEXT", None)
-    monkeypatch.delenv(ENV_STARTUP_TIMEOUT, raising=False)
-    values = {
-        "E2E_STARTUP_PROFILE": profile,
-        "E2E_ENGINE": "vllm",
-        "E2E_RUNTIME": "vllm",
-        "E2E_GPU_VENDOR": "amd",
-        "E2E_GPU_TIER": "1" if profile == "vllm-zmq-dp2-chat" else "4",
-        "E2E_CONNECTION_MODE": "zmq" if profile == "vllm-zmq-dp2-chat" else "",
-        "E2E_ZMQ_ENGINE_COUNT": "2" if profile == "vllm-zmq-dp2-chat" else "",
-        "TEST_DIRS": "e2e_test/chat_completions",
-        "TEST_FILTER": "",
-        "E2E_MIN_SELECTED": "202" if profile == "vllm-zmq-dp2-chat" else "32",
-    }
-    for key, value in values.items():
-        monkeypatch.setenv(key, value)
-
-
 @pytest.mark.parametrize(
     "profile,model,tp,bound,mode",
     [
@@ -216,7 +197,7 @@ def _original_profile(monkeypatch, profile):
         ("vllm-4gpu-chat", "openai/gpt-oss-120b", 4, 600, ConnectionMode.GRPC),
     ],
 )
-def test_profile_value_reaches_actual_spawn_and_wait_seams(
+def test_profile_value_reaches_worker_spawn_and_wait_arguments(
     launch,
     monkeypatch,
     profile,
@@ -226,7 +207,7 @@ def test_profile_value_reaches_actual_spawn_and_wait_seams(
     mode,
 ):
     events, _ = launch
-    _original_profile(monkeypatch, profile)
+    set_profile_lane(monkeypatch, profile)
     monkeypatch.setattr(
         worker_module, "get_model_spec", lambda _: {"tp": tp, "startup_timeout": 9999}
     )
@@ -261,7 +242,7 @@ def test_profile_value_reaches_actual_spawn_and_wait_seams(
 )
 def test_profile_conflict_fails_before_any_fake_spawn(launch, monkeypatch, options):
     events, _ = launch
-    _original_profile(monkeypatch, "vllm-zmq-dp2-chat")
+    set_profile_lane(monkeypatch, "vllm-zmq-dp2-chat")
     kwargs = {"engine": "vllm", "mode": ConnectionMode.ZMQ, **options}
     with pytest.raises(ValueError):
         worker_module.start_workers("meta-llama/Llama-3.1-8B-Instruct", **kwargs)
@@ -270,7 +251,7 @@ def test_profile_conflict_fails_before_any_fake_spawn(launch, monkeypatch, optio
 
 def test_profile_readiness_failure_still_cleans_up(launch, monkeypatch):
     events, _ = launch
-    _original_profile(monkeypatch, "vllm-4gpu-chat")
+    set_profile_lane(monkeypatch, "vllm-4gpu-chat")
     monkeypatch.setattr(worker_module, "get_model_spec", lambda _: {"tp": 4})
 
     def fail(worker, timeout):

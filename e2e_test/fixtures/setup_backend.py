@@ -42,9 +42,14 @@ from infra import (
     get_runtime,
     launch_cloud_gateway,
 )
-from infra.constants import vllm_kv_backend
+from infra.constants import (
+    ENV_STARTUP_PROFILE,
+    get_startup_profile,
+    startup_profile_definition,
+    vllm_kv_backend,
+)
 from infra.model_specs import get_model_spec
-from infra.worker import stop_workers
+from infra.worker import stop_workers, validate_startup_profile_worker, worker_startup_timeout
 from infra.worker_pool import get_pool
 
 from .hooks import FINALIZED_ZMQ_GATEWAY_KEY, SERVING_CLASS_FAILED_KEY
@@ -117,6 +122,8 @@ def _start_workers_tracked(**kwargs) -> list:
     owns teardown of those.
     """
     engine = kwargs.get("engine") or get_runtime()
+    if os.environ.get(ENV_STARTUP_PROFILE, "").strip():
+        validate_startup_profile_worker(**kwargs)
     try:
         return get_pool().acquire(**kwargs)
     except (TimeoutError, RuntimeError):
@@ -151,8 +158,27 @@ def _gateway_readiness_timeout(
     their model load happens *inside* the gateway's readiness gate, so that gate
     must cover model load too. Use the model's ``startup_timeout`` (what the
     worker gate would have applied), never shrinking an explicitly larger
-    gateway timeout.
+    gateway timeout. An explicit startup profile instead pins its model-load
+    bound and rejects a larger gateway timeout; non-ZMQ profiles retain their
+    separate short gateway wait.
     """
+    profile = get_startup_profile() if os.environ.get(ENV_STARTUP_PROFILE, "").strip() else None
+    if profile is not None:
+        definition = startup_profile_definition()
+        if connection_mode not in definition.modes:
+            raise ValueError(f"{profile} does not permit gateway wire {connection_mode!r}")
+        bound = (
+            worker_startup_timeout(model_id)
+            if connection_mode == ConnectionMode.ZMQ
+            else definition.max_floor
+        )
+        if base_timeout > bound:
+            raise ValueError(
+                f"{profile} gateway timeout {base_timeout!r} exceeds frozen wait {bound}"
+            )
+        if connection_mode == ConnectionMode.ZMQ:
+            return bound
+        return effective_startup_timeout(base_timeout)
     if connection_mode != ConnectionMode.ZMQ:
         return effective_startup_timeout(base_timeout)
     startup_timeout = effective_startup_timeout(
