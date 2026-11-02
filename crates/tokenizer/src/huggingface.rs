@@ -3072,6 +3072,15 @@ mod tests {
         assert_eq!(ids_of(&no_configuration, "<|im_start|>a"), [3, 6, 7]);
     }
 
+    /// The table the gate reads is searched by `binary_search`, so it stays
+    /// strictly sorted in byte order and without repeats; a refresh that
+    /// misplaces an entry fails here instead of falling through to the class
+    /// pipeline.
+    #[test]
+    fn the_reference_s_file_table_is_strictly_sorted() {
+        assert!(super::REFERENCE_READS_AS_FILE.is_sorted_by(|a, b| a < b));
+    }
+
     /// A model type the reference leaves to the named class (`minicpm`,
     /// `zamba2`, or one it has no tokenizer class of its own for) is the
     /// class's too, with the scheme the flags select; a type the reference
