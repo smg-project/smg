@@ -20,11 +20,11 @@ use symphony::{
 };
 
 use super::{
-    eof_tests::{
+    super::*,
+    eof::{
         chat_spec, chat_text, chunk, chunk_with_logprobs, collect_events, complete, dispatch,
         logprob_carriers, processor, scripted_stream, CharacterTokenizer,
     },
-    *,
 };
 use crate::{
     config::ParserChoice,

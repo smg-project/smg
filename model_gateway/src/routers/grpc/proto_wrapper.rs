@@ -1393,7 +1393,7 @@ mod tracked_tests {
     #[tokio::test]
     async fn deferred_prefill_success_requires_its_own_response() {
         use crate::{
-            routers::grpc::regular::streaming::eof_tests::{chunk, scripted_stream},
+            routers::grpc::regular::streaming::tests::eof::{chunk, scripted_stream},
             worker::circuit_breaker::{CircuitBreakerConfig, CircuitState},
         };
         for answered in [false, true] {
@@ -2686,6 +2686,45 @@ mod tests {
     use smg_grpc_client::common_proto as common;
 
     #[test]
+    /// Keep PD references intact and reject metadata the SGLang wire cannot express.
+    fn sglang_media_refs_preserve_video_and_refuse_lossy_conversion() {
+        let mut request = ProtoGenerateRequest::Sglang(Box::default());
+        let refs = vllm::MediaRefs {
+            items: vec![vllm::MediaRef {
+                modality: common::Modality::Video as i32,
+                url: "data:video/mp4;base64,AA==".into(),
+            }],
+        };
+        request.set_media_refs(refs.clone()).unwrap();
+        let decode = request.clone_without_mm_pixels();
+        let ProtoGenerateRequest::Sglang(decode) = decode else {
+            panic!("expected SGLang decode request")
+        };
+        assert_eq!(
+            decode.mm_inputs.as_ref().unwrap().video_urls,
+            ["data:video/mp4;base64,AA=="],
+            "PD decode needs references to expand the same prompt as Prefill"
+        );
+        let ProtoGenerateRequest::Sglang(inner) = &request else {
+            panic!("expected SGLang request")
+        };
+        let mm = inner.mm_inputs.as_ref().unwrap();
+        assert_eq!(mm.video_urls, ["data:video/mp4;base64,AA=="]);
+        assert!(mm.image_urls.is_empty());
+        assert!(mm.pixel_values.is_none());
+        let mut mixed = refs;
+        mixed.items.push(vllm::MediaRef {
+            modality: common::Modality::Image as i32,
+            url: "https://example.test/image.png".into(),
+        });
+        assert!(request
+            .set_media_refs(mixed)
+            .unwrap_err()
+            .contains("single modality"));
+    }
+
+    #[test]
+    /// Account for all inline pixels and raw media across supported engine payloads.
     fn inline_bytes_counts_every_inline_tensor_and_raw_image() {
         let trtllm = MultimodalData::Trtllm(TrtllmMultimodalData {
             image_data: vec![vec![0; 3], vec![0; 5]],
@@ -2693,6 +2732,7 @@ mod tests {
         assert_eq!(trtllm.inline_bytes(), 8);
 
         let sglang = MultimodalData::Sglang(SglangMultimodalData {
+            modality: "image".to_string(),
             image_data: vec![vec![0; 2]],
             pixel_values: vec![0; 16],
             pixel_values_shape: vec![4, 4],
@@ -3116,7 +3156,7 @@ mod watched_tests {
     use crate::{
         routers::{
             common::sse::{sse_channel, SseReceiver},
-            grpc::regular::streaming::eof_tests::{chunk, complete, gated_stream, staged_stream},
+            grpc::regular::streaming::tests::eof::{chunk, complete, gated_stream, staged_stream},
         },
         worker::{BasicWorkerBuilder, Worker},
     };

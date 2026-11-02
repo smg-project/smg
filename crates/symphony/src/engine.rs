@@ -81,6 +81,10 @@ pub struct Engine {
     /// The bytes of the call being assembled, and the ignored terminals that arrived among them
     /// while the assembler held bytes.
     region: Region,
+    /// The buffer a call's assembler fills for one piece before its events are counted and
+    /// placed ([`Self::push_call_events`]): kept between pieces with its room, as a stream's
+    /// caller keeps its event buffer, so a piece inside a call costs no list of its own.
+    scratch: Events<'static>,
 }
 
 /// The bytes of the call region being assembled: how many the assembler took, how many its events
@@ -181,8 +185,10 @@ pub(crate) fn is_strip_space(c: char) -> bool {
 pub(crate) trait CallAssembler: std::fmt::Debug + Send + Sync {
     /// Takes the next bytes of the region and pushes the events they complete; the number of bytes
     /// taken. A JSON syntax stops at its object's end and leaves the rest to the engine, which
-    /// reports it as text after the object; every other syntax takes every byte.
-    fn feed(&mut self, text: &str, declared: &Declared, out: &mut Events) -> usize;
+    /// reports it as text after the object; every other syntax takes every byte. The events may
+    /// borrow `text` for the life of `out` (`'d`): a JSON syntax's argument fragment that lies
+    /// within the bytes is a slice of them, as a text event is a slice of its delta.
+    fn feed<'d>(&mut self, text: &'d str, declared: &Declared, out: &mut Events<'d>) -> usize;
 
     /// The table's ignored terminal arrived inside the call. Its bytes are the engine's to place
     /// ([`Region`]): dropped where it stands when the assembler holds nothing, else placed where
@@ -252,7 +258,7 @@ struct ShapedCall {
 }
 
 impl CallAssembler for ShapedCall {
-    fn feed(&mut self, text: &str, declared: &Declared, out: &mut Events) -> usize {
+    fn feed<'d>(&mut self, text: &'d str, declared: &Declared, out: &mut Events<'d>) -> usize {
         self.call.feed(text, declared, out);
         text.len()
     }
@@ -425,6 +431,7 @@ impl Engine {
             stay: Stay::default(),
             pending: None,
             region: Region::default(),
+            scratch: Events::new(),
         };
         // A table whose output starts inside a call (a bare list of calls, with no marker before
         // it) opens the call here, since no terminal will.
@@ -707,10 +714,30 @@ impl Engine {
                     out.push_content(self.tokens.text(text));
                     return;
                 };
-                let mut assembled = Events::new();
-                let taken = call.feed(&text, &self.declared, &mut assembled);
+                // The assembler's events of this piece fill the engine's own buffer, then go out
+                // counted and placed. A piece the delta carries whole is fed as the delta's bytes,
+                // so a fragment within it borrows them; one the engine held or merged is its own,
+                // and the events that borrow it are taken owned.
+                let taken = match &text {
+                    Cow::Borrowed(piece) => {
+                        let mut assembled: Events<'d> = std::mem::take(&mut self.scratch);
+                        let taken = call.feed(piece, &self.declared, &mut assembled);
+                        self.push_call_events(assembled.consume(), out);
+                        self.scratch = assembled.recycle();
+                        taken
+                    }
+                    Cow::Owned(piece) => {
+                        let mut assembled: Events<'_> = std::mem::take(&mut self.scratch);
+                        let taken = call.feed(piece, &self.declared, &mut assembled);
+                        let owned = assembled
+                            .consume()
+                            .map(|event| -> Event<'d> { event.into_owned() });
+                        self.push_call_events(owned, out);
+                        self.scratch = assembled.recycle();
+                        taken
+                    }
+                };
                 self.region.fed += taken;
-                self.push_call_events(assembled.drain(), out);
                 if taken < text.len() {
                     let rest = part(&text, taken..text.len());
                     self.wrapping(rest, MalformedReason::TextAfterTheArguments, out);
@@ -1135,7 +1162,11 @@ impl Engine {
     /// a request that declares no tools is not asked. An event's bytes are counted as carried out
     /// of the region, with the ignored terminals that arrived among them placed where they
     /// arrived.
-    fn push_call_events<'d>(&mut self, events: Vec<Event<'d>>, out: &mut Events<'d>) {
+    fn push_call_events<'d>(
+        &mut self,
+        events: impl IntoIterator<Item = Event<'d>>,
+        out: &mut Events<'d>,
+    ) {
         for event in events {
             if let Event::ToolCallStart { id, name, .. } = &event {
                 self.calls += 1;

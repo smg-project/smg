@@ -62,7 +62,9 @@ use futures::Stream;
 pub use server::init_tracing;
 pub(crate) use server::{lock, record_error, ServerThread, SharedError, Shutdown};
 pub use servicer_config::ServicerConfig;
-pub use sglang::{SglangModelInfo, SglangServicerConfig, SglangServicerServer};
+pub use sglang::{
+    SglangMediaProcessor, SglangModelInfo, SglangServicerConfig, SglangServicerServer,
+};
 pub use tokenspeed::{TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer};
 use tonic::Status;
 pub use trtllm::{TrtllmModelInfo, TrtllmServicerConfig, TrtllmServicerServer};

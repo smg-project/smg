@@ -124,16 +124,27 @@ impl ChatResponseSpec {
 /// ([`ProviderProfile::parses_tool_calls_without_tools`]). A `tool_choice`
 /// of `none` is the drivers' to check. [`ChatResponseSpec::tools`] is `Some`
 /// exactly then, and Symphony keeps a table's calls exactly then
-/// (`regular::symphony::assign`), so a call the conversation established
-/// without a tool inventory comes back as a call under either parser.
-pub(crate) fn scans_for_tool_calls(request: &ChatCompletionRequest) -> bool {
-    request.declares_tools()
-        || ProviderProfile::for_model(&request.model).parses_tool_calls_without_tools()
+/// (`regular::symphony::assign_for`), so a call the conversation established
+/// without a tool inventory comes back as a call under either parser. `provider`
+/// is the model's profile as the request's preparation derived it once.
+pub(crate) fn scans_for_tool_calls_for(
+    request: &ChatCompletionRequest,
+    provider: ProviderProfile,
+) -> bool {
+    request.declares_tools() || provider.parses_tool_calls_without_tools()
 }
 
 impl From<&ChatCompletionRequest> for ChatResponseSpec {
     fn from(request: &ChatCompletionRequest) -> Self {
-        let provider = ProviderProfile::for_model(&request.model);
+        Self::for_request(request, ProviderProfile::for_model(&request.model))
+    }
+}
+
+impl ChatResponseSpec {
+    /// The spec of `request` under `provider`, its model's profile as the
+    /// request's preparation derived it once; `From` derives the profile for
+    /// a request that carries none.
+    pub(crate) fn for_request(request: &ChatCompletionRequest, provider: ProviderProfile) -> Self {
         Self {
             provider,
             separate_reasoning: request.separate_reasoning,
@@ -144,8 +155,8 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             // not scanned for tool calls: the request declares no tools anywhere
             // (`ChatCompletionRequest::declares_tools`, the one answer every
             // gate reads) and the provider does not parse tool calls without
-            // them (`scans_for_tool_calls`).
-            tools: scans_for_tool_calls(request).then(|| request.shared_tool_list()),
+            // them (`scans_for_tool_calls_for`).
+            tools: scans_for_tool_calls_for(request, provider).then(|| request.shared_tool_list()),
             history_tool_calls_count: request.history_tool_calls_count(),
             stream_options: request.stream_options.clone(),
             first_tool_call_only: request.disables_parallel_tool_calls(),

@@ -22,8 +22,12 @@ pub enum CallFailure {
     /// A rank did not answer within the control deadline.
     Timeout,
     /// The call could not be made or the engine failed it: not connected,
-    /// a connection that carries no control calls, a dead engine.
+    /// a dead engine.
     Failed(String),
+    /// The connection cannot carry the call at all: the engine's wire has no
+    /// control calls (its handshake declared no control reply), so the route
+    /// is answered as for a worker without a control endpoint.
+    Unsupported(String),
 }
 
 /// A worker whose engine connection carries the RL routes as control calls.

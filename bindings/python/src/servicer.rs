@@ -24,11 +24,12 @@ use engine_servicer::{
     BoxFuture, EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
     EncodeRelease, EncoderDispatchErrorReq, MediaError, MediaFeatures, MediaProcessor,
     MediaRequest, ProcessedMedia, ServicerConfig, ServicerError, SglangEncodeDispatcher,
-    SglangModelInfo, SglangServicerConfig, SglangServicerServer, TokenSpeedModelInfo,
-    TokenSpeedServicerConfig, TokenSpeedServicerServer, TrtllmModelInfo, TrtllmServicerConfig,
-    TrtllmServicerServer, VllmModelInfo, VllmServicerConfig, VllmServicerServer, ALL_MODALITIES,
-    DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC, DEFAULT_ENGINE_SILENCE_TIMEOUT,
-    DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT, PIXEL_MODALITIES,
+    SglangMediaProcessor, SglangModelInfo, SglangServicerConfig, SglangServicerServer,
+    TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer, TrtllmModelInfo,
+    TrtllmServicerConfig, TrtllmServicerServer, VllmModelInfo, VllmServicerConfig,
+    VllmServicerServer, ALL_MODALITIES, DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC,
+    DEFAULT_ENGINE_SILENCE_TIMEOUT, DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT,
+    PIXEL_MODALITIES,
 };
 use llm_multimodal::{jpeg_turbo::TurboJpegPolicy, Modality};
 use prost::Message;
@@ -522,6 +523,79 @@ impl MediaProcessor for SmgMediaProcessor {
     }
 }
 
+struct SmgSglangMediaProcessor {
+    pipeline: Arc<WorkerMediaPipeline>,
+    admission: Arc<tokio::sync::Semaphore>,
+}
+
+impl SglangMediaProcessor for SmgSglangMediaProcessor {
+    fn identity_key(&self) -> Option<&str> {
+        self.pipeline.sglang_identity_key()
+    }
+
+    /// Bound preprocessing concurrency through cancellation and preserve typed media errors.
+    fn process(
+        &self,
+        mut request: smg_grpc_client::sglang_proto::GenerateRequest,
+    ) -> BoxFuture<Result<smg_grpc_client::sglang_proto::GenerateRequest, tonic::Status>> {
+        let pipeline = Arc::clone(&self.pipeline);
+        let admission = Arc::clone(&self.admission);
+        Box::pin(async move {
+            let permit = admission
+                .acquire_owned()
+                .await
+                .map_err(|_| tonic::Status::unavailable("media processor is closing"))?;
+            // Keep admission until preprocessing actually finishes, including
+            // when the caller aborts while a blocking decoder is running.
+            let span = tracing::debug_span!(target: "smg_request_timing",
+                "sglang_media", request_id = %request.request_id);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "keep the processing slot until a cancelled caller's decoder actually finishes"
+            )]
+            tokio::spawn(tracing::Instrument::instrument(async move {
+                let _permit = permit;
+
+                let mm = request.mm_inputs.take()
+                    .ok_or_else(|| tonic::Status::invalid_argument("missing media references"))?;
+                if mm.pixel_values.is_some() || !mm.model_specific_tensors.is_empty()
+                    || !mm.image_data.is_empty() || !mm.video_data.is_empty()
+                    || !mm.audio_urls.is_empty() || !mm.audio_data.is_empty()
+                    || (!mm.image_urls.is_empty() && !mm.video_urls.is_empty()) {
+                    return Err(tonic::Status::invalid_argument("SGLang references require one image or video modality without tensors or raw media"));
+                }
+                let (modality, urls) = if mm.video_urls.is_empty() {
+                    (Modality::Image, mm.image_urls)
+                } else {
+                    (Modality::Video, mm.video_urls)
+                };
+                let items = urls.into_iter().map(|url| WorkerMediaItem {
+                    modality, url,
+                }).collect::<Vec<_>>();
+                let tokenized = request.tokenized.as_mut()
+                    .ok_or_else(|| tonic::Status::invalid_argument("media references require tokenized input"))?;
+                let (tokens, inputs) = pipeline.process_sglang(
+                    std::mem::take(&mut tokenized.input_ids), &items,
+                ).await.map_err(|error| match error {
+                    WorkerMediaError::Invalid(message) => tonic::Status::invalid_argument(message),
+                    WorkerMediaError::Internal(message) => tonic::Status::internal(message),
+                    WorkerMediaError::Media { fault, code, message } => {
+                        smg_grpc_client::stamp_media_code(
+                            fault.stamp(match fault {
+                                smg_grpc_client::WorkerMediaFault::Client => tonic::Status::invalid_argument(message),
+                                smg_grpc_client::WorkerMediaFault::Transient => tonic::Status::unavailable(message),
+                            }), code.as_str(),
+                        )
+                    }
+                })?;
+                tokenized.input_ids = tokens;
+                request.mm_inputs = Some(inputs);
+                Ok(request)
+            }, span)).await.map_err(|error| tonic::Status::internal(format!("media task: {error}")))?
+        })
+    }
+}
+
 /// The settings the launcher passes as `smg_media_processor`, by key; the
 /// pipeline itself is built off the GIL once the tokenizer is loaded.
 struct NativeMediaOptions {
@@ -608,6 +682,7 @@ fn native_media_options(
     Ok(NativeMediaOptions {
         settings: WorkerMediaSettings {
             model_dir: required("model_dir")?,
+            tokenizer_dir: None,
             model_id: required("model_id")?,
             served_model_name: Some(served_model_name.to_string()),
             pixel_format: if raw_pixels {
@@ -686,6 +761,7 @@ impl PyVllmGrpcServer {
         max_num_seqs = 0,
         engine_reasoning_parser = String::new(),
         constrained_decoding_start = String::new(),
+        structural_tag_vocabulary = String::new(),
         log_stats = None,
         media_processor = None,
         smg_media_processor = None,
@@ -739,6 +815,7 @@ impl PyVllmGrpcServer {
         max_num_seqs: i32,
         engine_reasoning_parser: String,
         constrained_decoding_start: String,
+        structural_tag_vocabulary: String,
         log_stats: Option<bool>,
         media_processor: Option<Bound<'_, PyAny>>,
         smg_media_processor: Option<Bound<'_, PyDict>>,
@@ -799,6 +876,7 @@ impl PyVllmGrpcServer {
             max_num_seqs,
             engine_reasoning_parser,
             constrained_decoding_start,
+            structural_tag_vocabulary,
             log_stats,
         };
         let servicer = ServicerConfig {
@@ -1361,6 +1439,7 @@ impl PyTrtllmGrpcServer {
         context_parallel_size = 0,
         data_parallel_size = 1,
         guided_decoding_backend = String::new(),
+        structural_tag_vocabulary = String::new(),
         max_running_requests = 0,
         kv_events_endpoint = String::new(),
         kv_events_replay_endpoint = String::new(),
@@ -1397,6 +1476,7 @@ impl PyTrtllmGrpcServer {
         context_parallel_size: i32,
         data_parallel_size: i32,
         guided_decoding_backend: String,
+        structural_tag_vocabulary: String,
         max_running_requests: i32,
         kv_events_endpoint: String,
         kv_events_replay_endpoint: String,
@@ -1426,6 +1506,7 @@ impl PyTrtllmGrpcServer {
             context_parallel_size,
             data_parallel_size,
             guided_decoding_backend,
+            structural_tag_vocabulary,
             max_running_requests,
             kv_events_endpoint,
             kv_events_replay_endpoint,
@@ -1577,6 +1658,7 @@ impl PySglangGrpcServer {
         kv_events_replay_endpoint = String::new(),
         kv_events_topic = String::new(),
         encode_dispatcher = None,
+        smg_media_processor = None,
         engine_startup_timeout_secs = None,
         engine_startup_ceiling_secs = None,
         engine_silence_timeout_secs = None,
@@ -1618,6 +1700,7 @@ impl PySglangGrpcServer {
         kv_events_replay_endpoint: String,
         kv_events_topic: String,
         encode_dispatcher: Option<Bound<'_, PyAny>>,
+        smg_media_processor: Option<Bound<'_, PyDict>>,
         engine_startup_timeout_secs: Option<f64>,
         engine_startup_ceiling_secs: Option<f64>,
         engine_silence_timeout_secs: Option<f64>,
@@ -1631,6 +1714,14 @@ impl PySglangGrpcServer {
                 bridge: Arc::new(bridge.unbind()),
             }) as Arc<dyn SglangEncodeDispatcher>
         });
+        let native = smg_media_processor
+            .map(|options| {
+                native_media_options(
+                    &options,
+                    served_model_name.as_deref().unwrap_or(&model_path),
+                )
+            })
+            .transpose()?;
         let model = SglangModelInfo {
             served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
             tokenizer_path: tokenizer_path.unwrap_or_else(|| model_path.clone()),
@@ -1671,14 +1762,55 @@ impl PySglangGrpcServer {
             engine_prefill_tokens_per_sec: prefill_tokens_per_sec(engine_prefill_tokens_per_sec)?,
             metrics_bind_address,
         };
-        let config = SglangServicerConfig {
+        let mut config = SglangServicerConfig {
             servicer,
             model,
             encode_dispatcher,
+            media_processor: None,
         };
-        let inner = py
-            .detach(|| SglangServicerServer::start(config))
-            .map_err(to_py_err)?;
+        let inner = py.detach(|| -> PyResult<SglangServicerServer> {
+            if let Some(native) = native {
+                if !matches!(
+                    native.settings.encoder_dtype.as_str(),
+                    "float32" | "bfloat16" | "float16"
+                ) {
+                    return Err(PyValueError::new_err(
+                        "SGLang media dtype must be float32, bfloat16 or float16",
+                    ));
+                }
+                if native.max_inflight > tokio::sync::Semaphore::MAX_PERMITS {
+                    return Err(PyValueError::new_err(
+                        "media max_inflight exceeds the semaphore limit",
+                    ));
+                }
+                let dir = config.servicer.tokenizer_dir.as_ref().ok_or_else(|| {
+                    PyValueError::new_err("smg media processing requires tokenizer_dir")
+                })?;
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+                let pipeline = runtime
+                    .block_on(async {
+                        let tokenizer = llm_tokenizer::factory::create_tokenizer_async(dir).await?;
+                        let mut settings = native.settings;
+                        settings.tokenizer_dir = Some(dir.clone());
+                        WorkerMediaPipeline::new_sglang(settings, tokenizer).await
+                    })
+                    .map_err(|error| PyValueError::new_err(format!("{error:#}")))?;
+                if !matches!(pipeline.spec_name(), "glm53_flash" | "minimax_m3") {
+                    return Err(PyValueError::new_err(format!(
+                        "SGLang smg media processing currently supports GLM-5.3-Flash and MiniMax-M3; got {}",
+                        pipeline.spec_name()
+                    )));
+                }
+                config.media_processor = Some(Arc::new(SmgSglangMediaProcessor {
+                    pipeline: Arc::new(pipeline),
+                    admission: Arc::new(tokio::sync::Semaphore::new(native.max_inflight)),
+                }));
+            }
+            SglangServicerServer::start(config).map_err(to_py_err)
+        })?;
         Ok(Self { inner })
     }
 

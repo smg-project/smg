@@ -17,7 +17,7 @@ use crate::routers::{
     grpc::{
         common::responses::streaming::ResponseStreamEventEmitter,
         context,
-        regular::streaming::eof_tests::{complete, gated_stream, scripted_stream},
+        regular::streaming::tests::eof::{complete, gated_stream, scripted_stream},
     },
 };
 

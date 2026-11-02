@@ -17,6 +17,7 @@ use openai_protocol::{
     embedding::{EmbeddingRequest, EmbeddingResponse},
     generate::{GenerateRequest, GenerateResponse},
     messages::{CreateMessageRequest, Message},
+    profile::ProviderProfile,
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
@@ -42,7 +43,7 @@ use super::{
     },
     regular::stages::decisions::scoring::{DecisionPrompt, DecisionScoring},
     spec::ResponseSpec,
-    utils::{ParserResolver, WorkerDecoding},
+    utils::{Names, ParserResolver, WorkerDecoding},
 };
 use crate::{
     config::ParserChoice,
@@ -234,6 +235,21 @@ pub(crate) struct ProcessingState {
     /// otherwise, which the response reports as `x-smg-parser`. `None` on the other endpoints,
     /// which keep the legacy parsers.
     pub parser: Option<ParserChoice>,
+
+    /// The parser names the request's model's cards set (its workers' labels), resolved once
+    /// in preparation (`reading::prepare`: one resolution, a walk over the model's workers per
+    /// name) and read by request building in its place (`reading::reasoning_decision`,
+    /// `reading::decide`, `backed_plan::build`): one resolution for preparation and request
+    /// building. The response stages (`processor`, `streaming`) still resolve their two names
+    /// themselves; they are the next read. `None` on the endpoints whose preparation resolves
+    /// no names; a read then resolves them itself.
+    pub parser_names: Option<Names>,
+
+    /// The provider profile of the request's model (`ProviderProfile::for_model`), derived once
+    /// by the chat and Messages preparations and read by the later stages in place of a
+    /// derivation of their own (the output budget, the constraint's tool-call reading, the
+    /// response spec). `None` on the other endpoints; a read then derives it itself.
+    pub provider: Option<ProviderProfile>,
 
     /// Owned here rather than inside `PreparationOutput` so EPD's `EncodeStage`
     /// can borrow it for the with-pixels encode serialization before request
@@ -1695,6 +1711,61 @@ mod tests {
             Ok(_) => panic!("the output was there"),
             Err(failure) => failure,
         }
+    }
+
+    /// A disaggregated selection's wire is the prefill side's, which builds
+    /// the request: a direct-ZMQ prefill worker pins the plan to the ZMQ wire
+    /// of the pair's runtime whatever the decode side's transport, and a gRPC
+    /// prefill worker to gRPC.
+    #[test]
+    fn a_disaggregated_selections_wire_is_the_prefill_sides() {
+        use crate::worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType};
+
+        let worker = |url: &str, mode: ConnectionMode, role: WorkerType| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .connection_mode(mode)
+                    .runtime_type(RuntimeType::TokenSpeed)
+                    .worker_type(role)
+                    .build(),
+            )
+        };
+        let pair =
+            |prefill: Arc<dyn Worker>, decode: Arc<dyn Worker>| WorkerSelection::Disaggregated {
+                encode_assignments: None,
+                prefill,
+                decode,
+                runtime_type: RuntimeType::TokenSpeed,
+            };
+
+        let zmq_prefill = pair(
+            worker(
+                "ipc:///tmp/prefill.ipc",
+                ConnectionMode::Zmq,
+                WorkerType::Prefill,
+            ),
+            worker("grpc://decode:1", ConnectionMode::Grpc, WorkerType::Decode),
+        );
+        let wire = WireConstraint::of(&zmq_prefill, false, PipelinePin::Any);
+        assert_eq!(wire.connection, ConnectionMode::Zmq);
+        assert_eq!(wire.runtime, RuntimeType::TokenSpeed);
+        assert!(!wire.requires_media_refs);
+
+        let grpc_prefill = pair(
+            worker(
+                "grpc://prefill:1",
+                ConnectionMode::Grpc,
+                WorkerType::Prefill,
+            ),
+            worker(
+                "ipc:///tmp/decode.ipc",
+                ConnectionMode::Zmq,
+                WorkerType::Decode,
+            ),
+        );
+        let wire = WireConstraint::of(&grpc_prefill, true, PipelinePin::Any);
+        assert_eq!(wire.connection, ConnectionMode::Grpc);
+        assert!(wire.requires_media_refs);
     }
 
     #[tokio::test]

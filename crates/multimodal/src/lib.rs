@@ -9,6 +9,7 @@ pub mod hasher;
 pub mod hub;
 pub mod jpeg_turbo;
 pub mod media;
+pub mod minimax_resize;
 mod mp4_metadata;
 #[cfg(feature = "opencv-video")]
 mod opencv_buffer;

@@ -6,6 +6,9 @@ use llm_tokenizer::{
     chat_template::{ThinkingKeyName, ThinkingToggle},
     traits::Tokenizer,
 };
+/// The structural-tag vocabulary label lives beside `ConstrainedDecoding` in the
+/// protocol crate; it is re-exported here, where the routers read it.
+pub use openai_protocol::worker::TagVocabulary;
 use openai_protocol::{
     chat::{thinking_from_reasoning_effort, ChatCompletionRequest},
     model_card::ModelCard,
@@ -156,6 +159,44 @@ impl ParserResolver {
         }
     }
 
+    /// [`Self::names`] for a request whose preparation resolved the card names once
+    /// (`ProcessingState::parser_names`): `resolved` as they were then, with the flags, and no
+    /// second walk over the model's workers; `None` resolves them now, as [`Self::names`] does.
+    pub(crate) fn names_for(&self, resolved: Option<&Names>, model: &str) -> ModelNames<'_> {
+        ModelNames {
+            labels: resolved.map_or_else(|| self.card_names(model), Names::clone),
+            flags: &self.flags,
+        }
+    }
+
+    /// [`Self::tool_parser`] for a request whose card names were resolved once
+    /// ([`Self::names_for`]).
+    pub(crate) fn tool_parser_for(&self, resolved: Option<&Names>, model: &str) -> Option<String> {
+        match resolved {
+            Some(names) => names
+                .tool
+                .clone()
+                .or_else(|| self.legacy_flags.tool.clone()),
+            None => self.tool_parser(model),
+        }
+    }
+
+    /// [`Self::reasoning_parser`] for a request whose card names were resolved once
+    /// ([`Self::names_for`]).
+    pub(crate) fn reasoning_parser_for(
+        &self,
+        resolved: Option<&Names>,
+        model: &str,
+    ) -> Option<String> {
+        match resolved {
+            Some(names) => names
+                .reasoning
+                .clone()
+                .or_else(|| self.legacy_flags.reasoning.clone()),
+            None => self.reasoning_parser(model),
+        }
+    }
+
     /// The names `model`'s own cards set (worker labels), without the process-wide fallback:
     /// what the workers say of the model, each `None` when no card names one.
     fn card_names(&self, model: &str) -> Names {
@@ -301,9 +342,10 @@ pub(crate) fn extract_thinking_from_kwargs(
         Some(ThinkingKeyName::EnableThinking) => {
             kwargs?.get("enable_thinking").and_then(Value::as_bool)
         }
-        // Renderers that honour vLLM's `enable_thinking` alias (DeepSeek-V4.1)
-        // read it too; `thinking` wins when both are present (the renderer
-        // rejects a disagreeing pair before anything is dispatched).
+        // Renderers that honour vLLM's `enable_thinking` alias (DeepSeek-V3.2,
+        // V4 and V4.1) read it too; `thinking` wins when both are present, the
+        // order their shims render in (V3.2 and V4 resolve a disagreeing pair
+        // silently that way; V4.1 rejects it before anything is dispatched).
         Some(ThinkingKeyName::Thinking) => {
             let kwargs = kwargs?;
             kwargs.get("thinking").and_then(Value::as_bool).or_else(|| {
@@ -478,6 +520,25 @@ pub fn chat_reasoning_starts_in_rendered_prefill(
     continued_final_message: bool,
     tokenizer: &dyn Tokenizer,
 ) -> bool {
+    chat_reasoning_starts_in_rendered_prefill_for(
+        request,
+        ProviderProfile::for_model(&request.model),
+        generation_prompt,
+        continued_final_message,
+        tokenizer,
+    )
+}
+
+/// [`chat_reasoning_starts_in_rendered_prefill`] with the model's provider
+/// profile already derived: the preparation stage derives it once per request
+/// and the later reads take that copy.
+pub fn chat_reasoning_starts_in_rendered_prefill_for(
+    request: &ChatCompletionRequest,
+    provider: ProviderProfile,
+    generation_prompt: bool,
+    continued_final_message: bool,
+    tokenizer: &dyn Tokenizer,
+) -> bool {
     if !generation_prompt && !continued_final_message {
         return false;
     }
@@ -487,7 +548,7 @@ pub fn chat_reasoning_starts_in_rendered_prefill(
         request.thinking_toggle(),
         continued_final_message,
         tokenizer,
-        ProviderProfile::for_model(&request.model),
+        provider,
     )
 }
 
@@ -498,8 +559,25 @@ pub fn chat_reasoning_starts_in_rendered_prefill(
 /// message with text and no tool call is continued where the template can).
 /// `output_config.effort` is the `reasoning_effort` the template renders, as
 /// a Chat request's effective effort is.
+#[cfg(test)]
 pub fn messages_reasoning_starts_in_prefill(
     request: &openai_protocol::messages::CreateMessageRequest,
+    continued_final_message: bool,
+    tokenizer: &dyn Tokenizer,
+) -> bool {
+    messages_reasoning_starts_in_prefill_for(
+        request,
+        ProviderProfile::for_model(&request.model),
+        continued_final_message,
+        tokenizer,
+    )
+}
+
+/// [`messages_reasoning_starts_in_prefill`] with the model's provider profile
+/// already derived (the preparation stage derives it once per request).
+pub fn messages_reasoning_starts_in_prefill_for(
+    request: &openai_protocol::messages::CreateMessageRequest,
+    provider: ProviderProfile,
     continued_final_message: bool,
     tokenizer: &dyn Tokenizer,
 ) -> bool {
@@ -509,7 +587,7 @@ pub fn messages_reasoning_starts_in_prefill(
         request.thinking_toggle(),
         continued_final_message,
         tokenizer,
-        ProviderProfile::for_model(&request.model),
+        provider,
     )
 }
 
@@ -517,39 +595,6 @@ pub fn messages_reasoning_starts_in_prefill(
 /// that ends inside the model's thinking block ([`WorkerDecoding::start`]).
 pub fn grammar_start_for(workers: Option<&WorkerSelection>) -> GrammarStart {
     WorkerDecoding::of(workers).start
-}
-
-/// The vocabulary of structural-tag nodes a worker's grammar compiler
-/// takes, from its `structural_tag_vocabulary` label: the current one unless
-/// the label says `older`, for a compiler that predates the `optional`,
-/// `plus` and `star` nodes and refuses a tag that carries one. The tables'
-/// tags go to such a worker spelled without them
-/// (`Grammar::in_older_vocabulary`), the same language, which every compiler
-/// takes; a worker without the label gets the tag as the table built it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum TagVocabulary {
-    /// Every node the tables use.
-    #[default]
-    Current,
-    /// Without the `optional`, `plus` and `star` nodes; a `token` node stays
-    /// as derived.
-    Older,
-}
-
-impl TagVocabulary {
-    /// The worker label that carries it.
-    pub const LABEL: &'static str = "structural_tag_vocabulary";
-    /// The label's value for [`Self::Older`].
-    pub const OLDER: &'static str = "older";
-
-    /// The vocabulary a worker's `structural_tag_vocabulary` label names;
-    /// anything else, the label's absence included, is [`Self::Current`].
-    pub fn from_label(value: Option<&str>) -> Self {
-        match value {
-            Some(Self::OLDER) => Self::Older,
-            _ => Self::Current,
-        }
-    }
 }
 
 /// The selected worker's constrained decoding; under PD the decode worker's,
@@ -585,16 +630,14 @@ impl WorkerDecoding {
         }
     }
 
+    /// The worker's labels as its metadata parsed them at construction
+    /// (`WorkerMetadata::decoding`): no lookup on a request path.
     fn of_worker(worker: &dyn Worker) -> Self {
-        let spec = &worker.metadata().spec;
+        let labels = worker.metadata().decoding;
         Self {
-            policy: ConstrainedDecoding::of(spec),
-            start: GrammarStart::from_label(
-                spec.labels.get(GrammarStart::LABEL).map(String::as_str),
-            ),
-            vocabulary: TagVocabulary::from_label(
-                spec.labels.get(TagVocabulary::LABEL).map(String::as_str),
-            ),
+            policy: labels.policy,
+            start: labels.start,
+            vocabulary: labels.vocabulary,
         }
     }
 
@@ -2183,6 +2226,49 @@ mod parser_resolver_tests {
             .build();
         registry.register(Arc::new(worker));
         registry
+    }
+
+    /// A request's card names, resolved once in preparation, are what the later reads take: the
+    /// names as resolved then with the legacy flags behind them, and no second walk over the
+    /// model's workers (a card registered after the resolution does not move them); a read with
+    /// nothing resolved walks the cards as before.
+    #[test]
+    fn names_resolved_once_are_read_in_place_of_the_cards() {
+        let registry = registry_with_card(ModelCard::new("m").with_tool_parser("json"));
+        let resolver =
+            ParserResolver::with_flags(Arc::clone(&registry), None, Some("qwen3".to_string()));
+        let resolved = resolver.names("m").labels;
+        assert_eq!(resolved.tool.as_deref(), Some("json"));
+        let later = BasicWorkerBuilder::new("http://w2:8000")
+            .model(ModelCard::new("m").with_tool_parser("alpha"))
+            .worker_type(WorkerType::Regular)
+            .build();
+        registry.register(Arc::new(later));
+        let read = resolver.names_for(Some(&resolved), "m");
+        assert_eq!(read.labels, resolved);
+        assert_eq!(read.flags, &resolver.flags);
+        assert_eq!(
+            resolver.tool_parser_for(Some(&resolved), "m").as_deref(),
+            Some("json")
+        );
+        assert_eq!(
+            resolver
+                .reasoning_parser_for(Some(&resolved), "m")
+                .as_deref(),
+            Some("qwen3")
+        );
+        assert_eq!(
+            resolver.names_for(None, "m").labels.tool.as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(
+            resolver.tool_parser_for(None, "m").as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(
+            resolver.reasoning_parser_for(None, "m").as_deref(),
+            Some("qwen3")
+        );
     }
 
     #[test]

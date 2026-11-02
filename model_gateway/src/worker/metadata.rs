@@ -7,8 +7,9 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use openai_protocol::{
     model_card::ModelCard,
     model_type::{Endpoint, ModelType},
-    worker::{HealthCheckConfig, ProviderType, WorkerSpec},
+    worker::{ConstrainedDecoding, HealthCheckConfig, ProviderType, TagVocabulary, WorkerSpec},
 };
+use tool_parser::GrammarStart;
 
 use super::{
     overload::OverloadThresholds, pd_pairing::PdPairing, WorkerError, WorkerResult,
@@ -73,6 +74,42 @@ pub struct WorkerMetadata {
     /// value. Empty for a worker that was not discovered (a mesh import, a
     /// test fixture).
     pub discovered_labels: Arc<HashMap<String, String>>,
+    /// The worker's constrained-decoding labels (`constrained_decoding`,
+    /// `constrained_decoding_start`, `structural_tag_vocabulary`), parsed
+    /// once at construction: request building reads them for every worker
+    /// of the model on every request, so nothing on a request path looks a
+    /// label up.
+    pub decoding: DecodingLabels,
+}
+
+/// A worker's constrained-decoding labels as the routers read them, parsed
+/// once from its spec at construction ([`WorkerMetadata::decoding`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DecodingLabels {
+    /// Whether the engine constrains every turn or only the requested ones
+    /// (the spec's `constrained_decoding` field, else its label).
+    pub policy: ConstrainedDecoding,
+    /// Where the engine starts a grammar (the `constrained_decoding_start`
+    /// label; unknown without one).
+    pub start: GrammarStart,
+    /// The vocabulary of structural-tag nodes its grammar compiler takes
+    /// (the `structural_tag_vocabulary` label; the current one without one).
+    pub vocabulary: TagVocabulary,
+}
+
+impl DecodingLabels {
+    /// The labels of `spec`, read once.
+    pub fn of(spec: &WorkerSpec) -> Self {
+        Self {
+            policy: ConstrainedDecoding::of(spec),
+            start: GrammarStart::from_label(
+                spec.labels.get(GrammarStart::LABEL).map(String::as_str),
+            ),
+            vocabulary: TagVocabulary::from_label(
+                spec.labels.get(TagVocabulary::LABEL).map(String::as_str),
+            ),
+        }
+    }
 }
 
 impl WorkerMetadata {

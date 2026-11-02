@@ -171,11 +171,27 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          closed",
     ),
     (
+        "deepseek-v3.2-exp/render/text-developer-role",
+        "the gateway renders this checkpoint through its port of the checkpoint's own \
+         encoder, as the serving engine does for this architecture, which renders a \
+         developer message as a user turn under a heading; the reference is the run of the \
+         Jinja template the checkpoint ships, handed the developer message as a system one; \
+         the entry goes when the group is re-recorded under the engine's rule",
+    ),
+    (
         "deepseek-v3.2-exp/render/text-system-after-user",
         "the gateway renders this checkpoint through its port of the checkpoint's own \
          encoder, as the engines do, where the reference is the run of the Jinja \
          template the checkpoint ships, which renders no tools block and places a system \
          message after a user turn otherwise",
+    ),
+    (
+        "deepseek-v3.2-exp/render/thinking-kwarg-on",
+        "the gateway renders this checkpoint through its port of the checkpoint's own \
+         encoder, as the serving engine does for this architecture, and switches thinking on \
+         from the `enable_thinking` alias as the engine's wrapper does; the reference is the \
+         run of the Jinja template the checkpoint ships, which reads no alias and leaves the \
+         thought closed; the entry goes when the group is re-recorded under the engine's rule",
     ),
     (
         "deepseek-v3.2-exp/render/tools-declared-user-asks",
@@ -233,21 +249,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          message closed (an empty thought, the response, the end of the message), while the \
          gateway appends the prefill after the generation prompt as the serving engine's \
          prefix append does (smg-project/smg#2434)",
-    ),
-    (
-        "kimi-k3/render/thinking-kwarg-off",
-        "the checkpoint's own encoder reads `thinking`, not the engine's `enable_thinking` \
-         alias, so the vendor-code reference of `enable_thinking: false` keeps thinking on with \
-         the default effort directive; the gateway resolves the alias before rendering as the \
-         engine's own server does (smg-project/smg#3004): no directive, the response channel \
-         opened",
-    ),
-    (
-        "kimi-k3/render/thinking-reasoning-effort-kwarg",
-        "the checkpoint's own encoder reads `thinking_effort`, not the request's \
-         `reasoning_effort`, so the vendor-code reference of `reasoning_effort: low` writes the \
-         default `max`; the gateway maps the request's level to the directive \
-         (smg-project/smg#1968)",
     ),
     (
         "llama-3.1-nemotron-nano-8b-v1/render/glaive-v2-32.jsonl",
@@ -401,6 +402,12 @@ const KNOWN_UNLOADED: &[(&str, &str)] = &[
     ),
     (
         "llama-3.2-1b-instruct",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "llama-3.3-70b-instruct",
         "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
          files behind the gate are not fetched (bellwether recorded the group with its \
          own secret)",

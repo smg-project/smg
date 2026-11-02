@@ -1,8 +1,9 @@
-//! Symphony reading a chat response or a message: the opt-in path that parses a model's output
+//! Symphony reading a chat response or a message: the default path that parses a model's output
 //! with one [`Engine`](::symphony::Engine) per choice in place of the tool and reasoning parser crates.
 //!
-//! The switch is the gateway's `--parser` flag (`RouterConfig::parser`, `legacy` by default),
-//! which a request's `X-SMG-Parser` header overrides for that one request ([`choice`]). With
+//! The switch is the gateway's `--parser` flag (`RouterConfig::parser`, `symphony` by default,
+//! `legacy` the way back to the older parsers), which a request's `X-SMG-Parser` header overrides
+//! for that one request ([`choice`]). With
 //! `symphony` on, one precedence decides what reads a model ([`reads`](names::reads)), among the parser names
 //! set for it (`ParserResolver::names`: the `tool_parser` and `reasoning_parser` of the model's
 //! card, its workers' labels, apart from the gateway's `--tool-call-parser` and
@@ -132,6 +133,9 @@ pub(crate) fn choice(
     })
 }
 
+#[cfg(test)]
+pub(crate) use reader::assign;
+
 pub(crate) use self::{
     constraint::{
         constraint, grammar_start_of, turn_constraint, vocabulary_of, worker_constraint, Asks,
@@ -141,5 +145,5 @@ pub(crate) use self::{
         check_names, keeps_special_tokens, labels_select_nothing, named_table, reasoning_open,
         set_aside_by_the_registry, table_label_read,
     },
-    reader::{assign, engine_finish, finished, Assignment, Delta, Reader},
+    reader::{assign_for, engine_finish, finished, Assignment, Delta, Reader},
 };

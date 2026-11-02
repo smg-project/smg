@@ -1489,8 +1489,8 @@ const GROUPS: &[Group] = &[
         released: "2024-11-26",
         smg: (Some("json"), None),
         table: Some(Table::Json),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(14),
+        status: Status::Replaying,
     },
     Group {
         slug: "llama-3.3-nemotron-70b-reward-principle",

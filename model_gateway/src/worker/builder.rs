@@ -11,13 +11,14 @@ use openai_protocol::{
 use tokio::sync::mpsc;
 
 use super::{
+    basic::{BasicWorker, ConnectionMode, RuntimeType, WorkerMetadata, WorkerRuntime, WorkerType},
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
     endpoint::Endpoint,
     event::WorkerConnected,
     http_client::LazyHttpClient,
+    metadata::DecodingLabels,
     overload::OverloadThresholds,
     resilience::ResolvedResilience,
-    worker::{BasicWorker, ConnectionMode, RuntimeType, WorkerMetadata, WorkerRuntime, WorkerType},
 };
 use crate::{
     config::types::DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS, observability::metrics::Metrics,
@@ -347,6 +348,7 @@ impl BasicWorkerBuilder {
             overload: OverloadThresholds::resolve(&self.spec.overload, self.overload_defaults),
             pd_pairing: PdPairing::derive(&self.spec),
             redacted_url: Endpoint::redacted_url(&self.spec.url),
+            decoding: DecodingLabels::of(&self.spec),
             spec: Arc::new(self.spec),
             health_config,
             health_endpoint: self.health_endpoint,
@@ -464,7 +466,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::worker::worker::Worker;
+    use crate::worker::basic::Worker;
 
     /// `new(url)` is `from_spec` of the default spec for `url`: the two constructors give the same
     /// worker, every default written once.

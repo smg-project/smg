@@ -10,10 +10,10 @@ use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as 
 use tokio::{sync::oneshot, task::JoinHandle};
 
 use super::{
-    eof_tests::{
+    super::*,
+    eof::{
         chunk, collect_events, complete_with_prompt, processor, scripted_stream, CharacterTokenizer,
     },
-    *,
 };
 use crate::routers::grpc::{
     common::response_collection::collect_responses,
@@ -272,7 +272,7 @@ async fn sglang_gated_stream(
         SglangSchedulerClient,
     };
 
-    use super::eof_tests::{data_frame, decoded_stream, mock_worker_endpoint, trailers_frame};
+    use super::eof::{data_frame, decoded_stream, mock_worker_endpoint, trailers_frame};
 
     let frames = |responses: Vec<proto::GenerateResponse>| {
         responses

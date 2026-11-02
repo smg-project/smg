@@ -98,6 +98,10 @@ The gateway's prefill-decode code uses one word per thing, so a reader never has
 
 "Leg" is not used for any of these: it meant all three at once, and it does not come back in code, comments, test names or log lines. Metric names and labels keep their published spelling.
 
+## Where a module's tests live
+
+Unit tests sit in `#[cfg(test)] mod tests` at the bottom of the file they test. When they outgrow the file, the whole module moves out of line under one name: `x.rs` declares `#[cfg(test)] mod tests;` once, and the tests live in `x/tests.rs`. Past about 1,500 lines, and once the tests fall into named topics, `x/tests.rs` becomes a directory: `x/tests/mod.rs` declares one file per topic (`x/tests/eof.rs`, `x/tests/usage.rs`; the directory already says they are tests, so the files carry no `_tests` suffix), and the recorded fixtures the tests read sit in `x/tests/fixtures/`. A directory `x/` whose only child is production code is a submodule tree with one leaf: fold the leaf back into `x.rs`, or give the tree the children its name promises. A move is `git mv` plus the `mod` and `use` lines, never a test body change, so the diff reads as renames and the test list before and after is the same.
+
 ## Pull requests
 
 - **Fill in the [PR template](./.github/PULL_REQUEST_TEMPLATE.md)** — especially
@@ -214,6 +218,15 @@ They stay off in a fork until you set `SMG_RUN_BENCHMARKS` to `true`. Only
 
 The `release-*`, `nightly-*` and `stale` workflows are deliberately **not**
 opt-in — a fork should not publish artifacts or manage upstream's issues.
+
+---
+
+## Releases
+
+A release is cut from `main` onto a `release/<x.y>` branch and moves there by pull requests
+(cherry-picks from `main`, candidate and final bumps); `main` never pauses, and nothing is
+published without a maintainer's dispatch. The steps, the `make release-*` targets and the
+gate are in [`scripts/release/README.md`](./scripts/release/README.md).
 
 ---
 

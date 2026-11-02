@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use axum::response::Response;
 use llm_tokenizer::traits::Tokenizer;
-use openai_protocol::common::Tool;
+use openai_protocol::{common::Tool, profile::ProviderProfile};
 use tracing::error;
 
 use crate::{
@@ -24,7 +24,7 @@ use crate::{
             common::stages::helpers::TagForStart,
             context::RequestContext,
             regular::symphony::{self, Asks, Assignment, AutoRequest, PreparedConstraint},
-            utils,
+            utils::{self, Names},
         },
     },
 };
@@ -43,6 +43,10 @@ pub(crate) struct Prepared {
     /// The decoder keeps the special tokens the reader of the response needs:
     /// a table's markers, or a legacy reasoning parser's.
     pub keeps_special_tokens: bool,
+    /// The parser names the model's cards set, resolved here once for the request: the stage
+    /// stores them (`ProcessingState::parser_names`) and request building reads them in
+    /// place of a second resolution.
+    pub names: Names,
 }
 
 /// The constraint preparation finds for what the request asks, and whether
@@ -80,7 +84,11 @@ pub(crate) fn prepare(
     stage: &'static str,
 ) -> Result<Prepared, Response> {
     let model = asks.model();
-    let parser = ctx.state.parser.unwrap_or_default();
+    // Only the chat and messages preparations choose a parser; a request
+    // that chose none (transcription shares the chat preparation) keeps the
+    // legacy parsers here and at the two sites below, whatever the enum's
+    // default.
+    let parser = ctx.state.parser.unwrap_or(ParserChoice::Legacy);
     let names = ctx.components.parser_resolver.names(model);
     // A forced call's tag takes the start the model's workers name together;
     // a JSON answer's tag and the `auto` tag take the selected worker's own
@@ -157,7 +165,7 @@ pub(crate) fn prepare(
                     &ctx.components.reasoning_parser_factory,
                     ctx.components
                         .parser_resolver
-                        .reasoning_parser(model)
+                        .reasoning_parser_for(Some(&names.labels), model)
                         .as_deref(),
                     model,
                 )
@@ -167,6 +175,7 @@ pub(crate) fn prepare(
         constraint,
         json_schema,
         keeps_special_tokens,
+        names: names.labels,
     })
 }
 
@@ -195,8 +204,10 @@ pub(crate) fn reasoning_decision(
             .is_some_and(|tokenizer| switch(tokenizer.as_ref()))
     };
     match symphony::reasoning_open(
-        ctx.state.parser.unwrap_or_default(),
-        &ctx.components.parser_resolver.names(model),
+        ctx.state.parser.unwrap_or(ParserChoice::Legacy),
+        &ctx.components
+            .parser_resolver
+            .names_for(ctx.state.parser_names.as_ref(), model),
         model,
         &ctx.components.templates,
         processed_text,
@@ -207,7 +218,7 @@ pub(crate) fn reasoning_decision(
                 &ctx.components.reasoning_parser_factory,
                 ctx.components
                     .parser_resolver
-                    .reasoning_parser(model)
+                    .reasoning_parser_for(ctx.state.parser_names.as_ref(), model)
                     .as_deref(),
                 model,
                 processed_text,
@@ -280,8 +291,11 @@ pub(crate) fn decide(
     auto: impl FnOnce(&RequestContext) -> Auto,
 ) -> Result<Decided, Response> {
     let model = asks.model();
-    let names = ctx.components.parser_resolver.names(model);
-    let parser = ctx.state.parser.unwrap_or_default();
+    let names = ctx
+        .components
+        .parser_resolver
+        .names_for(ctx.state.parser_names.as_ref(), model);
+    let parser = ctx.state.parser.unwrap_or(ParserChoice::Legacy);
     let decoding = utils::WorkerDecoding::of(ctx.state.workers.as_ref());
     let decided = symphony::worker_constraint(
         decoding,
@@ -319,13 +333,18 @@ pub(crate) fn decide(
         ctx.state.constraint_decided_on = Some(decoding);
     }
     let tool_constraints = decided.constraint.map(|constraint| constraint.to_tuple());
-    let assignment = symphony::assign(
+    let provider = ctx
+        .state
+        .provider
+        .unwrap_or_else(|| ProviderProfile::for_model(model));
+    let assignment = symphony::assign_for(
         parser,
         &names,
         asks,
         tool_constraints.as_ref(),
         processed_text,
         &ctx.components.templates,
+        provider,
     )
     .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
     ctx.state.parser = Some(match assignment {
@@ -343,41 +362,15 @@ pub(crate) fn decide(
 
 #[cfg(test)]
 mod tests {
-    use llm_tokenizer::TokenizerRegistry;
     use openai_protocol::{chat::ChatCompletionRequest, messages::CreateMessageRequest};
-    use reasoning_parser::ParserFactory as ReasoningParserFactory;
     use serde_json::json;
-    use tool_parser::ParserFactory as ToolParserFactory;
 
     use super::*;
-    use crate::{
-        routers::grpc::{
-            context::SharedComponents, regular::symphony::template::Templates,
-            utils::ParserResolver,
-        },
-        worker::WorkerRegistry,
-    };
+    use crate::routers::grpc::regular::stages::testing::components;
 
     /// A model the registry has a table for, named by no label or flag.
     const MODEL: &str = "Qwen/Qwen3-8B";
     const PROMPT: &str = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n";
-
-    /// The gateway with `--parser symphony`, no parser names and no worker.
-    fn components() -> Arc<SharedComponents> {
-        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-        Arc::new(SharedComponents {
-            templates: Arc::new(Templates::new(Arc::clone(&tokenizer_registry))),
-            tokenizer_registry,
-            worker_registry: Arc::new(WorkerRegistry::new()),
-            tool_parser_factory: ToolParserFactory::default(),
-            reasoning_parser_factory: ReasoningParserFactory::default(),
-            parser_resolver: ParserResolver::disabled(),
-            multimodal: None,
-            tokenizer_autoload: true,
-            tokenizer_load_failures: Arc::default(),
-            parser: ParserChoice::Symphony,
-        })
-    }
 
     /// What [`decide`] said: the state's parser after, the table assigned with the prompt it
     /// replays, and the constraint.
@@ -445,5 +438,30 @@ mod tests {
             Some("qwen3")
         );
         assert!(for_chat.constraint.is_none());
+    }
+
+    /// Request building reads the parser names preparation resolved for the request
+    /// (`ProcessingState::parser_names`), not the registry again: the names stored name the
+    /// Kimi K2 table, so that table reads the response, though no label of the model's workers
+    /// and no flag names it (the registry's own table for the model is Qwen3's).
+    #[test]
+    fn the_decision_reads_the_names_preparation_resolved() {
+        let chat: Arc<ChatCompletionRequest> = Arc::new(
+            serde_json::from_value(
+                json!({"model": MODEL, "messages": [{"role": "user", "content": "hi"}]}),
+            )
+            .expect("chat request"),
+        );
+        let mut ctx = RequestContext::for_chat(Arc::clone(&chat), None, MODEL.into(), components());
+        ctx.state.parser_names = Some(Names {
+            tool: Some("kimi_k2".to_string()),
+            reasoning: None,
+        });
+        let outcome = decided(&mut ctx, Asks::Chat(&chat));
+        assert_eq!(outcome.parser, Some(ParserChoice::Symphony));
+        assert_eq!(
+            outcome.assigned.as_ref().map(|(table, _)| table.as_str()),
+            Some("kimi_k2")
+        );
     }
 }

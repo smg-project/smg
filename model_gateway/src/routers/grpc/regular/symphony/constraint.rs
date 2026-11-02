@@ -8,6 +8,7 @@ use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{ResponseFormat, Tool, ToolChoice, ToolChoiceValue},
     messages::{CreateMessageRequest, ToolChoice as MessagesToolChoice},
+    profile::ProviderProfile,
     worker::ConstrainedDecoding,
 };
 use serde_json::{json, Value};
@@ -26,7 +27,7 @@ use crate::{
     config::ParserChoice,
     routers::grpc::{
         common::stages::helpers::TagForStart,
-        spec::scans_for_tool_calls,
+        spec::scans_for_tool_calls_for,
         utils::{ModelNames, Names, TagVocabulary, WorkerDecoding},
     },
     worker::{Worker, WorkerType},
@@ -174,7 +175,9 @@ pub(crate) fn grammar_start_from(start: WorkerGrammarStart) -> GrammarStart {
 }
 
 /// Where the model's `workers` start a grammar, before one is selected: the start every one of
-/// them names in its `constrained_decoding_start` label, a prefill or encode worker left out
+/// them names in its `constrained_decoding_start` label (parsed once at its construction,
+/// [`WorkerMetadata::decoding`](crate::worker::metadata::WorkerMetadata::decoding): this walk runs on every
+/// request and looks nothing up), a prefill or encode worker left out
 /// since it generates no token a grammar constrains (the roles that do are allow-listed, so a
 /// role added later is left out until it is named); `Either` when one that starts at the first
 /// token stands beside one that does not, since no one tag fits both (the answer keeps the
@@ -185,16 +188,7 @@ pub(crate) fn grammar_start_of(workers: &[Arc<dyn Worker>]) -> GrammarStart {
     let mut starts = workers
         .iter()
         .filter(|worker| generates(worker.as_ref()))
-        .map(|worker| {
-            WorkerGrammarStart::from_label(
-                worker
-                    .metadata()
-                    .spec
-                    .labels
-                    .get(WorkerGrammarStart::LABEL)
-                    .map(String::as_str),
-            )
-        });
+        .map(|worker| worker.metadata().decoding.start);
     let Some(first) = starts.next() else {
         return GrammarStart::Unknown;
     };
@@ -222,7 +216,8 @@ fn generates(worker: &dyn Worker) -> bool {
 /// The vocabulary of structural-tag nodes the model's `workers` take together, before one is
 /// selected, for a tag every one of them takes as it is (a forced call's, [`constraint`]): the
 /// older one when any worker that generates tokens ([`generates`]) advertises it in its
-/// `structural_tag_vocabulary` label, since every compiler takes that spelling and the worker
+/// `structural_tag_vocabulary` label (read as parsed at its construction, like the start above),
+/// since every compiler takes that spelling and the worker
 /// that needs it may be the one selected; the current one otherwise, the tag then as the table
 /// built it ([`TagVocabulary`]). The tags derived for the selected worker take its own label
 /// ([`WorkerDecoding::vocabulary`]).
@@ -230,16 +225,7 @@ pub(crate) fn vocabulary_of(workers: &[Arc<dyn Worker>]) -> TagVocabulary {
     let older = workers
         .iter()
         .filter(|worker| generates(worker.as_ref()))
-        .any(|worker| {
-            TagVocabulary::from_label(
-                worker
-                    .metadata()
-                    .spec
-                    .labels
-                    .get(TagVocabulary::LABEL)
-                    .map(String::as_str),
-            ) == TagVocabulary::Older
-        });
+        .any(|worker| worker.metadata().decoding.vocabulary == TagVocabulary::Older);
     if older {
         TagVocabulary::Older
     } else {
@@ -391,13 +377,14 @@ impl<'a> Asks<'a> {
 
     /// The table reads no calls from the output: the legacy path would run no tool parser for the
     /// request (a chat response it would not scan for calls, no tools declared anywhere, for a
-    /// provider that reads calls only with them: [`scans_for_tool_calls`]; a Messages request
+    /// provider that reads calls only with them: [`scans_for_tool_calls_for`]; a Messages request
     /// that declares no tools, an empty list being a declaration). A `tool_choice` of `none` is
     /// not this: the table keeps its calls and the reader delivers none of them
-    /// ([`Asks::forbids_calls`]).
-    pub(super) fn no_calls(self) -> bool {
+    /// ([`Asks::forbids_calls_for`]). `provider` is the chat model's profile as the request's
+    /// preparation derived it once.
+    pub(super) fn no_calls_for(self, provider: ProviderProfile) -> bool {
         match self {
-            Self::Chat(request) => !scans_for_tool_calls(request),
+            Self::Chat(request) => !scans_for_tool_calls_for(request, provider),
             Self::Messages { request, .. } => request.tools.is_none(),
         }
     }
@@ -406,14 +393,15 @@ impl<'a> Asks<'a> {
     /// declared tools, or over a provider that reads calls without any): the table keeps its
     /// calls, so a call the model writes anyway is read whole, and the reader drops it, as the
     /// engine's own server reads such a call and withholds it. The prompt declares the tools as
-    /// under `auto` (`utils::request_as_rendered`), so the model may well write one.
-    pub(super) fn forbids_calls(self) -> bool {
+    /// under `auto` (`utils::request_as_rendered`), so the model may well write one. `provider`
+    /// is the chat model's profile as the request's preparation derived it once.
+    pub(super) fn forbids_calls_for(self, provider: ProviderProfile) -> bool {
         match self {
             Self::Chat(request) => {
                 matches!(
                     request.tool_choice,
                     Some(ToolChoice::Value(ToolChoiceValue::None))
-                ) && scans_for_tool_calls(request)
+                ) && scans_for_tool_calls_for(request, provider)
             }
             Self::Messages { request, .. } => {
                 matches!(request.tool_choice, Some(MessagesToolChoice::None))

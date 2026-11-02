@@ -26,11 +26,11 @@ use crate::{
         zmq_client::zmq_handshake_address,
     },
     worker::{
+        basic::{merge_labels, RuntimeType, WINDOW_LABELS},
         circuit_breaker::CircuitBreakerConfig,
         endpoint::Endpoint,
         overload::OverloadThresholds,
         resilience::resolve_resilience,
-        worker::{merge_labels, RuntimeType, WINDOW_LABELS},
         BasicWorkerBuilder, ConnectionMode, Worker, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
     workflow::data::{WorkerKind, WorkerRegistrationMode, WorkerWorkflowData},
@@ -2519,7 +2519,7 @@ mod rank_window_tests {
     use super::{dp_rank_expansion, labels_for_rank};
     use crate::{
         routers::grpc::client::ServerInfo,
-        worker::{worker::merge_labels, BasicWorkerBuilder, ConnectionMode, Worker},
+        worker::{basic::merge_labels, BasicWorkerBuilder, ConnectionMode, Worker},
         workflow::steps::local::discover_dp::dp_info_from_labels,
     };
 

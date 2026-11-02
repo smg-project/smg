@@ -133,7 +133,7 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 Event::ToolCallArguments { index, json, .. } if *index == call => {
-                    Some(json.as_str())
+                    Some(json.as_ref())
                 }
                 _ => None,
             })

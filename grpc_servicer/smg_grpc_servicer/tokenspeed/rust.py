@@ -55,6 +55,7 @@ from typing import Any
 from smg_grpc_servicer.constrained_decoding import (
     grammar_backend_entry,
     grammar_start_labels,
+    structural_tag_vocabulary_entry,
     tokenspeed_constrained_decoding_start,
     tokenspeed_grammar_backend,
 )
@@ -319,7 +320,12 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     # checkpoint's default, which the engine may not have read yet): the Rust
     # servicer refuses a constraint that backend cannot enforce before the
     # scheduler, and judges nothing when the backend is not known.
-    grammar_backend_entry(args_dict, tokenspeed_grammar_backend(server_args))
+    grammar_backend = tokenspeed_grammar_backend(server_args)
+    grammar_backend_entry(args_dict, grammar_backend)
+    # The vocabulary of structural-tag nodes that backend takes, when the
+    # xgrammar installed beside the engine predates the current one: the
+    # Router spells such a worker's structural tags in the older vocabulary.
+    structural_tag_vocabulary_entry(args_dict, grammar_backend)
     # The encode role's worker names its own address in every encode request
     # (the Rust servicer reads it off these args, next to the bootstrap port).
     if EngineConfigView(server_args).server_args.disaggregation_mode == "encode":

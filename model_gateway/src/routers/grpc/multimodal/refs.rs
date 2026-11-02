@@ -1,5 +1,5 @@
 //! Media-reference forwarding: decide per request whether the router
-//! preprocesses media itself or forwards references to a vLLM gRPC worker that
+//! preprocesses media itself or forwards references to a gRPC worker that
 //! advertises worker-side processing, and build the wire payload.
 
 use std::{
@@ -208,12 +208,17 @@ impl std::fmt::Display for MmRefsError {
 /// Whether `worker` can fetch and process media references itself.
 pub(crate) fn worker_accepts_media_refs(worker: &dyn Worker) -> bool {
     let spec = &worker.metadata().spec;
-    spec.runtime_type == RuntimeType::Vllm
-        && *worker.connection_mode() == ConnectionMode::Grpc
+    *worker.connection_mode() == ConnectionMode::Grpc
         && spec
             .labels
             .get(MM_PROCESSOR_LABEL)
-            .is_some_and(|value| !value.is_empty())
+            .is_some_and(|value| match spec.runtime_type {
+                RuntimeType::Vllm => !value.is_empty(),
+                RuntimeType::Sglang => value
+                    .trim()
+                    .eq_ignore_ascii_case(GATEWAY_PIPELINE_PROCESSOR),
+                _ => false,
+            })
 }
 
 /// Whether `worker` processes media references with the gateway's own
@@ -766,6 +771,7 @@ mod tests {
         )
         .expect("components");
         components.processing = mode;
+        assert!(!components.drain_fetches_on_error);
         components
     }
 
@@ -807,8 +813,9 @@ mod tests {
     );
 
     #[test]
-    fn accepts_only_labeled_vllm_grpc_workers() {
-        let cases: [AcceptCase; 5] = [
+    /// Forward references only to gRPC workers advertising a supported processor.
+    fn accepts_only_supported_labeled_grpc_workers() {
+        let cases: [AcceptCase; 8] = [
             (
                 RuntimeType::Vllm,
                 ConnectionMode::Grpc,
@@ -832,6 +839,19 @@ mod tests {
                 RuntimeType::Sglang,
                 ConnectionMode::Grpc,
                 &[(MM_PROCESSOR_LABEL, "inprocess")],
+                false,
+            ),
+            (
+                RuntimeType::Sglang,
+                ConnectionMode::Grpc,
+                &[(MM_PROCESSOR_LABEL, "smg")],
+                true,
+            ),
+            (RuntimeType::Sglang, ConnectionMode::Grpc, &[], false),
+            (
+                RuntimeType::Sglang,
+                ConnectionMode::Zmq,
+                &[(MM_PROCESSOR_LABEL, "smg")],
                 false,
             ),
         ];

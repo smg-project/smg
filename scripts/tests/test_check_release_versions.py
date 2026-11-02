@@ -154,6 +154,7 @@ def repo(tmp_path, mod):
     put(root, "quiet/quiet.py", "y = 1\n")
     put(root, "bindings/Cargo.toml", manifest("smg-binding", "1.0.0"))
     put(root, "bindings/pyproject.toml", '[project]\nname = "smg"\nversion = "1.0.0"\n')
+    put(root, "bindings/smg/version.py", '__version__ = "1.0.0"\n')
     put(
         root, "chart/Chart.yaml", 'apiVersion: v2\nname: smg\nversion: 1.0.0\nappVersion: "1.0.0"\n'
     )
@@ -222,6 +223,7 @@ def tables(mod):
     mirrors = (
         mod.Mirror("binding", "bindings/Cargo.toml", "cargo"),
         mod.Mirror("pyproject", "bindings/pyproject.toml", "pyproject"),
+        mod.Mirror("version.py", "bindings/smg/version.py", "python"),
         mod.Mirror("chart", "chart/Chart.yaml", "helm"),
         mod.Mirror("workflow", "wf.yml", "workflow"),
     )
@@ -292,6 +294,7 @@ def test_the_verdicts(mod, repo):
     assert "quiet" not in out
     for label, file in (
         ("binding", "bindings/Cargo.toml"),
+        ("version.py", "bindings/smg/version.py"),
         ("chart", "chart/Chart.yaml"),
         ("workflow", "wf.yml"),
     ):
@@ -300,8 +303,19 @@ def test_the_verdicts(mod, repo):
         "Summary: 4 crate(s) with changes, 2 unchanged; 1 Python package(s) with changes, 1 unchanged"
         in out
     )
-    assert "8 issue(s) found." in out
+    assert "9 issue(s) found." in out
     assert "Proposed fixes" not in out, "--check never proposes"
+
+
+def test_the_installed_packages_version_file_is_a_checked_mirror(mod):
+    """smg.__version__ is read from bindings/python/src/smg/version.py; the bump writes it and this check reads it."""
+    mirror = next(m for m in mod.MIRRORS if m.file == "bindings/python/src/smg/version.py")
+    assert mirror.kind == "python"
+    assert mod.read_version(mirror.kind, '__version__ = "1.2.3"\n', mirror.file) == "1.2.3"
+    assert (
+        mod.write_version(mirror.kind, '__version__ = "1.2.3"\n', "1.2.3", "1.3.0")
+        == '__version__ = "1.3.0"\n'
+    )
 
 
 def test_the_prompt_declined_changes_nothing(mod, repo):
@@ -340,6 +354,7 @@ def test_the_fixes_make_the_tree_consistent(mod, repo):
     assert mod.workspace_dep_version(root, "alpha") == "1.1.0"
     assert mod.read_version("cargo", (repo / "model_gateway/Cargo.toml").read_text(), "") == "2.0.0"
     assert mod.read_version("pyproject", (repo / "pkg/pyproject.toml").read_text(), "") == "0.2.0"
+    assert (repo / "bindings/smg/version.py").read_text() == '__version__ = "2.0.0"\n'
     assert (
         repo / "chart/Chart.yaml"
     ).read_text() == 'apiVersion: v2\nname: smg\nversion: 2.0.0\nappVersion: "2.0.0"\n'
@@ -349,6 +364,120 @@ def test_the_fixes_make_the_tree_consistent(mod, repo):
     code, out = run(mod, repo)
     assert code == 0, out
     assert "All versions consistent." in out
+
+
+def test_the_plan_lists_the_bump_quietly_and_changes_nothing(mod, repo):
+    """Before a cut, main reads every changed crate as unbumped by design: the plan names what the
+    cut's bump writes, without the verdicts and the issue count, and exits 0."""
+    files = ("Cargo.toml", "crates/beta/Cargo.toml", "model_gateway/Cargo.toml", "chart/Chart.yaml")
+    before = {path: (repo / path).read_text() for path in files}
+    code, out = run(mod, repo, mode="plan", tag="v1.0.0")
+    assert code == 0
+    assert (
+        "The bump the next cut writes against v1.0.0: the crates and packages by their conventional"
+        " commits since it, the gateway and its mirrors by the checker's own step (the cut writes the"
+        " VERSION it is given there: pass it as VERSION_OVERRIDE for those lines). Nothing is changed here"
+        in out
+    )
+    assert "  patch beta v1.0.0 → v1.0.1 (crates/beta/Cargo.toml)" in out
+    assert "       sync workspace Cargo.toml beta → v1.0.1" in out
+    assert "  sync workspace Cargo.toml delta v0.1.0 → v0.2.0" in out
+    assert "  major smg v1.0.0 → v2.0.0 (model_gateway/Cargo.toml)" in out
+    assert "  minor pkg v0.1.0 → v0.2.0 (pkg/pyproject.toml)" in out
+    assert "  sync chart v1.0.0 → v2.0.0 (chart/Chart.yaml)" in out
+    assert out.rstrip().endswith(
+        "9 component(s) and mirror(s) move (a crate's workspace pin follows it)."
+        " Bumped already since v1.0.0, left as they are: alpha v1.1.0, delta v0.2.0 (new)."
+    )
+    for quiet in ("not bumped", "issue(s) found", "Checking workspace", "Summary:", "✓", "!"):
+        assert quiet not in out, quiet
+    assert {path: (repo / path).read_text() for path in files} == before
+    # the cut's own version for the gateway and its mirrors: a candidate is allowed here, and only here; the gateway
+    # is set to it whatever its conventional commits say (the fixture's are breaking: the checker alone says major)
+    code, out = run(mod, repo, mode="plan", tag="v1.0.0", override="1.1.0-rc.1")
+    assert code == 0
+    assert "the gateway and its mirrors to 1.1.0-rc.1. Nothing is changed here" in out
+    assert "  set smg v1.0.0 → v1.1.0-rc.1 (model_gateway/Cargo.toml)" in out
+    assert "major smg" not in out
+    assert "  sync chart v1.0.0 → v1.1.0-rc.1 (chart/Chart.yaml)" in out
+    assert "  patch beta v1.0.0 → v1.0.1 (crates/beta/Cargo.toml)" in out
+    assert "9 component(s) and mirror(s) move" in out
+    with pytest.raises(mod.Fatal, match="X.Y.Z format"):
+        run(mod, repo, override="1.1.0-rc.1")
+    with pytest.raises(mod.Fatal, match="X.Y.Z or X.Y.Z-rc.N format"):
+        run(mod, repo, mode="plan", override="1.1.0-rc1")
+    assert {path: (repo / path).read_text() for path in files} == before
+    # once the tree is consistent there is nothing to plan, still exit 0
+    assert run(mod, repo, mode="fix")[0] == 0
+    code, out = run(mod, repo, mode="plan", tag="v1.0.0")
+    assert code == 0
+    assert out.startswith(
+        "Nothing to bump against v1.0.0: every crate and package changed since it is bumped already ("
+    )
+    assert "alpha v1.1.0" in out and "beta v1.0.1" in out and "smg v2.0.0" in out
+    # a gateway bumped already (2.0.0 against v1.0.0) is still set to the cut's version, with its mirrors: the cut
+    # writes that version unconditionally, so the plan never lists the gateway as left alone when it is given one
+    code, out = run(mod, repo, mode="plan", tag="v1.0.0", override="2.1.0-rc.1")
+    assert code == 0
+    assert "  set smg v2.0.0 → v2.1.0-rc.1 (model_gateway/Cargo.toml)" in out
+    assert "  sync chart v2.0.0 → v2.1.0-rc.1 (chart/Chart.yaml)" in out
+    assert "smg v2.0.0" not in out.split("Bumped already")[-1]
+    assert "6 component(s) and mirror(s) move" in out
+
+
+def test_the_plan_lists_a_gateway_already_at_the_cuts_version_among_the_bumped(mod, repo):
+    """After a local ``make bump-version VERSION=<cut>`` the gateway carries the cut's version: the plan prints no
+    ``set`` line for it and names it among the components bumped already, in both closing lines."""
+    put(repo, "model_gateway/Cargo.toml", manifest("smg", "1.1.0-rc.1"))
+    code, out = run(mod, repo, mode="plan", tag="v1.0.0", override="1.1.0-rc.1")
+    assert code == 0
+    assert "set smg" not in out and "major smg" not in out
+    assert "  sync chart v1.0.0 → v1.1.0-rc.1 (chart/Chart.yaml)" in out
+    assert out.rstrip().endswith(
+        "8 component(s) and mirror(s) move (a crate's workspace pin follows it)."
+        " Bumped already since v1.0.0, left as they are: smg v1.1.0-rc.1, alpha v1.1.0, delta v0.2.0 (new)."
+    )
+    # the whole tree at the cut's version (the crates bumped, the gateway and its mirrors set): nothing to bump,
+    # the gateway named among the bumped
+    assert run(mod, repo, mode="fix")[0] == 0
+    put(repo, "model_gateway/Cargo.toml", manifest("smg", "2.1.0-rc.1"))
+    put(repo, "bindings/Cargo.toml", manifest("smg-binding", "2.1.0-rc.1"))
+    put(repo, "bindings/pyproject.toml", '[project]\nname = "smg"\nversion = "2.1.0-rc.1"\n')
+    put(repo, "bindings/smg/version.py", '__version__ = "2.1.0-rc.1"\n')
+    put(
+        repo,
+        "chart/Chart.yaml",
+        'apiVersion: v2\nname: smg\nversion: 2.1.0-rc.1\nappVersion: "2.1.0-rc.1"\n',
+    )
+    put(
+        repo,
+        "wf.yml",
+        "run-name: smg=${{ env.SMG_RELEASE_TAG }}\nenv:\n  SMG_RELEASE_TAG: v2.1.0-rc.1\n",
+    )
+    code, out = run(mod, repo, mode="plan", tag="v1.0.0", override="2.1.0-rc.1")
+    assert code == 0
+    assert out.rstrip() == (
+        "Nothing to bump against v1.0.0: every crate and package changed since it is bumped already"
+        " (smg v2.1.0-rc.1, alpha v1.1.0, beta v1.0.1, delta v0.2.0 (new), pkg v0.2.0); the mirrors agree."
+    )
+
+
+def test_the_plan_compares_against_the_highest_final_tag_by_default(mod, repo):
+    put(repo, "crates/beta/src/lib.rs", "// beta 3\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "chore: a candidate", date="2026-06-01T00:00:00Z")
+    git(
+        repo, "tag", "v1.1.0-rc.1"
+    )  # the newest tag by date, a candidate: not what a cut compares against
+    code, out = run(mod, repo, mode="plan")
+    assert code == 0 and "against v1.0.0" in out
+    assert "against tag: v1.1.0-rc.1" in run(mod, repo)[1], (
+        "--check keeps the newest tag as its default"
+    )
+    git(
+        repo, "tag", "v1.0.9", "v1.0.0"
+    )  # a patch of an older line, lower than v1.1.0-rc.1 by date and by value
+    assert "against v1.0.9" in run(mod, repo, mode="plan")[1]
 
 
 def test_the_override_applies_to_the_gateway_only(mod, repo):
@@ -377,3 +506,107 @@ def test_the_newest_tag_is_the_default(mod, repo):
         "Summary: 0 crate(s) with changes, 6 unchanged; 0 Python package(s) with changes, 2 unchanged"
         in out
     )
+
+
+# --- the versions release tags carry ----------------------------------------------
+
+
+def test_version_keys_order_candidates_below_their_finals(mod):
+    versions = ("1.9.0", "1.10.0-rc.1", "1.10.0-rc.2", "1.10.0", "1.10.1")
+    keys = [mod.version_key(v) for v in versions]
+    assert keys == sorted(keys)
+    assert mod.version_key("1.2") is None and mod.version_key("v1.2.3") is None
+
+
+def test_texts_at_reads_every_ref_and_path_in_one_call(mod, repo):
+    wanted = [
+        ("v1.0.0", "crates/alpha/Cargo.toml"),
+        ("v1.0.0", "crates/delta/Cargo.toml"),  # not at the tag
+        ("HEAD", "crates/delta/Cargo.toml"),
+    ]
+    texts = mod.Repo(repo).texts_at(wanted)
+    assert set(texts) == {wanted[0], wanted[2]}
+    assert mod.read_version("cargo", texts[wanted[0]], "") == "1.0.0"
+    assert mod.read_version("cargo", texts[wanted[2]], "") == "0.2.0"
+
+
+def side_line(repo):
+    """Another release line's tag, off v1.0.0: beta patched to 1.0.1 there, alpha at the 1.1.0
+    main gave it (with v1.0.0's code), gamma at the 1.0.1 main gave it with the very code main
+    carries (the same fix picked), and a tag of another shape that published nothing."""
+    put(repo, "crates/gamma/src/lib.rs", "// gamma fixed\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "fix(gamma): real")
+    git(repo, "switch", "-q", "-c", "release/1.0", "v1.0.0")
+    put(repo, "crates/beta/src/lib.rs", "// beta patched on the line\n")
+    put(repo, "crates/beta/Cargo.toml", manifest("beta", "1.0.1"))
+    put(repo, "crates/alpha/Cargo.toml", manifest("alpha", "1.1.0"))
+    put(repo, "crates/gamma/src/lib.rs", "// gamma fixed\n")
+    put(repo, "crates/gamma/Cargo.toml", manifest("gamma", "1.0.1"))
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "chore(release): bump versions for v1.0.9")
+    git(repo, "tag", "v1.0.9")
+    put(repo, "crates/alpha/Cargo.toml", manifest("alpha", "1.2.0"))  # never published
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "chore: a trial tag")
+    git(repo, "tag", "v1.0.9-qa")
+    git(repo, "switch", "-q", "main")
+
+
+def test_a_version_any_release_tag_carries_is_not_a_bump(mod, repo):
+    """Two release lines share the crate versions and a registry takes a version once. Against
+    v1.0.0: beta, unbumped there, is proposed 1.0.2, past the 1.0.1 the other line's tag carries;
+    alpha, raised to 1.1.0 since v1.0.0 but at the version that tag carries with other code,
+    reads unbumped too and its minor bump lands on 1.2.0 (the 1.2.0 of a tag of another shape
+    counts for nothing); gamma, changed since v1.0.0 but at the version that tag carries with
+    this very code, needs no bump, and its workspace pin, still at 1.0.0, is the one thing it
+    needs (the comparison tag's path reads the pin of every changed crate; this path must too).
+    Against the other line's tag, beta's 1.0.0 sits below its 1.0.1, a difference the equality
+    rule read as a bump: it is v1.0.0's version, so unbumped."""
+    side_line(repo)
+    assert mod.Repo(repo).release_tags() == ["v1.0.0", "v1.0.9"]
+    code, out = run(mod, repo, tag="v1.0.0")
+    assert code == 1
+    assert (
+        "  ! beta (crates/beta/) — 1 file(s) changed but version not bumped (v1.0.0) [patch]" in out
+    )
+    assert (
+        "  ! alpha (crates/alpha/) — 1 file(s) changed but version not bumped (v1.1.0, v1.0.9's) [minor]"
+        in out
+    )
+    assert "gamma (crates/gamma/) — v1.0.1 is v1.0.9's, with this code" in out
+    assert "    ✗ workspace Cargo.toml has gamma v1.0.0, expected v1.0.1" in out
+    assert "not bumped (v1.0.1" not in out, "the tag's copy of gamma is this very code: no bump"
+    assert "Summary: 5 crate(s) with changes, 1 unchanged" in out, (
+        "gamma's pin counts it as changed"
+    )
+    code, out = run(mod, repo, tag="v1.0.9")
+    assert (
+        "  ! beta (crates/beta/) — 1 file(s) changed but version not bumped (v1.0.0, v1.0.0's) [patch]"
+        in out
+    )
+    code, out = run(mod, repo, tag="v1.0.0", mode="prompt", answer="n")
+    assert "  patch beta v1.0.0 → v1.0.2 (crates/beta/Cargo.toml; v1.0.1 is v1.0.9's)" in out
+    assert "       sync workspace Cargo.toml beta → v1.0.2" in out
+    assert "  minor alpha v1.1.0 → v1.2.0 (crates/alpha/Cargo.toml)" in out
+    assert "  sync workspace Cargo.toml gamma v1.0.0 → v1.0.1" in out
+    code, out = run(mod, repo, tag="v1.0.0", mode="fix")
+    assert code == 0, out
+    assert mod.read_version("cargo", (repo / "crates/beta/Cargo.toml").read_text(), "") == "1.0.2"
+    assert mod.read_version("cargo", (repo / "crates/alpha/Cargo.toml").read_text(), "") == "1.2.0"
+    root = (repo / "Cargo.toml").read_text()
+    assert mod.workspace_dep_version(root, "beta") == "1.0.2"
+    assert mod.workspace_dep_version(root, "alpha") == "1.2.0"
+    assert mod.workspace_dep_version(root, "gamma") == "1.0.1"
+    code, out = run(mod, repo, tag="v1.0.0")
+    assert code == 0, out
+    assert "All versions consistent." in out
+
+
+def test_a_component_whose_files_went_is_named_loudly(mod, repo):
+    """A crate deleted since the tag but still in the table: its files read as changed and its
+    version file is gone; the check says which entry to drop rather than printing a green line."""
+    git(repo, "rm", "-q", "-r", "crates/beta")
+    git(repo, "commit", "-q", "-m", "refactor: beta goes")
+    with pytest.raises(mod.Fatal, match="crates/beta/Cargo.toml is gone: drop beta from the table"):
+        run(mod, repo, tag="v1.0.0")

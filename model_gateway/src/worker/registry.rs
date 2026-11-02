@@ -33,12 +33,12 @@ use crate::{
     config::types::RetryConfig,
     observability::metrics::{metrics_labels, Metrics},
     worker::{
+        basic::{RuntimeType, WorkerType},
         circuit_breaker::CircuitState,
         event::{WorkerConnected, WorkerEvent},
         hash_ring::HashRing,
         pd_pair_index::{PdPairIndex, PdWire},
         pd_pairing::PdPairingMode,
-        worker::{RuntimeType, WorkerType},
         ConnectionMode, Worker, DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
     },
 };

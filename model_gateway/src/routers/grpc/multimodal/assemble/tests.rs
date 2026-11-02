@@ -71,8 +71,9 @@ fn inline_image(payload: &'static [u8], hash: &str) -> Arc<ImageFrame> {
 
 /// One image whose flat span is the whole encoder input: the tensor
 /// handed over by value moves into the item's payload, and the item is
-/// the same as the one written from a view of it.
-fn single_image_intermediate() -> PrecomputedMultimodalIntermediate {
+/// the same as the one written from a view of it. (Shared with the encode
+/// stage's tests, which plan this one image for an encode server.)
+pub(crate) fn single_image_intermediate() -> PrecomputedMultimodalIntermediate {
     let mut model_specific = HashMap::new();
     model_specific.insert(
         "patches_per_image".to_string(),

@@ -569,6 +569,26 @@ mod tests {
             }
         }
 
+        /// Default SGLang workers retain the early refusal; only native media
+        /// reference workers may fetch and preprocess video at the destination.
+        #[test]
+        fn sglang_video_requires_an_advertised_native_media_processor() {
+            use crate::routers::grpc::multimodal::refs::MM_PROCESSOR_LABEL;
+
+            for (processor, expected) in [("", false), ("python", false), ("smg", true)] {
+                let pool = registry_with(vec![worker_of(
+                    "grpc://10.0.0.1:1",
+                    RuntimeType::Sglang,
+                    &[(MM_PROCESSOR_LABEL, processor)],
+                )]);
+                assert_eq!(
+                    ensure_model_accepts_media(&pool, MODEL, &video_plan()).is_ok(),
+                    expected,
+                    "processor={processor:?}"
+                );
+            }
+        }
+
         /// The sentence is the one worker selection writes for the same pair
         /// after the decode, so a client sees one refusal whichever check
         /// answers; a pool of several engines that take none of a modality

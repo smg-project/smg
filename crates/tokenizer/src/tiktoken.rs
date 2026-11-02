@@ -17,7 +17,7 @@ use crate::{
     byte_level::{ByteLevelIncremental, ByteLevelTable, ByteLevelTableBuilder, UnknownId},
     chat_template::{
         load_chat_template_from_file, python_isspace, ChatTemplateContentFormat,
-        ChatTemplateParams, ChatTemplateState, ConfigChatTemplates, ThinkingKeyName,
+        ChatTemplateParams, ChatTemplateState, ConfigChatTemplates, PreparedTools, ThinkingKeyName,
         ThinkingToggle,
     },
     encoders::{
@@ -213,6 +213,12 @@ pub struct TiktokenTokenizer {
     /// Encode a text in the pieces the checkpoint's own tokenizer cuts it
     /// into (see [`checkpoint_pieces`]): the Kimi family's `tokenization_kimi.py`.
     checkpoint_pieces: bool,
+    /// Render with the keys of every map in the tools sorted, at every
+    /// depth, as the checkpoint's own tokenizer class does before its
+    /// template or tool encoder reads them: the Kimi family's
+    /// `tokenization_kimi.py` sorts them in its `apply_chat_template`
+    /// (Kimi K3's class, which renders its own format, does not).
+    tools_key_sorted: bool,
 }
 
 /// Supported Tiktoken models
@@ -280,6 +286,7 @@ impl TiktokenTokenizer {
             profile: None,
             byte_level,
             checkpoint_pieces: false,
+            tools_key_sorted: false,
         })
     }
 
@@ -407,6 +414,11 @@ impl TiktokenTokenizer {
             byte_level,
             // The same file gives the pattern and the piece rule.
             checkpoint_pieces: kimi,
+            tools_key_sorted: match renderer {
+                Renderer::KimiK25Tools => true,
+                Renderer::KimiK3Xtml => false,
+                Renderer::Jinja => kimi,
+            },
         })
     }
 
@@ -472,6 +484,30 @@ impl TiktokenTokenizer {
                 special_tokens: Some(&self.special_tokens),
                 ..params
             }
+        };
+        // The checkpoint's own class sorts the tools' keys before anything
+        // reads them: so here, from the kept sorted form of the prepared set
+        // when the caller hands one (made once per set), else sorted now.
+        let sorted;
+        let params = match params.tools.filter(|_| self.tools_key_sorted) {
+            Some(tools) => {
+                let prepared = match params
+                    .prepared_tools
+                    .filter(|prepared| prepared.is_of(tools))
+                {
+                    Some(prepared) => prepared.key_sorted(),
+                    None => {
+                        sorted = PreparedTools::key_sorted_of(tools);
+                        &sorted
+                    }
+                };
+                ChatTemplateParams {
+                    tools: Some(prepared.tools()),
+                    prepared_tools: Some(prepared),
+                    ..params
+                }
+            }
+            None => params,
         };
         match self.renderer {
             Renderer::Jinja => self.chat_template.apply_with_continuation(messages, params),

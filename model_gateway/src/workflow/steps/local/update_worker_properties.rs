@@ -16,8 +16,8 @@ use super::create_worker::{
 use crate::{
     service_discovery::DISCOVERY_PROVIDER_LABEL,
     worker::{
-        overload::OverloadThresholds, service::MAX_WORKER_LABELS, worker::merge_labels,
-        BasicWorker, BasicWorkerBuilder, RuntimeType, Worker,
+        basic::merge_labels, overload::OverloadThresholds, service::MAX_WORKER_LABELS, BasicWorker,
+        BasicWorkerBuilder, RuntimeType, Worker,
     },
     workflow::data::WorkerUpdateWorkflowData,
 };

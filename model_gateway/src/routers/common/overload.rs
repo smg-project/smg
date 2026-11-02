@@ -457,7 +457,7 @@ mod tests {
     /// to an overloaded one.
     #[test]
     fn all_stalled_falls_back_to_the_least_loaded_ready_worker() {
-        use crate::worker::worker::StallReason;
+        use crate::worker::basic::StallReason;
 
         let a = worker("http://127.0.0.1:9841", "m");
         let b = worker("http://127.0.0.1:9842", "m");

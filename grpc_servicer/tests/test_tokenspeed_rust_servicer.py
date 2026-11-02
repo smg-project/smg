@@ -26,6 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from smg_grpc_servicer import constrained_decoding as cd
 from smg_grpc_servicer import rust_lifecycle
 from smg_grpc_servicer.tokenspeed import rust
 
@@ -1677,3 +1678,34 @@ def test_mrope_positions_are_read_off_the_text_rope_config():
     assert rust.mrope_positions({"text_config": {"rope_scaling": {"mrope_section": [1]}}}) is True
     assert rust.mrope_positions(SimpleNamespace(model_type="x")) is None
     assert rust.mrope_positions(None) is None
+
+
+def test_server_facts_carry_the_structural_tag_vocabulary_of_an_older_xgrammar(monkeypatch):
+    # The xgrammar installed beside the engine predates the structural-tag
+    # nodes the Router writes (0.1.33 is the first release with them): the
+    # key says so under xgrammar, and under a backend the engine has not
+    # resolved yet (its default where a grammar runs at all); an explicit
+    # `none` and a current xgrammar leave no key.
+    _stub_servicer_module(monkeypatch)
+    monkeypatch.delenv("SMG_PAIRING_PROTOCOL", raising=False)
+    monkeypatch.setattr(cd, "installed_xgrammar_version", lambda: "0.1.32")
+    pinned = json.loads(
+        rust.server_facts(_GrammarServerArgs(grammar_backend="xgrammar"))["server_args_json"]
+    )
+    assert pinned["structural_tag_vocabulary"] == "older"
+    unset = _GrammarServerArgs(grammar_backend="none")
+    unset._grammar_backend_unset = True
+    unset._beam_checkpoint = None
+    unresolved = json.loads(rust.server_facts(unset)["server_args_json"])
+    assert "grammar_backend" not in unresolved
+    assert unresolved["structural_tag_vocabulary"] == "older"
+    explicit_none = _GrammarServerArgs(grammar_backend="none")
+    explicit_none._grammar_backend_unset = False
+    assert "structural_tag_vocabulary" not in json.loads(
+        rust.server_facts(explicit_none)["server_args_json"]
+    )
+    monkeypatch.setattr(cd, "installed_xgrammar_version", lambda: "0.2.8")
+    current = json.loads(
+        rust.server_facts(_GrammarServerArgs(grammar_backend="xgrammar"))["server_args_json"]
+    )
+    assert "structural_tag_vocabulary" not in current

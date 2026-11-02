@@ -3271,6 +3271,35 @@ async fn server_info_advertises_where_the_engine_starts_a_grammar() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// The vocabulary of structural-tag nodes the engine's grammar compiler takes
+/// is a fact of the installation the launcher read: advertised so the Router
+/// spells such a worker's structural tags in the older vocabulary; a launcher
+/// that reported none advertises none.
+#[tokio::test]
+async fn server_info_advertises_the_structural_tag_vocabulary() {
+    let mut model = model_info();
+    model.structural_tag_vocabulary = "older".to_string();
+    let mut h = harness_with(model, None, None).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.structural_tag_vocabulary, "older");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+
+    let mut h = harness_with(model_info(), None, None).await;
+    let info = h
+        .client
+        .get_server_info(vllm::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.structural_tag_vocabulary, "");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// `GetServerInfo` advertises the processor only while it answers its probe
 /// and the engine takes multimodal input, as the Python servicer does.
 #[tokio::test]

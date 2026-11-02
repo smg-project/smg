@@ -4,7 +4,7 @@
 //! counters, the health-check counters, the routing-key load, the overload
 //! and liveness vetoes with their clocks, the PD admission rooms with their
 //! queue, and the prefill book the wedged rule's bound reads. The `Worker`
-//! trait and `BasicWorker` in `worker.rs` read and write it.
+//! trait and `BasicWorker` in `basic.rs` read and write it.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -21,8 +21,8 @@ use tokio::sync::Notify;
 
 // The trait is named only by the doc links of this module.
 #[cfg(doc)]
-use super::worker::Worker;
-use super::worker::WorkerRoutingKeyLoad;
+use super::basic::Worker;
+use super::basic::WorkerRoutingKeyLoad;
 
 /// Why the liveness tracker vetoes a worker (see the `liveness` module).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

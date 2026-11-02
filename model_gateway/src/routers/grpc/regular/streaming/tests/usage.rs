@@ -28,12 +28,12 @@ use symphony::{formats::qwen3, CallSyntax};
 use tokio::{sync::oneshot, task::JoinHandle};
 
 use super::{
-    eof_tests::{
+    super::*,
+    eof::{
         chunk, collect_events, data_frame, decoded_stream, gated_stream, mock_worker_endpoint,
         processor, scripted_stream, trailers_frame, CharacterTokenizer,
     },
-    symphony_tests::assigned_message,
-    *,
+    symphony::assigned_message,
 };
 use crate::{
     rate_limit::test_support::RecordingBackend,
@@ -105,6 +105,7 @@ fn scheduler_choice_frames(
             let token_ids: Vec<u32> = text.chars().map(u32::from).collect();
             generated += token_ids.len() as u32;
             scheduler::GenerateResponse {
+                media_identity: None,
                 request_id: String::new(),
                 response: Some(SchedulerEvent::Chunk(scheduler::GenerateStreamChunk {
                     index,
@@ -116,6 +117,7 @@ fn scheduler_choice_frames(
         })
         .collect();
     frames.push(scheduler::GenerateResponse {
+        media_identity: None,
         request_id: String::new(),
         response: Some(SchedulerEvent::Complete(scheduler::GenerateComplete {
             index,

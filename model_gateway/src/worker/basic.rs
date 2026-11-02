@@ -27,8 +27,14 @@ use tokio::{
 
 pub(crate) use super::runtime::COLD_PREFILL_TOKENS_PER_SEC;
 use super::{
-    event::WorkerConnected, http_client::LazyHttpClient, pd_pairing::PdPairing, CircuitBreaker,
-    ResolvedResilience, WorkerError, WorkerResult,
+    engine_admin::{
+        admin_backend_client, admin_grpc_result, admin_http_post, FLUSH_HTTP_TIMEOUT,
+        PROFILE_HTTP_TIMEOUT,
+    },
+    event::WorkerConnected,
+    http_client::LazyHttpClient,
+    pd_pairing::PdPairing,
+    CircuitBreaker, ResolvedResilience, WorkerError, WorkerResult,
 };
 pub use super::{
     load::{WorkerLoadGuard, WorkerRoutingKeyLoad},
@@ -39,15 +45,6 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     routers::grpc::{backend_client::BackendClient, client::GrpcClient, zmq_client},
 };
-
-/// Timeout for worker HTTP `flush_cache` requests. Matches the gRPC
-/// client's local flush deadline.
-const FLUSH_HTTP_TIMEOUT: Duration = Duration::from_secs(45);
-
-/// Timeout for worker HTTP profile requests. Stopping a profile can take
-/// a long time while the backend serializes large traces. Matches the
-/// gRPC client's profile deadline.
-const PROFILE_HTTP_TIMEOUT: Duration = Duration::from_secs(630);
 
 /// Connect the ZMQ backend for this worker URL. All connect mechanics —
 /// address derivation, socket-dir prep, EOS resolution, handshake — live in
@@ -68,12 +65,6 @@ async fn connect_zmq_backend(
     startup: Duration,
     request_timeout: Option<Duration>,
 ) -> WorkerResult<Arc<BackendClient>> {
-    let registered_role = match worker_type {
-        WorkerType::Regular => None,
-        WorkerType::Prefill => Some("prefill"),
-        WorkerType::Decode => Some("decode"),
-        WorkerType::Encode => Some("encode"),
-    };
     zmq_client::connect_for_worker(
         &base_url,
         model_id,
@@ -85,7 +76,7 @@ async fn connect_zmq_backend(
     )
     .await
     .and_then(|client| {
-        client.check_declared_role(registered_role)?;
+        client.check_declared_role(worker_type)?;
         Ok(Arc::new(BackendClient::Zmq(client)))
     })
     .map_err(|reason| WorkerError::ConnectionFailed {
@@ -108,102 +99,6 @@ pub const MORIIO_CONNECTOR: &str = "MoRIIOConnector";
 
 /// Worker label naming a MoRI-IO engine's transfer mode, `read` or `write`.
 pub const MORIIO_MODE_LABEL: &str = "moriio_mode";
-
-/// POST an admin endpoint on an HTTP worker and map the outcome to a
-/// [`WorkerResult`].
-async fn admin_http_post(
-    client: &reqwest::Client,
-    url: String,
-    api_key: Option<&String>,
-    body: Option<serde_json::Value>,
-    operation: &str,
-    timeout: Duration,
-) -> WorkerResult<()> {
-    let mut req = client.post(&url).timeout(timeout);
-    if let Some(key) = api_key {
-        req = req.bearer_auth(key);
-    }
-    if let Some(body) = body {
-        req = req.json(&body);
-    }
-    match req.send().await {
-        Ok(resp) if resp.status().is_success() => Ok(()),
-        Ok(resp) => Err(WorkerError::OperationFailed {
-            url,
-            operation: operation.to_string(),
-            reason: format!("HTTP {}", resp.status()),
-        }),
-        Err(e) => Err(WorkerError::OperationFailed {
-            url,
-            operation: operation.to_string(),
-            reason: e.to_string(),
-        }),
-    }
-}
-
-/// Unwrap the optional gRPC client for an admin op, erroring when absent.
-fn require_backend_client(
-    url: &str,
-    operation: &str,
-    client: Option<Arc<BackendClient>>,
-) -> WorkerResult<Arc<BackendClient>> {
-    client.ok_or_else(|| WorkerError::OperationFailed {
-        url: url.to_string(),
-        operation: operation.to_string(),
-        reason: "no backend client available".to_string(),
-    })
-}
-
-/// A ZMQ engine whose wire carries no control calls (vLLM's EngineCore, a
-/// TokenSpeed scheduler that declares none) has no admin RPC: refused before
-/// anything is sent.
-fn zmq_admin_unsupported(url: &str, operation: &str) -> WorkerError {
-    WorkerError::OperationFailed {
-        url: url.to_string(),
-        operation: operation.to_string(),
-        reason: format!("{operation} is not supported over this engine's ZMQ wire"),
-    }
-}
-
-/// The worker's backend client for an admin op, refused when the backend
-/// answers none ([`zmq_admin_unsupported`]).
-fn admin_backend_client(
-    url: &str,
-    operation: &str,
-    client: Option<Arc<BackendClient>>,
-) -> WorkerResult<Arc<BackendClient>> {
-    let client = require_backend_client(url, operation, client)?;
-    if !client.carries_admin_calls() {
-        return Err(zmq_admin_unsupported(url, operation));
-    }
-    Ok(client)
-}
-
-/// Map a gRPC admin-op outcome (`success` flag plus message) to a
-/// [`WorkerResult`].
-fn admin_grpc_result(
-    url: &str,
-    operation: &str,
-    result: Result<(bool, String), tonic::Status>,
-) -> WorkerResult<()> {
-    match result {
-        Ok((true, _)) => Ok(()),
-        Ok((false, message)) => Err(WorkerError::OperationFailed {
-            url: url.to_string(),
-            operation: operation.to_string(),
-            reason: if message.is_empty() {
-                "backend reported failure".to_string()
-            } else {
-                message
-            },
-        }),
-        Err(status) => Err(WorkerError::OperationFailed {
-            url: url.to_string(),
-            operation: operation.to_string(),
-            reason: status.to_string(),
-        }),
-    }
-}
 
 /// Context window advertised for `model_id` in `models`: the matching card's
 /// (aliases included), else the primary card's. Borrows only, so it is safe on
@@ -865,6 +760,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// entry alive.
     fn http_client_handle_if_initialized(&self) -> Option<Arc<reqwest::Client>>;
 
+    /// Strong handle to the worker's backend client (gRPC or ZMQ), if its
+    /// lazy connect landed. Never drives the connect: a worker still
+    /// connecting, or an HTTP worker, has none.
+    fn backend_client_if_initialized(&self) -> Option<Arc<BackendClient>> {
+        None
+    }
+
     // ── Metadata convenience delegates ──────────────────────────────
     //
     // These default impls forward to the canonical implementation on
@@ -883,14 +785,6 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Get the bootstrap port for PD mode.
     fn bootstrap_port(&self) -> Option<u16> {
         self.metadata().bootstrap_port()
-    }
-
-    /// The bootstrap rendezvous the worker's engine declared at its handshake
-    /// (`host`, `port`): a TokenSpeed engine on the direct ZMQ lane says where
-    /// its bootstrap server listens. `None` for a worker whose engine declared
-    /// none or has not connected.
-    fn declared_bootstrap(&self) -> Option<(String, u16)> {
-        None
     }
 
     /// Get the base URL without any DP rank suffix.
@@ -1567,15 +1461,6 @@ impl BasicWorker {
 
 #[async_trait]
 impl Worker for BasicWorker {
-    fn declared_bootstrap(&self) -> Option<(String, u16)> {
-        let cell = self.backend_client.load_full();
-        let BackendClient::Zmq(client) = cell.get()?.as_ref() else {
-            return None;
-        };
-        let (host, port) = client.ready_response()?.bootstrap_address()?;
-        Some((host.to_string(), port))
-    }
-
     /// [`BasicWorker`] keeps the trait's default `prepare_request`, so the
     /// HTTP proxy path may apply the DP-rank edit on raw slices.
     fn uses_builtin_prepare_request(&self) -> bool {
@@ -2072,6 +1957,10 @@ impl Worker for BasicWorker {
         self.http_client.handle_if_initialized()
     }
 
+    fn backend_client_if_initialized(&self) -> Option<Arc<BackendClient>> {
+        self.backend_client.load_full().get().cloned()
+    }
+
     fn supports_model(&self, model_id: &str) -> bool {
         let overridden = self.models_override.load();
         if !overridden.is_wildcard() {
@@ -2342,12 +2231,14 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
 mod tests {
     use std::{thread, time::Duration};
 
+    use engine_zmq_client::protocol::handshake::EngineCoreReadyResponse;
     use metrics_exporter_prometheus::PrometheusBuilder;
     use openai_protocol::worker::{HealthCheckConfig, WorkerSpec};
 
     use super::*;
     use crate::worker::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        metadata::DecodingLabels,
         BasicWorkerBuilder, OverloadThresholds,
     };
 
@@ -3420,6 +3311,7 @@ mod tests {
             pd_pairing: PdPairing::derive(&WorkerSpec::new("http://test:8080")),
             spec: Arc::new(WorkerSpec::new("http://test:8080")),
             redacted_url: "http://test:8080".to_string(),
+            decoding: DecodingLabels::default(),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
             zmq_startup_timeout: Duration::from_secs(600),
@@ -3450,6 +3342,7 @@ mod tests {
             pd_pairing: PdPairing::derive(&spec),
             spec: Arc::new(spec),
             redacted_url: "http://test:8080".to_string(),
+            decoding: DecodingLabels::default(),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
             zmq_startup_timeout: Duration::from_secs(600),
@@ -3521,6 +3414,66 @@ mod tests {
             &retyped.backend_client.load_full(),
             &old.backend_client.load_full()
         ));
+    }
+
+    /// What the engine declared at its handshake is read through the backend
+    /// peek, never through a method of its own: a direct-ZMQ worker whose
+    /// engine declared a bootstrap address answers it once the connect landed,
+    /// and nothing before (the peek never drives the connect).
+    #[tokio::test]
+    async fn the_declared_bootstrap_is_read_through_the_backend_peek() {
+        use engine_zmq_client::{
+            mock_engine::{connect_to_frontend, default_ready_response},
+            protocol::handshake::EngineCoreReadyResponse,
+            EngineId,
+        };
+
+        use crate::routers::grpc::zmq_client::{EosTokenIds, ZmqEngineClient};
+
+        let base = tempfile::tempdir().unwrap();
+        let ep = |name: &str| format!("ipc://{}", base.path().join(name).display());
+        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+        let worker = BasicWorkerBuilder::new(ep("ts0.ipc"))
+            .connection_mode(ConnectionMode::Zmq)
+            .worker_type(WorkerType::Prefill)
+            .health_config(no_health_check())
+            .build();
+        assert!(worker.backend_client_if_initialized().is_none());
+
+        let (client, engine) = tokio::join!(
+            ZmqEngineClient::connect(
+                &handshake,
+                &input,
+                &output,
+                1,
+                "m".to_string(),
+                EosTokenIds::default(),
+                RuntimeType::TokenSpeed,
+                Duration::from_secs(10)
+            ),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                EngineCoreReadyResponse {
+                    bootstrap_host: Some("10.0.0.7".to_string()),
+                    bootstrap_port: Some(8998),
+                    ..default_ready_response()
+                }
+            ),
+        );
+        let client = client.expect("adapter connect");
+        let _engine = engine.expect("mock engine");
+        worker
+            .backend_client
+            .load_full()
+            .set(Arc::new(BackendClient::Zmq(client)))
+            .ok()
+            .expect("cell empty");
+
+        let backend = worker
+            .backend_client_if_initialized()
+            .expect("the connect landed");
+        assert_eq!(backend.declared_bootstrap(), Some(("10.0.0.7", 8998)));
     }
 
     /// A ZMQ client whose engine dies must be evicted by the health probe (the
@@ -3611,6 +3564,237 @@ mod tests {
         assert!(
             !worker.zmq_connect_started.load(Ordering::SeqCst),
             "handshake guard must reset to allow a reconnect"
+        );
+    }
+
+    /// A direct-ZMQ worker whose connect landed on one mock rank that
+    /// declared `ready`, the backend injected as the connect driver leaves
+    /// it, plus the rank itself for the test to answer what the worker sends.
+    async fn zmq_worker_on_a_mock_rank(
+        dir: &std::path::Path,
+        ready: EngineCoreReadyResponse,
+    ) -> (BasicWorker, engine_zmq_client::mock_engine::MockEngine) {
+        use engine_zmq_client::{mock_engine::connect_to_frontend, EngineId};
+
+        use crate::routers::grpc::zmq_client::{EosTokenIds, ZmqEngineClient};
+
+        std::fs::create_dir_all(dir).unwrap();
+        let ep = |name: &str| format!("ipc://{}", dir.join(name).display());
+        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+        let (client, engine) = tokio::join!(
+            ZmqEngineClient::connect(
+                &handshake,
+                &input,
+                &output,
+                1,
+                "m".to_string(),
+                EosTokenIds::default(),
+                RuntimeType::TokenSpeed,
+                Duration::from_secs(10)
+            ),
+            connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready),
+        );
+        let client = client.expect("adapter connect");
+        let engine = engine.expect("mock engine");
+        let worker = BasicWorkerBuilder::new(ep("ts0.ipc"))
+            .connection_mode(ConnectionMode::Zmq)
+            .runtime_type(RuntimeType::TokenSpeed)
+            .health_config(no_health_check())
+            .build();
+        worker
+            .backend_client
+            .load_full()
+            .set(Arc::new(BackendClient::Zmq(client)))
+            .ok()
+            .expect("cell empty");
+        worker.zmq_connect_started.store(true, Ordering::SeqCst);
+        (worker, engine)
+    }
+
+    /// The handshake of a rank whose wire carries control calls.
+    fn control_ready() -> EngineCoreReadyResponse {
+        EngineCoreReadyResponse {
+            positional_layouts: std::collections::BTreeMap::from([(
+                "ControlReplySlim".to_string(),
+                ["call_id", "success", "message", "engine_index"]
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            )]),
+            ..engine_zmq_client::mock_engine::default_ready_response()
+        }
+    }
+
+    /// Answer the one control call a rank receives with `success` and
+    /// `message`; the call's method and arguments, for the test to check.
+    async fn answer_control_call(
+        engine: &mut engine_zmq_client::mock_engine::MockEngine,
+        success: bool,
+        message: Option<&str>,
+    ) -> (String, Vec<engine_zmq_client::codec::OpaqueValue>) {
+        use engine_zmq_client::{
+            codec::{decode_msgpack, encode_msgpack, OpaqueValue},
+            protocol::{control::ControlReplySlim, tokenspeed::request::TokenSpeedRequestType},
+        };
+
+        let frames = engine.recv_request().await.unwrap();
+        assert_eq!(
+            TokenSpeedRequestType::from_frame(frames[0].as_ref()),
+            Some(TokenSpeedRequestType::Control)
+        );
+        let (call_id, method, args): (i64, String, Vec<OpaqueValue>) =
+            decode_msgpack(frames[1].as_ref()).unwrap();
+        let reply = ControlReplySlim {
+            call_id,
+            success,
+            message: message.map(str::to_string),
+            engine_index: 0,
+        };
+        engine
+            .send_output(vec![bytes::Bytes::from(encode_msgpack(&reply).unwrap())])
+            .await
+            .unwrap();
+        (method, args)
+    }
+
+    /// A direct-ZMQ worker whose engine declared no control reply has no
+    /// admin call to take: its cache flush and both profiler operations are
+    /// refused by name before anything is sent.
+    #[tokio::test]
+    async fn a_zmq_workers_admin_operations_are_refused_without_the_control_reply() {
+        use engine_zmq_client::mock_engine::default_ready_response;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (worker, _engine) =
+            zmq_worker_on_a_mock_rank(dir.path(), default_ready_response()).await;
+        let outcomes = [
+            ("flush_cache", worker.flush_cache().await),
+            (
+                "start_profile",
+                worker.start_profile(&ProfileOptions::default()).await,
+            ),
+            ("stop_profile", worker.stop_profile().await),
+        ];
+        for (operation, outcome) in outcomes {
+            let error = outcome.expect_err(operation);
+            assert!(
+                error.to_string().contains(&format!(
+                    "{operation} is not supported over this engine's ZMQ wire"
+                )),
+                "{operation}: {error}"
+            );
+        }
+    }
+
+    /// A direct-ZMQ worker's cache flush and profiler ride its engine's
+    /// control wire when the handshake declared the control reply: each
+    /// operation is one control call named after it (the flush with its
+    /// timeout, the start with its options and a stamped profile id, the stop
+    /// with nothing), and the rank's reply is the operation's outcome.
+    #[tokio::test]
+    async fn a_zmq_workers_admin_operations_ride_its_control_wire() {
+        use engine_zmq_client::codec::OpaqueValue;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (worker, mut engine) = zmq_worker_on_a_mock_rank(dir.path(), control_ready()).await;
+
+        let (flushed, (method, args)) = tokio::join!(
+            worker.flush_cache(),
+            answer_control_call(&mut engine, true, None)
+        );
+        flushed.expect("the flush succeeded");
+        assert_eq!(method, "flush_cache");
+        assert_eq!(args, vec![OpaqueValue::F64(0.0)]);
+
+        let options = ProfileOptions {
+            output_dir: Some("/traces".to_string()),
+            num_steps: Some(8),
+            profile_by_stage: true,
+            ..ProfileOptions::default()
+        };
+        let (started, (method, args)) = tokio::join!(
+            worker.start_profile(&options),
+            answer_control_call(&mut engine, true, None)
+        );
+        started.expect("the start succeeded");
+        assert_eq!(method, "start_profile");
+        let fields = args[0].as_map().expect("the start's options");
+        let field = |key: &str| {
+            fields
+                .iter()
+                .find(|(name, _)| name.as_str() == Some(key))
+                .map(|(_, value)| value)
+        };
+        assert_eq!(field("output_dir"), Some(&OpaqueValue::from("/traces")));
+        assert_eq!(field("num_steps"), Some(&OpaqueValue::from(8i64)));
+        assert_eq!(field("profile_by_stage"), Some(&OpaqueValue::Boolean(true)));
+        assert!(field("start_step").is_none());
+        let profile_id = field("profile_id")
+            .and_then(OpaqueValue::as_str)
+            .expect("a stamped profile id");
+        assert!(profile_id.parse::<f64>().is_ok(), "{profile_id}");
+
+        let (stopped, (method, args)) = tokio::join!(
+            worker.stop_profile(),
+            answer_control_call(&mut engine, false, Some("nothing is running"))
+        );
+        assert_eq!(method, "stop_profile");
+        assert!(args.is_empty());
+        let error = stopped.expect_err("the rank's failure is the operation's");
+        assert!(error.to_string().contains("nothing is running"), "{error}");
+    }
+
+    /// A fleet-wide cache flush fans out to the direct-ZMQ workers whose
+    /// engine wire carries control calls and skips the others, counted apart
+    /// so that `total = http + grpc + zmq` holds; a fleet of nothing but
+    /// skipped workers answers with the skip named. (Beside the worker rather
+    /// than the manager: the injected backend needs the worker's own cell.)
+    #[tokio::test]
+    async fn a_fleet_flush_skips_the_zmq_workers_without_control_calls_and_counts_them() {
+        use engine_zmq_client::mock_engine::default_ready_response;
+
+        use crate::worker::{WorkerManager, WorkerRegistry};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (silent, _silent_rank) =
+            zmq_worker_on_a_mock_rank(&dir.path().join("silent"), default_ready_response()).await;
+        let (speaking, mut engine) =
+            zmq_worker_on_a_mock_rank(&dir.path().join("speaking"), control_ready()).await;
+        let speaking_url = speaking.url().to_string();
+        let registry = WorkerRegistry::new();
+        registry.register(Arc::new(silent)).expect("registered");
+        registry.register(Arc::new(speaking)).expect("registered");
+
+        let (result, (method, _)) = tokio::join!(
+            WorkerManager::flush_cache_all(&registry),
+            answer_control_call(&mut engine, true, None)
+        );
+        assert_eq!(method, "flush_cache");
+        assert_eq!(
+            (
+                result.total_workers,
+                result.http_workers,
+                result.grpc_workers,
+                result.zmq_workers
+            ),
+            (2, 0, 1, 1)
+        );
+        assert_eq!(result.successful, vec![speaking_url]);
+        assert!(result.failed.is_empty(), "{:?}", result.failed);
+
+        let (alone, _alone_rank) =
+            zmq_worker_on_a_mock_rank(&dir.path().join("alone"), default_ready_response()).await;
+        let only_silent = WorkerRegistry::new();
+        only_silent.register(Arc::new(alone)).expect("registered");
+        let result = WorkerManager::flush_cache_all(&only_silent).await;
+        assert_eq!((result.total_workers, result.zmq_workers), (1, 1));
+        assert!(result.successful.is_empty() && result.failed.is_empty());
+        assert!(
+            result
+                .message
+                .contains("1 ZMQ workers skipped: no cache-flush RPC"),
+            "{}",
+            result.message
         );
     }
 

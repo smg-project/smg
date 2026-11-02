@@ -16,7 +16,7 @@ use tokio::{sync::oneshot, time::timeout};
 use super::{usage_tests::harmony_tokens, HarmonyStreamingProcessor};
 use crate::{
     observability::metrics::metrics_labels,
-    routers::grpc::{context, regular::streaming::eof_tests::gated_stream, utils},
+    routers::grpc::{context, regular::streaming::tests::eof::gated_stream, utils},
 };
 
 fn chunk(token_ids: Vec<u32>) -> proto::GenerateResponse {

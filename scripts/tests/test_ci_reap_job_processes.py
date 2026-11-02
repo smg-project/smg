@@ -139,6 +139,38 @@ def test_the_teardown_terminates_then_kills_what_ignores_the_term(mod, tree):
     assert (tree / "60").exists() and (tree / "200").exists() and (tree / "102").exists()
 
 
+def test_teardown_never_signals_init_with_an_inherited_job_marker(mod, tree):
+    (tree / "1" / "environ").write_bytes(f"E2E_JOB_MARKER={MARKER}\0".encode())
+    assert 1 in [process.pid for process in mod.marked_processes(MARKER, proc_root=str(tree))]
+    sent: list[tuple[int, int]] = []
+
+    def kill(pid: int, sig: int) -> None:
+        sent.append((pid, sig))
+        if (pid, sig) in ((101, signal.SIGTERM), (100, signal.SIGKILL)):
+            for name in ("stat", "cmdline", "environ"):
+                (tree / str(pid) / name).unlink()
+            (tree / str(pid)).rmdir()
+
+    lines: list[str] = []
+    found = mod.reap(
+        MARKER,
+        proc_root=str(tree),
+        grace=0.4,
+        kill=kill,
+        sleep=lambda seconds: None,
+        self_pid=61,
+        log=lines.append,
+    )
+    assert [process.pid for process in found] == [100, 101]
+    assert sent == [(100, signal.SIGTERM), (101, signal.SIGTERM), (100, signal.SIGKILL)]
+    assert all(pid != 1 for pid, _ in sent)
+    assert not (tree / "100").exists() and not (tree / "101").exists()
+    assert mod.alive(str(tree), 1)
+    assert (tree / "1" / "environ").read_bytes() == f"E2E_JOB_MARKER={MARKER}\0".encode()
+    assert all((tree / str(pid)).exists() for pid in (50, 60, 61, 102, 200, 300, 400))
+    assert lines[-1] == "ended 2 of 2 process(es) of E2E_JOB_MARKER=" + MARKER
+
+
 def test_a_survivor_of_the_kill_is_reported_as_a_warning(mod, tree):
     lines: list[str] = []
     mod.reap(

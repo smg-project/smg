@@ -1015,3 +1015,72 @@ def test_slim_output_carries_hidden_states_as_rows_per_position():
         msgspec.msgpack.encode(arr[:-1]), type=wire.BatchTokenIDSlimOutput
     )
     assert older.output_hidden_states is None
+
+
+# Pinned by the Rust request encoder test, including the video_token_id slot.
+RUST_VIDEO_REQUEST = (
+    "9eb9546f6b656e697a656447656e6572617465526571496e707574a26d6dc0c0950107070702c099919902c0c09192010301"
+    "c734020000001093920204a7666c6f61743332a3637075000000000000003f0000803f0000c03f0000004000002040000040"
+    "4000006040c0c281ae766964656f5f677269645f746877c72a020000000e93920103a5696e743634a3637075010000000000"
+    "000002000000000000000200000000000000c0c007c0c0c0c007c0dc001acc80c0c0c0cb3ff0000000000000cb3ff0000000"
+    "000000ffcb0000000000000000cb0000000000000000cb0000000000000000cb3ff00000000000000001c0c0c0c0c0c2c3c3"
+    "c2c0c0c0c0c2ff00c0c2"
+)
+
+
+def test_rust_video_tokens_are_padded_before_embedding():
+    """Use the native SGLang decoder to verify video placeholder padding."""
+    from sglang.srt.managers.mm_utils import (
+        MultiModalityDataPaddingPatternMultimodalTokens,
+    )
+    from sglang.srt.managers.schedule_batch import Modality
+
+    (req,) = wire.decode_request_frames([wire.REQ_TYPE_ADD, bytes.fromhex(RUST_VIDEO_REQUEST)])
+    media = req.mm_inputs
+    assert media.video_token_id == 7
+    (item,) = media.mm_items
+    assert item.modality is Modality.VIDEO
+    item.pad_value = 1000
+    padded = MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
+        req.input_ids, media
+    )
+    assert list(padded) == [1, 1000, 1000, 1000, 2]
+    assert list(req.input_ids) == [1, 7, 7, 7, 2]
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
+@pytest.mark.parametrize("modality", [1, 2])
+def test_sender_cpu_hash_preserves_engine_identity_padding_and_features(
+    monkeypatch, dtype, modality
+):
+    """Rust's SHA256 wire identity replaces hashing, never feature computation."""
+    import hashlib
+
+    torch = pytest.importorskip("torch")
+    from sglang.srt.managers import mm_utils
+
+    monkeypatch.setenv("SGLANG_MM_SKIP_COMPUTE_HASH", "0")
+    feature = torch.arange(32768, dtype=torch.float32).to(getattr(torch, dtype))
+    raw = feature.view(torch.uint8).numpy().tobytes()
+    payload = msgspec.msgpack.decode(bytes.fromhex(RUST_MM_FRAMED_REQUEST))
+    item = payload[6][0][0]
+    item[0] = modality
+    item[5] = msgspec.msgpack.Ext(100, msgspec.msgpack.encode([[32768], dtype, 1]))
+    (baseline,) = wire.decode_request_frames(
+        [wire.REQ_TYPE_ADD, msgspec.msgpack.encode(payload), bytearray(raw), b"\x80"]
+    )
+    expected = baseline.mm_inputs.mm_items[0]
+    expected.set_pad_value()
+    item[1] = int.from_bytes(hashlib.sha256(raw).digest()[:8], "big")
+    (candidate,) = wire.decode_request_frames(
+        [wire.REQ_TYPE_ADD, msgspec.msgpack.encode(payload), bytearray(raw), b"\x80"]
+    )
+    actual = candidate.mm_inputs.mm_items[0]
+    monkeypatch.setattr(
+        mm_utils, "hash_feature", lambda _: pytest.fail("sender hash must be reused")
+    )
+    actual.set_pad_value()
+    assert (actual.hash, actual.pad_value) == (expected.hash, expected.pad_value)
+    assert actual.feature.dtype == expected.feature.dtype
+    assert torch.equal(actual.feature, expected.feature)
+    assert actual.offsets == expected.offsets

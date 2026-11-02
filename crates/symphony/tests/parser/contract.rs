@@ -2365,7 +2365,7 @@ fn check_well_formed(subject: &Subject, text: &str, cuts: &[usize], events: &[Ev
                     // string the model opened and closed at once or the JSON it wrote: one with
                     // none, or whitespace alone, is made up for a member that has no value.
                     assert!(
-                        !(matches!(json.as_str(), "\"\"" | ", \"\"")
+                        !(matches!(json.as_ref(), "\"\"" | ", \"\"")
                             && source.text.trim().is_empty()),
                         "{}: the fragment {json:?} writes an empty string with no byte of the output behind it, a made-up value",
                         place()

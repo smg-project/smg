@@ -339,6 +339,39 @@ pub(crate) fn namespace_test_request() -> ResponsesRequest {
     })).unwrap()
 }
 
+/// The usage the serialization-path tests feed in: 12 input and 7 output
+/// tokens, 3 of them cached and 2 reasoning; `assert_responses_api_usage`
+/// reads it back off the wire.
+#[cfg(test)]
+pub(crate) fn responses_api_test_usage() -> openai_protocol::common::Usage {
+    use openai_protocol::common::Usage;
+    Usage::from_counts(12, 7)
+        .with_cached_tokens(3)
+        .with_reasoning_tokens(2)
+}
+
+/// The Responses usage object as the tests of the serialization paths read it
+/// off the wire: `responses_api_test_usage` under the Responses names only (no
+/// chat-style `prompt_tokens` / `completion_tokens`).
+#[cfg(test)]
+pub(crate) fn assert_responses_api_usage(wire: &Value) {
+    let usage = wire.get("usage").expect("usage should be present");
+
+    assert_eq!(usage.get("input_tokens"), Some(&serde_json::json!(12)));
+    assert_eq!(usage.get("output_tokens"), Some(&serde_json::json!(7)));
+    assert_eq!(usage.get("total_tokens"), Some(&serde_json::json!(19)));
+    assert_eq!(
+        usage.pointer("/input_tokens_details/cached_tokens"),
+        Some(&serde_json::json!(3))
+    );
+    assert_eq!(
+        usage.pointer("/output_tokens_details/reasoning_tokens"),
+        Some(&serde_json::json!(2))
+    );
+    assert!(usage.get("prompt_tokens").is_none());
+    assert!(usage.get("completion_tokens").is_none());
+}
+
 /// A response the client expects stored (`store` unset or true) whose record
 /// could not be written: nothing of it is stored, so it can be neither
 /// retrieved nor continued. A foreground request is answered with it, so the

@@ -13,7 +13,7 @@ use tokio::time::timeout;
 use super::{usage_tests::harmony_tokens, HarmonyStreamingProcessor};
 use crate::{
     observability::metrics::metrics_labels,
-    routers::grpc::{context, regular::streaming::eof_tests::scripted_stream, utils},
+    routers::grpc::{context, regular::streaming::tests::eof::scripted_stream, utils},
 };
 
 /// One token per engine step, with its logprob.

@@ -778,7 +778,7 @@ impl Assembler {
         self.written += 1;
         out.push(Event::ToolCallArguments {
             index: self.index,
-            json: fragment,
+            json: fragment.into(),
             source: Text::uncounted(std::mem::take(&mut self.carried)),
         });
     }
@@ -839,7 +839,7 @@ impl Assembler {
     fn end_call<'d>(&mut self, source: Text<'d>, out: &mut Events<'d>) {
         out.push(Event::ToolCallArguments {
             index: self.index,
-            json: if self.written == 0 { "{}" } else { "}" }.to_string(),
+            json: if self.written == 0 { "{}" } else { "}" }.into(),
             source,
         });
         out.push(Event::ToolCallEnd {

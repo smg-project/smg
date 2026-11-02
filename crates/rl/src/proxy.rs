@@ -317,6 +317,14 @@ async fn call_over_engine_connection(
                 message,
             });
         }
+        // The connection cannot carry the call: the same answer as a worker
+        // without a control endpoint, with the engine's reason and the way out.
+        Err(CallFailure::Unsupported(message)) => {
+            return Err(no_control_endpoint(
+                worker,
+                &format!("{message}; label `rl.control_url` to reach the engine's own control app"),
+            ));
+        }
     };
     let (status, body) = route_answer(&replies);
     let outcome = RlCallOutcome {
@@ -817,6 +825,12 @@ mod tests {
             (
                 CallFailure::Failed("engine not connected".to_string()),
                 StatusCode::BAD_GATEWAY,
+            ),
+            (
+                CallFailure::Unsupported(
+                    "the engine's handshake declares no control reply".to_string(),
+                ),
+                StatusCode::UNPROCESSABLE_ENTITY,
             ),
         ] {
             let app = crate::router::<()>(state(

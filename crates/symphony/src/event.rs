@@ -341,8 +341,11 @@ pub enum Event<'d> {
     ToolCallArguments {
         /// Which call the fragment belongs to.
         index: u32,
-        /// The fragment, as JSON text.
-        json: String,
+        /// The fragment, as JSON text: borrowed from the delta it came from where the fragment
+        /// is the model's own bytes and arrived in one delta, as a text event's text is; owned
+        /// where the syntax wrote it (a value given as text between tags, a raw control
+        /// character written as its escape) or where it reaches back into an earlier delta.
+        json: Cow<'d, str>,
         /// The output bytes this event accounts for, in the format's own syntax. Empty when the
         /// fragment came from bytes an earlier event already accounted for.
         source: Text<'d>,
@@ -406,7 +409,7 @@ impl Event<'_> {
                 source,
             } => Event::ToolCallArguments {
                 index,
-                json,
+                json: Cow::Owned(json.into_owned()),
                 source: source.into_owned(),
             },
             Event::ToolCallEnd { index, source } => Event::ToolCallEnd {
@@ -735,7 +738,7 @@ mod tests {
                 },
                 Event::ToolCallArguments {
                     index,
-                    json: "{}".to_string(),
+                    json: "{}".into(),
                     source: Text::uncounted("{}"),
                 },
                 Event::ToolCallEnd {
@@ -819,7 +822,7 @@ mod tests {
                 },
                 Event::ToolCallArguments {
                     index,
-                    json: "{}".to_string(),
+                    json: "{}".into(),
                     source: Text::uncounted("{}"),
                 },
                 Event::ToolCallEnd {

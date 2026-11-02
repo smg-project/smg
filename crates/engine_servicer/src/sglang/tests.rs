@@ -76,6 +76,7 @@ fn config(dir: &std::path::Path, handshake: &str, model: SglangModelInfo) -> Sgl
         servicer: servicer_config(dir, handshake),
         model,
         encode_dispatcher: None,
+        media_processor: None,
     }
 }
 
@@ -131,12 +132,32 @@ async fn harness_with(
     model: SglangModelInfo,
     configure: impl FnOnce(&mut SglangServicerConfig),
 ) -> Harness {
+    harness_with_media_reuse(model, configure, false).await
+}
+
+/// Create a connected fake scheduler with explicit media reuse settings for control-stream tests.
+async fn harness_with_media_reuse(
+    model: SglangModelInfo,
+    configure: impl FnOnce(&mut SglangServicerConfig),
+    reuse: bool,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
     let mut config = config(dir.path(), &handshake, model);
     configure(&mut config);
     let ranks = u32::try_from(config.servicer.engine_count).expect("a small rank count");
-    let server = SglangServicerServer::start(config).expect("servicer starts");
+    let server = if reuse {
+        SglangServicerServer::start_with_media_options(
+            config,
+            Some(engine_zmq_adapter::SglangCpuMmHasher::new(
+                std::num::NonZeroUsize::new(2).unwrap(),
+            )),
+            true,
+        )
+    } else {
+        SglangServicerServer::start(config)
+    }
+    .expect("servicer starts");
     let mut engines = Vec::new();
     for index in 0..ranks {
         engines.push(
@@ -3453,4 +3474,261 @@ async fn the_zero_filled_loads_count_the_connected_ranks() {
             .collect::<Vec<_>>(),
         vec![0, 1]
     );
+}
+
+struct NativeVideoProcessor;
+
+impl SglangMediaProcessor for NativeVideoProcessor {
+    /// Advertise the deterministic processor contract used by this test fixture.
+    fn identity_key(&self) -> Option<&str> {
+        Some("test-processor")
+    }
+
+    /// Provide deterministic media behavior without decoding or model inference.
+    fn process(
+        &self,
+        mut request: sg::GenerateRequest,
+    ) -> crate::BoxFuture<Result<sg::GenerateRequest, tonic::Status>> {
+        Box::pin(async move {
+            let refs = request.mm_inputs.take().unwrap();
+            assert_eq!(refs.video_urls, ["data:video/mp4;base64,AA=="]);
+            assert!(refs.pixel_values.is_none());
+            assert_eq!(request.tokenized.as_ref().unwrap().input_ids, [1, 7, 2]);
+            request.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 7, 7, 2];
+            request.mm_inputs = Some(sg::MultimodalInputs {
+                modalities: vec!["video".into()],
+                pixel_values: Some(sg::TensorData {
+                    data: vec![0; 32].into(),
+                    shape: vec![2, 4],
+                    dtype: "float32".into(),
+                }),
+                model_specific_tensors: [(
+                    "video_grid_thw".into(),
+                    sg::TensorData {
+                        data: [1i64, 2, 2]
+                            .iter()
+                            .flat_map(|x| x.to_le_bytes())
+                            .collect::<Vec<_>>()
+                            .into(),
+                        shape: vec![1, 3],
+                        dtype: "int64".into(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                im_token_id: Some(7),
+                mm_placeholders: vec![sg::PlaceholderRange {
+                    offset: 1,
+                    length: 3,
+                }],
+                ..Default::default()
+            });
+            Ok(request)
+        })
+    }
+}
+
+#[tokio::test]
+/// References must expand tokens before their video tensors reach the scheduler.
+async fn native_video_refs_expand_before_scheduler_dispatch() {
+    use engine_zmq_client::protocol::sglang::multimodal::SglangWireModality;
+    let mut h = harness_with(model_info(), |config| {
+        config.media_processor = Some(Arc::new(NativeVideoProcessor));
+    })
+    .await;
+    let info = h
+        .client
+        .get_server_info(sg::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        info.server_args.unwrap().fields["mm_processor"].kind,
+        Some(Kind::StringValue("smg".into()))
+    );
+    let mut request = generate_request("native-video", true, Vec::new());
+    request.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 2];
+    request.mm_inputs = Some(sg::MultimodalInputs {
+        video_urls: vec!["data:video/mp4;base64,AA==".into()],
+        ..Default::default()
+    });
+    let _stream = h.client.generate(request).await.unwrap().into_inner();
+    let received = recv_add(&mut h.engine_in).await;
+    assert_eq!(received.input_ids, [1, 7, 7, 7, 2]);
+    let mm = received.mm_inputs.unwrap();
+    assert_eq!(mm.mm_items[0].modality, SglangWireModality::Video);
+    assert_eq!(mm.mm_items[0].offsets, Some(vec![(1, 3)]));
+    assert!(mm.mm_items[0]
+        .model_specific_data
+        .contains_key("video_grid_thw"));
+    h.server.stop(Duration::from_secs(5)).unwrap();
+}
+
+struct PendingMediaProcessor;
+
+impl SglangMediaProcessor for PendingMediaProcessor {
+    /// Provide deterministic media behavior without decoding or model inference.
+    fn process(
+        &self,
+        _request: sg::GenerateRequest,
+    ) -> crate::BoxFuture<Result<sg::GenerateRequest, tonic::Status>> {
+        Box::pin(std::future::pending())
+    }
+}
+
+#[tokio::test]
+/// Aborting preprocessing unregisters the request without sending scheduler work.
+async fn abort_during_native_media_processing_never_submits_to_scheduler() {
+    let mut h = harness_with(model_info(), |config| {
+        config.media_processor = Some(Arc::new(PendingMediaProcessor));
+    })
+    .await;
+    let mut request = generate_request("pending-media", true, Vec::new());
+    request.mm_inputs = Some(sg::MultimodalInputs {
+        image_urls: vec!["https://example.test/image.png".into()],
+        ..Default::default()
+    });
+    let mut client = h.client.clone();
+    #[expect(clippy::disallowed_methods, reason = "test awaits this request task")]
+    let pending = tokio::spawn(async move { client.generate(request).await });
+    wait_until(|| h.server.active_requests() == 1).await;
+    h.client
+        .abort(sg::AbortRequest {
+            request_id: "pending-media".into(),
+            reason: String::new(),
+        })
+        .await
+        .unwrap();
+    let error = pending.bounded().await.unwrap().unwrap_err();
+    assert_eq!(error.code(), Code::Cancelled);
+    wait_until(|| h.server.active_requests() == 0).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), h.engine_in.recv_frames())
+            .await
+            .is_err()
+    );
+    h.server.stop(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+/// Keep engine hash opt-outs authoritative and reject out-of-range concurrency.
+fn cpu_mm_hash_configuration_preserves_engine_opt_outs() {
+    use super::mm_hash_threads;
+    assert_eq!(mm_hash_threads(Some("0"), true, "0", "0").unwrap(), 0);
+    assert_eq!(mm_hash_threads(Some("16"), true, "0", "0").unwrap(), 16);
+    for (gpu, skip) in [("64", "0"), ("0", "1"), ("unknown", "0"), ("0", "true")] {
+        assert_eq!(mm_hash_threads(Some("16"), true, gpu, skip).unwrap(), 0);
+    }
+    for invalid in ["-1", "33", "x"] {
+        assert!(mm_hash_threads(Some(invalid), true, "0", "0").is_err());
+    }
+}
+
+#[tokio::test]
+/// Verify early metadata delivery and Decode reuse or original-reference fallback.
+async fn media_identity_arrives_before_kv_and_decode_falls_back_when_invalid() {
+    use smg_grpc_client::sglang_media_identity as contract;
+    let mut model = model_info();
+    model.server_args_json = r#"{"disaggregation_mode":"prefill"}"#.into();
+    let mut p = harness_with_media_reuse(
+        model,
+        |c| c.media_processor = Some(Arc::new(NativeVideoProcessor)),
+        true,
+    )
+    .await;
+    let mut original = generate_request("reuse-video", true, Vec::new());
+    original.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 2];
+    original.mm_inputs = Some(sg::MultimodalInputs {
+        video_urls: vec!["data:video/mp4;base64,AA==".into()],
+        ..Default::default()
+    });
+    original.disaggregated_params = Some(sg::DisaggregatedParams {
+        bootstrap_host: "127.0.0.1".into(),
+        bootstrap_port: 8998,
+        bootstrap_room: 1,
+    });
+    let mut prefill = original.clone();
+    prefill.return_media_identity = true;
+    let mut stream = p.client.generate(prefill).await.unwrap().into_inner();
+    let prefill_wire = recv_add(&mut p.engine_in).await;
+    // No engine output or KV readiness has been supplied: the control item
+    // must still arrive, otherwise real PD would deadlock here.
+    let early = tokio::time::timeout(Duration::from_secs(1), stream.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(early.response.is_none());
+    let identity = early.media_identity.unwrap();
+    assert!(contract::validate(
+        &identity,
+        &original,
+        "v1:0.5.20:test-processor"
+    ));
+    let mut model = model_info();
+    model.server_args_json = r#"{"disaggregation_mode":"decode"}"#.into();
+    let mut d = harness_with_media_reuse(
+        model,
+        |c| c.media_processor = Some(Arc::new(NativeVideoProcessor)),
+        true,
+    )
+    .await;
+    let mut decode = original.clone();
+    decode.media_identity = Some(identity.clone());
+    let _decode_stream = d.client.generate(decode).await.unwrap().into_inner();
+    let wire = recv_add(&mut d.engine_in).await;
+    assert_eq!(wire.input_ids, prefill_wire.input_ids);
+    let pmm = prefill_wire.mm_inputs.unwrap();
+    let dmm = wire.mm_inputs.unwrap();
+    assert!(dmm.mm_items[0].feature.is_none());
+    assert!(pmm.mm_items[0].feature.is_some());
+    assert_eq!(dmm.mm_items[0].hash, pmm.mm_items[0].hash);
+    assert_eq!(dmm.mm_items[0].offsets, pmm.mm_items[0].offsets);
+    assert_eq!(
+        dmm.mm_items[0].model_specific_data,
+        pmm.mm_items[0].model_specific_data
+    );
+    let mut fallback_streams = Vec::new();
+    for case in 0..5 {
+        let mut req = original.clone();
+        req.request_id = format!("fallback-{case}");
+        let mut bad = identity.clone();
+        bad.request_digest = contract::request_digest(&req);
+        match case {
+            0 => bad.processor_key = "different-config".into(),
+            1 => bad.request_digest[0] ^= 1,
+            2 => bad.mm_inputs.as_mut().unwrap().mm_placeholders[0].length = u32::MAX,
+            3 => bad
+                .mm_inputs
+                .as_mut()
+                .unwrap()
+                .model_specific_tensors
+                .clear(),
+            _ => bad.version += 1,
+        }
+        req.media_identity = Some(bad);
+        fallback_streams.push(d.client.generate(req).await.unwrap().into_inner());
+        let wire = recv_add(&mut d.engine_in).await;
+        assert_eq!(wire.input_ids, [1, 7, 7, 7, 2]);
+        assert!(
+            wire.mm_inputs.unwrap().mm_items[0].feature.is_some(),
+            "case {case} must process references"
+        );
+    }
+    p.server.stop(Duration::from_secs(5)).unwrap();
+    d.server.stop(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+/// Only complete supported processor contracts enable the default optimization.
+fn media_optimization_defaults_require_a_supported_identity() {
+    assert!(media_reuse_enabled(None, true).unwrap());
+    assert!(!media_reuse_enabled(None, false).unwrap());
+    assert!(!media_reuse_enabled(Some("0"), true).unwrap());
+    assert!(media_reuse_enabled(Some("1"), false).unwrap());
+    assert!(media_reuse_enabled(Some("auto"), true).is_err());
+    assert_eq!(mm_hash_threads(None, true, "0", "0").unwrap(), 16);
+    assert_eq!(mm_hash_threads(None, false, "0", "0").unwrap(), 0);
+    assert_eq!(mm_hash_threads(None, true, "64", "0").unwrap(), 0);
+    assert_eq!(mm_hash_threads(None, true, "0", "1").unwrap(), 0);
 }

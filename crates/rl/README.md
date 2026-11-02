@@ -39,6 +39,9 @@ keeps the route's shape: `{"success", "message"}` with 200 when every rank
 succeeded, 400 with the failing ranks' words otherwise. GET routes and routes
 below one path segment have no call. Discovery reports such a worker with
 `control_url: null` and `engine_control_calls: true`; a label, when set, wins.
+An engine whose handshake declares no control reply (its wire carries generate
+and abort only) is reported with `engine_control_calls: false` once connected,
+and a call on it answers `no_control_endpoint` (HTTP 422) naming the reason.
 
 A worker with no control endpoint is reported in `failed[]` as
 `no_control_endpoint` (HTTP 422 on the per-worker route), so a fan-out over

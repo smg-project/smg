@@ -40,7 +40,7 @@ on:
       - .github/actions/setup-rust/**
       - scripts/ci_install_rust.sh
   pull_request:
-    branches: [ main ]
+    branches: [ main, release/** ]
     types: [opened, synchronize, reopened]
     paths:
       - crates/protocols/**

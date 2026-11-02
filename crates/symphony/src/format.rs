@@ -964,8 +964,10 @@ impl Format {
             .collect()
     }
 
-    /// The turn opener, if the table names one.
-    pub(crate) fn turn_opener(&self) -> Option<&str> {
+    /// The turn opener, if the table names one: what the template writes before the model's turn.
+    /// The corpus replay feeds it before a generation prompt's tail, since a table may key the
+    /// turn's start on it ([`Self::unopened_turn_starts_in`]).
+    pub fn turn_opener(&self) -> Option<&str> {
         self.turn_opener.as_deref()
     }
 

@@ -16,6 +16,7 @@ import sys
 import types
 
 import pytest
+from smg_grpc_servicer import constrained_decoding as cd
 from smg_grpc_servicer import rust_lifecycle
 from smg_grpc_servicer.trtllm import __main__ as cli
 from smg_grpc_servicer.trtllm import rust
@@ -123,6 +124,7 @@ def test_model_facts_without_a_local_checkpoint_leave_the_config_facts_at_zero(m
 
 def test_server_facts_name_the_backend_the_sizes_and_the_grammar_backend(monkeypatch):
     monkeypatch.setattr(rust, "_engine_version", lambda: "1.3.0")
+    monkeypatch.setattr(cd, "installed_xgrammar_version", lambda: "0.2.7")
     facts = rust.server_facts(
         ServeArgs(
             model="m",
@@ -143,6 +145,7 @@ def test_server_facts_name_the_backend_the_sizes_and_the_grammar_backend(monkeyp
         "context_parallel_size": 1,
         "data_parallel_size": 1,
         "guided_decoding_backend": "xgrammar",
+        "structural_tag_vocabulary": "",
         "max_running_requests": 32,
     }
     # No guided-decoding backend: the engine enforces no grammar.
@@ -365,3 +368,23 @@ def test_a_metrics_port_under_the_python_servicer_is_refused(monkeypatch):
     with pytest.raises(SystemExit) as exited:
         cli.main(["--model", "org/model", "--metrics-port", "9000"])
     assert exited.value.code == 2
+
+
+def test_server_facts_carry_the_structural_tag_vocabulary_of_an_older_xgrammar(monkeypatch):
+    # The xgrammar installed beside the engine predates the structural-tag
+    # nodes the Router writes (0.1.33 is the first release with them): the
+    # fact says so under `guided_decoding_backend: xgrammar`; no backend (the
+    # engine enforces no grammar), another backend, or a current xgrammar
+    # says nothing.
+    monkeypatch.setattr(rust, "_engine_version", lambda: "1.3.0")
+    monkeypatch.setattr(cd, "installed_xgrammar_version", lambda: "0.1.32")
+
+    def facts(**llm_args):
+        return rust.server_facts(ServeArgs(model="m", llm_args=llm_args))
+
+    assert facts(guided_decoding_backend="xgrammar")["structural_tag_vocabulary"] == "older"
+    assert facts(guided_decoding_backend="XGrammar")["structural_tag_vocabulary"] == "older"
+    assert facts()["structural_tag_vocabulary"] == ""
+    assert facts(guided_decoding_backend="llguidance")["structural_tag_vocabulary"] == ""
+    monkeypatch.setattr(cd, "installed_xgrammar_version", lambda: "0.1.33")
+    assert facts(guided_decoding_backend="xgrammar")["structural_tag_vocabulary"] == ""

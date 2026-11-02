@@ -20,9 +20,9 @@ use crate::{
     routers::provider_support,
     service_discovery::{DISCOVERY_LABEL_PREFIX, DISCOVERY_PROVIDER_LABEL},
     worker::{
+        basic::{merge_labels, worker_to_info},
         endpoint::Endpoint,
         registry::WorkerId,
-        worker::{merge_labels, worker_to_info},
         Worker, WorkerRegistry, WorkerType,
     },
     workflow::{Job, JobQueue, WorkerRegistrationMode},

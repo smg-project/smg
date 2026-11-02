@@ -7,7 +7,7 @@ use std::{
 };
 
 use llm_tokenizer::stop::StopSequenceDecoder;
-use openai_protocol::common::Tool;
+use openai_protocol::{common::Tool, profile::ProviderProfile};
 use parking_lot::RwLock;
 use symphony::{
     Declared, DropReason, Engine, EngineFinish, Event, Events, Format, Input, Parser as _, Text,
@@ -35,7 +35,7 @@ pub(crate) struct Assignment {
     pub format: Arc<Format>,
     pub prompt: String,
     /// The request forbade the calls the table reads (`tool_choice: none`,
-    /// [`Asks::forbids_calls`]): the reader drops every call, as the engine's own server reads
+    /// [`Asks::forbids_calls_for`]): the reader drops every call, as the engine's own server reads
     /// such a call and withholds it.
     pub forbids_calls: bool,
 }
@@ -65,7 +65,7 @@ pub(super) fn assignment(
 
 /// The table as the request's asks make it: without its calls when the legacy path would run no
 /// tool parser (the response is not scanned for calls:
-/// [`scans_for_tool_calls`](crate::routers::grpc::spec::scans_for_tool_calls)), so a table that reads calls from the output's first byte (`json`,
+/// [`scans_for_tool_calls_for`](crate::routers::grpc::spec::scans_for_tool_calls_for)), so a table that reads calls from the output's first byte (`json`,
 /// `xlam`) is content from it; without its thought when the request keeps the reasoning in the
 /// content, as the legacy path runs no reasoning parser then. A variant is a copy of the shared
 /// table; a request that asks for neither reads with the shared table itself. A `tool_choice` of
@@ -155,12 +155,13 @@ struct AskedVariant {
 /// constraint is not a JSON schema: the older path's forced call, whose output has no markers for
 /// a table to read, which the older registry writes where the table has no tag. The table goes
 /// without its calls where the legacy path would run no tool parser, without its thought where it
-/// would run no reasoning parser ([`Asks::no_calls`], [`Asks::no_reasoning`], [`asked`]). A call
+/// would run no reasoning parser ([`Asks::no_calls_for`], [`Asks::no_reasoning`], [`asked`]). A call
 /// the conversation established without a tool inventory comes back as a call under either
 /// parser. `None` where the legacy parsers read the response, which the response's header then
 /// says; a request Symphony was configured for is counted once here, by the reason
 /// ([`telemetry::record_fallback`]): request building asks once per request, and nothing else
 /// decides the reader.
+#[cfg(test)]
 pub(crate) fn assign(
     parser: ParserChoice,
     names: &ModelNames<'_>,
@@ -168,6 +169,28 @@ pub(crate) fn assign(
     constraint: Option<&(String, String)>,
     prompt: &str,
     templates: &Templates,
+) -> Result<Option<Assignment>, SymphonyError> {
+    assign_for(
+        parser,
+        names,
+        asks,
+        constraint,
+        prompt,
+        templates,
+        ProviderProfile::for_model(asks.model()),
+    )
+}
+
+/// [`assign`] with the model's provider profile already derived (the
+/// preparation stage derives it once per request; request building passes it).
+pub(crate) fn assign_for(
+    parser: ParserChoice,
+    names: &ModelNames<'_>,
+    asks: Asks<'_>,
+    constraint: Option<&(String, String)>,
+    prompt: &str,
+    templates: &Templates,
+    provider: ProviderProfile,
 ) -> Result<Option<Assignment>, SymphonyError> {
     let format = match reading(parser, names, asks.model(), templates)? {
         Reading::Table(format, _) => format,
@@ -184,12 +207,12 @@ pub(crate) fn assign(
         );
         return Ok(None);
     }
-    let format = asked(format, asks.no_calls(), asks.no_reasoning());
+    let format = asked(format, asks.no_calls_for(provider), asks.no_reasoning());
     Ok(Some(assignment(
         format,
         asks.model(),
         prompt,
-        asks.forbids_calls(),
+        asks.forbids_calls_for(provider),
     )))
 }
 
@@ -1668,7 +1691,10 @@ mod tests {
             .format
         };
         let retry = request(json!({"model": "MiniMax-M3", "messages": retry_messages()}));
-        assert!(scans_for_tool_calls(&retry));
+        assert!(scans_for_tool_calls_for(
+            &retry,
+            ProviderProfile::for_model(&retry.model)
+        ));
         assert_eq!(
             assigned(&retry),
             table(&retry),
@@ -1692,14 +1718,20 @@ mod tests {
         );
         assert!(forbidden.forbids_calls);
         let declared_none = request(json!({"tools": []}));
-        assert!(scans_for_tool_calls(&declared_none));
+        assert!(scans_for_tool_calls_for(
+            &declared_none,
+            ProviderProfile::for_model(&declared_none.model)
+        ));
         assert_eq!(
             assigned(&declared_none),
             table(&declared_none),
             "an empty list is a declaration"
         );
         let undeclared = request(json!({"messages": retry_messages()}));
-        assert!(!scans_for_tool_calls(&undeclared));
+        assert!(!scans_for_tool_calls_for(
+            &undeclared,
+            ProviderProfile::for_model(&undeclared.model)
+        ));
         assert_eq!(
             *assigned(&undeclared),
             Arc::unwrap_or_clone(table(&undeclared)).without_calls(),

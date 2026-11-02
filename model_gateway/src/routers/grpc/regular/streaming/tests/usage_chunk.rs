@@ -9,8 +9,8 @@ use http_body_util::BodyExt;
 use openai_protocol::{chat::ChatCompletionRequest, validated::Normalizable};
 
 use super::{
-    eof_tests::{chunk, complete, processor, scripted_stream, CharacterTokenizer},
-    *,
+    super::*,
+    eof::{chunk, complete, processor, scripted_stream, CharacterTokenizer},
 };
 
 /// The spec of a streamed chat request for `model` with `fields` on top, as

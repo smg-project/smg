@@ -368,7 +368,7 @@ impl Assembler {
     /// Append the next bytes of the call, after its start, and push the events they complete,
     /// a parameter's value typed by `declared`. Every byte is the call's until the engine closes
     /// the region.
-    pub fn feed(&mut self, bytes: &str, declared: &Declared, out: &mut Events) {
+    pub fn feed<'d>(&mut self, bytes: &'d str, declared: &Declared, out: &mut Events<'d>) {
         let shape = self.shape;
         let Stage::Body(body) = &mut self.stage else {
             return;
@@ -492,12 +492,12 @@ impl Value {
         }
     }
 
-    fn feed(
+    fn feed<'d>(
         &mut self,
         shape: &'static CallShape,
         (values, declared): (&Values, &Declared),
-        bytes: &str,
-        out: &mut Events,
+        bytes: &'d str,
+        out: &mut Events<'d>,
     ) {
         let mut rest = bytes;
         let handed_back;
@@ -510,14 +510,15 @@ impl Value {
                 declared,
                 name: &self.name,
             };
+            // The reader takes the delta's own bytes, so a fragment within them borrows them.
             let taken = match &mut self.reader {
-                JsonReader::Json(arguments) => arguments.feed(rest, &typing, out),
-                JsonReader::Envelope(assembler) => assembler.feed(rest, out),
+                JsonReader::Json(arguments) => arguments.feed(bytes, &typing, out),
+                JsonReader::Envelope(assembler) => assembler.feed(bytes, out),
             };
-            if let Some(last) = rest[..taken].chars().next_back() {
+            if let Some(last) = bytes[..taken].chars().next_back() {
                 self.before = Some(last);
             }
-            rest = &rest[taken..];
+            rest = &bytes[taken..];
             if !self.reader.over() {
                 return;
             }
@@ -793,7 +794,7 @@ mod tests {
                         source: bytes,
                     },
                 ) if *index == other => {
-                    json.push_str(&more);
+                    json.to_mut().push_str(&more);
                     source.text.to_mut().push_str(&bytes.text);
                 }
                 (Some(Event::Content(text)), Event::Content(more))
@@ -904,7 +905,7 @@ mod tests {
     fn arguments(json: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index: 0,
-            json: json.to_string(),
+            json: json.to_string().into(),
             source: Text::uncounted(json.to_owned()),
         }
     }
@@ -1595,7 +1596,7 @@ mod tests {
     fn member(json: &str, source: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index: 0,
-            json: json.to_string(),
+            json: json.to_string().into(),
             source: Text::uncounted(source.to_owned()),
         }
     }
@@ -1603,7 +1604,7 @@ mod tests {
     fn closed() -> Event<'static> {
         Event::ToolCallArguments {
             index: 0,
-            json: "}".to_string(),
+            json: "}".into(),
             source: Text::default(),
         }
     }
@@ -2059,7 +2060,7 @@ mod tests {
             events[2],
             Event::ToolCallArguments {
                 index: 0,
-                json: "{\"n\": 5, \"s\": \"5\", \"m\": [\"5\"], \"x\": \"1\"}".to_string(),
+                json: "{\"n\": 5, \"s\": \"5\", \"m\": [\"5\"], \"x\": \"1\"}".into(),
                 source: Text::uncounted(
                     "{\"n\": \"5\", \"s\": \"5\", \"m\": [\"5\"], \"x\": \"1\"}"
                 ),
@@ -2078,7 +2079,7 @@ mod tests {
             [
                 Event::ToolCallArguments {
                     index: 0,
-                    json: "{\"n\": 5, ".to_string(),
+                    json: "{\"n\": 5, ".into(),
                     source: Text::uncounted("{\"n\": \"5\", "),
                 },
                 Event::Malformed {
@@ -2087,7 +2088,7 @@ mod tests {
                 },
                 Event::ToolCallArguments {
                     index: 0,
-                    json: "x}".to_string(),
+                    json: "x}".into(),
                     source: Text::uncounted("x}"),
                 },
             ],

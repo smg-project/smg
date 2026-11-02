@@ -692,7 +692,7 @@ mod tests {
     use tonic::{transport::Server, Request, Response, Status};
 
     use super::*;
-    use crate::worker::{worker::StallReason, BasicWorkerBuilder};
+    use crate::worker::{basic::StallReason, BasicWorkerBuilder};
 
     /// One batch of stored events, one block per event, `(hash, block_size)` each.
     fn stored_batch(blocks: &[(i64, usize)]) -> KvEventBatch {

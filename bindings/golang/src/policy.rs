@@ -28,10 +28,11 @@ use smg::{
     },
     routers::grpc::backend_client::BackendClient,
     worker::{
+        basic::{RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad},
         circuit_breaker::{CircuitBreaker, CircuitState},
         endpoint::Endpoint,
+        metadata::DecodingLabels,
         resilience::ResolvedResilience,
-        worker::{RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad},
         ConnectionMode, OverloadThresholds, PdPairing, Worker, WorkerResult, WorkerType,
     },
 };
@@ -71,6 +72,7 @@ impl GrpcWorker {
         let metadata = WorkerMetadata {
             pd_pairing: PdPairing::derive(&spec),
             redacted_url: Endpoint::redacted_url(&endpoint),
+            decoding: DecodingLabels::of(&spec),
             spec: Arc::new(spec),
             discovered_labels: Arc::default(),
             health_config: HealthCheckConfig::default(),

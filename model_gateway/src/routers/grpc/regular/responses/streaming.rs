@@ -1321,35 +1321,48 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
 
     use super::*;
-    use crate::routers::grpc::common::responses::utils::namespace_test_request;
+    use crate::routers::grpc::common::responses::utils::{
+        assert_responses_api_usage, namespace_test_request, responses_api_test_usage,
+    };
 
     #[test]
     fn streaming_accumulator_serializes_responses_api_usage() {
         let request = ResponsesRequest::default();
         let mut accumulator = StreamingResponseAccumulator::new(&request);
-        accumulator.usage = Some(
-            Usage::from_counts(12, 7)
-                .with_cached_tokens(3)
-                .with_reasoning_tokens(2),
-        );
+        accumulator.usage = Some(responses_api_test_usage());
 
         let wire = serde_json::to_value(accumulator.finalize())
             .expect("streaming response should serialize");
-        let usage = wire.get("usage").expect("usage should be present");
+        assert_responses_api_usage(&wire);
+    }
 
-        assert_eq!(usage.get("input_tokens"), Some(&serde_json::json!(12)));
-        assert_eq!(usage.get("output_tokens"), Some(&serde_json::json!(7)));
-        assert_eq!(usage.get("total_tokens"), Some(&serde_json::json!(19)));
-        assert_eq!(
-            usage.pointer("/input_tokens_details/cached_tokens"),
-            Some(&serde_json::json!(3))
-        );
-        assert_eq!(
-            usage.pointer("/output_tokens_details/reasoning_tokens"),
-            Some(&serde_json::json!(2))
-        );
-        assert!(usage.get("prompt_tokens").is_none());
-        assert!(usage.get("completion_tokens").is_none());
+    /// Runs chat SSE frames through the Responses transform as an unstored
+    /// request over empty memory storages (no tenant, no request context) and
+    /// hands back the client's receiver once the transform has returned.
+    async fn transformed_chat_stream(
+        frames: Vec<String>,
+    ) -> mpsc::Receiver<Result<Bytes, std::io::Error>> {
+        let body = Body::from_stream(futures_util::stream::iter(
+            frames.into_iter().map(Ok::<_, std::convert::Infallible>),
+        ));
+        let (tx, rx) = mpsc::channel(64);
+        process_and_transform_sse_stream(
+            body,
+            ResponsesRequest {
+                store: Some(false),
+                ..Default::default()
+            },
+            None,
+            Arc::new(smg_data_connector::MemoryResponseStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
+            None,
+            tx,
+        )
+        .await
+        .unwrap();
+        rx
     }
 
     #[tokio::test]
@@ -1366,26 +1379,7 @@ mod tests {
                 format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap()),
                 "data: [DONE]\n\n".into(),
             ];
-            let body = Body::from_stream(futures_util::stream::iter(
-                frames.into_iter().map(Ok::<_, std::convert::Infallible>),
-            ));
-            let (tx, mut rx) = mpsc::channel(64);
-            process_and_transform_sse_stream(
-                body,
-                ResponsesRequest {
-                    store: Some(false),
-                    ..Default::default()
-                },
-                None,
-                Arc::new(smg_data_connector::MemoryResponseStorage::new()),
-                Arc::new(smg_data_connector::MemoryConversationStorage::new()),
-                Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
-                None,
-                None,
-                tx,
-            )
-            .await
-            .unwrap();
+            let mut rx = transformed_chat_stream(frames).await;
             let mut terminal = None;
             while let Some(Ok(bytes)) = rx.recv().await {
                 let text = std::str::from_utf8(&bytes).unwrap();
@@ -1547,26 +1541,7 @@ mod tests {
         let frames = vec![format!("data: {reasoning}\n\n"),
             "data: {\"error\":{\"message\":\"engine unavailable\",\"type\":\"internal_error\"}}\n\n".into(),
             "data: [DONE]\n\n".into()];
-        let body = Body::from_stream(futures_util::stream::iter(
-            frames.into_iter().map(Ok::<_, std::convert::Infallible>),
-        ));
-        let (tx, mut rx) = mpsc::channel(64);
-        process_and_transform_sse_stream(
-            body,
-            ResponsesRequest {
-                store: Some(false),
-                ..Default::default()
-            },
-            None,
-            Arc::new(smg_data_connector::MemoryResponseStorage::new()),
-            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
-            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
-            None,
-            None,
-            tx,
-        )
-        .await
-        .unwrap();
+        let mut rx = transformed_chat_stream(frames).await;
         let mut events: Vec<Value> = Vec::new();
         while let Some(Ok(bytes)) = rx.recv().await {
             let text = std::str::from_utf8(&bytes).unwrap();
@@ -1926,26 +1901,7 @@ mod tests {
             ]
             .concat(),
         ];
-        let body = Body::from_stream(futures_util::stream::iter(
-            frames.into_iter().map(Ok::<_, std::convert::Infallible>),
-        ));
-        let (tx, mut rx) = mpsc::channel(64);
-        process_and_transform_sse_stream(
-            body,
-            ResponsesRequest {
-                store: Some(false),
-                ..Default::default()
-            },
-            None,
-            Arc::new(smg_data_connector::MemoryResponseStorage::new()),
-            Arc::new(smg_data_connector::MemoryConversationStorage::new()),
-            Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
-            None,
-            None,
-            tx,
-        )
-        .await
-        .unwrap();
+        let mut rx = transformed_chat_stream(frames).await;
         let mut events: Vec<Value> = Vec::new();
         while let Some(Ok(bytes)) = rx.recv().await {
             let text = std::str::from_utf8(&bytes).unwrap();

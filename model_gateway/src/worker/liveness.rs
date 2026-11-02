@@ -143,7 +143,7 @@ use openai_protocol::worker::WorkerStatus;
 use tracing::{info, warn};
 
 use super::{
-    worker::{StallReason, COLD_PREFILL_TOKENS_PER_SEC},
+    basic::{StallReason, COLD_PREFILL_TOKENS_PER_SEC},
     Worker,
 };
 use crate::{config::RouterConfig, observability::metrics::Metrics};

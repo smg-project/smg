@@ -1607,6 +1607,9 @@ pub(crate) fn attach_mcp_server_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routers::grpc::common::responses::utils::{
+        assert_responses_api_usage, responses_api_test_usage,
+    };
 
     /// The frame of an event: its `type` on the `event:` line and the JSON on
     /// the `data:` line, the text escaped as JSON; an error frame has no
@@ -1724,26 +1727,10 @@ mod tests {
         let emitter =
             ResponseStreamEventEmitter::new("resp_test".to_string(), "test-model".to_string(), 1);
 
-        let usage = Usage::from_counts(12, 7)
-            .with_cached_tokens(3)
-            .with_reasoning_tokens(2);
+        let usage = responses_api_test_usage();
         let wire = serde_json::to_value(emitter.finalize(Some(usage)))
             .expect("finalized response should serialize");
-        let usage = wire.get("usage").expect("usage should be present");
-
-        assert_eq!(usage.get("input_tokens"), Some(&serde_json::json!(12)));
-        assert_eq!(usage.get("output_tokens"), Some(&serde_json::json!(7)));
-        assert_eq!(usage.get("total_tokens"), Some(&serde_json::json!(19)));
-        assert_eq!(
-            usage.pointer("/input_tokens_details/cached_tokens"),
-            Some(&serde_json::json!(3))
-        );
-        assert_eq!(
-            usage.pointer("/output_tokens_details/reasoning_tokens"),
-            Some(&serde_json::json!(2))
-        );
-        assert!(usage.get("prompt_tokens").is_none());
-        assert!(usage.get("completion_tokens").is_none());
+        assert_responses_api_usage(&wire);
     }
 
     #[tokio::test]
