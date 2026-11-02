@@ -336,6 +336,9 @@ async fn execute_mcp_tool_loop_streaming(
                 partial_text,
                 usage,
                 request_id: _,
+                // The stored object and the terminal read the finish the
+                // emitter was told.
+                finish_reason: _,
             } => {
                 debug!(
                     tool_call_count = tool_calls.len(),

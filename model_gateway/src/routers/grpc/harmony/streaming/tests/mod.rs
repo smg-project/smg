@@ -3,6 +3,7 @@ mod closed_message;
 mod local_stop;
 mod logprobs;
 mod lone_complete;
+mod status;
 mod usage;
 
 use super::*;

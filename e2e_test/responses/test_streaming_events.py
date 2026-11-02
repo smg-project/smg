@@ -128,7 +128,7 @@ class TestStreamingEventsGptOss:
             model=model,
             input="Count from 1 to 3",
             stream=True,
-            max_output_tokens=50,
+            max_output_tokens=512,
         )
 
         events = list(resp)
@@ -198,7 +198,7 @@ class TestStreamingEventsGptOss:
             model=model,
             input="What is the capital of France? Think step by step.",
             stream=True,
-            max_output_tokens=200,
+            max_output_tokens=1024,
         )
 
         events = list(resp)
