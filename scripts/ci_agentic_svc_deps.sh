@@ -172,7 +172,10 @@ cmd_setup_oracle_client() {
                 "https://download.oracle.com/otn_software/linux/instantclient/2326100/$INSTANT_CLIENT_ZIP"
             unzip -tq "$staging/$INSTANT_CLIENT_ZIP"
             unzip -q "$staging/$INSTANT_CLIENT_ZIP" -d "$staging/unpacked"
-            test -d "$staging/unpacked/instantclient_23_26"
+            test -d "$staging/unpacked/instantclient_23_26" || {
+                echo "Oracle archive $INSTANT_CLIENT_ZIP has no instantclient_23_26/ root" >&2
+                exit 1
+            }
             mv -T "$staging/unpacked/instantclient_23_26" "$INSTANT_CLIENT_DIR/instantclient_23_26"
         )
     else

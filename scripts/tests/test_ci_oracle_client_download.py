@@ -252,6 +252,7 @@ def test_attempts_have_finite_timeout_and_exhausted_timeout_stays_failure(downlo
 def test_valid_zip_with_wrong_client_directory_is_not_published(download):
     result, _, cache = download(wrong_folder=True)
     assert result.returncode != 0
+    assert f"Oracle archive {ARCHIVE} has no {CLIENT}/ root" in result.stderr
     empty_cache(cache)
 
 
