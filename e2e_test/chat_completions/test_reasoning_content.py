@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm")
+@pytest.mark.engine("sglang", "vllm", "trtllm", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.model("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
 @pytest.mark.gateway(
@@ -28,10 +28,25 @@ logger = logging.getLogger(__name__)
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestReasoningContentAPI:
-    """Tests for reasoning content API with DeepSeek R1 reasoning parser."""
+    """Tests for reasoning content API with DeepSeek R1 reasoning parser.
 
-    def test_streaming_separate_reasoning_false(self, model, api_client):
+    On the mock engine each test states the model's answer first (``mock_answers``, a
+    no-op on a real engine): the template opens the thought in the prompt, so the
+    answer is the thought's text, its close and the content.
+    """
+
+    # The model's answer as it writes it after the prompt's ``<think>``.
+    MOCK_ANSWER = (
+        "Okay, the user asks for 1 plus 3. One plus three is four.\n</think>\n\n1 + 3 = 4."
+    )
+    # The answer an engine cut at max_tokens inside the thought: no close, finish
+    # length; short enough for the stop test's 24-token limit with the tail it
+    # appends.
+    MOCK_CUT_ANSWER = "Okay, one plus three. Let me count it out:"
+
+    def test_streaming_separate_reasoning_false(self, model, api_client, mock_answers):
         """Test streaming with separate_reasoning=False, reasoning_content should be empty."""
+        mock_answers.enqueue(self.MOCK_ANSWER)
 
         response = api_client.chat.completions.create(
             model=model,
@@ -58,8 +73,9 @@ class TestReasoningContentAPI:
         assert len(reasoning_content) == 0
         assert len(content) > 0
 
-    def test_streaming_separate_reasoning_true(self, model, api_client):
+    def test_streaming_separate_reasoning_true(self, model, api_client, mock_answers):
         """Test streaming with separate_reasoning=True, reasoning_content should not be empty."""
+        mock_answers.enqueue(self.MOCK_ANSWER)
 
         response = api_client.chat.completions.create(
             model=model,
@@ -86,8 +102,11 @@ class TestReasoningContentAPI:
         assert len(reasoning_content) > 0
         assert len(content) > 0
 
-    def test_streaming_separate_reasoning_true_stream_reasoning_false(self, model, api_client):
+    def test_streaming_separate_reasoning_true_stream_reasoning_false(
+        self, model, api_client, mock_answers
+    ):
         """Test streaming with separate_reasoning=True and stream_reasoning=False."""
+        mock_answers.enqueue(self.MOCK_ANSWER)
 
         response = api_client.chat.completions.create(
             model=model,
@@ -123,7 +142,9 @@ class TestReasoningContentAPI:
         assert len(content) > 0
 
     @pytest.mark.parametrize("stop", [["wtf"], ["wtfx"], ["0123456789"]])
-    def test_streaming_unmatched_stop_word_does_not_change_output(self, model, api_client, stop):
+    def test_streaming_unmatched_stop_word_does_not_change_output(
+        self, model, api_client, stop, mock_answers
+    ):
         """A `stop` word that never fires must not change what the client sees.
 
         The stop decoder withholds text that could still complete a stop
@@ -137,6 +158,12 @@ class TestReasoningContentAPI:
 
         def run(stop_words):
             kwargs = {"stop": stop_words} if stop_words else {}
+            # On the mock the answer ends in the stop word minus its last
+            # character, in both runs: the decoder holds that tail back as a
+            # possible match until the stream ends, so the baseline carries it
+            # in reasoning_content and the stopped run only if the flush goes
+            # through the reasoning parser.
+            mock_answers.enqueue(f"{self.MOCK_CUT_ANSWER} {stop[0][:-1]}", finish_reason="length")
             response = api_client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": "What is 1+3?"}],
@@ -169,8 +196,9 @@ class TestReasoningContentAPI:
             "matches must not affect the reasoning/content split"
         )
 
-    def test_nonstreaming_separate_reasoning_false(self, model, api_client):
+    def test_nonstreaming_separate_reasoning_false(self, model, api_client, mock_answers):
         """Test non-streaming with separate_reasoning=False, reasoning_content should be empty."""
+        mock_answers.enqueue(self.MOCK_ANSWER)
 
         response = api_client.chat.completions.create(
             model=model,
@@ -190,8 +218,9 @@ class TestReasoningContentAPI:
         )
         assert len(response.choices[0].message.content) > 0
 
-    def test_nonstreaming_separate_reasoning_true(self, model, api_client):
+    def test_nonstreaming_separate_reasoning_true(self, model, api_client, mock_answers):
         """Test non-streaming with separate_reasoning=True, reasoning_content should not be empty."""
+        mock_answers.enqueue(self.MOCK_ANSWER)
 
         response = api_client.chat.completions.create(
             model=model,
