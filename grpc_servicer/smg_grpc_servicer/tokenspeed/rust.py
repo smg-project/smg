@@ -462,9 +462,10 @@ def _run_headless(server_args: Any) -> None:
 def launch_headless_scheduler(server_args: Any) -> EngineProcess:
     """Start TokenSpeed's headless launcher in a spawned child: a fresh
     interpreter that inherits no Rust thread and never consults the servicer
-    switch. Only the cases :func:`launch_scheduler_ranks` cannot serve go
-    this way: the child is a second full Python/torch process per engine
-    pod."""
+    switch. Only the cases :func:`launch_scheduler_ranks` cannot serve, and a
+    prefill launch whose KV bootstrap server the engine's launcher hosts
+    (:func:`prefill_bootstrap_server_is_the_launchers`), go this way: the
+    child is a second full Python/torch process per engine pod."""
     context = multiprocessing.get_context("spawn")
     process = context.Process(
         target=_run_headless, args=(server_args,), name="smg-headless-scheduler"
@@ -493,8 +494,11 @@ def launch_scheduler_ranks(server_args: Any) -> EngineProcessGroup | EngineProce
     group's own handler takes its place and the servicer drains and exits
     through :func:`supervise`. The spawned launcher child is kept for a
     TokenSpeed that lacks these entry points (they are the launcher's own
-    internals) and for a caller off the main thread, where no handler can be
-    installed.
+    internals), for a caller off the main thread, where no handler can be
+    installed, and for a prefill launch whose KV bootstrap server the
+    engine's launcher hosts, which :meth:`TokenSpeedLauncher.launch` leaves
+    to that launcher before this function is reached
+    (:func:`prefill_bootstrap_server_is_the_launchers`).
     """
     if threading.current_thread() is not threading.main_thread():
         logger.info(
