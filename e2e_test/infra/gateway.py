@@ -7,6 +7,7 @@ import os
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any
@@ -753,12 +754,15 @@ def launch_cloud_gateway(
     timeout: float = 60,
     show_output: bool | None = None,
     max_attempts: int = 3,
+    post_start: Callable[[Gateway, float], None] | None = None,
 ) -> Gateway:
     """Launch gateway with a cloud API runtime (openai, xai, anthropic).
 
     Retries up to max_attempts because the AddWorker workflow can fail
     intermittently due to a race condition in the workflow engine's
-    parallel step context handling.
+    parallel step context handling. An optional post_start barrier receives
+    the same attempt's absolute deadline; its TimeoutError uses these existing
+    attempts, while other failures are cleaned up and propagated without retry.
     """
     from .model_specs import THIRD_PARTY_MODELS
 
@@ -770,7 +774,9 @@ def launch_cloud_gateway(
     last_error: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         gateway = Gateway()
+        barrier_started = False
         try:
+            deadline = time.monotonic() + timeout
             gateway.start(
                 cloud_backend=runtime,
                 history_backend=history_backend,
@@ -778,14 +784,27 @@ def launch_cloud_gateway(
                 show_output=show_output,
                 extra_args=extra_args,
             )
+            if post_start is not None:
+                barrier_started = True
+                post_start(gateway, deadline)
             return gateway
-        except TimeoutError as e:
-            last_error = e
+        except BaseException as error:
+            if barrier_started:
+                gateway._started = False
+                if gateway.log_path is not None:
+                    error.add_note(f"Gateway setup log retained at {gateway.log_path}")
+            if not isinstance(error, TimeoutError):
+                if barrier_started:
+                    gateway.shutdown()
+                raise
+            last_error = error
             logger.warning(
                 "Cloud gateway startup attempt %d/%d timed out: %s",
                 attempt,
                 max_attempts,
-                e,
+                error,
             )
+            # Cleanup failures propagate from here, never becoming another
+            # startup attempt with ownership of the previous router uncertain.
             gateway.shutdown()
     raise last_error  # type: ignore[misc]

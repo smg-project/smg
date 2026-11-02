@@ -111,16 +111,19 @@ def gateway_with_mcp_config(require_brave_server, mcp_config_file):
         "openai",
         history_backend="memory",
         extra_args=["--mcp-config-path", mcp_config_file],
+        post_start=lambda gateway, deadline: wait_for_single_mcp_registration(
+            gateway, deadline=deadline
+        ),
     )
 
-    client = openai.OpenAI(
-        base_url=f"{gateway.base_url}/v1",
-        api_key=os.environ.get(api_key_env),
-    )
-
-    yield gateway, client
-
-    gateway.shutdown()
+    try:
+        client = openai.OpenAI(
+            base_url=f"{gateway.base_url}/v1",
+            api_key=os.environ.get(api_key_env),
+        )
+        yield gateway, client
+    finally:
+        gateway.shutdown()
 
 
 @pytest.fixture(scope="class")
