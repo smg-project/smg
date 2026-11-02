@@ -1011,7 +1011,8 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
     monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
     monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
 
-    def fake_launch(headless):
+    def fake_launch(headless, *, before_ranks):
+        before_ranks()
         recorded["headless"] = headless
         return "engine-handle"
 
@@ -1093,7 +1094,7 @@ def _run_serve_rust(monkeypatch, tmp_path) -> dict:
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: str(tmp_path))
     monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
     monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
-    monkeypatch.setattr(rust, "launch_scheduler_ranks", lambda headless: "engine-handle")
+    monkeypatch.setattr(rust, "launch_scheduler_ranks", lambda headless, **_: "engine-handle")
 
     async def fake_supervise(server, engine, *, drain_secs, **kwargs):
         recorded["supervise_kwargs"] = kwargs
@@ -1152,10 +1153,13 @@ def _install_fake_pd_utils(monkeypatch) -> dict:
     return asked
 
 
-def _serve_rust_role(monkeypatch, tmp_path, caplog, mode: str) -> dict:
+def _serve_rust_role(monkeypatch, tmp_path, caplog, mode: str, *, in_process: bool = True) -> dict:
     """``serve_rust`` for a launch in disaggregation ``mode`` against the
     recording fakes: when the ranks were launched relative to the bootstrap
-    server, and the supervisor's end."""
+    server, and the supervisor's end. With ``in_process`` the rank launch is
+    a fake standing for the start from this process; without it the real
+    launch runs and, on an engine without the in-process entry points, goes
+    to the (faked) spawned headless launcher."""
     recorded: dict = {"launched_with_servers": None}
 
     class FakeServer:
@@ -1178,9 +1182,10 @@ def _serve_rust_role(monkeypatch, tmp_path, caplog, mode: str) -> dict:
     monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
     monkeypatch.delenv("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", raising=False)
 
-    def fake_launch(headless):
-        # The ranks register with the bootstrap server when they start: it
-        # must already be up.
+    def fake_launch(headless, *, before_ranks):
+        # The start from this process runs what must be up first; the ranks
+        # register with the bootstrap server when they start.
+        before_ranks()
         recorded["launched_with_servers"] = [
             (server.port, server.closed) for server in _FakeBootstrapServer.built
         ]
@@ -1190,7 +1195,10 @@ def _serve_rust_role(monkeypatch, tmp_path, caplog, mode: str) -> dict:
         recorded["supervised"] = engine
         return 0
 
-    monkeypatch.setattr(rust, "launch_scheduler_ranks", fake_launch)
+    if in_process:
+        monkeypatch.setattr(rust, "launch_scheduler_ranks", fake_launch)
+    else:
+        monkeypatch.setattr(rust, "launch_headless_scheduler", lambda headless: "engine-handle")
     monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
     with caplog.at_level("INFO", logger=rust.logger.name):
         recorded["exit"] = asyncio.run(
@@ -1205,8 +1213,9 @@ def test_a_prefill_launch_starts_the_engines_kv_bootstrap_server_before_the_rank
     """The prefill side hosts the rendezvous the decode side discovers its KV
     at. The engine's frontend starts it on the Python path; here the
     launcher starts the same class, through the engine's registry for the
-    transfer backend, on the configured port, before the ranks (each
-    registers with it once), logs it, and closes it when it ends."""
+    transfer backend, on the configured port, before ranks that start from
+    this process (each registers with it once), logs it, and closes it when
+    it ends."""
     asked = _install_fake_pd_utils(monkeypatch)
     recorded = _serve_rust_role(monkeypatch, tmp_path, caplog, "prefill")
     assert recorded["exit"] == 0 and recorded["supervised"] == "engine-handle"
@@ -1233,6 +1242,23 @@ def test_a_decode_or_aggregated_launch_starts_no_bootstrap_server(
     assert recorded["launched_with_servers"] == []
     assert _FakeBootstrapServer.built == []
     assert "Bootstrap server started" not in caplog.text
+
+
+def test_a_prefill_launch_left_to_the_spawned_launcher_hosts_no_bootstrap_server(
+    monkeypatch, tmp_path, caplog
+):
+    """Ranks left to the engine's own headless launcher (an engine without
+    the in-process entry points: every TokenSpeed since its Rust control
+    plane) get their bootstrap server from that launcher, which hosts it on
+    the prefill side's node 0. The servicer starts none, so the port is bound
+    once, and never reaches for the registry that engine no longer has."""
+    _stub_rank_launch(monkeypatch, missing="run_event_loop")
+    asked = _install_fake_pd_utils(monkeypatch)
+    recorded = _serve_rust_role(monkeypatch, tmp_path, caplog, "prefill", in_process=False)
+    assert recorded["exit"] == 0 and recorded["supervised"] == "engine-handle"
+    assert _FakeBootstrapServer.built == [] and asked == {}
+    assert "Bootstrap server started" not in caplog.text
+    assert "left to TokenSpeed's headless launcher in a spawned process" in caplog.text
 
 
 def test_an_encode_launch_runs_on_the_rust_path_with_its_rendezvous_fact(launcher, monkeypatch):
@@ -1585,7 +1611,7 @@ def test_a_launch_that_fails_stops_the_already_bound_server(monkeypatch, tmp_pat
     monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
     monkeypatch.delenv("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", raising=False)
 
-    def failing_launch(headless):
+    def failing_launch(headless, **_kwargs):
         raise RuntimeError("scheduler would not start")
 
     async def never_supervise(*_args, **_kwargs):

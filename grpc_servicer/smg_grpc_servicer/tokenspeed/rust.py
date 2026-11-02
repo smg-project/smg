@@ -19,9 +19,11 @@ emulates: ``FlushCache`` and profiling ride the wire's control call on a
 scheduler whose handshake declares its control reply, and answer UNIMPLEMENTED
 on one that does not; ranked ``top_logprobs`` and prompt logprobs are refused.
 Prefill/decode disaggregation is served: the request's bootstrap fields ride
-the wire as the Python servicer forwards them, and a prefill launch starts the
-engine's KV bootstrap server here as the engine's own frontend does
-(:func:`kv_bootstrap_server`). The EPD prefill side is served the same way,
+the wire as the Python servicer forwards them, and a prefill launch whose
+ranks start from this process starts the engine's KV bootstrap server here as
+the engine's own frontend does (:func:`kv_bootstrap_server`; ranks left to
+the engine's headless launcher get it from that launcher). The EPD prefill
+side is served the same way,
 and the EPD encode role on an engine whose handshake lists the encode
 request: the Rust servicer mounts the encoder service and hands each
 ``Encode`` to the worker over the wire, the launcher adds the worker's own
@@ -49,7 +51,7 @@ import logging
 import multiprocessing
 import signal
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from smg_grpc_servicer.constrained_decoding import (
@@ -470,7 +472,9 @@ def launch_headless_scheduler(server_args: Any) -> EngineProcess:
     return EngineProcess(process)
 
 
-def launch_scheduler_ranks(server_args: Any) -> EngineProcessGroup | EngineProcess:
+def launch_scheduler_ranks(
+    server_args: Any, *, before_ranks: Callable[[], None] | None = None
+) -> EngineProcessGroup | EngineProcess:
     """Start the scheduler rank processes from this process, the way
     TokenSpeed's headless launcher (``launch_scheduler_headless``, what ``ts
     serve --headless`` runs) starts them: the environment and start method it
@@ -492,6 +496,11 @@ def launch_scheduler_ranks(server_args: Any) -> EngineProcessGroup | EngineProce
     TokenSpeed that lacks these entry points (they are the launcher's own
     internals) and for a caller off the main thread, where no handler can be
     installed.
+
+    ``before_ranks`` runs once the ranks are to start from this process and
+    before any of them does: what the headless launcher brings up ahead of
+    its ranks, and so hosts itself where the launch is left to it (the
+    prefill side's KV bootstrap server, :func:`kv_bootstrap_server`).
     """
     if threading.current_thread() is not threading.main_thread():
         logger.info(
@@ -517,6 +526,8 @@ def launch_scheduler_ranks(server_args: Any) -> EngineProcessGroup | EngineProce
         )
         return launch_headless_scheduler(server_args)
 
+    if before_ranks is not None:
+        before_ranks()
     configure_logger(server_args)
     set_envs_and_config(server_args)
     ensure_spawn_start_method("TokenSpeed scheduler")
@@ -598,7 +609,11 @@ def kv_bootstrap_server(server_args: Any) -> Any | None:
     the decode side discovers its KV at (``--disaggregation-bootstrap-port``).
     The engine's own frontend starts it when it is built, which the Python
     servicer inherits; this path builds no frontend, so the launcher starts
-    the same class (the transfer backend's, through the engine's registry).
+    the same class (the transfer backend's, through the engine's registry)
+    when the ranks start from this process. Ranks left to the engine's
+    headless launcher get it from that launcher, which hosts it on the
+    prefill side's node 0: one started here too would bind the port twice,
+    through a registry that engine no longer hands the class out of.
     It must be up before the prefill ranks start: each rank registers with
     it once, and a rank that misses it is a prefill no decode can find. The
     server runs on its own thread and binds the port on every interface;
@@ -717,7 +732,9 @@ class TokenSpeedLauncher(RustLauncher):
     # layer labels off it, the facts the rest.
     _cached_model_config: Any = None
     # The prefill side's KV bootstrap server (:func:`kv_bootstrap_server`),
-    # started right before the ranks and closed when the launcher ends.
+    # started right before ranks that start from this process and closed
+    # when the launcher ends; ``None`` for the other roles and for ranks left
+    # to the engine's headless launcher, which hosts its own.
     _bootstrap_server: Any = None
 
     def model_config(self, args: Any) -> Any:
@@ -743,9 +760,16 @@ class TokenSpeedLauncher(RustLauncher):
         return tokenizer_dir_for(args)
 
     def launch(self, args: Any, handshake_port: int, facts: Mapping[str, Any]) -> Any:
-        # Before the ranks: a prefill rank registers with the server once.
-        self._bootstrap_server = kv_bootstrap_server(args)
-        return launch_scheduler_ranks(headless_server_args(args, handshake_port=handshake_port))
+        def host_bootstrap_server() -> None:
+            # Before the ranks: a prefill rank registers with the server once.
+            self._bootstrap_server = kv_bootstrap_server(args)
+
+        # Hosted here for ranks that start from this process only: the
+        # spawned headless launcher hosts its own.
+        return launch_scheduler_ranks(
+            headless_server_args(args, handshake_port=handshake_port),
+            before_ranks=host_bootstrap_server,
+        )
 
     async def serve(self, args: Any) -> int:
         try:

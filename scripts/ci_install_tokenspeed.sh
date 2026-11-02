@@ -243,9 +243,15 @@ print('quack version   ->', getattr(quack, '__version__', '?'))
 echo "=== TokenSpeed verification ==="
 # The engine's ranks run on its Rust control plane behind a headless
 # launcher; the Rust gRPC servicer starts them through it. The in-process
-# Python frontend (AsyncLLM) is gone from the engine, so nothing imports it.
+# Python frontend (AsyncLLM) is gone from the engine, so nothing imports it
+# at import time. The worker entrypoint the e2e harness starts
+# (python3 -m smg_grpc_servicer.tokenspeed) is imported whole: its
+# module-level imports are every path's, so an engine bump that removes what
+# one of them reads fails here, not twenty minutes into a lane.
 python3 -c "from tokenspeed.runtime.entrypoints.engine import launch_scheduler_headless; \
     print('headless launcher: importable')"
+python3 -c "import smg_grpc_servicer.tokenspeed.__main__; \
+    print('worker entrypoint: importable')"
 python3 -c "from smg_grpc_servicer.tokenspeed import serve_rust; \
     print('Rust gRPC servicer: importable')"
 python3 -c "from smg_grpc_servicer.tokenspeed.servicer import TokenSpeedSchedulerServicer; \

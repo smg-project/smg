@@ -780,9 +780,10 @@ class Worker:
     def _build_tokenspeed_grpc_cmd(self, model_path: str, tp_size: int, spec: dict) -> list[str]:
         """Build TokenSpeed gRPC server command.
 
-        Launches ``smg_grpc_servicer.tokenspeed`` which wraps TokenSpeed's
-        ``AsyncLLM`` behind the dedicated ``tokenspeed.grpc.scheduler``
-        service.
+        Launches ``smg_grpc_servicer.tokenspeed``, which serves the dedicated
+        ``tokenspeed.grpc.scheduler`` service over the engine's ranks (the
+        Rust servicer under ``--servicer-impl rust``, the harness's setting
+        for TokenSpeed).
         """
         cmd = [
             "python3",
