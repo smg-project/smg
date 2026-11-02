@@ -823,6 +823,7 @@ jobs:
               - 'crates/engine_zmq_adapter/**'
               - 'crates/engine_servicer/**'
               - 'crates/mock_worker/**'
+              - 'crates/gateway_perf/**'
               - 'crates/protocols/**'
               - 'crates/tokenizer/**'
               - 'crates/kv_index/**'
@@ -1078,6 +1079,7 @@ jobs:
               ("crates/*/tools/**",                              NONE),
               ("crates/grpc_client/go/**",                       NONE),
               ("crates/mock_worker/**",                          NONE),
+              ("crates/gateway_perf/**",                         NONE),
               ("crates/radix_tree/**",                           NONE),
               ("crates/tokenizer/**",                            "go-bindings"),
               # Symphony and the response templates it compiles: the default
