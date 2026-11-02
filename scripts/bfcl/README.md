@@ -99,11 +99,13 @@ a GitHub Actions matrix — one leg per model, `fail-fast: false`, each on its o
   (`vllm/vllm-openai-rocm:v0.31.0`, set up by
   `scripts/ci_setup_vllm_rocm_image.sh`), so an AMD leg and its H100 counterpart
   differ only in hardware, and the runner needs only Docker and the GPUs, not a
-  particular ROCm release. These legs need an
-  AMD-provided self-hosted runner; until one is registered and the repo variable
-  `SMG_RUN_AMD_LEGS` is `true`, they run only from a `workflow_dispatch` that
-  asks for them, with `only` or with `hardware: amd`. They never run on
-  `pull_request`.
+  particular ROCm release. These legs need an AMD-provided self-hosted runner
+  and `SMG_RUN_AMD_BFCL=true`, including explicit `workflow_dispatch` requests.
+  With that gate enabled, `SMG_RUN_AMD_LEGS=true` selects AMD automatically;
+  otherwise a dispatch must ask for it with `only` or `hardware: amd`.
+  They never run on `pull_request`. Keep the BFCL gate off until shared-host
+  admission and process-owned teardown are qualified: the container-local BFCL
+  lock does not provide cross-CI exclusion.
 
   The AMD legs whose models need ROCm fixes newer than the pin run in a pinned
   vLLM ROCm nightly instead, on the channel the model's vLLM recipe names, with

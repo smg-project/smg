@@ -165,7 +165,8 @@ edits, so upstream syncs stay conflict-free.
 | `SMG_RUNNER_GPU_2` | `2-gpu-h100` | 2-GPU e2e jobs |
 | `SMG_RUNNER_GPU_4` | `4-gpu-h100` | 4-GPU e2e and benchmark jobs |
 | `SMG_RUNNER_AMD_GPU_4` | `4-gpu-mi300x` | AMD nightly benchmark (off unless `SMG_RUN_AMD_LEGS` is `true`) |
-| `SMG_RUNNER_AMD_GPU_8` | `8-gpu-mi300x` | AMD legs of the BFCL A/B and AMD rows of the nightly PD sweep (off unless `SMG_RUN_AMD_LEGS` is `true`) |
+| `SMG_RUNNER_AMD_GPU_8` | `8-gpu-mi300x` | AMD BFCL and nightly PD runner; automatic AMD selection requires `SMG_RUN_AMD_LEGS=true` |
+| `SMG_RUN_AMD_BFCL` | `false` | Required for every AMD BFCL selection, including explicit dispatch; keep off until shared-host admission and owned teardown are qualified |
 
 GitHub-hosted labels (`ubuntu-latest`, `macos-latest`) are left as-is — every
 fork already has those.
