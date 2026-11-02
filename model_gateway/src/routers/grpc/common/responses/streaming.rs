@@ -157,6 +157,11 @@ pub(crate) struct ResponseStreamEventEmitter {
     /// Chat `finish_reason` of the final chunk, e.g. `"length"` for a
     /// `max_output_tokens` truncation. Drives the terminal event's status.
     finish_reason: Option<String>,
+    /// Whether a closed call was cut: its function-shaped arguments read
+    /// `incomplete` under the finish reason, before a custom tool's call became
+    /// its `custom_tool_call` item, which carries no status. The terminal event
+    /// and the stored object read it.
+    cut_call: bool,
     /// The response runs in the background: `response.created` reports it
     /// `queued`, `response.queued` follows, and the objects echo the flag.
     background: bool,
@@ -200,6 +205,7 @@ impl ResponseStreamEventEmitter {
             tool_call_items: Vec::new(),
             reasoning_item: None,
             finish_reason: None,
+            cut_call: false,
             background: false,
             last_error: None,
             encoder: SseEncoder::new(),
@@ -248,12 +254,6 @@ impl ResponseStreamEventEmitter {
                 }
             }
         }
-    }
-
-    /// Whether a streamed output item is a call cut short: a `function_call` whose status says
-    /// its arguments are not complete JSON.
-    fn is_cut_call(item: &serde_json::Value) -> bool {
-        item["type"] == "function_call" && item["status"] == "incomplete"
     }
 
     fn next_sequence(&mut self) -> u64 {
@@ -409,20 +409,20 @@ impl ResponseStreamEventEmitter {
             output
         };
 
-        // A `length` finish means max_output_tokens truncated the response;
-        // the Responses contract reports that as status=incomplete with
-        // incomplete_details and terminates the stream with
-        // response.incomplete, mirroring the non-streaming conversion.
-        let length = self.finish_reason.as_deref() == Some("length");
-        let truncated = length || output.iter().any(Self::is_cut_call);
-        let failed = matches!(self.finish_reason.as_deref(), Some("failed" | "error"));
+        // The event's status is read where the stored object and the
+        // non-streaming conversion read theirs: a `length` finish is incomplete
+        // with `max_output_tokens`, a cut call is incomplete without details, a
+        // failed generation is failed; the stream ends with the event of that
+        // status.
+        let (status, incomplete_details) =
+            super::utils::response_status(self.finish_reason.as_deref(), self.cut_call);
 
         // Build base response object
         let mut response_obj = json!({
             "id": self.response_id,
             "object": "response",
             "created_at": self.created_at,
-            "status": if failed { "failed" } else if truncated { "incomplete" } else { "completed" },
+            "status": status,
             "background": self.background,
             "model": self.model,
             "output": output
@@ -430,8 +430,8 @@ impl ResponseStreamEventEmitter {
         if let Some(error) = generation_failure_error(self.finish_reason.as_deref()) {
             response_obj["error"] = error;
         }
-        if length {
-            response_obj["incomplete_details"] = json!({ "reason": "max_output_tokens" });
+        if let Some(details) = incomplete_details {
+            response_obj["incomplete_details"] = json!(details);
         }
 
         // Add usage if provided
@@ -479,12 +479,10 @@ impl ResponseStreamEventEmitter {
         }
 
         json!({
-            "type": if failed {
-                ResponseEvent::FAILED
-            } else if truncated {
-                ResponseEvent::INCOMPLETE
-            } else {
-                ResponseEvent::COMPLETED
+            "type": match status {
+                ResponseStatus::Failed => ResponseEvent::FAILED,
+                ResponseStatus::Incomplete => ResponseEvent::INCOMPLETE,
+                _ => ResponseEvent::COMPLETED,
             },
             "sequence_number": self.next_sequence(),
             "response": response_obj
@@ -892,11 +890,8 @@ impl ResponseStreamEventEmitter {
 
         // Match the streamed terminal event: a `length` finish reports
         // status=incomplete with the truncation reason, a cut call without one.
-        let cut_call = output.iter().any(|item| {
-            matches!(item, ResponseOutputItem::FunctionToolCall { status, .. } if status == "incomplete")
-        });
         let (status, incomplete_details) =
-            super::utils::response_status(self.finish_reason.as_deref(), cut_call);
+            super::utils::response_status(self.finish_reason.as_deref(), self.cut_call);
 
         // Build response using builder
         let mut builder = ResponsesResponse::builder(&self.response_id, &self.model)
@@ -1098,6 +1093,11 @@ impl ResponseStreamEventEmitter {
     /// output, so they must be closed and collected here.
     async fn close_tool_call_items(&mut self, tx: &SseSender) -> Result<(), String> {
         for item in std::mem::take(&mut self.tool_call_items) {
+            // The call's status as a function call, read before a custom
+            // tool's call becomes its item: the cut state lives here alone.
+            let status =
+                super::utils::function_call_status(self.finish_reason.as_deref(), &item.arguments);
+            self.cut_call |= status == "incomplete";
             let full = if item.custom {
                 let input = super::utils::custom_tool_input(&item.arguments);
                 for (event_type, field) in [
@@ -1133,10 +1133,7 @@ impl ResponseStreamEventEmitter {
                     "call_id": item.call_id,
                     "name": item.name,
                     "arguments": item.arguments,
-                    "status": super::utils::function_call_status(
-                        self.finish_reason.as_deref(),
-                        &item.arguments,
-                    ),
+                    "status": status,
                 })
             };
             let event = self.emit_output_item_done(item.output_index, &full);
@@ -2277,5 +2274,55 @@ mod process_chunk_tests {
             wire["incomplete_details"],
             json!({"reason": "max_output_tokens"})
         );
+    }
+
+    #[tokio::test]
+    async fn a_cut_custom_tool_call_reads_incomplete_on_the_terminal_event_and_the_stored_object() {
+        for finish in [Some("abort"), Some("stop")] {
+            let mut emitter =
+                ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+            emitter.set_original_request(
+                serde_json::from_value(json!({"model": "test-model", "input": "hi",
+                    "tools": [{"type": "custom", "name": "emit_command"}]}))
+                .unwrap(),
+            );
+            let (tx, mut rx) = mpsc::channel(256);
+            emitter
+                .process_chunk(
+                    &chunk(
+                        json!({"tool_calls": [{"index": 0, "id": "call_c", "type": "function",
+                            "function": {"name": "emit_command", "arguments": "{\"input\": \"pw"}}]}),
+                        None,
+                    ),
+                    &tx,
+                )
+                .await
+                .unwrap();
+            emitter
+                .process_chunk(&chunk(json!({}), finish), &tx)
+                .await
+                .unwrap();
+            drop(tx);
+            while rx.recv().await.is_some() {}
+
+            let stored = serde_json::to_value(emitter.finalize(None)).unwrap();
+            assert_eq!(stored["status"], "incomplete", "{finish:?}");
+            assert!(stored["incomplete_details"].is_null(), "{finish:?}");
+            assert_eq!(
+                stored["output"][0]["type"], "custom_tool_call",
+                "{finish:?}"
+            );
+            let terminal = emitter.emit_completed(None);
+            assert_eq!(terminal["type"], "response.incomplete", "{finish:?}");
+            assert_eq!(terminal["response"]["status"], "incomplete", "{finish:?}");
+            assert!(
+                terminal["response"]["incomplete_details"].is_null(),
+                "{finish:?}"
+            );
+            assert_eq!(
+                terminal["response"]["output"][0]["type"], "custom_tool_call",
+                "{finish:?}"
+            );
+        }
     }
 }
