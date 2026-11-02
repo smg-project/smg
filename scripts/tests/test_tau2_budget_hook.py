@@ -25,11 +25,28 @@ SOURCE = Path(
 
 
 def pinned_source():
-    source = SOURCE.read_bytes()
+    try:
+        source = SOURCE.read_bytes()
+    except FileNotFoundError:
+        pytest.fail(
+            "Missing pinned tau2 source. Check out sierra-research/tau2-bench at "
+            "5bfa7e37b36656b37dc6d022156be6563c1007f3 into .tau2-upstream "
+            "(src/tau2/utils/llm_utils.py), or set TAU2_LLM_UTILS_SOURCE to that file. "
+            f"Tried: {SOURCE}",
+            pytrace=False,
+        )
     assert hashlib.sha256(source).hexdigest() == (
         "fa7d61e34ef9c668452ec44e8ba9efafec14a349a530481fac1dc19eff275c65"
     )
     return source.decode()
+
+
+def test_missing_pinned_source_explains_required_checkout(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys.modules[__name__], "SOURCE", tmp_path / "llm_utils.py")
+    with pytest.raises(pytest.fail.Exception, match="TAU2_LLM_UTILS_SOURCE") as failure:
+        pinned_source()
+    assert "5bfa7e37b36656b37dc6d022156be6563c1007f3" in str(failure.value)
+    assert ".tau2-upstream" in str(failure.value)
 
 
 def generate(litellm, monkeypatch):
