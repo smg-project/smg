@@ -31,7 +31,7 @@ use smg_grpc_client::common_proto::{
     kv_block_extra_key, kv_cache_event, KvBlocksStored, KvCacheEvent, KvCacheTier, KvEventBatch,
 };
 
-use super::{Counts, Normalizer, WireBatch};
+use super::super::{Counts, Normalizer, WireBatch};
 
 const BLOCK_SIZE: u64 = 4;
 
