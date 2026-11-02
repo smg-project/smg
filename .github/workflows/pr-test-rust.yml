@@ -1959,15 +1959,15 @@ jobs:
         env:
           SHOW_WORKER_LOGS: "0"
           E2E_LOG_DIR: e2e-logs
-          # floor ≈ 95% of the 223 cases the mock marker selects: the chat
+          # floor ≈ 95% of the 225 cases the mock marker selects: the chat
           # completion, request-id, concurrency, reasoning-content, EOS
-          # stripping, function-calling, tool-choice (three models) and
-          # multi-turn classes, the constraint-failure and the reader-panic
-          # classes, the completions classes, the context-length and
-          # load-report classes, and the Responses local classes (state,
-          # background, streaming events, sampling parameters, item
-          # references, the object shape)
-          E2E_MIN_SELECTED: "212"
+          # stripping, function-calling, tool-choice (three models),
+          # multi-turn and sampling-defaults classes, the constraint-failure
+          # and the reader-panic classes, the completions classes, the
+          # context-length and load-report classes, and the Responses local
+          # classes (state, background, streaming events, sampling
+          # parameters, item references, the object shape)
+          E2E_MIN_SELECTED: "214"
           MOCK_WORKER_BIN: ${{ github.workspace }}/target/debug/mock-worker
           ROUTER_LOCAL_MODEL_PATH: ${{ runner.temp }}/models
         run: |
