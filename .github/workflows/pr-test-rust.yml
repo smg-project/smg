@@ -1922,6 +1922,8 @@ jobs:
         RedHatAI/Llama-3.2-1B-Instruct-FP8@6b92f62217b2f2d88f38575eadb157cf7a6dd5c9
         Qwen/Qwen3-4B-Instruct-2507@cdbee75f17c01a7cc42f958dc650907174af0554
         mistralai/Mistral-7B-Instruct-v0.3@c170c708c41dac9275d15a8fff4eca08d52bab71
+        RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8@870a1177ed082c0ba5dbefd62573ab8f91803f6a
+        deepseek-ai/DeepSeek-R1-Distill-Qwen-7B@916b56a44061fd5cd7d6a8fb632557ed4f724f60
       SHOW_ROUTER_LOGS: "1"
     steps:
       - name: Checkout code
@@ -1991,11 +1993,12 @@ jobs:
         env:
           SHOW_WORKER_LOGS: "0"
           E2E_LOG_DIR: e2e-logs
-          # floor ≈ 95% of the 106 cases the mock marker selects: the
-          # function-calling, tool-choice (three models) and multi-turn
-          # classes with their two clients, the constraint-failure and the
-          # reader-panic classes
-          E2E_MIN_SELECTED: "100"
+          # floor ≈ 95% of the 168 cases the mock marker selects: the chat
+          # completion, request-id, concurrency, reasoning-content, EOS
+          # stripping, function-calling, tool-choice (three models) and
+          # multi-turn classes, the constraint-failure and the reader-panic
+          # classes
+          E2E_MIN_SELECTED: "160"
           MOCK_WORKER_BIN: ${{ github.workspace }}/target/debug/mock-worker
           ROUTER_LOCAL_MODEL_PATH: ${{ runner.temp }}/models
         run: |
