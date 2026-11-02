@@ -721,6 +721,234 @@ async fn zmq_pushes_the_scripted_tokens_with_their_stats_finish_and_stop() {
     );
 }
 
+// ── the request's token limit ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn grpc_cuts_a_scripted_answer_at_the_requests_max_new_tokens() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let script = script_file(
+        dir.path(),
+        "cut.jsonl",
+        &[json!({
+            "input_ids": [7, 8, 9],
+            "output_ids": [30, 31, 32],
+            "finish_reason": "stop",
+            "matched_stop": 32,
+            "logprobs": [-0.1, -0.2, -0.3],
+        })],
+    );
+    let (client, _) = start_grpc(config(Some(script))).await;
+    let limited = |limit: u32| {
+        let mut request = grpc_request("c", &[7, 8, 9], true, true);
+        request.sampling_params = Some(ts::SamplingParams {
+            max_new_tokens: Some(limit),
+            ..Default::default()
+        });
+        request
+    };
+
+    // Longer than the limit: cut there, the length finish, no matched stop.
+    let streamed = generate(&client, limited(2)).await;
+    assert_eq!(
+        streamed,
+        vec![
+            chunk("c", vec![30], 3, 1, 0, logprobs(&[30], &[-0.1])),
+            chunk("c", vec![31], 3, 2, 0, logprobs(&[31], &[-0.2])),
+            ts::GenerateResponse {
+                request_id: "c".to_string(),
+                response: Some(GenResp::Complete(ts::GenerateComplete {
+                    output_ids: vec![30, 31],
+                    finish_reason: "length".to_string(),
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    cached_tokens: 0,
+                    output_logprobs: logprobs(&[30, 31], &[-0.1, -0.2]),
+                    matched_stop: None,
+                    index: 0,
+                    weight_version: None,
+                    ..Default::default()
+                })),
+            },
+        ]
+    );
+
+    // Within the limit: the answer as scripted, its stop included.
+    let whole = generate(&client, limited(5)).await;
+    assert!(matches!(
+        whole.last().and_then(|f| f.response.as_ref()),
+        Some(GenResp::Complete(c))
+            if c.output_ids == vec![30, 31, 32]
+                && c.finish_reason == "stop"
+                && c.matched_stop == Some(ts::generate_complete::MatchedStop::MatchedTokenId(32))
+    ));
+}
+
+#[tokio::test]
+async fn grpc_answers_an_empty_scripted_text_with_the_completion_alone() {
+    // The word-level tokenizer of the encode test: an empty text encodes to no ids.
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        dir.path().join("tokenizer.json"),
+        r#"{"version":"1.0","model":{"type":"WordLevel","vocab":{"[UNK]":0,"the":1},"unk_token":"[UNK]"},"pre_tokenizer":{"type":"Whitespace"}}"#,
+    )
+    .expect("write the tokenizer");
+    let cfg = Config {
+        tokenizer_path: dir.path().display().to_string(),
+        ..config(None)
+    };
+    let (client, worker) = start_grpc(cfg).await;
+    script::enqueue(
+        &worker,
+        vec![
+            script::Answer::parse(&json!({"output_text": "", "finish_reason": "stop"}))
+                .expect("an empty answer"),
+        ],
+    )
+    .expect("a started worker");
+
+    let frames = generate(&client, grpc_request("z", &[7, 7], true, false)).await;
+    assert_eq!(
+        frames,
+        vec![ts::GenerateResponse {
+            request_id: "z".to_string(),
+            response: Some(GenResp::Complete(ts::GenerateComplete {
+                output_ids: Vec::new(),
+                finish_reason: "stop".to_string(),
+                prompt_tokens: 2,
+                completion_tokens: 0,
+                cached_tokens: 0,
+                output_logprobs: None,
+                matched_stop: None,
+                index: 0,
+                weight_version: None,
+                ..Default::default()
+            })),
+        }],
+        "no chunk, a completion of zero tokens"
+    );
+}
+
+#[tokio::test]
+async fn http_cuts_a_scripted_text_at_the_requests_max_tokens() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let prompt = "count for me";
+    let script = script_file(
+        dir.path(),
+        "http-cut.jsonl",
+        &[json!({
+            "input_ids": http::synth_token_ids(prompt),
+            "output_text": ["one", " two", " three"],
+            "finish_reason": "stop",
+            "matched_stop": "\n",
+        })],
+    );
+    let (base, _) = start_http(config(Some(script))).await;
+    let http = common::http_client();
+    let ask = |max_tokens: u32| {
+        json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+        })
+    };
+
+    let cut: Value = http
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&ask(2))
+        .send()
+        .await
+        .expect("response")
+        .json()
+        .await
+        .expect("a JSON body");
+    assert_eq!(cut["choices"][0]["message"]["content"], "one two", "{cut}");
+    assert_eq!(cut["choices"][0]["finish_reason"], "length", "{cut}");
+    assert!(cut["choices"][0]["matched_stop"].is_null(), "{cut}");
+    assert_eq!(cut["usage"]["completion_tokens"], 2, "{cut}");
+
+    let whole: Value = http
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&ask(8))
+        .send()
+        .await
+        .expect("response")
+        .json()
+        .await
+        .expect("a JSON body");
+    assert_eq!(
+        whole["choices"][0]["message"]["content"], "one two three",
+        "{whole}"
+    );
+    assert_eq!(whole["choices"][0]["finish_reason"], "stop", "{whole}");
+    assert_eq!(whole["usage"]["completion_tokens"], 3, "{whole}");
+}
+
+#[tokio::test]
+async fn zmq_cuts_a_scripted_answer_at_the_requests_max_tokens() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let endpoint = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+    let (handshake, input, output) = (
+        endpoint("hs.sock"),
+        endpoint("in.sock"),
+        endpoint("out.sock"),
+    );
+    let script = script_file(
+        dir.path(),
+        "zmq-cut.jsonl",
+        &[json!({
+            "input_ids": [14, 15, 16],
+            "output_ids": [40, 41, 42],
+            "finish_reason": "stop",
+            "matched_stop": 42,
+        })],
+    );
+    // Rank 8 and prompts of this test's own: the store is process-wide.
+    let rank = 8;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "serve loops until the test drops its handles"
+    )]
+    let _engine = tokio::spawn(zmq::serve(
+        Arc::new(config(Some(script))),
+        handshake.clone(),
+        rank,
+    ));
+    let transport = connect_handshake(&handshake, 1, &input, &output, Duration::from_secs(10))
+        .await
+        .expect("frontend handshake");
+    let client = EngineCoreClient::new(transport);
+
+    let mut stream = client
+        .submit(EngineCoreRequest {
+            request_id: "cut".to_string(),
+            prompt_token_ids: Some(vec![14, 15, 16]),
+            sampling_params: Some(EngineCoreSamplingParams {
+                max_tokens: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("submit");
+    let mut outputs = Vec::new();
+    while let Some(item) = stream.next().await {
+        let output = item.expect("output ok");
+        let finished = output.finished();
+        outputs.push(output);
+        if finished {
+            break;
+        }
+    }
+    let tokens: Vec<u32> = outputs
+        .iter()
+        .flat_map(|o| o.new_token_ids.clone())
+        .collect();
+    assert_eq!(tokens, vec![40, 41], "cut after two tokens");
+    let last = outputs.last().expect("a finishing batch");
+    assert_eq!(last.finish_reason, Some(EngineCoreFinishReason::Length));
+    assert_eq!(last.stop_reason, None, "no matched stop on a cut answer");
+}
+
 // ── the binary ──────────────────────────────────────────────────────────────
 
 #[test]
