@@ -163,13 +163,14 @@ edits, so upstream syncs stay conflict-free.
 | `SMG_RUNNER_AMD_GPU_4` | `4-gpu-mi300x` | AMD nightly benchmark (off unless `SMG_RUN_AMD_LEGS` is `true`) |
 | `SMG_RUNNER_AMD_GPU_8` | `8-gpu-mi300x` | AMD legs of the BFCL A/B and AMD rows of the nightly PD sweep (off unless `SMG_RUN_AMD_LEGS` is `true`) |
 
-The `e2e-1gpu-gateway-amd` job in `pr-test-rust.yml` requires both
+The `e2e-1gpu-completions-amd`, `e2e-1gpu-embeddings-amd` and
+`e2e-1gpu-gateway-amd` jobs in `pr-test-rust.yml` require both
 `SMG_RUN_AMD_VLLM_LOCAL_LEGS` and `SMG_RUN_AMD_LEGS` to be `true`.
-The extra switch allows this AMD vLLM gateway lane to be qualified
-separately on shared runners; "local" does not select a model-cache
-location. On pull requests, `SMG_RUN_AMD_ON_PRS` must also be `true`.
-Unset values skip the job; normal workflow triggers, wheel builds and
-change filters still apply.
+The extra switch allows these AMD vLLM lanes to be qualified separately
+on shared runners; "local" does not select a model-cache location. On
+pull requests, `SMG_RUN_AMD_ON_PRS` must also be `true`. Unset values skip
+those jobs; normal workflow triggers, wheel builds and change filters
+still apply.
 
 GitHub-hosted labels (`ubuntu-latest`, `macos-latest`) are left as-is — every
 fork already has those.

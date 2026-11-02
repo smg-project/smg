@@ -42,8 +42,8 @@ def definition_exists(root, case_id):
 
 @pytest.mark.parametrize("case_id", REQUIRED)
 def test_manifest_resolves_to_real_definitions_without_importing_vllm(case_id):
-    # Several modules importorskip vLLM at import time; CPU collection would
-    # silently miss renamed tests. Parse their source without loading an engine.
+    # A module-level vLLM skip can hide definitions from CPU collection.
+    # Parse source to check required test renames without loading an engine.
     assert definition_exists(ROOT, case_id), f"Required vLLM case no longer exists: {case_id}"
 
 
