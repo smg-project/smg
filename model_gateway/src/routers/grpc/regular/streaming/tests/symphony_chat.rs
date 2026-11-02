@@ -698,6 +698,7 @@ pub(super) fn assigned_message(
             forbids_calls: false,
             past_the_end: false,
         }),
+        parser_names: None,
     }
 }
 

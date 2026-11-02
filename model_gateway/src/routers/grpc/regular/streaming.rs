@@ -2606,8 +2606,12 @@ impl<'a> ChatStream<'a> {
             })
             .map(|_| ChatStreamUsage::default());
 
-        let reasoning_parser_name = processor.parser_resolver.reasoning_parser(model);
-        let tool_parser_name = processor.parser_resolver.tool_parser(model);
+        let reasoning_parser_name = processor
+            .parser_resolver
+            .reasoning_parser_for(spec.parser_names.as_ref(), model);
+        let tool_parser_name = processor
+            .parser_resolver
+            .tool_parser_for(spec.parser_names.as_ref(), model);
 
         // Where a Symphony table reads the response its reader takes the thought, and no
         // legacy parser is built to be asked whether one is available.
@@ -4061,9 +4065,14 @@ impl<'a> MessagesStream<'a> {
             )
         };
 
-        // Per-request effective parser names (model-card override → configured).
-        let reasoning_parser_name = processor.parser_resolver.reasoning_parser(model);
-        let tool_parser_name = processor.parser_resolver.tool_parser(model);
+        // The request's parser names as its preparation resolved them (the spec carries
+        // them); resolved here only where the spec carries none.
+        let reasoning_parser_name = processor
+            .parser_resolver
+            .reasoning_parser_for(spec.parser_names.as_ref(), model);
+        let tool_parser_name = processor
+            .parser_resolver
+            .tool_parser_for(spec.parser_names.as_ref(), model);
 
         // Check parser availability once upfront. Run parser when the user explicitly
         // enabled thinking, or when the selected parser needs structural special tokens.

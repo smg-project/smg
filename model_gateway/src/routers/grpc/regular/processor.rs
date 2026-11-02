@@ -374,8 +374,12 @@ impl ResponseProcessor {
     {
         let started = generation_start(&execution_result, Instant::now());
         let model = &dispatch.model;
-        let reasoning_parser_name = self.parser_resolver.reasoning_parser(model);
-        let tool_parser_name = self.parser_resolver.tool_parser(model);
+        let reasoning_parser_name = self
+            .parser_resolver
+            .reasoning_parser_for(chat_request.parser_names.as_ref(), model);
+        let tool_parser_name = self
+            .parser_resolver
+            .tool_parser_for(chat_request.parser_names.as_ref(), model);
         // Collect all responses from the execution result
         let all_responses =
             response_collection::collect_responses(execution_result, request_logprobs).await?;
@@ -768,8 +772,12 @@ impl ResponseProcessor {
     ) -> Result<(Message, response_formatting::TokenCounts), axum::response::Response> {
         let started = Instant::now();
         let model = &dispatch.model;
-        let reasoning_parser_name = self.parser_resolver.reasoning_parser(model);
-        let tool_parser_name = self.parser_resolver.tool_parser(model);
+        let reasoning_parser_name = self
+            .parser_resolver
+            .reasoning_parser_for(messages_request.parser_names.as_ref(), model);
+        let tool_parser_name = self
+            .parser_resolver
+            .tool_parser_for(messages_request.parser_names.as_ref(), model);
         // Collect all responses (no logprobs for Messages API)
         let all_responses = response_collection::collect_responses(execution_result, false).await?;
 
