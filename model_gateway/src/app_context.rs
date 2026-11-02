@@ -155,7 +155,7 @@ pub(crate) const DEFAULT_INFLIGHT_FLOOR: usize = 4096;
 /// overloaded router sheds instead of queueing without bound: every parked
 /// request holds its body and its encoding until it is served, so growth
 /// without a bound only ends at the memory limit.
-pub(crate) fn default_max_concurrent_requests() -> usize {
+fn default_max_concurrent_requests() -> usize {
     let cores = std::thread::available_parallelism().map_or(1, usize::from);
     (cores * DEFAULT_INFLIGHT_PER_CORE).max(DEFAULT_INFLIGHT_FLOOR)
 }
