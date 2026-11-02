@@ -759,7 +759,7 @@ impl StreamingProcessor {
                         "output_ids": complete.output_ids()[complete.output_ids().len().saturating_sub(1)..].to_vec(),
                         "meta_info": {
                             "id": index_id,
-                            "finish_reason": complete.finish_reason(),
+                            "finish_reason": utils::parse_finish_reason(complete.finish_reason(), complete.completion_tokens()),
                             "prompt_tokens": complete.prompt_tokens(),
                             "weight_version": effective_weight_version(complete.weight_version(), Some(ctx.weight_version.as_str())),
                             "completion_tokens": completion_tokens,
