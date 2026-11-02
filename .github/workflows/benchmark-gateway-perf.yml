@@ -49,6 +49,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 100
+          persist-credentials: false
 
       - name: Setup Rust
         uses: ./.github/actions/setup-rust
