@@ -522,7 +522,9 @@ def test_failed_prefill_bootstrap_never_launches_rust_scheduler_ranks(
             assert (host, port) == ("prefill.invalid", 8998)
             raise socket.gaierror(socket.EAI_NONAME, "test bootstrap host cannot resolve")
 
-        monkeypatch.setattr(socket, "getaddrinfo", fail_resolution)
+        monkeypatch.setattr(
+            "smg_grpc_servicer.sglang.bootstrap._resolve_addresses", fail_resolution
+        )
         error_type, expected_error = socket.gaierror, "test bootstrap host cannot resolve"
     else:
         error_type, expected_error = RuntimeError, "exited before its listener was ready"

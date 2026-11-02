@@ -253,7 +253,9 @@ def test_failed_prefill_bootstrap_never_launches_schedulers_or_serves(
             assert (host, port) == ("prefill.invalid", 8998)
             raise socket.gaierror(socket.EAI_NONAME, "test bootstrap host cannot resolve")
 
-        monkeypatch.setattr(socket, "getaddrinfo", fail_resolution)
+        monkeypatch.setattr(
+            "smg_grpc_servicer.sglang.bootstrap._resolve_addresses", fail_resolution
+        )
         expected_error = "test bootstrap host cannot resolve"
     else:
         expected_error = "exited before its listener was ready"
