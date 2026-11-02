@@ -24,7 +24,7 @@ use crate::{
             common::stages::helpers::TagForStart,
             context::RequestContext,
             regular::symphony::{
-                self, Asks, Assignment, AutoRequest, PreparedConstraint, PromptReplay,
+                self, Asks, Assignment, AutoRequest, PreparedConstraint, PromptReplay, Reading,
             },
             utils::{self, Names},
         },
@@ -54,13 +54,21 @@ pub(crate) struct Prepared {
     /// reasoning decision reads it in place of a second replay of the same prompt. `None` when
     /// the request's thinking switch armed the reasoning and no replay was needed.
     pub prompt_thought: Option<PromptReplay>,
+    /// The table decision for the request (`regular::symphony::reading`: which table reads the
+    /// response under the parser, or why the legacy parsers do), read here once for the replay,
+    /// the constraint and the decoder's special tokens: the stage stores it
+    /// (`ProcessingState::reading`) and request building's assignment reads it in place of a
+    /// fourth decision over the same names; the whole turn's grammar and the `auto` tag still
+    /// decide for the selected worker. `None` when the names refused (the constraint carries the
+    /// refusal).
+    pub reading: Option<Reading>,
 }
 
 /// The constraint preparation finds for what the request asks, and whether
 /// the decoder keeps the special tokens the reader needs. When Symphony reads
 /// the response, its table gives a forced call, or a JSON `response_format`,
 /// its tag, so the output comes back in the syntax the table parses
-/// (`regular::symphony::constraint`, which decides with the predicate the
+/// (`regular::symphony::constraint_for`, over the table decision the
 /// reader is assigned by; the answer's tag derives for the selected worker at
 /// request building); the older registry decides for every other request
 /// (`generate_tool_constraint`, over `tools`, the ones the request's choice
@@ -76,7 +84,7 @@ pub(crate) struct Prepared {
 /// logged under `stage`). A table whose markers the decoder would drop as
 /// special tokens needs them kept whatever the request asks of the channels:
 /// without them the table reads neither the thought nor the calls
-/// (`regular::symphony::keeps_special_tokens`); under a JSON-schema constraint
+/// (`regular::symphony::keeps_special_tokens_for`); under a JSON-schema constraint
 /// no table reads (request building makes no assignment), so the legacy
 /// parsers answer for themselves, as they do where no table reads at all: a
 /// reasoning parser that needs its control tokens, for a request that
@@ -104,31 +112,34 @@ pub(crate) fn prepare(
         .components
         .worker_registry
         .get_by_model(&ctx.input.model_id);
+    // Which table reads the response under the parser, decided once for the
+    // request: the replay, the constraint and the decoder's special tokens
+    // read it here, the assignment at request building after them. A refusal
+    // (the names ask for a response template the model cannot compile) is the
+    // constraint's to carry, as before.
+    let reading = symphony::reading(parser, &names, model, &ctx.components.templates);
     let prompt_thought = (!switch).then(|| {
-        symphony::reasoning_open(
-            parser,
-            &names,
-            model,
-            &ctx.components.templates,
-            processed_text,
-        )
+        reading
+            .as_ref()
+            .ok()
+            .and_then(|read| symphony::reasoning_open_for(read, processed_text))
     });
     let replay = prompt_thought.flatten();
     let reasoning = switch || replay.is_some_and(|thought| thought.open);
     // The prompt closed the thought itself and wrote the template's text
     // after it (thinking switched off): the calls' tag owes none of it.
     let thought_closed = replay.is_some_and(|thought| thought.closed);
-    let from_the_table = symphony::constraint(
-        parser,
-        &names,
-        asks,
-        tools,
-        reasoning,
-        thought_closed,
-        symphony::grammar_start_of(&workers),
-        symphony::vocabulary_of(&workers),
-        &ctx.components.templates,
-    );
+    let from_the_table = reading.as_ref().map_err(Clone::clone).and_then(|read| {
+        symphony::constraint_for(
+            read,
+            asks,
+            tools,
+            reasoning,
+            thought_closed,
+            symphony::grammar_start_of(&workers),
+            symphony::vocabulary_of(&workers),
+        )
+    });
     let choice = asks.choice();
     let constraint = match (from_the_table, choice.as_deref()) {
         (Ok(symphony::Prepared::None), Some(tool_choice)) if !tools.is_empty() => {
@@ -157,13 +168,9 @@ pub(crate) fn prepare(
         &constraint,
         Ok(symphony::Prepared::Constraint { constraint, .. }) if constraint.is_json_schema()
     );
-    let keeps_special_tokens = match symphony::keeps_special_tokens(
-        parser,
-        &names,
-        model,
-        &ctx.components.templates,
-        tokenizer,
-    ) {
+    let keeps_special_tokens = match reading.as_ref().ok().and_then(|read| {
+        symphony::keeps_special_tokens_for(read, model, &ctx.components.templates, tokenizer)
+    }) {
         Some(kept) if !json_schema => kept,
         _ => {
             !asks.no_reasoning()
@@ -183,6 +190,7 @@ pub(crate) fn prepare(
         keeps_special_tokens,
         names: names.labels,
         prompt_thought,
+        reading: reading.ok(),
     })
 }
 
@@ -352,16 +360,23 @@ pub(crate) fn decide(
         .state
         .provider
         .unwrap_or_else(|| ProviderProfile::for_model(model));
+    // The table decision preparation read for the request stands: the names
+    // are the request's and the parser is still preparation's choice until the
+    // assignment below records the response's. Where none was kept (another
+    // endpoint's preparation; a refusal the constraint carried), the assignment
+    // decides itself.
+    let read = match ctx.state.reading.clone() {
+        Some(read) => read,
+        None => symphony::reading(parser, &names, model, &ctx.components.templates)
+            .map_err(|why| error::bad_request("invalid_parser_configuration", why))?,
+    };
     let assignment = symphony::assign_for(
-        parser,
-        &names,
+        read,
         asks,
         tool_constraints.as_ref(),
         processed_text,
-        &ctx.components.templates,
         provider,
-    )
-    .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
+    );
     ctx.state.parser = Some(match assignment {
         Some(_) => ParserChoice::Symphony,
         None => ParserChoice::Legacy,
@@ -544,5 +559,54 @@ mod tests {
             outcome.assigned.as_ref().map(|(table, _)| table.as_str()),
             Some("kimi_k2")
         );
+    }
+
+    /// Request building's assignment reads the table decision preparation kept for the request
+    /// (`ProcessingState::reading`), not the names again: the decision kept names the Kimi K2
+    /// table, so that table reads the response, though the names and the registry say Qwen3's; a
+    /// kept legacy decision leaves the response to the legacy parsers; with nothing kept the
+    /// assignment decides itself.
+    #[test]
+    fn the_assignment_reads_the_decision_preparation_kept() {
+        let chat: Arc<ChatCompletionRequest> = Arc::new(
+            serde_json::from_value(
+                json!({"model": MODEL, "messages": [{"role": "user", "content": "hi"}]}),
+            )
+            .expect("chat request"),
+        );
+        let mut ctx = RequestContext::for_chat(Arc::clone(&chat), None, MODEL.into(), components());
+        let table = |outcome: &Outcome| {
+            outcome
+                .assigned
+                .as_ref()
+                .map(|(table, _)| table.to_string())
+        };
+        // Nothing kept: the assignment decides itself, the registry's table for the model.
+        assert_eq!(
+            table(&decided(&mut ctx, Asks::Chat(&chat))).as_deref(),
+            Some("qwen3")
+        );
+        // The kept decision stands in place of a fourth one over the same names.
+        let kimi = Names {
+            tool: Some("kimi_k2".to_string()),
+            reasoning: None,
+        };
+        ctx.state.reading = Some(
+            symphony::reading(
+                ParserChoice::Symphony,
+                &ctx.components.parser_resolver.names_for(Some(&kimi), MODEL),
+                MODEL,
+                &ctx.components.templates,
+            )
+            .expect("a table the names select"),
+        );
+        let outcome = decided(&mut ctx, Asks::Chat(&chat));
+        assert_eq!(outcome.parser, Some(ParserChoice::Symphony));
+        assert_eq!(table(&outcome).as_deref(), Some("kimi_k2"));
+        // A kept legacy decision: no table reads the response.
+        ctx.state.reading = Some(Reading::Legacy);
+        let outcome = decided(&mut ctx, Asks::Chat(&chat));
+        assert_eq!(outcome.parser, Some(ParserChoice::Legacy));
+        assert!(outcome.assigned.is_none());
     }
 }

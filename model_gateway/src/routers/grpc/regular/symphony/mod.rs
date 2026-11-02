@@ -134,16 +134,16 @@ pub(crate) fn choice(
 }
 
 #[cfg(test)]
-pub(crate) use reader::assign;
-
+pub(crate) use self::{constraint::constraint, reader::assign};
 pub(crate) use self::{
     constraint::{
-        constraint, grammar_start_of, turn_constraint, vocabulary_of, worker_constraint, Asks,
+        constraint_for, grammar_start_of, turn_constraint, vocabulary_of, worker_constraint, Asks,
         AutoRequest, AutoTag, Prepared, PreparedConstraint,
     },
     names::{
-        check_names, keeps_special_tokens, labels_select_nothing, named_table, reasoning_open,
-        set_aside_by_the_registry, table_label_read, PromptReplay,
+        check_names, keeps_special_tokens_for, labels_select_nothing, named_table, reading,
+        reasoning_open, reasoning_open_for, set_aside_by_the_registry, table_label_read,
+        PromptReplay, Reading,
     },
     reader::{assign_for, engine_finish, finished, Assignment, Delta, Reader},
 };

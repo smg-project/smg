@@ -43,7 +43,7 @@ use super::{
     },
     regular::{
         stages::decisions::scoring::{DecisionPrompt, DecisionScoring},
-        symphony::PromptReplay,
+        symphony::{PromptReplay, Reading},
     },
     spec::ResponseSpec,
     utils::{Names, ParserResolver, WorkerDecoding},
@@ -259,6 +259,17 @@ pub(crate) struct ProcessingState {
     /// did not replay (the request's thinking switch armed the reasoning, or the endpoint's
     /// preparation reads no prompt); a decision then replays itself.
     pub prompt_thought: Option<PromptReplay>,
+    /// The table decision for the request's model under its parser (`regular::symphony::reading`:
+    /// the table that reads the response, or why the legacy parsers do), as the chat and Messages
+    /// preparations made it once for the replay, the constraint and the decoder's special tokens
+    /// (`reading::prepare`): request building's assignment reads it in its place
+    /// (`reading::decide`), so those four share one decision. The whole turn's grammar and the
+    /// `auto` tag still decide over the same inputs, shaped for the selected worker's start
+    /// (`regular::symphony::turn_constraint`, `AutoTag`). Transcription shares the chat
+    /// preparation and keeps the legacy decision it makes, which nothing reads. `None` on the
+    /// endpoints whose preparation decides nothing, and when the names refused (the constraint
+    /// carries the refusal); the assignment then decides itself.
+    pub reading: Option<Reading>,
 
     /// Owned here rather than inside `PreparationOutput` so EPD's `EncodeStage`
     /// can borrow it for the with-pixels encode serialization before request

@@ -175,8 +175,11 @@ pub(super) fn decision(names: &ModelNames<'_>, model: &str) -> Decision {
     }
 }
 
-/// What reads a model's responses under a parser ([`reading`]).
-pub(super) enum Reading {
+/// What reads a model's responses under a parser ([`reading`]). Preparation reads it once per
+/// request and keeps it (`ProcessingState::reading`) for the readers after it: the replay, the
+/// constraint, the decoder's special tokens, the assignment.
+#[derive(Clone)]
+pub(crate) enum Reading {
     /// A table, and whether it is the response template's, compiled for the model: a constraint
     /// is compiled against it, and a worker may take its whole turn's grammar.
     Table(Arc<Format>, bool),
@@ -191,7 +194,7 @@ pub(super) enum Reading {
 /// [`decision`] gives, the response template's table compiled for the model (an error when the
 /// model has none that compiles, which refuses the request, since the names ask for what the
 /// model cannot give), another table, or the legacy parsers with the reason.
-pub(super) fn reading(
+pub(crate) fn reading(
     parser: ParserChoice,
     names: &ModelNames<'_>,
     model: &str,
@@ -228,9 +231,10 @@ pub(super) fn table_reading(
 /// The table that reads `model`'s responses under `parser`, if one does: the response template's,
 /// the registry's, or the one the parser names select, by the precedence [`decision`] states; `None`
 /// under `legacy`, and when the legacy parsers read the response. What a request asks of the
-/// channels takes a variant of the table ([`assign`](super::assign)). Preparation and request building both
-/// decide with this one predicate. The table comes shared, built once for every request and
-/// engine that reads with it; a variant is a copy.
+/// channels takes a variant of the table ([`assign`](super::assign)). Preparation decides through
+/// [`reading`] once and carries the decision; the `auto` tag decides with this predicate for the
+/// selected worker. The table comes shared, built once for every request and engine that reads
+/// with it; a variant is a copy.
 pub(crate) fn reads(
     parser: ParserChoice,
     names: &ModelNames<'_>,
@@ -401,18 +405,27 @@ pub(crate) fn reasoning_open(
     templates: &Templates,
     prompt: &str,
 ) -> Option<PromptThought> {
-    match reads(parser, names, model, templates) {
+    match reading(parser, names, model, templates) {
+        Ok(read) => reasoning_open_for(&read, prompt),
+        Err(_) => None,
+    }
+}
+
+/// [`reasoning_open`] over the table decision already read for the request (`read`): the
+/// thought's state in `prompt` where a table reads the response, `None` where none does.
+pub(crate) fn reasoning_open_for(read: &Reading, prompt: &str) -> Option<PromptThought> {
+    match read {
         // The registry's Gemma 4 table carries the rule; a Gemma 4 model read through its own
         // response template (a table named for the template) is left to the switch beside the
         // replay, as every other table is: telling that model apart would take the legacy
         // registry's pattern match, which it offers only by building the parser, and no Gemma 4
         // tokenizer ships a response template today.
-        Ok(Some(format)) => Some(PromptThought {
+        Reading::Table(format, _) => Some(PromptThought {
             open: format.reasoning_open(prompt),
             closed: format.thought_closed(prompt),
             alone: format.name() == Table::Gemma4.name(),
         }),
-        _ => None,
+        Reading::Legacy | Reading::Fallback(_) => None,
     }
 }
 
@@ -460,6 +473,7 @@ impl PromptThought {
 /// ([`Templates::markers_hidden`]). `None` when no table reads the response: the legacy parsers
 /// answer for themselves then, and where a table reads they are not built to be asked, since the
 /// table's markers alone decide what its reader needs.
+#[cfg(test)]
 pub(crate) fn keeps_special_tokens(
     parser: ParserChoice,
     names: &ModelNames<'_>,
@@ -467,11 +481,28 @@ pub(crate) fn keeps_special_tokens(
     templates: &Templates,
     tokenizer: &Arc<dyn Tokenizer>,
 ) -> Option<bool> {
-    match reads(parser, names, model, templates) {
-        Ok(Some(format)) => Some(templates.markers_hidden(model, &format, tokenizer, || {
-            markers_hidden_by_the_decoder(&format, tokenizer.as_ref())
-        })),
-        _ => None,
+    match reading(parser, names, model, templates) {
+        Ok(read) => keeps_special_tokens_for(&read, model, templates, tokenizer),
+        Err(_) => None,
+    }
+}
+
+/// [`keeps_special_tokens`] over the table decision already read for the request (`read`),
+/// which preparation reads once (`regular::stages::reading::prepare`); the tests ask through
+/// [`keeps_special_tokens`].
+pub(crate) fn keeps_special_tokens_for(
+    read: &Reading,
+    model: &str,
+    templates: &Templates,
+    tokenizer: &Arc<dyn Tokenizer>,
+) -> Option<bool> {
+    match read {
+        Reading::Table(format, _) => {
+            Some(templates.markers_hidden(model, format, tokenizer, || {
+                markers_hidden_by_the_decoder(format, tokenizer.as_ref())
+            }))
+        }
+        Reading::Legacy | Reading::Fallback(_) => None,
     }
 }
 

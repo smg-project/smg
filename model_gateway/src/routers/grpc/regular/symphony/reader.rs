@@ -17,15 +17,15 @@ use tracing::debug;
 
 use super::{
     constraint::Asks,
-    names::{reading, Fallback, Reading},
+    names::{Fallback, Reading},
     telemetry::{self, Tally, Who},
-    template::Templates,
     SymphonyError,
 };
-use crate::{
-    config::ParserChoice,
-    routers::grpc::utils::{isolation, ModelNames},
-};
+#[cfg(test)]
+use super::{names::reading, template::Templates};
+use crate::routers::grpc::utils::isolation;
+#[cfg(test)]
+use crate::{config::ParserChoice, routers::grpc::utils::ModelNames};
 
 /// Symphony's assignment to a response: the table that reads it, as the request's asks make it
 /// ([`assign`]), and the part of the rendered prompt the engine replays.
@@ -177,34 +177,32 @@ pub(crate) fn assign(
     prompt: &str,
     templates: &Templates,
 ) -> Result<Option<Assignment>, SymphonyError> {
-    assign_for(
-        parser,
-        names,
+    Ok(assign_for(
+        reading(parser, names, asks.model(), templates)?,
         asks,
         constraint,
         prompt,
-        templates,
         ProviderProfile::for_model(asks.model()),
-    )
+    ))
 }
 
-/// [`assign`] with the model's provider profile already derived (the
-/// preparation stage derives it once per request; request building passes it).
+/// [`assign`] with the table decision already read (`read`: preparation reads it once per
+/// request and request building passes it, `ProcessingState::reading`) and the model's provider
+/// profile already derived (the preparation stage derives it once per request; request building
+/// passes it).
 pub(crate) fn assign_for(
-    parser: ParserChoice,
-    names: &ModelNames<'_>,
+    read: Reading,
     asks: Asks<'_>,
     constraint: Option<&(String, String)>,
     prompt: &str,
-    templates: &Templates,
     provider: ProviderProfile,
-) -> Result<Option<Assignment>, SymphonyError> {
-    let format = match reading(parser, names, asks.model(), templates)? {
+) -> Option<Assignment> {
+    let format = match read {
         Reading::Table(format, _) => format,
-        Reading::Legacy => return Ok(None),
+        Reading::Legacy => return None,
         Reading::Fallback(why) => {
             telemetry::record_fallback(why, None);
-            return Ok(None);
+            return None;
         }
     };
     if constraint.is_some_and(|(kind, _)| kind == "json_schema") {
@@ -212,16 +210,16 @@ pub(crate) fn assign_for(
             Fallback::ForcedCallWithoutTag,
             Some(telemetry::table_label(format.name())),
         );
-        return Ok(None);
+        return None;
     }
     let format = asked(format, asks.no_calls_for(provider), asks.no_reasoning());
-    Ok(Some(assignment(
+    Some(assignment(
         format,
         asks.model(),
         prompt,
         asks.forbids_calls_for(provider),
         asks.past_the_end(),
-    )))
+    ))
 }
 
 /// The engine's finish reason as Symphony takes it.

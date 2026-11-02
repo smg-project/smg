@@ -158,6 +158,7 @@ impl MessagePreparationStage {
             keeps_special_tokens: preserve_reasoning_special_tokens,
             names: parser_names,
             prompt_thought,
+            reading,
         } = reading::prepare(
             ctx,
             symphony::Asks::Messages {
@@ -177,6 +178,7 @@ impl MessagePreparationStage {
         )?;
         ctx.state.parser_names = Some(parser_names);
         ctx.state.prompt_thought = prompt_thought;
+        ctx.state.reading = reading;
 
         // Derive skip_special_tokens from parser and constraint type:
         // - typed reasoning parsers need their control tokens preserved

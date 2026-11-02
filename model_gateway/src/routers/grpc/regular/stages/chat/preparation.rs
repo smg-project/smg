@@ -177,6 +177,7 @@ pub(crate) async fn prepare_chat_like(
             keeps_special_tokens: preserve_reasoning_special_tokens,
             names: parser_names,
             prompt_thought,
+            reading,
         } = reading::prepare(
             ctx,
             symphony::Asks::Chat(request),
@@ -194,6 +195,7 @@ pub(crate) async fn prepare_chat_like(
         )?;
         ctx.state.parser_names = Some(parser_names);
         ctx.state.prompt_thought = prompt_thought;
+        ctx.state.reading = reading;
 
         let skip_special_tokens = skips_special_tokens(
             request,
