@@ -215,6 +215,13 @@ impl MergeTable {
     /// Appends the ids `piece` merges to under the table: the model's
     /// `tokenize` of the piece's byte-level alphabet form, minus its strings
     /// (and minus the whole-piece lookup of `ignore_merges`, the caller's).
+    ///
+    /// Never inlined: with its one call site the merge was inlined into the
+    /// piece lookup, whose frame then carried the arrays of the short loop
+    /// and the heap of the long one on every piece, hits included (4 to 6
+    /// instructions more per token on warm text, at identical work). As a
+    /// call, a hit pays nothing for the merge and a miss pays the call.
+    #[inline(never)]
     pub(super) fn merge(&self, piece: &[u8], ids: &mut Vec<u32>) {
         if piece.len() <= SHORT_PIECE_SYMBOLS {
             self.merge_short(piece, ids);
