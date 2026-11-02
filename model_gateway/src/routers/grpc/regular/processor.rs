@@ -404,6 +404,7 @@ impl ResponseProcessor {
 
         let tool_parser_available = tool_choice_enabled
             && chat_request.tools.is_some()
+            && chat_request.symphony.is_none()
             && utils::check_tool_parser_availability(
                 &self.tool_parser_factory,
                 tool_parser_name.as_deref(),
@@ -420,7 +421,11 @@ impl ResponseProcessor {
             );
         }
 
-        if chat_request.tools.is_some() && tool_choice_enabled && !tool_parser_available {
+        if chat_request.tools.is_some()
+            && tool_choice_enabled
+            && chat_request.symphony.is_none()
+            && !tool_parser_available
+        {
             tracing::debug!("No tool parser found for model '{model}', skipping tool call parsing");
         }
 
