@@ -85,7 +85,7 @@ ENV_PARSER = "E2E_PARSER"  # The gateway's --parser for a lane — see get_parse
 ENV_STARTUP_TIMEOUT = (
     "E2E_STARTUP_TIMEOUT"  # Floor on every startup wait — see effective_startup_timeout
 )
-ENV_STARTUP_PROFILE = "E2E_STARTUP_PROFILE"  # Explicit frozen original13/29 timers
+ENV_STARTUP_PROFILE = "E2E_STARTUP_PROFILE"  # Declared worker startup profile
 ENV_GPU_OFFSET = "E2E_GPU_OFFSET"  # First GPU index a lane's workers take — see get_gpu_offset
 ENV_GPU_VENDOR = "E2E_GPU_VENDOR"  # The GPU vendor a lane runs on — see get_gpu_vendor
 ENV_SKIP_MODEL_POOL = "SKIP_MODEL_POOL"
@@ -400,8 +400,8 @@ def effective_startup_timeout(spec_timeout: int) -> int:
 # Fixed per pytest process, as are the pool's lane environment/model specs.
 # The model is deliberately absent: every model in a profile may run in turn.
 _STARTUP_PROFILE_CONTEXT: tuple[str, ...] | None = None
-_ORIGINAL_STARTUP_MODELS = {
-    "original38-13": {
+_STARTUP_PROFILE_MODELS = {
+    "vllm-zmq-dp2-chat": {
         "Qwen/Qwen3-30B-A3B": (300, 1),
         "Qwen/Qwen3-4B-Instruct-2507": (300, 1),
         "Qwen/Qwen3-VL-8B-Instruct": (300, 1),
@@ -411,7 +411,7 @@ _ORIGINAL_STARTUP_MODELS = {
         "mistralai/Mistral-7B-Instruct-v0.3": (300, 1),
         "openai/gpt-oss-20b": (300, 1),
     },
-    "original38-29": {
+    "vllm-4gpu-chat": {
         "meta-llama/Llama-4-Scout-17B-16E-Instruct": (1200, 4),
         "openai/gpt-oss-120b": (600, 4),
     },
@@ -419,7 +419,7 @@ _ORIGINAL_STARTUP_MODELS = {
 
 
 def get_startup_profile() -> str | None:
-    """An opt-in original timer contract, never a change to ordinary defaults.
+    """An opt-in declared startup profile, never a change to ordinary defaults.
 
     Pin only profile/lane context, not a model: a chat lane starts many models.
     Pin blank too so later calls cannot change an ordinary process context.
@@ -431,8 +431,8 @@ def get_startup_profile() -> str | None:
     if not profile:
         context = ("",)
     else:
-        if profile not in _ORIGINAL_STARTUP_MODELS:
-            raise ValueError(f"{ENV_STARTUP_PROFILE}={profile!r} is not an original timer profile")
+        if profile not in _STARTUP_PROFILE_MODELS:
+            raise ValueError(f"{ENV_STARTUP_PROFILE}={profile!r} is not a declared startup profile")
         fields = (
             "E2E_ENGINE",
             ENV_RUNTIME,
@@ -447,15 +447,15 @@ def get_startup_profile() -> str | None:
         lane = tuple(os.environ.get(key, "").strip() for key in fields)
         expected = (
             ("vllm", "vllm", "amd", "1", "zmq", "2", "e2e_test/chat_completions", "", "202")
-            if profile == "original38-13"
+            if profile == "vllm-zmq-dp2-chat"
             else ("vllm", "vllm", "amd", "4", "", "", "e2e_test/chat_completions", "", "32")
         )
         if lane != expected:
-            raise ValueError(f"{ENV_STARTUP_PROFILE}={profile!r} requires its original lane tuple")
+            raise ValueError(f"{ENV_STARTUP_PROFILE}={profile!r} requires its declared lane tuple")
         floor = get_startup_timeout()
-        # Row29's workers are already loaded when its ordinary gateway starts;
+        # This four-GPU profile loads workers before its ordinary gateway starts;
         # preserve that separate 60s gateway wait, not only the 1200/600s worker.
-        max_floor = 300 if profile == "original38-13" else DEFAULT_ROUTER_TIMEOUT
+        max_floor = 300 if profile == "vllm-zmq-dp2-chat" else DEFAULT_ROUTER_TIMEOUT
         if floor is not None and floor > max_floor:
             raise ValueError(f"{ENV_STARTUP_TIMEOUT} would extend {profile}'s frozen wait")
         context = (profile, *lane, str(floor))
@@ -465,7 +465,7 @@ def get_startup_profile() -> str | None:
     return profile or None
 
 
-def original_startup_timeout(model_id: str, tp: int) -> int | None:
+def profile_startup_timeout(model_id: str, tp: int) -> int | None:
     """The explicit frozen model bound, with no extra warm-up or env headroom.
 
     Native warm-up still runs before SERVING; exceeding this wait fails the
@@ -474,7 +474,7 @@ def original_startup_timeout(model_id: str, tp: int) -> int | None:
     profile = get_startup_profile()
     if profile is None:
         return None
-    entry = _ORIGINAL_STARTUP_MODELS[profile].get(model_id)
+    entry = _STARTUP_PROFILE_MODELS[profile].get(model_id)
     if entry is None:
         raise ValueError(f"{profile} has no frozen startup contract for {model_id!r}")
     bound, expected_tp = entry

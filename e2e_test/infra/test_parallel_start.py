@@ -191,12 +191,12 @@ def _original_profile(monkeypatch, profile):
         "E2E_ENGINE": "vllm",
         "E2E_RUNTIME": "vllm",
         "E2E_GPU_VENDOR": "amd",
-        "E2E_GPU_TIER": "1" if profile == "original38-13" else "4",
-        "E2E_CONNECTION_MODE": "zmq" if profile == "original38-13" else "",
-        "E2E_ZMQ_ENGINE_COUNT": "2" if profile == "original38-13" else "",
+        "E2E_GPU_TIER": "1" if profile == "vllm-zmq-dp2-chat" else "4",
+        "E2E_CONNECTION_MODE": "zmq" if profile == "vllm-zmq-dp2-chat" else "",
+        "E2E_ZMQ_ENGINE_COUNT": "2" if profile == "vllm-zmq-dp2-chat" else "",
         "TEST_DIRS": "e2e_test/chat_completions",
         "TEST_FILTER": "",
-        "E2E_MIN_SELECTED": "202" if profile == "original38-13" else "32",
+        "E2E_MIN_SELECTED": "202" if profile == "vllm-zmq-dp2-chat" else "32",
     }
     for key, value in values.items():
         monkeypatch.setenv(key, value)
@@ -205,15 +205,15 @@ def _original_profile(monkeypatch, profile):
 @pytest.mark.parametrize(
     "profile,model,tp,bound,mode",
     [
-        ("original38-13", "meta-llama/Llama-3.1-8B-Instruct", 1, 300, ConnectionMode.ZMQ),
+        ("vllm-zmq-dp2-chat", "meta-llama/Llama-3.1-8B-Instruct", 1, 300, ConnectionMode.ZMQ),
         (
-            "original38-29",
+            "vllm-4gpu-chat",
             "meta-llama/Llama-4-Scout-17B-16E-Instruct",
             4,
             1200,
             ConnectionMode.GRPC,
         ),
-        ("original38-29", "openai/gpt-oss-120b", 4, 600, ConnectionMode.GRPC),
+        ("vllm-4gpu-chat", "openai/gpt-oss-120b", 4, 600, ConnectionMode.GRPC),
     ],
 )
 def test_profile_value_reaches_actual_spawn_and_wait_seams(
@@ -261,7 +261,7 @@ def test_profile_value_reaches_actual_spawn_and_wait_seams(
 )
 def test_profile_conflict_fails_before_any_fake_spawn(launch, monkeypatch, options):
     events, _ = launch
-    _original_profile(monkeypatch, "original38-13")
+    _original_profile(monkeypatch, "vllm-zmq-dp2-chat")
     kwargs = {"engine": "vllm", "mode": ConnectionMode.ZMQ, **options}
     with pytest.raises(ValueError):
         worker_module.start_workers("meta-llama/Llama-3.1-8B-Instruct", **kwargs)
@@ -270,7 +270,7 @@ def test_profile_conflict_fails_before_any_fake_spawn(launch, monkeypatch, optio
 
 def test_profile_readiness_failure_still_cleans_up(launch, monkeypatch):
     events, _ = launch
-    _original_profile(monkeypatch, "original38-29")
+    _original_profile(monkeypatch, "vllm-4gpu-chat")
     monkeypatch.setattr(worker_module, "get_model_spec", lambda _: {"tp": 4})
 
     def fail(worker, timeout):

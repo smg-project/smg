@@ -38,7 +38,7 @@ from .constants import (
     get_zmq_engine_count,
     host_port,
     moriio_host,
-    original_startup_timeout,
+    profile_startup_timeout,
     sglang_transfer_backend,
     vllm_kv_backend,
     vllm_moriio_backend,
@@ -1164,13 +1164,13 @@ def _require_rust_servicer_hook() -> None:
 def worker_startup_timeout(model_id: str, timeout: int = DEFAULT_STARTUP_TIMEOUT) -> int:
     """The bound the harness gives a worker of ``model_id`` to start: its spec's
     ``startup_timeout`` (else ``timeout``), raised to the ``E2E_STARTUP_TIMEOUT``
-    floor, unless an explicit original timer profile selects its frozen value.
+    floor, unless a declared startup profile selects its frozen value.
     ``start_workers`` waits this long for the worker's health; a gateway
     that registers the same worker needs the same bound for its own wait, so
     both read it here and a term added to one reaches the other.
     """
     spec = get_model_spec(model_id)
-    original = original_startup_timeout(model_id, spec.get("tp", 1))
+    original = profile_startup_timeout(model_id, spec.get("tp", 1))
     if original is not None:
         return original
     return effective_startup_timeout(spec.get("startup_timeout", timeout))
@@ -1196,7 +1196,7 @@ def validate_startup_profile_worker(
         raise ValueError(f"{profile} requires exactly one worker group")
     expected_mode = (
         mode == ConnectionMode.ZMQ
-        if profile == "original38-13"
+        if profile == "vllm-zmq-dp2-chat"
         else mode in (ConnectionMode.GRPC, ConnectionMode.HTTP)
     )
     if (
@@ -1207,10 +1207,10 @@ def validate_startup_profile_worker(
         raise ValueError(f"{profile} does not match the effective worker engine/wire/type")
     spec = get_model_spec(model_id)
     actual_tp = spec.get("tp", 1) if tp is None else tp
-    original_startup_timeout(model_id, actual_tp)
+    profile_startup_timeout(model_id, actual_tp)
     # _build_cmd uses the spec unless an explicit tp was supplied; a process
     # override in get_model_spec must match the frozen TP as well.
-    original_startup_timeout(model_id, spec.get("tp", 1))
+    profile_startup_timeout(model_id, spec.get("tp", 1))
     expected_gpus = actual_tp * (2 if mode == ConnectionMode.ZMQ else 1)
     if gpus is not None and (type(gpus) is not int or gpus != expected_gpus):
         raise ValueError(f"{profile} requires {expected_gpus} GPUs per worker")
