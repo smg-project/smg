@@ -239,11 +239,12 @@ async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Respon
     // A scripted answer, ahead of either engine mode: the worker's queue or
     // the prompt's key decides ([`crate::script`]).
     if let Some(answer) = script::take(&state.name, &prompt_ids) {
+        // The request's limit ends the answer as it would an engine's.
         return scripted_response(
             endpoint,
             &state.cfg,
             &parsed,
-            answer,
+            answer.cut_to(extract_max_tokens(&parsed)),
             prompt_ids.len(),
             stream_requested,
             in_flight,
@@ -835,7 +836,9 @@ fn hash_word(w: &str) -> u32 {
 }
 
 fn extract_max_tokens(v: &Value) -> Option<u32> {
-    for key in ["max_tokens", "max_new_tokens"] {
+    // The chat API's current name first, then the one it deprecates and the
+    // engines' native one.
+    for key in ["max_completion_tokens", "max_tokens", "max_new_tokens"] {
         if let Some(n) = v.get(key).and_then(Value::as_u64) {
             return Some(n as u32);
         }
@@ -869,6 +872,19 @@ mod tests {
             completion_tokens: tokens,
             cached_tokens: 0,
         }
+    }
+
+    #[test]
+    fn the_request_limit_is_read_under_each_of_its_names() {
+        for key in ["max_completion_tokens", "max_tokens", "max_new_tokens"] {
+            assert_eq!(extract_max_tokens(&json!({ key: 7 })), Some(7), "{key}");
+        }
+        assert_eq!(extract_max_tokens(&json!({ "stream": true })), None);
+        assert_eq!(
+            extract_max_tokens(&json!({ "max_completion_tokens": 3, "max_tokens": 9 })),
+            Some(3),
+            "the current name wins over the deprecated one"
+        );
     }
 
     #[tokio::test]

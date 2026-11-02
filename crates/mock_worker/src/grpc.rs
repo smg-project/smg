@@ -259,6 +259,12 @@ impl TokenSpeedScheduler for MockScheduler {
         let scripted = script::take_ids(&self.cfg, &self.name, prompt_ids)
             .map_err(Status::failed_precondition)?;
         if let Some(answer) = scripted {
+            // The request's limit ends the answer as it would an engine's.
+            let answer = answer.cut_to(
+                req.sampling_params
+                    .as_ref()
+                    .and_then(|params| params.max_new_tokens),
+            );
             let prompt_tokens = answer.prompt_tokens(prompt_ids.len());
             let stream = scripted_stream(
                 answer,
