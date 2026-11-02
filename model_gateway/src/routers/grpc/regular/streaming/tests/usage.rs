@@ -774,6 +774,47 @@ async fn chat_settlement_carries_the_engines_counts_streamed_and_not() {
     assert_eq!(backend.closes(), 1);
 }
 
+/// The two cases the completion, generate and messages settlement tests
+/// drive, each with the settlement it expects: the engine's counts (a
+/// scheduler stream whose terminal frames
+/// carry `reasoning` reasoning tokens per choice and the cache hit of
+/// `SETTLED`) and no counts from the engine (an engine stream, no cache
+/// hit, no reasoning); `completion` is the completion count the choices
+/// generate together.
+fn settlement_cases(
+    reasoning: u32,
+    completion: u32,
+    choices: u32,
+) -> [(&'static str, Option<u32>, Counters, UsageSettlement); 2] {
+    [
+        (
+            "the engine's counts",
+            Some(reasoning),
+            SETTLED,
+            UsageSettlement {
+                actual_input_tokens: SETTLED.prompt,
+                completion_tokens: completion,
+                cached_input_tokens: SETTLED.cached,
+                reasoning_tokens: reasoning * choices,
+            },
+        ),
+        (
+            "no counts from the engine",
+            None,
+            Counters {
+                cached: 0,
+                ..SETTLED
+            },
+            UsageSettlement {
+                actual_input_tokens: SETTLED.prompt,
+                completion_tokens: completion,
+                cached_input_tokens: 0,
+                reasoning_tokens: 0,
+            },
+        ),
+    ]
+}
+
 /// The settlement of a legacy completion carries the engine's counts summed
 /// over the choices, streamed and not; the non-streamed answer's usage
 /// object is those counts, so the pipeline settles from it.
@@ -789,33 +830,8 @@ async fn completion_settlement_carries_the_engines_counts_streamed_and_not() {
         }
         serde_json::from_value(request).expect("completion request")
     };
-    for (name, scheduler_reasoning, counters, expected) in [
-        (
-            "the engine's counts",
-            Some(3),
-            SETTLED,
-            UsageSettlement {
-                actual_input_tokens: SETTLED.prompt,
-                completion_tokens: 2 * choices,
-                cached_input_tokens: SETTLED.cached,
-                reasoning_tokens: 3 * choices,
-            },
-        ),
-        (
-            "no counts from the engine",
-            None,
-            Counters {
-                cached: 0,
-                ..SETTLED
-            },
-            UsageSettlement {
-                actual_input_tokens: SETTLED.prompt,
-                completion_tokens: 2 * choices,
-                cached_input_tokens: 0,
-                reasoning_tokens: 0,
-            },
-        ),
-    ] {
+    for (name, scheduler_reasoning, counters, expected) in settlement_cases(3, 2 * choices, choices)
+    {
         let scripted = || async {
             match scheduler_reasoning {
                 Some(reasoning) => {
@@ -842,33 +858,8 @@ async fn completion_settlement_carries_the_engines_counts_streamed_and_not() {
 #[tokio::test]
 async fn generate_settlement_carries_the_engines_counts_streamed_and_not() {
     let choices = 2;
-    for (name, scheduler_reasoning, counters, expected) in [
-        (
-            "the engine's counts",
-            Some(3),
-            SETTLED,
-            UsageSettlement {
-                actual_input_tokens: SETTLED.prompt,
-                completion_tokens: 2 * choices,
-                cached_input_tokens: SETTLED.cached,
-                reasoning_tokens: 3 * choices,
-            },
-        ),
-        (
-            "no counts from the engine",
-            None,
-            Counters {
-                cached: 0,
-                ..SETTLED
-            },
-            UsageSettlement {
-                actual_input_tokens: SETTLED.prompt,
-                completion_tokens: 2 * choices,
-                cached_input_tokens: 0,
-                reasoning_tokens: 0,
-            },
-        ),
-    ] {
+    for (name, scheduler_reasoning, counters, expected) in settlement_cases(3, 2 * choices, choices)
+    {
         let scripted = || async {
             match scheduler_reasoning {
                 Some(reasoning) => {
@@ -904,33 +895,7 @@ async fn generate_settlement_carries_the_engines_counts_streamed_and_not() {
 async fn messages_settlement_carries_the_engines_counts_streamed_and_not() {
     let texts = ["<think>", "ab", "</think>", "de"];
     let completion = texts.concat().chars().count() as u32;
-    for (name, scheduler_reasoning, counters, expected) in [
-        (
-            "the engine's counts",
-            Some(1),
-            SETTLED,
-            UsageSettlement {
-                actual_input_tokens: SETTLED.prompt,
-                completion_tokens: completion,
-                cached_input_tokens: SETTLED.cached,
-                reasoning_tokens: 1,
-            },
-        ),
-        (
-            "no counts from the engine",
-            None,
-            Counters {
-                cached: 0,
-                ..SETTLED
-            },
-            UsageSettlement {
-                actual_input_tokens: SETTLED.prompt,
-                completion_tokens: completion,
-                cached_input_tokens: 0,
-                reasoning_tokens: 0,
-            },
-        ),
-    ] {
+    for (name, scheduler_reasoning, counters, expected) in settlement_cases(1, completion, 1) {
         let scripted = || async {
             match scheduler_reasoning {
                 Some(reasoning) => {
