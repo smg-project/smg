@@ -159,10 +159,10 @@ class TestWorkerLoadReports:
         )
 
 
-@pytest.mark.engine("sglang", "vllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "tokenspeed", "mock")
 @pytest.mark.gpu(2)
 @pytest.mark.e2e
-@pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct")
+@pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct", mock="RedHatAI/Llama-3.2-1B-Instruct-FP8")
 @pytest.mark.gateway(extra_args=_GATEWAY_ARGS)
 @pytest.mark.parametrize("setup_backend", ["pd_grpc"], indirect=True)
 class TestDisaggregatedWorkerLoadReports:
