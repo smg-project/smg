@@ -33,7 +33,7 @@ class TestChatCompletion:
 
     On the mock engine each test states the model's answer first (``mock_answers``, a
     no-op on a real engine), through the same checkpoint's tokenizer from an ungated
-    repository; the ``n=2`` cases skip there, the mock answering one choice per request.
+    repository, one answer per choice the request samples.
     """
 
     # Whether the backend trims stop sequences from output.
@@ -59,24 +59,14 @@ class TestChatCompletion:
             ),
         ],
     )
-    @pytest.mark.parametrize(
-        "parallel_sample_num",
-        [
-            1,
-            pytest.param(
-                2,
-                marks=pytest.mark.skip_for_runtime(
-                    "mock", reason="the mock answers one choice per request"
-                ),
-            ),
-        ],
-    )
+    @pytest.mark.parametrize("parallel_sample_num", [1, 2])
     def test_chat_completion(self, model, api_client, logprobs, parallel_sample_num, mock_answers):
         """Test non-streaming chat completion with logprobs and parallel sampling."""
-        # Stated with a logprob per token so the logprobs cases read them, and long
-        # enough for top_logprobs=5: the mock's alternatives are the answer's own
-        # distinct tokens.
-        mock_answers.enqueue_with_logprobs("The capital of France is Paris.")
+        # One answer per choice, stated with a logprob per token so the logprobs
+        # cases read them, and long enough for top_logprobs=5: the mock's
+        # alternatives are the answer's own distinct tokens.
+        for _ in range(parallel_sample_num):
+            mock_answers.enqueue_with_logprobs("The capital of France is Paris.")
         # Use temperature > 0 for n > 1 (greedy sampling rejects n > 1)
         temperature = 0.7 if parallel_sample_num > 1 else 0
         response = api_client.chat.completions.create(
@@ -134,24 +124,15 @@ class TestChatCompletion:
             ),
         ],
     )
-    @pytest.mark.parametrize(
-        "parallel_sample_num",
-        [
-            1,
-            pytest.param(
-                2,
-                marks=pytest.mark.skip_for_runtime(
-                    "mock", reason="the mock answers one choice per request"
-                ),
-            ),
-        ],
-    )
+    @pytest.mark.parametrize("parallel_sample_num", [1, 2])
     def test_chat_completion_stream(
         self, model, api_client, logprobs, parallel_sample_num, mock_answers
     ):
         """Test streaming chat completion with logprobs and parallel sampling."""
-        # As above: a logprob per token, at least five distinct tokens.
-        mock_answers.enqueue_with_logprobs("The capital of France is Paris.")
+        # As above: one answer per choice, a logprob per token, at least five
+        # distinct tokens.
+        for _ in range(parallel_sample_num):
+            mock_answers.enqueue_with_logprobs("The capital of France is Paris.")
         temperature = 0.7 if parallel_sample_num > 1 else 0
         generator = api_client.chat.completions.create(
             model=model,
