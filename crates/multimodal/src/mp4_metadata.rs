@@ -421,6 +421,14 @@ mod tests {
         elst
     }
 
+    /// `whole_track_edit`, starting `media_time` media ticks into the track
+    /// instead of at its first sample (`-1`: an empty edit).
+    fn edit_starting_at(movie_duration_ms: u32, media_time: i32) -> Vec<u8> {
+        let mut elst = whole_track_edit(movie_duration_ms);
+        elst[12..16].copy_from_slice(&media_time.to_be_bytes());
+        elst
+    }
+
     fn written(bytes: &[u8]) -> tempfile::NamedTempFile {
         use std::io::Write;
         let mut file = tempfile::NamedTempFile::new().expect("temp file");
@@ -502,17 +510,147 @@ mod tests {
         assert_eq!(info.frames_per_second(), Some(30000.0 / 1001.0));
     }
 
+    /// The edit list a muxer writes when the codec reorders frames: the whole
+    /// track at normal speed, started at the reorder delay, a whole number of
+    /// frames in (16 is the deepest accepted). The demuxer's numbers do not
+    /// depend on the start, so the track reads exactly as it does when its
+    /// edit list starts at the first sample. (A real B-frame track also
+    /// carries composition offsets, `ctts`; the reader does not read them,
+    /// and the agreement test in the media module runs real B-frame clips.)
+    #[test]
+    fn a_codec_delay_edit_is_read_like_the_probe() {
+        let undelayed = written(&movie(
+            12288,
+            512,
+            24,
+            320,
+            240,
+            Some(whole_track_edit(1000)),
+            vec![(24, 512)],
+        ));
+        let undelayed = read(undelayed.path()).expect("readable");
+        assert!(undelayed.is_some());
+        for frames in [1, 2, 4, 16] {
+            let file = written(&movie(
+                12288,
+                512,
+                24,
+                320,
+                240,
+                Some(edit_starting_at(1000, 512 * frames)),
+                vec![(24, 512)],
+            ));
+            assert_eq!(
+                read(file.path()).expect("readable"),
+                undelayed,
+                "a {frames}-frame codec delay"
+            );
+        }
+    }
+
+    /// Starts a muxer does not write for a codec delay keep the probe
+    /// process: deeper than 16 frames, part of a frame in, or before the
+    /// track (`-1` is an empty edit, which presents nothing for its
+    /// duration; the format defines no other negative start).
+    #[test]
+    fn an_edit_that_is_no_codec_delay_keeps_the_probe() {
+        for media_time in [512 * 17, 700, -1, -512] {
+            let file = written(&movie(
+                12288,
+                512,
+                24,
+                320,
+                240,
+                Some(edit_starting_at(1000, media_time)),
+                vec![(24, 512)],
+            ));
+            assert_eq!(
+                read(file.path()).expect("readable"),
+                None,
+                "an edit list starting at {media_time}"
+            );
+        }
+    }
+
+    /// An edit list that starts at a codec delay but is not the one whole
+    /// track at normal speed keeps the probe process. A shortened edit
+    /// changes what the demuxer reports: the edit's length, which the tables
+    /// do not show. The rate and the entry count are shape policy (the
+    /// demuxer ignores the rate, and reports these two-entry lists as it
+    /// reports the track): the module vouches only for the shape it has
+    /// compared with the probe.
+    #[test]
+    fn an_edit_that_is_not_the_whole_track_keeps_the_probe() {
+        // 0.9 s of the 1 s track: a trim the tables do not show.
+        let shortened = edit_starting_at(900, 1024);
+        // Rate 2.0 (`0x0002_0000`), whose fraction is zero.
+        let mut doubled = edit_starting_at(1000, 1024);
+        doubled[16..18].copy_from_slice(&2u16.to_be_bytes());
+        // Two entries: 83 ms of nothing (an empty edit) and then the track,
+        // as `-avoid_negative_ts make_zero` writes it, which its first start
+        // declines as well; and the whole track followed by half of it
+        // again, which only the entry count declines.
+        let two_entries = |entries: [(u32, i32); 2]| {
+            let mut elst = full(0, &2u32.to_be_bytes());
+            for (duration, start) in entries {
+                elst.extend_from_slice(&duration.to_be_bytes());
+                elst.extend_from_slice(&start.to_be_bytes());
+                elst.extend_from_slice(&[0, 1, 0, 0]);
+            }
+            elst
+        };
+        let cases = [
+            ("shortened", shortened),
+            ("rate 2", doubled),
+            ("an empty edit first", two_entries([(83, -1), (1000, 1024)])),
+            ("a second edit", two_entries([(1000, 1024), (500, 1024)])),
+        ];
+        for (case, elst) in cases {
+            let file = written(&movie(
+                12288,
+                512,
+                24,
+                320,
+                240,
+                Some(elst),
+                vec![(24, 512)],
+            ));
+            assert_eq!(read(file.path()).expect("readable"), None, "{case}");
+        }
+    }
+
+    /// The repository's H.264 fixture starts its edit list at a codec delay,
+    /// but its media header runs one frame past its sample table (18432
+    /// ticks against 8 frames of 2048), a shape ffmpeg's muxer writes for
+    /// some B-frame clips. The demuxer then reports the shorter of the two,
+    /// which this module does not compute, so the file keeps the probe. The
+    /// fixture's edit is as long as its samples, so the duration clause
+    /// declines it too; a copy whose edit is as long as the header, as a
+    /// B-frame clip cut with `-t` inside a group of B-frames has it, is
+    /// declined by the header check alone.
+    #[test]
+    fn a_media_header_past_the_samples_keeps_the_probe() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/videos/testsrc_128x96_8fps_1s.mp4");
+        assert_eq!(read(&fixture).expect("readable"), None);
+        let mut bytes = std::fs::read(&fixture).expect("fixture bytes");
+        // The edit's duration, in the movie's milliseconds: after the `elst`
+        // box type, its version, flags and entry count.
+        let elst = bytes
+            .windows(4)
+            .position(|kind| kind == b"elst")
+            .expect("elst")
+            + 4;
+        assert_eq!(&bytes[elst + 8..elst + 12], &1000u32.to_be_bytes());
+        bytes[elst + 8..elst + 12].copy_from_slice(&1125u32.to_be_bytes());
+        assert_eq!(read(written(&bytes).path()).expect("readable"), None);
+    }
+
     /// Shapes the module does not vouch for keep the probe process.
     #[test]
     fn other_shapes_are_declined() {
         let vfr = movie(12288, 512, 25, 320, 240, None, vec![(24, 512), (1, 1024)]);
         assert_eq!(read(written(&vfr).path()).expect("read"), None);
-        let mut offset_edit = full(0, &1u32.to_be_bytes());
-        offset_edit.extend_from_slice(&1000u32.to_be_bytes());
-        offset_edit.extend_from_slice(&512u32.to_be_bytes());
-        offset_edit.extend_from_slice(&[0, 1, 0, 0]);
-        let edited = movie(12288, 512, 24, 320, 240, Some(offset_edit), vec![(24, 512)]);
-        assert_eq!(read(written(&edited).path()).expect("read"), None);
         assert_eq!(
             read(written(b"RIFF\0\0\0\0WEBPVP8 ").path()).expect("read"),
             None

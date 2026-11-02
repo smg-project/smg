@@ -1,86 +1,291 @@
 mod video_sampling;
 
-use std::io::Write as _;
+use std::{
+    collections::HashMap,
+    io::Write as _,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+/// Set to a non-empty value where the video tools must be installed (CI sets
+/// it on the shard that installs ffmpeg): the container agreement tests then
+/// fail, instead of skipping, when ffmpeg, ffprobe or an encoder they use is
+/// missing.
+const REQUIRE_VIDEO_TOOLS: &str = "SMG_REQUIRE_VIDEO_TOOLS";
+
+/// Reports that `missing` keeps a test or a case from running: a failure
+/// where [`REQUIRE_VIDEO_TOOLS`] is set, a skip said on stderr elsewhere.
+#[expect(
+    clippy::print_stderr,
+    reason = "a skip says so; the harness shows it under --nocapture"
+)]
+fn skip_for(missing: &str) {
+    let required = std::env::var_os(REQUIRE_VIDEO_TOOLS).is_some_and(|value| !value.is_empty());
+    assert!(!required, "{missing}, and {REQUIRE_VIDEO_TOOLS} is set");
+    eprintln!("{missing}: skipping; the synthetic container tests still run");
+}
+
+/// Whether ffmpeg and ffprobe run on this host.
+fn video_tools_available() -> bool {
+    let runs = |tool: &str| {
+        Command::new(tool)
+            .arg("-version")
+            .output()
+            .is_ok_and(|out| out.status.success())
+    };
+    let available = runs("ffmpeg") && runs("ffprobe");
+    if !available {
+        skip_for("ffmpeg or ffprobe is not installed");
+    }
+    available
+}
+
+/// Whether this ffmpeg build carries `encoder`. `ffmpeg -h encoder=<name>`
+/// exits 0 for a name it does not know as well, so the answer is what it
+/// prints: the help of a built encoder opens with `Encoder <name> `.
+fn have_encoder(encoder: &str) -> bool {
+    let built = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-h"])
+        .arg(format!("encoder={encoder}"))
+        .output()
+        .is_ok_and(|out| {
+            out.status.success()
+                && out
+                    .stdout
+                    .starts_with(format!("Encoder {encoder} ").as_bytes())
+        });
+    if !built {
+        skip_for(&format!("this ffmpeg has no {encoder} encoder"));
+    }
+    built
+}
+
+/// A `seconds`-long clip of the test pattern at `rate`, written into `dir` as
+/// a `container` file with `codec` (the arguments after `-c:v`).
+fn write_clip(dir: &Path, codec: &[&str], rate: &str, seconds: u32, container: &str) -> PathBuf {
+    let path = dir.join(format!(
+        "clip_{}_{}_{seconds}.{container}",
+        codec.concat(),
+        rate.replace('/', "_")
+    ));
+    let encoded = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+        ])
+        .arg(format!("testsrc=size=64x48:rate={rate}:duration={seconds}"))
+        .args(["-pix_fmt", "yuv420p", "-c:v"])
+        .args(codec)
+        .arg(&path)
+        .output()
+        .expect("ffmpeg runs");
+    assert!(
+        encoded.status.success(),
+        "ffmpeg wrote {path:?}: {}",
+        String::from_utf8_lossy(&encoded.stderr)
+    );
+    path
+}
+
+/// The probe tool's report for `path`, as the connector parses it.
+fn probe_report(path: &Path) -> ProbedVideoInfo {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,duration,duration_ts,time_base,r_frame_rate,avg_frame_rate,nb_frames:format=duration",
+            "-of",
+            "json",
+        ])
+        .arg(path)
+        .output()
+        .expect("ffprobe runs");
+    assert!(output.status.success());
+    parse_ffprobe_video_info(&output.stdout).expect("probe parses")
+}
+
+/// Where a clip's edit list starts presenting its track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditStart {
+    /// At the first sample: the encoder keeps the frames in order.
+    FirstSample,
+    /// A whole number of frames in: the encoder writes B-frames, and the
+    /// muxer starts the edit list at the codec's reorder delay so that the
+    /// first frame is presented at zero.
+    CodecDelay,
+}
+
+/// Where the first track of the file at `path` starts its edit list, read
+/// from its boxes; a start that is neither (before the track, or part of a
+/// frame in) fails the test.
+fn edit_start(path: &Path) -> EditStart {
+    let bytes = std::fs::read(path).expect("clip bytes");
+    let (elst, _) = video_sampling::mp4_payload(&bytes, &[*b"moov", *b"trak", *b"edts", *b"elst"]);
+    // After the version, flags and entry count: the first entry's duration,
+    // then its start, both 32-bit in version 0 and 64-bit in version 1.
+    let start = if bytes[elst] == 0 {
+        i64::from(i32::from_be_bytes(
+            bytes[elst + 12..elst + 16].try_into().unwrap(),
+        ))
+    } else {
+        i64::from_be_bytes(bytes[elst + 16..elst + 24].try_into().unwrap())
+    };
+    let (stts, _) = video_sampling::mp4_payload(
+        &bytes,
+        &[*b"moov", *b"trak", *b"mdia", *b"minf", *b"stbl", *b"stts"],
+    );
+    // After the version, flags, entry count and the first entry's count:
+    // its frame duration.
+    let frame = i64::from(u32::from_be_bytes(
+        bytes[stts + 12..stts + 16].try_into().unwrap(),
+    ));
+    match start {
+        0 => EditStart::FirstSample,
+        start if start > 0 && start % frame == 0 => EditStart::CodecDelay,
+        start => panic!("{path:?} starts its edit list {start} ticks in, frames of {frame}"),
+    }
+}
+
 /// Where the tools are installed: clips written by the encoder at several
 /// frame rates and lengths, read through the container tables, equal the
 /// probe tool's own report field by field (the numbers the frame
 /// selection and the clip's sample rate are built from).
+///
+/// The plain `mpeg4` clips keep their frames in order, so the muxer starts
+/// their edit list at the first sample. The B-frame clips (`mpeg4 -bf 2`,
+/// and `libx264` and `libx265` at their defaults) start it at the codec's
+/// reorder delay, one or two frames in: the shape of a clip from an
+/// ordinary encoder. Each clip's start is checked, so an encoder or muxer
+/// default that stopped writing the delay fails here rather than leaving
+/// those cases to test the first shape again.
 #[test]
 fn container_tables_agree_with_the_probe_tool() {
-    use std::process::Command;
-    let have = |tool: &str| {
-        Command::new(tool)
-            .arg("-version")
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false)
-    };
-    if !have("ffmpeg") || !have("ffprobe") {
-        // Without the tools there is nothing to agree with; the unit tests
-        // on synthetic containers still run.
+    use EditStart::{CodecDelay, FirstSample};
+    if !video_tools_available() {
         return;
     }
     let dir = tempfile::tempdir().expect("temp dir");
-    let cases = [
-        ("24", "1", "mp4"),
-        ("30000/1001", "2", "mp4"),
-        ("25", "3", "mov"),
-        ("60", "1", "mp4"),
-        ("24000/1001", "2", "mp4"),
+    // (the arguments after `-c:v`, rate, seconds, container, edit list start)
+    let cases: [(&[&str], &str, u32, &str, EditStart); 10] = [
+        (&["mpeg4"], "24", 1, "mp4", FirstSample),
+        (&["mpeg4"], "30000/1001", 2, "mp4", FirstSample),
+        (&["mpeg4"], "25", 3, "mov", FirstSample),
+        (&["mpeg4"], "60", 1, "mp4", FirstSample),
+        (&["mpeg4"], "24000/1001", 2, "mp4", FirstSample),
+        (&["mpeg4", "-bf", "2"], "24", 2, "mp4", CodecDelay),
+        (&["mpeg4", "-bf", "2"], "30000/1001", 2, "mov", CodecDelay),
+        (&["libx264"], "24", 2, "mp4", CodecDelay),
+        (&["libx264"], "30000/1001", 2, "mov", CodecDelay),
+        (&["libx265"], "25", 3, "mp4", CodecDelay),
     ];
-    for (rate, seconds, container) in cases {
-        let path = dir.path().join(format!(
-            "clip_{}_{seconds}.{container}",
-            rate.replace('/', "_")
-        ));
-        // A codec every ffmpeg build carries; the tables under test are
-        // the container's, whichever codec fills them.
-        let encoded = Command::new("ffmpeg")
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-            ])
-            .arg(format!("testsrc=size=64x48:rate={rate}:duration={seconds}"))
-            .args(["-pix_fmt", "yuv420p", "-c:v", "mpeg4"])
-            .arg(&path)
-            .output()
-            .expect("ffmpeg runs");
-        assert!(
-            encoded.status.success(),
-            "ffmpeg wrote {path:?}: {}",
-            String::from_utf8_lossy(&encoded.stderr)
-        );
+    let mut built = HashMap::new();
+    for (codec, rate, seconds, container, start) in cases {
+        if !*built
+            .entry(codec[0])
+            .or_insert_with(|| have_encoder(codec[0]))
+        {
+            continue;
+        }
+        let case = format!("{}, {rate} fps, {seconds} s, {container}", codec.join(" "));
+        let path = write_clip(dir.path(), codec, rate, seconds, container);
+        assert_eq!(edit_start(&path), start, "{case}");
         let container_info = crate::mp4_metadata::read(&path)
             .expect("readable")
-            .unwrap_or_else(|| panic!("{path:?} not accepted by the container reader"));
-        let output = Command::new("ffprobe")
-            .args([
-                "-v",
-                "error",
-                "-select_streams",
-                "v:0",
-                "-show_entries",
-                "stream=width,height,duration,duration_ts,time_base,r_frame_rate,avg_frame_rate,nb_frames:format=duration",
-                "-of",
-                "json",
-            ])
-            .arg(&path)
-            .output()
-            .expect("ffprobe runs");
-        assert!(output.status.success());
-        let probed = parse_ffprobe_video_info(&output.stdout).expect("probe parses");
+            .unwrap_or_else(|| panic!("{case}: not accepted by the container reader"));
         assert_eq!(
             super::probed_from_container(&container_info),
-            probed,
-            "{rate} fps, {seconds} s, {container}"
+            probe_report(&path),
+            "{case}"
         );
     }
+}
+
+/// Why the container reader may accept an edit list that starts at the
+/// codec delay: the probe reports a clip written with B-frames exactly as
+/// it reports the same clip written without them, whose edit list starts at
+/// the first sample. The start enters none of the numbers it prints.
+#[test]
+fn the_codec_delay_changes_nothing_the_probe_reports() {
+    if !video_tools_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    // (with B-frames, without), the arguments after `-c:v`
+    let pairs: [(&[&str], &[&str]); 2] = [
+        (&["mpeg4", "-bf", "2"], &["mpeg4"]),
+        (&["libx264"], &["libx264", "-bf", "0"]),
+    ];
+    for (delayed, control) in pairs {
+        if !have_encoder(delayed[0]) {
+            continue;
+        }
+        let delayed_clip = write_clip(dir.path(), delayed, "24", 2, "mp4");
+        let control_clip = write_clip(dir.path(), control, "24", 2, "mp4");
+        assert_eq!(
+            edit_start(&delayed_clip),
+            EditStart::CodecDelay,
+            "{}",
+            delayed.join(" ")
+        );
+        assert_eq!(
+            edit_start(&control_clip),
+            EditStart::FirstSample,
+            "{}",
+            control.join(" ")
+        );
+        assert_eq!(
+            probe_report(&delayed_clip),
+            probe_report(&control_clip),
+            "{}",
+            delayed.join(" ")
+        );
+    }
+}
+
+/// The edit's duration is what keeps a shortened edit list off the
+/// container tables. The clip starts its edit list at the codec delay and is
+/// read from its tables; then only the edit's duration is cut in place, from
+/// the whole 2 s to 1.75 s, with the media header and the sample table left
+/// as they were. The probe now reports 1.75 s where the tables still say
+/// 2 s, and the reader declines the file, so the probe process runs.
+#[test]
+fn a_shortened_edit_keeps_the_probe_process() {
+    if !video_tools_available() || !have_encoder("mpeg4") {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = write_clip(dir.path(), &["mpeg4", "-bf", "2"], "24", 2, "mp4");
+    assert_eq!(edit_start(&path), EditStart::CodecDelay);
+    assert!(
+        crate::mp4_metadata::read(&path)
+            .expect("readable")
+            .is_some(),
+        "the whole clip is read from its tables"
+    );
+    let mut bytes = std::fs::read(&path).expect("clip bytes");
+    let (elst, _) = video_sampling::mp4_payload(&bytes, &[*b"moov", *b"trak", *b"edts", *b"elst"]);
+    // A version 0 list: after the version, flags and entry count, the first
+    // entry's duration in the movie's time scale (milliseconds, as ffmpeg
+    // writes it).
+    assert_eq!(bytes[elst], 0);
+    assert_eq!(&bytes[elst + 8..elst + 12], &2000u32.to_be_bytes());
+    bytes[elst + 8..elst + 12].copy_from_slice(&1750u32.to_be_bytes());
+    std::fs::write(&path, bytes).expect("clip rewritten");
+    assert_eq!(probe_report(&path).duration_seconds, Some(1.75));
+    assert_eq!(
+        crate::mp4_metadata::read(&path).expect("readable"),
+        None,
+        "a shortened edit must keep the probe process"
+    );
 }
 
 /// The engine's frame budget replaces only the loader-style budget: the
