@@ -38,7 +38,9 @@ use tracing::{debug, error, warn};
 use super::{
     request_body::RawBody,
     stream_failure::{cause, head_success_recorded, RelaySource},
-    stream_relay::{relay_streaming_body, ChunkMode, ChunkStep, Relay},
+    stream_relay::{
+        relay_streaming_body, ChunkHook, ChunkMode, ChunkStep, CompletionStreamHook, Relay,
+    },
 };
 use crate::{
     config::types::RetryConfig,
@@ -2211,7 +2213,7 @@ impl PDRouter {
         // when the previous chunk ended with an end of line.
         let mut encoder = SseEncoder::new();
         let mut at_line_start = true;
-        let per_chunk: Box<dyn FnMut(Bytes) -> ChunkStep + Send> = Box::new(move |chunk: Bytes| {
+        let per_chunk: Box<dyn ChunkHook> = Box::new(move |chunk: Bytes| {
             let is_done = Self::chunk_contains_done_event(&chunk, at_line_start);
             if let Some(&last) = chunk.last() {
                 at_line_start = last == b'\n' || last == b'\r';
@@ -2225,8 +2227,15 @@ impl PDRouter {
             ChunkStep {
                 bytes,
                 last: is_done,
+                failure: None,
             }
         });
+        let per_chunk: Box<dyn ChunkHook> =
+            if status.is_success() && upstream_sse && source.is_completion_route() {
+                Box::new(CompletionStreamHook::new(per_chunk))
+            } else {
+                per_chunk
+            };
         relay_streaming_body(
             stream,
             Relay {
@@ -6739,9 +6748,9 @@ mod tests {
     }
 
     /// A cut that lands inside a frame (the decode engine died mid-write)
-    /// leaves the partial line as it is and writes the error event on its
-    /// own frame, so a client that parses frame by frame still reads the
-    /// typed error.
+    /// keeps the incomplete frame quarantined and writes a typed error.
+    /// Error framing must not make a partial backend frame into a valid
+    /// abort completion or DONE event.
     #[tokio::test]
     async fn a_decode_cut_inside_a_frame_writes_the_error_event_on_its_own_frame() {
         const CHUNKS: &[&str] = &[
@@ -6761,13 +6770,17 @@ mod tests {
             .expect("the body ends cleanly after the error event");
         let body = std::str::from_utf8(&body).unwrap();
         let events = sse_events(body);
-        assert_eq!(events.len(), 4, "{body}");
+        assert_eq!(events.len(), 3, "{body}");
         assert_eq!(events[0], CHUNKS[0].trim_end());
-        assert_eq!(events[1], CHUNKS[1], "the partial frame stands alone");
-        let error: Value = serde_json::from_str(events[2].strip_prefix("data: ").unwrap())
+        assert_eq!(
+            body.matches("data: {\"choices\":").count(),
+            1,
+            "only the complete payload frame is relayed: {body}"
+        );
+        let error: Value = serde_json::from_str(events[1].strip_prefix("data: ").unwrap())
             .expect("the error event is a frame of its own");
         assert_eq!(error["error"]["type"], "stream_error", "{body}");
-        assert_eq!(events[3], "data: [DONE]");
+        assert_eq!(events[2], "data: [DONE]");
         assert!(!decode.circuit_breaker_can_execute());
     }
 
@@ -6851,10 +6864,93 @@ mod tests {
         );
     }
 
-    /// A stream the decode engine completes is relayed as it was: nothing is
-    /// added and neither worker is charged.
+    /// Drive the real PDRouter and HTTP client through a complete payload
+    /// followed by an unterminated frame. Error framing must not complete
+    /// that held frame, and accounting must charge only decode.
+    async fn assert_incomplete_decode_frame_is_quarantined(raw: &'static [u8], cut: bool) {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || async move {
+                let mut items: Vec<Result<Bytes, std::io::Error>> = vec![
+                    Ok(Bytes::from_static(
+                        b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"safe\"}}]}\n\n",
+                    )),
+                    Ok(Bytes::from_static(raw)),
+                ];
+                if cut {
+                    items.push(Err(std::io::Error::other("decode died")));
+                }
+                let body = futures_util::stream::iter(items).then(|item| async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    item
+                });
+                (
+                    [(CONTENT_TYPE, "text/event-stream")],
+                    Body::from_stream(body),
+                )
+            }),
+        );
+        let router = create_test_pd_router();
+        let (prefill, decode) = register_fragile_pair(&router, spawn_stub(app).await).await;
+        let response = stream_chat_through(&router).await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).expect("held invalid UTF-8 cannot reach the client");
+        assert!(text.contains("safe"), "complete payload lost: {text}");
+        assert!(text.contains("stream_error"), "silent failure: {text}");
+        assert_eq!(
+            text.matches("data: [DONE]").count(),
+            1,
+            "premature/duplicate DONE: {text}"
+        );
+        assert!(
+            !text.contains("\"finish_reason\":\"abort\""),
+            "unterminated abort was promoted: {text}"
+        );
+        assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+        let events = sse_events(text);
+        assert_eq!(
+            events.len(),
+            3,
+            "only complete payload, error, DONE: {text}"
+        );
+        assert!(
+            !decode.circuit_breaker_can_execute(),
+            "failure must charge decode"
+        );
+        assert!(prefill.circuit_breaker_can_execute(), "prefill succeeded");
+    }
+
     #[tokio::test]
-    async fn a_decode_stream_that_completes_is_relayed_unchanged() {
+    async fn ws05_partial_done_is_not_promoted_by_error_framing() {
+        for cut in [false, true] {
+            assert_incomplete_decode_frame_is_quarantined(b"data: [DONE]\n", cut).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn ws05_unterminated_abort_is_not_promoted_by_error_framing() {
+        for cut in [false, true] {
+            assert_incomplete_decode_frame_is_quarantined(
+                b"data: {\"choices\":[{\"index\":0,\"finish_reason\":\"abort\"}]}",
+                cut,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn ws05_unterminated_invalid_utf8_is_not_relayed_before_error() {
+        for cut in [false, true] {
+            assert_incomplete_decode_frame_is_quarantined(b"data: \xff", cut).await;
+        }
+    }
+
+    /// A graceful HTTP body EOF is not a completed generation when no
+    /// completion sentinel or terminal choice has arrived.
+    #[tokio::test]
+    async fn ws05_decode_eof_before_a_terminal_frame_is_an_explicit_stream_error() {
         let decode_url = spawn_cut_stub(
             "/v1/chat/completions",
             "text/event-stream",
@@ -6864,6 +6960,66 @@ mod tests {
         .await;
         let router = create_test_pd_router();
         let (prefill, decode) = register_fragile_pair(&router, decode_url).await;
+        let response = stream_chat_through(&router).await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(
+            body.contains("stream_error"),
+            "silent incomplete generation: {body}"
+        );
+        assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+        assert!(
+            !decode.circuit_breaker_can_execute(),
+            "EOF failure belongs to decode"
+        );
+        assert!(prefill.circuit_breaker_can_execute(), "prefill completed");
+    }
+
+    /// Engine abort must not look like a successful completion even when
+    /// its HTTP response closes without a transport error and sends DONE.
+    #[tokio::test]
+    async fn ws05_decode_abort_is_an_error_instead_of_a_successful_completion() {
+        const CHUNKS: &[&str] = &[
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"abort\"}]}\n\ndata: [DONE]\n\n",
+        ];
+        let decode_url =
+            spawn_cut_stub("/v1/chat/completions", "text/event-stream", CHUNKS, false).await;
+        let router = create_test_pd_router();
+        let (prefill, decode) = register_fragile_pair(&router, decode_url).await;
+        let response = stream_chat_through(&router).await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(
+            !body.contains("\"finish_reason\":\"abort\""),
+            "abort was relayed as completion: {body}"
+        );
+        assert!(body.contains("stream_error"), "no explicit error: {body}");
+        assert_eq!(body.matches("data: [DONE]").count(), 1, "{body}");
+        assert!(
+            !decode.circuit_breaker_can_execute(),
+            "abort belongs to decode"
+        );
+        assert!(prefill.circuit_breaker_can_execute(), "prefill completed");
+    }
+
+    /// A stream the decode engine completes is relayed as it was: nothing is
+    /// added and neither worker is charged.
+    #[tokio::test]
+    async fn a_decode_stream_that_completes_is_relayed_unchanged() {
+        const COMPLETE: &[&str] = &[
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n",
+        ];
+        let decode_url =
+            spawn_cut_stub("/v1/chat/completions", "text/event-stream", COMPLETE, false).await;
+        let router = create_test_pd_router();
+        let (prefill, decode) = register_fragile_pair(&router, decode_url).await;
 
         let response = stream_chat_through(&router).await;
 
@@ -6871,10 +7027,7 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert_eq!(
-            std::str::from_utf8(&body).unwrap(),
-            CHAT_SSE_CHUNKS.concat()
-        );
+        assert_eq!(std::str::from_utf8(&body).unwrap(), COMPLETE.concat());
         assert!(decode.circuit_breaker_can_execute());
         assert!(prefill.circuit_breaker_can_execute());
     }
