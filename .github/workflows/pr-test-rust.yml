@@ -1649,6 +1649,8 @@ jobs:
       test_timeout: 24
       test_dirs: e2e_test/responses
       setup_agentic_deps: true
+      # Require clean passes for the pinned 128 IDs and every current selection.
+      # Review reference-ID moves with scripts/ci_responses_original128.json and its fingerprints.
       responses_evidence: true
       min_selected: 92 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
     secrets: inherit

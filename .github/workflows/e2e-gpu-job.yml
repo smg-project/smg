@@ -302,6 +302,7 @@ jobs:
 
       # Run tests
       - name: Run E2E tests
+        id: e2e_tests
         timeout-minutes: ${{ inputs.test_timeout }}
         env:
           SMG_PROVIDER_OPENAI_API_KEY: ${{ inputs.provider_api_keys && secrets.OPENAI_API_KEY || '' }}
@@ -345,6 +346,7 @@ jobs:
             bash scripts/ci_killall_sglang.sh "nuke_gpus"
           fi
           if [ "${{ inputs.responses_evidence }}" = true ]; then
+            # Retries retain diagnostics; the verifier rejects failed and rerun phases.
             export RESPONSES_EVIDENCE_DIR="${{ steps.responses-evidence.outputs.directory }}"
             python3 -m pytest ${{ inputs.test_dirs }} \
               -p scripts.ci_responses_evidence \
@@ -364,7 +366,7 @@ jobs:
           fi
 
       - name: Verify complete Responses business evidence
-        if: always() && inputs.responses_evidence && steps.responses-evidence.outcome == 'success'
+        if: always() && inputs.responses_evidence && steps.responses-evidence.outcome == 'success' && steps.e2e_tests.outcome != 'skipped'
         env:
           RESPONSES_EVIDENCE_DIR: ${{ steps.responses-evidence.outputs.directory }}
         run: python3 scripts/ci_responses_evidence.py verify "$RESPONSES_EVIDENCE_DIR" "$RESPONSES_EVIDENCE_DIR/junit.xml" scripts/ci_responses_original128.json
