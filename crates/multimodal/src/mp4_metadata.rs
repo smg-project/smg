@@ -171,6 +171,17 @@ fn child<'a>(list: &[([u8; 4], &'a [u8])], kind: [u8; 4]) -> Option<&'a [u8]> {
         .map(|(_, payload)| *payload)
 }
 
+/// The `kind` box of `list` if it holds at most one: `Some(None)` when it
+/// holds none, `None` when it holds several.
+fn sole_child<'a>(list: &[([u8; 4], &'a [u8])], kind: [u8; 4]) -> Option<Option<&'a [u8]>> {
+    let mut found = list
+        .iter()
+        .filter(|(k, _)| *k == kind)
+        .map(|(_, payload)| *payload);
+    let first = found.next();
+    found.next().is_none().then_some(first)
+}
+
 fn be_u32(data: &[u8], at: usize) -> Option<u32> {
     data.get(at..at + 4)
         .map(|bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
@@ -198,9 +209,22 @@ fn header_timescale_duration(payload: &[u8]) -> Option<(u32, u64)> {
     }
 }
 
+/// Whether the demuxer reads `time_scale` as written: it holds a time scale
+/// in a signed 32-bit integer and puts 1 in place of one that is not
+/// positive (zero, or past `i32::MAX`).
+fn time_scale_kept(time_scale: u32) -> bool {
+    i32::try_from(time_scale).is_ok_and(|time_scale| time_scale > 0)
+}
+
 fn parse_moov(moov: &[u8]) -> Option<ContainerVideoInfo> {
     let top = boxes(moov)?;
     let (movie_timescale, movie_duration_ts) = header_timescale_duration(child(&top, *b"mvhd")?)?;
+    // The demuxer puts a tick a second in place of a time scale it cannot
+    // hold, so its numbers are not the header's; and against a zero movie
+    // time scale a zero-length edit would pass for the track.
+    if !time_scale_kept(movie_timescale) {
+        return None;
+    }
     for (kind, trak) in &top {
         if kind != b"trak" {
             continue;
@@ -214,7 +238,7 @@ fn parse_moov(moov: &[u8]) -> Option<ContainerVideoInfo> {
         // The first video track decides; a shape this module does not
         // accept keeps the probe process.
         let (timescale, duration_ts) = header_timescale_duration(child(&mdia, *b"mdhd")?)?;
-        if timescale == 0 || duration_ts == 0 {
+        if !time_scale_kept(timescale) || duration_ts == 0 {
             return None;
         }
         let stbl = boxes(child(&boxes(child(&mdia, *b"minf")?)?, *b"stbl")?)?;
@@ -227,10 +251,12 @@ fn parse_moov(moov: &[u8]) -> Option<ContainerVideoInfo> {
         if count == 0 || delta == 0 || count.checked_mul(delta)? != duration_ts {
             return None;
         }
-        // After the sample table: a codec delay is counted in its frames.
-        if let Some(edts) = child(&trak, *b"edts") {
+        // After the sample table: a codec delay is counted in its frames. At
+        // most one edit list in at most one `edts`: of several, the demuxer
+        // reads the last that has entries.
+        if let Some(edts) = sole_child(&trak, *b"edts")? {
             if !edit_list_is_whole_track(
-                child(&boxes(edts)?, *b"elst")?,
+                sole_child(&boxes(edts)?, *b"elst")??,
                 duration_ts,
                 timescale,
                 movie_timescale,
@@ -405,6 +431,23 @@ mod tests {
         edit: Option<Vec<u8>>,
         stts_entries: Vec<(u32, u32)>,
     ) -> Vec<u8> {
+        let edts = edit
+            .map(|elst| boxed(*b"edts", &boxed(*b"elst", &elst)))
+            .unwrap_or_default();
+        movie_with_edts(timescale, delta, frames, width, height, &edts, stts_entries)
+    }
+
+    /// `movie`, with `edts` (whole boxes, as many as it holds) where the
+    /// track keeps its edit list.
+    fn movie_with_edts(
+        timescale: u32,
+        delta: u32,
+        frames: u32,
+        width: u16,
+        height: u16,
+        edts: &[u8],
+        stts_entries: Vec<(u32, u32)>,
+    ) -> Vec<u8> {
         let duration = u64::from(delta) * u64::from(frames);
         let movie_timescale = 1000u32;
         let movie_duration = (duration * u64::from(movie_timescale) / u64::from(timescale)) as u32;
@@ -447,10 +490,7 @@ mod tests {
             boxed(*b"minf", &minf),
         ]
         .concat();
-        let mut trak = Vec::new();
-        if let Some(elst) = edit {
-            trak.extend_from_slice(&boxed(*b"edts", &boxed(*b"elst", &elst)));
-        }
+        let mut trak = edts.to_vec();
         trak.extend_from_slice(&boxed(*b"mdia", &mdia));
         let moov = [boxed(*b"mvhd", &full(0, &mvhd)), boxed(*b"trak", &trak)].concat();
         let mut file = boxed(*b"ftyp", b"isom\0\0\0\0isom");
@@ -691,6 +731,71 @@ mod tests {
         assert_eq!(&bytes[elst + 8..elst + 12], &1000u32.to_be_bytes());
         bytes[elst + 8..elst + 12].copy_from_slice(&1125u32.to_be_bytes());
         assert_eq!(read(written(&bytes).path()).expect("readable"), None);
+    }
+
+    /// Two edit lists in one track, in one `edts` or in two: the demuxer
+    /// reads the last that has entries, so the first is no account of the
+    /// track. Here the first is the whole track and the last only half of
+    /// it, the half the demuxer would report; the file keeps the probe
+    /// process.
+    #[test]
+    fn a_track_with_two_edit_lists_keeps_the_probe() {
+        let whole = boxed(*b"elst", &edit_starting_at(1000, 512));
+        let half = boxed(*b"elst", &edit_starting_at(500, 512));
+        let cases = [
+            (
+                "one edts",
+                boxed(*b"edts", &[whole.clone(), half.clone()].concat()),
+            ),
+            (
+                "two edts",
+                [boxed(*b"edts", &whole), boxed(*b"edts", &half)].concat(),
+            ),
+        ];
+        for (case, edts) in cases {
+            let file = written(&movie_with_edts(
+                12288,
+                512,
+                24,
+                320,
+                240,
+                &edts,
+                vec![(24, 512)],
+            ));
+            assert_eq!(read(file.path()).expect("readable"), None, "{case}");
+        }
+    }
+
+    /// A time scale the demuxer does not read as written keeps the probe
+    /// process: it holds a time scale in a signed 32-bit integer and puts 1
+    /// in place of one that is not positive. Against a zero movie time scale
+    /// a zero-length edit would pass for the whole track, and a media time
+    /// scale past `i32::MAX` would be read as written here and as 1 by the
+    /// probe.
+    #[test]
+    fn a_time_scale_the_demuxer_replaces_keeps_the_probe() {
+        let cases = [
+            (*b"mvhd", 0, Some(edit_starting_at(0, 512))),
+            (*b"mvhd", 0x8000_0000, None),
+            (*b"mdhd", 0x8000_0000, None),
+        ];
+        for (header, time_scale, edit) in cases {
+            let mut bytes = movie(12288, 512, 24, 320, 240, edit, vec![(24, 512)]);
+            // The time scale follows the header's box header, its version and
+            // flags, and two 32-bit times.
+            let at = bytes
+                .windows(4)
+                .position(|kind| kind == header)
+                .expect("header")
+                + 4;
+            bytes[at + 12..at + 16].copy_from_slice(&u32::to_be_bytes(time_scale));
+            assert_eq!(
+                read(written(&bytes).path()).expect("readable"),
+                None,
+                "{} time scale {time_scale}",
+                String::from_utf8_lossy(&header)
+            );
+        }
     }
 
     /// Shapes the module does not vouch for keep the probe process.
