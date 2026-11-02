@@ -861,9 +861,12 @@ impl HuggingFaceTokenizer {
     /// The class is read from `tokenizer_config.json`, as the reference reads
     /// it, before any `config.json`: a checkpoint shipped as the tokenizer's
     /// files alone, with no `config.json` or none that says a `model_type`,
-    /// is the class's. A `config.json` that names a model type other than
-    /// `llama` keeps the file (the reference reads several of those, `phi3`
-    /// and `llava` among them, as their file).
+    /// is the class's, and so is one whose `config.json` names a model type
+    /// the reference leaves to the named class (`llama`, `minicpm`, `zamba2`,
+    /// and every type it has no tokenizer class of its own for). A
+    /// `config.json` that names a model type the reference reads as its file
+    /// ([`REFERENCE_READS_AS_FILE`]: `phi3`, `llava`, `mistral`, ...) keeps
+    /// the file.
     fn llama_class_pipeline(
         tokenizer: &mut LoadingTokenizer,
         dir: Option<&Path>,
@@ -877,7 +880,7 @@ impl HuggingFaceTokenizer {
         }
         if dir
             .and_then(model_type_from_config)
-            .is_some_and(|model_type| model_type != "llama")
+            .is_some_and(|model_type| reference_reads_as_file(&model_type))
         {
             return;
         }
@@ -1275,6 +1278,110 @@ fn model_type_from_config(dir: &Path) -> Option<String> {
     let content = std::fs::read_to_string(dir.join("config.json")).ok()?;
     let value: serde_json::Value = serde_json::from_str(&content).ok()?;
     value.get("model_type")?.as_str().map(String::from)
+}
+
+/// The model types whose checkpoints `transformers` reads as their
+/// `tokenizer.json` although `tokenizer_config.json` names the Llama class:
+/// the types it lists as carrying a wrong class on the Hub, and the ones it
+/// registers to a plain or Mistral backend (its 5.22.1 tables, sorted). For
+/// every other type, registered to a class of its own or to none, the named
+/// class builds the pipeline, so a type missing here reads as the reference
+/// reads a type it does not know.
+const REFERENCE_READS_AS_FILE: &[&str] = &[
+    "EvollaModel",
+    "arctic",
+    "aria",
+    "beam",
+    "bigbird_pegasus",
+    "camembertv2-base",
+    "canary",
+    "chatlm",
+    "cohere_asr",
+    "ernie4_5",
+    "ernie4_5_moe",
+    "flex_olmo",
+    "fuyu",
+    "glm",
+    "glm4",
+    "glm4_moe",
+    "glm4_moe_lite",
+    "glm4v",
+    "glm4v_moe",
+    "glm_image",
+    "glmasr",
+    "got_ocr2",
+    "gpt_bigcode",
+    "gradium_phonon_tts",
+    "granite",
+    "granitemoe",
+    "granitemoehybrid",
+    "granitemoeshared",
+    "h2ovl_chat",
+    "hyperclovax",
+    "hyperclovax_vision_v2",
+    "hyperclovax_vlm",
+    "internlm2",
+    "jamba",
+    "kimi_k25",
+    "kimi_linear",
+    "kosmos-2",
+    "llava",
+    "llava_next",
+    "mimo_v2_flash",
+    "minicpm3",
+    "minicpm_ocr",
+    "minicpmv",
+    "minicpmv4_6",
+    "minicpmv4_7",
+    "minimax_m2",
+    "ministral",
+    "ministral3",
+    "mistral",
+    "mistral3",
+    "mistral_large4",
+    "mixtral",
+    "modernbert",
+    "modernbert-decoder",
+    "molmo",
+    "molmo2",
+    "nemo_speechlm",
+    "nemotron",
+    "nvfp4",
+    "nystromformer",
+    "olmo2",
+    "olmo3",
+    "olmo_hybrid",
+    "opencua",
+    "openvla",
+    "paddleocr_vl",
+    "pegasus_x",
+    "persimmon",
+    "phi3",
+    "phi3_v",
+    "phimoe",
+    "pix2struct",
+    "pixtral",
+    "pocket_tts",
+    "qwen2",
+    "qwen3_5",
+    "qwen3_5_moe",
+    "qwen3_5_moe_text",
+    "qwen4_exp",
+    "siglip2",
+    "smolvlm",
+    "stablelm",
+    "step3_vl",
+    "umt5",
+    "vipllava",
+    "voxtral",
+    "voxtral_realtime",
+    "xlm-roberta-xl",
+];
+
+/// Whether the reference reads a Llama-class checkpoint of `model_type` as
+/// its file ([`REFERENCE_READS_AS_FILE`]).
+fn reference_reads_as_file(model_type: &str) -> bool {
+    REFERENCE_READS_AS_FILE.binary_search(&model_type).is_ok()
 }
 
 /// Whether `normalizer` is the one a legacy conversion of a sentencepiece
@@ -2942,9 +3049,9 @@ mod tests {
         assert_eq!(ids_of(&first, "<|im_start|>a"), [3, 7]);
     }
 
-    /// A checkpoint of another model type keeps its file's pipeline (the
-    /// reference reads those as their file), and so does one whose
-    /// configuration names another class or is missing.
+    /// A checkpoint of a model type the reference reads as its file (`phi3`)
+    /// keeps its file's pipeline, and so does one whose configuration names
+    /// another class or is missing.
     #[test]
     fn other_checkpoints_keep_their_file_pipeline() {
         let temp = TempDir::new().unwrap();
@@ -2974,6 +3081,57 @@ mod tests {
         fs::write(&path, LLAMA_STYLE_TOKENIZER_JSON).unwrap();
         let no_configuration = HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
         assert_eq!(ids_of(&no_configuration, "<|im_start|>a"), [3, 6, 7]);
+    }
+
+    /// The table the gate reads is searched by `binary_search`, so it stays
+    /// strictly sorted in byte order and without repeats; a refresh that
+    /// misplaces an entry fails here instead of falling through to the class
+    /// pipeline.
+    #[test]
+    fn the_reference_s_file_table_is_strictly_sorted() {
+        assert!(super::REFERENCE_READS_AS_FILE.is_sorted_by(|a, b| a < b));
+    }
+
+    /// A model type the reference leaves to the named class (`minicpm`,
+    /// `zamba2`, or one it has no tokenizer class of its own for) is the
+    /// class's too, with the scheme the flags select; a type the reference
+    /// reads as its file (`mistral`, `granite`, `llava`) keeps the file.
+    #[test]
+    fn the_reference_s_model_type_table_decides_between_the_class_and_the_file() {
+        for model_type in ["minicpm", "zamba2", "a_type_the_reference_has_no_class_for"] {
+            let temp = TempDir::new().unwrap();
+            let path =
+                llama_style_checkpoint(temp.path(), "LlamaTokenizer", Some(true), None, model_type);
+            let class = HuggingFaceTokenizer::from_file(&path).unwrap();
+            assert!(
+                class.tokenizers_pipeline().get_normalizer().is_none(),
+                "{model_type}"
+            );
+            // `legacy: true`: the marker before every split (file: [6, 7, 5, 6, 8]);
+            // a text starting with a space gets one marker, not two (file: [6, 6, 7]).
+            assert_eq!(
+                ids_of(&class, "a </think> b"),
+                [6, 7, 6, 5, 6, 8],
+                "{model_type}"
+            );
+            assert_eq!(ids_of(&class, " a"), [6, 7], "{model_type}");
+        }
+        for model_type in ["mistral", "granite", "llava"] {
+            let temp = TempDir::new().unwrap();
+            let path =
+                llama_style_checkpoint(temp.path(), "LlamaTokenizer", Some(true), None, model_type);
+            let file = HuggingFaceTokenizer::from_file(&path).unwrap();
+            assert!(
+                file.tokenizers_pipeline().get_normalizer().is_some(),
+                "{model_type}"
+            );
+            assert_eq!(
+                ids_of(&file, "a </think> b"),
+                [6, 7, 5, 6, 8],
+                "{model_type}"
+            );
+            assert_eq!(ids_of(&file, " a"), [6, 6, 7], "{model_type}");
+        }
     }
 
     /// A Llama-class file whose normalizer replaces something other than the
