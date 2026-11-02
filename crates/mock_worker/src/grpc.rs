@@ -529,7 +529,7 @@ impl TokenSpeedScheduler for MockScheduler {
             pad_token_id: 0,
             bos_token_id: 1,
             weight_version: "mock".to_string(),
-            default_sampling_params_json: String::new(),
+            default_sampling_params_json: self.cfg.default_sampling_params_json.clone(),
             supports_vision: self.overrides.info_bool("supports_vision").unwrap_or(false),
             ..Default::default()
         }))
