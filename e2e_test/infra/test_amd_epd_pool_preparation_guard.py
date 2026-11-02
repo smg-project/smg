@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import logging
+import re
 import textwrap
 import threading
 import unittest
@@ -55,6 +56,18 @@ def _load_start_workers():
     tree = ast.parse(source, filename=str(path))
     entrypoint = _one(tree.body, ast.FunctionDef, "start_workers")
     selected = ast.get_source_segment(source, entrypoint)
+    exec(compile("from __future__ import annotations\n" + selected, str(path), "exec"), namespace)
+    return namespace
+
+
+def _load_diagnostic_entrypoints():
+    namespace = _load_start_workers()
+    path = Path(__file__).resolve().parent / "worker.py"
+    source = path.read_text()
+    tree = ast.parse(source, filename=str(path))
+    worker = _one(tree.body, ast.ClassDef, "Worker")
+    build_cmd = _one(worker.body, ast.FunctionDef, "_build_cmd")
+    selected = textwrap.dedent(ast.get_source_segment(source, build_cmd))
     exec(compile("from __future__ import annotations\n" + selected, str(path), "exec"), namespace)
     return namespace
 
@@ -113,9 +126,11 @@ class PoolPreparationGuardCases(unittest.TestCase):
 
                 pool._evict_locked = forbidden_evict
                 self.scope["start_workers"] = forbidden_start
-                with self.assertRaisesRegex(
-                    ValueError, "^EPD encode workers currently require TokenSpeed over gRPC$"
-                ):
+                expected = (
+                    "EPD encode workers currently require TokenSpeed over gRPC; "
+                    f"got engine={engine!r}, mode={mode.value!r}"
+                )
+                with self.assertRaisesRegex(ValueError, "^" + re.escape(expected) + "$"):
                     self.scope["acquire"](
                         pool,
                         model_id="never-look-up-this-model",
@@ -243,9 +258,11 @@ class PoolPreparationGuardCases(unittest.TestCase):
                 scope["worker_startup_timeout"] = forbidden("timeout_resolution")
                 scope["get_engine_port"] = forbidden("port_reservation")
                 scope["Worker"] = forbidden("Worker_construction")
-                with self.assertRaisesRegex(
-                    ValueError, "^EPD encode workers currently require TokenSpeed over gRPC$"
-                ):
+                expected = (
+                    "EPD encode workers currently require TokenSpeed over gRPC; "
+                    f"got engine={resolved!r}, mode={wire.value!r}"
+                )
+                with self.assertRaisesRegex(ValueError, "^" + re.escape(expected) + "$"):
                     scope["start_workers"](
                         "never-look-up-this-model",
                         engine=engine,
@@ -297,6 +314,82 @@ class PoolPreparationGuardCases(unittest.TestCase):
                     )
                 expected = ["resolve_engine"] if engine is None else []
                 self.assertEqual(events, expected + [("model_lookup", "supported-control-model")])
+
+    def test_PG07_diagnostics_identify_rejected_pair_at_all_entrypoints(self):
+        scope = _load_diagnostic_entrypoints()
+        mode, role = scope["ConnectionMode"], scope["WorkerType"]
+        prefix = "EPD encode workers currently require TokenSpeed over gRPC; "
+        cases = [
+            ("sglang", "sglang", mode.GRPC, "got engine='sglang', mode='grpc'"),
+            ("tokenspeed", "tokenspeed", None, "got engine='tokenspeed', mode=None"),
+            ("vllm", "vllm", "bad-wire", "got engine='vllm', mode='bad-wire'"),
+        ]
+        entries = {name: scope[name] for name in ("acquire", "start_workers", "_build_cmd")}
+        for name, entry in entries.items():
+            selected = cases + (
+                [(None, "vllm", mode.GRPC, "got engine='vllm', mode='grpc'")]
+                if name == "start_workers"
+                else []
+            )
+            for engine, resolved, wire, expected_suffix in selected:
+                with self.subTest(entry=name, engine=engine, mode=wire):
+                    events = []
+
+                    def forbidden(stage):
+                        def fail(*args, **kwargs):
+                            events.append(stage)
+                            raise AssertionError(f"diagnostic refusal reached {stage}")
+
+                        return fail
+
+                    def runtime():
+                        events.append("resolve_engine")
+                        return resolved
+
+                    scope["get_runtime"] = runtime
+                    scope["get_gpu_offset"] = lambda: 0
+                    for symbol in ("get_model_spec", "worker_startup_timeout", "get_engine_port"):
+                        scope[symbol] = forbidden(symbol)
+                    scope["Worker"] = forbidden("Worker_construction")
+                    scope["start_workers"] = forbidden("pool_worker_preparation")
+                    pool = self._pool(cached=True)
+                    cache = (pool._key, pool._workers, tuple(pool._workers))
+                    gateway = (pool._gateway, pool._gateway_key)
+                    pool._evict_locked = forbidden("eviction")
+                    with self.assertRaises(ValueError) as caught:
+                        if name == "acquire":
+                            entry(
+                                pool,
+                                model_id="never-prepare",
+                                engine=engine,
+                                mode=wire,
+                                worker_type=role.ENCODE,
+                            )
+                        elif name == "start_workers":
+                            entry(
+                                "never-prepare",
+                                engine=engine,
+                                mode=wire,
+                                worker_type=role.ENCODE,
+                                log_dir="private-logs",
+                            )
+                        else:
+                            entry(
+                                SimpleNamespace(
+                                    engine=engine,
+                                    mode=wire,
+                                    worker_type=role.ENCODE,
+                                    model_id="never-prepare",
+                                )
+                            )
+                    self.assertIs(type(caught.exception), ValueError)
+                    self.assertEqual(str(caught.exception), prefix + expected_suffix)
+                    self.assertEqual(events, ["resolve_engine"] if engine is None else [])
+                    self.assertIs(pool._key, cache[0])
+                    self.assertIs(pool._workers, cache[1])
+                    self.assertEqual(tuple(pool._workers), cache[2])
+                    self.assertIs(pool._gateway, gateway[0])
+                    self.assertIs(pool._gateway_key, gateway[1])
 
 
 if __name__ == "__main__":

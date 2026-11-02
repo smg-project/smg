@@ -108,7 +108,10 @@ class WorkerPool:
             if worker_type == WorkerType.ENCODE and (
                 engine != "tokenspeed" or mode != ConnectionMode.GRPC
             ):
-                raise ValueError("EPD encode workers currently require TokenSpeed over gRPC")
+                raise ValueError(
+                    "EPD encode workers currently require TokenSpeed over gRPC; "
+                    f"got engine={engine!r}, mode={getattr(mode, 'value', mode)!r}"
+                )
 
             # Non-REGULAR workers (PD prefill/decode) aren't cached, but we
             # still have to release any cached regular worker first — it

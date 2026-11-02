@@ -459,7 +459,10 @@ class Worker:
         if self.worker_type == WorkerType.ENCODE and (
             self.engine != "tokenspeed" or self.mode != ConnectionMode.GRPC
         ):
-            raise ValueError("EPD encode workers currently require TokenSpeed over gRPC")
+            raise ValueError(
+                "EPD encode workers currently require TokenSpeed over gRPC; "
+                f"got engine={self.engine!r}, mode={getattr(self.mode, 'value', self.mode)!r}"
+            )
         spec = get_model_spec(self.model_id)
         model_path = spec["model"]
         tp_size = self.tp or spec.get("tp", 1)
@@ -1222,7 +1225,10 @@ def start_workers(
         engine = get_runtime()
 
     if worker_type == WorkerType.ENCODE and (engine != "tokenspeed" or mode != ConnectionMode.GRPC):
-        raise ValueError("EPD encode workers currently require TokenSpeed over gRPC")
+        raise ValueError(
+            "EPD encode workers currently require TokenSpeed over gRPC; "
+            f"got engine={engine!r}, mode={getattr(mode, 'value', mode)!r}"
+        )
 
     spec = get_model_spec(model_id)
     gpus_per_worker = gpus or tp or spec.get("tp", 1)
