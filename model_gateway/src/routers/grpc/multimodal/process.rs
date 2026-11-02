@@ -289,6 +289,7 @@ pub(crate) async fn process_multimodal_plan(
 async fn fetch_media(plan: MediaPlan, ctx: &PlanContext<'_>) -> Result<Fetched> {
     let video_config = ctx.model_config.video_preprocessor_config.as_ref();
     let mut tracker = AsyncMultiModalTracker::new(ctx.components.media_connector.clone())
+        .with_drain_on_error(ctx.components.drain_fetches_on_error)
         .with_fetch_observer(
             Metrics::interned_model_label(ctx.model_id),
             Metrics::record_mm_fetch,
@@ -300,7 +301,22 @@ async fn fetch_media(plan: MediaPlan, ctx: &PlanContext<'_>) -> Result<Fetched> 
                 .with_frame_budget(ctx.components.video_frame_budget),
         )
         .with_image_transparency(ctx.transparency)
-        .with_minimax_image_resize(ctx.spec.name() == "minimax_m3");
+        .with_minimax_sglang_resize(
+            ctx.spec.name() == "minimax_m3"
+                && ctx
+                    .model_config
+                    .preprocessor_config
+                    .get_extra::<bool>(llm_multimodal::minimax_resize::SGLANG_RESIZE_KEY)
+                    .unwrap_or(false),
+        )
+        .with_minimax_image_resize(
+            ctx.spec.name() == "minimax_m3"
+                && !ctx
+                    .model_config
+                    .preprocessor_config
+                    .get_extra::<bool>(llm_multimodal::minimax_resize::SGLANG_RESIZE_KEY)
+                    .unwrap_or(false),
+        );
 
     for part in plan.into_parts() {
         tracker

@@ -557,7 +557,7 @@ struct Router {
     otlp_traces_endpoint: String,
     overlap_decay: f32,
     overload_token_usage_threshold: f32,
-    /// `legacy` or `symphony`: which parser reads a chat completion's output.
+    /// `symphony` (the default) or `legacy`: which parser reads a chat completion's output.
     parser: String,
     pd_admission_wait_secs: u64,
     pd_disaggregation: bool,
@@ -1103,7 +1103,7 @@ impl Router {
         // additionally pins the startup workers' runtime: the shared EngineCore
         // handshake carries no engine identity, so the wire protocol cannot be
         // probed. HTTP/gRPC keep auto-detection (None). Mirrors
-        // `to_router_config` in model_gateway/src/main.rs.
+        // `to_router_config` in model_gateway/src/cli/configure.rs.
         let startup_worker_runtime_type =
             if matches!(self.connection_mode, worker::ConnectionMode::Zmq) {
                 match self.backend {
@@ -1434,7 +1434,7 @@ impl Router {
         otlp_traces_endpoint = String::from("localhost:4317"),
         overlap_decay = 0.0,
         overload_token_usage_threshold = 1.0,
-        parser = String::from("legacy"),
+        parser = String::from("symphony"),
         pd_admission_wait_secs = 30,
         pd_disaggregation = false,
         pd_pairing_mode = String::from("lenient"),
@@ -2117,7 +2117,7 @@ impl Router {
                             })
                         })
                         .transpose()?;
-                    // Mirrors the CLI check in `main.rs`: port 0 parses as a
+                    // Mirrors the CLI check in `cli/configure.rs`: port 0 parses as a
                     // socket address but is undialable once gossiped to peers,
                     // and reaches router discovery as the fallback mesh port
                     // for Pods with no usable annotation.

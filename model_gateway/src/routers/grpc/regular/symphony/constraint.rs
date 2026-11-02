@@ -8,6 +8,7 @@ use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{ResponseFormat, Tool, ToolChoice, ToolChoiceValue},
     messages::{CreateMessageRequest, ToolChoice as MessagesToolChoice},
+    profile::ProviderProfile,
     worker::ConstrainedDecoding,
 };
 use serde_json::{json, Value};
@@ -17,8 +18,10 @@ use symphony::{
 };
 use tool_parser::{GrammarStart as WorkerGrammarStart, ToolConstraint};
 
+#[cfg(test)]
+use super::names::reading;
 use super::{
-    names::{reads, table_reading},
+    names::{reads, table_reading, Reading},
     template::Templates,
     SymphonyError,
 };
@@ -26,7 +29,7 @@ use crate::{
     config::ParserChoice,
     routers::grpc::{
         common::stages::helpers::TagForStart,
-        spec::scans_for_tool_calls,
+        spec::scans_for_tool_calls_for,
         utils::{ModelNames, Names, TagVocabulary, WorkerDecoding},
     },
     worker::{Worker, WorkerType},
@@ -376,13 +379,14 @@ impl<'a> Asks<'a> {
 
     /// The table reads no calls from the output: the legacy path would run no tool parser for the
     /// request (a chat response it would not scan for calls, no tools declared anywhere, for a
-    /// provider that reads calls only with them: [`scans_for_tool_calls`]; a Messages request
+    /// provider that reads calls only with them: [`scans_for_tool_calls_for`]; a Messages request
     /// that declares no tools, an empty list being a declaration). A `tool_choice` of `none` is
     /// not this: the table keeps its calls and the reader delivers none of them
-    /// ([`Asks::forbids_calls`]).
-    pub(super) fn no_calls(self) -> bool {
+    /// ([`Asks::forbids_calls_for`]). `provider` is the chat model's profile as the request's
+    /// preparation derived it once.
+    pub(super) fn no_calls_for(self, provider: ProviderProfile) -> bool {
         match self {
-            Self::Chat(request) => !scans_for_tool_calls(request),
+            Self::Chat(request) => !scans_for_tool_calls_for(request, provider),
             Self::Messages { request, .. } => request.tools.is_none(),
         }
     }
@@ -391,14 +395,15 @@ impl<'a> Asks<'a> {
     /// declared tools, or over a provider that reads calls without any): the table keeps its
     /// calls, so a call the model writes anyway is read whole, and the reader drops it, as the
     /// engine's own server reads such a call and withholds it. The prompt declares the tools as
-    /// under `auto` (`utils::request_as_rendered`), so the model may well write one.
-    pub(super) fn forbids_calls(self) -> bool {
+    /// under `auto` (`utils::request_as_rendered`), so the model may well write one. `provider`
+    /// is the chat model's profile as the request's preparation derived it once.
+    pub(super) fn forbids_calls_for(self, provider: ProviderProfile) -> bool {
         match self {
             Self::Chat(request) => {
                 matches!(
                     request.tool_choice,
                     Some(ToolChoice::Value(ToolChoiceValue::None))
-                ) && scans_for_tool_calls(request)
+                ) && scans_for_tool_calls_for(request, provider)
             }
             Self::Messages { request, .. } => {
                 matches!(request.tool_choice, Some(MessagesToolChoice::None))
@@ -413,6 +418,21 @@ impl<'a> Asks<'a> {
     pub(crate) fn no_reasoning(self) -> bool {
         match self {
             Self::Chat(request) => !request.separate_reasoning,
+            Self::Messages { .. } => false,
+        }
+    }
+
+    /// The request asked for generation past the model's own end of output (a chat request's
+    /// `ignore_eos`; a Messages request cannot ask it): the engine keeps sampling after the
+    /// end-of-turn token, and the gateway's stop decoder does not stop on it either
+    /// (`utils::create_stop_decoder`), so the output the table reads carries an unconstrained
+    /// tail after the model's answer. A marker of the table in that tail is the tail's doing,
+    /// not a frame the table failed to read, and the tally counts every such marker of the
+    /// output apart, the answer's own included
+    /// ([`Assignment::past_the_end`](super::reader::Assignment::past_the_end)).
+    pub(super) fn past_the_end(self) -> bool {
+        match self {
+            Self::Chat(request) => request.ignore_eos,
             Self::Messages { .. } => false,
         }
     }
@@ -444,6 +464,7 @@ pub(super) fn callable<'t>(choice: Option<&ToolChoice>, declared: &'t [Tool]) ->
 /// refusal comes with the derivation), or a chat request's `regex` or `ebnf` constraint would
 /// apply outside its format. `thought_closed` says the prompt closed the thought itself and wrote
 /// the template's text after it, which the calls' tag then owes nothing of.
+#[cfg(test)]
 #[expect(
     clippy::too_many_arguments,
     reason = "the table, the request's ask, where the prompt and the engines leave the model"
@@ -459,9 +480,33 @@ pub(crate) fn constraint(
     vocabulary: TagVocabulary,
     templates: &Templates,
 ) -> PreparedConstraint {
-    let Some((format, compiled)) = table_reading(parser, names, asks.model(), templates)? else {
+    constraint_for(
+        &reading(parser, names, asks.model(), templates)?,
+        asks,
+        tools,
+        reasoning_open,
+        thought_closed,
+        start,
+        vocabulary,
+    )
+}
+
+/// [`constraint`] over the table decision already read for the request (`read`), which
+/// preparation reads once for the replay, the constraint and the decoder's special tokens
+/// (`regular::stages::reading::prepare`); the tests ask through [`constraint`].
+pub(crate) fn constraint_for(
+    read: &Reading,
+    asks: Asks<'_>,
+    tools: &[Tool],
+    reasoning_open: bool,
+    thought_closed: bool,
+    start: GrammarStart,
+    vocabulary: TagVocabulary,
+) -> PreparedConstraint {
+    let Reading::Table(format, compiled) = read else {
         return Ok(Prepared::None);
     };
+    let (format, compiled) = (Arc::clone(format), *compiled);
     if compiled && asks.constrains_outside_the_format() {
         return Err(SymphonyError::Constraint(format!(
             "model '{}' writes its output in the format its response template declares, and a \
@@ -1379,8 +1424,9 @@ mod tests {
         );
     }
 
-    /// A prompt the template leaves without a turn opener (a system message rendered in place
-    /// after the user turn) starts the model inside its thought on the DeepSeek V4 table, and the
+    /// A prompt with no turn opener after a system message (as the checkpoint's own encoder file
+    /// writes one, or the template one a latest reminder follows) starts the model inside its
+    /// thought on the DeepSeek V4 table, and the
     /// grammar built for the request reads it as the engine does, whatever the thinking switch
     /// said: the answer tag of a JSON `response_format` takes the closed thought first where the
     /// engine starts the grammar at the first token, and is the engine's own schema where it does

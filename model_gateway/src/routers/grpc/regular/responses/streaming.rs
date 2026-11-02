@@ -23,7 +23,7 @@ use openai_protocol::{
         ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
         ChatCompletionStreamResponse,
     },
-    common::{FunctionCallResponse, ToolCall, ToolCallDelta, Usage, UsageInfo},
+    common::{FunctionCallResponse, ToolCall, ToolCallDelta, Usage},
     responses::{
         IncompleteDetails, IncompleteReason, ResponseContentPart, ResponseOutputItem,
         ResponseReasoningContent, ResponseStatus, ResponsesRequest, ResponsesResponse,
@@ -60,8 +60,9 @@ use crate::{
         grpc::{
             common::{
                 responses::{
-                    await_stream_startup, build_sse_response, persist_response_if_needed,
-                    signal_stream_startup, stored_foreground, stream_startup_channel,
+                    await_stream_startup, build_sse_response, naming_parser,
+                    persist_response_if_needed, signal_stream_startup, stored_foreground,
+                    stream_startup_channel,
                     streaming::{
                         attach_mcp_server_label, ResponseStreamEventEmitter, StreamStartupSender,
                     },
@@ -72,6 +73,7 @@ use crate::{
                 },
                 stages::{iteration_charge, RateLimitCell},
             },
+            regular::symphony,
             utils,
         },
     },
@@ -127,8 +129,10 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
         return chat_response;
     }
 
-    // Extract body from chat response
-    let (_parts, body) = chat_response.into_parts();
+    // The chat answer's body, and the parser that read it, which this
+    // answer names as the chat route does.
+    let (parts, body) = chat_response.into_parts();
+    let parser = parts.headers.get(symphony::HEADER).cloned();
 
     // Create channel for transformed SSE events
     let (tx, rx) = sse_channel();
@@ -186,7 +190,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     }
 
     // Build SSE response with transformed stream
-    build_sse_response(rx)
+    naming_parser(build_sse_response(rx), parser)
 }
 
 /// The SSE events of one frame of the chat stream's body.
@@ -605,19 +609,7 @@ impl StreamingResponseAccumulator {
         };
 
         // Convert usage
-        let usage = self.usage.as_ref().map(|u| {
-            let usage_info = UsageInfo {
-                prompt_tokens: u.prompt_tokens,
-                completion_tokens: u.completion_tokens,
-                total_tokens: u.total_tokens,
-                reasoning_tokens: u
-                    .completion_tokens_details
-                    .as_ref()
-                    .and_then(|d| d.reasoning_tokens),
-                prompt_tokens_details: u.prompt_tokens_details.clone(),
-            };
-            ResponsesUsage::Modern(usage_info.to_response_usage())
-        });
+        let usage = self.usage.as_ref().map(conversions::responses_usage);
 
         let mut builder = ResponsesResponse::builder(&self.response_id, &self.model)
             .copy_from_request(&self.original_request)

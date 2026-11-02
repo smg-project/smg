@@ -19,13 +19,16 @@ registers the class's workers here (every wire, cached or not).
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 import pytest
 from infra import get_runtime
+from infra.model_specs import get_model_spec
 from infra.worker import Worker
+from tokenizers import Tokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +44,50 @@ def set_class_workers(workers: list[Worker]) -> None:
 
 def clear_class_workers() -> None:
     _CLASS_WORKERS.clear()
+
+
+# The tokenizers that encoded an answer, by model directory.
+_TOKENIZERS: dict[str, Tokenizer] = {}
+
+
+def _tokenizer(model_dir: str) -> Tokenizer:
+    """The model's ``tokenizer.json``, loaded once per directory."""
+    tokenizer = _TOKENIZERS.get(model_dir)
+    if tokenizer is None:
+        path = os.path.join(model_dir, "tokenizer.json")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(
+                f"{path}: no tokenizer file; the mock engine's classes read the model's "
+                "files from ROUTER_LOCAL_MODEL_PATH/<model id>"
+            )
+        tokenizer = Tokenizer.from_file(path)
+        _TOKENIZERS[model_dir] = tokenizer
+    return tokenizer
+
+
+def _pieces(model_dir: str, text: str) -> tuple[list[int], list[str]]:
+    """``text`` as the ids the model's ``tokenizer.json`` gives it, no special
+    tokens (the encode the mock worker does for an answer stated as text), and
+    one piece of the text per id, so a text wire carries one logprob per piece.
+
+    A piece runs from where its token starts in ``text`` to where the next one
+    starts (decoding an id on its own loses a sentencepiece token's leading
+    space), so the pieces concatenate back to ``text`` for every tokenizer whose
+    offsets run forward; a character split over two ids leaves the second
+    piece empty. Refused when the text has no tokens or the offsets do not
+    partition it.
+    """
+    encoding = _tokenizer(model_dir).encode(text, add_special_tokens=False)
+    if not encoding.ids:
+        raise ValueError(f"{text!r}: no tokens to state a logprob for")
+    bounds = [0] + [start for start, _ in encoding.offsets[1:]] + [len(text)]
+    pieces = [text[start:end] for start, end in zip(bounds, bounds[1:])]
+    if "".join(pieces) != text:
+        raise ValueError(
+            f"{text!r}: the tokenizer's offsets {encoding.offsets} do not partition the text; "
+            "state this answer as pieces (enqueue([...], output_ids=[...], logprobs=[...]))"
+        )
+    return encoding.ids, pieces
 
 
 @dataclass
@@ -72,6 +119,23 @@ class MockAnswers:
         )
         response.raise_for_status()
         self.enqueued += 1
+
+    def enqueue_with_logprobs(self, output_text: str, logprob: float = -0.1, **answer: Any) -> None:
+        """State the mock worker's next answer with a logprob per token.
+
+        The text is stated as the ids the model's ``tokenizer.json`` gives it
+        (the files the worker serves, the encode the mock does itself for a
+        text answer), the piece of the text each id covers, and ``logprob`` on
+        each: a token wire carries the ids, a text wire the pieces, one logprob
+        per unit on either. A request that asks for logprobs then reads one per
+        token; for ``top_logprobs`` the mock lists the answer's own distinct
+        tokens as the alternatives, so an answer states at least as many as
+        the request asks for. No-op on a real engine.
+        """
+        if self.worker is None:
+            return
+        ids, pieces = _pieces(get_model_spec(self.worker.model_id)["model"], output_text)
+        self.enqueue(pieces, output_ids=ids, logprobs=[logprob] * len(ids), **answer)
 
     def leftovers(self) -> int:
         """Queued answers no request took."""

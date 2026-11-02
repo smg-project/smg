@@ -16,10 +16,12 @@
 //! ```
 //!
 //! The template writes `<｜Assistant｜>` and the thought's opener (`<think>`, or `</think>` in chat
-//! mode) after a user message only: a conversation that ends with a system message rendered in
-//! place leaves the turn unopened, and the model, which thinks unless told not to, starts inside
-//! its thought. The table starts there too (the unopened row, `<｜end▁of▁sentence｜>` ending a turn
-//! the model wrote), so `</think>` closes the thought instead of reaching the content.
+//! mode) after a user message, and after a system message that ends the conversation or that an
+//! assistant turn follows; a system message a latest reminder follows stays bare, and the
+//! checkpoint's own encoder file opens the turn after user and developer turns only, so a prompt
+//! can still leave the turn unopened, and the model, which thinks unless told not to, starts
+//! inside its thought. The table starts there too (the unopened row, `<｜end▁of▁sentence｜>` ending
+//! a turn the model wrote), so `</think>` closes the thought instead of reaching the content.
 //!
 //! The block's opener is spelled as the family's reference parser spells it: the blank line the
 //! template writes before the block and the tag, `\n\n<｜DSML｜tool_calls>`, so the blank line
@@ -1062,9 +1064,9 @@ mod tests {
     fn the_turn_after_a_tool_result_reads_the_opener_as_the_turns_start_does() {
         // The template renders a tool result as a block inside a user message and opens the
         // model's turn after it, `<｜Assistant｜>` with the thought opened (thinking) or closed
-        // (chat), or leaves the turn unopened when a system note follows the result; the blank
-        // line before a block is the opener's whether or not text came before it, so no mode and
-        // no start shows it as content.
+        // (chat), a trailing system note after the result included; only a latest reminder after
+        // such a note leaves the turn unopened; the blank line before a block is the opener's
+        // whether or not text came before it, so no mode and no start shows it as content.
         let result = concat!(
             "<｜User｜>Weather in Paris?<｜Assistant｜><think>Need the weather.</think>\n\n",
             "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n",

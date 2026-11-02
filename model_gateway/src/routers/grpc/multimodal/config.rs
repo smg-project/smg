@@ -86,7 +86,12 @@ impl VisionProcessors {
     fn build(spec: &dyn ModelProcessorSpec, model_config: &MultimodalModelConfig) -> Self {
         let build = |modality| {
             let mut config = preprocessor_config_for(model_config, modality).clone();
-            if spec.name() == "minimax_m3" && modality == Modality::Image {
+            if spec.name() == "minimax_m3"
+                && modality == Modality::Image
+                && !config
+                    .get_extra::<bool>(llm_multimodal::minimax_resize::SGLANG_RESIZE_KEY)
+                    .unwrap_or(false)
+            {
                 if config.max_pixels.is_some_and(|pixels| {
                     pixels != llm_multimodal::minimax_resize::IMAGE_MAX_TOTAL_PIXELS as usize
                 }) || config.min_pixels.is_some_and(|pixels| pixels != 28 * 28)
@@ -417,6 +422,8 @@ pub(crate) struct MultimodalComponents {
     pub modality_limit_overrides: HashMap<Modality, usize>,
     /// Where media is fetched and preprocessed for vLLM gRPC workers.
     pub processing: MmProcessingMode,
+    /// Worker admission must cover sibling fetches and blocking decoders on error.
+    pub drain_fetches_on_error: bool,
     /// Cap on preprocessed media bytes in flight; `None` leaves it unbounded.
     pub inflight: Option<Arc<MultimodalInflight>>,
     /// The engine's own video frame budget, for the specs that sample a clip
@@ -510,6 +517,7 @@ impl MultimodalComponents {
                 .map(|limit| HashMap::from([(Modality::Image, limit)]))
                 .unwrap_or_default(),
             processing,
+            drain_fetches_on_error: false,
             inflight,
             video_frame_budget: None,
         })

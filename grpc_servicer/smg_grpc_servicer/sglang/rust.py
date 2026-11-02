@@ -564,6 +564,44 @@ class SglangLauncher(RustLauncher):
             dispatches_from_the_frontend,
         )
 
+        processor = os.environ.get("SMG_SGLANG_MM_PROCESSOR", "").strip().lower()
+        if processor not in ("", "smg"):
+            raise ValueError("SMG_SGLANG_MM_PROCESSOR must be empty or smg")
+        if processor:
+            if dispatches_from_the_frontend(args):
+                raise ValueError(
+                    "native media processing cannot be combined with encode disaggregation"
+                )
+            if not tokenizer_dir:
+                raise ValueError("native media processing requires a tokenizer directory")
+            try:
+                concurrency = int(os.environ.get("SMG_SGLANG_MM_MAX_INFLIGHT", "64"))
+            except ValueError as error:
+                raise ValueError("SMG_SGLANG_MM_MAX_INFLIGHT must be positive integer") from error
+            if concurrency <= 0:
+                raise ValueError("SMG_SGLANG_MM_MAX_INFLIGHT must be positive integer")
+            from smg_grpc_servicer.sglang.mm_defaults import configure_threads, encoder_dtype
+
+            dtype = encoder_dtype(
+                os.environ.get("SMG_SGLANG_MM_DTYPE"),
+                lambda: _model_config(args).dtype,
+            )
+            configure_threads()
+            return {
+                "smg_media_processor": {
+                    "model_dir": str(args.model_path),
+                    "model_id": str(args.model_path),
+                    "encoder_dtype": dtype,
+                    "source": "env",
+                    "max_inflight": concurrency,
+                    "engine_item_limits": {
+                        modality: int(count)
+                        for entry in sglang_item_limits(args).split(",")
+                        if entry
+                        for modality, count in [entry.split("=", 1)]
+                    },
+                }
+            }
         if not dispatches_from_the_frontend(args):
             return {}
         self.encode = EncodeDispatchBridge(args)

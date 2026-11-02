@@ -273,7 +273,7 @@ pub(super) fn assemble_vllm_batches_with(
 /// per-modality capability is enforced by
 /// [`ensure_client_supports_intermediate`]; this only enforces the structural
 /// single-batch constraint.
-fn into_single_batch(
+pub(super) fn into_single_batch(
     intermediate: MultimodalIntermediate,
     backend: &str,
 ) -> Result<PrecomputedMultimodalIntermediate> {
@@ -298,24 +298,41 @@ fn ensure_client_supports_intermediate(
     ensure_backend_supports_modalities(client.runtime_type(), intermediate)
 }
 
+/// Assemble router-side tensors with the backward-compatible float32 dtype.
 fn assemble_sglang(
     intermediate: PrecomputedMultimodalIntermediate,
 ) -> Result<SglangMultimodalData> {
-    // Pinned to float32: nothing on this wire reports which widths the worker
-    // accepts, and the three names it does document are all four bytes or wider.
+    // Router-side processing retains its established dtype. A native worker
+    // may select the vision encoder's dtype explicitly.
+    assemble_sglang_with_dtype(intermediate, "float32")
+}
+
+/// Serialize worker pixels in the configured vision dtype, preserving integer metadata.
+pub(super) fn assemble_sglang_with_dtype(
+    intermediate: PrecomputedMultimodalIntermediate,
+    dtype: &str,
+) -> Result<SglangMultimodalData> {
+    anyhow::ensure!(
+        matches!(dtype, "float32" | "bfloat16" | "float16"),
+        "SGLang media dtype must be float32, bfloat16 or float16"
+    );
+    // Normalize in float32 first, then round once, as the engine does before
+    // its vision encoder. Integer grids and other metadata keep their dtype.
     let (pixel_values, pixel_values_shape, pixel_values_dtype) =
-        serialize_encoder_input_owned(intermediate.preprocessed.encoder_input, "float32")?;
+        serialize_encoder_input_owned(intermediate.preprocessed.encoder_input, dtype)?;
     let model_specific_tensors = serialize_model_specific(intermediate.preprocessed.model_specific);
-    let MediaBatch::Images(images) = &intermediate.media else {
-        anyhow::bail!("SGLang assembly requires an image batch");
+    let modality = match &intermediate.media {
+        MediaBatch::Images(_) => "image",
+        MediaBatch::Videos(_) => "video",
+        MediaBatch::Audios(_) => anyhow::bail!("SGLang assembly requires images or videos"),
     };
-    // Sent alongside the preprocessed tensors: a worker that does its own
-    // preprocessing has nothing else to work from.
-    let image_data = images.iter().map(|f| f.raw_bytes.to_vec()).collect();
+    // A tensor request is already preprocessed; raw media are only sent on
+    // the separate reference path, never duplicated alongside its pixels.
     let mm_placeholders = placeholders_for_bindings(&intermediate.bindings, true)?;
 
     Ok(SglangMultimodalData {
-        image_data,
+        modality: modality.to_string(),
+        image_data: Vec::new(),
         pixel_values,
         pixel_values_shape,
         pixel_values_dtype,

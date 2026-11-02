@@ -1,5 +1,5 @@
-//! The Router's media pipeline run worker-side. A vLLM gRPC servicer that
-//! processes `media_refs` itself (`--mm-processor smg`) fetches, decodes,
+//! The Router's media pipeline run worker-side. A Rust gRPC servicer that
+//! processes media references itself fetches, decodes,
 //! preprocesses and expands the placeholders with the code the Router runs
 //! for `--mm-processing router`, so the engine receives what the Router
 //! would have sent, without the Router carrying the pixels.
@@ -15,16 +15,17 @@ use llm_multimodal::{
     configure_parallelism, data_url::data_url_payload_bytes, jpeg_turbo::TurboJpegPolicy,
     registry::modality_limit_override, vision::PreProcessorConfig, FrameSampling, MediaConnector,
     MediaConnectorConfig, MediaConnectorError, MediaContentPart, MediaErrorCode, MediaFault,
-    Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism, TransparencyPolicy,
-    POOL_THREADS_ENV,
+    Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism, POOL_THREADS_ENV,
 };
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
-use smg_grpc_client::{vllm_proto as vllm, WorkerMediaFault};
+use smg_grpc_client::{sglang_proto as sglang, vllm_proto as vllm, WorkerMediaFault};
 use tracing::{info, warn};
 
 use super::{
-    assemble::{assemble_vllm_batches_with, VllmAssembly},
+    assemble::{
+        assemble_sglang_with_dtype, assemble_vllm_batches_with, into_single_batch, VllmAssembly,
+    },
     capability::runtime_reads_format,
     config::{MultimodalComponents, MultimodalConfigRegistry, MultimodalModelConfig},
     encoder_budget::ItemOverEncoderBudget,
@@ -63,6 +64,8 @@ pub struct WorkerMediaSettings {
     /// Directory (or Hub id) holding the model's `config.json` and
     /// preprocessor configs.
     pub model_dir: String,
+    /// Resolved tokenizer directory; defaults to the model directory.
+    pub tokenizer_dir: Option<String>,
     /// The id the model specs match on: the served model path or Hub id.
     pub model_id: String,
     /// The name the model is served under, for messages an operator reads;
@@ -358,6 +361,7 @@ pub struct WorkerMediaPipeline {
     tokenizer: Arc<dyn TokenizerTrait>,
     assembly: VllmAssembly,
     spec_name: &'static str,
+    sglang_identity_key: Option<String>,
     pixel_format: PixelFormat,
     max_item_bytes: Option<usize>,
     item_limits: HashMap<Modality, ItemLimit>,
@@ -371,6 +375,23 @@ impl WorkerMediaPipeline {
     pub async fn new(
         settings: WorkerMediaSettings,
         tokenizer: Arc<dyn TokenizerTrait>,
+    ) -> anyhow::Result<Self> {
+        Self::new_for_runtime(settings, tokenizer, RuntimeType::Vllm).await
+    }
+
+    /// Load native SGLang media processing with its checkpoint-specific resize contract.
+    pub async fn new_sglang(
+        settings: WorkerMediaSettings,
+        tokenizer: Arc<dyn TokenizerTrait>,
+    ) -> anyhow::Result<Self> {
+        Self::new_for_runtime(settings, tokenizer, RuntimeType::Sglang).await
+    }
+
+    /// Resolve engine-specific preprocessing once, before any requests are admitted.
+    async fn new_for_runtime(
+        settings: WorkerMediaSettings,
+        tokenizer: Arc<dyn TokenizerTrait>,
+        runtime: RuntimeType,
     ) -> anyhow::Result<Self> {
         // The servicer runs requests concurrently already, so each request's
         // preprocessing stays on its own thread unless an operator sized a pool.
@@ -410,6 +431,53 @@ impl WorkerMediaPipeline {
             None => loaded,
         };
         let model_registry = Arc::new(ModelRegistry::default());
+        let native_minimax = runtime == RuntimeType::Sglang
+            && model_registry
+                .lookup(&ModelMetadata {
+                    model_id: &settings.model_id,
+                    tokenizer: &RegistryTokenizer(tokenizer.as_ref()),
+                    config: &loaded.config,
+                })
+                .is_some_and(|spec| spec.name() == "minimax_m3");
+        let loaded = if native_minimax {
+            let mut image = loaded.preprocessor_config.clone();
+            image.extra.insert(
+                llm_multimodal::minimax_resize::SGLANG_RESIZE_KEY.into(),
+                serde_json::json!(true),
+            );
+            image.extra.insert(
+                llm_multimodal::minimax_resize::RESIZED_KEY.into(),
+                serde_json::json!(true),
+            );
+            let mut video = loaded
+                .video_preprocessor_config
+                .clone()
+                .unwrap_or_else(|| loaded.preprocessor_config.clone());
+            // The day-0 builtin processor reads its frame cap from checkpoint size.
+            let size = loaded.preprocessor_config.size.as_ref();
+            let side = size
+                .and_then(|size| size.get("height").zip(size.get("width")))
+                .map_or(672, |(height, width)| (*height).max(*width));
+            video.max_pixels = Some((side as usize).saturating_mul(side as usize));
+            // MiniMaxVLProcessor defaults videos_kwargs.do_resize to false: the
+            // SGLang loader already aligned the byte frames before this stage.
+            if !settings.processor_kwargs.contains_key("do_resize") {
+                video.do_resize = Some(false);
+            }
+            video.extra.insert(
+                llm_multimodal::minimax_resize::SGLANG_RESIZE_KEY.into(),
+                serde_json::json!(true),
+            );
+            let overridden = Arc::new(MultimodalModelConfig::new(
+                loaded.config.clone(),
+                image,
+                Some(video),
+            ));
+            config_registry.insert(CONFIG_KEY.to_string(), overridden.clone());
+            overridden
+        } else {
+            loaded
+        };
         let (spec_name, spec_limits, video_sampling, vision_processors) = {
             let adapter = RegistryTokenizer(tokenizer.as_ref());
             let metadata = ModelMetadata {
@@ -517,10 +585,61 @@ impl WorkerMediaPipeline {
                 .map(|(&modality, limit)| (modality, limit.limit))
                 .collect(),
             processing: MmProcessingMode::Worker,
+            drain_fetches_on_error: true,
             inflight: None,
             video_frame_budget: settings.video_frame_budget,
         };
+        // Only processors with a pixel-less Decode metadata contract advertise reuse.
+        let sglang_identity_key = if spec_name == "glm53_flash"
+            || (spec_name == "minimax_m3" && runtime == RuntimeType::Sglang)
+        {
+            let mut hash = blake3::Hasher::new();
+            hash.update(b"sglang-media-identity-v1");
+            let mut config = serde_json::json!({
+                "image": loaded.preprocessor_config,
+                "video": loaded.video_preprocessor_config,
+                "dtype": settings.encoder_dtype,
+                "format": format!("{:?}", settings.pixel_format),
+                "frames": settings.video_frame_budget,
+                "model": loaded.config,
+                "jpeg": format!("{turbojpeg:?}"),
+                "max_items": settings.max_items,
+                "max_item_bytes": settings.max_item_bytes,
+                "allowed_domains": settings.allowed_domains,
+                "allow_private_hosts": mm_settings().allow_private_media_hosts.value,
+                "effective_limits": item_limits.iter().map(|(m, n)| (format!("{m:?}"), n.limit)).collect::<std::collections::BTreeMap<_, _>>(),
+                "encoder_budget": settings.encoder_budget,
+                "limits": settings.engine_item_limits.iter().map(|(m, n)| (format!("{m:?}"), *n)).collect::<std::collections::BTreeMap<_, _>>(),
+            });
+            config.sort_all_objects();
+            hash.update(config.to_string().as_bytes());
+            let tokenizer_dir = settings
+                .tokenizer_dir
+                .as_deref()
+                .unwrap_or(&settings.model_dir);
+            let mut complete = true;
+            for name in ["tokenizer.json", "tokenizer_config.json"] {
+                match tokio::fs::read(std::path::Path::new(tokenizer_dir).join(name)).await {
+                    Ok(bytes) => {
+                        hash.update(&(bytes.len() as u64).to_le_bytes());
+                        hash.update(&bytes);
+                    }
+                    Err(error) => {
+                        tracing::info!(
+                            file = name,
+                            %error,
+                            "Tokenizer fingerprint unavailable; P/D media identity reuse disabled"
+                        );
+                        complete = false;
+                    }
+                }
+            }
+            complete.then(|| hash.finalize().to_hex().to_string())
+        } else {
+            None
+        };
         Ok(Self {
+            sglang_identity_key,
             components,
             model_id: settings.model_id,
             model_dir: settings.model_dir,
@@ -538,6 +657,11 @@ impl WorkerMediaPipeline {
             item_limits,
             encoder_budget: settings.encoder_budget,
         })
+    }
+
+    /// Fingerprint for the supported pixel-less SGLang Decode contract.
+    pub fn sglang_identity_key(&self) -> Option<&str> {
+        self.sglang_identity_key.as_deref()
     }
 
     /// The model spec the pipeline resolved (`qwen3_vl`, `llama4`, ...).
@@ -585,6 +709,57 @@ impl WorkerMediaPipeline {
         items: &[WorkerMediaItem],
         want_identity: bool,
     ) -> Result<WorkerMediaOutput, WorkerMediaError> {
+        let output = self
+            .process_inputs(prompt_token_ids, items, RuntimeType::Vllm)
+            .await?;
+        let data = assemble_vllm_batches_with(output.intermediate, &self.assembly)
+            .map_err(|error| WorkerMediaError::Internal(format!("{error:#}")))?;
+        let (first, extras) = data.into_protos();
+        let identity = want_identity.then(|| vllm::MediaIdentity {
+            prompt_token_ids: output.expanded_token_ids.clone(),
+            mm_inputs: vllm_mm_identity(&first),
+            extra_mm_inputs: extras.iter().filter_map(vllm_mm_identity).collect(),
+        });
+        let mut batches = Vec::with_capacity(1 + extras.len());
+        batches.push(first);
+        batches.extend(extras);
+        Ok(WorkerMediaOutput {
+            prompt_token_ids: output.expanded_token_ids,
+            batches,
+            identity,
+        })
+    }
+
+    /// Run the shared fetch, sampling and token expansion pipeline, then
+    /// encode SGLang's processor output rather than vLLM's feature contract.
+    pub async fn process_sglang(
+        &self,
+        prompt_token_ids: Vec<u32>,
+        items: &[WorkerMediaItem],
+    ) -> Result<(Vec<u32>, sglang::MultimodalInputs), WorkerMediaError> {
+        let output = self
+            .process_inputs(prompt_token_ids, items, RuntimeType::Sglang)
+            .await?;
+        let dtype = self.assembly.encoder_dtype.clone();
+        let span = tracing::Span::current();
+        let inputs = tokio::task::spawn_blocking(move || {
+            let _entered = span.enter();
+            assemble_sglang_with_dtype(into_single_batch(output.intermediate, "SGLang")?, &dtype)
+                .map(|data| data.into_proto())
+        })
+        .await
+        .map_err(|error| WorkerMediaError::Internal(format!("media assembly task: {error}")))?
+        .map_err(|error| WorkerMediaError::Invalid(format!("{error:#}")))?;
+        Ok((output.expanded_token_ids, inputs))
+    }
+
+    /// Fetch and expand media using the destination engine's format and alpha policy.
+    async fn process_inputs(
+        &self,
+        prompt_token_ids: Vec<u32>,
+        items: &[WorkerMediaItem],
+        runtime: RuntimeType,
+    ) -> Result<super::MultimodalOutput, WorkerMediaError> {
         if items.is_empty() {
             return Err(WorkerMediaError::Invalid(
                 "media_refs is set but carries no items".to_string(),
@@ -608,16 +783,14 @@ impl WorkerMediaPipeline {
             CONFIG_KEY,
             &self.model_dir,
             &HashMap::new(),
-            |format| runtime_reads_format(RuntimeType::Vllm, format),
+            |format| runtime_reads_format(runtime, format),
         )
         .await
         .map_err(|error| WorkerMediaError::Invalid(format!("{error:#}")))?;
         validate_rendered_media_anchors(&plan, &placeholders, tokenizer, &prompt_token_ids)
             .map_err(|error| WorkerMediaError::Invalid(format!("{error:#}")))?;
-        // This pipeline runs inside the engine whose batches it assembles
-        // (`VllmAssembly`), so its frames decode under that engine's own
-        // transparency rule, the white composite of its image loader; a
-        // processor that keeps alpha overrides it inside the plan.
+        // Follow the destination engine's image loader. SGLang drops alpha,
+        // while vLLM composites over white; model overrides still apply.
         let output = process_multimodal_plan(
             plan,
             &self.model_id,
@@ -626,28 +799,17 @@ impl WorkerMediaPipeline {
             &self.components,
             CONFIG_KEY,
             &self.model_dir,
-            self.assembly.image_wire_dtype(),
-            TransparencyPolicy::CompositeOverWhite,
+            if runtime == RuntimeType::Vllm {
+                self.assembly.image_wire_dtype()
+            } else {
+                None
+            },
+            super::transparency::runtime_transparency_policy(runtime),
             self.encoder_budget,
         )
         .await
         .map_err(classify)?;
-        let data = assemble_vllm_batches_with(output.intermediate, &self.assembly)
-            .map_err(|error| WorkerMediaError::Internal(format!("{error:#}")))?;
-        let (first, extras) = data.into_protos();
-        let identity = want_identity.then(|| vllm::MediaIdentity {
-            prompt_token_ids: output.expanded_token_ids.clone(),
-            mm_inputs: vllm_mm_identity(&first),
-            extra_mm_inputs: extras.iter().filter_map(vllm_mm_identity).collect(),
-        });
-        let mut batches = Vec::with_capacity(1 + extras.len());
-        batches.push(first);
-        batches.extend(extras);
-        Ok(WorkerMediaOutput {
-            prompt_token_ids: output.expanded_token_ids,
-            batches,
-            identity,
-        })
+        Ok(output)
     }
 
     /// The content part for one item, with the checks the Python servicer
@@ -684,8 +846,8 @@ impl WorkerMediaPipeline {
             Modality::Image => MediaContentPart::ImageUrl {
                 url: item.url.clone(),
                 detail: None,
-                uuid: None,
                 max_long_side_pixel: None,
+                uuid: None,
             },
             Modality::Video => MediaContentPart::VideoUrl {
                 url: item.url.clone(),
@@ -821,6 +983,7 @@ mod tests {
     pub(super) fn pipeline_settings(model_dir: &str) -> WorkerMediaSettings {
         WorkerMediaSettings {
             model_dir: model_dir.to_string(),
+            tokenizer_dir: None,
             model_id: model_dir.to_string(),
             served_model_name: None,
             pixel_format: PixelFormat::Normalized,
@@ -1022,6 +1185,288 @@ mod tests {
             576
         );
         assert_eq!(output.batches.len(), 1);
+        let (tokens, sglang) = pipeline
+            .process_sglang(vec![1, 32000, 2], &items)
+            .await
+            .unwrap();
+        assert_eq!(tokens, output.prompt_token_ids);
+        assert_eq!(sglang.modalities, ["image"]);
+        assert_eq!(sglang.im_token_id, Some(32000));
+        assert!(
+            sglang.image_data.is_empty(),
+            "do not duplicate source media beside tensors"
+        );
+        assert_eq!(
+            sglang.mm_placeholders,
+            [sglang::PlaceholderRange {
+                offset: 1,
+                length: 576
+            }]
+        );
+        assert_eq!(
+            sglang.pixel_values.as_ref().unwrap().shape,
+            output.batches[0].pixel_values.as_ref().unwrap().shape
+        );
+        // PIXEL stores half-transparent blue. SGLang drops alpha, so its
+        // tensor must equal opaque blue, while vLLM composites it over white.
+        let mut opaque = items.clone();
+        opaque[0].url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYPgPAAEDAQAIicLsAAAAAElFTkSuQmCC".into();
+        let (_, opaque_sglang) = pipeline
+            .process_sglang(vec![1, 32000, 2], &opaque)
+            .await
+            .unwrap();
+        let pixels = &sglang.pixel_values.as_ref().unwrap().data;
+        assert_eq!(pixels, &opaque_sglang.pixel_values.unwrap().data);
+        let Some(vllm::tensor_data::Payload::Inline(vllm_pixels)) =
+            &output.batches[0].pixel_values.as_ref().unwrap().payload
+        else {
+            panic!("expected inline image tensor")
+        };
+        assert_ne!(pixels, vllm_pixels);
+    }
+
+    /// Build an isolated processor registry with explicit model tokens.
+    async fn vision_test_pipeline(
+        config: &str,
+        tokens: &[(&str, u32)],
+    ) -> (tempfile::TempDir, WorkerMediaPipeline) {
+        let dir = tempfile::Builder::new()
+            .prefix("vision-pipeline-")
+            .tempdir()
+            .unwrap();
+        std::fs::write(dir.path().join("config.json"), config).unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let settings = WorkerMediaSettings {
+            model_dir: path.clone(),
+            tokenizer_dir: None,
+            model_id: path,
+            served_model_name: None,
+            pixel_format: PixelFormat::Normalized,
+            encoder_dtype: "float32".into(),
+            processor_kwargs: serde_json::Map::new(),
+            max_items: None,
+            engine_item_limits: HashMap::new(),
+            max_item_bytes: None,
+            allowed_domains: None,
+            fetch_timeout: Duration::from_secs(1),
+            video_fetch_timeout: Duration::from_secs(1),
+            video_frame_budget: None,
+            video_loader_rule: None,
+            encoder_budget: None,
+            turbojpeg: None,
+        };
+        let tokenizer = Arc::new(MockTokenizer::new().with_tokens(tokens));
+        let pipeline = WorkerMediaPipeline::new(settings, tokenizer).await.unwrap();
+        (dir, pipeline)
+    }
+
+    #[tokio::test]
+    /// Compare BF16 pixels with an independent nearest-even reference and unchanged metadata.
+    async fn sglang_worker_bfloat16_rounds_once_and_preserves_metadata() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let (_dir, mut pipeline) = vision_test_pipeline(
+            r#"{"model_type":"glm53_flash","image_token_id":32000}"#,
+            &[
+                ("<|image|>", 32000),
+                ("<|begin_of_image|>", 32001),
+                ("<|end_of_image|>", 32002),
+            ],
+        )
+        .await;
+        let image = image::RgbImage::from_fn(56, 56, |x, y| {
+            image::Rgb([(x * 4) as u8, (y * 4) as u8, ((x + y) * 2) as u8])
+        });
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let items = [WorkerMediaItem {
+            modality: Modality::Image,
+            url: format!(
+                "data:image/png;base64,{}",
+                STANDARD.encode(bytes.into_inner())
+            ),
+        }];
+        let (float_tokens, float) = pipeline
+            .process_sglang(vec![1, 32000, 2], &items)
+            .await
+            .unwrap();
+        pipeline.assembly.encoder_dtype = "bfloat16".into();
+        let (bf_tokens, bf) = pipeline
+            .process_sglang(vec![1, 32000, 2], &items)
+            .await
+            .unwrap();
+        assert_eq!(float_tokens, bf_tokens);
+        assert_eq!(float.model_specific_tensors, bf.model_specific_tensors);
+        assert_eq!(float.mm_placeholders, bf.mm_placeholders);
+        let float = float.pixel_values.unwrap();
+        let bf = bf.pixel_values.unwrap();
+        assert_eq!(float.dtype, "float32");
+        assert_eq!(bf.dtype, "bfloat16");
+        assert_eq!(float.shape, bf.shape);
+        assert_eq!(float.data.len(), bf.data.len() * 2);
+        // Independent IEEE round-to-nearest-even reference for these finite values.
+        for (source, actual) in float
+            .data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(bf.data.as_chunks::<2>().0)
+        {
+            let bits = u32::from_le_bytes(*source);
+            let expected = ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16;
+            assert_eq!(u16::from_le_bytes(*actual), expected);
+        }
+        pipeline.assembly.encoder_dtype = "int8".into();
+        assert!(pipeline
+            .process_sglang(vec![1, 32000, 2], &items)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("media dtype"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ffmpeg and ffprobe; run explicitly for SGLang video validation"]
+    /// Check real video sampling, timestamps and temporal patch offsets across engines.
+    async fn sglang_glm_video_preserves_tensors_and_temporal_patch_offsets() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let (_dir, pipeline) = vision_test_pipeline(
+            r#"{"model_type":"glm53_flash","image_token_id":32000}"#,
+            &[
+                ("<|image|>", 32000),
+                ("<|begin_of_image|>", 32001),
+                ("<|end_of_image|>", 32002),
+                ("<|video|>", 32003),
+                ("0.0", 32004),
+                ("seconds", 32005),
+            ],
+        )
+        .await;
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../crates/multimodal/tests/fixtures/videos/testsrc_128x96_8fps_1s.mp4"
+        ));
+        let items = [WorkerMediaItem {
+            modality: Modality::Video,
+            url: format!("data:video/mp4;base64,{}", STANDARD.encode(bytes)),
+        }];
+        let (tokens, sglang) = pipeline
+            .process_sglang(vec![1, 32003, 2], &items)
+            .await
+            .unwrap();
+        let vllm = pipeline
+            .process(vec![1, 32003, 2], &items, false)
+            .await
+            .unwrap();
+        assert_eq!(tokens, vllm.prompt_token_ids);
+        assert_eq!(sglang.modalities, ["video"]);
+        assert_eq!(sglang.im_token_id, Some(32000));
+        assert!(!tokens.contains(&32003));
+        assert!(
+            tokens.windows(2).any(|pair| pair == [32004, 32005]),
+            "keep the frame timestamp after its vision group"
+        );
+        assert!(sglang.video_data.is_empty());
+        let grid = &sglang.model_specific_tensors["video_grid_thw"];
+        let dims: Vec<i64> = grid
+            .data
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| i64::from_le_bytes(*b))
+            .collect();
+        let expected = (dims[0] * dims[1] * dims[2] / 4) as u32;
+        assert_eq!(
+            sglang.mm_placeholders.iter().map(|p| p.length).sum::<u32>(),
+            expected
+        );
+        assert_eq!(sglang.mm_placeholders.len(), dims[0] as usize);
+        for p in &sglang.mm_placeholders {
+            assert!(tokens[p.offset as usize..(p.offset + p.length) as usize]
+                .iter()
+                .all(|&t| t == 32000));
+        }
+        let Some(vllm::tensor_data::Payload::Inline(pixels)) = vllm.batches[0]
+            .pixel_values
+            .as_ref()
+            .unwrap()
+            .payload
+            .as_ref()
+        else {
+            panic!("worker pipeline must return inline tensors")
+        };
+        assert_eq!(&sglang.pixel_values.as_ref().unwrap().data, pixels);
+    }
+
+    /// Only GLM with both tokenizer files can advertise the pixel-less contract.
+    #[tokio::test]
+    async fn sglang_reuse_requires_supported_processor_and_complete_fingerprint() {
+        for model_type in ["glm53_flash", "llava", "deepseek_v41"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("config.json"),
+                serde_json::json!({"model_type": model_type, "image_token_id": 32000,
+                    "image_token_index": 32000})
+                .to_string(),
+            )
+            .unwrap();
+            let path = dir.path().to_str().unwrap();
+            for complete in [false, true] {
+                if complete {
+                    for name in ["tokenizer.json", "tokenizer_config.json"] {
+                        std::fs::write(dir.path().join(name), "{}").unwrap();
+                    }
+                }
+                let pipeline = WorkerMediaPipeline::new(
+                    pipeline_settings(path),
+                    Arc::new(MockTokenizer::new()),
+                )
+                .await
+                .unwrap();
+                assert!(pipeline.components.drain_fetches_on_error);
+                assert_eq!(
+                    pipeline.sglang_identity_key().is_some(),
+                    model_type == "glm53_flash" && complete,
+                    "{model_type}: {complete}"
+                );
+            }
+        }
+    }
+
+    /// Reuse follows the tokenizer actually loaded, including a separate local directory.
+    #[tokio::test]
+    async fn sglang_fingerprint_uses_resolved_tokenizer_directory() {
+        let model = tempfile::tempdir().unwrap();
+        let tokenizer = tempfile::tempdir().unwrap();
+        std::fs::write(
+            model.path().join("config.json"),
+            r#"{"model_type":"glm53_flash"}"#,
+        )
+        .unwrap();
+        let mut settings = pipeline_settings(model.path().to_str().unwrap());
+        settings.tokenizer_dir = Some(tokenizer.path().to_str().unwrap().to_owned());
+        for name in ["tokenizer.json", "tokenizer_config.json"] {
+            std::fs::write(tokenizer.path().join(name), "{}").unwrap();
+        }
+        let first = WorkerMediaPipeline::new(settings.clone(), Arc::new(MockTokenizer::new()))
+            .await
+            .unwrap();
+        assert!(first.sglang_identity_key().is_some());
+        std::fs::write(
+            tokenizer.path().join("tokenizer_config.json"),
+            r#"{"changed":true}"#,
+        )
+        .unwrap();
+        let changed = WorkerMediaPipeline::new(settings.clone(), Arc::new(MockTokenizer::new()))
+            .await
+            .unwrap();
+        assert_ne!(first.sglang_identity_key(), changed.sglang_identity_key());
+        std::fs::remove_file(tokenizer.path().join("tokenizer.json")).unwrap();
+        let missing = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::new()))
+            .await
+            .unwrap();
+        assert!(missing.sglang_identity_key().is_none());
     }
 
     /// The Rust servicer runs the router's source policy, preserves the resulting
@@ -1099,7 +1544,7 @@ mod tests {
                 CONFIG_KEY,
                 &pipeline.model_dir,
                 pipeline.assembly.image_wire_dtype(),
-                TransparencyPolicy::CompositeOverWhite,
+                llm_multimodal::TransparencyPolicy::CompositeOverWhite,
                 None,
             )
             .await
@@ -1260,6 +1705,91 @@ mod tests {
                 if message.contains("192001 feature tokens (900 sampled frames)")
                     && message.contains("192000-token encoder budget")
         ));
+    }
+    /// SGLang follows its day-0 source geometry and advertises pixel-less Decode reuse.
+    #[tokio::test]
+    async fn sglang_minimax_matches_day0_image_geometry_and_reuse_contract() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type":"minimax_m3_vl","image_token_index":32000}"#,
+        )
+        .unwrap();
+        for name in ["tokenizer.json", "tokenizer_config.json"] {
+            std::fs::write(dir.path().join(name), "{}").unwrap();
+        }
+        let tokenizer = Arc::new(MockTokenizer::new().with_tokens(&[
+            ("]<]image[>[", 32000),
+            ("]<]start of image[>[", 32001),
+            ("]<]end of image[>[", 32002),
+        ]));
+        let settings = pipeline_settings(dir.path().to_str().unwrap());
+        // The same checkpoint must keep the pre-existing vLLM defaults. Native
+        // source-policy overrides belong only to the explicit SGLang constructor.
+        let vllm = WorkerMediaPipeline::new(settings.clone(), tokenizer.clone())
+            .await
+            .unwrap();
+        assert!(vllm.sglang_identity_key().is_none());
+        let vllm_config = vllm
+            .components
+            .config_registry
+            .get_or_load(CONFIG_KEY, dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(!vllm_config
+            .preprocessor_config
+            .get_extra::<bool>(llm_multimodal::minimax_resize::SGLANG_RESIZE_KEY)
+            .unwrap_or(false));
+        assert!(vllm_config.video_preprocessor_config.is_none());
+        let pipeline = WorkerMediaPipeline::new_sglang(settings, tokenizer)
+            .await
+            .unwrap();
+        assert!(pipeline.sglang_identity_key().is_some());
+        let loaded = pipeline
+            .components
+            .config_registry
+            .get_or_load(CONFIG_KEY, dir.path().to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded.video_preprocessor_config.as_ref().unwrap().do_resize,
+            Some(false)
+        );
+        // Independent day-0 source resize: 112², 504², 1036², and 2016x112.
+        for (width, height, tokens) in [
+            (56, 56, 16),
+            (512, 512, 324),
+            (1024, 1024, 1369),
+            (1000, 50, 288),
+        ] {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(width, height)
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            let item = WorkerMediaItem {
+                modality: Modality::Image,
+                url: format!(
+                    "data:image/png;base64,{}",
+                    STANDARD.encode(bytes.into_inner())
+                ),
+            };
+            let (ids, mm) = pipeline
+                .process_sglang(vec![1, 32000, 2], &[item])
+                .await
+                .unwrap();
+            assert_eq!(ids.iter().filter(|&&id| id == 32000).count(), tokens);
+            assert_eq!(
+                mm.pixel_values.as_ref().unwrap().shape,
+                [(tokens * 4) as u32, 1176]
+            );
+            assert_eq!(mm.pixel_values.as_ref().unwrap().dtype, "bfloat16");
+            assert_eq!(mm.mm_placeholders.len(), 1);
+            assert_eq!(mm.mm_placeholders[0].offset, 2);
+            assert_eq!(mm.mm_placeholders[0].length, tokens as u32);
+            assert_eq!(ids[1], 32001);
+            assert_eq!(ids[ids.len() - 2], 32002);
+        }
     }
 }
 

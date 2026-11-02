@@ -21,10 +21,10 @@
 //! whole; a run that leaves it unset or empty replays every case. A second parity test replays
 //! every Qwen checkpoint bellwether has recorded ([`MODELS`]): the Qwen3 table with the JSON call
 //! syntax, the same table with the tagged syntax (Qwen 3.5 and later, Qwen3-Coder), typed by each
-//! case's request tools, and the Qwen2.5 table, each after the prompt tail its template leaves,
-//! on as many threads as the run has CPUs, each model's report written in the table's order as
-//! soon as it and the models before it are done; it skips the slugs bellwether has not recorded
-//! yet, and says so. When a preview run sets
+//! case's request tools, and the Qwen2.5 table, each after the turn opener the registry names
+//! for it and the prompt tail its template leaves, on as many threads as the run has CPUs, each
+//! model's report written in the table's order as soon as it and the models before it are done;
+//! it skips the slugs bellwether has not recorded yet, and says so. When a preview run sets
 //! `SYMPHONY_CORPUS_ALLOWANCES=1`, that test also allows the classes of difference the recorded
 //! sets have ([`Allowance`]): a reference argument whose type contradicts the one the tool
 //! declares, which the template writes the same way as the string; reasoning in a reference whose
@@ -58,11 +58,11 @@
 //! A fourth test corrupts the recorded outputs: three seeded corruptions of every sampled case of
 //! every recorded model (a span deleted or doubled, one of the table's own markers or a cut one
 //! inserted, the tail cut, a character swapped), each read through the model's table after its
-//! prompt tail, whole, on two seeded plans and, up to 512 bytes, a character at a time. Nothing
-//! may panic, every byte must land in exactly one event with `Finish` last, and the message the
-//! chat adapter folds from the events must be the same however the output was cut; a panic is
-//! caught per output, so one run reports every breach with the case, the round and the corrupted
-//! output that replay it. The sample switch applies as above.
+//! turn opener and prompt tail, whole, on two seeded plans and, up to 512 bytes, a character at a
+//! time. Nothing may panic, every byte must land in exactly one event with `Finish` last, and the
+//! message the chat adapter folds from the events must be the same however the output was cut; a
+//! panic is caught per output, so one run reports every breach with the case, the round and the
+//! corrupted output that replay it. The sample switch applies as above.
 //!
 //! What a replay prints, per model: the cases that differ from the reference and nothing allows
 //! (`DIFFERS`, up to [`SHOWN`] of them) and the summary line of its sets. The per-case report, one
@@ -96,7 +96,7 @@ use serde::Deserialize;
 use symphony::{
     adapt,
     formats::{for_model, groups, table_for, Table},
-    Declared, DropReason, Engine, EngineFinish, Event, Events, Input, ParseError, Parser,
+    Declared, DropReason, Engine, EngineFinish, Event, Events, Format, Input, ParseError, Parser,
     TokenSpan,
 };
 
@@ -247,33 +247,51 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("qwen-drive-1.0-4b", GenerationPrompt::OpensTheThought),
     // DeepSeek V4.1 writes DSML and opens the thought in the prompt (`<think>`, no newline).
     ("deepseek-v4.1-flash", GenerationPrompt::OpensTheThought),
+    // DeepSeek V4 writes the DSML spelling before V4.1's and opens the thought in the prompt as
+    // V4.1 does (`<think>` after the assistant token; `</think>` in chat mode). Its table starts a
+    // turn the prompt opens no turn for inside the thought, so the opener the replay feeds before
+    // the tail ([`GenerationPrompt::text`]) is what tells a closed thought from an unopened turn.
+    ("deepseek-v4-flash", GenerationPrompt::OpensTheThought),
     // DeepSeek V3.2 and V3.2-Speciale write DSML; the encoder ends the prompt with `<think>` in
-    // thinking mode and `</think>` in chat mode, right after `<｜Assistant｜>`. bellwether holds
-    // their manifests and no set yet: each slug is skipped with the notice until the pin holds it.
-    ("deepseek-v3.2", GenerationPrompt::OpensTheThought),
-    ("deepseek-v3.2-speciale", GenerationPrompt::OpensTheThought),
+    // thinking mode and `</think>` in chat mode, right after `<｜Assistant｜>`. Chat mode is its
+    // default: only a request that turns thinking on opens the thought, so a recorded case that
+    // leaves the switch alone starts in content. bellwether holds their manifests and no set yet:
+    // each slug is skipped with the notice until the pin holds it.
+    // DeepSeek-V3.2-Exp ships a chat template in V3.1's spelling, but the engine renders its
+    // architecture through the same encoder, and bellwether records it so: its sets read with the
+    // V3.2 table and this statement.
+    ("deepseek-v3.2", GenerationPrompt::OpensTheThoughtWhenAsked),
+    (
+        "deepseek-v3.2-speciale",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    (
+        "deepseek-v3.2-exp",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
     // The Kimi K2 line reads with one table, and each template ends the generation prompt its own
     // way: K2 Instruct and Instruct-0905 write no thought; K2 Thinking ends at the turn's opener
     // and the model writes its own `<think>`; K2.5, K2.6 and K2.7-Code open the thought in the
     // prompt (`<think>`, no newline: the shared tail's is prompt text inside the thought, as for
     // Kimi K3). K2.5 and K2.6 close it at once (`<think></think>`) when the request's `thinking`
-    // is false, a switch bellwether's requests do not set (they carry `enable_thinking`), so the
-    // recorded sets start inside the thought whatever the request says. bellwether holds the six
-    // manifests and no set yet: each slug is skipped with the notice until the pin holds its sets.
+    // is false: the turns set carries that switch beside `enable_thinking`, so its thinking-off
+    // cases start in content, and the common set carries `enable_thinking` alone, which these
+    // templates do not read, so its cases start inside the thought; K2.7-Code's template reads
+    // neither. bellwether's reference refused the reasoning probes for K2 Thinking, K2.5 and K2.6
+    // ([`REFUSED_PROBES`]).
     ("kimi-k2-instruct", GenerationPrompt::Plain),
     ("kimi-k2-instruct-0905", GenerationPrompt::Plain),
     ("kimi-k2-thinking", GenerationPrompt::ModelDecides),
-    ("kimi-k2.5", GenerationPrompt::AlwaysOpensTheThought),
-    ("kimi-k2.6", GenerationPrompt::AlwaysOpensTheThought),
+    ("kimi-k2.5", GenerationPrompt::OpensTheThoughtOrClosesIt),
+    ("kimi-k2.6", GenerationPrompt::OpensTheThoughtOrClosesIt),
     ("kimi-k2.7-code", GenerationPrompt::AlwaysOpensTheThought),
-    // DeepSeek V3.1 and V3.2-Exp close the thought in the prompt (`</think>` right after the
-    // opener) unless the request's `thinking` kwarg opens it; the recorded requests carry
-    // `enable_thinking`, which these templates do not read, so every recorded prompt closes it
-    // and the output starts in content. DeepSeek V3's template writes no thought. Their sets hold
-    // content alone: the templates take a call's arguments as a string, and the recorder refused every
-    // call case of the corpus, whose arguments are objects.
+    // DeepSeek V3.1 closes the thought in the prompt (`</think>` right after the opener) unless
+    // the request's `thinking` kwarg opens it; the recorded requests carry `enable_thinking`,
+    // which its template does not read, so every recorded prompt closes it and the output starts
+    // in content. DeepSeek V3's template writes no thought. Their sets hold content alone: the
+    // templates take a call's arguments as a string, and the recorder refused every call case of
+    // the corpus, whose arguments are objects.
     ("deepseek-v3.1", GenerationPrompt::Plain),
-    ("deepseek-v3.2-exp", GenerationPrompt::Plain),
     ("deepseek-v3-0324", GenerationPrompt::Plain),
     ("deepseek-v3-0324-bf16", GenerationPrompt::Plain),
     // The R1 line writes V3's call spelling from its history and a thought of its own. The
@@ -771,6 +789,10 @@ enum GenerationPrompt {
     /// off, when the template opens the answer instead (`<|open|>response<|sep|>`): the engine's
     /// renderer hands the request's switch to the vendor class, and the output starts in content.
     OpensTheThoughtOrTheAnswer,
+    /// Kimi K2.5 and K2.6: `<think>` (the thought opened, no newline) unless the request's
+    /// `thinking` is false, when the template closes it at once (`<think></think>`) and the output
+    /// starts in content; `enable_thinking` moves nothing in these templates.
+    OpensTheThoughtOrClosesIt,
     /// Qwen3.5-2B: `<think>\n` only when the request turns thinking on (`enable_thinking: true`);
     /// otherwise `<think>\n\n</think>\n\n`, and the output starts in content. The reverse of
     /// [`Self::OpensTheThought`]'s default, so a request without the switch gets no thought.
@@ -794,12 +816,26 @@ enum GenerationPrompt {
 }
 
 impl GenerationPrompt {
-    /// The bytes after the assistant header for the case's request, in the family's spelling of
-    /// the thought's markers.
-    fn tail(self, fixture: &Fixture, table: Table) -> String {
-        self.tail_for(&fixture.request, table)
+    /// The prompt the replay feeds before the output: the turn opener the registry names for the
+    /// model, where its table has one, then the case's tail ([`Self::tail_for`]), as the whole
+    /// prompt the gateway replays carries them (the opener as the registry spells it; the newline
+    /// some templates write after it is not fed, and the walk reads it as whitespace). A table
+    /// that starts a turn the prompt opens no turn for in a state of its own (DeepSeek V4: inside
+    /// the thought) reads a tail with no opener as such a turn, whatever the tail closed, so the
+    /// opener is what tells the closed thought of a thinking-off request from an unopened turn;
+    /// a table without a turn opener gets the tail alone, as before.
+    fn text(self, fixture: &Fixture, format: &Format, table: Table) -> String {
+        self.text_for(&fixture.request, format, table)
     }
 
+    fn text_for(self, request: &Request, format: &Format, table: Table) -> String {
+        let mut text = format.turn_opener().unwrap_or_default().to_string();
+        text.push_str(&self.tail_for(request, table));
+        text
+    }
+
+    /// The bytes after the assistant header for the case's request, in the family's spelling of
+    /// the thought's markers.
     fn tail_for(self, request: &Request, table: Table) -> String {
         let (open, close) = table.think_markers();
         let opened = format!("{open}\n");
@@ -811,6 +847,10 @@ impl GenerationPrompt {
             (Self::OpensTheThought | Self::ModelWritesTheThought, true) => closed,
             (Self::OpensTheThought, false) | (Self::AlwaysOpensTheThought, _) => opened,
             (Self::OpensTheThoughtOrTheAnswer, true) => K3_ANSWER_OPEN.to_string(),
+            (Self::OpensTheThoughtOrClosesIt, _) if request.thinking_kwarg_off() => {
+                format!("{open}{close}")
+            }
+            (Self::OpensTheThoughtOrClosesIt, _) => opened,
             (Self::OpensTheThoughtOrTheAnswer, false) => opened,
             (Self::OpensTheThoughtWhenAsked, _) if request.thinking_on() => opened,
             (Self::OpensTheThoughtWhenAsked, _) => closed,
@@ -832,8 +872,9 @@ impl GenerationPrompt {
 
 /// Every recorded model is in the registry, so the replays below read each with the table
 /// `formats::for_model` gives it, the one the gateway asks for; a correction to the registry
-/// reaches the replay. The replay feeds the generation prompt's tail alone, so it says nothing
-/// about a turn opener: [`MEASURED_OPENERS`] pins those.
+/// reaches the replay. The replay feeds the registry's turn opener and the generation prompt's
+/// tail, and only a table whose start keys on the opener reads a wrong one: [`MEASURED_OPENERS`]
+/// pins the openers measured against the templates.
 #[test]
 fn every_recorded_model_is_in_the_registry() {
     for (slug, _) in MODELS {
@@ -1185,6 +1226,12 @@ const REFUSED_PROBES: &[(&str, &str)] = &[
         "llama-3-3-nemotron-super-49b-v1-5",
         "parse/reasoning-with-marker-text",
     ),
+    // bellwether's reference refused the reasoning probes for these templates: each slug's common
+    // set records the two content probes and the fence probe, three of the sixteen cases, and no
+    // reasoning probe (K2.7-Code's records seven, this one among them).
+    ("kimi-k2-thinking", "parse/reasoning-with-marker-text"),
+    ("kimi-k2.5", "parse/reasoning-with-marker-text"),
+    ("kimi-k2.6", "parse/reasoning-with-marker-text"),
 ];
 
 /// The reasoning probe: its reasoning holds a `</think>`, which every table with that marker
@@ -1263,6 +1310,15 @@ impl Request {
         self.enable_thinking() == Some(true)
     }
 
+    /// Whether the request's `thinking`, the switch Kimi K2.5's and K2.6's templates read, is
+    /// false.
+    fn thinking_kwarg_off(&self) -> bool {
+        self.chat_template_kwargs
+            .as_ref()
+            .and_then(|kwargs| kwargs.thinking)
+            == Some(false)
+    }
+
     fn enable_thinking(&self) -> Option<bool> {
         self.chat_template_kwargs
             .as_ref()
@@ -1273,6 +1329,7 @@ impl Request {
 #[derive(Deserialize)]
 struct ChatTemplateKwargs {
     enable_thinking: Option<bool>,
+    thinking: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1636,7 +1693,7 @@ fn replay_model(root: &std::path::Path, slug: &str, prompt: GenerationPrompt) ->
         &fixtures,
         &ids,
         &|fixture| Engine::new(format.clone(), Declared::of(&fixture.request.tools)),
-        &|fixture| prompt.tail(fixture, table),
+        &|fixture| prompt.text(fixture, &format, table),
         Rules {
             known_differences: &known_differences,
             allowed: &allowed,
@@ -1771,8 +1828,8 @@ struct Rules<'a> {
     holds_a_list_after_content: bool,
 }
 
-/// Replays every fixture through a fresh parser from `new_parser`, after a prompt ending in the
-/// case's `prompt_tail`, on every chunking, reports one line per case and the set's summary, and
+/// Replays every fixture through a fresh parser from `new_parser`, after the case's
+/// `prompt_text`, on every chunking, reports one line per case and the set's summary, and
 /// returns with them every difference the family's `rules` do not account for. `every_id` is the
 /// id of every case the set files hold, before any sample thinned them: a listed difference no
 /// longer among them is a failure too, so the list cannot rot.
@@ -1784,7 +1841,7 @@ fn parity(
     fixtures: &[Fixture],
     every_id: &[String],
     new_parser: &dyn Fn(&Fixture) -> Engine,
-    prompt_tail: &dyn Fn(&Fixture) -> String,
+    prompt_text: &dyn Fn(&Fixture) -> String,
     rules: Rules<'_>,
 ) -> Parity {
     let Rules {
@@ -1817,7 +1874,7 @@ fn parity(
         let replay_text = |cuts: &[usize], plan: &str| {
             replay_after(
                 &mut new_parser(fixture),
-                &prompt_tail(fixture),
+                &prompt_text(fixture),
                 text,
                 cuts,
                 &finish,
@@ -1886,7 +1943,7 @@ fn parity(
                     &mut new_parser(fixture),
                     Input::Prompt {
                         token_ids: &[],
-                        text: &prompt_tail(fixture),
+                        text: &prompt_text(fixture),
                     },
                     &fixture.output_ids,
                     pieces,
@@ -2653,7 +2710,7 @@ fn corruption_seed(id: &str, round: u64) -> u64 {
 /// The pieces a corruption puts into a recorded output: the table's own terminals and the tags
 /// of its call syntax, each whole and cut short at either end and in the middle, and the
 /// delimiters every syntax has a use for.
-fn markers_of(format: &symphony::Format) -> Vec<String> {
+fn markers_of(format: &Format) -> Vec<String> {
     let mut markers: Vec<String> = format.terminal_texts().map(str::to_string).collect();
     if let Some(syntax) = format.call_syntax() {
         markers.extend(syntax.tag_texts().into_iter().map(str::to_string));
@@ -2778,13 +2835,13 @@ fn conserved(text: &str, events: &[Event]) -> Result<(), String> {
 fn replay_plan(
     name: &str,
     new_engine: &dyn Fn() -> Engine,
-    tail: &str,
+    prompt_text: &str,
     text: &str,
     cuts: &[usize],
     finish: &EngineFinish,
 ) -> Result<Vec<Event<'static>>, String> {
     let replayed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        replay_after(&mut new_engine(), tail, text, cuts, finish, false)
+        replay_after(&mut new_engine(), prompt_text, text, cuts, finish, false)
     }));
     match replayed {
         Ok(Ok(events)) => Ok(events),
@@ -2793,18 +2850,18 @@ fn replay_plan(
     }
 }
 
-/// One corrupted output through a fresh engine from `new_engine`, after the prompt's `tail`:
-/// whole, on two seeded plans and, up to 512 bytes, a character at a time; the first breach of
-/// conservation, or of the message the chat adapter folds from the events, if any, named by its
-/// plan.
+/// One corrupted output through a fresh engine from `new_engine`, after `prompt_text` (the turn
+/// opener and the prompt's tail): whole, on two seeded plans and, up to 512 bytes, a character at
+/// a time; the first breach of conservation, or of the message the chat adapter folds from the
+/// events, if any, named by its plan.
 fn check_corrupted(
     new_engine: &dyn Fn() -> Engine,
-    tail: &str,
+    prompt_text: &str,
     text: &str,
     finish: &EngineFinish,
     random: &mut Scramble,
 ) -> Result<(), String> {
-    let whole = replay_plan("whole", new_engine, tail, text, &[], finish)?;
+    let whole = replay_plan("whole", new_engine, prompt_text, text, &[], finish)?;
     conserved(text, &whole).map_err(|e| format!("whole: {e}"))?;
     let expected = Said::of(&whole);
     let mut plans = vec![
@@ -2818,7 +2875,7 @@ fn check_corrupted(
         ));
     }
     for (name, cuts) in plans {
-        let events = replay_plan(name, new_engine, tail, text, &cuts, finish)?;
+        let events = replay_plan(name, new_engine, prompt_text, text, &cuts, finish)?;
         // The plan is named, not spelled out: the seeded plans are rebuilt from the case's id and
         // round, and the character plan from the text.
         conserved(text, &events).map_err(|e| format!("{name}: {e}"))?;
@@ -2866,7 +2923,8 @@ enum Corrupted {
 }
 
 /// Three seeded corruptions of every sampled output of `slug`'s parse sets, each replayed through
-/// the model's table after its prompt tail ([`check_corrupted`]), a panic caught per output.
+/// the model's table after its turn opener and prompt tail ([`check_corrupted`]), a panic caught
+/// per output.
 #[expect(
     clippy::panic,
     reason = "a set that cannot be read ends the test with its path"
@@ -2890,7 +2948,7 @@ fn corrupt_model(
     let mut failures = Vec::new();
     let mut outputs = 0;
     for fixture in &fixtures {
-        let tail = prompt.tail(fixture, table);
+        let prompt_text = prompt.text(fixture, &format, table);
         let finish = engine_finish(&fixture.reference.finish_reason);
         for round in 0..3u64 {
             let mut random = Scramble::new(corruption_seed(&fixture.id, round));
@@ -2899,7 +2957,7 @@ fn corrupt_model(
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 check_corrupted(
                     &|| Engine::new(format.clone(), Declared::of(&fixture.request.tools)),
-                    &tail,
+                    &prompt_text,
                     &text,
                     &finish,
                     &mut random,
@@ -2913,7 +2971,7 @@ fn corrupt_model(
             // The breach and its plan first, the output last: a window on the
             // message keeps what names the failure.
             failures.push(format!(
-                "{} round {round} ({}, prompt tail {tail:?}, finish {finish:?}):\n  \
+                "{} round {round} ({}, prompt {prompt_text:?}, finish {finish:?}):\n  \
                  {failure}\n  corrupted output {text:?}",
                 fixture.id,
                 table.name()
@@ -3030,6 +3088,370 @@ fn a_template_that_opens_the_thought_only_when_asked_closes_it_otherwise() {
         .known_differences("qwen3.5-2b", when_asked)
         .iter()
         .all(|known| known.id != REASONING_PROBE.id));
+}
+
+/// The prompt fed before the output is the registry's turn opener and the tail. The DeepSeek V4
+/// table starts a turn the prompt opens no turn for inside the thought, so the tail alone, which
+/// holds no opener, started every output there and a thinking-off request's text was said to be
+/// reasoning; after the opener the closed thought reads as the template wrote it, and a thinking
+/// request's output starts inside the thought as before. A table that names no turn opener gets
+/// the tail alone.
+#[test]
+fn the_prompt_fed_before_the_output_is_the_turn_opener_and_the_tail() {
+    let request = |kwargs: &str| -> Request {
+        serde_json::from_str(&format!("{{\"chat_template_kwargs\": {kwargs}}}")).expect("a request")
+    };
+    let (off, on) = (request("{\"enable_thinking\": false}"), request("null"));
+    let opens = GenerationPrompt::OpensTheThought;
+    let v4 = model_of("deepseek-v4-flash");
+    let format = for_model(&v4).expect("in the registry");
+    let table = table_for(&v4).expect("in the registry");
+    let (chat, thinking) = (
+        opens.text_for(&off, &format, table),
+        opens.text_for(&on, &format, table),
+    );
+    assert_eq!(chat, "<｜Assistant｜><think>\n\n</think>\n\n");
+    assert_eq!(thinking, "<｜Assistant｜><think>\n");
+    let said = |prompt_text: &str, output: &str| {
+        let events = replay_after(
+            &mut Engine::new(format.clone(), Declared::default()),
+            prompt_text,
+            output,
+            &[],
+            &EngineFinish::Stop,
+            false,
+        )
+        .expect("replays");
+        let said = Said::of(&events);
+        (said.content, said.reasoning, said.calls)
+    };
+    // Thinking off: the text is content, alone and before a calls block.
+    assert_eq!(
+        said(&chat, "Hello!"),
+        (Some("Hello!".to_string()), None, Vec::new())
+    );
+    let block = concat!(
+        "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n",
+        "<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n",
+        "</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+    );
+    assert_eq!(
+        said(&chat, &format!("Let me check.\n\n{block}")),
+        (
+            Some("Let me check.".to_string()),
+            None,
+            vec![(
+                "get_weather".to_string(),
+                "{\"city\": \"Paris\"}".to_string()
+            )]
+        )
+    );
+    // Thinking on: the output starts inside the thought, which `</think>` closes.
+    assert_eq!(
+        said(&thinking, "</think>Hello!"),
+        (Some("Hello!".to_string()), None, Vec::new())
+    );
+    assert_eq!(
+        said(&thinking, "A thought.</think>Hi"),
+        (
+            Some("Hi".to_string()),
+            Some("A thought.".to_string()),
+            Vec::new()
+        )
+    );
+    // The same table after the tail alone is the turn the prompt leaves unopened: the thought.
+    let tail = opens.tail_for(&off, table);
+    assert_eq!(
+        said(&tail, "Hello!"),
+        (None, Some("Hello!".to_string()), Vec::new())
+    );
+    // DeepSeek V3.2 anchors the turn at the encoder's tails and names no opener: the tail alone,
+    // as before. Qwen3's prompt is its own opener as the registry spells it (without the newline
+    // its template writes after it) and the tail.
+    let v3_2 = model_of("deepseek-v3.2");
+    let v3_2_format = for_model(&v3_2).expect("in the registry");
+    assert_eq!(
+        opens.text_for(
+            &off,
+            &v3_2_format,
+            table_for(&v3_2).expect("in the registry")
+        ),
+        tail
+    );
+    let qwen3 = model_of("qwen3-8b");
+    let qwen3_format = for_model(&qwen3).expect("in the registry");
+    assert_eq!(
+        GenerationPrompt::ModelWritesTheThought.text_for(
+            &off,
+            &qwen3_format,
+            table_for(&qwen3).expect("in the registry")
+        ),
+        "<|im_start|>assistant<think>\n\n</think>\n\n"
+    );
+}
+
+/// The corpus replay, as [`replay_model`] runs it for a slug, reads the DeepSeek V4 table's
+/// thinking-off turns as the reference does: five cases in the family's shapes, written here in
+/// a tree of their own (content alone and content before a calls block under thinking off, an
+/// empty and a written thought under thinking on, and the reasoning probe the table lists, so the
+/// list check holds). With the tail alone fed before the output, the two thinking-off cases
+/// differed: the table started them inside the thought and said their text was reasoning.
+#[test]
+fn the_corpus_replay_reads_a_thinking_off_turn_of_the_unopened_row_table_as_content() {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("unopened-row-replay-{}", std::process::id()));
+    let dir = root.join("deepseek-v4-flash").join("parse");
+    fs::create_dir_all(&dir).expect("the set's directory");
+    let block = concat!(
+        "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n",
+        "<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n",
+        "</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+    );
+    let off = serde_json::json!({"chat_template_kwargs": {"enable_thinking": false}});
+    let on = serde_json::json!({});
+    let call = serde_json::json!([
+        {"function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}
+    ]);
+    let cases = [
+        (
+            "content-thinking-off",
+            &off,
+            "Hello!".to_string(),
+            serde_json::json!({"content": "Hello!"}),
+            "stop",
+        ),
+        (
+            "call-with-content",
+            &off,
+            format!("Let me check.\n\n{block}"),
+            serde_json::json!({"content": "Let me check.", "tool_calls": call}),
+            "tool_calls",
+        ),
+        (
+            "content-thinking-on",
+            &on,
+            "</think>Hello!".to_string(),
+            serde_json::json!({"content": "Hello!"}),
+            "stop",
+        ),
+        (
+            "reasoning-then-content",
+            &on,
+            "A thought.</think>Hi".to_string(),
+            serde_json::json!({"content": "Hi", "reasoning_content": "A thought."}),
+            "stop",
+        ),
+        (
+            "reasoning-with-marker-text",
+            &on,
+            "A </think> in the text.</think>Hi".to_string(),
+            serde_json::json!({"content": "Hi", "reasoning_content": "A </think> in the text."}),
+            "stop",
+        ),
+    ];
+    let lines: Vec<String> = cases
+        .iter()
+        .map(|(name, request, text, message, finish)| {
+            serde_json::json!({
+                "id": format!("deepseek-v4-flash/parse/{name}"),
+                "request": request,
+                "reference": {"text": text, "message": message, "finish_reason": finish},
+            })
+            .to_string()
+        })
+        .collect();
+    fs::write(dir.join("common.jsonl"), lines.join("\n") + "\n").expect("the set");
+    let replayed = replay_model(
+        &root,
+        "deepseek-v4-flash",
+        GenerationPrompt::OpensTheThought,
+    );
+    fs::remove_dir_all(&root).expect("the tree removed");
+    let (report, failures) = match replayed {
+        Replayed::Compared {
+            report, failures, ..
+        } => (report, failures),
+        Replayed::Skipped(why) => (why, vec!["the slug was skipped".to_string()]),
+    };
+    assert!(failures.is_empty(), "{failures:#?}\n{report}");
+    let verdict = |name: &str| -> String {
+        report
+            .lines()
+            .find(|line| line.ends_with(&format!("parse/{name}")))
+            .map_or("not in the report", str::trim_start)
+            .to_string()
+    };
+    for name in [
+        "content-thinking-off",
+        "call-with-content",
+        "content-thinking-on",
+        "reasoning-then-content",
+    ] {
+        assert!(
+            verdict(name).starts_with("bitwise"),
+            "{name}: {}\n{report}",
+            verdict(name)
+        );
+    }
+    assert!(
+        verdict("reasoning-with-marker-text").starts_with("listed"),
+        "{report}"
+    );
+}
+
+/// Every row the DeepSeek V3.2 table reads states the generation prompt as the family's encoder
+/// renders it: chat mode unless the request turns thinking on. The tail the replay feeds for a
+/// request that leaves the switch alone, or turns it off, is the thought closed, so the output
+/// starts in content, and only `enable_thinking: true` gets it opened; and a row that writes no
+/// thought unasked does not list the reasoning probe, whose request leaves the switch alone,
+/// among the family's differences (a set recorded through the encoder cannot hold it: the turn
+/// carries no reasoning). Stated as opening the thought unless told otherwise, a row fed the open
+/// thought for a request that said nothing and listed the probe.
+#[test]
+fn a_v3_2_rows_generation_prompt_closes_the_thought_unless_the_request_turns_thinking_on() {
+    let request = |text: &str| -> Request { serde_json::from_str(text).expect("a request") };
+    let rows: Vec<(&str, GenerationPrompt)> = MODELS
+        .iter()
+        .copied()
+        .filter(|(slug, _)| table_for(&model_of(slug)) == Some(Table::DeepSeekV3_2))
+        .collect();
+    assert!(
+        !rows.is_empty(),
+        "no recorded slug reads with the V3.2 table"
+    );
+    let table = Table::DeepSeekV3_2;
+    let (open, close) = table.think_markers();
+    let (opened, closed) = (format!("{open}\n"), format!("{open}\n\n{close}\n\n"));
+    for (slug, prompt) in rows {
+        for unasked in [
+            "{}",
+            "{\"chat_template_kwargs\": null}",
+            "{\"chat_template_kwargs\": {\"enable_thinking\": false}}",
+        ] {
+            assert_eq!(
+                prompt.tail_for(&request(unasked), table),
+                closed,
+                "{slug} ({prompt:?}): the prompt's tail for the request {unasked}"
+            );
+        }
+        assert_eq!(
+            prompt.tail_for(
+                &request("{\"chat_template_kwargs\": {\"enable_thinking\": true}}"),
+                table
+            ),
+            opened,
+            "{slug} ({prompt:?}): the prompt's tail for a request that turns thinking on"
+        );
+        assert!(
+            table
+                .known_differences(slug, prompt)
+                .iter()
+                .all(|known| known.id != REASONING_PROBE.id),
+            "{slug} ({prompt:?}): the reasoning probe is among the listed differences"
+        );
+    }
+}
+
+/// The corpus replay, as [`replay_model`] runs it for a slug, reads a DeepSeek V3.2 set as the
+/// encoder records one: chat mode, so every case starts in content whether its request turns
+/// thinking off or says nothing, and the reasoning probe, whose request says nothing, is refused
+/// at record time and not among the set's cases. Three cases in the family's shapes, written here
+/// in a tree of their own (content alone and content before a calls block under thinking off,
+/// content alone under a request that says nothing), replayed under every row the V3.2 table
+/// reads with that row's statement: every case bitwise, nothing to fail. The table names no turn
+/// opener and the tail holds none of its anchors, so the cases read from content under either
+/// statement; what the statement decides is the family's expected list, and stated as opening
+/// the thought unless told otherwise, a row expected the probe and failed the set for not holding
+/// it (`listed in KNOWN_DIFFERENCES but not among the fixtures`).
+#[test]
+fn the_corpus_replay_reads_a_v3_2_set_recorded_in_chat_mode_without_the_reasoning_probe() {
+    let rows: Vec<(&str, GenerationPrompt)> = MODELS
+        .iter()
+        .copied()
+        .filter(|(slug, _)| table_for(&model_of(slug)) == Some(Table::DeepSeekV3_2))
+        .collect();
+    assert!(
+        !rows.is_empty(),
+        "no recorded slug reads with the V3.2 table"
+    );
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("v3-2-chat-mode-replay-{}", std::process::id()));
+    let block = concat!(
+        "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n",
+        "<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n",
+        "</｜DSML｜invoke>\n</｜DSML｜function_calls>"
+    );
+    let off = serde_json::json!({"chat_template_kwargs": {"enable_thinking": false}});
+    let unasked = serde_json::json!({});
+    let call = serde_json::json!([
+        {"function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}}
+    ]);
+    let cases = [
+        (
+            "content-thinking-off",
+            &off,
+            "Hello!".to_string(),
+            serde_json::json!({"content": "Hello!"}),
+            "stop",
+        ),
+        (
+            "call-with-content",
+            &off,
+            format!("Let me check.\n\n{block}"),
+            serde_json::json!({"content": "Let me check.", "tool_calls": call}),
+            "tool_calls",
+        ),
+        (
+            "content-unasked",
+            &unasked,
+            "Hello!".to_string(),
+            serde_json::json!({"content": "Hello!"}),
+            "stop",
+        ),
+    ];
+    let replayed: Vec<(&str, GenerationPrompt, Replayed)> = rows
+        .iter()
+        .map(|&(slug, prompt)| {
+            let dir = root.join(slug).join("parse");
+            fs::create_dir_all(&dir).expect("the set's directory");
+            let lines: Vec<String> = cases
+                .iter()
+                .map(|(name, request, text, message, finish)| {
+                    serde_json::json!({
+                        "id": format!("{slug}/parse/{name}"),
+                        "request": request,
+                        "reference": {"text": text, "message": message, "finish_reason": finish},
+                    })
+                    .to_string()
+                })
+                .collect();
+            fs::write(dir.join("common.jsonl"), lines.join("\n") + "\n").expect("the set");
+            (slug, prompt, replay_model(&root, slug, prompt))
+        })
+        .collect();
+    fs::remove_dir_all(&root).expect("the tree removed");
+    for (slug, prompt, replayed) in replayed {
+        let (report, failures) = match replayed {
+            Replayed::Compared {
+                report, failures, ..
+            } => (report, failures),
+            Replayed::Skipped(why) => (why, vec!["the slug was skipped".to_string()]),
+        };
+        assert!(
+            failures.is_empty(),
+            "{slug} ({prompt:?}): {failures:#?}\n{report}"
+        );
+        for (name, ..) in &cases {
+            let verdict = report
+                .lines()
+                .find(|line| line.ends_with(&format!("parse/{name}")))
+                .map_or("not in the report", str::trim_start);
+            assert!(
+                verdict.starts_with("bitwise"),
+                "{slug}/{name}: {verdict}\n{report}"
+            );
+        }
+    }
 }
 
 /// Spins until `ready` holds, for at most ten seconds, so that a test waiting on another thread's

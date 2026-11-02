@@ -18,6 +18,30 @@ import pytest
 from smg.servicer import SglangGrpcServer, TokenSpeedGrpcServer, VllmGrpcServer
 
 SERVERS = [VllmGrpcServer, TokenSpeedGrpcServer, SglangGrpcServer]
+
+
+def test_sglang_native_media_requires_tokenizer_before_starting():
+    """Reject native preprocessing without a tokenizer before starting a server."""
+    with pytest.raises(ValueError, match="requires tokenizer_dir"):
+        SglangGrpcServer(
+            **GOOD,
+            smg_media_processor={"model_dir": "/nonexistent/model", "model_id": "model"},
+        )
+
+
+def test_sglang_native_media_refuses_overflowing_concurrency_before_loading():
+    """Reject semaphore overflow before attempting model loading."""
+    with pytest.raises(ValueError, match="exceeds the semaphore limit"):
+        SglangGrpcServer(
+            **GOOD,
+            smg_media_processor={
+                "model_dir": "/nonexistent/model",
+                "model_id": "model",
+                "max_inflight": 2**63,
+            },
+        )
+
+
 # The servicer's own parameters and the default every constructor gives them
 # (``inspect.Parameter.empty``: required).
 SHARED_DEFAULTS = {

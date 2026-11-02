@@ -1945,12 +1945,15 @@ class TestControlPlaneApiKeyEntryErrors:
 
 
 class TestParserFlag:
-    """--parser picks the gateway's chat parser: legacy by default, or symphony."""
+    """--parser picks the gateway's chat parser: symphony by default, or legacy."""
 
-    def test_defaults_to_legacy_and_takes_symphony(self):
+    def test_defaults_to_symphony_and_takes_legacy(self):
         parser = argparse.ArgumentParser()
         RouterArgs.add_cli_args(parser)
-        assert RouterArgs.from_cli_args(parser.parse_args([])).parser == "legacy"
+        assert RouterArgs().parser == "symphony"
+        assert RouterArgs.from_cli_args(parser.parse_args([])).parser == "symphony"
+        chosen = RouterArgs.from_cli_args(parser.parse_args(["--parser", "legacy"]))
+        assert chosen.parser == "legacy"
         chosen = RouterArgs.from_cli_args(parser.parse_args(["--parser", "symphony"]))
         assert chosen.parser == "symphony"
 
