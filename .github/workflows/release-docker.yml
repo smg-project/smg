@@ -1,13 +1,15 @@
 name: Release Docker Image
 
+# A push builds the image to validate the Dockerfile and pushes nothing; the images are published
+# only on a maintainer's dispatch against a release tag or branch (scripts/release/README.md).
 on:
   push:
     branches:
       - main
+      - release/**
     paths:
       - .cargo/config.toml
       - docker/Dockerfile
-      - bindings/python/pyproject.toml
   workflow_dispatch:
     inputs:
       tag:
@@ -25,7 +27,7 @@ permissions:
 
 jobs:
   # Always runs: validates the Dockerfile builds successfully.
-  # Pushes only when triggered by a version bump (pyproject.toml) or manual dispatch.
+  # Pushes only on a manual dispatch.
   build-and-push:
     name: Build and push Docker image
     if: github.repository == 'smg-project/smg'
@@ -57,28 +59,35 @@ jobs:
         id: should-push
         env:
           EVENT_NAME: ${{ github.event_name }}
-          EVENT_BEFORE: ${{ github.event.before }}
-          EVENT_AFTER: ${{ github.sha }}
         run: |
+          # Only a manual dispatch publishes; a push run validates the build.
           PUSH="false"
-          # Manual dispatch always pushes
           if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
             PUSH="true"
           fi
-          # Push event: only push if pyproject.toml changed (version bump)
-          # Uses the full push range (before..after) to catch changes across
-          # multiple commits, not just HEAD~1.
-          if [[ "${EVENT_NAME}" == "push" ]]; then
-            # Capture changed files first so a git failure fails the step,
-            # instead of being swallowed by the pipe and silently leaving
-            # PUSH=false.
-            CHANGED=$(git diff --name-only "${EVENT_BEFORE}" "${EVENT_AFTER}")
-            if grep -q '^bindings/python/pyproject.toml$' <<<"${CHANGED}"; then
-              PUSH="true"
-            fi
-          fi
           echo "push=${PUSH}" >> "$GITHUB_OUTPUT"
           echo "Will push: ${PUSH}"
+
+      - name: Image tags
+        id: tags
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          # A candidate (a pre-release suffix such as 1.14.0-rc.1) never moves `latest`.
+          TAGS="lightseekorg/smg:${VERSION}"$'\n'"ghcr.io/${OWNER}/smg:${VERSION}"
+          LATEST="false"
+          if [[ "${VERSION}" != *-* ]]; then
+            TAGS+=$'\n'"lightseekorg/smg:latest"$'\n'"ghcr.io/${OWNER}/smg:latest"
+            LATEST="true"
+          fi
+          {
+            echo "tags<<EOF"
+            echo "${TAGS}"
+            echo "EOF"
+            echo "latest=${LATEST}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Tags: ${TAGS//$'\n'/ } (latest moves: ${LATEST})"
 
       - name: Set up QEMU
         if: env.MIRROR_EXISTING != 'true'
@@ -110,11 +119,7 @@ jobs:
           context: .
           file: docker/Dockerfile
           push: ${{ steps.should-push.outputs.push }}
-          tags: |
-            lightseekorg/smg:${{ steps.version.outputs.version }}
-            lightseekorg/smg:latest
-            ghcr.io/${{ github.repository_owner }}/smg:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/smg:latest
+          tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64,linux/arm64
@@ -124,6 +129,7 @@ jobs:
         if: env.MIRROR_EXISTING == 'true'
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          LATEST: ${{ steps.tags.outputs.latest }}
         run: |
           CURRENT_VERSION=$(grep -m1 '^version = ' bindings/python/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
           if [[ "${VERSION}" != "${CURRENT_VERSION}" ]]; then
@@ -133,10 +139,11 @@ jobs:
           SOURCE="lightseekorg/smg:${VERSION}"
           GHCR_IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/smg:${VERSION}"
           GHCR_LATEST="ghcr.io/${GITHUB_REPOSITORY_OWNER}/smg:latest"
-          docker buildx imagetools create \
-            --tag "${GHCR_IMAGE}" \
-            --tag "${GHCR_LATEST}" \
-            "${SOURCE}"
+          TAG_ARGS=(--tag "${GHCR_IMAGE}")
+          if [[ "${LATEST}" == "true" ]]; then
+            TAG_ARGS+=(--tag "${GHCR_LATEST}")
+          fi
+          docker buildx imagetools create "${TAG_ARGS[@]}" "${SOURCE}"
           DIGEST=$(docker buildx imagetools inspect "${GHCR_IMAGE}" --format '{{.Manifest.Digest}}')
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
 
@@ -146,10 +153,11 @@ jobs:
           PUSH: ${{ steps.should-push.outputs.push }}
           PUBLISH_OUTCOME: ${{ env.MIRROR_EXISTING == 'true' && steps.mirror.outcome || steps.build.outcome }}
           VERSION: ${{ steps.version.outputs.version }}
+          LATEST: ${{ steps.tags.outputs.latest }}
           DIGEST: ${{ env.MIRROR_EXISTING == 'true' && steps.mirror.outputs.digest || steps.build.outputs.digest }}
         run: |
           IMAGE="lightseekorg/smg:${VERSION}"
-          LATEST="lightseekorg/smg:latest"
+          LATEST_IMAGE="lightseekorg/smg:latest"
           GHCR_IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER}/smg:${VERSION}"
           GHCR_LATEST="ghcr.io/${GITHUB_REPOSITORY_OWNER}/smg:latest"
           if [[ "${PUBLISH_OUTCOME}" == "success" && "${PUSH}" == "true" ]]; then
@@ -159,9 +167,11 @@ jobs:
               echo "| Registry | Tag | Reference |"
               echo "| --- | --- | --- |"
               echo "| Docker Hub | \`${VERSION}\` | \`${IMAGE}\` |"
-              echo "| Docker Hub | \`latest\` | \`${LATEST}\` |"
               echo "| GHCR | \`${VERSION}\` | \`${GHCR_IMAGE}\` |"
-              echo "| GHCR | \`latest\` | \`${GHCR_LATEST}\` |"
+              if [[ "${LATEST}" == "true" ]]; then
+                echo "| Docker Hub | \`latest\` | \`${LATEST_IMAGE}\` |"
+                echo "| GHCR | \`latest\` | \`${GHCR_LATEST}\` |"
+              fi
               if [[ -n "${DIGEST}" ]]; then
                 echo ""
                 echo "Digest: \`${DIGEST}\`"
@@ -171,7 +181,7 @@ jobs:
             {
               echo "### ⚠️ Docker image built but NOT pushed"
               echo ""
-              echo "\`${IMAGE}\` was built and validated, but not published — no version bump in \`bindings/python/pyproject.toml\` and not a manual dispatch."
+              echo "\`${IMAGE}\` was built and validated, but not published — the images are published on a manual dispatch only."
             } >> "$GITHUB_STEP_SUMMARY"
             echo "::warning::Docker image ${IMAGE} was built but not pushed."
           else

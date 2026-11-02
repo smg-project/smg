@@ -32,15 +32,29 @@ jobs:
       - run: ruff format --check scripts/check_grpc_compatibility.py
       - run: |
           python -m venv .grpc178
-          .grpc178/bin/python -m pip install grpcio==1.78.0 grpcio-tools==1.78.0 grpcio-health-checking==1.78.0 grpcio-reflection==1.78.0 protobuf==6.31.1
-          .grpc178/bin/python -m pip install crates/grpc_client/python/ grpc_servicer/
+          .grpc178/bin/python -m pip install grpcio==1.78.0 grpcio-tools==1.78.0 grpcio-health-checking==1.78.0 grpcio-reflection==1.78.0 protobuf==6.33.5 crates/grpc_client/python/ grpc_servicer/
           .grpc178/bin/python -m pip check
           .grpc178/bin/python -m pip install pytest pytest-asyncio msgspec pydantic numpy pyzmq pillow
+          .grpc178/bin/python -m pip check
+          .grpc178/bin/python - <<'PYTHON'
+          from importlib.metadata import version
+          expected = {"grpcio": "1.78.0", "grpcio-tools": "1.78.0", "grpcio-health-checking": "1.78.0", "grpcio-reflection": "1.78.0", "protobuf": "6.33.5", "smg-grpc-proto": "0.4.29", "smg-grpc-servicer": "0.14.2"}
+          actual = {name: version(name) for name in expected}
+          print(actual)
+          assert actual == expected, (actual, expected)
+          PYTHON
           .grpc178/bin/python -m pytest -q scripts/test_grpc_ci_dependencies.py
           .grpc178/bin/python -m pytest -q grpc_servicer/tests -rs
           python -m venv .grpc181
           .grpc181/bin/python -m pip install grpcio==1.81.1 grpcio-tools==1.81.1 grpcio-health-checking==1.81.1 grpcio-reflection==1.81.1 protobuf==6.33.6
           .grpc181/bin/python -m pip check
+          .grpc181/bin/python - <<'PYTHON'
+          from importlib.metadata import version
+          expected = {"grpcio": "1.81.1", "grpcio-tools": "1.81.1", "grpcio-health-checking": "1.81.1", "grpcio-reflection": "1.81.1", "protobuf": "6.33.6"}
+          actual = {name: version(name) for name in expected}
+          print(actual)
+          assert actual == expected, (actual, expected)
+          PYTHON
           .grpc178/bin/python grpc_servicer/scripts/gen_proto_stubs.py .gencode178
           .grpc181/bin/python grpc_servicer/scripts/gen_proto_stubs.py .gencode181
           python scripts/check_grpc_compatibility.py .grpc178/bin/python .gencode178 .grpc181/bin/python .gencode181

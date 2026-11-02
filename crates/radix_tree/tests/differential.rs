@@ -15,57 +15,15 @@
 
 mod common;
 
-use std::collections::BTreeMap;
-
 use common::{
     model::{Model, StoreResult},
     oracle::Oracle,
+    subject::Subject,
     workload, Op,
 };
-use radix_tree::{Config, FlatTree, HolderId, OverlapScratch, RadixTree, StoreError};
-
-/// The implementations under test (flat R1 and chain-native R3),
-/// driven by the harness Op protocol. Every observable is asserted
-/// for BOTH against the model.
-enum Core {
-    Flat(FlatTree),
-    Chain(RadixTree),
-}
-
-struct Subject {
-    core: Core,
-    ids: Vec<HolderId>,
-    scratch: Vec<radix_tree::Overlap>,
-    qscratch: OverlapScratch,
-}
+use radix_tree::StoreError;
 
 impl Subject {
-    fn new_flat(holders: usize) -> Self {
-        let mut tree = FlatTree::new(Config::default());
-        let ids = (0..holders)
-            .map(|h| tree.create_holder(&format!("holder-{h}")))
-            .collect();
-        Self {
-            core: Core::Flat(tree),
-            ids,
-            scratch: Vec::new(),
-            qscratch: OverlapScratch::default(),
-        }
-    }
-
-    fn new_chain(holders: usize) -> Self {
-        let mut tree = RadixTree::new(Config::default());
-        let ids = (0..holders)
-            .map(|h| tree.create_holder(&format!("holder-{h}")))
-            .collect();
-        Self {
-            core: Core::Chain(tree),
-            ids,
-            scratch: Vec::new(),
-            qscratch: OverlapScratch::default(),
-        }
-    }
-
     /// Returns false when the store was rejected (must match model).
     fn apply(&mut self, op: &Op) -> bool {
         match op {
@@ -73,80 +31,19 @@ impl Subject {
                 holder,
                 parent,
                 blocks,
-            } => {
-                let r = match &mut self.core {
-                    Core::Flat(t) => t.store(self.ids[*holder], *parent, blocks),
-                    Core::Chain(t) => t.store(self.ids[*holder], *parent, blocks),
-                };
-                match r {
-                    Ok(_) => true,
-                    Err(StoreError::ParentNotFound) => false,
-                    Err(e) => panic!("unexpected store error {e:?}"),
-                }
-            }
+            } => match self.store(*holder, *parent, blocks) {
+                Ok(_) => true,
+                Err(StoreError::ParentNotFound) => false,
+                Err(e) => panic!("unexpected store error {e:?}"),
+            },
             Op::Remove { holder, keys } => {
-                match &mut self.core {
-                    Core::Flat(t) => t.remove(self.ids[*holder], keys),
-                    Core::Chain(t) => t.remove(self.ids[*holder], keys),
-                };
+                self.remove(*holder, keys);
                 true
             }
             Op::Clear { holder } => {
-                match &mut self.core {
-                    Core::Flat(t) => t.clear(self.ids[*holder]),
-                    Core::Chain(t) => t.clear(self.ids[*holder]),
-                }
+                self.clear(*holder);
                 true
             }
-        }
-    }
-
-    fn overlap(&mut self, query: &[u64]) -> BTreeMap<usize, u32> {
-        let scratch = &mut self.scratch;
-        match &mut self.core {
-            Core::Flat(t) => t.overlap(query, &mut self.qscratch, scratch),
-            Core::Chain(t) => t.overlap(query, &mut self.qscratch, scratch),
-        }
-        // Shape check on the RAW Vec before the BTreeMap collapse: every
-        // holder must appear at most once. The map projection would hide a
-        // merge-loop regression that emitted a holder twice (a downstream
-        // consumer iterating the Vec would then double-count).
-        let mut out = BTreeMap::new();
-        for o in scratch.iter() {
-            assert!(
-                out.insert(o.holder.parts().0 as usize, o.depth).is_none(),
-                "overlap emitted holder {} twice in the raw Vec",
-                o.holder.parts().0
-            );
-        }
-        out
-    }
-
-    fn holder_blocks(&self, h: usize) -> u64 {
-        match &self.core {
-            Core::Flat(t) => t.holder_blocks(self.ids[h]),
-            Core::Chain(t) => t.holder_blocks(self.ids[h]),
-        }
-    }
-
-    fn enumerate(&self, h: usize) -> Vec<(u32, u64, u64)> {
-        match &self.core {
-            Core::Flat(t) => t.enumerate(self.ids[h]).collect(),
-            Core::Chain(t) => t.enumerate(self.ids[h]).collect(),
-        }
-    }
-
-    fn distinct_entries(&self) -> u64 {
-        match &self.core {
-            Core::Flat(t) => t.stats().distinct_entries,
-            Core::Chain(t) => t.stats().distinct_entries,
-        }
-    }
-
-    fn audit(&self) -> Result<(), String> {
-        match &self.core {
-            Core::Flat(t) => t.audit(),
-            Core::Chain(t) => t.audit(),
         }
     }
 }
@@ -269,7 +166,7 @@ fn checkpoint(
                 "core{ci} != model (seed {seed}, op {at}, query len {})",
                 query.len()
             );
-            for o in subject.scratch.iter() {
+            for o in subject.last_overlaps() {
                 let h = o.holder.parts().0 as usize;
                 assert_eq!(
                     o.total_blocks,

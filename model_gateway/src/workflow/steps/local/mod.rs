@@ -354,7 +354,7 @@ mod dp_removal_tests {
 
     #[test]
     fn base_url_matches_plain_and_expanded_registrations() {
-        for scheme in ["http", "https", "grpc", "grpcs", "ipc"] {
+        for scheme in ["http", "https", "grpc", "grpcs", "ipc", "tcp"] {
             let registry = WorkerRegistry::new();
             let base = format!("{scheme}://worker:3000");
             register(&registry, &base, None);

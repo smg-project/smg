@@ -1,17 +1,19 @@
-# Keep generated stubs compatible with the gRPC runtime in ROCm vLLM images.
-# Pin protoc so a build cannot silently raise the generated runtime floor.
+# Pin the generator to keep stubs compatible with gRPC 1.78 engine runtimes.
+# The installed-wheel tests/test_declared_floors.py checks that every generated
+# module's runtime version is covered by the declared dependency floors.
+# Keep the existing protobuf minimum; change the generator and floors together.
 [build-system]
 requires = ["setuptools>=77.0", "grpcio-tools==1.78.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "smg-grpc-proto"
-version = "0.4.28"
+version = "0.4.29"
 description = "SMG gRPC proto definitions for vLLM, TRT-LLM, MLX, TokenSpeed, and SGLang"
 requires-python = ">=3.10"
 dependencies = [
     "grpcio>=1.78.0",
-    "protobuf>=6.31.1",
+    "protobuf>=6.33.5",
 ]
 readme = "README.md"
 license = "Apache-2.0"

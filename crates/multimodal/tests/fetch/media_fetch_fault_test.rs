@@ -6,8 +6,8 @@
 #![allow(clippy::expect_used)]
 
 use std::{
-    io::{Read, Write},
-    net::TcpListener,
+    io::{ErrorKind, Write},
+    net::{TcpListener, TcpStream},
     thread,
     time::Duration,
 };
@@ -33,18 +33,7 @@ fn serve_once(
     let port = listener.local_addr().expect("local addr").port();
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept");
-        let mut head = Vec::new();
-        let mut buf = [0u8; 4096];
-        loop {
-            let read = stream.read(&mut buf).unwrap_or(0);
-            if read == 0 {
-                break;
-            }
-            head.extend_from_slice(&buf[..read]);
-            if head.windows(4).any(|window| window == b"\r\n\r\n") {
-                break;
-            }
-        }
+        common::read_head(&mut stream);
         thread::sleep(header_delay);
         let headers = format!(
             "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {declared}\r\n\
@@ -102,12 +91,25 @@ async fn a_host_that_cannot_be_resolved_is_the_requests_fault() {
 
 #[tokio::test]
 async fn a_host_that_refuses_the_connection_is_the_requests_fault() {
-    let port = {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        listener.local_addr().expect("local addr").port()
-    };
-    let (fault, message) = fault_of(format!("http://127.0.0.1:{port}/picture.png"), BUDGET).await;
+    let refused = common::RefusedAddress::reserve();
+    let (fault, message) = fault_of(
+        format!("http://127.0.0.1:{}/picture.png", refused.port()),
+        BUDGET,
+    )
+    .await;
     assert_eq!(fault, MediaFault::Client, "{message}");
+}
+
+/// The refused-connection case's address: refused at once, and held, so no
+/// other test's one-shot server can take the port while the case runs.
+#[test]
+fn the_refused_address_refuses_connections_and_keeps_its_port() {
+    let refused = common::RefusedAddress::reserve();
+    let error = TcpStream::connect(refused.addr()).expect_err("nothing answers there");
+    assert_eq!(error.kind(), ErrorKind::ConnectionRefused, "{error}");
+    let taken = TcpListener::bind(refused.addr()).expect_err("the port is held");
+    assert_eq!(taken.kind(), ErrorKind::AddrInUse, "{taken}");
+    assert_eq!(refused.addr().port(), refused.port());
 }
 
 #[tokio::test]

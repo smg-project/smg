@@ -519,4 +519,16 @@ message GetServerInfoResponse {
   int32 pipeline_parallel_size = 4; // PP size
   int32 context_parallel_size = 5;  // CP size
   int32 world_size = 6;             // Total world size
+
+  // The vocabulary of structural-tag nodes the engine's guided-decoding
+  // backend takes: "older" when the xgrammar installed beside the engine
+  // predates the `optional`, `plus`, `star` and `token` nodes (0.1.33 is the
+  // first release with them) and refuses a tag that carries one at compile
+  // time; "" for a current one, another backend, or a servicer that does not
+  // say. Flattened into the `structural_tag_vocabulary` worker label, by
+  // which the router spells such a worker's structural tags without
+  // `optional`, `plus` and `star`, the same language; a `token` node stays as
+  // derived, so a table that writes single-token markers still meets the
+  // older compiler's refusal.
+  string structural_tag_vocabulary = 7;
 }

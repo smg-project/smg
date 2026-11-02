@@ -1,8 +1,10 @@
 //! What the crate's tests build an MCP session from: an orchestrator over
-//! one internal SSE server, and the binding a request names that server by.
+//! one internal SSE server, the binding a request names that server by, and
+//! the session over the two.
 
 use smg_mcp::{
-    BuiltinToolType, McpConfig, McpOrchestrator, McpServerBinding, McpServerConfig, McpTransport,
+    BuiltinToolType, McpConfig, McpOrchestrator, McpServerBinding, McpServerConfig, McpToolSession,
+    McpTransport, Tool, ToolEntry,
 };
 
 /// The server `internal_orchestrator` configures and `internal_binding` names.
@@ -42,10 +44,31 @@ pub(crate) async fn internal_orchestrator(
 
 /// The binding a request names [`INTERNAL_SERVER`] by: label `internal-label`,
 /// no tool allow-list.
-pub(crate) fn internal_binding() -> McpServerBinding {
+fn internal_binding() -> McpServerBinding {
     McpServerBinding {
         label: "internal-label".to_string(),
         server_key: INTERNAL_SERVER.to_string(),
         allowed_tools: None,
     }
+}
+
+/// An orchestrator from [`internal_orchestrator`] whose inventory holds
+/// `tools`, each one a tool of [`INTERNAL_SERVER`].
+pub(crate) async fn internal_orchestrator_serving(
+    builtin: Option<(BuiltinToolType, &str)>,
+    tools: Vec<Tool>,
+) -> McpOrchestrator {
+    let orchestrator = internal_orchestrator(builtin).await;
+    for tool in tools {
+        orchestrator
+            .tool_inventory()
+            .insert_entry(ToolEntry::from_server_tool(INTERNAL_SERVER, tool));
+    }
+    orchestrator
+}
+
+/// The session a request that names [`INTERNAL_SERVER`] through
+/// [`internal_binding`] opens over `orchestrator`.
+pub(crate) fn internal_session(orchestrator: &McpOrchestrator) -> McpToolSession<'_> {
+    McpToolSession::new(orchestrator, vec![internal_binding()], "test-request")
 }

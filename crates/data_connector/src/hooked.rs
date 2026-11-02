@@ -761,11 +761,60 @@ mod tests {
 
     use super::*;
     use crate::{
-        context::{with_request_context, RequestContext},
+        context::{current_extra_columns, with_request_context, RequestContext},
         core::StorageFailure,
         hooks::HookError,
         memory::{MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage},
     };
+
+    // ── Capturing conversation storage ───────────────────────────────────
+
+    /// A memory conversation store that records the task-local `ExtraColumns`
+    /// in force while a conversation is created: what a hooked wrapper handed
+    /// its backend.
+    struct CapturingConversationStorage {
+        inner: MemoryConversationStorage,
+        captured: parking_lot::Mutex<Option<ExtraColumns>>,
+    }
+
+    impl CapturingConversationStorage {
+        fn new() -> Self {
+            Self {
+                inner: MemoryConversationStorage::new(),
+                captured: parking_lot::Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ConversationStorage for CapturingConversationStorage {
+        async fn create_conversation(
+            &self,
+            input: NewConversation,
+        ) -> ConversationResult<Conversation> {
+            *self.captured.lock() = current_extra_columns();
+            self.inner.create_conversation(input).await
+        }
+
+        async fn get_conversation(
+            &self,
+            id: &ConversationId,
+        ) -> ConversationResult<Option<Conversation>> {
+            self.inner.get_conversation(id).await
+        }
+
+        async fn update_conversation(
+            &self,
+            id: &ConversationId,
+            metadata: Option<ConversationMetadata>,
+        ) -> ConversationResult<Option<Conversation>> {
+            self.inner.update_conversation(id, metadata).await
+        }
+
+        async fn delete_conversation(&self, id: &ConversationId) -> ConversationResult<bool> {
+            self.inner.delete_conversation(id).await
+        }
+    }
 
     // ── Mock hook ────────────────────────────────────────────────────────
 
@@ -1103,8 +1152,6 @@ mod tests {
 
     #[tokio::test]
     async fn extra_columns_available_to_backend_during_write() {
-        use crate::context::current_extra_columns;
-
         /// Hook that returns extra columns from `before`.
         struct ExtraColumnsHook;
 
@@ -1136,47 +1183,7 @@ mod tests {
             }
         }
 
-        /// Storage that captures the task-local ExtraColumns during writes.
-        struct CapturingStorage {
-            inner: MemoryConversationStorage,
-            captured: parking_lot::Mutex<Option<ExtraColumns>>,
-        }
-
-        #[async_trait]
-        impl ConversationStorage for CapturingStorage {
-            async fn create_conversation(
-                &self,
-                input: NewConversation,
-            ) -> ConversationResult<Conversation> {
-                // Capture the extra columns that the hooked wrapper set
-                *self.captured.lock() = current_extra_columns();
-                self.inner.create_conversation(input).await
-            }
-
-            async fn get_conversation(
-                &self,
-                id: &ConversationId,
-            ) -> ConversationResult<Option<Conversation>> {
-                self.inner.get_conversation(id).await
-            }
-
-            async fn update_conversation(
-                &self,
-                id: &ConversationId,
-                metadata: Option<ConversationMetadata>,
-            ) -> ConversationResult<Option<Conversation>> {
-                self.inner.update_conversation(id, metadata).await
-            }
-
-            async fn delete_conversation(&self, id: &ConversationId) -> ConversationResult<bool> {
-                self.inner.delete_conversation(id).await
-            }
-        }
-
-        let capturing = Arc::new(CapturingStorage {
-            inner: MemoryConversationStorage::new(),
-            captured: parking_lot::Mutex::new(None),
-        });
+        let capturing = Arc::new(CapturingConversationStorage::new());
         let hooked = HookedConversationStorage::new(
             capturing.clone() as Arc<dyn ConversationStorage>,
             Arc::new(ExtraColumnsHook),
@@ -1204,8 +1211,6 @@ mod tests {
     /// 4. The response round-trips correctly (store → get)
     #[tokio::test]
     async fn hook_with_extra_columns_replaces_forked_backend() {
-        use crate::context::current_extra_columns;
-
         /// Hook that returns a TENANT_ID extra column value.
         struct TenantHook;
 
@@ -1321,8 +1326,6 @@ mod tests {
     /// drive extra column values — the full pipeline from request to storage.
     #[tokio::test]
     async fn request_context_drives_hook_extra_columns() {
-        use crate::context::{current_extra_columns, with_request_context};
-
         /// Hook that reads tenant_id from RequestContext and produces ExtraColumns.
         struct ContextDrivenHook;
 
@@ -1358,46 +1361,7 @@ mod tests {
             }
         }
 
-        /// Storage that captures task-local ExtraColumns during writes.
-        struct CapturingConvStorage {
-            inner: MemoryConversationStorage,
-            captured: parking_lot::Mutex<Option<ExtraColumns>>,
-        }
-
-        #[async_trait]
-        impl ConversationStorage for CapturingConvStorage {
-            async fn create_conversation(
-                &self,
-                input: NewConversation,
-            ) -> ConversationResult<Conversation> {
-                *self.captured.lock() = current_extra_columns();
-                self.inner.create_conversation(input).await
-            }
-
-            async fn get_conversation(
-                &self,
-                id: &ConversationId,
-            ) -> ConversationResult<Option<Conversation>> {
-                self.inner.get_conversation(id).await
-            }
-
-            async fn update_conversation(
-                &self,
-                id: &ConversationId,
-                metadata: Option<ConversationMetadata>,
-            ) -> ConversationResult<Option<Conversation>> {
-                self.inner.update_conversation(id, metadata).await
-            }
-
-            async fn delete_conversation(&self, id: &ConversationId) -> ConversationResult<bool> {
-                self.inner.delete_conversation(id).await
-            }
-        }
-
-        let capturing = Arc::new(CapturingConvStorage {
-            inner: MemoryConversationStorage::new(),
-            captured: parking_lot::Mutex::new(None),
-        });
+        let capturing = Arc::new(CapturingConversationStorage::new());
         let hooked = HookedConversationStorage::new(
             capturing.clone() as Arc<dyn ConversationStorage>,
             Arc::new(ContextDrivenHook),

@@ -80,7 +80,11 @@ pub(crate) fn prepare(
     stage: &'static str,
 ) -> Result<Prepared, Response> {
     let model = asks.model();
-    let parser = ctx.state.parser.unwrap_or_default();
+    // Only the chat and messages preparations choose a parser; a request
+    // that chose none (transcription shares the chat preparation) keeps the
+    // legacy parsers here and at the two sites below, whatever the enum's
+    // default.
+    let parser = ctx.state.parser.unwrap_or(ParserChoice::Legacy);
     let names = ctx.components.parser_resolver.names(model);
     // A forced call's tag takes the start the model's workers name together;
     // a JSON answer's tag and the `auto` tag take the selected worker's own
@@ -112,6 +116,7 @@ pub(crate) fn prepare(
         reasoning,
         thought_closed,
         symphony::grammar_start_of(&workers),
+        symphony::vocabulary_of(&workers),
         &ctx.components.templates,
     );
     let choice = asks.choice();
@@ -194,7 +199,7 @@ pub(crate) fn reasoning_decision(
             .is_some_and(|tokenizer| switch(tokenizer.as_ref()))
     };
     match symphony::reasoning_open(
-        ctx.state.parser.unwrap_or_default(),
+        ctx.state.parser.unwrap_or(ParserChoice::Legacy),
         &ctx.components.parser_resolver.names(model),
         model,
         &ctx.components.templates,
@@ -280,7 +285,7 @@ pub(crate) fn decide(
 ) -> Result<Decided, Response> {
     let model = asks.model();
     let names = ctx.components.parser_resolver.names(model);
-    let parser = ctx.state.parser.unwrap_or_default();
+    let parser = ctx.state.parser.unwrap_or(ParserChoice::Legacy);
     let decoding = utils::WorkerDecoding::of(ctx.state.workers.as_ref());
     let decided = symphony::worker_constraint(
         decoding,
@@ -292,6 +297,7 @@ pub(crate) fn decide(
                 asks,
                 declared,
                 processed_text,
+                decoding.vocabulary,
                 &ctx.components.templates,
             )
         },
@@ -341,41 +347,15 @@ pub(crate) fn decide(
 
 #[cfg(test)]
 mod tests {
-    use llm_tokenizer::TokenizerRegistry;
     use openai_protocol::{chat::ChatCompletionRequest, messages::CreateMessageRequest};
-    use reasoning_parser::ParserFactory as ReasoningParserFactory;
     use serde_json::json;
-    use tool_parser::ParserFactory as ToolParserFactory;
 
     use super::*;
-    use crate::{
-        routers::grpc::{
-            context::SharedComponents, regular::symphony::template::Templates,
-            utils::ParserResolver,
-        },
-        worker::WorkerRegistry,
-    };
+    use crate::routers::grpc::regular::stages::testing::components;
 
     /// A model the registry has a table for, named by no label or flag.
     const MODEL: &str = "Qwen/Qwen3-8B";
     const PROMPT: &str = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n";
-
-    /// The gateway with `--parser symphony`, no parser names and no worker.
-    fn components() -> Arc<SharedComponents> {
-        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-        Arc::new(SharedComponents {
-            templates: Arc::new(Templates::new(Arc::clone(&tokenizer_registry))),
-            tokenizer_registry,
-            worker_registry: Arc::new(WorkerRegistry::new()),
-            tool_parser_factory: ToolParserFactory::default(),
-            reasoning_parser_factory: ReasoningParserFactory::default(),
-            parser_resolver: ParserResolver::disabled(),
-            multimodal: None,
-            tokenizer_autoload: true,
-            tokenizer_load_failures: Arc::default(),
-            parser: ParserChoice::Symphony,
-        })
-    }
 
     /// What [`decide`] said: the state's parser after, the table assigned with the prompt it
     /// replays, and the constraint.

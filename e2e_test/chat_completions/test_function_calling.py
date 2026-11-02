@@ -16,7 +16,7 @@ import httpx
 import openai
 import pytest
 import smg_client
-from infra.constants import get_parser, get_runtime
+from infra.constants import effective_parser, get_runtime
 from infra.streams import collect_streamed_chat
 
 logger = logging.getLogger(__name__)
@@ -108,7 +108,7 @@ PYTHONIC_MESSAGES = [
 
 @pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed", "mock")
 @pytest.mark.gpu(1)
-@pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct")
+@pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct", mock="RedHatAI/Llama-3.2-1B-Instruct-FP8")
 @pytest.mark.gateway(
     reuse=True, extra_args=["--tool-call-parser", "llama", "--history-backend", "memory"]
 )
@@ -120,6 +120,13 @@ class TestOpenAIServerFunctionCalling:
     On the mock engine each test states the model's answer first, in the
     llama parser's syntax (``mock_answers`` does nothing on a real engine);
     the ``n=2`` cases skip there, the mock answering one choice per request.
+
+    On a real engine the cases that leave the choice to the model
+    (``tool_choice: auto``) decode greedily (``temperature=0``): they assert
+    the shape of the tool call the gateway reads, and a sampled answer in
+    plain words would fail that by chance. The constrained cases (a
+    ``required`` or a named choice) are decided by the grammar the gateway
+    installs, not by the draw.
     """
 
     def test_function_calling_format(self, model, api_client, mock_answers):
@@ -161,8 +168,7 @@ class TestOpenAIServerFunctionCalling:
             model=model,
             max_tokens=2048,
             messages=messages,
-            temperature=0.8,
-            top_p=0.8,
+            temperature=0,
             stream=False,
             tools=tools,
         )
@@ -223,8 +229,7 @@ class TestOpenAIServerFunctionCalling:
             model=model,
             max_tokens=2048,
             messages=messages,
-            temperature=0.8,
-            top_p=0.8,
+            temperature=0,
             stream=True,
             tools=tools,
         )
@@ -290,8 +295,7 @@ class TestOpenAIServerFunctionCalling:
             model=model,
             max_tokens=2048,
             messages=messages,
-            temperature=0.9,
-            top_p=0.9,
+            temperature=0,
             stream=True,
             tools=tools,
         )
@@ -469,9 +473,16 @@ class TestOpenAIServerFunctionCalling:
 
         - When tool_choice is a specific ToolChoice, the model should return one or more tool_calls.
         """
-        # Under a named choice the gateway constrains the engine to that
-        # function's parameters object and names the call itself.
-        mock_answers.enqueue('{"city": "Paris"}')
+        # Under a named choice the gateway constrains the engine to the call it
+        # names: Symphony's json table, this model's under the default, gives
+        # the forced call its own structural tag, the list holding that one
+        # call, which the table reads; the legacy path constrains the engine to
+        # the function's parameters object and names the call itself.
+        mock_answers.enqueue(
+            '[{"name": "get_weather", "parameters": {"city": "Paris"}}]'
+            if effective_parser() == "symphony"
+            else '{"city": "Paris"}'
+        )
         tools = [
             {
                 "type": "function",
@@ -733,8 +744,20 @@ class TestOpenAIServerFunctionCalling:
 )
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
+@pytest.mark.skipif(
+    effective_parser() == "symphony",
+    reason="the registry reads this model with the json table under Symphony, the default; "
+    "the pythonic list is the legacy parsers' reading",
+)
 class TestOpenAIPythonicFunctionCalling:
-    """Tests for pythonic function calling format."""
+    """Tests for pythonic function calling format.
+
+    Under Symphony (the default) the registry reads this model with its own table (``json``)
+    whatever ``--tool-call-parser`` names, so the gateway-wide ``pythonic`` name this class
+    relies on does not apply there: the class runs where the legacy parsers read (the
+    ``--parser legacy`` lane), and skips under Symphony at collection, before any fixture
+    starts a worker or a gateway.
+    """
 
     def test_pythonic_tool_call_prompt(self, model, api_client):
         """Test: Explicit prompt for pythonic tool call format without chat template."""
@@ -1670,7 +1693,7 @@ class TestToolChoiceLlama(_TestToolChoiceBase):
         """Under --parser symphony the pair is served: the `llama` name reads the json table,
         whose forced call carries each tool's own `$defs`. On the legacy path the merged schema
         refuses the pair, as the base test expects."""
-        if get_parser() != "symphony":
+        if effective_parser() != "symphony":
             super().test_conflicting_defs_required_tool_choice(model, api_client)
             return
         self._assert_conflicting_defs_served(model, api_client)
@@ -1699,7 +1722,7 @@ class TestToolChoiceQwen(_TestToolChoiceBase):
         """Under --parser symphony the pair is served: the Qwen3 table gives the forced call a
         structural tag that carries each tool's own `$defs`. On the legacy path the merged schema
         refuses the pair, as the base test expects."""
-        if get_parser() != "symphony":
+        if effective_parser() != "symphony":
             super().test_conflicting_defs_required_tool_choice(model, api_client)
             return
         self._assert_conflicting_defs_served(model, api_client)

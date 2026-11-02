@@ -17,7 +17,7 @@ use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams, PreparedTools},
     stop::StopSequenceDecoderBuilder,
-    traits::{Encoding, PromptEncoding, RendererCapabilities, Tokenizer},
+    traits::{Encoding, PromptEncoding, Tokenizer},
     StopSequenceDecoder,
 };
 use openai_protocol::{
@@ -480,8 +480,8 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
 }
 
 /// The thinking preference the prompt is rendered with: the typed toggle,
-/// else the effective effort, both as the request's provider profile reads
-/// them (`ChatCompletionRequest::template_thinking`).
+/// else the effective effort as the request's provider profile reads it
+/// (`ChatCompletionRequest::template_thinking`).
 fn resolve_template_thinking(request: &ChatCompletionRequest) -> Option<bool> {
     request.template_thinking()
 }
@@ -735,25 +735,24 @@ pub(crate) fn filter_chat_request_by_tool_choice(
 /// The request whose tools the template renders. A named `tool_choice`
 /// renders every tool, as the engine's own server renders it (the named call
 /// is forced by the tool constraint, built from `callable_tools`); an
-/// `allowed_tools` choice renders its subset; `none` renders no tool, as the
-/// Responses path renders it, so the model is not offered a call it may not
-/// make and answers in text, unless the renderer declares the tools under
-/// `none` itself and forbids the call in the prompt
-/// ([`RendererCapabilities::declares_tools_under_tool_choice_none`]); any
-/// other request renders as it is.
+/// `allowed_tools` choice renders its subset; any other request renders as
+/// it is. Under `none` the tools stay declared, as the engine's own server
+/// declares them (its prompt keeps the definitions and the choice reaches the
+/// template as a kwarg, `build_chat_template_kwargs`): the model answers the
+/// same prompt whichever way the choice is set, so a session that toggles the
+/// choice between turns keeps its prefix. A call the model writes anyway is
+/// not delivered where Symphony reads the response (the reader's forbidden
+/// calls, `regular::symphony`); the legacy parsers run no tool parser under
+/// `none`, as they never did, so there such markup stays in the content. The
+/// Responses API keeps withholding the request's function tools under `none`
+/// (`regular::responses::conversions::chat_tools`, for its replayed tool-loop
+/// histories), so the same request renders a different prompt through it: a
+/// divergence kept until that API's rule is decided on its own.
 pub fn request_as_rendered(
     request: &ChatCompletionRequest,
-    capabilities: RendererCapabilities,
 ) -> std::borrow::Cow<'_, ChatCompletionRequest> {
     match request.tool_choice {
         Some(ToolChoice::Function { .. }) => std::borrow::Cow::Borrowed(request),
-        Some(ToolChoice::Value(ToolChoiceValue::None))
-            if request.tools.is_some() && !capabilities.declares_tools_under_tool_choice_none =>
-        {
-            let mut rendered = request.clone();
-            rendered.tools = None;
-            std::borrow::Cow::Owned(rendered)
-        }
         _ => filter_chat_request_by_tool_choice(request),
     }
 }
@@ -866,7 +865,14 @@ pub(crate) fn process_chat_messages_with_placeholders(
                 .native_assistant_continuation;
 
         let params = ChatTemplateParams {
-            add_generation_prompt: !native_continuation,
+            // A continued final message decides its header by the renderer
+            // (none natively, the emulation's otherwise); any other request's
+            // header is its own `add_generation_prompt`, `true` when absent.
+            add_generation_prompt: if continues_final_assistant {
+                !native_continuation
+            } else {
+                request.adds_generation_prompt()
+            },
             continue_final_message: native_continuation,
             tools: prepared_tools.as_deref().map(PreparedTools::tools),
             prepared_tools: prepared_tools.as_deref(),
@@ -887,6 +893,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
                         text: String::new(),
                         unbilled_prompt_tokens: 0,
                         continued_final_message: false,
+                        generation_prompt: false,
                     },
                     PromptEncoding::FromText,
                 ));
@@ -917,6 +924,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
             text,
             unbilled_prompt_tokens: rendered.unbilled_prompt_tokens,
             continued_final_message: rendered.continued_final_message,
+            generation_prompt: rendered.generation_prompt,
         },
         rendered.encoding,
     ))

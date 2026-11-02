@@ -30,12 +30,12 @@ const PREPARED_TOOLS_KEPT: usize = 64;
 
 /// The largest tool set looked up, by its serialized bytes: a set above it is
 /// prepared for its request alone, before any key is hashed or kept. What an
-/// entry keeps is larger than its key (the JSON values and the render's
-/// values of the same content), so the kept side is bounded by weight below,
-/// not by this.
+/// entry keeps is larger than its key (the JSON values, the render's values
+/// of the same content and the `tojson` texts the tools come to keep), so the
+/// kept side is bounded by weight below, not by this.
 const PREPARED_TOOLS_MAX_KEY_BYTES: usize = 64 * 1024;
 
-/// The most a kept set may weigh ([`kept_weight`]): a heavier one is prepared
+/// The most a kept set may weigh ([`set_weight`]): a heavier one is prepared
 /// for its request alone.
 const PREPARED_TOOLS_MAX_SET_WEIGHT: usize = 1024 * 1024;
 
@@ -51,6 +51,16 @@ static PREPARED_TOOLS: LazyLock<RwLock<Kept>> = LazyLock::new(|| RwLock::new(Kep
 struct Kept {
     sets: HashMap<Vec<u8>, Arc<PreparedTools>>,
     weight: usize,
+}
+
+/// What an entry costs kept: its key, the values ([`kept_weight`]) and the
+/// `tojson` texts its tools keep as the renders go, up to
+/// [`PreparedTools::KEPT_TOJSON_TEXTS_PER_TOOL`] per tool, charged at that cap
+/// as the tool's share of the key bytes each (a compact form's size; an
+/// `indent` form runs about twice that, and the values' term dominates, so
+/// the table's bound stays close whatever the template asks of the filter).
+fn set_weight(key_len: usize, values: &[Value]) -> usize {
+    key_len * (1 + PreparedTools::KEPT_TOJSON_TEXTS_PER_TOOL) + kept_weight(values)
 }
 
 /// What a set's values cost kept, estimated from its JSON values: the bytes
@@ -103,8 +113,7 @@ pub(crate) fn prepare_tools(tools: &[Tool]) -> Result<Arc<PreparedTools>, String
             return Ok(Arc::clone(kept));
         }
         let values = tool_values(tools)?;
-        // What the entry holds: its key, its JSON values and the render's values.
-        let weight = key.len() + kept_weight(&values);
+        let weight = set_weight(key.len(), &values);
         let prepared = Arc::new(PreparedTools::new(values));
         if weight > PREPARED_TOOLS_MAX_SET_WEIGHT {
             return Ok(prepared);
@@ -245,12 +254,12 @@ mod tests {
             .unwrap()
         };
         let one = [enum_tool("weight_probe")];
-        let weight = serde_json::to_vec(&one).unwrap().len()
-            + kept_weight(
-                &one.iter()
-                    .map(|t| serde_json::to_value(t).unwrap())
-                    .collect::<Vec<_>>(),
-            );
+        let weight = set_weight(
+            serde_json::to_vec(&one).unwrap().len(),
+            &one.iter()
+                .map(|t| serde_json::to_value(t).unwrap())
+                .collect::<Vec<_>>(),
+        );
         assert!(weight < PREPARED_TOOLS_MAX_SET_WEIGHT, "{weight}");
         let sets = PREPARED_TOOLS_KEPT_WEIGHT / weight + 2;
         assert!(
@@ -276,13 +285,13 @@ mod tests {
         let heavy = [serde_json::from_value::<Tool>(json!({"type": "function", "function": {"name": "heavy",
             "parameters": {"type": "object", "properties": {"code": {"type": "integer", "enum": (0..12000).map(|i| i % 10).collect::<Vec<_>>()}}}}})).unwrap()];
         let heavy_key = serde_json::to_vec(&heavy).unwrap().len();
-        let heavy_weight = heavy_key
-            + kept_weight(
-                &heavy
-                    .iter()
-                    .map(|t| serde_json::to_value(t).unwrap())
-                    .collect::<Vec<_>>(),
-            );
+        let heavy_weight = set_weight(
+            heavy_key,
+            &heavy
+                .iter()
+                .map(|t| serde_json::to_value(t).unwrap())
+                .collect::<Vec<_>>(),
+        );
         assert!(
             heavy_key <= PREPARED_TOOLS_MAX_KEY_BYTES
                 && heavy_weight > PREPARED_TOOLS_MAX_SET_WEIGHT,
