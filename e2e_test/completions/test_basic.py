@@ -10,10 +10,12 @@ import pytest
 
 # The answers the classes state on the mock engine (``mock_answers``, a no-op on a real
 # engine), as the engines' token wire delivers them: a stop sequence inside the ids with
-# the matched stop named, a cut at max_tokens with the length finish.
+# the matched stop named; the long count the request's max_tokens cuts (the mock ends it
+# with the length finish, as an engine does); no tokens at all for max_tokens=0.
 _ANSWER = " Paris."
 _STOPPED_ANSWER = dict(output_text=" 11,", finish_reason="stop", matched_stop=",")
-_CUT_ANSWER = dict(output_text=" 4, 5", finish_reason="length")
+_LONG_ANSWER = " 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,"
+_NO_TOKENS = ""
 
 
 @pytest.mark.engine("sglang", "vllm", "tokenspeed", "mock")
@@ -26,8 +28,7 @@ class TestCompletionBasic:
     """Tests for OpenAI-compatible /v1/completions API (non-streaming).
 
     On the mock engine each test states the answer first; the ``n=2`` case skips there
-    (the mock answers one choice per request), and so does the ``max_tokens=0`` case
-    (the mock answers at least one token).
+    (the mock answers one choice per request).
     """
 
     STOP_SEQUENCE_TRIMMED = True
@@ -64,7 +65,7 @@ class TestCompletionBasic:
 
     def test_non_streaming_max_tokens(self, model, api_client, mock_answers):
         """Test that max_tokens limits output length."""
-        mock_answers.enqueue(**_CUT_ANSWER)
+        mock_answers.enqueue(_LONG_ANSWER)
 
         response = api_client.completions.create(
             model=model,
@@ -190,9 +191,9 @@ class TestCompletionBasic:
         assert response.id == "cmpl-correlation-1"
 
     @pytest.mark.skip_for_runtime("vllm", reason="vLLM rejects max_tokens=0")
-    @pytest.mark.skip_for_runtime("mock", reason="the mock answers at least one token")
-    def test_non_streaming_echo_max_tokens_zero(self, model, api_client):
+    def test_non_streaming_echo_max_tokens_zero(self, model, api_client, mock_answers):
         """Test that echo=True with max_tokens=0 returns just the prompt."""
+        mock_answers.enqueue(_NO_TOKENS)
 
         prompt = "The capital of France is"
         response = api_client.completions.create(
@@ -217,8 +218,7 @@ class TestCompletionBasic:
 class TestCompletionStreaming:
     """Tests for streaming /v1/completions API.
 
-    On the mock engine each test states the answer first; the ``max_tokens=0`` case
-    skips there (the mock answers at least one token).
+    On the mock engine each test states the answer first.
     """
 
     STOP_SEQUENCE_TRIMMED = True
@@ -299,9 +299,9 @@ class TestCompletionStreaming:
         assert len(full_text) > 0
 
     @pytest.mark.skip_for_runtime("vllm", reason="vLLM rejects max_tokens=0")
-    @pytest.mark.skip_for_runtime("mock", reason="the mock answers at least one token")
-    def test_streaming_echo_max_tokens_zero(self, model, api_client):
+    def test_streaming_echo_max_tokens_zero(self, model, api_client, mock_answers):
         """Test that echo=True with max_tokens=0 streams just the prompt."""
+        mock_answers.enqueue(_NO_TOKENS)
 
         prompt = "The capital of France is"
         stream = api_client.completions.create(
