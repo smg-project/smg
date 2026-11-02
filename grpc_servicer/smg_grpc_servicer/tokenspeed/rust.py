@@ -51,7 +51,7 @@ import logging
 import multiprocessing
 import signal
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from typing import Any
 
 from smg_grpc_servicer.constrained_decoding import (
@@ -472,9 +472,7 @@ def launch_headless_scheduler(server_args: Any) -> EngineProcess:
     return EngineProcess(process)
 
 
-def launch_scheduler_ranks(
-    server_args: Any, *, before_ranks: Callable[[], None] | None = None
-) -> EngineProcessGroup | EngineProcess:
+def launch_scheduler_ranks(server_args: Any) -> EngineProcessGroup | EngineProcess:
     """Start the scheduler rank processes from this process, the way
     TokenSpeed's headless launcher (``launch_scheduler_headless``, what ``ts
     serve --headless`` runs) starts them: the environment and start method it
@@ -496,11 +494,6 @@ def launch_scheduler_ranks(
     TokenSpeed that lacks these entry points (they are the launcher's own
     internals) and for a caller off the main thread, where no handler can be
     installed.
-
-    ``before_ranks`` runs once the ranks are to start from this process and
-    before any of them does: what the headless launcher brings up ahead of
-    its ranks, and so hosts itself where the launch is left to it (the
-    prefill side's KV bootstrap server, :func:`kv_bootstrap_server`).
     """
     if threading.current_thread() is not threading.main_thread():
         logger.info(
@@ -526,8 +519,6 @@ def launch_scheduler_ranks(
         )
         return launch_headless_scheduler(server_args)
 
-    if before_ranks is not None:
-        before_ranks()
     configure_logger(server_args)
     set_envs_and_config(server_args)
     ensure_spawn_start_method("TokenSpeed scheduler")
@@ -603,28 +594,40 @@ def tokenizer_dir_for(server_args: Any) -> str | None:
 
 def kv_bootstrap_server(server_args: Any) -> Any | None:
     """Start the engine's KV bootstrap server for a prefill launch and return
-    it; ``None`` for any other role.
+    it; ``None`` for any other role, and on an engine whose own headless
+    launcher hosts it.
 
     Under prefill/decode disaggregation the prefill side hosts the rendezvous
     the decode side discovers its KV at (``--disaggregation-bootstrap-port``).
-    The engine's own frontend starts it when it is built, which the Python
-    servicer inherits; this path builds no frontend, so the launcher starts
-    the same class (the transfer backend's, through the engine's registry)
-    when the ranks start from this process. Ranks left to the engine's
-    headless launcher get it from that launcher, which hosts it on the
-    prefill side's node 0: one started here too would bind the port twice,
-    through a registry that engine no longer hands the class out of.
-    It must be up before the prefill ranks start: each rank registers with
-    it once, and a rank that misses it is a prefill no decode can find. The
-    server runs on its own thread and binds the port on every interface;
+    Who starts it is the engine's contract, not this launcher's launch path.
+    Since the engine's Rust control plane its headless launcher brings the
+    server up itself ahead of the ranks, and its PD registry no longer hands
+    the server class out: one started here too would bind the port twice.
+    Before that the engine's frontend started it (which the Python servicer
+    inherits), a headless launch had none, and the registry hands the class
+    out: this launcher starts it, whichever way the ranks start (from this
+    process or through the engine's spawned launcher). The registry's class
+    is the capability read, so neither kind of engine is mistaken for the
+    other. It must be up before the prefill ranks start: each rank registers
+    with it once, and a rank that misses it is a prefill no decode can find.
+    The server runs on its own thread and binds the port on every interface;
     the launcher closes it when it ends."""
     args = EngineConfigView(server_args).server_args
     if args.disaggregation_mode != "prefill":
         return None
-    from tokenspeed.runtime.pd.utils import KVClassType, TransferBackend, get_kv_class
-
-    backend = TransferBackend(args.disaggregation_transfer_backend)
-    server = get_kv_class(backend, KVClassType.BOOTSTRAP_SERVER)(args.disaggregation_bootstrap_port)
+    pd_utils = importlib.import_module("tokenspeed.runtime.pd.utils")
+    class_types = getattr(pd_utils, "KVClassType", None)
+    if getattr(class_types, "BOOTSTRAP_SERVER", None) is None:
+        logger.info(
+            "Bootstrap server for disaggregation mode on port %s left to the engine's headless "
+            "launcher, which hosts its own",
+            args.disaggregation_bootstrap_port,
+        )
+        return None
+    backend = pd_utils.TransferBackend(args.disaggregation_transfer_backend)
+    server = pd_utils.get_kv_class(backend, class_types.BOOTSTRAP_SERVER)(
+        args.disaggregation_bootstrap_port
+    )
     logger.info(
         "Bootstrap server started for disaggregation mode on port %s (%s transfer)",
         args.disaggregation_bootstrap_port,
@@ -737,9 +740,9 @@ class TokenSpeedLauncher(RustLauncher):
     # layer labels off it, the facts the rest.
     _cached_model_config: Any = None
     # The prefill side's KV bootstrap server (:func:`kv_bootstrap_server`),
-    # started right before ranks that start from this process and closed
-    # when the launcher ends; ``None`` for the other roles and for ranks left
-    # to the engine's headless launcher, which hosts its own.
+    # started before the ranks and closed when the launcher ends; ``None``
+    # for the other roles and on an engine whose headless launcher hosts its
+    # own.
     _bootstrap_server: Any = None
 
     def model_config(self, args: Any) -> Any:
@@ -765,16 +768,10 @@ class TokenSpeedLauncher(RustLauncher):
         return tokenizer_dir_for(args)
 
     def launch(self, args: Any, handshake_port: int, facts: Mapping[str, Any]) -> Any:
-        def host_bootstrap_server() -> None:
-            # Before the ranks: a prefill rank registers with the server once.
-            self._bootstrap_server = kv_bootstrap_server(args)
-
-        # Hosted here for ranks that start from this process only: the
-        # spawned headless launcher hosts its own.
-        return launch_scheduler_ranks(
-            headless_server_args(args, handshake_port=handshake_port),
-            before_ranks=host_bootstrap_server,
-        )
+        # Before the ranks, whichever way they start: a prefill rank registers
+        # with the server once (``None`` where the engine's launcher hosts it).
+        self._bootstrap_server = kv_bootstrap_server(args)
+        return launch_scheduler_ranks(headless_server_args(args, handshake_port=handshake_port))
 
     async def serve(self, args: Any) -> int:
         try:

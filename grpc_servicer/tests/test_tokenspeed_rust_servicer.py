@@ -1011,8 +1011,7 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
     monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
     monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
 
-    def fake_launch(headless, *, before_ranks):
-        before_ranks()
+    def fake_launch(headless):
         recorded["headless"] = headless
         return "engine-handle"
 
@@ -1122,10 +1121,12 @@ class _FakeBootstrapServer:
         self.closed += 1
 
 
-def _install_fake_pd_utils(monkeypatch) -> dict:
+def _install_fake_pd_utils(monkeypatch, *, hands_out_bootstrap_server: bool = True) -> dict:
     """``tokenspeed.runtime.pd.utils`` as the launcher reads it: the transfer
-    backend and class-type enums and the registry that hands out the
-    bootstrap server class; records what was asked for."""
+    backend enum and, on an engine before its Rust control plane, the
+    class-type enum and the registry that hands out the bootstrap server
+    class (an engine since then has neither: its headless launcher hosts the
+    server itself); records what was asked for."""
     import enum
 
     asked: dict = {}
@@ -1142,12 +1143,13 @@ def _install_fake_pd_utils(monkeypatch) -> dict:
         assert class_type is KVClassType.BOOTSTRAP_SERVER
         return _FakeBootstrapServer
 
+    registry = (
+        {"KVClassType": KVClassType, "get_kv_class": get_kv_class}
+        if hands_out_bootstrap_server
+        else {}
+    )
     _install(
-        monkeypatch,
-        "tokenspeed.runtime.pd.utils",
-        TransferBackend=TransferBackend,
-        KVClassType=KVClassType,
-        get_kv_class=get_kv_class,
+        monkeypatch, "tokenspeed.runtime.pd.utils", TransferBackend=TransferBackend, **registry
     )
     _FakeBootstrapServer.built = []
     return asked
@@ -1182,10 +1184,9 @@ def _serve_rust_role(monkeypatch, tmp_path, caplog, mode: str, *, in_process: bo
     monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
     monkeypatch.delenv("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", raising=False)
 
-    def fake_launch(headless, *, before_ranks):
-        # The start from this process runs what must be up first; the ranks
-        # register with the bootstrap server when they start.
-        before_ranks()
+    def record_launch(headless):
+        # The ranks register with the bootstrap server when they start: what
+        # is up at the launch is what they find, whichever way they start.
         recorded["launched_with_servers"] = [
             (server.port, server.closed) for server in _FakeBootstrapServer.built
         ]
@@ -1196,9 +1197,9 @@ def _serve_rust_role(monkeypatch, tmp_path, caplog, mode: str, *, in_process: bo
         return 0
 
     if in_process:
-        monkeypatch.setattr(rust, "launch_scheduler_ranks", fake_launch)
+        monkeypatch.setattr(rust, "launch_scheduler_ranks", record_launch)
     else:
-        monkeypatch.setattr(rust, "launch_headless_scheduler", lambda headless: "engine-handle")
+        monkeypatch.setattr(rust, "launch_headless_scheduler", record_launch)
     monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
     with caplog.at_level("INFO", logger=rust.logger.name):
         recorded["exit"] = asyncio.run(
@@ -1213,9 +1214,8 @@ def test_a_prefill_launch_starts_the_engines_kv_bootstrap_server_before_the_rank
     """The prefill side hosts the rendezvous the decode side discovers its KV
     at. The engine's frontend starts it on the Python path; here the
     launcher starts the same class, through the engine's registry for the
-    transfer backend, on the configured port, before ranks that start from
-    this process (each registers with it once), logs it, and closes it when
-    it ends."""
+    transfer backend, on the configured port, before the ranks (each
+    registers with it once), logs it, and closes it when it ends."""
     asked = _install_fake_pd_utils(monkeypatch)
     recorded = _serve_rust_role(monkeypatch, tmp_path, caplog, "prefill")
     assert recorded["exit"] == 0 and recorded["supervised"] == "engine-handle"
@@ -1244,20 +1244,50 @@ def test_a_decode_or_aggregated_launch_starts_no_bootstrap_server(
     assert "Bootstrap server started" not in caplog.text
 
 
-def test_a_prefill_launch_left_to_the_spawned_launcher_hosts_no_bootstrap_server(
+def test_a_prefill_launch_on_an_engine_whose_launcher_hosts_the_bootstrap_server_starts_none(
     monkeypatch, tmp_path, caplog
 ):
-    """Ranks left to the engine's own headless launcher (an engine without
-    the in-process entry points: every TokenSpeed since its Rust control
-    plane) get their bootstrap server from that launcher, which hosts it on
-    the prefill side's node 0. The servicer starts none, so the port is bound
-    once, and never reaches for the registry that engine no longer has."""
+    """Since the engine's Rust control plane its headless launcher brings the
+    prefill side's bootstrap server up itself, and its PD registry no longer
+    hands the server class out; such an engine lacks the in-process entry
+    points too, so its ranks are left to that launcher. The servicer reads
+    the registry, starts none and says so: the port is bound once."""
     _stub_rank_launch(monkeypatch, missing="run_event_loop")
+    asked = _install_fake_pd_utils(monkeypatch, hands_out_bootstrap_server=False)
+    recorded = _serve_rust_role(monkeypatch, tmp_path, caplog, "prefill", in_process=False)
+    assert recorded["exit"] == 0 and recorded["supervised"] == "engine-handle"
+    assert recorded["launched_with_servers"] == [] and _FakeBootstrapServer.built == []
+    assert asked == {}
+    assert "Bootstrap server started" not in caplog.text
+    assert (
+        "Bootstrap server for disaggregation mode on port 8998 left to the engine's headless "
+        "launcher, which hosts its own" in caplog.text
+    )
+    assert "left to TokenSpeed's headless launcher in a spawned process" in caplog.text
+
+
+def test_a_prefill_launch_left_to_an_older_engines_launcher_hosts_the_bootstrap_server_here(
+    monkeypatch, tmp_path, caplog
+):
+    """An engine before its Rust control plane may lack an in-process entry
+    point as well (the one of 2026-10-06 has no ``_scheduler_ranks``), so its
+    ranks are left to its spawned headless launcher, which starts no
+    bootstrap server (that engine's frontend did). Its registry hands the
+    class out, so the servicer hosts the server here, up before the spawned
+    launch, and closes it at the end: the ownership follows the engine, not
+    the launch path."""
+    _stub_rank_launch(monkeypatch, missing="_scheduler_ranks")
     asked = _install_fake_pd_utils(monkeypatch)
     recorded = _serve_rust_role(monkeypatch, tmp_path, caplog, "prefill", in_process=False)
     assert recorded["exit"] == 0 and recorded["supervised"] == "engine-handle"
-    assert _FakeBootstrapServer.built == [] and asked == {}
-    assert "Bootstrap server started" not in caplog.text
+    assert recorded["launched_with_servers"] == [(8998, 0)]
+    assert asked["class_type"].value == "bootstrap_server"
+    (server,) = _FakeBootstrapServer.built
+    assert server.closed == 1
+    assert (
+        "Bootstrap server started for disaggregation mode on port 8998 (mooncake transfer)"
+        in caplog.text
+    )
     assert "left to TokenSpeed's headless launcher in a spawned process" in caplog.text
 
 
