@@ -152,8 +152,11 @@ it there when it sets this value: the gateway refuses the flag twice and exits a
 startup. A request's `X-SMG-Parser` header overrides the flag for that
 request. `router.toolCallParser` and `router.reasoningParser` are read
 differently by each parser: under Symphony, a model the registry knows keeps
-its own table and the flags apply only to models it does not know; `hf` and
-Symphony's table names are refused at startup under `legacy`.
+its own table and the flags apply only to models it does not know; under
+`legacy`, each flag takes only a legacy parser's name of its own kind: `hf`
+and a Symphony-only name (`muse`, for one) are refused at startup, while a
+name a legacy parser of that kind also has (`qwen` as `toolCallParser`, for
+one) keeps that parser.
 
 #### Worker Discovery
 
