@@ -105,6 +105,11 @@ class WorkerPool:
             if self._closed:
                 raise RuntimeError("WorkerPool has been closed")
 
+            if worker_type == WorkerType.ENCODE and (
+                engine != "tokenspeed" or mode != ConnectionMode.GRPC
+            ):
+                raise ValueError("EPD encode workers currently require TokenSpeed over gRPC")
+
             # Non-REGULAR workers (PD prefill/decode) aren't cached, but we
             # still have to release any cached regular worker first — it
             # holds the GPUs the caller is about to claim. ZMQ workers are
