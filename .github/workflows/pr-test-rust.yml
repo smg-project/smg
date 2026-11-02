@@ -658,7 +658,6 @@ jobs:
       # The GPU e2e lanes' decisions, one per area, from the tier table (the same step).
       skip-chat-one-engine: ${{ steps.lanes.outputs.skip-chat-one-engine }}
       skip-chat-completions: ${{ steps.lanes.outputs.skip-chat-completions }}
-      skip-chat-symphony: ${{ steps.lanes.outputs.skip-chat-symphony }}
       skip-completions: ${{ steps.lanes.outputs.skip-completions }}
       skip-embeddings: ${{ steps.lanes.outputs.skip-embeddings }}
       skip-realtime: ${{ steps.lanes.outputs.skip-realtime }}
@@ -891,22 +890,21 @@ jobs:
           #   chat-completions  the chat and router suites on every engine: the chat,
           #                     Rust-servicer, worker-side multimodal, ZMQ, gateway, PD,
           #                     EPD and 4-GPU lanes
-          #   chat-symphony     the chat suite read through Symphony
           #   completions, embeddings, realtime, go-bindings   that suite's lane
           #   agentic           the Responses suite on an engine
           #   vendor            the Responses, Messages and realtime suites on the cloud
           #                     providers (CPU)
-          AREAS = ("chat-one-engine", "chat-completions", "chat-symphony", "completions",
+          AREAS = ("chat-one-engine", "chat-completions", "completions",
                    "embeddings", "realtime", "agentic", "vendor", "go-bindings")
           FULL = " ".join(AREAS)
           NONE = ""
           # A gateway module no suite targets: one engine's chat and router suites, the
-          # Symphony and Responses suites and the vendor rows read every response
-          # through it and witness a regression; the other engines' rows run the
+          # Responses suite and the vendor rows read every response through it and
+          # witness a regression; the other engines' rows run the
           # same gateway code and add nothing for it, and the completions,
           # embeddings, realtime and Go suites drive paths of their own, named
           # below where a change reaches them.
-          CORE = "chat-one-engine chat-symphony agentic vendor"
+          CORE = "chat-one-engine agentic vendor"
           # The core, and the Go suite: the Go library links the gateway crate whole
           # and calls these paths itself.
           CORE_GO = CORE + " go-bindings"
@@ -916,11 +914,11 @@ jobs:
           # cache-aware policy of the EPD suite reads, the media pipeline with its
           # worker-side and 4-GPU classes, the tool parser whose forced-call grammars
           # each engine's own backend compiles).
-          CORE_EVERY_ENGINE = "chat-completions chat-symphony agentic vendor"
+          CORE_EVERY_ENGINE = "chat-completions agentic vendor"
           CORE_EVERY_ENGINE_GO = CORE_EVERY_ENGINE + " go-bindings"
           # One engine's own files reach the lanes with a row for that engine.
-          SGLANG = "chat-completions chat-symphony completions embeddings agentic go-bindings"
-          VLLM = "chat-completions chat-symphony completions embeddings realtime"
+          SGLANG = "chat-completions completions embeddings agentic go-bindings"
+          VLLM = "chat-completions completions embeddings realtime"
           TRTLLM = "chat-completions"
           TOKENSPEED = "chat-completions"
 
@@ -1007,7 +1005,7 @@ jobs:
               ("grpc_servicer/**",                               FULL),
               # the e2e suites: a suite its lane; the suites of other workflows and the
               # advisory benchmarks none; the harness, its fixtures and the client every lane
-              ("e2e_test/chat_completions/**",                   "chat-completions chat-symphony"),
+              ("e2e_test/chat_completions/**",                   "chat-completions"),
               ("e2e_test/router/**",                             "chat-completions"),
               ("e2e_test/completions/**",                        "completions"),
               ("e2e_test/embeddings/**",                         "embeddings"),
@@ -1080,7 +1078,6 @@ jobs:
               ("crates/tokenizer/**",                            "go-bindings"),
               # Symphony and the response templates it compiles: the default
               # parser, read on every lane's chat, messages and responses path
-              # (the Symphony lane pins it with --parser symphony)
               ("crates/symphony/**",                             CORE_EVERY_ENGINE),
               ("crates/response_template/**",                    CORE_EVERY_ENGINE),
               # the Rust servicer and the ZMQ wire: lanes of the chat family
@@ -1298,44 +1295,6 @@ jobs:
       gpu_vendor: amd
       container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
       container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
-    secrets: inherit
-
-  # The chat cases with the gateway pinned to Symphony (--parser symphony, the
-  # default; e2e-1gpu-chat leaves the flag unset and reads with it too): the
-  # same workers and suite as e2e-1gpu-chat, the Symphony path for every model
-  # its registry knows. Runs for a chat, common or Symphony change, as the tier
-  # table decides.
-  e2e-1gpu-chat-symphony:
-    name: e2e-1gpu-chat-symphony (${{ matrix.engine }})
-    needs: [build-wheel, detect-changes]
-    if: >-
-      always()
-      && !cancelled()
-      && needs.build-wheel.result == 'success'
-      && (github.event_name != 'pull_request' || needs.detect-changes.result == 'success')
-      && needs.detect-changes.outputs.skip-chat-symphony != 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - engine: sglang
-            timeout: 36
-            test_timeout: 28
-            min_selected: 204
-          - engine: vllm
-            timeout: 32
-            test_timeout: 24
-            min_selected: 202
-    uses: ./.github/workflows/e2e-gpu-job.yml
-    with:
-      engine: ${{ matrix.engine }}
-      gpu_tier: "1"
-      runner: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
-      timeout: ${{ matrix.timeout }}
-      test_timeout: ${{ matrix.test_timeout }}
-      test_dirs: e2e_test/chat_completions
-      min_selected: ${{ matrix.min_selected }}
-      parser: symphony
     secrets: inherit
 
   # The chat cases against the Rust gRPC servicer (SMG_SGLANG_SERVICER_IMPL=rust,
@@ -2291,7 +2250,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-symphony, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -2364,7 +2323,6 @@ jobs:
                 "${{ needs.rust-aarch64.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-amd.result }}" =~ $bad || \
-                "${{ needs.e2e-1gpu-chat-symphony.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-rust-servicer.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-mm-worker.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-zmq.result }}" =~ $bad || \
