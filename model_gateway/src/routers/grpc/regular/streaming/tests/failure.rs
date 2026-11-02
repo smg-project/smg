@@ -10,8 +10,8 @@ use smg_grpc_client::vllm_engine::proto;
 use tracing_test::traced_test;
 
 use super::{
-    eof_tests::{chat_spec, chunk, complete, scripted_stream, CharacterTokenizer},
-    *,
+    super::*,
+    eof::{chat_spec, chunk, complete, scripted_stream, CharacterTokenizer},
 };
 use crate::{
     observability::metrics::test_support::render_with_recorder,

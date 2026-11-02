@@ -18,11 +18,9 @@ use smg_grpc_client::vllm_engine::proto;
 use symphony::{formats::qwen3, CallSyntax};
 
 use super::{
-    eof_tests::{
-        chat_spec, chunk, complete, dispatch, processor, scripted_stream, CharacterTokenizer,
-    },
-    symphony_tests::{assigned, assigned_message, scraped, series_line},
-    *,
+    super::*,
+    eof::{chat_spec, chunk, complete, dispatch, processor, scripted_stream, CharacterTokenizer},
+    symphony::{assigned, assigned_message, scraped, series_line},
 };
 use crate::routers::{
     common::retry::is_retryable_response,

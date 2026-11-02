@@ -9,10 +9,10 @@ use openai_protocol::chat::ChatCompletionRequest;
 use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as GenerationEvent};
 
 use super::{
-    eof_tests::{
+    super::*,
+    eof::{
         chunk, collect_events, complete_with_prompt, processor, scripted_stream, CharacterTokenizer,
     },
-    *,
 };
 use crate::routers::grpc::{
     common::response_collection::collect_responses,

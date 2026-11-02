@@ -8,9 +8,9 @@ use smg_grpc_client::vllm_engine::proto::generate_response::Response as Generati
 use symphony::{formats::qwen3, CallSyntax};
 
 use super::{
-    eof_tests::{chunk, complete, dispatch, scripted_stream, CharacterTokenizer},
-    symphony_tests::{message_blocks, message_events},
-    *,
+    super::*,
+    eof::{chunk, complete, dispatch, scripted_stream, CharacterTokenizer},
+    symphony::{message_blocks, message_events},
 };
 use crate::{
     routers::grpc::{

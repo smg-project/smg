@@ -13,8 +13,8 @@ use openai_protocol::chat::ChatCompletionRequest;
 use tokio::{sync::oneshot, time::timeout};
 
 use super::{
-    eof_tests::{chunk, complete, gated_stream, processor, CharacterTokenizer},
-    *,
+    super::*,
+    eof::{chunk, complete, gated_stream, processor, CharacterTokenizer},
 };
 
 /// Chunks per stream: two-character deltas, so a re-slicer holds all of them

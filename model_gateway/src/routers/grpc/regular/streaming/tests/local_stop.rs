@@ -38,11 +38,11 @@ use smg_grpc_client::{
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle, time::timeout};
 
 use super::{
-    eof_tests::{
+    super::*,
+    eof::{
         chat_spec, chat_text, collect_events, complete, complete_with_prompt, dispatch,
         gated_stream, processor, scripted_stream, CharacterTokenizer,
     },
-    *,
 };
 use crate::routers::{
     common::sse::sse_channel,
