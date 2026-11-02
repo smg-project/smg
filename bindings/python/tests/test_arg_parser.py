@@ -290,6 +290,7 @@ class TestRouterArgs:
             router_request_id_headers=["x-request-id", "x-trace-id"],
             router_storage_context_headers=["x-tenant-id=tenant_id", "x-user-id=user_id"],
             router_request_timeout_secs=1200,
+            router_grpc_request_timeout_secs=30,
             router_max_concurrent_requests=512,
             router_queue_size=200,
             router_queue_timeout_secs=120,
@@ -347,6 +348,7 @@ class TestRouterArgs:
             "x-user-id": "user_id",
         }
         assert router_args.request_timeout_secs == 1200
+        assert router_args.grpc_request_timeout_secs == 30
         assert router_args.max_concurrent_requests == 512
         assert router_args.queue_size == 200
         assert router_args.queue_timeout_secs == 120
@@ -422,6 +424,7 @@ class TestRouterArgs:
             router_request_id_headers=None,
             router_storage_context_headers=None,
             router_request_timeout_secs=1800,
+            router_grpc_request_timeout_secs=0,
             router_max_concurrent_requests=256,
             router_queue_size=100,
             router_queue_timeout_secs=60,
@@ -493,6 +496,7 @@ class TestRouterArgs:
             request_id_headers=None,
             storage_context_headers=None,
             request_timeout_secs=1800,
+            grpc_request_timeout_secs=0,
             max_concurrent_requests=256,
             queue_size=100,
             queue_timeout_secs=60,
@@ -807,14 +811,12 @@ class TestParseRouterArgs:
         disabled = parse_router_args(["--disable-worker-overload-protection"])
         assert disabled.worker_overload_protection is False
 
-    def test_parse_overload_shed_liveness_warmup_index_and_selection_flags(self):
+    def test_parse_overload_shed_liveness_warmup_and_selection_flags(self):
         """Every RouterConfig field the Rust CLI exposes reaches RouterArgs,
         with the CLI's defaults when the flags are absent."""
         router_args = parse_router_args(
             [
                 "--worker-overload-shed",
-                "--kv-index",
-                "chain",
                 "--worker-stall-secs",
                 "5",
                 "--worker-wedge-secs",
@@ -844,14 +846,6 @@ class TestParseRouterArgs:
         )
         assert router_args.worker_overload_shed is True
         assert router_args.zmq_startup_timeout_secs == 900
-        # Deprecated: chain is the only value, read in any case as the Rust CLI
-        # reads it; the removed positional index and any other spelling are
-        # refused by the parser.
-        assert router_args.kv_index == "chain"
-        assert parse_router_args(["--kv-index", " Chain "]).kv_index == "chain"
-        for value in ("positional", "Positional", "run", "tree"):
-            with pytest.raises(SystemExit):
-                parse_router_args(["--kv-index", value])
         assert router_args.worker_stall_secs == 5
         assert router_args.worker_wedge_secs == 7
         assert router_args.worker_stale_secs == 9
@@ -867,7 +861,6 @@ class TestParseRouterArgs:
 
         defaults = parse_router_args([])
         assert defaults.worker_overload_shed is False
-        assert defaults.kv_index is None
         assert defaults.zmq_startup_timeout_secs == 3600
         assert defaults.worker_stall_secs == 2
         assert defaults.worker_wedge_secs == 3
@@ -881,6 +874,20 @@ class TestParseRouterArgs:
         assert defaults.selection_accounting_ttl_ms == 0
         assert defaults.balance_prefix_margin_tokens == 0
         assert defaults.balance_uncached_credit is False
+
+    def test_removed_kv_index_flags_are_refused(self):
+        """The deprecated --kv-index, --kv-indexer-ttl-secs and
+        --kv-indexer-max-entries flags went with the positional indexer they
+        configured, from the Rust CLI and the launcher alike: a launch line
+        that still carries one is refused by the parser, not accepted and
+        ignored."""
+        for argv in (
+            ["--kv-index", "chain"],
+            ["--kv-indexer-ttl-secs", "600"],
+            ["--kv-indexer-max-entries", "500000"],
+        ):
+            with pytest.raises(SystemExit):
+                parse_router_args(argv)
 
     def test_parse_tenancy_flags(self):
         """The tenancy flags of the Rust CLI reach RouterArgs: tenant header

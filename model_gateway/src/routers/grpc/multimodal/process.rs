@@ -299,7 +299,8 @@ async fn fetch_media(plan: MediaPlan, ctx: &PlanContext<'_>) -> Result<Fetched> 
                 .video_frame_sampling_with(video_config)
                 .with_frame_budget(ctx.components.video_frame_budget),
         )
-        .with_image_transparency(ctx.transparency);
+        .with_image_transparency(ctx.transparency)
+        .with_minimax_image_resize(ctx.spec.name() == "minimax_m3");
 
     for part in plan.into_parts() {
         tracker

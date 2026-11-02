@@ -3,8 +3,9 @@
 //! same-host ZMQ engine adapter (`engine-zmq-adapter`).
 //!
 //! The Router keeps speaking the engine's own proto (`vllm_engine.proto` for
-//! vLLM, `sglang_scheduler.proto` for SGLang, and so on per engine), so it cannot
-//! tell this servicer from the Python one. What changes is the node:
+//! vLLM, `sglang_scheduler.proto` for SGLang, `trtllm_service.proto` for
+//! TensorRT-LLM, and so on per engine), so it cannot tell this servicer from
+//! the Python one. What changes is the node:
 //! the Python frontend leaves the request path, and the engine is reached the
 //! way the direct-ZMQ lane already reaches it. Python keeps the lifecycle only
 //! — it launches the headless engine and drives the server through the PyO3
@@ -47,6 +48,7 @@ mod testing;
 mod tokenizer_bundle;
 pub mod tokenspeed;
 mod trace_context;
+pub mod trtllm;
 pub mod vllm;
 
 use std::{pin::Pin, time::Duration};
@@ -63,6 +65,7 @@ pub use servicer_config::ServicerConfig;
 pub use sglang::{SglangModelInfo, SglangServicerConfig, SglangServicerServer};
 pub use tokenspeed::{TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer};
 use tonic::Status;
+pub use trtllm::{TrtllmModelInfo, TrtllmServicerConfig, TrtllmServicerServer};
 pub use vllm::{
     BoxFuture, MediaError, MediaFeatures, MediaProcessor, MediaRefItem, MediaRequest,
     ProcessedMedia, VllmModelInfo, VllmServicerConfig, VllmServicerServer, ALL_MODALITIES,

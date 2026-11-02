@@ -13,9 +13,12 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
 };
 
-use crate::protocol::{
-    positional::{drain_trailing, expect_tag, next_field},
-    sglang::{multimodal::SglangWireMmInputs, sampling::SamplingParams},
+use crate::{
+    codec::tensor::{TensorFields, WireArrayData},
+    protocol::{
+        positional::{drain_trailing, expect_tag, next_field},
+        sglang::{multimodal::SglangWireMmInputs, sampling::SamplingParams},
+    },
 };
 
 /// The msgspec tag for [`TokenizedGenerateReqInput`] (element 0 on the wire).
@@ -224,8 +227,13 @@ pub struct TokenizedGenerateReqInput {
 
 /// What rides beside an ADD's positional request, as one more msgpack frame
 /// (a map, every key optional): the request's metadata the scheduler's own
-/// struct has no slot for. The plugin in the scheduler reads it; a scheduler
-/// without the plugin's reader ignores the extra frame. Absent when empty.
+/// struct has no slot for. The plugin in the scheduler reads it at the END
+/// of the message, so it is the last frame whenever anything follows the
+/// payload: alone when there is something to carry and no tensor frame,
+/// written empty when tensor frames come first (the plugin counts those
+/// from the message length, this frame excluded); absent only from a
+/// message of the payload alone. A scheduler without the plugin's reader
+/// ignores it.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RequestMeta {
     /// The caller's W3C trace context (`traceparent`, `tracestate`): the
@@ -237,11 +245,23 @@ pub struct RequestMeta {
 
 impl RequestMeta {
     /// The metadata frame for `request`, or `None` when there is nothing to
-    /// carry.
+    /// carry (the encoder still writes it empty behind tensor frames: see
+    /// the type's doc).
     pub fn for_request(request: &TokenizedGenerateReqInput) -> Option<Self> {
         request.trace_headers.as_ref().map(|headers| Self {
             trace_headers: Some(headers.clone()),
         })
+    }
+}
+
+/// The request's tensors: its multimodal payload's, in wire order.
+impl TensorFields for TokenizedGenerateReqInput {
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        self.mm_inputs.for_each_tensor(visit);
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        self.mm_inputs.for_each_tensor_mut(visit);
     }
 }
 
@@ -750,6 +770,21 @@ impl Serialize for SglangRequest {
         match self {
             Self::Generate(request) => request.serialize(serializer),
             Self::Embed(request) => request.serialize(serializer),
+        }
+    }
+}
+
+/// A generation's tensors; an embedding request carries none on this wire.
+impl TensorFields for SglangRequest {
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        if let Self::Generate(request) = self {
+            request.for_each_tensor(visit);
+        }
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        if let Self::Generate(request) = self {
+            request.for_each_tensor_mut(visit);
         }
     }
 }
@@ -1389,7 +1424,10 @@ mod tests {
 
     #[test]
     fn trace_headers_ride_as_the_metadata_frame_not_the_positional_array() {
-        use crate::protocol::{sglang::SglangProtocol, EngineProtocol};
+        use crate::protocol::{
+            sglang::{SglangLayout, SglangProtocol},
+            EngineProtocol,
+        };
 
         let headers = BTreeMap::from([
             ("traceparent".to_string(), "00-aa-bb-01".to_string()),
@@ -1404,9 +1442,11 @@ mod tests {
             trace_headers: Some(headers.clone()),
             ..plain.clone()
         };
+        let layout = SglangLayout::default();
         let (plain_payload, plain_aux) =
-            SglangProtocol::encode_add(&SglangRequest::Generate(plain)).unwrap();
-        let (payload, aux) = SglangProtocol::encode_add(&SglangRequest::Generate(traced)).unwrap();
+            SglangProtocol::encode_add(&SglangRequest::Generate(plain), &layout).unwrap();
+        let (payload, aux) =
+            SglangProtocol::encode_add(&SglangRequest::Generate(traced), &layout).unwrap();
         // The scheduler's own array is byte-identical: the context never enters it.
         assert_eq!(payload, plain_payload);
         assert!(plain_aux.is_empty());
@@ -1505,6 +1545,76 @@ mod tests {
             ..TokenizedGenerateReqInput::default()
         };
         assert_eq!(encode_msgpack(&request).unwrap(), hex(PLUGIN_TEST_PAYLOAD));
+    }
+
+    /// The `ADD` message the plugin's own test decodes with the pixel tensor
+    /// as an auxiliary frame (`grpc_servicer/tests/test_sglang_zmq_msgpack.py`,
+    /// `RUST_MM_FRAMED_REQUEST`): the request above with the feature
+    /// `torch.arange(8192, dtype=torch.float32) * 0.5` (32 KiB, the frame
+    /// bar) on a scheduler whose plugin resolves frames. The payload carries
+    /// the frame's index in the feature's slot, the grid inline; the frames
+    /// behind it are the pixels, then the empty metadata map. The two pins
+    /// are one constant: a change here is a change there.
+    #[test]
+    fn the_framed_payload_the_plugins_test_decodes_is_pinned() {
+        use crate::{
+            codec::tensor::TENSOR_AUX_MIN_BYTES,
+            protocol::{
+                sglang::{
+                    multimodal::{SglangWireMmItem, SglangWireModality, SglangWireTensor},
+                    SglangLayout, SglangProtocol,
+                },
+                EngineProtocol,
+            },
+        };
+        const PLUGIN_TEST_FRAMED_PAYLOAD: &str = "9eb9546f6b656e697a656447656e6572617465526571496e707574a26d6dc0c0950107070702c094919901c0c09192010301c70e649391cd2000a7666c6f6174333201c0c281ae696d6167655f677269645f746877c72a020000000e93920103a5696e743634a3637075010000000000000002000000000000000200000000000000c0c007c0dc001acc80c0c0c0cb3ff0000000000000cb3ff0000000000000ffcb0000000000000000cb0000000000000000cb0000000000000000cb3ff00000000000000001c0c0c0c0c0c2c3c3c2c0c0c0c0c2ff00c0c2";
+        let pixels: Vec<u8> = (0..8192)
+            .flat_map(|i| (i as f32 * 0.5).to_le_bytes())
+            .collect();
+        assert_eq!(pixels.len(), TENSOR_AUX_MIN_BYTES);
+        let grid: Vec<u8> = [1i64, 2, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let request = TokenizedGenerateReqInput {
+            rid: "mm".into(),
+            input_ids: vec![1, 7, 7, 7, 2],
+            mm_inputs: Some(SglangWireMmInputs {
+                mm_items: vec![SglangWireMmItem {
+                    modality: SglangWireModality::Image,
+                    offsets: Some(vec![(1, 3)]),
+                    feature: Some(
+                        SglangWireTensor::new("float32", vec![8192], Bytes::from(pixels.clone()))
+                            .unwrap(),
+                    ),
+                    model_specific_data: BTreeMap::from([(
+                        "image_grid_thw".to_string(),
+                        SglangWireTensor::new("int64", vec![1, 3], Bytes::from(grid)).unwrap(),
+                    )]),
+                }],
+                im_token_id: Some(7),
+            }),
+            ..TokenizedGenerateReqInput::default()
+        };
+        let (payload, aux) = SglangProtocol::encode_add(
+            &SglangRequest::Generate(request),
+            &SglangLayout {
+                tensor_aux_frames: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            aux.iter().map(|frame| frame.to_vec()).collect::<Vec<_>>(),
+            vec![pixels, vec![0x80]],
+            "the pixel frame, then the empty metadata map"
+        );
+        assert_eq!(payload, hex(PLUGIN_TEST_FRAMED_PAYLOAD));
+        // The feature's slot is the frame reference extension (type 100) over
+        // `[[8192], "float32", 1]`.
+        let reference = hex("c70e649391cd2000a7666c6f6174333201");
+        assert!(
+            payload
+                .windows(reference.len())
+                .any(|window| window == reference),
+            "the frame reference in the feature's slot"
+        );
     }
 
     #[test]

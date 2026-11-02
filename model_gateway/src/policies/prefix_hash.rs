@@ -366,7 +366,7 @@ impl LoadBalancingPolicy for PrefixHashPolicy {
         debug!(
             branch = branch.as_str(),
             level,
-            worker = result.map_or("none", |idx| workers[idx].url()),
+            worker = result.map_or("none", |idx| workers[idx].redacted_url()),
             model_id = result.map_or("none", |idx| workers[idx].model_id()),
             "Prefix-hash selection"
         );
@@ -384,10 +384,12 @@ impl LoadBalancingPolicy for PrefixHashPolicy {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use openai_protocol::worker::WorkerStatus;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, HashRing, WorkerLoadGuard, WorkerType};
+    use crate::worker::{
+        test_support::no_health_check, BasicWorkerBuilder, HashRing, WorkerLoadGuard, WorkerType,
+    };
 
     fn create_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
         urls.iter()
@@ -395,10 +397,7 @@ mod tests {
                 Arc::new(
                     BasicWorkerBuilder::new(*url)
                         .worker_type(WorkerType::Regular)
-                        .health_config(HealthCheckConfig {
-                            disable_health_check: true,
-                            ..Default::default()
-                        })
+                        .health_config(no_health_check())
                         .build(),
                 ) as Arc<dyn Worker>
             })

@@ -22,6 +22,7 @@ import types
 from types import SimpleNamespace
 
 import pytest
+from smg_grpc_servicer import constrained_decoding as cd
 from smg_grpc_servicer import rust_lifecycle
 from smg_grpc_servicer.sglang import plugin, rust
 
@@ -1369,3 +1370,25 @@ def test_a_launch_that_fails_stops_the_already_bound_server(monkeypatch, tmp_pat
     with pytest.raises(RuntimeError, match="scheduler would not start"):
         asyncio.run(rust.serve_rust(_server_args()))
     assert events == ["serving:False", "stop:5.0"]
+
+
+def test_server_facts_carry_the_structural_tag_vocabulary_of_an_older_xgrammar(monkeypatch):
+    # The xgrammar installed beside the engine predates the structural-tag
+    # nodes the Router writes (0.1.33 is the first release with them): the
+    # key says so under the backends that run xgrammar (the engine's default
+    # included); a current xgrammar, or a backend with a vocabulary of its
+    # own, leaves no key.
+    monkeypatch.setattr(rust, "pairing_protocol_from_env", lambda: "")
+    monkeypatch.setattr(cd, "installed_xgrammar_version", lambda: "0.1.32")
+    older = json.loads(rust.server_facts(_server_args(grammar_backend=None))["server_args_json"])
+    assert older["grammar_backend"] == "xgrammar"
+    assert older["structural_tag_vocabulary"] == "older"
+    other = json.loads(
+        rust.server_facts(_server_args(grammar_backend="llguidance"))["server_args_json"]
+    )
+    assert "structural_tag_vocabulary" not in other
+    monkeypatch.setattr(cd, "installed_xgrammar_version", lambda: "0.1.33")
+    current = json.loads(
+        rust.server_facts(_server_args(grammar_backend="xgrammar"))["server_args_json"]
+    )
+    assert "structural_tag_vocabulary" not in current

@@ -25,10 +25,10 @@ use engine_servicer::{
     EncodeRelease, EncoderDispatchErrorReq, MediaError, MediaFeatures, MediaProcessor,
     MediaRequest, ProcessedMedia, ServicerConfig, ServicerError, SglangEncodeDispatcher,
     SglangModelInfo, SglangServicerConfig, SglangServicerServer, TokenSpeedModelInfo,
-    TokenSpeedServicerConfig, TokenSpeedServicerServer, VllmModelInfo, VllmServicerConfig,
-    VllmServicerServer, ALL_MODALITIES, DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC,
-    DEFAULT_ENGINE_SILENCE_TIMEOUT, DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT,
-    PIXEL_MODALITIES,
+    TokenSpeedServicerConfig, TokenSpeedServicerServer, TrtllmModelInfo, TrtllmServicerConfig,
+    TrtllmServicerServer, VllmModelInfo, VllmServicerConfig, VllmServicerServer, ALL_MODALITIES,
+    DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC, DEFAULT_ENGINE_SILENCE_TIMEOUT,
+    DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT, PIXEL_MODALITIES,
 };
 use llm_multimodal::{jpeg_turbo::TurboJpegPolicy, Modality};
 use prost::Message;
@@ -668,6 +668,7 @@ impl PyVllmGrpcServer {
         kv_connector = String::new(),
         kv_role = String::new(),
         kv_engine_id = String::new(),
+        runs_mooncake = false,
         kv_cache_dtype = String::new(),
         attention_backend = String::new(),
         model_dtype = String::new(),
@@ -685,6 +686,7 @@ impl PyVllmGrpcServer {
         max_num_seqs = 0,
         engine_reasoning_parser = String::new(),
         constrained_decoding_start = String::new(),
+        structural_tag_vocabulary = String::new(),
         log_stats = None,
         media_processor = None,
         smg_media_processor = None,
@@ -720,6 +722,7 @@ impl PyVllmGrpcServer {
         kv_connector: String,
         kv_role: String,
         kv_engine_id: String,
+        runs_mooncake: bool,
         kv_cache_dtype: String,
         attention_backend: String,
         model_dtype: String,
@@ -737,6 +740,7 @@ impl PyVllmGrpcServer {
         max_num_seqs: i32,
         engine_reasoning_parser: String,
         constrained_decoding_start: String,
+        structural_tag_vocabulary: String,
         log_stats: Option<bool>,
         media_processor: Option<Bound<'_, PyAny>>,
         smg_media_processor: Option<Bound<'_, PyDict>>,
@@ -779,6 +783,7 @@ impl PyVllmGrpcServer {
             kv_connector,
             kv_role,
             kv_engine_id,
+            runs_mooncake,
             kv_cache_dtype,
             attention_backend,
             model_dtype,
@@ -796,6 +801,7 @@ impl PyVllmGrpcServer {
             max_num_seqs,
             engine_reasoning_parser,
             constrained_decoding_start,
+            structural_tag_vocabulary,
             log_stats,
         };
         let servicer = ServicerConfig {
@@ -1316,6 +1322,218 @@ impl DispatchError {
             error_msg,
             error_code: u16::try_from(error_code).unwrap_or(500),
         });
+    }
+}
+
+/// Rust-owned `trtllm.TrtllmService` server over a same-host TensorRT-LLM
+/// engine on the msgpack ZMQ wire (the shim beside the engine's LLM API dials
+/// in). The Python launcher keeps the lifecycle: it starts the shim against
+/// the handshake address, polls `engine_ready`/`last_error`, drains and
+/// stops. The facts come from the engine's arguments, which the launcher
+/// reads before the engine starts; the handshake fills what it left at 0.
+#[pyclass(name = "TrtllmGrpcServer")]
+pub struct PyTrtllmGrpcServer {
+    inner: TrtllmServicerServer,
+}
+
+#[pymethods]
+impl PyTrtllmGrpcServer {
+    #[new]
+    #[pyo3(signature = (
+        bind_address,
+        ipc_base_url,
+        handshake_address,
+        model_path,
+        *,
+        engine_count = 1,
+        tokenizer_dir = None,
+        served_model_name = None,
+        max_input_len = 0,
+        max_seq_len = 0,
+        max_batch_size = 0,
+        vocab_size = 0,
+        hidden_size = 0,
+        num_layers = 0,
+        num_heads = 0,
+        supported_features = None,
+        eos_token_ids = None,
+        backend = String::new(),
+        trtllm_version = String::new(),
+        tensor_parallel_size = 0,
+        pipeline_parallel_size = 0,
+        context_parallel_size = 0,
+        data_parallel_size = 1,
+        guided_decoding_backend = String::new(),
+        structural_tag_vocabulary = String::new(),
+        max_running_requests = 0,
+        kv_events_endpoint = String::new(),
+        kv_events_replay_endpoint = String::new(),
+        kv_events_topic = String::new(),
+        engine_startup_timeout_secs = None,
+        engine_startup_ceiling_secs = None,
+        engine_silence_timeout_secs = None,
+        engine_prefill_tokens_per_sec = None,
+        metrics_bind_address = None,
+    ))]
+    #[expect(clippy::too_many_arguments)]
+    fn new(
+        py: Python<'_>,
+        bind_address: String,
+        ipc_base_url: String,
+        handshake_address: String,
+        model_path: String,
+        engine_count: usize,
+        tokenizer_dir: Option<String>,
+        served_model_name: Option<String>,
+        max_input_len: i32,
+        max_seq_len: i32,
+        max_batch_size: i32,
+        vocab_size: i32,
+        hidden_size: i32,
+        num_layers: i32,
+        num_heads: i32,
+        supported_features: Option<Vec<String>>,
+        eos_token_ids: Option<Vec<u32>>,
+        backend: String,
+        trtllm_version: String,
+        tensor_parallel_size: i32,
+        pipeline_parallel_size: i32,
+        context_parallel_size: i32,
+        data_parallel_size: i32,
+        guided_decoding_backend: String,
+        structural_tag_vocabulary: String,
+        max_running_requests: i32,
+        kv_events_endpoint: String,
+        kv_events_replay_endpoint: String,
+        kv_events_topic: String,
+        engine_startup_timeout_secs: Option<f64>,
+        engine_startup_ceiling_secs: Option<f64>,
+        engine_silence_timeout_secs: Option<f64>,
+        engine_prefill_tokens_per_sec: Option<i64>,
+        metrics_bind_address: Option<String>,
+    ) -> PyResult<Self> {
+        let model = TrtllmModelInfo {
+            served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
+            model_path,
+            max_input_len,
+            max_seq_len,
+            max_batch_size,
+            vocab_size,
+            hidden_size,
+            num_layers,
+            num_heads,
+            supported_features: supported_features.unwrap_or_default(),
+            eos_token_ids: eos_token_ids.unwrap_or_default(),
+            backend,
+            trtllm_version,
+            tensor_parallel_size,
+            pipeline_parallel_size,
+            context_parallel_size,
+            data_parallel_size,
+            guided_decoding_backend,
+            structural_tag_vocabulary,
+            max_running_requests,
+            kv_events_endpoint,
+            kv_events_replay_endpoint,
+            kv_events_topic,
+        };
+        let servicer = ServicerConfig {
+            bind_address,
+            ipc_base_url,
+            handshake_address,
+            engine_count,
+            tokenizer_dir,
+            engine_startup_timeout: startup_timeout(engine_startup_timeout_secs)?,
+            engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
+            engine_silence_timeout: silence_timeout(engine_silence_timeout_secs)?,
+            engine_prefill_tokens_per_sec: prefill_tokens_per_sec(engine_prefill_tokens_per_sec)?,
+            metrics_bind_address,
+        };
+        let config = TrtllmServicerConfig { servicer, model };
+        let inner = py
+            .detach(|| TrtllmServicerServer::start(config))
+            .map_err(to_py_err)?;
+        Ok(Self { inner })
+    }
+
+    /// The bound `ip:port`.
+    #[getter]
+    fn address(&self) -> String {
+        self.inner.address()
+    }
+
+    /// The metrics listener's bound `ip:port`; `None` when the server was
+    /// built without `metrics_bind_address`.
+    #[getter]
+    fn metrics_address(&self) -> Option<String> {
+        self.inner.metrics_address()
+    }
+
+    #[getter]
+    fn running(&self) -> bool {
+        self.inner.running()
+    }
+
+    /// Whether the engine handshake completed; health is NOT_SERVING until
+    /// it has.
+    #[getter]
+    fn engine_ready(&self) -> bool {
+        self.inner.engine_ready()
+    }
+
+    /// Report that the engine process is alive while the handshake runs: the
+    /// launcher calls this each time it polls the process it spawned and
+    /// finds it running. Each report resets the handshake's silence bound
+    /// (`engine_startup_timeout_secs`); the ceiling
+    /// (`engine_startup_ceiling_secs`) still holds. A no-op once the engine
+    /// is connected.
+    fn note_engine_alive(&self) {
+        self.inner.note_engine_alive();
+    }
+
+    /// The last fatal error (engine connect or server exit), if any.
+    #[getter]
+    fn last_error(&self) -> PyResult<Option<String>> {
+        self.inner.last_error().map_err(to_py_err)
+    }
+
+    /// Admitted requests whose processing or response stream has not ended.
+    #[getter]
+    fn active_requests(&self) -> usize {
+        self.inner.active_requests()
+    }
+
+    /// Announce SERVING (`True`) or drain (`False`); health flips at once and
+    /// admission closes with the drain.
+    fn set_serving(&self, serving: bool) {
+        self.inner.set_serving(serving);
+    }
+
+    /// Hold (`False`) or release (`True`) readiness alone: health flips,
+    /// admission stays open for the launcher's own requests before SERVING
+    /// and closes to every other; `set_serving(False)` is the drain switch.
+    fn set_ready(&self, ready: bool) {
+        self.inner.set_ready(ready);
+    }
+
+    /// Whether the KV-event relay's subscriptions have reached the engine's
+    /// publishers (`True` as well when there is none to wait for).
+    #[getter]
+    fn kv_relay_subscribed(&self) -> bool {
+        self.inner.kv_relay_subscribed()
+    }
+
+    /// Stop the server: open streams are cancelled, connections get most of
+    /// `timeout_secs` to close, then the listener thread is joined.
+    #[pyo3(signature = (timeout_secs = 5.0))]
+    fn stop(&self, py: Python<'_>, timeout_secs: f64) -> PyResult<()> {
+        if !timeout_secs.is_finite() || timeout_secs <= 0.0 {
+            return Err(PyValueError::new_err(
+                "timeout_secs must be finite and positive",
+            ));
+        }
+        let timeout = Duration::from_secs_f64(timeout_secs);
+        py.detach(|| self.inner.stop(timeout)).map_err(to_py_err)
     }
 }
 

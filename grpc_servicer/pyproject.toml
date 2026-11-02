@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "smg-grpc-servicer"
-version = "0.14.0"
+version = "0.14.1"
 description = "SMG gRPC servicer implementations for LLM inference engines (vLLM, MLX, TokenSpeed, SGLang)"
 requires-python = ">=3.10"
 dependencies = [
@@ -12,6 +12,12 @@ dependencies = [
     "grpcio>=1.81.1",
     "grpcio-reflection>=1.81.1",
     "grpcio-health-checking>=1.81.1",
+    # The servicers import google.protobuf themselves, and the generated health
+    # and reflection modules of the grpcio 1.81.x line above were written for
+    # protobuf 6.33.5 (an older runtime refuses them at import, as it refuses
+    # smg-grpc-proto's modules): declared here so pip settles the floor at
+    # install time instead of the first import failing.
+    "protobuf>=6.33.5",
 ]
 readme = "README.md"
 license = "Apache-2.0"

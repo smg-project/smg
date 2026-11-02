@@ -10,9 +10,12 @@ use serde_json::{json, Value};
 use smg_mcp::{BuiltinToolType, McpOrchestrator, McpServerBinding, McpServerConfig, McpTransport};
 use tracing::{debug, warn};
 
-use crate::openai_bridge::{
-    self, apply_hosted_tool_overrides, extract_hosted_tool_overrides, FormatRegistry,
-    ResponseFormat,
+use crate::{
+    openai_bridge::{
+        self, apply_hosted_tool_overrides, extract_hosted_tool_overrides, FormatRegistry,
+        ResponseFormat,
+    },
+    worker::redacted_url,
 };
 
 /// Default maximum tool loop iterations (safety limit).
@@ -84,7 +87,7 @@ pub async fn connect_mcp_servers(
             if !(server_url.starts_with("http://") || server_url.starts_with("https://")) {
                 warn!(
                     "Ignoring MCP server_url with unsupported scheme: {}",
-                    server_url
+                    redacted_url(server_url)
                 );
                 continue;
             }
@@ -513,6 +516,29 @@ mod tests {
             Arc::new(McpOrchestrator::new(config).await.unwrap()),
             FormatRegistry::new(),
         )
+    }
+
+    /// A server URL of a scheme the connector does not take is refused with
+    /// a line that names it masked: credentials in it stay out of the log.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_refused_server_url_is_named_masked() {
+        let (orchestrator, format_registry) = create_test_orchestrator_no_builtin().await;
+        let inputs = [McpServerInput {
+            label: "tools".to_string(),
+            url: Some("wss://user:secret@127.0.0.1:1/sse".to_string()),
+            authorization: None,
+            headers: HashMap::new(),
+            allowed_tools: None,
+        }];
+
+        let bindings = connect_mcp_servers(&orchestrator, &format_registry, &inputs).await;
+
+        assert!(!logs_contain("secret"));
+        assert!(bindings.is_empty());
+        assert!(logs_contain(
+            "Ignoring MCP server_url with unsupported scheme: wss://***@127.0.0.1:1/sse"
+        ));
     }
 
     #[tokio::test]

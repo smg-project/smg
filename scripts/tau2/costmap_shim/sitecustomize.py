@@ -28,8 +28,8 @@ if guard_enabled and guard_mode != "1":
 try:
     import litellm
 except Exception as exc:
-    # Non-tau2 interpreters share this PYTHONPATH; enable the guard only in
-    # the tau2 child's environment, not the whole benchmark workflow step.
+    # run_ab.py, launch_arms.sh's port picker, and vLLM/SMG share this PYTHONPATH.
+    # Enable the guard only in the tau2 subprocess env, never the workflow step.
     if guard_enabled:
         raise SystemExit("Cannot initialize the tau2 budget guard without LiteLLM") from exc
     if not isinstance(exc, ImportError):
@@ -64,10 +64,14 @@ if guard_enabled:
             raise RuntimeError("The tau2 budget hook did not initialize")
 
         litellm.completion = _deny_uninitialized
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-        from budget_hook import install
+        original_path = sys.path[:]
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+            from budget_hook import install
 
-        install(litellm, original=original_completion)
+            install(litellm, original=original_completion)
+        finally:
+            sys.path[:] = original_path
     except Exception as exc:
         # sitecustomize errors normally allow startup to continue; SystemExit does not.
         raise SystemExit("Cannot initialize the tau2 budget hook") from exc

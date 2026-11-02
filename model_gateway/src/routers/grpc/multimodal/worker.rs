@@ -814,6 +814,31 @@ mod tests {
         ]
     }
 
+    /// The settings every pipeline test starts from: a model at `model_dir`
+    /// served under its own path, normalized pixels in bfloat16, one-second
+    /// fetch timeouts, and no limit, budget or override of any kind; a test
+    /// names the fields it is about.
+    pub(super) fn pipeline_settings(model_dir: &str) -> WorkerMediaSettings {
+        WorkerMediaSettings {
+            model_dir: model_dir.to_string(),
+            model_id: model_dir.to_string(),
+            served_model_name: None,
+            pixel_format: PixelFormat::Normalized,
+            encoder_dtype: "bfloat16".to_string(),
+            processor_kwargs: serde_json::Map::new(),
+            max_items: None,
+            engine_item_limits: HashMap::new(),
+            max_item_bytes: None,
+            allowed_domains: None,
+            fetch_timeout: Duration::from_secs(1),
+            video_fetch_timeout: Duration::from_secs(1),
+            video_frame_budget: None,
+            video_loader_rule: None,
+            encoder_budget: None,
+            turbojpeg: None,
+        }
+    }
+
     /// The engine's `--limit-mm-per-prompt` caps the pipeline's own limits
     /// (`--mm-max-items`, the environment override, the spec's), which keep
     /// their precedence below it; without an engine limit nothing changes.
@@ -895,22 +920,10 @@ mod tests {
         )
         .unwrap();
         let settings = WorkerMediaSettings {
-            model_dir: dir.display().to_string(),
-            served_model_name: None,
-            model_id: dir.display().to_string(),
-            pixel_format: PixelFormat::Normalized,
             encoder_dtype: "float32".to_string(),
-            processor_kwargs: serde_json::Map::new(),
-            max_items: None,
-            engine_item_limits: HashMap::from([(Modality::Image, 1)]),
-            max_item_bytes: None,
-            allowed_domains: None,
-            fetch_timeout: Duration::from_secs(1),
-            video_fetch_timeout: Duration::from_secs(1),
-            video_frame_budget: None,
-            video_loader_rule: None,
+            engine_item_limits: limits(&[(Modality::Image, 1)]),
             encoder_budget: Some(192_000),
-            turbojpeg: None,
+            ..pipeline_settings(&dir.display().to_string())
         };
         let pipeline = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::new()))
             .await
@@ -965,22 +978,9 @@ mod tests {
         .unwrap();
         let path = dir.path().to_str().unwrap().to_string();
         let settings = |encoder_budget| WorkerMediaSettings {
-            model_dir: path.clone(),
-            model_id: path.clone(),
-            served_model_name: None,
-            pixel_format: PixelFormat::Normalized,
             encoder_dtype: "float32".to_string(),
-            processor_kwargs: serde_json::Map::new(),
-            max_items: None,
-            engine_item_limits: HashMap::new(),
-            max_item_bytes: None,
-            allowed_domains: None,
-            fetch_timeout: Duration::from_secs(1),
-            video_fetch_timeout: Duration::from_secs(1),
-            video_frame_budget: None,
-            video_loader_rule: None,
             encoder_budget,
-            turbojpeg: None,
+            ..pipeline_settings(&path)
         };
         let tokenizer = || Arc::new(MockTokenizer::new().with_tokens(&[("<image>", 32000)]));
         let items = vec![WorkerMediaItem {
@@ -1024,6 +1024,97 @@ mod tests {
         assert_eq!(output.batches.len(), 1);
     }
 
+    /// The Rust servicer runs the router's source policy, preserves the resulting
+    /// patch grid through preprocessing and emits exactly that many image tokens.
+    #[tokio::test]
+    async fn minimax_worker_resizes_once_from_source_geometry() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let dir = tempfile::Builder::new()
+            .prefix("minimax-m3-")
+            .tempdir()
+            .unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type":"minimax_m3_vl","image_token_index":32000}"#,
+        )
+        .unwrap();
+        let path = dir.path().to_str().unwrap();
+        let settings = WorkerMediaSettings {
+            encoder_dtype: "float32".into(),
+            ..pipeline_settings(path)
+        };
+        let tokenizer = Arc::new(MockTokenizer::new().with_tokens(&[
+            ("]<]image[>[", 32000),
+            ("]<]start of image[>[", 32001),
+            ("]<]end of image[>[", 32002),
+        ]));
+        let pipeline = WorkerMediaPipeline::new(settings, tokenizer).await.unwrap();
+        for (width, height, tokens, router_tokens) in [
+            (1000, 1000, 1296, 1296),
+            (2200, 100, 216, 72),
+            (1000, 50, 320, 320),
+            (224, 112, 32, 32),
+        ] {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(width, height)
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            let item = WorkerMediaItem {
+                modality: Modality::Image,
+                url: format!(
+                    "data:image/png;base64,{}",
+                    STANDARD.encode(bytes.into_inner())
+                ),
+            };
+            let output = pipeline
+                .process(vec![1, 32000, 2], std::slice::from_ref(&item), false)
+                .await
+                .unwrap();
+            assert_eq!(
+                output
+                    .prompt_token_ids
+                    .iter()
+                    .filter(|&&id| id == 32000)
+                    .count(),
+                tokens
+            );
+            assert_eq!(
+                output.batches[0].pixel_values.as_ref().unwrap().shape,
+                vec![(tokens * 4) as u32, 1176]
+            );
+            // The router also accepts a non-grid request cap, before handing
+            // the aligned dimensions to the same cached image processor.
+            let plan = MediaPlan::new(vec![MediaContentPart::ImageUrl {
+                url: item.url,
+                detail: None,
+                uuid: None,
+                max_long_side_pixel: Some(1000),
+            }]);
+            let routed = process_multimodal_plan(
+                plan,
+                &pipeline.model_id,
+                pipeline.tokenizer.as_ref(),
+                vec![1, 32000, 2],
+                &pipeline.components,
+                CONFIG_KEY,
+                &pipeline.model_dir,
+                pipeline.assembly.image_wire_dtype(),
+                TransparencyPolicy::CompositeOverWhite,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                routed
+                    .expanded_token_ids
+                    .iter()
+                    .filter(|&&id| id == 32000)
+                    .count(),
+                router_tokens
+            );
+        }
+    }
+
     /// The inline payload cap sizes a `data:` URL by the shared rule: the
     /// scheme's case does not matter, so an uppercase scheme cannot slip a
     /// payload past `--mm-max-item-bytes` that the router and the servicer
@@ -1042,22 +1133,9 @@ mod tests {
         )
         .unwrap();
         let settings = WorkerMediaSettings {
-            model_dir: dir.display().to_string(),
-            served_model_name: None,
-            model_id: dir.display().to_string(),
-            pixel_format: PixelFormat::Normalized,
             encoder_dtype: "float32".to_string(),
-            processor_kwargs: serde_json::Map::new(),
-            max_items: None,
-            engine_item_limits: HashMap::new(),
             max_item_bytes: Some(4),
-            allowed_domains: None,
-            fetch_timeout: Duration::from_secs(1),
-            video_fetch_timeout: Duration::from_secs(1),
-            video_frame_budget: None,
-            video_loader_rule: None,
-            encoder_budget: None,
-            turbojpeg: None,
+            ..pipeline_settings(&dir.display().to_string())
         };
         let pipeline = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::new()))
             .await
@@ -1248,7 +1326,7 @@ mod processor_kwargs_tests {
 mod unsupported_model_tests {
     use llm_tokenizer::MockTokenizer;
 
-    use super::*;
+    use super::{tests::pipeline_settings, *};
 
     /// A spec whose encoder inputs vLLM does not read never preprocesses for
     /// this vLLM worker: the pipeline refuses to start.
@@ -1261,24 +1339,7 @@ mod unsupported_model_tests {
         )
         .unwrap();
         let path = dir.path().to_str().unwrap().to_string();
-        let settings = WorkerMediaSettings {
-            model_dir: path.clone(),
-            model_id: path,
-            served_model_name: None,
-            pixel_format: PixelFormat::Normalized,
-            encoder_dtype: "bfloat16".to_string(),
-            processor_kwargs: serde_json::Map::new(),
-            max_items: None,
-            engine_item_limits: HashMap::new(),
-            max_item_bytes: None,
-            allowed_domains: None,
-            fetch_timeout: Duration::from_secs(1),
-            video_fetch_timeout: Duration::from_secs(1),
-            video_frame_budget: None,
-            video_loader_rule: None,
-            encoder_budget: None,
-            turbojpeg: None,
-        };
+        let settings = pipeline_settings(&path);
         let error = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::default()))
             .await
             .err()
@@ -1302,22 +1363,8 @@ mod unsupported_model_tests {
         .unwrap();
         let path = dir.path().to_str().unwrap().to_string();
         let settings = WorkerMediaSettings {
-            model_dir: path.clone(),
-            model_id: path.clone(),
             served_model_name: Some("m6".to_string()),
-            pixel_format: PixelFormat::Normalized,
-            encoder_dtype: "bfloat16".to_string(),
-            processor_kwargs: serde_json::Map::new(),
-            max_items: None,
-            engine_item_limits: HashMap::new(),
-            max_item_bytes: None,
-            allowed_domains: None,
-            fetch_timeout: Duration::from_secs(1),
-            video_fetch_timeout: Duration::from_secs(1),
-            video_frame_budget: None,
-            video_loader_rule: None,
-            encoder_budget: None,
-            turbojpeg: None,
+            ..pipeline_settings(&path)
         };
         let error = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::default()))
             .await
@@ -1344,22 +1391,8 @@ mod unsupported_model_tests {
     #[test]
     fn the_served_name_is_omitted_when_it_is_the_path() {
         let settings = WorkerMediaSettings {
-            model_dir: "/models/x".to_string(),
-            model_id: "/models/x".to_string(),
             served_model_name: Some("/models/x".to_string()),
-            pixel_format: PixelFormat::Normalized,
-            encoder_dtype: "bfloat16".to_string(),
-            processor_kwargs: serde_json::Map::new(),
-            max_items: None,
-            engine_item_limits: HashMap::new(),
-            max_item_bytes: None,
-            allowed_domains: None,
-            fetch_timeout: Duration::from_secs(1),
-            video_fetch_timeout: Duration::from_secs(1),
-            video_frame_budget: None,
-            video_loader_rule: None,
-            encoder_budget: None,
-            turbojpeg: None,
+            ..pipeline_settings("/models/x")
         };
         let message = unsupported_model_message(
             &settings,

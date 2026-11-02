@@ -71,7 +71,7 @@ def _arm_engine_error(mock_answers, after_tokens: int, count: int) -> None:
 
 @pytest.mark.engine("mock")
 @pytest.mark.gpu(1)
-@pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct")
+@pytest.mark.model("RedHatAI/Llama-3.2-1B-Instruct-FP8")
 @pytest.mark.workers(extra_engine_args=["--engine", "realistic"])
 @pytest.mark.gateway(extra_args=["--retry-max-retries", "5"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)

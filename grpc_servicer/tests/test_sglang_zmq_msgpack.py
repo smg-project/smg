@@ -3,6 +3,7 @@ shapes SMG relies on, and a loopback through a fake SMG that binds the three
 sockets. Needs an SGLang install (its io_struct and sampling params)."""
 
 import array
+import ctypes
 import logging
 import os
 import struct
@@ -310,6 +311,100 @@ def test_the_rust_servicers_media_decodes_as_the_schedulers_processor_output():
     assert torch.equal(item.feature, expected)
     grid = item.model_specific_data["image_grid_thw"]
     assert grid.dtype is torch.int64 and torch.equal(grid, torch.tensor([[1, 2, 2]]))
+
+
+# The `ADD` message the Rust servicer sends for the same request on a
+# scheduler whose plugin resolves auxiliary frames, with the feature
+# `torch.arange(8192, dtype=torch.float32) * 0.5` (32 KiB, the frame bar): the
+# payload carries SMG's frame-reference extension (type 100) over
+# `[[8192], "float32", 1]` in the feature's slot (the frame's one-based index in
+# the data's place), the grid inline; behind it ride the pixels, then the empty metadata map. The
+# same constant is pinned in `protocol/sglang/request.rs`
+# (`the_framed_payload_the_plugins_test_decodes_is_pinned`).
+RUST_MM_FRAMED_REQUEST = (
+    "9eb9546f6b656e697a656447656e6572617465526571496e707574a26d6dc0c0950107070702c094919901c0c0919201"
+    "0301c70e649391cd2000a7666c6f6174333201c0c281ae696d6167655f677269645f746877c72a020000000e93920103"
+    "a5696e743634a3637075010000000000000002000000000000000200000000000000c0c007c0dc001acc80c0c0c0cb3f"
+    "f0000000000000cb3ff0000000000000ffcb0000000000000000cb0000000000000000cb0000000000000000cb3ff000"
+    "00000000000001c0c0c0c0c0c2c3c3c2c0c0c0c0c2ff00c0c2"
+)
+
+
+def _framed_pixels():
+    torch = pytest.importorskip("torch")
+    return torch.arange(8192, dtype=torch.float32) * 0.5
+
+
+def _framed_message(meta: bytes = b"\x80") -> list:
+    """``[type, payload, pixels, metadata]`` as the receiver sees them: the
+    frames are writable buffers (a zmq frame's buffer is)."""
+    pixels = bytearray(_framed_pixels().numpy().tobytes())
+    return [wire.REQ_TYPE_ADD, bytes.fromhex(RUST_MM_FRAMED_REQUEST), pixels, meta]
+
+
+def test_a_tensor_sent_as_a_frame_is_built_over_the_frame_without_a_copy():
+    """The feature's slot names its frame; the tensor the scheduler gets is
+    the frame's memory itself (no copy: its storage address is the frame's),
+    equal to the sender's values, and it outlives the receiver's frame list;
+    the small grid rides inline as before."""
+    torch = pytest.importorskip("torch")
+    frames = _framed_message()
+    frame_address = ctypes.addressof(ctypes.c_char.from_buffer(frames[2]))
+    (req,) = wire.decode_request_frames(frames)
+    assert req.rid == "mm" and list(req.input_ids) == [1, 7, 7, 7, 2]
+    (item,) = req.mm_inputs.mm_items
+    assert item.feature.dtype is torch.float32 and tuple(item.feature.shape) == (8192,)
+    assert torch.equal(item.feature, _framed_pixels())
+    assert item.feature.data_ptr() == frame_address, "the tensor is the frame, not a copy"
+    grid = item.model_specific_data["image_grid_thw"]
+    assert grid.dtype is torch.int64 and torch.equal(grid, torch.tensor([[1, 2, 2]]))
+    assert item.offsets == [(1, 3)] and req.mm_inputs.im_token_id == 7
+    del frames
+    assert float(item.feature.sum()) == float(_framed_pixels().sum())
+
+
+def test_a_frame_reference_outside_the_message_or_of_the_wrong_length_is_refused():
+    """A frame index the message has no frame for, or a frame whose length is
+    not the tensor's, is a decode error by name (the request is answered, not
+    served from a plausible tensor of wrong numbers)."""
+    pytest.importorskip("torch")
+    missing = _framed_message()
+    del missing[2]  # [type, payload, metadata]: no tensor frame at all
+    with pytest.raises(Exception, match="frame index 1 is outside the 0 tensor frame"):
+        wire.decode_request_frames(missing)
+    short = _framed_message()
+    short[2] = short[2][:-4]
+    with pytest.raises(Exception, match="holds 32764 bytes, float32 \\[8192\\] needs 32768"):
+        wire.decode_request_frames(short)
+
+
+def test_the_metadata_frame_is_the_last_frame_behind_the_tensors():
+    """The request's metadata rides as the message's last frame, behind the
+    tensor frames when there are any, where a message without tensor frames
+    has always carried it."""
+    pytest.importorskip("torch")
+    meta = msgspec.msgpack.encode({"trace_headers": {"traceparent": "00-aa-bb-01"}})
+
+    class Traces:
+        seen: list = []
+
+        def attach(self, request, headers):
+            self.seen.append((request.rid, headers))
+            return True
+
+    traces = Traces()
+    wire.decode_request_frames(_framed_message(meta=meta), traces)
+    wire.decode_request_frames([wire.REQ_TYPE_ADD, bytes.fromhex(RUST_MM_REQUEST), meta], traces)
+    assert traces.seen == [("mm", {"traceparent": "00-aa-bb-01"})] * 2
+
+
+def test_the_ready_response_declares_that_frames_are_resolved():
+    """What SMG reads at the handshake before it frames a tensor: the key goes
+    out on every registration (an older plugin sent none, and SMG reads an
+    absent key as "every tensor inline")."""
+    ready = wire.WireEngineCoreReadyResponse()
+    assert ready.tensor_aux_frames is True
+    assert msgspec.msgpack.decode(wire.encode(ready))["tensor_aux_frames"] is True
 
 
 def test_abort_frame_fans_out_one_abort_per_rid():

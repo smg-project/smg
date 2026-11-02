@@ -82,14 +82,25 @@ pub(crate) struct VisionProcessors {
 }
 
 impl VisionProcessors {
+    /// Build processors that consume the geometry selected during media fetching.
     fn build(spec: &dyn ModelProcessorSpec, model_config: &MultimodalModelConfig) -> Self {
         let build = |modality| {
-            spec.vision_processor(
-                &model_config.config,
-                preprocessor_config_for(model_config, modality),
-                modality,
-            )
-            .map(Arc::from)
+            let mut config = preprocessor_config_for(model_config, modality).clone();
+            if spec.name() == "minimax_m3" && modality == Modality::Image {
+                if config.max_pixels.is_some_and(|pixels| {
+                    pixels != llm_multimodal::minimax_resize::IMAGE_MAX_TOTAL_PIXELS as usize
+                }) || config.min_pixels.is_some_and(|pixels| pixels != 28 * 28)
+                {
+                    warn!(max_pixels = ?config.max_pixels, min_pixels = ?config.min_pixels,
+                        "MiniMax M3 source image sizing overrides legacy area limits: use max_long_side_pixel for image size and encoder_budget for an engine token limit");
+                }
+                config.extra.insert(
+                    llm_multimodal::minimax_resize::RESIZED_KEY.into(),
+                    serde_json::json!(true),
+                );
+            }
+            spec.vision_processor(&model_config.config, &config, modality)
+                .map(Arc::from)
         };
         Self {
             spec: spec.name(),

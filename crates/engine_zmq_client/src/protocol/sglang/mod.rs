@@ -25,7 +25,9 @@
 //!
 //! The positional-array helpers (`next_field`, `expect_tag`, `drain_trailing`)
 //! are shared with the TokenSpeed dialect, whose structs follow the same
-//! `msgspec` convention.
+//! `msgspec` convention; the slim-output decoder
+//! (`output::decode_slim_batch`) with the TensorRT-LLM dialect, whose
+//! engine-side shim answers with the same records.
 
 pub mod multimodal;
 pub mod output;
@@ -35,7 +37,7 @@ pub mod sampling;
 use bytes::Bytes;
 
 use crate::{
-    codec::{decode_msgpack, encode_msgpack, OpaqueValue},
+    codec::{encode_msgpack, tensor::encode_with_aux_frames, OpaqueValue},
     error::Result,
     protocol::{
         handshake::EngineCoreReadyResponse,
@@ -45,7 +47,7 @@ use crate::{
                 DATA_ITEM_WIRE_FIELDS, MULTIMODAL_DATA_ITEM_NAME, MULTIMODAL_PROCESSOR_OUTPUT_NAME,
                 PROCESSOR_OUTPUT_WIRE_FIELDS,
             },
-            output::{SglangOutput, SglangWireOutput},
+            output::{decode_slim_batch, SglangOutput},
             request::{
                 RequestMeta, SglangRequest, SglangRequestType, EMBEDDING_WIRE_FIELDS,
                 ENCODER_DISPATCH_ERROR_REQ_TAG, ENCODER_DISPATCH_ERROR_WIRE_FIELDS,
@@ -54,7 +56,7 @@ use crate::{
             },
             sampling::{SAMPLING_PARAMS_NAME, WIRE_FIELDS as SAMPLING_WIRE_FIELDS},
         },
-        EngineBatch, EngineLoad, EngineProtocol, UtilityReply,
+        EngineBatch, EngineProtocol,
     },
 };
 
@@ -63,10 +65,23 @@ use crate::{
 /// plugin's tagged slim outputs back.
 pub struct SglangProtocol;
 
+/// What this wire reads off a scheduler's handshake and needs for its
+/// requests: whether the plugin in the scheduler resolves a tensor sent as an
+/// auxiliary frame of the request's message
+/// ([`EngineCoreReadyResponse::tensor_aux_frames`]). The slim outputs carry no
+/// optional columns.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SglangLayout {
+    /// A tensor of [`crate::codec::tensor::TENSOR_AUX_MIN_BYTES`] or more
+    /// leaves the payload as an auxiliary frame; false (a plugin that declares
+    /// nothing) keeps every tensor inline, as SGLang's own encoder writes it.
+    pub tensor_aux_frames: bool,
+}
+
 impl EngineProtocol for SglangProtocol {
     type Request = SglangRequest;
     type Output = SglangOutput;
-    type Layout = ();
+    type Layout = SglangLayout;
 
     fn add_frame() -> Bytes {
         SglangRequestType::Add.to_frame()
@@ -165,23 +180,41 @@ impl EngineProtocol for SglangProtocol {
         )
     }
 
-    fn encode_add(request: &Self::Request) -> Result<(Vec<u8>, Vec<Bytes>)> {
-        let payload = encode_msgpack(request)?;
-        // The request's metadata (the caller's trace context) rides as one
-        // more frame: the positional array is the scheduler's own struct. Its
-        // tensors (`mm_inputs`) ride inline, as SGLang's own encoder writes
-        // them: the plugin's decoder resolves no auxiliary frames on this
-        // wire. The day it does, their frames go behind the metadata frame,
-        // which the plugin reads at a fixed position
-        // (`codec::tensor::TensorFields`).
+    fn read_layout(ready: &EngineCoreReadyResponse) -> SglangLayout {
+        SglangLayout {
+            tensor_aux_frames: ready.tensor_aux_frames,
+        }
+    }
+
+    fn encode_add(request: &Self::Request, layout: &SglangLayout) -> Result<(Vec<u8>, Vec<Bytes>)> {
+        // A scheduler whose plugin resolves auxiliary frames is sent the
+        // request's large tensors (`mm_inputs`) as frames behind the payload,
+        // through the typed-tensor wires' routine: the tensor's slot carries
+        // its frame's one-based index, the frame shares the tensor's storage.
+        // Any other scheduler is sent every tensor inline, as SGLang's own
+        // encoder writes them.
+        let (payload, mut aux_frames) = if layout.tensor_aux_frames {
+            encode_with_aux_frames(request)?
+        } else {
+            (encode_msgpack(request)?, Vec::new())
+        };
+        // The request's metadata (the caller's trace context) rides as the
+        // LAST frame, behind the tensor frames: the positional array is the
+        // scheduler's own struct, and the plugin reads the metadata at the
+        // end of the message whenever more than the payload follows the type
+        // byte, so it is written, empty, when tensor frames follow and there
+        // is nothing to carry.
         let meta = match request {
             SglangRequest::Generate(request) => RequestMeta::for_request(request),
             SglangRequest::Embed(_) => None,
         };
-        let aux_frames = match meta {
-            Some(meta) => vec![Bytes::from(encode_msgpack(&meta)?)],
-            None => Vec::new(),
-        };
+        match meta {
+            Some(meta) => aux_frames.push(Bytes::from(encode_msgpack(&meta)?)),
+            None if !aux_frames.is_empty() => {
+                aux_frames.push(Bytes::from(encode_msgpack(&RequestMeta::default())?));
+            }
+            None => {}
+        }
         Ok((payload, aux_frames))
     }
 
@@ -208,83 +241,25 @@ impl EngineProtocol for SglangProtocol {
         )))
     }
 
-    fn decode_batch(frames: &[Bytes], _layout: &()) -> Result<EngineBatch<Self::Output>> {
-        if frames.len() > 1 {
-            tracing::debug!(
-                aux_frames = frames.len() - 1,
-                "ignoring aux frames on an SGLang output (the slim batches have no tensor fields)"
-            );
-        }
-        let payload = frames.first().map(AsRef::as_ref).unwrap_or_default();
-        let (engine_index, load, outputs) = match decode_msgpack::<SglangWireOutput>(payload)? {
-            SglangWireOutput::Tokens(batch) => (
-                batch.engine_index,
-                load_of(
-                    batch.num_running,
-                    batch.num_waiting,
-                    batch.kv_used_tokens,
-                    batch.kv_total_tokens,
-                ),
-                (*batch).into_outputs()?,
-            ),
-            SglangWireOutput::Embeddings(batch) => (
-                batch.engine_index,
-                load_of(
-                    batch.num_running,
-                    batch.num_waiting,
-                    batch.kv_used_tokens,
-                    batch.kv_total_tokens,
-                ),
-                batch.into_outputs()?,
-            ),
-            SglangWireOutput::ControlReply(reply) => {
-                return Ok(EngineBatch {
-                    engine_index: reply.engine_index,
-                    utility: Some(UtilityReply {
-                        call_id: reply.call_id,
-                        outcome: Ok(reply.into_outcome()),
-                    }),
-                    ..EngineBatch::default()
-                });
-            }
-        };
-        let finished_request_ids = outputs
-            .iter()
-            .filter(|output| output.finish_reason.is_some())
-            .map(|output| output.request_id.clone())
-            .collect();
-        Ok(EngineBatch {
-            engine_index,
-            outputs,
-            finished_request_ids,
-            load,
-            wave: None,
-            utility: None,
-        })
+    fn decode_batch(frames: &[Bytes], _layout: &SglangLayout) -> Result<EngineBatch<Self::Output>> {
+        decode_slim_batch(frames)
     }
-}
-
-/// The load tail as a signal. A zero capacity marks a batch sent before the
-/// load probe was wired (or a probe that failed): report no load rather than
-/// an empty scheduler that least-loaded selection would trust.
-fn load_of(
-    num_running: u64,
-    num_waiting: u64,
-    kv_used_tokens: u64,
-    kv_total_tokens: u64,
-) -> Option<EngineLoad> {
-    (kv_total_tokens > 0).then(|| EngineLoad {
-        num_running,
-        num_waiting,
-        kv_cache_usage: kv_used_tokens as f64 / kv_total_tokens as f64,
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::sglang::output::{
-        BatchEmbeddingSlimOutput, BatchTokenIDSlimOutput, ControlReplySlim, MatchedStop,
+    use crate::{
+        codec::decode_msgpack,
+        protocol::{
+            sglang::{
+                output::{
+                    BatchEmbeddingSlimOutput, BatchTokenIDSlimOutput, ControlReplySlim, MatchedStop,
+                },
+                request::TokenizedGenerateReqInput,
+            },
+            EngineLoad,
+        },
     };
 
     fn slim_batch() -> BatchTokenIDSlimOutput {
@@ -357,7 +332,7 @@ mod tests {
     #[test]
     fn decode_batch_maps_outputs_finished_ids_and_load() {
         let frames = vec![Bytes::from(encode_msgpack(&slim_batch()).unwrap())];
-        let decoded = SglangProtocol::decode_batch(&frames, &()).unwrap();
+        let decoded = SglangProtocol::decode_batch(&frames, &SglangLayout::default()).unwrap();
         assert_eq!(decoded.outputs.len(), 2);
         assert_eq!(decoded.finished_request_ids, vec!["b".to_string()]);
         assert_eq!(decoded.engine_index, 1);
@@ -381,7 +356,7 @@ mod tests {
             Bytes::from(encode_msgpack(&slim_batch()).unwrap()),
             Bytes::from_static(b"aux"),
         ];
-        let decoded = SglangProtocol::decode_batch(&frames, &()).unwrap();
+        let decoded = SglangProtocol::decode_batch(&frames, &SglangLayout::default()).unwrap();
         assert_eq!(decoded.outputs.len(), 2);
     }
 
@@ -392,10 +367,12 @@ mod tests {
             ..slim_batch()
         };
         let frames = vec![Bytes::from(encode_msgpack(&batch).unwrap())];
-        assert!(SglangProtocol::decode_batch(&frames, &())
-            .unwrap()
-            .load
-            .is_none());
+        assert!(
+            SglangProtocol::decode_batch(&frames, &SglangLayout::default())
+                .unwrap()
+                .load
+                .is_none()
+        );
     }
 
     #[test]
@@ -421,7 +398,7 @@ mod tests {
             engine_index: 1,
         };
         let frames = vec![Bytes::from(encode_msgpack(&reply).unwrap())];
-        let batch = SglangProtocol::decode_batch(&frames, &()).unwrap();
+        let batch = SglangProtocol::decode_batch(&frames, &SglangLayout::default()).unwrap();
         assert!(batch.outputs.is_empty() && batch.load.is_none());
         let utility = batch.utility.expect("a utility reply");
         assert_eq!(utility.call_id, 9);
@@ -445,7 +422,7 @@ mod tests {
             kv_total_tokens: 100,
         };
         let frames = vec![Bytes::from(encode_msgpack(&embeddings).unwrap())];
-        let batch = SglangProtocol::decode_batch(&frames, &()).unwrap();
+        let batch = SglangProtocol::decode_batch(&frames, &SglangLayout::default()).unwrap();
         assert_eq!(batch.finished_request_ids, vec!["e1".to_string()]);
         assert_eq!(batch.outputs[0].embedding, Some(vec![0.5]));
         assert!(batch.load.is_some());
@@ -587,5 +564,150 @@ mod tests {
         let payload = SglangProtocol::encode_abort("req-1").unwrap();
         let decoded: Vec<String> = decode_msgpack(&payload).unwrap();
         assert_eq!(decoded, vec!["req-1".to_string()]);
+    }
+
+    fn media_request(feature_bytes: usize) -> TokenizedGenerateReqInput {
+        use crate::protocol::sglang::multimodal::{
+            SglangWireMmInputs, SglangWireMmItem, SglangWireModality, SglangWireTensor,
+        };
+        let grid: Vec<u8> = [1i64, 2, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+        TokenizedGenerateReqInput {
+            rid: "mm".into(),
+            input_ids: vec![1, 7, 7, 7, 2],
+            mm_inputs: Some(SglangWireMmInputs {
+                mm_items: vec![SglangWireMmItem {
+                    modality: SglangWireModality::Image,
+                    offsets: Some(vec![(1, 3)]),
+                    feature: Some(
+                        SglangWireTensor::new(
+                            "uint8",
+                            vec![feature_bytes as u64],
+                            Bytes::from(vec![9u8; feature_bytes]),
+                        )
+                        .unwrap(),
+                    ),
+                    model_specific_data: std::collections::BTreeMap::from([(
+                        "image_grid_thw".to_string(),
+                        SglangWireTensor::new("int64", vec![1, 3], Bytes::from(grid)).unwrap(),
+                    )]),
+                }],
+                im_token_id: Some(7),
+            }),
+            ..TokenizedGenerateReqInput::default()
+        }
+    }
+
+    /// On a scheduler whose plugin resolves auxiliary frames, a tensor of the
+    /// frame bar or more leaves the payload as a frame behind it, sharing the
+    /// request's bytes, addressed one-based from its slot; the small tensors
+    /// stay inline; the metadata frame comes LAST, empty when the request
+    /// carries no trace context, the context otherwise; the request itself
+    /// is untouched.
+    #[test]
+    fn large_tensors_ride_as_frames_behind_the_payload_with_the_metadata_last() {
+        use crate::{
+            codec::{
+                decode_msgpack,
+                tensor::{WireArrayData, TENSOR_AUX_MIN_BYTES},
+            },
+            protocol::sglang::request::RequestMeta,
+        };
+        let resolving = SglangLayout {
+            tensor_aux_frames: true,
+        };
+        let request = media_request(TENSOR_AUX_MIN_BYTES);
+        let inline = encode_msgpack(&request).unwrap();
+        let pixel_ptr = request.mm_inputs.as_ref().unwrap().mm_items[0]
+            .feature
+            .as_ref()
+            .unwrap()
+            .data
+            .as_raw_view()
+            .unwrap()
+            .as_ptr();
+        let (payload, aux) =
+            SglangProtocol::encode_add(&SglangRequest::Generate(request.clone()), &resolving)
+                .unwrap();
+        assert_eq!(aux.len(), 2, "the pixel frame, then the metadata frame");
+        assert_eq!(aux[0].len(), TENSOR_AUX_MIN_BYTES);
+        assert_eq!(
+            aux[0].as_ptr(),
+            pixel_ptr,
+            "the frame shares the request's bytes"
+        );
+        assert_eq!(aux[1].as_ref(), b"\x80", "an empty metadata map");
+        assert!(payload.len() < 256, "{} bytes", payload.len());
+        let decoded: TokenizedGenerateReqInput = decode_msgpack(&payload).unwrap();
+        let item = &decoded.mm_inputs.as_ref().unwrap().mm_items[0];
+        assert_eq!(
+            item.feature.as_ref().unwrap().data,
+            WireArrayData::AuxIndex(1),
+            "the slot addresses the first frame behind the payload"
+        );
+        assert_eq!(
+            item.model_specific_data["image_grid_thw"],
+            request.mm_inputs.as_ref().unwrap().mm_items[0].model_specific_data["image_grid_thw"],
+            "the grid stays inline"
+        );
+        assert_eq!(
+            encode_msgpack(&request).unwrap(),
+            inline,
+            "the request is untouched"
+        );
+
+        // With a trace context the metadata frame carries it, still last.
+        let traced = TokenizedGenerateReqInput {
+            trace_headers: Some(std::collections::BTreeMap::from([(
+                "traceparent".to_string(),
+                "00-aa-bb-01".to_string(),
+            )])),
+            ..request.clone()
+        };
+        let (traced_payload, aux) =
+            SglangProtocol::encode_add(&SglangRequest::Generate(traced), &resolving).unwrap();
+        assert_eq!(traced_payload, payload);
+        assert_eq!(aux.len(), 2);
+        let meta: RequestMeta = decode_msgpack(&aux[1]).unwrap();
+        assert_eq!(meta.trace_headers.unwrap()["traceparent"], "00-aa-bb-01");
+
+        // Under the bar every tensor stays inline and nothing follows the
+        // payload: the one-frame message of a text request.
+        let small = media_request(TENSOR_AUX_MIN_BYTES - 1);
+        let (payload, aux) =
+            SglangProtocol::encode_add(&SglangRequest::Generate(small.clone()), &resolving)
+                .unwrap();
+        assert!(aux.is_empty());
+        assert_eq!(payload, encode_msgpack(&small).unwrap());
+    }
+
+    /// A scheduler that declares nothing (an older plugin) is sent every
+    /// tensor inline, as SGLang's own encoder writes it, whatever its size;
+    /// the metadata frame rides as before, only with a trace context.
+    #[test]
+    fn a_scheduler_that_declares_no_frames_is_sent_every_tensor_inline() {
+        use crate::codec::tensor::TENSOR_AUX_MIN_BYTES;
+        let request = media_request(4 * TENSOR_AUX_MIN_BYTES);
+        let (payload, aux) = SglangProtocol::encode_add(
+            &SglangRequest::Generate(request.clone()),
+            &SglangLayout::default(),
+        )
+        .unwrap();
+        assert!(aux.is_empty());
+        assert_eq!(payload, encode_msgpack(&request).unwrap());
+        assert!(payload.len() > 4 * TENSOR_AUX_MIN_BYTES);
+        let ready = EngineCoreReadyResponse {
+            tensor_aux_frames: true,
+            ..crate::mock_engine::default_ready_response()
+        };
+        assert_eq!(
+            SglangProtocol::read_layout(&ready),
+            SglangLayout {
+                tensor_aux_frames: true
+            }
+        );
+        assert_eq!(
+            SglangProtocol::read_layout(&crate::mock_engine::default_ready_response()),
+            SglangLayout::default()
+        );
     }
 }

@@ -1,0 +1,45 @@
+name: E2E MCP mock
+
+on:
+  pull_request:
+    paths:
+      - e2e_test/infra/mock_mcp_server.py
+      - e2e_test/infra/test_mock_mcp_server.py
+      - e2e_test/pyproject.toml
+      - scripts/ci_install_e2e_deps.sh
+      - scripts/tests/test_ci_engine_http_dependencies.py
+      - .github/workflows/e2e-mcp-mock.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-mcp-mock-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  protocol:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+        # HTTP requirements from TRT-LLM 1.3.0rc24 and ROCm vLLM 0.31.
+        http:
+          - mcp: "mcp<2.0.0"
+            fastapi: "fastapi<=0.121.3,>=0.120.1"
+            starlette: "starlette>=0.49.1"
+          - mcp: "mcp>=2.0.0,<3"
+            fastapi: "fastapi[standard]>=0.133.0,<0.137.0"
+            starlette: "starlette>=1.0.1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install '${{ matrix.http.mcp }}' '${{ matrix.http.fastapi }}' '${{ matrix.http.starlette }}' ./e2e_test
+      - run: python -m pip check
+      - run: python -m pytest -q --noconftest e2e_test/infra/test_mock_mcp_server.py scripts/tests/test_ci_engine_http_dependencies.py
+        env:
+          PYTHONPATH: e2e_test
