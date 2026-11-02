@@ -101,6 +101,45 @@ impl Frame {
     }
 }
 
+/// The top alternatives of one output position on a token wire: the sampled
+/// id first, then the others, with their logprobs in the same order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TopAlternatives {
+    pub ids: Vec<u32>,
+    pub values: Vec<f32>,
+}
+
+/// Up to `k` alternatives for `sampled`: itself first at `logprob`, then the
+/// pool's other distinct entries in order from its first occurrence on
+/// (wrapping), each half a nat less likely than the one before. Keyed by
+/// value, not by position: a repeated entry reads the same alternatives
+/// wherever it stands, which keeps a streamed chunk's reading the whole
+/// answer's.
+fn top_k<T: Clone + PartialEq>(
+    pool: &[T],
+    sampled: &T,
+    logprob: f32,
+    k: usize,
+) -> (Vec<T>, Vec<f32>) {
+    let mut picked = vec![sampled.clone()];
+    let start = pool
+        .iter()
+        .position(|entry| entry == sampled)
+        .map_or(0, |at| at + 1);
+    for other in pool.iter().cycle().skip(start).take(pool.len()) {
+        if picked.len() == k {
+            break;
+        }
+        if !picked.contains(other) {
+            picked.push(other.clone());
+        }
+    }
+    let values = (0..picked.len())
+        .map(|rank| logprob - 0.5 * rank as f32)
+        .collect();
+    (picked, values)
+}
+
 /// An answer with the key it is filed under, when it has one.
 pub struct Scripted {
     pub key: Option<String>,
@@ -416,6 +455,52 @@ impl Answer {
             },
             |range| pieces[range].to_vec(),
         )
+    }
+
+    /// The top alternatives of some output tokens, as a request asking for
+    /// `top_logprobs` reads them: at most `k` entries per position, the
+    /// sampled token first with its own logprob, then the answer's other
+    /// distinct tokens in output order from the token's first occurrence in
+    /// the answer on (wrapping), each half a nat less likely than the one
+    /// before; a token the answer repeats reads the same alternatives at each
+    /// of its positions. The alternatives are the answer's own
+    /// tokens, so they decode under the request's tokenizer; an answer with
+    /// fewer distinct tokens than `k` reports fewer. Empty when `k` is 0 or
+    /// the logprobs do not align with the tokens.
+    pub fn top_logprobs(&self, ids: &[u32], logprobs: &[f32], k: usize) -> Vec<TopAlternatives> {
+        if k == 0 || ids.len() != logprobs.len() {
+            return Vec::new();
+        }
+        ids.iter()
+            .zip(logprobs)
+            .map(|(sampled, &logprob)| {
+                let (ids, values) = top_k(&self.output_ids, sampled, logprob, k);
+                TopAlternatives { ids, values }
+            })
+            .collect()
+    }
+
+    /// The top alternatives of some text pieces, the text wire's reading of
+    /// [`Self::top_logprobs`]: the piece first, then the answer's other
+    /// distinct pieces, up to `k` per position, each with its logprob.
+    pub fn top_pieces(
+        &self,
+        pieces: &[String],
+        logprobs: &[f32],
+        k: usize,
+    ) -> Vec<Vec<(String, f32)>> {
+        if k == 0 || pieces.len() != logprobs.len() {
+            return Vec::new();
+        }
+        let pool = self.output_text.as_deref().unwrap_or(&[]);
+        pieces
+            .iter()
+            .zip(logprobs)
+            .map(|(sampled, &logprob)| {
+                let (pieces, values) = top_k(pool, sampled, logprob, k);
+                pieces.into_iter().zip(values).collect()
+            })
+            .collect()
     }
 
     fn frames(

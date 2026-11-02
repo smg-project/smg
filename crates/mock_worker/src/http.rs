@@ -365,6 +365,20 @@ fn wants_logprobs(endpoint: Endpoint, request: &Value) -> bool {
     }
 }
 
+/// How many top alternatives the request asked for per token: chat's
+/// `top_logprobs`, a completion's `logprobs: <n>` (the sampled token counts
+/// as one of them).
+fn wants_top(endpoint: Endpoint, request: &Value) -> usize {
+    let key = match endpoint {
+        Endpoint::Chat => "top_logprobs",
+        Endpoint::Completions => "logprobs",
+    };
+    request
+        .get(key)
+        .and_then(Value::as_u64)
+        .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX))
+}
+
 /// The usage block of a scripted answer.
 fn scripted_usage(answer: &Answer, prompt_len: usize) -> Value {
     let prompt_tokens = answer.prompt_tokens(prompt_len);
@@ -378,21 +392,41 @@ fn scripted_usage(answer: &Answer, prompt_len: usize) -> Value {
 }
 
 /// The logprobs of some text pieces in the endpoint's shape: chat's
-/// `content` entries, a completion's parallel `tokens` and `token_logprobs`.
-fn scripted_logprobs(endpoint: Endpoint, pieces: &[String], logprobs: &[f32]) -> Value {
+/// `content` entries, a completion's parallel `tokens` and `token_logprobs`,
+/// with the answer's `top` alternatives per piece where the request asked for
+/// them (chat's entry list, a completion's piece-to-logprob map).
+fn scripted_logprobs(
+    endpoint: Endpoint,
+    answer: &Answer,
+    pieces: &[String],
+    logprobs: &[f32],
+    top: usize,
+) -> Value {
+    let mut alternatives = answer.top_pieces(pieces, logprobs, top).into_iter();
     match endpoint {
         Endpoint::Chat => json!({
             "content": pieces.iter().zip(logprobs).map(|(piece, logprob)| json!({
                 "token": piece,
                 "logprob": logprob,
                 "bytes": Value::Null,
-                "top_logprobs": [],
+                "top_logprobs": alternatives.next().unwrap_or_default().into_iter().map(|(token, logprob)| json!({
+                    "token": token,
+                    "logprob": logprob,
+                    "bytes": Value::Null,
+                })).collect::<Vec<Value>>(),
             })).collect::<Vec<Value>>(),
         }),
         Endpoint::Completions => json!({
             "tokens": pieces,
             "token_logprobs": logprobs,
-            "top_logprobs": pieces.iter().map(|_| json!({})).collect::<Vec<Value>>(),
+            "top_logprobs": pieces.iter().map(|_| {
+                alternatives
+                    .next()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(token, logprob)| (token, json!(logprob)))
+                    .collect::<serde_json::Map<String, Value>>()
+            }).collect::<Vec<serde_json::Map<String, Value>>>(),
             "text_offset": [],
         }),
     }
@@ -414,6 +448,11 @@ async fn scripted_response(
     in_flight: InFlight,
 ) -> Response {
     let want_logprobs = wants_logprobs(endpoint, request);
+    let top = if want_logprobs {
+        wants_top(endpoint, request)
+    } else {
+        0
+    };
     let usage = scripted_usage(&answer, prompt_len);
     let model = cfg.model_id.clone();
     let frames = answer.text_frames();
@@ -429,6 +468,7 @@ async fn scripted_response(
             answer,
             frames,
             want_logprobs,
+            top,
             usage,
         )))
         .into_response();
@@ -457,7 +497,7 @@ async fn scripted_response(
         (want_logprobs, &answer.output_text, &answer.logprobs)
     {
         if pieces.len() == logprobs.len() {
-            choice["logprobs"] = scripted_logprobs(endpoint, pieces, logprobs);
+            choice["logprobs"] = scripted_logprobs(endpoint, &answer, pieces, logprobs, top);
         }
     }
     let body = match endpoint {
@@ -489,6 +529,7 @@ fn scripted_frames(
     answer: Answer,
     frames: Vec<script::Frame>,
     want_logprobs: bool,
+    top: usize,
     usage: Option<Value>,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     struct Scripted {
@@ -497,6 +538,7 @@ fn scripted_frames(
         answer: Answer,
         frames: std::collections::VecDeque<script::Frame>,
         want_logprobs: bool,
+        top: usize,
         usage: Option<Value>,
         started: bool,
         finished: bool,
@@ -508,6 +550,7 @@ fn scripted_frames(
         answer,
         frames: frames.into(),
         want_logprobs,
+        top,
         usage,
         started: false,
         finished: false,
@@ -565,7 +608,13 @@ fn scripted_frames(
             && !frame.logprobs.is_empty()
             && frame.logprobs.len() == frame.pieces.len()
         {
-            choice["logprobs"] = scripted_logprobs(st.endpoint, &frame.pieces, &frame.logprobs);
+            choice["logprobs"] = scripted_logprobs(
+                st.endpoint,
+                &st.answer,
+                &frame.pieces,
+                &frame.logprobs,
+                st.top,
+            );
         }
         st.started = true;
         let frame = scripted_chunk(st.endpoint, &st.model, choice);
