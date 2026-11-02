@@ -45,6 +45,7 @@ use crate::{
                     streaming::{
                         attach_mcp_server_label, OutputItemKind, ResponseStreamEventEmitter,
                     },
+                    utils::function_call_status,
                 },
             },
             context,
@@ -651,6 +652,9 @@ impl HarmonyStreamingProcessor {
         pd_timing: Option<context::PdTiming>,
     ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
         let mut decode = ResponsesDecode::new(pd_timing)?;
+        // A fresh iteration: no finish until its terminal frame names one, so the finish of an
+        // earlier turn of the request never reads for this one.
+        emitter.set_finish_reason(None);
         // Each read races the engine against the client's leaving (see `next_response`).
         loop {
             let result = match next_response(&mut decode_stream, tx).await {
@@ -708,6 +712,9 @@ struct ResponsesDecode {
     final_text: String,
     /// The calls the terminal frame or the recovery found.
     tool_calls: Option<Vec<ToolCall>>,
+    /// The turn's finish reason as the parser reads it (`tool_calls` when the turn ended on
+    /// closed calls, else the engine's), once the terminal frame came.
+    finish_reason: Option<String>,
     /// The message item the first final-channel delta opened: its output index and id.
     message: Option<(usize, String)>,
     content_part_added: bool,
@@ -742,6 +749,7 @@ impl ResponsesDecode {
             has_analysis: false,
             final_text: String::new(),
             tool_calls: None,
+            finish_reason: None,
             message: None,
             content_part_added: false,
             calls: HashMap::new(),
@@ -988,6 +996,11 @@ impl ResponsesDecode {
         self.finalized_analysis = final_output.analysis;
         self.tool_calls = final_output.commentary;
         self.reasoning_token_count = final_output.reasoning_token_count;
+        // Each closed call reads its status under this finish, the message item through the
+        // emitter, and the terminal event and the stored object their own, as the regular
+        // stream's do under the final chunk's.
+        self.finish_reason = Some(final_output.finish_reason);
+        emitter.set_finish_reason(self.finish_reason.as_deref());
 
         self.close_calls(emitter, tx, session).await;
         self.close_message(emitter, tx).await;
@@ -1032,13 +1045,21 @@ impl ResponsesDecode {
 
             let type_str =
                 ResponseStreamEventEmitter::type_str_for_format(response_format.as_ref());
+            // A function call's status is read under this iteration's finish (none when the
+            // stream ended before its terminal frame): a recovered call the finish cut is
+            // `incomplete`, and the response reads it as cut. A hosted or MCP call's item keeps
+            // `completed`; its result replaces the item.
+            let status = match response_format {
+                Some(_) => "completed",
+                None => function_call_status(self.finish_reason.as_deref(), args_str),
+            };
             let mut item = json!({
                 "id": item_id,
                 "type": type_str,
                 "name": tool_name,
                 "call_id": &tool_call.id,
                 "arguments": args_str,
-                "status": "completed"
+                "status": status
             });
             let label = session
                 .map(|s| s.resolve_tool_server_label(tool_name))
@@ -1152,6 +1173,7 @@ impl ResponsesDecode {
                 partial_text: self.final_text,
                 usage,
                 request_id: emitter.response_id.clone(),
+                finish_reason: self.finish_reason,
             };
         }
         // For streaming, the caller builds the response from the SSE events; this result's

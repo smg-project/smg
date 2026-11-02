@@ -233,6 +233,16 @@ impl ResponseStreamEventEmitter {
         self.original_request = Some(request);
     }
 
+    /// The finish reason of the iteration a stream that drives the emitter
+    /// through its own events (never through chat chunks) has just read,
+    /// `None` when its stream ended before the terminal frame: the terminal
+    /// event and the stored object read their status from it, as they read
+    /// the final chunk's. Written once per iteration, so the finish of an
+    /// earlier turn of the request never reads for a later one.
+    pub(crate) fn set_finish_reason(&mut self, finish_reason: Option<&str>) {
+        self.finish_reason = finish_reason.map(str::to_string);
+    }
+
     /// Update tool call output items with tool execution results.
     ///
     /// Replaces each matched item's stored payload with the authoritative
