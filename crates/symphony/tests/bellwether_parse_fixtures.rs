@@ -248,14 +248,22 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // DeepSeek V4.1 writes DSML and opens the thought in the prompt (`<think>`, no newline).
     ("deepseek-v4.1-flash", GenerationPrompt::OpensTheThought),
     // DeepSeek V3.2 and V3.2-Speciale write DSML; the encoder ends the prompt with `<think>` in
-    // thinking mode and `</think>` in chat mode, right after `<｜Assistant｜>`. bellwether holds
-    // their manifests and no set yet: each slug is skipped with the notice until the pin holds it.
+    // thinking mode and `</think>` in chat mode, right after `<｜Assistant｜>`. Chat mode is its
+    // default: only a request that turns thinking on opens the thought, so a recorded case that
+    // leaves the switch alone starts in content. bellwether holds their manifests and no set yet:
+    // each slug is skipped with the notice until the pin holds it.
     // DeepSeek-V3.2-Exp ships a chat template in V3.1's spelling, but the engine renders its
     // architecture through the same encoder, and bellwether records it so: its sets read with the
     // V3.2 table and this statement.
-    ("deepseek-v3.2", GenerationPrompt::OpensTheThought),
-    ("deepseek-v3.2-speciale", GenerationPrompt::OpensTheThought),
-    ("deepseek-v3.2-exp", GenerationPrompt::OpensTheThought),
+    ("deepseek-v3.2", GenerationPrompt::OpensTheThoughtWhenAsked),
+    (
+        "deepseek-v3.2-speciale",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
+    (
+        "deepseek-v3.2-exp",
+        GenerationPrompt::OpensTheThoughtWhenAsked,
+    ),
     // The Kimi K2 line reads with one table, and each template ends the generation prompt its own
     // way: K2 Instruct and Instruct-0905 write no thought; K2 Thinking ends at the turn's opener
     // and the model writes its own `<think>`; K2.5, K2.6 and K2.7-Code open the thought in the
@@ -1188,10 +1196,6 @@ const REFUSED_PROBES: &[(&str, &str)] = &[
         "llama-3-3-nemotron-super-49b-v1-5",
         "parse/reasoning-with-marker-text",
     ),
-    // Its reference is the V3.2 encoder in chat mode (the probe's request leaves the switch
-    // alone), which writes no thought; the checkpoint's own template, which rendered the earlier
-    // set, closed it too: the reasoning probe is not among the slug's fixtures either way.
-    ("deepseek-v3.2-exp", "parse/reasoning-with-marker-text"),
 ];
 
 /// The reasoning probe: its reasoning holds a `</think>`, which every table with that marker
