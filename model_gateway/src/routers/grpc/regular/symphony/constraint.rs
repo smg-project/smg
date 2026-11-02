@@ -419,6 +419,21 @@ impl<'a> Asks<'a> {
             Self::Messages { .. } => false,
         }
     }
+
+    /// The request asked for generation past the model's own end of output (a chat request's
+    /// `ignore_eos`; a Messages request cannot ask it): the engine keeps sampling after the
+    /// end-of-turn token, and the gateway's stop decoder does not stop on it either
+    /// (`utils::create_stop_decoder`), so the output the table reads carries an unconstrained
+    /// tail after the model's answer. A marker of the table in that tail is the tail's doing,
+    /// not a frame the table failed to read, and the tally counts every such marker of the
+    /// output apart, the answer's own included
+    /// ([`Assignment::past_the_end`](super::reader::Assignment::past_the_end)).
+    pub(super) fn past_the_end(self) -> bool {
+        match self {
+            Self::Chat(request) => request.ignore_eos,
+            Self::Messages { .. } => false,
+        }
+    }
 }
 
 /// The tools the request's `choice` leaves callable among `declared`: none for a `tool_choice` of

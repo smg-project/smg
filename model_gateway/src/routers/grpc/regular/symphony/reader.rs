@@ -38,6 +38,11 @@ pub(crate) struct Assignment {
     /// [`Asks::forbids_calls_for`]): the reader drops every call, as the engine's own server reads
     /// such a call and withholds it.
     pub forbids_calls: bool,
+    /// The request asked for generation past the model's own end of output (`ignore_eos`,
+    /// [`Asks::past_the_end`]): the output carries an unconstrained tail after the answer, which
+    /// the reader reads and delivers like the rest, and a marker of the table kept as text in it
+    /// is no failure of the table's reading ([`Tally::new`]).
+    pub past_the_end: bool,
 }
 
 impl Assignment {
@@ -53,6 +58,7 @@ pub(super) fn assignment(
     model: &str,
     prompt: &str,
     forbids_calls: bool,
+    past_the_end: bool,
 ) -> Assignment {
     debug!(model, table = format.name(), "Symphony reads the response");
     let prompt = format.replay(prompt).to_string();
@@ -60,6 +66,7 @@ pub(super) fn assignment(
         format,
         prompt,
         forbids_calls,
+        past_the_end,
     }
 }
 
@@ -213,6 +220,7 @@ pub(crate) fn assign_for(
         asks.model(),
         prompt,
         asks.forbids_calls_for(provider),
+        asks.past_the_end(),
     )))
 }
 
@@ -341,7 +349,7 @@ impl Reader {
         let mut reader = Self {
             table: assignment.table(),
             engine: Engine::shared(Arc::clone(&assignment.format), Declared::shared(tools)),
-            tally: Tally::default(),
+            tally: Tally::new(assignment.past_the_end),
             last_token: None,
             read: 0,
             ended: false,
@@ -743,6 +751,7 @@ mod tests {
             format: Arc::new(format),
             prompt: prompt.to_string(),
             forbids_calls: false,
+            past_the_end: false,
         };
         // A step's events borrow its delta, as a stream's do: each piece is a step of its own,
         // its events taken owned before the next.
@@ -1759,6 +1768,46 @@ mod tests {
         assert_eq!(messages(json!({})).call_syntax(), None);
     }
 
+    /// A chat request's `ignore_eos` reaches the assignment as `past_the_end`, so the reader's
+    /// tally knows the output carries an unconstrained tail; a request without it, and a
+    /// Messages request, which cannot ask it, read as before.
+    #[test]
+    fn a_request_that_ignores_the_end_assigns_a_reader_that_knows_it() {
+        let forced = assign(
+            ParserChoice::Symphony,
+            &ModelNames::default(),
+            &request(json!({"ignore_eos": true})),
+            None,
+            PROMPT,
+        )
+        .expect("assigned");
+        assert!(forced.past_the_end);
+        assert_eq!(forced.format.name(), "qwen3");
+        let plain = assign(
+            ParserChoice::Symphony,
+            &ModelNames::default(),
+            &request(json!({})),
+            None,
+            PROMPT,
+        )
+        .expect("assigned");
+        assert!(!plain.past_the_end);
+        let messages = super::assign(
+            ParserChoice::Symphony,
+            &ModelNames::default(),
+            Asks::Messages {
+                request: &message_request(json!({})),
+                continues: false,
+            },
+            None,
+            PROMPT,
+            &templates(),
+        )
+        .expect("read")
+        .expect("assigned");
+        assert!(!messages.past_the_end);
+    }
+
     #[test]
     fn a_known_model_is_assigned_its_table_and_the_prompts_replay() {
         let assignment = assign(
@@ -1827,6 +1876,7 @@ mod tests {
             format: Arc::new(symphony::formats::inkling().without_calls()),
             prompt: "<|message_model|>".to_string(),
             forbids_calls: false,
+            past_the_end: false,
         };
         let json = "{\"city\": \"Oslo\", \"country\": \"Norway\"}";
         let thought = "<|content_thinking|>plan<|end_message|><|message_model|><|content_text|>";
@@ -1898,6 +1948,7 @@ mod tests {
             format: Arc::new(glm4()),
             prompt: GLM4_PROMPT.to_string(),
             forbids_calls: false,
+            past_the_end: false,
         };
         let pieces = [
             "\n<think></think>\n<tool_call>answer_string\n<arg_key>answer</arg_key>\n<arg_value>",
@@ -1954,6 +2005,7 @@ mod tests {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: String::new(),
             forbids_calls: false,
+            past_the_end: false,
         };
         let mut events = Events::new();
         let mut reader = Reader::new(&assignment, Arc::default(), &mut events).expect("a reader");
@@ -1976,6 +2028,7 @@ mod tests {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: String::new(),
             forbids_calls: false,
+            past_the_end: false,
         };
         let tokenizer: Arc<dyn Tokenizer> = Arc::new(Refusing::default());
         let mut decoder = StopSequenceDecoder::new(
@@ -2100,6 +2153,7 @@ mod tests {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: "<|im_start|>assistant\n".to_string(),
             forbids_calls: false,
+            past_the_end: false,
         };
         let calls = |first_only: bool| {
             let mut events = Events::new();
@@ -2130,6 +2184,7 @@ mod tests {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: String::new(),
             forbids_calls: false,
+            past_the_end: false,
         };
         let first_run_at = |steps: &[&str]| -> (Option<usize>, usize) {
             let mut events = Events::new();
@@ -2177,6 +2232,7 @@ mod tests {
             format: Arc::new(symphony::formats::json().without_calls()),
             prompt: String::new(),
             forbids_calls: false,
+            past_the_end: false,
         };
         let mut events = Events::new();
         let mut reader = Reader::new(&assignment, Arc::default(), &mut events).expect("a reader");
@@ -2210,6 +2266,7 @@ mod tests {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: "<|im_start|>assistant\n".to_string(),
             forbids_calls: true,
+            past_the_end: false,
         };
         let mut events = Vec::new();
         let scrape = rendered(|| {
@@ -2259,6 +2316,7 @@ mod tests {
         // The same output under `auto` is a call: the ask, not the table, decides.
         let allowed = Assignment {
             forbids_calls: false,
+            past_the_end: false,
             ..assignment
         };
         let mut out = Events::new();
@@ -2452,6 +2510,7 @@ mod tests {
                 format: Arc::new(format),
                 prompt: prompt.to_string(),
                 forbids_calls: false,
+                past_the_end: false,
             };
             let mut replayed = Events::new();
             let mut reader =
