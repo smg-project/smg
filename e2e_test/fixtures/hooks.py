@@ -332,10 +332,12 @@ def _filter_tokenspeed_rust_items(
         param = _setup_backend_param(item)
         workers = _workers_marker_kwargs(item)
         # A wire this lane does not serve: anything but the local wires and
-        # the prefill/decode and encode-prefill-decode topologies.
+        # the prefill/decode and encode-prefill-decode topologies. The wire is
+        # the param's mode: a topology tuple may carry per-pool dicts, which
+        # no set membership can hash.
         unserved_wire = (
             param is not None
-            and param not in _ZMQ_LOCAL_WIRES
+            and _topology_mode(param) not in _ZMQ_LOCAL_WIRES
             and not (_is_pd_topology(param) or _is_epd_topology(param))
         )
         pd_workers = bool(workers.get("prefill") or workers.get("decode"))
@@ -366,8 +368,12 @@ def _filter_sglang_rust_items(
         param = _setup_backend_param(item)
         # The wires this servicer serves: the local ones and the
         # prefill/decode topologies; EPD and anything else stay with Python.
+        # The wire is the param's mode (a topology tuple may carry per-pool
+        # dicts, which no set membership can hash).
         unserved_wire = (
-            param is not None and param not in _ZMQ_LOCAL_WIRES and not _is_pd_param(param)
+            param is not None
+            and _topology_mode(param) not in _ZMQ_LOCAL_WIRES
+            and not _is_pd_param(param)
         )
         if unserved_wire or _is_epd_worker_set(item):
             deselected.append(item)

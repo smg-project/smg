@@ -310,6 +310,23 @@ def test_tokenspeed_rust_lane_drops_only_unserved_wires_and_plain_fleets():
     pd = _FakeItem(
         "router/test_pd_topologies.py::T::t[1p1d]", params={"setup_backend": ("pd_grpc", (1, 1))}
     )
+    # A topology whose pools carry a dict (per-pool transports or environment):
+    # the whole param cannot be hashed, its mode still names the wire.
+    pd_mixed = _FakeItem(
+        "router/test_pd_topologies.py::T::t[2p2d-mixed]",
+        params={
+            "setup_backend": (
+                "pd_grpc",
+                (2, 2, {"prefill_kv": ["nixl", "mooncake"], "decode_kv": ["nixl", "mooncake"]}),
+            )
+        },
+    )
+    pd_env = _FakeItem(
+        "router/test_pd_topologies.py::T::t[1p1d-env]",
+        params={
+            "setup_backend": ("pd_grpc", (1, 1, {"prefill_env": {"SMG_PAIRING_PROTOCOL": "kv-v1"}}))
+        },
+    )
     pd_workers = _FakeItem(
         "router/test_pd_responses.py::t", markers={"workers": workers(prefill=1, decode=1)}
     )
@@ -322,10 +339,12 @@ def test_tokenspeed_rust_lane_drops_only_unserved_wires_and_plain_fleets():
     plain = _FakeItem("chat_completions/test_openai_server.py::t", params={"setup_backend": "grpc"})
     other = _FakeItem("router/test_other_wire.py::t", params={"setup_backend": "mesh_grpc"})
     kept, deselected = hooks._filter_tokenspeed_rust_items(
-        [pd, pd_workers, epd, admin, fleet, plain, other]
+        [pd, pd_mixed, pd_env, pd_workers, epd, admin, fleet, plain, other]
     )
     assert [item.nodeid for item in kept] == [
         pd.nodeid,
+        pd_mixed.nodeid,
+        pd_env.nodeid,
         pd_workers.nodeid,
         epd.nodeid,
         admin.nodeid,
@@ -342,6 +361,17 @@ def test_sglang_rust_lane_drops_only_what_the_msgpack_wire_lacks():
         "e2e_test/chat_completions/test_pd.py::test_pd[pd_mooncake]",
         params={"setup_backend": "pd_mooncake"},
     )
+    # A topology whose pools carry a dict: the whole param cannot be hashed,
+    # its mode still names the wire.
+    pd_mixed = _FakeItem(
+        "e2e_test/router/test_pd_topologies.py::test_pd[2p2d-mixed]",
+        params={
+            "setup_backend": (
+                "pd_grpc",
+                (2, 2, {"prefill_kv": ["nixl", "mooncake"], "decode_kv": ["nixl", "mooncake"]}),
+            )
+        },
+    )
     epd = _FakeItem(
         "e2e_test/chat_completions/test_epd.py::test_epd[1e1p1d]",
         params={"setup_backend": ("epd_grpc", (1, 1, 1))},
@@ -357,11 +387,11 @@ def test_sglang_rust_lane_drops_only_what_the_msgpack_wire_lacks():
     embed = _FakeItem(
         "e2e_test/embeddings/test_basic.py::test_embed[grpc]", params={"setup_backend": "grpc"}
     )
-    kept, deselected = hooks._filter_sglang_rust_items([chat, pd, epd, mm, admin, embed])
+    kept, deselected = hooks._filter_sglang_rust_items([chat, pd, pd_mixed, epd, mm, admin, embed])
     # Prefill/decode topologies, multimodal payloads, admin ops and embeddings
     # ride the wire (the bootstrap slots, the scheduler's processor output,
     # control calls, embedding requests); the EPD encode dispatch does not.
-    assert kept == [chat, pd, mm, admin, embed] and deselected == [epd]
+    assert kept == [chat, pd, pd_mixed, mm, admin, embed] and deselected == [epd]
 
 
 # ---------------------------------------------------------------------------
