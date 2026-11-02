@@ -55,11 +55,14 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
     // `<｜Assistant｜><think>` ends the prompt when thinking is on.
     think_in_prefill: true,
     // The shim reads the engine's `enable_thinking` alias too. The encoder
-    // writes a system message after the first as bare text and the
-    // assistant header after user and developer turns only
-    // (`render_message`), so the gateway renders a system message sent
-    // after the first as a user turn, which the encoder merges into the
-    // turn before it and follows with the header.
+    // writes a system message after the first as bare text with no role
+    // marker, and opens the assistant turn after it only when it ends the
+    // conversation or an assistant turn follows (`render_turn_open`); on
+    // the Messages path the gateway renders a system message sent after
+    // the first as a user turn, which sets the text off from the turn
+    // before it (a role marker of its own after an assistant turn, a blank
+    // line inside a user turn); both forms take the header when the message
+    // ends the conversation or an assistant turn follows.
     capabilities: RendererCapabilities {
         enable_thinking_alias: true,
         leading_system_only: true,
@@ -398,7 +401,8 @@ fn render_assistant(prompt: &mut String, parts: &AssistantParts<'_>) {
 /// The transition tokens after a message, by what follows it: nothing
 /// before a message that is neither the assistant's nor a latest reminder;
 /// a task's token (an action task after the assistant token and the
-/// thinking token); after a user or developer message the assistant token
+/// thinking token); after a user or developer message, or a system message
+/// that takes the header ([`system_opens_the_turn`]), the assistant token
 /// and the thinking token that opens or closes the thinking.
 fn render_turn_open(
     prompt: &mut String,
@@ -437,7 +441,7 @@ fn render_turn_open(
             // Non-action tasks: append task sp token directly after the message.
             prompt.push_str(sp_token);
         }
-    } else if matches!(role, "user" | "developer") {
+    } else if matches!(role, "user" | "developer") || system_opens_the_turn(messages, index, role) {
         // Normal generation: append Assistant + thinking token.
         prompt.push_str(ASSISTANT);
         let opens_thinking = thinking_mode == ThinkingMode::Thinking
@@ -449,6 +453,19 @@ fn render_turn_open(
         }
     }
     Ok(())
+}
+
+/// Whether a system message takes the assistant header, as the serving
+/// engine's copy of the encoder renders it: a trailing system message opens
+/// generation, and one an assistant turn follows opens that history turn;
+/// one a user turn, a tool result or a latest reminder follows stays bare
+/// text (the checkpoint's own encoder file opens the turn after user and
+/// developer turns only).
+fn system_opens_the_turn(messages: &[Value], index: usize, role: &str) -> bool {
+    role == "system"
+        && messages
+            .get(index + 1)
+            .is_none_or(|next| next.get("role").and_then(Value::as_str) == Some("assistant"))
 }
 
 // ---------------------------------------------------------------------------
@@ -536,7 +553,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        super::deepseek_common::{ASSISTANT_SP_TOKEN, USER_SP_TOKEN},
+        super::deepseek_common::{ASSISTANT_SP_TOKEN, LATEST_REMINDER_SP_TOKEN, USER_SP_TOKEN},
         *,
     };
 
@@ -702,14 +719,15 @@ mod tests {
             "<{DSML_TOKEN}parameter name=\"limit\" string=\"false\">5</{DSML_TOKEN}parameter>"
         )));
     }
-    /// A system message after the first renders as the reference renders
-    /// it: bare text with no role marker, and no assistant header after one
-    /// that ends the conversation (the header follows user and developer
-    /// turns only), which is why the profile declares `leading_system_only`.
-    /// The same messages as user turns, what the gateway renders for such a
-    /// renderer, merge into the turn before them and take the header.
+    /// A system message after the first renders as the serving engine's copy
+    /// of the encoder renders it: bare text with no role marker, and the
+    /// assistant header after it when it ends the conversation or an
+    /// assistant turn follows. The same messages as user turns, what the
+    /// gateway's Messages path renders for a `leading_system_only` renderer,
+    /// are set off from the turn before them by a blank line and take the
+    /// same headers.
     #[test]
-    fn a_system_message_after_the_first_has_no_turn_of_its_own() {
+    fn a_system_message_after_the_first_opens_the_turn_it_ends_or_an_assistant_turn_follows() {
         let system = |text: &str| json!({ "role": "system", "content": text });
         let assistant = json!({ "role": "assistant", "content": "A" });
         let in_place = [
@@ -724,7 +742,10 @@ mod tests {
             encode_messages(&in_place, ThinkingMode::Thinking, &EncodeParams::default()).unwrap();
         assert_eq!(
             out,
-            format!("{BOS_TOKEN}S{USER_SP_TOKEN}TaskEnvA{EOS_TOKEN}{USER_SP_TOKEN}Q2Note")
+            format!(
+                "{BOS_TOKEN}S{USER_SP_TOKEN}TaskEnv{ASSISTANT_SP_TOKEN}{THINKING_END_TOKEN}A{EOS_TOKEN}\
+                 {USER_SP_TOKEN}Q2Note{ASSISTANT_SP_TOKEN}{THINKING_START_TOKEN}"
+            )
         );
 
         let as_user_turns = [
@@ -746,6 +767,136 @@ mod tests {
             format!(
                 "{BOS_TOKEN}S{USER_SP_TOKEN}Task\n\nEnv{ASSISTANT_SP_TOKEN}{THINKING_END_TOKEN}A{EOS_TOKEN}\
                  {USER_SP_TOKEN}Q2\n\nNote{ASSISTANT_SP_TOKEN}{THINKING_START_TOKEN}"
+            )
+        );
+    }
+
+    /// A system message that ends the conversation opens the assistant
+    /// turn in both modes, the thinking token after the header as after a
+    /// user turn; the checkpoint's own encoder file leaves the prompt
+    /// without the header, the serving engine's copy writes it.
+    #[test]
+    fn a_trailing_system_message_opens_the_assistant_turn() {
+        let msgs = [
+            json!({ "role": "system", "content": "You are a terse assistant." }),
+            user("Hello."),
+            json!({ "role": "system", "content": "Answer in French." }),
+        ];
+        for (mode, think) in [
+            (ThinkingMode::Thinking, THINKING_START_TOKEN),
+            (ThinkingMode::Chat, THINKING_END_TOKEN),
+        ] {
+            let out = encode_messages(&msgs, mode, &EncodeParams::default()).unwrap();
+            assert_eq!(
+                out,
+                format!(
+                    "{BOS_TOKEN}You are a terse assistant.{USER_SP_TOKEN}Hello.Answer in French.\
+                     {ASSISTANT_SP_TOKEN}{think}"
+                )
+            );
+        }
+    }
+
+    /// The neighbours of the trailing case: a system message a user turn
+    /// follows stays bare text with no header, one an assistant turn
+    /// follows opens that history turn (closed thinking before the last
+    /// user turn under the default `drop_thinking`).
+    #[test]
+    fn a_system_message_inside_the_conversation_takes_the_header_before_an_assistant_turn_only() {
+        let note = json!({ "role": "system", "content": "Answer in French." });
+        let before_user = [user("Hello."), note.clone(), user("How are you?")];
+        let out = encode_messages(
+            &before_user,
+            ThinkingMode::Thinking,
+            &EncodeParams::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "{BOS_TOKEN}{USER_SP_TOKEN}Hello.Answer in French.{USER_SP_TOKEN}How are you?\
+                 {ASSISTANT_SP_TOKEN}{THINKING_START_TOKEN}"
+            )
+        );
+
+        let before_assistant = [
+            user("Hello."),
+            note,
+            json!({ "role": "assistant", "content": "Bonjour." }),
+            user("How are you?"),
+        ];
+        let out = encode_messages(
+            &before_assistant,
+            ThinkingMode::Thinking,
+            &EncodeParams::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "{BOS_TOKEN}{USER_SP_TOKEN}Hello.Answer in French.{ASSISTANT_SP_TOKEN}{THINKING_END_TOKEN}\
+                 Bonjour.{EOS_TOKEN}{USER_SP_TOKEN}How are you?{ASSISTANT_SP_TOKEN}{THINKING_START_TOKEN}"
+            )
+        );
+    }
+
+    /// The first system message takes the header before a history assistant
+    /// turn too: the serving engine's copy of the encoder has no index rule
+    /// (the family's newer encoder leaves a first system message bare there).
+    #[test]
+    fn the_first_system_message_takes_the_header_before_an_assistant_turn() {
+        let msgs = [
+            json!({ "role": "system", "content": "S" }),
+            json!({ "role": "assistant", "content": "Hi!" }),
+            user("Q"),
+        ];
+        for (mode, think) in [
+            (ThinkingMode::Thinking, THINKING_START_TOKEN),
+            (ThinkingMode::Chat, THINKING_END_TOKEN),
+        ] {
+            let out = encode_messages(&msgs, mode, &EncodeParams::default()).unwrap();
+            assert_eq!(
+                out,
+                format!(
+                    "{BOS_TOKEN}S{ASSISTANT_SP_TOKEN}{THINKING_END_TOKEN}Hi!{EOS_TOKEN}\
+                     {USER_SP_TOKEN}Q{ASSISTANT_SP_TOKEN}{think}"
+                )
+            );
+        }
+    }
+
+    /// A system message a latest reminder follows stays bare text with no
+    /// header, where a user message before the reminder takes it.
+    #[test]
+    fn a_system_message_before_a_latest_reminder_stays_bare_text() {
+        let reminder = json!({ "role": "latest_reminder", "content": "Reminder" });
+        let after_system = [
+            user("Hello."),
+            json!({ "role": "system", "content": "Note" }),
+            reminder.clone(),
+        ];
+        let out = encode_messages(
+            &after_system,
+            ThinkingMode::Thinking,
+            &EncodeParams::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            format!("{BOS_TOKEN}{USER_SP_TOKEN}Hello.Note{LATEST_REMINDER_SP_TOKEN}Reminder")
+        );
+        let after_user = [user("Hello."), reminder];
+        let out = encode_messages(
+            &after_user,
+            ThinkingMode::Thinking,
+            &EncodeParams::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "{BOS_TOKEN}{USER_SP_TOKEN}Hello.{ASSISTANT_SP_TOKEN}{THINKING_START_TOKEN}\
+                 {LATEST_REMINDER_SP_TOKEN}Reminder"
             )
         );
     }

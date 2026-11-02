@@ -3747,9 +3747,11 @@ mod segment_tests {
     }
 
     /// The report follows the text where the encoders differ on a trailing
-    /// system message: V4 writes no header after one, V4.1 writes it after a
-    /// system message that is not the conversation's first and none after a
-    /// lone one or one left alone by its thinking-drop.
+    /// system message: V4 writes the header after one that ends the
+    /// conversation (a lone one included), as the serving engine's copy of
+    /// its encoder does; V4.1 writes it after a system message that is not
+    /// the conversation's first and none after a lone one or one left alone
+    /// by its thinking-drop.
     #[test]
     fn the_native_renderers_report_the_header_after_a_trailing_system_message_as_written() {
         let params = || ChatTemplateParams {
@@ -3765,11 +3767,13 @@ mod segment_tests {
             .apply_chat_template_with_encoding(&system_last, params(), None)
             .expect("the renderer renders the conversation");
         assert!(
-            rendered.text.ends_with("Answer in French."),
+            rendered
+                .text
+                .ends_with("Answer in French.<｜Assistant｜><think>"),
             "{}",
             rendered.text
         );
-        assert!(!rendered.generation_prompt);
+        assert!(rendered.generation_prompt);
         let rendered = v41_like(&ADDED)
             .apply_chat_template_with_encoding(&system_last, params(), None)
             .expect("the renderer renders the conversation");
@@ -3782,6 +3786,15 @@ mod segment_tests {
         );
         assert!(rendered.generation_prompt);
         let system_alone = [json!({"role": "system", "content": "Be brief."})];
+        let rendered = v4_like(&ADDED)
+            .apply_chat_template_with_encoding(&system_alone, params(), None)
+            .expect("the renderer renders the conversation");
+        assert!(
+            rendered.text.ends_with("Be brief.<｜Assistant｜><think>"),
+            "{}",
+            rendered.text
+        );
+        assert!(rendered.generation_prompt);
         let rendered = v41_like(&ADDED)
             .apply_chat_template_with_encoding(&system_alone, params(), None)
             .expect("the renderer renders the conversation");
