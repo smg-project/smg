@@ -259,8 +259,10 @@ impl ProtoGenerateRequest {
                     return Self::Sglang(req.clone());
                 }
                 let mm = req.mm_inputs.take();
+                let extras = std::mem::take(&mut req.extra_mm_inputs);
                 let clone = Self::Sglang(req.clone());
                 req.mm_inputs = mm;
+                req.extra_mm_inputs = extras;
                 clone
             }
             Self::Vllm(req) => {
@@ -351,7 +353,10 @@ impl ProtoGenerateRequest {
     /// but prefill still needs placeholders/model-specific metadata to slot them.
     pub fn clear_mm_pixel_values(&mut self) {
         match self {
-            Self::Sglang(req) => req.mm_inputs = None,
+            Self::Sglang(req) => {
+                req.mm_inputs = None;
+                req.extra_mm_inputs.clear();
+            }
             Self::Vllm(req) => {
                 req.mm_inputs = None;
                 req.extra_mm_inputs.clear();
@@ -463,11 +468,6 @@ impl ProtoGenerateRequest {
                         }
                         _ => return Err("SGLang media references require images or videos".into()),
                     }
-                }
-                if !mm.image_urls.is_empty() && !mm.video_urls.is_empty() {
-                    return Err(
-                        "SGLang media references require a single modality per request".into(),
-                    );
                 }
                 req.mm_inputs = Some(Box::new(mm));
                 Ok(())

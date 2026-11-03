@@ -2587,10 +2587,10 @@ mod tests {
             modality: common::Modality::Image as i32,
             url: "https://example.test/image.png".into(),
         });
-        assert!(request
-            .set_media_refs(mixed)
-            .unwrap_err()
-            .contains("single modality"));
+        request.set_media_refs(mixed).unwrap();
+        let mm = request.as_sglang().mm_inputs.as_ref().unwrap();
+        assert_eq!(mm.image_urls, ["https://example.test/image.png"]);
+        assert_eq!(mm.video_urls, ["data:video/mp4;base64,AA=="]);
     }
 
     #[test]
@@ -2602,6 +2602,7 @@ mod tests {
         assert_eq!(trtllm.inline_bytes(), 8);
 
         let sglang = MultimodalData::Sglang(SglangMultimodalData {
+            extra_batches: Vec::new(),
             modality: "image".to_string(),
             image_data: vec![vec![0; 2]],
             pixel_values: vec![0; 16],

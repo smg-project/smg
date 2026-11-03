@@ -23,9 +23,7 @@ use smg_grpc_client::{sglang_proto as sglang, vllm_proto as vllm, WorkerMediaFau
 use tracing::{info, warn};
 
 use super::{
-    assemble::{
-        assemble_sglang_with_dtype, assemble_vllm_batches_with, into_single_batch, VllmAssembly,
-    },
+    assemble::{assemble_sglang_batches, assemble_vllm_batches_with, VllmAssembly},
     capability::runtime_reads_format,
     config::{MultimodalComponents, MultimodalConfigRegistry, MultimodalModelConfig},
     encoder_budget::ItemOverEncoderBudget,
@@ -736,7 +734,14 @@ impl WorkerMediaPipeline {
         &self,
         prompt_token_ids: Vec<u32>,
         items: &[WorkerMediaItem],
-    ) -> Result<(Vec<u32>, sglang::MultimodalInputs), WorkerMediaError> {
+    ) -> Result<
+        (
+            Vec<u32>,
+            sglang::MultimodalInputs,
+            Vec<sglang::MultimodalInputs>,
+        ),
+        WorkerMediaError,
+    > {
         let output = self
             .process_inputs(prompt_token_ids, items, RuntimeType::Sglang)
             .await?;
@@ -744,13 +749,12 @@ impl WorkerMediaPipeline {
         let span = tracing::Span::current();
         let inputs = tokio::task::spawn_blocking(move || {
             let _entered = span.enter();
-            assemble_sglang_with_dtype(into_single_batch(output.intermediate, "SGLang")?, &dtype)
-                .map(|data| data.into_proto())
+            assemble_sglang_batches(output.intermediate, &dtype).map(|data| data.into_protos())
         })
         .await
         .map_err(|error| WorkerMediaError::Internal(format!("media assembly task: {error}")))?
         .map_err(|error| WorkerMediaError::Invalid(format!("{error:#}")))?;
-        Ok((output.expanded_token_ids, inputs))
+        Ok((output.expanded_token_ids, inputs.0, inputs.1))
     }
 
     /// Fetch and expand media using the destination engine's format and alpha policy.
@@ -1185,7 +1189,7 @@ mod tests {
             576
         );
         assert_eq!(output.batches.len(), 1);
-        let (tokens, sglang) = pipeline
+        let (tokens, sglang, _) = pipeline
             .process_sglang(vec![1, 32000, 2], &items)
             .await
             .unwrap();
@@ -1211,7 +1215,7 @@ mod tests {
         // tensor must equal opaque blue, while vLLM composites it over white.
         let mut opaque = items.clone();
         opaque[0].url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYPgPAAEDAQAIicLsAAAAAElFTkSuQmCC".into();
-        let (_, opaque_sglang) = pipeline
+        let (_, opaque_sglang, _) = pipeline
             .process_sglang(vec![1, 32000, 2], &opaque)
             .await
             .unwrap();
@@ -1287,12 +1291,12 @@ mod tests {
                 STANDARD.encode(bytes.into_inner())
             ),
         }];
-        let (float_tokens, float) = pipeline
+        let (float_tokens, float, _) = pipeline
             .process_sglang(vec![1, 32000, 2], &items)
             .await
             .unwrap();
         pipeline.assembly.encoder_dtype = "bfloat16".into();
-        let (bf_tokens, bf) = pipeline
+        let (bf_tokens, bf, _) = pipeline
             .process_sglang(vec![1, 32000, 2], &items)
             .await
             .unwrap();
@@ -1328,6 +1332,95 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires ffmpeg and ffprobe; run explicitly for SGLang video validation"]
+    /// Grouped references retain per-modality anchors in interleaved prompts.
+    async fn sglang_mixed_media_preserves_interleaved_anchors() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let (_dir, pipeline) = vision_test_pipeline(
+            r#"{"model_type":"glm53_flash","image_token_id":32000}"#,
+            &[
+                ("<|image|>", 32000),
+                ("<|begin_of_image|>", 32001),
+                ("<|end_of_image|>", 32002),
+                ("<|video|>", 32003),
+                ("0.0", 32004),
+                ("seconds", 32005),
+            ],
+        )
+        .await;
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(56, 56))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let video = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../crates/multimodal/tests/fixtures/videos/testsrc_128x96_8fps_1s.mp4"
+        ));
+        let item = |modality, url| WorkerMediaItem { modality, url };
+        // Match the reference adapter: URLs grouped by modality, while the
+        // actual prompt interleaves media in either order.
+        let image = item(
+            Modality::Image,
+            format!(
+                "data:image/png;base64,{}",
+                STANDARD.encode(png.into_inner())
+            ),
+        );
+        let video = item(
+            Modality::Video,
+            format!("data:video/mp4;base64,{}", STANDARD.encode(video)),
+        );
+        for prompt in [
+            vec![1, 32000, 2, 32003, 2, 32000, 2],
+            vec![1, 32003, 2, 32000, 2, 32000, 2],
+        ] {
+            let video_first = prompt[1] == 32003;
+            let items = [image.clone(), image.clone(), video.clone()];
+            let (tokens, mm, extras) = pipeline
+                .process_sglang(prompt.clone(), &items)
+                .await
+                .unwrap();
+            let expected = pipeline
+                .process_inputs(prompt, &items, RuntimeType::Sglang)
+                .await
+                .unwrap();
+            assert_eq!(tokens, expected.expanded_token_ids);
+            assert_eq!(extras.len(), 1);
+            let batches: Vec<_> = std::iter::once(&mm).chain(&extras).collect();
+            let images = batches.iter().find(|b| b.modalities == ["image"]).unwrap();
+            let videos = batches.iter().find(|b| b.modalities == ["video"]).unwrap();
+            assert_eq!(images.mm_placeholders.len(), 2);
+            assert!(images.model_specific_tensors.contains_key("image_grid_thw"));
+            assert!(videos.model_specific_tensors.contains_key("video_grid_thw"));
+            let mut spans = Vec::new();
+            for batch in batches {
+                assert!(batch.pixel_values.is_some());
+                for p in &batch.mm_placeholders {
+                    let start = p.offset as usize;
+                    let end = start + p.length as usize;
+                    assert!(tokens[start..end]
+                        .iter()
+                        .all(|&t| Some(t) == batch.im_token_id));
+                    spans.push((start, end, batch.modalities[0].as_str()));
+                }
+            }
+            spans.sort_unstable();
+            assert!(spans.windows(2).all(|pair| pair[0].1 <= pair[1].0));
+            let mut order = spans.iter().map(|span| span.2).collect::<Vec<_>>();
+            order.dedup();
+            assert_eq!(
+                order,
+                if video_first {
+                    vec!["video", "image"]
+                } else {
+                    vec!["image", "video", "image"]
+                }
+            );
+            assert!(!tokens.contains(&32003), "all video anchors must expand");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ffmpeg and ffprobe; run explicitly for SGLang video validation"]
     /// Check real video sampling, timestamps and temporal patch offsets across engines.
     async fn sglang_glm_video_preserves_tensors_and_temporal_patch_offsets() {
         use base64::{engine::general_purpose::STANDARD, Engine};
@@ -1351,7 +1444,7 @@ mod tests {
             modality: Modality::Video,
             url: format!("data:video/mp4;base64,{}", STANDARD.encode(bytes)),
         }];
-        let (tokens, sglang) = pipeline
+        let (tokens, sglang, _) = pipeline
             .process_sglang(vec![1, 32003, 2], &items)
             .await
             .unwrap();
@@ -1774,7 +1867,7 @@ mod tests {
                     STANDARD.encode(bytes.into_inner())
                 ),
             };
-            let (ids, mm) = pipeline
+            let (ids, mm, _) = pipeline
                 .process_sglang(vec![1, 32000, 2], &[item])
                 .await
                 .unwrap();
