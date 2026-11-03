@@ -1102,7 +1102,7 @@ class TestPDTopology:
                 outcomes.append(outcome)
 
             try:
-                # Readiness, baseline and all eight first-token observations
+                # Readiness, baseline and all first-token observations
                 # share the original absolute 60s deadline, never 60s + 60s.
                 await _wait_for_death_stream_fleet(gateway, client, deadline)
                 before = len(_pairs_logged())
@@ -1113,12 +1113,16 @@ class TestPDTopology:
                     for i, event in enumerate(first_tokens)
                 ]
                 try:
-                    async with asyncio.timeout(max(0.0, deadline - time.monotonic())):
+                    first_token_budget = max(0.0, deadline - time.monotonic())
+                    async with asyncio.timeout(first_token_budget):
                         for event in first_tokens:
                             await event.wait()
                         assert time.monotonic() < deadline, "first-token work used the work budget"
                 except TimeoutError as exc:
-                    raise AssertionError("a stream had no first token within 60s") from exc
+                    raise AssertionError(
+                        f"a stream had no first token within the {first_token_budget:.1f}s "
+                        "left after fleet readiness and placement baseline"
+                    ) from exc
                 # As in _wait_for_pairs, log flushing starts after first tokens
                 # and keeps its original independent fifteen-second allowance.
                 pairs = _pairs_logged()
