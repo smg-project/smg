@@ -4,7 +4,9 @@
 //! machines write through. Moved out of `streaming.rs` as is; the streams
 //! keep writing through them by name.
 
-use bytes::{BufMut, BytesMut};
+use std::io;
+
+use bytes::BytesMut;
 use openai_protocol::{
     chat::{ChatMessageDelta, ChatStreamChoice},
     common::{ToolCallDelta, ToolChoice, Usage},
@@ -15,6 +17,32 @@ use serde_json::json;
 use tracing::error;
 
 use crate::routers::grpc::spec::ChatResponseSpec;
+
+/// The frame buffer as serde's sink: every write is one `extend_from_slice`,
+/// the shape a `Vec<u8>` gives serde. The `bytes` writer adapter instead slices
+/// each write to the buffer's remaining room before it appends, which costs the
+/// length bookkeeping on every JSON token and turns the one-byte constant tokens
+/// into libc calls: about 7 % of a 128-delta stream request's user instructions.
+struct FrameSink<'a>(&'a mut BytesMut);
+
+impl io::Write for FrameSink<'_> {
+    #[inline]
+    fn write(&mut self, src: &[u8]) -> io::Result<usize> {
+        self.0.extend_from_slice(src);
+        Ok(src.len())
+    }
+
+    #[inline]
+    fn write_all(&mut self, src: &[u8]) -> io::Result<()> {
+        self.0.extend_from_slice(src);
+        Ok(())
+    }
+
+    #[inline]
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Buffered chat chunks are flushed to the response channel at this size even
 /// while the engine keeps more ready, so one frame stays a bounded burst.
@@ -65,12 +93,12 @@ impl ChatChunkFrame {
     ) {
         let start = buffer.len();
         buffer.extend_from_slice(&self.head);
-        let mut serialized = serde_json::to_writer((&mut *buffer).writer(), choice);
+        let mut serialized = serde_json::to_writer(FrameSink(buffer), choice);
         if serialized.is_ok() {
             buffer.extend_from_slice(b"]");
             if let Some(usage) = usage {
                 buffer.extend_from_slice(b",\"usage\":");
-                serialized = serde_json::to_writer((&mut *buffer).writer(), usage);
+                serialized = serde_json::to_writer(FrameSink(buffer), usage);
             } else if emit_usage_null {
                 buffer.extend_from_slice(b",\"usage\":null");
             }
@@ -135,7 +163,7 @@ impl CompletionChunkFrame {
     pub(super) fn write_chunk(&self, buffer: &mut BytesMut, choice: &CompletionStreamChoice) {
         let start = buffer.len();
         buffer.extend_from_slice(&self.head);
-        match serde_json::to_writer((&mut *buffer).writer(), choice) {
+        match serde_json::to_writer(FrameSink(buffer), choice) {
             Ok(()) => buffer.extend_from_slice(&self.tail),
             Err(e) => {
                 error!("Failed to serialize completion SSE chunk: {}", e);

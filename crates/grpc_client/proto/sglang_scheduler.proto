@@ -172,13 +172,19 @@ message GenerateRequest {
   // Decode-only hint. Original tokenized input and references remain for fallback.
   MediaIdentity media_identity = 20;
 
-  // Router-selected external encoders for one prefill attempt. Not a decode hint.
-  EncodeHandoff encode_handoff = 21;
+  // Additional modality batches, matching vLLM's mm_inputs + extra_mm_inputs.
+  // Each batch owns its tensors, token ID and placeholders.
+  repeated MultimodalInputs extra_mm_inputs = 21;
+
+  // Router-selected IMAGE encoders for one n == 1 prefill attempt. Not a decode hint.
+  EncodeHandoff encode_handoff = 22;
 }
 
 message EncodeHandoff {
+  // The final scheduler-side request ID; must match GenerateRequest.request_id.
+  // Multiple samples need per-choice handoffs and are not supported by this contract.
   string request_id = 1;
-  // Ordered snapshot: keep each URL aligned with its item count.
+  // Ordered IMAGE-only snapshot: keep each URL aligned with its image count.
   repeated string encoder_urls = 2;
   repeated uint32 num_items_assigned = 3;
 }

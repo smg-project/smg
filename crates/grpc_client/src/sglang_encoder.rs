@@ -3,13 +3,13 @@
 //! Without embedding ports, zmq_to_scheduler Encode waits for scheduler
 //! registration and delivery, so dispatch it alongside prefill Generate.
 
-use std::{collections::HashSet, future::Future, time::Duration};
+use std::{collections::HashSet, future::Future, sync::Arc};
 
 use futures::future::try_join_all;
 use tokio::time::{sleep_until, Instant};
 use tonic::{transport::Channel, Request, Status};
 
-use crate::sglang_proto;
+use crate::{sglang_proto, BoxedTraceInjector, NoopTraceInjector, RequestDeadline};
 
 #[expect(clippy::allow_attributes)]
 pub mod proto {
@@ -21,32 +21,42 @@ pub mod proto {
 pub struct SglangEncoderClient {
     endpoint: String,
     client: proto::sglang_encoder_client::SglangEncoderClient<Channel>,
+    trace_injector: BoxedTraceInjector,
 }
 
 impl SglangEncoderClient {
     pub async fn connect(endpoint: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::connect_with_trace_injector(endpoint, Arc::new(NoopTraceInjector)).await
+    }
+
+    pub async fn connect_with_trace_injector(
+        endpoint: &str,
+        trace_injector: BoxedTraceInjector,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let channel = crate::connect_channel(endpoint).await?;
         Ok(Self {
             endpoint: endpoint.to_string(),
             client: proto::sglang_encoder_client::SglangEncoderClient::new(channel),
+            trace_injector,
         })
     }
 
+    #[must_use]
+    pub fn with_trace_injector(mut self, trace_injector: BoxedTraceInjector) -> Self {
+        self.trace_injector = trace_injector;
+        self
+    }
+
     /// Complete Encode; only zmq_to_scheduler includes scheduler delivery.
+    /// The caller owns the deadline, shared with its other request work.
     pub async fn encode(
         &self,
         request: proto::EncodeRequest,
-        timeout: Duration,
+        deadline: RequestDeadline,
     ) -> Result<proto::EncodeResponse, Status> {
-        if timeout.is_zero() {
-            return Err(Status::invalid_argument("encode deadline must be nonzero"));
-        }
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| Status::invalid_argument("encode deadline overflow"))?;
         tokio::select! {
             biased;
-            () = sleep_until(deadline) => Err(Status::deadline_exceeded("SGLang encode deadline elapsed")),
+            () = sleep_until(deadline.at()) => Err(deadline.status()),
             result = self.encode_until(request, deadline) => result,
         }
     }
@@ -54,15 +64,18 @@ impl SglangEncoderClient {
     async fn encode_until(
         &self,
         request: proto::EncodeRequest,
-        deadline: Instant,
+        deadline: RequestDeadline,
     ) -> Result<proto::EncodeResponse, Status> {
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.at().saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(Status::deadline_exceeded("SGLang encode deadline elapsed"));
+            return Err(deadline.status());
         }
         let mut client = self.client.clone();
         let mut request = Request::new(request);
         request.set_timeout(remaining);
+        if let Err(error) = self.trace_injector.inject(request.metadata_mut()) {
+            tracing::warn!("Failed to inject trace context: {error}");
+        }
         client
             .encode(request)
             .await
@@ -80,26 +93,26 @@ impl SglangEncoderClient {
 pub async fn encode_with_prefill<F, Fut, T>(
     encoders: Vec<SglangEncoderClient>,
     prefill: sglang_proto::GenerateRequest,
-    timeout: Duration,
+    deadline: RequestDeadline,
     dispatch_prefill: F,
 ) -> Result<(Vec<proto::EncodeResponse>, T), Status>
 where
     F: FnOnce(sglang_proto::GenerateRequest) -> Fut,
     Fut: Future<Output = Result<T, Status>>,
 {
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .ok_or_else(|| Status::invalid_argument("attempt deadline overflow"))?;
+    if deadline.at() <= Instant::now() {
+        return Err(deadline.status());
+    }
     let handoff = prefill
         .encode_handoff
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("prefill encoder handoff missing"))?;
-    if timeout.is_zero()
-        || prefill.request_id.is_empty()
+    if prefill.request_id.is_empty()
         || handoff.request_id != prefill.request_id
         || handoff.encoder_urls.len() != handoff.num_items_assigned.len()
         || handoff.encoder_urls.iter().collect::<HashSet<_>>().len() != handoff.encoder_urls.len()
         || encoders.is_empty()
+        || !prefill.extra_mm_inputs.is_empty()
     {
         return Err(Status::invalid_argument("invalid SGLang encode attempt"));
     }
@@ -174,7 +187,7 @@ where
     // Tonic reports its transport timeout as Cancelled; poll our deadline first.
     tokio::select! {
         biased;
-        () = sleep_until(deadline) => Err(Status::deadline_exceeded("SGLang EPD attempt deadline elapsed")),
+        () = sleep_until(deadline.at()) => Err(deadline.status()),
         result = async { futures::try_join!(encode, dispatch_prefill(prefill)) } => result,
     }
 }

@@ -21,6 +21,7 @@ pub struct State {
     pub requests: Mutex<Vec<ep::EncodeRequest>>,
     pub fail: AtomicUsize,
     pub timeouts: Mutex<Vec<String>>,
+    pub traceparents: Mutex<Vec<String>>,
 }
 
 #[tonic::async_trait]
@@ -29,6 +30,17 @@ impl ep::sglang_encoder_server::SglangEncoder for State {
         &self,
         request: Request<ep::EncodeRequest>,
     ) -> Result<Response<ep::EncodeResponse>, Status> {
+        self.traceparents
+            .lock()
+            .map_err(|_| Status::internal("encoder trace recorder lock poisoned"))?
+            .push(
+                request
+                    .metadata()
+                    .get("traceparent")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("")
+                    .to_string(),
+            );
         self.timeouts
             .lock()
             .map_err(|_| Status::internal("encoder timeout recorder lock poisoned"))?
@@ -50,6 +62,9 @@ impl ep::sglang_encoder_server::SglangEncoder for State {
         }
         if self.fail.load(Ordering::SeqCst) == 2 {
             return Err(Status::cancelled("Timeout expired"));
+        }
+        if self.fail.load(Ordering::SeqCst) == 3 {
+            return Err(Status::deadline_exceeded("remote encoder deadline"));
         }
         loop {
             let changed = self.changed.notified();

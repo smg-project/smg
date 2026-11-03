@@ -1376,7 +1376,7 @@ async fn multimodal_inputs_reach_the_scheduler_as_its_processor_output() {
         input_ids: vec![1, 7, 7, 7, 2, 3, 4, 5, 6],
     });
     request.sampling_params.as_mut().unwrap().n = 2;
-    request.mm_inputs = Some(sg::MultimodalInputs {
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
         modalities: vec!["image".to_string()],
         pixel_values: Some(sg::TensorData {
             data: pixels.clone().into(),
@@ -1399,7 +1399,7 @@ async fn multimodal_inputs_reach_the_scheduler_as_its_processor_output() {
             length: 3,
         }],
         ..Default::default()
-    });
+    }));
     let _stream = h
         .client
         .generate(request)
@@ -1569,11 +1569,11 @@ fn media_reference_request(id: &str, n: u32) -> sg::GenerateRequest {
         input_ids: vec![1, 7, 7, 7, 2],
     });
     request.sampling_params.as_mut().unwrap().n = n;
-    request.mm_inputs = Some(sg::MultimodalInputs {
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
         modalities: vec!["image".to_string()],
         image_urls: vec![IMAGE_REFERENCE.to_string()],
         ..Default::default()
-    });
+    }));
     request
 }
 
@@ -3495,7 +3495,7 @@ impl SglangMediaProcessor for NativeVideoProcessor {
             assert!(refs.pixel_values.is_none());
             assert_eq!(request.tokenized.as_ref().unwrap().input_ids, [1, 7, 2]);
             request.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 7, 7, 2];
-            request.mm_inputs = Some(sg::MultimodalInputs {
+            request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
                 modalities: vec!["video".into()],
                 pixel_values: Some(sg::TensorData {
                     data: vec![0; 32].into(),
@@ -3522,7 +3522,7 @@ impl SglangMediaProcessor for NativeVideoProcessor {
                     length: 3,
                 }],
                 ..Default::default()
-            });
+            }));
             Ok(request)
         })
     }
@@ -3548,10 +3548,10 @@ async fn native_video_refs_expand_before_scheduler_dispatch() {
     );
     let mut request = generate_request("native-video", true, Vec::new());
     request.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 2];
-    request.mm_inputs = Some(sg::MultimodalInputs {
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
         video_urls: vec!["data:video/mp4;base64,AA==".into()],
         ..Default::default()
-    });
+    }));
     let _stream = h.client.generate(request).await.unwrap().into_inner();
     let received = recv_add(&mut h.engine_in).await;
     assert_eq!(received.input_ids, [1, 7, 7, 7, 2]);
@@ -3584,10 +3584,10 @@ async fn abort_during_native_media_processing_never_submits_to_scheduler() {
     })
     .await;
     let mut request = generate_request("pending-media", true, Vec::new());
-    request.mm_inputs = Some(sg::MultimodalInputs {
+    request.mm_inputs = Some(Box::new(sg::MultimodalInputs {
         image_urls: vec!["https://example.test/image.png".into()],
         ..Default::default()
-    });
+    }));
     let mut client = h.client.clone();
     #[expect(clippy::disallowed_methods, reason = "test awaits this request task")]
     let pending = tokio::spawn(async move { client.generate(request).await });
@@ -3638,10 +3638,10 @@ async fn media_identity_arrives_before_kv_and_decode_falls_back_when_invalid() {
     .await;
     let mut original = generate_request("reuse-video", true, Vec::new());
     original.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 2];
-    original.mm_inputs = Some(sg::MultimodalInputs {
+    original.mm_inputs = Some(Box::new(sg::MultimodalInputs {
         video_urls: vec!["data:video/mp4;base64,AA==".into()],
         ..Default::default()
-    });
+    }));
     original.disaggregated_params = Some(sg::DisaggregatedParams {
         bootstrap_host: "127.0.0.1".into(),
         bootstrap_port: 8998,
@@ -3674,7 +3674,7 @@ async fn media_identity_arrives_before_kv_and_decode_falls_back_when_invalid() {
     )
     .await;
     let mut decode = original.clone();
-    decode.media_identity = Some(identity.clone());
+    decode.media_identity = Some(Box::new(identity.clone()));
     let _decode_stream = d.client.generate(decode).await.unwrap().into_inner();
     let wire = recv_add(&mut d.engine_in).await;
     assert_eq!(wire.input_ids, prefill_wire.input_ids);
@@ -3706,7 +3706,7 @@ async fn media_identity_arrives_before_kv_and_decode_falls_back_when_invalid() {
                 .clear(),
             _ => bad.version += 1,
         }
-        req.media_identity = Some(bad);
+        req.media_identity = Some(Box::new(bad));
         fallback_streams.push(d.client.generate(req).await.unwrap().into_inner());
         let wire = recv_add(&mut d.engine_in).await;
         assert_eq!(wire.input_ids, [1, 7, 7, 7, 2]);

@@ -1104,7 +1104,7 @@ async fn execute_parallel_pd(
             {
                 if let ProtoGenerateRequest::Sglang(req) = &mut decode_request {
                     if smg_grpc_client::sglang_media_identity::validate(&identity, req, &key) {
-                        req.media_identity = Some(identity);
+                        req.media_identity = Some(Box::new(identity));
                     }
                 }
             }
@@ -3095,10 +3095,10 @@ mod tests {
                 input_ids: vec![1, 7, 2],
                 ..Default::default()
             }),
-            mm_inputs: Some(sg::MultimodalInputs {
+            mm_inputs: Some(Box::new(sg::MultimodalInputs {
                 image_urls: vec!["data:image/png;base64,AA==".into()],
                 ..Default::default()
-            }),
+            })),
             disaggregated_params: Some(sg::DisaggregatedParams {
                 bootstrap_host: "prefill".into(),
                 bootstrap_port: 8998,

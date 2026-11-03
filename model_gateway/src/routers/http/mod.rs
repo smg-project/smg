@@ -7,6 +7,7 @@ pub(crate) mod request_stream;
 pub mod router;
 pub(crate) mod stream_failure;
 pub(crate) mod stream_relay;
+pub(crate) mod tenant_rate_limit;
 
 use axum::response::Response;
 use openai_protocol::{

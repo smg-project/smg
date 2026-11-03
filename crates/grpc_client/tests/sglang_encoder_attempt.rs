@@ -12,16 +12,18 @@ use std::{
 };
 
 use encoder_peer::{register, Peer};
-use smg_grpc_client::{encode_with_prefill, sglang_proto as sg};
+use smg_grpc_client::{
+    encode_with_prefill, is_request_timeout, sglang_proto as sg, RequestDeadline,
+};
 use tonic::Status;
 
 fn prefill(id: &str, urls: Vec<String>, counts: Vec<u32>) -> sg::GenerateRequest {
     sg::GenerateRequest {
         request_id: id.into(),
-        mm_inputs: Some(sg::MultimodalInputs {
+        mm_inputs: Some(Box::new(sg::MultimodalInputs {
             image_urls: vec!["a".into()],
             ..Default::default()
-        }),
+        })),
         encode_handoff: Some(sg::EncodeHandoff {
             request_id: id.into(),
             encoder_urls: urls,
@@ -50,7 +52,7 @@ async fn encoder_waits_for_registration_and_concurrent_attempts_keep_final_ids()
         let (_, forwarded) = encode_with_prefill(
             vec![second.client.clone(), first.client.clone()],
             envelope.clone(),
-            Duration::from_secs(2),
+            RequestDeadline::after(Duration::from_secs(2)),
             |actual| async move {
                 assert_eq!(actual, envelope);
                 let first_done = first_ref.state.finished.notified();
@@ -85,7 +87,7 @@ async fn encoder_waits_for_registration_and_concurrent_attempts_keep_final_ids()
 async fn stale_ids_counts_endpoint_order_and_non_images_reject_before_dispatch() {
     let peer = Peer::new().await.unwrap();
     let calls = AtomicUsize::new(0);
-    for mutation in 0..10 {
+    for mutation in 0..11 {
         let mut generate = prefill("final", vec![peer.url.clone()], vec![1]);
         let encoders = vec![peer.client.clone()];
         match mutation {
@@ -128,17 +130,25 @@ async fn stale_ids_counts_endpoint_order_and_non_images_reject_before_dispatch()
                     .model_specific_tensors
                     .insert("image_grid_thw".into(), sg::TensorData::default());
             }
-            _ => {
+            9 => {
                 generate.sampling_params = Some(sg::SamplingParams {
                     n: 2,
                     ..Default::default()
                 });
             }
+            _ => generate
+                .extra_mm_inputs
+                .push(sg::MultimodalInputs::default()),
         }
-        let result = encode_with_prefill(encoders, generate, Duration::from_secs(1), |_| async {
-            calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        })
+        let result = encode_with_prefill(
+            encoders,
+            generate,
+            RequestDeadline::after(Duration::from_secs(1)),
+            |_| async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
         .await;
         assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -167,14 +177,14 @@ async fn deadline_drops_local_prefill_future_without_detaching_it() {
     let result = encode_with_prefill(
         vec![peer.client.clone()],
         prefill("bound", vec![peer.url.clone()], vec![1]),
-        Duration::from_millis(30),
+        RequestDeadline::after(Duration::from_millis(30)),
         |_| future,
     )
     .await;
     assert!(dropped.load(Ordering::SeqCst));
     let error = result.unwrap_err();
     assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
-    assert_eq!(error.message(), "SGLang EPD attempt deadline elapsed");
+    assert!(is_request_timeout(&error));
 }
 
 #[tokio::test]
@@ -194,12 +204,13 @@ async fn encode_error_is_propagated_and_drops_local_prefill_future() {
         let result = encode_with_prefill(
             vec![peer.client.clone()],
             prefill("failed", vec![peer.url.clone()], vec![1]),
-            Duration::from_secs(2),
+            RequestDeadline::after(Duration::from_secs(2)),
             |_| future,
         )
         .await;
         let error = result.unwrap_err();
         assert_eq!(error.code(), code);
+        assert!(!is_request_timeout(&error));
         if code == tonic::Code::Cancelled {
             assert_eq!(error.message(), "Timeout expired");
         }

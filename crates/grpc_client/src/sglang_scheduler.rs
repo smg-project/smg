@@ -206,7 +206,7 @@ impl SglangSchedulerClient {
                 original_text: processed_text,
                 input_ids: token_ids,
             }),
-            mm_inputs: options.multimodal_inputs,
+            mm_inputs: options.multimodal_inputs.map(Box::new),
             sampling_params: Some(sampling_params),
             return_logprob: body.logprobs,
             logprob_start_len: -1,
@@ -432,8 +432,8 @@ impl SglangSchedulerClient {
             presence_penalty: request.presence_penalty.unwrap_or(0.0),
             repetition_penalty: request.repetition_penalty,
             max_new_tokens,
-            stop: vec![], // Does not pass through request.stop yet (follow-up fix)
-            stop_token_ids: vec![], // Handled by Harmony stop tokens
+            stop: stop_strings(request.stop.as_ref()),
+            stop_token_ids: vec![],     // Handled by Harmony stop tokens
             skip_special_tokens: false, // Keep special tokens for Harmony
             spaces_between_special_tokens: true,
             ignore_eos: false,
@@ -509,7 +509,7 @@ impl SglangSchedulerClient {
                 original_text: processed_text,
                 input_ids: token_ids,
             }),
-            mm_inputs: options.multimodal_inputs,
+            mm_inputs: options.multimodal_inputs.map(Box::new),
             sampling_params: Some(sampling_params),
             return_logprob: false,
             logprob_start_len: -1,
@@ -957,6 +957,29 @@ mod tests {
             SglangSchedulerClient::build_grpc_sampling_params_from_responses(&disabled, None)
                 .expect("build sampling params");
         assert_eq!(disabled_params.top_k, -1);
+    }
+
+    #[test]
+    fn a_responses_request_s_stop_sequences_reach_the_sampling_params() {
+        use openai_protocol::responses::ResponsesRequest;
+
+        // The string form, as the chat builder forwards it.
+        let request = ResponsesRequest {
+            stop: Some(openai_protocol::common::StringOrArray::String(
+                "STOP".to_string(),
+            )),
+            ..Default::default()
+        };
+        let params =
+            SglangSchedulerClient::build_grpc_sampling_params_from_responses(&request, None)
+                .expect("build sampling params");
+        assert_eq!(params.stop, vec!["STOP"]);
+
+        // A request without `stop` leaves the list empty.
+        let unset = ResponsesRequest::default();
+        let params = SglangSchedulerClient::build_grpc_sampling_params_from_responses(&unset, None)
+            .expect("build sampling params");
+        assert!(params.stop.is_empty());
     }
 
     #[test]
