@@ -50,9 +50,9 @@ class TestChatCompletion:
                     pytest.mark.skip_for_runtime(
                         "tokenspeed",
                         reason=(
-                            "tokenspeed's --enable-top-logprobs is not yet implemented "
-                            "(raises at startup); base output logprobs work via "
-                            "--enable-output-logprobs but the test requires top_logprobs=5"
+                            "the engine computes top-k alternatives only for "
+                            "prefill-sampled tokens; a decode step returns none and "
+                            "the request is aborted"
                         ),
                     ),
                 ],
@@ -115,9 +115,9 @@ class TestChatCompletion:
                     pytest.mark.skip_for_runtime(
                         "tokenspeed",
                         reason=(
-                            "tokenspeed's --enable-top-logprobs is not yet implemented "
-                            "(raises at startup); base output logprobs work via "
-                            "--enable-output-logprobs but the test requires top_logprobs=5"
+                            "the engine computes top-k alternatives only for "
+                            "prefill-sampled tokens; a decode step returns none and "
+                            "the request is aborted"
                         ),
                     ),
                 ],
@@ -467,9 +467,9 @@ class TestChatCompletionGptOss(TestChatCompletion):
                 marks=pytest.mark.skip_for_runtime(
                     "tokenspeed",
                     reason=(
-                        "tokenspeed's --enable-top-logprobs is not yet implemented "
-                        "(raises at startup); base output logprobs work via "
-                        "--enable-output-logprobs but the test requires top_logprobs=5"
+                        "the engine computes top-k alternatives only for "
+                        "prefill-sampled tokens; a decode step returns none and "
+                        "the request is aborted"
                     ),
                 ),
             ),
@@ -489,9 +489,9 @@ class TestChatCompletionGptOss(TestChatCompletion):
                 marks=pytest.mark.skip_for_runtime(
                     "tokenspeed",
                     reason=(
-                        "tokenspeed's --enable-top-logprobs is not yet implemented "
-                        "(raises at startup); base output logprobs work via "
-                        "--enable-output-logprobs but the test requires top_logprobs=5"
+                        "the engine computes top-k alternatives only for "
+                        "prefill-sampled tokens; a decode step returns none and "
+                        "the request is aborted"
                     ),
                 ),
             ),
