@@ -3850,8 +3850,10 @@ fn hash_mode_hit_records_the_selected_holders_age() {
         .unwrap()
         .build_recorder();
     let handle = recorder.handle();
+    let before = Instant::now();
     let selected =
         metrics::with_local_recorder(&recorder, || route_tokens(&policy, &workers, &tokens));
+    let after = Instant::now();
     assert_eq!(selected, 0);
     let rendered = handle.render();
     let sum: f64 = rendered
@@ -3864,9 +3866,17 @@ fn hash_mode_hit_records_the_selected_holders_age() {
         .unwrap_or_else(|| panic!("no hash reuse age; rendered:\n{rendered}"))
         .parse()
         .unwrap();
-    // Whole seconds since the placement, so a slow run reads more: w1's age
-    // is 30 plus the run's delay, w2's would be 5 plus it.
-    assert!((30.0..60.0).contains(&sum), "{sum}: w1's age, not w2's 5 s");
+    // The routing reads its clock between `before` and `after`: w1's age then
+    // lies between the two readings of it, whatever the run's delay (w2's
+    // would lie 25 s below).
+    let (low, high) = (
+        before.duration_since(ago(30)).as_secs(),
+        after.duration_since(ago(30)).as_secs(),
+    );
+    assert!(
+        (low as f64..=high as f64).contains(&sum),
+        "{sum}: w1's age ({low}..={high} s), not w2's"
+    );
 }
 
 #[test]
