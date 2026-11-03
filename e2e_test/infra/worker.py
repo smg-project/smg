@@ -21,6 +21,7 @@ from .constants import (
     DEFAULT_STARTUP_TIMEOUT,
     ENV_SHOW_WORKER_LOGS,
     ENV_VLLM_SERVICER_IMPL,
+    ENV_WORKER_RUST_LOG,
     HEALTH_CHECK_INTERVAL,
     LAUNCH_STAGGER_DELAY,
     MM_PROCESSING_WORKER,
@@ -994,6 +995,12 @@ class Worker:
                 env["NCCL_IB_DISABLE"] = "1"
                 env["NCCL_SHM_DISABLE"] = "1"
                 env["TLLM_DISABLE_ALLREDUCE_AUTOTUNE"] = "1"
+
+        # The lane's tracing filter for the Rust servicer this worker hosts (the
+        # per-request line's target, say); the shell's own RUST_LOG yields to it,
+        # the worker's extra_env below still wins.
+        if worker_rust_log := os.environ.get(ENV_WORKER_RUST_LOG, "").strip():
+            env["RUST_LOG"] = worker_rust_log
 
         if self.extra_env:
             env.update(self.extra_env)
