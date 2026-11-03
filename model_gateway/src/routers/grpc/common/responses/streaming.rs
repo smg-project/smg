@@ -159,8 +159,9 @@ pub(crate) struct ResponseStreamEventEmitter {
     finish_reason: Option<String>,
     /// Whether a closed call was cut: its function-shaped arguments read
     /// `incomplete` under the finish reason, before a custom tool's call became
-    /// its `custom_tool_call` item, which carries no status. The terminal event
-    /// and the stored object read it.
+    /// its `custom_tool_call` item, which carries no status. Recorded by the
+    /// one read of a call's status (`function_call_status`), whichever stream
+    /// closes the call; the terminal event and the stored object read it.
     cut_call: bool,
     /// The response runs in the background: `response.created` reports it
     /// `queued`, `response.queued` follows, and the objects echo the flag.
@@ -240,11 +241,11 @@ impl ResponseStreamEventEmitter {
     }
 
     /// The finish reason of the iteration a stream that drives the emitter
-    /// through its own events (never through chat chunks) has just read,
-    /// `None` when its stream ended before the terminal frame: the terminal
-    /// event and the stored object read their status from it, as they read
-    /// the final chunk's. Written once per iteration, so the finish of an
-    /// earlier turn of the request never reads for a later one.
+    /// through its own events (never through chat chunks) has read: the
+    /// terminal event, the stored object and the items the stream closes read
+    /// their status from it, as they read the final chunk's. Cleared when each
+    /// iteration starts and set when its terminal frame comes, so the finish
+    /// of an earlier turn never reads for a later one.
     pub(crate) fn set_finish_reason(&mut self, finish_reason: Option<&str>) {
         self.finish_reason = finish_reason.map(str::to_string);
     }
@@ -1111,6 +1112,18 @@ impl ResponseStreamEventEmitter {
         }
     }
 
+    /// The status of a function call the stream closes, read under the
+    /// finish reason the emitter holds, as `message_status` reads the message
+    /// item's: a call whose arguments the finish cut reads `incomplete`, and
+    /// the response reads it as cut on its terminal event and stored object.
+    /// The chat-chunk path and a stream that closes its own call items read
+    /// every call's status here, so the cut is recorded wherever it is read.
+    pub(crate) fn function_call_status(&mut self, arguments: &str) -> &'static str {
+        let status = super::utils::function_call_status(self.finish_reason.as_deref(), arguments);
+        self.cut_call |= status == "incomplete";
+        status
+    }
+
     /// Closing the event sequence does not imply generation succeeded: partial
     /// messages remain in_progress on the wire, but belong in terminal output.
     async fn close_message_item(&mut self, tx: &SseSender) -> Result<(), String> {
@@ -1150,10 +1163,8 @@ impl ResponseStreamEventEmitter {
     async fn close_tool_call_items(&mut self, tx: &SseSender) -> Result<(), String> {
         for item in std::mem::take(&mut self.tool_call_items) {
             // The call's status as a function call, read before a custom
-            // tool's call becomes its item: the cut state lives here alone.
-            let status =
-                super::utils::function_call_status(self.finish_reason.as_deref(), &item.arguments);
-            self.cut_call |= status == "incomplete";
+            // tool's call becomes its item.
+            let status = self.function_call_status(&item.arguments);
             let full = if item.custom {
                 let input = super::utils::custom_tool_input(&item.arguments);
                 for (event_type, field) in [
