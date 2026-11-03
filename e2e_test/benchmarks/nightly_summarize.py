@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from collections import defaultdict
@@ -138,7 +139,12 @@ class RunResult:
     tpot_p99: float
     e2e_mean: float
     e2e_p99: float
-    error_rate: float
+    error_rate: float | None
+    error_note: str = ""
+
+    @property
+    def is_error_free(self) -> bool:
+        return self.error_rate == 0 and not self.error_note
 
 
 @dataclass
@@ -224,6 +230,99 @@ _KNOWN_PROTOCOLS = {"http", "grpc"}
 _KNOWN_WORKER_TYPES = {"single", "multi"}
 # Runtimes recognized in folder names. Add new runtimes here.
 _KNOWN_RUNTIMES = {"sglang", "vllm", "trtllm"}
+
+
+def _error_metrics(data: dict) -> tuple[float | None, str]:
+    """Cross-check attempted/failed counts; retain rate-only legacy results."""
+    agg = data.get("aggregated_metrics", {})
+    counts = {}
+    errors = []
+    totals = []
+
+    def count(field, value):
+        if type(value) is not int or value < 0:
+            raise ValueError(f"{field}: expected a nonnegative integer")
+        return value
+
+    try:
+        for key in ("num_requests", "num_error_requests", "num_completed_requests"):
+            if key in agg:
+                counts[key] = count(key, agg[key])
+        if "num_error_requests" in counts:
+            errors.append(counts["num_error_requests"])
+        if "num_requests" in counts:
+            totals.append(counts["num_requests"])
+        if "error_codes_frequency" in agg:
+            frequencies = agg["error_codes_frequency"]
+            if not isinstance(frequencies, dict):
+                raise ValueError("error_codes_frequency must be an object")
+            errors.append(
+                sum(
+                    count(f"error_codes_frequency[{key}]", value)
+                    for key, value in frequencies.items()
+                )
+            )
+        if "individual_request_metrics" in data:
+            records = data["individual_request_metrics"]
+            if not isinstance(records, list) or any(
+                not isinstance(record, dict)
+                or not {"error_code", "error_message"}.intersection(record)
+                for record in records
+            ):
+                raise ValueError("invalid individual request error records")
+            totals.append(len(records))
+            errors.append(
+                sum(
+                    record.get("error_code") is not None or bool(record.get("error_message"))
+                    for record in records
+                )
+            )
+        if "num_completed_requests" in counts:
+            completed = counts["num_completed_requests"]
+            if totals:
+                if completed > totals[0]:
+                    return None, "Request/error counts disagree"
+                errors.append(totals[0] - completed)
+            if errors:
+                totals.append(completed + errors[0])
+    except ValueError as exc:
+        return None, f"Invalid error metrics: {exc}"
+
+    if len(set(errors)) > 1 or len(set(totals)) > 1:
+        return None, "Request/error counts disagree"
+
+    reported = None
+    reported_invalid = False
+    if agg.get("error_rate") is not None:
+        try:
+            if isinstance(agg["error_rate"], bool):
+                raise ValueError
+            reported = float(agg["error_rate"])
+            if not math.isfinite(reported) or not 0 <= reported <= 1:
+                raise ValueError
+        except (OverflowError, TypeError, ValueError):
+            reported = None
+            reported_invalid = True
+
+    if totals and totals[0] == 0:
+        return None, "Failure rate unavailable: no attempted requests"
+    if errors:
+        if not totals or errors[0] > totals[0]:
+            return None, "Failure rate unavailable: no valid attempted-request count"
+        rate = errors[0] / totals[0]
+        notes = [f"{errors[0]}/{totals[0]} failed requests"] if errors[0] else []
+        if reported_invalid:
+            notes.append("Invalid reported error_rate")
+        elif reported is not None and not math.isclose(rate, reported, abs_tol=1e-12):
+            notes.append(
+                f"Reported error_rate disagrees with request counts (reported={reported:g})"
+            )
+        return rate, "; ".join(notes)
+    if reported_invalid:
+        return None, "Invalid reported error_rate"
+    if reported is not None:
+        return reported, ""
+    return None, "Failure rate unavailable"
 
 
 def parse_folder_name(folder_name: str) -> dict:
@@ -320,6 +419,7 @@ def parse_experiment(folder: Path) -> ExperimentInfo | None:
             tpot = stats.get("tpot", {})
             e2e = stats.get("e2e_latency", {})
 
+            error_rate, error_note = _error_metrics(data)
             run = RunResult(
                 scenario=agg.get("scenario", "unknown"),
                 concurrency=agg.get("num_concurrency", 0) or 0,
@@ -332,7 +432,8 @@ def parse_experiment(folder: Path) -> ExperimentInfo | None:
                 tpot_p99=_get_float(tpot, "p99"),
                 e2e_mean=_get_float(e2e, "mean"),
                 e2e_p99=_get_float(e2e, "p99"),
-                error_rate=_get_float(agg, "error_rate"),
+                error_rate=error_rate,
+                error_note=error_note,
             )
             info.runs.append(run)
         except Exception as e:
@@ -375,7 +476,7 @@ def build_comparisons(experiments: list[ExperimentInfo]) -> list[ComparisonPoint
 
         for grpc_run in grpc_exp.runs:
             http_run = http_runs.get((grpc_run.scenario, grpc_run.concurrency))
-            if http_run and grpc_run.error_rate == 0 and http_run.error_rate == 0:
+            if http_run and grpc_run.is_error_free and http_run.is_error_free:
                 comparisons.append(
                     ComparisonPoint(
                         model=grpc_exp.model,
@@ -412,7 +513,7 @@ def build_runtime_comparisons(experiments: list[ExperimentInfo]) -> list[Runtime
 
                 for run_a in exp_a.runs:
                     run_b = runs_b.get((run_a.scenario, run_a.concurrency))
-                    if run_b and run_a.error_rate == 0 and run_b.error_rate == 0:
+                    if run_b and run_a.is_error_free and run_b.is_error_free:
                         comparisons.append(
                             RuntimeComparisonPoint(
                                 model=exp_a.model,
@@ -700,9 +801,12 @@ def _section_key_findings(
 
     # 3. Error rates
     total_runs = sum(len(e.runs) for e in experiments)
-    error_runs = [(e, r) for e in experiments for r in e.runs if r.error_rate > 0]
+    error_runs = [(e, r) for e in experiments for r in e.runs if not r.is_error_free]
     if error_runs:
-        lines.append(f"- **Errors**: {len(error_runs)}/{total_runs} runs had non-zero error rates")
+        lines.append(
+            f"- **Errors**: {len(error_runs)}/{total_runs} runs had errors "
+            "or unverified error metrics"
+        )
     else:
         lines.append(f"- **Errors**: All {total_runs} runs completed with 0% error rate")
 
@@ -738,23 +842,29 @@ def _section_key_findings(
 
 
 def _section_error_rates(experiments: list[ExperimentInfo]) -> list[str]:
-    """Surface any non-zero error rates."""
-    errors = [(e, r) for e in experiments for r in e.runs if r.error_rate > 0]
+    """Surface errors and results whose error metrics cannot establish success."""
+    errors = [(e, r) for e in experiments for r in e.runs if not r.is_error_free]
     if not errors:
         return []
 
     lines = [
         "<details>",
-        f"<summary><b>Runs with Errors</b> ({len(errors)} runs)</summary>",
+        "<summary><b>Runs with Errors or Unverified Error Metrics</b> "
+        f"({len(errors)} runs)</summary>",
         "",
-        "| Model | Protocol | Runtime | Workers | Scenario | C | Error Rate |",
-        "|-------|----------|---------|---------|----------|--:|-----------:|",
+        "| Model | Protocol | Runtime | Workers | Scenario | C | Error Rate | Details |",
+        "|-------|----------|---------|---------|----------|--:|-----------:|---------|",
     ]
 
-    for e, r in sorted(errors, key=lambda x: x[1].error_rate, reverse=True):
+    for e, r in sorted(
+        errors,
+        key=lambda item: item[1].error_rate if item[1].error_rate is not None else -1,
+        reverse=True,
+    ):
+        rate = f"{r.error_rate:.1%}" if r.error_rate is not None else "unknown"
         lines.append(
             f"| {e.model} | {e.protocol} | {e.runtime} | {e.worker_type} "
-            f"| `{r.scenario}` | {r.concurrency} | {r.error_rate:.1%} |"
+            f"| `{r.scenario}` | {r.concurrency} | {rate} | {r.error_note} |"
         )
 
     lines.extend(["", "</details>", ""])

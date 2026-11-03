@@ -879,6 +879,10 @@ pub struct ChatTemplateParams<'a> {
 pub struct PreparedTools {
     tools: Vec<JsonValue>,
     value: Value,
+    /// The same tools with the keys of every map in them sorted, prepared
+    /// as these were, for a checkpoint whose own tokenizer class reads them
+    /// so ([`Self::key_sorted`]); made on the first such render.
+    key_sorted: OnceLock<Box<PreparedTools>>,
 }
 
 impl PreparedTools {
@@ -898,7 +902,11 @@ impl PreparedTools {
                 .map(PreparedTool::value)
                 .collect::<Vec<Value>>(),
         );
-        Self { tools, value }
+        Self {
+            tools,
+            value,
+            key_sorted: OnceLock::new(),
+        }
     }
 
     /// How many `tojson` texts the tools keep between them.
@@ -921,11 +929,35 @@ impl PreparedTools {
         &self.tools
     }
 
+    /// Whether this was made of `tools` (the same slice): the only tools it
+    /// is read for.
+    pub(crate) fn is_of(&self, tools: &[JsonValue]) -> bool {
+        std::ptr::eq(self.tools.as_ptr(), tools.as_ptr()) && self.tools.len() == tools.len()
+    }
+
+    /// These tools with the keys of every map in them sorted, at every depth
+    /// (a tool's `function` before its `type`, a schema's `properties` before
+    /// its `type`), prepared as these were: what a checkpoint whose own
+    /// tokenizer class sorts the tools before its template or tool encoder
+    /// reads them renders. Made once, on the first call, and kept beside the
+    /// plain form, so a caller that keeps a prepared set per distinct tool
+    /// set spares the sort and the conversion per request as it spares them
+    /// for the plain form.
+    pub(crate) fn key_sorted(&self) -> &PreparedTools {
+        self.key_sorted
+            .get_or_init(|| Box::new(Self::key_sorted_of(&self.tools)))
+    }
+
+    /// `tools` with the keys of every map in them sorted, prepared
+    /// ([`Self::new`] of the sorted values); see [`Self::key_sorted`].
+    pub(crate) fn key_sorted_of(tools: &[JsonValue]) -> PreparedTools {
+        Self::new(tools.iter().map(sort_json_keys).collect())
+    }
+
     /// The render's value of `tools`, when they are the values this was made
     /// of (the same slice).
     fn value_of(&self, tools: &[JsonValue]) -> Option<Value> {
-        (std::ptr::eq(self.tools.as_ptr(), tools.as_ptr()) && self.tools.len() == tools.len())
-            .then(|| self.value.clone())
+        self.is_of(tools).then(|| self.value.clone())
     }
 }
 
@@ -1418,6 +1450,15 @@ pub(crate) fn compact_python_json(value: &JsonValue) -> Result<String> {
         .map_err(Into::into)
 }
 
+/// Whether a filter call passed no keyword argument at all. `Kwargs::args`
+/// lists the string keys only, so a splat with a non-string key would read
+/// as empty; the engine's own check, run before any read, is `Ok` for an
+/// empty map alone (a string key reads as unknown, a non-string key as its
+/// own error), and costs nothing on an empty map.
+fn passed_no_keyword(kwargs: &Kwargs) -> bool {
+    kwargs.args().next().is_none() && kwargs.assert_all_used().is_ok()
+}
+
 /// Custom tojson filter compatible with HuggingFace transformers' implementation.
 ///
 /// HuggingFace transformers registers a custom `tojson` filter that accepts additional
@@ -1431,13 +1472,27 @@ pub(crate) fn compact_python_json(value: &JsonValue) -> Result<String> {
 /// This is necessary for compatibility with chat templates from HuggingFace Hub models.
 /// See: <https://github.com/huggingface/transformers/blob/main/src/transformers/utils/chat_template_utils.py>
 fn tojson_filter(value: Value, kwargs: Kwargs) -> std::result::Result<Value, MinijinjaError> {
-    let ensure_ascii: Option<bool> = kwargs.get("ensure_ascii")?;
-    let indent: Option<Value> = kwargs.get("indent")?;
-    let separators: Option<Value> = kwargs.get("separators")?;
-    let sort_keys: Option<bool> = kwargs.get("sort_keys")?;
-
-    // Ensure all kwargs are consumed to avoid "unknown keyword argument" errors
-    kwargs.assert_all_used()?;
+    // A call without keyword arguments, the common `value | tojson`, takes the
+    // defaults without reading the keywords: `Kwargs::get` records every key
+    // it reads in a set the engine allocates per call, so the four reads cost
+    // six allocations on each call, paid before a kept text is found. A call
+    // with keywords reads them as before, and an unknown one still raises the
+    // engine's own error.
+    let (ensure_ascii, indent, separators, sort_keys): (
+        Option<bool>,
+        Option<Value>,
+        Option<Value>,
+        Option<bool>,
+    ) = if passed_no_keyword(&kwargs) {
+        (None, None, None, None)
+    } else {
+        let ensure_ascii = kwargs.get("ensure_ascii")?;
+        let indent = kwargs.get("indent")?;
+        let separators = kwargs.get("separators")?;
+        let sort_keys = kwargs.get("sort_keys")?;
+        kwargs.assert_all_used()?;
+        (ensure_ascii, indent, separators, sort_keys)
+    };
 
     let indent = parse_indent(indent)?;
     let separators = parse_separators(separators, indent.is_some())?;
@@ -1739,8 +1794,14 @@ fn python_join_filter(
     joiner: Option<Cow<'_, str>>,
     kwargs: Kwargs,
 ) -> std::result::Result<String, MinijinjaError> {
-    let attribute: Option<Cow<'_, str>> = kwargs.get("attribute")?;
-    kwargs.assert_all_used()?;
+    // As in `tojson_filter`: no keyword, no recorded read.
+    let attribute: Option<Cow<'_, str>> = if passed_no_keyword(&kwargs) {
+        None
+    } else {
+        let attribute = kwargs.get("attribute")?;
+        kwargs.assert_all_used()?;
+        attribute
+    };
     let joiner = joiner.as_deref().unwrap_or_default();
     let mut text = String::new();
     for (index, item) in value.try_iter()?.enumerate() {
@@ -3446,6 +3507,55 @@ mod tests {
         );
     }
 
+    /// A filter call without keyword arguments takes its defaults without
+    /// reading any (the engine records every read in a set it allocates per
+    /// call); a call with a keyword the filter does not know still raises
+    /// the engine's own error, and so does a splat with a non-string key
+    /// (the key `args()` does not list), for `tojson` and for `join`.
+    #[test]
+    fn a_filter_call_with_an_unknown_keyword_still_raises_the_engine_s_error() {
+        let messages = [serde_json::json!({"role": "user", "content": "Hi"})];
+        let tools = vec![serde_json::json!({"type": "function", "function": {"name": "f"}})];
+        for (template, expected) in [
+            (
+                "{{ tools | tojson(bogus=1) }}",
+                "unknown keyword argument 'bogus'",
+            ),
+            (
+                "{{ ['a', 'b'] | join(', ', bogus=1) }}",
+                "unknown keyword argument 'bogus'",
+            ),
+            (
+                "{{ tools | tojson(**{1: 2}) }}",
+                "non string keys passed to kwargs",
+            ),
+            (
+                "{{ ['a', 'b'] | join(', ', **{1: 2}) }}",
+                "non string keys passed to kwargs",
+            ),
+        ] {
+            let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+            let params = ChatTemplateParams {
+                tools: Some(&tools),
+                ..Default::default()
+            };
+            let error = state.apply(&messages, params).unwrap_err().to_string();
+            assert!(error.contains(expected), "{template}: {error}");
+        }
+        let state = ChatTemplateState::new(Some(
+            "{{ tools | tojson }}|{{ ['a', 'b'] | join(', ') }}".to_string(),
+        ))
+        .unwrap();
+        let params = ChatTemplateParams {
+            tools: Some(&tools),
+            ..Default::default()
+        };
+        assert_eq!(
+            state.apply(&messages, params).unwrap(),
+            "[{\"type\": \"function\", \"function\": {\"name\": \"f\"}}]|a, b"
+        );
+    }
+
     /// The case of the record: a template that loops over content somewhere
     /// (the openai content format) and prints `message.content` elsewhere
     /// gets a string content as a one-item part list, and prints it the way
@@ -3741,6 +3851,62 @@ mod tests {
             .unwrap();
         assert_eq!(kept, plain);
         assert_eq!(prepared.kept_tojson_texts(), vec![0, 0, 1]);
+    }
+
+    /// The key-sorted form of a prepared set is the tools with every map's
+    /// keys sorted at every depth (lists keep their order, a tool that is not
+    /// a map is as it was), made once and kept; a render with it is the
+    /// render of the sorted values, with their own kept `tojson` texts.
+    #[test]
+    fn a_prepared_set_keeps_its_key_sorted_form_once() {
+        let state = ChatTemplateState::new(Some(
+            "[{% for tool in tools %}{{ tool | tojson(separators=(',', ':')) }}\
+             {% if not loop.last %},{% endif %}{% endfor %}]"
+                .to_string(),
+        ))
+        .unwrap();
+        let messages = [serde_json::json!({"role": "user", "content": "Hi"})];
+        let tools = vec![
+            serde_json::json!({"type": "function", "function": {"name": "f", "description": "d",
+                "parameters": {"type": "object", "properties": {
+                    "b": {"type": "string"}, "a": {"enum": ["z", "a"], "type": "string"}},
+                    "required": ["b", "a"]}}}),
+            serde_json::json!("not a map"),
+        ];
+        let prepared = PreparedTools::new(tools.clone());
+        let sorted = prepared.key_sorted();
+        assert!(std::ptr::eq(sorted, prepared.key_sorted()), "made once");
+        let sorted_text = concat!(
+            r#"[{"function":{"description":"d","name":"f","parameters":{"properties":"#,
+            r#"{"a":{"enum":["z","a"],"type":"string"},"b":{"type":"string"}},"#,
+            r#""required":["b","a"],"type":"object"}},"type":"function"},"not a map"]"#
+        );
+        assert_eq!(serde_json::to_string(sorted.tools()).unwrap(), sorted_text);
+        assert_eq!(
+            serde_json::to_string(PreparedTools::key_sorted_of(&tools).tools()).unwrap(),
+            sorted_text
+        );
+        let render = |tools: &[serde_json::Value], prepared: Option<&PreparedTools>| {
+            state
+                .apply(
+                    &messages,
+                    ChatTemplateParams {
+                        tools: Some(tools),
+                        prepared_tools: prepared,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        assert_eq!(render(sorted.tools(), Some(sorted)), sorted_text);
+        assert_eq!(sorted.kept_tojson_texts(), vec![1, 0]);
+        assert_eq!(render(sorted.tools(), Some(sorted)), sorted_text);
+        assert_eq!(render(sorted.tools(), None), sorted_text);
+        assert!(
+            render(prepared.tools(), Some(&prepared)).starts_with(r#"[{"type":"function","#),
+            "the plain form is as it was"
+        );
+        assert_eq!(prepared.kept_tojson_texts(), vec![1, 0]);
     }
 
     /// A checkpoint's processor template renders the requests that declare no

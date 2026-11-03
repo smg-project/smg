@@ -1581,6 +1581,72 @@ def test_a_lone_legs_plan_marks_every_request_and_says_so():
     assert "stand-in bootstrap" not in plain.describe()
 
 
+@pytest.mark.parametrize("level", ["fast", "full"])
+@pytest.mark.parametrize("ranks", [1, 2])
+def test_an_engine_that_runs_prefill_alone_plans_one_request(level, ranks):
+    # The prefill side of a disaggregated pair never decodes, and an engine
+    # release that keeps every stand-in transfer's KV ran a side's pool dry
+    # under a ladder of them: its plan is one request of the smallest shape
+    # per rank, so at most a rank's worth of stand-in transfers is ever held.
+    lone = dataclasses.replace(SMALL, lone_leg_bootstrap="2.2.2.2", data_parallel_size=ranks)
+    prefill_only = plan_warmup(dataclasses.replace(lone, prefill_only=True), level)
+    both = plan_warmup(lone, level)
+    assert [s.kind for s in both.steps][:ranks] == ["decode"] * ranks and len(
+        both.steps
+    ) > ranks + 1
+    assert [s.kind for s in prefill_only.steps] == ["prefill"]
+    assert [s.name for s in prefill_only.steps] == ["one request on the prefill side"]
+    assert len(prefill_only.steps[0].requests) == ranks
+    assert {r.prompt_tokens for r in prefill_only.steps[0].requests} == {
+        warmup.STAIRCASE_PROMPT_TOKENS
+    }
+    assert {r.max_tokens for r in prefill_only.steps[0].requests} == {1}
+    assert {r.lone_leg_bootstrap for r in prefill_only.steps[0].requests} == {"2.2.2.2"}
+    assert [r.data_parallel_rank for r in prefill_only.steps[0].requests] == (
+        list(range(ranks)) if ranks > 1 else [None]
+    )
+    assert "0 decode staircases, 1 prefill shapes" in prefill_only.describe()
+    assert "one request: this engine runs prefill alone" in prefill_only.describe()
+    assert "runs prefill alone" not in both.describe()
+    # A single engine and the decode side keep the whole plan: the flag alone
+    # shrinks it, never the stand-in bootstrap.
+    assert len(plan_warmup(dataclasses.replace(SMALL, prefill_only=True), level).steps) == 1
+    assert plan_warmup(SMALL, level).steps[0].kind == "decode"
+
+
+@pytest.mark.parametrize("level", ["fast", "full"])
+@pytest.mark.parametrize("ranks", [1, 2])
+def test_an_engine_that_runs_prefill_alone_keeps_the_media_step(level, ranks):
+    # A prefill side whose engine module asks for the media step (a language
+    # side whose frontend dispatches to the encoders) keeps it: the media
+    # path's first use is its own, no text request reaches it, and the step
+    # is one more request per rank, nothing like the ladder.
+    lone = dataclasses.replace(
+        SMALL, lone_leg_bootstrap="2.2.2.2", data_parallel_size=ranks, prefill_only=True
+    )
+    plan = plan_warmup(dataclasses.replace(lone, media_leg=True), level)
+    assert [s.kind for s in plan.steps] == ["prefill", "media"]
+    assert [s.name for s in plan.steps] == [
+        "one request on the prefill side",
+        "one media item through the engine's media path",
+    ]
+    text, media = plan.steps
+    assert [len(text.requests), len(media.requests)] == [ranks, ranks]
+    assert not any(r.media for r in text.requests) and all(r.media for r in media.requests)
+    assert {r.prompt_tokens for r in media.requests} == {warmup.STAIRCASE_PROMPT_TOKENS}
+    assert {r.max_tokens for r in media.requests} == {1}
+    assert {r.lone_leg_bootstrap for r in media.requests} == {"2.2.2.2"}
+    assert [r.data_parallel_rank for r in media.requests] == (
+        list(range(ranks)) if ranks > 1 else [None]
+    )
+    assert "one media item" in plan.describe()
+    assert "one request: this engine runs prefill alone" in plan.describe()
+    # The media step is the same step a whole plan ends its shapes with.
+    whole = plan_warmup(dataclasses.replace(SMALL, media_leg=True), level)
+    assert [s.name for s in whole.steps if s.kind == "media"] == [media.name]
+    assert not any(s.kind == "media" for s in plan_warmup(lone, level).steps)
+
+
 def test_the_sglang_inputs_come_from_the_server_arguments_and_the_facts(monkeypatch, caplog):
     args = SimpleNamespace(max_running_requests=64, chunked_prefill_size=8192, context_length=None)
     facts = {"is_generation": True, "max_context_length": 32768, "vocab_size": 151936}
@@ -1612,15 +1678,20 @@ def test_the_sglang_inputs_come_from_the_server_arguments_and_the_facts(monkeypa
         SimpleNamespace(FAKE_BOOTSTRAP_HOST="2.2.2.2"),
     )
     for role in ("prefill", "decode"):
-        leg = sglang_warmup.warmup_inputs(SimpleNamespace(disaggregation_mode=role), facts)
-        assert leg.lone_leg_bootstrap == "2.2.2.2"
-        assert leg.max_num_batched_tokens == sglang_warmup.DEFAULT_STEP_TOKENS
-        # A leg of two ranks plans both, each request pinned to its rank.
+        side = sglang_warmup.warmup_inputs(SimpleNamespace(disaggregation_mode=role), facts)
+        assert side.lone_leg_bootstrap == "2.2.2.2"
+        assert side.max_num_batched_tokens == sglang_warmup.DEFAULT_STEP_TOKENS
+        # The prefill side runs prefill alone (its decode steps are its
+        # peer's): no decode staircase there; the decode side keeps it.
+        assert side.prefill_only is (role == "prefill")
+        # A side of two ranks plans both, each request pinned to its rank.
         two = sglang_warmup.warmup_inputs(
             SimpleNamespace(disaggregation_mode=role, dp_size=2), facts
         )
         assert (two.data_parallel_size, two.lone_leg_bootstrap) == (2, "2.2.2.2")
-    assert sglang_warmup.warmup_inputs(SimpleNamespace(), facts).lone_leg_bootstrap is None
+        assert two.prefill_only is (role == "prefill")
+    single = sglang_warmup.warmup_inputs(SimpleNamespace(), facts)
+    assert single.lone_leg_bootstrap is None and single.prefill_only is False
     # An aggregated engine of two ranks plans both on the wire that pins; on
     # the Python servicer's wire, which forwards no pin, the plan is one
     # rank's and a WARNING says the other rank pays the first-time cost.

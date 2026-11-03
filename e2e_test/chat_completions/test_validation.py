@@ -107,16 +107,18 @@ class TestIgnoreEOS:
 # =============================================================================
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed", "mock")
 @pytest.mark.gpu(1)
-@pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct")
+@pytest.mark.model(
+    "meta-llama/Llama-3.1-8B-Instruct", mock="RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8"
+)
 @pytest.mark.gateway(reuse=True, extra_args=["--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestLargeMaxNewTokens:
     """Tests for handling large max_new_tokens with concurrent requests."""
 
-    def test_concurrent_chat_completions(self, model, api_client):
+    def test_concurrent_chat_completions(self, model, api_client, mock_answers):
         """Test that multiple concurrent requests with large token generation complete.
 
         This test sends multiple requests that ask for long outputs concurrently
@@ -124,6 +126,9 @@ class TestLargeMaxNewTokens:
         """
 
         num_requests = 4
+        # On the mock engine every request takes one of these, in any order.
+        for _ in range(num_requests):
+            mock_answers.enqueue(" ".join(["hello"] * 100) + ".")
 
         def run_chat_completion():
             response = api_client.chat.completions.create(
@@ -244,9 +249,9 @@ class TestGptOssValidation:
 # =============================================================================
 
 
-@pytest.mark.engine("sglang", "vllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "tokenspeed", "mock")
 @pytest.mark.gpu(1)
-@pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct")
+@pytest.mark.model("meta-llama/Llama-3.2-1B-Instruct", mock="RedHatAI/Llama-3.2-1B-Instruct-FP8")
 @pytest.mark.gateway(
     reuse=True, extra_args=["--tool-call-parser", "llama", "--history-backend", "memory"]
 )
@@ -259,13 +264,20 @@ class TestEosTokenStripping:
     strip EOS at the token ID level before decoding, matching vllm/sglang
     HTTP behavior. Without this fix, skip_special_tokens=false causes EOS
     tokens like <|eom_id|> to appear in decoded text.
+
+    On the mock engine each answer ends with the EOS token id and names it as
+    the matched stop, as the engines' token wire does.
     """
 
     # Llama 3 EOS tokens that should never appear in output
     EOS_TOKENS = ["<|eom_id|>", "<|eot_id|>", "<|end_of_text|>"]
+    # The answer the mock engine gives: the text, then the turn's end token.
+    MOCK_ANSWER = "Hello there, nice to meet you.<|eot_id|>"
+    MOCK_EOS_ID = 128009
 
-    def test_no_eos_in_content_default(self, model, api_client):
+    def test_no_eos_in_content_default(self, model, api_client, mock_answers):
         """With default settings, EOS tokens should not appear in content."""
+        mock_answers.enqueue(self.MOCK_ANSWER, matched_stop=self.MOCK_EOS_ID)
         response = api_client.chat.completions.create(
             model=model,
             messages=[
@@ -280,8 +292,9 @@ class TestEosTokenStripping:
         for eos in self.EOS_TOKENS:
             assert eos not in content, f"EOS token {eos} leaked into content: {content}"
 
-    def test_no_eos_in_content_skip_special_false(self, model, api_client):
+    def test_no_eos_in_content_skip_special_false(self, model, api_client, mock_answers):
         """With skip_special_tokens=false, EOS should still be stripped by StopDecoder."""
+        mock_answers.enqueue(self.MOCK_ANSWER, matched_stop=self.MOCK_EOS_ID)
         response = api_client.chat.completions.create(
             model=model,
             messages=[
@@ -297,8 +310,12 @@ class TestEosTokenStripping:
         for eos in self.EOS_TOKENS:
             assert eos not in content, f"EOS token {eos} leaked into content: {content}"
 
-    def test_no_eos_in_tool_call_with_tools(self, model, api_client):
+    def test_no_eos_in_tool_call_with_tools(self, model, api_client, mock_answers):
         """With tools and skip_special_tokens=false, tool calls should not contain EOS."""
+        mock_answers.enqueue(
+            '[{"name": "add", "parameters": {"a": 3, "b": 5}}]<|eot_id|>',
+            matched_stop=self.MOCK_EOS_ID,
+        )
         tools = [
             {
                 "type": "function",
@@ -345,9 +362,10 @@ class TestEosTokenStripping:
                     f"EOS token {eos} in content: {choice.message.content}"
                 )
 
-    def test_no_stop_trim_with_skip_special_true(self, model, api_client):
+    def test_no_stop_trim_with_skip_special_true(self, model, api_client, mock_answers):
         """With no_stop_trim=true and skip_special_tokens=true (default),
         EOS should be kept in token list but invisible (decoded to empty)."""
+        mock_answers.enqueue(self.MOCK_ANSWER, matched_stop=self.MOCK_EOS_ID)
         response = api_client.chat.completions.create(
             model=model,
             messages=[
@@ -365,9 +383,10 @@ class TestEosTokenStripping:
                 f"EOS token {eos} should be invisible with skip_special_tokens=true: {content}"
             )
 
-    def test_no_stop_trim_with_skip_special_false(self, model, api_client):
+    def test_no_stop_trim_with_skip_special_false(self, model, api_client, mock_answers):
         """With no_stop_trim=true and skip_special_tokens=false,
         EOS should be visible in output (matching sglang behavior)."""
+        mock_answers.enqueue(self.MOCK_ANSWER, matched_stop=self.MOCK_EOS_ID)
         response = api_client.chat.completions.create(
             model=model,
             messages=[

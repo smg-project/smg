@@ -18,7 +18,10 @@ pub(super) const STATS_INTERVAL: Duration = Duration::from_secs(10);
 /// vLLM's periodic stats line. Its AsyncLLM logs one every interval; the
 /// headless engine has no frontend to do it, so the servicer does, from the
 /// piggybacked scheduler stats and its own token counters. One line marks the
-/// transition to idle, then it stays quiet until there is traffic again.
+/// transition to idle, then it stays quiet until there is traffic again. The
+/// frontend's `KV Transfer metrics` line comes the same way: whenever a rank's
+/// KV connector reported transfers since the last tick, its figures in the
+/// frontend's words.
 pub(super) async fn log_engine_stats(state: Arc<State>) {
     let mut ticker = tokio::time::interval(STATS_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -29,6 +32,9 @@ pub(super) async fn log_engine_stats(state: Arc<State>) {
         let Some(client) = state.shared.engine.client.get() else {
             continue;
         };
+        for (engine_index, transfers) in client.take_kv_transfer() {
+            info!(engine_index, "KV Transfer metrics: {}", transfers.summary());
+        }
         let prompt = state.shared.metrics.prompt_tokens_total();
         let generation = state.shared.metrics.generation_tokens_total();
         let prompt_delta = prompt.saturating_sub(last_prompt);

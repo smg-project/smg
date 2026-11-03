@@ -221,7 +221,7 @@ class TestStateManagementOracleCustom(_StateManagementCloudBase):
 # =============================================================================
 
 
-@pytest.mark.engine("sglang")
+@pytest.mark.engine("sglang", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.e2e
 @pytest.mark.model("Qwen/Qwen2.5-14B-Instruct")
@@ -229,7 +229,11 @@ class TestStateManagementOracleCustom(_StateManagementCloudBase):
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
 class TestStateManagementLocal:
-    """State management tests against local gRPC backend."""
+    """State management tests against local gRPC backend.
+
+    On the mock engine each test states the model's answers first (``mock_answers``, a
+    no-op on a real engine), one per request the gateway sends.
+    """
 
     def test_previous_response_id_invalid(self, model, api_client):
         """Test using invalid previous_response_id."""
@@ -241,8 +245,9 @@ class TestStateManagementLocal:
                 max_output_tokens=50,
             )
 
-    def test_basic_response_creation(self, model, api_client):
+    def test_basic_response_creation(self, model, api_client, mock_answers):
         """Test basic response creation without state."""
+        mock_answers.enqueue("2 + 2 = 4.")
         resp = api_client.responses.create(model=model, input="What is 2+2?")
 
         assert resp.id is not None
@@ -252,8 +257,9 @@ class TestStateManagementLocal:
         assert resp.usage is not None
         assert resp.usage.total_tokens == resp.usage.input_tokens + resp.usage.output_tokens
 
-    def test_streaming_response(self, model, api_client):
+    def test_streaming_response(self, model, api_client, mock_answers):
         """Test streaming response."""
+        mock_answers.enqueue("1, 2, 3, 4, 5.")
         resp = api_client.responses.create(
             model=model, input="Count to 5", stream=True, max_output_tokens=50
         )
@@ -264,8 +270,19 @@ class TestStateManagementLocal:
 
         assert any(e.type in ["response.completed", "response.in_progress"] for e in events)
 
-    def test_previous_response_id_chaining(self, model, api_client):
+    def test_previous_response_id_chaining(self, model, api_client, mock_answers):
         """Test chaining responses using previous_response_id."""
+        # The first two answers are long on purpose: a chained turn must report
+        # more input tokens than the previous turn's prompt and output together,
+        # and that check tells a dropped stored turn only when the turn's answer
+        # outweighs the next user message and its template tokens.
+        remember = " I will keep that in mind for the rest of our conversation."
+        for answer in (
+            "Noted: you are Alice, your friend is Bob." + remember * 6,
+            "Your name is Alice." + remember * 6,
+            "Your friend is Bob.",
+        ):
+            mock_answers.enqueue(answer)
         # First response
         resp1 = api_client.responses.create(
             model=model, input="My name is Alice and my friend is Bob. Remember it."
@@ -280,6 +297,11 @@ class TestStateManagementLocal:
         assert resp2.error is None
         assert resp2.status == "completed"
         assert "Alice" in resp2.output_text
+        # the stored turn is part of the second prompt: a chained turn reports
+        # more input tokens than the previous turn's prompt and output together
+        # (on the mock, the prompt's own length; on an engine, the same)
+        assert resp1.usage is not None and resp2.usage is not None
+        assert resp2.usage.input_tokens > resp1.usage.input_tokens + resp1.usage.output_tokens
 
         # Third response referencing second
         resp3 = api_client.responses.create(
@@ -290,9 +312,12 @@ class TestStateManagementLocal:
         assert resp3.error is None
         assert resp3.status == "completed"
         assert "Bob" in resp3.output_text
+        assert resp3.usage is not None
+        assert resp3.usage.input_tokens > resp2.usage.input_tokens + resp2.usage.output_tokens
 
-    def test_store_false_not_retrievable(self, model, api_client):
+    def test_store_false_not_retrievable(self, model, api_client, mock_answers):
         """Test that store=false responses cannot be retrieved."""
+        mock_answers.enqueue("Hello!")
         resp = api_client.responses.create(model=model, input="Hello", store=False)
         assert resp.id is not None
         assert resp.status == "completed"
@@ -300,8 +325,9 @@ class TestStateManagementLocal:
         with pytest.raises((openai.NotFoundError, smg_client.NotFoundError)):
             api_client.responses.retrieve(response_id=resp.id)
 
-    def test_store_false_previous_response_id_rejected(self, model, api_client):
+    def test_store_false_previous_response_id_rejected(self, model, api_client, mock_answers):
         """Test that store=false response id cannot be used as previous_response_id."""
+        mock_answers.enqueue("Hello!")
         resp = api_client.responses.create(model=model, input="Hello", store=False)
         assert resp.id is not None
 
@@ -312,8 +338,9 @@ class TestStateManagementLocal:
                 previous_response_id=resp.id,
             )
 
-    def test_mutually_exclusive_parameters(self, model, api_client):
+    def test_mutually_exclusive_parameters(self, model, api_client, mock_answers):
         """Test that previous_response_id and conversation are mutually exclusive."""
+        mock_answers.enqueue("Tested.")
         conversation_id = "conv_123"
         resp1 = api_client.responses.create(model=model, input="Test")
 
@@ -331,10 +358,10 @@ class TestStateManagementLocal:
 # =============================================================================
 
 
-@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed")
+@pytest.mark.engine("sglang", "vllm", "trtllm", "tokenspeed", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.e2e
-@pytest.mark.model("openai/gpt-oss-20b")
+@pytest.mark.model("openai/gpt-oss-20b", mock="openai/gpt-oss-20b")
 @pytest.mark.gateway(extra_args=["--history-backend", "memory"])
 @pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
 @pytest.mark.parametrize("api_client", ["openai", "smg"], indirect=True)
@@ -351,8 +378,9 @@ class TestStateManagementGptOss:
                 max_output_tokens=50,
             )
 
-    def test_basic_response_creation(self, model, api_client):
+    def test_basic_response_creation(self, model, api_client, mock_answers):
         """Test basic response creation without state."""
+        mock_answers.enqueue("2 + 2 = 4.")
         resp = api_client.responses.create(model=model, input="What is 2+2?")
 
         assert resp.id is not None
@@ -362,8 +390,9 @@ class TestStateManagementGptOss:
         assert resp.usage is not None
         assert resp.usage.total_tokens == resp.usage.input_tokens + resp.usage.output_tokens
 
-    def test_streaming_response(self, model, api_client):
+    def test_streaming_response(self, model, api_client, mock_answers):
         """Test streaming response."""
+        mock_answers.enqueue("1, 2, 3, 4, 5.")
         resp = api_client.responses.create(
             model=model, input="Count to 5", stream=True, max_output_tokens=50
         )
@@ -374,8 +403,12 @@ class TestStateManagementGptOss:
 
         assert any(e.type in ["response.completed", "response.in_progress"] for e in events)
 
-    def test_previous_response_id_chaining(self, model, api_client):
+    def test_previous_response_id_chaining(self, model, api_client, mock_answers):
         """Test chaining responses using previous_response_id."""
+        # On the mock: the three turns' answers, in order.
+        mock_answers.enqueue("Noted: you are Alice, your friend is Bob.")
+        mock_answers.enqueue("Your name is Alice.")
+        mock_answers.enqueue("Your friend is Bob.")
         # First response
         resp1 = api_client.responses.create(
             model=model, input="My name is Alice and my friend is Bob. Remember it."
@@ -401,8 +434,9 @@ class TestStateManagementGptOss:
         assert resp3.status == "completed"
         assert "Bob" in resp3.output_text
 
-    def test_store_false_not_retrievable(self, model, api_client):
+    def test_store_false_not_retrievable(self, model, api_client, mock_answers):
         """Test that store=false responses cannot be retrieved."""
+        mock_answers.enqueue("Hello!")
         resp = api_client.responses.create(model=model, input="Hello", store=False)
         assert resp.id is not None
         assert resp.status == "completed"
@@ -410,8 +444,9 @@ class TestStateManagementGptOss:
         with pytest.raises((openai.NotFoundError, smg_client.NotFoundError)):
             api_client.responses.retrieve(response_id=resp.id)
 
-    def test_store_false_previous_response_id_rejected(self, model, api_client):
+    def test_store_false_previous_response_id_rejected(self, model, api_client, mock_answers):
         """Test that store=false response id cannot be used as previous_response_id."""
+        mock_answers.enqueue("Hello!")
         resp = api_client.responses.create(model=model, input="Hello", store=False)
         assert resp.id is not None
 
@@ -422,8 +457,9 @@ class TestStateManagementGptOss:
                 previous_response_id=resp.id,
             )
 
-    def test_mutually_exclusive_parameters(self, model, api_client):
+    def test_mutually_exclusive_parameters(self, model, api_client, mock_answers):
         """Test that previous_response_id and conversation are mutually exclusive."""
+        mock_answers.enqueue("OK.")
         conversation_id = "conv_123"
         resp1 = api_client.responses.create(model=model, input="Test")
 
@@ -441,7 +477,7 @@ class TestStateManagementGptOss:
 # =============================================================================
 
 
-@pytest.mark.engine("sglang")
+@pytest.mark.engine("sglang", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.e2e
 @pytest.mark.model("Qwen/Qwen2.5-14B-Instruct")
@@ -450,10 +486,11 @@ class TestStateManagementGptOss:
 class TestResponseObjectShapeLocal:
     """The Response object carries every field the public API always returns."""
 
-    def test_response_object_carries_always_present_fields(self, setup_backend):
+    def test_response_object_carries_always_present_fields(self, setup_backend, mock_answers):
         """Spec-required fields are present (``null`` when unset) and the
         request-parameter echoes carry their defaults; read on the raw JSON so a
         tolerant SDK model cannot hide a missing key."""
+        mock_answers.enqueue("Hi!")
         _, model_path, _, gw = setup_backend
         resp = httpx.post(
             f"{gw.base_url}/v1/responses",
@@ -483,7 +520,7 @@ class TestResponseObjectShapeLocal:
 # =============================================================================
 
 
-@pytest.mark.engine("sglang")
+@pytest.mark.engine("sglang", "mock")
 @pytest.mark.gpu(1)
 @pytest.mark.e2e
 @pytest.mark.model("Qwen/Qwen2.5-14B-Instruct")
@@ -502,7 +539,9 @@ class TestItemReferenceLocal:
             timeout=120.0,
         )
 
-    def test_item_reference_resolves_a_stored_output_item(self, setup_backend):
+    def test_item_reference_resolves_a_stored_output_item(self, setup_backend, mock_answers):
+        for answer in ("Blue.", "Green."):
+            mock_answers.enqueue(answer)
         _, model_path, _, gw = setup_backend
         first = self._post(
             gw,

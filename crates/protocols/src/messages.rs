@@ -414,8 +414,9 @@ pub enum Role {
     /// own template. See <https://github.com/smg-project/smg/issues/1795>. A
     /// renderer whose reference writes no turn for a system message past the
     /// leading run (`RendererCapabilities::leading_system_only`) gets such a
-    /// message as a user turn at its position instead, so the prompt keeps
-    /// its assistant header; the leading run is the system prompt and stays.
+    /// message as a user turn at its position instead, set off from the text
+    /// before it rather than glued to it; the leading run is the system
+    /// prompt and stays.
     System,
 }
 

@@ -10,12 +10,12 @@ if command -v sudo >/dev/null 2>&1; then
     sudo dpkg --configure -a --force-confnew 2>/dev/null || true
     bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_mirror.sh"
     bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_update.sh" sudo
-    sudo apt-get install -y build-essential libssl-dev pkg-config protobuf-compiler
+    bash "$(dirname "${BASH_SOURCE[0]}")/ci_retry.sh" 3 10 sudo apt-get install -y build-essential libssl-dev pkg-config protobuf-compiler
 else
     dpkg --configure -a --force-confnew 2>/dev/null || true
     bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_mirror.sh"
     bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_update.sh"
-    apt-get install -y build-essential libssl-dev pkg-config protobuf-compiler
+    bash "$(dirname "${BASH_SOURCE[0]}")/ci_retry.sh" 3 10 apt-get install -y build-essential libssl-dev pkg-config protobuf-compiler
 fi
 
 # Install rustup (Rust installer and version manager)
