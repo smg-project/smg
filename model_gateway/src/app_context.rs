@@ -1328,8 +1328,8 @@ mod tests {
             .is_err());
     }
 
-    #[test]
-    fn maybe_rate_limit_manager_enabled_with_valid_policy_succeeds() {
+    #[tokio::test]
+    async fn maybe_rate_limit_manager_enabled_with_valid_policy_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rate_limit.yaml");
         std::fs::write(

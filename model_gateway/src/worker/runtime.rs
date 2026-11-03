@@ -86,6 +86,55 @@ impl RoutingState {
     }
 }
 
+/// The `smg_worker_state` series, `(state, reason)`, in the order the routing
+/// decision reads the facts ([`Worker::is_available`]): the status first,
+/// then the overload veto, the liveness veto, the circuit breaker.
+pub(super) const ROUTING_STATE_SERIES: [(&str, &str); 9] = [
+    ("available", "none"),
+    ("excluded", "pending"),
+    ("excluded", "not_ready"),
+    ("excluded", "failed"),
+    ("excluded", "draining"),
+    ("excluded", "overloaded"),
+    ("excluded", "unreachable"),
+    ("excluded", "wedged"),
+    ("excluded", "circuit_open"),
+];
+
+/// The published-state code of the `circuit_open` series (its index plus
+/// one): the one series a read of the breaker can end, when the breaker's
+/// timeout moves it from open to half-open.
+pub(super) const CIRCUIT_OPEN_CODE: u8 = 9;
+const _: () = assert!(matches!(
+    ROUTING_STATE_SERIES[CIRCUIT_OPEN_CODE as usize - 1]
+        .1
+        .as_bytes(),
+    b"circuit_open"
+));
+
+/// The index in [`ROUTING_STATE_SERIES`] of a worker with these facts: the
+/// first that excludes it, else available.
+pub(super) fn routing_state_series(
+    status: WorkerStatus,
+    overloaded: bool,
+    stall: Option<StallReason>,
+    circuit_open: bool,
+) -> usize {
+    match status {
+        WorkerStatus::Pending => 1,
+        WorkerStatus::NotReady => 2,
+        WorkerStatus::Failed => 3,
+        WorkerStatus::Draining => 4,
+        WorkerStatus::Ready if overloaded => 5,
+        WorkerStatus::Ready => match stall {
+            Some(StallReason::Unreachable) => 6,
+            Some(StallReason::Wedged) => 7,
+            None if circuit_open => 8,
+            None => 0,
+        },
+    }
+}
+
 /// Shared mutable worker state preserved across same-URL replacements.
 #[derive(Debug)]
 pub struct WorkerRuntime {
