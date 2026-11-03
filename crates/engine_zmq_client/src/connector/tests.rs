@@ -1299,7 +1299,7 @@ async fn a_wave_drained_while_a_handed_prompt_is_unanswered_wakes_the_group_agai
 
     // The holder answers and finishes the prompt: the next drain is
     // bookkeeping again, and the group stays parked.
-    answered_prompt_leaves_the_group_parked(&client, &mut engines, &mut stream, "req-1", again)
+    answered_prompt_leaves_the_group_parked(&client, &mut engines, &mut stream, "req-1", 0, again)
         .await;
 
     // A later prompt is owed its own re-wake: the bound is per prompt, not
@@ -1329,8 +1329,15 @@ async fn a_holder_whose_add_is_still_unread_after_the_rewoken_wave_is_woken_agai
 
     // The holder's loop reads the add at last and answers it: the next
     // drain is bookkeeping again, and the group stays parked.
-    answered_prompt_leaves_the_group_parked(&client, &mut engines, &mut stream, "req-1", once_more)
-        .await;
+    answered_prompt_leaves_the_group_parked(
+        &client,
+        &mut engines,
+        &mut stream,
+        "req-1",
+        0,
+        once_more,
+    )
+    .await;
 }
 
 /// Submit `request_id` pinned to `rank` on a two-rank lockstep group: the
@@ -1381,20 +1388,22 @@ async fn drained_then_woken_again(engines: &mut [MockEngine], parked: u64, drain
     again
 }
 
-/// The holder answers and finishes `request_id`: the next drain, of the wave
-/// the group `parked` on, is bookkeeping again and the group stays parked.
-/// Nothing else may have reached a rank meanwhile: the reports of one park
-/// were one wake.
+/// The holder, `rank`, answers and finishes `request_id`: the next drain, of
+/// the wave the group `parked` on, is bookkeeping again and the group stays
+/// parked. Nothing else may have reached the other rank meanwhile: the
+/// reports of one park were one wake.
 async fn answered_prompt_leaves_the_group_parked(
     client: &EngineCoreClient,
     engines: &mut [MockEngine],
     stream: &mut EngineCoreStream,
     request_id: &str,
+    rank: u32,
     parked: u64,
 ) {
-    engines[0]
+    let other = (1 - rank) as usize;
+    engines[rank as usize]
         .send_output(batch(
-            0,
+            rank,
             EngineCoreOutput {
                 request_id: request_id.into(),
                 new_token_ids: vec![10],
@@ -1410,8 +1419,8 @@ async fn answered_prompt_leaves_the_group_parked(
         .unwrap()
         .is_ok());
     assert!(stream.next().await.is_none());
-    engines[0]
-        .send_output(wave_control(0, DpControlMessage::WaveComplete(parked)))
+    engines[rank as usize]
+        .send_output(wave_control(rank, DpControlMessage::WaveComplete(parked)))
         .await
         .unwrap();
     tokio::time::timeout(TIMEOUT, async {
@@ -1422,7 +1431,7 @@ async fn answered_prompt_leaves_the_group_parked(
     .await
     .expect("the drained wave never reached the clock");
     assert!(
-        tokio::time::timeout(Duration::from_millis(100), engines[1].recv())
+        tokio::time::timeout(Duration::from_millis(100), engines[other].recv())
             .await
             .is_err(),
         "a drained wave with nothing pending woke the group"
