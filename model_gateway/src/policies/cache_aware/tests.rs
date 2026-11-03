@@ -3864,11 +3864,9 @@ fn hash_mode_hit_records_the_selected_holders_age() {
         .unwrap_or_else(|| panic!("no hash reuse age; rendered:\n{rendered}"))
         .parse()
         .unwrap();
-    // Whole seconds since the placement; the test may cross one.
-    assert!(
-        (30.0..=31.0).contains(&sum),
-        "{sum}: w1's age, not w2's 5 s"
-    );
+    // Whole seconds since the placement, so a slow run reads more: w1's age
+    // is 30 plus the run's delay, w2's would be 5 plus it.
+    assert!((30.0..60.0).contains(&sum), "{sum}: w1's age, not w2's 5 s");
 }
 
 #[test]
