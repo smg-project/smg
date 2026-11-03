@@ -7566,7 +7566,7 @@ dependencies = [
 
 [[package]]
 name = "smg"
-version = "1.14.0-rc.1"
+version = "1.14.0-rc.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -7765,7 +7765,7 @@ dependencies = [
 
 [[package]]
 name = "smg-golang"
-version = "1.14.0-rc.1"
+version = "1.14.0-rc.2"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -7881,7 +7881,7 @@ dependencies = [
 
 [[package]]
 name = "smg-python"
-version = "1.14.0-rc.1"
+version = "1.14.0-rc.2"
 dependencies = [
  "bytes",
  "engine-servicer",

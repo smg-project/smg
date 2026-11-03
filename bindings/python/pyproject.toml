@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "smg"
-version = "1.14.0-rc.1"
+version = "1.14.0-rc.2"
 description = "High-performance Rust-based inference gateway for large-scale LLM deployments"
 authors = [
     {name = "Simo Lin", email = "linsimo.mark@gmail.com"},
