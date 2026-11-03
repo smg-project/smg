@@ -236,7 +236,7 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 
 <!-- models: begin -->
 224 groups, 397 checkpoints, newest first.
-12 ready, 157 replaying a recorded set, 6 on main awaiting fixtures, 49 pending.
+12 ready, 159 replaying a recorded set, 4 on main awaiting fixtures, 49 pending.
 
 | Released | Group | Model | Also | Table | bellwether set | Status | SMG today |
 |---|---|---|---|---|---:|---|---|
@@ -287,7 +287,7 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2026-05-01 | [apertus-v1.1-4b-instruct](https://github.com/smg-project/bellwether/tree/main/fixtures/apertus-v1.1-4b-instruct) | swiss-ai/Apertus-v1.1-4B-Instruct | Apertus-v1.1-0.5B-Instruct, Apertus-v1.1-1.5B-Instruct | — | 184,972 | pending | none |
 | 2026-04-27 | [mimo-v2.5](https://github.com/smg-project/bellwether/tree/main/fixtures/mimo-v2.5) | XiaomiMiMo/MiMo-V2.5 | MiMo-V2.5-Base | `qwen3`, tagged calls, the value between the tags | 589,278 | replaying the set | none |
 | 2026-04-23 | [laguna-xs.2](https://github.com/smg-project/bellwether/tree/main/fixtures/laguna-xs.2) | poolside/Laguna-XS.2 |  | `glm4` | 490,452 | replaying the set | none |
-| 2026-04-22 | [deepseek-v4-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4-flash) | deepseek-ai/DeepSeek-V4-Flash | DeepSeek-V4-Pro | `deepseek_v4` | — | awaiting fixtures | `deepseek_v4`, `deepseek_v4` |
+| 2026-04-22 | [deepseek-v4-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v4-flash) | deepseek-ai/DeepSeek-V4-Flash | DeepSeek-V4-Pro | `deepseek_v4` | 28 | replaying the set | `deepseek_v4`, `deepseek_v4` |
 | 2026-04-21 | [qwen3.6-27b](https://github.com/smg-project/bellwether/tree/main/fixtures/qwen3.6-27b) | Qwen/Qwen3.6-27B |  | `qwen3`, tagged calls | 474,563 | replaying the set | `qwen_xml`, `qwen3` |
 | 2026-04-19 | [bar-2x7b-base](https://github.com/smg-project/bellwether/tree/main/fixtures/bar-2x7b-base) | allenai/BAR-2x7B-Base |  | — | 328,662 | pending | none |
 | 2026-04-19 | [bar-2x7b-code](https://github.com/smg-project/bellwether/tree/main/fixtures/bar-2x7b-code) | allenai/BAR-2x7B-Code | BAR-2x7B-Code-SFT, BAR-2x7B-Safety, BAR-2x7B-Tool-Use, BAR-5x7B | — | 328,662 | pending | none |
@@ -341,7 +341,7 @@ table and no alias: it stays on the Harmony pipeline, by the maintainers' decisi
 | 2025-12-07 | [glm-4.6v](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-4.6v) | zai-org/GLM-4.6V |  | `glm4` | 492,389 | replaying the set | `glm45_moe`, none |
 | 2025-12-07 | [glm-4.6v-flash](https://github.com/smg-project/bellwether/tree/main/fixtures/glm-4.6v-flash) | zai-org/GLM-4.6V-Flash |  | `glm4` | 492,389 | replaying the set | `glm45_moe`, none |
 | 2025-12-04 | [nvidia-nemotron-3-nano-30b-a3b-bf16](https://github.com/smg-project/bellwether/tree/main/fixtures/nvidia-nemotron-3-nano-30b-a3b-bf16) | nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 |  | `qwen3`, tagged calls | 12,829 | replaying the set | `qwen_xml`, `nano_v3` |
-| 2025-12-01 | [deepseek-v3.2](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v3.2) | deepseek-ai/DeepSeek-V3.2 | DeepSeek-V3.2-Speciale | `deepseek_v3.2` | — | awaiting fixtures | `deepseek32`, none |
+| 2025-12-01 | [deepseek-v3.2](https://github.com/smg-project/bellwether/tree/main/fixtures/deepseek-v3.2) | deepseek-ai/DeepSeek-V3.2 | DeepSeek-V3.2-Speciale | `deepseek_v3.2` | 19 | replaying the set | `deepseek32`, none |
 | 2025-12-01 | [trinity-mini](https://github.com/smg-project/bellwether/tree/main/fixtures/trinity-mini) | arcee-ai/Trinity-Mini |  | — | — | pending | none |
 | 2025-11-28 | [devstral-2-123b-instruct-2512](https://github.com/smg-project/bellwether/tree/main/fixtures/devstral-2-123b-instruct-2512) | mistralai/Devstral-2-123B-Instruct-2512 |  | `mistral_v13` | 570,194 | replaying the set | none |
 | 2025-11-25 | [nemotron-orchestrator-8b](https://github.com/smg-project/bellwether/tree/main/fixtures/nemotron-orchestrator-8b) | nvidia/Nemotron-Orchestrator-8B | IQuestLab/Fleming-R1-32B | `qwen3` | 583,086 | replaying the set | none |

@@ -730,8 +730,8 @@ const GROUPS: &[Group] = &[
         released: "2025-12-01",
         smg: (Some("deepseek32"), None),
         table: Some(Table::DeepSeekV3_2),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(19),
+        status: Status::Replaying,
     },
     Group {
         slug: "deepseek-v3.2-exp",
@@ -750,8 +750,8 @@ const GROUPS: &[Group] = &[
         released: "2026-04-22",
         smg: (Some("deepseek_v4"), Some("deepseek_v4")),
         table: Some(Table::DeepSeekV4),
-        set: None,
-        status: Status::AwaitingFixtures,
+        set: Some(28),
+        status: Status::Replaying,
     },
     Group {
         slug: "deepseek-v4.1-flash",

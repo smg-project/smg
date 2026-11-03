@@ -101,7 +101,11 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
   opens a block written without the blank line, as it did; what precedes it is content (the
   legacy parser trims those newlines too). The prompt ends with `<think>` in thinking mode and
   with `</think>` right after `<｜Assistant｜>` in chat mode, so the replay starts the output inside
-  the thought or in the content; bellwether has not recorded the group's set yet.
+  the thought or in the content. bellwether records the group's hand-written sets through the
+  engine's copy of the encoder (V4-Pro shares the group and replays its sets under its own row),
+  and the corpus harness (`tests/bellwether_parse_fixtures.rs`) replays them from the fixture pin:
+  28 parse cases, sixteen common and twelve turns, every one bitwise but the listed reasoning
+  probe (bellwether #16).
 - **A turn the prompt leaves unopened starts inside the thought.** The template writes
   `<｜Assistant｜>` and the thought's opener after a user message, and after a system message that
   ends the conversation or that an assistant turn follows (a coding agent's environment notes and
@@ -170,10 +174,13 @@ every cut, and once each a thought and an answer, a calls block inside the thoug
 inside a string value, and the turn after a tool result in thinking and in chat mode. The other
 shapes of a tool-calling conversation (two calls in one block, a call after content, a call with
 no parameters, every kind of value, non-ASCII text) are hand-written cases of bellwether's sets,
-which its recorder renders through the encoder once the group has a manifest there; the corpus
-harness replays them from the fixture pin, and until then nothing in this repository checks what
-they parse to; the README row says awaiting fixtures until the pin holds it. What the table
-leaves open: the recorded set, and the live reading against the engine's own server.
+which its recorder renders through the engine's copy of the encoder (V3.2 and V3.2-Speciale as one
+group, V3.2-Exp as its own); the corpus harness (`tests/bellwether_parse_fixtures.rs`) replays
+them from the fixture pin: 19 parse cases a group, eleven common and eight turns, every one
+bitwise. The nine cases whose message carries a thought are not recorded: the encoder's chat-mode
+default renders none for a request that leaves the thinking switch alone, and the recorder
+refuses a reference the rendered turn does not carry. What the table leaves open: the live
+reading against the engine's own server.
 
 ## DeepSeek V3.1 (`deepseek_v3.1`)
 
