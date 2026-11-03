@@ -1235,7 +1235,8 @@ connected ranks is refused as the caller's error. On the prefill side of a disag
 the rank of its room's residue instead (`bootstrap_room % dp_size`: SGLang's
 prefill side follows the room and its KV sender fails a request placed
 elsewhere, and the decode side looks for the KV on that rank), the Router's pin
-yielding to it with a warning; the decode side keeps the pin. A prefill leg of
+yielding to it (a warning on the connection's first such request, a debug line
+on each later one); the decode side keeps the pin. A prefill side of
 several plain data-parallel replicas (`--dp-size N` without attention DP) is
 refused at launch with the engine's reason: every replica reports attention-DP
 rank 0 to the engine's KV sender, which fails each request whose room's residue

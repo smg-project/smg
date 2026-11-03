@@ -42,7 +42,9 @@ use tonic_health::pb::{
 use super::*;
 use crate::{
     kv_events,
-    testing::{assert_bucket_edges, assert_golden, http_get, servicer_config, Bounded},
+    testing::{
+        assert_bucket_edges, assert_golden, captured_logs, http_get, servicer_config, Bounded,
+    },
     ServicerError,
 };
 
@@ -2145,9 +2147,12 @@ async fn an_idle_rank_keeps_its_zero_entry_once_a_sibling_reports() {
 /// handshake, not the order or the identity it dialled in with: here the
 /// scheduler that dialled in as identity 0 declares rank 1. An aggregated
 /// request goes where its pin says, under the same numbering, and a pin
-/// outside the ranks is refused as the engine refuses it.
+/// outside the ranks is refused as the engine refuses it. A pin that
+/// disagrees with the room yields to it: the connection's first such request
+/// is the warning line with the request's fields, the second logs below WARN.
 #[tokio::test]
 async fn a_disaggregated_request_is_placed_on_the_rank_of_its_rooms_residue() {
+    let logs = captured_logs();
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
     let mut config = config(dir.path(), &handshake, model_info());
@@ -2205,6 +2210,58 @@ async fn a_disaggregated_request_is_placed_on_the_rank_of_its_rooms_residue() {
         assert_eq!(done.finish_reason, "stop");
         assert!(stream.message().bounded().await.unwrap().is_none());
     }
+
+    // A pin that disagrees with the room yields to it (rooms 9 and 11 are
+    // rank 1, the pin says 0): the connection's first such request is the
+    // WARN line with the request's fields, the second logs below WARN (the
+    // capture reads WARN and above).
+    let mut yielding = disaggregated_request("pinned-9", 9);
+    yielding.data_parallel_rank = Some(0);
+    let mut first_yield = client
+        .generate(yielding)
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank1_in).await;
+    assert_eq!(
+        (add.rid.as_str(), add.bootstrap_room),
+        ("pinned-9", Some(9))
+    );
+    let mut yielding_again = disaggregated_request("pinned-11", 11);
+    yielding_again.data_parallel_rank = Some(0);
+    let mut second_yield = client
+        .generate(yielding_again)
+        .await
+        .expect("generate")
+        .into_inner();
+    let add = recv_add(&mut rank1_in).await;
+    assert_eq!(
+        (add.rid.as_str(), add.bootstrap_room),
+        ("pinned-11", Some(11))
+    );
+    send(&mut rank1_out, &answer("pinned-9", 0)).await;
+    send(&mut rank1_out, &answer("pinned-11", 0)).await;
+    for stream in [&mut first_yield, &mut second_yield] {
+        let done = complete(stream.message().bounded().await.unwrap().unwrap());
+        assert_eq!(done.finish_reason, "stop");
+        assert!(stream.message().bounded().await.unwrap().is_none());
+    }
+    let lines = logs.lines_containing("pinned-9");
+    assert_eq!(lines.len(), 1, "one warning line: {lines:?}");
+    for field in [
+        "WARN",
+        "data_parallel_rank conflicts with the bootstrap_room residue",
+        "data_parallel_rank=0",
+        "bootstrap_room=9",
+        "dp_size=2",
+    ] {
+        assert!(lines[0].contains(field), "{field} in {}", lines[0]);
+    }
+    assert!(
+        logs.lines_containing("pinned-11").is_empty(),
+        "the connection's second yield logs below WARN: {:?}",
+        logs.lines_containing("pinned-11")
+    );
 
     let mut outside = generate_request("pin-9", false, Vec::new());
     outside.data_parallel_rank = Some(9);

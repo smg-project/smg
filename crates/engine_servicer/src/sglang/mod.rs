@@ -16,7 +16,8 @@
 //! prefill side of a disaggregated pair a request runs on the rank of its
 //! room's residue instead (`bootstrap_room % dp_size`: where SGLang's prefill
 //! side requires it and the decode side looks for the KV), the pin yielding
-//! to it with a warning; the decode side keeps the pin.
+//! to it (a warning on the connection's first such request, a debug line on
+//! each later one); the decode side keeps the pin.
 //!
 //! The language side of encode/prefill disaggregation (`--language-only`)
 //! works as behind the engine's own frontend: a request's image references
