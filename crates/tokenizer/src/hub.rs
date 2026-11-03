@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use hf_hub::api::tokio::{Api, ApiBuilder};
+use hf_hub::api::tokio::{Api, ApiBuilder, ApiError};
+use http::StatusCode;
 
 /// Environment variable for HuggingFace token
 /// Note: The hf-hub crate's from_env() doesn't read HF_TOKEN directly,
@@ -134,11 +135,24 @@ pub async fn download_tokenizer_from_hf(model_id: impl AsRef<Path>) -> anyhow::R
         ));
     }
 
-    // Download config files for EOS token loading (best-effort, non-fatal).
+    // The config files the loaders read beside the tokenizer (the model type
+    // of the pipeline rule, the EOS ids), best-effort: a repository shipped
+    // as its tokenizer files alone has neither, and the loaders take a missing
+    // file as absent. Any other failure is logged, so a tokenizer loaded as if
+    // the file were absent can be traced to the fetch that failed.
     // Downloaded separately by name to avoid matching nested files like
     // 1_Pooling/config.json that would break cache_dir resolution.
     for config_file in ["config.json", "generation_config.json"] {
-        let _ = repo.get(config_file).await;
+        if let Err(error) = repo.get(config_file).await {
+            if !is_absent(&error) {
+                tracing::warn!(
+                    model = %model_name,
+                    file = config_file,
+                    %error,
+                    "config file not fetched; the tokenizer loads as if the file were absent"
+                );
+            }
+        }
     }
 
     match cache_dir {
@@ -153,6 +167,17 @@ pub async fn download_tokenizer_from_hf(model_id: impl AsRef<Path>) -> anyhow::R
             "Invalid HF cache path for model '{model_name}'"
         )),
     }
+}
+
+/// `true` when the Hub answered that the file is not in the repository (HTTP
+/// 404): the expected answer of a repository shipped as its tokenizer files
+/// alone. Every other failure (no answer, a 5xx, a proxy error, a denied
+/// token) is a fetch that should have succeeded.
+fn is_absent(error: &ApiError) -> bool {
+    matches!(
+        error,
+        ApiError::RequestError(request) if request.status() == Some(StatusCode::NOT_FOUND)
+    )
 }
 
 /// One file of a Hub repository: served from the local HF cache when it is
@@ -227,7 +252,42 @@ fn resolve_model_cache_dir(path: &Path, model_name: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_chat_template_file, is_tokenizer_file, is_weight_file};
+    use std::io;
+
+    use hf_hub::api::tokio::ApiError;
+
+    use super::{is_absent, is_chat_template_file, is_tokenizer_file, is_weight_file};
+
+    /// The error `repo.get` returns when the Hub answers `status` to the
+    /// file's request (hf-hub runs `error_for_status` on the answer).
+    fn hub_answer(status: u16) -> ApiError {
+        let answer = http::Response::builder()
+            .status(status)
+            .body("")
+            .expect("a valid status code");
+        let error = reqwest_hub::Response::from(answer)
+            .error_for_status()
+            .expect_err("a 4xx or 5xx answer is an error");
+        ApiError::RequestError(error)
+    }
+
+    #[test]
+    fn a_404_answer_is_an_absent_file() {
+        assert!(is_absent(&hub_answer(404)));
+    }
+
+    #[test]
+    fn every_other_failure_is_a_fetch_that_failed() {
+        for status in [401, 403, 429, 500, 502, 503, 504] {
+            assert!(!is_absent(&hub_answer(status)), "status {status}");
+        }
+        assert!(!is_absent(&ApiError::IoError(io::Error::other(
+            "connection reset"
+        ))));
+        assert!(!is_absent(&ApiError::TooManyRetries(Box::new(hub_answer(
+            503
+        )))));
+    }
 
     #[test]
     fn test_is_tokenizer_file() {
