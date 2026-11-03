@@ -9,9 +9,13 @@ import pytest
 import yaml
 
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/nightly-pd.yml"
+DEFAULT_AMD_OPTIONS = (
+    "--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host "
+    "--shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN"
+)
 
 
-def plan(tmp_path, engines="", enabled="false", options="", test_filter=""):
+def plan(tmp_path, engines="", enabled="false", options="", test_filter="", base_options=""):
     workflow = yaml.safe_load(WORKFLOW.read_text())
     script = workflow["jobs"]["plan"]["steps"][0]["run"]
     output = tmp_path / "outputs"
@@ -21,6 +25,7 @@ def plan(tmp_path, engines="", enabled="false", options="", test_filter=""):
         | {
             "ENGINES": engines,
             "AMD_ENABLED": enabled,
+            "AMD_CONTAINER_OPTIONS": base_options,
             "AMD_RDMA_OPTIONS": options,
             "TEST_FILTER": test_filter,
             "GITHUB_OUTPUT": str(output),
@@ -61,7 +66,7 @@ def test_explicit_read_uses_full_suite_and_captures_options_once(tmp_path, optio
     result, values = plan(tmp_path, engines="vllm-amd-moriio-read", options=options)
     assert result.returncode == 0, result.stderr
     assert values == {
-        "amd_read_rdma_options_json": options,
+        "amd_read_rdma_options_json": f"{DEFAULT_AMD_OPTIONS} {options}",
         "matrix": [
             {
                 "engine": "vllm",
@@ -72,6 +77,25 @@ def test_explicit_read_uses_full_suite_and_captures_options_once(tmp_path, optio
             }
         ],
     }
+
+
+@pytest.mark.parametrize(
+    "base_options",
+    [
+        "--device=/dev/kfd --device=/dev/dri --volume /custom:/models --env HF_TOKEN",
+        "--device /dev/kfd --device /dev/dri --volume '/cache with spaces:/models'",
+    ],
+)
+def test_rdma_extras_preserve_custom_amd_base_options(tmp_path, base_options):
+    extras = "--device=/dev/infiniband --ulimit memlock=-1 --cap-add=IPC_LOCK"
+    result, values = plan(
+        tmp_path,
+        engines="vllm-amd-moriio-read",
+        options=extras,
+        base_options=base_options,
+    )
+    assert result.returncode == 0, result.stderr
+    assert values["amd_read_rdma_options_json"] == f"{base_options} {extras}"
 
 
 @pytest.mark.parametrize(

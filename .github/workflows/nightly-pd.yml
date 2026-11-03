@@ -37,6 +37,7 @@ jobs:
           ENGINES: ${{ inputs.engines }}
           TEST_FILTER: ${{ inputs.filter }}
           AMD_ENABLED: ${{ vars.SMG_RUN_AMD_LEGS }}
+          AMD_CONTAINER_OPTIONS: ${{ vars.SMG_AMD_CONTAINER_OPTIONS }}
           AMD_RDMA_OPTIONS: ${{ vars.SMG_AMD_RDMA_CONTAINER_OPTIONS }}
         run: |
           wanted="${ENGINES:-sglang vllm tokenspeed}"
@@ -69,8 +70,11 @@ jobs:
           ):
               raise SystemExit("READ/RDMA needs explicit InfiniBand device options")
           PY_OPTIONS
-              # Capture the public device options once, not a later vars lookup.
-              options_json=$(jq -cn --arg options "$AMD_RDMA_OPTIONS" '$options')
+              # RDMA declarations are extras: preserve the GPU devices, cache,
+              # credentials and IPC settings of the normal AMD container.
+              base_options="${AMD_CONTAINER_OPTIONS:---device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN}"
+              # Capture the combined options once, not a later vars lookup.
+              options_json=$(jq -cn --arg options "$base_options $AMD_RDMA_OPTIONS" '$options')
               echo "amd_read_rdma_options_json=$options_json" >> "$GITHUB_OUTPUT"
             fi
           done
@@ -213,7 +217,7 @@ jobs:
       # (scripts/ci_install_vllm.sh), which ships NIXL, UCX and MoRI. The
       # container gets the GPUs, the runner's model cache and its HF_TOKEN, but
       # no RDMA devices by default, so those rows move KV over XGMI. An explicit
-      # READ/RDMA dispatch instead requires the dedicated, verified RDMA options.
+      # READ/RDMA dispatch adds verified RDMA extras to the same AMD base options.
       gpu_vendor: ${{ matrix.vendor || 'nvidia' }}
       container_image: ${{ matrix.vendor == 'amd' && 'vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f' || '' }}
       container_options: ${{ matrix.moriio_backend == 'rdma' && fromJSON(needs.plan.outputs.amd_read_rdma_options_json) || (matrix.vendor == 'amd' && (vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN') || '') }}
