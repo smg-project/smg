@@ -112,8 +112,12 @@ pub struct OutputConfig {
 /// The thinking preference a prompt is rendered with: the `thinking` block,
 /// else the provider profile's reading of the effort (see
 /// [`crate::chat::ChatCompletionRequest::template_thinking`]).
-fn template_thinking(model: &str, thinking: Option<bool>, effort: Option<&str>) -> Option<bool> {
-    thinking.or_else(|| ProviderProfile::for_model(model).thinking_from_reasoning_effort(effort))
+fn template_thinking_for(
+    provider: ProviderProfile,
+    thinking: Option<bool>,
+    effort: Option<&str>,
+) -> Option<bool> {
+    thinking.or_else(|| provider.thinking_from_reasoning_effort(effort))
 }
 
 impl CreateMessageRequest {
@@ -165,7 +169,13 @@ impl CreateMessageRequest {
 
     /// The thinking preference the prompt is rendered with.
     pub fn template_thinking(&self) -> Option<bool> {
-        template_thinking(&self.model, self.thinking_toggle(), self.reasoning_effort())
+        self.template_thinking_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::template_thinking`] with the model's provider profile the caller
+    /// derived already (the gateway's preparation derives it once per request).
+    pub fn template_thinking_for(&self, provider: ProviderProfile) -> Option<bool> {
+        template_thinking_for(provider, self.thinking_toggle(), self.reasoning_effort())
     }
 
     /// The field the request asks for a structured output format with,
@@ -1629,8 +1639,14 @@ impl CountMessageTokensRequest {
 
     /// The thinking preference the prompt is rendered with.
     pub fn template_thinking(&self) -> Option<bool> {
+        self.template_thinking_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::template_thinking`] with the model's provider profile the caller
+    /// derived already.
+    pub fn template_thinking_for(&self, provider: ProviderProfile) -> Option<bool> {
         let thinking = self.thinking.as_ref().map(ThinkingConfig::enabled);
-        template_thinking(&self.model, thinking, self.reasoning_effort())
+        template_thinking_for(provider, thinking, self.reasoning_effort())
     }
 }
 
